@@ -8,7 +8,30 @@ collaborative CRDT documents, and topic-based gossip messaging.
 
 # Import native extension module
 try:
-    from iroh_python._iroh_python import *
+    from iroh_python._iroh_python import (
+        # Exception
+        IrohError,
+        # Core node
+        IrohNode,
+        # Blobs
+        BlobsClient,
+        blobs_client,
+        # Docs
+        DocsClient,
+        DocHandle,
+        docs_client,
+        # Gossip
+        GossipClient,
+        GossipTopicHandle,
+        gossip_client,
+        # Net / QUIC
+        NetClient,
+        IrohConnection,
+        IrohSendStream,
+        IrohRecvStream,
+        net_client,
+        create_endpoint,
+    )
 except ImportError as e:
     # Provide helpful error if native module not built
     raise ImportError(
@@ -18,5 +41,27 @@ except ImportError as e:
 
 __version__ = "0.1.0"
 
-# __all__ will be populated as modules are implemented
-__all__ = []
+__all__ = [
+    # Exception
+    "IrohError",
+    # Core node
+    "IrohNode",
+    # Blobs
+    "BlobsClient",
+    "blobs_client",
+    # Docs
+    "DocsClient",
+    "DocHandle",
+    "docs_client",
+    # Gossip
+    "GossipClient",
+    "GossipTopicHandle",
+    "gossip_client",
+    # Net / QUIC
+    "NetClient",
+    "IrohConnection",
+    "IrohSendStream",
+    "IrohRecvStream",
+    "net_client",
+    "create_endpoint",
+]

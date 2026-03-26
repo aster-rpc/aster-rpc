@@ -15,6 +15,7 @@ iroh        = { workspace = true }
 iroh-blobs  = { workspace = true }
 iroh-docs   = { workspace = true }
 iroh-gossip = { workspace = true }
+iroh-tickets = { workspace = true }
 # iroh-automerge = { workspace = true }  # Experimental/optional - deferred
 
 # Python FFI
