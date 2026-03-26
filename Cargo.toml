@@ -1,0 +1,23 @@
+[workspace]
+members = ["iroh_python_rs"]
+resolver = "2"
+
+[workspace.dependencies]
+# Core Iroh
+iroh        = "0.97.0"
+
+# Protocol Crates (Option B - Router Pattern)
+iroh-blobs  = "0.99.0"  # ⚠️ Not production-ready per README, but usable
+iroh-docs   = "0.97.0"
+iroh-gossip = "0.97.0"
+# iroh-automerge = { git = "https://github.com/n0-computer/iroh-automerge", branch = "main" }  # Experimental/optional
+
+# Python FFI
+pyo3        = { version = "0.20", features = ["extension-module", "abi3-py39"] }
+pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"] }
+
+# Common dependencies
+tokio       = { version = "1", features = ["full"] }
+bytes       = "1"
+anyhow      = "1"
+futures-lite = "2"

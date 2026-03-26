@@ -1,0 +1,28 @@
+[package]
+name    = "iroh_python_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name    = "iroh_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Core Iroh
+iroh        = { workspace = true }
+
+# Protocol Crates
+iroh-blobs  = { workspace = true }
+iroh-docs   = { workspace = true }
+iroh-gossip = { workspace = true }
+# iroh-automerge = { workspace = true }  # Experimental/optional - deferred
+
+# Python FFI
+pyo3        = { workspace = true }
+pyo3-asyncio = { workspace = true }
+
+# Common dependencies
+tokio       = { workspace = true }
+bytes       = { workspace = true }
+anyhow      = { workspace = true }
+futures-lite = { workspace = true }
