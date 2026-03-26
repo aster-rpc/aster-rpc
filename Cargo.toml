@@ -10,6 +10,7 @@ iroh        = "0.97.0"
 iroh-blobs  = "0.99.0"  # ⚠️ Not production-ready per README, but usable
 iroh-docs   = "0.97.0"
 iroh-gossip = "0.97.0"
+iroh-tickets = "0.4.0"
 # iroh-automerge = { git = "https://github.com/n0-computer/iroh-automerge", branch = "main" }  # Experimental/optional
 
 # Python FFI

@@ -22,6 +22,7 @@ fn _iroh_python(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<node::IrohNode>()?;
     m.add_class::<blobs::BlobsClient>()?;
     m.add_class::<docs::DocsClient>()?;
+    m.add_class::<docs::DocHandle>()?;
     m.add_class::<gossip::GossipClient>()?;
     m.add_class::<gossip::GossipTopicHandle>()?;
     m.add_class::<net::NetClient>()?;

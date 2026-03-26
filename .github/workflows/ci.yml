@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Rust lint ──────────────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: cargo fmt
+        run: cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings
+
+  # ── Build + Test matrix ────────────────────────────────────────────
+  test:
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64
+          - os: macos-14
+            target: aarch64
+          - os: windows-latest
+            target: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create venv & install test deps (unix)
+        if: runner.os != 'Windows'
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install pytest pytest-asyncio pytest-timeout maturin
+        shell: bash
+
+      - name: Create venv & install test deps (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -m venv .venv
+          .venv\Scripts\pip install pytest pytest-asyncio pytest-timeout maturin
+        shell: pwsh
+
+      - name: Build extension (unix)
+        if: runner.os != 'Windows'
+        run: .venv/bin/maturin develop -m iroh_python_rs/Cargo.toml
+
+      - name: Build extension (Windows)
+        if: runner.os == 'Windows'
+        run: .venv\Scripts\maturin develop -m iroh_python_rs/Cargo.toml
+        shell: pwsh
+
+      - name: Run tests (unix)
+        if: runner.os != 'Windows'
+        run: .venv/bin/pytest tests/ -v --timeout=60
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        run: .venv\Scripts\pytest tests/ -v --timeout=60
+        shell: pwsh
