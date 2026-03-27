@@ -1,14 +1,14 @@
-use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use crate::error::err_to_py;
+use crate::node::IrohNode;
+use iroh::address_lookup::memory::MemoryLookup;
+use iroh::endpoint::Endpoint;
+use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::Store as BlobStore;
 use iroh_blobs::ticket::BlobTicket;
 use iroh_blobs::BlobFormat;
-use iroh_blobs::api::downloader::Downloader;
-use iroh::endpoint::Endpoint;
-use iroh::address_lookup::memory::MemoryLookup;
 use iroh_tickets::Ticket;
-use crate::error::err_to_py;
-use crate::node::IrohNode;
+use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 /// Python wrapper for the Iroh Blobs client.
 #[pyclass]
@@ -23,10 +23,7 @@ impl BlobsClient {
     fn add_bytes<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<&'py PyAny> {
         let store = self.store.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
-            let tag_info = store
-                .add_slice(&data)
-                .await
-                .map_err(err_to_py)?;
+            let tag_info = store.add_slice(&data).await.map_err(err_to_py)?;
             Ok(tag_info.hash.to_string())
         })
     }
@@ -36,10 +33,7 @@ impl BlobsClient {
         let store = self.store.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let hash: iroh_blobs::Hash = hash_hex.parse().map_err(err_to_py)?;
-            let data: bytes::Bytes = store
-                .get_bytes(hash)
-                .await
-                .map_err(err_to_py)?;
+            let data: bytes::Bytes = store.get_bytes(hash).await.map_err(err_to_py)?;
             let result: PyObject = Python::with_gil(|py| PyBytes::new(py, &data).into_py(py));
             Ok(result)
         })
@@ -80,10 +74,7 @@ impl BlobsClient {
                 .map_err(err_to_py)?;
 
             // Read downloaded blob from local store
-            let data: bytes::Bytes = store
-                .get_bytes(hash)
-                .await
-                .map_err(err_to_py)?;
+            let data: bytes::Bytes = store.get_bytes(hash).await.map_err(err_to_py)?;
             let result: PyObject = Python::with_gil(|py| PyBytes::new(py, &data).into_py(py));
             Ok(result)
         })

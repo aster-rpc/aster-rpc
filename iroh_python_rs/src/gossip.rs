@@ -6,11 +6,11 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3_asyncio::tokio::future_into_py;
 
+use futures_lite::StreamExt;
 use iroh::EndpointId;
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
-use futures_lite::StreamExt;
 
 use crate::error::err_to_py;
 use crate::node::IrohNode;
@@ -60,16 +60,18 @@ impl GossipTopicHandle {
                         Python::with_gil(|py| PyBytes::new(py, &msg.content).into_py(py));
                     Ok(("received".to_string(), Some(content)))
                 }
-                Event::NeighborUp(id) => Ok(("neighbor_up".to_string(), Some(
-                    Python::with_gil(|py| {
+                Event::NeighborUp(id) => Ok((
+                    "neighbor_up".to_string(),
+                    Some(Python::with_gil(|py| {
                         PyBytes::new(py, id.to_string().as_bytes()).into_py(py)
-                    }),
-                ))),
-                Event::NeighborDown(id) => Ok(("neighbor_down".to_string(), Some(
-                    Python::with_gil(|py| {
+                    })),
+                )),
+                Event::NeighborDown(id) => Ok((
+                    "neighbor_down".to_string(),
+                    Some(Python::with_gil(|py| {
                         PyBytes::new(py, id.to_string().as_bytes()).into_py(py)
-                    }),
-                ))),
+                    })),
+                )),
                 Event::Lagged => {
                     let none: Option<PyObject> = None;
                     Ok(("lagged".to_string(), none))

@@ -15,10 +15,10 @@ pub fn err_to_py(e: impl std::fmt::Display) -> PyErr {
 }
 
 /// Convert anyhow::Error to Python exception
-/// 
+///
 /// This is the central error conversion function. All Rust errors should
 /// be mapped through this function before being returned to Python.
-/// 
+///
 /// Future enhancement: Add downcasting to detect specific error types
 /// and map them to the appropriate Python exception subclass.
 pub fn anyhow_to_py(e: anyhow::Error) -> PyErr {
