@@ -10,8 +10,21 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: cargo fmt
+        run: cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings
+
   # ── Linux (x86_64 + aarch64) ──────────────────────────────────────
   linux:
+    needs: lint
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -34,6 +47,7 @@ jobs:
 
   # ── macOS (x86_64 + aarch64) ──────────────────────────────────────
   macos:
+    needs: lint
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -59,6 +73,7 @@ jobs:
 
   # ── Windows (x86_64) ──────────────────────────────────────────────
   windows:
+    needs: lint
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,6 +92,7 @@ jobs:
 
   # ── Source distribution ────────────────────────────────────────────
   sdist:
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
