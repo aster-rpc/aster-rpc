@@ -4,7 +4,7 @@ use pyo3_asyncio::tokio::future_into_py;
 use iroh::endpoint::{Endpoint, presets};
 use iroh::protocol::Router;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh_blobs::{BlobsProtocol, store::mem::MemStore, ALPN as BLOBS_ALPN};
+use iroh_blobs::{api::Store as BlobStore, BlobsProtocol, store::fs::FsStore, store::mem::MemStore, ALPN as BLOBS_ALPN};
 use iroh_docs::{protocol::Docs, ALPN as DOCS_ALPN};
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 
@@ -22,7 +22,7 @@ pub struct IrohNode {
     pub(crate) blobs: BlobsProtocol,
     pub(crate) docs: Docs,
     pub(crate) gossip: Gossip,
-    pub(crate) store: MemStore,
+    pub(crate) store: BlobStore,
 }
 
 #[pymethods]
@@ -36,13 +36,47 @@ impl IrohNode {
                 .map_err(err_to_py)?;
             endpoint.online().await;
 
-            // MemStore derefs to iroh_blobs::api::Store
-            let store = MemStore::new();
+            let mem_store = MemStore::new();
+            let store: BlobStore = (*mem_store).clone();
             let blobs = BlobsProtocol::new(&store, None);
             let gossip = Gossip::builder().spawn(endpoint.clone());
-            // Docs::memory() returns Builder; Builder::spawn takes (endpoint, Store, gossip)
             let docs = Docs::memory()
-                .spawn(endpoint.clone(), (*store).clone(), gossip.clone())
+                .spawn(endpoint.clone(), store.clone(), gossip.clone())
+                .await
+                .map_err(err_to_py)?;
+
+            let router = Router::builder(endpoint.clone())
+                .accept(BLOBS_ALPN, blobs.clone())
+                .accept(GOSSIP_ALPN, gossip.clone())
+                .accept(DOCS_ALPN, docs.clone())
+                .spawn();
+
+            Ok(IrohNode {
+                endpoint,
+                router,
+                blobs,
+                docs,
+                gossip,
+                store,
+            })
+        })
+    }
+
+    /// Create a persistent Iroh node backed by an FsStore at the given path.
+    #[staticmethod]
+    fn persistent<'py>(py: Python<'py>, path: String) -> PyResult<&'py PyAny> {
+        future_into_py(py, async move {
+            let endpoint = Endpoint::bind(presets::N0)
+                .await
+                .map_err(err_to_py)?;
+            endpoint.online().await;
+
+            let fs_store = FsStore::load(path).await.map_err(err_to_py)?;
+            let store: BlobStore = fs_store.into();
+            let blobs = BlobsProtocol::new(&store, None);
+            let gossip = Gossip::builder().spawn(endpoint.clone());
+            let docs = Docs::memory()
+                .spawn(endpoint.clone(), store.clone(), gossip.clone())
                 .await
                 .map_err(err_to_py)?;
 

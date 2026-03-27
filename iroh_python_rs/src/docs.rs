@@ -2,13 +2,12 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use bytes::Bytes;
+use iroh_blobs::api::Store as BlobStore;
 use iroh_docs::protocol::Docs;
 use iroh_docs::api::Doc;
 use iroh_docs::api::protocol::{ShareMode, AddrInfoOptions};
 use iroh_docs::AuthorId;
 use iroh_tickets::Ticket;
-use iroh_blobs::BlobsProtocol;
-use iroh_blobs::store::mem::MemStore;
 use iroh::address_lookup::memory::MemoryLookup;
 
 use crate::error::err_to_py;
@@ -16,14 +15,14 @@ use crate::error::err_to_py;
 #[pyclass]
 pub struct DocsClient {
     pub(crate) inner: Docs,
-    pub(crate) store: MemStore,
+    pub(crate) store: BlobStore,
     pub(crate) endpoint: iroh::endpoint::Endpoint,
 }
 
 #[pyclass]
 pub struct DocHandle {
     pub(crate) doc: Doc,
-    pub(crate) store: MemStore,
+    pub(crate) store: BlobStore,
 }
 
 #[pymethods]

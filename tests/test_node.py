@@ -3,10 +3,12 @@ Basic tests for IrohNode functionality.
 
 Tests:
 - Node creation (memory)
+- Node creation (persistent)
 - Node ID retrieval
 - Graceful shutdown
 """
 import asyncio
+import tempfile
 import pytest
 
 pytestmark = pytest.mark.asyncio
@@ -61,3 +63,14 @@ async def test_multiple_nodes():
 
     await node1.shutdown()
     await node2.shutdown()
+
+
+async def test_persistent_node_creation():
+    """Test creating a persistent node backed by FsStore."""
+    from iroh_python import IrohNode
+
+    with tempfile.TemporaryDirectory() as td:
+        node = await IrohNode.persistent(td)
+        assert node is not None
+        assert isinstance(node.node_id(), str)
+        await node.shutdown()
