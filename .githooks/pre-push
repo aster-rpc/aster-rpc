@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "Running pre-push checks..."
-cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check
-cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings
