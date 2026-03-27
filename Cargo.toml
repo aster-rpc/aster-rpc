@@ -1,5 +1,5 @@
 [workspace]
-members = ["iroh_python_rs"]
+members = ["iroh_transport_core", "iroh_transport_ffi", "iroh_python_rs"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -22,3 +22,5 @@ tokio       = { version = "1", features = ["full"] }
 bytes       = "1"
 anyhow      = "1"
 futures-lite = "2"
+once_cell = "1"
+libc = "0.2"
