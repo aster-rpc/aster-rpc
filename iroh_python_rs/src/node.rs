@@ -1,10 +1,13 @@
 use pyo3::prelude::*;
 use pyo3_asyncio::tokio::future_into_py;
 
-use iroh::endpoint::{Endpoint, presets};
-use iroh::protocol::Router;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh_blobs::{api::Store as BlobStore, BlobsProtocol, store::fs::FsStore, store::mem::MemStore, ALPN as BLOBS_ALPN};
+use iroh::endpoint::{presets, Endpoint};
+use iroh::protocol::Router;
+use iroh_blobs::{
+    api::Store as BlobStore, store::fs::FsStore, store::mem::MemStore, BlobsProtocol,
+    ALPN as BLOBS_ALPN,
+};
 use iroh_docs::{protocol::Docs, ALPN as DOCS_ALPN};
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 
@@ -31,9 +34,7 @@ impl IrohNode {
     #[staticmethod]
     fn memory<'py>(py: Python<'py>) -> PyResult<&'py PyAny> {
         future_into_py(py, async move {
-            let endpoint = Endpoint::bind(presets::N0)
-                .await
-                .map_err(err_to_py)?;
+            let endpoint = Endpoint::bind(presets::N0).await.map_err(err_to_py)?;
             endpoint.online().await;
 
             let mem_store = MemStore::new();
@@ -66,9 +67,7 @@ impl IrohNode {
     #[staticmethod]
     fn persistent<'py>(py: Python<'py>, path: String) -> PyResult<&'py PyAny> {
         future_into_py(py, async move {
-            let endpoint = Endpoint::bind(presets::N0)
-                .await
-                .map_err(err_to_py)?;
+            let endpoint = Endpoint::bind(presets::N0).await.map_err(err_to_py)?;
             endpoint.online().await;
 
             let fs_store = FsStore::load(path).await.map_err(err_to_py)?;

@@ -1,11 +1,11 @@
 use pyo3::prelude::*;
 
-mod error;
-mod node;
 mod blobs;
 mod docs;
+mod error;
 mod gossip;
 mod net;
+mod node;
 
 /// The native Iroh Python module implemented in Rust.
 #[pymodule]

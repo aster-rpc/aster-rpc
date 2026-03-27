@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3_asyncio::tokio::future_into_py;
 
-use iroh::endpoint::{Endpoint, Connection, presets};
+use iroh::endpoint::{presets, Connection, Endpoint};
 use iroh::EndpointId;
 
 use crate::error::err_to_py;
@@ -165,7 +165,11 @@ impl NetClient {
                 .accept()
                 .await
                 .ok_or_else(|| err_to_py("endpoint closed, no incoming connection"))?;
-            let conn = incoming.accept().map_err(err_to_py)?.await.map_err(err_to_py)?;
+            let conn = incoming
+                .accept()
+                .map_err(err_to_py)?
+                .await
+                .map_err(err_to_py)?;
             Ok(IrohConnection { inner: conn })
         })
     }

@@ -2,13 +2,13 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use bytes::Bytes;
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh_blobs::api::Store as BlobStore;
-use iroh_docs::protocol::Docs;
+use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::api::Doc;
-use iroh_docs::api::protocol::{ShareMode, AddrInfoOptions};
+use iroh_docs::protocol::Docs;
 use iroh_docs::AuthorId;
 use iroh_tickets::Ticket;
-use iroh::address_lookup::memory::MemoryLookup;
 
 use crate::error::err_to_py;
 
@@ -63,7 +63,11 @@ impl DocsClient {
                 }
             }
 
-            let doc = docs.api().import_namespace(ticket.capability).await.map_err(err_to_py)?;
+            let doc = docs
+                .api()
+                .import_namespace(ticket.capability)
+                .await
+                .map_err(err_to_py)?;
             Ok(DocHandle { doc, store })
         })
     }
@@ -123,16 +127,28 @@ impl DocHandle {
 
     /// Share this document, returning a ticket string.
     /// mode: "read" or "write"
-    fn share<'py>(&self, py: Python<'py>, mode: String, endpoint: &crate::node::IrohNode) -> PyResult<&'py PyAny> {
+    fn share<'py>(
+        &self,
+        py: Python<'py>,
+        mode: String,
+        endpoint: &crate::node::IrohNode,
+    ) -> PyResult<&'py PyAny> {
         let doc = self.doc.clone();
         let ep = endpoint.endpoint.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let share_mode = match mode.as_str() {
                 "read" | "Read" => ShareMode::Read,
                 "write" | "Write" => ShareMode::Write,
-                _ => return Err(crate::error::IrohError::new_err("mode must be 'read' or 'write'")),
+                _ => {
+                    return Err(crate::error::IrohError::new_err(
+                        "mode must be 'read' or 'write'",
+                    ))
+                }
             };
-            let ticket = doc.share(share_mode, AddrInfoOptions::Id).await.map_err(err_to_py)?;
+            let ticket = doc
+                .share(share_mode, AddrInfoOptions::Id)
+                .await
+                .map_err(err_to_py)?;
             Ok(ticket.serialize())
         })
     }
