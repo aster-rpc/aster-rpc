@@ -11,6 +11,8 @@ use iroh_blobs::{
 use iroh_docs::{protocol::Docs, ALPN as DOCS_ALPN};
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 
+use crate::net::{endpoint_addr_to_py, NodeAddr};
+
 /// Wraps an error type that implements Display into a PyErr via IrohError.
 fn err_to_py(e: impl std::fmt::Display) -> PyErr {
     crate::error::IrohError::new_err(e.to_string())
@@ -105,6 +107,11 @@ impl IrohNode {
     fn node_addr(&self) -> String {
         let addr = self.endpoint.addr();
         format!("{addr:?}")
+    }
+
+    /// Return the node's structured address info.
+    fn node_addr_info(&self) -> NodeAddr {
+        endpoint_addr_to_py(self.endpoint.addr())
     }
 
     /// Gracefully shut down the node.
