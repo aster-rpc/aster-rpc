@@ -124,6 +124,21 @@ asyncio.run(main())
 uv run pytest tests/ -v --timeout=30
 ```
 
+## Run lint locally
+
+```bash
+cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check
+cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings
+```
+
+## Enable pre-push checks
+
+```bash
+./scripts/install-git-hooks.sh
+```
+
+After that, every `git push` will run `cargo fmt --check` and `cargo clippy` before pushing.
+
 ## API Overview
 
 | Class / Function | Description |
