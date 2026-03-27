@@ -25,6 +25,8 @@ fn _iroh_python(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<docs::DocHandle>()?;
     m.add_class::<gossip::GossipClient>()?;
     m.add_class::<gossip::GossipTopicHandle>()?;
+    m.add_class::<net::NodeAddr>()?;
+    m.add_class::<net::EndpointConfig>()?;
     m.add_class::<net::NetClient>()?;
     m.add_class::<net::IrohConnection>()?;
     m.add_class::<net::IrohSendStream>()?;
@@ -36,6 +38,7 @@ fn _iroh_python(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gossip::gossip_client, m)?)?;
     m.add_function(wrap_pyfunction!(net::net_client, m)?)?;
     m.add_function(wrap_pyfunction!(net::create_endpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(net::create_endpoint_with_config, m)?)?;
 
     Ok(())
 }
