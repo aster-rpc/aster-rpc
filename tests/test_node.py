@@ -7,7 +7,6 @@ Tests:
 - Node ID retrieval
 - Graceful shutdown
 """
-import asyncio
 import tempfile
 import pytest
 
@@ -74,3 +73,24 @@ async def test_persistent_node_creation():
         assert node is not None
         assert isinstance(node.node_id(), str)
         await node.shutdown()
+
+
+async def test_node_addr_info_roundtrip():
+    """Structured node addr can be serialized and deserialized."""
+    from iroh_python import IrohNode, NodeAddr
+
+    node = await IrohNode.memory()
+    addr = node.node_addr_info()
+    assert isinstance(addr.endpoint_id, str)
+    assert addr.endpoint_id == node.node_id()
+
+    data = addr.to_bytes()
+    restored = NodeAddr.from_bytes(data)
+    assert restored.endpoint_id == addr.endpoint_id
+    assert restored.relay_url == addr.relay_url
+    assert restored.direct_addresses == addr.direct_addresses
+
+    restored2 = NodeAddr.from_dict(addr.to_dict())
+    assert restored2.endpoint_id == addr.endpoint_id
+
+    await node.shutdown()
