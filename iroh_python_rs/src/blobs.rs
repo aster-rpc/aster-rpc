@@ -1,6 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::api::Store as BlobStore;
 use iroh_blobs::ticket::BlobTicket;
 use iroh_blobs::BlobFormat;
 use iroh_blobs::api::downloader::Downloader;
@@ -13,7 +13,7 @@ use crate::node::IrohNode;
 /// Python wrapper for the Iroh Blobs client.
 #[pyclass]
 pub struct BlobsClient {
-    pub(crate) store: MemStore,
+    pub(crate) store: BlobStore,
     pub(crate) endpoint: Endpoint,
 }
 

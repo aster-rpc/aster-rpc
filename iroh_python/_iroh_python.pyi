@@ -14,6 +14,11 @@ class IrohNode:
         """Create an in-memory Iroh node with all protocols."""
         ...
 
+    @staticmethod
+    def persistent(path: str) -> Coroutine[Any, Any, "IrohNode"]:
+        """Create a persistent Iroh node backed by an FsStore at path."""
+        ...
+
     def node_id(self) -> str:
         """Return this node's EndpointId as a hex string."""
         ...
