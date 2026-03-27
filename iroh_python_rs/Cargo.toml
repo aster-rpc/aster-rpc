@@ -8,15 +8,7 @@ name    = "iroh_python"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Core Iroh
-iroh        = { workspace = true }
-
-# Protocol Crates
-iroh-blobs  = { workspace = true }
-iroh-docs   = { workspace = true }
-iroh-gossip = { workspace = true }
-iroh-tickets = { workspace = true }
-# iroh-automerge = { workspace = true }  # Experimental/optional - deferred
+iroh_transport_ffi = { path = "../iroh_transport_ffi" }
 
 # Python FFI
 pyo3        = { workspace = true }
@@ -24,6 +16,3 @@ pyo3-asyncio = { workspace = true }
 
 # Common dependencies
 tokio       = { workspace = true }
-bytes       = { workspace = true }
-anyhow      = { workspace = true }
-futures-lite = { workspace = true }
