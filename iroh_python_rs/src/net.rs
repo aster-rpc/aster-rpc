@@ -20,7 +20,7 @@ use crate::PyBytesResult;
 // Shared Types
 // ============================================================================
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct NodeAddr {
     #[pyo3(get)]
@@ -117,7 +117,7 @@ impl NodeAddr {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct EndpointConfig {
     #[pyo3(get, set)]
@@ -180,7 +180,7 @@ impl From<&EndpointConfig> for CoreEndpointConfig {
 // ============================================================================
 
 /// Python representation of connection type
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct ConnectionInfo {
     #[pyo3(get)]
@@ -215,7 +215,7 @@ impl From<CoreConnectionInfo> for ConnectionInfo {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct RemoteInfo {
     #[pyo3(get)]
