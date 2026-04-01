@@ -1,33 +1,26 @@
+//! Node module - wraps CoreNode from iroh_transport_core.
+//!
+//! Phase 2: Now wraps iroh_transport_core::CoreNode instead of iroh types directly.
+
 use pyo3::prelude::*;
 use pyo3_asyncio::tokio::future_into_py;
 
-use iroh::address_lookup::memory::MemoryLookup;
-use iroh::endpoint::{presets, Endpoint};
-use iroh::protocol::Router;
-use iroh_blobs::{
-    api::Store as BlobStore, store::fs::FsStore, store::mem::MemStore, BlobsProtocol,
-    ALPN as BLOBS_ALPN,
-};
-use iroh_docs::{protocol::Docs, ALPN as DOCS_ALPN};
-use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
+use iroh_transport_core::CoreNode;
 
-use crate::net::{endpoint_addr_to_py, NodeAddr};
+use crate::error::err_to_py;
+use crate::net::NodeAddr;
 
-/// Wraps an error type that implements Display into a PyErr via IrohError.
-fn err_to_py(e: impl std::fmt::Display) -> PyErr {
-    crate::error::IrohError::new_err(e.to_string())
-}
-
-/// IrohNode – composite wrapper for Endpoint + Router + protocol handlers.
+/// IrohNode – wrapper for CoreNode with all protocols enabled.
 #[pyclass]
 pub struct IrohNode {
-    pub(crate) endpoint: Endpoint,
-    #[allow(dead_code)]
-    pub(crate) router: Router,
-    pub(crate) blobs: BlobsProtocol,
-    pub(crate) docs: Docs,
-    pub(crate) gossip: Gossip,
-    pub(crate) store: BlobStore,
+    pub(crate) inner: CoreNode,
+}
+
+impl IrohNode {
+    /// Get the inner CoreNode for use by other modules.
+    pub(crate) fn inner(&self) -> &CoreNode {
+        &self.inner
+    }
 }
 
 #[pymethods]
@@ -36,32 +29,10 @@ impl IrohNode {
     #[staticmethod]
     fn memory<'py>(py: Python<'py>) -> PyResult<&'py PyAny> {
         future_into_py(py, async move {
-            let endpoint = Endpoint::bind(presets::N0).await.map_err(err_to_py)?;
-            endpoint.online().await;
-
-            let mem_store = MemStore::new();
-            let store: BlobStore = (*mem_store).clone();
-            let blobs = BlobsProtocol::new(&store, None);
-            let gossip = Gossip::builder().spawn(endpoint.clone());
-            let docs = Docs::memory()
-                .spawn(endpoint.clone(), store.clone(), gossip.clone())
+            CoreNode::memory()
                 .await
-                .map_err(err_to_py)?;
-
-            let router = Router::builder(endpoint.clone())
-                .accept(BLOBS_ALPN, blobs.clone())
-                .accept(GOSSIP_ALPN, gossip.clone())
-                .accept(DOCS_ALPN, docs.clone())
-                .spawn();
-
-            Ok(IrohNode {
-                endpoint,
-                router,
-                blobs,
-                docs,
-                gossip,
-                store,
-            })
+                .map(IrohNode::from)
+                .map_err(err_to_py)
         })
     }
 
@@ -69,56 +40,38 @@ impl IrohNode {
     #[staticmethod]
     fn persistent<'py>(py: Python<'py>, path: String) -> PyResult<&'py PyAny> {
         future_into_py(py, async move {
-            let endpoint = Endpoint::bind(presets::N0).await.map_err(err_to_py)?;
-            endpoint.online().await;
-
-            let fs_store = FsStore::load(path).await.map_err(err_to_py)?;
-            let store: BlobStore = fs_store.into();
-            let blobs = BlobsProtocol::new(&store, None);
-            let gossip = Gossip::builder().spawn(endpoint.clone());
-            let docs = Docs::memory()
-                .spawn(endpoint.clone(), store.clone(), gossip.clone())
+            CoreNode::persistent(path)
                 .await
-                .map_err(err_to_py)?;
-
-            let router = Router::builder(endpoint.clone())
-                .accept(BLOBS_ALPN, blobs.clone())
-                .accept(GOSSIP_ALPN, gossip.clone())
-                .accept(DOCS_ALPN, docs.clone())
-                .spawn();
-
-            Ok(IrohNode {
-                endpoint,
-                router,
-                blobs,
-                docs,
-                gossip,
-                store,
-            })
+                .map(IrohNode::from)
+                .map_err(err_to_py)
         })
     }
 
     /// Return this node's EndpointId as a hex string.
     fn node_id(&self) -> String {
-        self.endpoint.id().to_string()
+        self.inner.node_id()
     }
 
-    /// Return the node's address info.
+    /// Return the node's address info (debug format).
     fn node_addr(&self) -> String {
-        let addr = self.endpoint.addr();
-        format!("{addr:?}")
+        format!("{:?}", self.inner.node_addr_info())
     }
 
     /// Return the node's structured address info.
     fn node_addr_info(&self) -> NodeAddr {
-        endpoint_addr_to_py(self.endpoint.addr())
+        let addr = self.inner.node_addr_info();
+        NodeAddr {
+            endpoint_id: addr.endpoint_id,
+            relay_url: addr.relay_url,
+            direct_addresses: addr.direct_addresses,
+        }
     }
 
     /// Gracefully shut down the node.
     fn close<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
-        let endpoint = self.endpoint.clone();
+        let node = self.inner.clone();
         future_into_py(py, async move {
-            endpoint.close().await;
+            node.close().await;
             Ok(())
         })
     }
@@ -131,14 +84,20 @@ impl IrohNode {
     /// Add another node's address info so this node can connect to it.
     /// Used for peer discovery in testing/local scenarios.
     fn add_node_addr(&self, other: &IrohNode) -> PyResult<()> {
-        let addr = other.endpoint.addr();
-        let memory_lookup = MemoryLookup::new();
-        memory_lookup.add_endpoint_info(addr);
-        self.endpoint
-            .address_lookup()
-            .map_err(err_to_py)?
-            .add(memory_lookup);
-        Ok(())
+        self.inner
+            .add_node_addr(&other.inner)
+            .map_err(err_to_py)
+    }
+
+    /// Export the node's secret key as 32 bytes.
+    fn export_secret_key(&self) -> Vec<u8> {
+        self.inner.export_secret_key()
+    }
+}
+
+impl From<CoreNode> for IrohNode {
+    fn from(inner: CoreNode) -> Self {
+        Self { inner }
     }
 }
 

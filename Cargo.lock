@@ -1997,7 +1997,7 @@ dependencies = [
 name = "iroh_python_rs"
 version = "0.1.0"
 dependencies = [
- "iroh_transport_ffi",
+ "iroh_transport_core",
  "pyo3",
  "pyo3-asyncio",
  "tokio",
