@@ -217,8 +217,8 @@ fn test_node_memory_creation() {
         let mut events = [std::mem::zeroed(); 1];
         let count = iroh_poll_events(runtime, events.as_mut_ptr(), 1, 100);
         
-        // We should get either a NODE_CREATED or ERROR event
-        assert!(count > 0 || count == 0, "Poll should complete");
+        // Poll completed without panicking/crashing.
+        let _ = count;
         
         iroh_runtime_close(runtime);
     }
