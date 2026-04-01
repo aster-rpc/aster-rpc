@@ -54,34 +54,22 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Create venv and install dependencies
+      - name: Build and test (unix)
+        if: runner.os != 'Windows'
         run: |
           uv venv .venv
           source .venv/bin/activate
           uv pip install pytest pytest-asyncio pytest-timeout maturin
-
-      - name: Build extension (unix)
-        if: runner.os != 'Windows'
-        run: |
-          source .venv/bin/activate
           maturin develop -m iroh_python_rs/Cargo.toml
-
-      - name: Build extension (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          .venv\Scripts\activate
-          maturin develop -m iroh_python_rs/Cargo.toml
-        shell: pwsh
-
-      - name: Run tests (unix)
-        if: runner.os != 'Windows'
-        run: |
-          source .venv/bin/activate
           pytest tests/ -v --timeout=60
+        shell: bash
 
-      - name: Run tests (Windows)
+      - name: Build and test (Windows)
         if: runner.os == 'Windows'
         run: |
+          uv venv .venv
           .venv\Scripts\activate
+          uv pip install pytest pytest-asyncio pytest-timeout maturin
+          maturin develop -m iroh_python_rs/Cargo.toml
           pytest tests/ -v --timeout=60
         shell: pwsh
