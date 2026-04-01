@@ -360,32 +360,30 @@ interoperability.
 
 |Protocol         |Fory Family        |Cross-Language                                      |Schema Evolution            |Use Case                                                                                                |
 |-----------------|-------------------|----------------------------------------------------|----------------------------|--------------------------------------------------------------------------------------------------------|
-|`XLANG` (default)|Xlang Serialization|Yes — Java, Python, C++, Go, JS, Rust, Scala, Kotlin|Optional (`compatible=True`)|Cross-language services. Object graphs, shared refs, polymorphism.                                      |
-|`NATIVE`         |Language-specific  |No — single language only                           |Optional (`compatible=True`)|Maximum performance within one language. Python: pickle replacement. JVM: JDK serialization replacement.|
+|`XLANG` (default)|Xlang Serialization|Yes — Java, Python, C++, Go, JS, Rust, Scala, Kotlin|Via content-addressed registry (§11.3)|Cross-language services. Object graphs, shared refs, polymorphism.                                      |
+|`NATIVE`         |Language-specific  |No — single language only                           |Via content-addressed registry (§11.3)|Maximum performance within one language. Python: pickle replacement. JVM: JDK serialization replacement.|
 |`ROW`            |Row Format         |Yes — Java, Python, C++, Rust                       |N/A                         |Zero-copy random access, partial deserialization, Arrow integration.                                    |
 
 `NATIVE_COMPATIBLE` and `SerializationMode.JAVA` do not exist in Aster. Schema
-evolution for both `XLANG` and `NATIVE` is controlled by the `compatible`
-option on the service or method decorator (see §5.2), which maps directly to
-Fory’s `compatible=True` / `CompatibleMode.COMPATIBLE` flag. There is no
-separate wire protocol for compatible vs. consistent mode — the choice affects
-how type metadata is encoded within the selected protocol.
+evolution is handled by the content-addressed contract registry (§11.3): each
+type version produces a distinct hash, so different schema versions coexist as
+separate immutable artifacts. Fory's `compatible` mode (which embeds per-field
+metadata in every payload) is not used — the registry provides the same
+forward/backward evolution guarantees without per-payload overhead.
 
 ### 5.2 Protocol Selection
 
-Services declare a default protocol. Individual methods may override. Schema
-evolution (`compatible`) can be enabled per service or method:
+Services declare a default protocol. Individual methods may override:
 
 ```python
 @service(
     name="AgentControl",
     version=1,
     serialization=[SerializationMode.XLANG],
-    compatible=True,   # Enable Fory compatible mode: forward/backward field evolution
 )
 class AgentControlService:
 
-    @rpc  # Inherits XLANG + compatible=True from service
+    @rpc  # Inherits XLANG from service
     async def assign_task(self, req: TaskAssignment) -> TaskAck: ...
 
     @server_stream  # Also inherits
@@ -396,9 +394,7 @@ class AgentControlService:
 ```
 
 The wire protocol carries the protocol mode in the `StreamHeader` (see §6.2)
-so the receiver knows how to deserialize. The `compatible` flag is not carried
-on the wire — it is a registration-time configuration that both sides must agree
-on through the service contract.
+so the receiver knows how to deserialize.
 
 **Cross-language enforcement:** If client and server are different languages,
 only `XLANG` and `ROW` protocols are permitted. `NATIVE` is always
@@ -496,8 +492,8 @@ class AgentControlService:
     # Add @fory_type(tag="your.package/TaskAssignment") to the class.
 ```
 
-Tag validation is skipped for `NATIVE` and `NATIVE_COMPATIBLE` modes, which are
-single-language and do not require cross-language type identity.
+Tag validation is skipped for `NATIVE` mode, which is single-language and does
+not require cross-language type identity.
 
 #### 5.3.4 Numeric Type IDs (Local Optimisation Only)
 
@@ -527,8 +523,7 @@ Each language maps to its own Fory native implementation:
 |JS/TS   |JS native           |Dynamic serialization.                                                                      |
 
 No tag registration required. Not wire-compatible across languages — `NATIVE`
-is only valid when both client and server are the same language. Schema
-evolution is available via `compatible=True` on the decorator.
+is only valid when both client and server are the same language.
 
 ### 5.5 ROW Mode
 
@@ -2188,14 +2183,14 @@ No `protoc`. No `protobuf`. No external codegen beyond `foryc` (optional).
 ## Appendix B: Fory Serialization Mode Reference
 
 Aster exposes the three Fory serialization protocol families described in §5.
-`NATIVE_COMPATIBLE` is not a separate protocol in Aster; schema evolution for
-`XLANG` and `NATIVE` is controlled by the `compatible` flag on the service or
-method decorator (§5.2).
+`NATIVE_COMPATIBLE` is not a separate protocol in Aster. Schema evolution is
+handled by the content-addressed contract registry (§11.3), not by Fory's
+`compatible` mode.
 
 |Mode  |Wire Compatible   |Schema Evolution                |Random Access               |Arrow Integration            |Languages                                           |
 |------|------------------|--------------------------------|----------------------------|-----------------------------|----------------------------------------------------|
-|XLANG |All Fory-supported|Yes (via `compatible=True`)     |No                          |No                           |Java, Python, Rust, C++, Go, JS, C#, Swift          |
-|NATIVE|Same language only|Optional (via `compatible=True`)|No                          |No                           |Per-language (Python pickle-compat, Java JDK-compat)|
+|XLANG |All Fory-supported|Yes (via content-addressed registry)|No                          |No                           |Java, Python, Rust, C++, Go, JS, C#, Swift          |
+|NATIVE|Same language only |Via content-addressed registry      |No                          |No                           |Per-language (Python pickle-compat, Java JDK-compat)|
 |ROW   |Java, Python, C++ |N/A                             |Yes (zero-copy field access)|Yes (Arrow RecordBatch/Table)|Java, Python, C++ (others per Fory roadmap)         |
 
 -----
