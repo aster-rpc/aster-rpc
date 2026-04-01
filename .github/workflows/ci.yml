@@ -58,15 +58,15 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           uv pip install --system pytest pytest-asyncio pytest-timeout maturin
-          uv maturin develop -m iroh_python_rs/Cargo.toml
+          maturin develop -m iroh_python_rs/Cargo.toml
         shell: bash
 
       - name: Install dependencies and build extension (Windows)
         if: runner.os == 'Windows'
         run: |
           uv pip install --system pytest pytest-asyncio pytest-timeout maturin
-          uv maturin develop -m iroh_python_rs/Cargo.toml
+          maturin develop -m iroh_python_rs/Cargo.toml
         shell: bash
 
       - name: Run tests
-        run: uv pytest tests/ -v --timeout=60
+        run: pytest tests/ -v --timeout=60
