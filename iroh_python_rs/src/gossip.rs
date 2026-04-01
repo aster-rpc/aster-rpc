@@ -1,40 +1,38 @@
-use std::sync::Arc;
-use tokio::sync::Mutex;
+//! Gossip module - wraps CoreGossipClient, CoreGossipTopic from iroh_transport_core.
+//!
+//! Phase 2: Now wraps iroh_transport_core types instead of iroh_gossip types directly.
 
-use bytes::Bytes;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3_asyncio::tokio::future_into_py;
 
-use futures_lite::StreamExt;
-use iroh::EndpointId;
-use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
-use iroh_gossip::net::Gossip;
-use iroh_gossip::proto::TopicId;
+use iroh_transport_core::{CoreGossipClient, CoreGossipTopic};
 
 use crate::error::err_to_py;
 use crate::node::IrohNode;
 
-// ---------------------------------------------------------------------------
-// GossipTopicHandle — Python wrapper for a subscribed gossip topic
-// ---------------------------------------------------------------------------
+// ============================================================================
+// GossipTopicHandle
+// ============================================================================
 
 #[pyclass]
 pub struct GossipTopicHandle {
-    sender: GossipSender,
-    receiver: Arc<Mutex<GossipReceiver>>,
+    inner: CoreGossipTopic,
+}
+
+impl From<CoreGossipTopic> for GossipTopicHandle {
+    fn from(inner: CoreGossipTopic) -> Self {
+        Self { inner }
+    }
 }
 
 #[pymethods]
 impl GossipTopicHandle {
     /// Broadcast a message to all peers on this topic.
     fn broadcast<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<&'py PyAny> {
-        let sender = self.sender.clone();
+        let topic = self.inner.clone();
         future_into_py(py, async move {
-            sender
-                .broadcast(Bytes::from(data))
-                .await
-                .map_err(err_to_py)?;
+            topic.broadcast(data).await.map_err(err_to_py)?;
             Ok(())
         })
     }
@@ -45,49 +43,43 @@ impl GossipTopicHandle {
     /// event_type is one of: "received", "neighbor_up", "neighbor_down", "lagged".
     /// data is the message content for "received" events, None otherwise.
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
-        let receiver = self.receiver.clone();
+        let topic = self.inner.clone();
         future_into_py(py, async move {
-            let mut rx = receiver.lock().await;
-            use std::pin::Pin;
-            let event = Pin::new(&mut *rx)
-                .next()
-                .await
-                .ok_or_else(|| err_to_py("gossip topic closed"))?
-                .map_err(err_to_py)?;
-            match event {
-                Event::Received(msg) => {
-                    let content: PyObject =
-                        Python::with_gil(|py| PyBytes::new(py, &msg.content).into_py(py));
-                    Ok(("received".to_string(), Some(content)))
+            let event = topic.recv().await.map_err(err_to_py)?;
+            let (event_type, data): (String, Option<PyObject>) = match event.event_type.as_str() {
+                "received" => (
+                    "received".to_string(),
+                    event.data.map(|d| {
+                        Python::with_gil(|py| PyBytes::new(py, &d).into_py(py))
+                    }),
+                ),
+                "neighbor_up" | "neighbor_down" => {
+                    let data: Option<PyObject> = event.data.map(|d| {
+                        Python::with_gil(|py| PyBytes::new(py, &d).into_py(py))
+                    });
+                    (event.event_type, data)
                 }
-                Event::NeighborUp(id) => Ok((
-                    "neighbor_up".to_string(),
-                    Some(Python::with_gil(|py| {
-                        PyBytes::new(py, id.to_string().as_bytes()).into_py(py)
-                    })),
-                )),
-                Event::NeighborDown(id) => Ok((
-                    "neighbor_down".to_string(),
-                    Some(Python::with_gil(|py| {
-                        PyBytes::new(py, id.to_string().as_bytes()).into_py(py)
-                    })),
-                )),
-                Event::Lagged => {
-                    let none: Option<PyObject> = None;
-                    Ok(("lagged".to_string(), none))
-                }
-            }
+                "lagged" => ("lagged".to_string(), None),
+                _ => (event.event_type, None),
+            };
+            Ok((event_type, data))
         })
     }
 }
 
-// ---------------------------------------------------------------------------
-// GossipClient — wraps a Gossip instance
-// ---------------------------------------------------------------------------
+// ============================================================================
+// GossipClient
+// ============================================================================
 
 #[pyclass]
 pub struct GossipClient {
-    pub(crate) inner: Gossip,
+    inner: CoreGossipClient,
+}
+
+impl From<CoreGossipClient> for GossipClient {
+    fn from(inner: CoreGossipClient) -> Self {
+        Self { inner }
+    }
 }
 
 #[pymethods]
@@ -106,46 +98,28 @@ impl GossipClient {
         topic_bytes: Vec<u8>,
         bootstrap_peers: Vec<String>,
     ) -> PyResult<&'py PyAny> {
-        let gossip = self.inner.clone();
+        let client = self.inner.clone();
         future_into_py(py, async move {
-            // Parse topic
-            let topic_arr: [u8; 32] = topic_bytes
-                .try_into()
-                .map_err(|_| err_to_py("topic_bytes must be exactly 32 bytes"))?;
-            let topic_id = TopicId::from_bytes(topic_arr);
-
-            // Parse bootstrap peers
-            let peers: Vec<EndpointId> = bootstrap_peers
-                .iter()
-                .map(|s| s.parse::<EndpointId>().map_err(err_to_py))
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let topic = gossip
-                .subscribe_and_join(topic_id, peers)
+            let topic = client
+                .subscribe(topic_bytes, bootstrap_peers)
                 .await
                 .map_err(err_to_py)?;
-
-            let (sender, receiver) = topic.split();
-            Ok(GossipTopicHandle {
-                sender,
-                receiver: Arc::new(Mutex::new(receiver)),
-            })
+            Ok(GossipTopicHandle::from(topic))
         })
     }
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Factory function
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// Extract a GossipClient from an IrohNode.
 #[pyfunction]
 pub fn gossip_client(node: &IrohNode) -> GossipClient {
-    GossipClient {
-        inner: node.gossip.clone(),
-    }
+    GossipClient::from(node.inner().gossip_client())
 }
 
+/// Register the gossip types with the Python module.
 pub fn register(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<GossipClient>()?;
     m.add_class::<GossipTopicHandle>()?;

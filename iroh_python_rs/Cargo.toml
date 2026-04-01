@@ -8,7 +8,8 @@ name    = "iroh_python"
 crate-type = ["cdylib"]
 
 [dependencies]
-iroh_transport_ffi = { path = "../iroh_transport_ffi" }
+# Core transport layer - the authoritative backend for all Python bindings
+iroh_transport_core = { path = "../iroh_transport_core" }
 
 # Python FFI
 pyo3        = { workspace = true }

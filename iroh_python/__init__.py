@@ -4,6 +4,9 @@ iroh_python - Python bindings for the Iroh P2P networking library.
 This package provides Python access to Iroh's peer-to-peer networking
 capabilities, including QUIC connections, content-addressed blob storage,
 collaborative CRDT documents, and topic-based gossip messaging.
+
+Phase 2: All bindings now use iroh_transport_core as the backend.
+Phase 1b: Includes datagram completion, connection info, remote-info, and hooks.
 """
 
 # Import native extension module
@@ -11,6 +14,10 @@ try:
     from iroh_python import (
         # Exception
         IrohError,
+        BlobNotFound,
+        DocNotFound,
+        ConnectionError,
+        TicketError,
         # Core node
         IrohNode,
         # Blobs
@@ -27,6 +34,8 @@ try:
         # Net / QUIC
         NodeAddr,
         EndpointConfig,
+        ConnectionInfo,
+        RemoteInfo,
         NetClient,
         IrohConnection,
         IrohSendStream,
@@ -34,6 +43,13 @@ try:
         net_client,
         create_endpoint,
         create_endpoint_with_config,
+        # Hooks (Phase 1b)
+        HookConnectInfo,
+        HookHandshakeInfo,
+        HookDecision,
+        HookReceiver,
+        HookRegistration,
+        HookManager,
     )
 except ImportError as e:
     # Provide helpful error if native module not built
@@ -42,11 +58,15 @@ except ImportError as e:
         "Please build the extension with 'maturin develop' first."
     ) from e
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # Exception
     "IrohError",
+    "BlobNotFound",
+    "DocNotFound",
+    "ConnectionError",
+    "TicketError",
     # Core node
     "IrohNode",
     # Blobs
@@ -63,6 +83,8 @@ __all__ = [
     # Net / QUIC
     "NodeAddr",
     "EndpointConfig",
+    "ConnectionInfo",
+    "RemoteInfo",
     "NetClient",
     "IrohConnection",
     "IrohSendStream",
@@ -70,4 +92,11 @@ __all__ = [
     "net_client",
     "create_endpoint",
     "create_endpoint_with_config",
+    # Hooks (Phase 1b)
+    "HookConnectInfo",
+    "HookHandshakeInfo",
+    "HookDecision",
+    "HookReceiver",
+    "HookRegistration",
+    "HookManager",
 ]

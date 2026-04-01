@@ -1,9 +1,17 @@
-"""Type stubs for iroh_python package."""
+"""Type stubs for iroh_python package.
+
+Phase 2: All bindings now use iroh_transport_core as the backend.
+Phase 1b: Includes datagram completion, connection info, remote-info, and hooks.
+"""
 
 from typing import Any, Coroutine, Optional
 
 
 class IrohError(Exception): ...
+class BlobNotFound(IrohError): ...
+class DocNotFound(IrohError): ...
+class ConnectionError(IrohError): ...
+class TicketError(IrohError): ...
 
 __version__: str
 __all__: list[str]
@@ -32,13 +40,38 @@ class EndpointConfig:
     relay_mode: Optional[str]
     alpns: list[bytes]
     secret_key: Optional[bytes]
+    enable_monitoring: bool  # Phase 1b
+    enable_hooks: bool  # Phase 1b
+    hook_timeout_ms: int  # Phase 1b
 
     def __init__(
         self,
         alpns: list[bytes],
         relay_mode: Optional[str] = ...,
         secret_key: Optional[bytes] = ...,
+        enable_monitoring: bool = ...,
+        enable_hooks: bool = ...,
+        hook_timeout_ms: int = ...,
     ) -> None: ...
+
+
+class ConnectionInfo:  # Phase 1b
+    connection_type: str
+    bytes_sent: int
+    bytes_received: int
+    rtt_ns: Optional[int]
+    alpn: bytes
+    is_connected: bool
+
+
+class RemoteInfo:  # Phase 1b
+    node_id: str
+    relay_url: Optional[str]
+    connection_type: str
+    last_handshake_ns: Optional[int]
+    bytes_sent: int
+    bytes_received: int
+    is_connected: bool
 
 
 class IrohNode:
@@ -52,19 +85,52 @@ class IrohNode:
     def close(self) -> Coroutine[Any, Any, None]: ...
     def shutdown(self) -> Coroutine[Any, Any, None]: ...
     def add_node_addr(self, other: "IrohNode") -> None: ...
+    def export_secret_key(self) -> bytes: ...
 
 
-class BlobsClient: ...
+class BlobsClient:
+    def add_bytes(self, data: bytes) -> Coroutine[Any, Any, str]: ...
+    def read_to_bytes(self, hash_hex: str) -> Coroutine[Any, Any, bytes]: ...
+    def create_ticket(self, hash_hex: str) -> str: ...
+    def download_blob(self, ticket_str: str) -> Coroutine[Any, Any, bytes]: ...
+
+
 def blobs_client(node: IrohNode) -> BlobsClient: ...
 
 
-class DocsClient: ...
-class DocHandle: ...
+class DocsClient:
+    def create(self) -> Coroutine[Any, Any, "DocHandle"]: ...
+    def create_author(self) -> Coroutine[Any, Any, str]: ...
+    def join(self, ticket_str: str) -> Coroutine[Any, Any, "DocHandle"]: ...
+
+
+class DocHandle:
+    def doc_id(self) -> str: ...
+    def set_bytes(
+        self, author_hex: str, key: bytes, value: bytes
+    ) -> Coroutine[Any, Any, str]: ...
+    def get_exact(
+        self, author_hex: str, key: bytes
+    ) -> Coroutine[Any, Any, Optional[bytes]]: ...
+    def share(self, mode: str) -> Coroutine[Any, Any, str]: ...
+
+
 def docs_client(node: IrohNode) -> DocsClient: ...
 
 
-class GossipClient: ...
-class GossipTopicHandle: ...
+class GossipClient:
+    def subscribe(
+        self, topic_bytes: bytes, bootstrap_peers: list[str]
+    ) -> Coroutine[Any, Any, "GossipTopicHandle"]: ...
+
+
+class GossipTopicHandle:
+    def broadcast(self, data: bytes) -> Coroutine[Any, Any, None]: ...
+    def recv(
+        self,
+    ) -> Coroutine[Any, Any, tuple[str, Optional[bytes]]]: ...
+
+
 def gossip_client(node: IrohNode) -> GossipClient: ...
 
 
@@ -79,6 +145,12 @@ class NetClient:
     def endpoint_addr_info(self) -> NodeAddr: ...
     def close(self) -> Coroutine[Any, Any, None]: ...
     def closed(self) -> Coroutine[Any, Any, None]: ...
+    def export_secret_key(self) -> bytes: ...
+    # Phase 1b: Remote-info & monitoring
+    def remote_info(self, node_id: str) -> Optional[RemoteInfo]: ...
+    def remote_info_list(self) -> list[RemoteInfo]: ...
+    def has_monitoring(self) -> bool: ...
+    def has_hooks(self) -> bool: ...
 
 
 class IrohConnection:
@@ -91,6 +163,11 @@ class IrohConnection:
     def remote_id(self) -> str: ...
     def close(self, code: int, reason: bytes) -> None: ...
     def closed(self) -> Coroutine[Any, Any, dict[str, Any]]: ...
+    # Phase 1b: Datagram completion
+    def max_datagram_size(self) -> Optional[int]: ...
+    def datagram_send_buffer_space(self) -> int: ...
+    # Phase 1b: Connection info
+    def connection_info(self) -> ConnectionInfo: ...
 
 
 class IrohSendStream:
@@ -109,3 +186,43 @@ class IrohRecvStream:
 def net_client(node: IrohNode) -> NetClient: ...
 def create_endpoint(alpn: bytes) -> Coroutine[Any, Any, NetClient]: ...
 def create_endpoint_with_config(config: EndpointConfig) -> Coroutine[Any, Any, NetClient]: ...
+
+
+# Phase 1b: Hooks
+
+
+class HookConnectInfo:  # Phase 1b
+    remote_endpoint_id: str
+    alpn: bytes
+
+
+class HookHandshakeInfo:  # Phase 1b
+    remote_endpoint_id: str
+    alpn: bytes
+    is_alive: bool
+
+
+class HookDecision:  # Phase 1b
+    @staticmethod
+    def Allow() -> "HookDecision": ...
+    @staticmethod
+    def Deny(error_code: int, reason: bytes) -> "HookDecision": ...
+
+
+class HookReceiver:  # Phase 1b
+    def has_pending(self) -> bool: ...
+
+
+class HookRegistration:  # Phase 1b
+    has_before_connect: bool
+    has_after_connect: bool
+
+
+class HookManager:  # Phase 1b
+    def __init__(
+        self,
+        before_connect: Optional[Any] = ...,
+        after_connect: Optional[Any] = ...,
+    ) -> None: ...
+    def set_before_connect(self, callback: Optional[Any]) -> None: ...
+    def set_after_connect(self, callback: Optional[Any]) -> None: ...

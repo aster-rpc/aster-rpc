@@ -23,8 +23,8 @@ jobs:
           components: rustfmt #, clippy
       - name: cargo fmt
         run: cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check
-      #- name: cargo clippy
-      #  run: cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings
+      - name: cargo clippy
+        run: cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings
 
   # ── Build + Test matrix ────────────────────────────────────────────
   test:
