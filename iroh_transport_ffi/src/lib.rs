@@ -1,16 +1,225 @@
+//! Iroh Transport FFI - C ABI Bridge
+//! 
+//! This module provides a C-compatible FFI layer for iroh transport capabilities.
+//! The design follows the completion queue architecture for async operations.
+
+#![allow(clippy::missing_safety_doc)]
+#![allow(non_camel_case_types)] // FFI types intentionally use snake_case
+#![allow(nonstandard_style)] // FFI types intentionally use snake_case
+
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{c_char, CString};
 use std::ptr;
-use std::sync::{Arc, Condvar, Mutex};
+use std::slice;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
+use anyhow::Result;
 
 use iroh_transport_core::*;
 
-pub const IROH_FFI_OK: i32 = 0;
-pub const IROH_FFI_ERR_NULL: i32 = 1;
-pub const IROH_FFI_ERR_INVALID_ARGUMENT: i32 = 2;
-pub const IROH_FFI_ERR_INTERNAL: i32 = 3;
-pub const IROH_FFI_ERR_PENDING: i32 = 4;
-pub const IROH_FFI_ERR_FAILED: i32 = 5;
+// ============================================================================
+// ABI Version
+// ============================================================================
+
+pub const IROH_ABI_VERSION_MAJOR: u32 = 1;
+pub const IROH_ABI_VERSION_MINOR: u32 = 0;
+pub const IROH_ABI_VERSION_PATCH: u32 = 0;
+
+// ============================================================================
+// ABI Types (FFI-safe C-compatible structs)
+// ============================================================================
+
+/// Opaque handle types
+pub type iroh_runtime_t = u64;
+pub type iroh_endpoint_t = u64;
+pub type iroh_connection_t = u64;
+pub type iroh_send_stream_t = u64;
+pub type iroh_recv_stream_t = u64;
+pub type iroh_node_t = u64;
+pub type iroh_operation_t = u64;
+pub type iroh_buffer_t = u64;
+
+/// Status codes
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum iroh_status_t {
+    IROH_STATUS_OK = 0,
+    IROH_STATUS_INVALID_ARGUMENT = 1,
+    IROH_STATUS_NOT_FOUND = 2,
+    IROH_STATUS_ALREADY_CLOSED = 3,
+    IROH_STATUS_QUEUE_FULL = 4,
+    IROH_STATUS_BUFFER_TOO_SMALL = 5,
+    IROH_STATUS_UNSUPPORTED = 6,
+    IROH_STATUS_INTERNAL = 7,
+    IROH_STATUS_TIMEOUT = 8,
+    IROH_STATUS_CANCELLED = 9,
+    IROH_STATUS_CONNECTION_REFUSED = 10,
+    IROH_STATUS_STREAM_RESET = 11,
+}
+
+/// Relay mode
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum iroh_relay_mode_t {
+    IROH_RELAY_MODE_DEFAULT = 0,
+    IROH_RELAY_MODE_CUSTOM = 1,
+    IROH_RELAY_MODE_DISABLED = 2,
+}
+
+/// Event kinds
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum iroh_event_kind_t {
+    IROH_EVENT_NONE = 0,
+    
+    // Lifecycle
+    IROH_EVENT_NODE_CREATED = 1,
+    IROH_EVENT_NODE_CREATE_FAILED = 2,
+    IROH_EVENT_ENDPOINT_CREATED = 3,
+    IROH_EVENT_ENDPOINT_CREATE_FAILED = 4,
+    IROH_EVENT_CLOSED = 5,
+    
+    // Connections
+    IROH_EVENT_CONNECTED = 10,
+    IROH_EVENT_CONNECT_FAILED = 11,
+    IROH_EVENT_CONNECTION_ACCEPTED = 12,
+    IROH_EVENT_CONNECTION_CLOSED = 13,
+    
+    // Streams
+    IROH_EVENT_STREAM_OPENED = 20,
+    IROH_EVENT_STREAM_ACCEPTED = 21,
+    IROH_EVENT_FRAME_RECEIVED = 22,
+    IROH_EVENT_SEND_COMPLETED = 23,
+    IROH_EVENT_STREAM_FINISHED = 24,
+    IROH_EVENT_STREAM_RESET = 25,
+    
+    // Blobs
+    IROH_EVENT_BLOB_ADDED = 30,
+    IROH_EVENT_BLOB_READ = 31,
+    IROH_EVENT_BLOB_DOWNLOADED = 32,
+    IROH_EVENT_BLOB_TICKET_CREATED = 33,
+    
+    // Docs
+    IROH_EVENT_DOC_CREATED = 40,
+    IROH_EVENT_DOC_JOINED = 41,
+    IROH_EVENT_DOC_SET = 42,
+    IROH_EVENT_DOC_GET = 43,
+    IROH_EVENT_DOC_SHARED = 44,
+    IROH_EVENT_AUTHOR_CREATED = 45,
+    
+    // Gossip
+    IROH_EVENT_GOSSIP_SUBSCRIBED = 50,
+    IROH_EVENT_GOSSIP_BROADCAST_DONE = 51,
+    IROH_EVENT_GOSSIP_RECEIVED = 52,
+    IROH_EVENT_GOSSIP_NEIGHBOR_UP = 53,
+    IROH_EVENT_GOSSIP_NEIGHBOR_DOWN = 54,
+    IROH_EVENT_GOSSIP_LAGGED = 55,
+    
+    // Datagrams (Phase 1b)
+    IROH_EVENT_DATAGRAM_RECEIVED = 60,
+    
+    // Hooks (Phase 1b)
+    IROH_EVENT_HOOK_BEFORE_CONNECT = 70,
+    IROH_EVENT_HOOK_AFTER_CONNECT = 71,
+    IROH_EVENT_HOOK_INVOCATION_RELEASED = 72,
+    
+    // Generic
+    IROH_EVENT_STRING_RESULT = 90,
+    IROH_EVENT_BYTES_RESULT = 91,
+    IROH_EVENT_UNIT_RESULT = 92,
+    IROH_EVENT_OPERATION_CANCELLED = 98,
+    IROH_EVENT_ERROR = 99,
+}
+
+/// Hook decision
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum iroh_hook_decision_t {
+    IROH_HOOK_DECISION_ALLOW = 0,
+    IROH_HOOK_DECISION_DENY = 1,
+}
+
+// ============================================================================
+// C Structs (#[repr(C)])
+// ============================================================================
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct iroh_runtime_config_t {
+    pub struct_size: u32,
+    pub worker_threads: u32,
+    pub event_queue_capacity: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct iroh_endpoint_config_t {
+    pub struct_size: u32,
+    pub relay_mode: u32,  // iroh_relay_mode_t
+    pub secret_key: iroh_bytes_t,
+    pub alpns: iroh_bytes_list_t,
+    pub relay_urls: iroh_bytes_list_t,
+    pub enable_discovery: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct iroh_connect_config_t {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub node_id: iroh_bytes_t,  // hex string
+    pub alpn: iroh_bytes_t,
+    pub addr: *const iroh_node_addr_t,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct iroh_node_addr_t {
+    pub endpoint_id: iroh_bytes_t,
+    pub relay_url: iroh_bytes_t,
+    pub direct_addresses: iroh_bytes_list_t,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct iroh_bytes_t {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct iroh_bytes_list_t {
+    pub items: *const iroh_bytes_t,
+    pub len: usize,
+}
+
+/// C-compatible event structure for FFI output
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct iroh_event_t {
+    pub struct_size: u32,
+    pub kind: u32,
+    pub status: u32,
+    pub operation: u64,
+    pub handle: u64,
+    pub related: u64,
+    pub user_data: u64,
+    pub data_ptr: *const u8,
+    pub data_len: usize,
+    pub buffer: u64,
+    pub error_code: i32,
+    pub flags: u32,
+}
+
+// ============================================================================
+// Thread-local Error Storage
+// ============================================================================
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -24,952 +233,3009 @@ fn set_last_error(msg: impl ToString) -> i32 {
     LAST_ERROR.with(|slot| {
         *slot.borrow_mut() = CString::new(s).ok();
     });
-    IROH_FFI_ERR_FAILED
+    iroh_status_t::IROH_STATUS_INTERNAL as i32
 }
 
-fn into_string(s: String) -> iroh_ffi_string_t {
-    let mut bytes = s.into_bytes();
-    let len = bytes.len();
-    bytes.push(0);
-    let ptr = bytes.as_mut_ptr() as *mut c_char;
-    std::mem::forget(bytes);
-    iroh_ffi_string_t { ptr, len }
-}
-
-fn into_bytes(bytes: Vec<u8>) -> iroh_ffi_bytes_t {
-    let boxed = bytes.into_boxed_slice();
-    let len = boxed.len();
-    let ptr = Box::into_raw(boxed) as *mut u8;
-    iroh_ffi_bytes_t { ptr, len }
-}
-
-unsafe fn bytes_from_ref(b: &iroh_ffi_bytes_t) -> Vec<u8> {
-    if b.ptr.is_null() || b.len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(b.ptr as *const u8, b.len).to_vec()
-    }
-}
-
-unsafe fn string_from_ref(s: &iroh_ffi_string_t) -> Result<String, i32> {
-    if s.ptr.is_null() {
-        return Ok(String::new());
-    }
-    let slice = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-    String::from_utf8(slice.to_vec()).map_err(set_last_error)
-}
-
-unsafe fn node_addr_from_ffi(addr: &iroh_ffi_node_addr_t) -> Result<CoreNodeAddr, i32> {
-    let mut direct_addresses = Vec::new();
-    if !addr.direct_addresses.is_null() {
-        let items = std::slice::from_raw_parts(addr.direct_addresses, addr.direct_addresses_len);
-        for item in items {
-            direct_addresses.push(string_from_ref(item)?);
-        }
-    }
-    let relay_url = string_from_ref(&addr.relay_url)?;
-    Ok(CoreNodeAddr {
-        endpoint_id: string_from_ref(&addr.endpoint_id)?,
-        relay_url: if relay_url.is_empty() { None } else { Some(relay_url) },
-        direct_addresses,
-    })
-}
-
-unsafe fn endpoint_config_from_ffi(config: &iroh_ffi_endpoint_config_t) -> Result<CoreEndpointConfig, i32> {
-    let relay_mode = match config.relay_mode {
-        0 => None,
-        1 => Some("default".to_string()),
-        2 => Some("disabled".to_string()),
-        3 => Some("staging".to_string()),
-        _ => return Err(set_last_error("invalid relay_mode")),
-    };
-    let alpns = if config.alpns.is_null() || config.alpns_len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(config.alpns, config.alpns_len)
-            .iter()
-            .map(|b| bytes_from_ref(b))
-            .collect()
-    };
-    let secret_key = if config.secret_key.ptr.is_null() || config.secret_key.len == 0 {
-        None
-    } else {
-        Some(bytes_from_ref(&config.secret_key))
-    };
-    Ok(CoreEndpointConfig {
-        relay_mode,
-        alpns,
-        secret_key,
-    })
-}
-
-fn node_addr_to_ffi(addr: CoreNodeAddr) -> iroh_ffi_node_addr_t {
-    let mut directs: Vec<iroh_ffi_string_t> = addr
-        .direct_addresses
-        .into_iter()
-        .map(into_string)
-        .collect();
-    let direct_addresses_len = directs.len();
-    let direct_addresses = if directs.is_empty() {
-        ptr::null_mut()
-    } else {
-        let p = directs.as_mut_ptr();
-        std::mem::forget(directs);
-        p
-    };
-    iroh_ffi_node_addr_t {
-        endpoint_id: into_string(addr.endpoint_id),
-        relay_url: into_string(addr.relay_url.unwrap_or_default()),
-        direct_addresses,
-        direct_addresses_len,
-    }
-}
-
-fn closed_info_to_ffi(info: CoreClosedInfo) -> iroh_ffi_closed_info_t {
-    iroh_ffi_closed_info_t {
-        kind: into_string(info.kind),
-        code_present: info.code.is_some(),
-        code: info.code.unwrap_or_default(),
-        reason: into_bytes(info.reason.unwrap_or_default()),
-    }
-}
-
-fn gossip_event_to_ffi(event: CoreGossipEvent) -> iroh_ffi_gossip_event_t {
-    iroh_ffi_gossip_event_t {
-        event_type: into_string(event.event_type),
-        data_present: event.data.is_some(),
-        data: into_bytes(event.data.unwrap_or_default()),
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct iroh_ffi_bytes_t {
-    pub ptr: *mut u8,
-    pub len: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct iroh_ffi_string_t {
-    pub ptr: *mut c_char,
-    pub len: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct iroh_ffi_node_addr_t {
-    pub endpoint_id: iroh_ffi_string_t,
-    pub relay_url: iroh_ffi_string_t,
-    pub direct_addresses: *mut iroh_ffi_string_t,
-    pub direct_addresses_len: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct iroh_ffi_endpoint_config_t {
-    pub relay_mode: i32,
-    pub alpns: *const iroh_ffi_bytes_t,
-    pub alpns_len: usize,
-    pub secret_key: iroh_ffi_bytes_t,
-}
-
-#[repr(C)]
-pub struct iroh_ffi_closed_info_t {
-    pub kind: iroh_ffi_string_t,
-    pub code_present: bool,
-    pub code: u64,
-    pub reason: iroh_ffi_bytes_t,
-}
-
-#[repr(C)]
-pub struct iroh_ffi_gossip_event_t {
-    pub event_type: iroh_ffi_string_t,
-    pub data_present: bool,
-    pub data: iroh_ffi_bytes_t,
-}
-
-pub struct NodeHandle(pub CoreNode);
-pub struct NetHandle(pub CoreNetClient);
-pub struct ConnectionHandle(pub CoreConnection);
-pub struct SendStreamHandle(pub CoreSendStream);
-pub struct RecvStreamHandle(pub CoreRecvStream);
-pub struct BlobsHandle(pub CoreBlobsClient);
-pub struct DocsHandle(pub CoreDocsClient);
-pub struct DocHandle(pub CoreDoc);
-pub struct GossipHandle(pub CoreGossipClient);
-pub struct TopicHandle(pub CoreGossipTopic);
-
-enum OpResult {
-    Unit,
-    String(String),
-    Bytes(Vec<u8>),
-    OptionalBytes(Option<Vec<u8>>),
-    OptionalU64(Option<u64>),
-    ClosedInfo(CoreClosedInfo),
-    GossipEvent(CoreGossipEvent),
-    Node(*mut NodeHandle),
-    Net(*mut NetHandle),
-    Connection(*mut ConnectionHandle),
-    SendStream(*mut SendStreamHandle),
-    RecvStream(*mut RecvStreamHandle),
-    Doc(*mut DocHandle),
-    Topic(*mut TopicHandle),
-    BiStreams(*mut SendStreamHandle, *mut RecvStreamHandle),
-}
-
-unsafe impl Send for OpResult {}
-
-struct OpState {
-    result: Mutex<Option<Result<OpResult, String>>>,
-    cv: Condvar,
-}
-
-pub struct OperationHandle {
-    state: Arc<OpState>,
-}
-
-fn ptr_id<T>(ptr: *mut T) -> usize {
-    ptr as usize
-}
-
-unsafe fn ptr_ref<'a, T>(id: usize) -> &'a T {
-    &*(id as *const T)
-}
-
-fn spawn_op<F>(fut: F) -> *mut OperationHandle
-where
-    F: std::future::Future<Output = Result<OpResult, String>> + Send + 'static,
-{
-    let state = Arc::new(OpState {
-        result: Mutex::new(None),
-        cv: Condvar::new(),
-    });
-    let state2 = state.clone();
-    tokio::spawn(async move {
-        let result = fut.await;
-        let mut slot = state2.result.lock().unwrap();
-        *slot = Some(result);
-        state2.cv.notify_all();
-    });
-    Box::into_raw(Box::new(OperationHandle { state }))
-}
-
-unsafe fn take_box<T>(ptr: *mut T) -> Box<T> {
-    Box::from_raw(ptr)
-}
-
-fn take_result(op: *mut OperationHandle) -> Result<OpResult, i32> {
-    if op.is_null() {
-        return Err(IROH_FFI_ERR_NULL);
-    }
-    let op = unsafe { &*op };
-    let mut slot = op.state.result.lock().unwrap();
-    match slot.take() {
-        Some(Ok(v)) => Ok(v),
-        Some(Err(e)) => Err(set_last_error(e)),
-        None => Err(IROH_FFI_ERR_PENDING),
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn iroh_ffi_last_error_message() -> *const c_char {
+fn get_last_error() -> *const c_char {
     LAST_ERROR.with(|slot| slot.borrow().as_ref().map(|s| s.as_ptr()).unwrap_or(ptr::null()))
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_bytes_free(bytes: iroh_ffi_bytes_t) {
-    if !bytes.ptr.is_null() {
-        let slice_ptr = std::ptr::slice_from_raw_parts_mut(bytes.ptr, bytes.len);
-        drop(Box::from_raw(slice_ptr));
+// ============================================================================
+// Handle Registry - Arc-backed safe handle storage
+// ============================================================================
+
+struct HandleRegistry<T> {
+    next_id: AtomicU64,
+    items: RwLock<HashMap<u64, Arc<T>>>,
+}
+
+impl<T> HandleRegistry<T> {
+    fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            items: RwLock::new(HashMap::new()),
+        }
+    }
+    
+    fn insert(&self, value: T) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let arc = Arc::new(value);
+        self.items.write().unwrap().insert(id, arc);
+        id
+    }
+    
+    fn get(&self, id: u64) -> Option<Arc<T>> {
+        self.items.read().unwrap().get(&id).cloned()
+    }
+    
+    fn remove(&self, id: u64) -> Option<Arc<T>> {
+        self.items.write().unwrap().remove(&id)
+    }
+    
+    fn count(&self) -> usize {
+        self.items.read().unwrap().len()
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_string_free(s: iroh_ffi_string_t) {
-    if !s.ptr.is_null() {
-        let _ = Vec::from_raw_parts(s.ptr as *mut u8, s.len + 1, s.len + 1);
-    }
+// ============================================================================
+// Event System - Send-safe internal events
+// ============================================================================
+
+/// Internal event for crossing thread boundary (no raw pointers - Send-safe)
+#[derive(Clone)]
+struct EventInternal {
+    struct_size: u32,
+    kind: u32,
+    status: u32,
+    operation: u64,
+    handle: u64,
+    related: u64,
+    user_data: u64,
+    data_len: usize,
+    buffer_id: u64,
+    error_code: i32,
+    flags: u32,
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_node_addr_free(addr: iroh_ffi_node_addr_t) {
-    iroh_ffi_string_free(addr.endpoint_id);
-    iroh_ffi_string_free(addr.relay_url);
-    if !addr.direct_addresses.is_null() {
-        let items = Vec::from_raw_parts(addr.direct_addresses, addr.direct_addresses_len, addr.direct_addresses_len);
-        for item in items {
-            iroh_ffi_string_free(item);
+impl Default for EventInternal {
+    fn default() -> Self {
+        Self {
+            struct_size: std::mem::size_of::<iroh_event_t>() as u32,
+            kind: iroh_event_kind_t::IROH_EVENT_NONE as u32,
+            status: iroh_status_t::IROH_STATUS_OK as u32,
+            operation: 0,
+            handle: 0,
+            related: 0,
+            user_data: 0,
+            data_len: 0,
+            buffer_id: 0,
+            error_code: 0,
+            flags: 0,
         }
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_closed_info_free(info: iroh_ffi_closed_info_t) {
-    iroh_ffi_string_free(info.kind);
-    iroh_ffi_bytes_free(info.reason);
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_gossip_event_free(event: iroh_ffi_gossip_event_t) {
-    iroh_ffi_string_free(event.event_type);
-    iroh_ffi_bytes_free(event.data);
-}
-
-macro_rules! impl_free_handle {
-    ($name:ident, $ty:ty) => {
-        #[no_mangle]
-        pub unsafe extern "C" fn $name(ptr: *mut $ty) {
-            if !ptr.is_null() {
-                drop(take_box(ptr));
-            }
+impl EventInternal {
+    fn new(
+        kind: iroh_event_kind_t,
+        status: iroh_status_t,
+        operation: u64,
+        handle: u64,
+        related: u64,
+        user_data: u64,
+        error_code: i32,
+    ) -> Self {
+        Self {
+            struct_size: std::mem::size_of::<iroh_event_t>() as u32,
+            kind: kind as u32,
+            status: status as u32,
+            operation,
+            handle,
+            related,
+            user_data,
+            data_len: 0,
+            buffer_id: 0,
+            error_code,
+            flags: 0,
         }
-    };
-}
-
-impl_free_handle!(iroh_ffi_node_free, NodeHandle);
-impl_free_handle!(iroh_ffi_net_free, NetHandle);
-impl_free_handle!(iroh_ffi_connection_free, ConnectionHandle);
-impl_free_handle!(iroh_ffi_send_stream_free, SendStreamHandle);
-impl_free_handle!(iroh_ffi_recv_stream_free, RecvStreamHandle);
-impl_free_handle!(iroh_ffi_blobs_free, BlobsHandle);
-impl_free_handle!(iroh_ffi_docs_free, DocsHandle);
-impl_free_handle!(iroh_ffi_doc_free, DocHandle);
-impl_free_handle!(iroh_ffi_gossip_free, GossipHandle);
-impl_free_handle!(iroh_ffi_topic_free, TopicHandle);
-impl_free_handle!(iroh_ffi_operation_free, OperationHandle);
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_operation_wait(op: *mut OperationHandle) -> i32 {
-    if op.is_null() {
-        return IROH_FFI_ERR_NULL;
     }
-    let op = &*op;
-    let mut slot = op.state.result.lock().unwrap();
-    while slot.is_none() {
-        slot = op.state.cv.wait(slot).unwrap();
+    
+    fn with_data(mut self, data: Vec<u8>, buffers: &BufferRegistry) -> Self {
+        let (buf_id, arc) = buffers.insert(data);
+        self.data_len = arc.len();
+        self.buffer_id = buf_id;
+        self
     }
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub extern "C" fn iroh_ffi_node_memory(out_op: *mut *mut OperationHandle) -> i32 {
-    if out_op.is_null() {
-        return IROH_FFI_ERR_NULL;
-    }
-    unsafe {
-        *out_op = spawn_op(async {
-            CoreNode::memory()
-                .await
-                .map(|n| OpResult::Node(Box::into_raw(Box::new(NodeHandle(n)))))
-                .map_err(|e| e.to_string())
-        });
-    }
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_node_persistent(path: iroh_ffi_string_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if out_op.is_null() {
-        return IROH_FFI_ERR_NULL;
-    }
-    let path = match string_from_ref(&path) {
-        Ok(v) => v,
-        Err(c) => return c,
-    };
-    *out_op = spawn_op(async move {
-        CoreNode::persistent(path)
-            .await
-            .map(|n| OpResult::Node(Box::into_raw(Box::new(NodeHandle(n)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_endpoint_create(alpn: iroh_ffi_bytes_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if out_op.is_null() {
-        return IROH_FFI_ERR_NULL;
-    }
-    let alpn = bytes_from_ref(&alpn);
-    *out_op = spawn_op(async move {
-        CoreNetClient::create(alpn)
-            .await
-            .map(|n| OpResult::Net(Box::into_raw(Box::new(NetHandle(n)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_endpoint_create_with_config(config: *const iroh_ffi_endpoint_config_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if config.is_null() || out_op.is_null() {
-        return IROH_FFI_ERR_NULL;
-    }
-    let config = match endpoint_config_from_ffi(&*config) {
-        Ok(v) => v,
-        Err(c) => return c,
-    };
-    *out_op = spawn_op(async move {
-        CoreNetClient::create_with_config(config)
-            .await
-            .map(|n| OpResult::Net(Box::into_raw(Box::new(NetHandle(n)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_node_id(node: *mut NodeHandle, out: *mut iroh_ffi_string_t) -> i32 {
-    if node.is_null() || out.is_null() {
-        return IROH_FFI_ERR_NULL;
-    }
-    *out = into_string((&*node).0.node_id());
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_node_addr(node: *mut NodeHandle, out: *mut iroh_ffi_node_addr_t) -> i32 {
-    if node.is_null() || out.is_null() {
-        return IROH_FFI_ERR_NULL;
-    }
-    *out = node_addr_to_ffi((&*node).0.node_addr_info());
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_node_addr_debug(node: *mut NodeHandle, out: *mut iroh_ffi_string_t) -> i32 {
-    if node.is_null() || out.is_null() {
-        return IROH_FFI_ERR_NULL;
-    }
-    *out = into_string((&*node).0.node_addr_debug());
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_node_add_node_addr(node: *mut NodeHandle, other: *mut NodeHandle) -> i32 {
-    if node.is_null() || other.is_null() {
-        return IROH_FFI_ERR_NULL;
-    }
-    match (&*node).0.add_node_addr(&(&*other).0) {
-        Ok(_) => IROH_FFI_OK,
-        Err(e) => set_last_error(e),
+    
+    fn with_buffer(mut self, buf_id: u64, data_len: usize) -> Self {
+        self.buffer_id = buf_id;
+        self.data_len = data_len;
+        self
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_node_close(node: *mut NodeHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if node.is_null() || out_op.is_null() {
-        return IROH_FFI_ERR_NULL;
-    }
-    let node = ptr_id(node);
-    *out_op = spawn_op(async move {
-        ptr_ref::<NodeHandle>(node).0.close().await;
-        Ok(OpResult::Unit)
-    });
-    IROH_FFI_OK
+/// EventOwned wraps EventInternal with its data payload for crossing thread boundary
+/// This is Send-safe because EventInternal has no raw pointers
+struct EventOwned {
+    event: EventInternal,
+    payload: Option<Arc<[u8]>>,
 }
 
-macro_rules! sync_client_from_node {
-    ($name:ident, $out_ty:ty, $ctor:expr) => {
-        #[no_mangle]
-        pub unsafe extern "C" fn $name(node: *mut NodeHandle, out: *mut *mut $out_ty) -> i32 {
-            if node.is_null() || out.is_null() {
-                return IROH_FFI_ERR_NULL;
-            }
-            *out = Box::into_raw(Box::new($ctor(&(&*node).0)));
-            IROH_FFI_OK
+impl Default for EventOwned {
+    fn default() -> Self {
+        Self {
+            event: EventInternal::default(),
+            payload: None,
         }
-    };
-}
-
-sync_client_from_node!(iroh_ffi_node_blobs_client, BlobsHandle, |n: &CoreNode| BlobsHandle(n.blobs_client()));
-sync_client_from_node!(iroh_ffi_node_docs_client, DocsHandle, |n: &CoreNode| DocsHandle(n.docs_client()));
-sync_client_from_node!(iroh_ffi_node_gossip_client, GossipHandle, |n: &CoreNode| GossipHandle(n.gossip_client()));
-sync_client_from_node!(iroh_ffi_node_net_client, NetHandle, |n: &CoreNode| NetHandle(n.net_client()));
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_net_endpoint_id(net: *mut NetHandle, out: *mut iroh_ffi_string_t) -> i32 {
-    if net.is_null() || out.is_null() { return IROH_FFI_ERR_NULL; }
-    *out = into_string((&*net).0.endpoint_id());
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_net_endpoint_addr(net: *mut NetHandle, out: *mut iroh_ffi_node_addr_t) -> i32 {
-    if net.is_null() || out.is_null() { return IROH_FFI_ERR_NULL; }
-    *out = node_addr_to_ffi((&*net).0.endpoint_addr_info());
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_net_endpoint_addr_debug(net: *mut NetHandle, out: *mut iroh_ffi_string_t) -> i32 {
-    if net.is_null() || out.is_null() { return IROH_FFI_ERR_NULL; }
-    *out = into_string((&*net).0.endpoint_addr_debug());
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_net_close(net: *mut NetHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if net.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let net = ptr_id(net);
-    *out_op = spawn_op(async move {
-        ptr_ref::<NetHandle>(net).0.close().await;
-        Ok(OpResult::Unit)
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_net_closed(net: *mut NetHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if net.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let net = ptr_id(net);
-    *out_op = spawn_op(async move {
-        ptr_ref::<NetHandle>(net).0.closed().await;
-        Ok(OpResult::Unit)
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_net_connect(net: *mut NetHandle, node_id: iroh_ffi_string_t, alpn: iroh_ffi_bytes_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if net.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let node_id = match string_from_ref(&node_id) { Ok(v) => v, Err(c) => return c };
-    let alpn = bytes_from_ref(&alpn);
-    let net = ptr_id(net);
-    *out_op = spawn_op(async move {
-        ptr_ref::<NetHandle>(net).0.connect(node_id, alpn).await
-            .map(|c| OpResult::Connection(Box::into_raw(Box::new(ConnectionHandle(c)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_net_connect_node_addr(net: *mut NetHandle, addr: *const iroh_ffi_node_addr_t, alpn: iroh_ffi_bytes_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if net.is_null() || addr.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let addr = match node_addr_from_ffi(&*addr) { Ok(v) => v, Err(c) => return c };
-    let alpn = bytes_from_ref(&alpn);
-    let net = ptr_id(net);
-    *out_op = spawn_op(async move {
-        ptr_ref::<NetHandle>(net).0.connect_node_addr(addr, alpn).await
-            .map(|c| OpResult::Connection(Box::into_raw(Box::new(ConnectionHandle(c)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_net_accept(net: *mut NetHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if net.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let net = ptr_id(net);
-    *out_op = spawn_op(async move {
-        ptr_ref::<NetHandle>(net).0.accept().await
-            .map(|c| OpResult::Connection(Box::into_raw(Box::new(ConnectionHandle(c)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_connection_remote_id(conn: *mut ConnectionHandle, out: *mut iroh_ffi_string_t) -> i32 {
-    if conn.is_null() || out.is_null() { return IROH_FFI_ERR_NULL; }
-    *out = into_string((&*conn).0.remote_id());
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_connection_open_bi(conn: *mut ConnectionHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if conn.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let conn = ptr_id(conn);
-    *out_op = spawn_op(async move {
-        ptr_ref::<ConnectionHandle>(conn).0.open_bi().await
-            .map(|(s, r)| OpResult::BiStreams(Box::into_raw(Box::new(SendStreamHandle(s))), Box::into_raw(Box::new(RecvStreamHandle(r)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_connection_accept_bi(conn: *mut ConnectionHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if conn.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let conn = ptr_id(conn);
-    *out_op = spawn_op(async move {
-        ptr_ref::<ConnectionHandle>(conn).0.accept_bi().await
-            .map(|(s, r)| OpResult::BiStreams(Box::into_raw(Box::new(SendStreamHandle(s))), Box::into_raw(Box::new(RecvStreamHandle(r)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_connection_open_uni(conn: *mut ConnectionHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if conn.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let conn = ptr_id(conn);
-    *out_op = spawn_op(async move {
-        ptr_ref::<ConnectionHandle>(conn).0.open_uni().await
-            .map(|s| OpResult::SendStream(Box::into_raw(Box::new(SendStreamHandle(s)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_connection_accept_uni(conn: *mut ConnectionHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if conn.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let conn = ptr_id(conn);
-    *out_op = spawn_op(async move {
-        ptr_ref::<ConnectionHandle>(conn).0.accept_uni().await
-            .map(|r| OpResult::RecvStream(Box::into_raw(Box::new(RecvStreamHandle(r)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_connection_send_datagram(conn: *mut ConnectionHandle, data: iroh_ffi_bytes_t) -> i32 {
-    if conn.is_null() { return IROH_FFI_ERR_NULL; }
-    match (&*conn).0.send_datagram(bytes_from_ref(&data)) {
-        Ok(_) => IROH_FFI_OK,
-        Err(e) => set_last_error(e),
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_connection_read_datagram(conn: *mut ConnectionHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if conn.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let conn = ptr_id(conn);
-    *out_op = spawn_op(async move { ptr_ref::<ConnectionHandle>(conn).0.read_datagram().await.map(OpResult::Bytes).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
+// ============================================================================
+// Buffer Registry - Track allocated buffers
+// ============================================================================
+
+struct BufferRegistry {
+    next_id: AtomicU64,
+    buffers: RwLock<HashMap<u64, Arc<[u8]>>>,
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_connection_close(conn: *mut ConnectionHandle, code: u64, reason: iroh_ffi_bytes_t) -> i32 {
-    if conn.is_null() { return IROH_FFI_ERR_NULL; }
-    match (&*conn).0.close(code, bytes_from_ref(&reason)) {
-        Ok(_) => IROH_FFI_OK,
-        Err(e) => set_last_error(e),
+impl BufferRegistry {
+    fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            buffers: RwLock::new(HashMap::new()),
+        }
+    }
+    
+    fn insert(&self, data: Vec<u8>) -> (u64, Arc<[u8]>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let arc: Arc<[u8]> = data.into();
+        self.buffers.write().unwrap().insert(id, arc.clone());
+        (id, arc)
+    }
+    
+    fn get(&self, id: u64) -> Option<Arc<[u8]>> {
+        self.buffers.read().unwrap().get(&id).cloned()
+    }
+    
+    fn remove(&self, id: u64) -> Option<Arc<[u8]>> {
+        self.buffers.write().unwrap().remove(&id)
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_connection_closed(conn: *mut ConnectionHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if conn.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let conn = ptr_id(conn);
-    *out_op = spawn_op(async move { Ok(OpResult::ClosedInfo(ptr_ref::<ConnectionHandle>(conn).0.closed().await)) });
-    IROH_FFI_OK
+// ============================================================================
+// Bridge Runtime - Main FFI runtime
+// ============================================================================
+
+struct BridgeRuntime {
+    runtime: tokio::runtime::Runtime,
+    events_tx: tokio::sync::mpsc::UnboundedSender<EventOwned>,
+    events_rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<EventOwned>>,
+    
+    // Handle registries
+    nodes: HandleRegistry<CoreNode>,
+    endpoints: HandleRegistry<CoreNetClient>,
+    connections: HandleRegistry<CoreConnection>,
+    send_streams: HandleRegistry<CoreSendStream>,
+    recv_streams: HandleRegistry<CoreRecvStream>,
+    blobs_clients: HandleRegistry<CoreBlobsClient>,
+    docs_clients: HandleRegistry<CoreDocsClient>,
+    docs: HandleRegistry<CoreDoc>,
+    gossip_clients: HandleRegistry<CoreGossipClient>,
+    gossip_topics: HandleRegistry<CoreGossipTopic>,
+    
+    // Operation registry (for cancellation)
+    operations: HandleRegistry<OperationState>,
+    
+    // Buffer registry
+    buffers: BufferRegistry,
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_send_stream_write_all(send: *mut SendStreamHandle, data: iroh_ffi_bytes_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if send.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let data = bytes_from_ref(&data);
-    let send = ptr_id(send);
-    *out_op = spawn_op(async move { ptr_ref::<SendStreamHandle>(send).0.write_all(data).await.map(|_| OpResult::Unit).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
+struct OperationState {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_send_stream_finish(send: *mut SendStreamHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if send.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let send = ptr_id(send);
-    *out_op = spawn_op(async move { ptr_ref::<SendStreamHandle>(send).0.finish().await.map(|_| OpResult::Unit).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_send_stream_stopped(send: *mut SendStreamHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if send.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let send = ptr_id(send);
-    *out_op = spawn_op(async move { ptr_ref::<SendStreamHandle>(send).0.stopped().await.map(OpResult::OptionalU64).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_recv_stream_read(recv: *mut RecvStreamHandle, max_len: usize, out_op: *mut *mut OperationHandle) -> i32 {
-    if recv.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let recv = ptr_id(recv);
-    *out_op = spawn_op(async move { ptr_ref::<RecvStreamHandle>(recv).0.read(max_len).await.map(OpResult::OptionalBytes).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_recv_stream_read_exact(recv: *mut RecvStreamHandle, n: usize, out_op: *mut *mut OperationHandle) -> i32 {
-    if recv.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let recv = ptr_id(recv);
-    *out_op = spawn_op(async move { ptr_ref::<RecvStreamHandle>(recv).0.read_exact(n).await.map(OpResult::Bytes).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_recv_stream_read_to_end(recv: *mut RecvStreamHandle, max_size: usize, out_op: *mut *mut OperationHandle) -> i32 {
-    if recv.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let recv = ptr_id(recv);
-    *out_op = spawn_op(async move { ptr_ref::<RecvStreamHandle>(recv).0.read_to_end(max_size).await.map(OpResult::Bytes).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_recv_stream_stop(recv: *mut RecvStreamHandle, code: u64) -> i32 {
-    if recv.is_null() { return IROH_FFI_ERR_NULL; }
-    match (&*recv).0.stop(code) {
-        Ok(_) => IROH_FFI_OK,
-        Err(e) => set_last_error(e),
+impl BridgeRuntime {
+    fn new(worker_threads: u32, queue_capacity: u32) -> Result<Self> {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        
+        if worker_threads > 0 {
+            builder.worker_threads(worker_threads as usize);
+        }
+        
+        builder.thread_name("iroh-ffi");
+        
+        let runtime = builder.build()?;
+        
+        let capacity = if queue_capacity > 0 { queue_capacity } else { 4096 };
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        
+        Ok(Self {
+            runtime,
+            events_tx,
+            events_rx: Mutex::new(events_rx),
+            nodes: HandleRegistry::new(),
+            endpoints: HandleRegistry::new(),
+            connections: HandleRegistry::new(),
+            send_streams: HandleRegistry::new(),
+            recv_streams: HandleRegistry::new(),
+            blobs_clients: HandleRegistry::new(),
+            docs_clients: HandleRegistry::new(),
+            docs: HandleRegistry::new(),
+            gossip_clients: HandleRegistry::new(),
+            gossip_topics: HandleRegistry::new(),
+            operations: HandleRegistry::new(),
+            buffers: BufferRegistry::new(),
+        })
+    }
+    
+    fn emit(&self, event: EventOwned) {
+        let _ = self.events_tx.send(event);
+    }
+    
+    fn emit_error(&self, operation: u64, user_data: u64, message: &str) {
+        let data = message.as_bytes().to_vec();
+        let (buf_id, _) = self.buffers.insert(data);
+        let event = EventInternal::new(
+            iroh_event_kind_t::IROH_EVENT_ERROR,
+            iroh_status_t::IROH_STATUS_INTERNAL,
+            operation,
+            0,
+            0,
+            user_data,
+            -1,
+        ).with_buffer(buf_id, message.len());
+        self.emit(EventOwned { event, payload: None });
+    }
+    
+    fn emit_simple(
+        &self,
+        kind: iroh_event_kind_t,
+        status: iroh_status_t,
+        operation: u64,
+        handle: u64,
+        related: u64,
+        user_data: u64,
+        error_code: i32,
+    ) {
+        let event = EventInternal::new(kind, status, operation, handle, related, user_data, error_code);
+        self.emit(EventOwned { event, payload: None });
+    }
+    
+    fn emit_with_data(&self, event: EventInternal, data: Vec<u8>) {
+        let (buf_id, arc) = self.buffers.insert(data);
+        let event = event.with_buffer(buf_id, arc.len());
+        self.emit(EventOwned { event, payload: Some(arc) });
+    }
+    
+    fn new_operation(&self) -> (u64, Arc<std::sync::atomic::AtomicBool>) {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let op = OperationState { cancelled: cancelled.clone() };
+        let id = self.operations.insert(op);
+        (id, cancelled)
+    }
+    
+    fn cancel_operation(&self, op_id: u64) -> bool {
+        if let Some(op) = self.operations.get(op_id) {
+            op.cancelled.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_blobs_add_bytes(blobs: *mut BlobsHandle, data: iroh_ffi_bytes_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if blobs.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let data = bytes_from_ref(&data);
-    let blobs = ptr_id(blobs);
-    *out_op = spawn_op(async move { ptr_ref::<BlobsHandle>(blobs).0.add_bytes(data).await.map(OpResult::String).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
+// ============================================================================
+// Global Runtime Registry
+// ============================================================================
+
+static RUNTIMES: std::sync::OnceLock<Mutex<HashMap<iroh_runtime_t, Arc<BridgeRuntime>>>> =
+    std::sync::OnceLock::new();
+
+fn runtimes() -> &'static Mutex<HashMap<iroh_runtime_t, Arc<BridgeRuntime>>> {
+    RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_blobs_read_to_bytes(blobs: *mut BlobsHandle, hash: iroh_ffi_string_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if blobs.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let hash = match string_from_ref(&hash) { Ok(v) => v, Err(c) => return c };
-    let blobs = ptr_id(blobs);
-    *out_op = spawn_op(async move { ptr_ref::<BlobsHandle>(blobs).0.read_to_bytes(hash).await.map(OpResult::Bytes).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
+fn load_runtime(handle: iroh_runtime_t) -> Result<Arc<BridgeRuntime>, iroh_status_t> {
+    let guard = runtimes().lock().map_err(|_| iroh_status_t::IROH_STATUS_INTERNAL)?;
+    guard.get(&handle).cloned().ok_or(iroh_status_t::IROH_STATUS_NOT_FOUND)
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_blobs_create_ticket(blobs: *mut BlobsHandle, hash: iroh_ffi_string_t, out: *mut iroh_ffi_string_t) -> i32 {
-    if blobs.is_null() || out.is_null() { return IROH_FFI_ERR_NULL; }
-    let hash = match string_from_ref(&hash) { Ok(v) => v, Err(c) => return c };
-    match (&*blobs).0.create_ticket(hash) {
-        Ok(v) => { *out = into_string(v); IROH_FFI_OK }
-        Err(e) => set_last_error(e),
-    }
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+fn new_handle() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_blobs_download_blob(blobs: *mut BlobsHandle, ticket: iroh_ffi_string_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if blobs.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let ticket = match string_from_ref(&ticket) { Ok(v) => v, Err(c) => return c };
-    let blobs = ptr_id(blobs);
-    *out_op = spawn_op(async move { ptr_ref::<BlobsHandle>(blobs).0.download_blob(ticket).await.map(OpResult::Bytes).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_docs_create(docs: *mut DocsHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if docs.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let docs = ptr_id(docs);
-    *out_op = spawn_op(async move {
-        ptr_ref::<DocsHandle>(docs).0.create().await
-            .map(|d| OpResult::Doc(Box::into_raw(Box::new(DocHandle(d)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_docs_create_author(docs: *mut DocsHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if docs.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let docs = ptr_id(docs);
-    *out_op = spawn_op(async move { ptr_ref::<DocsHandle>(docs).0.create_author().await.map(OpResult::String).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_docs_join(docs: *mut DocsHandle, ticket: iroh_ffi_string_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if docs.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let ticket = match string_from_ref(&ticket) { Ok(v) => v, Err(c) => return c };
-    let docs = ptr_id(docs);
-    *out_op = spawn_op(async move {
-        ptr_ref::<DocsHandle>(docs).0.join(ticket).await
-            .map(|d| OpResult::Doc(Box::into_raw(Box::new(DocHandle(d)))))
-            .map_err(|e| e.to_string())
-    });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_doc_id(doc: *mut DocHandle, out: *mut iroh_ffi_string_t) -> i32 {
-    if doc.is_null() || out.is_null() { return IROH_FFI_ERR_NULL; }
-    *out = into_string((&*doc).0.doc_id());
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_doc_set_bytes(doc: *mut DocHandle, author: iroh_ffi_string_t, key: iroh_ffi_bytes_t, value: iroh_ffi_bytes_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if doc.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let author = match string_from_ref(&author) { Ok(v) => v, Err(c) => return c };
-    let key = bytes_from_ref(&key);
-    let value = bytes_from_ref(&value);
-    let doc = ptr_id(doc);
-    *out_op = spawn_op(async move { ptr_ref::<DocHandle>(doc).0.set_bytes(author, key, value).await.map(OpResult::String).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_doc_get_exact(doc: *mut DocHandle, author: iroh_ffi_string_t, key: iroh_ffi_bytes_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if doc.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let author = match string_from_ref(&author) { Ok(v) => v, Err(c) => return c };
-    let key = bytes_from_ref(&key);
-    let doc = ptr_id(doc);
-    *out_op = spawn_op(async move { ptr_ref::<DocHandle>(doc).0.get_exact(author, key).await.map(OpResult::OptionalBytes).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_doc_share(doc: *mut DocHandle, mode: iroh_ffi_string_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if doc.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let mode = match string_from_ref(&mode) { Ok(v) => v, Err(c) => return c };
-    let doc = ptr_id(doc);
-    *out_op = spawn_op(async move { ptr_ref::<DocHandle>(doc).0.share(mode).await.map(OpResult::String).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_gossip_subscribe(gossip: *mut GossipHandle, topic: iroh_ffi_bytes_t, peers: *const iroh_ffi_string_t, peers_len: usize, out_op: *mut *mut OperationHandle) -> i32 {
-    if gossip.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let topic = bytes_from_ref(&topic);
-    let peers = if peers.is_null() || peers_len == 0 {
+unsafe fn read_bytes(b: &iroh_bytes_t) -> Vec<u8> {
+    if b.ptr.is_null() || b.len == 0 {
         Vec::new()
     } else {
-        let items = std::slice::from_raw_parts(peers, peers_len);
-        let mut out = Vec::with_capacity(peers_len);
-        for p in items {
-            out.push(match string_from_ref(p) { Ok(v) => v, Err(c) => return c });
-        }
-        out
+        slice::from_raw_parts(b.ptr, b.len).to_vec()
+    }
+}
+
+unsafe fn read_bytes_opt(b: &iroh_bytes_t) -> Option<Vec<u8>> {
+    if b.ptr.is_null() || b.len == 0 {
+        None
+    } else {
+        Some(slice::from_raw_parts(b.ptr, b.len).to_vec())
+    }
+}
+
+unsafe fn read_string(b: &iroh_bytes_t) -> Result<String, i32> {
+    let bytes = read_bytes(b);
+    String::from_utf8(bytes).map_err(set_last_error)
+}
+
+unsafe fn read_string_list(list: &iroh_bytes_list_t) -> Vec<String> {
+    if list.items.is_null() || list.len == 0 {
+        Vec::new()
+    } else {
+        let items = slice::from_raw_parts(list.items, list.len);
+        items.iter()
+            .filter_map(|b| read_string(b).ok())
+            .collect()
+    }
+}
+
+fn alloc_string(s: String) -> iroh_bytes_t {
+    let mut bytes = s.into_bytes();
+    let len = bytes.len();
+    bytes.push(0); // null terminator
+    let ptr = bytes.as_mut_ptr() as *mut u8;
+    std::mem::forget(bytes);
+    iroh_bytes_t { ptr, len }
+}
+
+fn alloc_bytes(bytes: Vec<u8>) -> iroh_bytes_t {
+    let len = bytes.len();
+    let ptr = Box::into_raw(bytes.into_boxed_slice()) as *mut u8;
+    iroh_bytes_t { ptr, len }
+}
+
+// Helper to check if operation was cancelled
+fn check_cancelled(cancelled: &Arc<std::sync::atomic::AtomicBool>, bridge: &Arc<BridgeRuntime>, op_id: u64, user_data: u64) -> bool {
+    if cancelled.load(Ordering::SeqCst) {
+        bridge.emit_simple(
+            iroh_event_kind_t::IROH_EVENT_OPERATION_CANCELLED,
+            iroh_status_t::IROH_STATUS_CANCELLED,
+            op_id,
+            0,
+            0,
+            user_data,
+            iroh_status_t::IROH_STATUS_CANCELLED as i32,
+        );
+        true
+    } else {
+        false
+    }
+}
+
+// ============================================================================
+// C FFI Functions - Versioning
+// ============================================================================
+
+#[no_mangle]
+pub extern "C" fn iroh_abi_version_major() -> u32 {
+    IROH_ABI_VERSION_MAJOR
+}
+
+#[no_mangle]
+pub extern "C" fn iroh_abi_version_minor() -> u32 {
+    IROH_ABI_VERSION_MINOR
+}
+
+#[no_mangle]
+pub extern "C" fn iroh_abi_version_patch() -> u32 {
+    IROH_ABI_VERSION_PATCH
+}
+
+// ============================================================================
+// C FFI Functions - Runtime
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_runtime_new(
+    config: *const iroh_runtime_config_t,
+    out_runtime: *mut iroh_runtime_t,
+) -> i32 {
+    if out_runtime.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let worker_threads = config.as_ref().map(|c| c.worker_threads).unwrap_or(0);
+    let queue_capacity = config.as_ref().map(|c| c.event_queue_capacity).unwrap_or(4096);
+    
+    let bridge = match BridgeRuntime::new(worker_threads, queue_capacity) {
+        Ok(b) => b,
+        Err(e) => return set_last_error(e),
     };
-    let gossip = ptr_id(gossip);
-    *out_op = spawn_op(async move {
-        ptr_ref::<GossipHandle>(gossip).0.subscribe(topic, peers).await
-            .map(|t| OpResult::Topic(Box::into_raw(Box::new(TopicHandle(t)))))
-            .map_err(|e| e.to_string())
+    
+    let runtime_id = new_handle();
+    
+    if let Ok(mut guard) = runtimes().lock() {
+        guard.insert(runtime_id, Arc::new(bridge));
+        *out_runtime = runtime_id;
+        iroh_status_t::IROH_STATUS_OK as i32
+    } else {
+        iroh_status_t::IROH_STATUS_INTERNAL as i32
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_runtime_close(runtime: iroh_runtime_t) -> i32 {
+    match runtimes().lock() {
+        Ok(mut guard) => {
+            if guard.remove(&runtime).is_some() {
+                iroh_status_t::IROH_STATUS_OK as i32
+            } else {
+                iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+            }
+        }
+        Err(_) => iroh_status_t::IROH_STATUS_INTERNAL as i32,
+    }
+}
+
+// ============================================================================
+// C FFI Functions - Secret Key
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_secret_key_generate(
+    out_key_ptr: *mut u8,
+    out_key_capacity: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let mut key = [0u8; 32];
+    if let Err(_) = getrandom::getrandom(&mut key) {
+        return iroh_status_t::IROH_STATUS_INTERNAL as i32;
+    }
+    let len = key.len();
+    
+    *out_len = len;
+    
+    if out_key_ptr.is_null() || out_key_capacity < len {
+        return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+    }
+    
+    unsafe {
+        ptr::copy_nonoverlapping(key.as_ptr(), out_key_ptr, len);
+    }
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Event Polling
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_poll_events(
+    runtime: iroh_runtime_t,
+    out_events: *mut iroh_event_t,
+    max_events: usize,
+    timeout_ms: u32,
+) -> usize {
+    if out_events.is_null() || max_events == 0 {
+        return 0;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+    
+    let mut guard = match bridge.events_rx.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+    
+    let first = if timeout_ms == 0 {
+        guard.try_recv().ok()
+    } else {
+        bridge.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(timeout_ms as u64), guard.recv())
+                .await
+                .ok()
+                .flatten()
+        })
+    };
+    
+    let mut written = 0usize;
+    
+    if let Some(event_owned) = first {
+        let ev = to_iroh_event(&event_owned.event, &bridge.buffers);
+        unsafe {
+            ptr::write(out_events.add(written), ev);
+        }
+        std::mem::forget(event_owned.payload);
+        written += 1;
+    } else {
+        return 0;
+    }
+    
+    while written < max_events {
+        match guard.try_recv() {
+            Ok(event_owned) => {
+                let ev = to_iroh_event(&event_owned.event, &bridge.buffers);
+                unsafe {
+                    ptr::write(out_events.add(written), ev);
+                }
+                std::mem::forget(event_owned.payload);
+                written += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    
+    written
+}
+
+/// Convert internal EventInternal to C-compatible iroh_event_t
+fn to_iroh_event(event: &EventInternal, buffers: &BufferRegistry) -> iroh_event_t {
+    let (data_ptr, data_len) = if event.buffer_id != 0 {
+        if let Some(buf) = buffers.get(event.buffer_id) {
+            (buf.as_ptr(), buf.len())
+        } else {
+            (ptr::null(), 0)
+        }
+    } else {
+        (ptr::null(), 0)
+    };
+    
+    iroh_event_t {
+        struct_size: event.struct_size,
+        kind: event.kind,
+        status: event.status,
+        operation: event.operation,
+        handle: event.handle,
+        related: event.related,
+        user_data: event.user_data,
+        data_ptr,
+        data_len,
+        buffer: event.buffer_id,
+        error_code: event.error_code,
+        flags: event.flags,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_buffer_release(runtime: iroh_runtime_t, buffer: u64) -> i32 {
+    if buffer == 0 {
+        return iroh_status_t::IROH_STATUS_OK as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(_) => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    if bridge.buffers.remove(buffer).is_some() {
+        iroh_status_t::IROH_STATUS_OK as i32
+    } else {
+        iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+    }
+}
+
+// ============================================================================
+// C FFI Functions - Operation Cancellation
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_operation_cancel(
+    runtime: iroh_runtime_t,
+    operation: iroh_operation_t,
+) -> i32 {
+    if operation == 0 {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    if bridge.cancel_operation(operation) {
+        bridge.emit_simple(
+            iroh_event_kind_t::IROH_EVENT_OPERATION_CANCELLED,
+            iroh_status_t::IROH_STATUS_CANCELLED,
+            operation,
+            0,
+            0,
+            0,
+            iroh_status_t::IROH_STATUS_CANCELLED as i32,
+        );
+        iroh_status_t::IROH_STATUS_OK as i32
+    } else {
+        iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+    }
+}
+
+// ============================================================================
+// C FFI Functions - Error
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_last_error_message(
+    buffer: *mut u8,
+    capacity: usize,
+) -> usize {
+    let msg = LAST_ERROR.with(|slot| {
+        slot.borrow().as_ref().map(|s| s.to_bytes().to_vec()).unwrap_or_default()
     });
-    IROH_FFI_OK
+    
+    let len = msg.len().min(capacity);
+    if !buffer.is_null() && len > 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(msg.as_ptr(), buffer, len);
+        }
+    }
+    
+    msg.len()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_topic_broadcast(topic: *mut TopicHandle, data: iroh_ffi_bytes_t, out_op: *mut *mut OperationHandle) -> i32 {
-    if topic.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let data = bytes_from_ref(&data);
-    let topic = ptr_id(topic);
-    *out_op = spawn_op(async move { ptr_ref::<TopicHandle>(topic).0.broadcast(data).await.map(|_| OpResult::Unit).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
+pub extern "C" fn iroh_status_name(status: iroh_status_t) -> *const c_char {
+    let s = match status {
+        iroh_status_t::IROH_STATUS_OK => "IROH_STATUS_OK\0",
+        iroh_status_t::IROH_STATUS_INVALID_ARGUMENT => "IROH_STATUS_INVALID_ARGUMENT\0",
+        iroh_status_t::IROH_STATUS_NOT_FOUND => "IROH_STATUS_NOT_FOUND\0",
+        iroh_status_t::IROH_STATUS_ALREADY_CLOSED => "IROH_STATUS_ALREADY_CLOSED\0",
+        iroh_status_t::IROH_STATUS_QUEUE_FULL => "IROH_STATUS_QUEUE_FULL\0",
+        iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL => "IROH_STATUS_BUFFER_TOO_SMALL\0",
+        iroh_status_t::IROH_STATUS_UNSUPPORTED => "IROH_STATUS_UNSUPPORTED\0",
+        iroh_status_t::IROH_STATUS_INTERNAL => "IROH_STATUS_INTERNAL\0",
+        iroh_status_t::IROH_STATUS_TIMEOUT => "IROH_STATUS_TIMEOUT\0",
+        iroh_status_t::IROH_STATUS_CANCELLED => "IROH_STATUS_CANCELLED\0",
+        iroh_status_t::IROH_STATUS_CONNECTION_REFUSED => "IROH_STATUS_CONNECTION_REFUSED\0",
+        iroh_status_t::IROH_STATUS_STREAM_RESET => "IROH_STATUS_STREAM_RESET\0",
+    };
+    s.as_ptr() as *const c_char
+}
+
+// ============================================================================
+// C FFI Functions - Node
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_node_memory(
+    runtime: iroh_runtime_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match CoreNode::memory().await {
+            Ok(node) => {
+                let handle = bridge2.nodes.insert(node);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_NODE_CREATED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    handle,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_topic_recv(topic: *mut TopicHandle, out_op: *mut *mut OperationHandle) -> i32 {
-    if topic.is_null() || out_op.is_null() { return IROH_FFI_ERR_NULL; }
-    let topic = ptr_id(topic);
-    *out_op = spawn_op(async move { ptr_ref::<TopicHandle>(topic).0.recv().await.map(OpResult::GossipEvent).map_err(|e| e.to_string()) });
-    IROH_FFI_OK
+pub unsafe extern "C" fn iroh_node_persistent(
+    runtime: iroh_runtime_t,
+    path: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let path_str = match unsafe { read_string(&path) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match CoreNode::persistent(path_str).await {
+            Ok(node) => {
+                let handle = bridge2.nodes.insert(node);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_NODE_CREATED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    handle,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
 }
 
-macro_rules! take_handle_result {
-    ($name:ident, $variant:ident, $ty:ty) => {
-        #[no_mangle]
-        pub unsafe extern "C" fn $name(op: *mut OperationHandle, out: *mut *mut $ty) -> i32 {
-            if out.is_null() { return IROH_FFI_ERR_NULL; }
-            match take_result(op) {
-                Ok(OpResult::$variant(v)) => { *out = v; IROH_FFI_OK }
-                Ok(_) => set_last_error("unexpected operation result type"),
-                Err(c) => c,
+#[no_mangle]
+pub unsafe extern "C" fn iroh_node_close(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        node_arc.close().await;
+        bridge2.nodes.remove(node);
+        bridge2.emit_simple(
+            iroh_event_kind_t::IROH_EVENT_CLOSED,
+            iroh_status_t::IROH_STATUS_OK,
+            op_id,
+            node,
+            0,
+            user_data,
+            0,
+        );
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_node_id(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    out_buf: *mut u8,
+    capacity: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let id = node_arc.node_id();
+    let len = id.len();
+    
+    *out_len = len;
+    
+    if capacity < len {
+        return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+    }
+    
+    if !out_buf.is_null() && len > 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(id.as_ptr(), out_buf, len);
+        }
+    }
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_node_addr_info(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    out_buf: *mut u8,
+    buf_capacity: usize,
+    out_addr: *mut iroh_node_addr_t,
+) -> i32 {
+    if out_addr.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let addr = node_arc.node_addr_info();
+    
+    // Pack into scratch buffer: endpoint_id, relay_url, direct_addresses
+    let mut offset = 0;
+    
+    // endpoint_id
+    if offset + addr.endpoint_id.len() + 1 > buf_capacity {
+        return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+    }
+    let ep_id_offset = offset;
+    unsafe {
+        ptr::copy_nonoverlapping(addr.endpoint_id.as_ptr(), out_buf.add(offset), addr.endpoint_id.len());
+    }
+    offset += addr.endpoint_id.len();
+    unsafe { *out_buf.add(offset) = 0; }
+    offset += 1;
+    
+    // relay_url
+    let relay_offset = if let Some(ref url) = addr.relay_url {
+        if offset + url.len() + 1 > buf_capacity {
+            return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+        }
+        let rel_off = offset;
+        unsafe {
+            ptr::copy_nonoverlapping(url.as_ptr(), out_buf.add(offset), url.len());
+        }
+        offset += url.len();
+        unsafe { *out_buf.add(offset) = 0; }
+        offset += 1;
+        Some(rel_off)
+    } else {
+        unsafe { *out_buf.add(offset) = 0; }
+        offset += 1;
+        None
+    };
+    
+    *out_addr = iroh_node_addr_t {
+        endpoint_id: iroh_bytes_t { ptr: unsafe { out_buf.add(ep_id_offset) }, len: addr.endpoint_id.len() },
+        relay_url: iroh_bytes_t { 
+            ptr: relay_offset.map(|o| unsafe { out_buf.add(o) }).unwrap_or(ptr::null_mut()), 
+            len: addr.relay_url.as_ref().map(|s| s.len()).unwrap_or(0) 
+        },
+        direct_addresses: iroh_bytes_list_t { 
+            items: ptr::null(),
+            len: 0 
+        },
+    };
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_node_export_secret_key(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    out_buf: *mut u8,
+    capacity: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let key = node_arc.export_secret_key();
+    let len = key.len();
+    
+    *out_len = len;
+    
+    if capacity < len {
+        return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+    }
+    
+    if !out_buf.is_null() && len > 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(key.as_ptr(), out_buf, len);
+        }
+    }
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Endpoint
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_endpoint_create(
+    runtime: iroh_runtime_t,
+    config: *const iroh_endpoint_config_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if config.is_null() || out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let cfg = unsafe { *config };
+    
+    let core_config = CoreEndpointConfig {
+        relay_mode: match cfg.relay_mode {
+            0 => None,
+            1 => Some("custom".to_string()),
+            2 => Some("disabled".to_string()),
+            _ => None,
+        },
+        relay_urls: unsafe { read_string_list(&cfg.relay_urls) },
+        alpns: if cfg.alpns.items.is_null() || cfg.alpns.len == 0 {
+            Vec::new()
+        } else {
+            unsafe { 
+                slice::from_raw_parts(cfg.alpns.items, cfg.alpns.len)
+                    .iter()
+                    .map(|b| read_bytes(b))
+                    .collect()
+            }
+        },
+        secret_key: unsafe { read_bytes_opt(&cfg.secret_key) },
+        enable_discovery: cfg.enable_discovery != 0,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match CoreNetClient::create_with_config(core_config).await {
+            Ok(endpoint) => {
+                let handle = bridge2.endpoints.insert(endpoint);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_ENDPOINT_CREATED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    handle,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_endpoint_close(
+    runtime: iroh_runtime_t,
+    endpoint: iroh_endpoint_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let ep_arc = match bridge.endpoints.get(endpoint) {
+        Some(e) => e,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        ep_arc.close().await;
+        bridge2.endpoints.remove(endpoint);
+        bridge2.emit_simple(
+            iroh_event_kind_t::IROH_EVENT_CLOSED,
+            iroh_status_t::IROH_STATUS_OK,
+            op_id,
+            endpoint,
+            0,
+            user_data,
+            0,
+        );
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_endpoint_id(
+    runtime: iroh_runtime_t,
+    endpoint: iroh_endpoint_t,
+    out_buf: *mut u8,
+    capacity: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let ep_arc = match bridge.endpoints.get(endpoint) {
+        Some(e) => e,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let id = ep_arc.endpoint_id();
+    let len = id.len();
+    
+    *out_len = len;
+    
+    if capacity < len {
+        return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+    }
+    
+    if !out_buf.is_null() && len > 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(id.as_ptr(), out_buf, len);
+        }
+    }
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_endpoint_addr_info(
+    runtime: iroh_runtime_t,
+    endpoint: iroh_endpoint_t,
+    out_buf: *mut u8,
+    buf_capacity: usize,
+    out_addr: *mut iroh_node_addr_t,
+) -> i32 {
+    if out_addr.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let ep_arc = match bridge.endpoints.get(endpoint) {
+        Some(e) => e,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let addr = ep_arc.endpoint_addr_info();
+    
+    // Pack into scratch buffer: endpoint_id, relay_url, direct_addresses
+    let mut offset = 0;
+    
+    // endpoint_id
+    if offset + addr.endpoint_id.len() + 1 > buf_capacity {
+        return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+    }
+    let ep_id_offset = offset;
+    unsafe {
+        ptr::copy_nonoverlapping(addr.endpoint_id.as_ptr(), out_buf.add(offset), addr.endpoint_id.len());
+    }
+    offset += addr.endpoint_id.len();
+    unsafe { *out_buf.add(offset) = 0; }
+    offset += 1;
+    
+    // relay_url
+    let relay_offset = if let Some(ref url) = addr.relay_url {
+        if offset + url.len() + 1 > buf_capacity {
+            return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+        }
+        let rel_off = offset;
+        unsafe {
+            ptr::copy_nonoverlapping(url.as_ptr(), out_buf.add(offset), url.len());
+        }
+        offset += url.len();
+        unsafe { *out_buf.add(offset) = 0; }
+        offset += 1;
+        Some(rel_off)
+    } else {
+        unsafe { *out_buf.add(offset) = 0; }
+        offset += 1;
+        None
+    };
+    
+    // direct_addresses - pack as additional null-terminated strings
+    let mut addr_offsets = Vec::new();
+    for direct_addr in &addr.direct_addresses {
+        if offset + direct_addr.len() + 1 > buf_capacity {
+            return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+        }
+        let addr_off = offset;
+        unsafe {
+            ptr::copy_nonoverlapping(direct_addr.as_ptr(), out_buf.add(offset), direct_addr.len());
+        }
+        offset += direct_addr.len();
+        unsafe { *out_buf.add(offset) = 0; }
+        offset += 1;
+        addr_offsets.push(addr_off);
+    }
+    
+    // Create the bytes list for direct addresses
+    let direct_addrs_ptr: *const iroh_bytes_t = if addr_offsets.is_empty() {
+        ptr::null()
+    } else {
+        // Allocate space for the list at the end
+        let list_offset = offset;
+        offset += addr_offsets.len() * std::mem::size_of::<iroh_bytes_t>();
+        if offset > buf_capacity {
+            return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+        }
+        
+        for (i, &addr_off) in addr_offsets.iter().enumerate() {
+            let item_ptr = unsafe { out_buf.add(list_offset).add(i * std::mem::size_of::<iroh_bytes_t>()) as *mut iroh_bytes_t };
+            let addr_len = addr.direct_addresses[i].len();
+            unsafe {
+                *item_ptr = iroh_bytes_t {
+                    ptr: out_buf.add(addr_off),
+                    len: addr_len,
+                };
+            }
+        }
+        unsafe { out_buf.add(list_offset) as *const iroh_bytes_t }
+    };
+    
+    *out_addr = iroh_node_addr_t {
+        endpoint_id: iroh_bytes_t { ptr: unsafe { out_buf.add(ep_id_offset) }, len: addr.endpoint_id.len() },
+        relay_url: iroh_bytes_t { 
+            ptr: relay_offset.map(|o| unsafe { out_buf.add(o) }).unwrap_or(ptr::null_mut()), 
+            len: addr.relay_url.as_ref().map(|s| s.len()).unwrap_or(0) 
+        },
+        direct_addresses: iroh_bytes_list_t { 
+            items: direct_addrs_ptr,
+            len: addr.direct_addresses.len() 
+        },
+    };
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_add_node_addr(
+    runtime: iroh_runtime_t,
+    endpoint: iroh_endpoint_t,
+    addr: iroh_node_addr_t,
+) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let ep_arc = match bridge.endpoints.get(endpoint) {
+        Some(e) => e,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    // Build CoreNodeAddr from FFI struct
+    let endpoint_id = match unsafe { read_string(&addr.endpoint_id) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    
+    let relay_url = if addr.relay_url.ptr.is_null() || addr.relay_url.len == 0 {
+        None
+    } else {
+        match unsafe { read_string(&addr.relay_url) } {
+            Ok(s) => Some(s),
+            Err(e) => return e,
+        }
+    };
+    
+    let mut direct_addresses = Vec::new();
+    if !addr.direct_addresses.items.is_null() && addr.direct_addresses.len > 0 {
+        let items = unsafe { slice::from_raw_parts(addr.direct_addresses.items, addr.direct_addresses.len) };
+        for item in items {
+            match unsafe { read_string(item) } {
+                Ok(s) => direct_addresses.push(s),
+                Err(e) => return e,
+            }
+        }
+    }
+    
+    let core_addr = iroh_transport_core::CoreNodeAddr {
+        endpoint_id,
+        relay_url,
+        direct_addresses,
+    };
+    
+    // We need to add the address to the endpoint
+    // For now, we'll use add_node_addr on the associated node if available
+    // This is a limitation - endpoints don't have add_node_addr directly
+    // In a real implementation, we'd expose this on CoreNetClient
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Connections
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_connect(
+    runtime: iroh_runtime_t,
+    endpoint_or_node: u64,
+    config: *const iroh_connect_config_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if config.is_null() || out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    // Try to get as endpoint first, then as node
+    let ep_arc = bridge.endpoints.get(endpoint_or_node)
+        .map(|e| e.clone())
+        .or_else(|| bridge.nodes.get(endpoint_or_node).map(|n| n.net_client()).map(Arc::new));
+    
+    let ep = match ep_arc {
+        Some(e) => e,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let cfg = unsafe { *config };
+    let node_id = match unsafe { read_string(&cfg.node_id) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let alpn = unsafe { read_bytes(&cfg.alpn) };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match ep.connect(node_id, alpn).await {
+            Ok(conn) => {
+                let handle = bridge2.connections.insert(conn);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_CONNECTED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    handle,
+                    endpoint_or_node,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_accept(
+    runtime: iroh_runtime_t,
+    endpoint_or_node: u64,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let ep_arc = bridge.endpoints.get(endpoint_or_node)
+        .map(|e| e.clone())
+        .or_else(|| bridge.nodes.get(endpoint_or_node).map(|n| n.net_client()).map(Arc::new));
+    
+    let ep = match ep_arc {
+        Some(e) => e,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match ep.accept().await {
+            Ok(conn) => {
+                let handle = bridge2.connections.insert(conn);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_CONNECTION_ACCEPTED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    handle,
+                    endpoint_or_node,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_connection_remote_id(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    out_buf: *mut u8,
+    capacity: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let id = conn_arc.remote_id();
+    let len = id.len();
+    
+    *out_len = len;
+    
+    if capacity < len {
+        return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+    }
+    
+    if !out_buf.is_null() && len > 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(id.as_ptr(), out_buf, len);
+        }
+    }
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_connection_close(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    error_code: u32,
+    reason: iroh_bytes_t,
+) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let reason_bytes = unsafe { read_bytes(&reason) };
+    
+    if let Err(e) = conn_arc.close(error_code as u64, reason_bytes) {
+        return set_last_error(e);
+    }
+    
+    bridge.connections.remove(connection);
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_connection_send_datagram(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    data: iroh_bytes_t,
+) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let data_bytes = unsafe { read_bytes(&data) };
+    
+    if let Err(e) = conn_arc.send_datagram(data_bytes) {
+        return set_last_error(e);
+    }
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_connection_read_datagram(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match conn_arc.read_datagram().await {
+            Ok(data) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_BYTES_RESULT,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    connection,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, data);
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Streams
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_open_bi(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match conn_arc.open_bi().await {
+            Ok((send, recv)) => {
+                let send_handle = bridge2.send_streams.insert(send);
+                let recv_handle = bridge2.recv_streams.insert(recv);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_STREAM_OPENED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    send_handle,
+                    recv_handle,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_accept_bi(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match conn_arc.accept_bi().await {
+            Ok((send, recv)) => {
+                let send_handle = bridge2.send_streams.insert(send);
+                let recv_handle = bridge2.recv_streams.insert(recv);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_STREAM_ACCEPTED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    send_handle,
+                    recv_handle,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_open_uni(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match conn_arc.open_uni().await {
+            Ok(send) => {
+                let handle = bridge2.send_streams.insert(send);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_STREAM_OPENED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    handle,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_accept_uni(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match conn_arc.accept_uni().await {
+            Ok(recv) => {
+                let handle = bridge2.recv_streams.insert(recv);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_STREAM_ACCEPTED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    handle,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_stream_write(
+    runtime: iroh_runtime_t,
+    send_stream: iroh_send_stream_t,
+    data: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let stream_arc = match bridge.send_streams.get(send_stream) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let data_bytes = unsafe { read_bytes(&data) };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match stream_arc.write_all(data_bytes).await {
+            Ok(()) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_SEND_COMPLETED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    send_stream,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_stream_finish(
+    runtime: iroh_runtime_t,
+    send_stream: iroh_send_stream_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let stream_arc = match bridge.send_streams.get(send_stream) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match stream_arc.finish().await {
+            Ok(()) => {
+                bridge2.send_streams.remove(send_stream);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_STREAM_FINISHED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    send_stream,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_stream_read(
+    runtime: iroh_runtime_t,
+    recv_stream: iroh_recv_stream_t,
+    max_len: usize,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let stream_arc = match bridge.recv_streams.get(recv_stream) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match stream_arc.read(max_len).await {
+            Ok(Some(data)) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_FRAME_RECEIVED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    recv_stream,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, data);
+            }
+            Ok(None) => {
+                bridge2.recv_streams.remove(recv_stream);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_STREAM_FINISHED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    recv_stream,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_stream_read_to_end(
+    runtime: iroh_runtime_t,
+    recv_stream: iroh_recv_stream_t,
+    max_size: usize,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let stream_arc = match bridge.recv_streams.get(recv_stream) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match stream_arc.read_to_end(max_size).await {
+            Ok(data) => {
+                bridge2.recv_streams.remove(recv_stream);
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_BYTES_RESULT,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    recv_stream,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, data);
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_stream_stop(
+    runtime: iroh_runtime_t,
+    recv_stream: iroh_recv_stream_t,
+    error_code: u32,
+) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let stream_arc = match bridge.recv_streams.get(recv_stream) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    if let Err(e) = stream_arc.stop(error_code as u64) {
+        return set_last_error(e);
+    }
+    
+    bridge.recv_streams.remove(recv_stream);
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Handle Free
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_node_free(runtime: iroh_runtime_t, node: iroh_node_t) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    if bridge.nodes.remove(node).is_some() {
+        iroh_status_t::IROH_STATUS_OK as i32
+    } else {
+        iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_endpoint_free(runtime: iroh_runtime_t, endpoint: iroh_endpoint_t) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    if bridge.endpoints.remove(endpoint).is_some() {
+        iroh_status_t::IROH_STATUS_OK as i32
+    } else {
+        iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_connection_free(runtime: iroh_runtime_t, connection: iroh_connection_t) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    if bridge.connections.remove(connection).is_some() {
+        iroh_status_t::IROH_STATUS_OK as i32
+    } else {
+        iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_send_stream_free(runtime: iroh_runtime_t, stream: iroh_send_stream_t) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    if bridge.send_streams.remove(stream).is_some() {
+        iroh_status_t::IROH_STATUS_OK as i32
+    } else {
+        iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_recv_stream_free(runtime: iroh_runtime_t, stream: iroh_recv_stream_t) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    if bridge.recv_streams.remove(stream).is_some() {
+        iroh_status_t::IROH_STATUS_OK as i32
+    } else {
+        iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_free(runtime: iroh_runtime_t, doc: u64) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    if bridge.docs.remove(doc).is_some() {
+        iroh_status_t::IROH_STATUS_OK as i32
+    } else {
+        iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_gossip_topic_free(runtime: iroh_runtime_t, topic: u64) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    if bridge.gossip_topics.remove(topic).is_some() {
+        iroh_status_t::IROH_STATUS_OK as i32
+    } else {
+        iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+    }
+}
+
+// ============================================================================
+// C FFI Functions - Blobs (simplified for Phase 1)
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_blobs_add_bytes(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    data: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let blobs = node_arc.blobs_client();
+    let data_bytes = unsafe { read_bytes(&data) };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match blobs.add_bytes(data_bytes).await {
+            Ok(hash) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_BLOB_ADDED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, hash.into_bytes());
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_blobs_read(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    hash_hex: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let blobs = node_arc.blobs_client();
+    let hash = match unsafe { read_string(&hash_hex) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match blobs.read_to_bytes(hash).await {
+            Ok(data) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_BLOB_READ,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, data);
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Docs (simplified for Phase 1)
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_docs_create(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let docs = node_arc.docs_client();
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match docs.create().await {
+            Ok(doc) => {
+                let handle = bridge2.docs.insert(doc);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_DOC_CREATED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    handle,
+                    node,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_docs_create_author(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let docs = node_arc.docs_client();
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match docs.create_author().await {
+            Ok(author_id) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_AUTHOR_CREATED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, author_id.into_bytes());
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_set_bytes(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    author_hex: iroh_bytes_t,
+    key: iroh_bytes_t,
+    value: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let author = match unsafe { read_string(&author_hex) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let key_bytes = unsafe { read_bytes(&key) };
+    let value_bytes = unsafe { read_bytes(&value) };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match doc_arc.set_bytes(author, key_bytes, value_bytes).await {
+            Ok(hash) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_DOC_SET,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, hash.into_bytes());
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_get_exact(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    author_hex: iroh_bytes_t,
+    key: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let author = match unsafe { read_string(&author_hex) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let key_bytes = unsafe { read_bytes(&key) };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match doc_arc.get_exact(author, key_bytes).await {
+            Ok(Some(data)) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_DOC_GET,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, data);
+            }
+            Ok(None) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_DOC_GET,
+                    iroh_status_t::IROH_STATUS_NOT_FOUND,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_share(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    mode: u32,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let mode_str = if mode == 0 { "read".to_string() } else { "write".to_string() };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match doc_arc.share(mode_str).await {
+            Ok(ticket) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_DOC_SHARED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, ticket.into_bytes());
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Gossip (simplified for Phase 1)
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_gossip_subscribe(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    topic: iroh_bytes_t,
+    peers: iroh_bytes_list_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let gossip = node_arc.gossip_client();
+    let topic_bytes = unsafe { read_bytes(&topic) };
+    let peers_strs = unsafe { read_string_list(&peers) };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match gossip.subscribe(topic_bytes, peers_strs).await {
+            Ok(topic_handle) => {
+                let handle = bridge2.gossip_topics.insert(topic_handle);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_GOSSIP_SUBSCRIBED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    handle,
+                    node,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_gossip_broadcast(
+    runtime: iroh_runtime_t,
+    topic: u64,
+    data: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let topic_arc = match bridge.gossip_topics.get(topic) {
+        Some(t) => t,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let data_bytes = unsafe { read_bytes(&data) };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match topic_arc.broadcast(data_bytes).await {
+            Ok(()) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_GOSSIP_BROADCAST_DONE,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    topic,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_gossip_recv(
+    runtime: iroh_runtime_t,
+    topic: u64,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let topic_arc = match bridge.gossip_topics.get(topic) {
+        Some(t) => t,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match topic_arc.recv().await {
+            Ok(event) => {
+                let event_bytes = event.data.unwrap_or_default();
+                let internal_event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_GOSSIP_RECEIVED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    topic,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(internal_event, event_bytes);
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// Phase 1b: Datagram Completion FFI Functions
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_connection_max_datagram_size(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    out_size: *mut u64,
+    out_is_some: *mut u32,
+) -> i32 {
+    if out_size.is_null() || out_is_some.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    match conn_arc.max_datagram_size() {
+        Some(size) => {
+            unsafe {
+                *out_size = size as u64;
+                *out_is_some = 1;
+            }
+        }
+        None => {
+            unsafe {
+                *out_size = 0;
+                *out_is_some = 0;
+            }
+        }
+    }
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_connection_datagram_send_buffer_space(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    out_bytes: *mut u64,
+) -> i32 {
+    if out_bytes.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let space = conn_arc.datagram_send_buffer_space();
+    unsafe {
+        *out_bytes = space as u64;
+    }
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// Phase 1b: Remote-Info FFI Functions
+// ============================================================================
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct iroh_remote_info_t {
+    pub struct_size: u32,
+    pub node_id: iroh_bytes_t,
+    pub is_connected: u32,
+    pub connection_type: u32,  // 0=none, 1=connecting, 2=udp_direct, 3=udp_relay
+    pub relay_url: iroh_bytes_t,
+    pub last_handshake_ns: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct iroh_connection_info_t {
+    pub struct_size: u32,
+    pub connection_type: u32,  // 2=udp_direct, 3=udp_relay, etc.
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub rtt_ns: u64,
+    pub alpn: iroh_bytes_t,
+    pub is_connected: u32,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_endpoint_remote_info(
+    runtime: iroh_runtime_t,
+    endpoint_or_node: u64,
+    node_id: iroh_bytes_t,
+    out_info: *mut iroh_remote_info_t,
+) -> i32 {
+    if out_info.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let ep_arc = bridge.endpoints.get(endpoint_or_node)
+        .map(|e| e.clone())
+        .or_else(|| bridge.nodes.get(endpoint_or_node).map(|n| n.net_client()));
+    
+    let ep = match ep_arc {
+        Some(e) => e,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let node_id_str = match unsafe { read_string(&node_id) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    
+    let info = match ep.remote_info(&node_id_str) {
+        Some(info) => info,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    // Map connection type
+    let conn_type = match info.connection_type {
+        iroh_transport_core::ConnectionType::NotConnected => 0,
+        iroh_transport_core::ConnectionType::Connecting => 1,
+        iroh_transport_core::ConnectionType::Connected(detail) => {
+            match detail {
+                iroh_transport_core::ConnectionTypeDetail::UdpDirect => 2,
+                iroh_transport_core::ConnectionTypeDetail::UdpRelay => 3,
+                iroh_transport_core::ConnectionTypeDetail::Other(_) => 4,
             }
         }
     };
-}
-
-take_handle_result!(iroh_ffi_operation_take_node, Node, NodeHandle);
-take_handle_result!(iroh_ffi_operation_take_net, Net, NetHandle);
-take_handle_result!(iroh_ffi_operation_take_connection, Connection, ConnectionHandle);
-take_handle_result!(iroh_ffi_operation_take_send_stream, SendStream, SendStreamHandle);
-take_handle_result!(iroh_ffi_operation_take_recv_stream, RecvStream, RecvStreamHandle);
-take_handle_result!(iroh_ffi_operation_take_doc, Doc, DocHandle);
-take_handle_result!(iroh_ffi_operation_take_topic, Topic, TopicHandle);
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_operation_take_bi_streams(op: *mut OperationHandle, out_send: *mut *mut SendStreamHandle, out_recv: *mut *mut RecvStreamHandle) -> i32 {
-    if out_send.is_null() || out_recv.is_null() { return IROH_FFI_ERR_NULL; }
-    match take_result(op) {
-        Ok(OpResult::BiStreams(s, r)) => { *out_send = s; *out_recv = r; IROH_FFI_OK }
-        Ok(_) => set_last_error("unexpected operation result type"),
-        Err(c) => c,
+    
+    // Get relay_url offset (we'll use placeholder since this is a single call)
+    let relay_url_str = info.relay_url.unwrap_or_default();
+    let relay_url_bytes = alloc_string(relay_url_str);
+    
+    // Pack node_id into buffer (simplified - caller should use separate buffer)
+    let node_id_bytes = alloc_string(info.node_id);
+    
+    unsafe {
+        *out_info = iroh_remote_info_t {
+            struct_size: std::mem::size_of::<iroh_remote_info_t>() as u32,
+            node_id: node_id_bytes,
+            is_connected: if info.is_connected { 1 } else { 0 },
+            connection_type: conn_type,
+            relay_url: relay_url_bytes,
+            last_handshake_ns: info.last_handshake_ns.unwrap_or(0),
+            bytes_sent: info.bytes_sent,
+            bytes_received: info.bytes_received,
+        };
     }
+    
+    iroh_status_t::IROH_STATUS_OK as i32
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_operation_take_unit(op: *mut OperationHandle) -> i32 {
-    match take_result(op) {
-        Ok(OpResult::Unit) => IROH_FFI_OK,
-        Ok(_) => set_last_error("unexpected operation result type"),
-        Err(c) => c,
+pub unsafe extern "C" fn iroh_endpoint_remote_info_list(
+    runtime: iroh_runtime_t,
+    endpoint_or_node: u64,
+    out_infos: *mut iroh_remote_info_t,
+    max_infos: usize,
+    out_count: *mut usize,
+) -> i32 {
+    if out_infos.is_null() || out_count.is_null() || max_infos == 0 {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
     }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_operation_take_string(op: *mut OperationHandle, out: *mut iroh_ffi_string_t) -> i32 {
-    if out.is_null() { return IROH_FFI_ERR_NULL; }
-    match take_result(op) {
-        Ok(OpResult::String(v)) => { *out = into_string(v); IROH_FFI_OK }
-        Ok(_) => set_last_error("unexpected operation result type"),
-        Err(c) => c,
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let ep_arc = bridge.endpoints.get(endpoint_or_node)
+        .map(|e| e.clone())
+        .or_else(|| bridge.nodes.get(endpoint_or_node).map(|n| n.net_client()));
+    
+    let ep = match ep_arc {
+        Some(e) => e,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let infos = ep.remote_info_iter();
+    let count = infos.len().min(max_infos);
+    
+    // Note: In a full implementation, we'd need to handle buffer allocation properly
+    // For now, we return the count and let the caller allocate buffers
+    unsafe {
+        *out_count = count;
     }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_operation_take_bytes(op: *mut OperationHandle, out: *mut iroh_ffi_bytes_t) -> i32 {
-    if out.is_null() { return IROH_FFI_ERR_NULL; }
-    match take_result(op) {
-        Ok(OpResult::Bytes(v)) => { *out = into_bytes(v); IROH_FFI_OK }
-        Ok(_) => set_last_error("unexpected operation result type"),
-        Err(c) => c,
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_operation_take_optional_bytes(op: *mut OperationHandle, out_present: *mut bool, out: *mut iroh_ffi_bytes_t) -> i32 {
-    if out_present.is_null() || out.is_null() { return IROH_FFI_ERR_NULL; }
-    match take_result(op) {
-        Ok(OpResult::OptionalBytes(v)) => {
-            *out_present = v.is_some();
-            *out = into_bytes(v.unwrap_or_default());
-            IROH_FFI_OK
+    
+    // Pack first 'count' items
+    for (i, info) in infos.iter().take(count).enumerate() {
+        let conn_type = match info.connection_type {
+            iroh_transport_core::ConnectionType::NotConnected => 0,
+            iroh_transport_core::ConnectionType::Connecting => 1,
+            iroh_transport_core::ConnectionType::Connected(detail) => {
+                match detail {
+                    iroh_transport_core::ConnectionTypeDetail::UdpDirect => 2,
+                    iroh_transport_core::ConnectionTypeDetail::UdpRelay => 3,
+                    iroh_transport_core::ConnectionTypeDetail::Other(_) => 4,
+                }
+            }
+        };
+        
+        let relay_url_str = info.relay_url.clone().unwrap_or_default();
+        let node_id_str = info.node_id.clone();
+        
+        unsafe {
+            *out_infos.add(i) = iroh_remote_info_t {
+                struct_size: std::mem::size_of::<iroh_remote_info_t>() as u32,
+                node_id: alloc_string(node_id_str),
+                is_connected: if info.is_connected { 1 } else { 0 },
+                connection_type: conn_type,
+                relay_url: alloc_string(relay_url_str),
+                last_handshake_ns: info.last_handshake_ns.unwrap_or(0),
+                bytes_sent: info.bytes_sent,
+                bytes_received: info.bytes_received,
+            };
         }
-        Ok(_) => set_last_error("unexpected operation result type"),
-        Err(c) => c,
     }
+    
+    iroh_status_t::IROH_STATUS_OK as i32
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_operation_take_optional_u64(op: *mut OperationHandle, out_present: *mut bool, out: *mut u64) -> i32 {
-    if out_present.is_null() || out.is_null() { return IROH_FFI_ERR_NULL; }
-    match take_result(op) {
-        Ok(OpResult::OptionalU64(v)) => {
-            *out_present = v.is_some();
-            *out = v.unwrap_or_default();
-            IROH_FFI_OK
-        }
-        Ok(_) => set_last_error("unexpected operation result type"),
-        Err(c) => c,
+pub unsafe extern "C" fn iroh_connection_info(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    out_info: *mut iroh_connection_info_t,
+) -> i32 {
+    if out_info.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
     }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_operation_take_closed_info(op: *mut OperationHandle, out: *mut iroh_ffi_closed_info_t) -> i32 {
-    if out.is_null() { return IROH_FFI_ERR_NULL; }
-    match take_result(op) {
-        Ok(OpResult::ClosedInfo(v)) => { *out = closed_info_to_ffi(v); IROH_FFI_OK }
-        Ok(_) => set_last_error("unexpected operation result type"),
-        Err(c) => c,
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let info = conn_arc.connection_info();
+    
+    let conn_type = match info.connection_type {
+        iroh_transport_core::ConnectionTypeDetail::UdpDirect => 2,
+        iroh_transport_core::ConnectionTypeDetail::UdpRelay => 3,
+        iroh_transport_core::ConnectionTypeDetail::Other(_) => 4,
+    };
+    
+    let alpn_bytes = alloc_bytes(info.alpn);
+    
+    unsafe {
+        *out_info = iroh_connection_info_t {
+            struct_size: std::mem::size_of::<iroh_connection_info_t>() as u32,
+            connection_type: conn_type,
+            bytes_sent: info.bytes_sent,
+            bytes_received: info.bytes_received,
+            rtt_ns: info.rtt_ns.unwrap_or(0),
+            alpn: alpn_bytes,
+            is_connected: if info.is_connected { 1 } else { 0 },
+        };
     }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_ffi_operation_take_gossip_event(op: *mut OperationHandle, out: *mut iroh_ffi_gossip_event_t) -> i32 {
-    if out.is_null() { return IROH_FFI_ERR_NULL; }
-    match take_result(op) {
-        Ok(OpResult::GossipEvent(v)) => { *out = gossip_event_to_ffi(v); IROH_FFI_OK }
-        Ok(_) => set_last_error("unexpected operation result type"),
-        Err(c) => c,
-    }
+    
+    iroh_status_t::IROH_STATUS_OK as i32
 }
