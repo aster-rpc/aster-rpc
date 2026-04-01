@@ -11,7 +11,7 @@ Phase 1b: Includes datagram completion, connection info, remote-info, and hooks.
 
 # Import native extension module
 try:
-    from iroh_python import (
+    from ._iroh_python import (
         # Exception
         IrohError,
         BlobNotFound,
