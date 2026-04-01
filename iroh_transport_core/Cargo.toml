@@ -10,6 +10,8 @@ iroh-docs = { workspace = true }
 iroh-gossip = { workspace = true }
 iroh-tickets = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = "0.1"
 bytes = { workspace = true }
 anyhow = { workspace = true }
 futures-lite = { workspace = true }
+tracing = "0.1"
