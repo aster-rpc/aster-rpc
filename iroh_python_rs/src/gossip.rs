@@ -46,18 +46,16 @@ impl GossipTopicHandle {
         let topic = self.inner.clone();
         future_into_py(py, async move {
             let event = topic.recv().await.map_err(err_to_py)?;
-            let (event_type, data): (String, Option<PyBytesResult>) = match event.event_type.as_str() {
-                "received" => (
-                    "received".to_string(),
-                    event.data.map(PyBytesResult),
-                ),
-                "neighbor_up" | "neighbor_down" => {
-                    let data = event.data.map(PyBytesResult);
-                    (event.event_type, data)
-                }
-                "lagged" => ("lagged".to_string(), None),
-                _ => (event.event_type, None),
-            };
+            let (event_type, data): (String, Option<PyBytesResult>) =
+                match event.event_type.as_str() {
+                    "received" => ("received".to_string(), event.data.map(PyBytesResult)),
+                    "neighbor_up" | "neighbor_down" => {
+                        let data = event.data.map(PyBytesResult);
+                        (event.event_type, data)
+                    }
+                    "lagged" => ("lagged".to_string(), None),
+                    _ => (event.event_type, None),
+                };
             Ok((event_type, data))
         })
     }

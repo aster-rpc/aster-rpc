@@ -29,10 +29,7 @@ impl BlobsClient {
     fn add_bytes<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
-            client
-                .add_bytes(data)
-                .await
-                .map_err(err_to_py)
+            client.add_bytes(data).await.map_err(err_to_py)
         })
     }
 
@@ -40,10 +37,7 @@ impl BlobsClient {
     fn read_to_bytes<'py>(&self, py: Python<'py>, hash_hex: String) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
-            let data = client
-                .read_to_bytes(hash_hex)
-                .await
-                .map_err(err_to_py)?;
+            let data = client.read_to_bytes(hash_hex).await.map_err(err_to_py)?;
             Ok(PyBytesResult(data))
         })
     }
@@ -51,20 +45,19 @@ impl BlobsClient {
     /// Create a blob ticket string for sharing a blob with a remote peer.
     /// The ticket contains the blob hash, this node's address, and format info.
     fn create_ticket(&self, hash_hex: String) -> PyResult<String> {
-        self.inner
-            .create_ticket(hash_hex)
-            .map_err(err_to_py)
+        self.inner.create_ticket(hash_hex).map_err(err_to_py)
     }
 
     /// Download a blob from a remote peer using a blob ticket string.
     /// Returns the blob content as bytes.
-    fn download_blob<'py>(&self, py: Python<'py>, ticket_str: String) -> PyResult<Bound<'py, PyAny>> {
+    fn download_blob<'py>(
+        &self,
+        py: Python<'py>,
+        ticket_str: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
-            let data = client
-                .download_blob(ticket_str)
-                .await
-                .map_err(err_to_py)?;
+            let data = client.download_blob(ticket_str).await.map_err(err_to_py)?;
             Ok(PyBytesResult(data))
         })
     }
