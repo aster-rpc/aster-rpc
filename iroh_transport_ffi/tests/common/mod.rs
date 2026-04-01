@@ -2,6 +2,8 @@
 //!
 //! This module provides shared test utilities and helper functions.
 
+#![allow(dead_code)]
+
 /// Helper to create a default runtime config
 #[cfg(test)]
 pub fn default_runtime_config() -> iroh_transport_ffi::iroh_runtime_config_t {

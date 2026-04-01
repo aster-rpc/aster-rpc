@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use futures_lite::StreamExt;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{presets, Connection, ConnectionError, Endpoint, RelayMode, VarInt};
 use iroh::protocol::Router;
@@ -141,24 +140,13 @@ pub struct HookConnectInfo {
 }
 
 /// Configuration for hook registration
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CoreHookConfig {
     pub enable_before_connect: bool,
     pub enable_after_connect: bool,
     pub include_remote_info: bool,
     /// User data echoed back in hook events
     pub user_data: u64,
-}
-
-impl Default for CoreHookConfig {
-    fn default() -> Self {
-        Self {
-            enable_before_connect: false,
-            enable_after_connect: false,
-            include_remote_info: false,
-            user_data: 0,
-        }
-    }
 }
 
 // ============================================================================
@@ -239,6 +227,7 @@ struct CoreNodeInner {
     endpoint: Endpoint,
     #[allow(dead_code)]
     router: Router,
+    #[allow(dead_code)]
     blobs: BlobsProtocol,
     docs: Docs,
     gossip: Gossip,
@@ -401,66 +390,41 @@ impl CoreNetClient {
     // ============================================================================
     
     /// Query information about a specific known remote endpoint.
-    pub fn remote_info(&self, node_id: &str) -> Option<CoreRemoteInfo> {
-        let id: EndpointId = node_id.parse().ok()?;
-        let info = self.endpoint.remote_info(id)?;
-        
-        let addr = info.addr.clone();
-        let relay_url = info.relay_url.map(|url| url.to_string());
-        
-        let connection_type = if info.is_connected {
-            ConnectionType::Connected(if info.relay_url.is_some() {
-                ConnectionTypeDetail::UdpRelay
-            } else {
-                ConnectionTypeDetail::UdpDirect
-            })
-        } else {
-            ConnectionType::NotConnected
-        };
-        
-        Some(CoreRemoteInfo {
-            node_id: node_id.to_string(),
-            addr: addr.map(endpoint_addr_to_core),
-            relay_url,
-            connection_type,
-            last_handshake_ns: None, // Not exposed in current iroh API
-            bytes_sent: 0,           // Not exposed per-peer in current iroh API
-            bytes_received: 0,
-            is_connected: info.is_connected,
-        })
+    ///
+    /// `iroh 0.97.0` does not expose a simple endpoint-level remote-info query.
+    /// The faithful model is userland aggregation over `ConnectionInfo`, `paths()`,
+    /// and `closed()`. Until such tracking is implemented in this crate, this
+    /// remains unsupported and returns `None`.
+    pub fn remote_info(&self, _node_id: &str) -> Option<CoreRemoteInfo> {
+        None
     }
     
     /// Get information about all known remote endpoints.
+    ///
+    /// `iroh 0.97.0` does not expose endpoint-level remote iteration directly.
+    /// This requires an internal tracker built from `ConnectionInfo` instances.
     pub fn remote_info_iter(&self) -> Vec<CoreRemoteInfo> {
-        self.endpoint
-            .remote_info_broadcast()
-            .flat_map(|iter| iter)
-            .map(|info| {
-                let node_id = info.addr.id.to_string();
-                let relay_url = info.relay_url.map(|url| url.to_string());
-                
-                let connection_type = if info.is_connected {
-                    ConnectionType::Connected(if info.relay_url.is_some() {
-                        ConnectionTypeDetail::UdpRelay
-                    } else {
-                        ConnectionTypeDetail::UdpDirect
-                    })
-                } else {
-                    ConnectionType::NotConnected
-                };
-                
-                CoreRemoteInfo {
-                    node_id,
-                    addr: info.addr.clone().map(endpoint_addr_to_core),
-                    relay_url,
-                    connection_type,
-                    last_handshake_ns: None,
-                    bytes_sent: 0,
-                    bytes_received: 0,
-                    is_connected: info.is_connected,
-                }
-            })
-            .collect()
+        Vec::new()
+    }
+    
+    // ============================================================================
+    // Phase 1b: Hooks (stub implementation)
+    // Note: `iroh 0.97.0` supports builder-time `EndpointHooks`, not dynamic
+    // post-creation hook registration. These methods remain placeholders until a
+    // compatible adapter is implemented at endpoint construction time.
+    // ============================================================================
+    
+    /// Set hook callbacks for connection events.
+    /// 
+    /// Note: This is currently a stub. Dynamic registration is not a direct match
+    /// for the `iroh 0.97.0` builder-time `EndpointHooks` API.
+    pub fn set_hooks(&self, _config: CoreHookConfig, _callbacks: Option<Arc<dyn HookCallbacks>>) {
+        // Intentionally a no-op until a builder-time adapter is implemented.
+    }
+    
+    /// Clear any registered hook callbacks.
+    pub fn clear_hooks(&self) {
+        // Hooks cleared
     }
 }
 
@@ -516,7 +480,7 @@ impl CoreConnection {
         let closed = self.inner.closed().await;
         let (code, reason) = match &closed {
             ConnectionError::ApplicationClosed(app) => (
-                Some(u64::from(app.error_code.into_inner())), 
+                Some(app.error_code.into_inner()), 
                 Some(app.reason.to_vec())
             ),
             _ => (None, Some(closed.to_string().into_bytes())),
@@ -537,7 +501,7 @@ impl CoreConnection {
     /// Returns the amount of send buffer space available for datagrams.
     /// Always returns 0 if datagrams are unsupported.
     pub fn datagram_send_buffer_space(&self) -> usize {
-        self.inner.datagram_send_buffer_space().into()
+        self.inner.datagram_send_buffer_space()
     }
     
     // ============================================================================
@@ -545,27 +509,31 @@ impl CoreConnection {
     // ============================================================================
     
     /// Get detailed information about this connection.
-    /// Note: Some fields may not be available in all iroh versions.
+    ///
+    /// This is derived from the actual `iroh 0.97.0` surface using
+    /// `Connection::to_info()`, `ConnectionInfo::selected_path()`, and
+    /// `ConnectionInfo::stats()`.
     pub fn connection_info(&self) -> CoreConnectionInfo {
-        let conn_info = self.inner.info();
-        
-        // Determine connection type from node addr
-        let addr = conn_info.remote();
-        let connection_type = if addr.relay_url().next().is_some() {
-            ConnectionTypeDetail::UdpRelay
-        } else if addr.ip_addrs().next().is_some() {
-            ConnectionTypeDetail::UdpDirect
-        } else {
-            ConnectionTypeDetail::Other("unknown".to_string())
+        let info = self.inner.to_info();
+        let stats = info.stats();
+        let selected_path = info.selected_path();
+
+        let connection_type = match selected_path.as_ref() {
+            Some(path) if path.is_relay() => ConnectionTypeDetail::UdpRelay,
+            Some(path) if path.is_ip() => ConnectionTypeDetail::UdpDirect,
+            Some(path) => ConnectionTypeDetail::Other(format!("{:?}", path.remote_addr())),
+            None => ConnectionTypeDetail::Other("unknown".to_string()),
         };
-        
+
         CoreConnectionInfo {
             connection_type,
-            bytes_sent: 0,  // Not exposed in current iroh API
-            bytes_received: 0,
-            rtt_ns: None,   // Not exposed in current iroh API
-            alpn: conn_info.alpn().to_vec(),
-            is_connected: true,
+            bytes_sent: stats.as_ref().map(|s| s.udp_tx.bytes).unwrap_or(0),
+            bytes_received: stats.as_ref().map(|s| s.udp_rx.bytes).unwrap_or(0),
+            rtt_ns: selected_path
+                .and_then(|p| p.rtt())
+                .map(|d| d.as_nanos().min(u64::MAX as u128) as u64),
+            alpn: info.alpn().to_vec(),
+            is_connected: info.is_alive(),
         }
     }
 }
@@ -598,7 +566,7 @@ impl CoreSendStream {
     
     pub async fn stopped(&self) -> Result<Option<u64>> { 
         let s = &mut *self.inner.lock().await; 
-        Ok(s.stopped().await?.map(|v| u64::from(v.into_inner()))) 
+        Ok(s.stopped().await?.map(|v| v.into_inner())) 
     }
 }
 
@@ -801,9 +769,9 @@ impl CoreGossipTopic {
     }
     
     pub async fn recv(&self) -> Result<CoreGossipEvent> {
+        use futures_lite::StreamExt;
         let mut rx = self.receiver.lock().await;
-        use std::pin::Pin;
-        let event = Pin::new(&mut *rx).next().await.ok_or_else(|| anyhow!("gossip topic closed"))??;
+        let event = rx.next().await.ok_or_else(|| anyhow!("gossip topic closed"))??;
         Ok(match event {
             Event::Received(msg) => CoreGossipEvent { 
                 event_type: "received".into(), 

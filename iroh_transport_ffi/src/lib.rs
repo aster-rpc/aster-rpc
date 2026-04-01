@@ -236,6 +236,7 @@ fn set_last_error(msg: impl ToString) -> i32 {
     iroh_status_t::IROH_STATUS_INTERNAL as i32
 }
 
+#[allow(dead_code)]
 fn get_last_error() -> *const c_char {
     LAST_ERROR.with(|slot| slot.borrow().as_ref().map(|s| s.as_ptr()).unwrap_or(ptr::null()))
 }
@@ -272,6 +273,7 @@ impl<T> HandleRegistry<T> {
         self.items.write().unwrap().remove(&id)
     }
     
+    #[allow(dead_code)]
     fn count(&self) -> usize {
         self.items.read().unwrap().len()
     }
@@ -340,6 +342,7 @@ impl EventInternal {
         }
     }
     
+    #[allow(dead_code)]
     fn with_data(mut self, data: Vec<u8>, buffers: &BufferRegistry) -> Self {
         let (buf_id, arc) = buffers.insert(data);
         self.data_len = arc.len();
@@ -356,18 +359,10 @@ impl EventInternal {
 
 /// EventOwned wraps EventInternal with its data payload for crossing thread boundary
 /// This is Send-safe because EventInternal has no raw pointers
+#[derive(Default)]
 struct EventOwned {
     event: EventInternal,
     payload: Option<Arc<[u8]>>,
-}
-
-impl Default for EventOwned {
-    fn default() -> Self {
-        Self {
-            event: EventInternal::default(),
-            payload: None,
-        }
-    }
 }
 
 // ============================================================================
@@ -418,9 +413,12 @@ struct BridgeRuntime {
     connections: HandleRegistry<CoreConnection>,
     send_streams: HandleRegistry<CoreSendStream>,
     recv_streams: HandleRegistry<CoreRecvStream>,
+    #[allow(dead_code)]
     blobs_clients: HandleRegistry<CoreBlobsClient>,
+    #[allow(dead_code)]
     docs_clients: HandleRegistry<CoreDocsClient>,
     docs: HandleRegistry<CoreDoc>,
+    #[allow(dead_code)]
     gossip_clients: HandleRegistry<CoreGossipClient>,
     gossip_topics: HandleRegistry<CoreGossipTopic>,
     
@@ -448,7 +446,7 @@ impl BridgeRuntime {
         
         let runtime = builder.build()?;
         
-        let capacity = if queue_capacity > 0 { queue_capacity } else { 4096 };
+        let _capacity = if queue_capacity > 0 { queue_capacity } else { 4096 };
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         
         Ok(Self {
@@ -489,6 +487,7 @@ impl BridgeRuntime {
         self.emit(EventOwned { event, payload: None });
     }
     
+    #[allow(clippy::too_many_arguments)]
     fn emit_simple(
         &self,
         kind: iroh_event_kind_t,
@@ -587,7 +586,7 @@ fn alloc_string(s: String) -> iroh_bytes_t {
     let mut bytes = s.into_bytes();
     let len = bytes.len();
     bytes.push(0); // null terminator
-    let ptr = bytes.as_mut_ptr() as *mut u8;
+    let ptr = bytes.as_mut_ptr();
     std::mem::forget(bytes);
     iroh_bytes_t { ptr, len }
 }
@@ -696,7 +695,7 @@ pub unsafe extern "C" fn iroh_secret_key_generate(
     }
     
     let mut key = [0u8; 32];
-    if let Err(_) = getrandom::getrandom(&mut key) {
+    if getrandom::getrandom(&mut key).is_err() {
         return iroh_status_t::IROH_STATUS_INTERNAL as i32;
     }
     let len = key.len();
@@ -1140,11 +1139,9 @@ pub unsafe extern "C" fn iroh_node_addr_info(
         }
         offset += url.len();
         unsafe { *out_buf.add(offset) = 0; }
-        offset += 1;
         Some(rel_off)
     } else {
         unsafe { *out_buf.add(offset) = 0; }
-        offset += 1;
         None
     };
     
@@ -1487,8 +1484,7 @@ pub unsafe extern "C" fn iroh_add_node_addr(
         Ok(b) => b,
         Err(s) => return s as i32,
     };
-    
-    let ep_arc = match bridge.endpoints.get(endpoint) {
+    let _ep_arc = match bridge.endpoints.get(endpoint) {
         Some(e) => e,
         None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
     };
@@ -1519,7 +1515,7 @@ pub unsafe extern "C" fn iroh_add_node_addr(
         }
     }
     
-    let core_addr = iroh_transport_core::CoreNodeAddr {
+    let _core_addr = iroh_transport_core::CoreNodeAddr {
         endpoint_id,
         relay_url,
         direct_addresses,
@@ -1556,7 +1552,6 @@ pub unsafe extern "C" fn iroh_connect(
     
     // Try to get as endpoint first, then as node
     let ep_arc = bridge.endpoints.get(endpoint_or_node)
-        .map(|e| e.clone())
         .or_else(|| bridge.nodes.get(endpoint_or_node).map(|n| n.net_client()).map(Arc::new));
     
     let ep = match ep_arc {
@@ -1619,7 +1614,6 @@ pub unsafe extern "C" fn iroh_accept(
     };
     
     let ep_arc = bridge.endpoints.get(endpoint_or_node)
-        .map(|e| e.clone())
         .or_else(|| bridge.nodes.get(endpoint_or_node).map(|n| n.net_client()).map(Arc::new));
     
     let ep = match ep_arc {
@@ -3072,8 +3066,7 @@ pub unsafe extern "C" fn iroh_endpoint_remote_info(
     };
     
     let ep_arc = bridge.endpoints.get(endpoint_or_node)
-        .map(|e| e.clone())
-        .or_else(|| bridge.nodes.get(endpoint_or_node).map(|n| n.net_client()));
+        .or_else(|| bridge.nodes.get(endpoint_or_node).map(|n| Arc::new(n.net_client())));
     
     let ep = match ep_arc {
         Some(e) => e,
@@ -3084,7 +3077,7 @@ pub unsafe extern "C" fn iroh_endpoint_remote_info(
         Ok(s) => s,
         Err(e) => return e,
     };
-    
+        
     let info = match ep.remote_info(&node_id_str) {
         Some(info) => info,
         None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
@@ -3144,8 +3137,7 @@ pub unsafe extern "C" fn iroh_endpoint_remote_info_list(
     };
     
     let ep_arc = bridge.endpoints.get(endpoint_or_node)
-        .map(|e| e.clone())
-        .or_else(|| bridge.nodes.get(endpoint_or_node).map(|n| n.net_client()));
+        .or_else(|| bridge.nodes.get(endpoint_or_node).map(|n| Arc::new(n.net_client())));
     
     let ep = match ep_arc {
         Some(e) => e,
@@ -3163,7 +3155,7 @@ pub unsafe extern "C" fn iroh_endpoint_remote_info_list(
     
     // Pack first 'count' items
     for (i, info) in infos.iter().take(count).enumerate() {
-        let conn_type = match info.connection_type {
+        let conn_type = match &info.connection_type {
             iroh_transport_core::ConnectionType::NotConnected => 0,
             iroh_transport_core::ConnectionType::Connecting => 1,
             iroh_transport_core::ConnectionType::Connected(detail) => {
