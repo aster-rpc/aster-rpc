@@ -431,3 +431,201 @@ fn test_relay_mode_values() {
     assert_eq!(iroh_relay_mode_t::IROH_RELAY_MODE_CUSTOM as u32, 1);
     assert_eq!(iroh_relay_mode_t::IROH_RELAY_MODE_DISABLED as u32, 2);
 }
+
+// ============================================================================
+// Phase 1b: Datagram & Connection Info Tests
+// ============================================================================
+
+#[test]
+fn test_connection_max_datagram_size_invalid_handle() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        
+        let mut out_size: u64 = 0;
+        let mut out_is_some: u32 = 0;
+        
+        let status = iroh_connection_max_datagram_size(runtime, 999999, &mut out_size, &mut out_is_some);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+        
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_connection_max_datagram_size_null_params() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        
+        // Null out_size
+        let status = iroh_connection_max_datagram_size(runtime, 1, ptr::null_mut(), &mut 0);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+        
+        // Null out_is_some
+        let status = iroh_connection_max_datagram_size(runtime, 1, &mut 0, ptr::null_mut());
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+        
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_connection_datagram_send_buffer_space_invalid_handle() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        
+        let mut out_bytes: u64 = 0;
+        
+        let status = iroh_connection_datagram_send_buffer_space(runtime, 999999, &mut out_bytes);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+        
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_connection_datagram_send_buffer_space_null_param() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        
+        let status = iroh_connection_datagram_send_buffer_space(runtime, 1, ptr::null_mut());
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+        
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_connection_info_invalid_handle() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        
+        let mut out_info: iroh_connection_info_t = std::mem::zeroed();
+        
+        let status = iroh_connection_info(runtime, 999999, &mut out_info);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+        
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_connection_info_null_param() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        
+        let status = iroh_connection_info(runtime, 1, ptr::null_mut());
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+        
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_endpoint_remote_info_invalid_params() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        
+        let mut out_info: iroh_remote_info_t = std::mem::zeroed();
+        
+        // Invalid endpoint handle
+        let node_id = iroh_bytes_t { ptr: ptr::null(), len: 0 };
+        let status = iroh_endpoint_remote_info(runtime, 999999, node_id, &mut out_info);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+        
+        // Null out_info
+        let status = iroh_endpoint_remote_info(runtime, 1, node_id, ptr::null_mut());
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+        
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_endpoint_remote_info_list_invalid_params() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        
+        let mut out_infos: [iroh_remote_info_t; 10] = [std::mem::zeroed(); 10];
+        let mut out_count: usize = 0;
+        
+        // Invalid endpoint handle
+        let status = iroh_endpoint_remote_info_list(runtime, 999999, out_infos.as_mut_ptr(), 10, &mut out_count);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+        
+        // Null out_infos
+        let status = iroh_endpoint_remote_info_list(runtime, 1, ptr::null_mut(), 10, &mut out_count);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+        
+        // Null out_count
+        let status = iroh_endpoint_remote_info_list(runtime, 1, out_infos.as_mut_ptr(), 10, ptr::null_mut());
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+        
+        // Zero max_infos
+        let status = iroh_endpoint_remote_info_list(runtime, 1, out_infos.as_mut_ptr(), 0, &mut out_count);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+        
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_hook_decision_values() {
+    assert_eq!(iroh_hook_decision_t::IROH_HOOK_DECISION_ALLOW as u32, 0);
+    assert_eq!(iroh_hook_decision_t::IROH_HOOK_DECISION_DENY as u32, 1);
+}
+
+#[test]
+fn test_hook_event_kinds() {
+    assert_eq!(iroh_event_kind_t::IROH_EVENT_HOOK_BEFORE_CONNECT as u32, 70);
+    assert_eq!(iroh_event_kind_t::IROH_EVENT_HOOK_AFTER_CONNECT as u32, 71);
+    assert_eq!(iroh_event_kind_t::IROH_EVENT_HOOK_INVOCATION_RELEASED as u32, 72);
+}
+
+#[test]
+fn test_datagram_event_kinds() {
+    assert_eq!(iroh_event_kind_t::IROH_EVENT_DATAGRAM_RECEIVED as u32, 60);
+}
+
+#[test]
+fn test_connection_info_struct_size() {
+    let expected_size = std::mem::size_of::<iroh_connection_info_t>() as u32;
+    assert!(expected_size > 0, "Connection info struct should have non-zero size");
+    
+    // Verify struct fields are accessible
+    unsafe {
+        let mut info: iroh_connection_info_t = std::mem::zeroed();
+        info.struct_size = expected_size;
+        info.connection_type = 2; // UdpDirect
+        info.is_connected = 1;
+    }
+}
+
+#[test]
+fn test_remote_info_struct_size() {
+    let expected_size = std::mem::size_of::<iroh_remote_info_t>() as u32;
+    assert!(expected_size > 0, "Remote info struct should have non-zero size");
+    
+    // Verify struct fields are accessible
+    unsafe {
+        let mut info: iroh_remote_info_t = std::mem::zeroed();
+        info.struct_size = expected_size;
+        info.connection_type = 2; // UdpDirect
+        info.is_connected = 1;
+    }
+}

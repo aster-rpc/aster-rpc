@@ -1242,6 +1242,9 @@ pub unsafe extern "C" fn iroh_endpoint_create(
         },
         secret_key: unsafe { read_bytes_opt(&cfg.secret_key) },
         enable_discovery: cfg.enable_discovery != 0,
+        enable_monitoring: true,  // Always enable monitoring for FFI endpoints
+        enable_hooks: false,      // Hooks not yet wired through FFI event queue
+        hook_timeout_ms: 5000,
     };
     
     let (op_id, cancelled) = bridge.new_operation();
