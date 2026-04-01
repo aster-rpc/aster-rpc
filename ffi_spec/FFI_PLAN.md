@@ -401,7 +401,7 @@ iroh_status_t iroh_connection_closed(
     uint64_t connection,
     uint64_t user_data,
     iroh_operation_t* out_operation
-);
+);  // Async: awaits until connection drops, emits CONNECTION_CLOSED with error_code and reason payload
 iroh_status_t iroh_connection_send_datagram(
     iroh_runtime_t runtime,
     uint64_t connection,
@@ -466,10 +466,30 @@ iroh_status_t iroh_stream_read_to_end(
     uint64_t user_data,
     iroh_operation_t* out_operation
 );
+iroh_status_t iroh_stream_read_exact(
+    iroh_runtime_t runtime,
+    uint64_t recv_stream,
+    size_t exact_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+iroh_status_t iroh_stream_stopped(
+    iroh_runtime_t runtime,
+    uint64_t send_stream,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
 iroh_status_t iroh_stream_stop(
     iroh_runtime_t runtime,
     uint64_t recv_stream,
     uint32_t error_code
+);
+
+// ─── Endpoint ───
+iroh_status_t iroh_endpoint_export_secret_key(
+    iroh_runtime_t runtime,
+    uint64_t endpoint,
+    uint8_t* out_buf, size_t capacity, size_t* out_len
 );
 
 // ─── Blobs ───
