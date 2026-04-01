@@ -5,7 +5,7 @@
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
-use iroh_transport_core::{CoreDocsClient, CoreDoc};
+use iroh_transport_core::{CoreDoc, CoreDocsClient};
 
 use crate::error::err_to_py;
 use crate::node::IrohNode;
@@ -41,10 +41,7 @@ impl DocsClient {
     fn create_author<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
-            client
-                .create_author()
-                .await
-                .map_err(err_to_py)
+            client.create_author().await.map_err(err_to_py)
         })
     }
 
@@ -114,9 +111,7 @@ impl DocHandle {
     /// mode: "read" or "write"
     fn share<'py>(&self, py: Python<'py>, mode: String) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.inner.clone();
-        future_into_py(py, async move {
-            doc.share(mode).await.map_err(err_to_py)
-        })
+        future_into_py(py, async move { doc.share(mode).await.map_err(err_to_py) })
     }
 }
 

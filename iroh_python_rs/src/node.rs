@@ -84,9 +84,7 @@ impl IrohNode {
     /// Add another node's address info so this node can connect to it.
     /// Used for peer discovery in testing/local scenarios.
     fn add_node_addr(&self, other: &IrohNode) -> PyResult<()> {
-        self.inner
-            .add_node_addr(&other.inner)
-            .map_err(err_to_py)
+        self.inner.add_node_addr(&other.inner).map_err(err_to_py)
     }
 
     /// Export the node's secret key as 32 bytes.

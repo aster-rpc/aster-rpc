@@ -9,7 +9,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 
 use iroh_transport_core::{
     ConnectionType, ConnectionTypeDetail, CoreConnection, CoreConnectionInfo, CoreEndpointConfig,
-    CoreNetClient, CoreNodeAddr, CoreRemoteInfo, CoreSendStream, CoreRecvStream,
+    CoreNetClient, CoreNodeAddr, CoreRecvStream, CoreRemoteInfo, CoreSendStream,
 };
 
 use crate::error::err_to_py;
@@ -529,7 +529,10 @@ impl NetClient {
             direct_addresses: addr.direct_addresses,
         };
         future_into_py(py, async move {
-            let conn = client.connect_node_addr(core_addr, alpn).await.map_err(err_to_py)?;
+            let conn = client
+                .connect_node_addr(core_addr, alpn)
+                .await
+                .map_err(err_to_py)?;
             Ok(IrohConnection::from(conn))
         })
     }
