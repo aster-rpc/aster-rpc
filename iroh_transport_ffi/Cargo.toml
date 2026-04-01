@@ -8,7 +8,12 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 iroh_transport_core = { path = "../iroh_transport_core" }
+iroh = { workspace = true }
 tokio = { workspace = true }
 libc = { workspace = true }
 once_cell = { workspace = true }
 anyhow = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }
+getrandom = "0.2"
+cbindgen = { version = "0.24", optional = true }
