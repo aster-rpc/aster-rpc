@@ -49,34 +49,24 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Create venv & install test deps (unix)
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies and build extension (unix)
         if: runner.os != 'Windows'
         run: |
-          python -m venv .venv
-          .venv/bin/pip install pytest pytest-asyncio pytest-timeout maturin
+          uv pip install --system pytest pytest-asyncio pytest-timeout maturin
+          uv maturin develop -m iroh_python_rs/Cargo.toml
         shell: bash
 
-      - name: Create venv & install test deps (Windows)
+      - name: Install dependencies and build extension (Windows)
         if: runner.os == 'Windows'
         run: |
-          python -m venv .venv
-          .venv\Scripts\pip install pytest pytest-asyncio pytest-timeout maturin
-        shell: pwsh
+          uv pip install --system pytest pytest-asyncio pytest-timeout maturin
+          uv maturin develop -m iroh_python_rs/Cargo.toml
+        shell: bash
 
-      - name: Build extension (unix)
-        if: runner.os != 'Windows'
-        run: .venv/bin/maturin develop -m iroh_python_rs/Cargo.toml
-
-      - name: Build extension (Windows)
-        if: runner.os == 'Windows'
-        run: .venv\Scripts\maturin develop -m iroh_python_rs/Cargo.toml
-        shell: pwsh
-
-      - name: Run tests (unix)
-        if: runner.os != 'Windows'
-        run: .venv/bin/pytest tests/ -v --timeout=60
-
-      - name: Run tests (Windows)
-        if: runner.os == 'Windows'
-        run: .venv\Scripts\pytest tests/ -v --timeout=60
-        shell: pwsh
+      - name: Run tests
+        run: uv pytest tests/ -v --timeout=60
