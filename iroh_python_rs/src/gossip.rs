@@ -3,13 +3,13 @@
 //! Phase 2: Now wraps iroh_transport_core types instead of iroh_gossip types directly.
 
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
-use pyo3_asyncio::tokio::future_into_py;
+use pyo3_async_runtimes::tokio::future_into_py;
 
 use iroh_transport_core::{CoreGossipClient, CoreGossipTopic};
 
 use crate::error::err_to_py;
 use crate::node::IrohNode;
+use crate::PyBytesResult;
 
 // ============================================================================
 // GossipTopicHandle
@@ -29,7 +29,7 @@ impl From<CoreGossipTopic> for GossipTopicHandle {
 #[pymethods]
 impl GossipTopicHandle {
     /// Broadcast a message to all peers on this topic.
-    fn broadcast<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<&'py PyAny> {
+    fn broadcast<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let topic = self.inner.clone();
         future_into_py(py, async move {
             topic.broadcast(data).await.map_err(err_to_py)?;
@@ -42,21 +42,17 @@ impl GossipTopicHandle {
     /// Returns a tuple (event_type: str, data: bytes | None).
     /// event_type is one of: "received", "neighbor_up", "neighbor_down", "lagged".
     /// data is the message content for "received" events, None otherwise.
-    fn recv<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let topic = self.inner.clone();
         future_into_py(py, async move {
             let event = topic.recv().await.map_err(err_to_py)?;
-            let (event_type, data): (String, Option<PyObject>) = match event.event_type.as_str() {
+            let (event_type, data): (String, Option<PyBytesResult>) = match event.event_type.as_str() {
                 "received" => (
                     "received".to_string(),
-                    event.data.map(|d| {
-                        Python::with_gil(|py| PyBytes::new(py, &d).into_py(py))
-                    }),
+                    event.data.map(PyBytesResult),
                 ),
                 "neighbor_up" | "neighbor_down" => {
-                    let data: Option<PyObject> = event.data.map(|d| {
-                        Python::with_gil(|py| PyBytes::new(py, &d).into_py(py))
-                    });
+                    let data = event.data.map(PyBytesResult);
                     (event.event_type, data)
                 }
                 "lagged" => ("lagged".to_string(), None),
@@ -97,7 +93,7 @@ impl GossipClient {
         py: Python<'py>,
         topic_bytes: Vec<u8>,
         bootstrap_peers: Vec<String>,
-    ) -> PyResult<&'py PyAny> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
             let topic = client
@@ -120,7 +116,7 @@ pub fn gossip_client(node: &IrohNode) -> GossipClient {
 }
 
 /// Register the gossip types with the Python module.
-pub fn register(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GossipClient>()?;
     m.add_class::<GossipTopicHandle>()?;
     m.add_function(wrap_pyfunction!(gossip_client, m)?)?;

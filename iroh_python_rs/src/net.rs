@@ -5,7 +5,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
-use pyo3_asyncio::tokio::future_into_py;
+use pyo3_async_runtimes::tokio::future_into_py;
 
 use iroh_transport_core::{
     ConnectionType, ConnectionTypeDetail, CoreConnection, CoreConnectionInfo, CoreEndpointConfig,
@@ -14,6 +14,7 @@ use iroh_transport_core::{
 
 use crate::error::err_to_py;
 use crate::node::IrohNode;
+use crate::PyBytesResult;
 
 // ============================================================================
 // Shared Types
@@ -56,7 +57,7 @@ impl NodeAddr {
         }
     }
 
-    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<&'py PyDict> {
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
         d.set_item("endpoint_id", self.endpoint_id.clone())?;
         d.set_item("relay_url", self.relay_url.clone())?;
@@ -64,7 +65,7 @@ impl NodeAddr {
         Ok(d)
     }
 
-    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<&'py PyBytes> {
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let relay = self.relay_url.clone().unwrap_or_default();
         let direct = self.direct_addresses.join("\n");
         let encoded = format!("{}\n{}\n{}", self.endpoint_id, relay, direct);
@@ -95,7 +96,7 @@ impl NodeAddr {
     }
 
     #[staticmethod]
-    fn from_dict(data: &PyDict) -> PyResult<Self> {
+    fn from_dict(data: &Bound<'_, PyDict>) -> PyResult<Self> {
         let endpoint_id = data
             .get_item("endpoint_id")?
             .ok_or_else(|| err_to_py("missing endpoint_id"))?
@@ -257,6 +258,32 @@ impl From<CoreRemoteInfo> for RemoteInfo {
 }
 
 // ============================================================================
+// ClosedResult — returned by connection.closed()
+// ============================================================================
+
+/// Result of waiting for a connection to close.
+/// Provides kind, code, and optional reason as a dict-like object.
+pub(crate) struct ClosedResult {
+    pub kind: String,
+    pub code: Option<u64>,
+    pub reason: Option<Vec<u8>>,
+}
+
+impl<'py> IntoPyObject<'py> for ClosedResult {
+    type Target = PyDict;
+    type Output = Bound<'py, PyDict>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let d = PyDict::new(py);
+        d.set_item("kind", self.kind)?;
+        d.set_item("code", self.code)?;
+        d.set_item("reason", self.reason.map(PyBytesResult))?;
+        Ok(d)
+    }
+}
+
+// ============================================================================
 // SendStream wrapper
 // ============================================================================
 
@@ -274,7 +301,7 @@ impl From<CoreSendStream> for IrohSendStream {
 #[pymethods]
 impl IrohSendStream {
     /// Write all bytes to the stream.
-    fn write_all<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<&'py PyAny> {
+    fn write_all<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let stream = self.inner.clone();
         future_into_py(py, async move {
             stream.write_all(data).await.map_err(err_to_py)?;
@@ -283,7 +310,7 @@ impl IrohSendStream {
     }
 
     /// Signal that no more data will be written.
-    fn finish<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let stream = self.inner.clone();
         future_into_py(py, async move {
             stream.finish().await.map_err(err_to_py)?;
@@ -291,7 +318,7 @@ impl IrohSendStream {
         })
     }
 
-    fn stopped<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn stopped<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let stream = self.inner.clone();
         future_into_py(py, async move {
             let code = stream.stopped().await.map_err(err_to_py)?;
@@ -317,34 +344,28 @@ impl From<CoreRecvStream> for IrohRecvStream {
 
 #[pymethods]
 impl IrohRecvStream {
-    fn read<'py>(&self, py: Python<'py>, max_len: usize) -> PyResult<&'py PyAny> {
+    fn read<'py>(&self, py: Python<'py>, max_len: usize) -> PyResult<Bound<'py, PyAny>> {
         let stream = self.inner.clone();
         future_into_py(py, async move {
             let chunk = stream.read(max_len).await.map_err(err_to_py)?;
-            let result = Python::with_gil(|py| match chunk {
-                Some(data) => PyBytes::new(py, &data).into_py(py),
-                None => py.None(),
-            });
-            Ok(result)
+            Ok(chunk.map(PyBytesResult))
         })
     }
 
-    fn read_exact<'py>(&self, py: Python<'py>, n: usize) -> PyResult<&'py PyAny> {
+    fn read_exact<'py>(&self, py: Python<'py>, n: usize) -> PyResult<Bound<'py, PyAny>> {
         let stream = self.inner.clone();
         future_into_py(py, async move {
             let data = stream.read_exact(n).await.map_err(err_to_py)?;
-            let result: PyObject = Python::with_gil(|py| PyBytes::new(py, &data).into_py(py));
-            Ok(result)
+            Ok(PyBytesResult(data))
         })
     }
 
     /// Read all remaining data up to `max_size` bytes.
-    fn read_to_end<'py>(&self, py: Python<'py>, max_size: usize) -> PyResult<&'py PyAny> {
+    fn read_to_end<'py>(&self, py: Python<'py>, max_size: usize) -> PyResult<Bound<'py, PyAny>> {
         let stream = self.inner.clone();
         future_into_py(py, async move {
             let data = stream.read_to_end(max_size).await.map_err(err_to_py)?;
-            let result: PyObject = Python::with_gil(|py| PyBytes::new(py, &data).into_py(py));
-            Ok(result)
+            Ok(PyBytesResult(data))
         })
     }
 
@@ -371,7 +392,7 @@ impl From<CoreConnection> for IrohConnection {
 #[pymethods]
 impl IrohConnection {
     /// Open a bidirectional QUIC stream, returning (send, recv).
-    fn open_bi<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn open_bi<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.inner.clone();
         future_into_py(py, async move {
             let (send, recv) = conn.open_bi().await.map_err(err_to_py)?;
@@ -379,7 +400,7 @@ impl IrohConnection {
         })
     }
 
-    fn open_uni<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn open_uni<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.inner.clone();
         future_into_py(py, async move {
             let send = conn.open_uni().await.map_err(err_to_py)?;
@@ -388,7 +409,7 @@ impl IrohConnection {
     }
 
     /// Accept an incoming bidirectional stream from the peer.
-    fn accept_bi<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn accept_bi<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.inner.clone();
         future_into_py(py, async move {
             let (send, recv) = conn.accept_bi().await.map_err(err_to_py)?;
@@ -396,7 +417,7 @@ impl IrohConnection {
         })
     }
 
-    fn accept_uni<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn accept_uni<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.inner.clone();
         future_into_py(py, async move {
             let recv = conn.accept_uni().await.map_err(err_to_py)?;
@@ -410,12 +431,11 @@ impl IrohConnection {
     }
 
     /// Read the next datagram received on this connection.
-    fn read_datagram<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn read_datagram<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.inner.clone();
         future_into_py(py, async move {
             let data = conn.read_datagram().await.map_err(err_to_py)?;
-            let result: PyObject = Python::with_gil(|py| PyBytes::new(py, &data).into_py(py));
-            Ok(result)
+            Ok(PyBytesResult(data))
         })
     }
 
@@ -428,21 +448,15 @@ impl IrohConnection {
         self.inner.close(code, reason).map_err(err_to_py)
     }
 
-    fn closed<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn closed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.inner.clone();
         future_into_py(py, async move {
             let closed = conn.closed().await;
-            let result = Python::with_gil(|py| -> PyResult<PyObject> {
-                let d = PyDict::new(py);
-                d.set_item("kind", closed.kind)?;
-                d.set_item("code", closed.code)?;
-                let reason_obj: Option<PyObject> = closed
-                    .reason
-                    .map(|r| PyBytes::new(py, &r).into_py(py));
-                d.set_item("reason", reason_obj)?;
-                Ok(d.into_py(py))
-            })?;
-            Ok(result)
+            Ok(ClosedResult {
+                kind: closed.kind,
+                code: closed.code,
+                reason: closed.reason,
+            })
         })
     }
 
@@ -494,7 +508,7 @@ impl NetClient {
         py: Python<'py>,
         node_id: String,
         alpn: Vec<u8>,
-    ) -> PyResult<&'py PyAny> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
             let conn = client.connect(node_id, alpn).await.map_err(err_to_py)?;
@@ -507,7 +521,7 @@ impl NetClient {
         py: Python<'py>,
         addr: NodeAddr,
         alpn: Vec<u8>,
-    ) -> PyResult<&'py PyAny> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         let core_addr = CoreNodeAddr {
             endpoint_id: addr.endpoint_id,
@@ -521,7 +535,7 @@ impl NetClient {
     }
 
     /// Accept one incoming connection (only works on bare endpoints, not IrohNode).
-    fn accept<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn accept<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
             let conn = client.accept().await.map_err(err_to_py)?;
@@ -543,7 +557,7 @@ impl NetClient {
         NodeAddr::from(self.inner.endpoint_addr_info())
     }
 
-    fn close<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
             client.close().await;
@@ -551,7 +565,7 @@ impl NetClient {
         })
     }
 
-    fn closed<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn closed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
             client.closed().await;
@@ -608,7 +622,7 @@ pub fn net_client(node: &IrohNode) -> NetClient {
 /// Create a bare QUIC endpoint with custom config for custom QUIC usage.
 /// Supports both connect and accept.
 #[pyfunction]
-pub fn create_endpoint<'py>(py: Python<'py>, alpn: Vec<u8>) -> PyResult<&'py PyAny> {
+pub fn create_endpoint<'py>(py: Python<'py>, alpn: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
     future_into_py(py, async move {
         let client = CoreNetClient::create(alpn).await.map_err(err_to_py)?;
         Ok(NetClient::from(client))
@@ -619,7 +633,7 @@ pub fn create_endpoint<'py>(py: Python<'py>, alpn: Vec<u8>) -> PyResult<&'py PyA
 pub fn create_endpoint_with_config<'py>(
     py: Python<'py>,
     config: EndpointConfig,
-) -> PyResult<&'py PyAny> {
+) -> PyResult<Bound<'py, PyAny>> {
     let config = CoreEndpointConfig::from(&config);
     future_into_py(py, async move {
         let client = CoreNetClient::create_with_config(config)
@@ -633,7 +647,7 @@ pub fn create_endpoint_with_config<'py>(
 // Module registration
 // ============================================================================
 
-pub fn register(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NodeAddr>()?;
     m.add_class::<EndpointConfig>()?;
     m.add_class::<ConnectionInfo>()?;

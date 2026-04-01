@@ -195,8 +195,8 @@ impl HookManager {
     #[new]
     #[pyo3(signature = (_before_connect=None, _after_connect=None))]
     fn new_with_callbacks(
-        _before_connect: Option<PyObject>,
-        _after_connect: Option<PyObject>,
+        _before_connect: Option<Py<PyAny>>,
+        _after_connect: Option<Py<PyAny>>,
     ) -> Self {
         // Note: In the actual implementation, callbacks would be stored
         // and dispatched when hook events arrive from the core layer.
@@ -205,18 +205,18 @@ impl HookManager {
     }
 
     /// Update the before_connect callback.
-    fn set_before_connect(&mut self, _callback: Option<PyObject>) {
+    fn set_before_connect(&mut self, _callback: Option<Py<PyAny>>) {
         // Placeholder - actual implementation would update the stored callback
     }
 
     /// Update the after_connect callback.
-    fn set_after_connect(&mut self, _callback: Option<PyObject>) {
+    fn set_after_connect(&mut self, _callback: Option<Py<PyAny>>) {
         // Placeholder - actual implementation would update the stored callback
     }
 }
 
 /// Register the hooks types with the Python module.
-pub fn register(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HookConnectInfo>()?;
     m.add_class::<HookHandshakeInfo>()?;
     m.add_class::<HookDecision>()?;

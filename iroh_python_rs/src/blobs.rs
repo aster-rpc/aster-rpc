@@ -3,13 +3,13 @@
 //! Phase 2: Now wraps iroh_transport_core::CoreBlobsClient instead of iroh_blobs types directly.
 
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
-use pyo3_asyncio::tokio::future_into_py;
+use pyo3_async_runtimes::tokio::future_into_py;
 
 use iroh_transport_core::CoreBlobsClient;
 
 use crate::error::err_to_py;
 use crate::node::IrohNode;
+use crate::PyBytesResult;
 
 /// Python wrapper for the Iroh Blobs client.
 #[pyclass]
@@ -26,7 +26,7 @@ impl From<CoreBlobsClient> for BlobsClient {
 #[pymethods]
 impl BlobsClient {
     /// Store bytes and return the BLAKE3 hash as a hex string.
-    fn add_bytes<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<&'py PyAny> {
+    fn add_bytes<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
             client
@@ -37,15 +37,14 @@ impl BlobsClient {
     }
 
     /// Read a blob by its BLAKE3 hash hex string. Returns bytes or raises IrohError.
-    fn read_to_bytes<'py>(&self, py: Python<'py>, hash_hex: String) -> PyResult<&'py PyAny> {
+    fn read_to_bytes<'py>(&self, py: Python<'py>, hash_hex: String) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
             let data = client
                 .read_to_bytes(hash_hex)
                 .await
                 .map_err(err_to_py)?;
-            let result: PyObject = Python::with_gil(|py| PyBytes::new(py, &data).into_py(py));
-            Ok(result)
+            Ok(PyBytesResult(data))
         })
     }
 
@@ -59,15 +58,14 @@ impl BlobsClient {
 
     /// Download a blob from a remote peer using a blob ticket string.
     /// Returns the blob content as bytes.
-    fn download_blob<'py>(&self, py: Python<'py>, ticket_str: String) -> PyResult<&'py PyAny> {
+    fn download_blob<'py>(&self, py: Python<'py>, ticket_str: String) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
             let data = client
                 .download_blob(ticket_str)
                 .await
                 .map_err(err_to_py)?;
-            let result: PyObject = Python::with_gil(|py| PyBytes::new(py, &data).into_py(py));
-            Ok(result)
+            Ok(PyBytesResult(data))
         })
     }
 }
@@ -79,7 +77,7 @@ pub fn blobs_client(node: &IrohNode) -> BlobsClient {
 }
 
 /// Register the blobs types with the Python module.
-pub fn register(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BlobsClient>()?;
     m.add_function(wrap_pyfunction!(blobs_client, m)?)?;
     Ok(())

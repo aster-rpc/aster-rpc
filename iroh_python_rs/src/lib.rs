@@ -24,18 +24,34 @@ mod monitor;
 mod net;
 mod node;
 
+/// Wrapper to convert Vec<u8> to Python bytes via IntoPyObject.
+/// In pyo3 0.28, Vec<u8> converts to list[int], but we want bytes.
+pub(crate) struct PyBytesResult(pub Vec<u8>);
+
+impl<'py> IntoPyObject<'py> for PyBytesResult {
+    type Target = pyo3::types::PyBytes;
+    type Output = Bound<'py, pyo3::types::PyBytes>;
+    type Error = std::convert::Infallible;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(pyo3::types::PyBytes::new(py, &self.0))
+    }
+}
+
 /// Initialize the async runtime for tokio.
 fn init_tokio_runtime() {
-    use pyo3_asyncio::tokio::init as pyo3_asyncio_init;
+    use pyo3_async_runtimes::tokio::init as pyo3_asyncio_init;
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     pyo3_asyncio_init(builder);
 }
 
 #[pymodule]
-fn _iroh_python(py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn _iroh_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize tokio runtime for async operations
     init_tokio_runtime();
+
+    let py = m.py();
 
     // Register error types first (needed by other modules)
     error::register(py, m)?;

@@ -3,7 +3,7 @@
 //! Phase 2: Now wraps iroh_transport_core::CoreNode instead of iroh types directly.
 
 use pyo3::prelude::*;
-use pyo3_asyncio::tokio::future_into_py;
+use pyo3_async_runtimes::tokio::future_into_py;
 
 use iroh_transport_core::CoreNode;
 
@@ -27,7 +27,7 @@ impl IrohNode {
 impl IrohNode {
     /// Create an in-memory Iroh node with all protocols.
     #[staticmethod]
-    fn memory<'py>(py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn memory<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         future_into_py(py, async move {
             CoreNode::memory()
                 .await
@@ -38,7 +38,7 @@ impl IrohNode {
 
     /// Create a persistent Iroh node backed by an FsStore at the given path.
     #[staticmethod]
-    fn persistent<'py>(py: Python<'py>, path: String) -> PyResult<&'py PyAny> {
+    fn persistent<'py>(py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         future_into_py(py, async move {
             CoreNode::persistent(path)
                 .await
@@ -68,7 +68,7 @@ impl IrohNode {
     }
 
     /// Gracefully shut down the node.
-    fn close<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let node = self.inner.clone();
         future_into_py(py, async move {
             node.close().await;
@@ -77,7 +77,7 @@ impl IrohNode {
     }
 
     /// Alias for close() — gracefully shut down the node.
-    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.close(py)
     }
 
@@ -102,7 +102,7 @@ impl From<CoreNode> for IrohNode {
 }
 
 /// Register the node types with the Python module
-pub fn register(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IrohNode>()?;
     Ok(())
 }
