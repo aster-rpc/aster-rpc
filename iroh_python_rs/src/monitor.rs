@@ -23,7 +23,7 @@ use pyo3::prelude::*;
 ///
 /// Note: ConnectionInfo and RemoteInfo are registered in net.rs as they
 /// are used directly by NetClient and IrohConnection.
-pub fn register(_py: Python<'_>, _m: &PyModule) -> PyResult<()> {
+pub fn register(_py: Python<'_>, _m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ConnectionInfo and RemoteInfo are registered in net.rs::register()
     Ok(())
 }

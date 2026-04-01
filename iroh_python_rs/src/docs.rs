@@ -3,13 +3,13 @@
 //! Phase 2: Now wraps iroh_transport_core types instead of iroh_docs types directly.
 
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
-use pyo3_asyncio::tokio::future_into_py;
+use pyo3_async_runtimes::tokio::future_into_py;
 
 use iroh_transport_core::{CoreDocsClient, CoreDoc};
 
 use crate::error::err_to_py;
 use crate::node::IrohNode;
+use crate::PyBytesResult;
 
 // ============================================================================
 // DocsClient
@@ -29,7 +29,7 @@ impl From<CoreDocsClient> for DocsClient {
 #[pymethods]
 impl DocsClient {
     /// Create a new document, returns a DocHandle.
-    fn create<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn create<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
             let doc = client.create().await.map_err(err_to_py)?;
@@ -38,7 +38,7 @@ impl DocsClient {
     }
 
     /// Create a new author, returns the author ID as hex string.
-    fn create_author<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn create_author<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
             client
@@ -49,7 +49,7 @@ impl DocsClient {
     }
 
     /// Join a document from a ticket string, returns a DocHandle.
-    fn join<'py>(&self, py: Python<'py>, ticket_str: String) -> PyResult<&'py PyAny> {
+    fn join<'py>(&self, py: Python<'py>, ticket_str: String) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
             let doc = client.join(ticket_str).await.map_err(err_to_py)?;
@@ -87,7 +87,7 @@ impl DocHandle {
         author_hex: String,
         key: Vec<u8>,
         value: Vec<u8>,
-    ) -> PyResult<&'py PyAny> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.inner.clone();
         future_into_py(py, async move {
             doc.set_bytes(author_hex, key, value)
@@ -102,20 +102,17 @@ impl DocHandle {
         py: Python<'py>,
         author_hex: String,
         key: Vec<u8>,
-    ) -> PyResult<&'py PyAny> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.inner.clone();
         future_into_py(py, async move {
             let result = doc.get_exact(author_hex, key).await.map_err(err_to_py)?;
-            Ok(Python::with_gil(|py| match result {
-                Some(data) => PyBytes::new(py, &data).into_py(py),
-                None => py.None(),
-            }))
+            Ok(result.map(PyBytesResult))
         })
     }
 
     /// Share this document, returning a ticket string.
     /// mode: "read" or "write"
-    fn share<'py>(&self, py: Python<'py>, mode: String) -> PyResult<&'py PyAny> {
+    fn share<'py>(&self, py: Python<'py>, mode: String) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.inner.clone();
         future_into_py(py, async move {
             doc.share(mode).await.map_err(err_to_py)
@@ -134,7 +131,7 @@ pub fn docs_client(node: &IrohNode) -> DocsClient {
 }
 
 /// Register the docs types with the Python module.
-pub fn register(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DocsClient>()?;
     m.add_class::<DocHandle>()?;
     m.add_function(wrap_pyfunction!(docs_client, m)?)?;

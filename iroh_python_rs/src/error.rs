@@ -19,7 +19,7 @@ pub fn err_to_py(e: impl std::fmt::Display) -> PyErr {
 }
 
 /// Register all exception types with the Python module
-pub fn register(py: Python<'_>, m: &PyModule) -> PyResult<()> {
+pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("IrohError", py.get_type::<IrohError>())?;
     m.add("BlobNotFound", py.get_type::<BlobNotFound>())?;
     m.add("DocNotFound", py.get_type::<DocNotFound>())?;
