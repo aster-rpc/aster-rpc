@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Hook event types
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct HookConnectInfo {
     #[pyo3(get)]
@@ -27,7 +27,7 @@ pub struct HookConnectInfo {
 }
 
 /// Hook handshake event types
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct HookHandshakeInfo {
     #[pyo3(get)]
@@ -39,7 +39,7 @@ pub struct HookHandshakeInfo {
 }
 
 /// Hook decision types
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct HookDecision {
     #[pyo3(get)]
@@ -148,7 +148,7 @@ impl HookReceiver {
 ///     after_connect=my_after_connect,
 /// )
 /// ```
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct HookRegistration {
     #[pyo3(get)]
