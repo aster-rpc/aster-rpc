@@ -67,7 +67,7 @@ async def test_share_and_join():
     await doc1.set_bytes(author, b"key1", b"value1")
 
     # Share the doc
-    ticket = await doc1.share("write", node1)
+    ticket = await doc1.share("write")
     assert ticket.startswith("doc"), f"ticket should start with 'doc', got: {ticket[:20]}"
 
     # Join on node2

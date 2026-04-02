@@ -195,18 +195,38 @@ class HookConnectInfo:  # Phase 1b
     remote_endpoint_id: str
     alpn: bytes
 
+    def __init__(
+        self,
+        remote_endpoint_id: str = ...,
+        alpn: bytes = ...,
+    ) -> None: ...
+
 
 class HookHandshakeInfo:  # Phase 1b
     remote_endpoint_id: str
     alpn: bytes
     is_alive: bool
 
+    def __init__(
+        self,
+        remote_endpoint_id: str = ...,
+        alpn: bytes = ...,
+        is_alive: bool = ...,
+    ) -> None: ...
+
 
 class HookDecision:  # Phase 1b
+    is_allowed: bool
+    error_code: Optional[int]
+    reason: Optional[bytes]
+
+    def __init__(self) -> None: ...
+    @property
+    def allow(self) -> bool: ...
     @staticmethod
-    def Allow() -> "HookDecision": ...
+    def create_allow() -> "HookDecision": ...
     @staticmethod
-    def Deny(error_code: int, reason: bytes) -> "HookDecision": ...
+    def create_deny(error_code: int, reason: bytes) -> "HookDecision": ...
 
 
 class HookReceiver:  # Phase 1b
