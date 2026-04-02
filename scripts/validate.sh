@@ -32,15 +32,15 @@ fi
 
 # ── 1. Rust formatting ─────────────────────────────────────────────
 step "cargo fmt --check"
-if cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check; then
+if cargo fmt --manifest-path bindings/aster_python_rs/Cargo.toml --check; then
     pass "Formatting OK"
 else
-    fail "Formatting issues found. Run: cargo fmt --manifest-path iroh_python_rs/Cargo.toml"
+    fail "Formatting issues found. Run: cargo fmt --manifest-path bindings/aster_python_rs/Cargo.toml"
 fi
 
 # ── 2. Clippy (treats warnings as errors, same as CI) ──────────────
 step "cargo clippy -- -D warnings"
-if cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings; then
+if cargo clippy --manifest-path bindings/aster_python_rs/Cargo.toml -- -D warnings; then
     pass "Clippy OK"
 else
     fail "Clippy found errors. Fix the issues above."
@@ -49,7 +49,7 @@ fi
 # ── 3. Build the Python extension via uv ───────────────────────────
 step "uv run maturin develop"
 if command -v uv &>/dev/null; then
-    if uv run maturin develop -m iroh_python_rs/Cargo.toml; then
+    if uv run maturin develop -m bindings/aster_python_rs/Cargo.toml; then
         pass "Build OK"
     else
         fail "maturin develop failed"

@@ -4,7 +4,7 @@ Demonstrates creating two nodes, subscribing to a shared topic,
 and broadcasting/receiving messages.
 """
 import asyncio
-from iroh_python import IrohNode, gossip_client
+from aster_python import IrohNode, gossip_client
 
 
 TOPIC = bytes(32)  # 32 zero bytes as topic ID

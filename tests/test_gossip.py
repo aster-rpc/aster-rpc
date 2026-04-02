@@ -3,7 +3,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 
-from iroh_python import IrohNode, gossip_client, GossipTopicHandle
+from aster_python import IrohNode, gossip_client, GossipTopicHandle
 
 
 TOPIC = bytes(32)  # 32 zero bytes as topic ID

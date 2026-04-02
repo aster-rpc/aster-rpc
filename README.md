@@ -1,4 +1,4 @@
-# iroh-python
+# aster-python
 
 Python bindings for the [Iroh](https://iroh.computer) peer-to-peer networking library.
 
@@ -20,18 +20,18 @@ Built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs), providin
 ### Install from source
 
 ```bash
-git clone https://github.com/user/iroh-python.git
-cd iroh-python
+git clone https://github.com/user/aster-python.git
+cd aster-python
 
 # Using uv (recommended)
 uv venv
 uv pip install maturin pytest pytest-asyncio pytest-timeout
-uv run maturin develop -m iroh_python_rs/Cargo.toml
+uv run maturin develop -m bindings/aster_python_rs/Cargo.toml
 
 # Or using pip
 # python -m venv .venv && source .venv/bin/activate
 # pip install maturin pytest pytest-asyncio pytest-timeout
-# maturin develop -m iroh_python_rs/Cargo.toml
+# maturin develop -m bindings/aster_python_rs/Cargo.toml
 ```
 
 ### Optional: speed up local Rust builds with sccache
@@ -53,7 +53,7 @@ You can also use `./scripts/validate.sh`, which now auto-enables `sccache` when 
 
 ```python
 import asyncio
-from iroh_python import IrohNode, blobs_client
+from aster_python import IrohNode, blobs_client
 
 async def main():
     node = await IrohNode.memory()
@@ -72,7 +72,7 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from iroh_python import create_endpoint
+from aster_python import create_endpoint
 
 ALPN = b"iroh/echo/1"
 
@@ -103,7 +103,7 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from iroh_python import IrohNode, gossip_client
+from aster_python import IrohNode, gossip_client
 
 TOPIC = bytes(range(32))
 
@@ -140,8 +140,8 @@ uv run pytest tests/ -v --timeout=30
 ## Run lint locally
 
 ```bash
-cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check
-cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings
+cargo fmt --manifest-path bindings/aster_python_rs/Cargo.toml --check
+cargo clippy --manifest-path bindings/aster_python_rs/Cargo.toml -- -D warnings
 ```
 
 ## Enable pre-push checks

@@ -1,5 +1,5 @@
 import pytest
-from iroh_python._iroh_python import IrohNode, docs_client
+from aster_python._aster_python import IrohNode, docs_client
 
 
 @pytest.mark.asyncio

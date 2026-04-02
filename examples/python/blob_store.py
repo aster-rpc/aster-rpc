@@ -1,6 +1,6 @@
 """Example: store and retrieve content-addressed blobs."""
 import asyncio
-from iroh_python import IrohNode, blobs_client
+from aster_python import IrohNode, blobs_client
 
 
 async def main():
@@ -8,7 +8,7 @@ async def main():
     blobs = blobs_client(node)
 
     # Store some data
-    data = b"Hello from iroh-python blobs!"
+    data = b"Hello from aster-python blobs!"
     hash_str = await blobs.add_bytes(data)
     print(f"Stored blob: {hash_str}")
 

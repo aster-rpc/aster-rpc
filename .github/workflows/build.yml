@@ -37,9 +37,9 @@ jobs:
           sccache --version
           sccache --show-stats || true
       - name: cargo fmt
-        run: cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check
+        run: cargo fmt --manifest-path bindings/aster_python_rs/Cargo.toml --check
       - name: cargo clippy
-        run: cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings
+        run: cargo clippy --manifest-path bindings/aster_python_rs/Cargo.toml -- -D warnings
       - name: Cache diagnostics (post-lint)
         run: sccache --show-stats || true
 
@@ -75,7 +75,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -m iroh_python_rs/Cargo.toml
+          args: --release --out dist -m bindings/aster_python_rs/Cargo.toml
           manylinux: auto
       - name: Cache diagnostics (post-build)
         run: sccache --show-stats || true
@@ -120,7 +120,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -m iroh_python_rs/Cargo.toml
+          args: --release --out dist -m bindings/aster_python_rs/Cargo.toml
       - name: Cache diagnostics (post-build)
         run: sccache --show-stats || true
       - uses: actions/upload-artifact@v4
@@ -158,7 +158,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: x64
-          args: --release --out dist -m iroh_python_rs/Cargo.toml
+          args: --release --out dist -m bindings/aster_python_rs/Cargo.toml
       - name: Cache diagnostics (post-build)
         shell: pwsh
         run: sccache --show-stats
@@ -193,7 +193,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          args: --out dist -m iroh_python_rs/Cargo.toml
+          args: --out dist -m bindings/aster_python_rs/Cargo.toml
       - name: Cache diagnostics (post-sdist)
         run: sccache --show-stats || true
       - uses: actions/upload-artifact@v4

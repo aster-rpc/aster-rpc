@@ -10,7 +10,7 @@ import asyncio
 import pathlib
 import sys
 
-from iroh_python import IrohNode, blobs_client
+from aster_python import IrohNode, blobs_client
 
 
 async def main(path: str) -> None:

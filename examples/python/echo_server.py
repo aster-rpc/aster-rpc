@@ -4,7 +4,7 @@ Run this in one terminal, then run echo_client.py in another
 (passing this server's endpoint ID as an argument).
 """
 import asyncio
-from iroh_python import create_endpoint
+from aster_python import create_endpoint
 
 ALPN = b"example/echo/1"
 

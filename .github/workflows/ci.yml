@@ -38,9 +38,9 @@ jobs:
           sccache --version
           sccache --show-stats || true
       - name: cargo fmt
-        run: cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check
+        run: cargo fmt --manifest-path bindings/aster_python_rs/Cargo.toml --check
       - name: cargo clippy
-        run: cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings
+        run: cargo clippy --manifest-path bindings/aster_python_rs/Cargo.toml -- -D warnings
       - name: Cache diagnostics (post-lint)
         run: sccache --show-stats || true
 
@@ -105,7 +105,7 @@ jobs:
           uv venv .venv
           source .venv/bin/activate
           uv pip install pytest pytest-asyncio pytest-timeout maturin
-          maturin develop -m iroh_python_rs/Cargo.toml
+          maturin develop -m bindings/aster_python_rs/Cargo.toml
           pytest tests/ -v --timeout=60
         shell: bash
 
@@ -115,7 +115,7 @@ jobs:
           uv venv .venv
           .venv\Scripts\activate
           uv pip install pytest pytest-asyncio pytest-timeout maturin
-          maturin develop -m iroh_python_rs/Cargo.toml
+          maturin develop -m bindings/aster_python_rs/Cargo.toml
           pytest tests/ -v --timeout=60
         shell: pwsh
       - name: Cache diagnostics (post-build)

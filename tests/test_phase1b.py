@@ -3,7 +3,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 
-from iroh_python import (
+from aster_python import (
     IrohNode,
     create_endpoint,
     EndpointConfig,
