@@ -1,7 +1,7 @@
 //! Hooks module - Python wrappers for Phase 1b endpoint hooks.
 //!
 //! This module provides Python access to the hook system exposed through
-//! iroh_transport_core's CoreHookReceiver.
+//! aster_transport_core's CoreHookReceiver.
 //!
 //! Phase 1b: Hooks are enabled via EndpointConfig.enable_hooks = true.
 //! The hook receiver is consumed from CoreNetClient via take_hook_receiver().
@@ -127,7 +127,7 @@ impl Default for HookDecision {
 /// is consumed internally by the core layer when enable_hooks=True.
 /// Python callbacks can be registered at the endpoint level.
 ///
-/// Note: The actual hook implementation in iroh_transport_core uses
+/// Note: The actual hook implementation in aster_transport_core uses
 /// channel-based communication. For Python, the recommended pattern is:
 /// - Use EndpointConfig(enable_hooks=True) when creating an endpoint
 /// - Pass Python callback functions when creating the endpoint
@@ -193,7 +193,7 @@ pub struct HookRegistration {
 /// HookManager for registering and managing hooks.
 ///
 /// Note: This is a simplified interface. The actual hook system
-/// in iroh_transport_core uses channel-based communication with
+/// in aster_transport_core uses channel-based communication with
 /// configurable timeouts. Hooks are registered at endpoint creation
 /// time via EndpointConfig(enable_hooks=True).
 #[pyclass]

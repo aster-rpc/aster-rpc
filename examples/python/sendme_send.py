@@ -1,7 +1,7 @@
 """Example: sendme-compatible sender using blob tickets.
 
 Usage:
-    uv run python examples/sendme_send.py <file>
+    uv run python examples/python/sendme_send.py <file>
 
 Prints a blob ticket that can be used by sendme_recv.py or the Rust sendme tool.
 """

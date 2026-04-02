@@ -34,6 +34,19 @@ uv run maturin develop -m iroh_python_rs/Cargo.toml
 # maturin develop -m iroh_python_rs/Cargo.toml
 ```
 
+### Optional: speed up local Rust builds with sccache
+
+```bash
+# macOS
+brew install sccache
+
+# one-off shell session
+export RUSTC_WRAPPER=sccache
+sccache --start-server || true
+```
+
+You can also use `./scripts/validate.sh`, which now auto-enables `sccache` when installed and prints cache stats at the end.
+
 ### Usage
 
 #### Store and retrieve blobs

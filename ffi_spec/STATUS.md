@@ -10,7 +10,7 @@
 
 ## Tasks
 
-### Phase 1.1: iroh_transport_core Changes
+### Phase 1.1: aster_transport_core Changes
 
 | Task | Status | Notes |
 |------|--------|-------|
@@ -24,7 +24,7 @@
 | Update `build_endpoint_config()` for custom relay | ✅ DONE | 2026-04-01 |
 | Verify datagram support completeness | ✅ DONE | Already implemented |
 
-### Phase 1.2: iroh_transport_ffi Rewrite
+### Phase 1.2: aster_transport_ffi Rewrite
 
 | Task | Status | Notes |
 |------|--------|-------|
@@ -155,7 +155,7 @@
 
 ### Implementation Summary
 
-Phase 2 has been completed. All Python bindings now use `iroh_transport_core` as the sole backend, replacing both the legacy FFI-based `lib.rs` implementation and the direct `iroh` upstream wrappers.
+Phase 2 has been completed. All Python bindings now use `aster_transport_core` as the sole backend, replacing both the legacy FFI-based `lib.rs` implementation and the direct `iroh` upstream wrappers.
 
 ### Module Structure (Complete)
 
@@ -176,8 +176,8 @@ iroh_python_rs/src/
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Update `iroh_python_rs/Cargo.toml` to depend on `iroh_transport_core` | ✅ DONE | 2026-04-01 |
-| Remove legacy FFI-based implementation | ✅ DONE | `iroh_transport_ffi` dependency removed |
+| Update `iroh_python_rs/Cargo.toml` to depend on `aster_transport_core` | ✅ DONE | 2026-04-01 |
+| Remove legacy FFI-based implementation | ✅ DONE | `aster_transport_ffi` dependency removed |
 | Refactor `src/node.rs` to wrap `CoreNode` | ✅ DONE | 2026-04-01 |
 | Refactor `src/net.rs` to wrap `CoreNetClient`, `CoreConnection` | ✅ DONE | 2026-04-01 |
 | Refactor `src/blobs.rs` to wrap `CoreBlobsClient` | ✅ DONE | 2026-04-01 |
@@ -217,7 +217,7 @@ iroh_python_rs/src/
 
 | Criterion | Status |
 |-----------|--------|
-| `iroh_python_rs` depends on `iroh_transport_core` | ✅ DONE |
+| `iroh_python_rs` depends on `aster_transport_core` | ✅ DONE |
 | Legacy FFI-based implementation path removed | ✅ DONE |
 | Python binding exposes Phase 1 and Phase 1b surfaces | ✅ DONE |
 | Existing Python tests pass | ✅ DONE |

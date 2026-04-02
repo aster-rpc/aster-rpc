@@ -57,7 +57,7 @@ These need explicit FFI query APIs beyond just hooks.
 
 ### 2.1 Core Layer
 
-In `iroh_transport_core/src/lib.rs`, on `CoreConnection`, add:
+In `aster_transport_core/src/lib.rs`, on `CoreConnection`, add:
 
 ```rust
 /// Returns the maximum size for datagrams on this connection.
@@ -138,7 +138,7 @@ Update `iroh_connection_read_datagram` to emit `IROH_EVENT_DATAGRAM_RECEIVED` in
                            │ iroh_hook_before_connect_respond()
                            │ iroh_hook_after_connect_respond()
 ┌──────────────────────────▼───────────────────────────────────┐
-│                 iroh_transport_ffi (C ABI)                    │
+│                 aster_transport_ffi (C ABI)                    │
 │  - Hook registration                                           │
 │  - Translates before_connect/after_connect to iroh events     │
 │  - Stores hook invocation handles in registry                 │
@@ -146,7 +146,7 @@ Update `iroh_connection_read_datagram` to emit `IROH_EVENT_DATAGRAM_RECEIVED` in
 └──────────────────────────┬───────────────────────────────────┘
                            │
 ┌──────────────────────────▼───────────────────────────────────┐
-│                 iroh_transport_core                             │
+│                 aster_transport_core                             │
 │  - CoreNetClient / CoreNode wrap iroh hooks                   │
 │  - Stores Arc<HookCallbacks> in EndpointBuilder               │
 │  - Emits hook events back through FFI event system            │
@@ -156,7 +156,7 @@ Update `iroh_connection_read_datagram` to emit `IROH_EVENT_DATAGRAM_RECEIVED` in
 ### 3.2 Core Layer — Hook Types
 
 ```rust
-// In iroh_transport_core/src/lib.rs
+// In aster_transport_core/src/lib.rs
 
 /// Hook callback interface — stored as Arc<dyn HookCallbacks>
 pub trait HookCallbacks: Send + Sync {
@@ -521,7 +521,7 @@ iroh_status_t iroh_connection_info(
 
 ### 5.1 Summary of Core Additions
 
-**File:** `iroh_transport_core/src/lib.rs`
+**File:** `aster_transport_core/src/lib.rs`
 
 #### On `CoreConnection`:
 
@@ -584,7 +584,7 @@ Same methods as `CoreNetClient`, delegating to the underlying endpoint.
 
 ### 6.1 Summary of FFI Additions
 
-**File:** `iroh_transport_ffi/src/lib.rs`
+**File:** `aster_transport_ffi/src/lib.rs`
 
 #### New handle types:
 

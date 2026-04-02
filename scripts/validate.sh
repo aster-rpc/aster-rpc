@@ -19,6 +19,17 @@ pass() { echo -e "${GREEN}✓ $1${RESET}"; }
 fail() { echo -e "${RED}✗ $1${RESET}"; exit 1; }
 step() { echo -e "\n${BOLD}── $1 ──${RESET}"; }
 
+# ── Optional local compiler cache (sccache) ─────────────────────────
+if command -v sccache &>/dev/null; then
+    export RUSTC_WRAPPER=sccache
+    pass "Using sccache (RUSTC_WRAPPER=sccache)"
+    # Reset stats for this run so end-of-run output is easier to read.
+    sccache --zero-stats >/dev/null 2>&1 || true
+else
+    echo "  ⚠ sccache not found — running without compiler artifact cache."
+    echo "  Install with: brew install sccache"
+fi
+
 # ── 1. Rust formatting ─────────────────────────────────────────────
 step "cargo fmt --check"
 if cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check; then
@@ -59,6 +70,11 @@ if command -v uv &>/dev/null; then
 else
     echo "  ⚠ uv not found — skipping test step."
     echo "  Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
+fi
+
+if command -v sccache &>/dev/null; then
+    step "sccache stats"
+    sccache --show-stats || true
 fi
 
 echo -e "\n${GREEN}${BOLD}All checks passed!${RESET}"

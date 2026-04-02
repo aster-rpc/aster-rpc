@@ -5,7 +5,7 @@ This package provides Python access to Iroh's peer-to-peer networking
 capabilities, including QUIC connections, content-addressed blob storage,
 collaborative CRDT documents, and topic-based gossip messaging.
 
-Phase 2: All bindings now use iroh_transport_core as the backend.
+Phase 2: All bindings now use aster_transport_core as the backend.
 Phase 1b: Includes datagram completion, connection info, remote-info, and hooks.
 """
 

@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Core transport layer - the authoritative backend for all Python bindings
-iroh_transport_core = { path = "../iroh_transport_core" }
+aster_transport_core = { path = "../aster_transport_core" }
 
 # Python FFI
 pyo3        = { workspace = true }

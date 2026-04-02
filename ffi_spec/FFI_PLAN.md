@@ -2,7 +2,7 @@
 
 **Status:** Final Plan  
 **Date:** 2026-04-01  
-**Scope:** Refactor `iroh_transport_core` and `iroh_transport_ffi` to provide a polished, language-neutral C ABI; update Python bindings; implement Java FFM bindings.
+**Scope:** Refactor `aster_transport_core` and `aster_transport_ffi` to provide a polished, language-neutral C ABI; update Python bindings; implement Java FFM bindings.
 
 ---
 
@@ -23,7 +23,7 @@
 
 ## 1. Executive Summary
 
-The current FFI layer (`iroh_transport_ffi`) has several structural problems that prevent it from being a safe, efficient, multi-language ABI:
+The current FFI layer (`aster_transport_ffi`) has several structural problems that prevent it from being a safe, efficient, multi-language ABI:
 
 1. **Use-after-free risk**: Raw pointers are cast to `usize`, sent across async task boundaries, and reconstructed — if the caller frees the handle while an operation is in-flight, this causes UB.
    2. **Per-operation condvar model**: Each async operation gets its own `Mutex<Option<Result>>` + `Condvar`. This doesn't scale and is awkward for languages that want non-blocking completion.
@@ -47,7 +47,7 @@ The plan replaces the current design with a **runtime + completion queue** archi
 │  └────┬──────┘  └────┬─────┘  └────┬──────┘          │
 │       │              │              │                 │
 │  ┌────▼──────────────▼──────────────▼──────┐         │
-│  │         iroh_transport_ffi (C ABI)       │         │
+│  │         aster_transport_ffi (C ABI)       │         │
 │  │  - #[no_mangle] extern "C" functions     │         │
 │  │  - #[repr(C)] structs                    │         │
 │  │  - Opaque u64 handles                    │         │
@@ -56,7 +56,7 @@ The plan replaces the current design with a **runtime + completion queue** archi
 │  └────────────────┬────────────────────────┘         │
 │                   │                                   │
 │  ┌────────────────▼────────────────────────┐         │
-│  │         iroh_transport_core              │         │
+│  │         aster_transport_core              │         │
 │  │  - Pure Rust async API                   │         │
 │  │  - No FFI concerns                       │         │
 │  │  - Wraps iroh, iroh-blobs, iroh-docs,   │         │
@@ -80,7 +80,7 @@ The plan replaces the current design with a **runtime + completion queue** archi
 
 ## 3. Phase 1: Core + FFI Refactoring
 
-### 3.1 `iroh_transport_core` Changes
+### 3.1 `aster_transport_core` Changes
 
 The core layer is already mostly clean. Changes needed:
 
@@ -132,7 +132,7 @@ impl CoreNode {
 
 Verify `send_datagram` and `read_datagram` work correctly end-to-end.
 
-### 3.2 `iroh_transport_ffi` Complete Rewrite
+### 3.2 `aster_transport_ffi` Complete Rewrite
 
 The FFI layer gets a ground-up rewrite based on the completion queue architecture.
 
@@ -757,27 +757,27 @@ Phase 2 is intentionally **not** a lightweight cleanup pass. It is the first bin
 
 There are two possible implementation strategies:
 
-**Option A: PyO3 directly wrapping `iroh_transport_core`**
-**Option B: PyO3 wrapping the C ABI via `iroh_transport_ffi`**
+**Option A: PyO3 directly wrapping `aster_transport_core`**
+**Option B: PyO3 wrapping the C ABI via `aster_transport_ffi`**
 
-**Decision: use Option A as the required implementation path, and require `iroh_transport_core` to be the immediate backend for every Python wrapper.**
+**Decision: use Option A as the required implementation path, and require `aster_transport_core` to be the immediate backend for every Python wrapper.**
 
 This is a deliberate architectural choice, not merely a convenience choice:
 
-1. **Strict layering and reuse come first.** Python should consume the same Rust-level abstractions that the C ABI consumes. Any awkwardness discovered here is valuable signal that `iroh_transport_core` itself still needs refinement before Java and other foreign-language bindings harden on top of it.
+1. **Strict layering and reuse come first.** Python should consume the same Rust-level abstractions that the C ABI consumes. Any awkwardness discovered here is valuable signal that `aster_transport_core` itself still needs refinement before Java and other foreign-language bindings harden on top of it.
 2. **Performance and safety remain primary goals.** PyO3 should expose the async/core model directly, preserve zero-copy behavior where practical, and avoid reintroducing ad-hoc blocking or duplicated marshalling logic.
 3. **Python must expose the full intended Phase 1b surface immediately.** Datagram completion, hooks, monitoring, remote-info, and related endpoint/connection observability are not optional “later” additions for Python; they are part of Phase 2 readiness.
 4. **Python depends on Phase 1b completeness.** We should not declare Phase 2 done while Phase 1b remains partially implemented, placeholder-backed, or undocumented in the core layer.
-5. **The Python binding is a design validation harness for Java and future bindings.** If a surface is hard to expose ergonomically and safely from `iroh_transport_core` into PyO3, it is a strong indicator that the same surface will be harder and riskier through Java FFM, Go, Zig, or other foreign runtimes.
+5. **The Python binding is a design validation harness for Java and future bindings.** If a surface is hard to expose ergonomically and safely from `aster_transport_core` into PyO3, it is a strong indicator that the same surface will be harder and riskier through Java FFM, Go, Zig, or other foreign runtimes.
 
-The consequence is that `iroh_python_rs` should not be a special-case wrapper built directly against upstream crates, and it should not retain a legacy FFI-based implementation in `src/lib.rs`. Instead, it should become a thin, idiomatic Python-facing layer over `iroh_transport_core`, with the core crate as the single source of truth for semantics, lifetime rules, async behavior, and feature completeness.
+The consequence is that `iroh_python_rs` should not be a special-case wrapper built directly against upstream crates, and it should not retain a legacy FFI-based implementation in `src/lib.rs`. Instead, it should become a thin, idiomatic Python-facing layer over `aster_transport_core`, with the core crate as the single source of truth for semantics, lifetime rules, async behavior, and feature completeness.
 
 ### 4.2 Changes
 
-1. **Require `iroh_transport_core` as the sole Python backend**
-   - Remove the `iroh_transport_ffi` dependency from `iroh_python_rs`
+1. **Require `aster_transport_core` as the sole Python backend**
+   - Remove the `aster_transport_ffi` dependency from `iroh_python_rs`
    - Remove any direct dependency on upstream `iroh*` crates from Python wrappers except where needed transitively through core-facing types
-   - Treat `iroh_transport_core` as the only authoritative implementation surface for Python behavior
+   - Treat `aster_transport_core` as the only authoritative implementation surface for Python behavior
 
 2. **Delete the legacy FFI-based Python implementation path**
    - `iroh_python_rs/src/lib.rs` must become module registration only
@@ -875,13 +875,13 @@ The Python binding must uphold the same architectural rules as the FFI layer whe
 
 Phase 2 is complete only when all of the following are true:
 
-1. `iroh_python_rs` depends on `iroh_transport_core` as its immediate backend for all transport features.
+1. `iroh_python_rs` depends on `aster_transport_core` as its immediate backend for all transport features.
 2. The legacy FFI-based implementation path has been fully removed from Python.
 3. All duplicate Python wrapper implementations have been consolidated.
 4. The Python binding exposes the completed Phase 1 and Phase 1b surfaces that exist in core.
 5. Existing Python tests pass without API regressions for previously supported features.
 6. New Python tests cover datagram completion, hooks, monitoring, remote-info, and any screening/admission-control APIs exposed by core.
-7. Any friction discovered while exposing these surfaces has either been fixed in `iroh_transport_core` or explicitly recorded as a blocker for Phase 3.
+7. Any friction discovered while exposing these surfaces has either been fixed in `aster_transport_core` or explicitly recorded as a blocker for Phase 3.
 
 ---
 
@@ -1000,7 +1000,7 @@ final class NativeBindings {
     private static final SymbolLookup LIB;
     
     static {
-        System.loadLibrary("iroh_transport_ffi");
+        System.loadLibrary("aster_transport_ffi");
         LIB = SymbolLookup.loaderLookup();
     }
     
@@ -1195,7 +1195,7 @@ For high-volume mixed workloads (gossip + many concurrent stream reads + doc syn
 
 ## 8. Testing & Validation Strategy
 
-### 8.1 Rust Unit Tests (`iroh_transport_core`)
+### 8.1 Rust Unit Tests (`aster_transport_core`)
 
 ```
 tests/
@@ -1208,7 +1208,7 @@ tests/
 └── test_datagram.rs            # Send/receive datagrams
 ```
 
-### 8.2 FFI Integration Tests (`iroh_transport_ffi`)
+### 8.2 FFI Integration Tests (`aster_transport_ffi`)
 
 These test the C ABI from Rust, simulating what a foreign language would do:
 
@@ -1295,7 +1295,7 @@ Generate `iroh_transport.h` using `cbindgen` and verify:
   - No Rust-specific types leak through
 
 ```bash
-cbindgen --config cbindgen.toml --crate iroh_transport_ffi --output iroh_transport.h
+cbindgen --config cbindgen.toml --crate aster_transport_ffi --output iroh_transport.h
 # Then compile a C test program against it
 cc -c test_ffi.c -include iroh_transport.h
 ```
@@ -1305,7 +1305,7 @@ cc -c test_ffi.c -include iroh_transport.h
 The Python test strategy serves two purposes simultaneously:
 
 1. validate user-facing Python behavior, and
-2. pressure-test `iroh_transport_core` as the reusable binding substrate for later languages.
+2. pressure-test `aster_transport_core` as the reusable binding substrate for later languages.
 
 Existing test suite (`tests/test_*.py`) should pass for the stable API surface:
 
@@ -1338,7 +1338,7 @@ Additional FFI-specific Python test using `ctypes` directly (validates the C ABI
 # tests/test_ffi_ctypes.py
 import ctypes
 
-lib = ctypes.CDLL("target/release/libiroh_transport_ffi.dylib")
+lib = ctypes.CDLL("target/release/libaster_transport_ffi.dylib")
 
 # Test runtime lifecycle
 rt = ctypes.c_uint64(0)
@@ -1529,7 +1529,7 @@ but in the current repository they split into three categories:
 
 iroh-docs stores entries per `(author, key)` — multiple authors can write to the same key, and each author's entry is an independent row. The existing `doc_get_exact` requires specifying both author and key, which prevents read-side filtering patterns where you query by key and then filter by trusted author.
 
-#### Core API (`iroh_transport_core`)
+#### Core API (`aster_transport_core`)
 
 Two new query methods on `CoreDoc` and a helper to read entry content:
 
@@ -1647,7 +1647,7 @@ TypeDef readType(String typeHash) {
 
 #### Required Additions
 
-**Core (`iroh_transport_core/src/lib.rs`):**
+**Core (`aster_transport_core/src/lib.rs`):**
 
 ```rust
 // On CoreConnection:
@@ -1655,7 +1655,7 @@ pub fn max_datagram_size(&self) -> Option<usize>;
 pub fn datagram_send_buffer_space(&self) -> usize;
 ```
 
-**FFI (`iroh_transport_ffi/src/lib.rs`):**
+**FFI (`aster_transport_ffi/src/lib.rs`):**
 
 ```c
 iroh_status_t iroh_connection_max_datagram_size(
@@ -1797,7 +1797,7 @@ iroh_status_t iroh_hook_after_connect_respond(
 
 #### Implementation (Done)
 
-The `CoreMonitor` struct in `iroh_transport_core` faithfully implements the `remote-info.rs` pattern:
+The `CoreMonitor` struct in `aster_transport_core` faithfully implements the `remote-info.rs` pattern:
 
 1. **`MonitorHook`** implements `EndpointHooks::after_handshake` — captures `ConnectionInfo` and sends it to the monitor task
 2. **Monitor background task** receives `ConnectionInfo` and:
@@ -1905,8 +1905,8 @@ This may lead to a future FFI feature separate from endpoint hooks, e.g. "accept
 
 ### Phase 1 (Core + FFI) — ~2-3 weeks
 
-1. Refactor `iroh_transport_core` — Arc-wrap types, add relay config, add secret key export
-2. Build `HandleRegistry` and `BridgeRuntime` in `iroh_transport_ffi`
+1. Refactor `aster_transport_core` — Arc-wrap types, add relay config, add secret key export
+2. Build `HandleRegistry` and `BridgeRuntime` in `aster_transport_ffi`
 3. Implement event queue (mpsc channel + poll)
 4. Port all existing FFI functions to new architecture
 5. Generate C header with cbindgen
@@ -1927,8 +1927,8 @@ This may lead to a future FFI feature separate from endpoint hooks, e.g. "accept
 
 ### Phase 2 (Python) — ~1 week
 
-1. Finish Phase 1b in `iroh_transport_core` for the surfaces Python is required to expose
-2. Make `iroh_transport_core` the immediate backend for every Python wrapper
+1. Finish Phase 1b in `aster_transport_core` for the surfaces Python is required to expose
+2. Make `aster_transport_core` the immediate backend for every Python wrapper
 3. Remove the legacy FFI-based Python implementation from `iroh_python_rs`
 4. Consolidate duplicate module implementations and make `lib.rs` registration-only
 5. Add/complete Python modules for hooks, monitoring, remote-info, and related observability
