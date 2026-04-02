@@ -1311,16 +1311,16 @@ Existing test suite (`tests/test_*.py`) should pass for the stable API surface:
 
 ```bash
 maturin develop
-pytest tests/ -v
+pytest tests/python/ -v
 ```
 
 In addition, Python must add coverage for every completed Phase 1b feature exposed through core:
 
 ```bash
-pytest tests/test_net.py -v
-pytest tests/test_hooks.py -v
-pytest tests/test_monitoring.py -v
-pytest tests/test_remote_info.py -v
+pytest tests/python/test_net.py -v
+pytest tests/python/test_hooks.py -v
+pytest tests/python/test_monitoring.py -v
+pytest tests/python/test_remote_info.py -v
 ```
 
 Required Python-specific validation areas:
@@ -1335,7 +1335,7 @@ Required Python-specific validation areas:
 Additional FFI-specific Python test using `ctypes` directly (validates the C ABI works from Python without PyO3):
 
 ```python
-# tests/test_ffi_ctypes.py
+# tests/python/test_ffi_ctypes.py
 import ctypes
 
 lib = ctypes.CDLL("target/release/libaster_transport_ffi.dylib")

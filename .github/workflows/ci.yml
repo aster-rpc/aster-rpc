@@ -74,7 +74,7 @@ jobs:
           source .venv/bin/activate
           uv pip install pytest pytest-asyncio pytest-timeout maturin
           maturin develop -m bindings/aster_python_rs/Cargo.toml
-          pytest tests/ -v --timeout=60
+          pytest tests/python/ -v --timeout=60
         shell: bash
 
       - name: Build and test (Windows)
@@ -84,5 +84,5 @@ jobs:
           .venv\Scripts\activate
           uv pip install pytest pytest-asyncio pytest-timeout maturin
           maturin develop -m bindings/aster_python_rs/Cargo.toml
-          pytest tests/ -v --timeout=60
+          pytest tests/python/ -v --timeout=60
         shell: pwsh
