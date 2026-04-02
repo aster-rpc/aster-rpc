@@ -42,7 +42,7 @@ async def test_bistream_echo(endpoint_pair):
 
     async def client_side():
         await asyncio.sleep(0.5)
-        conn = await ep_client.connect(ep_server.endpoint_id(), ALPN)
+        conn = await ep_client.connect_node_addr(ep_server.endpoint_addr_info(), ALPN)
         send, recv = await conn.open_bi()
         await send.write_all(payload)
         await send.finish()
@@ -67,7 +67,7 @@ async def test_connection_remote_id(endpoint_pair):
 
     async def client_side():
         await asyncio.sleep(0.5)
-        conn = await ep_client.connect(ep_server.endpoint_id(), ALPN)
+        conn = await ep_client.connect_node_addr(ep_server.endpoint_addr_info(), ALPN)
         assert conn.remote_id() == ep_server.endpoint_id()
         send, recv = await conn.open_bi()
         await send.write_all(b"hi")
@@ -120,7 +120,7 @@ async def test_stream_stop_and_stopped(endpoint_pair):
 
     async def client_side():
         await asyncio.sleep(0.2)
-        conn = await ep_client.connect(ep_server.endpoint_id(), ALPN)
+        conn = await ep_client.connect_node_addr(ep_server.endpoint_addr_info(), ALPN)
         send = await conn.open_uni()
         await send.write_all(b"x")
         result["code"] = await send.stopped()
@@ -140,7 +140,7 @@ async def test_connection_close_smoke(endpoint_pair):
 
     async def client_side():
         await asyncio.sleep(0.2)
-        conn = await ep_client.connect(ep_server.endpoint_id(), ALPN)
+        conn = await ep_client.connect_node_addr(ep_server.endpoint_addr_info(), ALPN)
         send = await conn.open_uni()
         await send.write_all(b"x")
         await send.finish()
