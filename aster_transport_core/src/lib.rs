@@ -8,12 +8,13 @@ use bytes::Bytes;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{
     presets, AfterHandshakeOutcome, BeforeConnectOutcome, Connection, ConnectionError,
-    ConnectionInfo, EndpointHooks, Endpoint, PathInfo, RelayMode, VarInt,
+    ConnectionInfo, Endpoint, EndpointHooks, PathInfo, RelayMode, VarInt,
 };
 use iroh::protocol::Router;
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher};
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::Store as BlobStore;
+use iroh_blobs::format::collection::Collection;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::ticket::BlobTicket;
@@ -318,10 +319,7 @@ struct MonitorHook {
 }
 
 impl EndpointHooks for MonitorHook {
-    async fn after_handshake<'a>(
-        &'a self,
-        conn: &'a ConnectionInfo,
-    ) -> AfterHandshakeOutcome {
+    async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
         self.tx.send(conn.clone()).await.ok();
         AfterHandshakeOutcome::Accept
     }
@@ -346,10 +344,7 @@ impl CoreMonitor {
         (hook, monitor)
     }
 
-    async fn run(
-        mut rx: mpsc::Receiver<ConnectionInfo>,
-        map: RemoteMapInner,
-    ) {
+    async fn run(mut rx: mpsc::Receiver<ConnectionInfo>, map: RemoteMapInner) {
         let mut conn_id: u64 = 0;
         let mut tasks = tokio::task::JoinSet::new();
 
@@ -441,7 +436,9 @@ impl CoreMonitor {
     /// Query information about a specific remote endpoint.
     pub fn remote_info(&self, node_id: &str) -> Option<CoreRemoteInfo> {
         let inner = self.map.read().expect("poisoned");
-        inner.get(node_id).map(|entry| entry.to_core_remote_info(node_id))
+        inner
+            .get(node_id)
+            .map(|entry| entry.to_core_remote_info(node_id))
     }
 
     /// Get all known remote endpoints.
@@ -464,19 +461,21 @@ impl CoreMonitor {
 /// FFI/Python callers can receive hook events and respond asynchronously.
 #[derive(Debug)]
 pub struct CoreHooksAdapter {
-    before_connect_tx:
-        mpsc::Sender<(CoreHookConnectInfo, oneshot::Sender<bool>)>,
-    after_handshake_tx:
-        mpsc::Sender<(CoreHookHandshakeInfo, oneshot::Sender<CoreAfterHandshakeDecision>)>,
+    before_connect_tx: mpsc::Sender<(CoreHookConnectInfo, oneshot::Sender<bool>)>,
+    after_handshake_tx: mpsc::Sender<(
+        CoreHookHandshakeInfo,
+        oneshot::Sender<CoreAfterHandshakeDecision>,
+    )>,
     timeout: Duration,
 }
 
 /// Receiver side for hook events. Stored in `CoreNetClient`.
 pub struct CoreHookReceiver {
-    pub before_connect_rx:
-        mpsc::Receiver<(CoreHookConnectInfo, oneshot::Sender<bool>)>,
-    pub after_handshake_rx:
-        mpsc::Receiver<(CoreHookHandshakeInfo, oneshot::Sender<CoreAfterHandshakeDecision>)>,
+    pub before_connect_rx: mpsc::Receiver<(CoreHookConnectInfo, oneshot::Sender<bool>)>,
+    pub after_handshake_rx: mpsc::Receiver<(
+        CoreHookHandshakeInfo,
+        oneshot::Sender<CoreAfterHandshakeDecision>,
+    )>,
 }
 
 impl CoreHooksAdapter {
@@ -524,17 +523,19 @@ impl EndpointHooks for CoreHooksAdapter {
         }
     }
 
-    async fn after_handshake<'a>(
-        &'a self,
-        conn: &'a ConnectionInfo,
-    ) -> AfterHandshakeOutcome {
+    async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
         let info = CoreHookHandshakeInfo {
             remote_endpoint_id: conn.remote_id().to_string(),
             alpn: conn.alpn().to_vec(),
             is_alive: conn.is_alive(),
         };
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.after_handshake_tx.send((info, reply_tx)).await.is_err() {
+        if self
+            .after_handshake_tx
+            .send((info, reply_tx))
+            .await
+            .is_err()
+        {
             return AfterHandshakeOutcome::Accept;
         }
         match tokio::time::timeout(self.timeout, reply_rx).await {
@@ -584,9 +585,7 @@ fn relay_mode_from_config(config: &CoreEndpointConfig) -> Result<RelayMode> {
         None | Some("default") => Ok(RelayMode::Default),
         Some("disabled") => Ok(RelayMode::Disabled),
         Some("staging") => Ok(RelayMode::Staging),
-        Some("custom") if !config.relay_urls.is_empty() => {
-            Ok(RelayMode::Default)
-        }
+        Some("custom") if !config.relay_urls.is_empty() => Ok(RelayMode::Default),
         Some("custom") if config.relay_urls.is_empty() => {
             Err(anyhow!("custom relay_mode requires at least one relay_url"))
         }
@@ -895,11 +894,7 @@ impl CoreNetClient {
     /// Take the hook receiver (can only be called once).
     /// Returns `None` if hooks are not enabled or the receiver was already taken.
     pub fn take_hook_receiver(&self) -> Option<CoreHookReceiver> {
-        self.hook_receiver
-            .as_ref()?
-            .lock()
-            .ok()?
-            .take()
+        self.hook_receiver.as_ref()?.lock().ok()?.take()
     }
 
     /// Returns whether hooks are enabled for this endpoint.
@@ -963,10 +958,9 @@ impl CoreConnection {
     pub async fn closed(&self) -> CoreClosedInfo {
         let closed = self.inner.closed().await;
         let (code, reason) = match &closed {
-            ConnectionError::ApplicationClosed(app) => (
-                Some(app.error_code.into_inner()),
-                Some(app.reason.to_vec()),
-            ),
+            ConnectionError::ApplicationClosed(app) => {
+                (Some(app.error_code.into_inner()), Some(app.reason.to_vec()))
+            }
             _ => (None, Some(closed.to_string().into_bytes())),
         };
         CoreClosedInfo {
@@ -1126,7 +1120,73 @@ impl CoreBlobsClient {
         .serialize())
     }
 
+    /// Store bytes as a single-file Collection (HashSeq), compatible with sendme.
+    ///
+    /// This wraps the data in a Collection with the given filename, matching
+    /// what `sendme send` does. Returns the collection hash (hex).
+    pub async fn add_bytes_as_collection(&self, name: String, data: Vec<u8>) -> Result<String> {
+        // First, store the raw blob
+        let tag = self.store.add_slice(&data).await?;
+        let blob_hash = tag.hash;
+
+        // Build a Collection containing just this one file
+        let collection: Collection = vec![(name, blob_hash)].into_iter().collect();
+
+        // Store the collection itself (produces a HashSeq blob)
+        let collection_tag = collection.store(&self.store).await?;
+        let hash_str = collection_tag.hash().to_string();
+
+        // Leak the tags to prevent the blobs from being garbage-collected.
+        // This is intentional: the data must remain available for as long as
+        // the Python process runs so remote peers can download it.
+        // (sendme does the equivalent by keeping its TempTags alive until Ctrl-C.)
+        std::mem::forget(tag);
+        std::mem::forget(collection_tag);
+
+        Ok(hash_str)
+    }
+
+    /// Create a ticket for a Collection (HashSeq format), compatible with sendme.
+    pub fn create_collection_ticket(&self, hash_hex: String) -> Result<String> {
+        Ok(BlobTicket::new(
+            self.endpoint.addr(),
+            hash_hex.parse::<Hash>()?,
+            BlobFormat::HashSeq,
+        )
+        .serialize())
+    }
+
     pub async fn download_blob(&self, ticket_str: String) -> Result<Vec<u8>> {
+        let ticket = BlobTicket::deserialize(&ticket_str)?;
+        let hash = ticket.hash();
+        let format = ticket.format();
+        let (addr, _, _) = ticket.into_parts();
+        if let Ok(lookup) = self.endpoint.address_lookup() {
+            let mem = MemoryLookup::new();
+            mem.add_endpoint_info(addr.clone());
+            lookup.add(mem);
+        }
+        Downloader::new(&self.store, &self.endpoint)
+            .download(hash, vec![addr.id])
+            .await?;
+
+        // If it's a HashSeq (Collection), extract the file contents
+        if format == BlobFormat::HashSeq {
+            let collection = Collection::load(hash, &self.store).await?;
+            // Concatenate all file contents (typically just one file for sendme)
+            let mut result = Vec::new();
+            for (_name, blob_hash) in collection.iter() {
+                let bytes = self.store.get_bytes(*blob_hash).await?;
+                result.extend_from_slice(&bytes);
+            }
+            Ok(result)
+        } else {
+            Ok(self.store.get_bytes(hash).await?.to_vec())
+        }
+    }
+
+    /// Download a collection and return list of (name, data) pairs.
+    pub async fn download_collection(&self, ticket_str: String) -> Result<Vec<(String, Vec<u8>)>> {
         let ticket = BlobTicket::deserialize(&ticket_str)?;
         let hash = ticket.hash();
         let (addr, _, _) = ticket.into_parts();
@@ -1138,7 +1198,14 @@ impl CoreBlobsClient {
         Downloader::new(&self.store, &self.endpoint)
             .download(hash, vec![addr.id])
             .await?;
-        Ok(self.store.get_bytes(hash).await?.to_vec())
+
+        let collection = Collection::load(hash, &self.store).await?;
+        let mut files = Vec::new();
+        for (name, blob_hash) in collection.iter() {
+            let bytes = self.store.get_bytes(*blob_hash).await?;
+            files.push((name.clone(), bytes.to_vec()));
+        }
+        Ok(files)
     }
 }
 
@@ -1214,9 +1281,7 @@ impl CoreDoc {
     /// Query all entries for an exact key, across all authors.
     /// Returns a list of CoreDocEntry with metadata (author, content hash, timestamp, etc.)
     pub async fn query_key_exact(&self, key: Vec<u8>) -> Result<Vec<CoreDocEntry>> {
-        let query = Query::key_exact(key)
-            .limit(QUERY_ENTRY_LIMIT)
-            .build();
+        let query = Query::key_exact(key).limit(QUERY_ENTRY_LIMIT).build();
         let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
         let mut results = Vec::new();
         while let Some(entry) = entries_stream.next().await {
@@ -1235,9 +1300,7 @@ impl CoreDoc {
     /// Query all entries matching a key prefix, across all authors.
     /// Returns a list of CoreDocEntry with metadata (author, content hash, timestamp, etc.)
     pub async fn query_key_prefix(&self, prefix: Vec<u8>) -> Result<Vec<CoreDocEntry>> {
-        let query = Query::key_prefix(prefix)
-            .limit(QUERY_ENTRY_LIMIT)
-            .build();
+        let query = Query::key_prefix(prefix).limit(QUERY_ENTRY_LIMIT).build();
         let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
         let mut results = Vec::new();
         while let Some(entry) = entries_stream.next().await {

@@ -117,7 +117,45 @@ pub struct CoreEndpointConfig {
 
 Update `build_endpoint_config()` to handle `relay_mode == "custom"` with the provided URLs.
 
-#### 3.1.4 Add secret key export
+#### 3.1.4 Add Collection/sendme-compatible blob API
+
+The `sendme` CLI tool (and iroh's native blob sharing) wraps files in a `Collection` (HashSeq format) before creating tickets. Raw blob tickets (`BlobFormat::Raw`) are **not interoperable** with `sendme` — they cause "stream reset by peer: error 3" during transfer because the receiver expects a HashSeq structure.
+
+To ensure cross-tool compatibility, the core layer provides Collection-aware methods:
+
+```rust
+impl CoreBlobsClient {
+    /// Store bytes as a single-file Collection (HashSeq), compatible with sendme.
+    /// Wraps the data in a Collection with the given filename.
+    /// Returns the collection hash (hex).
+    pub async fn add_bytes_as_collection(&self, name: String, data: Vec<u8>) -> Result<String>;
+
+    /// Create a ticket for a Collection (HashSeq format), compatible with sendme.
+    pub fn create_collection_ticket(&self, hash_hex: String) -> Result<String>;
+
+    /// Download a blob — auto-detects Raw vs HashSeq format from the ticket.
+    /// If HashSeq (Collection), extracts and concatenates file contents.
+    pub async fn download_blob(&self, ticket_str: String) -> Result<Vec<u8>>;
+
+    /// Download a collection and return list of (name, data) pairs.
+    pub async fn download_collection(&self, ticket_str: String) -> Result<Vec<(String, Vec<u8>)>>;
+}
+```
+
+**Interoperability matrix:**
+
+| Sender | Receiver | `create_ticket` (Raw) | `create_collection_ticket` (HashSeq) |
+|--------|----------|-----------------------|--------------------------------------|
+| Python | Python   | ✅ Works              | ✅ Works                             |
+| Python | sendme   | ❌ stream reset       | ✅ Works                             |
+| sendme | Python   | N/A (sendme always uses HashSeq) | ✅ `download_blob` auto-detects |
+
+**Language binding requirements:**
+- All language bindings MUST expose `add_bytes_as_collection`, `create_collection_ticket`, and the format-aware `download_blob`
+- The `download_blob` method MUST auto-detect `BlobFormat::HashSeq` from the ticket and extract Collection contents
+- The existing `add_bytes` + `create_ticket` (Raw format) remain available for Python-to-Python or internal use
+
+#### 3.1.5 Add secret key export
 
 ```rust
 impl CoreNetClient {
@@ -128,7 +166,7 @@ impl CoreNode {
 }
 ```
 
-#### 3.1.5 Add datagram support to core (already exists, verify completeness)
+#### 3.1.6 Add datagram support to core (already exists, verify completeness)
 
 Verify `send_datagram` and `read_datagram` work correctly end-to-end.
 
@@ -240,6 +278,8 @@ typedef enum iroh_event_kind_e {
     IROH_EVENT_BLOB_READ = 31,
     IROH_EVENT_BLOB_DOWNLOADED = 32,
     IROH_EVENT_BLOB_TICKET_CREATED = 33,
+    IROH_EVENT_BLOB_COLLECTION_ADDED = 34,
+    IROH_EVENT_BLOB_COLLECTION_TICKET_CREATED = 35,
     
     // Docs
     IROH_EVENT_DOC_CREATED = 40,
@@ -520,6 +560,27 @@ iroh_status_t iroh_blobs_download(
     const uint8_t* ticket_ptr, size_t ticket_len,
     uint64_t user_data,
     iroh_operation_t* out_operation
+);
+
+// ─── Blobs: Collection / sendme-compatible ───
+// Store bytes wrapped in a Collection (HashSeq format), compatible with sendme CLI.
+// The name parameter is the filename within the collection.
+// Emits IROH_EVENT_BLOB_ADDED with the collection hash hex in the payload.
+iroh_status_t iroh_blobs_add_bytes_as_collection(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* name_ptr, size_t name_len,
+    const uint8_t* data_ptr, size_t data_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+// Create a ticket for a Collection (HashSeq format), compatible with sendme CLI.
+// The hash_hex must be a collection hash returned by iroh_blobs_add_bytes_as_collection.
+iroh_status_t iroh_blobs_create_collection_ticket(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* hash_hex_ptr, size_t hash_hex_len,
+    uint8_t* out_buf, size_t capacity, size_t* out_len
 );
 
 // ─── Docs ───
