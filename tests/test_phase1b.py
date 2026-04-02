@@ -50,6 +50,7 @@ async def endpoint_pair():
 async def test_connection_max_datagram_size(endpoint_pair):
     """Test that max_datagram_size returns a valid value or None."""
     ep_server, ep_client = endpoint_pair
+    server_done = asyncio.Event()
 
     async def server_side():
         conn = await ep_server.accept()
@@ -61,6 +62,7 @@ async def test_connection_max_datagram_size(endpoint_pair):
             assert max_size > 0
         send, recv = await conn.accept_bi()
         await recv.read_to_end(65536)
+        server_done.set()
 
     async def client_side():
         await asyncio.sleep(0.2)
@@ -72,6 +74,7 @@ async def test_connection_max_datagram_size(endpoint_pair):
         send, recv = await conn.open_bi()
         await send.write_all(b"datagram test")
         await send.finish()
+        await server_done.wait()
 
     await asyncio.wait_for(asyncio.gather(server_side(), client_side()), timeout=30)
 
@@ -80,6 +83,7 @@ async def test_connection_max_datagram_size(endpoint_pair):
 async def test_connection_datagram_send_buffer_space(endpoint_pair):
     """Test that datagram_send_buffer_space returns a valid value."""
     ep_server, ep_client = endpoint_pair
+    server_done = asyncio.Event()
 
     async def server_side():
         conn = await ep_server.accept()
@@ -89,6 +93,7 @@ async def test_connection_datagram_send_buffer_space(endpoint_pair):
         assert buffer_space >= 0
         send, recv = await conn.accept_bi()
         await recv.read_to_end(65536)
+        server_done.set()
 
     async def client_side():
         await asyncio.sleep(0.2)
@@ -99,6 +104,7 @@ async def test_connection_datagram_send_buffer_space(endpoint_pair):
         send, recv = await conn.open_bi()
         await send.write_all(b"buffer test")
         await send.finish()
+        await server_done.wait()
 
     await asyncio.wait_for(asyncio.gather(server_side(), client_side()), timeout=30)
 
@@ -112,6 +118,7 @@ async def test_connection_datagram_send_buffer_space(endpoint_pair):
 async def test_connection_info_after_connect(endpoint_pair):
     """Test that connection_info returns valid connection information."""
     ep_server, ep_client = endpoint_pair
+    server_done = asyncio.Event()
 
     async def server_side():
         conn = await ep_server.accept()
@@ -130,6 +137,7 @@ async def test_connection_info_after_connect(endpoint_pair):
         assert info.rtt_ns is None or isinstance(info.rtt_ns, int)
         send, recv = await conn.accept_bi()
         await recv.read_to_end(65536)
+        server_done.set()
 
     async def client_side():
         await asyncio.sleep(0.2)
@@ -139,6 +147,7 @@ async def test_connection_info_after_connect(endpoint_pair):
         send, recv = await conn.open_bi()
         await send.write_all(b"info test")
         await send.finish()
+        await server_done.wait()
 
     await asyncio.wait_for(asyncio.gather(server_side(), client_side()), timeout=30)
 
@@ -150,10 +159,11 @@ async def test_connection_info_after_connect(endpoint_pair):
 
 @pytest.mark.asyncio
 async def test_net_client_has_monitoring_default():
-    """Test that bare endpoints have monitoring enabled by default (Phase 1b)."""
+    """Test that bare endpoints do NOT have monitoring enabled by default.
+    Monitoring is opt-in via create_endpoint_with_config(enable_monitoring=True)."""
     ep = await create_endpoint(ALPN)
-    # NetClient from bare endpoint should have monitoring enabled
-    assert ep.has_monitoring() is True
+    # Bare endpoints have no monitoring overhead unless explicitly requested
+    assert ep.has_monitoring() is False
     await ep.close()
 
 
@@ -283,6 +293,8 @@ async def test_full_connection_with_all_phase1b_surfaces(endpoint_pair):
     server_info = {}
     client_info = {}
 
+    client_done = asyncio.Event()
+
     async def server_side():
         conn = await ep_server.accept()
         
@@ -303,6 +315,8 @@ async def test_full_connection_with_all_phase1b_surfaces(endpoint_pair):
         data = await recv.read_to_end(65536)
         await send.write_all(b"echo: " + data)
         await send.finish()
+        # Keep connection alive until client has read the echo
+        await client_done.wait()
 
     async def client_side():
         await asyncio.sleep(0.2)
@@ -326,6 +340,7 @@ async def test_full_connection_with_all_phase1b_surfaces(endpoint_pair):
         await send.finish()
         echo = await recv.read_to_end(65536)
         assert echo == b"echo: hello phase1b"
+        client_done.set()
 
     await asyncio.wait_for(asyncio.gather(server_side(), client_side()), timeout=30)
     

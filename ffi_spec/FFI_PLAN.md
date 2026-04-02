@@ -1809,7 +1809,7 @@ The `CoreMonitor` struct in `iroh_transport_core` faithfully implements the `rem
 
 #### Configuration
 
-Monitoring is enabled via `CoreEndpointConfig.enable_monitoring = true`. For FFI-created endpoints, monitoring is **always enabled** automatically.
+Monitoring is enabled via `CoreEndpointConfig.enable_monitoring = true`. Both monitoring and hooks are **opt-in** — bare endpoints created via `CoreNetClient::create()` or `create_endpoint()` have neither monitoring nor hooks enabled by default. To enable monitoring, use `create_endpoint_with_config(EndpointConfig(enable_monitoring=True))` or the equivalent FFI call with the config flag set.
 
 #### Core Types (Implemented)
 
