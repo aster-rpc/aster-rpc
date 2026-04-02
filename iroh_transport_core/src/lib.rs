@@ -21,6 +21,7 @@ use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, ALPN as BLOBS_ALPN};
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::api::Doc;
 use iroh_docs::protocol::Docs;
+use iroh_docs::store::Query;
 use iroh_docs::{AuthorId, DocTicket, ALPN as DOCS_ALPN};
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
@@ -84,6 +85,25 @@ pub struct CoreClosedInfo {
 pub struct CoreGossipEvent {
     pub event_type: String,
     pub data: Option<Vec<u8>>,
+}
+
+/// Maximum number of entries returned per query.
+/// Limits result sets to prevent unbounded reads when multiple authors write to the same key.
+pub const QUERY_ENTRY_LIMIT: u64 = 3;
+
+/// A document entry returned from queries, containing metadata about who wrote it and what they wrote.
+#[derive(Clone, Debug)]
+pub struct CoreDocEntry {
+    /// The author who wrote this entry (hex string)
+    pub author_id: String,
+    /// The key this entry was written to
+    pub key: Vec<u8>,
+    /// The content hash of the value (hex string)
+    pub content_hash: String,
+    /// The content length in bytes
+    pub content_len: u64,
+    /// The timestamp when this entry was written (microseconds since epoch)
+    pub timestamp: u64,
 }
 
 // ============================================================================
@@ -745,8 +765,12 @@ pub struct CoreNetClient {
 
 impl CoreNetClient {
     pub async fn create(alpn: Vec<u8>) -> Result<Self> {
+        // Enable monitoring by default for bare endpoints so that
+        // remote_info / has_monitoring work out of the box.
+        let (hook, monitor) = CoreMonitor::new();
         let endpoint = Endpoint::builder(presets::N0)
             .alpns(vec![alpn])
+            .hooks(hook)
             .bind()
             .await?;
         endpoint.online().await;
@@ -754,7 +778,7 @@ impl CoreNetClient {
         Ok(Self {
             endpoint,
             secret_key_bytes,
-            monitor: None,
+            monitor: Some(monitor),
             hook_receiver: None,
         })
     }
@@ -1189,6 +1213,55 @@ impl CoreDoc {
             .await?
             .to_hex()
             .to_string())
+    }
+
+    /// Query all entries for an exact key, across all authors.
+    /// Returns a list of CoreDocEntry with metadata (author, content hash, timestamp, etc.)
+    pub async fn query_key_exact(&self, key: Vec<u8>) -> Result<Vec<CoreDocEntry>> {
+        let query = Query::key_exact(key)
+            .limit(QUERY_ENTRY_LIMIT)
+            .build();
+        let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
+        let mut results = Vec::new();
+        while let Some(entry) = entries_stream.next().await {
+            let entry = entry?;
+            results.push(CoreDocEntry {
+                author_id: entry.author().to_string(),
+                key: entry.key().to_vec(),
+                content_hash: entry.content_hash().to_hex().to_string(),
+                content_len: entry.content_len(),
+                timestamp: entry.timestamp(),
+            });
+        }
+        Ok(results)
+    }
+
+    /// Query all entries matching a key prefix, across all authors.
+    /// Returns a list of CoreDocEntry with metadata (author, content hash, timestamp, etc.)
+    pub async fn query_key_prefix(&self, prefix: Vec<u8>) -> Result<Vec<CoreDocEntry>> {
+        let query = Query::key_prefix(prefix)
+            .limit(QUERY_ENTRY_LIMIT)
+            .build();
+        let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
+        let mut results = Vec::new();
+        while let Some(entry) = entries_stream.next().await {
+            let entry = entry?;
+            results.push(CoreDocEntry {
+                author_id: entry.author().to_string(),
+                key: entry.key().to_vec(),
+                content_hash: entry.content_hash().to_hex().to_string(),
+                content_len: entry.content_len(),
+                timestamp: entry.timestamp(),
+            });
+        }
+        Ok(results)
+    }
+
+    /// Read the content bytes for a given content hash.
+    /// This can be used after querying entries to fetch the actual value.
+    pub async fn read_entry_content(&self, content_hash_hex: String) -> Result<Vec<u8>> {
+        let hash: Hash = content_hash_hex.parse()?;
+        Ok(self.store.get_bytes(hash).await?.to_vec())
     }
 
     pub async fn get_exact(&self, author_hex: String, key: Vec<u8>) -> Result<Option<Vec<u8>>> {

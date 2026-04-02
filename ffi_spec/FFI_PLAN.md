@@ -247,6 +247,7 @@ typedef enum iroh_event_kind_e {
     IROH_EVENT_DOC_SET = 42,
     IROH_EVENT_DOC_GET = 43,
     IROH_EVENT_DOC_SHARED = 44,
+    IROH_EVENT_DOC_QUERY = 46,
     IROH_EVENT_AUTHOR_CREATED = 45,
     
     // Gossip
@@ -558,6 +559,21 @@ iroh_status_t iroh_doc_get_exact(
     uint64_t user_data,
     iroh_operation_t* out_operation
 );
+iroh_status_t iroh_doc_query(
+    iroh_runtime_t runtime,
+    uint64_t doc,
+    uint32_t mode,  // 0=key_exact, 1=key_prefix
+    const uint8_t* key_ptr, size_t key_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);  // Returns DOC_QUERY event with packed entries in payload, entry count in flags
+iroh_status_t iroh_doc_read_entry_content(
+    iroh_runtime_t runtime,
+    uint64_t doc,
+    const uint8_t* content_hash_hex_ptr, size_t content_hash_hex_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);  // Returns BLOB_READ event with content bytes
 iroh_status_t iroh_doc_share(
     iroh_runtime_t runtime,
     uint64_t doc,
@@ -1508,6 +1524,115 @@ but in the current repository they split into three categories:
 2. **Add endpoint hooks** — planned, but must be constrained by the actual `v0.97.0` builder-time `EndpointHooks` API
 3. **Add remote-info / monitoring APIs** — planned, but should be based on the actual `ConnectionInfo` / watcher / aggregation patterns shown by `v0.97.0`
 4. **Distinguish protocol-level screening from endpoint hooks** — `screening-connection.rs` demonstrates a separate acceptance control point via `ProtocolHandler::on_accepting`
+
+### 3b.0 Document Query (Multi-Author Read-Side Filtering)
+
+iroh-docs stores entries per `(author, key)` — multiple authors can write to the same key, and each author's entry is an independent row. The existing `doc_get_exact` requires specifying both author and key, which prevents read-side filtering patterns where you query by key and then filter by trusted author.
+
+#### Core API (`iroh_transport_core`)
+
+Two new query methods on `CoreDoc` and a helper to read entry content:
+
+```rust
+/// Returned from query methods — contains metadata about each entry.
+pub struct CoreDocEntry {
+    pub author_id: String,       // hex string
+    pub key: Vec<u8>,
+    pub content_hash: String,    // hex string
+    pub content_len: u64,
+    pub timestamp: u64,          // microseconds since epoch
+}
+
+impl CoreDoc {
+    /// Query all entries for an exact key, across all authors.
+    pub async fn query_key_exact(&self, key: Vec<u8>) -> Result<Vec<CoreDocEntry>>;
+
+    /// Query all entries matching a key prefix, across all authors.
+    pub async fn query_key_prefix(&self, prefix: Vec<u8>) -> Result<Vec<CoreDocEntry>>;
+
+    /// Read the content bytes for a given content hash (from a CoreDocEntry).
+    pub async fn read_entry_content(&self, content_hash_hex: String) -> Result<Vec<u8>>;
+}
+```
+
+#### FFI API
+
+```c
+typedef enum iroh_doc_query_mode_e {
+    IROH_DOC_QUERY_KEY_EXACT = 0,
+    IROH_DOC_QUERY_KEY_PREFIX = 1,
+} iroh_doc_query_mode_t;
+
+// Query entries by key (exact or prefix), returning all authors' entries.
+// Emits IROH_EVENT_DOC_QUERY with packed entries in payload, entry count in event.flags.
+iroh_status_t iroh_doc_query(
+    iroh_runtime_t runtime,
+    uint64_t doc,
+    uint32_t mode,  // iroh_doc_query_mode_t
+    iroh_bytes_t key,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+
+// Read content bytes for a doc entry by its content hash.
+// Emits IROH_EVENT_BLOB_READ with content bytes.
+iroh_status_t iroh_doc_read_entry_content(
+    iroh_runtime_t runtime,
+    uint64_t doc,
+    iroh_bytes_t content_hash_hex,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+```
+
+#### Payload Format for `IROH_EVENT_DOC_QUERY`
+
+The event payload contains entries packed sequentially. The entry count is in `event.flags`. Each entry is:
+
+| Field | Size | Description |
+|-------|------|-------------|
+| `author_id_len` | 4 bytes LE | Length of author ID string |
+| `author_id` | variable | Author ID (UTF-8 hex string) |
+| `key_len` | 4 bytes LE | Length of key |
+| `key` | variable | Key bytes |
+| `content_hash_len` | 4 bytes LE | Length of content hash string |
+| `content_hash` | variable | Content hash (UTF-8 hex string) |
+| `content_len` | 8 bytes LE | Content length in bytes |
+| `timestamp` | 8 bytes LE | Timestamp (microseconds since epoch) |
+
+#### Target Language Usage Pattern
+
+This enables the multi-author read-side filtering pattern:
+
+**Python:**
+```python
+async def read_type(self, type_hash: str) -> TypeDef | None:
+    entries = await self.doc.query_key_exact(f"types/{type_hash}".encode())
+    acl_writers = self.get_acl_writers()  # cached set of trusted author IDs
+
+    for entry in entries:
+        if entry.author_id in acl_writers:
+            content = await self.doc.read_entry_content(entry.content_hash)
+            return deserialize(content)
+
+    return None  # no trusted author wrote this key
+```
+
+**Java:**
+```java
+TypeDef readType(String typeHash) {
+    var entries = doc.queryKeyExact(("types/" + typeHash).getBytes());
+    var aclWriters = getAclWriters();
+
+    for (var entry : entries) {
+        if (aclWriters.contains(entry.authorId())) {
+            byte[] content = doc.readEntryContent(entry.contentHash());
+            return deserialize(content);
+        }
+    }
+    return null;
+}
+```
 
 ### 3b.1 Datagram Completion
 

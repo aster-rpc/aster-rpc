@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Hook event types
-#[pyclass(skip_from_py_object)]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct HookConnectInfo {
     #[pyo3(get)]
@@ -26,8 +26,20 @@ pub struct HookConnectInfo {
     pub alpn: Vec<u8>,
 }
 
+#[pymethods]
+impl HookConnectInfo {
+    #[new]
+    #[pyo3(signature = (remote_endpoint_id="".to_string(), alpn=vec![]))]
+    fn new(remote_endpoint_id: String, alpn: Vec<u8>) -> Self {
+        Self {
+            remote_endpoint_id,
+            alpn,
+        }
+    }
+}
+
 /// Hook handshake event types
-#[pyclass(skip_from_py_object)]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct HookHandshakeInfo {
     #[pyo3(get)]
@@ -38,12 +50,26 @@ pub struct HookHandshakeInfo {
     pub is_alive: bool,
 }
 
+#[pymethods]
+impl HookHandshakeInfo {
+    #[new]
+    #[pyo3(signature = (remote_endpoint_id="".to_string(), alpn=vec![], is_alive=false))]
+    fn new(remote_endpoint_id: String, alpn: Vec<u8>, is_alive: bool) -> Self {
+        Self {
+            remote_endpoint_id,
+            alpn,
+            is_alive,
+        }
+    }
+}
+
 /// Hook decision types
 #[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct HookDecision {
+    /// Whether this decision allows the connection (True) or denies it (False).
     #[pyo3(get)]
-    pub allow: bool,
+    pub is_allowed: bool,
     #[pyo3(get)]
     pub error_code: Option<u32>,
     #[pyo3(get)]
@@ -55,17 +81,24 @@ impl HookDecision {
     #[new]
     fn new() -> Self {
         Self {
-            allow: true,
+            is_allowed: true,
             error_code: None,
             reason: None,
         }
     }
 
+    /// Whether this decision allows the connection.
+    /// Alias for is_allowed, kept for backwards compatibility with tests.
+    #[getter]
+    fn allow(&self) -> bool {
+        self.is_allowed
+    }
+
     /// Create an Allow decision
     #[staticmethod]
-    fn allow() -> Self {
+    fn create_allow() -> Self {
         Self {
-            allow: true,
+            is_allowed: true,
             error_code: None,
             reason: None,
         }
@@ -73,9 +106,9 @@ impl HookDecision {
 
     /// Create a Deny decision
     #[staticmethod]
-    fn deny(error_code: u32, reason: Vec<u8>) -> Self {
+    fn create_deny(error_code: u32, reason: Vec<u8>) -> Self {
         Self {
-            allow: false,
+            is_allowed: false,
             error_code: Some(error_code),
             reason: Some(reason),
         }
@@ -84,7 +117,7 @@ impl HookDecision {
 
 impl Default for HookDecision {
     fn default() -> Self {
-        Self::allow()
+        Self::create_allow()
     }
 }
 

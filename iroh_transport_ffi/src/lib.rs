@@ -108,6 +108,7 @@ pub enum iroh_event_kind_t {
     IROH_EVENT_DOC_SET = 42,
     IROH_EVENT_DOC_GET = 43,
     IROH_EVENT_DOC_SHARED = 44,
+    IROH_EVENT_DOC_QUERY = 46,
     IROH_EVENT_AUTHOR_CREATED = 45,
     
     // Gossip
@@ -3163,6 +3164,162 @@ pub unsafe extern "C" fn iroh_doc_share(
                     0,
                 );
                 bridge2.emit_with_data(event, ticket.into_bytes());
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Docs: Query (key_exact / key_prefix without author)
+// ============================================================================
+
+/// Query mode for doc queries
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum iroh_doc_query_mode_t {
+    IROH_DOC_QUERY_KEY_EXACT = 0,
+    IROH_DOC_QUERY_KEY_PREFIX = 1,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_query(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    mode: u32,
+    key: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let key_bytes = unsafe { read_bytes(&key) };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        let result = if mode == iroh_doc_query_mode_t::IROH_DOC_QUERY_KEY_PREFIX as u32 {
+            doc_arc.query_key_prefix(key_bytes).await
+        } else {
+            doc_arc.query_key_exact(key_bytes).await
+        };
+        
+        match result {
+            Ok(entries) => {
+                // Serialize entries into a packed binary payload
+                let mut payload = Vec::new();
+                let entry_count = entries.len() as u32;
+                
+                for entry in &entries {
+                    // author_id
+                    let author_bytes = entry.author_id.as_bytes();
+                    payload.extend_from_slice(&(author_bytes.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(author_bytes);
+                    // key
+                    payload.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(&entry.key);
+                    // content_hash
+                    let hash_bytes = entry.content_hash.as_bytes();
+                    payload.extend_from_slice(&(hash_bytes.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(hash_bytes);
+                    // content_len
+                    payload.extend_from_slice(&entry.content_len.to_le_bytes());
+                    // timestamp
+                    payload.extend_from_slice(&entry.timestamp.to_le_bytes());
+                }
+                
+                let mut event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_DOC_QUERY,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+                event.flags = entry_count;
+                bridge2.emit_with_data(event, payload);
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+    
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Read the content bytes for a doc entry given its content hash.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_read_entry_content(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    content_hash_hex: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    
+    let hash_hex = match unsafe { read_string(&content_hash_hex) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe { *out_operation = op_id; }
+    
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        
+        match doc_arc.read_entry_content(hash_hex).await {
+            Ok(data) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_BLOB_READ,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, data);
             }
             Err(e) => {
                 bridge2.emit_error(op_id, user_data, &e.to_string());

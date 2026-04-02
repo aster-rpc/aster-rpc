@@ -223,7 +223,7 @@ async def test_endpoint_config_hooks_flag():
 @pytest.mark.asyncio
 async def test_hook_decision_allow():
     """Test HookDecision.Allow creation."""
-    decision = HookDecision.allow()
+    decision = HookDecision.create_allow()
     assert decision.allow is True
     assert decision.error_code is None
     assert decision.reason is None
@@ -232,7 +232,7 @@ async def test_hook_decision_allow():
 @pytest.mark.asyncio
 async def test_hook_decision_deny():
     """Test HookDecision.Deny creation."""
-    decision = HookDecision.deny(42, b"connection rejected")
+    decision = HookDecision.create_deny(42, b"connection rejected")
     assert decision.allow is False
     assert decision.error_code == 42
     assert decision.reason == b"connection rejected"
