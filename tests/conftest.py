@@ -1,7 +1,7 @@
-"""Shared pytest fixtures for iroh-python tests."""
+"""Shared pytest fixtures for aster-python tests."""
 import pytest_asyncio
 
-from iroh_python import IrohNode, create_endpoint
+from aster_python import IrohNode, create_endpoint
 
 
 ALPN = b"test/echo/1"

@@ -119,6 +119,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster_python_rs"
+version = "0.1.0"
+dependencies = [
+ "aster_transport_core",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "tokio",
+]
+
+[[package]]
 name = "aster_transport_core"
 version = "0.1.0"
 dependencies = [
@@ -2015,16 +2025,6 @@ dependencies = [
  "n0-error",
  "postcard",
  "serde",
-]
-
-[[package]]
-name = "iroh_python_rs"
-version = "0.1.0"
-dependencies = [
- "aster_transport_core",
- "pyo3",
- "pyo3-async-runtimes",
- "tokio",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ import struct
 import pytest
 import pytest_asyncio
 
-from iroh_python import (
+from aster_python import (
     NodeAddr,
     create_endpoint,
 )

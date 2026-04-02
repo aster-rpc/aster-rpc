@@ -1,7 +1,7 @@
 """Example code for mypy type checking verification."""
 
 import asyncio
-from iroh_python import (
+from aster_python import (
     IrohNode,
     BlobsClient,
     DocsClient,

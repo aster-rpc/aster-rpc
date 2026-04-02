@@ -6,7 +6,7 @@ pytestmark = pytest.mark.asyncio
 
 async def test_blob_round_trip():
     """Store bytes, retrieve by hash, verify identical."""
-    from iroh_python import IrohNode, blobs_client
+    from aster_python import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -25,7 +25,7 @@ async def test_blob_round_trip():
 
 async def test_blob_different_data_different_hash():
     """Different data should produce different hashes."""
-    from iroh_python import IrohNode, blobs_client
+    from aster_python import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -39,7 +39,7 @@ async def test_blob_different_data_different_hash():
 
 async def test_blob_not_found():
     """Reading a non-existent hash should raise IrohError."""
-    from iroh_python import IrohNode, IrohError, blobs_client
+    from aster_python import IrohNode, IrohError, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -54,7 +54,7 @@ async def test_blob_not_found():
 
 async def test_blob_empty_data():
     """Storing empty bytes should work."""
-    from iroh_python import IrohNode, blobs_client
+    from aster_python import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
