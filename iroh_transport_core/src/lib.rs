@@ -765,12 +765,8 @@ pub struct CoreNetClient {
 
 impl CoreNetClient {
     pub async fn create(alpn: Vec<u8>) -> Result<Self> {
-        // Enable monitoring by default for bare endpoints so that
-        // remote_info / has_monitoring work out of the box.
-        let (hook, monitor) = CoreMonitor::new();
         let endpoint = Endpoint::builder(presets::N0)
             .alpns(vec![alpn])
-            .hooks(hook)
             .bind()
             .await?;
         endpoint.online().await;
@@ -778,7 +774,7 @@ impl CoreNetClient {
         Ok(Self {
             endpoint,
             secret_key_bytes,
-            monitor: Some(monitor),
+            monitor: None,
             hook_receiver: None,
         })
     }

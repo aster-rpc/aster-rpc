@@ -81,6 +81,7 @@ async def test_connection_remote_id(endpoint_pair):
 async def test_connect_node_addr_and_read_primitives(endpoint_pair):
     ep_server, ep_client = endpoint_pair
     payload = b"hello framed world"
+    server_done = asyncio.Event()
 
     async def server_side():
         conn = await ep_server.accept()
@@ -90,6 +91,7 @@ async def test_connect_node_addr_and_read_primitives(endpoint_pair):
         body = await recv.read(expected)
         assert body == payload
         assert await recv.read(1) is None
+        server_done.set()
 
     async def client_side():
         await asyncio.sleep(0.2)
@@ -98,6 +100,8 @@ async def test_connect_node_addr_and_read_primitives(endpoint_pair):
         await send.write_all(struct.pack(">I", len(payload)))
         await send.write_all(payload)
         await send.finish()
+        # Keep connection alive until server has fully read
+        await server_done.wait()
 
     await asyncio.wait_for(asyncio.gather(server_side(), client_side()), timeout=30)
 
