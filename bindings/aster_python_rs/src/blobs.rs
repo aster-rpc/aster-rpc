@@ -48,6 +48,30 @@ impl BlobsClient {
         self.inner.create_ticket(hash_hex).map_err(err_to_py)
     }
 
+    /// Store bytes as a single-file Collection (HashSeq), compatible with sendme.
+    /// Returns the collection hash (hex).
+    fn add_bytes_as_collection<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        data: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            client
+                .add_bytes_as_collection(name, data)
+                .await
+                .map_err(err_to_py)
+        })
+    }
+
+    /// Create a ticket for a Collection (HashSeq format), compatible with sendme.
+    fn create_collection_ticket(&self, hash_hex: String) -> PyResult<String> {
+        self.inner
+            .create_collection_ticket(hash_hex)
+            .map_err(err_to_py)
+    }
+
     /// Download a blob from a remote peer using a blob ticket string.
     /// Returns the blob content as bytes.
     fn download_blob<'py>(

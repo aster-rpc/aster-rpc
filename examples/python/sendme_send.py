@@ -4,6 +4,9 @@ Usage:
     uv run python examples/python/sendme_send.py <file>
 
 Prints a blob ticket that can be used by sendme_recv.py or the Rust sendme tool.
+
+IMPORTANT: This uses Collection (HashSeq) format, which is compatible with
+the `sendme` CLI tool. The old Raw format is NOT compatible with sendme.
 """
 
 import asyncio
@@ -20,12 +23,13 @@ async def main(path: str) -> None:
     node = await IrohNode.memory()
     blobs = blobs_client(node)
 
-    hash_hex = await blobs.add_bytes(data)
-    ticket = blobs.create_ticket(hash_hex)
+    # Store as a Collection (HashSeq) — this is what sendme expects
+    collection_hash = await blobs.add_bytes_as_collection(file_path.name, data)
+    ticket = blobs.create_collection_ticket(collection_hash)
 
     print(f"File: {file_path}")
     print(f"Size: {len(data)} bytes")
-    print(f"Hash: {hash_hex}")
+    print(f"Hash: {collection_hash}")
     print("\nBlob ticket:\n")
     print(ticket)
     print("\nKeep this process running while the receiver downloads the blob.")
