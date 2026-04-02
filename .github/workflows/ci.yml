@@ -11,6 +11,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   # ── Rust lint ──────────────────────────────────────────────────────
@@ -18,13 +20,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt #, clippy
+      - name: Cache Rust dependencies/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: lint
+      - name: Cache diagnostics (pre-lint)
+        run: |
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER}"
+          echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+          sccache --version
+          sccache --show-stats || true
       - name: cargo fmt
         run: cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check
       - name: cargo clippy
         run: cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings
+      - name: Cache diagnostics (post-lint)
+        run: sccache --show-stats || true
 
   # ── Build + Test matrix ────────────────────────────────────────────
   test:
@@ -44,6 +62,33 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: test-${{ matrix.target }}
+      - name: Cache diagnostics (pre-build)
+        if: runner.os != 'Windows'
+        run: |
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER}"
+          echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+          rustc -Vv
+          sccache --version
+          sccache --show-stats || true
+        shell: bash
+      - name: Cache diagnostics (pre-build, Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Write-Host "RUSTC_WRAPPER=$env:RUSTC_WRAPPER"
+          Write-Host "SCCACHE_GHA_ENABLED=$env:SCCACHE_GHA_ENABLED"
+          rustc -Vv
+          sccache --version
+          sccache --show-stats
+        shell: pwsh
 
       - uses: actions/setup-python@v5
         with:
@@ -72,4 +117,12 @@ jobs:
           uv pip install pytest pytest-asyncio pytest-timeout maturin
           maturin develop -m iroh_python_rs/Cargo.toml
           pytest tests/ -v --timeout=60
+        shell: pwsh
+      - name: Cache diagnostics (post-build)
+        if: runner.os != 'Windows'
+        run: sccache --show-stats || true
+        shell: bash
+      - name: Cache diagnostics (post-build, Windows)
+        if: runner.os == 'Windows'
+        run: sccache --show-stats
         shell: pwsh

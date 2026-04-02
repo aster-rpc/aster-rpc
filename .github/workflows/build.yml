@@ -9,18 +9,39 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt #, clippy
+      - name: Cache Rust dependencies/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: lint
+      - name: Cache diagnostics (pre-lint)
+        run: |
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER}"
+          echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+          sccache --version
+          sccache --show-stats || true
       - name: cargo fmt
         run: cargo fmt --manifest-path iroh_python_rs/Cargo.toml --check
       - name: cargo clippy
         run: cargo clippy --manifest-path iroh_python_rs/Cargo.toml -- -D warnings
+      - name: Cache diagnostics (post-lint)
+        run: sccache --show-stats || true
 
   # ── Linux (x86_64 + aarch64) ──────────────────────────────────────
   linux:
@@ -31,6 +52,22 @@ jobs:
         target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: linux-${{ matrix.target }}
+      - name: Cache diagnostics (pre-build)
+        run: |
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER}"
+          echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+          rustc -Vv
+          sccache --version
+          sccache --show-stats || true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -40,6 +77,8 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist -m iroh_python_rs/Cargo.toml
           manylinux: auto
+      - name: Cache diagnostics (post-build)
+        run: sccache --show-stats || true
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -58,6 +97,22 @@ jobs:
             runner: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: macos-${{ matrix.target }}
+      - name: Cache diagnostics (pre-build)
+        run: |
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER}"
+          echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+          rustc -Vv
+          sccache --version
+          sccache --show-stats || true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -66,6 +121,8 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist -m iroh_python_rs/Cargo.toml
+      - name: Cache diagnostics (post-build)
+        run: sccache --show-stats || true
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.target }}
@@ -77,6 +134,23 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: windows-x64
+      - name: Cache diagnostics (pre-build)
+        shell: pwsh
+        run: |
+          Write-Host "RUSTC_WRAPPER=$env:RUSTC_WRAPPER"
+          Write-Host "SCCACHE_GHA_ENABLED=$env:SCCACHE_GHA_ENABLED"
+          rustc -Vv
+          sccache --version
+          sccache --show-stats
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -85,6 +159,9 @@ jobs:
         with:
           target: x64
           args: --release --out dist -m iroh_python_rs/Cargo.toml
+      - name: Cache diagnostics (post-build)
+        shell: pwsh
+        run: sccache --show-stats
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-x64
@@ -96,11 +173,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: sdist
+      - name: Cache diagnostics (pre-sdist)
+        run: |
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER}"
+          echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+          rustc -Vv
+          sccache --version
+          sccache --show-stats || true
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist -m iroh_python_rs/Cargo.toml
+      - name: Cache diagnostics (post-sdist)
+        run: sccache --show-stats || true
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-sdist
