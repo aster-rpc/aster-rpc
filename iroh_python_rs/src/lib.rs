@@ -1,4 +1,4 @@
-//! iroh_python - Python bindings for iroh using iroh_transport_core.
+//! iroh_python - Python bindings for iroh using aster_transport_core.
 //!
 //! Phase 2: This module is now registration-only.
 //! All actual wrapper logic has been moved to individual modules:
@@ -11,7 +11,7 @@
 //! - hooks.rs: Phase 1b hooks utilities
 //! - error.rs: Exception types
 //!
-//! All wrappers now use iroh_transport_core as the backend.
+//! All wrappers now use aster_transport_core as the backend.
 
 use pyo3::prelude::*;
 

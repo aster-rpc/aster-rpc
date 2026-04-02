@@ -1,11 +1,11 @@
-//! Blobs module - wraps CoreBlobsClient from iroh_transport_core.
+//! Blobs module - wraps CoreBlobsClient from aster_transport_core.
 //!
-//! Phase 2: Now wraps iroh_transport_core::CoreBlobsClient instead of iroh_blobs types directly.
+//! Phase 2: Now wraps aster_transport_core::CoreBlobsClient instead of iroh_blobs types directly.
 
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
-use iroh_transport_core::CoreBlobsClient;
+use aster_transport_core::CoreBlobsClient;
 
 use crate::error::err_to_py;
 use crate::node::IrohNode;

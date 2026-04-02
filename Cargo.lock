@@ -119,6 +119,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster_transport_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures-lite",
+ "iroh",
+ "iroh-blobs",
+ "iroh-docs",
+ "iroh-gossip",
+ "iroh-tickets",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "aster_transport_ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aster_transport_core",
+ "bytes",
+ "cbindgen",
+ "getrandom 0.2.17",
+ "iroh",
+ "libc",
+ "once_cell",
+ "rand 0.10.0",
+ "tokio",
+]
+
+[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1988,42 +2021,9 @@ dependencies = [
 name = "iroh_python_rs"
 version = "0.1.0"
 dependencies = [
- "iroh_transport_core",
+ "aster_transport_core",
  "pyo3",
  "pyo3-async-runtimes",
- "tokio",
-]
-
-[[package]]
-name = "iroh_transport_core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "futures-lite",
- "iroh",
- "iroh-blobs",
- "iroh-docs",
- "iroh-gossip",
- "iroh-tickets",
- "tokio",
- "tokio-stream",
- "tracing",
-]
-
-[[package]]
-name = "iroh_transport_ffi"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "cbindgen",
- "getrandom 0.2.17",
- "iroh",
- "iroh_transport_core",
- "libc",
- "once_cell",
- "rand 0.10.0",
  "tokio",
 ]
 

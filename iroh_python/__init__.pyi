@@ -1,6 +1,6 @@
 """Type stubs for iroh_python package.
 
-Phase 2: All bindings now use iroh_transport_core as the backend.
+Phase 2: All bindings now use aster_transport_core as the backend.
 Phase 1b: Includes datagram completion, connection info, remote-info, and hooks.
 """
 

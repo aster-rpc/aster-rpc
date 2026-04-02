@@ -1,11 +1,11 @@
-//! Gossip module - wraps CoreGossipClient, CoreGossipTopic from iroh_transport_core.
+//! Gossip module - wraps CoreGossipClient, CoreGossipTopic from aster_transport_core.
 //!
-//! Phase 2: Now wraps iroh_transport_core types instead of iroh_gossip types directly.
+//! Phase 2: Now wraps aster_transport_core types instead of iroh_gossip types directly.
 
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
-use iroh_transport_core::{CoreGossipClient, CoreGossipTopic};
+use aster_transport_core::{CoreGossipClient, CoreGossipTopic};
 
 use crate::error::err_to_py;
 use crate::node::IrohNode;

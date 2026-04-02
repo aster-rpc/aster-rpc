@@ -1,11 +1,11 @@
-//! Node module - wraps CoreNode from iroh_transport_core.
+//! Node module - wraps CoreNode from aster_transport_core.
 //!
-//! Phase 2: Now wraps iroh_transport_core::CoreNode instead of iroh types directly.
+//! Phase 2: Now wraps aster_transport_core::CoreNode instead of iroh types directly.
 
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
-use iroh_transport_core::CoreNode;
+use aster_transport_core::CoreNode;
 
 use crate::error::err_to_py;
 use crate::net::NodeAddr;

@@ -1,6 +1,6 @@
 //! Error module - Exception types for Python bindings.
 //!
-//! Phase 2: Updated to work with iroh_transport_core types.
+//! Phase 2: Updated to work with aster_transport_core types.
 
 use pyo3::{create_exception, exceptions::PyException, prelude::*};
 

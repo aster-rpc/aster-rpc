@@ -1,7 +1,7 @@
 """Example: sendme-compatible receiver using blob tickets.
 
 Usage:
-    uv run python examples/sendme_recv.py <blob-ticket> [output-file]
+    uv run python examples/python/sendme_recv.py <blob-ticket> [output-file]
 
 Accepts a blob ticket produced by sendme_send.py or the Rust sendme tool.
 """

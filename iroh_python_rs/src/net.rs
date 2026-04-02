@@ -1,13 +1,13 @@
-//! Network module - wraps CoreNetClient, CoreConnection from iroh_transport_core.
+//! Network module - wraps CoreNetClient, CoreConnection from aster_transport_core.
 //!
-//! Phase 2: Now wraps iroh_transport_core types instead of iroh types directly.
+//! Phase 2: Now wraps aster_transport_core types instead of iroh types directly.
 //! Phase 1b surfaces: max_datagram_size, datagram_send_buffer_space, connection_info.
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::tokio::future_into_py;
 
-use iroh_transport_core::{
+use aster_transport_core::{
     ConnectionType, ConnectionTypeDetail, CoreConnection, CoreConnectionInfo, CoreEndpointConfig,
     CoreNetClient, CoreNodeAddr, CoreRecvStream, CoreRemoteInfo, CoreSendStream,
 };
