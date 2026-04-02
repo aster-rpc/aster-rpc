@@ -6,7 +6,7 @@
 #   1. cargo fmt --check
 #   2. cargo clippy -- -D warnings
 #   3. uv run maturin develop (build the extension)
-#   4. uv run pytest tests/
+#   4. uv run pytest tests/python/
 
 set -euo pipefail
 
@@ -60,9 +60,9 @@ else
 fi
 
 # ── 4. Tests via uv ────────────────────────────────────────────────
-step "uv run pytest tests/"
+step "uv run pytest tests/python/"
 if command -v uv &>/dev/null; then
-    if uv run pytest tests/ -v --timeout=60; then
+    if uv run pytest tests/python/ -v --timeout=60; then
         pass "Tests OK"
     else
         fail "Tests failed"

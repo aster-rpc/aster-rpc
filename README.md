@@ -134,7 +134,7 @@ asyncio.run(main())
 ## Running Tests
 
 ```bash
-uv run pytest tests/ -v --timeout=30
+uv run pytest tests/python/ -v --timeout=30
 ```
 
 ## Run lint locally
