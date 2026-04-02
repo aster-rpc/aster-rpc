@@ -66,7 +66,7 @@ async def test_connection_max_datagram_size(endpoint_pair):
 
     async def client_side():
         await asyncio.sleep(0.2)
-        conn = await ep_client.connect(ep_server.endpoint_id(), ALPN)
+        conn = await ep_client.connect_node_addr(ep_server.endpoint_addr_info(), ALPN)
         max_size = conn.max_datagram_size()
         assert max_size is None or isinstance(max_size, int)
         if max_size is not None:
@@ -97,7 +97,7 @@ async def test_connection_datagram_send_buffer_space(endpoint_pair):
 
     async def client_side():
         await asyncio.sleep(0.2)
-        conn = await ep_client.connect(ep_server.endpoint_id(), ALPN)
+        conn = await ep_client.connect_node_addr(ep_server.endpoint_addr_info(), ALPN)
         buffer_space = conn.datagram_send_buffer_space()
         assert isinstance(buffer_space, int)
         assert buffer_space >= 0
@@ -141,7 +141,7 @@ async def test_connection_info_after_connect(endpoint_pair):
 
     async def client_side():
         await asyncio.sleep(0.2)
-        conn = await ep_client.connect(ep_server.endpoint_id(), ALPN)
+        conn = await ep_client.connect_node_addr(ep_server.endpoint_addr_info(), ALPN)
         info = conn.connection_info()
         assert isinstance(info, ConnectionInfo)
         send, recv = await conn.open_bi()
@@ -320,7 +320,7 @@ async def test_full_connection_with_all_phase1b_surfaces(endpoint_pair):
 
     async def client_side():
         await asyncio.sleep(0.2)
-        conn = await ep_client.connect(ep_server.endpoint_id(), ALPN)
+        conn = await ep_client.connect_node_addr(ep_server.endpoint_addr_info(), ALPN)
         
         # Phase 1b: Datagram completion
         max_size = conn.max_datagram_size()
