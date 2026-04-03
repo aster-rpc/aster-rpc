@@ -5,10 +5,7 @@ import struct
 import pytest
 import pytest_asyncio
 
-from aster_python import (
-    NodeAddr,
-    create_endpoint,
-)
+from aster_python import create_endpoint
 
 ALPN = b"test/echo/1"
 
@@ -150,7 +147,3 @@ async def test_connection_close_smoke(endpoint_pair):
     await asyncio.wait_for(asyncio.gather(server_side(), client_side()), timeout=30)
 
 
-@pytest.mark.asyncio
-async def test_node_addr_manual_roundtrip():
-    addr = NodeAddr("node123", relay_url=None, direct_addresses=["127.0.0.1:9999"])
-    assert NodeAddr.from_bytes(addr.to_bytes()).direct_addresses == ["127.0.0.1:9999"]

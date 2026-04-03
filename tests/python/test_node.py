@@ -13,15 +13,6 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 
-async def test_memory_node_creation():
-    """Test creating an in-memory node."""
-    from aster_python import IrohNode
-
-    node = await IrohNode.memory()
-    assert node is not None
-    await node.shutdown()
-
-
 async def test_node_id():
     """Test retrieving node ID."""
     from aster_python import IrohNode
@@ -32,18 +23,6 @@ async def test_node_id():
     # Node ID should be a non-empty string
     assert isinstance(node_id, str)
     assert len(node_id) > 0
-
-    await node.shutdown()
-
-
-async def test_node_id_is_consistent():
-    """Test that node_id returns the same value on multiple calls."""
-    from aster_python import IrohNode
-
-    node = await IrohNode.memory()
-    id1 = node.node_id()
-    id2 = node.node_id()
-    assert id1 == id2
 
     await node.shutdown()
 

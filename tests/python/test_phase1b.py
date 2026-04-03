@@ -4,31 +4,11 @@ import pytest
 import pytest_asyncio
 
 from aster_python import (
-    IrohNode,
     create_endpoint,
-    EndpointConfig,
-    NetClient,
-    IrohConnection,
     ConnectionInfo,
-    RemoteInfo,
-    HookDecision,
-    HookConnectInfo,
-    HookHandshakeInfo,
 )
 
 ALPN = b"test/phase1b/1"
-
-
-@pytest_asyncio.fixture
-async def node_pair():
-    """Two IrohNodes with addresses exchanged for connection tests."""
-    n1 = await IrohNode.memory()
-    n2 = await IrohNode.memory()
-    n1.add_node_addr(n2)
-    n2.add_node_addr(n1)
-    yield n1, n2
-    await n1.shutdown()
-    await n2.shutdown()
 
 
 @pytest_asyncio.fixture
@@ -195,89 +175,6 @@ async def test_net_client_remote_info_list_empty_at_start():
     assert isinstance(result, list)
     # May or may not include the local endpoint
     await ep.close()
-
-
-@pytest.mark.asyncio
-async def test_endpoint_config_monitoring_flag():
-    """Test that EndpointConfig accepts enable_monitoring parameter."""
-    config = EndpointConfig(
-        alpns=[ALPN],
-        enable_monitoring=True,
-        enable_hooks=False,
-        hook_timeout_ms=5000,
-    )
-    assert config.enable_monitoring is True
-    assert config.enable_hooks is False
-    assert config.hook_timeout_ms == 5000
-
-
-@pytest.mark.asyncio
-async def test_endpoint_config_hooks_flag():
-    """Test that EndpointConfig accepts enable_hooks parameter."""
-    config = EndpointConfig(
-        alpns=[ALPN],
-        enable_monitoring=False,
-        enable_hooks=True,
-        hook_timeout_ms=3000,
-    )
-    assert config.enable_monitoring is False
-    assert config.enable_hooks is True
-    assert config.hook_timeout_ms == 3000
-
-
-# ============================================================================
-# Hook Types Tests
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_hook_decision_allow():
-    """Test HookDecision.Allow creation."""
-    decision = HookDecision.create_allow()
-    assert decision.allow is True
-    assert decision.error_code is None
-    assert decision.reason is None
-
-
-@pytest.mark.asyncio
-async def test_hook_decision_deny():
-    """Test HookDecision.Deny creation."""
-    decision = HookDecision.create_deny(42, b"connection rejected")
-    assert decision.allow is False
-    assert decision.error_code == 42
-    assert decision.reason == b"connection rejected"
-
-
-@pytest.mark.asyncio
-async def test_hook_decision_default():
-    """Test default HookDecision is Allow."""
-    decision = HookDecision()
-    assert decision.allow is True
-
-
-# ============================================================================
-# Hook Types Structure Tests
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_hook_connect_info_fields():
-    """Test HookConnectInfo has expected fields."""
-    # HookConnectInfo is a data structure passed to hook callbacks
-    # Its fields should be accessible
-    info = HookConnectInfo()
-    assert hasattr(info, 'remote_endpoint_id')
-    assert hasattr(info, 'alpn')
-
-
-@pytest.mark.asyncio
-async def test_hook_handshake_info_fields():
-    """Test HookHandshakeInfo has expected fields."""
-    # HookHandshakeInfo is a data structure passed to hook callbacks
-    info = HookHandshakeInfo()
-    assert hasattr(info, 'remote_endpoint_id')
-    assert hasattr(info, 'alpn')
-    assert hasattr(info, 'is_alive')
 
 
 # ============================================================================

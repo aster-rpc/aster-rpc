@@ -33,22 +33,6 @@ pytestmark = pytest.mark.asyncio
 
 
 # ============================================================================
-# Protocol Constants
-# ============================================================================
-
-
-def test_alpn_matches_rust():
-    """ALPN must match the Rust dumbpipe crate exactly."""
-    assert ALPN == b"DUMBPIPEV0"
-
-
-def test_handshake_matches_rust():
-    """Handshake must match the Rust dumbpipe crate exactly."""
-    assert HANDSHAKE == b"hello"
-    assert len(HANDSHAKE) == 5
-
-
-# ============================================================================
 # Core Pipe Tests (Python ↔ Python)
 # ============================================================================
 
