@@ -15,8 +15,6 @@ Pre-requisites complete. Phase 1–4 substantially implemented and checked off (
 **📌 Additional note from follow-up verification:**
 - The checklist below is stale for later phases: Phase 5 and Phase 6 contain unchecked boxes even though substantial code and tests now exist and pass locally. However, the high-level `Server` implementation still appears incomplete for real handler dispatch (`_get_handler_for_service()` currently returns `None`), so those phases should be re-reviewed rather than blindly checked off.
 
-
-
 ## Pre-Requisites
 
 - [x] Pin Python to 3.13 (`.python-version`)
