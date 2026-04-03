@@ -14,6 +14,18 @@ import time
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from aster_python.aster.codec import ForyCodec, ForyConfig
+from aster_python.aster.interceptors.base import (
+    CallContext,
+    apply_error_interceptors,
+    apply_request_interceptors,
+    apply_response_interceptors,
+    build_call_context,
+    normalize_error,
+)
+from aster_python.aster.interceptors.circuit_breaker import CircuitBreakerInterceptor
+from aster_python.aster.interceptors.deadline import DeadlineInterceptor
+from aster_python.aster.interceptors.retry import RetryInterceptor
+from aster_python.aster.status import RpcError
 from aster_python.aster.types import SerializationMode
 from aster_python.aster.transport.base import Transport, BidiChannel
 from aster_python.aster.service import ServiceInfo, MethodInfo, ServiceRegistry
@@ -77,6 +89,101 @@ class ServiceClient:
             return 0
         return int((time.time() + timeout) * 1000)
 
+    def _build_context(
+        self,
+        method_info: MethodInfo,
+        *,
+        metadata: dict[str, str] | None,
+        deadline_epoch_ms: int,
+    ) -> CallContext:
+        is_streaming = method_info.pattern != RpcPattern.UNARY
+        return build_call_context(
+            service=self._service_info.name,
+            method=method_info.name,
+            metadata=metadata,
+            deadline_epoch_ms=deadline_epoch_ms,
+            is_streaming=is_streaming,
+            pattern=method_info.pattern,
+            idempotent=method_info.idempotent,
+        )
+
+    def _matching_interceptors(self, interceptor_type: type[Any]) -> list[Any]:
+        return [i for i in self._interceptors if isinstance(i, interceptor_type)]
+
+    def _deadline_timeout(self, ctx: CallContext) -> float | None:
+        for interceptor in self._matching_interceptors(DeadlineInterceptor):
+            timeout = interceptor.timeout_seconds(ctx)
+            if timeout is not None:
+                return timeout
+        return None
+
+    async def _run_call_with_interceptors(
+        self,
+        ctx: CallContext,
+        request: Any,
+        invoke: Any,
+    ) -> Any:
+        retry_interceptors = self._matching_interceptors(RetryInterceptor)
+        breaker_interceptors = self._matching_interceptors(CircuitBreakerInterceptor)
+        max_attempts = 1
+        for retry in retry_interceptors:
+            max_attempts = max(max_attempts, retry.policy.max_attempts)
+
+        last_error: RpcError | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            ctx.attempt = attempt
+            current_request = request
+            for breaker in breaker_interceptors:
+                breaker.before_call(ctx)
+
+            try:
+                current_request = await apply_request_interceptors(self._interceptors, ctx, current_request)
+                timeout = self._deadline_timeout(ctx)
+                if timeout is not None:
+                    response = await self._invoke_with_timeout(invoke(current_request), timeout)
+                else:
+                    response = await invoke(current_request)
+                response = await apply_response_interceptors(self._interceptors, ctx, response)
+                for breaker in breaker_interceptors:
+                    breaker.record_success()
+                return response
+            except Exception as exc:
+                error = normalize_error(exc)
+                for breaker in breaker_interceptors:
+                    breaker.record_failure(error)
+                maybe_error = await apply_error_interceptors(self._interceptors, ctx, error)
+                if maybe_error is None:
+                    return None
+                last_error = maybe_error
+                should_retry = False
+                retry_delay = 0.0
+                for retry in retry_interceptors:
+                    if retry.should_retry(ctx, maybe_error) and attempt < retry.policy.max_attempts:
+                        should_retry = True
+                        retry_delay = max(retry_delay, retry.backoff_seconds(attempt))
+                if not should_retry:
+                    raise maybe_error
+                await self._sleep_with_deadline(retry_delay, ctx)
+
+        if last_error is not None:
+            raise last_error
+        raise RpcError.from_status(13, "call failed")
+
+    async def _invoke_with_timeout(self, awaitable: Any, timeout: float) -> Any:
+        async with timeouts(timeout):
+            return await awaitable
+
+    async def _sleep_with_deadline(self, delay: float, ctx: CallContext) -> None:
+        timeout = self._deadline_timeout(ctx)
+        if timeout is None:
+            await time_sleep(delay)
+            return
+        if timeout <= 0:
+            raise RpcError.from_status(4, "deadline exceeded")
+        async with timeouts(timeout):
+            await time_sleep(delay)
+
     async def _call_unary(
         self,
         method_info: MethodInfo,
@@ -95,16 +202,20 @@ class ServiceClient:
             else self._service_info.serialization_modes[0].value
         )
         contract_id = getattr(self._service_info, "contract_id", "") or ""
+        ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
 
-        return await self._transport.unary(
-            service=self._service_info.name,
-            method=method_info.name,
-            request=request,
-            metadata=metadata,
-            deadline_epoch_ms=deadline,
-            serialization_mode=serialization_mode,
-            contract_id=contract_id,
-        )
+        async def invoke(current_request: Any) -> Any:
+            return await self._transport.unary(
+                service=self._service_info.name,
+                method=method_info.name,
+                request=current_request,
+                metadata=ctx.metadata,
+                deadline_epoch_ms=deadline,
+                serialization_mode=serialization_mode,
+                contract_id=contract_id,
+            )
+
+        return await self._run_call_with_interceptors(ctx, request, invoke)
 
     def _call_server_stream(
         self,
@@ -125,15 +236,29 @@ class ServiceClient:
         )
         contract_id = getattr(self._service_info, "contract_id", "") or ""
 
-        return self._transport.server_stream(
-            service=self._service_info.name,
-            method=method_info.name,
-            request=request,
-            metadata=metadata,
-            deadline_epoch_ms=deadline,
-            serialization_mode=serialization_mode,
-            contract_id=contract_id,
-        )
+        ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
+
+        async def iterator() -> AsyncIterator[Any]:
+            current_request = await apply_request_interceptors(self._interceptors, ctx, request)
+            source = self._transport.server_stream(
+                service=self._service_info.name,
+                method=method_info.name,
+                request=current_request,
+                metadata=ctx.metadata,
+                deadline_epoch_ms=deadline,
+                serialization_mode=serialization_mode,
+                contract_id=contract_id,
+            )
+            try:
+                async for item in source:
+                    yield await apply_response_interceptors(self._interceptors, ctx, item)
+            except Exception as exc:
+                error = normalize_error(exc)
+                maybe_error = await apply_error_interceptors(self._interceptors, ctx, error)
+                if maybe_error is not None:
+                    raise maybe_error
+
+        return iterator()
 
     async def _call_client_stream(
         self,
@@ -154,15 +279,24 @@ class ServiceClient:
         )
         contract_id = getattr(self._service_info, "contract_id", "") or ""
 
-        return await self._transport.client_stream(
-            service=self._service_info.name,
-            method=method_info.name,
-            requests=requests,
-            metadata=metadata,
-            deadline_epoch_ms=deadline,
-            serialization_mode=serialization_mode,
-            contract_id=contract_id,
-        )
+        ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
+
+        async def wrapped_requests() -> AsyncIterator[Any]:
+            async for item in requests:
+                yield await apply_request_interceptors(self._interceptors, ctx, item)
+
+        async def invoke(_: Any) -> Any:
+            return await self._transport.client_stream(
+                service=self._service_info.name,
+                method=method_info.name,
+                requests=wrapped_requests(),
+                metadata=ctx.metadata,
+                deadline_epoch_ms=deadline,
+                serialization_mode=serialization_mode,
+                contract_id=contract_id,
+            )
+
+        return await self._run_call_with_interceptors(ctx, None, invoke)
 
     def _call_bidi_stream(
         self,
@@ -182,14 +316,57 @@ class ServiceClient:
         )
         contract_id = getattr(self._service_info, "contract_id", "") or ""
 
-        return self._transport.bidi_stream(
+        ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
+        channel = self._transport.bidi_stream(
             service=self._service_info.name,
             method=method_info.name,
-            metadata=metadata,
+            metadata=ctx.metadata,
             deadline_epoch_ms=deadline,
             serialization_mode=serialization_mode,
             contract_id=contract_id,
         )
+        if not self._interceptors:
+            return channel
+        return InterceptedBidiChannel(channel, self._interceptors, ctx)
+
+
+class InterceptedBidiChannel(BidiChannel):
+    def __init__(self, inner: BidiChannel, interceptors: list[Any], ctx: CallContext) -> None:
+        self._inner = inner
+        self._interceptors = interceptors
+        self._ctx = ctx
+
+    async def send(self, msg: Any) -> None:
+        msg = await apply_request_interceptors(self._interceptors, self._ctx, msg)
+        await self._inner.send(msg)
+
+    async def recv(self) -> Any:
+        try:
+            item = await self._inner.recv()
+            return await apply_response_interceptors(self._interceptors, self._ctx, item)
+        except Exception as exc:
+            error = normalize_error(exc)
+            maybe_error = await apply_error_interceptors(self._interceptors, self._ctx, error)
+            if maybe_error is not None:
+                raise maybe_error
+            raise
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+    async def wait_for_trailer(self) -> tuple[int, str]:
+        return await self._inner.wait_for_trailer()
+
+    async def __aenter__(self) -> "InterceptedBidiChannel":
+        if hasattr(self._inner, "__aenter__"):
+            await self._inner.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        if hasattr(self._inner, "__aexit__"):
+            await self._inner.__aexit__(exc_type, exc_val, exc_tb)
+        else:
+            await self.close()
 
 
 def _collect_service_types(service_class: type, service_info: ServiceInfo) -> set[type]:
@@ -374,7 +551,7 @@ def create_local_client(
         transport=transport,
         service_info=service_info,
         codec=codec,
-        interceptors=interceptors,
+        interceptors=None,
     )
 
 
@@ -492,3 +669,11 @@ class RpcPattern:
     SERVER_STREAM = "server_stream"
     CLIENT_STREAM = "client_stream"
     BIDI_STREAM = "bidi_stream"
+
+
+def time_sleep(delay: float):
+    return __import__("asyncio").sleep(delay)
+
+
+def timeouts(timeout: float):
+    return __import__("asyncio").timeout(timeout)

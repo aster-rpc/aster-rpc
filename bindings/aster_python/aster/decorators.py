@@ -175,9 +175,13 @@ class _RpcDecorator:
         serialization: SerializationMode | None = None,
         **kwargs: Any,
     ) -> Callable[P, Any]:
-        # Handle @rpc() - method is None, return self for chaining
+        # Handle @rpc(...) - return a new configured decorator instance.
         if method is None:
-            return self
+            return _RpcDecorator(
+                timeout=timeout if timeout is not None else self._timeout,
+                idempotent=idempotent if idempotent is not None else self._idempotent,
+                serialization=serialization if serialization is not None else self._serialization,
+            )
         
         # Get the method - merge options
         final_timeout = timeout if timeout is not None else self._timeout

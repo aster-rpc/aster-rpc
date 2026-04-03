@@ -14,13 +14,19 @@ using asyncio.Queue. It supports:
 from __future__ import annotations
 
 import asyncio
-import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
 from aster_python.aster.codec import ForyCodec, ForyConfig
-from aster_python.aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
-from aster_python.aster.protocol import StreamHeader, RpcStatus
+from aster_python.aster.interceptors.base import (
+    CallContext,
+    apply_error_interceptors,
+    apply_request_interceptors,
+    apply_response_interceptors,
+    build_call_context,
+    normalize_error,
+)
+from aster_python.aster.interceptors.deadline import DeadlineInterceptor
 from aster_python.aster.status import StatusCode, RpcError
 from aster_python.aster.types import SerializationMode
 from aster_python.aster.transport.base import (
@@ -32,26 +38,6 @@ from aster_python.aster.transport.base import (
 
 if TYPE_CHECKING:
     from aster_python.aster.interceptors.base import Interceptor
-
-
-# ── Minimal CallContext for Phase 3 (replaced by full implementation in Phase 7) ─────
-
-
-@dataclass
-class CallContext:
-    """Call context for interceptor chain.
-
-    This is a minimal implementation for Phase 3. The full implementation
-    with more fields will be added in Phase 7 (Interceptors).
-    """
-    service: str
-    method: str
-    call_id: str
-    session_id: str | None
-    peer: str | None
-    metadata: dict[str, str]
-    deadline: float | None
-    is_streaming: bool
 
 
 # ── Call request/response types for internal queuing ─────────────────────────
@@ -219,23 +205,37 @@ class LocalTransport(Transport):
         """LocalTransport doesn't hold network resources, nothing to close."""
         pass
 
+    def _deadline_timeout(self, ctx: CallContext) -> float | None:
+        for interceptor in self._interceptors:
+            if isinstance(interceptor, DeadlineInterceptor):
+                timeout = interceptor.timeout_seconds(ctx)
+                if timeout is not None:
+                    return timeout
+        return None
+
+    async def _await_with_deadline(self, ctx: CallContext, awaitable: Any) -> Any:
+        timeout = self._deadline_timeout(ctx)
+        if timeout is None:
+            return await awaitable
+        async with asyncio.timeout(timeout):
+            return await awaitable
+
     async def _build_context(
         self,
         service: str,
         method: str,
         metadata: dict[str, str] | None,
         deadline_epoch_ms: int,
+        *,
+        is_streaming: bool = False,
     ) -> CallContext:
         """Build a CallContext for interceptor chain."""
-        return CallContext(
+        return build_call_context(
             service=service,
             method=method,
-            call_id=str(uuid.uuid4()),
-            session_id=None,
-            peer=None,
-            metadata=metadata or {},
-            deadline=deadline_epoch_ms,
-            is_streaming=False,
+            metadata=metadata,
+            deadline_epoch_ms=deadline_epoch_ms,
+            is_streaming=is_streaming,
         )
 
     def _get_serialized_bytes(self, obj: Any, wire_compatible: bool) -> bytes:
@@ -288,13 +288,11 @@ class LocalTransport(Transport):
         )
         
         # Serialize request if wire_compatible
-        request_bytes = None
         if self._wire_compatible and types:
-            request_bytes = self._get_serialized_bytes(request, True)
+            self._get_serialized_bytes(request, True)
         
         # Run request through interceptor chain
-        for interceptor in self._interceptors:
-            request = await interceptor.on_request(ctx, request)
+        request = await apply_request_interceptors(self._interceptors, ctx, request)
         
         # Invoke handler
         try:
@@ -302,26 +300,22 @@ class LocalTransport(Transport):
             
             # Handle coroutines
             if asyncio.iscoroutine(response):
-                response = await response
+                response = await self._await_with_deadline(ctx, response)
                 
-        except RpcError:
-            # Re-raise RpcError after running error interceptors
-            for interceptor in reversed(self._interceptors):
-                result = await interceptor.on_error(ctx, RpcError(StatusCode.UNKNOWN, "handler error"))
-                if result is None:
-                    break
+        except RpcError as exc:
+            maybe_error = await apply_error_interceptors(self._interceptors, ctx, exc)
+            if maybe_error is not None:
+                raise maybe_error
             raise
         except Exception as e:
-            err = RpcError(StatusCode.UNKNOWN, str(e))
-            for interceptor in reversed(self._interceptors):
-                result = await interceptor.on_error(ctx, err)
-                if result is None:
-                    break
+            err = normalize_error(e)
+            maybe_error = await apply_error_interceptors(self._interceptors, ctx, err)
+            if maybe_error is not None:
+                raise maybe_error
             raise
 
         # Run response through interceptor chain
-        for interceptor in self._interceptors:
-            response = await interceptor.on_response(ctx, response)
+        response = await apply_response_interceptors(self._interceptors, ctx, response)
 
         # Serialize response if wire_compatible
         if self._wire_compatible and response is not None:
@@ -365,23 +359,22 @@ class LocalTransport(Transport):
         handler, types, pattern = self._registry(service, method)
         
         ctx = await self._build_context(
-            service, method, metadata, deadline_epoch_ms
+            service, method, metadata, deadline_epoch_ms, is_streaming=True
         )
         
         # Run request through interceptor chain
-        for interceptor in self._interceptors:
-            request = await interceptor.on_request(ctx, request)
+        request = await apply_request_interceptors(self._interceptors, ctx, request)
 
         try:
             response_iter = handler(request)
             
             if asyncio.iscoroutine(response_iter):
-                response_iter = await response_iter
+                response_iter = await self._await_with_deadline(ctx, response_iter)
             
             async for item in response_iter:
                 # Run each item through interceptor chain
                 for interceptor in self._interceptors:
-                    item = await interceptor.on_response(ctx, item)
+                    item = await apply_response_interceptors(self._interceptors, ctx, item)
                 
                 # Serialize if wire_compatible
                 if self._wire_compatible:
@@ -394,11 +387,10 @@ class LocalTransport(Transport):
                 yield item
                 
         except Exception as e:
-            err = RpcError(StatusCode.UNKNOWN, str(e))
-            for interceptor in reversed(self._interceptors):
-                result = await interceptor.on_error(ctx, err)
-                if result is None:
-                    break
+            err = normalize_error(e)
+            maybe_error = await apply_error_interceptors(self._interceptors, ctx, err)
+            if maybe_error is not None:
+                raise maybe_error
             raise
 
     # ── Client Streaming ───────────────────────────────────────────────────
@@ -418,7 +410,7 @@ class LocalTransport(Transport):
         handler, types, pattern = self._registry(service, method)
         
         ctx = await self._build_context(
-            service, method, metadata, deadline_epoch_ms
+            service, method, metadata, deadline_epoch_ms, is_streaming=True
         )
         
         # Collect requests (could be streaming in a real network scenario,
@@ -426,27 +418,24 @@ class LocalTransport(Transport):
         collected: list[Any] = []
         async for request in requests:
             # Run each request through interceptor chain
-            for interceptor in self._interceptors:
-                request = await interceptor.on_request(ctx, request)
+            request = await apply_request_interceptors(self._interceptors, ctx, request)
             collected.append(request)
 
         try:
             response = handler(collected)
             
             if asyncio.iscoroutine(response):
-                response = await response
+                response = await self._await_with_deadline(ctx, response)
                 
         except Exception as e:
-            err = RpcError(StatusCode.UNKNOWN, str(e))
-            for interceptor in reversed(self._interceptors):
-                result = await interceptor.on_error(ctx, err)
-                if result is None:
-                    break
+            err = normalize_error(e)
+            maybe_error = await apply_error_interceptors(self._interceptors, ctx, err)
+            if maybe_error is not None:
+                raise maybe_error
             raise
 
         # Run response through interceptor chain
-        for interceptor in self._interceptors:
-            response = await interceptor.on_response(ctx, response)
+        response = await apply_response_interceptors(self._interceptors, ctx, response)
 
         # Serialize if wire_compatible
         if self._wire_compatible and response is not None:
@@ -513,7 +502,7 @@ class LocalTransport(Transport):
         handler, types, pattern = self._registry(service, method)
         
         ctx = await self._build_context(
-            service, method, metadata, deadline_epoch_ms
+            service, method, metadata, deadline_epoch_ms, is_streaming=True
         )
 
         try:
@@ -521,7 +510,7 @@ class LocalTransport(Transport):
             response_iter = handler(None)  # Bidi handlers receive context
             
             if asyncio.iscoroutine(response_iter):
-                response_iter = await response_iter
+                response_iter = await self._await_with_deadline(ctx, response_iter)
             
             # Message loop — asyncio.Queue is NOT an async iterator,
             # so we use get() in a loop instead.
@@ -537,15 +526,13 @@ class LocalTransport(Transport):
                 
                 if msg.is_send:
                     # Run request through interceptor chain
-                    for interceptor in self._interceptors:
-                        msg.data = await interceptor.on_request(ctx, msg.data)
+                    msg.data = await apply_request_interceptors(self._interceptors, ctx, msg.data)
                     
                     # Send to handler
                     try:
                         item = await response_iter.__anext__()
                         # Run response through interceptor chain
-                        for interceptor in self._interceptors:
-                            item = await interceptor.on_response(ctx, item)
+                        item = await apply_response_interceptors(self._interceptors, ctx, item)
                         
                         # Serialize if wire_compatible
                         if self._wire_compatible:
@@ -565,11 +552,8 @@ class LocalTransport(Transport):
             await trailer_queue.put((StatusCode.OK, ""))
             
         except Exception as e:
-            err = RpcError(StatusCode.UNKNOWN, str(e))
-            for interceptor in reversed(self._interceptors):
-                result = await interceptor.on_error(ctx, err)
-                if result is None:
-                    break
+            err = normalize_error(e)
+            await apply_error_interceptors(self._interceptors, ctx, err)
             await recv_queue.put(LocalBidiMessage(is_send=False, is_close=True))
             await trailer_queue.put((StatusCode.UNKNOWN, str(e)))
 
