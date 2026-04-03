@@ -24,8 +24,14 @@ Phase 6 verification completed with uv:
 - `uv run ruff check bindings/aster_python/aster/client.py tests/python/test_aster_server.py tests/python/test_aster_transport.py ffi_spec/ASTER_PLAN_CHECKLIST.md` → **All checks passed**
 - `uv run pytest tests/python/test_aster_server.py tests/python/test_aster_transport.py -q` → **67 passed**
 
+Phase 7 is now implemented and verified. The interceptor subsystem has been added under `aster/interceptors/`, including a shared `CallContext`, ordered request/response/error chain helpers, and standard deadline, auth, retry, circuit-breaker, audit, and metrics interceptors. Client stubs now apply retry/deadline/circuit-breaker behavior, LocalTransport enforces deadline-aware execution while still running the full interceptor chain, and server dispatch paths now run interceptor hooks around all RPC patterns.
+
+Phase 7 verification completed with uv:
+- `uv run pytest tests/python/test_aster_interceptors.py tests/python/test_aster_server.py tests/python/test_aster_transport.py -q` → **72 passed**
+- `uv run ruff check bindings/aster_python/aster/client.py bindings/aster_python/aster/server.py bindings/aster_python/aster/transport/local.py bindings/aster_python/aster/interceptors tests/python/test_aster_interceptors.py ffi_spec/ASTER_PLAN_CHECKLIST.md` → **All checks passed**
+
 Outstanding issue / blocker:
-- None for Phase 6 at this time.
+- None for Phase 7 at this time.
 
 ## Pre-Requisites
 
@@ -164,22 +170,22 @@ Outstanding issue / blocker:
 
 ## Phase 7: Interceptors & Middleware
 
-- [ ] Create `aster/interceptors/__init__.py`
-- [ ] Create `aster/interceptors/base.py` — `CallContext` dataclass
-- [ ] Create `aster/interceptors/base.py` — `Interceptor` ABC (`on_request`, `on_response`, `on_error`)
-- [ ] Implement interceptor chain runner (ordered execution, short-circuit on error)
-- [ ] Wire interceptors into server dispatch
-- [ ] Wire interceptors into client stubs
-- [ ] Create `aster/interceptors/deadline.py` — `DeadlineInterceptor`
-- [ ] Create `aster/interceptors/auth.py` — `AuthInterceptor`
-- [ ] Create `aster/interceptors/retry.py` — `RetryInterceptor`
-- [ ] Create `aster/interceptors/circuit_breaker.py` — `CircuitBreakerInterceptor` (CLOSED → OPEN → HALF-OPEN)
-- [ ] Create `aster/interceptors/audit.py` — `AuditLogInterceptor`
-- [ ] Create `aster/interceptors/metrics.py` — `MetricsInterceptor` (optional OTel dependency)
-- [ ] Tests: deadline enforcement (cancels handler on expiry)
-- [ ] Tests: retry behavior (idempotent methods on `UNAVAILABLE`)
-- [ ] Tests: circuit breaker state transitions
-- [ ] Tests: interceptors run on LocalTransport calls
+- [x] Create `aster/interceptors/__init__.py`
+- [x] Create `aster/interceptors/base.py` — `CallContext` dataclass
+- [x] Create `aster/interceptors/base.py` — `Interceptor` ABC (`on_request`, `on_response`, `on_error`)
+- [x] Implement interceptor chain runner (ordered execution, short-circuit on error)
+- [x] Wire interceptors into server dispatch
+- [x] Wire interceptors into client stubs
+- [x] Create `aster/interceptors/deadline.py` — `DeadlineInterceptor`
+- [x] Create `aster/interceptors/auth.py` — `AuthInterceptor`
+- [x] Create `aster/interceptors/retry.py` — `RetryInterceptor`
+- [x] Create `aster/interceptors/circuit_breaker.py` — `CircuitBreakerInterceptor` (CLOSED → OPEN → HALF-OPEN)
+- [x] Create `aster/interceptors/audit.py` — `AuditLogInterceptor`
+- [x] Create `aster/interceptors/metrics.py` — `MetricsInterceptor` (optional OTel dependency)
+- [x] Tests: deadline enforcement (cancels handler on expiry)
+- [x] Tests: retry behavior (idempotent methods on `UNAVAILABLE`)
+- [x] Tests: circuit breaker state transitions
+- [x] Tests: interceptors run on LocalTransport calls
 
 ---
 
@@ -288,7 +294,7 @@ Outstanding issue / blocker:
 |-----------|--------|-------------|--------|
 | **Pre-requisites validated** | — | Python 3.13, pyfory determinism confirmed | ✅ Done |
 | **Minimal viable RPC** | 1–6 | Unary + streaming RPCs working end-to-end | ✅ Done |
-| **Production-ready RPC** | 1–7 | + interceptors (deadline, auth, retry, circuit breaker) | ⬜ Not started |
+| **Production-ready RPC** | 1–7 | + interceptors (deadline, auth, retry, circuit breaker) | ✅ Done |
 | **Session support** | 8 | Session-scoped services with CALL/CANCEL frames | ⬜ Not started |
 | **Contract identity** | 9 | Content-addressed contracts via BLAKE3 Merkle DAG | ⬜ Not started |
 | **Decentralized registry** | 10 | Service discovery via iroh-docs/gossip/blobs | ⬜ Not started |

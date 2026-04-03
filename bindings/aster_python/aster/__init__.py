@@ -66,6 +66,16 @@ from aster_python.aster.client import (
     ClientError,
     ClientTimeoutError,
 )
+from aster_python.aster.interceptors import (
+    CallContext,
+    Interceptor,
+    DeadlineInterceptor,
+    AuthInterceptor,
+    RetryInterceptor,
+    CircuitBreakerInterceptor,
+    AuditLogInterceptor,
+    MetricsInterceptor,
+)
 
 __all__ = [
     # status.py
@@ -129,4 +139,13 @@ __all__ = [
     "create_local_client",
     "ClientError",
     "ClientTimeoutError",
+    # interceptors (Phase 7)
+    "CallContext",
+    "Interceptor",
+    "DeadlineInterceptor",
+    "AuthInterceptor",
+    "RetryInterceptor",
+    "CircuitBreakerInterceptor",
+    "AuditLogInterceptor",
+    "MetricsInterceptor",
 ]

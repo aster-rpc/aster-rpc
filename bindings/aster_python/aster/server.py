@@ -22,6 +22,13 @@ from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from aster_python.aster.codec import ForyCodec, ForyConfig
 from aster_python.aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
+from aster_python.aster.interceptors.base import (
+    apply_error_interceptors,
+    apply_request_interceptors,
+    apply_response_interceptors,
+    build_call_context,
+    normalize_error,
+)
 from aster_python.aster.protocol import StreamHeader, RpcStatus
 from aster_python.aster.status import StatusCode, RpcError
 from aster_python.aster.types import SerializationMode
@@ -343,13 +350,13 @@ class Server:
             pattern = method_info.pattern
             
             if pattern == "unary":
-                await self._handle_unary(send, recv, header, handler_method, method_info)
+                await self._handle_unary(ctx, send, recv, header, handler_method, method_info)
             elif pattern == "server_stream":
-                await self._handle_server_stream(send, recv, header, handler_method, method_info)
+                await self._handle_server_stream(ctx, send, recv, header, handler_method, method_info)
             elif pattern == "client_stream":
-                await self._handle_client_stream(send, recv, header, handler_method, method_info)
+                await self._handle_client_stream(ctx, send, recv, header, handler_method, method_info)
             elif pattern == "bidi_stream":
-                await self._handle_bidi_stream(send, recv, header, handler_method, method_info)
+                await self._handle_bidi_stream(ctx, send, recv, header, handler_method, method_info)
             else:
                 await self._write_error_trailer(
                     send, StatusCode.INTERNAL, f"Unknown RPC pattern: {pattern}"
@@ -383,6 +390,35 @@ class Server:
             )
         return handler
 
+    def _resolve_interceptors(self, service_info: ServiceInfo) -> list[Any]:
+        resolved = list(self._interceptors)
+        for item in service_info.interceptors:
+            resolved.append(item() if inspect.isclass(item) else item)
+        return resolved
+
+    def _build_call_context(
+        self,
+        header: StreamHeader,
+        method_info: MethodInfo,
+        ctx: ConnectionContext,
+    ) -> Any:
+        peer = None
+        try:
+            peer = ctx.connection.remote_endpoint_id()
+        except Exception:
+            peer = None
+        return build_call_context(
+            service=header.service,
+            method=header.method,
+            metadata=header.metadata,
+            deadline_epoch_ms=header.deadline_epoch_ms,
+            peer=peer,
+            is_streaming=method_info.pattern != "unary",
+            pattern=method_info.pattern,
+            idempotent=method_info.idempotent,
+            call_id=header.call_id or None,
+        )
+
     async def _decode_request_frame(
         self,
         recv: Any,
@@ -398,6 +434,7 @@ class Server:
 
     async def _handle_unary(
         self,
+        conn_ctx: ConnectionContext,
         send: Any,
         recv: Any,
         header: StreamHeader,
@@ -405,6 +442,8 @@ class Server:
         method_info: MethodInfo,
     ) -> None:
         """Handle a unary RPC call."""
+        call_ctx = self._build_call_context(header, method_info, conn_ctx)
+        interceptors = self._resolve_interceptors(self._registry.lookup(header.service, header.version))
         try:
             # Read the request frame
             request, flags = await self._decode_request_frame(recv, method_info.request_type)
@@ -415,10 +454,13 @@ class Server:
                 await self._write_error_trailer(send, StatusCode.UNAVAILABLE, "Unexpected trailer")
                 return
 
+            request = await apply_request_interceptors(interceptors, call_ctx, request)
+
             # Invoke handler
             response = handler_method(request)
             if asyncio.iscoroutine(response):
                 response = await response
+            response = await apply_response_interceptors(interceptors, call_ctx, response)
 
             # Encode and write response
             response_payload, response_compressed = self._codec.encode_compressed(response)
@@ -432,14 +474,19 @@ class Server:
 
         except asyncio.CancelledError:
             raise
-        except RpcError:
-            raise  # Already handled at upper level
+        except RpcError as e:
+            maybe_error = await apply_error_interceptors(interceptors, call_ctx, e)
+            if maybe_error is not None:
+                raise maybe_error
         except Exception as e:
             logger.error("Unary handler error: %s", e)
-            await self._write_error_trailer(send, StatusCode.UNKNOWN, str(e))
+            maybe_error = await apply_error_interceptors(interceptors, call_ctx, normalize_error(e))
+            if maybe_error is not None:
+                await self._write_error_trailer(send, maybe_error.code, maybe_error.message)
 
     async def _handle_server_stream(
         self,
+        conn_ctx: ConnectionContext,
         send: Any,
         recv: Any,
         header: StreamHeader,
@@ -447,6 +494,8 @@ class Server:
         method_info: MethodInfo,
     ) -> None:
         """Handle a server-streaming RPC call."""
+        call_ctx = self._build_call_context(header, method_info, conn_ctx)
+        interceptors = self._resolve_interceptors(self._registry.lookup(header.service, header.version))
         try:
             # Read the request frame
             request, flags = await self._decode_request_frame(recv, method_info.request_type)
@@ -456,6 +505,7 @@ class Server:
             if flags & TRAILER:
                 await self._write_error_trailer(send, StatusCode.UNAVAILABLE, "Unexpected trailer")
                 return
+            request = await apply_request_interceptors(interceptors, call_ctx, request)
 
             # Invoke handler (async generator)
             response_iter = handler_method(request)
@@ -464,6 +514,7 @@ class Server:
 
             # Stream responses
             async for response in response_iter:
+                response = await apply_response_interceptors(interceptors, call_ctx, response)
                 response_payload, response_compressed = self._codec.encode_compressed(response)
                 response_flags = COMPRESSED if response_compressed else 0
                 await write_frame(send, response_payload, response_flags)
@@ -474,14 +525,19 @@ class Server:
 
         except asyncio.CancelledError:
             raise
-        except RpcError:
-            raise
+        except RpcError as e:
+            maybe_error = await apply_error_interceptors(interceptors, call_ctx, e)
+            if maybe_error is not None:
+                raise maybe_error
         except Exception as e:
             logger.error("Server stream handler error: %s", e)
-            await self._write_error_trailer(send, StatusCode.UNKNOWN, str(e))
+            maybe_error = await apply_error_interceptors(interceptors, call_ctx, normalize_error(e))
+            if maybe_error is not None:
+                await self._write_error_trailer(send, maybe_error.code, maybe_error.message)
 
     async def _handle_client_stream(
         self,
+        conn_ctx: ConnectionContext,
         send: Any,
         recv: Any,
         header: StreamHeader,
@@ -489,6 +545,8 @@ class Server:
         method_info: MethodInfo,
     ) -> None:
         """Handle a client-streaming RPC call."""
+        call_ctx = self._build_call_context(header, method_info, conn_ctx)
+        interceptors = self._resolve_interceptors(self._registry.lookup(header.service, header.version))
         try:
             # Collect all request frames until trailer or stream end
             requests: list[Any] = []
@@ -504,6 +562,7 @@ class Server:
 
                 compressed = bool(flags & COMPRESSED)
                 request = self._codec.decode_compressed(payload, compressed, method_info.request_type)
+                request = await apply_request_interceptors(interceptors, call_ctx, request)
                 requests.append(request)
 
             async def request_iter() -> AsyncIterator[Any]:
@@ -513,6 +572,7 @@ class Server:
             response = handler_method(request_iter())
             if asyncio.iscoroutine(response):
                 response = await response
+            response = await apply_response_interceptors(interceptors, call_ctx, response)
 
             # Encode and write response
             response_payload, response_compressed = self._codec.encode_compressed(response)
@@ -525,14 +585,19 @@ class Server:
 
         except asyncio.CancelledError:
             raise
-        except RpcError:
-            raise
+        except RpcError as e:
+            maybe_error = await apply_error_interceptors(interceptors, call_ctx, e)
+            if maybe_error is not None:
+                raise maybe_error
         except Exception as e:
             logger.error("Client stream handler error: %s", e)
-            await self._write_error_trailer(send, StatusCode.UNKNOWN, str(e))
+            maybe_error = await apply_error_interceptors(interceptors, call_ctx, normalize_error(e))
+            if maybe_error is not None:
+                await self._write_error_trailer(send, maybe_error.code, maybe_error.message)
 
     async def _handle_bidi_stream(
         self,
+        conn_ctx: ConnectionContext,
         send: Any,
         recv: Any,
         header: StreamHeader,
@@ -540,6 +605,8 @@ class Server:
         method_info: MethodInfo,
     ) -> None:
         """Handle a bidirectional-streaming RPC call."""
+        call_ctx = self._build_call_context(header, method_info, conn_ctx)
+        interceptors = self._resolve_interceptors(self._registry.lookup(header.service, header.version))
         try:
             request_queue: asyncio.Queue[Any] = asyncio.Queue()
             request_done = asyncio.Event()
@@ -558,11 +625,12 @@ class Server:
 
             # Start reader task
             reader_task = asyncio.create_task(
-                self._bidi_reader(recv, method_info.request_type, request_queue, request_done)
+                self._bidi_reader(recv, method_info.request_type, request_queue, request_done, interceptors, call_ctx)
             )
 
             # Stream responses from handler
             async for response in response_iter:
+                response = await apply_response_interceptors(interceptors, call_ctx, response)
                 response_payload, response_compressed = self._codec.encode_compressed(response)
                 response_flags = COMPRESSED if response_compressed else 0
                 await write_frame(send, response_payload, response_flags)
@@ -576,11 +644,15 @@ class Server:
 
         except asyncio.CancelledError:
             raise
-        except RpcError:
-            raise
+        except RpcError as e:
+            maybe_error = await apply_error_interceptors(interceptors, call_ctx, e)
+            if maybe_error is not None:
+                raise maybe_error
         except Exception as e:
             logger.error("Bidi stream handler error: %s", e)
-            await self._write_error_trailer(send, StatusCode.UNKNOWN, str(e))
+            maybe_error = await apply_error_interceptors(interceptors, call_ctx, normalize_error(e))
+            if maybe_error is not None:
+                await self._write_error_trailer(send, maybe_error.code, maybe_error.message)
 
     async def _bidi_reader(
         self,
@@ -588,6 +660,8 @@ class Server:
         request_type: type | None,
         request_queue: asyncio.Queue[Any],
         request_done: asyncio.Event,
+        interceptors: list[Any],
+        call_ctx: Any,
     ) -> None:
         """Read inbound bidi request frames and feed the handler iterator."""
         try:
@@ -602,6 +676,7 @@ class Server:
 
                 compressed = bool(flags & COMPRESSED)
                 request = self._codec.decode_compressed(payload, compressed, request_type)
+                request = await apply_request_interceptors(interceptors, call_ctx, request)
                 await request_queue.put(request)
 
         except asyncio.CancelledError:
