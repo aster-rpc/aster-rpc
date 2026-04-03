@@ -1,64 +1,71 @@
 # Aster Python Implementation — Progress Checklist
 
-**Tracks:** `ffi_spec/ASTER_PLAN.md`  
-**Last Updated:** 2026-04-03
+## INSTRUCTIONS
 
----
+Main plan: [ASTER_PLAN.md](ASTER_PLAN.md) - please read first.
+
+Please progress the tasks in this document one phase at a time and one step at a time. Please keep the `STATUS` section updated with your current status and list any outstanding issues or blockers.
+
+For each step we need to make sure the code passes tests and linting.
+
+## STATUS
+
+Pre-requisites complete. Phase 1 complete (42/42 tests passing). Phase 2 complete (47/47 tests passing, 89/89 total).
 
 ## Pre-Requisites
 
 - [x] Pin Python to 3.13 (`.python-version`)
 - [x] Install pyfory 0.16.0 from PyPI
 - [x] Install blake3 from PyPI
-- [ ] Install zstandard from PyPI
+- [x] Install zstandard from PyPI
 - [x] Verify pyfory serialization determinism (spike tests — 46/46 passed)
 - [x] Verify pyfory XLANG-mode tag registration (`namespace` + `typename`)
 - [x] Verify pyfory ROW format available
 - [x] Verify pyfory cross-process determinism
 - [x] Verify BLAKE3 hashing of pyfory output is stable
-- [ ] Add `pyfory`, `blake3`, `zstandard` to `pyproject.toml` dependencies
+- [x] Add `pyfory`, `blake3`, `zstandard` to `pyproject.toml` dependencies
 
 ---
 
 ## Phase 1: Wire Protocol & Framing
 
-- [ ] Create `bindings/aster_python/aster/` package directory
-- [ ] Create `aster/__init__.py` (public API re-exports)
-- [ ] Create `aster/status.py` — `StatusCode` enum (codes 0–16)
-- [ ] Create `aster/status.py` — `RpcError` exception hierarchy
-- [ ] Create `aster/types.py` — `SerializationMode` enum
-- [ ] Create `aster/types.py` — `RetryPolicy`, `ExponentialBackoff`
-- [ ] Create `aster/framing.py` — flag constants (`COMPRESSED`, `TRAILER`, `HEADER`, `ROW_SCHEMA`, `CALL`, `CANCEL`)
-- [ ] Create `aster/framing.py` — `write_frame(send_stream, payload, flags)`
-- [ ] Create `aster/framing.py` — `read_frame(recv_stream) -> (bytes, flags) | None`
-- [ ] Create `aster/framing.py` — max frame size enforcement (16 MiB)
-- [ ] Create `aster/framing.py` — zero-length frame rejection
-- [ ] Create `aster/protocol.py` — `StreamHeader` dataclass with `@fory_tag`
-- [ ] Create `aster/protocol.py` — `CallHeader` dataclass with `@fory_tag`
-- [ ] Create `aster/protocol.py` — `RpcStatus` dataclass with `@fory_tag`
-- [ ] Tests: frame round-trip encoding/decoding
-- [ ] Tests: flag parsing
-- [ ] Tests: max-size rejection
-- [ ] Tests: StreamHeader/RpcStatus Fory serialization round-trip
+- [x] Create `bindings/aster_python/aster/` package directory
+- [x] Create `aster/__init__.py` (public API re-exports)
+- [x] Create `aster/status.py` — `StatusCode` enum (codes 0–16)
+- [x] Create `aster/status.py` — `RpcError` exception hierarchy
+- [x] Create `aster/types.py` — `SerializationMode` enum
+- [x] Create `aster/types.py` — `RetryPolicy`, `ExponentialBackoff`
+- [x] Create `aster/framing.py` — flag constants (`COMPRESSED`, `TRAILER`, `HEADER`, `ROW_SCHEMA`, `CALL`, `CANCEL`)
+- [x] Create `aster/framing.py` — `write_frame(send_stream, payload, flags)`
+- [x] Create `aster/framing.py` — `read_frame(recv_stream) -> (bytes, flags) | None`
+- [x] Create `aster/framing.py` — max frame size enforcement (16 MiB)
+- [x] Create `aster/framing.py` — zero-length frame rejection
+- [x] Create `aster/protocol.py` — `StreamHeader` dataclass with `@fory_tag`
+- [x] Create `aster/protocol.py` — `CallHeader` dataclass with `@fory_tag`
+- [x] Create `aster/protocol.py` — `RpcStatus` dataclass with `@fory_tag`
+- [x] Tests: frame round-trip encoding/decoding
+- [x] Tests: flag parsing
+- [x] Tests: max-size rejection
+- [x] Tests: StreamHeader/RpcStatus Fory serialization round-trip
 
 ---
 
 ## Phase 2: Serialization Integration (Fory)
 
-- [ ] Create `aster/codec.py` — `@fory_tag(tag)` decorator (namespace/typename split)
-- [ ] Create `aster/codec.py` — `ForyCodec.__init__(mode, types)`
-- [ ] Create `aster/codec.py` — `ForyCodec.encode(obj) -> bytes`
-- [ ] Create `aster/codec.py` — `ForyCodec.decode(data, expected_type) -> Any`
-- [ ] Create `aster/codec.py` — `ForyCodec.encode_row_schema() -> bytes` (ROW mode)
-- [ ] Implement tag-based type registration (walk type graph, validate all types tagged for XLANG)
-- [ ] Implement zstd compression for payloads > threshold (default 4096 bytes)
-- [ ] Implement zstd decompression
-- [ ] Register framework-internal types (`_aster/StreamHeader`, `_aster/CallHeader`, `_aster/RpcStatus`)
-- [ ] Tests: XLANG round-trip for dataclasses
-- [ ] Tests: NATIVE round-trip
-- [ ] Tests: ROW random-access field read
-- [ ] Tests: compression round-trip
-- [ ] Tests: untagged type raises `TypeError` at registration time
+- [x] Create `aster/codec.py` — `@fory_tag(tag)` decorator (namespace/typename split)
+- [x] Create `aster/codec.py` — `ForyCodec.__init__(mode, types)`
+- [x] Create `aster/codec.py` — `ForyCodec.encode(obj) -> bytes`
+- [x] Create `aster/codec.py` — `ForyCodec.decode(data, expected_type) -> Any`
+- [x] Create `aster/codec.py` — `ForyCodec.encode_row_schema() -> bytes` (ROW mode)
+- [x] Implement tag-based type registration (walk type graph, validate all types tagged for XLANG)
+- [x] Implement zstd compression for payloads > threshold (default 4096 bytes)
+- [x] Implement zstd decompression
+- [x] Register framework-internal types (`_aster/StreamHeader`, `_aster/CallHeader`, `_aster/RpcStatus`)
+- [x] Tests: XLANG round-trip for dataclasses
+- [x] Tests: NATIVE round-trip
+- [x] Tests: ROW random-access field read
+- [x] Tests: compression round-trip
+- [x] Tests: untagged type raises `TypeError` at registration time
 
 ---
 
@@ -265,7 +272,7 @@
 | Milestone | Phases | Description | Status |
 |-----------|--------|-------------|--------|
 | **Pre-requisites validated** | — | Python 3.13, pyfory determinism confirmed | ✅ Done |
-| **Minimal viable RPC** | 1–6 | Unary + streaming RPCs working end-to-end | ⬜ Not started |
+| **Minimal viable RPC** | 1–6 | Unary + streaming RPCs working end-to-end | 🟡 Phase 2 complete |
 | **Production-ready RPC** | 1–7 | + interceptors (deadline, auth, retry, circuit breaker) | ⬜ Not started |
 | **Session support** | 8 | Session-scoped services with CALL/CANCEL frames | ⬜ Not started |
 | **Contract identity** | 9 | Content-addressed contracts via BLAKE3 Merkle DAG | ⬜ Not started |

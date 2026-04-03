@@ -1,0 +1,506 @@
+"""
+Phase 2 tests: Serialization Integration (Fory).
+
+Tests cover:
+- XLANG round-trip for dataclasses
+- NATIVE round-trip
+- ROW schema encoding
+- Compression round-trip
+- Untagged type raises TypeError at registration time
+- Type graph walking and registration
+- Framework-internal type registration
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+import pytest
+
+from aster_python.aster.codec import (
+    fory_tag,
+    ForyCodec,
+    DEFAULT_COMPRESSION_THRESHOLD,
+    _walk_type_graph,
+    _validate_xlang_tags,
+)
+from aster_python.aster.types import SerializationMode
+from aster_python.aster.protocol import StreamHeader, CallHeader, RpcStatus
+from aster_python.aster.status import StatusCode
+
+
+# ── Test types ───────────────────────────────────────────────────────────────
+
+
+@dataclass
+@fory_tag("test.codec/SimpleMsg")
+class SimpleMsg:
+    name: str = ""
+    value: int = 0
+    active: bool = False
+
+
+@dataclass
+@fory_tag("test.codec/InnerMsg")
+class InnerMsg:
+    label: str = ""
+    score: int = 0
+
+
+@dataclass
+@fory_tag("test.codec/OuterMsg")
+class OuterMsg:
+    title: str = ""
+    inner: InnerMsg = field(default_factory=InnerMsg)
+    count: int = 0
+
+
+@dataclass
+@fory_tag("test.codec/ListMsg")
+class ListMsg:
+    items: list[str] = field(default_factory=list)
+    values: list[int] = field(default_factory=list)
+
+
+@dataclass
+@fory_tag("test.codec/OptMsg")
+class OptMsg:
+    required: str = ""
+    optional_str: Optional[str] = None
+    optional_int: Optional[int] = None
+
+
+@dataclass
+class UntaggedMsg:
+    """A type WITHOUT @fory_tag — should fail XLANG registration."""
+
+    data: str = ""
+
+
+@dataclass
+@fory_tag("test.codec/LargeMsg")
+class LargeMsg:
+    """A type that can produce payloads larger than the compression threshold."""
+
+    payload: str = ""
+
+
+# ── @fory_tag decorator tests ───────────────────────────────────────────────
+
+
+class TestForyTagDecorator:
+    def test_tag_with_namespace(self):
+        assert SimpleMsg.__fory_tag__ == "test.codec/SimpleMsg"
+        assert SimpleMsg.__fory_namespace__ == "test.codec"
+        assert SimpleMsg.__fory_typename__ == "SimpleMsg"
+
+    def test_tag_without_namespace(self):
+        @fory_tag("PlainTag")
+        @dataclass
+        class Plain:
+            x: int = 0
+
+        assert Plain.__fory_tag__ == "PlainTag"
+        assert Plain.__fory_namespace__ == ""
+        assert Plain.__fory_typename__ == "PlainTag"
+
+    def test_tag_with_deep_namespace(self):
+        @fory_tag("com.example.deep/MyType")
+        @dataclass
+        class Deep:
+            x: int = 0
+
+        assert Deep.__fory_namespace__ == "com.example.deep"
+        assert Deep.__fory_typename__ == "MyType"
+
+    def test_tag_with_multiple_slashes(self):
+        """Only the last / is used for splitting."""
+
+        @fory_tag("a/b/c/TypeName")
+        @dataclass
+        class Multi:
+            x: int = 0
+
+        assert Multi.__fory_namespace__ == "a/b/c"
+        assert Multi.__fory_typename__ == "TypeName"
+
+
+# ── Type graph walking tests ────────────────────────────────────────────────
+
+
+class TestTypeGraphWalking:
+    def test_simple_type(self):
+        types = _walk_type_graph([SimpleMsg])
+        assert SimpleMsg in types
+
+    def test_nested_types_dependency_order(self):
+        """Nested types appear before their parents (leaves first)."""
+        types = _walk_type_graph([OuterMsg])
+        assert InnerMsg in types
+        assert OuterMsg in types
+        idx_inner = types.index(InnerMsg)
+        idx_outer = types.index(OuterMsg)
+        assert idx_inner < idx_outer, "InnerMsg should come before OuterMsg"
+
+    def test_deduplication(self):
+        """Same type is not listed twice."""
+        types = _walk_type_graph([SimpleMsg, SimpleMsg])
+        assert types.count(SimpleMsg) == 1
+
+    def test_primitives_excluded(self):
+        """Primitive types (str, int, etc.) are not included."""
+        types = _walk_type_graph([SimpleMsg])
+        assert int not in types
+        assert str not in types
+        assert bool not in types
+
+    def test_list_types_excluded(self):
+        """Generic container types are not included, but their dataclass args are."""
+        types = _walk_type_graph([ListMsg])
+        assert ListMsg in types
+        # str and int are primitives, shouldn't be in the list
+        assert len([t for t in types if t is ListMsg]) == 1
+
+    def test_optional_types_unwrapped(self):
+        """Optional[X] is unwrapped to find the inner type."""
+        types = _walk_type_graph([OptMsg])
+        assert OptMsg in types
+
+
+class TestXlangTagValidation:
+    def test_tagged_types_pass(self):
+        """Tagged types pass validation without error."""
+        _validate_xlang_tags([SimpleMsg, InnerMsg])
+
+    def test_untagged_type_raises(self):
+        """Untagged dataclass raises TypeError."""
+        with pytest.raises(TypeError, match="UntaggedMsg"):
+            _validate_xlang_tags([UntaggedMsg])
+
+    def test_mixed_tagged_untagged_raises(self):
+        """If any type is untagged, validation fails."""
+        with pytest.raises(TypeError, match="UntaggedMsg"):
+            _validate_xlang_tags([SimpleMsg, UntaggedMsg])
+
+
+# ── ForyCodec initialization tests ──────────────────────────────────────────
+
+
+class TestForyCodecInit:
+    def test_xlang_mode_creation(self):
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[SimpleMsg])
+        assert codec.mode == SerializationMode.XLANG
+
+    def test_native_mode_creation(self):
+        codec = ForyCodec(mode=SerializationMode.NATIVE, types=[SimpleMsg])
+        assert codec.mode == SerializationMode.NATIVE
+
+    def test_row_mode_creation(self):
+        codec = ForyCodec(mode=SerializationMode.ROW, types=[SimpleMsg])
+        assert codec.mode == SerializationMode.ROW
+
+    def test_no_types(self):
+        """Codec can be created with no user types (framework-internal only)."""
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[])
+        assert len(codec.registered_types) > 0  # internal types
+
+    def test_untagged_type_xlang_raises(self):
+        """Creating an XLANG codec with untagged types raises TypeError."""
+        with pytest.raises(TypeError, match="UntaggedMsg"):
+            ForyCodec(mode=SerializationMode.XLANG, types=[UntaggedMsg])
+
+    def test_untagged_type_native_ok(self):
+        """NATIVE mode does not require tags."""
+        # UntaggedMsg has no tag, but NATIVE should still work
+        codec = ForyCodec(mode=SerializationMode.NATIVE, types=[UntaggedMsg])
+        assert codec.mode == SerializationMode.NATIVE
+
+    def test_framework_internal_types_registered(self):
+        """StreamHeader, CallHeader, RpcStatus are always registered."""
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[])
+        registered = codec.registered_types
+        assert StreamHeader in registered
+        assert CallHeader in registered
+        assert RpcStatus in registered
+
+    def test_nested_types_auto_discovered(self):
+        """Nested types are automatically discovered and registered."""
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[OuterMsg])
+        registered = codec.registered_types
+        assert InnerMsg in registered
+        assert OuterMsg in registered
+
+    def test_custom_compression_threshold(self):
+        codec = ForyCodec(
+            mode=SerializationMode.XLANG,
+            types=[SimpleMsg],
+            compression_threshold=1024,
+        )
+        assert codec.compression_threshold == 1024
+
+    def test_compression_disabled(self):
+        codec = ForyCodec(
+            mode=SerializationMode.XLANG,
+            types=[SimpleMsg],
+            compression_threshold=-1,
+        )
+        assert codec.compression_threshold == -1
+
+
+# ── XLANG round-trip tests ──────────────────────────────────────────────────
+
+
+class TestXlangRoundTrip:
+    def test_simple_round_trip(self):
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[SimpleMsg])
+        original = SimpleMsg(name="hello", value=42, active=True)
+        data = codec.encode(original)
+        assert isinstance(data, bytes)
+        assert len(data) > 0
+        restored = codec.decode(data, SimpleMsg)
+        assert restored.name == original.name
+        assert restored.value == original.value
+        assert restored.active == original.active
+
+    def test_nested_round_trip(self):
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[OuterMsg])
+        original = OuterMsg(
+            title="outer",
+            inner=InnerMsg(label="inner", score=99),
+            count=7,
+        )
+        data = codec.encode(original)
+        restored = codec.decode(data, OuterMsg)
+        assert restored.title == original.title
+        assert restored.inner.label == original.inner.label
+        assert restored.inner.score == original.inner.score
+        assert restored.count == original.count
+
+    def test_list_round_trip(self):
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[ListMsg])
+        original = ListMsg(items=["a", "b", "c"], values=[1, 2, 3])
+        data = codec.encode(original)
+        restored = codec.decode(data, ListMsg)
+        assert restored.items == original.items
+        assert restored.values == original.values
+
+    def test_optional_present_round_trip(self):
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[OptMsg])
+        original = OptMsg(required="req", optional_str="opt", optional_int=42)
+        data = codec.encode(original)
+        restored = codec.decode(data, OptMsg)
+        assert restored.required == original.required
+        assert restored.optional_str == original.optional_str
+        assert restored.optional_int == original.optional_int
+
+    def test_optional_none_round_trip(self):
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[OptMsg])
+        original = OptMsg(required="req", optional_str=None, optional_int=None)
+        data = codec.encode(original)
+        restored = codec.decode(data, OptMsg)
+        assert restored.required == original.required
+        assert restored.optional_str is None
+        assert restored.optional_int is None
+
+    def test_framework_types_round_trip(self):
+        """Framework-internal types (StreamHeader, RpcStatus) round-trip."""
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[])
+        header = StreamHeader(
+            service="TestSvc",
+            method="do_thing",
+            version=1,
+            contract_id="abc123",
+            call_id="call-1",
+            deadline_epoch_ms=1712000000000,
+            serialization_mode=0,
+            metadata_keys=["k1"],
+            metadata_values=["v1"],
+        )
+        data = codec.encode(header)
+        restored = codec.decode(data, StreamHeader)
+        assert restored.service == header.service
+        assert restored.method == header.method
+        assert restored.version == header.version
+        assert restored.metadata_keys == header.metadata_keys
+
+    def test_rpc_status_round_trip(self):
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[])
+        status = RpcStatus(
+            code=StatusCode.INTERNAL,
+            message="something broke",
+            detail_keys=["trace"],
+            detail_values=["abc"],
+        )
+        data = codec.encode(status)
+        restored = codec.decode(data, RpcStatus)
+        assert restored.code == StatusCode.INTERNAL
+        assert restored.message == "something broke"
+
+    def test_determinism(self):
+        """Same object encodes to identical bytes."""
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[SimpleMsg])
+        msg = SimpleMsg(name="det", value=7, active=True)
+        b1 = codec.encode(msg)
+        b2 = codec.encode(msg)
+        assert b1 == b2
+
+    def test_expected_type_mismatch_raises(self):
+        """Decoding with wrong expected_type raises TypeError."""
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[SimpleMsg])
+        msg = SimpleMsg(name="test", value=1, active=False)
+        data = codec.encode(msg)
+        with pytest.raises(TypeError, match="Expected RpcStatus"):
+            codec.decode(data, RpcStatus)
+
+
+# ── NATIVE round-trip tests ─────────────────────────────────────────────────
+
+
+class TestNativeRoundTrip:
+    def test_simple_native_round_trip(self):
+        codec = ForyCodec(mode=SerializationMode.NATIVE, types=[SimpleMsg])
+        original = SimpleMsg(name="native", value=100, active=True)
+        data = codec.encode(original)
+        assert isinstance(data, bytes)
+        restored = codec.decode(data, SimpleMsg)
+        assert restored.name == original.name
+        assert restored.value == original.value
+
+    def test_untagged_native_round_trip(self):
+        """NATIVE mode works with untagged types."""
+        codec = ForyCodec(mode=SerializationMode.NATIVE, types=[UntaggedMsg])
+        original = UntaggedMsg(data="native-untagged")
+        data = codec.encode(original)
+        restored = codec.decode(data, UntaggedMsg)
+        assert restored.data == original.data
+
+    def test_nested_native_round_trip(self):
+        codec = ForyCodec(mode=SerializationMode.NATIVE, types=[OuterMsg])
+        original = OuterMsg(
+            title="native-outer",
+            inner=InnerMsg(label="native-inner", score=50),
+            count=3,
+        )
+        data = codec.encode(original)
+        restored = codec.decode(data, OuterMsg)
+        assert restored.title == original.title
+        assert restored.inner.label == original.inner.label
+
+
+# ── ROW mode tests ──────────────────────────────────────────────────────────
+
+
+class TestRowMode:
+    def test_row_codec_creation(self):
+        """ROW mode codec can be created."""
+        codec = ForyCodec(mode=SerializationMode.ROW, types=[SimpleMsg])
+        assert codec.mode == SerializationMode.ROW
+
+    def test_row_round_trip(self):
+        """ROW mode falls back to standard serialization for round-trip."""
+        codec = ForyCodec(mode=SerializationMode.ROW, types=[SimpleMsg])
+        original = SimpleMsg(name="row", value=42, active=True)
+        data = codec.encode(original)
+        restored = codec.decode(data, SimpleMsg)
+        assert restored.name == original.name
+        assert restored.value == original.value
+
+    def test_encode_row_schema(self):
+        """encode_row_schema produces bytes in ROW mode."""
+        codec = ForyCodec(mode=SerializationMode.ROW, types=[SimpleMsg])
+        schema = codec.encode_row_schema()
+        assert isinstance(schema, bytes)
+        assert len(schema) > 0
+
+    def test_encode_row_schema_wrong_mode_raises(self):
+        """encode_row_schema raises ValueError if not in ROW mode."""
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[SimpleMsg])
+        with pytest.raises(ValueError, match="ROW mode"):
+            codec.encode_row_schema()
+
+
+# ── Compression round-trip tests ────────────────────────────────────────────
+
+
+class TestCompressionRoundTrip:
+    def test_small_payload_not_compressed(self):
+        """Payloads below threshold are not compressed."""
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[SimpleMsg])
+        msg = SimpleMsg(name="small", value=1, active=True)
+        data, compressed = codec.encode_compressed(msg)
+        assert not compressed
+        # Should still be decodable
+        restored = codec.decode_compressed(data, compressed, SimpleMsg)
+        assert restored.name == "small"
+
+    def test_large_payload_compressed(self):
+        """Payloads above threshold are compressed."""
+        codec = ForyCodec(
+            mode=SerializationMode.XLANG,
+            types=[LargeMsg],
+            compression_threshold=100,  # Low threshold to trigger compression
+        )
+        msg = LargeMsg(payload="x" * 10_000)
+        data, compressed = codec.encode_compressed(msg)
+        assert compressed
+        # Compressed data should be smaller than raw
+        raw = codec.encode(msg)
+        assert len(data) < len(raw)
+
+    def test_compression_round_trip(self):
+        """Compressed data decompresses and deserializes correctly."""
+        codec = ForyCodec(
+            mode=SerializationMode.XLANG,
+            types=[LargeMsg],
+            compression_threshold=100,
+        )
+        msg = LargeMsg(payload="y" * 10_000)
+        data, compressed = codec.encode_compressed(msg)
+        assert compressed
+        restored = codec.decode_compressed(data, compressed, LargeMsg)
+        assert restored.payload == msg.payload
+
+    def test_compression_disabled(self):
+        """With threshold=-1, compression is never applied."""
+        codec = ForyCodec(
+            mode=SerializationMode.XLANG,
+            types=[LargeMsg],
+            compression_threshold=-1,
+        )
+        msg = LargeMsg(payload="z" * 10_000)
+        data, compressed = codec.encode_compressed(msg)
+        assert not compressed
+
+    def test_raw_compress_decompress(self):
+        """Raw compress/decompress methods work correctly."""
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[])
+        original = b"hello world " * 1000
+        compressed = codec.compress(original)
+        assert len(compressed) < len(original)
+        decompressed = codec.decompress(compressed)
+        assert decompressed == original
+
+    def test_default_threshold(self):
+        assert DEFAULT_COMPRESSION_THRESHOLD == 4096
+
+
+# ── Registration error tests ───────────────────────────────────────────────
+
+
+class TestRegistrationErrors:
+    def test_untagged_type_xlang_raises_at_init(self):
+        """Creating XLANG codec with untagged type raises TypeError immediately."""
+        with pytest.raises(TypeError, match="has no @fory_tag"):
+            ForyCodec(mode=SerializationMode.XLANG, types=[UntaggedMsg])
+
+    def test_untagged_nested_type_xlang_raises(self):
+        """An untagged type discovered via type graph walking raises TypeError."""
+
+        @dataclass
+        @fory_tag("test.codec/WrapperMsg")
+        class WrapperMsg:
+            inner: UntaggedMsg = field(default_factory=UntaggedMsg)
+
+        with pytest.raises(TypeError, match="UntaggedMsg"):
+            ForyCodec(mode=SerializationMode.XLANG, types=[WrapperMsg])
