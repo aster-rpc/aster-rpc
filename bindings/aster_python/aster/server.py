@@ -25,7 +25,6 @@ from aster_python.aster.framing import HEADER, TRAILER, COMPRESSED, write_frame,
 from aster_python.aster.protocol import StreamHeader, RpcStatus
 from aster_python.aster.status import StatusCode, RpcError
 from aster_python.aster.types import SerializationMode
-from aster_python.aster.transport.base import BidiChannel, TransportError
 from aster_python.aster.service import ServiceRegistry, ServiceInfo, MethodInfo
 
 if TYPE_CHECKING:
@@ -69,6 +68,8 @@ class ConnectionContext:
     stream_tasks: set[asyncio.Task] = field(default_factory=set)
     draining: bool = False
     _closed: bool = field(default=False, repr=False)
+
+    __hash__ = object.__hash__
 
 
 # ── Server ──────────────────────────────────────────────────────────────────
@@ -122,6 +123,7 @@ class Server:
         )
         self._interceptors = list(interceptors) if interceptors else []
         self._max_concurrent_streams = max_concurrent_streams
+        self._service_instances: dict[tuple[str, int], Any] = {}
 
         # Set up service registry
         if registry is not None:
@@ -131,7 +133,10 @@ class Server:
         elif services:
             self._registry = ServiceRegistry()
             for svc in services:
-                self._registry.register(svc)
+                service_class = svc if inspect.isclass(svc) else type(svc)
+                info = self._registry.register(service_class)
+                if not inspect.isclass(svc):
+                    self._service_instances[(info.name, info.version)] = svc
         else:
             self._registry = ServiceRegistry()
 
@@ -143,6 +148,14 @@ class Server:
         self._serving = False
         self._serve_task: asyncio.Task | None = None
         self._shutdown_event = asyncio.Event()
+
+        for service_info in self._registry.get_all_services():
+            key = (service_info.name, service_info.version)
+            if key not in self._service_instances:
+                raise ServerError(
+                    f"No implementation instance provided for service "
+                    f"{service_info.name} v{service_info.version}"
+                )
 
     @property
     def registry(self) -> ServiceRegistry:
@@ -163,6 +176,7 @@ class Server:
             raise ServerError("server is already serving")
 
         self._serving = True
+        self._serve_task = asyncio.current_task()
         self._shutdown_event.clear()
 
         logger.info("Server starting on %s", self._endpoint.endpoint_id())
@@ -187,12 +201,16 @@ class Server:
                     conn_ctx.connection_task = task
                     
                 except Exception as e:
+                    if not self._serving:
+                        break
                     if self._serving:
                         logger.error("Error accepting connection: %s", e)
                     continue
 
         finally:
             self._serving = False
+            self._serve_task = None
+            self._shutdown_event.set()
 
     async def _handle_connection(self, ctx: ConnectionContext) -> None:
         """Handle a single client connection.
@@ -357,10 +375,26 @@ class Server:
         For session-scoped services, this would create a new instance per stream.
         For shared services, we need to track registered instances.
         """
-        # For now, we assume service classes are registered with instances
-        # In a full implementation, we'd track instances separately
-        # This is a placeholder that looks up from the registry
-        return None
+        key = (service_info.name, service_info.version)
+        handler = self._service_instances.get(key)
+        if handler is None:
+            raise ServiceNotFoundError(
+                f"No implementation registered for service {service_info.name} v{service_info.version}"
+            )
+        return handler
+
+    async def _decode_request_frame(
+        self,
+        recv: Any,
+        expected_type: type | None,
+    ) -> tuple[Any, int] | tuple[None, None]:
+        frame = await read_frame(recv)
+        if frame is None:
+            return None, None
+        payload, flags = frame
+        compressed = bool(flags & COMPRESSED)
+        request = self._codec.decode_compressed(payload, compressed, expected_type)
+        return request, flags
 
     async def _handle_unary(
         self,
@@ -373,19 +407,13 @@ class Server:
         """Handle a unary RPC call."""
         try:
             # Read the request frame
-            frame = await read_frame(recv)
-            if frame is None:
+            request, flags = await self._decode_request_frame(recv, method_info.request_type)
+            if request is None:
                 await self._write_error_trailer(send, StatusCode.UNAVAILABLE, "Stream ended")
                 return
-
-            payload, flags = frame
             if flags & TRAILER:
                 await self._write_error_trailer(send, StatusCode.UNAVAILABLE, "Unexpected trailer")
                 return
-
-            # Decode request
-            compressed = bool(flags & COMPRESSED)
-            request = self._codec.decode_compressed(payload, compressed, method_info.request_type)
 
             # Invoke handler
             response = handler_method(request)
@@ -421,19 +449,13 @@ class Server:
         """Handle a server-streaming RPC call."""
         try:
             # Read the request frame
-            frame = await read_frame(recv)
-            if frame is None:
+            request, flags = await self._decode_request_frame(recv, method_info.request_type)
+            if request is None:
                 await self._write_error_trailer(send, StatusCode.UNAVAILABLE, "Stream ended")
                 return
-
-            payload, flags = frame
             if flags & TRAILER:
                 await self._write_error_trailer(send, StatusCode.UNAVAILABLE, "Unexpected trailer")
                 return
-
-            # Decode request
-            compressed = bool(flags & COMPRESSED)
-            request = self._codec.decode_compressed(payload, compressed, method_info.request_type)
 
             # Invoke handler (async generator)
             response_iter = handler_method(request)
@@ -470,13 +492,9 @@ class Server:
         try:
             # Collect all request frames until trailer or stream end
             requests: list[Any] = []
-            
-            while True:
-                try:
-                    frame = await read_frame(recv)
-                except Exception:
-                    break
 
+            while True:
+                frame = await read_frame(recv)
                 if frame is None:
                     break
 
@@ -488,11 +506,13 @@ class Server:
                 request = self._codec.decode_compressed(payload, compressed, method_info.request_type)
                 requests.append(request)
 
-            # Invoke handler with collected requests
-            if asyncio.iscoroutinefunction(handler_method):
-                response = await handler_method(requests)
-            else:
-                response = handler_method(requests)
+            async def request_iter() -> AsyncIterator[Any]:
+                for item in requests:
+                    yield item
+
+            response = handler_method(request_iter())
+            if asyncio.iscoroutine(response):
+                response = await response
 
             # Encode and write response
             response_payload, response_compressed = self._codec.encode_compressed(response)
@@ -521,14 +541,24 @@ class Server:
     ) -> None:
         """Handle a bidirectional-streaming RPC call."""
         try:
+            request_queue: asyncio.Queue[Any] = asyncio.Queue()
+            request_done = asyncio.Event()
+
+            async def request_iter() -> AsyncIterator[Any]:
+                while True:
+                    item = await request_queue.get()
+                    if item is _BIDI_EOF:
+                        break
+                    yield item
+
             # Invoke handler (async generator)
-            response_iter = handler_method(None)  # Bidi handlers don't receive requests directly
+            response_iter = handler_method(request_iter())
             if asyncio.iscoroutine(response_iter):
                 response_iter = await response_iter
 
             # Start reader task
             reader_task = asyncio.create_task(
-                self._bidi_reader(send, recv, response_iter)
+                self._bidi_reader(recv, method_info.request_type, request_queue, request_done)
             )
 
             # Stream responses from handler
@@ -542,11 +572,7 @@ class Server:
             await send.finish()
 
             # Wait for reader to finish
-            try:
-                await reader_task
-            except asyncio.CancelledError:
-                reader_task.cancel()
-                raise
+            await reader_task
 
         except asyncio.CancelledError:
             raise
@@ -558,11 +584,12 @@ class Server:
 
     async def _bidi_reader(
         self,
-        send: Any,
         recv: Any,
-        response_iter: AsyncIterator,
+        request_type: type | None,
+        request_queue: asyncio.Queue[Any],
+        request_done: asyncio.Event,
     ) -> None:
-        """Read frames from bidi stream (for future client-sent messages)."""
+        """Read inbound bidi request frames and feed the handler iterator."""
         try:
             while True:
                 frame = await read_frame(recv)
@@ -573,15 +600,17 @@ class Server:
                 if flags & TRAILER:
                     break
 
-                # For now, we don't process client messages in the handler
-                # This would be used for full duplex where handler receives messages
                 compressed = bool(flags & COMPRESSED)
-                # Could pass this to response_iter if supported
+                request = self._codec.decode_compressed(payload, compressed, request_type)
+                await request_queue.put(request)
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.debug("Bidi reader error: %s", e)
+        finally:
+            await request_queue.put(_BIDI_EOF)
+            request_done.set()
 
     async def _write_ok_trailer(self, send: Any) -> None:
         """Write an OK status trailer."""
@@ -667,9 +696,17 @@ class Server:
                     pass
             self._connections.clear()
 
+        try:
+            await self._endpoint.close()
+        except Exception:
+            pass
+
         self._shutdown_event.set()
         logger.info("Server closed")
 
     async def wait_until_stopped(self) -> None:
         """Wait until the server is stopped."""
         await self._shutdown_event.wait()
+
+
+_BIDI_EOF = object()

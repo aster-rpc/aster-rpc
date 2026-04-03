@@ -12,8 +12,20 @@ For each step we need to make sure the code passes tests and linting.
 
 Pre-requisites complete. Phase 1–4 substantially implemented and checked off (Phase 4 previously had unchecked boxes despite existing code — fixed).
 
-**📌 Additional note from follow-up verification:**
-- The checklist below is stale for later phases: Phase 5 and Phase 6 contain unchecked boxes even though substantial code and tests now exist and pass locally. However, the high-level `Server` implementation still appears incomplete for real handler dispatch (`_get_handler_for_service()` currently returns `None`), so those phases should be re-reviewed rather than blindly checked off.
+Phase 5 has now been re-reviewed and updated. The previous `Server` gap called out in follow-up verification was real: `_get_handler_for_service()` was still a stub returning `None`. That has now been fixed, and the server now tracks registered implementation instances, dispatches handlers across unary/server-stream/client-stream/bidi patterns, and supports graceful drain/close behavior.
+
+Phase 6 is now implemented and verified. Client stub generation supports all four RPC patterns, `create_client()` can build from either an `IrohConnection` or an injected `Transport`, `create_local_client()` builds wire-compatible local stubs, and per-call metadata/timeout overrides propagate through generated methods into transport calls.
+
+Verification completed with uv:
+- `uv run pytest tests/python/test_aster_server.py tests/python/test_aster_transport.py -q` → **62 passed**
+- `ruff check bindings/aster_python/aster/server.py tests/python/test_aster_server.py tests/python/test_aster_transport.py ffi_spec/ASTER_PLAN_CHECKLIST.md` → **All checks passed**
+
+Phase 6 verification completed with uv:
+- `uv run ruff check bindings/aster_python/aster/client.py tests/python/test_aster_server.py tests/python/test_aster_transport.py ffi_spec/ASTER_PLAN_CHECKLIST.md` → **All checks passed**
+- `uv run pytest tests/python/test_aster_server.py tests/python/test_aster_transport.py -q` → **67 passed**
+
+Outstanding issue / blocker:
+- None for Phase 6 at this time.
 
 ## Pre-Requisites
 
@@ -112,41 +124,41 @@ Pre-requisites complete. Phase 1–4 substantially implemented and checked off (
 
 ## Phase 5: Server Implementation
 
-- [ ] Create `aster/server.py` — `Server.__init__(endpoint, services, interceptors)`
-- [ ] Implement connection accept loop (per-connection task spawning)
-- [ ] Implement stream dispatch (read `StreamHeader`, validate, route)
-- [ ] Implement unary dispatch (read request → call handler → write response)
-- [ ] Implement server-stream dispatch (read request → iterate handler → write frames + trailer)
-- [ ] Implement client-stream dispatch (read frames until finish → call handler → write response)
-- [ ] Implement bidi-stream dispatch (concurrent read/write tasks)
-- [ ] Implement `Server.drain(grace_period)` for graceful shutdown
-- [ ] Implement error handling (handler exceptions → RpcStatus trailer)
-- [ ] Implement unknown service/method → `UNIMPLEMENTED` status
-- [ ] Tests: echo service (unary)
-- [ ] Tests: counter service (server-stream)
-- [ ] Tests: aggregation service (client-stream)
-- [ ] Tests: bidi echo service
-- [ ] Tests: handler exception → proper trailer
-- [ ] Tests: graceful shutdown
+- [x] Create `aster/server.py` — `Server.__init__(endpoint, services, interceptors)`
+- [x] Implement connection accept loop (per-connection task spawning)
+- [x] Implement stream dispatch (read `StreamHeader`, validate, route)
+- [x] Implement unary dispatch (read request → call handler → write response)
+- [x] Implement server-stream dispatch (read request → iterate handler → write frames + trailer)
+- [x] Implement client-stream dispatch (read frames until finish → call handler → write response)
+- [x] Implement bidi-stream dispatch (concurrent read/write tasks)
+- [x] Implement `Server.drain(grace_period)` for graceful shutdown
+- [x] Implement error handling (handler exceptions → RpcStatus trailer)
+- [x] Implement unknown service/method → `UNIMPLEMENTED` status
+- [x] Tests: echo service (unary)
+- [x] Tests: counter service (server-stream)
+- [x] Tests: aggregation service (client-stream)
+- [x] Tests: bidi echo service
+- [x] Tests: handler exception → proper trailer
+- [x] Tests: graceful shutdown
 
 ---
 
 ## Phase 6: Client Stub Generation
 
-- [ ] Create `aster/client.py` — stub class generation from `ServiceInfo`
-- [ ] Implement `create_client(service_class, connection, transport, interceptors)`
-- [ ] Implement `create_local_client(service_class, implementation, wire_compatible, interceptors)`
-- [ ] Implement per-call metadata override
-- [ ] Implement per-call timeout override
-- [ ] Implement unary stub method
-- [ ] Implement server-stream stub method (async iterator)
-- [ ] Implement client-stream stub method
-- [ ] Implement bidi-stream stub method (async context manager)
-- [ ] Tests: client ↔ server unary round-trip
-- [ ] Tests: client ↔ server streaming round-trip
-- [ ] Tests: local client round-trip
-- [ ] Tests: metadata and timeout propagate to `StreamHeader`
-- [ ] Tests: `wire_compatible=True` catches serialization issues
+- [x] Create `aster/client.py` — stub class generation from `ServiceInfo`
+- [x] Implement `create_client(service_class, connection, transport, interceptors)`
+- [x] Implement `create_local_client(service_class, implementation, wire_compatible, interceptors)`
+- [x] Implement per-call metadata override
+- [x] Implement per-call timeout override
+- [x] Implement unary stub method
+- [x] Implement server-stream stub method (async iterator)
+- [x] Implement client-stream stub method
+- [x] Implement bidi-stream stub method (async context manager)
+- [x] Tests: client ↔ server unary round-trip
+- [x] Tests: client ↔ server streaming round-trip
+- [x] Tests: local client round-trip
+- [x] Tests: metadata and timeout propagate to `StreamHeader`
+- [x] Tests: `wire_compatible=True` catches serialization issues
 
 ---
 
@@ -275,7 +287,7 @@ Pre-requisites complete. Phase 1–4 substantially implemented and checked off (
 | Milestone | Phases | Description | Status |
 |-----------|--------|-------------|--------|
 | **Pre-requisites validated** | — | Python 3.13, pyfory determinism confirmed | ✅ Done |
-| **Minimal viable RPC** | 1–6 | Unary + streaming RPCs working end-to-end | 🟡 Phase 2 complete |
+| **Minimal viable RPC** | 1–6 | Unary + streaming RPCs working end-to-end | ✅ Done |
 | **Production-ready RPC** | 1–7 | + interceptors (deadline, auth, retry, circuit breaker) | ⬜ Not started |
 | **Session support** | 8 | Session-scoped services with CALL/CANCEL frames | ⬜ Not started |
 | **Contract identity** | 9 | Content-addressed contracts via BLAKE3 Merkle DAG | ⬜ Not started |

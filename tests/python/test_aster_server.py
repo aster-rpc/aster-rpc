@@ -12,8 +12,7 @@ Tests cover:
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import AsyncIterator
 
 import pytest
@@ -29,7 +28,6 @@ from aster_python.aster.decorators import (
     bidi_stream,
 )
 from aster_python.aster.server import (
-    Server,
     ServerError,
     ServiceNotFoundError,
     MethodNotFoundError,
@@ -41,6 +39,7 @@ from aster_python.aster.client import (
     ClientError,
 )
 from aster_python.aster.transport.local import LocalTransport
+from aster_python.aster.transport.base import BidiChannel
 
 
 # ── Test types ───────────────────────────────────────────────────────────────
@@ -284,6 +283,50 @@ class TestClientCreation:
         assert hasattr(client, "sum")
         assert hasattr(client, "echo_bidi")
 
+    def test_create_client_requires_connection_or_transport(self):
+        with pytest.raises(ClientError, match="either connection or transport"):
+            create_client(TestEchoService)
+
+    def test_create_client_accepts_injected_transport(self):
+        class CaptureTransport:
+            async def unary(self, *args, **kwargs):
+                return EchoResponse(message="captured")
+
+            def server_stream(self, *args, **kwargs):
+                async def gen():
+                    if False:
+                        yield None
+                return gen()
+
+            async def client_stream(self, *args, **kwargs):
+                return AggregateResponse()
+
+            def bidi_stream(self, *args, **kwargs):
+                class DummyChannel(BidiChannel):
+                    async def send(self, msg):
+                        return None
+
+                    async def recv(self):
+                        raise RuntimeError("unused")
+
+                    async def close(self):
+                        return None
+
+                    async def wait_for_trailer(self):
+                        return StatusCode.OK, ""
+
+                return DummyChannel()
+
+            async def close(self):
+                return None
+
+        client = create_client(
+            TestEchoService,
+            transport=CaptureTransport(),
+        )
+        assert isinstance(client, ServiceClient)
+        assert client.service_name == "TestEchoService"
+
 
 # ── Local client round-trip tests ───────────────────────────────────────────
 
@@ -339,6 +382,110 @@ class TestLocalClientRoundTrip:
         
         assert exc_info.value.code == StatusCode.INVALID_ARGUMENT
         assert "bad message" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_client_close_delegates_to_transport(self):
+        client = create_local_client(
+            TestEchoService,
+            TestEchoService(),
+            wire_compatible=True,
+        )
+        await client.close()
+
+
+class TestClientCallOverrides:
+    """Test metadata/timeout propagation from generated client stubs."""
+
+    @pytest.mark.asyncio
+    async def test_unary_metadata_and_timeout_propagate(self):
+        captured: dict[str, object] = {}
+
+        class CaptureTransport:
+            async def unary(
+                self,
+                service,
+                method,
+                request,
+                *,
+                metadata=None,
+                deadline_epoch_ms=0,
+                serialization_mode=0,
+                contract_id="",
+            ):
+                captured.update(
+                    service=service,
+                    method=method,
+                    request=request,
+                    metadata=metadata,
+                    deadline_epoch_ms=deadline_epoch_ms,
+                    serialization_mode=serialization_mode,
+                    contract_id=contract_id,
+                )
+                return EchoResponse(message="ok")
+
+            def server_stream(self, *args, **kwargs):
+                raise AssertionError("unexpected")
+
+            async def client_stream(self, *args, **kwargs):
+                raise AssertionError("unexpected")
+
+            def bidi_stream(self, *args, **kwargs):
+                raise AssertionError("unexpected")
+
+            async def close(self):
+                return None
+
+        client = create_client(TestEchoService, transport=CaptureTransport())
+        request = EchoRequest(message="hello")
+        response = await client.echo(
+            request,
+            metadata={"trace_id": "abc123"},
+            timeout=5.0,
+        )
+
+        assert response.message == "ok"
+        assert captured["service"] == "TestEchoService"
+        assert captured["method"] == "echo"
+        assert captured["request"] is request
+        assert captured["metadata"] == {"trace_id": "abc123"}
+        assert captured["deadline_epoch_ms"] > 0
+        assert captured["serialization_mode"] == SerializationMode.XLANG.value
+        assert captured["contract_id"] == ""
+
+    def test_bidi_stub_returns_channel(self):
+        class DummyChannel(BidiChannel):
+            async def send(self, msg):
+                return None
+
+            async def recv(self):
+                raise RuntimeError("unused")
+
+            async def close(self):
+                return None
+
+            async def wait_for_trailer(self):
+                return StatusCode.OK, ""
+
+        channel = DummyChannel()
+
+        class CaptureTransport:
+            async def unary(self, *args, **kwargs):
+                raise AssertionError("unexpected")
+
+            def server_stream(self, *args, **kwargs):
+                raise AssertionError("unexpected")
+
+            async def client_stream(self, *args, **kwargs):
+                raise AssertionError("unexpected")
+
+            def bidi_stream(self, *args, **kwargs):
+                return channel
+
+            async def close(self):
+                return None
+
+        client = create_client(TestStreamService, transport=CaptureTransport())
+        assert client.echo_bidi(metadata={"trace_id": "bidi"}, timeout=1.0) is channel
 
 
 class TestServerStreaming:
