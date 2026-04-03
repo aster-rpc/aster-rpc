@@ -1,13 +1,14 @@
-"""Phase 4: Gossip protocol tests — interoperable with Iroh docs chat example.
+"""Phase 4: Gossip protocol tests.
 
-Message format matches https://docs.iroh.computer/examples/chat:
-    {
-        "body": {"AboutMe": {"from": "<EndpointId>", "name": "..."}}
-              | {"Message": {"from": "<EndpointId>", "text": "..."}},
-        "nonce": [<16 random u8 values>]
-    }
+These tests verify that two Python nodes can exchange raw bytes over
+iroh-gossip and handle the basic event lifecycle (neighbor up/down,
+broadcast, receive, lag).
 
-Serialized as JSON via serde_json on the Rust side.
+Note: iroh-gossip's upstream chat example uses signed, postcard-encoded
+messages (a Rust-specific binary serializer). Python clients are not
+expected to be wire-compatible with that format. Instead, we test raw
+byte exchange and the JSON-based application-layer protocol that this
+repository's own gossip_chat.py example uses.
 """
 import asyncio
 import json
@@ -105,11 +106,12 @@ async def test_gossip_broadcast_recv(node_pair):
 
 @pytest.mark.asyncio
 async def test_gossip_chat_interop(node_pair):
-    """Two-node gossip using the Iroh docs chat-example JSON message format.
+    """Two-node gossip using a JSON application-layer protocol.
 
     This test verifies that messages encoded in the same JSON schema used
-    by the Rust chat example (https://docs.iroh.computer/examples/chat)
-    can be sent and received correctly, ensuring wire-level interoperability.
+    by this repository's gossip_chat.py example can be sent and received
+    correctly over iroh-gossip. The upstream Rust chat example uses a
+    different (postcard) binary format and is not wire-compatible.
     """
     node1, node2 = node_pair
     g1 = gossip_client(node1)
@@ -166,7 +168,7 @@ async def test_gossip_chat_interop(node_pair):
 
 @pytest.mark.asyncio
 async def test_gossip_bidirectional_chat(node_pair):
-    """Both nodes exchange chat messages in the Iroh-compatible JSON format."""
+    """Both nodes exchange chat messages using the JSON application-layer format."""
     node1, node2 = node_pair
     g1 = gossip_client(node1)
     g2 = gossip_client(node2)
