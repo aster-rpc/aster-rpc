@@ -404,6 +404,7 @@ class IrohBidiChannel(BidiChannel):
     """BidiChannel implementation for Iroh QUIC streams.
 
     Manages a bidirectional stream for bidirectional or client-streaming RPCs.
+    Supports the async context manager protocol for convenient resource management.
     """
 
     def __init__(
@@ -431,6 +432,20 @@ class IrohBidiChannel(BidiChannel):
         self._closed = False
         self._trailer_read = False
         self._last_trailer: tuple[int, str] | None = None
+
+    async def __aenter__(self) -> "IrohBidiChannel":
+        """Enter the async context manager, opening the stream."""
+        await self._ensure_stream()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Exit the async context manager, closing the stream."""
+        await self.close()
+        if self._last_trailer is None:
+            try:
+                await self.wait_for_trailer()
+            except Exception:
+                pass  # Stream may already be closed
 
     async def _ensure_stream(self) -> tuple["aster_python.IrohSendStream", "aster_python.IrohRecvStream"]:
         """Lazily open the bidirectional stream and write header."""

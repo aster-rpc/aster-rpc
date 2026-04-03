@@ -10,7 +10,17 @@ For each step we need to make sure the code passes tests and linting.
 
 ## STATUS
 
-Pre-requisites complete. Phase 1 complete (42/42 tests passing). Phase 2 complete (47/47 tests passing, 89/89 total). Phase 3 complete (30/30 tests passing, 119/119 total).
+Pre-requisites complete. Phase 1–4 substantially implemented and checked off (Phase 4 previously had unchecked boxes despite existing code — fixed).
+
+**⚠️ Known limitations (not blocking for Phase 5):**
+- Phase 1: `RpcError` hierarchy is flat (single class, not a full hierarchy). `protocol.py` has its own `fory_tag` instead of importing from `codec.py` — duplication but not incorrect.
+- Phase 2: ROW mode falls back to standard serialization; `encode_row_schema()` is ad hoc, not native pyfory ROW. The test `test_aster_codec.py` tests the fallback, not native ROW random-access.
+- Phase 3: Real-Iroh round-trip test is skipped by default (requires Iroh node setup). Code review shows the implementation is structurally sound.
+- Phase 4: All items implemented in code and tests.
+
+**🔧 Bugs fixed during this review:**
+- `LocalTransport._bidi_handler_task()` used `async for msg in send_queue` — `asyncio.Queue` is not an async iterator. Fixed to use `await send_queue.get()` in a loop.
+- `IrohBidiChannel` lacked `__aenter__`/`__aexit__` for async context manager support. Added both methods.
 
 ## Pre-Requisites
 
@@ -91,19 +101,19 @@ Pre-requisites complete. Phase 1 complete (42/42 tests passing). Phase 2 complet
 
 ## Phase 4: Service Definition Layer
 
-- [ ] Create `aster/decorators.py` — `@service(name, version, serialization, scoped, ...)`
-- [ ] Create `aster/decorators.py` — `@rpc(timeout, idempotent, serialization)`
-- [ ] Create `aster/decorators.py` — `@server_stream`
-- [ ] Create `aster/decorators.py` — `@client_stream`
-- [ ] Create `aster/decorators.py` — `@bidi_stream`
-- [ ] Create `aster/service.py` — `MethodInfo` dataclass
-- [ ] Create `aster/service.py` — `ServiceInfo` dataclass
-- [ ] Create `aster/service.py` — `ServiceRegistry` (register, lookup)
-- [ ] Implement type introspection from method signatures (`typing.get_type_hints`, `inspect`)
-- [ ] Implement eager Fory type validation at decoration time (XLANG mode)
-- [ ] Tests: decorate a test service, verify `ServiceInfo` and `MethodInfo`
-- [ ] Tests: missing `@fory_tag` raises `TypeError`
-- [ ] Tests: `ServiceRegistry` lookup by name
+- [x] Create `aster/decorators.py` — `@service(name, version, serialization, scoped, ...)`
+- [x] Create `aster/decorators.py` — `@rpc(timeout, idempotent, serialization)`
+- [x] Create `aster/decorators.py` — `@server_stream`
+- [x] Create `aster/decorators.py` — `@client_stream`
+- [x] Create `aster/decorators.py` — `@bidi_stream`
+- [x] Create `aster/service.py` — `MethodInfo` dataclass
+- [x] Create `aster/service.py` — `ServiceInfo` dataclass
+- [x] Create `aster/service.py` — `ServiceRegistry` (register, lookup)
+- [x] Implement type introspection from method signatures (`typing.get_type_hints`, `inspect`)
+- [x] Implement eager Fory type validation at decoration time (XLANG mode)
+- [x] Tests: decorate a test service, verify `ServiceInfo` and `MethodInfo`
+- [x] Tests: missing `@fory_tag` raises `TypeError`
+- [x] Tests: `ServiceRegistry` lookup by name
 
 ---
 

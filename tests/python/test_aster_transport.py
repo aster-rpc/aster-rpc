@@ -17,6 +17,8 @@ from typing import AsyncIterator
 import pytest
 
 from aster_python.aster.codec import fory_tag, ForyCodec
+from aster_python.aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
+from aster_python.aster.protocol import StreamHeader, RpcStatus
 from aster_python.aster.types import SerializationMode
 from aster_python.aster.status import StatusCode, RpcError
 from aster_python.aster.transport.base import (
@@ -25,6 +27,7 @@ from aster_python.aster.transport.base import (
     TransportError,
     ConnectionLostError,
 )
+from aster_python.aster.transport.iroh import IrohTransport
 from aster_python.aster.transport.local import LocalTransport, LocalBidiChannel
 
 
@@ -521,27 +524,88 @@ class TestIrohTransportIntegration:
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(
-        True,  # Skip by default - requires Iroh setup
-        reason="Requires Iroh node setup"
-    )
     async def test_iroh_transport_unary(self):
-        """IrohTransport unary round-trip over real connection."""
+        """IrohTransport unary round-trip over a real in-memory Iroh connection."""
         import aster_python
 
-        # Create two in-memory nodes
-        node1 = await aster_python.IrohNode.memory()
-        node2 = await aster_python.IrohNode.memory()
-        
-        # Connect node2 to node1
-        await node1.add_node_addr(node2)
-        
-        # Create endpoints
-        client_endpoint = await aster_python.create_endpoint([b"aster/1"])
-        server_endpoint = await aster_python.create_endpoint([b"aster/1"])
-        
-        # Note: Full integration test would require server-side handling
-        # which is implemented in Phase 5
+        alpn = b"aster/1"
+        codec = ForyCodec(
+            mode=SerializationMode.XLANG,
+            types=[EchoRequest, EchoResponse],
+        )
 
-        await node1.close()
-        await node2.close()
+        server_endpoint = await aster_python.create_endpoint(alpn)
+        client_endpoint = await aster_python.create_endpoint(alpn)
+
+        async def server_side() -> None:
+            conn = await server_endpoint.accept()
+            send, recv = await conn.accept_bi()
+
+            try:
+                # Read and validate stream header
+                frame = await read_frame(recv)
+                assert frame is not None
+                payload, flags = frame
+                assert flags & HEADER
+
+                header = codec.decode(payload, StreamHeader)
+                assert header.service == "TestService"
+                assert header.method == "Echo"
+
+                # Read request payload
+                frame = await read_frame(recv)
+                assert frame is not None
+                payload, flags = frame
+                request = codec.decode_compressed(
+                    payload,
+                    bool(flags & COMPRESSED),
+                    EchoRequest,
+                )
+
+                # Write unary response
+                response = EchoResponse(
+                    message=f"echo: {request.message}",
+                    received_at_ms=0,
+                )
+                response_payload, response_compressed = codec.encode_compressed(response)
+                await write_frame(
+                    send,
+                    response_payload,
+                    COMPRESSED if response_compressed else 0,
+                )
+
+                # Write OK trailer
+                trailer = RpcStatus(code=StatusCode.OK, message="")
+                await write_frame(send, codec.encode(trailer), flags=TRAILER)
+                await send.finish()
+            finally:
+                conn.close(0, b"done")
+
+        async def client_side() -> None:
+            await asyncio.sleep(0.2)
+            conn = await client_endpoint.connect_node_addr(
+                server_endpoint.endpoint_addr_info(),
+                alpn,
+            )
+            transport = IrohTransport(conn, codec=codec)
+            try:
+                response = await transport.unary(
+                    "TestService",
+                    "Echo",
+                    EchoRequest(message="hello over iroh"),
+                    metadata={"trace_id": "integration-test"},
+                    serialization_mode=SerializationMode.XLANG.value,
+                )
+                assert isinstance(response, EchoResponse)
+                assert response.message == "echo: hello over iroh"
+            finally:
+                await transport.close()
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(server_side(), client_side()),
+                timeout=30,
+            )
+        finally:
+            await server_endpoint.close()
+            await client_endpoint.close()

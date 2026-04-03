@@ -11,30 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-
-# ── @fory_tag decorator (minimal, used for framework-internal types) ─────────
-
-
-def fory_tag(tag: str):
-    """Attach a Fory XLANG type tag to a dataclass.
-
-    The *tag* string is split on the last ``/`` into
-    ``(__fory_namespace__, __fory_typename__)``.  If there is no ``/``
-    the namespace is the empty string.
-    """
-
-    def decorator(cls):
-        parts = tag.rsplit("/", 1)
-        if len(parts) == 2:
-            cls.__fory_namespace__ = parts[0]
-            cls.__fory_typename__ = parts[1]
-        else:
-            cls.__fory_namespace__ = ""
-            cls.__fory_typename__ = tag
-        cls.__fory_tag__ = tag
-        return cls
-
-    return decorator
+# Import fory_tag from codec.py to avoid duplication
+from aster_python.aster.codec import fory_tag
 
 
 # ── Framework-internal protocol types ────────────────────────────────────────
