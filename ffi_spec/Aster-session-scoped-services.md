@@ -519,7 +519,7 @@ await session.close()
 Interceptors run on every call within a session, not once per session open.
 The `CallContext` is populated per-call with the method name from the
 `CallHeader`. Session-level context (peer identity, session ID) is available
-on the context throughout.
+on the context throughout. If rcan authorization is enabled (see Trust Spec) then claims are also included in the `CallContext`
 
 ```python
 class CallContext:

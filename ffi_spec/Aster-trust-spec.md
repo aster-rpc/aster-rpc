@@ -120,7 +120,24 @@ Three outcomes:
 |Returns nothing |Not authorized. The token may have been wrong, missing, or the service doesn’t recognize this consumer. Not an error — the consumer can try again with a different token.|
 |Returns an error|Something is broken — malformed input, misconfigured service, internal failure.                                                                                          |
 
-### 3.3 The Token Parameter
+### 3.3 Rcan Structure
+
+An rcan is a signed, binary-encoded token. Its fields map directly to JWT claims, which makes the model familiar and the security properties well-understood. The rcan is serialized as Fory XLANG — there is no JSON encoding on the wire.
+
+| rcan field   | JWT analogue | Required | Meaning                                                                                                                                                                 |
+|--------------|--------------|----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `jti`        | `jti`        | Yes      | Unique token ID. Used for revocation and replay detection.                                                                                                               |
+| `iss`        | `iss`        | Yes      | The service key that minted this token.                                                                                                                                  |
+| `aud`        | `aud`        | Yes      | The endpoint ID this token is bound to. Verified against the QUIC peer.                                                                                                  |
+| `sub`        | `sub`        | No       | The human or agent identity behind the peer (e.g. `emrul@emrul.com`). Signed by the issuer — not metadata. Absent for pure peer-to-peer calls where the peer is the identity. |
+| `capability` | custom claim | Yes      | List of role strings granted to this consumer (e.g. `["edit", "audit"]`). The service defines what these strings mean.                                                   |
+| `exp`        | `exp`        | Yes      | Expiry timestamp. The framework rejects tokens past this time.                                                                                                           |
+
+`iat` (issued-at) and `nbf` (not-before) are intentionally omitted. `iat` carries no enforcement value — `exp` is what the framework acts on. `nbf` has no practical use in a model where tokens are minted on demand at authorization time.
+
+`capability` is a list, not a scalar, so a single rcan can express multi-role membership (e.g. a bearer who is both `EDITOR` and `AUDITOR`).
+
+### 3.4 The Token Parameter
 
 The `token` parameter is an opaque string. The spec does not define what it contains. The service’s auth handler interprets it however it sees fit:
 
@@ -132,17 +149,18 @@ The `token` parameter is an opaque string. The spec does not define what it cont
 
 The service decides whether a token is single-use, reusable, scoped, rate-limited, or anything else. The spec doesn’t know, doesn’t care.
 
-### 3.4 Token Lifecycle
+### 3.5 Token Lifecycle
 
 1. Consumer connects to a producer. QUIC handshake proves both identities.
 1. Consumer calls `Authorize` on the service, optionally presenting a token.
 1. The service’s auth handler decides whether to mint an rcan.
 1. If authorized, the consumer receives an rcan scoped to that service, bound to their endpoint ID, with an expiry.
-1. On subsequent calls, the consumer includes the rcan in `StreamHeader.metadata` under the key `aster-auth-token`.
-1. The framework’s `AuthInterceptor` verifies the rcan: valid signature, not expired, capability permits the requested method.
+1. On subsequent calls, the framework attaches the rcan to `StreamHeader.auth_token` automatically. This is a typed, binary-encoded optional field — not a metadata string. Service code never touches it directly.
+1. The framework’s `AuthInterceptor` verifies the rcan before dispatch: valid signature, `aud` matches the QUIC peer, not expired, `jti` not revoked, and the `CapabilityRequirement` for the called method is satisfied. If any check fails, the call is rejected with `PERMISSION_DENIED` before the handler runs.
+1. The verified rcan claims are exposed on `CallContext`. The handler reads `ctx.subject`, `ctx.capability`, and `ctx.peer_id` without performing any token verification itself.
 1. To refresh, the consumer calls `Authorize` again before expiry. The QUIC connection is the refresh credential.
 
-### 3.5 Delegation
+### 3.6 Delegation
 
 A service may allow its authorized consumers to introduce new consumers. This is opt-in — the service must explicitly enable delegation.
 
@@ -161,27 +179,69 @@ The delegation rcan is an introduction letter, not a bearer credential. The serv
 
 Services that do not set `delegation=True` reject delegation rcans in `Authorize`. The framework does not need to understand delegation semantics beyond passing the token to the handler.
 
-### 3.6 Two-Layer Authorization
+### 3.7 Two-Layer Authorization
 
 Authorization is enforced at two layers:
 
-**Framework layer (AuthInterceptor).** Runs before the handler is invoked. Checks: is there a valid rcan in `aster-auth-token` metadata, is the signature valid, has it expired, does the capability permit calling this method. If any check fails, the call is rejected with `PERMISSION_DENIED` before the service code runs. This layer is generic, mechanical, and the same for every service.
+**Framework layer (AuthInterceptor).** Runs before the handler is invoked. The interceptor extracts `StreamHeader.auth_token`, then verifies: valid signature from the service key, `aud` matches the QUIC peer identity, token not expired, `jti` not in the revocation list, and the token’s `capability` list satisfies the method’s `CapabilityRequirement` (see §3.9). If any check fails, the call is rejected with `PERMISSION_DENIED` before the handler runs. This layer is generic, mechanical, and the same for every service.
 
-**Application layer (service code).** The handler runs with a verified endpoint ID and a capability that already passed the framework check. The service applies its own domain logic: is this user an author on this document, does this project allow external contributors, is this resource archived. If the check fails, the service returns a domain error.
+**Application layer (service code).** The handler runs with a `CallContext` populated from the verified rcan. The service applies its own domain logic: is this user an author on this document, does this project allow external contributors, is this resource archived. If the check fails, the service returns a domain error.
 
-The rcan capability encodes coarse access — which methods a consumer may call. Fine-grained, resource-level decisions are made by the service at call time, where the data lives. This keeps tokens small and simple. The intelligence lives in the service, not in the token.
+The rcan `capability` list encodes coarse access — which methods a consumer may call. Fine-grained, resource-level decisions are made by the service at call time, where the data lives. This keeps tokens small and simple. The intelligence lives in the service, not in the token.
 
-### 3.7 Reserved Metadata Keys
+### 3.8 CallContext
+
+Every handler receives an optional `ctx: CallContext` parameter. The framework populates it before the handler is invoked. All fields derived from the rcan are already verified — the handler does not need to re-check signatures or expiry.
+
+```python
+class CallContext:
+    service: str            # Service name
+    method: str             # Method name
+    call_id: str            # Unique ID for this call (for tracing)
+    session_id: str | None  # Non-None for session-scoped calls
+    peer_id: EndpointId     # Authenticated QUIC peer (the rcan aud)
+    subject: str | None     # rcan sub — human/agent identity behind the peer; None for direct peer-to-peer calls
+    capability: list[str]   # Verified rcan capability list
+    metadata: dict[str, str]# StreamHeader metadata, aster- keys stripped
+    deadline: float | None  # Call deadline (epoch seconds), None if not set
+    is_streaming: bool      # True for server_stream, client_stream, bidi_stream
+```
+
+`ctx.subject` is the appropriate identity to log, audit, or apply user-level policy against. `ctx.peer_id` identifies the connecting endpoint (the gateway or agent). For direct peer-to-peer calls without a gateway, `ctx.subject` will be absent and `ctx.peer_id` is the full identity.
+
+### 3.9 CapabilityRequirement
+
+Each `@rpc`, `@server_stream`, `@client_stream`, and `@bidi_stream` method may declare a `requires` parameter specifying which capabilities are sufficient to call it. The `requires` expression is a `CapabilityRequirement` — a small discriminated union:
+
+```python
+@rpc(requires=DocRole.VIEW)                           # single role
+@rpc(requires=anyOf(DocRole.ADMIN, DocRole.EDIT))     # caller must hold at least one
+@rpc(requires=allOf(DocRole.EDITOR, DocRole.AUDITOR)) # caller must hold all
+```
+
+The `AuthInterceptor` evaluates the requirement against the rcan’s `capability` list. No service-defined callback is needed for evaluation — the framework performs set membership checks directly against the string values in the list.
+
+The `requires` expression is extracted at contract-build time and encoded into the `ServiceContract` for each method. The contract is therefore self-describing: a consumer inspecting the contract can determine what capability is needed to call each method before attempting a call. Methods with no `requires` annotation are callable by any consumer who holds a valid rcan for the service.
+
+### 3.10 Reserved Metadata Keys
 
 All metadata keys prefixed with `aster-` are reserved for framework use. Services and applications must not use this prefix for their own metadata.
 
-Currently defined:
+No `aster-` keys are currently defined for authorization. The rcan is carried in the typed `StreamHeader.auth_token` field, not in metadata.
 
-|Key               |Purpose                                        |
-|------------------|-----------------------------------------------|
-|`aster-auth-token`|Serialized rcan token for request authorization|
+### 3.11 Multi-Session Endpoints
 
-### 3.8 Blob Access
+An endpoint that manages sessions on behalf of multiple users — such as a web gateway fronting human clients authenticated via OIDC or SAML — must maintain a session map. The gateway is the Aster peer: its endpoint ID is what appears in `aud`, and the QUIC handshake authenticates it. The `sub` field carries the human identity behind each request.
+
+Because different users may hold different roles, the gateway cannot use a single rcan for all traffic. It must call `Authorize` once per user session, presenting each user’s OIDC or SAML token, and cache the resulting per-user rcan. On each outbound call, the gateway attaches the rcan for the user making that specific request. The rcan cache is keyed by user identity and must respect `exp` — the gateway is responsible for refreshing rcans before they expire.
+
+### 3.12 Session-Scoped Authorization
+
+For session-scoped services (see Session-Scoped Services addendum), `Authorize` is called once at session open. The rcan is attached to the session’s `StreamHeader.auth_token` and verified by the `AuthInterceptor` at that point. Subsequent `CallHeader` frames within the session do not carry an rcan — the verified identity and capability from session open are retained on the session instance and propagated to `CallContext` for every call in the session.
+
+Carrying the rcan on every `CallHeader` within an established session would be pointless bloat: the session stream itself proves continuity of the QUIC connection, and the identity was already verified at open.
+
+### 3.13 Blob Access
 
 Blob access follows the same authorization model. A consumer authorized to use a service may receive blob capabilities (tickets or `FileRef` values) as RPC responses. The blob fetch itself uses iroh-blobs’ native transfer — the rcan authorizes the RPC that mints the ticket, not the blob transfer directly.
 
@@ -324,7 +384,7 @@ class DocServiceAuth(AuthPolicy):
     def _mint(self, peer_id, role):
         return Rcan.issuing_builder(
             self.service_key, peer_id, role
-        ).sign(Expires.valid_for(Duration.hours(8)))
+        ).with_capability([role.value]).sign(Expires.valid_for(Duration.hours(8)))
 ```
 
 Note that the delegation policy is entirely in the handler. The framework doesn’t know that “only admins and editors can introduce” or that “introductions only grant VIEW.” That’s this service’s rule.
@@ -340,33 +400,29 @@ Note that the delegation policy is entirely in the handler. The framework doesn�
 )
 class DocManagementService:
 
-    @rpc
+    @rpc(requires=DocRole.VIEW)
     async def get_document(self, req: GetDocRequest) -> Document:
-        # Framework already verified: caller has VIEW or above
         return self.doc_store.get(req.doc_id)
 
-    @rpc
+    @rpc(requires=anyOf(DocRole.EDIT, DocRole.ADMIN))
     async def update_document(self, ctx: CallContext, req: UpdateDocRequest) -> UpdateAck:
-        # Framework already verified: caller has EDIT or above
         # Application layer: check resource-level permission
         doc = self.doc_store.get(req.doc_id)
-        caller_role = ctx.capability  # The role from the verified rcan
-        if caller_role != DocRole.ADMIN and ctx.peer_id not in doc.authors:
+        if DocRole.ADMIN.value not in ctx.capability and ctx.peer_id not in doc.authors:
             raise RpcError(PERMISSION_DENIED, "not an author on this document")
         return self.doc_store.update(req.doc_id, req.content)
 
-    @rpc
+    @rpc(requires=DocRole.ADMIN)
     async def grant_access(self, req: GrantAccessRequest) -> GrantAck:
-        # Framework already verified: caller has ADMIN
         self.role_store.assign_role(req.target_peer_id, req.role)
         return GrantAck(success=True)
 ```
 
 The two-layer model in action:
 
-- `get_document`: framework checks the rcan role (VIEW or above), service serves the document. No further check needed.
-- `update_document`: framework checks the rcan role (EDIT or above), then the service checks whether the caller is an author on this specific document — or an admin, who can edit anything. This is a database query, not a token comparison.
-- `grant_access`: framework checks the rcan role (ADMIN), service modifies the role store.
+- `get_document`: `requires=DocRole.VIEW` is encoded in the contract. The `AuthInterceptor` evaluates it against the rcan’s `capability` list before dispatch. The handler runs unconditionally if the check passes.
+- `update_document`: `requires=anyOf(DocRole.EDIT, DocRole.ADMIN)` gates method access. The handler then applies a resource-level check — is the caller an author on this specific document? — which cannot be expressed in the token and lives where the data lives.
+- `grant_access`: `requires=DocRole.ADMIN` gates the method. No further check needed.
 
 ### 5.5 The Employee Experience
 
