@@ -12,15 +12,10 @@ For each step we need to make sure the code passes tests and linting.
 
 Pre-requisites complete. Phase 1–4 substantially implemented and checked off (Phase 4 previously had unchecked boxes despite existing code — fixed).
 
-**⚠️ Known limitations (not blocking for Phase 5):**
-- Phase 1: `RpcError` hierarchy is flat (single class, not a full hierarchy). `protocol.py` has its own `fory_tag` instead of importing from `codec.py` — duplication but not incorrect.
-- Phase 2: ROW mode falls back to standard serialization; `encode_row_schema()` is ad hoc, not native pyfory ROW. The test `test_aster_codec.py` tests the fallback, not native ROW random-access.
-- Phase 3: Real-Iroh round-trip test is skipped by default (requires Iroh node setup). Code review shows the implementation is structurally sound.
-- Phase 4: All items implemented in code and tests.
+**📌 Additional note from follow-up verification:**
+- The checklist below is stale for later phases: Phase 5 and Phase 6 contain unchecked boxes even though substantial code and tests now exist and pass locally. However, the high-level `Server` implementation still appears incomplete for real handler dispatch (`_get_handler_for_service()` currently returns `None`), so those phases should be re-reviewed rather than blindly checked off.
 
-**🔧 Bugs fixed during this review:**
-- `LocalTransport._bidi_handler_task()` used `async for msg in send_queue` — `asyncio.Queue` is not an async iterator. Fixed to use `await send_queue.get()` in a loop.
-- `IrohBidiChannel` lacked `__aenter__`/`__aexit__` for async context manager support. Added both methods.
+
 
 ## Pre-Requisites
 

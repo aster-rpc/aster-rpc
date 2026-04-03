@@ -28,6 +28,7 @@ from aster_python.aster.protocol import StreamHeader, CallHeader, RpcStatus
 from aster_python.aster.codec import (
     fory_tag,
     ForyCodec,
+    ForyConfig,
     DEFAULT_COMPRESSION_THRESHOLD,
 )
 from aster_python.aster.transport.base import (
@@ -92,6 +93,7 @@ __all__ = [
     # codec.py
     "fory_tag",
     "ForyCodec",
+    "ForyConfig",
     "DEFAULT_COMPRESSION_THRESHOLD",
     # transport/base.py
     "Transport",

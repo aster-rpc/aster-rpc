@@ -15,7 +15,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 import aster_python
-from aster_python.aster.codec import ForyCodec
+from aster_python.aster.codec import ForyCodec, ForyConfig
 from aster_python.aster.framing import (
     HEADER,
     TRAILER,
@@ -99,9 +99,13 @@ class IrohTransport(Transport):
         self,
         connection: "aster_python.IrohConnection",
         codec: ForyCodec | None = None,
+        fory_config: ForyConfig | None = None,
     ) -> None:
         self._conn = connection
-        self._codec = codec or ForyCodec(mode=SerializationMode.XLANG)
+        self._codec = codec or ForyCodec(
+            mode=SerializationMode.XLANG,
+            fory_config=fory_config,
+        )
 
     async def close(self) -> None:
         """Close the underlying Iroh connection."""

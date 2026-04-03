@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
-from aster_python.aster.codec import ForyCodec
+from aster_python.aster.codec import ForyCodec, ForyConfig
 from aster_python.aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
 from aster_python.aster.protocol import StreamHeader, RpcStatus
 from aster_python.aster.status import StatusCode, RpcError
@@ -203,11 +203,15 @@ class LocalTransport(Transport):
             tuple[Callable[..., Any], list[type], str],  # handler, types, pattern
         ],
         codec: ForyCodec | None = None,
+        fory_config: ForyConfig | None = None,
         wire_compatible: bool = False,
         interceptors: list["Interceptor"] | None = None,
     ) -> None:
         self._registry = handler_registry
-        self._codec = codec or ForyCodec(mode=SerializationMode.XLANG)
+        self._codec = codec or ForyCodec(
+            mode=SerializationMode.XLANG,
+            fory_config=fory_config,
+        )
         self._wire_compatible = wire_compatible
         self._interceptors = interceptors or []
 

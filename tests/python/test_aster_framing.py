@@ -17,7 +17,12 @@ from io import BytesIO
 
 import pytest
 
-from aster_python.aster.status import StatusCode, RpcError
+from aster_python.aster.status import (
+    StatusCode,
+    RpcError,
+    NotFoundError,
+    InvalidArgumentError,
+)
 from aster_python.aster.types import SerializationMode, RetryPolicy, ExponentialBackoff
 from aster_python.aster.framing import (
     COMPRESSED,
@@ -119,6 +124,17 @@ class TestRpcError:
         r = repr(err)
         assert "RpcError" in r
         assert "OK" in r
+
+    def test_from_status_returns_specific_subclass(self):
+        err = RpcError.from_status(StatusCode.NOT_FOUND, "missing")
+        assert isinstance(err, NotFoundError)
+        assert err.code == StatusCode.NOT_FOUND
+
+    def test_specific_subclass_preserves_status(self):
+        err = InvalidArgumentError("bad input")
+        assert isinstance(err, RpcError)
+        assert err.code == StatusCode.INVALID_ARGUMENT
+        assert err.message == "bad input"
 
 
 # ── SerializationMode tests ─────────────────────────────────────────────────
