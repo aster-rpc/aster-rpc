@@ -19,7 +19,7 @@ import sys
 from typing import Optional
 
 from aster_python import (
-    IrohEndpoint,
+    NetClient,
     IrohConnection,
     IrohSendStream,
     IrohRecvStream,
@@ -182,7 +182,7 @@ async def connect(node_addr: NodeAddr) -> None:
 # Listen-TCP / Connect-TCP
 # ---------------------------------------------------------------------------
 
-async def listen_tcp(host: str, port: int) -> IrohEndpoint:
+async def listen_tcp(host: str, port: int) -> NetClient:
     """Listen for incoming QUIC connections and forward each bi-stream to a TCP target.
 
     Returns the endpoint so the caller can manage its lifetime.
@@ -254,7 +254,7 @@ async def connect_tcp(
 # Listen-Unix / Connect-Unix
 # ---------------------------------------------------------------------------
 
-async def listen_unix(socket_path: str) -> IrohEndpoint:
+async def listen_unix(socket_path: str) -> NetClient:
     """Listen for incoming QUIC connections and forward each bi-stream to a Unix socket.
 
     Returns the endpoint so the caller can manage its lifetime.
@@ -331,7 +331,7 @@ async def connect_unix(
 # Programmatic helpers for testing  (no stdin/stdout)
 # ---------------------------------------------------------------------------
 
-async def create_listener() -> tuple[IrohEndpoint, NodeAddr]:
+async def create_listener() -> tuple[NetClient, NodeAddr]:
     """Create a dumbpipe listener endpoint.
 
     Returns (endpoint, node_addr) — the caller can pass node_addr to a connector.
@@ -341,7 +341,7 @@ async def create_listener() -> tuple[IrohEndpoint, NodeAddr]:
     return ep, addr
 
 
-async def accept_pipe(ep: IrohEndpoint) -> tuple[IrohSendStream, IrohRecvStream]:
+async def accept_pipe(ep: NetClient) -> tuple[IrohSendStream, IrohRecvStream]:
     """Accept one connection + bi-stream and consume the handshake.
 
     Returns (send, recv) ready for data transfer.
@@ -354,7 +354,7 @@ async def accept_pipe(ep: IrohEndpoint) -> tuple[IrohSendStream, IrohRecvStream]
 
 async def connect_pipe(
     remote_addr: NodeAddr,
-) -> tuple[IrohEndpoint, IrohSendStream, IrohRecvStream]:
+) -> tuple[NetClient, IrohSendStream, IrohRecvStream]:
     """Connect to a dumbpipe listener and send the handshake.
 
     Returns (endpoint, send, recv) ready for data transfer.
