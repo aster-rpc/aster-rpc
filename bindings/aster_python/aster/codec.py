@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import dataclasses
 import typing
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field
 from typing import Any, get_type_hints
 
 import pyfory
+import pyfory.format as pyfory_format
 import zstandard
 
 from aster_python.aster.types import SerializationMode
@@ -27,6 +28,34 @@ from aster_python.aster.types import SerializationMode
 # ── Default compression threshold ────────────────────────────────────────────
 
 DEFAULT_COMPRESSION_THRESHOLD: int = 4096  # bytes
+
+
+@dataclass(slots=True)
+class ForyConfig:
+    """Configuration for constructing the underlying ``pyfory.Fory`` instance.
+
+    Args:
+        xlang: Whether to enable Fory's cross-language mode. If ``None``,
+            :class:`ForyCodec` chooses a mode-appropriate default:
+            ``True`` for :class:`SerializationMode.XLANG`, otherwise ``False``.
+        extra_kwargs: Additional keyword arguments forwarded to
+            ``pyfory.Fory(...)``.
+    """
+
+    xlang: bool | None = None
+    extra_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def resolved_xlang(self, mode: SerializationMode) -> bool:
+        """Return the effective xlang setting for a codec mode."""
+        if self.xlang is not None:
+            return self.xlang
+        return mode == SerializationMode.XLANG
+
+    def to_kwargs(self, mode: SerializationMode) -> dict[str, Any]:
+        """Convert the config into ``pyfory.Fory`` constructor kwargs."""
+        kwargs = dict(self.extra_kwargs)
+        kwargs.setdefault("xlang", self.resolved_xlang(mode))
+        return kwargs
 
 
 # ── @fory_tag decorator ──────────────────────────────────────────────────────
@@ -176,6 +205,9 @@ class ForyCodec:
             For NATIVE mode, tags are optional.
         compression_threshold: Payloads larger than this (in bytes) are
             zstd-compressed.  Set to ``-1`` to disable compression.
+        fory_config: Optional configuration forwarded to ``pyfory.Fory``.
+            By default, XLANG codecs enable ``xlang=True`` and other modes
+            leave it disabled.
     """
 
     def __init__(
@@ -183,9 +215,11 @@ class ForyCodec:
         mode: SerializationMode = SerializationMode.XLANG,
         types: list[type] | None = None,
         compression_threshold: int = DEFAULT_COMPRESSION_THRESHOLD,
+        fory_config: ForyConfig | None = None,
     ) -> None:
         self.mode = mode
         self.compression_threshold = compression_threshold
+        self.fory_config = fory_config or ForyConfig()
         self._cctx = zstandard.ZstdCompressor()
         self._dctx = zstandard.ZstdDecompressor()
 
@@ -207,11 +241,7 @@ class ForyCodec:
         self._registered_types = all_types
 
         # Create the Fory instance.
-        if mode == SerializationMode.ROW:
-            # ROW mode uses a separate Fory instance
-            self._fory = pyfory.Fory()
-        else:
-            self._fory = pyfory.Fory()
+        self._fory = self._create_fory_instance()
 
         # Register all discovered types.
         for tp in all_types:
@@ -227,17 +257,38 @@ class ForyCodec:
 
         # For ROW mode, build encoder/decoder if available
         self._row_encoder = None
-        self._row_decoder = None
+        self._row_schema = None
+        self._row_type = None
         if mode == SerializationMode.ROW:
             self._setup_row(user_types)
 
+    def _create_fory_instance(self) -> Any:
+        """Create and return the configured ``pyfory.Fory`` instance."""
+        kwargs = self.fory_config.to_kwargs(self.mode)
+        try:
+            return pyfory.Fory(**kwargs)
+        except TypeError as exc:
+            raise TypeError(
+                f"Failed to construct pyfory.Fory with kwargs {kwargs!r}"
+            ) from exc
+
     def _setup_row(self, types: list[type]) -> None:
         """Set up ROW-mode encoder/decoder if pyfory supports it."""
-        # pyfory ROW support check — may not be available in all versions
-        if hasattr(pyfory, "create_row_encoder"):
-            # This path is for future pyfory versions with ROW support
-            pass
-        # ROW mode falls back to standard serialization if not available
+        if not types:
+            raise ValueError("ROW mode requires at least one root type")
+
+        if len(types) != 1:
+            raise ValueError(
+                "ROW mode currently supports exactly one root type per codec"
+            )
+
+        row_type = types[0]
+        if not dataclasses.is_dataclass(row_type):
+            raise TypeError("ROW mode requires a dataclass root type")
+
+        self._row_type = row_type
+        self._row_schema = pyfory_format.infer_schema(row_type)
+        self._row_encoder = pyfory_format.create_row_encoder(self._row_schema)
 
     def encode(self, obj: Any) -> bytes:
         """Serialize an object according to the configured mode.
@@ -245,6 +296,10 @@ class ForyCodec:
         Returns the raw serialized bytes (without compression).
         Use :meth:`encode_compressed` if you want automatic compression.
         """
+        if self.mode == SerializationMode.ROW and self._row_encoder is not None:
+            row = self._row_encoder.to_row(obj)
+            return bytes(row.to_bytes())
+
         data = self._fory.serialize(obj)
         return bytes(data)
 
@@ -261,13 +316,63 @@ class ForyCodec:
         Raises:
             TypeError: If *expected_type* is given and the result doesn't match.
         """
-        result = self._fory.deserialize(data)
+        if self.mode == SerializationMode.ROW and self._row_encoder is not None:
+            row = pyfory_format.RowData(self._row_schema, data)
+            result = self._row_encoder.from_row(row)
+            if (
+                expected_type is not None
+                and dataclasses.is_dataclass(expected_type)
+                and not isinstance(result, expected_type)
+            ):
+                result = self._row_to_dataclass(row, expected_type)
+        else:
+            result = self._fory.deserialize(data)
+
         if expected_type is not None and not isinstance(result, expected_type):
             raise TypeError(
                 f"Expected {expected_type.__qualname__}, "
                 f"got {type(result).__qualname__}"
             )
         return result
+
+    def _row_to_dataclass(self, row: pyfory_format.RowData, cls: type) -> Any:
+        """Rehydrate a dataclass instance from a pyfory RowData view."""
+        kwargs: dict[str, Any] = {}
+        hints = get_type_hints(cls)
+
+        for field in dataclasses.fields(cls):
+            field_type = hints.get(field.name, field.type)
+            index = row.schema.get_field_index(field.name)
+            kwargs[field.name] = self._row_field_value(row, index, field_type)
+
+        return cls(**kwargs)
+
+    def _row_field_value(
+        self,
+        row: pyfory_format.RowData,
+        index: int,
+        field_type: Any,
+    ) -> Any:
+        """Read a field value from RowData using a best-effort type mapping."""
+        origin = getattr(field_type, "__origin__", None)
+        if origin is not None:
+            args = [a for a in getattr(field_type, "__args__", ()) if a is not type(None)]
+            if len(args) == 1:
+                field_type = args[0]
+
+        if field_type is bool:
+            return row.get_boolean(index)
+        if field_type is str:
+            return row.get_str(index)
+        if field_type is int:
+            return row.get_int64(index)
+        if field_type is float:
+            return row.get_double(index)
+        if field_type is bytes:
+            return row.get_binary(index)
+
+        # Fallback to generic getter for types we don't explicitly map yet.
+        return row.get(index)
 
     def encode_compressed(self, obj: Any) -> tuple[bytes, bool]:
         """Serialize and optionally compress.
@@ -320,30 +425,18 @@ class ForyCodec:
         if self.mode != SerializationMode.ROW:
             raise ValueError("encode_row_schema() is only valid in ROW mode")
 
-        # Build a schema description from registered types
-        schema_types = []
-        for tp in self._registered_types:
-            if not dataclasses.is_dataclass(tp):
-                continue
-            tag = getattr(tp, "__fory_tag__", tp.__qualname__)
-            field_defs = []
-            try:
-                hints = get_type_hints(tp)
-            except Exception:
-                hints = {}
-            for f in dataclasses.fields(tp):
-                ft = hints.get(f.name, f.type)
-                field_defs.append({
-                    "name": f.name,
-                    "type": _type_name(ft),
-                })
-            schema_types.append({
-                "tag": tag,
-                "fields": field_defs,
-            })
+        if self._row_schema is None:
+            raise NotImplementedError("ROW schema is not initialized")
 
-        # Serialize the schema using standard Fory serialization
-        return self.encode(schema_types)
+        return bytes(self._row_schema.to_bytes())
+
+    def decode_row_data(self, data: bytes) -> pyfory_format.RowData:
+        """Decode raw ROW bytes into a RowData view for random-access reads."""
+        if self.mode != SerializationMode.ROW:
+            raise ValueError("decode_row_data() is only valid in ROW mode")
+        if self._row_schema is None:
+            raise NotImplementedError("ROW schema is not initialized")
+        return pyfory_format.RowData(self._row_schema, data)
 
     @property
     def registered_types(self) -> list[type]:

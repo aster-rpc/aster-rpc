@@ -21,6 +21,7 @@ import pytest
 from aster_python.aster.codec import (
     fory_tag,
     ForyCodec,
+    ForyConfig,
     DEFAULT_COMPRESSION_THRESHOLD,
     _walk_type_graph,
     _validate_xlang_tags,
@@ -188,6 +189,58 @@ class TestXlangTagValidation:
 
 
 class TestForyCodecInit:
+    def test_fory_config_defaults_to_xlang_for_xlang_mode(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        class DummyFory:
+            def __init__(self, **kwargs):
+                seen["kwargs"] = kwargs
+            def register_type(self, *args, **kwargs):
+                return None
+
+        monkeypatch.setattr("aster_python.aster.codec.pyfory.Fory", DummyFory)
+
+        ForyCodec(mode=SerializationMode.XLANG, types=[])
+
+        assert seen["kwargs"] == {"xlang": True}
+
+    def test_fory_config_defaults_to_non_xlang_for_native_mode(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        class DummyFory:
+            def __init__(self, **kwargs):
+                seen["kwargs"] = kwargs
+            def register_type(self, *args, **kwargs):
+                return None
+
+        monkeypatch.setattr("aster_python.aster.codec.pyfory.Fory", DummyFory)
+
+        ForyCodec(mode=SerializationMode.NATIVE, types=[])
+
+        assert seen["kwargs"] == {"xlang": False}
+
+    def test_fory_config_allows_explicit_override(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        class DummyFory:
+            def __init__(self, **kwargs):
+                seen["kwargs"] = kwargs
+            def register_type(self, *args, **kwargs):
+                return None
+
+        monkeypatch.setattr("aster_python.aster.codec.pyfory.Fory", DummyFory)
+
+        ForyCodec(
+            mode=SerializationMode.XLANG,
+            types=[],
+            fory_config=ForyConfig(xlang=False, extra_kwargs={"require_class_registration": True}),
+        )
+
+        assert seen["kwargs"] == {
+            "xlang": False,
+            "require_class_registration": True,
+        }
+
     def test_xlang_mode_creation(self):
         codec = ForyCodec(mode=SerializationMode.XLANG, types=[SimpleMsg])
         assert codec.mode == SerializationMode.XLANG
@@ -398,7 +451,7 @@ class TestRowMode:
         assert codec.mode == SerializationMode.ROW
 
     def test_row_round_trip(self):
-        """ROW mode falls back to standard serialization for round-trip."""
+        """ROW mode supports native row encode/decode round-trip."""
         codec = ForyCodec(mode=SerializationMode.ROW, types=[SimpleMsg])
         original = SimpleMsg(name="row", value=42, active=True)
         data = codec.encode(original)
@@ -406,12 +459,27 @@ class TestRowMode:
         assert restored.name == original.name
         assert restored.value == original.value
 
+    def test_row_random_access_reads(self):
+        """ROW mode exposes RowData for random-access field reads."""
+        codec = ForyCodec(mode=SerializationMode.ROW, types=[SimpleMsg])
+        original = SimpleMsg(name="row-access", value=99, active=True)
+        data = codec.encode(original)
+        row = codec.decode_row_data(data)
+        assert row.get_boolean(0) is True
+        assert row.get_str(1) == "row-access"
+        assert row.get_int64(2) == 99
+
     def test_encode_row_schema(self):
         """encode_row_schema produces bytes in ROW mode."""
         codec = ForyCodec(mode=SerializationMode.ROW, types=[SimpleMsg])
         schema = codec.encode_row_schema()
         assert isinstance(schema, bytes)
         assert len(schema) > 0
+
+    def test_row_mode_requires_single_root_type(self):
+        """ROW mode currently requires exactly one root dataclass type."""
+        with pytest.raises(ValueError, match="exactly one root type"):
+            ForyCodec(mode=SerializationMode.ROW, types=[SimpleMsg, InnerMsg])
 
     def test_encode_row_schema_wrong_mode_raises(self):
         """encode_row_schema raises ValueError if not in ROW mode."""

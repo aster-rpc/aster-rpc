@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
-from aster_python.aster.codec import ForyCodec
+from aster_python.aster.codec import ForyCodec, ForyConfig
 from aster_python.aster.protocol import StreamHeader, RpcStatus
 from aster_python.aster.status import StatusCode, RpcError
 from aster_python.aster.types import SerializationMode
@@ -214,6 +214,7 @@ def create_client(
     service_class: type,
     connection: "aster_python.IrohConnection",
     codec: ForyCodec | None = None,
+    fory_config: ForyConfig | None = None,
     interceptors: list[Any] | None = None,
     registry: ServiceRegistry | None = None,
 ) -> ServiceClient:
@@ -223,6 +224,7 @@ def create_client(
         service_class: A class decorated with @service.
         connection: The Iroh connection to use for RPC calls.
         codec: The ForyCodec for serialization. Defaults to XLANG mode.
+        fory_config: Optional configuration for implicitly created codecs.
         interceptors: List of interceptor instances to apply to all calls.
         registry: Optional ServiceRegistry for looking up service info.
 
@@ -249,6 +251,7 @@ def create_client(
         codec = ForyCodec(
             mode=SerializationMode.XLANG,
             types=list(service_info.methods.values()) if service_info.methods else None,
+            fory_config=fory_config,
         )
 
     transport = IrohTransport(connection=connection, codec=codec)
@@ -269,6 +272,7 @@ def create_local_client(
     implementation: Any,
     wire_compatible: bool = True,
     codec: ForyCodec | None = None,
+    fory_config: ForyConfig | None = None,
     interceptors: list[Any] | None = None,
 ) -> ServiceClient:
     """Create a typed client stub for an in-process service.
@@ -281,6 +285,7 @@ def create_local_client(
         wire_compatible: If True, exercises full serialization pipeline.
             Defaults to True for conformance testing.
         codec: The ForyCodec for serialization.
+        fory_config: Optional configuration for implicitly created codecs.
         interceptors: List of interceptor instances to apply to all calls.
 
     Returns:
@@ -331,6 +336,7 @@ def create_local_client(
         codec = ForyCodec(
             mode=SerializationMode.XLANG,
             types=request_response_types if request_response_types else None,
+            fory_config=fory_config,
         )
 
     # Build handler registry for LocalTransport

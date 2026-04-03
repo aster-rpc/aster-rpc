@@ -16,7 +16,7 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster_python.aster.codec import fory_tag, ForyCodec
+from aster_python.aster.codec import fory_tag, ForyCodec, ForyConfig
 from aster_python.aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
 from aster_python.aster.protocol import StreamHeader, RpcStatus
 from aster_python.aster.types import SerializationMode
@@ -176,6 +176,21 @@ class TestLocalTransportInit:
         registry = make_handler_registry()
         transport = LocalTransport(handler_registry=registry)
         assert transport._codec.mode == SerializationMode.XLANG
+
+    def test_default_codec_enables_xlang(self):
+        """Default implicit codec enables pyfory xlang mode."""
+        registry = make_handler_registry()
+        transport = LocalTransport(handler_registry=registry)
+        assert transport._codec.fory_config.resolved_xlang(transport._codec.mode) is True
+
+    def test_default_codec_accepts_fory_config(self):
+        """LocalTransport threads fory_config into implicit codec creation."""
+        registry = make_handler_registry()
+        transport = LocalTransport(
+            handler_registry=registry,
+            fory_config=ForyConfig(xlang=False),
+        )
+        assert transport._codec.fory_config.resolved_xlang(transport._codec.mode) is False
 
 
 class TestLocalTransportUnary:

@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
-from aster_python.aster.codec import ForyCodec
+from aster_python.aster.codec import ForyCodec, ForyConfig
 from aster_python.aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
 from aster_python.aster.protocol import StreamHeader, RpcStatus
 from aster_python.aster.status import StatusCode, RpcError
@@ -99,6 +99,7 @@ class Server:
         endpoint: "aster_python.IrohEndpoint",
         services: list[type] | ServiceRegistry | None = None,
         codec: ForyCodec | None = None,
+        fory_config: ForyConfig | None = None,
         interceptors: list[Any] | None = None,
         max_concurrent_streams: int | None = None,
         registry: ServiceRegistry | None = None,
@@ -109,12 +110,16 @@ class Server:
             endpoint: The Iroh endpoint to accept connections on.
             services: Service classes (decorated with @service) or a ServiceRegistry.
             codec: The ForyCodec for serialization. Defaults to XLANG mode.
+            fory_config: Optional configuration for implicitly created codecs.
             interceptors: List of interceptor instances to apply to all calls.
             max_concurrent_streams: Maximum concurrent streams per connection.
             registry: Optional ServiceRegistry. If not provided, creates one from services.
         """
         self._endpoint = endpoint
-        self._codec = codec or ForyCodec(mode=SerializationMode.XLANG)
+        self._codec = codec or ForyCodec(
+            mode=SerializationMode.XLANG,
+            fory_config=fory_config,
+        )
         self._interceptors = list(interceptors) if interceptors else []
         self._max_concurrent_streams = max_concurrent_streams
 

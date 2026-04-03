@@ -18,7 +18,7 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster_python.aster.codec import fory_tag, ForyCodec
+from aster_python.aster.codec import fory_tag, ForyCodec, ForyConfig
 from aster_python.aster.types import SerializationMode
 from aster_python.aster.status import StatusCode, RpcError
 from aster_python.aster.decorators import (
@@ -250,6 +250,15 @@ class TestClientCreation:
         assert isinstance(client, ServiceClient)
         assert client.service_name == "TestEchoService"
         assert client.service_version == 1
+
+    def test_local_client_threads_fory_config_to_implicit_codec(self):
+        client = create_local_client(
+            TestEchoService,
+            TestEchoService(),
+            wire_compatible=True,
+            fory_config=ForyConfig(xlang=False),
+        )
+        assert client._codec.fory_config.resolved_xlang(client._codec.mode) is False
 
     def test_local_client_has_methods(self):
         """Client has methods for each RPC."""
@@ -507,6 +516,11 @@ class TestRpcError:
             details={"key": "value"},
         )
         assert error.details == {"key": "value"}
+
+    def test_rpc_error_factory_returns_specific_subclass(self):
+        error = RpcError.from_status(StatusCode.NOT_FOUND, "resource not found")
+        assert error.code == StatusCode.NOT_FOUND
+        assert type(error).__name__ == "NotFoundError"
 
 
 # ── Server errors tests ──────────────────────────────────────────────────────
