@@ -878,7 +878,12 @@ Every message on a QUIC stream is framed as:
   - Bit 3 (`0x08`): `ROW_SCHEMA` — payload is a Fory row schema (see §5.5.2).
     Valid only on the first data frame of a ROW-mode stream; must not be set on
     any other frame. Must not be combined with `HEADER` or `TRAILER`.
-  - Bits 4–7: Reserved, must be zero.
+  - Bit 4 (`0x10`): `CALL` — per-call header within a session stream (see
+    session-scoped services addendum). Must not appear on non-session streams.
+  - Bit 5 (`0x20`): `CANCEL` — cancel the current in-flight call on a session
+    stream (see session-scoped services addendum). Must not appear on
+    non-session streams.
+  - Bits 6–7: Reserved, must be zero.
 - **Payload**: Serialized bytes (Fory or raw, depending on flags).
 
 ### 6.2 Stream Header
@@ -906,6 +911,12 @@ authoritative identity of the service contract and must match the published
 canonical contract selected during registry resolution. Servers must reject the
 call with `FAILED_PRECONDITION` if the referenced contract is unknown, disabled,
 or incompatible with the selected method or serialization mode.
+
+**Session-scoped streams:** When `method` is an empty string (`""`), the stream
+is a session-scoped stream (see session-scoped services addendum). The server
+instantiates a per-stream service instance and enters a session loop. The
+`call_id` field serves as the session identifier. Per-call method dispatch uses
+`CALL` frames (bit 4) instead of the `StreamHeader.method` field.
 
 > **TODO (Phase 1 blocker):** The canonical contract encoding (§11.3) must be
 > resolved before the wire implementation ships. `contract_id` is a BLAKE3 hash
@@ -1441,6 +1452,8 @@ class CallContext:
     service: str
     method: str
     call_id: str
+    session_id: str | None      # Non-None for session-scoped calls
+    peer: EndpointId | None     # Remote endpoint identity (always set for remote calls)
     metadata: dict[str, str]
     deadline: float | None
     is_streaming: bool
@@ -1558,11 +1571,19 @@ registry state is used to publish contracts, advertise live endpoints, and
 resolve compatibility without requiring infrastructure servers.
 
 **Design rule:** `iroh-docs` is the authoritative, eventually-consistent source
-of registry state. `iroh-gossip` carries low-latency notifications and hints.
-Consumers always reconcile against docs before acting on gossip. `iroh-blobs`
-transfers large immutable artifacts. Automerge is optional for higher-layer
-collaborative state, but is not the canonical storage format for the registry
-itself.
+of mutable registry state (aliases, leases, ACLs, channel pointers). `iroh-gossip`
+carries low-latency notifications and hints. Consumers always reconcile against
+docs before acting on gossip. `iroh-blobs` stores and transfers immutable
+contract artifacts as **Iroh collections** (HashSeq format with built-in
+`CollectionMeta` naming). Automerge is optional for higher-layer collaborative
+state, but is not the canonical storage format for the registry itself.
+
+**Separation of concerns:** Docs owns mutability. Blobs collections own
+immutability. A contract is published as an immutable Iroh collection bundle;
+docs stores lightweight pointers (collection root hash, optional provider
+metadata) that resolve to those bundles. This avoids simulating a filesystem
+hierarchy in docs keys for artifact storage, reduces read amplification, and
+aligns with Iroh's native content-addressed transfer primitives.
 
 ### 11.1 Iroh Primitives Used
 
@@ -1575,8 +1596,14 @@ itself.
 
 ### 11.2 Registry Data Model and Namespace Structure
 
-The registry separates **immutable contract artifacts** from **mutable service
-aliases and endpoint leases**.
+The registry separates **immutable contract artifacts** (stored as Iroh Blobs
+collections) from **mutable service aliases, pointers, and endpoint leases**
+(stored as iroh-docs entries).
+
+Immutable contract bundles live in `iroh-blobs` as **Iroh collections**
+(HashSeq format). Each collection uses Iroh's native `CollectionMeta` to name
+its members — no custom packaging format is needed. Docs stores lightweight
+`ArtifactRef` pointers that resolve to collection root hashes.
 
 ```text
 {namespace}/
@@ -1589,20 +1616,10 @@ aliases and endpoint leases**.
 │   └── config/
 │       ├── gossip_topic                         → TopicId for change notifications
 │       ├── lease_duration_s                     → int (default: 45)
-│       ├── lease_refresh_interval_s             → int (default: 15)
-│       └── max_inline_contract_bytes            → int (default: 65536)
+│       └── lease_refresh_interval_s             → int (default: 15)
 │
 ├── contracts/
-│   ├── {contract_id}/
-│   │   ├── manifest                             → ContractManifest JSON
-│   │   ├── schema.fdl                           → canonical Fory IDL source text OR blob ref
-│   │   ├── methods                              → Method metadata JSON
-│   │   ├── meta                                 → Contract metadata JSON
-│   │   ├── docs                                 → optional documentation bundle ref
-│   │   └── generated/
-│   │       ├── canonical.sha256                 → optional secondary digest for tooling
-│   │       └── descriptors                      → optional runtime descriptor bundle
-│   └── ...
+│   └── {contract_id}                            → ArtifactRef JSON (see §11.2.1)
 │
 ├── services/
 │   ├── {service_name}/
@@ -1631,8 +1648,75 @@ aliases and endpoint leases**.
         └── {other_contract_id}                  → Compatibility report / diff
 ```
 
-All entries are signed by their author’s keypair. The `AuthorId` on each entry
+All entries are signed by their author's keypair. The `AuthorId` on each entry
 is the cryptographic proof of who wrote it.
+
+#### 11.2.1 ArtifactRef — Docs Pointer to a Collection Bundle
+
+Each `contracts/{contract_id}` docs entry stores a small JSON `ArtifactRef`
+that points to the immutable Iroh collection containing the contract artifacts:
+
+```text
+ArtifactRef {
+    contract_id: string              // hex-encoded BLAKE3 of ServiceContract
+    collection_hash: string          // hex-encoded BLAKE3 root hash of the Iroh collection
+    provider_endpoint_id: string?    // optional: endpoint serving the blobs ALPN
+    relay_url: string?               // optional: relay for the provider
+    ticket: string?                  // optional: bearer blob ticket for direct fetch
+    published_by: AuthorId
+    published_at_epoch_ms: int64
+}
+```
+
+The `collection_hash` is the root hash of an Iroh collection (HashSeq format).
+The collection's `CollectionMeta` names its members. Consumers fetch the
+collection via `iroh-blobs` using the root hash or ticket.
+
+#### 11.2.2 Contract Collection Layout
+
+A contract is published as an Iroh collection with the following named members:
+
+| Collection member name     | Content                                       | Required |
+|---------------------------|-----------------------------------------------|----------|
+| `contract.xlang`          | Canonical XLANG bytes of `ServiceContract`    | Yes      |
+| `manifest.json`           | `ContractManifest` JSON (see §11.4)           | Yes      |
+| `types/{type_hash}.xlang` | Canonical XLANG bytes of each `TypeDef`       | Yes      |
+| `schema.fdl`              | Human-readable Fory IDL source text           | No       |
+| `docs/`                   | Documentation bundle                          | No       |
+| `compatibility/{other_id}`| Compatibility report vs another contract      | No       |
+
+The collection member names are carried by Iroh's native `CollectionMeta`
+(the `names: Vec<String>` field in the collection metadata blob). No custom
+metadata format is needed — the names are the layout.
+
+**Identity rule:** The `contract_id` is derived from the canonical
+`ServiceContract` bytes (the `contract.xlang` member), not from the collection
+root hash. The collection root hash identifies the *bundle*; the `contract_id`
+identifies the *contract*. Two bundles with different optional members (e.g.
+one includes `schema.fdl`, the other does not) may share the same
+`contract_id` if their `contract.xlang` bytes are identical.
+
+**Verification:** After fetching a contract collection, consumers must verify
+that `blake3(contract.xlang bytes) == contract_id` before trusting the bundle.
+
+#### 11.2.3 Trusted-Author Filtering on Docs Reads
+
+Because iroh-docs is multi-author (multiple authors can write to the same key),
+consumers must filter docs reads by trusted `AuthorId` before accepting values.
+
+When reading any mutable registry entry (alias, lease, channel pointer, ACL),
+consumers must:
+
+1. Query the key across all authors (e.g. via `query_key_exact`).
+2. Filter results to entries written by `AuthorId`s in the appropriate ACL
+   tier (`_aster/acl/writers` for service entries, `_aster/acl/admins` for
+   ACL entries).
+3. Among trusted entries, select the one with the highest `lease_seq` or
+   most recent timestamp as appropriate.
+
+This prevents untrusted authors from poisoning the registry by writing to
+well-known keys. The ACL tiers are cached locally and refreshed on gossip
+`ACL_CHANGED` events.
 
 ### 11.3 Contract Canonicalization and Identity
 
@@ -1662,18 +1746,44 @@ Canonicalization rules:
 
 ### 11.4 Contract Publication
 
-A published contract is immutable. The first publication of a `contract_id`
-creates its artifact set under `contracts/{contract_id}/`. Re-publishing the
-same canonical bytes is idempotent.
+A published contract is immutable. Publication creates an Iroh collection
+bundle containing the contract artifacts and writes an `ArtifactRef` pointer
+into docs. Re-publishing the same canonical bytes is idempotent — the
+`contract_id` (BLAKE3 of canonical `ServiceContract` bytes) guarantees
+identity.
+
+**Publication procedure:**
+
+1. Resolve the type graph from the service definition (decorators, IDL, or
+   code-first annotations).
+2. For each type in the closure, serialize a `TypeDef` to canonical XLANG
+   bytes.
+3. Serialize the `ServiceContract` to canonical XLANG bytes. Compute
+   `contract_id = hex(blake3(bytes))`.
+4. Build an Iroh collection with the layout defined in §11.2.2:
+   - `contract.xlang` → canonical `ServiceContract` bytes
+   - `manifest.json` → `ContractManifest` JSON (see below)
+   - `types/{type_hash}.xlang` → canonical `TypeDef` bytes for each type
+   - Optionally: `schema.fdl`, documentation bundle, compatibility reports
+5. Import the collection into the local `iroh-blobs` store. The collection
+   root hash is the BLAKE3 of the HashSeq (computed automatically by Iroh).
+6. Write an `ArtifactRef` to `contracts/{contract_id}` in the registry
+   namespace docs (see §11.2.1). If the key already exists with matching
+   `contract_id`, the write is idempotent.
+7. Write or confirm the version pointer at
+   `services/{name}/versions/v{version}` → `contract_id`.
+8. Optionally update channel aliases
+   (`services/{name}/channels/{channel}` → `contract_id`).
+9. Broadcast `CONTRACT_PUBLISHED` on gossip.
 
 ```text
 ContractManifest {
     service: string
     version: int32
-    contract_id: string
-    canonical_encoding: string          // e.g. "fory-idl/v1"
-    canonical_bytes_inline: bool
-    schema_blob_hash: string?           // required when schema.fdl stores a blob ref
+    contract_id: string              // hex-encoded BLAKE3 of ServiceContract
+    canonical_encoding: string       // e.g. "fory-xlang/0.15" (pinned Fory wire version)
+    type_count: int32                // number of distinct types in closure
+    type_hashes: list<string>        // all TypeDef hashes (transitive closure)
     method_count: int32
     serialization_modes: list<string>   // ordered by producer preference
     alpn: string
@@ -1683,8 +1793,16 @@ ContractManifest {
 }
 ```
 
-Contracts may also publish optional generated artifacts such as runtime
-descriptor bundles, documentation bundles, or compatibility reports.
+The `type_hashes` field allows a consumer to verify the type closure without
+walking the Merkle DAG. The authoritative type graph is encoded in the
+`TypeDef` references themselves; `type_hashes` is an optimisation for
+prefetching and integrity checking.
+
+**Fetching a contract:** A consumer that knows a `contract_id` reads the
+`ArtifactRef` from `contracts/{contract_id}` in docs, fetches the Iroh
+collection via `iroh-blobs` using the `collection_hash` (or `ticket`),
+verifies `blake3(contract.xlang) == contract_id`, and loads the type closure
+from the `types/` members.
 
 ### 11.5 Service Aliases, Versions, and Channels
 
@@ -2204,6 +2322,66 @@ handled by the content-addressed contract registry (§11.3), not by Fory's
 |0.6.0  |§5.3 XLANG Mode rewritten: numeric type IDs replaced by canonical tag string scheme (`"{dotted.package}/{TypeName}"`), `_aster/*` namespace reserved for framework types, hash-derived numeric IDs demoted to local optimisation, eager tag validation at class definition time specified. §5.5 ROW Mode: TODOs resolved; §5.5.1 confirms identical length-prefix framing for ROW payloads; §5.5.2 confirms ROW mode in all streaming patterns with schema hoisting (`ROW_SCHEMA` flag) defined. §6.1 Stream Framing: `ROW_SCHEMA` flag (bit 3, `0x08`) added; reserved bits updated from 3–7 to 4–7. §8.3 Local Client rewritten: `Transport` structural Protocol defined in `transport/base.py`; interceptor obligation on `LocalTransport` specified; `wire_compatible` mode documented. §15 Package structure: `transport/base.py` added. §16.1 Blocking questions closed.                                                                                                          |
 |0.5.0  |§6.6 ALPN resolved: single `aster/1` per wire version, rationale documented. §6.7 Streaming error recovery: new section, QUIC-layer handling, retry responsibility defined. §6.8 Deadline semantics: new section, per-call absolute epoch, no framework-level propagation, cancellation-via-stream-lifecycle rationale. §9.2 CircuitBreakerInterceptor added with state machine. §10.1 Bootstrap: EndpointId stability via stable secret key documented, “out-of-band” removed. §11.6 Health status values formalised with routing behaviour table. §11.9 Publisher flow updated with `starting`/`draining` transitions. §11.10 Named load balancing strategies defined (round_robin, least_load, random). §11.12 Registry partition tolerance policy added. §14 OTel moved to Phase 2. §15 circuit_breaker.py added to package structure. §16 ALPN question closed; new questions added for multi-registry federation, OTel schema, channel promotion rules, enterprise ACL extensions.|
 |0.4.0  |Initial internal draft.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+
+-----
+
+## Appendix D: Python Implementation Readiness Checklist
+
+Before starting the Python Aster implementation, the following items must be
+confirmed or resolved. This checklist captures the practical proof points
+identified during spec review.
+
+### D.1 Transport Layer (iroh-python)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `aster_transport_core` as sole Python backend | ✅ Done | PyO3 wraps core directly, no C ABI path |
+| Docs: create, set_bytes, get_exact, share, join | ✅ Done | `test_docs.py` passes |
+| Docs: query_key_exact, query_key_prefix, read_entry_content | ✅ Done | Multi-author filtering support |
+| Blobs: add_bytes, read, ticket, download | ✅ Done | `test_blobs.py` passes |
+| Blobs: add_bytes_as_collection, create_collection_ticket | ✅ Done | sendme-compatible |
+| Blobs: download_collection (name→data pairs) | ✅ Done | Required for contract fetch |
+| Gossip: subscribe, broadcast, receive | ✅ Done | `test_gossip.py` passes |
+| Connections: open_bi, accept_bi, streams | ✅ Done | `test_net.py` passes |
+| Datagrams: send, read, max_datagram_size, buffer_space | ✅ Done | Phase 1b |
+| Monitoring: remote_info, connection_info | ✅ Done | Phase 1b |
+| Hooks: endpoint hooks callback lifecycle | ⚠️ Partial | Core adapter done; Python callback dispatch is placeholder |
+| Secret key export/import | ✅ Done | Stable EndpointId support |
+
+### D.2 Serialization (Apache Fory / pyfory)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| pyfory XLANG mode available in Python | ❓ Verify | Must confirm pyfory supports XLANG serialization |
+| pyfory ROW mode available in Python | ❓ Verify | Zero-copy field access needed for ROW |
+| Canonical XLANG profile implementable in pyfory | ❓ Verify | Deterministic field-order, no ref tracking, standalone |
+| Golden vector spike: Python + Rust produce identical bytes | ❓ TODO | Pre-implementation proof required |
+| Tag-based type registration in pyfory | ❓ Verify | `@fory_type(tag=...)` must map to pyfory API |
+
+### D.3 Contract Identity
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Canonical XLANG profile produces deterministic bytes | ❓ TODO | Requires golden vector tests |
+| BLAKE3 hashing available in Python | ✅ Available | `blake3` PyPI package |
+| TypeDef / ServiceContract serialization in pyfory | ❓ TODO | Framework-internal types need pyfory registration |
+| Iroh collection build + import from Python | ❓ TODO | Need `Collection.store()` equivalent via PyO3 |
+| ArtifactRef write to docs from Python | ✅ Feasible | Uses existing `doc.set_bytes()` |
+| Collection fetch + verify from Python | ❓ TODO | Need `download_collection` + blake3 verify |
+
+### D.4 Decisions to Lock
+
+| Decision | Recommendation | Status |
+|----------|---------------|--------|
+| Python Phase 1 includes docs query APIs | Yes | Needed for registry reads |
+| Python Phase 1 includes monitoring/remote-info | Yes | Already exposed |
+| Python Phase 1 includes hooks | Defer full hooks; mark experimental | Callback plumbing incomplete |
+| Operational metadata format in docs entries | JSON initially | Switch to XLANG only if determinism needed |
+| Contract collection member order | Not significant for identity | `contract_id` comes from `contract.xlang` bytes |
+| Immutable artifact caching policy | Cache indefinitely by content hash | Standard for content-addressed data |
+| Failure: docs alias exists but collection fetch fails | Surface as `UNAVAILABLE` to caller | Consumer retries per policy |
+| Failure: collection contents don't hash to `contract_id` | Reject bundle, surface `DATA_LOSS` | Integrity check is mandatory |
+| Security for artifact fetch | Public immutable by default | Authenticated blob refs for private registries |
 
 -----
 

@@ -235,12 +235,17 @@ Client                                          Server
    sequencing rules as their equivalent stream-per-RPC pattern (§6.3):
    - **Unary:** one request frame, one response frame.
    - **Server stream:** one request frame, N response frames, one trailer.
-   - **Client stream:** N request frames, then the server reads until it
-     receives a `CALL` or `finish()` to detect end-of-input, then sends one
-     response frame.
-   - **Bidi stream:** concurrent request and response frames, terminated by a
-     `CALL` (next call) or `finish()` (session close) from the client, followed
-     by a trailer from the server.
+   - **Client stream:** N request frames, then the client sends a `TRAILER`
+     with status `OK` (code 0) to signal end-of-input for this call. The
+     server reads until it receives the client's `TRAILER`, then sends one
+     response frame. (In stream-per-RPC, `finish()` signals end-of-input; in
+     sessions, `finish()` means session close, so an explicit client `TRAILER`
+     is required instead.)
+   - **Bidi stream:** concurrent request and response frames. The client
+     signals end-of-input by sending a `TRAILER` with status `OK` (code 0).
+     The server must then send its own `TRAILER` to complete the call. The
+     client must wait for the server's `TRAILER` before releasing the session
+     lock and sending the next `CALL` frame.
 4. `finish()` from the client at a call boundary (not mid-call) signals session
    close. The server calls `on_session_close()` and finishes its side.
 5. A `CALL` frame must not appear while a previous call is still in flight.
@@ -609,6 +614,12 @@ Session streams use the same `aster/1` ALPN. No new ALPN is introduced.
 | `CANCEL` flag (bit 5, 0x20)| New flag    | In-band cancellation of the current call             |
 | `CallHeader` type          | New type    | method, call_id, deadline, metadata                  |
 | `StreamHeader.method = ""` | Convention  | Signals session-scoped stream (vs. single-RPC stream)|
+
+**Changes to contract identity (§11.3):** `ServiceContract` gains a `scoped`
+field (field 6). A session-scoped service (`scoped = "stream"`) and a shared
+service (`scoped = "shared"`) with otherwise identical methods produce
+**different `contract_id` values**. This prevents a client from accidentally
+connecting to a scoped endpoint with a stateless stub or vice versa.
 
 No changes to framing (§6.1), status codes (§6.5), trailer format (§6.4),
 ALPN (§6.6), or any existing flag semantics.

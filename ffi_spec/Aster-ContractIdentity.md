@@ -7,10 +7,18 @@
 
 ## §11.2 Registry Data Model and Namespace Structure
 
-The registry separates **immutable type and contract artifacts** from **mutable
-service aliases and endpoint leases**. Types and contracts are stored by their
+The registry separates **immutable type and contract artifacts** (stored as
+Iroh Blobs collections) from **mutable service aliases and endpoint leases**
+(stored as iroh-docs entries). Types and contracts are identified by their
 content address (BLAKE3 hash). The content address *is* the identity — no
 external ID assignment, no collision risk, no coordination required.
+
+**Storage model:** Immutable contract bundles are published as **Iroh
+collections** (HashSeq format with built-in `CollectionMeta` naming).
+iroh-docs stores lightweight `ArtifactRef` pointers that resolve to collection
+root hashes. This avoids simulating a filesystem hierarchy in docs keys for
+artifact storage and aligns with Iroh's native content-addressed transfer
+primitives.
 
 ```text
 {namespace}/
@@ -23,20 +31,10 @@ external ID assignment, no collision risk, no coordination required.
 │   └── config/
 │       ├── gossip_topic                         → TopicId for change notifications
 │       ├── lease_duration_s                     → int (default: 45)
-│       ├── lease_refresh_interval_s             → int (default: 15)
-│       └── max_inline_type_bytes                → int (default: 65536)
-│
-├── types/
-│   ├── {type_hash}/                             → canonical XLANG bytes of TypeDef
-│   └── ...
+│       └── lease_refresh_interval_s             → int (default: 15)
 │
 ├── contracts/
-│   ├── {contract_id}/
-│   │   ├── definition                           → canonical XLANG bytes of ServiceContract
-│   │   ├── manifest                             → ContractManifest (XLANG)
-│   │   ├── docs                                 → optional documentation bundle ref
-│   │   └── fdl                                  → optional human-readable FDL source text
-│   └── ...
+│   └── {contract_id}                            → ArtifactRef JSON (see below)
 │
 ├── services/
 │   ├── {service_name}/
@@ -68,10 +66,47 @@ external ID assignment, no collision risk, no coordination required.
 All entries are signed by their author's keypair. The `AuthorId` on each entry
 is the cryptographic proof of who wrote it.
 
-Key change from previous drafts: the `types/` namespace stores individual type
-definitions by content hash. Contract definitions reference types by hash, not
-by name. This forms a Merkle DAG: changing a type changes its hash, which
-changes the hash of every contract that references it.
+**ArtifactRef** — each `contracts/{contract_id}` docs entry stores a small JSON
+pointer to the immutable Iroh collection containing the contract artifacts:
+
+```text
+ArtifactRef {
+    contract_id: string              // hex-encoded BLAKE3 of ServiceContract
+    collection_hash: string          // hex-encoded BLAKE3 root hash of the Iroh collection
+    provider_endpoint_id: string?    // optional: endpoint serving the blobs ALPN
+    relay_url: string?               // optional: relay for the provider
+    ticket: string?                  // optional: bearer blob ticket for direct fetch
+    published_by: AuthorId
+    published_at_epoch_ms: int64
+}
+```
+
+**Contract collection layout** — a contract is published as an Iroh collection
+with the following named members (names carried by `CollectionMeta`):
+
+| Collection member name     | Content                                       | Required |
+|---------------------------|-----------------------------------------------|----------|
+| `contract.xlang`          | Canonical XLANG bytes of `ServiceContract`    | Yes      |
+| `manifest.json`           | `ContractManifest` JSON                       | Yes      |
+| `types/{type_hash}.xlang` | Canonical XLANG bytes of each `TypeDef`       | Yes      |
+| `schema.fdl`              | Human-readable Fory IDL source text           | No       |
+| `docs/`                   | Documentation bundle                          | No       |
+| `compatibility/{other_id}`| Compatibility report vs another contract      | No       |
+
+Key design points:
+
+- The `types/` namespace no longer exists as docs keys. Type definitions are
+  members of the contract collection, stored by content hash in the collection's
+  named blob list.
+- Contract definitions reference types by hash, forming a Merkle DAG. Changing
+  a type changes its hash, which changes the hash of every contract that
+  references it.
+- The `contract_id` is derived from the canonical `ServiceContract` bytes
+  (the `contract.xlang` member), **not** from the collection root hash. The
+  collection root hash identifies the *bundle*; the `contract_id` identifies
+  the *contract*.
+- After fetching a contract collection, consumers must verify
+  `blake3(contract.xlang bytes) == contract_id` before trusting the bundle.
 
 -----
 
@@ -185,6 +220,7 @@ message ServiceContract {
     list<MethodDef> methods = 3;    // Sorted by method name (lexicographic, ASCII)
     list<string> serialization_modes = 4; // Ordered by producer preference
     string alpn = 5;                // Always "aster/{wire_version}"
+    string scoped = 6;             // "shared" (default) or "stream" (session-scoped)
 }
 ```
 
@@ -226,10 +262,16 @@ request/response type hashes. Sort methods by name. Serialize the
 contract_id = hex(blake3(canonical_xlang_bytes(ServiceContract)))
 ```
 
-**Step 5 — Store.** Write each `TypeDef` to `types/{hex(hash)}` and the
-`ServiceContract` to `contracts/{contract_id}/definition` in the registry
-namespace. These entries are immutable — re-publishing the same bytes is
-idempotent and produces the same key.
+**Step 5 — Package as collection.** Build an Iroh collection (see §11.2
+contract collection layout) containing:
+- `contract.xlang` → canonical `ServiceContract` bytes
+- `manifest.json` → `ContractManifest` JSON
+- `types/{hex(hash)}.xlang` → canonical `TypeDef` bytes for each type
+
+Import the collection into `iroh-blobs`. Write an `ArtifactRef` to
+`contracts/{contract_id}` in the registry namespace docs. These entries are
+immutable — re-publishing the same bytes is idempotent and produces the same
+collection root hash.
 
 ### 11.3.5 Worked Example
 
@@ -317,37 +359,44 @@ canonical encoding is stable indefinitely.
 
 ## §11.4 Contract Publication
 
-A published contract is immutable. The first publication of a `contract_id`
-writes its artifacts into the registry namespace. Re-publishing the same
-content is idempotent — the content address guarantees identity.
+A published contract is immutable. Publication creates an Iroh collection
+bundle containing the contract artifacts and writes an `ArtifactRef` pointer
+into docs. Re-publishing the same canonical bytes is idempotent — the
+`contract_id` (BLAKE3 of canonical `ServiceContract` bytes) guarantees
+identity.
 
 **Publication procedure:**
 
 1. Resolve the type graph from the service definition (decorators, IDL, or
    code-first annotations).
 2. For each type in the closure, serialize a `TypeDef` to canonical XLANG
-   bytes. Check if `types/{hash}` already exists in the namespace. If not,
-   write it.
+   bytes.
 3. Serialize the `ServiceContract` to canonical XLANG bytes. Compute
    `contract_id = hex(blake3(bytes))`.
-4. If `contracts/{contract_id}/definition` does not exist, write:
-   - `contracts/{contract_id}/definition` → canonical XLANG bytes
-   - `contracts/{contract_id}/manifest` → `ContractManifest` (see below)
-   - `contracts/{contract_id}/fdl` → optional human-readable FDL source
-5. Write or confirm the version pointer at
+4. Build an Iroh collection with the layout defined in §11.2:
+   - `contract.xlang` → canonical `ServiceContract` bytes
+   - `manifest.json` → `ContractManifest` JSON (see below)
+   - `types/{type_hash}.xlang` → canonical `TypeDef` bytes for each type
+   - Optionally: `schema.fdl`, documentation bundle, compatibility reports
+5. Import the collection into the local `iroh-blobs` store. The collection
+   root hash is the BLAKE3 of the HashSeq (computed automatically by Iroh).
+6. Write an `ArtifactRef` to `contracts/{contract_id}` in the registry
+   namespace docs (see §11.2). If the key already exists with matching
+   `contract_id`, the write is idempotent.
+7. Write or confirm the version pointer at
    `services/{name}/versions/v{version}` → `contract_id`.
-6. Optionally update channel aliases
+8. Optionally update channel aliases
    (`services/{name}/channels/{channel}` → `contract_id`).
-7. Broadcast `CONTRACT_PUBLISHED` on gossip.
+9. Broadcast `CONTRACT_PUBLISHED` on gossip.
 
 ```text
 ContractManifest {
     service: string
     version: int32
-    contract_id: string              // hex-encoded BLAKE3
+    contract_id: string              // hex-encoded BLAKE3 of ServiceContract
     canonical_encoding: string       // "fory-xlang/0.15" (pinned Fory wire version)
-    type_count: int32                // Number of distinct types in closure
-    type_hashes: list<string>        // All TypeDef hashes referenced (transitive)
+    type_count: int32                // number of distinct types in closure
+    type_hashes: list<string>        // all TypeDef hashes (transitive closure)
     method_count: int32
     serialization_modes: list<string>
     alpn: string
@@ -357,16 +406,16 @@ ContractManifest {
 }
 ```
 
-The `type_hashes` field in the manifest allows a consumer to prefetch all
-types in the closure without walking the Merkle DAG. This is an optimisation —
-the authoritative type graph is the DAG encoded in the `TypeDef` references
-themselves.
+The `type_hashes` field allows a consumer to verify the type closure without
+walking the Merkle DAG. The authoritative type graph is encoded in the
+`TypeDef` references themselves; `type_hashes` is an optimisation for
+prefetching and integrity checking.
 
-**Fetching a contract:** A consumer that knows a `contract_id` reads
-`contracts/{contract_id}/definition` to get the `ServiceContract`. To inspect
-individual types, it reads `types/{hash}` for each type hash found in the
-method definitions. Large type closures may be fetched in bulk using the
-`type_hashes` list in the manifest.
+**Fetching a contract:** A consumer that knows a `contract_id` reads the
+`ArtifactRef` from `contracts/{contract_id}` in docs, fetches the Iroh
+collection via `iroh-blobs` using the `collection_hash` (or `ticket`),
+verifies `blake3(contract.xlang) == contract_id`, and loads the type closure
+from the `types/` members of the collection.
 
 -----
 
