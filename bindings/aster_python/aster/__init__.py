@@ -6,6 +6,7 @@ the existing iroh transport bindings in ``aster_python``.
 
 Phase 1 exports: wire protocol types and framing utilities.
 Phase 2 exports: Fory serialization codec.
+Phase 3 exports: Transport abstraction (IrohTransport, LocalTransport).
 """
 
 from aster_python.aster.status import StatusCode, RpcError
@@ -28,6 +29,14 @@ from aster_python.aster.codec import (
     ForyCodec,
     DEFAULT_COMPRESSION_THRESHOLD,
 )
+from aster_python.aster.transport.base import (
+    Transport,
+    BidiChannel,
+    TransportError,
+    ConnectionLostError,
+)
+from aster_python.aster.transport.iroh import IrohTransport
+from aster_python.aster.transport.local import LocalTransport
 
 __all__ = [
     # status.py
@@ -56,4 +65,13 @@ __all__ = [
     "fory_tag",
     "ForyCodec",
     "DEFAULT_COMPRESSION_THRESHOLD",
+    # transport/base.py
+    "Transport",
+    "BidiChannel",
+    "TransportError",
+    "ConnectionLostError",
+    # transport/iroh.py
+    "IrohTransport",
+    # transport/local.py
+    "LocalTransport",
 ]

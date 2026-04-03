@@ -10,7 +10,7 @@ For each step we need to make sure the code passes tests and linting.
 
 ## STATUS
 
-Pre-requisites complete. Phase 1 complete (42/42 tests passing). Phase 2 complete (47/47 tests passing, 89/89 total).
+Pre-requisites complete. Phase 1 complete (42/42 tests passing). Phase 2 complete (47/47 tests passing, 89/89 total). Phase 3 complete (30/30 tests passing, 119/119 total).
 
 ## Pre-Requisites
 
@@ -71,21 +71,21 @@ Pre-requisites complete. Phase 1 complete (42/42 tests passing). Phase 2 complet
 
 ## Phase 3: Transport Abstraction
 
-- [ ] Create `aster/transport/__init__.py`
-- [ ] Create `aster/transport/base.py` — `Transport` protocol
-- [ ] Create `aster/transport/base.py` — `BidiChannel` class (send/recv/close + async context manager)
-- [ ] Create `aster/transport/iroh.py` — `IrohTransport` (opens QUIC stream per call)
-- [ ] Implement `IrohTransport.unary()`
-- [ ] Implement `IrohTransport.server_stream()`
-- [ ] Implement `IrohTransport.client_stream()`
-- [ ] Implement `IrohTransport.bidi_stream()`
-- [ ] Create `aster/transport/local.py` — `LocalTransport` (asyncio.Queue-based)
-- [ ] Implement `LocalTransport` with full interceptor chain
-- [ ] Implement `wire_compatible` flag on `LocalTransport`
-- [ ] Tests: IrohTransport unary round-trip over real Iroh connection
-- [ ] Tests: LocalTransport unary round-trip
-- [ ] Tests: BidiChannel for both transports
-- [ ] Tests: `wire_compatible=True` catches missing type tags
+- [x] Create `aster/transport/__init__.py`
+- [x] Create `aster/transport/base.py` — `Transport` protocol
+- [x] Create `aster/transport/base.py` — `BidiChannel` class (send/recv/close + async context manager)
+- [x] Create `aster/transport/iroh.py` — `IrohTransport` (opens QUIC stream per call)
+- [x] Implement `IrohTransport.unary()`
+- [x] Implement `IrohTransport.server_stream()`
+- [x] Implement `IrohTransport.client_stream()`
+- [x] Implement `IrohTransport.bidi_stream()`
+- [x] Create `aster/transport/local.py` — `LocalTransport` (asyncio.Queue-based)
+- [x] Implement `LocalTransport` with full interceptor chain
+- [x] Implement `wire_compatible` flag on `LocalTransport`
+- [x] Tests: IrohTransport unary round-trip over real Iroh connection
+- [x] Tests: LocalTransport unary round-trip
+- [x] Tests: BidiChannel for both transports
+- [x] Tests: `wire_compatible=True` catches missing type tags
 
 ---
 
