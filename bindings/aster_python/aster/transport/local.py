@@ -87,6 +87,7 @@ class LocalBidiChannel(BidiChannel):
     """BidiChannel implementation for LocalTransport.
 
     Uses asyncio.Queue for send/receive within the same process.
+    Supports the async context manager protocol for convenient resource management.
     """
 
     def __init__(
@@ -113,8 +114,18 @@ class LocalBidiChannel(BidiChannel):
         self._trailer_queue = trailer_queue
         self._codec = codec
         self._closed = False
+        self._entered = False
         self._trailer_read = False
         self._last_trailer: tuple[int, str] | None = None
+
+    async def __aenter__(self) -> "LocalBidiChannel":
+        """Enter the async context manager."""
+        self._entered = True
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Exit the async context manager, closing the channel."""
+        await self.close()
 
     async def send(self, msg: Any) -> None:
         """Send a message on the channel."""
@@ -508,8 +519,15 @@ class LocalTransport(Transport):
             if asyncio.iscoroutine(response_iter):
                 response_iter = await response_iter
             
-            # Message loop
-            async for msg in send_queue:
+            # Message loop — asyncio.Queue is NOT an async iterator,
+            # so we use get() in a loop instead.
+            while True:
+                try:
+                    msg = await asyncio.wait_for(send_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    # Check if handler has more items to yield (non-blocking peek via try)
+                    continue
+                
                 if msg.is_close:
                     break
                 

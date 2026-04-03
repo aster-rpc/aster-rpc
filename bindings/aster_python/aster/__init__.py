@@ -7,6 +7,7 @@ the existing iroh transport bindings in ``aster_python``.
 Phase 1 exports: wire protocol types and framing utilities.
 Phase 2 exports: Fory serialization codec.
 Phase 3 exports: Transport abstraction (IrohTransport, LocalTransport).
+Phase 4 exports: Service definition (decorators, service registry).
 """
 
 from aster_python.aster.status import StatusCode, RpcError
@@ -37,6 +38,33 @@ from aster_python.aster.transport.base import (
 )
 from aster_python.aster.transport.iroh import IrohTransport
 from aster_python.aster.transport.local import LocalTransport
+
+# Phase 4: Service definition layer
+from aster_python.aster.decorators import (
+    service,
+    rpc,
+    server_stream,
+    client_stream,
+    bidi_stream,
+    RpcPattern,
+    ServiceInfo,
+    MethodInfo,
+)
+from aster_python.aster.service import ServiceRegistry, get_default_registry, set_default_registry
+from aster_python.aster.server import (
+    Server,
+    ServerError,
+    ServiceNotFoundError,
+    MethodNotFoundError,
+    SerializationModeError,
+)
+from aster_python.aster.client import (
+    ServiceClient,
+    create_client,
+    create_local_client,
+    ClientError,
+    ClientTimeoutError,
+)
 
 __all__ = [
     # status.py
@@ -74,4 +102,29 @@ __all__ = [
     "IrohTransport",
     # transport/local.py
     "LocalTransport",
+    # decorators.py (Phase 4)
+    "service",
+    "rpc",
+    "server_stream",
+    "client_stream",
+    "bidi_stream",
+    "RpcPattern",
+    "ServiceInfo",
+    "MethodInfo",
+    # service.py (Phase 4)
+    "ServiceRegistry",
+    "get_default_registry",
+    "set_default_registry",
+    # server.py (Phase 5)
+    "Server",
+    "ServerError",
+    "ServiceNotFoundError",
+    "MethodNotFoundError",
+    "SerializationModeError",
+    # client.py (Phase 6)
+    "ServiceClient",
+    "create_client",
+    "create_local_client",
+    "ClientError",
+    "ClientTimeoutError",
 ]
