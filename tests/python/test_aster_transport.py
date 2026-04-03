@@ -11,7 +11,7 @@ Tests cover:
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import AsyncIterator
 
 import pytest
@@ -20,7 +20,7 @@ from aster_python.aster.codec import fory_tag, ForyCodec, ForyConfig
 from aster_python.aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
 from aster_python.aster.protocol import StreamHeader, RpcStatus
 from aster_python.aster.types import SerializationMode
-from aster_python.aster.status import StatusCode, RpcError
+from aster_python.aster.status import StatusCode
 from aster_python.aster.transport.base import (
     Transport,
     BidiChannel,

@@ -1,25 +1,19 @@
-"""
-aster.client — Aster RPC client stub generation.
+"""aster.client — Aster RPC client stub generation.
 
 Spec reference: §8.2 (Client API), §8.3 (Local client)
 
 This module provides client stub generation for Aster RPC services:
-- create_client: Remote client over Iroh connection
-- create_local_client: In-process client using LocalTransport
+- ``create_client``: remote client over an Iroh connection or arbitrary transport
+- ``create_local_client``: in-process client using ``LocalTransport``
 """
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import time
-import uuid
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from aster_python.aster.codec import ForyCodec, ForyConfig
-from aster_python.aster.protocol import StreamHeader, RpcStatus
-from aster_python.aster.status import StatusCode, RpcError
 from aster_python.aster.types import SerializationMode
 from aster_python.aster.transport.base import Transport, BidiChannel
 from aster_python.aster.service import ServiceInfo, MethodInfo, ServiceRegistry
@@ -41,28 +35,7 @@ class ClientTimeoutError(ClientError):
     pass
 
 
-# ── Helper Functions ──────────────────────────────────────────────────────────
-
-
-def _build_metadata(
-    metadata: dict[str, str] | None,
-) -> tuple[list[str], list[str]]:
-    """Convert metadata dict to parallel key/value lists."""
-    if not metadata:
-        return [], []
-    keys = list(metadata.keys())
-    values = [metadata[k] for k in keys]
-    return keys, values
-
-
 # ── Client Stub Base ─────────────────────────────────────────────────────────
-
-
-@dataclass
-class MethodStub:
-    """Metadata for a single method stub."""
-    service_info: ServiceInfo
-    method_info: MethodInfo
 
 
 class ServiceClient:
@@ -83,6 +56,10 @@ class ServiceClient:
         self._service_info = service_info
         self._codec = codec
         self._interceptors = list(interceptors) if interceptors else []
+
+    async def close(self) -> None:
+        """Close the underlying transport if it exposes resources."""
+        await self._transport.close()
 
     @property
     def service_name(self) -> str:
@@ -117,6 +94,7 @@ class ServiceClient:
             if method_info.serialization
             else self._service_info.serialization_modes[0].value
         )
+        contract_id = getattr(self._service_info, "contract_id", "") or ""
 
         return await self._transport.unary(
             service=self._service_info.name,
@@ -125,6 +103,7 @@ class ServiceClient:
             metadata=metadata,
             deadline_epoch_ms=deadline,
             serialization_mode=serialization_mode,
+            contract_id=contract_id,
         )
 
     def _call_server_stream(
@@ -144,6 +123,7 @@ class ServiceClient:
             if method_info.serialization
             else self._service_info.serialization_modes[0].value
         )
+        contract_id = getattr(self._service_info, "contract_id", "") or ""
 
         return self._transport.server_stream(
             service=self._service_info.name,
@@ -152,6 +132,7 @@ class ServiceClient:
             metadata=metadata,
             deadline_epoch_ms=deadline,
             serialization_mode=serialization_mode,
+            contract_id=contract_id,
         )
 
     async def _call_client_stream(
@@ -171,6 +152,7 @@ class ServiceClient:
             if method_info.serialization
             else self._service_info.serialization_modes[0].value
         )
+        contract_id = getattr(self._service_info, "contract_id", "") or ""
 
         return await self._transport.client_stream(
             service=self._service_info.name,
@@ -179,6 +161,7 @@ class ServiceClient:
             metadata=metadata,
             deadline_epoch_ms=deadline,
             serialization_mode=serialization_mode,
+            contract_id=contract_id,
         )
 
     def _call_bidi_stream(
@@ -197,6 +180,7 @@ class ServiceClient:
             if method_info.serialization
             else self._service_info.serialization_modes[0].value
         )
+        contract_id = getattr(self._service_info, "contract_id", "") or ""
 
         return self._transport.bidi_stream(
             service=self._service_info.name,
@@ -204,7 +188,34 @@ class ServiceClient:
             metadata=metadata,
             deadline_epoch_ms=deadline,
             serialization_mode=serialization_mode,
+            contract_id=contract_id,
         )
+
+
+def _collect_service_types(service_class: type, service_info: ServiceInfo) -> set[type]:
+    """Collect concrete message types referenced by a service definition."""
+    request_response_types: set[type] = set()
+
+    for method_info in service_info.methods.values():
+        if isinstance(method_info.request_type, type):
+            request_response_types.add(method_info.request_type)
+        if isinstance(method_info.response_type, type):
+            request_response_types.add(method_info.response_type)
+
+    # If forward refs are present, fall back to scanning the defining module for
+    # tagged classes so implicit codec creation still succeeds in common cases.
+    if len(request_response_types) < len(service_info.methods) * 2:
+        module = getattr(service_class, "__module__", None)
+        if module:
+            import sys
+
+            mod = sys.modules.get(module)
+            if mod:
+                for _, obj in inspect.getmembers(mod, inspect.isclass):
+                    if hasattr(obj, "__fory_tag__"):
+                        request_response_types.add(obj)
+
+    return request_response_types
 
 
 # ── Dynamic Client Generation ─────────────────────────────────────────────────
@@ -212,7 +223,8 @@ class ServiceClient:
 
 def create_client(
     service_class: type,
-    connection: "aster_python.IrohConnection",
+    connection: "aster_python.IrohConnection | None" = None,
+    transport: Transport | None = None,
     codec: ForyCodec | None = None,
     fory_config: ForyConfig | None = None,
     interceptors: list[Any] | None = None,
@@ -223,6 +235,7 @@ def create_client(
     Args:
         service_class: A class decorated with @service.
         connection: The Iroh connection to use for RPC calls.
+        transport: Optional pre-built transport implementation.
         codec: The ForyCodec for serialization. Defaults to XLANG mode.
         fory_config: Optional configuration for implicitly created codecs.
         interceptors: List of interceptor instances to apply to all calls.
@@ -246,15 +259,19 @@ def create_client(
             f"Class {service_class.__name__} is not decorated with @service"
         )
 
-    # Create transport and codec
+    # Create codec if needed.
     if codec is None:
+        request_response_types = _collect_service_types(service_class, service_info)
         codec = ForyCodec(
             mode=SerializationMode.XLANG,
-            types=list(service_info.methods.values()) if service_info.methods else None,
+            types=list(request_response_types) if request_response_types else None,
             fory_config=fory_config,
         )
 
-    transport = IrohTransport(connection=connection, codec=codec)
+    if transport is None:
+        if connection is None:
+            raise ClientError("create_client requires either connection or transport")
+        transport = IrohTransport(connection=connection, codec=codec)
 
     # Create client class dynamically
     client_cls = _generate_client_class(service_info)
@@ -296,7 +313,7 @@ def create_local_client(
         client = create_local_client(EchoService, EchoServiceImpl())
         response = await client.echo(EchoRequest(message="hello"))
     """
-    from aster_python.aster.decorators import _SERVICE_INFO_ATTR, _METHOD_INFO_ATTR, RpcPattern
+    from aster_python.aster.decorators import _SERVICE_INFO_ATTR, _METHOD_INFO_ATTR
     from aster_python.aster.transport.local import LocalTransport
 
     # Get service info
@@ -306,30 +323,7 @@ def create_local_client(
             f"Class {service_class.__name__} is not decorated with @service"
         )
 
-    # Extract request/response types from all methods
-    # Handle both actual types and string forward references
-    request_response_types: set[type] = set()
-    for method_info in service_info.methods.values():
-        if method_info.request_type:
-            if isinstance(method_info.request_type, type):
-                request_response_types.add(method_info.request_type)
-        if method_info.response_type:
-            if isinstance(method_info.response_type, type):
-                request_response_types.add(method_info.response_type)
-
-    # If some types are string forward references (common when response types are
-    # defined after the service class), scan the service class module for all
-    # types with @fory_tag
-    if len(request_response_types) < len(service_info.methods) * 2:
-        module = getattr(service_class, '__module__', None)
-        if module:
-            import sys
-            mod = sys.modules.get(module)
-            if mod:
-                # Find all classes with __fory_tag__ in the module
-                for name, obj in inspect.getmembers(mod, inspect.isclass):
-                    if hasattr(obj, '__fory_tag__'):
-                        request_response_types.add(obj)
+    request_response_types = _collect_service_types(service_class, service_info)
 
     # Create codec
     if codec is None:
