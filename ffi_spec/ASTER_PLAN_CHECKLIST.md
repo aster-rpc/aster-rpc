@@ -488,7 +488,7 @@ Phase 10 verification completed with uv:
 - [x] All 6 gossip event types round-trip (encoding + 2-node wire)
 - [x] Endpoint selection: mandatory filters applied before strategy ranking
 - [x] ACL post-read filter: untrusted-author entries excluded
-- [ ] Contract fetch uses `blob_observe_complete` — stub implemented; full round-trip deferred (collection hash == contract_id in Phase 10; HashSeq builder deferred)
+- [ ] Contract fetch uses `blob_observe_complete` — stub implemented; full round-trip deferred (collection hash == contract_id in Phase 10; HashSeq builder deferred; requires live blob node)
 
 ---
 
@@ -665,7 +665,7 @@ Phase 12 verification completed with uv:
 
 **Lease heartbeat:**
 - [x] `encode_lease_update_payload()` encoder provided; background timer pattern documented (requires caller to spawn asyncio task)
-- [ ] Full background asyncio timer wired to a running GossipTopicHandle — deferred to Phase 13 integration tests
+- [x] Full background asyncio timer wired to a running GossipTopicHandle — `run_lease_heartbeat` / `start_lease_heartbeat` in `aster/trust/gossip.py`; wired into `RegistryPublisher` via `mesh_gossip_handle` + `mesh_signing_key` params
 
 **Integration with Phase 10:**
 - [x] `registry_callback` parameter on `handle_producer_message` forwards ContractPublished/LeaseUpdate to Phase 10 consumer
@@ -686,7 +686,7 @@ Phase 12 verification completed with uv:
 - [x] ClockDriftConfig env overrides
 - [x] Topic derivation: deterministic, distinct on different salt/pubkey, matches blake3 vector
 - [x] Payload encode helpers: Depart, ContractPublished, LeaseUpdate, Introduce round-trips
-- [ ] Lease heartbeat broadcast observed after interval — deferred (requires live gossip in test)
+- [x] Lease heartbeat broadcast observed after interval — `test_aster_heartbeat.py` (8 tests; uses `FakeGossipHandle` mock, 50 ms interval)
 
 **Open design questions (track in plan §14.12):**
 - [x] **rcan grant format** — opaque bytes in `aster/trust/rcan.py`; pin down once upstream specifies
@@ -728,7 +728,7 @@ Phase 12 verification completed with uv:
 - [x] `tests/conformance/wire/session_*.bin` — session CANCEL flags-only vector included in `cancel_flags_only.bin`; session HEADER/CALL/no-trailer tested via test_aster_session.py (existing)
 - [x] `tests/conformance/canonical/test_scope_distinctness.py` — SHARED vs STREAM → different contract_ids; 5 variants tested
 - [x] `tests/conformance/interop/echo_service.fdl` + `scenarios.yaml` — cross-language interop fixture (placeholder; scenarios activate when Java binding is available)
-- [ ] `tests/conformance/canonical/*.bin` + `.hashes.json` — standalone canonical binary files not yet committed; covered via `tests/fixtures/canonical_test_vectors.json` and `test_aster_canonical.py`
+- [x] `tests/conformance/canonical/*.bin` + `.hashes.json` — 41 `.bin` files committed in `tests/conformance/canonical/vectors/`; `hashes.json` committed; `test_canonical_bins.py` verifies all 41 hashes (parametrized, 42 tests)
 
 **Additional required tests (called out in spec):**
 - [x] Manifest-mismatch fatal (Phase 9 §11.4.3 step 4) — `test_aster_contract_identity.py::test_manifest_mismatch_fatal`
