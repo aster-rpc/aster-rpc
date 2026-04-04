@@ -18,7 +18,7 @@ use iroh_blobs::format::collection::Collection;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::ticket::BlobTicket;
-use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, ALPN as BLOBS_ALPN};
+use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat, ALPN as BLOBS_ALPN};
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::api::Doc;
 use iroh_docs::protocol::Docs;
@@ -1089,6 +1089,34 @@ impl CoreRecvStream {
 }
 
 // ============================================================================
+// CoreTagInfo - Tag information
+// ============================================================================
+
+/// Information about a named tag in the blob store.
+#[derive(Clone, Debug)]
+pub struct CoreTagInfo {
+    /// Tag name (UTF-8)
+    pub name: String,
+    /// Content hash (hex string)
+    pub hash: String,
+    /// Format: "raw" or "hash_seq"
+    pub format: String,
+}
+
+impl CoreTagInfo {
+    fn from_upstream(ti: iroh_blobs::api::tags::TagInfo) -> Self {
+        Self {
+            name: String::from_utf8_lossy(&ti.name.0).into_owned(),
+            hash: ti.hash.to_hex().to_string(),
+            format: match ti.format {
+                BlobFormat::HashSeq => "hash_seq".to_string(),
+                BlobFormat::Raw => "raw".to_string(),
+            },
+        }
+    }
+}
+
+// ============================================================================
 // CoreBlobsClient - Blob storage protocol
 // ============================================================================
 
@@ -1124,26 +1152,107 @@ impl CoreBlobsClient {
     ///
     /// This wraps the data in a Collection with the given filename, matching
     /// what `sendme send` does. Returns the collection hash (hex).
+    ///
+    /// A persistent named tag `"aster-python/{name}"` is set so the GC keeps the
+    /// collection alive. Call `tag_delete("aster-python/{name}")` to unpublish.
     pub async fn add_bytes_as_collection(&self, name: String, data: Vec<u8>) -> Result<String> {
-        // First, store the raw blob
-        let tag = self.store.add_slice(&data).await?;
-        let blob_hash = tag.hash;
+        // Store the raw blob (TempTag keeps it alive until we set a persistent tag)
+        let temp_blob = self.store.add_slice(&data).await?;
+        let blob_hash = temp_blob.hash;
 
         // Build a Collection containing just this one file
-        let collection: Collection = vec![(name, blob_hash)].into_iter().collect();
+        let collection: Collection = vec![(name.clone(), blob_hash)].into_iter().collect();
 
         // Store the collection itself (produces a HashSeq blob)
-        let collection_tag = collection.store(&self.store).await?;
-        let hash_str = collection_tag.hash().to_string();
+        let temp_collection = collection.store(&self.store).await?;
+        let collection_hash = temp_collection.hash();
+        let hash_str = collection_hash.to_string();
 
-        // Leak the tags to prevent the blobs from being garbage-collected.
-        // This is intentional: the data must remain available for as long as
-        // the Python process runs so remote peers can download it.
-        // (sendme does the equivalent by keeping its TempTags alive until Ctrl-C.)
-        std::mem::forget(tag);
-        std::mem::forget(collection_tag);
+        // Set a persistent named tag so the collection (and its children) survive GC.
+        // This replaces the previous std::mem::forget approach.
+        let tag_name = format!("aster-python/{name}");
+        self.store
+            .tags()
+            .set(
+                tag_name.as_bytes(),
+                HashAndFormat {
+                    hash: collection_hash,
+                    format: BlobFormat::HashSeq,
+                },
+            )
+            .await?;
+
+        // TempTags drop here — the persistent named tag now protects the data.
+        drop(temp_blob);
+        drop(temp_collection);
 
         Ok(hash_str)
+    }
+
+    // ── Tag methods ──────────────────────────────────────────────────────────
+
+    /// Set a named tag. `format` is "raw" or "hash_seq".
+    pub async fn tag_set(&self, name: String, hash_hex: String, format: String) -> Result<()> {
+        let hash: Hash = hash_hex.parse()?;
+        let fmt = if format == "hash_seq" {
+            BlobFormat::HashSeq
+        } else {
+            BlobFormat::Raw
+        };
+        self.store
+            .tags()
+            .set(name.as_bytes(), HashAndFormat { hash, format: fmt })
+            .await?;
+        Ok(())
+    }
+
+    /// Get a tag by name. Returns `None` if not found.
+    pub async fn tag_get(&self, name: String) -> Result<Option<CoreTagInfo>> {
+        let result = self.store.tags().get(name.as_bytes()).await?;
+        Ok(result.map(CoreTagInfo::from_upstream))
+    }
+
+    /// Delete a tag by name. Returns the number of tags removed (0 or 1).
+    pub async fn tag_delete(&self, name: String) -> Result<u64> {
+        Ok(self.store.tags().delete(name.as_bytes()).await?)
+    }
+
+    /// Delete all tags matching a prefix. Returns count removed.
+    pub async fn tag_delete_prefix(&self, prefix: String) -> Result<u64> {
+        Ok(self.store.tags().delete_prefix(prefix.as_bytes()).await?)
+    }
+
+    /// List all tags.
+    pub async fn tag_list(&self) -> Result<Vec<CoreTagInfo>> {
+        let stream = self.store.tags().list().await?;
+        let mut results = Vec::new();
+        let mut pinned = Box::pin(stream);
+        while let Some(item) = pinned.next().await {
+            results.push(CoreTagInfo::from_upstream(item?));
+        }
+        Ok(results)
+    }
+
+    /// List tags matching a prefix.
+    pub async fn tag_list_prefix(&self, prefix: String) -> Result<Vec<CoreTagInfo>> {
+        let stream = self.store.tags().list_prefix(prefix.as_bytes()).await?;
+        let mut results = Vec::new();
+        let mut pinned = Box::pin(stream);
+        while let Some(item) = pinned.next().await {
+            results.push(CoreTagInfo::from_upstream(item?));
+        }
+        Ok(results)
+    }
+
+    /// List only HashSeq-format tags (collections).
+    pub async fn tag_list_hash_seq(&self) -> Result<Vec<CoreTagInfo>> {
+        let stream = self.store.tags().list_hash_seq().await?;
+        let mut results = Vec::new();
+        let mut pinned = Box::pin(stream);
+        while let Some(item) = pinned.next().await {
+            results.push(CoreTagInfo::from_upstream(item?));
+        }
+        Ok(results)
     }
 
     /// Create a ticket for a Collection (HashSeq format), compatible with sendme.

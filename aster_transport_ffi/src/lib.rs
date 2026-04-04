@@ -105,6 +105,12 @@ pub enum iroh_event_kind_t {
     IROH_EVENT_BLOB_COLLECTION_ADDED = 34,
     IROH_EVENT_BLOB_COLLECTION_TICKET_CREATED = 35,
 
+    // Tags (Phase 1c)
+    IROH_EVENT_TAG_SET = 36,
+    IROH_EVENT_TAG_GET = 37,
+    IROH_EVENT_TAG_DELETED = 38,
+    IROH_EVENT_TAG_LIST = 39,
+
     // Docs
     IROH_EVENT_DOC_CREATED = 40,
     IROH_EVENT_DOC_JOINED = 41,
@@ -1404,9 +1410,9 @@ pub unsafe extern "C" fn iroh_endpoint_create(
                         let mut rx = before_connect_rx;
                         while let Some((info, reply_tx)) = rx.recv().await {
                             let state = HookInvocationState {
-                                sender: std::sync::Mutex::new(Some(
-                                    HookSender::BeforeConnect(reply_tx),
-                                )),
+                                sender: std::sync::Mutex::new(Some(HookSender::BeforeConnect(
+                                    reply_tx,
+                                ))),
                             };
                             let invocation_id = bridge3.hook_invocations.insert(state);
                             let payload = encode_hook_connect_payload(&info);
@@ -1429,9 +1435,9 @@ pub unsafe extern "C" fn iroh_endpoint_create(
                         let mut rx = after_handshake_rx;
                         while let Some((info, reply_tx)) = rx.recv().await {
                             let state = HookInvocationState {
-                                sender: std::sync::Mutex::new(Some(
-                                    HookSender::AfterConnect(reply_tx),
-                                )),
+                                sender: std::sync::Mutex::new(Some(HookSender::AfterConnect(
+                                    reply_tx,
+                                ))),
                             };
                             let invocation_id = bridge4.hook_invocations.insert(state);
                             let payload = encode_hook_handshake_payload(&info);
@@ -3191,6 +3197,295 @@ pub unsafe extern "C" fn iroh_blobs_download(
             Err(e) => {
                 bridge2.emit_error(op_id, user_data, &e.to_string());
             }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Tags (Phase 1c)
+// ============================================================================
+
+/// Encode a CoreTagInfo as a null-separated UTF-8 payload: name\0hash\0format\0
+fn encode_tag_payload(t: &aster_transport_core::CoreTagInfo) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(t.name.len() + t.hash.len() + t.format.len() + 3);
+    buf.extend_from_slice(t.name.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(t.hash.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(t.format.as_bytes());
+    buf.push(0);
+    buf
+}
+
+/// Encode a list of CoreTagInfo as concatenated null-separated records.
+/// `flags` in the event holds the count.
+fn encode_tag_list_payload(tags: &[aster_transport_core::CoreTagInfo]) -> Vec<u8> {
+    tags.iter().flat_map(encode_tag_payload).collect()
+}
+
+/// Set a named tag. format: 0 = raw, 1 = hash_seq. Emits IROH_EVENT_TAG_SET.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_tags_set(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    name_ptr: *const u8,
+    name_len: usize,
+    hash_hex_ptr: *const u8,
+    hash_hex_len: usize,
+    format: u32,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() || name_ptr.is_null() || hash_hex_ptr.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let name = String::from_utf8(unsafe { slice::from_raw_parts(name_ptr, name_len).to_vec() })
+        .unwrap_or_default();
+    let hash_hex =
+        String::from_utf8(unsafe { slice::from_raw_parts(hash_hex_ptr, hash_hex_len).to_vec() })
+            .unwrap_or_default();
+    let format_str = if format == 1 {
+        "hash_seq".to_string()
+    } else {
+        "raw".to_string()
+    };
+
+    let blobs = node_arc.blobs_client();
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        match blobs.tag_set(name, hash_hex, format_str).await {
+            Ok(()) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_TAG_SET,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Get a tag by name. Emits IROH_EVENT_TAG_GET with payload on found, NOT_FOUND status if absent.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_tags_get(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    name_ptr: *const u8,
+    name_len: usize,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() || name_ptr.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let name = String::from_utf8(unsafe { slice::from_raw_parts(name_ptr, name_len).to_vec() })
+        .unwrap_or_default();
+
+    let blobs = node_arc.blobs_client();
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        match blobs.tag_get(name).await {
+            Ok(Some(tag)) => {
+                let payload = encode_tag_payload(&tag);
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_TAG_GET,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, payload);
+            }
+            Ok(None) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_TAG_GET,
+                    iroh_status_t::IROH_STATUS_NOT_FOUND,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Delete a tag by name. Emits IROH_EVENT_TAG_DELETED with count in event.flags.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_tags_delete(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    name_ptr: *const u8,
+    name_len: usize,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() || name_ptr.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let name = String::from_utf8(unsafe { slice::from_raw_parts(name_ptr, name_len).to_vec() })
+        .unwrap_or_default();
+
+    let blobs = node_arc.blobs_client();
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        match blobs.tag_delete(name).await {
+            Ok(count) => {
+                let mut event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_TAG_DELETED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+                event.flags = count as u32;
+                bridge2.emit(EventOwned {
+                    event,
+                    payload: None,
+                });
+            }
+            Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// List tags matching a prefix (empty prefix = all tags).
+/// Emits IROH_EVENT_TAG_LIST with packed tag records in payload; event.flags = count.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_tags_list_prefix(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    prefix_ptr: *const u8,
+    prefix_len: usize,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let prefix = if prefix_ptr.is_null() || prefix_len == 0 {
+        String::new()
+    } else {
+        String::from_utf8(unsafe { slice::from_raw_parts(prefix_ptr, prefix_len).to_vec() })
+            .unwrap_or_default()
+    };
+
+    let blobs = node_arc.blobs_client();
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        let result = if prefix.is_empty() {
+            blobs.tag_list().await
+        } else {
+            blobs.tag_list_prefix(prefix).await
+        };
+        match result {
+            Ok(tags) => {
+                let count = tags.len() as u32;
+                let payload = encode_tag_list_payload(&tags);
+                let mut event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_TAG_LIST,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+                event.flags = count;
+                bridge2.emit_with_data(event, payload);
+            }
+            Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
         }
     });
 
