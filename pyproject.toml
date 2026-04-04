@@ -22,3 +22,9 @@ python-source  = "bindings"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests/python"]
+# Suppress known Cython warning from pyfory's internal pxd/enum mismatch.
+# pyfory 0.16.0 ships a cpdef enum in a .pxd file whose Python wrapper is
+# not importable from pyfory.includes.libformat.  Benign third-party issue.
+filterwarnings = [
+    "ignore:.*enum class CTypeId not importable from pyfory\\.includes\\.libformat.*:UserWarning",
+]
