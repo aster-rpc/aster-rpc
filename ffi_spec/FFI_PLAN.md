@@ -39,31 +39,38 @@ The plan replaces the current design with a **runtime + completion queue** archi
 ## 2. Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   Language Bindings                   │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐           │
-│  │  Python   │  │   Java   │  │  C / Zig  │  ...     │
-│  │  (PyO3)   │  │  (FFM)   │  │ (direct)  │          │
-│  └────┬──────┘  └────┬─────┘  └────┬──────┘          │
-│       │              │              │                 │
-│  ┌────▼──────────────▼──────────────▼──────┐         │
-│  │         aster_transport_ffi (C ABI)       │         │
-│  │  - #[no_mangle] extern "C" functions     │         │
-│  │  - #[repr(C)] structs                    │         │
-│  │  - Opaque u64 handles                    │         │
-│  │  - Central completion queue              │         │
-│  │  - Arc-backed handle registry            │         │
-│  └────────────────┬────────────────────────┘         │
-│                   │                                   │
-│  ┌────────────────▼────────────────────────┐         │
-│  │         aster_transport_core              │         │
-│  │  - Pure Rust async API                   │         │
-│  │  - No FFI concerns                       │         │
-│  │  - Wraps iroh, iroh-blobs, iroh-docs,   │         │
-│  │    iroh-gossip                           │         │
-│  └─────────────────────────────────────────┘         │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Language Bindings                           │
+│  ┌───────────┐      ┌──────────┐      ┌───────────┐                 │
+│  │  Python   │      │   Java   │      │  C / Zig  │  ...            │
+│  │  (PyO3)   │      │  (FFM)   │      │ (direct)  │                 │
+│  └────┬──────┘      └────┬─────┘      └────┬──────┘                 │
+│       │                  │                 │                        │
+│       │ direct Rust API  │                 │                        │
+│       │                  │                 │                        │
+│       ▼                  ▼                 ▼                        │
+│  ┌────────────────┐  ┌───────────────────────────────────────────┐  │
+│  │ aster_transport│  │         aster_transport_ffi (C ABI)       │  │
+│  │ _core          │  │  - #[no_mangle] extern "C" functions      │  │
+│  │ (PyO3 backend) │  │  - #[repr(C)] structs                     │  │
+│  └────────┬───────┘  │  - Opaque u64 handles                     │  │
+│           │          │  - Central completion queue               │  │
+│           │          ┤  - Arc-backed handle registry             │  │
+│           │          └────────────────┬──────────────────────────┘  │
+│           │                           │                             │
+│           │          ┌────────────────▼────────────────────────┐    │
+│           │          │         aster_transport_core            │    │
+│           │          │  - Pure Rust async API                  │    │
+│           └──────────│  - No FFI concerns                      │    │
+│                      │  - Wraps iroh, iroh-blobs, iroh-docs,   │    │
+│                      │    iroh-gossip                          │    │
+│                      └─────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Current repository reality:** Python is the special case here. `bindings/aster_python_rs`
+uses **PyO3 directly over `aster_transport_core`**, while Java/C/Zig-style foreign bindings are
+expected to consume the `aster_transport_ffi` C ABI.
 
 ### Key Design Decisions
 
@@ -1806,7 +1813,7 @@ pub struct CoreEndpointConfig {
 }
 ```
 
-#### FFI Types (Existing, ready for wiring)
+#### FFI Types (Partial — event kinds / enums exist, full hook reply path not yet wired)
 
 ```c
 IROH_EVENT_HOOK_BEFORE_CONNECT = 70,
@@ -1837,7 +1844,9 @@ iroh_status_t iroh_hook_after_connect_respond(
 );
 ```
 
-**Note:** Python (via PyO3 directly over core) does not need the FFI hook reply path — it can consume `CoreHookReceiver` directly.
+**Current repository status:** the Python hook *types* exist, but the end-to-end callback dispatch path is still partial; the fully-specified standalone FFI hook registration / invocation / reply ABI from `FFI_PLAN_PATCH.md` is not yet implemented.
+
+**Note:** Python (via PyO3 directly over core) does not need the FFI hook reply path in principle, but this repository still needs additional Python-side wiring to consume and dispatch `CoreHookReceiver` events end-to-end.
 
 ### 3b.3 Remote-Info & Monitoring
 

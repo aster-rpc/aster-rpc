@@ -747,31 +747,46 @@ impl HookCallbacks for BridgeHookCallbacks {
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Core: Add `max_datagram_size` to `CoreConnection` | ⬜ TODO | |
-| Core: Add `datagram_send_buffer_space` to `CoreConnection` | ⬜ TODO | |
-| Core: Add `connection_info` to `CoreConnection` | ⬜ TODO | |
-| Core: Define `HookCallbacks`, `HookConnectInfo`, `CoreHookConfig` | ⬜ TODO | |
-| Core: Add `set_hooks` / `clear_hooks` to `CoreNetClient` | ⬜ TODO | |
-| Core: Define `CoreRemoteInfo`, `ConnectionType` | ⬜ TODO | |
-| Core: Add `remote_info` / `remote_info_iter` to `CoreNetClient` | ⬜ TODO | |
-| Core: Add same methods to `CoreNode` | ⬜ TODO | |
-| FFI: Add `iroh_connection_max_datagram_size` | ⬜ TODO | |
-| FFI: Add `iroh_connection_datagram_send_buffer_space` | ⬜ TODO | |
-| FFI: Add `IROH_EVENT_DATAGRAM_RECEIVED` | ⬜ TODO | Optional |
-| FFI: Add hook types, enums, config structs | ⬜ TODO | |
-| FFI: Add hook registries to `BridgeRuntime` | ⬜ TODO | |
-| FFI: Implement `iroh_endpoint_set_hooks` | ⬜ TODO | |
-| FFI: Implement `iroh_endpoint_clear_hooks` | ⬜ TODO | |
-| FFI: Implement `iroh_hook_before_connect_respond` | ⬜ TODO | |
-| FFI: Implement `iroh_hook_after_connect_respond` | ⬜ TODO | |
-| FFI: Implement `iroh_endpoint_remote_info` | ⬜ TODO | |
-| FFI: Implement `iroh_endpoint_remote_info_list` | ⬜ TODO | |
-| FFI: Implement `iroh_connection_info` | ⬜ TODO | |
-| Tests: Datagram size + buffer space tests | ⬜ TODO | |
-| Tests: Hook before_connect allow/deny | ⬜ TODO | |
-| Tests: Hook after_connect delivery + ack | ⬜ TODO | |
-| Tests: Remote info query | ⬜ TODO | |
-| Docs: Update FFI_PLAN.md with hook section | ⬜ TODO | |
+| Core: Add `max_datagram_size` to `CoreConnection` | ✅ Done | Implemented in `aster_transport_core/src/lib.rs` |
+| Core: Add `datagram_send_buffer_space` to `CoreConnection` | ✅ Done | Implemented in `aster_transport_core/src/lib.rs` |
+| Core: Add `connection_info` to `CoreConnection` | ✅ Done | Implemented in `aster_transport_core/src/lib.rs` |
+| Core: Define hook types / config (`CoreHookConnectInfo`, `CoreHookHandshakeInfo`, `CoreAfterHandshakeDecision`, `CoreHookConfig`) | ✅ Done | Implemented with `v0.97.0`-compatible builder-time hook adapter design |
+| Core: Add hook support to `CoreNetClient` | ✅ Done | Implemented via `CoreHooksAdapter`, `take_hook_receiver()`, `has_hooks()` |
+| Core: Define `CoreRemoteInfo`, `ConnectionType` | ✅ Done | Implemented in `aster_transport_core/src/lib.rs` |
+| Core: Add `remote_info` / `remote_info_iter` to `CoreNetClient` | ✅ Done | Backed by `CoreMonitor` |
+| Core: Add same methods to `CoreNode` | ✅ Done | Available through `CoreNode::net_client()` |
+| FFI: Add `iroh_connection_max_datagram_size` | ✅ Done | Implemented in `aster_transport_ffi/src/lib.rs` |
+| FFI: Add `iroh_connection_datagram_send_buffer_space` | ✅ Done | Implemented in `aster_transport_ffi/src/lib.rs` |
+| FFI: Add `IROH_EVENT_DATAGRAM_RECEIVED` | ✅ Done | Event kind defined; `read_datagram` still currently emits `IROH_EVENT_BYTES_RESULT` |
+| FFI: Add hook types, enums, config structs | ⚠️ Partial | Hook event kinds / decision enum exist; full invocation/reply ABI is not wired |
+| FFI: Add hook registries to `BridgeRuntime` | ⬜ TODO | Not needed for current core-only hook path; full FFI hook reply path still deferred |
+| FFI: Implement `iroh_endpoint_set_hooks` | ⬜ TODO | Current implementation installs hooks at endpoint creation time rather than via standalone FFI registration |
+| FFI: Implement `iroh_endpoint_clear_hooks` | ⬜ TODO | Not implemented |
+| FFI: Implement `iroh_hook_before_connect_respond` | ⬜ TODO | Deferred; core adapter exists but FFI response plumbing is not implemented |
+| FFI: Implement `iroh_hook_after_connect_respond` | ⬜ TODO | Deferred; core adapter exists but FFI response plumbing is not implemented |
+| FFI: Implement `iroh_endpoint_remote_info` | ✅ Done | Implemented in `aster_transport_ffi/src/lib.rs` |
+| FFI: Implement `iroh_endpoint_remote_info_list` | ✅ Done | Implemented in `aster_transport_ffi/src/lib.rs` |
+| FFI: Implement `iroh_connection_info` | ✅ Done | Implemented in `aster_transport_ffi/src/lib.rs` |
+| Tests: Datagram size + buffer space tests | ✅ Done | Covered by `tests/python/test_phase1b.py` and FFI invalid-handle/null-param tests |
+| Tests: Hook before_connect allow/deny | ⬜ TODO | No end-to-end test yet |
+| Tests: Hook after_connect delivery + ack | ⬜ TODO | No end-to-end test yet |
+| Tests: Remote info query | ✅ Done | Covered by Python Phase 1b tests plus FFI struct/parameter tests |
+| Docs: Update FFI_PLAN.md with hook section | ✅ Done | `FFI_PLAN.md` now reflects core-complete / FFI-deferred hook status |
+
+### Verified Status (2026-04-04)
+
+The original checklist above was written as a forward-looking patch plan and was not kept in sync with implementation.
+Current code and test verification shows:
+
+- **Datagram completion:** implemented in core, FFI, and Python; verified by tests
+- **Connection info:** implemented in core, FFI, and Python; verified by tests
+- **Remote-info / monitoring:** implemented in core, FFI, and Python; verified by tests
+- **Hooks:** core-side builder-time hook adapter is implemented, but the full standalone **FFI hook registration + reply ABI** described in this patch document is still incomplete
+
+Verification run on 2026-04-04:
+
+- `cargo test -p aster_transport_ffi --test test_ffi` → **39 passed**
+- `uv run pytest tests/python/test_phase1b.py -q` → **8 passed**
 
 ---
 
