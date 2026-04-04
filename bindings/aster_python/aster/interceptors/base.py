@@ -22,6 +22,7 @@ class CallContext:
     session_id: str | None = None
     peer: str | None = None
     metadata: dict[str, str] = field(default_factory=dict)
+    attributes: dict[str, str] = field(default_factory=dict)  # Phase 11: enrollment attrs
     deadline: float | None = None
     is_streaming: bool = False
     pattern: str | None = None

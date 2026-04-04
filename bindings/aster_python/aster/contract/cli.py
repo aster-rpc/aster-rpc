@@ -212,6 +212,10 @@ def main() -> None:
         help="Optional semantic version string to embed in the manifest",
     )
 
+    # ``aster trust`` subcommand group (Phase 11)
+    from aster_python.aster.trust.cli import register_trust_subparser, run_trust_command
+    trust_parser = register_trust_subparser(subparsers)
+
     args = parser.parse_args()
 
     if args.command == "contract":
@@ -220,6 +224,8 @@ def main() -> None:
         else:
             contract_parser.print_help()
             sys.exit(1)
+    elif args.command == "trust":
+        sys.exit(run_trust_command(args))
     else:
         parser.print_help()
         sys.exit(1)

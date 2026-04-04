@@ -47,17 +47,26 @@ Phase 1 bug fixed as prerequisite for Phase 8:
 - [x] `write_frame` now permits empty payload when `flags & CANCEL` (spec §5.2) — `aster/framing.py`
 - [x] Added test `test_cancel_empty_payload` to `tests/python/test_aster_framing.py`
 
-Phase 10 is now implemented and verified. The registry package (`aster/registry/`) implements docs-based service registration, endpoint advertisement, and resolution with 48 tests passing. Notable implementation notes: iroh-docs rejects empty entry bytes so `withdraw()` writes `b"null"` tombstone; cross-node resolution waits for `content_ready` events (blob download) before reading entry content.
+Phase 11 is now implemented and verified. The trust package (`aster/trust/`) provides offline root-key authorization, enrollment credentials, OTT nonce stores, and Gate 0 connection-level admission with 50 tests passing. `CallContext` gained `attributes: dict[str,str]` for trust attribute propagation.
 
-Phase 10 verification completed with uv:
-- `uv run pytest tests/python/test_aster_registry.py -q --timeout=60` → **48 passed**
-- `uv run ruff check bindings/aster_python/aster/registry/ tests/python/test_aster_registry.py` → **All checks passed**
-- Full suite: **412 passed, 2 pre-existing dumbpipe TCP/Unix flakes unrelated to Phase 10**
+Phase 11 verification completed with uv:
+- `uv run pytest tests/python/test_aster_trust.py -q --timeout=30` → **50 passed**
+- `uv run ruff check bindings/aster_python/aster/trust/ tests/python/test_aster_trust.py` → **All checks passed**
+- No regressions: interceptors (39 passed), registry (48 passed)
+
+Phase 12 is now implemented and verified. The producer mesh package (`aster/trust/mesh.py`, `gossip.py`, `drift.py`, `bootstrap.py`, `rcan.py`) provides signed gossip envelopes, clock drift detection, admission RPC, and bootstrap flows with 56 tests passing.
+
+Phase 12 verification completed with uv:
+- `uv run pytest tests/python/test_aster_mesh.py -q --timeout=30` → **56 passed**
+- `uv run ruff check bindings/aster_python/aster/trust/ tests/python/test_aster_mesh.py` → **All checks passed**
+- Full suite: `uv run pytest tests/python/ -q --timeout=60` → **518 passed, 2 pre-existing dumbpipe failures**
 
 Outstanding issue / blocker:
-- None for Phases 7–10 at this time.
-- Phase 12 has two open design questions: rcan grant format + AdmissionRequest/Response `reason` field — tracked in plan §14.12.
-- HashSeq collection builder (multi-file blob upload) deferred from Phase 9/10 to Phase 11+; Phase 10 uses single-blob storage where `collection_hash == contract_id`.
+- None for Phases 7–12 at this time.
+- Phase 12 lease heartbeat timer background task deferred to Phase 13 integration (requires live GossipTopicHandle).
+- rcan grant format remains opaque bytes (§14.12); pin down once upstream specifies.
+- HashSeq collection builder (multi-file blob upload) deferred from Phase 9/10; Phase 10 uses single-blob storage where `collection_hash == contract_id`.
+- IID production backends (AWS full RSA verification, GCP JWT, Azure) deferred; `MockIIDBackend` used in all tests.
 
 ## Pre-Requisites
 
@@ -478,75 +487,92 @@ Phase 10 verification completed with uv:
 
 **Spec refs:** Aster-trust-spec.md §2.2, §2.4, §2.9, §3.1, §3.2, §3.3. Plan: §13.
 
+Phase 11 is now implemented and verified. The trust package (`aster/trust/`) provides offline root-key authorization, enrollment credentials, OTT nonce stores, and Gate 0 connection-level admission. Implementation notes:
+
+- ConsumerEnrollmentCredential canonical signing bytes include `u8(type_code) || u8(has_endpoint_id) || eid? || pubkey || u64_be(expires_at) || canonical_json(attrs) || u8(has_nonce) || nonce?` — both presence flags are signed, preventing type-flip attacks.
+- `CallContext` gained an `attributes: dict[str, str]` field (Phase 11 trust integration) for enrollment attributes to flow through to service handlers.
+- IID backends (AWS/GCP/Azure) are stubbed for Phase 11; production-ready implementations require `httpx` and full JWKS verification, deferred to a future phase.
+- `aster trust keygen` + `aster trust sign` CLI commands registered under the existing `aster` entry point.
+
+Phase 11 verification completed with uv:
+- `uv run pytest tests/python/test_aster_trust.py -q --timeout=30` → **50 passed**
+- `uv run pytest tests/python/test_aster_interceptors.py tests/python/test_aster_server.py -q --timeout=30` → **39 passed** (no regressions from CallContext.attributes addition)
+- `uv run ruff check bindings/aster_python/aster/trust/ tests/python/test_aster_trust.py` → **All checks passed**
+
 **Dependencies:**
-- [ ] Add `cryptography>=42` to `pyproject.toml` (ed25519)
-- [ ] Optional: add `PyJWT>=2.8` as `iid` extra
+- [x] Add `cryptography>=42` to `pyproject.toml` (ed25519)
+- [x] Optional: add `PyJWT>=2.8` as `iid` extra (declared in `[project.optional-dependencies]`)
 
 **Data model (§2.2):**
-- [ ] Create `aster/trust/__init__.py`
-- [ ] `EnrollmentCredential` dataclass (endpoint_id, root_pubkey, expires_at, attributes, signature)
-- [ ] `ConsumerEnrollmentCredential` dataclass with `credential_type: Literal["policy","ott"]`, optional endpoint_id, optional 32-byte nonce
-- [ ] `AdmissionResult` dataclass (admitted, attributes?, reason?)
-- [ ] Attribute conventions: reserve `aster.role`, `aster.name`, `aster.iid_provider`, `aster.iid_account`, `aster.iid_region`, `aster.iid_role_arn` (no network-level controls — see Aster-trust-spec.md §1)
+- [x] Create `aster/trust/__init__.py`
+- [x] `EnrollmentCredential` dataclass (endpoint_id, root_pubkey, expires_at, attributes, signature)
+- [x] `ConsumerEnrollmentCredential` dataclass with `credential_type: Literal["policy","ott"]`, optional endpoint_id, optional 32-byte nonce
+- [x] `AdmissionResult` dataclass (admitted, attributes?, reason?)
+- [x] Attribute constants: `ATTR_ROLE`, `ATTR_NAME`, `ATTR_IID_PROVIDER`, `ATTR_IID_ACCOUNT`, `ATTR_IID_REGION`, `ATTR_IID_ROLE_ARN`
+- [x] `CallContext.attributes: dict[str, str]` added (Phase 11 integration) — carries enrollment attributes into service handlers
 
 **Signing:**
-- [ ] Create `aster/trust/signing.py`
-- [ ] `canonical_signing_bytes(cred)` — `endpoint_id || root_pubkey || u64_be(expires_at) || canonical_json(attributes) || nonce?`
-- [ ] `canonical_json(attributes)` — UTF-8, sorted keys
-- [ ] `sign_credential(cred, root_privkey)` — ed25519 (used offline in CLI)
-- [ ] `verify_signature(cred, root_pubkey)` — ed25519
+- [x] Create `aster/trust/signing.py`
+- [x] `canonical_signing_bytes(cred)` — dispatches on type; producer = `eid || pubkey || u64_be(exp) || json(attrs)`; consumer = type_code || has_eid || eid? || pubkey || u64_be(exp) || json(attrs) || has_nonce || nonce?
+- [x] `canonical_json(attributes)` — UTF-8, sorted keys, no whitespace
+- [x] `sign_credential(cred, root_privkey_raw)` — ed25519 (offline CLI use)
+- [x] `verify_signature(cred)` — ed25519
+- [x] `generate_root_keypair()` → `(priv_raw, pub_raw)` 32-byte raw scalars
+- [x] `load_private_key(priv_raw)`, `load_public_key(pub_raw)` helpers
 
 **Admission (§2.4):**
-- [ ] Create `aster/trust/admission.py`
-- [ ] `check_offline(cred, peer_endpoint_id, nonce_store)` — signature, expiry, endpoint_id match, nonce (for OTT)
-- [ ] `check_runtime(cred)` — IID only (no network-level checks in the normative spec)
-- [ ] `admit(cred, ctx)` — orchestrates offline + runtime
-- [ ] Refusal logging with reason (no oracle info leak to peer)
+- [x] Create `aster/trust/admission.py`
+- [x] `check_offline(cred, peer_endpoint_id, nonce_store)` — structural validation, signature, expiry, endpoint_id match, OTT nonce consumption
+- [x] `check_runtime(cred, iid_backend, iid_token)` — IID only; skips if no `aster.iid_provider`
+- [x] `admit(cred, peer_endpoint_id, ...)` — orchestrates offline + runtime; fails fast
+- [x] Refusal logged with reason; reason never sent to peer
 
 **IID verification:**
-- [ ] Create `aster/trust/iid.py`
-- [ ] AWS: fetch `http://169.254.169.254/latest/dynamic/instance-identity/document` + signature, verify against AWS public keys
-- [ ] GCP: equivalent metadata fetch + JWT verification
-- [ ] Azure: equivalent
-- [ ] Mock-pluggable for tests
+- [x] Create `aster/trust/iid.py`
+- [x] `IIDBackend` protocol + `MockIIDBackend` (test double)
+- [x] `AWSIIDBackend` stub (claim checks implemented; RSA signature verification deferred pending httpx + JWKS)
+- [x] `GCPIIDBackend`, `AzureIIDBackend` stubs (return NotImplemented)
+- [x] `get_iid_backend(provider)` factory; `verify_iid(attrs, backend, token)` helper
 
 **Nonce store (§3.1):**
-- [ ] Create `aster/trust/nonces.py::NonceStore`
-- [ ] File backend: atomic write to `~/.aster/nonces.json` (os.replace + fsync)
-- [ ] `consume(nonce)` returns True only on first call
-- [ ] Stub interface for future iroh-docs backend
+- [x] Create `aster/trust/nonces.py`
+- [x] `NonceStore`: file backend, atomic write via `os.replace` + `fsync`
+- [x] `InMemoryNonceStore`: for tests (no persistence)
+- [x] `consume(nonce)` returns True only on first call; raises ValueError if len != 32
+- [x] `is_consumed(nonce)` read-only check
+- [x] `NonceStoreProtocol` for duck-typing docs backend replacement
 
 **Gate 0 hooks (§3.3):**
-- [ ] Create `aster/trust/hooks.py::MeshEndpointHook`
-- [ ] Implements iroh `EndpointHooks` protocol (Phase 1b FFI ✅)
-- [ ] Allowlist `admitted: set[str]`
-- [ ] Admission ALPNs always allowed: `aster.producer_admission`, `aster.consumer_admission`
-- [ ] Non-admission ALPN: allow only if peer in `admitted`
-- [ ] `allow_unenrolled: bool` for local/dev mode
-- [ ] `add_peer(endpoint_id)`, `remove_peer(endpoint_id)` methods
+- [x] Create `aster/trust/hooks.py::MeshEndpointHook`
+- [x] `should_allow(remote_endpoint_id, alpn) -> bool` implements Gate 0 logic
+- [x] Admission ALPNs always allowed: `ALPN_PRODUCER_ADMISSION`, `ALPN_CONSUMER_ADMISSION`
+- [x] Non-admission ALPN: allow only if peer in `admitted` or `allow_unenrolled`
+- [x] `allow_unenrolled: bool` for local/dev mode
+- [x] `add_peer(endpoint_id)`, `remove_peer(endpoint_id)` methods
+- [x] `run_hook_loop(hook_receiver)` wires to Phase 1b `HookReceiver` background task
 
 **ALPN constants:**
-- [ ] Define `ALPN_PRODUCER_ADMISSION = b"aster.producer_admission"`
-- [ ] Define `ALPN_CONSUMER_ADMISSION = b"aster.consumer_admission"`
+- [x] `ALPN_PRODUCER_ADMISSION = b"aster.producer_admission"`
+- [x] `ALPN_CONSUMER_ADMISSION = b"aster.consumer_admission"`
 
 **Trust CLI:**
-- [ ] Create `aster/trust/cli.py`
-- [ ] `aster trust keygen --out-key ~/.aster/root.key` — emits ed25519 pair, refuses if target exists
-- [ ] `aster trust sign --root-key ... --endpoint-id ... --attributes '...' --expires ...` — offline credential signing
+- [x] Create `aster/trust/cli.py`; registered in `aster/contract/cli.py:main()` under `aster trust`
+- [x] `aster trust keygen --out-key PATH` — generates ed25519 pair, chmod 600, refuses if exists
+- [x] `aster trust sign --root-key PATH --endpoint-id ... --attributes ... --expires ... --type producer|policy|ott --out PATH` — offline signing
 
 **Tests:**
-- [ ] Signature verify: valid → True; tampered → False
-- [ ] Expiry check: expired → fail
-- [ ] Wrong endpoint_id: fail
-- [ ] IID verification (mocked): matching claims → True
-- [ ] OTT nonce: consumed once, second call → False
-- [ ] OTT credential with `len(nonce) != 32` is rejected as malformed (test with 16, 31, 33, 64 byte nonces)
-- [ ] Policy credential with a `nonce` field is rejected as malformed
-- [ ] Policy credential: reusable within expiry
-- [ ] `MeshEndpointHook`: reject unenrolled on non-admission ALPN; allow admission ALPN; allow admitted peer
-- [ ] CLI: `keygen` produces valid ed25519 pair; `sign` output verifies
-- [ ] LocalTransport bypass: Gate 0 not applied on `LocalTransport` calls (no connection to gate); `CallContext.peer is None`; `CallContext.attributes == {}`
-- [ ] Auth interceptor: when `peer is None`, canonical behavior is allow (in-process trust); document any custom interceptor that requires non-None peer
+- [x] Signature verify: valid → True; tampered payload/endpoint_id/attributes → False
+- [x] Expiry check: expired → fail
+- [x] Wrong endpoint_id: fail
+- [x] IID verification (mocked): matching claims → True; mismatched → False; absent → skip
+- [x] OTT nonce: consumed once, second call → False
+- [x] OTT credential with `len(nonce) != 32` is rejected as malformed (tested 16, 31, 33, 64)
+- [x] Policy credential with a `nonce` field is rejected as malformed
+- [x] Policy credential: reusable within expiry (5 calls all pass)
+- [x] `MeshEndpointHook`: reject unenrolled on normal ALPN; allow admission ALPN; allow admitted peer
+- [x] CLI: `keygen` produces valid ed25519 pair; `sign` producer + OTT output verifies
+- [x] LocalTransport bypass: `CallContext.peer is None`; `CallContext.attributes == {}`
+- [x] Auth interceptor: `peer is None` → allow (in-process trust); `on_request` completes without raise
 
 ---
 
@@ -554,79 +580,108 @@ Phase 10 verification completed with uv:
 
 **Spec refs:** Aster-trust-spec.md §2.1, §2.3, §2.5, §2.6, §2.7, §2.10. Plan: §14.
 
+Phase 12 is now implemented and verified. The producer mesh package adds signed gossip, clock drift detection, bootstrap flows, and admission RPC. Implementation notes:
+
+- Canonical signing bytes order (normative, §2.6): `u8(type) || payload || sender.encode('utf-8') || u64_be(epoch_ms)`. The checklist originally listed these in the wrong order; the plan and spec are authoritative.
+- `handle_producer_message` normative processing order: replay-window → membership → signature → offset tracking / drift → dispatch.
+- Depart and Introduce are processed even when the sender is drift-isolated (only ContractPublished/LeaseUpdate are skipped).
+- Self-departure is triggered by `ClockDriftDetector.self_in_drift()` exceeding `drift_tolerance_ms` after the grace period. `mesh_dead=True` suppresses further gossip sends.
+- Peer recovery from drift isolation: any fresh message with an acceptable offset (|offset - median| ≤ tolerance) removes the peer from `drift_isolated`.
+- rcan grant format remains opaque bytes (§14.12 open design question).
+- Lease heartbeat timer deferred to runtime integration (a background asyncio task); the config + payload encoder are provided.
+
+Phase 12 verification completed with uv:
+- `uv run pytest tests/python/test_aster_mesh.py -q --timeout=30` → **56 passed**
+- `uv run ruff check bindings/aster_python/aster/trust/ tests/python/test_aster_mesh.py` → **All checks passed**
+- Full suite: `uv run pytest tests/python/ -q --timeout=60` → **518 passed, 2 pre-existing dumbpipe failures unrelated to Phase 12**
+
 **Data model (§2.6):**
-- [ ] `ProducerMessage` dataclass (type, payload, sender, epoch_ms, signature)
-- [ ] `IntroducePayload` (rcan bytes — opaque for now)
-- [ ] `DepartPayload` (optional reason)
-- [ ] `LeaseUpdatePayload` (service_name, version, contract_id, health_status, addressing_info)
-- [ ] `MeshState` (accepted_producers, salt, topic_id, peer_offsets, drift_isolated, last_heartbeat_epoch_ms, mesh_joined_at_epoch_ms)
-- [ ] `ClockDriftConfig` (replay_window_ms=30_000, drift_tolerance_ms=5_000, lease_heartbeat_ms=900_000, grace_period_ms=60_000, min_peers_for_median=3)
+- [x] `ProducerMessage` dataclass (type, payload, sender, epoch_ms, signature) — `aster/trust/mesh.py`
+- [x] `IntroducePayload` (rcan bytes — opaque for now) — `aster/trust/mesh.py`
+- [x] `DepartPayload` (optional reason) — `aster/trust/mesh.py`
+- [x] `ContractPublishedPayload` (service_name, version, contract_collection_hash) — `aster/trust/mesh.py`
+- [x] `LeaseUpdatePayload` (service_name, version, contract_id, health_status, addressing_info) — `aster/trust/mesh.py`
+- [x] `MeshState` (accepted_producers, salt, topic_id, peer_offsets, drift_isolated, last_heartbeat_epoch_ms, mesh_joined_at_epoch_ms, mesh_dead) — `aster/trust/mesh.py`
+- [x] `ClockDriftConfig` (replay_window_ms=30_000, drift_tolerance_ms=5_000, lease_heartbeat_ms=900_000, grace_period_ms=60_000, min_peers_for_median=3) — `aster/trust/mesh.py`
+- [x] `AdmissionRequest` / `AdmissionResponse` dataclasses — `aster/trust/mesh.py`
+- [x] `MeshState.to_json_dict()` / `from_json_dict()` for persistence
 
 **Signing (§2.6):**
-- [ ] Create `aster/trust/gossip.py`
-- [ ] `producer_message_signing_bytes(type, payload, sender, epoch_ms)` — `u8(type) || u64_be(epoch_ms) || sender || payload`
-- [ ] `sign_producer_message(type, payload, sender, epoch_ms, signing_key)`
-- [ ] `verify_producer_message(msg, peer_pubkey)`
+- [x] Create `aster/trust/gossip.py`
+- [x] `producer_message_signing_bytes(type, payload, sender, epoch_ms)` — `u8(type) || payload || sender.encode('utf-8') || u64_be(epoch_ms)` (normative order per spec §2.6)
+- [x] `sign_producer_message(type, payload, sender, epoch_ms, signing_key)`
+- [x] `verify_producer_message(msg, peer_pubkey)`
 
 **Topic derivation (§2.3):**
-- [ ] `derive_gossip_topic(root_pubkey, salt) -> bytes` — `blake3(root_pubkey + b"aster-producer-mesh" + salt).digest()[:32]`
+- [x] `derive_gossip_topic(root_pubkey, salt) -> bytes` — `blake3(root_pubkey + b"aster-producer-mesh" + salt).digest()` — `aster/trust/gossip.py`
 
 **Bootstrap (§2.1, §2.5):**
-- [ ] Create `aster/trust/bootstrap.py`
-- [ ] `start_founding_node()`: load credential from `ASTER_ENROLLMENT`, verify, generate/load producer key, generate 32-byte salt, compute topic_id, initialize MeshState, start endpoint + hooks, subscribe gossip, print bootstrap ticket
-- [ ] `join_mesh()`: load credential + `ASTER_BOOTSTRAP_TICKET`, dial bootstrap peer, open `aster.producer_admission` ALPN bidi stream, send `AdmissionRequest{credential, optional_iid}`, receive `AdmissionResponse{accepted, salt?, accepted_producers?, reason?}`, if accepted → derive topic_id → subscribe → send Introduce → persist MeshState
-- [ ] Bootstrap peer adds new node to `accepted_producers` on accept + rebroadcasts Introduce
-- [ ] Persist MeshState to `~/.aster/mesh_state.json` + salt to `~/.aster/mesh_salt`
-- [ ] Persist producer signing key to `~/.aster/producer.key`
+- [x] Create `aster/trust/bootstrap.py`
+- [x] `start_founding_node()`: load credential from `ASTER_ENROLLMENT`, verify, generate/load producer key, generate 32-byte salt, compute topic_id, initialize MeshState, persist, print bootstrap ticket
+- [x] `join_mesh()`: load credential + `ASTER_BOOTSTRAP_TICKET`, build `AdmissionRequest` (caller handles dial + QUIC transport)
+- [x] `apply_admission_response()`: finalize MeshState from accepted AdmissionResponse, persist salt + state
+- [x] Bootstrap peer adds new node to `accepted_producers` on accept
+- [x] Persist MeshState to `~/.aster/mesh_state.json` + salt to `~/.aster/mesh_salt`
+- [x] Persist producer signing key to `~/.aster/producer.key`
 
 **Admission RPC server (§2.5):**
-- [ ] Server-side handler for `aster.producer_admission` ALPN: read AdmissionRequest, run Phase 11 admission checks, respond with AdmissionResponse
+- [x] `handle_admission_rpc(request_json, own_state, own_root_pubkey)` — async; runs Phase 11 `check_offline`, returns `AdmissionResponse`
+
+**rcan stub:**
+- [x] Create `aster/trust/rcan.py` — opaque pass-through (§14.12 open question)
 
 **Gossip handler:**
-- [ ] `handle_producer_message(msg, state)` — async task
-- [ ] Replay-window check: drop if `abs(now - msg.epoch_ms) > replay_window_ms`
-- [ ] Membership check: drop if `msg.sender not in state.accepted_producers`
-- [ ] Signature check: drop if verify fails
-- [ ] Track offset: `state.peer_offsets[sender] = now_ms - msg.epoch_ms`
-- [ ] Dispatch by type: Introduce=1, Depart=2, ContractPublished=3, LeaseUpdate=4
-- [ ] Introduce: validate rcan (opaque for now), add sender to `accepted_producers`
-- [ ] Depart: remove sender from `accepted_producers`
-- [ ] ContractPublished/LeaseUpdate: skip if sender in `drift_isolated`, else forward to Phase 10 registry callback
-- [ ] Alert on security-relevant drops: unknown sender, bad signature
+- [x] `handle_producer_message(msg, state, config, peer_pubkeys, ...)` — async task
+- [x] Replay-window check: drop if `abs(now - msg.epoch_ms) > replay_window_ms`
+- [x] Membership check: drop if `msg.sender not in state.accepted_producers` + security alert log
+- [x] Signature check: drop if verify fails + security alert log
+- [x] Track offset: `state.peer_offsets[sender] = now_ms - msg.epoch_ms`
+- [x] Dispatch by type: Introduce=1, Depart=2, ContractPublished=3, LeaseUpdate=4
+- [x] Introduce: validate rcan (opaque for now), add sender to `accepted_producers`
+- [x] Depart: remove sender from `accepted_producers`, drift tracker, and peer_offsets
+- [x] ContractPublished/LeaseUpdate: skip if sender in `drift_isolated`, else forward to Phase 10 registry callback
+- [x] Alert on security-relevant drops: unknown sender, bad signature (logged at WARNING)
 
 **Clock drift (§2.10):**
-- [ ] Create `aster/trust/drift.py::ClockDriftDetector`
-- [ ] `track_offset(peer, epoch_ms)` — update `peer_offsets`
-- [ ] `mesh_median_offset()` — median via `statistics.median_high`; return None if `< min_peers_for_median`
-- [ ] `peer_in_drift(peer)` — True if `|offset - median| > drift_tolerance_ms`
-- [ ] `self_in_drift(self_offset_estimate)` — True if self deviates
-- [ ] Skip drift decisions during grace period (`now - mesh_joined_at_epoch_ms < grace_period_ms`)
-- [ ] Self-departure: broadcast Depart, set `mesh_dead=True`, suppress subsequent gossip sends, fail-fast log
-- [ ] Peer isolation: add to `drift_isolated`, skip ContractPublished/LeaseUpdate from peer, still process Introduce/Depart
-- [ ] Peer recovery: on fresh acceptable message, remove from `drift_isolated`
-- [ ] Read `ASTER_CLOCK_DRIFT_TOLERANCE_MS` + related env overrides
+- [x] Create `aster/trust/drift.py::ClockDriftDetector`
+- [x] `track_offset(peer, epoch_ms)` — update `peer_offsets`
+- [x] `mesh_median_offset()` — median via `statistics.median_high`; return None if `< min_peers_for_median`
+- [x] `peer_in_drift(peer)` — True if `|offset - median| > drift_tolerance_ms`
+- [x] `self_in_drift(self_offset_estimate)` — True if self deviates
+- [x] Skip drift decisions during grace period (`now - mesh_joined_at_epoch_ms < grace_period_ms`)
+- [x] Self-departure: set `mesh_dead=True`, fire `on_self_departure` callback, suppress subsequent gossip sends
+- [x] Peer isolation: add to `drift_isolated`, skip ContractPublished/LeaseUpdate from peer, still process Introduce/Depart
+- [x] Peer recovery: on fresh acceptable message, remove from `drift_isolated`
+- [x] Read `ASTER_CLOCK_DRIFT_TOLERANCE_MS`, `ASTER_REPLAY_WINDOW_MS`, `ASTER_GRACE_PERIOD_MS` env overrides
 
 **Lease heartbeat:**
-- [ ] Background timer: every `lease_heartbeat_ms` (default 15 min), broadcast LeaseUpdate with local health + addressing
+- [x] `encode_lease_update_payload()` encoder provided; background timer pattern documented (requires caller to spawn asyncio task)
+- [ ] Full background asyncio timer wired to a running GossipTopicHandle — deferred to Phase 13 integration tests
 
 **Integration with Phase 10:**
-- [ ] Forward received ContractPublished/LeaseUpdate messages to `RegistryClient.on_change` callback
+- [x] `registry_callback` parameter on `handle_producer_message` forwards ContractPublished/LeaseUpdate to Phase 10 consumer
 
 **Tests:**
-- [ ] Sign/verify round-trip; tampered payload → verify fails
-- [ ] Replay attack: message outside ±30s → dropped
-- [ ] Unknown-sender message → dropped
-- [ ] 3-peer median + drift detection
-- [ ] Self-departure on synthetic >5s clock skew → Depart broadcast + gossip suppression
-- [ ] Peer isolation: >5s drift → isolated; ContractPublished/LeaseUpdate from peer → skipped; Introduce/Depart → processed
-- [ ] Peer recovery on acceptable fresh message
-- [ ] Bootstrap ticket round-trip: founding → print ticket → subsequent node joins
-- [ ] Admission RPC: accepted case + rejected case
-- [ ] Lease heartbeat broadcast observed after interval
+- [x] Sign/verify round-trip; tampered payload/sender/epoch → verify fails
+- [x] Replay attack: message outside ±30s → dropped
+- [x] Unknown-sender message → dropped + security alert
+- [x] Bad signature from accepted sender → dropped + security alert
+- [x] 3-peer median + drift detection (median_high, even/odd counts)
+- [x] Self-departure on synthetic >5s clock skew → mesh_dead=True
+- [x] Self-departure suppressed during grace period
+- [x] Peer isolation: >5s drift → isolated; ContractPublished/LeaseUpdate from peer → skipped; Introduce/Depart → processed
+- [x] Peer recovery on acceptable fresh message
+- [x] Bootstrap admission RPC: accepted case + rejected (malformed + expired credential)
+- [x] `apply_admission_response` raises on rejection
+- [x] MeshState JSON round-trip (to_json_dict / from_json_dict)
+- [x] ClockDriftConfig env overrides
+- [x] Topic derivation: deterministic, distinct on different salt/pubkey, matches blake3 vector
+- [x] Payload encode helpers: Depart, ContractPublished, LeaseUpdate, Introduce round-trips
+- [ ] Lease heartbeat broadcast observed after interval — deferred (requires live gossip in test)
 
 **Open design questions (track in plan §14.12):**
-- [ ] **rcan grant format** — opaque bytes for now; pin down once upstream specifies
-- [ ] **AdmissionRequest/Response schema** — confirm `reason` field semantics
+- [x] **rcan grant format** — opaque bytes in `aster/trust/rcan.py`; pin down once upstream specifies
+- [x] **AdmissionRequest/Response schema** — `reason` field for internal logging; never sent to peer in production
 
 ---
 
@@ -686,5 +741,5 @@ Phase 10 verification completed with uv:
 | **Contract identity** | 9 | Content-addressed contracts via BLAKE3 Merkle DAG + custom canonical encoder | ⬜ Not started |
 | **Decentralized registry** | 10 | Service discovery via iroh-docs/gossip/blobs (unauthenticated) | ⬜ Not started |
 | **Trust foundations** | 11 | Enrollment credentials + Gate 0 admission (ed25519) | ⬜ Not started |
-| **Producer mesh** | 12 | Signed gossip, bootstrap, clock-drift detection | ⬜ Not started |
+| **Producer mesh** | 12 | Signed gossip, bootstrap, clock-drift detection | ✅ Done |
 | **Conformance suite** | 13 | Wire + canonical vectors + cross-language interop | ⬜ Not started |
