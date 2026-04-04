@@ -1,7 +1,7 @@
 # Iroh FFI — Complete Refactoring & Multi-Language Binding Plan
 
 **Status:** Final Plan  
-**Date:** 2026-04-01  
+**Date:** 2026-04-04 (Phase 1c added; Phase 1b merged from FFI_PLAN_PATCH.md)  
 **Scope:** Refactor `aster_transport_core` and `aster_transport_ffi` to provide a polished, language-neutral C ABI; update Python bindings; implement Java FFM bindings.
 
 ---
@@ -12,12 +12,13 @@
 2. [Architecture Overview](#2-architecture-overview)
 3. [Phase 1: Core + FFI Refactoring](#3-phase-1-core--ffi-refactoring)
 4. [Phase 1b: Datagram Completion & Hooks & Monitoring](#3b-phase-1b-datagram-completion--hooks--monitoring)
-5. [Phase 2: Python Bindings Update](#4-phase-2-python-bindings-update)
-6. [Phase 3: Java FFM Bindings](#5-phase-3-java-ffm-bindings)
-7. [C ABI Reference](#6-c-abi-reference)
-8. [Memory Ownership Rules](#7-memory-ownership-rules)
-9. [Testing & Validation Strategy](#8-testing--validation-strategy)
-10. [Migration Guide](#9-migration-guide)
+5. [Phase 1c: Registry & Publication Support](#3c-phase-1c-registry--publication-support)
+6. [Phase 2: Python Bindings Update](#4-phase-2-python-bindings-update)
+7. [Phase 3: Java FFM Bindings](#5-phase-3-java-ffm-bindings)
+8. [C ABI Reference](#6-c-abi-reference)
+9. [Memory Ownership Rules](#7-memory-ownership-rules)
+10. [Testing & Validation Strategy](#8-testing--validation-strategy)
+11. [Migration Guide](#9-migration-guide)
 
 ---
 
@@ -1490,6 +1491,15 @@ void testEchoRoundtrip() throws Exception {
 | Cancellation | — | ✓ | — | — | ✓ |
 | Custom relay URLs | ✓ | ✓ | — | — | ✓ |
 | Secret key export | ✓ | ✓ | — | — | ✓ |
+| **Phase 1c** | | | | | |
+| Tag set/get/delete | ✓ | ✓ | ✓ | — | ✓ |
+| Tag list/prefix | ✓ | ✓ | ✓ | — | ✓ |
+| Blob status/has | ✓ | ✓ | ✓ | — | ✓ |
+| Doc subscribe | ✓ | ✓ | ✓ | — | ✓ |
+| Doc start_sync/leave | ✓ | ✓ | ✓ | — | ✓ |
+| Doc download policy | ✓ | ✓ | ✓ | — | ✓ |
+| Doc share with addr | ✓ | ✓ | ✓ | — | ✓ |
+| Doc join+subscribe | ✓ | ✓ | ✓ | — | ✓ |
 
 ### 8.7 Stress/Soak Tests
 
@@ -1568,22 +1578,13 @@ int main() {
 
 ## 3b. Phase 1b: Datagram Completion, Endpoint Hooks & Monitoring
 
-> **See also:** `ffi_spec/FFI_PLAN_PATCH.md` for the original detailed design.
+> **History:** This section was originally developed as `ffi_spec/FFI_PLAN_PATCH.md` and has
+> been merged into this document as of 2026-04-04. The patch document is retained for
+> historical reference only; this section is authoritative.
 >
-> **Scope correction (2026-04-01):** `FFI_PLAN_PATCH.md` was written as a forward-looking design,
-> but this repository is currently pinned to **`iroh = 0.97.0`**. Some of the planned Phase 1b
-> surfaces line up more naturally with newer/stabilizing upstream APIs. Therefore, for the
-> current branch, this section should be interpreted as:
->
-> - **Datagram completion:** in scope now
-> - **Hooks:** design target only unless/until mapped cleanly to the `v0.97.0` surface
-> - **Remote-info / monitoring:** implement only what can be faithfully represented from `v0.97.0`
->
-> The upstream references to use when refining this plan are the `v0.97.0` examples:
-> - `monitor-connections.rs`
-> - `screening-connection.rs`
-> - `remote-info.rs`
-> - `auth-hook.rs`
+> **Scope:** All features in this section target the pinned **`iroh = 0.97.0`** surface.
+> The upstream references used when designing this phase are the `v0.97.0` examples:
+> `monitor-connections.rs`, `screening-connection.rs`, `remote-info.rs`, `auth-hook.rs`.
 
 This phase extends Phase 1 to add capabilities that are useful for production multi-language use,
 but in the current repository they split into three categories:
@@ -1971,6 +1972,503 @@ This may lead to a future FFI feature separate from endpoint hooks, e.g. "accept
 
 ---
 
+## 3c. Phase 1c: Registry & Publication Support
+
+> **Added:** 2026-04-04. Driven by §11.5 of `Aster-ContractIdentity.md`.
+>
+> **Scope:** iroh-blobs and iroh-docs extensions required for Aster contract
+> publication (Phase 9) and service registry (Phase 10). These are capabilities
+> that the upstream Rust APIs already provide but which are not yet exposed
+> through `aster_transport_core`, the Python bindings, or the C FFI.
+
+### 3c.0 Motivation
+
+The contract publication workflow (§11.4 of `Aster-ContractIdentity.md`) requires:
+
+1. **Blob Tags** — GC protection for published contract collections. Without tags, blobs are
+   garbage-collected when `TempTag` values are dropped. The current `add_bytes_as_collection`
+   implementation uses `std::mem::forget(tag)` as a workaround, which leaks memory and provides
+   no way to unpublish.
+2. **Blob Observe** — Partial transfer detection and completion tracking for resumable downloads.
+3. **Blob Status** — Check whether a blob is complete, partial, or missing before attempting to serve it.
+4. **Doc Subscribe** — Live event stream for `InsertRemote` / `ContentReady` events, needed for
+   registry change notifications.
+5. **Doc Sync Lifecycle** — Explicit `start_sync()` / `leave()` for controlling when a document
+   actively syncs with peers.
+6. **Doc Download Policy** — Selective sync by key prefix (`NothingExcept` policy) to avoid
+   pulling all service data when only `_aster/` keys are needed.
+7. **Doc Share with Full Addr** — Include relay URL and direct addresses in `DocTicket` for
+   bootstrapping remote nodes that have no prior addressing information.
+
+### 3c.1 Blob Tags API
+
+**Why P0:** Without proper tags, published contract collections will be garbage-collected on
+the next GC cycle. The `mem::forget` hack currently used in `add_bytes_as_collection` leaks
+memory and makes unpublishing impossible.
+
+#### Current State
+
+The upstream `iroh-blobs` crate exposes a full `Tags` API via `store.tags()`:
+- `set(name, hash_and_format)` — create/update a named tag
+- `get(name)` → `Option<TagInfo>` — read a tag
+- `delete(name)` → `u64` — delete a tag (returns count removed)
+- `list()` / `list_prefix(prefix)` — enumerate tags
+- `list_hash_seq()` — list only HashSeq-format tags
+
+None of these are exposed in `aster_transport_core` or any binding.
+
+#### Core API (`aster_transport_core`)
+
+```rust
+/// Information about a tag
+pub struct CoreTagInfo {
+    pub name: String,       // Tag name (UTF-8)
+    pub hash: String,       // Hash hex string
+    pub format: String,     // "raw" or "hash_seq"
+}
+
+impl CoreBlobsClient {
+    /// Set a named tag for GC protection.
+    /// If the tag already exists, it is overwritten.
+    pub async fn tag_set(&self, name: String, hash_hex: String, format: String) -> Result<()>;
+
+    /// Get a tag by name. Returns None if not found.
+    pub async fn tag_get(&self, name: String) -> Result<Option<CoreTagInfo>>;
+
+    /// Delete a tag by name. Returns the number of tags removed (0 or 1).
+    pub async fn tag_delete(&self, name: String) -> Result<u64>;
+
+    /// Delete all tags matching a prefix. Returns count removed.
+    pub async fn tag_delete_prefix(&self, prefix: String) -> Result<u64>;
+
+    /// List all tags. Returns a vector of tag info.
+    pub async fn tag_list(&self) -> Result<Vec<CoreTagInfo>>;
+
+    /// List tags matching a prefix.
+    pub async fn tag_list_prefix(&self, prefix: String) -> Result<Vec<CoreTagInfo>>;
+
+    /// List only HashSeq-format tags (collections).
+    pub async fn tag_list_hash_seq(&self) -> Result<Vec<CoreTagInfo>>;
+}
+```
+
+#### FFI API
+
+```c
+// ─── Blob Tags (Phase 1c) ───
+
+// Set a named tag for GC protection.
+// format: 0=raw, 1=hash_seq
+// Emits IROH_EVENT_TAG_SET on success.
+iroh_status_t iroh_tags_set(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* name_ptr, size_t name_len,
+    const uint8_t* hash_hex_ptr, size_t hash_hex_len,
+    uint32_t format,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+
+// Get a tag by name.
+// Emits IROH_EVENT_TAG_GET with tag info in payload, or IROH_EVENT_TAG_GET with
+// status NOT_FOUND if the tag does not exist.
+iroh_status_t iroh_tags_get(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* name_ptr, size_t name_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+
+// Delete a tag by name.
+// Emits IROH_EVENT_TAG_DELETED with count in event.flags.
+iroh_status_t iroh_tags_delete(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* name_ptr, size_t name_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+
+// List tags matching a prefix (empty prefix = all tags).
+// Emits IROH_EVENT_TAG_LIST with packed tag entries in payload.
+iroh_status_t iroh_tags_list_prefix(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* prefix_ptr, size_t prefix_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+```
+
+#### Event Kinds (new)
+
+```c
+IROH_EVENT_TAG_SET = 36,
+IROH_EVENT_TAG_GET = 37,
+IROH_EVENT_TAG_DELETED = 38,
+IROH_EVENT_TAG_LIST = 39,
+```
+
+#### Impact on Existing Code
+
+The `add_bytes_as_collection` implementation must be updated to use proper tags instead of
+`std::mem::forget`. The new flow:
+
+1. `add_bytes` → gets `TempTag` with blob hash
+2. Build `Collection`, store it → gets `TempTag` with collection hash
+3. Call `tag_set("aster/contract/{name}@{hash}", collection_hash, "hash_seq")`
+4. Drop both `TempTag` values — the named tag now protects the collection and its children
+
+To unpublish: `tag_delete("aster/contract/{name}@{hash}")` → GC reclaims the blobs.
+
+### 3c.2 Blob Status & Observe
+
+**Why P1:** Needed for smart download decisions — check if a blob is already present before
+fetching, and track partial download progress.
+
+#### Core API
+
+```rust
+/// Status of a blob in the local store
+pub enum CoreBlobStatus {
+    /// Blob is not present at all
+    NotFound,
+    /// Blob is partially present (some chunks available)
+    Partial { size: u64 },
+    /// Blob is complete
+    Complete { size: u64 },
+}
+
+impl CoreBlobsClient {
+    /// Check the status of a blob in the local store.
+    pub async fn blob_status(&self, hash_hex: String) -> Result<CoreBlobStatus>;
+
+    /// Check if a blob is complete in the local store.
+    pub async fn blob_has(&self, hash_hex: String) -> Result<bool>;
+}
+```
+
+#### FFI API
+
+```c
+// Check blob status. Synchronous — writes directly to out params.
+// out_status: 0=not_found, 1=partial, 2=complete
+// out_size: blob size in bytes (0 if not_found)
+iroh_status_t iroh_blobs_status(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* hash_hex_ptr, size_t hash_hex_len,
+    uint32_t* out_status,
+    uint64_t* out_size
+);
+
+// Check if blob is complete. Synchronous.
+iroh_status_t iroh_blobs_has(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* hash_hex_ptr, size_t hash_hex_len,
+    uint32_t* out_has  // 1 = complete, 0 = not complete
+);
+```
+
+### 3c.3 Doc Subscribe (Live Events)
+
+**Why P1:** The registry needs to react to remote document changes in real time. Without live
+events, the only option is polling, which is both slow and wasteful.
+
+#### Core API
+
+```rust
+/// A document event from the live subscription stream
+pub enum CoreDocEvent {
+    /// A local insert was made
+    InsertLocal {
+        author_id: String,
+        key: Vec<u8>,
+        content_hash: String,
+        content_len: u64,
+        timestamp: u64,
+    },
+    /// A remote insert was received via sync
+    InsertRemote {
+        author_id: String,
+        key: Vec<u8>,
+        content_hash: String,
+        content_len: u64,
+        timestamp: u64,
+        from_endpoint_id: String,
+    },
+    /// Content for an entry is now available locally
+    ContentReady {
+        content_hash: String,
+    },
+    /// A neighbor (sync peer) came online
+    NeighborUp {
+        endpoint_id: String,
+    },
+    /// A neighbor went offline
+    NeighborDown {
+        endpoint_id: String,
+    },
+    /// Sync with a peer finished
+    SyncFinished {
+        endpoint_id: String,
+    },
+}
+
+impl CoreDoc {
+    /// Subscribe to live document events. Returns a receiver that yields events
+    /// as they occur. The subscription is active until the receiver is dropped.
+    pub async fn subscribe(&self) -> Result<CoreDocEventReceiver>;
+}
+
+pub struct CoreDocEventReceiver { /* wraps iroh_docs event stream */ }
+
+impl CoreDocEventReceiver {
+    /// Receive the next event. Returns None when the subscription ends.
+    pub async fn recv(&self) -> Result<Option<CoreDocEvent>>;
+}
+```
+
+#### FFI API
+
+```c
+// Subscribe to live document events.
+// Emits IROH_EVENT_DOC_SUBSCRIBED once, then pushes DOC_EVENT_* events
+// keyed by the doc handle.
+iroh_status_t iroh_doc_subscribe(
+    iroh_runtime_t runtime,
+    uint64_t doc,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+
+// Receive next document event (long-poll, like gossip_recv).
+// Emits IROH_EVENT_DOC_EVENT with subtype indicating event kind.
+iroh_status_t iroh_doc_event_recv(
+    iroh_runtime_t runtime,
+    uint64_t doc,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+```
+
+#### Event Kinds (new)
+
+```c
+IROH_EVENT_DOC_SUBSCRIBED = 47,
+IROH_EVENT_DOC_EVENT = 48,
+```
+
+The `subtype` field of `IROH_EVENT_DOC_EVENT` distinguishes event kinds:
+
+| Subtype | Name | Payload |
+|---------|------|---------|
+| 0 | InsertLocal | Packed entry (same format as DOC_QUERY) |
+| 1 | InsertRemote | Packed entry + from_endpoint_id |
+| 2 | ContentReady | content_hash hex |
+| 3 | NeighborUp | endpoint_id hex |
+| 4 | NeighborDown | endpoint_id hex |
+| 5 | SyncFinished | endpoint_id hex |
+
+### 3c.4 Doc Sync Lifecycle
+
+**Why P1:** Without explicit sync control, documents begin syncing immediately on join and
+cannot be paused. The registry needs to control when sync happens to avoid downloading
+contract data before ACL validation.
+
+#### Core API
+
+```rust
+impl CoreDoc {
+    /// Start syncing this document with the given peers.
+    /// If already syncing, this is a no-op.
+    pub async fn start_sync(&self, peers: Vec<String>) -> Result<()>;
+
+    /// Stop syncing this document. Existing sync connections are dropped.
+    pub async fn leave(&self) -> Result<()>;
+}
+```
+
+#### FFI API
+
+```c
+// Start syncing a document with specified peers.
+// peers is an array of endpoint_id hex strings.
+// Emits IROH_EVENT_UNIT_RESULT on completion.
+iroh_status_t iroh_doc_start_sync(
+    iroh_runtime_t runtime,
+    uint64_t doc,
+    const iroh_bytes_t* peers, size_t peers_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+
+// Leave (stop syncing) a document.
+// Emits IROH_EVENT_UNIT_RESULT on completion.
+iroh_status_t iroh_doc_leave(
+    iroh_runtime_t runtime,
+    uint64_t doc,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+```
+
+### 3c.5 Doc Download Policy
+
+**Why P2:** Allows selective content sync — e.g., only download `_aster/` prefix keys without
+pulling all service data. This is an optimisation for large registries.
+
+#### Core API
+
+```rust
+/// Download policy for a document
+pub enum CoreDownloadPolicy {
+    /// Download everything (default)
+    Everything,
+    /// Download nothing except entries matching these key prefixes
+    NothingExcept { prefixes: Vec<Vec<u8>> },
+    /// Download everything except entries matching these key prefixes
+    EverythingExcept { prefixes: Vec<Vec<u8>> },
+}
+
+impl CoreDoc {
+    /// Set the download policy for this document.
+    pub async fn set_download_policy(&self, policy: CoreDownloadPolicy) -> Result<()>;
+
+    /// Get the current download policy.
+    pub async fn get_download_policy(&self) -> Result<CoreDownloadPolicy>;
+}
+```
+
+#### FFI API
+
+```c
+typedef enum iroh_download_policy_mode_e {
+    IROH_DOWNLOAD_POLICY_EVERYTHING = 0,
+    IROH_DOWNLOAD_POLICY_NOTHING_EXCEPT = 1,
+    IROH_DOWNLOAD_POLICY_EVERYTHING_EXCEPT = 2,
+} iroh_download_policy_mode_t;
+
+// Set download policy for a document.
+// prefixes: array of key prefixes (only used when mode != EVERYTHING)
+iroh_status_t iroh_doc_set_download_policy(
+    iroh_runtime_t runtime,
+    uint64_t doc,
+    uint32_t mode,  // iroh_download_policy_mode_t
+    const iroh_bytes_t* prefixes, size_t prefixes_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+```
+
+### 3c.6 Doc Share with Full Address
+
+**Why P2:** The existing `share()` returns a `DocTicket` containing only the node ID
+(`AddrInfoOptions::Id`). Remote nodes need full addressing information (relay URL, direct
+addresses) to bootstrap the first connection without prior discovery state.
+
+#### Core API
+
+```rust
+impl CoreDoc {
+    /// Share this document with full addressing information included in the ticket.
+    /// This is needed when the recipient has no prior knowledge of the sharer's address.
+    pub async fn share_with_addr(&self, mode: String) -> Result<String>;
+}
+```
+
+This calls `doc.share(share_mode, AddrInfoOptions::RelayAndAddresses)` instead of
+`AddrInfoOptions::Id`.
+
+#### FFI API
+
+```c
+// Share a document with full address info in the ticket.
+// mode: 0=read, 1=write
+// Emits IROH_EVENT_DOC_SHARED with ticket string in payload.
+iroh_status_t iroh_doc_share_with_addr(
+    iroh_runtime_t runtime,
+    uint64_t doc,
+    uint32_t mode,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+```
+
+### 3c.7 Doc Import and Subscribe (Race-Free Join)
+
+**Why P2:** When joining a registry namespace, there's a race between subscribing for live
+events and the initial sync delivering the first batch of entries. `import_and_subscribe`
+atomically joins the document and starts the event subscription before the first sync
+completes, ensuring no events are missed.
+
+#### Core API
+
+```rust
+impl CoreDocsClient {
+    /// Join a document and immediately subscribe to its events.
+    /// This is atomic: the subscription is active before the first sync starts,
+    /// so no InsertRemote events are missed.
+    pub async fn join_and_subscribe(&self, ticket_str: String)
+        -> Result<(CoreDoc, CoreDocEventReceiver)>;
+}
+```
+
+#### FFI API
+
+```c
+// Join a document and immediately subscribe to events.
+// Emits IROH_EVENT_DOC_JOINED with the doc handle,
+// then automatically begins emitting DOC_EVENT_* events for the doc handle.
+iroh_status_t iroh_docs_join_and_subscribe(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* ticket_ptr, size_t ticket_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+```
+
+### 3c.8 Priority Summary
+
+| Feature | Priority | Aster Phase | Status |
+|---------|----------|-------------|--------|
+| Blob Tags (`set`, `get`, `delete`, `list`) | P0 | Phase 9 (contract publication) | ⬜ TODO |
+| Blob Status / Has | P1 | Phase 10 (smart fetching) | ⬜ TODO |
+| Doc Subscribe (live events) | P1 | Phase 10 (registry notifications) | ⬜ TODO |
+| Doc Sync Lifecycle (`start_sync`, `leave`) | P1 | Phase 10 (sync control) | ⬜ TODO |
+| Doc Download Policy | P2 | Phase 10 (efficient sync) | ⬜ TODO |
+| Doc Share with Full Addr | P2 | Phase 10 (bootstrapping) | ⬜ TODO |
+| Doc Import and Subscribe | P2 | Phase 10 (race-free join) | ⬜ TODO |
+
+### 3c.9 Implementation Notes
+
+**Blob Tags:** The upstream `iroh-blobs` `Tags` API is accessed via `store.tags()` which
+returns a `&Tags` reference. The `BlobStore` type already exposes this. Since `CoreBlobsClient`
+holds `pub store: BlobStore`, adding tag methods is straightforward delegation.
+
+**Doc Subscribe:** The upstream `iroh-docs` `Doc` type has a `subscribe()` method that returns
+an event stream. The core wrapper needs to convert the upstream event types to `CoreDocEvent`.
+
+**Doc Sync Lifecycle:** The upstream `Doc` has `start_sync(peers)` and `leave()` methods.
+Direct delegation from `CoreDoc`.
+
+**Download Policy:** The upstream `Doc` has `set_download_policy()` / `get_download_policy()`.
+The policy types need to be mapped from upstream `DownloadPolicy` to `CoreDownloadPolicy`.
+
+**Share with Full Addr:** The existing `CoreDoc::share()` calls
+`doc.share(mode, AddrInfoOptions::Id)`. The new variant calls
+`doc.share(mode, AddrInfoOptions::RelayAndAddresses)`.
+
+**Import and Subscribe:** This requires calling `docs.api().import_namespace(capability)` and
+`doc.subscribe()` in sequence before the first sync completes. The upstream API may provide
+an atomic variant; if not, subscribe immediately after import before yielding to the event loop.
+
+---
+
 ## Implementation Order
 
 ### Phase 1 (Core + FFI) — ~2-3 weeks
@@ -1995,9 +2493,22 @@ This may lead to a future FFI feature separate from endpoint hooks, e.g. "accept
 4. Write integration tests for all implemented features
 5. Update documentation/status so placeholders are never reported as completed functionality
 
+### Phase 1c (Registry & Publication Support) — ~1-2 weeks
+
+1. **P0: Blob Tags** — Add `tag_set`, `tag_get`, `tag_delete`, `tag_list` to core + Python + FFI
+2. **P0: Fix `add_bytes_as_collection`** — Replace `mem::forget` hack with proper tag-based GC protection
+3. **P1: Blob Status / Has** — Add `blob_status`, `blob_has` to core + Python + FFI
+4. **P1: Doc Subscribe** — Add live event subscription to core + Python + FFI
+5. **P1: Doc Sync Lifecycle** — Add `start_sync`, `leave` to core + Python + FFI
+6. **P2: Doc Download Policy** — Add `set_download_policy` to core + Python + FFI
+7. **P2: Doc Share with Full Addr** — Add `share_with_addr` to core + Python + FFI
+8. **P2: Doc Import and Subscribe** — Add `join_and_subscribe` to core + Python + FFI
+9. Write integration tests for all Phase 1c features
+10. Update `Aster-ContractIdentity.md` §11.5 to reflect completed items
+
 ### Phase 2 (Python) — ~1 week
 
-1. Finish Phase 1b in `aster_transport_core` for the surfaces Python is required to expose
+1. Finish Phase 1b and 1c in `aster_transport_core` for the surfaces Python is required to expose
 2. Make `aster_transport_core` the immediate backend for every Python wrapper
 3. Remove the legacy FFI-based Python implementation from `iroh_python_rs`
 4. Consolidate duplicate module implementations and make `lib.rs` registration-only
