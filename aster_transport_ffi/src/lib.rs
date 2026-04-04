@@ -105,6 +105,9 @@ pub enum iroh_event_kind_t {
     IROH_EVENT_BLOB_COLLECTION_ADDED = 34,
     IROH_EVENT_BLOB_COLLECTION_TICKET_CREATED = 35,
 
+    /// Emitted by iroh_blobs_observe_complete when the blob is fully available locally.
+    IROH_EVENT_BLOB_OBSERVE_COMPLETE = 56,
+
     // Tags (Phase 1c)
     IROH_EVENT_TAG_SET = 36,
     IROH_EVENT_TAG_GET = 37,
@@ -119,6 +122,10 @@ pub enum iroh_event_kind_t {
     IROH_EVENT_DOC_SHARED = 44,
     IROH_EVENT_DOC_QUERY = 46,
     IROH_EVENT_AUTHOR_CREATED = 45,
+    IROH_EVENT_DOC_SUBSCRIBED = 47,
+    IROH_EVENT_DOC_EVENT = 48,
+    /// join_and_subscribe: event.handle = doc_handle, event.related = receiver_handle
+    IROH_EVENT_DOC_JOINED_AND_SUBSCRIBED = 49,
 
     // Gossip
     IROH_EVENT_GOSSIP_SUBSCRIBED = 50,
@@ -459,6 +466,9 @@ struct BridgeRuntime {
     // Hook invocation registry (Phase 1b)
     hook_invocations: HandleRegistry<HookInvocationState>,
 
+    // Doc event receiver registry (Phase 1c.4)
+    doc_event_receivers: HandleRegistry<aster_transport_core::CoreDocEventReceiver>,
+
     // Buffer registry
     buffers: BufferRegistry,
 }
@@ -503,6 +513,7 @@ impl BridgeRuntime {
             gossip_topics: HandleRegistry::new(),
             operations: HandleRegistry::new(),
             hook_invocations: HandleRegistry::new(),
+            doc_event_receivers: HandleRegistry::new(),
             buffers: BufferRegistry::new(),
         })
     }
@@ -3204,6 +3215,264 @@ pub unsafe extern "C" fn iroh_blobs_download(
 }
 
 // ============================================================================
+// C FFI Functions - Blob Status / Has (Phase 1c.3)
+// ============================================================================
+
+/// Check the status of a blob in the local store. Synchronous.
+///
+/// Writes to `out_status`: 0 = not_found, 1 = partial, 2 = complete.
+/// Writes to `out_size`: byte size (0 if not_found).
+#[no_mangle]
+pub unsafe extern "C" fn iroh_blobs_status(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    hash_hex_ptr: *const u8,
+    hash_hex_len: usize,
+    out_status: *mut u32,
+    out_size: *mut u64,
+) -> i32 {
+    if hash_hex_ptr.is_null() || out_status.is_null() || out_size.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let hash_hex =
+        String::from_utf8(unsafe { slice::from_raw_parts(hash_hex_ptr, hash_hex_len).to_vec() })
+            .unwrap_or_default();
+
+    let blobs = node_arc.blobs_client();
+    let result = bridge
+        .runtime
+        .block_on(async move { blobs.blob_status(hash_hex).await });
+
+    match result {
+        Ok(status) => {
+            let (code, size) = match status {
+                aster_transport_core::CoreBlobStatus::NotFound => (0u32, 0u64),
+                aster_transport_core::CoreBlobStatus::Partial { size } => (1u32, size),
+                aster_transport_core::CoreBlobStatus::Complete { size } => (2u32, size),
+            };
+            unsafe {
+                *out_status = code;
+                *out_size = size;
+            }
+            iroh_status_t::IROH_STATUS_OK as i32
+        }
+        Err(_) => iroh_status_t::IROH_STATUS_INTERNAL as i32,
+    }
+}
+
+/// Check if a blob is fully stored locally. Synchronous.
+///
+/// Writes to `out_has`: 1 = complete/present, 0 = not complete.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_blobs_has(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    hash_hex_ptr: *const u8,
+    hash_hex_len: usize,
+    out_has: *mut u32,
+) -> i32 {
+    if hash_hex_ptr.is_null() || out_has.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let hash_hex =
+        String::from_utf8(unsafe { slice::from_raw_parts(hash_hex_ptr, hash_hex_len).to_vec() })
+            .unwrap_or_default();
+
+    let blobs = node_arc.blobs_client();
+    let result = bridge
+        .runtime
+        .block_on(async move { blobs.blob_has(hash_hex).await });
+
+    match result {
+        Ok(has) => {
+            unsafe {
+                *out_has = if has { 1 } else { 0 };
+            }
+            iroh_status_t::IROH_STATUS_OK as i32
+        }
+        Err(_) => iroh_status_t::IROH_STATUS_INTERNAL as i32,
+    }
+}
+
+// ============================================================================
+// C FFI Functions - Blob Transfer Observability (Phase 1d)
+// ============================================================================
+
+/// Snapshot of the current bitfield for a blob.
+/// Fills `out_is_complete` (1=complete, 0=partial/not-found) and `out_size` (total bytes, 0 if unknown).
+/// Returns IROH_STATUS_NOT_FOUND if the node handle is unknown.
+/// Returns IROH_STATUS_INVALID_ARGUMENT if any pointer is null.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_blobs_observe_snapshot(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    hash_hex_ptr: *const u8,
+    hash_hex_len: usize,
+    out_is_complete: *mut u32,
+    out_size: *mut u64,
+) -> i32 {
+    if hash_hex_ptr.is_null() || out_is_complete.is_null() || out_size.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let hash_hex =
+        String::from_utf8(unsafe { slice::from_raw_parts(hash_hex_ptr, hash_hex_len).to_vec() })
+            .unwrap_or_default();
+    let blobs = node_arc.blobs_client();
+
+    let result = bridge
+        .runtime
+        .block_on(async move { blobs.blob_observe_snapshot(hash_hex).await });
+
+    match result {
+        Ok(r) => {
+            unsafe {
+                *out_is_complete = if r.is_complete { 1 } else { 0 };
+                *out_size = r.size;
+            }
+            iroh_status_t::IROH_STATUS_OK as i32
+        }
+        Err(_) => iroh_status_t::IROH_STATUS_INTERNAL as i32,
+    }
+}
+
+/// Wait until a blob is fully downloaded locally.
+/// Emits IROH_EVENT_BLOB_OBSERVE_COMPLETE (via IROH_EVENT_UNIT_RESULT) when complete,
+/// or an error event if the observation stream ends without completion.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_blobs_observe_complete(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    hash_hex_ptr: *const u8,
+    hash_hex_len: usize,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if hash_hex_ptr.is_null() || out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let hash_hex =
+        String::from_utf8(unsafe { slice::from_raw_parts(hash_hex_ptr, hash_hex_len).to_vec() })
+            .unwrap_or_default();
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        let blobs = node_arc.blobs_client();
+        match blobs.blob_observe_complete(hash_hex).await {
+            Ok(()) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_BLOB_OBSERVE_COMPLETE,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Check local availability of a blob using the Remote API.
+/// Fills `out_is_complete` (1=complete, 0=partial) and `out_local_bytes` (bytes we have locally).
+/// Returns IROH_STATUS_NOT_FOUND if the node handle is unknown.
+/// Returns IROH_STATUS_INVALID_ARGUMENT if any pointer is null.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_blobs_local_info(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    hash_hex_ptr: *const u8,
+    hash_hex_len: usize,
+    out_is_complete: *mut u32,
+    out_local_bytes: *mut u64,
+) -> i32 {
+    if hash_hex_ptr.is_null() || out_is_complete.is_null() || out_local_bytes.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let hash_hex =
+        String::from_utf8(unsafe { slice::from_raw_parts(hash_hex_ptr, hash_hex_len).to_vec() })
+            .unwrap_or_default();
+    let blobs = node_arc.blobs_client();
+
+    let result = bridge
+        .runtime
+        .block_on(async move { blobs.blob_local_info(hash_hex).await });
+
+    match result {
+        Ok(r) => {
+            unsafe {
+                *out_is_complete = if r.is_complete { 1 } else { 0 };
+                *out_local_bytes = r.local_bytes;
+            }
+            iroh_status_t::IROH_STATUS_OK as i32
+        }
+        Err(_) => iroh_status_t::IROH_STATUS_INTERNAL as i32,
+    }
+}
+
+// ============================================================================
 // C FFI Functions - Tags (Phase 1c)
 // ============================================================================
 
@@ -4021,6 +4290,509 @@ pub unsafe extern "C" fn iroh_doc_read_entry_content(
             Err(e) => {
                 bridge2.emit_error(op_id, user_data, &e.to_string());
             }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Doc Sync Lifecycle (Phase 1c.5)
+// ============================================================================
+
+/// Start syncing a document with the specified peers (endpoint-ID hex strings).
+/// Emits IROH_EVENT_UNIT_RESULT on completion.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_start_sync(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    peers: iroh_bytes_list_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let peer_strs = unsafe { read_string_list(&peers) };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match doc_arc.start_sync(peer_strs).await {
+            Ok(()) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_UNIT_RESULT,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Leave (stop syncing) a document.
+/// Emits IROH_EVENT_UNIT_RESULT on completion.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_leave(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match doc_arc.leave().await {
+            Ok(()) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_UNIT_RESULT,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Doc Subscribe (Phase 1c.4)
+// ============================================================================
+
+/// Encode a CoreDocEntry into the packed binary format used by DOC_QUERY payloads.
+fn encode_entry_payload(entry: &aster_transport_core::CoreDocEntry) -> Vec<u8> {
+    let mut payload = Vec::new();
+    let author_bytes = entry.author_id.as_bytes();
+    payload.extend_from_slice(&(author_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(author_bytes);
+    payload.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&entry.key);
+    let hash_bytes = entry.content_hash.as_bytes();
+    payload.extend_from_slice(&(hash_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(hash_bytes);
+    payload.extend_from_slice(&entry.content_len.to_le_bytes());
+    payload.extend_from_slice(&entry.timestamp.to_le_bytes());
+    payload
+}
+
+/// Encode a CoreDocEvent into (subtype: u32, payload: Vec<u8>).
+///
+/// Subtype: 0=InsertLocal, 1=InsertRemote, 2=ContentReady, 3=PendingContentReady,
+///          4=NeighborUp, 5=NeighborDown, 6=SyncFinished
+fn encode_doc_event(ev: &aster_transport_core::CoreDocEvent) -> (u32, Vec<u8>) {
+    use aster_transport_core::CoreDocEvent::*;
+    match ev {
+        InsertLocal { entry } => (0, encode_entry_payload(entry)),
+        InsertRemote { from, entry } => {
+            let mut payload = encode_entry_payload(entry);
+            let from_bytes = from.as_bytes();
+            payload.extend_from_slice(&(from_bytes.len() as u32).to_le_bytes());
+            payload.extend_from_slice(from_bytes);
+            (1, payload)
+        }
+        ContentReady { hash } => (2, hash.as_bytes().to_vec()),
+        PendingContentReady => (3, Vec::new()),
+        NeighborUp { peer } => (4, peer.as_bytes().to_vec()),
+        NeighborDown { peer } => (5, peer.as_bytes().to_vec()),
+        SyncFinished { peer } => (6, peer.as_bytes().to_vec()),
+    }
+}
+
+/// Subscribe to live document events.
+/// Emits IROH_EVENT_DOC_SUBSCRIBED (status=OK, handle=receiver_handle) on success.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_subscribe(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match doc_arc.subscribe().await {
+            Ok(receiver) => {
+                let handle = bridge2.doc_event_receivers.insert(receiver);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_DOC_SUBSCRIBED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    handle,
+                    doc,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Receive the next live document event (long-poll, like gossip_recv).
+/// Emits IROH_EVENT_DOC_EVENT with event.subtype indicating the event kind and
+/// packed data in the payload.  When the subscription ends, emits with status=NOT_FOUND.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_event_recv(
+    runtime: iroh_runtime_t,
+    receiver: u64,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let receiver_arc = match bridge.doc_event_receivers.get(receiver) {
+        Some(r) => r,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match receiver_arc.recv().await {
+            Ok(Some(ev)) => {
+                let (subtype, payload) = encode_doc_event(&ev);
+                let mut event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_DOC_EVENT,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    receiver,
+                    0,
+                    user_data,
+                    subtype as i32,
+                );
+                event.flags = subtype;
+                bridge2.emit_with_data(event, payload);
+            }
+            Ok(None) => {
+                // Subscription ended cleanly.
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_DOC_EVENT,
+                    iroh_status_t::IROH_STATUS_NOT_FOUND,
+                    op_id,
+                    receiver,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Docs: Download Policy, Share with Addr, Join+Subscribe (Phase 1c.6-1c.8)
+// ============================================================================
+
+/// Download policy mode for iroh_doc_set_download_policy.
+/// 0 = everything (download all entries, no prefixes needed)
+/// 1 = nothing_except (only download entries matching the given prefixes)
+/// 2 = everything_except (download all except entries matching the given prefixes)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum iroh_download_policy_mode_t {
+    IROH_DOWNLOAD_POLICY_EVERYTHING = 0,
+    IROH_DOWNLOAD_POLICY_NOTHING_EXCEPT = 1,
+    IROH_DOWNLOAD_POLICY_EVERYTHING_EXCEPT = 2,
+}
+
+/// Set the download policy for a document.
+/// prefixes: list of byte-string prefixes (used for NOTHING_EXCEPT / EVERYTHING_EXCEPT modes).
+/// Emits IROH_EVENT_UNIT_RESULT on success.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_set_download_policy(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    mode: u32,
+    prefixes: iroh_bytes_list_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let prefix_list: Vec<Vec<u8>> = {
+        let n = prefixes.len;
+        if n == 0 || prefixes.items.is_null() {
+            vec![]
+        } else {
+            let slice = unsafe { std::slice::from_raw_parts(prefixes.items, n) };
+            slice.iter().map(|b| unsafe { read_bytes(b) }).collect()
+        }
+    };
+
+    let policy = match mode {
+        0 => aster_transport_core::CoreDownloadPolicy::Everything,
+        1 => aster_transport_core::CoreDownloadPolicy::NothingExcept {
+            prefixes: prefix_list,
+        },
+        2 => aster_transport_core::CoreDownloadPolicy::EverythingExcept {
+            prefixes: prefix_list,
+        },
+        _ => return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32,
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match doc_arc.set_download_policy(policy).await {
+            Ok(()) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_UNIT_RESULT,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Share a document with full relay+address info (AddrInfoOptions::RelayAndAddresses).
+/// mode: 0 = read, 1 = write.
+/// Emits IROH_EVENT_DOC_SHARED with the ticket string in the payload.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_share_with_addr(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    mode: u32,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let mode_str = if mode == 0 {
+        "read".to_string()
+    } else {
+        "write".to_string()
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match doc_arc.share_with_addr(mode_str).await {
+            Ok(ticket) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_DOC_SHARED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, ticket.into_bytes());
+            }
+            Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Join a document and subscribe to live events atomically.
+/// Emits IROH_EVENT_DOC_JOINED_AND_SUBSCRIBED:
+///   event.handle = doc handle
+///   event.flags  = event-receiver handle
+#[no_mangle]
+pub unsafe extern "C" fn iroh_docs_join_and_subscribe(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    ticket: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let docs = node_arc.docs_client();
+    let ticket_str = match unsafe { read_string(&ticket) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match docs.join_and_subscribe(ticket_str).await {
+            Ok((doc, receiver)) => {
+                let doc_handle = bridge2.docs.insert(doc);
+                let receiver_handle = bridge2.doc_event_receivers.insert(receiver);
+                // event.handle = doc_handle, event.related = receiver_handle
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_DOC_JOINED_AND_SUBSCRIBED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc_handle,
+                    receiver_handle,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
         }
     });
 

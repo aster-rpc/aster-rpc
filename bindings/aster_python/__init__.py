@@ -22,12 +22,18 @@ try:
         IrohNode,
         # Blobs
         BlobsClient,
+        BlobStatusResult,
+        BlobObserveResult,
+        BlobLocalInfo,
         TagInfo,
         blobs_client,
         # Docs
         DocsClient,
         DocHandle,
         DocEntry,
+        DocEvent,
+        DocEventReceiver,
+        DocDownloadPolicy,
         docs_client,
         # Gossip
         GossipClient,
@@ -73,12 +79,18 @@ __all__ = [
     "IrohNode",
     # Blobs
     "BlobsClient",
+    "BlobStatusResult",
+    "BlobObserveResult",
+    "BlobLocalInfo",
     "TagInfo",
     "blobs_client",
     # Docs
     "DocsClient",
     "DocHandle",
     "DocEntry",
+    "DocEvent",
+    "DocEventReceiver",
+    "DocDownloadPolicy",
     "docs_client",
     # Gossip
     "GossipClient",

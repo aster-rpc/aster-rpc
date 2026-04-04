@@ -2436,13 +2436,103 @@ iroh_status_t iroh_docs_join_and_subscribe(
 
 | Feature | Priority | Aster Phase | Status |
 |---------|----------|-------------|--------|
-| Blob Tags (`set`, `get`, `delete`, `list`) | P0 | Phase 9 (contract publication) | ⬜ TODO |
-| Blob Status / Has | P1 | Phase 10 (smart fetching) | ⬜ TODO |
-| Doc Subscribe (live events) | P1 | Phase 10 (registry notifications) | ⬜ TODO |
-| Doc Sync Lifecycle (`start_sync`, `leave`) | P1 | Phase 10 (sync control) | ⬜ TODO |
-| Doc Download Policy | P2 | Phase 10 (efficient sync) | ⬜ TODO |
-| Doc Share with Full Addr | P2 | Phase 10 (bootstrapping) | ⬜ TODO |
-| Doc Import and Subscribe | P2 | Phase 10 (race-free join) | ⬜ TODO |
+| Blob Tags (`set`, `get`, `delete`, `list`) | P0 | Phase 9 (contract publication) | ✅ Done (Phase 1c.1) |
+| Blob Status / Has | P1 | Phase 10 (smart fetching) | ✅ Done (Phase 1c.3) |
+| Doc Subscribe (live events) | P1 | Phase 10 (registry notifications) | ✅ Done (Phase 1c.4) |
+| Doc Sync Lifecycle (`start_sync`, `leave`) | P1 | Phase 10 (sync control) | ✅ Done (Phase 1c.5) |
+| Doc Download Policy | P2 | Phase 10 (efficient sync) | ✅ Done (Phase 1c.6) |
+| Doc Share with Full Addr | P2 | Phase 10 (bootstrapping) | ✅ Done (Phase 1c.7) |
+| Doc Import and Subscribe | P2 | Phase 10 (race-free join) | ✅ Done (Phase 1c.8) |
+
+---
+
+## 3d. Phase 1d: Blob Transfer Observability
+
+These two capabilities were listed in `Aster-ContractIdentity.md §11.5` as pending. They were
+inadvertently omitted from the Phase 1c checklist. Both are needed before §11.4 (contract
+publication/consumption) can be fully implemented.
+
+### 3d.1 `observe()` — Blob Bitfield Observation (P1)
+
+**What it is:** `store.blobs().observe(hash)` returns an `ObserveProgress` stream of `Bitfield`
+values showing which byte ranges of the blob are locally available. The first item is the current
+state; subsequent items are updates as more data arrives.
+
+**Key methods on `ObserveProgress`:**
+- `.await` (via `IntoFuture`) — snapshot of the current bitfield
+- `.await_completion()` — wait until all chunks are locally present
+
+**Key methods on `Bitfield`:**
+- `is_complete()` — all chunks present and validated
+- `size()` — total blob size in bytes (0 if not yet known)
+
+**Core:**
+- Add `CoreBlobObserveResult { is_complete: bool, size: u64 }` (snapshot)
+- `CoreBlobsClient::blob_observe_snapshot(hash_hex)` — single snapshot via `store.blobs().observe(hash).await`
+- `CoreBlobsClient::blob_observe_complete(hash_hex)` — wait until complete via `store.blobs().observe(hash).await_completion().await`
+
+**Python:**
+- `BlobObserveResult` class (`is_complete: bool`, `size: int`)
+- `BlobsClient.blob_observe_snapshot(hash_hex)` → `BlobObserveResult`
+- `BlobsClient.blob_observe_complete(hash_hex)` → `None` (awaitable; completes when blob is fully available)
+
+**FFI:**
+- `iroh_blobs_observe_snapshot` — synchronous, out params `out_is_complete: *mut u32`, `out_size: *mut u64`
+- `IROH_EVENT_BLOB_OBSERVE_COMPLETE = 56` — emitted by `iroh_blobs_observe_complete` when done
+- `iroh_blobs_observe_complete` — async, emits `IROH_EVENT_BLOB_OBSERVE_COMPLETE` (or ERROR on timeout)
+
+### 3d.2 Remote API — Local Availability Info (P1)
+
+**What it is:** `store.remote().local(HashAndFormat::raw(hash))` returns a `LocalInfo` with:
+- `is_complete()` — all requested data is locally available
+- `local_bytes()` — how many bytes we already have
+
+This is useful for resumable downloads: check what you already have before deciding to re-fetch.
+
+**Core:**
+- Add `CoreBlobLocalInfo { is_complete: bool, local_bytes: u64 }`
+- `CoreBlobsClient::blob_local_info(hash_hex)` — via `store.remote().local(HashAndFormat::raw(hash)).await`
+
+**Python:**
+- `BlobLocalInfo` class (`is_complete: bool`, `local_bytes: int`)
+- `BlobsClient.blob_local_info(hash_hex)` → `BlobLocalInfo`
+
+**FFI:**
+- `iroh_blobs_local_info` — synchronous, out params `out_is_complete: *mut u32`, `out_local_bytes: *mut u64`
+
+### 3d.3 C ABI Signatures
+
+```c
+/* Synchronous — fills out params; returns IROH_STATUS_NOT_FOUND if node unknown */
+int32_t iroh_blobs_observe_snapshot(
+    iroh_runtime_t runtime,
+    iroh_node_t node,
+    const uint8_t* hash_hex_ptr,
+    uintptr_t hash_hex_len,
+    uint32_t* out_is_complete,
+    uint64_t* out_size
+);
+
+/* Async — emits IROH_EVENT_BLOB_OBSERVE_COMPLETE (UNIT_RESULT) when blob is fully available */
+int32_t iroh_blobs_observe_complete(
+    iroh_runtime_t runtime,
+    iroh_node_t node,
+    const uint8_t* hash_hex_ptr,
+    uintptr_t hash_hex_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+
+/* Synchronous — fills out params; returns IROH_STATUS_NOT_FOUND if node unknown */
+int32_t iroh_blobs_local_info(
+    iroh_runtime_t runtime,
+    iroh_node_t node,
+    const uint8_t* hash_hex_ptr,
+    uintptr_t hash_hex_len,
+    uint32_t* out_is_complete,
+    uint64_t* out_local_bytes
+);
+```
 
 ### 3c.9 Implementation Notes
 

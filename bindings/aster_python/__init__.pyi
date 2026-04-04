@@ -88,6 +88,23 @@ class IrohNode:
     def export_secret_key(self) -> bytes: ...
 
 
+class BlobStatusResult:
+    status: str  # "not_found", "partial", or "complete"
+    size: int
+
+
+class BlobObserveResult:
+    """Snapshot of a blob's local bitfield."""
+    is_complete: bool
+    size: int  # total blob size in bytes; 0 if not yet known
+
+
+class BlobLocalInfo:
+    """Local availability info for a blob from the Remote API."""
+    is_complete: bool
+    local_bytes: int  # bytes already present locally
+
+
 class TagInfo:
     name: str
     hash: str
@@ -111,6 +128,15 @@ class BlobsClient:
     def tag_list(self) -> Coroutine[Any, Any, list["TagInfo"]]: ...
     def tag_list_prefix(self, prefix: str) -> Coroutine[Any, Any, list["TagInfo"]]: ...
     def tag_list_hash_seq(self) -> Coroutine[Any, Any, list["TagInfo"]]: ...
+    # Phase 1c.3: Blob status
+    def blob_status(self, hash_hex: str) -> Coroutine[Any, Any, "BlobStatusResult"]: ...
+    def blob_has(self, hash_hex: str) -> Coroutine[Any, Any, bool]: ...
+    # Phase 1d: Blob observability
+    def blob_observe_snapshot(
+        self, hash_hex: str
+    ) -> Coroutine[Any, Any, "BlobObserveResult"]: ...
+    def blob_observe_complete(self, hash_hex: str) -> Coroutine[Any, Any, None]: ...
+    def blob_local_info(self, hash_hex: str) -> Coroutine[Any, Any, "BlobLocalInfo"]: ...
 
 
 def blobs_client(node: IrohNode) -> BlobsClient: ...
@@ -124,10 +150,43 @@ class DocEntry:
     timestamp: int
 
 
+class DocEvent:
+    """Live document event. Check `kind` to determine which fields are populated.
+
+    kind values: "insert_local", "insert_remote", "content_ready",
+                 "pending_content_ready", "neighbor_up", "neighbor_down", "sync_finished"
+    """
+    kind: str
+    entry: Optional["DocEntry"]   # InsertLocal / InsertRemote
+    from_peer: Optional[str]      # InsertRemote
+    hash: Optional[str]           # ContentReady
+    peer: Optional[str]           # NeighborUp / NeighborDown / SyncFinished
+
+
+class DocEventReceiver:
+    def recv(self) -> Coroutine[Any, Any, Optional["DocEvent"]]: ...
+
+
+class DocDownloadPolicy:
+    """Download policy for a document.
+
+    mode values:
+      "everything"        — download all entries (default)
+      "nothing_except"    — download only entries matching one of the prefixes
+      "everything_except" — download all entries except those matching one of the prefixes
+    """
+    mode: str
+    prefixes: list[bytes]
+
+
 class DocsClient:
     def create(self) -> Coroutine[Any, Any, "DocHandle"]: ...
     def create_author(self) -> Coroutine[Any, Any, str]: ...
     def join(self, ticket_str: str) -> Coroutine[Any, Any, "DocHandle"]: ...
+    # Phase 1c.8
+    def join_and_subscribe(
+        self, ticket_str: str
+    ) -> Coroutine[Any, Any, tuple["DocHandle", "DocEventReceiver"]]: ...
 
 
 class DocHandle:
@@ -148,6 +207,17 @@ class DocHandle:
         self, content_hash_hex: str
     ) -> Coroutine[Any, Any, bytes]: ...
     def share(self, mode: str) -> Coroutine[Any, Any, str]: ...
+    def subscribe(self) -> Coroutine[Any, Any, "DocEventReceiver"]: ...
+    # Phase 1c.5: Sync lifecycle
+    def start_sync(self, peers: list[str]) -> Coroutine[Any, Any, None]: ...
+    def leave(self) -> Coroutine[Any, Any, None]: ...
+    # Phase 1c.6: Download policy
+    def set_download_policy(
+        self, mode: str, prefixes: list[bytes]
+    ) -> Coroutine[Any, Any, None]: ...
+    def get_download_policy(self) -> Coroutine[Any, Any, "DocDownloadPolicy"]: ...
+    # Phase 1c.7: Share with full address
+    def share_with_addr(self, mode: str) -> Coroutine[Any, Any, str]: ...
 
 
 def docs_client(node: IrohNode) -> DocsClient: ...
