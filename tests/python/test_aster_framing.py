@@ -255,6 +255,19 @@ class TestFrameRoundTrip:
         assert got_flags == TRAILER
 
     @pytest.mark.asyncio
+    async def test_cancel_empty_payload(self):
+        """CANCEL flag allows an empty payload (flags-only cancel frame, spec §5.2)."""
+        send = MemSendStream()
+        await write_frame(send, b"", flags=CANCEL)
+
+        recv = MemRecvStream(bytes(send.buf))
+        result = await read_frame(recv)
+        assert result is not None
+        got_payload, got_flags = result
+        assert got_payload == b""
+        assert got_flags == CANCEL
+
+    @pytest.mark.asyncio
     async def test_large_payload(self):
         """A payload near-but-under the max frame size works."""
         send = MemSendStream()

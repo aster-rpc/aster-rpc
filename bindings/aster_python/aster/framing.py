@@ -87,14 +87,13 @@ async def write_frame(
     """
     frame_body_len = _FLAGS_SIZE + len(payload)
 
-    if frame_body_len < _FLAGS_SIZE + 1 and flags & TRAILER == 0:
-        # Zero-length payload is only valid for certain control scenarios;
-        # the spec says Length==0 is invalid.  We allow an empty payload
-        # only when it is a TRAILER (status-only frame with no extra data
-        # is fine — the flags byte alone is the content).
-        pass  # Allow trailers with empty payload
-
-    if frame_body_len == _FLAGS_SIZE and not (flags & TRAILER):
+    # Zero-length payloads are permitted for control frames that carry their
+    # meaning entirely in the flags byte:
+    #   - TRAILER: status-only trailer (status is serialized in payload when
+    #     present, but an empty trailer is still a valid end-of-stream marker)
+    #   - CANCEL: flags-only cancel frame in a session stream (spec §5.2)
+    # Any other empty-payload frame is a wire-format error.
+    if frame_body_len == _FLAGS_SIZE and not (flags & (TRAILER | CANCEL)):
         raise FramingError("zero-length payload is not permitted")
 
     if frame_body_len > MAX_FRAME_SIZE:
