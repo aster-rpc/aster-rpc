@@ -1,8 +1,8 @@
 # Aster Specification
 
-**Version:** 0.7.1-internal-draft
+**Version:** 0.7.2-internal-draft
 **Status:** Design Phase
-**Last Updated:** 2026-04-01
+**Last Updated:** 2026-04-04
 
 -----
 
@@ -61,7 +61,7 @@ no infrastructure servers.
 
 |Language             |Priority          |Status|
 |---------------------|------------------|------|
-|Python               |Phase 1 (exemplar)|TODO  |
+|Python               |Phase 1 (exemplar)|Implemented through Phase 7 |
 |Rust                 |Phase 2           |TODO  |
 |JVM (Java/Kotlin)    |Phase 3           |TODO  |
 |.NET (C#/F#)         |Phase 3           |TODO  |
@@ -659,7 +659,7 @@ Aster extends Fory IDL with service definition blocks:
 service AgentControl {
     version = 1;
     alpn = "aster/1";
-    serialization = [xlang, java];    // ordered list of supported formats, producer preference order
+    serialization = [xlang, native];    // ordered list of supported formats, producer preference order
 
     rpc assign_task(TaskAssignment) returns (TaskAck) {
         timeout = 30.0;
@@ -1196,7 +1196,7 @@ class TaskAck:
     accepted: bool
     reason: str | None = None
 
-@service(name="AgentControl", version=1, serialization=[SerializationMode.XLANG, SerializationMode.JAVA])
+@service(name="AgentControl", version=1, serialization=[SerializationMode.XLANG, SerializationMode.NATIVE])
 class AgentControlService:
 
     @rpc(timeout=30.0, idempotent=True)
@@ -1246,7 +1246,7 @@ class AgentControlService:
 @service(
     name="AgentControl",                    # Wire name (stable across refactors)
     version=1,                              # Service version
-    serialization=[SerializationMode.XLANG, SerializationMode.PYTHON],  # Ordered supported formats
+    serialization=[SerializationMode.XLANG, SerializationMode.NATIVE],  # Ordered supported formats
     alpn=b"aster/1",                         # ALPN protocol identifier (always aster/{wire_version})
     max_concurrent_streams=64,              # Per-connection stream limit
     interceptors=[AuthInterceptor, AuditLogInterceptor],
@@ -1473,13 +1473,13 @@ class Interceptor:
 
 |Interceptor                |Purpose                                           |Status|
 |---------------------------|--------------------------------------------------|------|
-|`AuthInterceptor`          |Inject/validate auth tokens in metadata           |TODO  |
-|`DeadlineInterceptor`      |Enforce per-call deadlines (see §6.8)             |TODO  |
-|`AuditLogInterceptor`      |Log calls for replay/audit                        |TODO  |
-|`MetricsInterceptor`       |Call count, latency, error rate (OTel)            |TODO  |
-|`RetryInterceptor`         |Auto-retry idempotent RPCs on transient failures  |TODO  |
+|`AuthInterceptor`          |Inject/validate auth tokens in metadata           |Implemented |
+|`DeadlineInterceptor`      |Enforce per-call deadlines (see §6.8)             |Implemented |
+|`AuditLogInterceptor`      |Log calls for replay/audit                        |Implemented |
+|`MetricsInterceptor`       |Call count, latency, error rate (OTel)            |Implemented |
+|`RetryInterceptor`         |Auto-retry idempotent RPCs on transient failures  |Implemented |
 |`CompressionInterceptor`   |Override per-call compression settings            |TODO  |
-|`CircuitBreakerInterceptor`|Open circuit on sustained failure; prevent cascade|TODO  |
+|`CircuitBreakerInterceptor`|Open circuit on sustained failure; prevent cascade|Implemented |
 
 **`CircuitBreakerInterceptor` state machine:**
 
@@ -2107,16 +2107,16 @@ Every cell is a CI job using the echo service as the minimal interop contract.
 
 |Deliverable              |Description                                                                |Status|
 |-------------------------|---------------------------------------------------------------------------|------|
-|`iroh-python`            |PyO3 FFI wrapper for Iroh transport primitives                             |TODO  |
-|Wire protocol            |Framing, StreamHeader, RpcStatus implementation                            |TODO  |
-|`Aster` (Python)         |Decorators, server, client, dispatch                                       |TODO  |
-|Fory integration         |XLANG + NATIVE + NATIVE_COMPATIBLE modes                                   |TODO  |
-|Fory ROW integration     |ROW mode with random access                                                |TODO  |
+|`iroh-python`            |PyO3 FFI wrapper for Iroh transport primitives                             |✅ Done |
+|Wire protocol            |Framing, StreamHeader, RpcStatus implementation                            |✅ Done |
+|`Aster` (Python)         |Decorators, server, client, dispatch                                       |✅ Done |
+|Fory integration         |XLANG + NATIVE modes                                                       |✅ Done |
+|Fory ROW integration     |ROW mode with random access                                                |✅ Done |
 |Blob capability responses|File/directory responses via `iroh-blobs` tickets or authenticated locators|TODO  |
 |Sibling tunnel support   |Stream/datagram tunnel negotiation and helper APIs                         |TODO  |
-|Core interceptors        |Auth, deadline, audit, circuit breaker                                     |TODO  |
+|Core interceptors        |Auth, deadline, audit, circuit breaker                                     |✅ Done |
 |Conformance tests        |Byte-level wire format test vectors                                        |TODO  |
-|Local client             |In-process transport (asyncio.Queue)                                       |TODO  |
+|Local client             |In-process transport (asyncio.Queue)                                       |✅ Done |
 
 ### Phase 2: Rust + Cross-Language Foundation
 
@@ -2317,6 +2317,7 @@ handled by the content-addressed contract registry (§11.3), not by Fory's
 
 |Version|Changes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 |-------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|0.7.2  |Spec status refresh after Python implementation progress: marked Python exemplar as implemented through Phase 7, updated interceptor statuses, updated Phase 1 roadmap rows to reflect completed Python work, corrected stale enum references (`SerializationMode.JAVA`/`SerializationMode.PYTHON` → `NATIVE`), corrected stale IDL serialization example (`java` → `native`), corrected Phase 1 Fory roadmap text to remove `NATIVE_COMPATIBLE`, and refreshed Appendix D pyfory verification items based on completed spike tests and implementation status. |
 |0.7.1  |Editorial pass: removed self-referential framing (“this is intentional”, “this is a deliberate design choice”) throughout. §3.2 Stream-per-RPC: removed two bullets restating QUIC properties already covered in §2.1 (HOL blocking, cheap streams); retained Aster-specific design consequences (no multiplexing complexity, clean lifecycle). §6.7 Streaming Error Recovery: trimmed rationale paragraph to core argument; removed sentences restating §3.2 stream-per-RPC scoping.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 |0.7.0  |§6.2 StreamHeader: added Phase 1 blocker TODO for canonical contract encoding dependency on `contract_id`. §6.5 Status Codes: added application-tier status code guidance (100+ range) with concrete examples. §6.6 ALPN and global: replaced all stale xRPC references with Aster. §6.8.2 Deadline propagation: trimmed to single paragraph. §8.4 Responsibility Split: deleted (redundant with §3.1.1). §3.1.3 Consequences for Implementations: deleted (redundant with §3.1.1–3.1.2). §10.2 Connection Health: rewritten to confirm QUIC keep-alive covers long-lived streams with no application heartbeat required. §11.8–11.12: compressed from five sections to three (§11.8 Publication and Resolution Flows, §11.9 Endpoint Selection, §11.10 Compatibility/Staleness/Failure). Appendix B: rewritten to match three actual Fory protocols (XLANG, NATIVE, ROW); removed NATIVE_COMPATIBLE row.                                                                               |
 |0.6.0  |§5.3 XLANG Mode rewritten: numeric type IDs replaced by canonical tag string scheme (`"{dotted.package}/{TypeName}"`), `_aster/*` namespace reserved for framework types, hash-derived numeric IDs demoted to local optimisation, eager tag validation at class definition time specified. §5.5 ROW Mode: TODOs resolved; §5.5.1 confirms identical length-prefix framing for ROW payloads; §5.5.2 confirms ROW mode in all streaming patterns with schema hoisting (`ROW_SCHEMA` flag) defined. §6.1 Stream Framing: `ROW_SCHEMA` flag (bit 3, `0x08`) added; reserved bits updated from 3–7 to 4–7. §8.3 Local Client rewritten: `Transport` structural Protocol defined in `transport/base.py`; interceptor obligation on `LocalTransport` specified; `wire_compatible` mode documented. §15 Package structure: `transport/base.py` added. §16.1 Blocking questions closed.                                                                                                          |
@@ -2352,11 +2353,11 @@ identified during spec review.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| pyfory XLANG mode available in Python | ❓ Verify | Must confirm pyfory supports XLANG serialization |
-| pyfory ROW mode available in Python | ❓ Verify | Zero-copy field access needed for ROW |
+| pyfory XLANG mode available in Python | ✅ Verified | Verified in spike tests and Python Aster implementation |
+| pyfory ROW mode available in Python | ✅ Verified | Verified in spike tests and Python Aster implementation |
 | Canonical XLANG profile implementable in pyfory | ❓ Verify | Deterministic field-order, no ref tracking, standalone |
 | Golden vector spike: Python + Rust produce identical bytes | ❓ TODO | Pre-implementation proof required |
-| Tag-based type registration in pyfory | ❓ Verify | `@fory_type(tag=...)` must map to pyfory API |
+| Tag-based type registration in pyfory | ✅ Verified | `@fory_type(tag=...)` maps to pyfory namespace/typename registration |
 
 ### D.3 Contract Identity
 
