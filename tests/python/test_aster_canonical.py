@@ -36,8 +36,8 @@ from aster_python.aster.contract.identity import (
 
 # ── Fixture loading ────────────────────────────────────────────────────────────
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_VECTORS_PATH = _REPO_ROOT / "tests" / "fixtures" / "canonical_test_vectors.json"
+
+_VECTORS_PATH = Path(__file__).parent / "fixtures" / "canonical_test_vectors.json"
 
 
 def _load_vectors() -> dict[str, dict]:
@@ -62,7 +62,6 @@ def test_vector_A2_minimal_service_contract(vectors):
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
         requires=None,
     )
@@ -161,7 +160,6 @@ def test_scope_distinctness_hashes_differ():
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
     )
     stream = ServiceContract(
@@ -169,7 +167,6 @@ def test_scope_distinctness_hashes_differ():
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.STREAM,
     )
     id_shared = compute_contract_id(canonical_xlang_bytes(shared))

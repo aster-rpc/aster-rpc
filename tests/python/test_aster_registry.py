@@ -1030,7 +1030,6 @@ async def test_publication_round_trip():
             )
         ],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
     )
     type_defs = {}  # no custom types
@@ -1090,7 +1089,6 @@ async def test_publish_contract_full_collection_via_publisher():
             )
         ],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
     )
     type_defs = {}

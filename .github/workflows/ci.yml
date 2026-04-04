@@ -40,9 +40,9 @@ jobs:
             . -> target
           key: lint
       - name: cargo fmt
-        run: cargo fmt --manifest-path bindings/aster_python_rs/Cargo.toml --check
+        run: cargo fmt --manifest-path bindings/python/rust/Cargo.toml --check
       - name: cargo clippy
-        run: cargo clippy --manifest-path bindings/aster_python_rs/Cargo.toml -- -D warnings
+        run: cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings
 
   # ── Build + Test matrix ────────────────────────────────────────────
   test:
@@ -114,7 +114,7 @@ jobs:
               print("import pyfory failed:", repr(exc))
           PY
 
-          uv run maturin develop -m bindings/aster_python_rs/Cargo.toml
+          uv run maturin develop -m bindings/python/rust/Cargo.toml
           uv run pytest tests/python/ -v --timeout=60
         shell: bash
 
@@ -154,6 +154,6 @@ jobs:
           '@
           uv run python -c $script
 
-          uv run maturin develop -m bindings/aster_python_rs/Cargo.toml
+          uv run maturin develop -m bindings/python/rust/Cargo.toml
           uv run pytest tests/python/ -v --timeout=60
         shell: pwsh

@@ -58,8 +58,8 @@ from aster_python.aster.contract.manifest import (
 
 # ── Fixtures path ──────────────────────────────────────────────────────────────
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_VECTORS_PATH = _REPO_ROOT / "tests" / "fixtures" / "canonical_test_vectors.json"
+
+_VECTORS_PATH = Path(__file__).parent / "fixtures" / "canonical_test_vectors.json"
 
 
 def _load_vectors() -> dict[str, dict]:
@@ -194,7 +194,6 @@ def test_hash_stability():
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
     )
     data = canonical_xlang_bytes(sc)
@@ -214,7 +213,6 @@ def test_scope_distinctness():
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
     )
     sc_shared = ServiceContract(**base, scoped=ScopeKind.SHARED)
     sc_stream = ServiceContract(**base, scoped=ScopeKind.STREAM)
@@ -244,11 +242,11 @@ def test_nfc_normalization():
     # Build contracts using the normalized names — they should be identical
     sc_nfc = ServiceContract(
         name=norm_nfc, version=1, methods=[], serialization_modes=["xlang"],
-        alpn="aster/1", scoped=ScopeKind.SHARED,
+        scoped=ScopeKind.SHARED,
     )
     sc_nfd = ServiceContract(
         name=norm_nfd, version=1, methods=[], serialization_modes=["xlang"],
-        alpn="aster/1", scoped=ScopeKind.SHARED,
+        scoped=ScopeKind.SHARED,
     )
     # Both normalized to the same name, so same bytes and same contract_id
     assert canonical_xlang_bytes(sc_nfc) == canonical_xlang_bytes(sc_nfd)
@@ -269,7 +267,6 @@ def test_vectors_A2_to_A6():
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
         requires=None,
     )
@@ -553,7 +550,6 @@ def test_changing_type_changes_contract_id():
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
     )
     # Add a method
@@ -571,7 +567,6 @@ def test_changing_type_changes_contract_id():
             )
         ],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
     )
     id_base = compute_contract_id(canonical_xlang_bytes(base))
@@ -589,7 +584,6 @@ def test_manifest_mismatch_fatal(tmp_path):
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
     )
     live_bytes = canonical_xlang_bytes(sc)
@@ -620,7 +614,6 @@ def test_manifest_roundtrip(tmp_path):
         version=2,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
     )
     live_bytes = canonical_xlang_bytes(sc)

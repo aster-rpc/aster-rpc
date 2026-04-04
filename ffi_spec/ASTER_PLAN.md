@@ -961,9 +961,8 @@ class ServiceContract:
     version: int32                       # field=2
     methods: list[MethodDef]             # field=3: sorted by name (Unicode codepoint, NFC)
     serialization_modes: list[str]       # field=4
-    alpn: str                            # field=5: "aster/{wire_version}"
-    scoped: ScopeKind                    # field=6: SHARED or STREAM
-    requires: CapabilityRequirement | None  # field=7: optional
+    scoped: ScopeKind                    # field=5: SHARED or STREAM
+    requires: CapabilityRequirement | None  # field=6: optional
 ```
 
 **Fully-qualified type name** = `package + "." + name`. Used for cycle-breaking SELF_REF encoding.
@@ -1035,7 +1034,6 @@ class ContractManifest:
     type_hashes: list[str]        # hex, in publish order
     method_count: int
     serialization_modes: list[str]
-    alpn: str
     scoped: str                   # "shared" | "stream"
     deprecated: bool
     # Provenance (written by `aster contract gen` — optional)
@@ -1123,7 +1121,7 @@ Uses Phase 1d FFI primitives (`blob_observe_complete`, `blob_local_info`) for ca
    - `write_type_def(w, t)` — 6 fields (kind, package, name, fields[], enum_values[], union_variants[]); sorts fields by id, enum_values by value, union_variants by id
    - `write_capability_requirement(w, cr)` — 2 fields (kind, roles[]); roles NFC-normalized + sorted by Unicode codepoint
    - `write_method_def(w, m)` — 7 fields (name, pattern, request_type, response_type, idempotent, default_timeout, requires?); NULL_FLAG when requires absent
-   - `write_service_contract(w, c)` — 7 fields (name, version, methods[], serialization_modes[], alpn, scoped, requires?); methods NFC-normalized + sorted by name (Unicode codepoint)
+   - `write_service_contract(w, c)` — 6 fields (name, version, methods[], serialization_modes[], scoped, requires?); methods NFC-normalized + sorted by name (Unicode codepoint)
 5. **Produce canonical golden vectors.** Python is the reference implementation; Phase 9 generates the first set of vectors. Write `tools/gen_canonical_vectors.py` that constructs Appendix A fixture inputs (A.2–A.6) + rule-level micro-fixtures (one per §11.3.2 rule — varint edges, ZigZag boundaries, NULL_FLAG placement, sort stability, zero-value conventions, `scoped` SHARED/STREAM distinctness), runs the canonical encoder, and emits `tests/fixtures/canonical_test_vectors.json` with hex bytes + BLAKE3 hex hashes. Copy the vectors into `Aster-ContractIdentity.md` Appendix A as "Python-reference v1, pending cross-verification". Tests assert byte-equality + hash-equality against the committed file.
 6. Implement `resolve_type_graph(service_class) -> dict[type_name, TypeDef]`: walk method signatures via `typing.get_type_hints()` + `inspect`, construct TypeDefs.
 7. Implement SCC computation (Tarjan's) on the type-reference graph.

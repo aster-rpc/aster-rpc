@@ -4,7 +4,7 @@ tools/gen_canonical_vectors.py — Generate canonical test vectors for Phase 9.
 
 Constructs the Appendix A and B fixtures from Aster-ContractIdentity.md,
 runs the canonical encoder, computes BLAKE3 hashes, and writes:
-  - tests/fixtures/canonical_test_vectors.json
+  - tests/python/fixtures/canonical_test_vectors.json
   - Updates ffi_spec/Aster-ContractIdentity.md Appendix A placeholders
 
 Usage::
@@ -88,7 +88,6 @@ def vector_A2() -> Vector:
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
         requires=None,
     )
@@ -542,7 +541,6 @@ def micro_scope_vectors() -> list[Vector]:
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
         requires=None,
     )
@@ -551,7 +549,6 @@ def micro_scope_vectors() -> list[Vector]:
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.STREAM,
         requires=None,
     )
@@ -574,7 +571,6 @@ def micro_nfc_vectors() -> list[Vector]:
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
         requires=None,
     )
@@ -583,7 +579,6 @@ def micro_nfc_vectors() -> list[Vector]:
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        alpn="aster/1",
         scoped=ScopeKind.SHARED,
         requires=None,
     )
@@ -688,7 +683,7 @@ def main() -> None:
 
     # Write JSON fixture file
     repo_root = Path(__file__).resolve().parent.parent
-    fixture_path = repo_root / "tests" / "fixtures" / "canonical_test_vectors.json"
+    fixture_path = repo_root / "tests" / "python" / "fixtures" / "canonical_test_vectors.json"
     fixture_path.parent.mkdir(parents=True, exist_ok=True)
 
     output = {

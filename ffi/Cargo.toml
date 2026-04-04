@@ -1,0 +1,19 @@
+[package]
+name = "aster_transport_ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+aster_transport_core = { path = "../core" }
+iroh = { workspace = true }
+tokio = { workspace = true }
+libc = { workspace = true }
+once_cell = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }
+getrandom = "0.2"
+cbindgen = { version = "0.24", optional = true }

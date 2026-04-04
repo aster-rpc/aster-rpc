@@ -22,9 +22,9 @@ aster = "aster_python.aster.contract.cli:main"
 
 [tool.maturin]
 module-name    = "aster_python._aster_python"
-manifest-path  = "bindings/aster_python_rs/Cargo.toml"
+manifest-path  = "bindings/python/rust/Cargo.toml"
 features       = ["pyo3/extension-module"]
-python-source  = "bindings"
+python-source  = "bindings/python"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
