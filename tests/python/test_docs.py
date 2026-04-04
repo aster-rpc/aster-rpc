@@ -232,3 +232,307 @@ async def test_query_and_filter_by_author():
     assert bytes(content_b) == b"from_b"
 
     await node.shutdown()
+
+
+# ============================================================================
+# Phase 1c.5: Doc Sync Lifecycle Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_start_sync_empty_peers_does_not_raise():
+    """start_sync with no peers is a valid no-op — doc enters sync mode."""
+    from aster_python import IrohNode, docs_client
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    doc = await dc.create()
+
+    # Should succeed without error.
+    await doc.start_sync([])
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_leave_after_start_sync_does_not_raise():
+    """start_sync followed by leave completes without error."""
+    from aster_python import IrohNode, docs_client
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    doc = await dc.create()
+
+    await doc.start_sync([])
+    await doc.leave()
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_leave_without_sync_does_not_raise():
+    """leave on a doc that was never synced completes without error."""
+    from aster_python import IrohNode, docs_client
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    doc = await dc.create()
+
+    await doc.leave()
+
+    await node.shutdown()
+
+
+# ============================================================================
+# Phase 1c.4: Doc Subscribe Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_subscribe_receives_insert_local_event():
+    """subscribe() delivers an insert_local event after set_bytes."""
+    import asyncio
+    from aster_python import IrohNode, DocEvent, docs_client
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    doc = await dc.create()
+    author = await dc.create_author()
+
+    receiver = await doc.subscribe()
+
+    # Write a key — this should produce an insert_local event.
+    await doc.set_bytes(author, b"sub-key", b"sub-value")
+
+    event = await asyncio.wait_for(receiver.recv(), timeout=10.0)
+
+    assert event is not None
+    assert isinstance(event, DocEvent)
+    assert event.kind == "insert_local"
+    assert event.entry is not None
+    assert bytes(event.entry.key) == b"sub-key"
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_insert_local_entry_fields():
+    """insert_local event contains correct author, content_hash, and size."""
+    import asyncio
+    from aster_python import IrohNode, docs_client
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    doc = await dc.create()
+    author = await dc.create_author()
+
+    receiver = await doc.subscribe()
+    content_hash_hex = await doc.set_bytes(author, b"field-key", b"hello")
+
+    event = await asyncio.wait_for(receiver.recv(), timeout=10.0)
+
+    assert event is not None
+    assert event.kind == "insert_local"
+    entry = event.entry
+    assert entry is not None
+    assert entry.author_id == author
+    assert bytes(entry.key) == b"field-key"
+    assert entry.content_hash == content_hash_hex
+    assert entry.content_len == len(b"hello")
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_multiple_events_in_order():
+    """Multiple writes produce multiple insert_local events in order."""
+    import asyncio
+    from aster_python import IrohNode, docs_client
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    doc = await dc.create()
+    author = await dc.create_author()
+
+    receiver = await doc.subscribe()
+
+    keys = [b"a", b"b", b"c"]
+    for k in keys:
+        await doc.set_bytes(author, k, b"val")
+
+    received_keys = []
+    for _ in keys:
+        event = await asyncio.wait_for(receiver.recv(), timeout=10.0)
+        assert event is not None
+        assert event.kind == "insert_local"
+        received_keys.append(bytes(event.entry.key))
+
+    assert set(received_keys) == {b"a", b"b", b"c"}
+
+    await node.shutdown()
+
+
+# ============================================================================
+# Phase 1c.6: Doc Download Policy Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_set_download_policy_everything_does_not_raise():
+    """set_download_policy(everything) is a valid no-op."""
+    from aster_python import IrohNode, docs_client
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    doc = await dc.create()
+
+    await doc.set_download_policy("everything", [])
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_download_policy_roundtrip():
+    """set then get download policy returns the same mode and prefixes."""
+    from aster_python import IrohNode, DocDownloadPolicy, docs_client
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    doc = await dc.create()
+
+    await doc.set_download_policy("nothing_except", [b"foo/", b"bar/"])
+
+    policy = await doc.get_download_policy()
+    assert isinstance(policy, DocDownloadPolicy)
+    assert policy.mode == "nothing_except"
+    prefix_set = {bytes(p) for p in policy.prefixes}
+    assert b"foo/" in prefix_set
+    assert b"bar/" in prefix_set
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_download_policy_everything_except():
+    """everything_except policy round-trips correctly."""
+    from aster_python import IrohNode, docs_client
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    doc = await dc.create()
+
+    await doc.set_download_policy("everything_except", [b"secret/"])
+
+    policy = await doc.get_download_policy()
+    assert policy.mode == "everything_except"
+    assert b"secret/" in {bytes(p) for p in policy.prefixes}
+
+    await node.shutdown()
+
+
+# ============================================================================
+# Phase 1c.7: Doc Share with Full Address Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_share_with_addr_returns_ticket():
+    """share_with_addr returns a valid ticket string starting with 'doc'."""
+    from aster_python import IrohNode, docs_client
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    doc = await dc.create()
+
+    ticket = await doc.share_with_addr("write")
+    assert isinstance(ticket, str)
+    assert ticket.startswith("doc"), f"ticket should start with 'doc', got: {ticket[:20]}"
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_share_with_addr_read_mode():
+    """share_with_addr(read) produces a read-only ticket."""
+    from aster_python import IrohNode, docs_client
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    doc = await dc.create()
+
+    ticket = await doc.share_with_addr("read")
+    assert isinstance(ticket, str)
+    assert len(ticket) > 0
+
+    await node.shutdown()
+
+
+# ============================================================================
+# Phase 1c.8: Doc Join and Subscribe Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_join_and_subscribe_returns_doc_and_receiver():
+    """join_and_subscribe returns a (DocHandle, DocEventReceiver) tuple."""
+    import asyncio
+    from aster_python import IrohNode, DocHandle, DocEventReceiver, docs_client
+
+    node1 = await IrohNode.memory()
+    node2 = await IrohNode.memory()
+
+    node1.add_node_addr(node2)
+    node2.add_node_addr(node1)
+
+    dc1 = docs_client(node1)
+    dc2 = docs_client(node2)
+
+    doc1 = await dc1.create()
+    ticket = await doc1.share("write")
+
+    result = await dc2.join_and_subscribe(ticket)
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    doc2, receiver = result
+    assert isinstance(doc2, DocHandle)
+    assert isinstance(receiver, DocEventReceiver)
+    assert doc2.doc_id() == doc1.doc_id()
+
+    await node1.shutdown()
+    await node2.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_join_and_subscribe_receives_event_after_write():
+    """Events from the remote writer appear via join_and_subscribe receiver."""
+    import asyncio
+    from aster_python import IrohNode, docs_client
+
+    node1 = await IrohNode.memory()
+    node2 = await IrohNode.memory()
+
+    node1.add_node_addr(node2)
+    node2.add_node_addr(node1)
+
+    dc1 = docs_client(node1)
+    dc2 = docs_client(node2)
+
+    doc1 = await dc1.create()
+    author1 = await dc1.create_author()
+    ticket = await doc1.share("write")
+
+    doc2, receiver = await dc2.join_and_subscribe(ticket)
+
+    # Write from node1 — node2's receiver should eventually see InsertRemote
+    await doc1.set_bytes(author1, b"remote-key", b"remote-value")
+
+    # Receive events until we see insert_remote (may come after sync_finished etc.)
+    for _ in range(10):
+        event = await asyncio.wait_for(receiver.recv(), timeout=10.0)
+        if event is not None and event.kind in ("insert_remote", "insert_local"):
+            break
+    else:
+        assert False, "Did not receive insert event within 10 attempts"
+
+    await node1.shutdown()
+    await node2.shutdown()

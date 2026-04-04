@@ -21,8 +21,9 @@ use iroh_blobs::ticket::BlobTicket;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat, ALPN as BLOBS_ALPN};
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::api::Doc;
+use iroh_docs::engine::LiveEvent;
 use iroh_docs::protocol::Docs;
-use iroh_docs::store::Query;
+use iroh_docs::store::{DownloadPolicy, FilterKind, Query};
 use iroh_docs::{AuthorId, DocTicket, ALPN as DOCS_ALPN};
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
@@ -105,6 +106,79 @@ pub struct CoreDocEntry {
     pub content_len: u64,
     /// The timestamp when this entry was written (microseconds since epoch)
     pub timestamp: u64,
+}
+
+/// Download policy for a document. Controls which remote entries are automatically downloaded.
+#[derive(Clone, Debug)]
+pub enum CoreDownloadPolicy {
+    /// Download all entries (default — maps to EverythingExcept with empty list).
+    Everything,
+    /// Download nothing except entries whose keys match one of the given byte prefixes.
+    NothingExcept { prefixes: Vec<Vec<u8>> },
+    /// Download everything except entries whose keys match one of the given byte prefixes.
+    EverythingExcept { prefixes: Vec<Vec<u8>> },
+}
+
+fn core_policy_to_iroh(policy: CoreDownloadPolicy) -> DownloadPolicy {
+    match policy {
+        CoreDownloadPolicy::Everything => DownloadPolicy::EverythingExcept(vec![]),
+        CoreDownloadPolicy::NothingExcept { prefixes } => DownloadPolicy::NothingExcept(
+            prefixes
+                .into_iter()
+                .map(|p| FilterKind::Prefix(p.into()))
+                .collect(),
+        ),
+        CoreDownloadPolicy::EverythingExcept { prefixes } => DownloadPolicy::EverythingExcept(
+            prefixes
+                .into_iter()
+                .map(|p| FilterKind::Prefix(p.into()))
+                .collect(),
+        ),
+    }
+}
+
+fn iroh_policy_to_core(policy: DownloadPolicy) -> CoreDownloadPolicy {
+    match policy {
+        DownloadPolicy::EverythingExcept(filters) if filters.is_empty() => {
+            CoreDownloadPolicy::Everything
+        }
+        DownloadPolicy::EverythingExcept(filters) => CoreDownloadPolicy::EverythingExcept {
+            prefixes: filters
+                .into_iter()
+                .map(|f| match f {
+                    FilterKind::Prefix(b) => b.to_vec(),
+                    FilterKind::Exact(b) => b.to_vec(),
+                })
+                .collect(),
+        },
+        DownloadPolicy::NothingExcept(filters) => CoreDownloadPolicy::NothingExcept {
+            prefixes: filters
+                .into_iter()
+                .map(|f| match f {
+                    FilterKind::Prefix(b) => b.to_vec(),
+                    FilterKind::Exact(b) => b.to_vec(),
+                })
+                .collect(),
+        },
+    }
+}
+
+/// Snapshot of the local bitfield for a blob — how much data is locally available.
+#[derive(Clone, Debug)]
+pub struct CoreBlobObserveResult {
+    /// Whether all chunks of the blob are present locally.
+    pub is_complete: bool,
+    /// Total blob size in bytes (0 if not yet known — header not fetched).
+    pub size: u64,
+}
+
+/// Local availability info for a blob, from the Remote API.
+#[derive(Clone, Debug)]
+pub struct CoreBlobLocalInfo {
+    /// Whether all requested data is present locally.
+    pub is_complete: bool,
+    /// Number of bytes we have locally for this blob.
+    pub local_bytes: u64,
 }
 
 // ============================================================================
@@ -1120,6 +1194,17 @@ impl CoreTagInfo {
 // CoreBlobsClient - Blob storage protocol
 // ============================================================================
 
+/// Status of a blob in the local store.
+#[derive(Debug, Clone)]
+pub enum CoreBlobStatus {
+    /// Blob is not present.
+    NotFound,
+    /// Blob is partially present. `size` is the number of bytes currently stored (0 if unknown).
+    Partial { size: u64 },
+    /// Blob is fully present.
+    Complete { size: u64 },
+}
+
 #[derive(Clone)]
 pub struct CoreBlobsClient {
     pub store: BlobStore,
@@ -1255,6 +1340,57 @@ impl CoreBlobsClient {
         Ok(results)
     }
 
+    /// Return the status of a blob in the local store.
+    pub async fn blob_status(&self, hash_hex: String) -> Result<CoreBlobStatus> {
+        let hash = hash_hex.parse::<Hash>()?;
+        let status = self.store.blobs().status(hash).await?;
+        Ok(match status {
+            iroh_blobs::api::proto::BlobStatus::NotFound => CoreBlobStatus::NotFound,
+            iroh_blobs::api::proto::BlobStatus::Partial { size } => CoreBlobStatus::Partial {
+                size: size.unwrap_or(0),
+            },
+            iroh_blobs::api::proto::BlobStatus::Complete { size } => {
+                CoreBlobStatus::Complete { size }
+            }
+        })
+    }
+
+    /// Return true if the blob is fully stored locally.
+    pub async fn blob_has(&self, hash_hex: String) -> Result<bool> {
+        let hash = hash_hex.parse::<Hash>()?;
+        Ok(self.store.blobs().has(hash).await?)
+    }
+
+    /// Snapshot of the current bitfield for a blob — is it complete, and what is its size?
+    /// Returns the first bitfield emitted by `store.blobs().observe(hash)`.
+    pub async fn blob_observe_snapshot(&self, hash_hex: String) -> Result<CoreBlobObserveResult> {
+        let hash = hash_hex.parse::<Hash>()?;
+        let bitfield = self.store.blobs().observe(hash).await?;
+        Ok(CoreBlobObserveResult {
+            is_complete: bitfield.is_complete(),
+            size: bitfield.size(),
+        })
+    }
+
+    /// Wait until the blob is fully downloaded locally.
+    /// Resolves immediately if the blob is already complete.
+    pub async fn blob_observe_complete(&self, hash_hex: String) -> Result<()> {
+        let hash = hash_hex.parse::<Hash>()?;
+        self.store.blobs().observe(hash).await_completion().await?;
+        Ok(())
+    }
+
+    /// Check how many bytes of the blob we already have locally, and whether it is complete.
+    /// Uses the Remote API which accounts for partial downloads.
+    pub async fn blob_local_info(&self, hash_hex: String) -> Result<CoreBlobLocalInfo> {
+        let hash = hash_hex.parse::<Hash>()?;
+        let info = self.store.remote().local(HashAndFormat::raw(hash)).await?;
+        Ok(CoreBlobLocalInfo {
+            is_complete: info.is_complete(),
+            local_bytes: info.local_bytes(),
+        })
+    }
+
     /// Create a ticket for a Collection (HashSeq format), compatible with sendme.
     pub fn create_collection_ticket(&self, hash_hex: String) -> Result<String> {
         Ok(BlobTicket::new(
@@ -1355,6 +1491,31 @@ impl CoreDocsClient {
             store: self.store.clone(),
         })
     }
+
+    /// Join a document and subscribe to live events in one atomic step.
+    /// Returns a `(CoreDoc, CoreDocEventReceiver)` pair.
+    pub async fn join_and_subscribe(
+        &self,
+        ticket_str: String,
+    ) -> Result<(CoreDoc, CoreDocEventReceiver)> {
+        let ticket = DocTicket::deserialize(&ticket_str)?;
+        if let Ok(lookup) = self.endpoint.address_lookup() {
+            for node_addr in &ticket.nodes {
+                let mem = MemoryLookup::new();
+                mem.add_endpoint_info(node_addr.clone());
+                lookup.add(mem);
+            }
+        }
+        let (doc, stream) = self.inner.api().import_and_subscribe(ticket).await?;
+        let core_doc = CoreDoc {
+            doc,
+            store: self.store.clone(),
+        };
+        let receiver = CoreDocEventReceiver {
+            inner: Arc::new(Mutex::new(Box::pin(stream))),
+        };
+        Ok((core_doc, receiver))
+    }
 }
 
 // ============================================================================
@@ -1453,6 +1614,142 @@ impl CoreDoc {
             .share(share_mode, AddrInfoOptions::Id)
             .await?
             .serialize())
+    }
+
+    /// Start syncing this document with the given peers (by endpoint ID hex string).
+    pub async fn start_sync(&self, peers: Vec<String>) -> Result<()> {
+        let endpoint_addrs: Vec<EndpointAddr> = peers
+            .iter()
+            .map(|s| {
+                let id: EndpointId = s.parse()?;
+                Ok(EndpointAddr::from_parts(id, std::iter::empty()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.doc.start_sync(endpoint_addrs).await?;
+        Ok(())
+    }
+
+    /// Stop syncing this document.
+    pub async fn leave(&self) -> Result<()> {
+        self.doc.leave().await?;
+        Ok(())
+    }
+
+    /// Subscribe to live document events.
+    pub async fn subscribe(&self) -> Result<CoreDocEventReceiver> {
+        let stream = self.doc.subscribe().await?;
+        Ok(CoreDocEventReceiver {
+            inner: Arc::new(Mutex::new(Box::pin(stream))),
+        })
+    }
+
+    /// Set the download policy for this document.
+    pub async fn set_download_policy(&self, policy: CoreDownloadPolicy) -> Result<()> {
+        self.doc
+            .set_download_policy(core_policy_to_iroh(policy))
+            .await?;
+        Ok(())
+    }
+
+    /// Get the current download policy for this document.
+    pub async fn get_download_policy(&self) -> Result<CoreDownloadPolicy> {
+        let policy = self.doc.get_download_policy().await?;
+        Ok(iroh_policy_to_core(policy))
+    }
+
+    /// Share this document with full relay+address info, returning a ticket string.
+    /// mode: "read" or "write"
+    pub async fn share_with_addr(&self, mode: String) -> Result<String> {
+        let share_mode = match mode.as_str() {
+            "read" | "Read" => ShareMode::Read,
+            "write" | "Write" => ShareMode::Write,
+            _ => return Err(anyhow!("mode must be 'read' or 'write'")),
+        };
+        Ok(self
+            .doc
+            .share(share_mode, AddrInfoOptions::RelayAndAddresses)
+            .await?
+            .serialize())
+    }
+}
+
+// ============================================================================
+// CoreDocEvent / CoreDocEventReceiver - Live document event subscription
+// ============================================================================
+
+/// A live document event, emitted when the doc's content changes or peers connect.
+#[derive(Debug, Clone)]
+pub enum CoreDocEvent {
+    /// A local insertion: this node wrote an entry.
+    InsertLocal { entry: CoreDocEntry },
+    /// A remote insertion: a peer sent us an entry.
+    InsertRemote { from: String, entry: CoreDocEntry },
+    /// The content for an entry is now available locally.
+    ContentReady { hash: String },
+    /// All pending content downloads from the last sync run completed (or failed).
+    PendingContentReady,
+    /// A new peer joined the swarm for this document.
+    NeighborUp { peer: String },
+    /// A peer left the swarm for this document.
+    NeighborDown { peer: String },
+    /// A set-reconciliation sync with a peer finished.
+    SyncFinished { peer: String },
+}
+
+fn live_event_to_core(ev: LiveEvent) -> CoreDocEvent {
+    match ev {
+        LiveEvent::InsertLocal { entry } => CoreDocEvent::InsertLocal {
+            entry: CoreDocEntry {
+                author_id: entry.author().to_string(),
+                key: entry.key().to_vec(),
+                content_hash: entry.content_hash().to_hex().to_string(),
+                content_len: entry.content_len(),
+                timestamp: entry.timestamp(),
+            },
+        },
+        LiveEvent::InsertRemote { from, entry, .. } => CoreDocEvent::InsertRemote {
+            from: from.to_string(),
+            entry: CoreDocEntry {
+                author_id: entry.author().to_string(),
+                key: entry.key().to_vec(),
+                content_hash: entry.content_hash().to_hex().to_string(),
+                content_len: entry.content_len(),
+                timestamp: entry.timestamp(),
+            },
+        },
+        LiveEvent::ContentReady { hash } => CoreDocEvent::ContentReady {
+            hash: hash.to_string(),
+        },
+        LiveEvent::PendingContentReady => CoreDocEvent::PendingContentReady,
+        LiveEvent::NeighborUp(peer) => CoreDocEvent::NeighborUp {
+            peer: peer.to_string(),
+        },
+        LiveEvent::NeighborDown(peer) => CoreDocEvent::NeighborDown {
+            peer: peer.to_string(),
+        },
+        LiveEvent::SyncFinished(ev) => CoreDocEvent::SyncFinished {
+            peer: ev.peer.to_string(),
+        },
+    }
+}
+
+type DocEventStream = std::pin::Pin<Box<dyn futures_lite::Stream<Item = Result<LiveEvent>> + Send>>;
+
+/// Receiver for live document events. Clone-safe via Arc<Mutex>.
+#[derive(Clone)]
+pub struct CoreDocEventReceiver {
+    inner: Arc<Mutex<DocEventStream>>,
+}
+
+impl CoreDocEventReceiver {
+    /// Receive the next event. Returns None when the subscription ends.
+    pub async fn recv(&self) -> Result<Option<CoreDocEvent>> {
+        let mut stream = self.inner.lock().await;
+        match futures_lite::StreamExt::next(&mut *stream).await {
+            None => Ok(None),
+            Some(Ok(ev)) => Ok(Some(live_event_to_core(ev))),
+            Some(Err(e)) => Err(e),
+        }
     }
 }
 

@@ -756,6 +756,310 @@ fn test_hook_after_connect_respond_invalid_invocation() {
 }
 
 // ============================================================================
+// Phase 1c.5: Doc Sync Lifecycle FFI Tests
+// ============================================================================
+
+#[test]
+fn test_doc_start_sync_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let peers = iroh_bytes_list_t {
+            items: ptr::null(),
+            len: 0,
+        };
+        let status = iroh_doc_start_sync(
+            runtime,
+            0,
+            peers,
+            0,
+            ptr::null_mut(), // null out_operation -> INVALID_ARGUMENT
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_doc_start_sync_unknown_doc_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let peers = iroh_bytes_list_t {
+            items: ptr::null(),
+            len: 0,
+        };
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_doc_start_sync(
+            runtime,
+            999999, // unknown doc
+            peers,
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_doc_leave_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let status = iroh_doc_leave(
+            runtime,
+            0,
+            0,
+            ptr::null_mut(), // null out_operation -> INVALID_ARGUMENT
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_doc_leave_unknown_doc_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_doc_leave(
+            runtime,
+            999999, // unknown doc
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+// ============================================================================
+// Phase 1c.4: Doc Subscribe FFI Tests
+// ============================================================================
+
+#[test]
+fn test_doc_event_kind_values() {
+    assert_eq!(iroh_event_kind_t::IROH_EVENT_DOC_SUBSCRIBED as u32, 47);
+    assert_eq!(iroh_event_kind_t::IROH_EVENT_DOC_EVENT as u32, 48);
+}
+
+#[test]
+fn test_doc_subscribe_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let status = iroh_doc_subscribe(
+            runtime,
+            0,
+            0,
+            ptr::null_mut(), // null out_operation -> INVALID_ARGUMENT
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_doc_subscribe_unknown_doc_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_doc_subscribe(
+            runtime,
+            999999, // unknown doc
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_doc_event_recv_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let status = iroh_doc_event_recv(
+            runtime,
+            0,
+            0,
+            ptr::null_mut(), // null out_operation -> INVALID_ARGUMENT
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_doc_event_recv_unknown_receiver_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_doc_event_recv(
+            runtime,
+            999999, // unknown receiver handle
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+// ============================================================================
+// Phase 1c.3: Blob Status / Has FFI Tests
+// ============================================================================
+
+#[test]
+fn test_blobs_status_null_hash_ptr() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let mut out_status: u32 = 0;
+        let mut out_size: u64 = 0;
+        let status = iroh_blobs_status(
+            runtime,
+            0,
+            ptr::null(),
+            0, // null hash_ptr -> INVALID_ARGUMENT
+            &mut out_status,
+            &mut out_size,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_blobs_status_null_out_status() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let hash = b"aabbcc";
+        let mut out_size: u64 = 0;
+        let status = iroh_blobs_status(
+            runtime,
+            0,
+            hash.as_ptr(),
+            hash.len(),
+            ptr::null_mut(), // null out_status -> INVALID_ARGUMENT
+            &mut out_size,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_blobs_status_unknown_node_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let hash = b"aabbcc";
+        let mut out_status: u32 = 0;
+        let mut out_size: u64 = 0;
+        let status = iroh_blobs_status(
+            runtime,
+            999999, // unknown node
+            hash.as_ptr(),
+            hash.len(),
+            &mut out_status,
+            &mut out_size,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_blobs_has_null_hash_ptr() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let mut out_has: u32 = 0;
+        let status = iroh_blobs_has(
+            runtime,
+            0,
+            ptr::null(),
+            0, // null hash_ptr -> INVALID_ARGUMENT
+            &mut out_has,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_blobs_has_null_out_has() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let hash = b"aabbcc";
+        let status = iroh_blobs_has(
+            runtime,
+            0,
+            hash.as_ptr(),
+            hash.len(),
+            ptr::null_mut(), // null out_has -> INVALID_ARGUMENT
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_blobs_has_unknown_node_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let hash = b"aabbcc";
+        let mut out_has: u32 = 0;
+        let status = iroh_blobs_has(
+            runtime,
+            999999, // unknown node
+            hash.as_ptr(),
+            hash.len(),
+            &mut out_has,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+// ============================================================================
 // Phase 1c: Tag FFI Tests
 // ============================================================================
 
@@ -935,6 +1239,167 @@ fn test_tags_list_prefix_null_out_operation() {
     }
 }
 
+// ============================================================================
+// Phase 1c.6: Doc Download Policy FFI Tests
+// ============================================================================
+
+#[test]
+fn test_download_policy_mode_constants() {
+    assert_eq!(
+        iroh_download_policy_mode_t::IROH_DOWNLOAD_POLICY_EVERYTHING as u32,
+        0
+    );
+    assert_eq!(
+        iroh_download_policy_mode_t::IROH_DOWNLOAD_POLICY_NOTHING_EXCEPT as u32,
+        1
+    );
+    assert_eq!(
+        iroh_download_policy_mode_t::IROH_DOWNLOAD_POLICY_EVERYTHING_EXCEPT as u32,
+        2
+    );
+}
+
+#[test]
+fn test_doc_set_download_policy_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let empty_list = iroh_bytes_list_t {
+            items: ptr::null(),
+            len: 0,
+        };
+        let status = iroh_doc_set_download_policy(
+            runtime,
+            0,
+            iroh_download_policy_mode_t::IROH_DOWNLOAD_POLICY_EVERYTHING as u32,
+            empty_list,
+            0,
+            ptr::null_mut(),
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_doc_set_download_policy_unknown_doc_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let empty_list = iroh_bytes_list_t {
+            items: ptr::null(),
+            len: 0,
+        };
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_doc_set_download_policy(
+            runtime,
+            999999, // unknown doc handle
+            iroh_download_policy_mode_t::IROH_DOWNLOAD_POLICY_EVERYTHING as u32,
+            empty_list,
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+// ============================================================================
+// Phase 1c.7: Doc Share with Full Address FFI Tests
+// ============================================================================
+
+#[test]
+fn test_doc_share_with_addr_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let status = iroh_doc_share_with_addr(runtime, 0, 0, 0, ptr::null_mut());
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_doc_share_with_addr_unknown_doc_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_doc_share_with_addr(
+            runtime,
+            999999, // unknown doc handle
+            0,
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+// ============================================================================
+// Phase 1c.8: Doc Join and Subscribe FFI Tests
+// ============================================================================
+
+#[test]
+fn test_doc_join_and_subscribe_event_kind_value() {
+    assert_eq!(
+        iroh_event_kind_t::IROH_EVENT_DOC_JOINED_AND_SUBSCRIBED as u32,
+        49
+    );
+}
+
+#[test]
+fn test_docs_join_and_subscribe_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let ticket_bytes = b"some-ticket";
+        let ticket = iroh_bytes_t {
+            ptr: ticket_bytes.as_ptr(),
+            len: ticket_bytes.len(),
+        };
+        let status = iroh_docs_join_and_subscribe(runtime, 0, ticket, 0, ptr::null_mut());
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_docs_join_and_subscribe_unknown_node_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let ticket_bytes = b"some-ticket";
+        let ticket = iroh_bytes_t {
+            ptr: ticket_bytes.as_ptr(),
+            len: ticket_bytes.len(),
+        };
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_docs_join_and_subscribe(
+            runtime,
+            999999, // unknown node
+            ticket,
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
 #[test]
 fn test_hook_endpoint_config_with_hooks_creates_operation() {
     // Verify that iroh_endpoint_create with enable_hooks=1 accepts the config
@@ -959,6 +1424,218 @@ fn test_hook_endpoint_config_with_hooks_creates_operation() {
             runtime,
             999999,
             iroh_hook_decision_t::IROH_HOOK_DECISION_ALLOW,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+// ============================================================================
+// Phase 1d: Blob Transfer Observability FFI Tests
+// ============================================================================
+
+#[test]
+fn test_blob_observe_complete_event_kind_value() {
+    assert_eq!(
+        iroh_event_kind_t::IROH_EVENT_BLOB_OBSERVE_COMPLETE as u32,
+        56
+    );
+}
+
+#[test]
+fn test_blobs_observe_snapshot_null_out_args() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let hash = b"abcdefghijklmnopqrstuvwxyz012345678901234567890123";
+        let mut is_complete: u32 = 0;
+        let mut size: u64 = 0;
+
+        // null hash pointer
+        let status = iroh_blobs_observe_snapshot(
+            runtime,
+            0,
+            ptr::null(),
+            0,
+            &mut is_complete,
+            &mut size,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        // null out_is_complete
+        let status = iroh_blobs_observe_snapshot(
+            runtime,
+            0,
+            hash.as_ptr(),
+            hash.len(),
+            ptr::null_mut(),
+            &mut size,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        // null out_size
+        let status = iroh_blobs_observe_snapshot(
+            runtime,
+            0,
+            hash.as_ptr(),
+            hash.len(),
+            &mut is_complete,
+            ptr::null_mut(),
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_blobs_observe_snapshot_unknown_node_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let hash = b"abcdefghijklmnopqrstuvwxyz012345678901234567890123";
+        let mut is_complete: u32 = 0;
+        let mut size: u64 = 0;
+
+        let status = iroh_blobs_observe_snapshot(
+            runtime,
+            999999, // unknown node
+            hash.as_ptr(),
+            hash.len(),
+            &mut is_complete,
+            &mut size,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_blobs_observe_complete_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let hash = b"abcdefghijklmnopqrstuvwxyz012345678901234567890123";
+
+        // null hash pointer
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_blobs_observe_complete(
+            runtime,
+            0,
+            ptr::null(),
+            0,
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        // null out_operation
+        let status = iroh_blobs_observe_complete(
+            runtime,
+            0,
+            hash.as_ptr(),
+            hash.len(),
+            0,
+            ptr::null_mut(),
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_blobs_observe_complete_unknown_node_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let hash = b"abcdefghijklmnopqrstuvwxyz012345678901234567890123";
+        let mut operation: iroh_operation_t = 0;
+
+        let status = iroh_blobs_observe_complete(
+            runtime,
+            999999, // unknown node
+            hash.as_ptr(),
+            hash.len(),
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_blobs_local_info_null_out_args() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let hash = b"abcdefghijklmnopqrstuvwxyz012345678901234567890123";
+        let mut is_complete: u32 = 0;
+        let mut local_bytes: u64 = 0;
+
+        // null hash pointer
+        let status = iroh_blobs_local_info(
+            runtime,
+            0,
+            ptr::null(),
+            0,
+            &mut is_complete,
+            &mut local_bytes,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        // null out_is_complete
+        let status = iroh_blobs_local_info(
+            runtime,
+            0,
+            hash.as_ptr(),
+            hash.len(),
+            ptr::null_mut(),
+            &mut local_bytes,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        // null out_local_bytes
+        let status = iroh_blobs_local_info(
+            runtime,
+            0,
+            hash.as_ptr(),
+            hash.len(),
+            &mut is_complete,
+            ptr::null_mut(),
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_blobs_local_info_unknown_node_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let hash = b"abcdefghijklmnopqrstuvwxyz012345678901234567890123";
+        let mut is_complete: u32 = 0;
+        let mut local_bytes: u64 = 0;
+
+        let status = iroh_blobs_local_info(
+            runtime,
+            999999, // unknown node
+            hash.as_ptr(),
+            hash.len(),
+            &mut is_complete,
+            &mut local_bytes,
         );
         assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
 
