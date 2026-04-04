@@ -36,7 +36,6 @@ Example usage::
 from __future__ import annotations
 
 import asyncio
-import functools
 import inspect
 import typing
 from typing import (
@@ -44,10 +43,8 @@ from typing import (
     AsyncGenerator,
     AsyncIterator,
     Callable,
-    ForwardRef,
     ParamSpec,
     TypeVar,
-    overload,
 )
 
 from aster_python.aster.types import SerializationMode
@@ -473,6 +470,16 @@ def service(
         # Check that this is a class
         if not isinstance(cls, type):
             raise TypeError("@service can only be applied to classes")
+
+        # For session-scoped services, validate that __init__ accepts a 'peer' parameter
+        if scoped == "stream":
+            init_sig = inspect.signature(cls.__init__)
+            params = list(init_sig.parameters.keys())
+            if "peer" not in params:
+                raise TypeError(
+                    f"@service(scoped='stream') class {cls.__name__}.__init__ "
+                    f"must accept a 'peer' parameter"
+                )
 
         # Scan all methods to collect type information
         methods = _scan_service_methods(cls, serialization)

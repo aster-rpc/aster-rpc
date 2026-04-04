@@ -131,6 +131,8 @@ class Server:
         self._interceptors = list(interceptors) if interceptors else []
         self._max_concurrent_streams = max_concurrent_streams
         self._service_instances: dict[tuple[str, int], Any] = {}
+        # For session-scoped services we store the class (not an instance)
+        self._service_classes: dict[tuple[str, int], type] = {}
 
         # Set up service registry
         if registry is not None:
@@ -142,6 +144,8 @@ class Server:
             for svc in services:
                 service_class = svc if inspect.isclass(svc) else type(svc)
                 info = self._registry.register(service_class)
+                # Store the class for session-scoped services
+                self._service_classes[(info.name, info.version)] = service_class
                 if not inspect.isclass(svc):
                     self._service_instances[(info.name, info.version)] = svc
         else:
@@ -150,7 +154,7 @@ class Server:
         # Connection tracking
         self._connections: set[ConnectionContext] = set()
         self._connections_lock = asyncio.Lock()
-        
+
         # Server state
         self._serving = False
         self._serve_task: asyncio.Task | None = None
@@ -158,6 +162,9 @@ class Server:
 
         for service_info in self._registry.get_all_services():
             key = (service_info.name, service_info.version)
+            # Session-scoped services don't need a pre-existing instance
+            if service_info.scoped == "stream":
+                continue
             if key not in self._service_instances:
                 raise ServerError(
                     f"No implementation instance provided for service "
@@ -304,10 +311,11 @@ class Server:
                 )
                 return
 
-            # Validate header
-            if not header.service or not header.method:
+            # Validate header — service name is always required; method may be ""
+            # for session streams
+            if not header.service:
                 await self._write_error_trailer(
-                    send, StatusCode.INVALID_ARGUMENT, "Missing service or method name"
+                    send, StatusCode.INVALID_ARGUMENT, "Missing service name"
                 )
                 return
 
@@ -320,7 +328,41 @@ class Server:
                 )
                 return
 
-            # Look up the method
+            # ── Session discriminator check ───────────────────────────────
+            is_session_stream = (header.method == "")
+            is_session_service = (service_info.scoped == "stream")
+            if is_session_stream != is_session_service:
+                await self._write_error_trailer(
+                    send, StatusCode.FAILED_PRECONDITION, "Stream/service scope mismatch"
+                )
+                return
+
+            if is_session_stream:
+                from aster_python.aster.session import SessionServer
+                key = (service_info.name, service_info.version)
+                svc_class = self._service_classes.get(key)
+                if svc_class is None:
+                    await self._write_error_trailer(
+                        send, StatusCode.INTERNAL, "Session service class not found"
+                    )
+                    return
+                all_interceptors = self._resolve_interceptors(service_info)
+                peer: str | None = None
+                try:
+                    peer = ctx.connection.remote_endpoint_id()
+                except Exception:
+                    peer = None
+                session_server = SessionServer(
+                    service_class=svc_class,
+                    service_info=service_info,
+                    codec=self._codec,
+                    interceptors=all_interceptors,
+                )
+                await session_server.run(header, send, recv, peer=peer)
+                return
+            # ── End session discriminator check ───────────────────────────
+
+            # Look up the method (only for non-session streams)
             method_info = service_info.get_method(header.method)
             if method_info is None:
                 await self._write_error_trailer(

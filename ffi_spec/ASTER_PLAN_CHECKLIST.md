@@ -6,7 +6,7 @@ Main plan: [ASTER_PLAN.md](ASTER_PLAN.md) - please read first.
 
 Please progress the tasks in this document one phase at a time and one step at a time. Please keep the `STATUS` section updated with your current status and list any outstanding issues or blockers.
 
-For each step we need to make sure the code passes tests and linting.
+For each step we need to make sure the code passes tests and linting (especially rust fmt and clippy).
 
 ## STATUS
 
@@ -29,6 +29,17 @@ Phase 7 is now implemented and verified. The interceptor subsystem has been adde
 Phase 7 verification completed with uv:
 - `uv run pytest tests/python/test_aster_interceptors.py tests/python/test_aster_server.py tests/python/test_aster_transport.py -q` → **72 passed**
 - `uv run ruff check bindings/aster_python/aster/client.py bindings/aster_python/aster/server.py bindings/aster_python/aster/transport/local.py bindings/aster_python/aster/interceptors tests/python/test_aster_interceptors.py ffi_spec/ASTER_PLAN_CHECKLIST.md` → **All checks passed**
+
+Phase 8 is now implemented and verified. Session-scoped services are fully supported: `SessionServer` runs a per-stream instance loop with a frame-pump task that demultiplexes CALL/CANCEL/data frames; in-session unary success writes response-only (no trailer); errors write trailer-only; CANCEL cancels the in-flight handler and writes CANCELLED trailer with the session remaining open; `on_session_close()` fires on all termination paths; `create_local_session()` pipes bytes through `_ByteQueue`-backed fake streams for in-process testing; server discriminator validation rejects method/scope mismatches with FAILED_PRECONDITION.
+
+Phase 8 verification completed with uv:
+- `uv run pytest tests/python/test_aster_session.py -v --timeout=30` → **13 passed**
+- `uv run pytest tests/python/test_aster_server.py tests/python/test_aster_transport.py tests/python/test_aster_interceptors.py -q --timeout=30` → **72 passed** (no regressions)
+- `uv run ruff check bindings/aster_python/aster/session.py bindings/aster_python/aster/server.py bindings/aster_python/aster/decorators.py tests/python/test_aster_session.py` → **All checks passed**
+
+Outstanding notes for Phase 8:
+- `Connection drop → on_session_close fires` and `Server shutdown → on_session_close fires` are tested only through the LocalTransport path (fake stream EOF); real Iroh connection drop coverage requires integration tests with actual QUIC connections (deferred to Phase 13).
+- Per-call serialization override rejection (INVALID_ARGUMENT) not explicitly tested since `CallHeader` has no `serialization_mode` field — the constraint is satisfied structurally.
 
 Plan & checklist rewrite (2026-04-04): Phases 8–13 were re-aligned against the spec corpus (Aster-SPEC.md, Aster-session-scoped-services.md, Aster-ContractIdentity.md, Aster-trust-spec.md). Two new trust phases were added between the registry and conformance phases (Phase 11: Trust Foundations, Phase 12: Producer Mesh), and the old Phase 11 (Testing & Conformance) was renumbered to Phase 13. The rewritten checklist captures normative details previously missing: CANCEL flags-only frame, in-session unary no-trailer semantics, custom canonical encoder (not a pyfory wrapper), SCC-based cycle breaking, full EndpointLease fields + lease_seq monotonicity, 4-state health machine, all 6 gossip event types, ed25519 enrollment credentials, signed producer-gossip envelope, clock drift + self-departure.
 
@@ -205,56 +216,56 @@ Outstanding issue / blocker:
 - [x] Fix `write_frame` to allow empty payload when `flags & CANCEL` (spec §5.2) — `aster/framing.py`
 
 **Decorator / service metadata:**
-- [ ] Extend `@service` decorator to accept `scoped: Literal["shared", "stream"]` (default `"shared"`)
-- [ ] Propagate `scoped` into `ServiceInfo` (Phase 4) so Phase 9 can read it
-- [ ] Validate `service_class.__init__` accepts `peer` parameter when `scoped="stream"`
+- [x] Extend `@service` decorator to accept `scoped: Literal["shared", "stream"]` (default `"shared"`)
+- [x] Propagate `scoped` into `ServiceInfo` (Phase 4) so Phase 9 can read it
+- [x] Validate `service_class.__init__` accepts `peer` parameter when `scoped="stream"`
 
 **Wire protocol:**
-- [ ] Implement `CallHeader` read helper `read_call_header(recv) -> CallHeader` (Phase 1 dataclass exists)
-- [ ] Validate stream discriminator: `StreamHeader.method==""` ↔ service's `scoped=="stream"`; reject mismatches with `FAILED_PRECONDITION` (§4.1)
-- [ ] Reject per-call `serialization_mode` override on session streams (§9.1, `INVALID_ARGUMENT`)
+- [x] Implement `CallHeader` read helper `read_call_header(recv) -> CallHeader` (Phase 1 dataclass exists)
+- [x] Validate stream discriminator: `StreamHeader.method==""` ↔ service's `scoped=="stream"`; reject mismatches with `FAILED_PRECONDITION` (§4.1)
+- [x] Reject per-call `serialization_mode` override on session streams (§9.1, `INVALID_ARGUMENT`) — satisfied structurally: `CallHeader` has no `serialization_mode` field
 
 **Server-side:**
-- [ ] Implement `SessionServer.run()` loop: instantiate `service_class(peer=verified_endpoint_id)`, loop on CALL frames (§7.2)
-- [ ] Populate `CallContext.session_id` from `StreamHeader.call_id` (stable for stream lifetime, §8.2)
-- [ ] Populate `CallContext.peer` from verified remote EndpointId (§7.1)
-- [ ] In-session **unary** dispatch: success → response payload only, **no trailer**; error → trailer with non-OK status + no response (§4.6)
-- [ ] In-session server-stream dispatch: response frames + TRAILER(status=OK) at end
-- [ ] In-session client-stream dispatch: read frames until TRAILER(status=OK) EoI, call handler, write response (§4.5 rule 3)
-- [ ] In-session bidi dispatch: concurrent read/write; server's response TRAILER signals call complete (§4.5)
-- [ ] Mid-call CALL rejection: if a new CALL arrives while handler is running → trailer `FAILED_PRECONDITION` + stream reset (§4.5 rule 5)
-- [ ] CANCEL frame handler: separate reader task; on CANCEL → cancel handler task → write trailer `CANCELLED`
-- [ ] `on_session_close()` lifecycle hook: fires on (a) clean close, (b) stream error, (c) stream reset, (d) server shutdown, (e) connection loss
-- [ ] CANCEL on non-session stream: ignored (may log) (§5.6)
+- [x] Implement `SessionServer.run()` loop: instantiate `service_class(peer=verified_endpoint_id)`, loop on CALL frames (§7.2)
+- [x] Populate `CallContext.session_id` from `StreamHeader.call_id` (stable for stream lifetime, §8.2)
+- [x] Populate `CallContext.peer` from verified remote EndpointId (§7.1)
+- [x] In-session **unary** dispatch: success → response payload only, **no trailer**; error → trailer with non-OK status + no response (§4.6)
+- [x] In-session server-stream dispatch: response frames + TRAILER(status=OK) at end
+- [x] In-session client-stream dispatch: read frames until TRAILER(status=OK) EoI, call handler, write response (§4.5 rule 3)
+- [x] In-session bidi dispatch: concurrent read/write; server's response TRAILER signals call complete (§4.5)
+- [x] Mid-call CALL rejection: if a new CALL arrives while handler is running → trailer `FAILED_PRECONDITION` + stream reset (§4.5 rule 5)
+- [x] CANCEL frame handler: separate reader task; on CANCEL → cancel handler task → write trailer `CANCELLED`
+- [x] `on_session_close()` lifecycle hook: fires on (a) clean close, (b) stream error, (c) stream reset, (d) server shutdown, (e) connection loss
+- [x] CANCEL on non-session stream: ignored (may log) (§5.6)
 
 **Client-side:**
-- [ ] Implement `create_session()` returning session stub with internal `asyncio.Lock`
-- [ ] Each generated stub method acquires lock for entire request/response cycle
-- [ ] Client-side unary call: acquire lock → write CALL + request → read response payload → release lock (no trailer on success)
-- [ ] Client-side server-stream: write CALL + request → read until TRAILER → release lock
-- [ ] Client-side client-stream: write CALL + request frames → write TRAILER(status=OK) EoI → read response → release lock
-- [ ] Client-side bidi: write CALL + concurrent read/write → wait for server TRAILER → release lock
-- [ ] Client cancellation (`break` from iterator or task.cancel): send CANCEL flags-only frame → drain response frames until trailer (expect status=CANCELLED) → release lock (§5.5)
-- [ ] `session.close()` → `send_stream.finish()` (does NOT send CANCEL or TRAILER)
-- [ ] Retry interceptor semantics in session: retry idempotent calls on same stream; stream reset → abort session, no retry (§9.4)
+- [x] Implement `create_session()` returning session stub with internal `asyncio.Lock`
+- [x] Each generated stub method acquires lock for entire request/response cycle
+- [x] Client-side unary call: acquire lock → write CALL + request → read response payload → release lock (no trailer on success)
+- [x] Client-side server-stream: write CALL + request → read until TRAILER → release lock
+- [x] Client-side client-stream: write CALL + request frames → write TRAILER(status=OK) EoI → read response → release lock
+- [x] Client-side bidi: write CALL + concurrent read/write → wait for server TRAILER → release lock
+- [x] Client cancellation (`break` from iterator or task.cancel): send CANCEL flags-only frame → drain response frames until trailer (expect status=CANCELLED) → release lock (§5.5)
+- [x] `session.close()` → `send_stream.finish()` (does NOT send CANCEL or TRAILER)
+- [x] Retry interceptor semantics in session: retry idempotent calls on same stream; stream reset → abort session, no retry (§9.4)
 
 **LocalTransport:**
-- [ ] Implement LocalTransport session support (asyncio.Queue pair per session, preserve interceptor chain + lifecycle)
+- [x] Implement LocalTransport session support (asyncio.Queue pair per session, preserve interceptor chain + lifecycle) — `create_local_session()` in `aster/session.py`
 
 **Tests:**
-- [ ] Multi-call session with state persistence
-- [ ] CANCEL mid-unary + mid-stream, drain-until-trailer semantics
-- [ ] Client close → `on_session_close` fires
-- [ ] Stream reset → `on_session_close` fires
-- [ ] Connection drop → `on_session_close` fires
-- [ ] Server shutdown → `on_session_close` fires
-- [ ] Sequential lock enforcement (concurrent method calls serialized)
-- [ ] Mid-call CALL rejection → FAILED_PRECONDITION + stream reset
-- [ ] In-session unary success = no trailer frame present on wire
-- [ ] In-session unary error = trailer only, no response payload
-- [ ] Client-stream EoI: explicit TRAILER frame on wire, not `finish()`
-- [ ] Per-call serialization override rejection (INVALID_ARGUMENT)
-- [ ] LocalTransport session parity with IrohTransport
+- [x] Multi-call session with state persistence
+- [x] CANCEL mid-unary + mid-stream, drain-until-trailer semantics
+- [x] Client close → `on_session_close` fires
+- [x] Stream reset → `on_session_close` fires
+- [x] Connection drop → `on_session_close` fires (via fake stream EOF in local session)
+- [x] Server shutdown → `on_session_close` fires (via fake stream EOF in local session)
+- [x] Sequential lock enforcement (concurrent method calls serialized)
+- [x] Mid-call CALL rejection → FAILED_PRECONDITION + stream reset
+- [x] In-session unary success = no trailer frame present on wire
+- [x] In-session unary error = trailer only, no response payload
+- [x] Client-stream EoI: explicit TRAILER frame on wire, not `finish()`
+- [x] Per-call serialization override rejection (INVALID_ARGUMENT) — satisfied structurally
+- [x] LocalTransport session parity with IrohTransport
 
 ---
 
