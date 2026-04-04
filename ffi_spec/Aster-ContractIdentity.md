@@ -15,12 +15,12 @@ external ID assignment, no collision risk, no coordination required.
 
 **Storage model:** Immutable contract bundles are published as **Iroh
 collections** (HashSeq format). An Iroh collection is an ordered sequence of
-blob hashes; by convention the first element (index 0) is the application's
+blob hashes; by convention the first element (index 0) is the application’s
 metadata blob. Aster uses a `ContractManifest` JSON blob at index 0, which
 carries the name-to-hash mapping for all other members. iroh-docs stores
 lightweight `ArtifactRef` pointers that resolve to collection root hashes. This
 avoids simulating a filesystem hierarchy in docs keys for artifact storage and
-aligns with Iroh's native content-addressed transfer primitives.
+aligns with Iroh’s native content-addressed transfer primitives.
 
 ```text
 {namespace}/
@@ -46,6 +46,8 @@ aligns with Iroh's native content-addressed transfer primitives.
 │   │   │   ├── stable                           → contract_id
 │   │   │   ├── canary                           → contract_id
 │   │   │   └── dev                              → contract_id
+│   │   ├── tags/
+│   │   │   └── {label}                          → contract_id
 │   │   ├── meta                                 → service metadata
 │   │   └── contracts/
 │   │       └── {contract_id}/
@@ -65,7 +67,7 @@ aligns with Iroh's native content-addressed transfer primitives.
         └── {other_contract_id}                  → Compatibility report / diff
 ```
 
-All entries are signed by their author's keypair. The `AuthorId` on each entry
+All entries are signed by their author’s keypair. The `AuthorId` on each entry
 is the cryptographic proof of who wrote it.
 
 **ArtifactRef** — each `contracts/{contract_id}` docs entry stores a small JSON
@@ -89,14 +91,14 @@ member names are an Aster convention carried in the manifest, not an Iroh API
 feature. The manifest at index 0 maps logical names to blob hashes, allowing
 consumers to fetch any member by its content hash.
 
-| Index | Logical name               | Content                                       | Required |
-|-------|---------------------------|-----------------------------------------------|----------|
-| 0     | `manifest.json`           | `ContractManifest` JSON (metadata blob)       | Yes      |
-| 1     | `contract.xlang`          | Canonical XLANG bytes of `ServiceContract`    | Yes      |
-| 2..N  | `types/{type_hash}.xlang` | Canonical XLANG bytes of each `TypeDef`       | Yes      |
-| opt   | `schema.fdl`              | Human-readable Fory IDL source text           | No       |
-| opt   | `docs/`                   | Documentation bundle                          | No       |
-| opt   | `compatibility/{other_id}`| Compatibility report vs another contract      | No       |
+|Index|Logical name              |Content                                   |Required|
+|-----|--------------------------|------------------------------------------|--------|
+|0    |`manifest.json`           |`ContractManifest` JSON (metadata blob)   |Yes     |
+|1    |`contract.xlang`          |Canonical XLANG bytes of `ServiceContract`|Yes     |
+|2..N |`types/{type_hash}.xlang` |Canonical XLANG bytes of each `TypeDef`   |Yes     |
+|opt  |`schema.fdl`              |Human-readable Fory IDL source text       |No      |
+|opt  |`docs/`                   |Documentation bundle                      |No      |
+|opt  |`compatibility/{other_id}`|Compatibility report vs another contract  |No      |
 
 Required members occupy fixed indices 0–(2+len(types)). Optional members follow
 in any order; their hashes are listed in the manifest.
@@ -127,9 +129,41 @@ and service contract is serialized to a deterministic byte sequence using Fory
 XLANG, then hashed with BLAKE3. The hash *is* the identity.
 
 Types reference other types by hash, forming a Merkle DAG. A service contract
-references its method request/response types by hash. The contract's own hash
+references its method request/response types by hash. The contract’s own hash
 is therefore transitively dependent on every type in its closure — a change to
 any leaf type propagates upward automatically.
+
+**Normative identity surface.** The `contract_id` is defined as the BLAKE3
+hash of the canonical `ServiceContract` XLANG bytes — not of any FDL source
+text. FDL is one authoring syntax; code-first decorators and proto/FlatBuffers
+import are others. All front ends are equivalent: identity is defined solely by
+the resulting `TypeDef` / `ServiceContract` descriptor graph. Two contracts
+authored via different front ends that produce the same descriptor graph are the
+same contract and will hash to the same `contract_id`.
+
+**Alignment with Fory IDL and compiler IR.** Where the source contract is Fory
+FDL, Aster aligns with stock Fory syntax and the normal compiler pipeline:
+
+- FDL is parsed using the ordinary Fory parser and lowered into the compiler IR
+  (`Schema`, `Message`, `Enum`, `Union`, `Service`, `RpcMethod`, `Field`).
+- Aster contract hashing operates over a deterministic descriptor graph derived
+  from that IR; it does **not** require a separate Aster-specific FDL parser.
+- Aster-specific service metadata should be expressed, where needed, as normal
+  Fory `option` entries so that stock tooling can parse the file. Unrecognised
+  options may be ignored by non-Aster tooling.
+
+This keeps authoring maximally compatible with Fory out of the box while still
+allowing Aster to define stronger identity rules over the resulting IR.
+
+FDL source, when present in the contract bundle, is advisory — useful for
+human inspection and tooling, but not an input to identity. The `schema.fdl`
+bundle member is optional for this reason.
+
+Non-FDL front ends (proto import, code-first, FlatBuffers) carry a translation
+correctness burden: they must produce a TypeDef-equivalent descriptor graph.
+Whether they do so is a translator specification concern, not an Aster identity
+concern. Aster does not specify proto→TypeDef or FBS→TypeDef mappings; those
+are defined by the respective import tools.
 
 ```text
                     ServiceContract
@@ -151,15 +185,15 @@ profile ensures byte-identical output from any conforming implementation:
 
 1. **Fields emitted in ascending field ID order.** Fory XLANG normally leaves
    field order implementation-defined; this profile makes it mandatory.
-2. **Schema-consistent mode.** No per-object TypeDef metadata headers in the
+1. **Schema-consistent mode.** No per-object TypeDef metadata headers in the
    payload. Types are known statically.
-3. **No reference tracking.** Type descriptors are acyclic trees (self-
+1. **No reference tracking.** Type descriptors are acyclic trees (self-
    references use a placeholder mechanism described below), so ref tracking
    is unnecessary overhead.
-4. **Standalone serialization.** No stream context, no meta sharing state from
+1. **Standalone serialization.** No stream context, no meta sharing state from
    prior objects, no session-scoped caches. Each canonical byte sequence is
    self-contained.
-5. **No compression.** Canonical bytes are stored and hashed uncompressed.
+1. **No compression.** Canonical bytes are stored and hashed uncompressed.
 
 With these constraints, the same `TypeDef` value produces identical bytes from
 any conforming Fory XLANG implementation.
@@ -168,7 +202,9 @@ any conforming Fory XLANG implementation.
 
 These types live in the `_aster` reserved namespace and are used exclusively
 for registry storage and contract identity. They are not application-visible
-message types.
+message types. They are defined using ordinary Fory IDL `message` syntax so
+they can be parsed by the stock Fory compiler and represented in the normal
+compiler IR.
 
 ```
 // _aster/registry.fdl
@@ -181,14 +217,14 @@ message FieldDef {
     string name = 2;                // Canonical field name (snake_case)
     string type_kind = 3;           // "primitive", "ref", "self_ref", "any"
     string type_primitive = 4;      // e.g. "string", "int32", "bool" — set when type_kind = "primitive"
-    binary type_ref = 5;            // BLAKE3 hash (32 bytes) of referenced TypeDef — set when type_kind = "ref"
+    bytes type_ref = 5;             // BLAKE3 hash (32 bytes) of referenced TypeDef — set when type_kind = "ref"
     string self_ref_name = 6;       // Local type name — set when type_kind = "self_ref"
     bool optional = 7;
     bool ref_tracked = 8;           // Fory `ref` modifier
     string container = 9;           // "", "list", "set", "map"
     string container_key_kind = 10; // For maps: "primitive" or "ref"
     string container_key_primitive = 11;
-    binary container_key_ref = 12;
+    bytes container_key_ref = 12;
 }
 
 message EnumValueDef {
@@ -199,7 +235,7 @@ message EnumValueDef {
 message UnionVariantDef {
     string name = 1;                // Variant label
     int32 id = 2;                   // Variant case ID
-    binary type_ref = 3;            // BLAKE3 hash of variant TypeDef
+    bytes type_ref = 3;             // BLAKE3 hash of variant TypeDef
 }
 
 message TypeDef {
@@ -226,8 +262,8 @@ message CapabilityRequirement {
 message MethodDef {
     string name = 1;
     string pattern = 2;            // "unary", "server_stream", "client_stream", "bidi_stream"
-    binary request_type = 3;       // BLAKE3 hash of request TypeDef
-    binary response_type = 4;      // BLAKE3 hash of response TypeDef (stream item type for streaming)
+    bytes request_type = 3;        // BLAKE3 hash of request TypeDef
+    bytes response_type = 4;       // BLAKE3 hash of response TypeDef (stream item type for streaming)
     bool idempotent = 5;
     float64 default_timeout = 6;   // Seconds, 0 = none
     CapabilityRequirement requires = 7;  // Optional. Absent = no rcan check required.
@@ -258,14 +294,14 @@ caller must satisfy both independently:
 effective = conjunction(service.requires, method.requires)
 ```
 
-Evaluation of each `CapabilityRequirement` against the caller's rcan
+Evaluation of each `CapabilityRequirement` against the caller’s rcan
 `capability` list:
 
-| `kind`    | Satisfied when |
-|-----------|----------------|
-| `"role"`  | `capability` contains `roles[0]` |
-| `"any_of"`| `capability` contains at least one entry in `roles` |
-| `"all_of"`| `capability` contains every entry in `roles` |
+|`kind`    |Satisfied when                                     |
+|----------|---------------------------------------------------|
+|`"role"`  |`capability` contains `roles[0]`                   |
+|`"any_of"`|`capability` contains at least one entry in `roles`|
+|`"all_of"`|`capability` contains every entry in `roles`       |
 
 The conjunction means both the service requirement and the method requirement
 must evaluate to satisfied. If either fails, the call is rejected with
@@ -281,14 +317,16 @@ at least one of `{Admin, Operator}` AND must hold `TaskManager`. An rcan
 carrying `["Admin", "TaskManager"]` passes. An rcan carrying only `["Admin"]`
 fails the method check. An rcan carrying only `["TaskManager"]` fails the
 service check.
-```
 
+```
 ### 11.3.4 Hashing Procedure
 
 Given a source contract (FDL file, code-first decorators, or any other input):
 
 **Step 1 — Resolve all types.** Walk the type graph reachable from every method
-signature. For each unique type, construct a `TypeDef`.
+signature. For each unique type, construct a `TypeDef`. For Fory FDL input,
+this starts from the standard Fory compiler IR (`Schema`/`Service`/`Message`/
+`Enum`/`Union`) rather than reparsing into an Aster-only model.
 
 **Step 2 — Hash leaves first.** Process the type graph bottom-up:
 
@@ -323,6 +361,7 @@ contract_id = hex(blake3(canonical_xlang_bytes(ServiceContract)))
 
 **Step 5 — Package as collection.** Build an Iroh collection (see §11.2
 contract collection layout) containing:
+
 - `contract.xlang` → canonical `ServiceContract` bytes
 - `manifest.json` → `ContractManifest` JSON
 - `types/{hex(hash)}.xlang` → canonical `TypeDef` bytes for each type
@@ -334,49 +373,61 @@ collection root hash.
 
 ### 11.3.5 Worked Example
 
-Given this FDL:
+Given this FDL (valid stock Fory IDL syntax plus Aster-specific `option`
+entries that non-Aster tooling may ignore):
 
 ```
 package aster.agent;
 
-struct TaskAssignment {
-    task_id: string;
-    workflow_yaml: string;
-    credential_refs: list<string>;
-    step_budget: int32;
+message TaskAssignment {
+    string task_id = 1;
+    string workflow_yaml = 2;
+    list<string> credential_refs = 3;
+    int32 step_budget = 4;
 }
 
-struct TaskAck {
-    accepted: bool;
-    reason: optional<string>;
+message TaskAck {
+    bool accepted = 1;
+    optional string reason = 2;
 }
 
 service AgentControl {
-    version = 1;
-    serialization = [xlang];
+    option version = 1;
+    option serialization = "xlang";
 
     rpc assign_task(TaskAssignment) returns (TaskAck) {
-        timeout = 30.0;
-        idempotent = true;
-        requires = any_of("TaskManager", "Admin");
+        option timeout_ms = 30000;
+        option idempotent = true;
+        option requires = "any_of:TaskManager,Admin";
     }
 }
 ```
+
+Interpretation note:
+
+- `option version = 1;` is Aster service metadata carried via standard Fory
+  option syntax.
+- `option serialization = "xlang";` expresses the preferred serialization mode
+  using a plain string value.
+- `option timeout_ms = 30000;` is interpreted by Aster tooling as
+  `default_timeout = 30.0` seconds in `MethodDef`.
+- `option requires = "any_of:TaskManager,Admin";` is an Aster-defined string
+  DSL carried in a standard Fory option field.
 
 Resolution:
 
 1. `TaskAssignment` has only primitive fields → serialize `TypeDef`, hash →
    `ta_hash`.
-2. `TaskAck` has only primitive fields → serialize `TypeDef`, hash →
+1. `TaskAck` has only primitive fields → serialize `TypeDef`, hash →
    `ack_hash`.
-3. Build `MethodDef`:
+1. Build `MethodDef`:
    `{name: "assign_task", pattern: "unary", request_type: ta_hash, response_type: ack_hash, idempotent: true, default_timeout: 30.0, requires: {kind: "any_of", roles: ["TaskManager", "Admin"]}}`
-4. Build `ServiceContract`:
+1. Build `ServiceContract`:
    `{name: "AgentControl", version: 1, methods: [<above>], serialization_modes: ["xlang"], alpn: "aster/1"}`
-5. Serialize → hash → `contract_id`.
+1. Serialize → hash → `contract_id`.
 
 If `TaskAssignment` gains a new field, its hash changes, which changes
-`assign_task`'s `request_type`, which changes the `ServiceContract` hash.
+`assign_task`’s `request_type`, which changes the `ServiceContract` hash.
 The old and new contracts coexist as separate immutable entries.
 
 ### 11.3.6 Compatibility Detection
@@ -410,81 +461,159 @@ spec version must be bumped and all contract hashes recomputed. This is
 acceptable during the pre-1.0 phase of both projects. After Fory 1.0,
 canonical encoding is stable indefinitely.
 
-| Aster Spec Version | Fory Wire Version | Status      |
-|--------------------|-------------------|-------------|
-| 0.9.x              | Fory 0.15.x XLANG | Pre-stable  |
-| 1.0.x              | Fory 1.x XLANG    | Stable      |
+|Aster Spec Version|Fory Wire Version|Status    |
+|------------------|-----------------|----------|
+|0.9.x             |Fory 0.15.x XLANG|Pre-stable|
+|1.0.x             |Fory 1.x XLANG   |Stable    |
 
 -----
 
 ## §11.4 Contract Publication
 
-A published contract is immutable. Publication creates an Iroh collection
-bundle containing the contract artifacts and writes an `ArtifactRef` pointer
-into docs. Re-publishing the same canonical bytes is idempotent — the
-`contract_id` (BLAKE3 of canonical `ServiceContract` bytes) guarantees
-identity.
+### 11.4.1 Authoring Model
 
-**Publication procedure:**
+The `ContractManifest` is a **build artifact, not a source artifact.** The
+service definition — FDL file or decorated source code — is the human-authored
+source of truth and lives in version control. The manifest is generated from
+that source at commit time, carries git provenance, and is embedded in the
+deployable artifact. It is never committed to the repository.
 
-1. Resolve the type graph from the service definition (decorators, IDL, or
-   code-first annotations).
-2. For each type in the closure, serialize a `TypeDef` to canonical XLANG
-   bytes.
-3. Serialize the `ServiceContract` to canonical XLANG bytes. Compute
-   `contract_id = hex(blake3(bytes))`.
-4. Build an Iroh collection with the layout defined in §11.2:
-   - `contract.xlang` → canonical `ServiceContract` bytes
-   - `manifest.json` → `ContractManifest` JSON (see below)
-   - `types/{type_hash}.xlang` → canonical `TypeDef` bytes for each type
-   - Optionally: `schema.fdl`, documentation bundle, compatibility reports
-5. Import the collection into the local `iroh-blobs` store. The collection
-   root hash is the BLAKE3 of the HashSeq (computed automatically by Iroh).
-5a. **Tag the collection for GC protection.** Untagged blobs are eligible for
-   garbage collection. Set a persistent named tag immediately after import:
+```
+git repo (committed)           build artifact (gitignored / generated)
+────────────────────           ──────────────────────────────────────
+service.py  ─────────────────► .aster/manifest.json
+  (or service.fdl)               git_commit, git_tag, semver, ...
+                                 ↓ embedded at build time
+                               service_node binary / wheel / container
+                                 ↓ on startup
+                               Iroh collection published to registry
+```
 
+The analogy is exact: the FDL or source file is the `pyproject.toml`; the
+published contract bundle is the `.whl` on a package registry. You commit the
+former, you publish the latter.
+
+**Fory IDL compatibility note.** When FDL is used as the source of truth,
+authors should prefer stock Fory syntax (`message`, `enum`, `union`, `service`,
+`rpc`, and ordinary `option` statements). Aster-specific semantics are layered
+on top by interpreting selected option keys/values after parsing the normal
+Fory compiler IR. This keeps source files consumable by standard Fory tooling,
+with only advisory warnings for unknown options.
+
+**Credential separation.** Contract publication uses the node’s registry write
+credential (the docs `NamespaceSecret` or an author key with write access) — the
+same credential used for endpoint lease writes. The offline root key (§2.1 of
+the trust spec) is not involved. Publication is a normal node operation, not an
+administrative act.
+
+### 11.4.2 `aster contract gen` — Offline Manifest Generation
+
+`aster contract gen` is a **purely offline tool** — no running node, no
+credentials, no network. It is intended for use as a git commit hook.
+
+```bash
+# .git/hooks/post-commit (or pre-commit)
+aster contract gen --out .aster/manifest.json
+```
+
+It reads the service definition from the current source tree, resolves the type
+graph, computes `contract_id`, captures the current `git_commit` and `git_tag`
+(if any), and writes `.aster/manifest.json`. Add `.aster/manifest.json` to
+`.gitignore`.
+
+The manifest is then embedded in the deployable artifact using the language’s
+native resource embedding mechanism:
+
+|Language|Mechanism                                                                                                                                        |
+|--------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+|Rust    |`include_bytes!(".aster/manifest.json")` or appended binary resource                                                                             |
+|Python  |`importlib.resources` via package data in wheel                                                                                                  |
+|Go      |`//go:embed .aster/manifest.json`                                                                                                                |
+|Other   |Append to binary — binary formats permit trailing resource data; collection hash is computed at publish time from canonical bytes, not the binary|
+
+### 11.4.3 Startup Publication
+
+On node startup, before advertising endpoint leases, the node:
+
+1. Reads the embedded `ContractManifest`.
+1. Resolves the type graph from its own service definitions (already required
+   to serve calls).
+1. Serializes each `TypeDef` to canonical XLANG bytes.
+1. Serializes the `ServiceContract` to canonical XLANG bytes. Verifies
+   `blake3(bytes) == manifest.contract_id` — a mismatch means the embedded
+   manifest does not match the compiled service definition and is a fatal
+   startup error.
+1. Builds the Iroh collection with the layout defined in §11.2:
+- index 0: `manifest.json` → `ContractManifest` JSON
+- index 1: `contract.xlang` → canonical `ServiceContract` bytes
+- index 2..N: `types/{type_hash}.xlang` → canonical `TypeDef` bytes
+- optional: `schema.fdl`, documentation bundle, compatibility reports
+1. Imports the collection into the local `iroh-blobs` store.
+1. Tags the collection for GC protection:
+   
    ```
-   tag name: aster/contract/{friendly_name}@{contract_id}
+   tag name:  aster/contract/{friendly_name}@{contract_id}
    tag value: HashAndFormat { hash: collection_root_hash, format: HashSeq }
    ```
-
-   `friendly_name` is a human-readable label (e.g. `AgentControl-v1`) chosen
-   by the publisher. It is decorative — the `contract_id` in the tag name is
-   the authoritative identity and is what tooling must use. Because HashSeq tags
-   protect all referenced child blobs, a single tag on the collection root is
-   sufficient to protect the manifest, `contract.xlang`, and all type blobs.
-   To unpublish, delete the tag; the blobs become GC-eligible on the next
-   collection cycle.
-6. Write an `ArtifactRef` to `contracts/{contract_id}` in the registry
-   namespace docs (see §11.2). If the key already exists with matching
-   `contract_id`, the write is idempotent.
-7. Write or confirm the version pointer at
-   `services/{name}/versions/v{version}` → `contract_id`.
-8. Optionally update channel aliases
+   
+   `friendly_name` is taken from the manifest (e.g. `manifest.semver` or
+   `manifest.service`). The `contract_id` in the tag name is authoritative;
+   `friendly_name` is decorative. A single HashSeq tag protects all child blobs.
+   To unpublish, delete the tag.
+1. Writes an `ArtifactRef` to `contracts/{contract_id}` in the registry docs.
+   Idempotent — re-publishing the same `contract_id` is a no-op.
+1. Writes the version pointer at `services/{name}/versions/v{version}` →
+   `contract_id`.
+1. Optionally writes human tags at `services/{name}/tags/{label}` →
+   `contract_id`, where `{label}` may be a semver string, git tag, or any
+   human label from the manifest.
+1. Optionally updates channel aliases
    (`services/{name}/channels/{channel}` → `contract_id`).
-9. Broadcast `CONTRACT_PUBLISHED` on gossip.
+1. Broadcasts `CONTRACT_PUBLISHED` on gossip.
+1. Begins advertising endpoint leases.
+
+Step 13 is last deliberately — a contract is always discoverable before any
+endpoint lease appears for it. Consumers will never observe an endpoint without
+a resolvable contract.
+
+### 11.4.4 `ContractManifest` Structure
 
 ```text
 ContractManifest {
+    // ── Contract identity ──────────────────────────────────
     service: string
     version: int32
     contract_id: string              // hex-encoded BLAKE3 of ServiceContract
     canonical_encoding: string       // "fory-xlang/0.15" (pinned Fory wire version)
-    type_count: int32                // number of distinct types in closure
+    type_count: int32
     type_hashes: list<string>        // all TypeDef hashes (transitive closure)
     method_count: int32
     serialization_modes: list<string>
     alpn: string
     deprecated: bool
-    published_by: AuthorId
-    published_at_epoch_ms: int64
+
+    // ── Git provenance (written by aster contract gen) ────
+    semver: string?                  // e.g. "2.1.0" — advisory, not enforced
+    git_commit: string?              // full SHA of the commit that produced this contract
+    git_tag: string?                 // e.g. "v2.1.0"
+    git_repo: string?                // repo URL for traceability
+    changelog: string?               // short human note about what changed
+
+    // ── Publication metadata (written at startup) ─────────
+    published_by: AuthorId           // set at publish time, not by aster contract gen
+    published_at_epoch_ms: int64     // set at publish time
 }
 ```
 
+`git_*` and `semver` fields are written by `aster contract gen` at commit time.
+`published_by` and `published_at_epoch_ms` are written by the node at startup.
+None of these fields are inputs to `contract_id` — they live in the manifest
+blob (collection index 0), which is separate from `contract.xlang` (index 1).
+
 The `type_hashes` field allows a consumer to verify the type closure without
-walking the Merkle DAG. The authoritative type graph is encoded in the
-`TypeDef` references themselves; `type_hashes` is an optimisation for
-prefetching and integrity checking.
+walking the Merkle DAG. The authoritative type graph is encoded in the `TypeDef`
+references themselves; `type_hashes` is an optimisation for prefetching and
+integrity checking.
 
 **Fetching a contract:** A consumer that knows a `contract_id` reads the
 `ArtifactRef` from `contracts/{contract_id}` in docs, fetches the Iroh
@@ -506,24 +635,24 @@ required before §11.4 can be fully implemented in any language other than Rust.
 
 **iroh-blobs extensions**
 
-| Capability | Why needed |
-|---|---|
-| `Tags` API (`set`, `get`, `delete`, `list`) | GC protection for published contract collections (step 5a) |
-| `FsStore` | Persistent blob storage across restarts; in-memory store loses all blobs on shutdown |
-| `Downloader` | Multi-provider parallel fetch of contract collections |
-| `Remote` API | Single-provider fetch with resume support |
-| `BlobTicket` serving | Accepting inbound connections from consumers holding an `ArtifactRef.ticket`; the ticket string itself is opaque and requires no parsing — only serving requires Rust-level integration |
-| `observe()` | Partial transfer detection and resumable download progress |
+|Capability                                 |Why needed                                                                                                                                                                             |
+|-------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|`Tags` API (`set`, `get`, `delete`, `list`)|GC protection for published contract collections (step 5a)                                                                                                                             |
+|`FsStore`                                  |Persistent blob storage across restarts; in-memory store loses all blobs on shutdown                                                                                                   |
+|`Downloader`                               |Multi-provider parallel fetch of contract collections                                                                                                                                  |
+|`Remote` API                               |Single-provider fetch with resume support                                                                                                                                              |
+|`BlobTicket` serving                       |Accepting inbound connections from consumers holding an `ArtifactRef.ticket`; the ticket string itself is opaque and requires no parsing — only serving requires Rust-level integration|
+|`observe()`                                |Partial transfer detection and resumable download progress                                                                                                                             |
 
 **iroh-docs extensions**
 
-| Capability | Why needed |
-|---|---|
-| `import_and_subscribe()` | Race-free join: subscribe before first sync to avoid missing initial `CONTRACT_PUBLISHED` events |
-| `Doc.subscribe()` (live events) | React to `InsertRemote` / `ContentReady` events for registry change notifications |
-| `start_sync()` / `leave()` | Explicit sync lifecycle control |
-| `DownloadPolicy` | `NothingExcept` policy to selectively sync `_aster/` prefix without pulling all service data |
-| `DocTicket` creation | Constructing share tickets for registry namespace bootstrapping |
+|Capability                     |Why needed                                                                                      |
+|-------------------------------|------------------------------------------------------------------------------------------------|
+|`import_and_subscribe()`       |Race-free join: subscribe before first sync to avoid missing initial `CONTRACT_PUBLISHED` events|
+|`Doc.subscribe()` (live events)|React to `InsertRemote` / `ContentReady` events for registry change notifications               |
+|`start_sync()` / `leave()`     |Explicit sync lifecycle control                                                                 |
+|`DownloadPolicy`               |`NothingExcept` policy to selectively sync `_aster/` prefix without pulling all service data    |
+|`DocTicket` creation           |Constructing share tickets for registry namespace bootstrapping                                 |
 
 **Priority order for implementation:** Tags + FsStore are P0 (without them,
 published contracts are lost on restart). `import_and_subscribe` and

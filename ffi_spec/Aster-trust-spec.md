@@ -7,7 +7,7 @@ the running system — it is generated once, stored securely, and only brought
 online to authorize new nodes or for catastrophic recovery.
 
 Each node in the mesh has a stable producer key, generated once and reused across
-restarts. This key is the node's Iroh secret key and determines its endpoint ID.
+restarts. This key is the node’s Iroh secret key and determines its endpoint ID.
 It is distinct from the offline root key.
 
 **Founding node (first node in the mesh)**
@@ -15,15 +15,16 @@ It is distinct from the offline root key.
 The founding node has no peers to find and no one to present credentials to. It:
 
 1. Generates its stable producer key if not already present.
-2. Loads its enrollment credential and verifies the root key's signature.
-3. Generates a random salt. This salt is secret — it is never encoded in the
+1. Loads its enrollment credential and verifies the root key’s signature.
+1. Generates a random salt. This salt is secret — it is never encoded in the
    enrollment credential and is only handed to new nodes after they pass all
    admission checks.
-4. Derives the gossip topic from the root public key and salt (§2.3).
-5. Starts listening. Prints its endpoint ticket on startup.
+1. Derives the gossip topic from the root public key and salt (§2.3).
+1. Persists the salt and its accepted producer set to local storage.
+1. Starts listening. Prints its endpoint ticket on startup.
 
 The endpoint ticket is an iroh `EndpointTicket` — a postcard-encoded, base32
-string containing the node's public key, relay URL, and direct addresses. The
+string containing the node’s public key, relay URL, and direct addresses. The
 operator passes this to subsequent nodes via `ASTER_BOOTSTRAP_TICKET`.
 
 **Subsequent nodes**
@@ -31,14 +32,29 @@ operator passes this to subsequent nodes via `ASTER_BOOTSTRAP_TICKET`.
 A node joining an existing mesh:
 
 1. Generates its stable producer key if not already present.
-2. Loads its enrollment credential and `ASTER_BOOTSTRAP_TICKET`.
-3. Dials the bootstrap peer. The QUIC handshake verifies both identities.
-4. Presents its enrollment credential and, if available, its IID token (§2.4).
-5. The bootstrap peer runs admission checks (§2.4). If all checks pass, the
+1. Loads its enrollment credential and `ASTER_BOOTSTRAP_TICKET`.
+1. Dials the bootstrap peer. The QUIC handshake verifies both identities.
+1. Presents its enrollment credential and, if available, its IID token (§2.4).
+1. The bootstrap peer runs admission checks (§2.4). If all checks pass, the
    bootstrap peer broadcasts an `Introduce` message on the gossip channel and
    returns the salt and current mesh membership to the new node.
-6. The new node derives the gossip topic, joins the channel, and connects to
-   other mesh members directly.
+1. The new node derives the gossip topic, joins the channel, connects to
+   other mesh members directly, and persists the salt and accepted producer
+   set to local storage.
+
+**Membership persistence and restart**
+
+Each node persists its accepted producer set and salt to local storage. On
+restart, the node loads this persisted state and rejoins the gossip topic
+without requiring re-admission. The persisted set is the authoritative
+membership record for that node — gossip is the live delta feed, not the
+source of truth.
+
+After a network partition or extended offline period, a rejoining node
+requests a full membership sync from any reachable peer rather than relying
+solely on the delta it missed. `Introduce` messages are idempotent: receiving
+an introduction for an already-admitted node updates that node’s entry but
+does not produce an error or duplicate entry.
 
 **CLI workflow**
 
@@ -88,15 +104,15 @@ unprefixed keys or their own namespace prefix.
 
 Reserved keys:
 
-| Key                  | Meaning                                                                 |
-|----------------------|-------------------------------------------------------------------------|
-| `aster.role`         | Node role: `producer`, `gateway`, `consumer`                            |
-| `aster.name`         | Human-readable node name, e.g. `"payments-node-eu-1"`                  |
-| `aster.allowed_cidrs` | Comma-separated CIDRs the source IP must match at least one of, e.g. `"10.0.4.0/24,192.168.1.0/24"` |
-| `aster.iid_provider` | Required IID provider: `aws`, `gcp`, `azure`                            |
-| `aster.iid_account`  | Expected cloud account or project ID                                    |
-| `aster.iid_region`   | Expected cloud region (optional tightening)                             |
-| `aster.iid_role_arn` | Expected IAM role ARN (AWS-specific, optional)                          |
+|Key                  |Meaning                                                                                            |
+|---------------------|---------------------------------------------------------------------------------------------------|
+|`aster.role`         |Node role: `producer`, `gateway`, `consumer`                                                       |
+|`aster.name`         |Human-readable node name, e.g. `"payments-node-eu-1"`                                              |
+|`aster.allowed_cidrs`|Comma-separated CIDRs the source IP must match at least one of, e.g. `"10.0.4.0/24,192.168.1.0/24"`|
+|`aster.iid_provider` |Required IID provider: `aws`, `gcp`, `azure`                                                       |
+|`aster.iid_account`  |Expected cloud account or project ID                                                               |
+|`aster.iid_region`   |Expected cloud region (optional tightening)                                                        |
+|`aster.iid_role_arn` |Expected IAM role ARN (AWS-specific, optional)                                                     |
 
 The `aster.role` attribute governs what the admitting node does after admission:
 
@@ -106,6 +122,16 @@ The `aster.role` attribute governs what the admitting node does after admission:
 - `consumer` — treated as an authorized consumer; does not join the mesh.
 
 If `aster.role` is absent, the node is treated as `producer`.
+
+For `gateway` and `consumer` roles, post-admission lifecycle is governed by
+§3 (Consumer Authorization). The enrollment credential is the pre-authorization
+— it establishes that this endpoint ID is already trusted by the operator. The
+service’s auth handler still runs and still mints an rcan; the enrollment
+credential substitutes for the one-time token that would otherwise be required
+at `Authorize` time. The handler reads the peer’s verified attributes from
+`CallContext` and uses them to decide what capabilities to grant. Nothing in the
+consumer authorization model changes — the enrollment credential is an
+alternative token source, not a bypass of the authorization layer.
 
 Verified attributes are available to service handlers via `CallContext` without
 re-checking the signature. The framework populates this from the admitted
@@ -147,8 +173,8 @@ runtime checks (against live data at connection time). Both must pass.
 
 1. The enrollment credential signature is valid against the root public key
    carried in the credential.
-2. The credential has not expired (`expires_at` is in the future).
-3. The credential's `endpoint_id` matches the QUIC peer identity established
+1. The credential has not expired (`expires_at` is in the future).
+1. The credential’s `endpoint_id` matches the QUIC peer identity established
    by the handshake.
 
 **Runtime checks (conditional on credential attributes)**
@@ -158,7 +184,7 @@ the credential. Absence of an attribute means no check is performed.
 
 *Source IP restriction (`aster.allowed_cidrs`):*
 
-The admitting node checks the peer's observed source IP against the comma-separated
+The admitting node checks the peer’s observed source IP against the comma-separated
 list of CIDRs in the credential. The source IP is the address from the QUIC
 connection — it cannot be spoofed by the connecting node. The IP must fall within
 at least one listed CIDR; if it matches none, admission is refused.
@@ -173,8 +199,8 @@ node attaches the IID to its introduction request.
 
 The admitting node:
 
-1. Verifies the IID signature against the cloud provider's published public key.
-2. Checks the IID claims against the `aster.iid_*` attributes in the credential.
+1. Verifies the IID signature against the cloud provider’s published public key.
+1. Checks the IID claims against the `aster.iid_*` attributes in the credential.
    All attributes present must match.
 
 IID verification and enrollment credential verification are independent and
@@ -199,8 +225,8 @@ introduced on the gossip channel.
 The admitting node:
 
 1. Adds the new endpoint ID to its accepted producer set.
-2. Broadcasts an `Introduce` message on the gossip channel (§2.5).
-3. Returns the salt and current mesh membership to the new node.
+1. Broadcasts an `Introduce` message on the gossip channel (§2.5).
+1. Returns the salt and current mesh membership to the new node.
 
 The new node derives the gossip topic, joins the channel, and connects to other
 mesh members directly using the returned membership list.
@@ -214,11 +240,11 @@ rest of the mesh via the gossip channel.
 
 1. The admitting node mints an rcan granting the `Producer` capability to the
    new endpoint ID, with an expiry.
-2. The admitting node broadcasts a signed `Introduce` message on the producer
+1. The admitting node broadcasts a signed `Introduce` message on the producer
    gossip channel. The payload carries the rcan.
-3. Other producers verify the signature (the introducer is in their accepted set)
+1. Other producers verify the signature (the introducer is in their accepted set)
    and add the new endpoint ID to their own accepted sets.
-4. The new producer receives the current mesh membership and connects to other
+1. The new producer receives the current mesh membership and connects to other
    producers directly.
 
 The rcan expiry defines the **admission window** — the time by which the new
@@ -238,28 +264,48 @@ ProducerMessage {
     type:      uint8
     payload:   binary
     sender:    EndpointId
+    epoch_ms:  int64
     signature: binary
 }
 ```
 
-The `signature` covers `type || payload` and is verified against `sender`.
+The `signature` covers `type || payload || sender || epoch_ms` and is verified
+against `sender`. `epoch_ms` is the sender’s wall-clock time in milliseconds
+at the time of broadcast.
+
+**Replay resistance**
+
+iroh-gossip provides no replay resistance. The `epoch_ms` field is the
+mechanism. Receivers reject any message whose `epoch_ms` falls outside a
+configurable acceptance window (default: ±30 seconds of local wall clock).
+Messages outside this window are dropped silently — they are treated as stale
+or clock-skewed, not as attacks.
+
+The replay threat is not uniform across message types. `Introduce` replays are
+benign: re-admitting an already-admitted node is idempotent (§2.5). `Depart`
+and `LeaseUpdate` replays are genuine problems — a replayed `Depart` can
+falsely evict an active producer from peers’ accepted sets, and a replayed
+`LeaseUpdate` can corrupt health and addressing state. The acceptance window
+is the primary defence. Implementations may additionally track recently seen
+`(sender, epoch_ms)` pairs to suppress exact duplicates within the window,
+but this is not a protocol requirement.
 
 iroh-gossip delivers raw bytes and the identity of the *forwarding neighbor* —
 not the original sender. Messages are relayed through intermediate nodes, so the
 peer that handed a message to you is not necessarily who sent it. `sender` and
-`signature` are therefore Aster's own application-layer origin authentication,
+`signature` are therefore Aster’s own application-layer origin authentication,
 not a duplication of anything iroh provides. `sender` is a lookup hint: without
 it, the receiver would have to trial-verify against every public key in the
 accepted set. With it, one key lookup and one signature check suffices.
 
 **Message handling rules**
 
-| Condition                                             | Action                  |
-|-------------------------------------------------------|-------------------------|
-| Malformed message (bad framing, unrecognised type)    | Drop silently           |
-| Valid message, sender not in accepted producer set    | Drop + security alert   |
-| Valid message, sender in accepted set, bad signature  | Drop + security alert   |
-| Valid message, sender in accepted set, good signature | Dispatch                |
+|Condition                                            |Action               |
+|-----------------------------------------------------|---------------------|
+|Malformed message (bad framing, unrecognised type)   |Drop silently        |
+|Valid message, sender not in accepted producer set   |Drop + security alert|
+|Valid message, sender in accepted set, bad signature |Drop + security alert|
+|Valid message, sender in accepted set, good signature|Dispatch             |
 
 Silent drop is appropriate for garbage. A security alert is appropriate when the
 authorization model itself appears to be violated. These are operationally
@@ -268,19 +314,44 @@ a deauthorized node is still subscribed. Operators must be notified.
 
 Message types:
 
-| Type | Name              | Payload                                          |
-|------|-------------------|--------------------------------------------------|
-| 1    | Introduce         | rcan granting `Producer` to a new endpoint ID    |
-| 2    | Depart            | Empty. Signals graceful departure from the mesh. |
-| 3    | ContractPublished | Service name, version, contract collection hash  |
-| 4    | LeaseUpdate       | Service name, health status, addressing info     |
+|Type|Name             |Payload                                         |
+|----|-----------------|------------------------------------------------|
+|1   |Introduce        |rcan granting `Producer` to a new endpoint ID   |
+|2   |Depart           |Empty. Signals graceful departure from the mesh.|
+|3   |ContractPublished|Service name, version, contract collection hash |
+|4   |LeaseUpdate      |Service name, health status, addressing info    |
 
 Implementations may define additional message types above 128. Types 0–127 are
 reserved for the spec.
 
 -----
 
-### 2.7 Compromise and Recovery
+### 2.7 Deauthorization
+
+Deauthorization in Aster is **intentionally epochal**, not incremental.
+
+There is no signed “remove this producer now” message that cryptographically
+forces other nodes to evict a peer. A `Depart` message (§2.6) signals graceful
+departure and peers will honor it, but it is voluntary — a misbehaving or
+compromised node will not send one, and a replayed `Depart` cannot be
+distinguished from a genuine one by signature alone.
+
+The only hard deauthorization guarantee is salt rotation: moving the mesh to a
+new gossip topic that the removed node cannot derive. This is coarse-grained by
+design. It forces the entire mesh to rotate rather than surgically removing one
+node, which is an acceptable trade-off for the simplicity it buys. There is no
+persistent revocation list, no epoch counter, and no incremental signed-revoke
+path.
+
+A future `Revoke` message type (reserved in the type space above 128) could
+serve as a soft deauthorization hint — nodes that receive and trust it would
+voluntarily drop the target from their accepted sets. This would accelerate
+eviction in cooperative deployments but would not be cryptographically enforced.
+Salt rotation would remain the hard guarantee.
+
+-----
+
+### 2.8 Compromise and Recovery
 
 Compromise response is an operational concern, not a protocol concern. The spec
 provides the mechanism; operators provide the procedure.
@@ -288,13 +359,67 @@ provides the mechanism; operators provide the procedure.
 The general shape of recovery is:
 
 1. An operator retrieves the offline root key.
-2. The operator generates a new random salt and a new producer set excluding
+1. The operator generates a new random salt and a new producer set excluding
    compromised nodes.
-3. Trusted producers receive the new salt and set out of band.
-4. Trusted producers derive the new gossip topic and re-bootstrap on it.
-5. Compromised producers are left on the old topic, unable to discover the new
+1. Trusted producers receive the new salt and set out of band.
+1. Trusted producers derive the new gossip topic and re-bootstrap on it.
+1. Compromised producers are left on the old topic, unable to discover the new
    one.
 
 Producers should also regenerate any namespace keys, blob store secrets, or
 other material that the compromised node had access to. The specifics depend on
 the deployment.
+
+-----
+
+### 2.9 Authorization Layer Composition
+
+Three independent authorization gates operate in sequence for every call. They
+are evaluated at different times and by different parts of the framework. Each
+must pass; none substitutes for another.
+
+**Gate 1 — Enrollment (mesh join time, once per node)**
+
+The enrollment credential is checked when a node first connects to the mesh.
+It is the operator’s pre-authorization: the root key asserts that this endpoint
+ID is permitted to exist in this mesh with these attributes. This gate runs
+once. Its output is the node’s verified `attributes` map, persisted for the
+lifetime of the connection.
+
+**Gate 2 — Service authorization (session open time, once per service session)**
+
+The service’s `Authorize` method is called when a consumer opens a session with
+a service. The auth handler inspects the caller’s `peer_id`, `attributes`, and
+any presented token, then decides whether to mint an rcan and what capabilities
+to grant. For `gateway` and `consumer` role nodes with an enrollment credential,
+the handler may read `ctx.attributes` to make this decision — for example,
+granting elevated capabilities to a node whose IID confirms it is running in a
+trusted cloud account. The enrollment credential does not bypass this gate; it
+is an input to it.
+
+**Gate 3 — Method dispatch (call time, every call)**
+
+The `AuthInterceptor` evaluates the method’s `requires` expression against the
+rcan’s `capability` list before the handler runs. This is a pure set-membership
+check — the framework does not call back into the service. If the capability
+requirement is not satisfied, the call is rejected with `PERMISSION_DENIED`
+before the handler sees it.
+
+**Composition rules**
+
+The gates are independent. Enrollment attributes do not automatically synthesize
+rcan capabilities — the service author decides whether and how to translate
+attributes into capabilities inside the `Authorize` handler. A service may
+require both an rcan capability (enforced by Gate 3) and an attribute-backed
+condition (enforced by Gate 2 at `Authorize` time or by the handler at call
+time). These combine by conjunction: all conditions must hold.
+
+The service is the intentional bridge between Gate 1 (operator trust) and
+Gate 3 (method-level enforcement). This keeps the framework generic and the
+policy in the service where the domain logic lives.
+
+```
+Enrollment credential   →  Gate 1 (mesh join)    →  attributes on CallContext
+Token / attributes      →  Gate 2 (Authorize)    →  rcan with capability list
+rcan capability list    →  Gate 3 (dispatch)     →  handler runs or PERMISSION_DENIED
+```
