@@ -183,8 +183,10 @@ The framework-internal types defined in this section are serialized using a
 constrained subset of Fory XLANG called the **canonical XLANG profile**. This
 profile ensures byte-identical output from any conforming implementation:
 
-1. **Fields emitted in ascending field ID order.** Fory XLANG normally leaves
-   field order implementation-defined; this profile makes it mandatory.
+1. **Fields emitted in ascending field ID order.** This is an Aster-specific
+   canonicalization rule for hashing. It intentionally overrides Fory’s normal
+   struct field ordering algorithm so that identity depends on a smaller,
+   simpler, explicitly specified rule.
 1. **Schema-consistent mode.** No per-object TypeDef metadata headers in the
    payload. Types are known statically.
 1. **No reference tracking.** Type descriptors are acyclic trees (self-
@@ -197,6 +199,51 @@ profile ensures byte-identical output from any conforming implementation:
 
 With these constraints, the same `TypeDef` value produces identical bytes from
 any conforming Fory XLANG implementation.
+
+#### 11.3.2.1 Canonical byte layout
+
+For Aster contract hashing, `canonical_xlang_bytes(T)` means the XLANG encoding
+of a **non-null root value of statically known type `T`**, with all optional
+and implementation-dependent framing removed or pinned as follows:
+
+- **No outer Fory header.** The 1-byte top-level Fory bitmap header is not part
+  of canonical bytes.
+- **No outer reference/null meta for the root value.** The root `TypeDef` /
+  `ServiceContract` being hashed is always present and statically known.
+- **No root type meta.** The canonical bytes do not include a top-level type ID,
+  user type ID, named-type metadata, or shared TypeDef marker.
+- **No schema hash prefix.** The optional 4-byte schema hash used by some Fory
+  schema-consistent encodings is not part of canonical bytes.
+- **Nested field values use the ordinary XLANG field-value encodings for their
+  statically known field types**, subject to the constraints in this section.
+
+Operationally, implementations should behave as if they are serializing the
+field values of a known message directly, in ascending field-ID order, using
+Fory’s primitive/container encodings with all optional metadata features turned
+off unless this profile explicitly requires them.
+
+#### 11.3.2.2 Primitive, string, bytes, and collection pinning
+
+To avoid implementation drift, the following details are normative:
+
+- **Primitive mapping follows Fory IDL exactly.** In particular, in stock Fory
+  IDL `int32` maps to `VARINT32` and `int64` maps to `VARINT64`. Aster adopts
+  that mapping for its framework-internal schema. If fixed-width encoding is
+  desired in a future revision, the schema must use `fixed_int32` /
+  `fixed_int64` explicitly.
+- **Strings must be encoded as UTF-8** in canonical bytes, even though general
+  Fory XLANG may choose LATIN1 or UTF16 opportunistically.
+- **Hash-bearing `bytes` fields use standard XLANG bytes encoding** and must
+  contain exactly 32 payload bytes when carrying a BLAKE3 digest.
+- **Lists in the framework-internal schema are homogeneous, declared-type,
+  non-null, non-ref-tracked lists.** Their canonical elements header is
+  therefore the XLANG optimal header for that case (`0x0C`).
+- **Maps, if introduced into future framework-internal descriptor types, must
+  likewise use statically known key/value types with nullability and ref
+  tracking pinned by schema, not by runtime heuristics.**
+
+These rules mean canonical hashing is coupled not just to “Fory XLANG in
+general” but to a precisely pinned subset of it.
 
 ### 11.3.3 Framework-Internal Type Definitions
 
@@ -266,7 +313,7 @@ message MethodDef {
     bytes response_type = 4;       // BLAKE3 hash of response TypeDef (stream item type for streaming)
     bool idempotent = 5;
     float64 default_timeout = 6;   // Seconds, 0 = none
-    CapabilityRequirement requires = 7;  // Optional. Absent = no rcan check required.
+    CapabilityRequirement requires = 7;  // Optional. Absent = no capability check required.
 }
 
 message ServiceContract {
@@ -318,7 +365,6 @@ carrying `["Admin", "TaskManager"]` passes. An rcan carrying only `["Admin"]`
 fails the method check. An rcan carrying only `["TaskManager"]` fails the
 service check.
 
-```
 ### 11.3.4 Hashing Procedure
 
 Given a source contract (FDL file, code-first decorators, or any other input):
@@ -412,7 +458,20 @@ Interpretation note:
 - `option timeout_ms = 30000;` is interpreted by Aster tooling as
   `default_timeout = 30.0` seconds in `MethodDef`.
 - `option requires = "any_of:TaskManager,Admin";` is an Aster-defined string
-  DSL carried in a standard Fory option field.
+  DSL carried in a standard Fory option field. This authoring DSL is not itself
+  part of contract identity; it must be lowered to a concrete
+  `CapabilityRequirement { kind, roles }` value before canonical hashing.
+
+For interoperability, the current DSL grammar is:
+
+```text
+requires-dsl := role:<name>
+              | any_of:<name>(,<name>)*
+              | all_of:<name>(,<name>)*
+```
+
+Whitespace is not significant around commas after parsing, but canonical
+hashing never consumes the raw DSL string directly.
 
 Resolution:
 
