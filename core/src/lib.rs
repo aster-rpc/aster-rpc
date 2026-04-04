@@ -4,11 +4,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Result};
+use url::Url;
 use bytes::Bytes;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{
     presets, AfterHandshakeOutcome, BeforeConnectOutcome, Connection, ConnectionError,
-    ConnectionInfo, Endpoint, EndpointHooks, PathInfo, RelayMode, VarInt,
+    ConnectionInfo, Endpoint, EndpointHooks, PathInfo, RelayMode, VarInt, PortmapperConfig,
 };
 use iroh::protocol::Router;
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher};
@@ -59,6 +60,18 @@ pub struct CoreEndpointConfig {
     pub enable_hooks: bool,
     /// Timeout in ms for hook replies (default 5000)
     pub hook_timeout_ms: u64,
+    /// Bind address string e.g. "0.0.0.0:9000", "127.0.0.1:0", "[::]:0"
+    pub bind_addr: Option<String>,
+    /// Remove all direct IP (UDP/QUIC) transports; relay-only mode
+    pub clear_ip_transports: bool,
+    /// Remove all relay transports; direct IP-only mode
+    pub clear_relay_transports: bool,
+    /// Portmapper: "enabled" (default) or "disabled"
+    pub portmapper_config: Option<String>,
+    /// HTTP/SOCKS proxy URL for relay/HTTPS traffic e.g. "http://proxy:8080"
+    pub proxy_url: Option<String>,
+    /// Read proxy URL from HTTP_PROXY / HTTPS_PROXY environment variables
+    pub proxy_from_env: bool,
 }
 
 impl Default for CoreEndpointConfig {
@@ -72,6 +85,12 @@ impl Default for CoreEndpointConfig {
             enable_monitoring: false,
             enable_hooks: false,
             hook_timeout_ms: 5000,
+            bind_addr: None,
+            clear_ip_transports: false,
+            clear_relay_transports: false,
+            portmapper_config: None,
+            proxy_url: None,
+            proxy_from_env: false,
         }
     }
 }
@@ -679,6 +698,37 @@ fn build_endpoint_config(config: &CoreEndpointConfig) -> Result<iroh::endpoint::
             .try_into()
             .map_err(|_| anyhow!("secret_key must be exactly 32 bytes"))?;
         builder = builder.secret_key(SecretKey::from_bytes(&bytes));
+    }
+
+    if config.clear_ip_transports {
+        builder = builder.clear_ip_transports();
+    }
+
+    if config.clear_relay_transports {
+        builder = builder.clear_relay_transports();
+    }
+
+    if let Some(ref addr) = config.bind_addr {
+        builder = builder
+            .bind_addr(addr.as_str())
+            .map_err(|e| anyhow!("invalid bind_addr '{}': {}", addr, e))?;
+    }
+
+    match config.portmapper_config.as_deref() {
+        None | Some("enabled") => {}
+        Some("disabled") => {
+            builder = builder.portmapper_config(PortmapperConfig::Disabled);
+        }
+        Some(other) => return Err(anyhow!("unsupported portmapper_config value: {other}")),
+    }
+
+    if let Some(ref url_str) = config.proxy_url {
+        let url: Url = url_str
+            .parse()
+            .map_err(|e| anyhow!("invalid proxy_url '{}': {}", url_str, e))?;
+        builder = builder.proxy_url(url);
+    } else if config.proxy_from_env {
+        builder = builder.proxy_from_env();
     }
 
     Ok(builder)

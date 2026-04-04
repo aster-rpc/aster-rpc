@@ -135,12 +135,43 @@ pub struct EndpointConfig {
     /// Timeout in ms for hook replies (default 5000)
     #[pyo3(get, set)]
     pub hook_timeout_ms: u64,
+    /// Bind address e.g. "0.0.0.0:9000", "127.0.0.1:0", "[::]:0"
+    #[pyo3(get, set)]
+    pub bind_addr: Option<String>,
+    /// Relay-only mode: disable all direct IP (UDP/QUIC) transports
+    #[pyo3(get, set)]
+    pub clear_ip_transports: bool,
+    /// Direct IP-only mode: disable all relay transports
+    #[pyo3(get, set)]
+    pub clear_relay_transports: bool,
+    /// Portmapper (UPnP/NAT-PMP): "enabled" (default) or "disabled"
+    #[pyo3(get, set)]
+    pub portmapper_config: Option<String>,
+    /// HTTP/SOCKS proxy URL for relay/HTTPS traffic e.g. "http://proxy:8080"
+    #[pyo3(get, set)]
+    pub proxy_url: Option<String>,
+    /// Read proxy from HTTP_PROXY / HTTPS_PROXY environment variables
+    #[pyo3(get, set)]
+    pub proxy_from_env: bool,
 }
 
 #[pymethods]
 impl EndpointConfig {
     #[new]
-    #[pyo3(signature = (alpns, relay_mode=None, secret_key=None, enable_monitoring=false, enable_hooks=false, hook_timeout_ms=5000))]
+    #[pyo3(signature = (
+        alpns,
+        relay_mode=None,
+        secret_key=None,
+        enable_monitoring=false,
+        enable_hooks=false,
+        hook_timeout_ms=5000,
+        bind_addr=None,
+        clear_ip_transports=false,
+        clear_relay_transports=false,
+        portmapper_config=None,
+        proxy_url=None,
+        proxy_from_env=false,
+    ))]
     fn new(
         alpns: Vec<Vec<u8>>,
         relay_mode: Option<String>,
@@ -148,6 +179,12 @@ impl EndpointConfig {
         enable_monitoring: bool,
         enable_hooks: bool,
         hook_timeout_ms: u64,
+        bind_addr: Option<String>,
+        clear_ip_transports: bool,
+        clear_relay_transports: bool,
+        portmapper_config: Option<String>,
+        proxy_url: Option<String>,
+        proxy_from_env: bool,
     ) -> Self {
         Self {
             relay_mode,
@@ -156,6 +193,12 @@ impl EndpointConfig {
             enable_monitoring,
             enable_hooks,
             hook_timeout_ms,
+            bind_addr,
+            clear_ip_transports,
+            clear_relay_transports,
+            portmapper_config,
+            proxy_url,
+            proxy_from_env,
         }
     }
 }
@@ -171,6 +214,12 @@ impl From<&EndpointConfig> for CoreEndpointConfig {
             enable_monitoring: config.enable_monitoring,
             enable_hooks: config.enable_hooks,
             hook_timeout_ms: config.hook_timeout_ms,
+            bind_addr: config.bind_addr.clone(),
+            clear_ip_transports: config.clear_ip_transports,
+            clear_relay_transports: config.clear_relay_transports,
+            portmapper_config: config.portmapper_config.clone(),
+            proxy_url: config.proxy_url.clone(),
+            proxy_from_env: config.proxy_from_env,
         }
     }
 }

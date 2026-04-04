@@ -250,6 +250,7 @@ async def test_tcp_forwarding():
         writer.write(b"echo:" + data)
         await writer.drain()
         writer.close()
+        await writer.wait_closed()
 
     echo_server = await asyncio.start_server(echo_handler, "127.0.0.1", 0)
     echo_port = echo_server.sockets[0].getsockname()[1]
@@ -258,8 +259,12 @@ async def test_tcp_forwarding():
     ep_listen = await create_endpoint(ALPN)
     listen_addr = ep_listen.endpoint_addr_info()
 
+    # Signal readiness rather than sleeping an arbitrary duration.
+    listener_ready = asyncio.Event()
+
     async def dumbpipe_listener():
         """Accept one QUIC connection, one bi-stream, forward to TCP echo."""
+        listener_ready.set()
         conn = await ep_listen.accept()
         send, recv = await conn.accept_bi()
         await recv_handshake(recv)
@@ -282,12 +287,13 @@ async def test_tcp_forwarding():
         return result
 
     listener_task = asyncio.create_task(dumbpipe_listener())
-    await asyncio.sleep(1.0)
+    await asyncio.wait_for(listener_ready.wait(), timeout=5)
     result = await asyncio.wait_for(dumbpipe_connector(), timeout=30)
     await listener_task
 
     assert result == b"echo:forwarded data"
     echo_server.close()
+    await echo_server.wait_closed()
     await ep_listen.close()
 
 
@@ -308,6 +314,7 @@ async def test_unix_socket_forwarding():
             writer.write(b"unix-echo:" + data)
             await writer.drain()
             writer.close()
+            await writer.wait_closed()
 
         echo_server = await asyncio.start_unix_server(echo_handler, path=echo_sock)
 
@@ -315,7 +322,10 @@ async def test_unix_socket_forwarding():
         ep_listen = await create_endpoint(ALPN)
         listen_addr = ep_listen.endpoint_addr_info()
 
+        listener_ready = asyncio.Event()
+
         async def dumbpipe_listener():
+            listener_ready.set()
             conn = await ep_listen.accept()
             send, recv = await conn.accept_bi()
             await recv_handshake(recv)
@@ -334,12 +344,13 @@ async def test_unix_socket_forwarding():
             return result
 
         listener_task = asyncio.create_task(dumbpipe_listener())
-        await asyncio.sleep(1.0)
+        await asyncio.wait_for(listener_ready.wait(), timeout=5)
         result = await asyncio.wait_for(dumbpipe_connector(), timeout=30)
         await listener_task
 
         assert result == b"unix-echo:unix forwarded"
         echo_server.close()
+        await echo_server.wait_closed()
         await ep_listen.close()
 
 

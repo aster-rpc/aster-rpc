@@ -84,7 +84,7 @@ jobs:
         run: |
           uv venv .venv
           source .venv/bin/activate
-          uv pip install pytest pytest-asyncio pytest-timeout maturin
+          uv pip install pytest pytest-asyncio pytest-timeout pytest-rerunfailures maturin
           uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
 
           echo "=== Environment parity diagnostics ==="
@@ -123,7 +123,7 @@ jobs:
         run: |
           uv venv .venv
           .venv\Scripts\activate
-          uv pip install pytest pytest-asyncio pytest-timeout maturin
+          uv pip install pytest pytest-asyncio pytest-timeout pytest-rerunfailures maturin
           uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
 
           Write-Host "=== Environment parity diagnostics ==="

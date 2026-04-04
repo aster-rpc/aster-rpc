@@ -13,6 +13,7 @@
 3. [Phase 1: Core + FFI Refactoring](#3-phase-1-core--ffi-refactoring)
 4. [Phase 1b: Datagram Completion & Hooks & Monitoring](#3b-phase-1b-datagram-completion--hooks--monitoring)
 5. [Phase 1c: Registry & Publication Support](#3c-phase-1c-registry--publication-support)
+5d. [Phase 1d: Endpoint Builder Gaps](#3d-phase-1d-endpoint-builder-gaps)
 6. [Phase 2: Python Bindings Update](#4-phase-2-python-bindings-update)
 7. [Phase 3: Java FFM Bindings](#5-phase-3-java-ffm-bindings)
 8. [C ABI Reference](#6-c-abi-reference)
@@ -116,14 +117,24 @@ Currently `CoreSendStream` wraps `Arc<Mutex<iroh::endpoint::SendStream>>`. Since
 ```rust
 pub struct CoreEndpointConfig {
     pub relay_mode: Option<String>,
-    pub relay_urls: Vec<String>,        // NEW: custom relay URLs
+    pub relay_urls: Vec<String>,           // custom relay URLs
     pub alpns: Vec<Vec<u8>>,
     pub secret_key: Option<Vec<u8>>,
-    pub enable_discovery: bool,          // NEW: default true
+    pub enable_discovery: bool,            // default true
+    pub enable_monitoring: bool,           // Phase 1b
+    pub enable_hooks: bool,                // Phase 1b
+    pub hook_timeout_ms: u64,              // Phase 1b; default 5000
+    // Phase 1d: endpoint builder gaps
+    pub bind_addr: Option<String>,         // e.g. "0.0.0.0:9000", "127.0.0.1:0"
+    pub clear_ip_transports: bool,         // relay-only mode
+    pub clear_relay_transports: bool,      // direct-IP-only mode
+    pub portmapper_config: Option<String>, // "enabled" (default) | "disabled"
+    pub proxy_url: Option<String>,         // HTTP/SOCKS proxy e.g. "http://proxy:8080"
+    pub proxy_from_env: bool,              // read from HTTP_PROXY / HTTPS_PROXY
 }
 ```
 
-Update `build_endpoint_config()` to handle `relay_mode == "custom"` with the provided URLs.
+Update `build_endpoint_config()` to handle `relay_mode == "custom"` with the provided URLs and the new Phase 1d fields (see Phase 1d below).
 
 #### 3.1.4 Add Collection/sendme-compatible blob API
 
@@ -701,13 +712,23 @@ typedef struct iroh_runtime_config_s {
 
 typedef struct iroh_endpoint_config_s {
     uint32_t struct_size;
-    uint32_t relay_mode;         // 0=default, 1=custom, 2=disabled
-    iroh_bytes_t secret_key;     // 32 bytes or empty
+    uint32_t relay_mode;              // 0=default, 1=custom, 2=disabled, 3=staging
+    iroh_bytes_t secret_key;          // 32 bytes or empty
     const iroh_bytes_t* alpns;
     size_t alpns_len;
-    const iroh_bytes_t* relay_urls; // UTF-8 URLs
+    const iroh_bytes_t* relay_urls;   // UTF-8 URLs (used when relay_mode==1)
     size_t relay_urls_len;
-    uint32_t enable_discovery;   // 1=yes, 0=no
+    uint32_t enable_discovery;        // 1=yes (default), 0=no
+    uint32_t enable_monitoring;       // Phase 1b; 0=no (default)
+    uint32_t enable_hooks;            // Phase 1b; 0=no (default)
+    uint64_t hook_timeout_ms;         // Phase 1b; 0 = use default (5000)
+    // Phase 1d: endpoint builder gaps
+    iroh_bytes_t bind_addr;           // socket addr string e.g. "0.0.0.0:9000"; empty=default
+    uint32_t clear_ip_transports;     // 1=relay-only mode
+    uint32_t clear_relay_transports;  // 1=direct-IP-only mode
+    uint32_t portmapper_config;       // 0=enabled (default), 1=disabled
+    iroh_bytes_t proxy_url;           // HTTP/SOCKS proxy URL string; empty=none
+    uint32_t proxy_from_env;          // 1=read HTTP_PROXY/HTTPS_PROXY from env
     uint32_t reserved;
 } iroh_endpoint_config_t;
 
@@ -815,6 +836,107 @@ pub extern "C" fn iroh_connect(
   - Input pointers (`config`) are only read during the synchronous part
   - Data is copied into owned types before the async boundary
   - Freeing the handle from the caller's side only drops one `Arc` reference
+
+---
+
+## 3d. Phase 1d: Endpoint Builder Gaps
+
+> **Added:** 2026-04-05. Addresses options present in the iroh `Endpoint::builder` API that were not previously exposed via any FFI layer.
+
+### Overview
+
+The following builder options are now exposed through `CoreEndpointConfig`, the Python `EndpointConfig` class, and the C `iroh_endpoint_config_t` struct. All are **opt-in** — existing callers that don't set these fields get identical behaviour to before.
+
+### 3d.1 `bind_addr` — Socket Binding Control
+
+**Field:** `bind_addr: Option<String>` / `iroh_bytes_t bind_addr`
+
+Sets the UDP/QUIC socket bind address. By default iroh binds to `0.0.0.0:0` (random port, all IPv4 interfaces) and `[::]:0` (all IPv6 interfaces).
+
+- `"0.0.0.0:9000"` — fixed port, all IPv4 interfaces
+- `"127.0.0.1:0"` — loopback only, random port
+- `"[::]:9000"` — fixed port, all IPv6 interfaces
+- `":9000"` — all interfaces, fixed port
+
+Calling this once **replaces** the default socket for the matching address family. Calling it twice (once IPv4, once IPv6) replaces both. Leave empty/`None` to use the iroh defaults.
+
+**Wire-through:** `build_endpoint_config()` calls `builder.bind_addr(addr_str)?` when non-empty. Returns a descriptive error if the address string is invalid or the port is already in use.
+
+### 3d.2 `clear_ip_transports` — Relay-only Mode
+
+**Field:** `clear_ip_transports: bool` / `uint32_t clear_ip_transports`
+
+When `true`, removes all direct IP (UDP/QUIC) transports. The endpoint communicates via relay only. Useful for firewall-restricted environments where UDP is blocked.
+
+**Wire-through:** `build_endpoint_config()` calls `builder.clear_ip_transports()` when `true`.
+
+> ⚠️ Do not set both `clear_ip_transports` and `clear_relay_transports` — the endpoint will be unable to connect to any peer.
+
+### 3d.3 `clear_relay_transports` — Direct-IP-only Mode
+
+**Field:** `clear_relay_transports: bool` / `uint32_t clear_relay_transports`
+
+When `true`, removes all relay transports. The endpoint communicates via direct IP connections only. Suitable for LAN/VPN environments where relay infrastructure is unavailable or untrusted.
+
+**Wire-through:** `build_endpoint_config()` calls `builder.clear_relay_transports()` when `true`.
+
+### 3d.4 `portmapper_config` — NAT Port Mapping
+
+**Field:** `portmapper_config: Option<String>` / `uint32_t portmapper_config`
+
+Controls the UPnP/NAT-PMP port mapper. Accepted string values (Python/core): `"enabled"` (default) or `"disabled"`. C ABI: `0` = enabled (default), `1` = disabled.
+
+Set to `"disabled"` in corporate or CI environments where UPnP probes fail or are unwanted.
+
+**Wire-through:** `build_endpoint_config()` calls `builder.portmapper_config(PortmapperConfig::Disabled)` when set to `"disabled"`.
+
+### 3d.5 `proxy_url` / `proxy_from_env` — HTTP/SOCKS Proxy
+
+**Fields:** `proxy_url: Option<String>`, `proxy_from_env: bool`
+
+Routes all HTTP/HTTPS traffic (relay connections, pkarr lookups) through a proxy.
+
+- `proxy_url` — explicit URL e.g. `"http://proxy.corp:8080"`, `"socks5://localhost:1080"`
+- `proxy_from_env` — reads `HTTP_PROXY` / `HTTPS_PROXY` / `http_proxy` / `https_proxy` from the environment
+
+`proxy_url` takes precedence over `proxy_from_env`. Setting both is allowed but `proxy_url` wins.
+
+**Wire-through:** `build_endpoint_config()` calls `builder.proxy_url(url)` when `proxy_url` is set, or `builder.proxy_from_env()` when `proxy_from_env` is `true`.
+
+### 3d.6 Python API
+
+```python
+# Server with a fixed port
+EndpointConfig(alpns=[b"myproto/1"], bind_addr="0.0.0.0:9000")
+
+# Relay-only node behind strict firewall
+EndpointConfig(alpns=[b"myproto/1"], clear_ip_transports=True)
+
+# Direct IP-only for LAN cluster
+EndpointConfig(alpns=[b"myproto/1"], clear_relay_transports=True)
+
+# Corporate network — disable UPnP probes and use proxy
+EndpointConfig(alpns=[b"myproto/1"], portmapper_config="disabled", proxy_url="http://proxy:8080")
+
+# Read proxy from environment
+EndpointConfig(alpns=[b"myproto/1"], proxy_from_env=True)
+```
+
+### 3d.7 What is NOT yet exposed
+
+The following iroh builder options were evaluated but deferred (see `docs/endpointbuildergaps.md`):
+
+| Option | Reason deferred |
+|---|---|
+| `bind_addr_with_opts` (BindOpts) | Niche multi-NIC routing; simple `bind_addr` covers 99% of use cases |
+| `transport_config` (QUIC tuning) | Deep QUIC knobs; not needed for any current Python application |
+| `dns_resolver` | Custom DNS is niche; system DNS is correct for almost all deployments |
+| `ca_roots_config` | Enterprise PKI only; not needed with public iroh relay infrastructure |
+| `address_lookup` | Custom discovery; relay-based discovery covers standard use cases |
+| `addr_filter` | Advanced privacy control; not needed currently |
+| `user_data_for_address_lookup` | Useful metadata feature; can be added on demand |
+| `keylog` | Debugging tool; security risk in production — add only if explicitly requested |
+| `max_tls_tickets` | Memory tuning; defaults are correct for Python use cases |
 
 ---
 
