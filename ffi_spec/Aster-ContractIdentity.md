@@ -817,28 +817,36 @@ required before §11.4 can be fully implemented in any language other than Rust.
 
 **iroh-blobs extensions**
 
-|Capability                                 |Why needed                                                                                                                                                                             |
-|-------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|`Tags` API (`set`, `get`, `delete`, `list`)|GC protection for published contract collections (step 5a)                                                                                                                             |
-|`FsStore`                                  |Persistent blob storage across restarts; in-memory store loses all blobs on shutdown                                                                                                   |
-|`Downloader`                               |Multi-provider parallel fetch of contract collections                                                                                                                                  |
-|`Remote` API                               |Single-provider fetch with resume support                                                                                                                                              |
-|`BlobTicket` serving                       |Accepting inbound connections from consumers holding an `ArtifactRef.ticket`; the ticket string itself is opaque and requires no parsing — only serving requires Rust-level integration|
-|`observe()`                                |Partial transfer detection and resumable download progress                                                                                                                             |
+|Capability                                 |Status     |Why needed                                                                                                                                                                             |
+|-------------------------------------------|-----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|`Tags` API (`set`, `get`, `delete`, `list`)|✅ Done (Phase 1c.1)|GC protection for published contract collections (step 5a)                                                                                                              |
+|`FsStore`                                  |✅ Done    |`CoreNode::persistent(path)` uses `FsStore::load()`; exposed as `IrohNode.persistent()` in Python — implemented before Phase 1c                                                       |
+|`Downloader`                               |✅ Done    |`CoreBlobsClient::download_blob/download_collection` use `Downloader::new(&store, &endpoint).download(hash, providers)` — single-provider today, multi-provider ready                 |
+|`BlobTicket` serving                       |✅ Done    |`create_ticket`/`create_collection_ticket` mint tickets; `BlobsProtocol` in the router handles inbound connections automatically — implemented before Phase 1c                         |
+|`Remote` API (`iroh_blobs::api::Remote`)   |✅ Done (Phase 1d.2)|`blob_local_info(hash_hex)` via `store.remote().local(HashAndFormat::raw(hash))` — returns `is_complete` + `local_bytes`; exposed in Python and FFI            |
+|`observe()`                                |✅ Done (Phase 1d.1)|`blob_observe_snapshot(hash_hex)` (bitfield snapshot) and `blob_observe_complete(hash_hex)` (wait until complete) via `store.blobs().observe(hash)`; exposed in Python and FFI|
 
 **iroh-docs extensions**
 
-|Capability                     |Why needed                                                                                      |
-|-------------------------------|------------------------------------------------------------------------------------------------|
-|`import_and_subscribe()`       |Race-free join: subscribe before first sync to avoid missing initial `CONTRACT_PUBLISHED` events|
-|`Doc.subscribe()` (live events)|React to `InsertRemote` / `ContentReady` events for registry change notifications               |
-|`start_sync()` / `leave()`     |Explicit sync lifecycle control                                                                 |
-|`DownloadPolicy`               |`NothingExcept` policy to selectively sync `_aster/` prefix without pulling all service data    |
-|`DocTicket` creation           |Constructing share tickets for registry namespace bootstrapping                                 |
+|Capability                     |Status     |Why needed                                                                                      |
+|-------------------------------|-----------|------------------------------------------------------------------------------------------------|
+|`import_and_subscribe()`       |✅ Done (Phase 1c.8)|Race-free join: subscribe before first sync to avoid missing initial `CONTRACT_PUBLISHED` events|
+|`Doc.subscribe()` (live events)|✅ Done (Phase 1c.4)|React to `InsertRemote` / `ContentReady` events for registry change notifications         |
+|`start_sync()` / `leave()`     |✅ Done (Phase 1c.5)|Explicit sync lifecycle control                                                           |
+|`DownloadPolicy`               |✅ Done (Phase 1c.6)|`NothingExcept` policy to selectively sync `_aster/` prefix without pulling all service data|
+|`DocTicket` creation           |✅ Done (Phase 1c.7)|Constructing share tickets with full relay+address info for registry namespace bootstrapping|
 
 **Priority order for implementation:** Tags + FsStore are P0 (without them,
 published contracts are lost on restart). `import_and_subscribe` and
 `Doc.subscribe` are P1 (needed for live registry sync). Everything else is P2.
+
+**Phase 1c completion (2026-04-04):** All iroh-docs extensions and the Tags API
+are now implemented across Core, Python bindings, and the FFI layer.
+
+**Phase 1d completion (2026-04-04):** All remaining iroh-blobs capabilities
+(Remote API `blob_local_info`, `observe()` via `blob_observe_snapshot` /
+`blob_observe_complete`) are now implemented across Core, Python bindings, and
+the FFI layer. All §11.5 capabilities are complete.
 
 -----
 
