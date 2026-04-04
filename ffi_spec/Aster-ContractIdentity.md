@@ -14,11 +14,13 @@ content address (BLAKE3 hash). The content address *is* the identity — no
 external ID assignment, no collision risk, no coordination required.
 
 **Storage model:** Immutable contract bundles are published as **Iroh
-collections** (HashSeq format with built-in `CollectionMeta` naming).
-iroh-docs stores lightweight `ArtifactRef` pointers that resolve to collection
-root hashes. This avoids simulating a filesystem hierarchy in docs keys for
-artifact storage and aligns with Iroh's native content-addressed transfer
-primitives.
+collections** (HashSeq format). An Iroh collection is an ordered sequence of
+blob hashes; by convention the first element (index 0) is the application's
+metadata blob. Aster uses a `ContractManifest` JSON blob at index 0, which
+carries the name-to-hash mapping for all other members. iroh-docs stores
+lightweight `ArtifactRef` pointers that resolve to collection root hashes. This
+avoids simulating a filesystem hierarchy in docs keys for artifact storage and
+aligns with Iroh's native content-addressed transfer primitives.
 
 ```text
 {namespace}/
@@ -82,22 +84,28 @@ ArtifactRef {
 ```
 
 **Contract collection layout** — a contract is published as an Iroh collection
-with the following named members (names carried by `CollectionMeta`):
+with the following positional layout. Iroh collections are positional HashSeqs;
+member names are an Aster convention carried in the manifest, not an Iroh API
+feature. The manifest at index 0 maps logical names to blob hashes, allowing
+consumers to fetch any member by its content hash.
 
-| Collection member name     | Content                                       | Required |
-|---------------------------|-----------------------------------------------|----------|
-| `contract.xlang`          | Canonical XLANG bytes of `ServiceContract`    | Yes      |
-| `manifest.json`           | `ContractManifest` JSON                       | Yes      |
-| `types/{type_hash}.xlang` | Canonical XLANG bytes of each `TypeDef`       | Yes      |
-| `schema.fdl`              | Human-readable Fory IDL source text           | No       |
-| `docs/`                   | Documentation bundle                          | No       |
-| `compatibility/{other_id}`| Compatibility report vs another contract      | No       |
+| Index | Logical name               | Content                                       | Required |
+|-------|---------------------------|-----------------------------------------------|----------|
+| 0     | `manifest.json`           | `ContractManifest` JSON (metadata blob)       | Yes      |
+| 1     | `contract.xlang`          | Canonical XLANG bytes of `ServiceContract`    | Yes      |
+| 2..N  | `types/{type_hash}.xlang` | Canonical XLANG bytes of each `TypeDef`       | Yes      |
+| opt   | `schema.fdl`              | Human-readable Fory IDL source text           | No       |
+| opt   | `docs/`                   | Documentation bundle                          | No       |
+| opt   | `compatibility/{other_id}`| Compatibility report vs another contract      | No       |
+
+Required members occupy fixed indices 0–(2+len(types)). Optional members follow
+in any order; their hashes are listed in the manifest.
 
 Key design points:
 
 - The `types/` namespace no longer exists as docs keys. Type definitions are
-  members of the contract collection, stored by content hash in the collection's
-  named blob list.
+  members of the contract collection, fetched by their content hash as listed in
+  the manifest.
 - Contract definitions reference types by hash, forming a Merkle DAG. Changing
   a type changes its hash, which changes the hash of every contract that
   references it.
@@ -205,6 +213,16 @@ message TypeDef {
 
 // ── Service contract ────────────────────────────────────────
 
+message CapabilityRequirement {
+    string kind = 1;               // "role", "any_of", "all_of"
+    list<string> roles = 2;        // Role strings. Single item for kind="role".
+}
+// kind semantics:
+//   "role"   — caller must hold exactly this one role (roles has one entry)
+//   "any_of" — caller must hold at least one of the listed roles
+//   "all_of" — caller must hold every listed role
+// Absent field (default) means no capability check is required for this method.
+
 message MethodDef {
     string name = 1;
     string pattern = 2;            // "unary", "server_stream", "client_stream", "bidi_stream"
@@ -212,6 +230,7 @@ message MethodDef {
     binary response_type = 4;      // BLAKE3 hash of response TypeDef (stream item type for streaming)
     bool idempotent = 5;
     float64 default_timeout = 6;   // Seconds, 0 = none
+    CapabilityRequirement requires = 7;  // Optional. Absent = no rcan check required.
 }
 
 message ServiceContract {
@@ -220,8 +239,48 @@ message ServiceContract {
     list<MethodDef> methods = 3;    // Sorted by method name (lexicographic, ASCII)
     list<string> serialization_modes = 4; // Ordered by producer preference
     string alpn = 5;                // Always "aster/{wire_version}"
-    string scoped = 6;             // "shared" (default) or "stream" (session-scoped)
+    string scoped = 6;              // "shared" (default) or "stream" (session-scoped)
+    CapabilityRequirement requires = 7;  // Optional service-level baseline. Effective
+                                         // requirement for a method is the conjunction of
+                                         // this field and the method's own requires field.
+                                         // Absent on both = no rcan check for that method.
 }
+```
+
+**Capability requirement evaluation**
+
+The effective requirement for a method call is resolved at call time from two
+sources: the service-level `ServiceContract.requires` (baseline) and the
+method-level `MethodDef.requires` (refinement). The rule is additive — the
+caller must satisfy both independently:
+
+```
+effective = conjunction(service.requires, method.requires)
+```
+
+Evaluation of each `CapabilityRequirement` against the caller's rcan
+`capability` list:
+
+| `kind`    | Satisfied when |
+|-----------|----------------|
+| `"role"`  | `capability` contains `roles[0]` |
+| `"any_of"`| `capability` contains at least one entry in `roles` |
+| `"all_of"`| `capability` contains every entry in `roles` |
+
+The conjunction means both the service requirement and the method requirement
+must evaluate to satisfied. If either fails, the call is rejected with
+`PERMISSION_DENIED` before the handler is invoked.
+
+Absence of a `requires` field (at either level) is treated as unconditionally
+satisfied — it contributes nothing to the conjunction. A method with no
+`requires` on either level requires no rcan at all.
+
+**Example:** service sets `requires = any_of("Admin", "Operator")`, method sets
+`requires = role("TaskManager")`. The effective requirement is: caller must hold
+at least one of `{Admin, Operator}` AND must hold `TaskManager`. An rcan
+carrying `["Admin", "TaskManager"]` passes. An rcan carrying only `["Admin"]`
+fails the method check. An rcan carrying only `["TaskManager"]` fails the
+service check.
 ```
 
 ### 11.3.4 Hashing Procedure
@@ -299,6 +358,7 @@ service AgentControl {
     rpc assign_task(TaskAssignment) returns (TaskAck) {
         timeout = 30.0;
         idempotent = true;
+        requires = any_of("TaskManager", "Admin");
     }
 }
 ```
@@ -310,7 +370,7 @@ Resolution:
 2. `TaskAck` has only primitive fields → serialize `TypeDef`, hash →
    `ack_hash`.
 3. Build `MethodDef`:
-   `{name: "assign_task", pattern: "unary", request_type: ta_hash, response_type: ack_hash, idempotent: true, default_timeout: 30.0}`
+   `{name: "assign_task", pattern: "unary", request_type: ta_hash, response_type: ack_hash, idempotent: true, default_timeout: 30.0, requires: {kind: "any_of", roles: ["TaskManager", "Admin"]}}`
 4. Build `ServiceContract`:
    `{name: "AgentControl", version: 1, methods: [<above>], serialization_modes: ["xlang"], alpn: "aster/1"}`
 5. Serialize → hash → `contract_id`.
@@ -380,6 +440,21 @@ identity.
    - Optionally: `schema.fdl`, documentation bundle, compatibility reports
 5. Import the collection into the local `iroh-blobs` store. The collection
    root hash is the BLAKE3 of the HashSeq (computed automatically by Iroh).
+5a. **Tag the collection for GC protection.** Untagged blobs are eligible for
+   garbage collection. Set a persistent named tag immediately after import:
+
+   ```
+   tag name: aster/contract/{friendly_name}@{contract_id}
+   tag value: HashAndFormat { hash: collection_root_hash, format: HashSeq }
+   ```
+
+   `friendly_name` is a human-readable label (e.g. `AgentControl-v1`) chosen
+   by the publisher. It is decorative — the `contract_id` in the tag name is
+   the authoritative identity and is what tooling must use. Because HashSeq tags
+   protect all referenced child blobs, a single tag on the collection root is
+   sufficient to protect the manifest, `contract.xlang`, and all type blobs.
+   To unpublish, delete the tag; the blobs become GC-eligible on the next
+   collection cycle.
 6. Write an `ArtifactRef` to `contracts/{contract_id}` in the registry
    namespace docs (see §11.2). If the key already exists with matching
    `contract_id`, the write is idempotent.
@@ -413,9 +488,46 @@ prefetching and integrity checking.
 
 **Fetching a contract:** A consumer that knows a `contract_id` reads the
 `ArtifactRef` from `contracts/{contract_id}` in docs, fetches the Iroh
-collection via `iroh-blobs` using the `collection_hash` (or `ticket`),
-verifies `blake3(contract.xlang) == contract_id`, and loads the type closure
-from the `types/` members of the collection.
+collection via `iroh-blobs` using the `collection_hash` (or the `ticket` string
+passed directly to the blobs fetch API — no deserialization required),
+reads the manifest blob at collection index 0 to resolve logical names to blob
+hashes, fetches `contract.xlang` and all type blobs by their hashes, and
+verifies `blake3(contract.xlang bytes) == contract_id` before trusting the
+bundle.
+
+-----
+
+## §11.5 Required Python and FFI Surface Extensions
+
+The publication and consumption procedures in §11.4 depend on iroh-blobs and
+iroh-docs capabilities that are not yet exposed in the Python bindings
+(`bindings/aster_python_rs/`) or the FFI layer. The following extensions are
+required before §11.4 can be fully implemented in any language other than Rust.
+
+**iroh-blobs extensions**
+
+| Capability | Why needed |
+|---|---|
+| `Tags` API (`set`, `get`, `delete`, `list`) | GC protection for published contract collections (step 5a) |
+| `FsStore` | Persistent blob storage across restarts; in-memory store loses all blobs on shutdown |
+| `Downloader` | Multi-provider parallel fetch of contract collections |
+| `Remote` API | Single-provider fetch with resume support |
+| `BlobTicket` serving | Accepting inbound connections from consumers holding an `ArtifactRef.ticket`; the ticket string itself is opaque and requires no parsing — only serving requires Rust-level integration |
+| `observe()` | Partial transfer detection and resumable download progress |
+
+**iroh-docs extensions**
+
+| Capability | Why needed |
+|---|---|
+| `import_and_subscribe()` | Race-free join: subscribe before first sync to avoid missing initial `CONTRACT_PUBLISHED` events |
+| `Doc.subscribe()` (live events) | React to `InsertRemote` / `ContentReady` events for registry change notifications |
+| `start_sync()` / `leave()` | Explicit sync lifecycle control |
+| `DownloadPolicy` | `NothingExcept` policy to selectively sync `_aster/` prefix without pulling all service data |
+| `DocTicket` creation | Constructing share tickets for registry namespace bootstrapping |
+
+**Priority order for implementation:** Tags + FsStore are P0 (without them,
+published contracts are lost on restart). `import_and_subscribe` and
+`Doc.subscribe` are P1 (needed for live registry sync). Everything else is P2.
 
 -----
 
