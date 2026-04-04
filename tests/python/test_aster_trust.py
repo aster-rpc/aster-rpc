@@ -507,7 +507,7 @@ def test_mesh_hook_admission_alpns_in_frozenset():
 
 
 def test_cli_keygen_produces_valid_key_pair():
-    from aster_python.aster.trust.cli import _keygen_command
+    from aster_cli.trust import _keygen_command
     from aster_python.aster.trust.signing import load_private_key, load_public_key
 
     with tempfile.TemporaryDirectory() as d:
@@ -536,7 +536,7 @@ def test_cli_keygen_produces_valid_key_pair():
 
 
 def test_cli_keygen_refuses_existing_file():
-    from aster_python.aster.trust.cli import _keygen_command
+    from aster_cli.trust import _keygen_command
 
     with tempfile.NamedTemporaryFile(delete=False) as tf:
         tf.write(b"existing content")
@@ -556,7 +556,7 @@ def test_cli_keygen_refuses_existing_file():
 
 
 def test_cli_sign_producer_credential():
-    from aster_python.aster.trust.cli import _keygen_command, _sign_command
+    from aster_cli.trust import _keygen_command, _sign_command
 
     with tempfile.TemporaryDirectory() as d:
         key_path = Path(d) / "root.key"
@@ -599,7 +599,7 @@ def test_cli_sign_producer_credential():
 
 
 def test_cli_sign_ott_credential():
-    from aster_python.aster.trust.cli import _keygen_command, _sign_command
+    from aster_cli.trust import _keygen_command, _sign_command
 
     with tempfile.TemporaryDirectory() as d:
         key_path = Path(d) / "root.key"

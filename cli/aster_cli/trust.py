@@ -1,5 +1,5 @@
 """
-aster.trust CLI — Offline trust management commands.
+aster_cli.trust — Offline trust management commands.
 
 Commands:
   aster trust keygen --out-key PATH

@@ -1,5 +1,5 @@
 """
-aster.contract.cli — Offline ``aster contract gen`` command-line interface.
+aster_cli.contract — Offline ``aster contract gen`` command-line interface.
 
 Usage::
 
@@ -212,7 +212,7 @@ def main() -> None:
     )
 
     # ``aster trust`` subcommand group (Phase 11)
-    from aster_python.aster.trust.cli import register_trust_subparser, run_trust_command
+    from aster_cli.trust import register_trust_subparser, run_trust_command
     trust_parser = register_trust_subparser(subparsers)
 
     args = parser.parse_args()

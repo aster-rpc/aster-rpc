@@ -17,9 +17,6 @@ dependencies = [
 [project.optional-dependencies]
 iid = ["PyJWT>=2.8"]
 
-[project.scripts]
-aster = "aster_python.aster.contract.cli:main"
-
 [tool.maturin]
 module-name    = "aster_python._aster_python"
 manifest-path  = "bindings/python/rust/Cargo.toml"
