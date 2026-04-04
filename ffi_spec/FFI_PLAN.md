@@ -2454,87 +2454,181 @@ publication/consumption) can be fully implemented.
 
 ### 3d.1 `observe()` — Blob Bitfield Observation (P1)
 
-**What it is:** `store.blobs().observe(hash)` returns an `ObserveProgress` stream of `Bitfield`
-values showing which byte ranges of the blob are locally available. The first item is the current
-state; subsequent items are updates as more data arrives.
+**Why P1:** Callers fetching blobs from remote peers need to know when a blob has fully arrived
+locally before reading it. `blob_observe_complete` is the canonical "wait until ready" primitive.
+`blob_observe_snapshot` lets callers check the current state without blocking.
 
-**Key methods on `ObserveProgress`:**
-- `.await` (via `IntoFuture`) — snapshot of the current bitfield
-- `.await_completion()` — wait until all chunks are locally present
+**Upstream model:** `store.blobs().observe(hash)` returns an `ObserveProgress` stream of
+`Bitfield` values showing which byte ranges are locally available.
 
-**Key methods on `Bitfield`:**
-- `is_complete()` — all chunks present and validated
-- `size()` — total blob size in bytes (0 if not yet known)
+- Awaiting `ObserveProgress` directly (via `IntoFuture`) returns a snapshot of the **current**
+  bitfield without blocking for further changes.
+- `.await_completion()` drives the stream until a `Bitfield` with `is_complete() == true` is
+  observed. For a blob that is already locally complete this resolves immediately. If the stream
+  ends before completion (no active download, node shut down), it returns an error.
 
-**Core:**
-- Add `CoreBlobObserveResult { is_complete: bool, size: u64 }` (snapshot)
-- `CoreBlobsClient::blob_observe_snapshot(hash_hex)` — single snapshot via `store.blobs().observe(hash).await`
-- `CoreBlobsClient::blob_observe_complete(hash_hex)` — wait until complete via `store.blobs().observe(hash).await_completion().await`
+**`Bitfield` fields exposed by the Core layer:**
+- `is_complete: bool` — all chunks are present and verified
+- `size: u64` — total blob size in bytes; **0 if the header chunk has not yet been fetched**
 
-**Python:**
-- `BlobObserveResult` class (`is_complete: bool`, `size: int`)
-- `BlobsClient.blob_observe_snapshot(hash_hex)` → `BlobObserveResult`
-- `BlobsClient.blob_observe_complete(hash_hex)` → `None` (awaitable; completes when blob is fully available)
+**Behavior for an unknown or not-yet-downloaded hash:**
+- `blob_observe_snapshot` returns `IROH_STATUS_OK` with `is_complete=0, size=0` — the blob is
+  simply not present yet; this is not an error.
+- `blob_observe_complete` will eventually error with `IROH_STATUS_INTERNAL` if no active download
+  for that hash exists, because the stream will terminate without ever reaching completion.
 
-**FFI:**
-- `iroh_blobs_observe_snapshot` — synchronous, out params `out_is_complete: *mut u32`, `out_size: *mut u64`
-- `IROH_EVENT_BLOB_OBSERVE_COMPLETE = 56` — emitted by `iroh_blobs_observe_complete` when done
-- `iroh_blobs_observe_complete` — async, emits `IROH_EVENT_BLOB_OBSERVE_COMPLETE` (or ERROR on timeout)
+#### Core API
 
-### 3d.2 Remote API — Local Availability Info (P1)
+```rust
+/// Snapshot of the current download state for a blob.
+pub struct CoreBlobObserveResult {
+    /// True when all chunks are present and verified.
+    pub is_complete: bool,
+    /// Total size in bytes; 0 if the header chunk has not yet arrived.
+    pub size: u64,
+}
 
-**What it is:** `store.remote().local(HashAndFormat::raw(hash))` returns a `LocalInfo` with:
-- `is_complete()` — all requested data is locally available
-- `local_bytes()` — how many bytes we already have
+impl CoreBlobsClient {
+    /// Single bitfield snapshot via `store.blobs().observe(hash).await`.
+    /// Returns Ok even if the blob is unknown — is_complete will be false, size will be 0.
+    pub async fn blob_observe_snapshot(&self, hash_hex: String) -> Result<CoreBlobObserveResult>;
 
-This is useful for resumable downloads: check what you already have before deciding to re-fetch.
+    /// Wait until the blob is fully local via `store.blobs().observe(hash).await_completion()`.
+    /// Resolves immediately if the blob is already complete.
+    /// Errors if the observation stream ends without completion (no active download).
+    pub async fn blob_observe_complete(&self, hash_hex: String) -> Result<()>;
+}
+```
 
-**Core:**
-- Add `CoreBlobLocalInfo { is_complete: bool, local_bytes: u64 }`
-- `CoreBlobsClient::blob_local_info(hash_hex)` — via `store.remote().local(HashAndFormat::raw(hash)).await`
-
-**Python:**
-- `BlobLocalInfo` class (`is_complete: bool`, `local_bytes: int`)
-- `BlobsClient.blob_local_info(hash_hex)` → `BlobLocalInfo`
-
-**FFI:**
-- `iroh_blobs_local_info` — synchronous, out params `out_is_complete: *mut u32`, `out_local_bytes: *mut u64`
-
-### 3d.3 C ABI Signatures
+#### FFI API
 
 ```c
-/* Synchronous — fills out params; returns IROH_STATUS_NOT_FOUND if node unknown */
+// ─── Blob Observe (Phase 1d) ───
+
+// Snapshot the current download state for a blob.
+// Synchronous — writes directly to out params.
+// out_is_complete: 1 = all chunks present and verified, 0 = incomplete or not present
+// out_size:        total size in bytes; 0 if header chunk not yet fetched or blob unknown
+//
+// Returns IROH_STATUS_OK even if the blob is not locally present (is_complete=0, size=0).
+// Returns IROH_STATUS_NOT_FOUND if the node handle is unknown.
+// Returns IROH_STATUS_INVALID_ARGUMENT if any pointer is NULL.
+// Returns IROH_STATUS_INTERNAL if the hash cannot be parsed.
 int32_t iroh_blobs_observe_snapshot(
     iroh_runtime_t runtime,
-    iroh_node_t node,
-    const uint8_t* hash_hex_ptr,
-    uintptr_t hash_hex_len,
-    uint32_t* out_is_complete,
-    uint64_t* out_size
+    iroh_node_t    node,
+    const uint8_t* hash_hex_ptr, uintptr_t hash_hex_len,
+    uint32_t*      out_is_complete,
+    uint64_t*      out_size
 );
 
-/* Async — emits IROH_EVENT_BLOB_OBSERVE_COMPLETE (UNIT_RESULT) when blob is fully available */
+// Wait until a blob is fully downloaded locally.
+// Async — returns immediately; completion is signalled via the event queue.
+// Emits IROH_EVENT_BLOB_OBSERVE_COMPLETE when the blob becomes fully available.
+//   event.operation = the operation handle returned in *out_operation
+//   event.user_data = user_data passed here
+//   event.handle    = node handle
+//   event.status    = IROH_STATUS_OK
+// Emits IROH_EVENT_ERROR if the observation stream ends before the blob completes
+// (e.g., no active download, or node shut down).
+//
+// Resolves immediately (with IROH_EVENT_BLOB_OBSERVE_COMPLETE) if the blob is already complete.
+// Supports cancellation: cancel the returned operation handle to stop waiting.
+//
+// Returns IROH_STATUS_NOT_FOUND if the node handle is unknown.
+// Returns IROH_STATUS_INVALID_ARGUMENT if hash_hex_ptr or out_operation is NULL.
 int32_t iroh_blobs_observe_complete(
-    iroh_runtime_t runtime,
-    iroh_node_t node,
-    const uint8_t* hash_hex_ptr,
-    uintptr_t hash_hex_len,
-    uint64_t user_data,
+    iroh_runtime_t    runtime,
+    iroh_node_t       node,
+    const uint8_t*    hash_hex_ptr, uintptr_t hash_hex_len,
+    uint64_t          user_data,
     iroh_operation_t* out_operation
-);
-
-/* Synchronous — fills out params; returns IROH_STATUS_NOT_FOUND if node unknown */
-int32_t iroh_blobs_local_info(
-    iroh_runtime_t runtime,
-    iroh_node_t node,
-    const uint8_t* hash_hex_ptr,
-    uintptr_t hash_hex_len,
-    uint32_t* out_is_complete,
-    uint64_t* out_local_bytes
 );
 ```
 
-### 3c.9 Implementation Notes
+#### Event Kinds (new)
+
+```c
+IROH_EVENT_BLOB_OBSERVE_COMPLETE = 56,  // emitted by iroh_blobs_observe_complete
+```
+
+### 3d.2 Remote API — Local Availability Info (P1)
+
+**Why P1:** `blob_observe_snapshot` reports whether the blob is complete; `blob_local_info`
+reports *how many bytes* are already held locally. This is the right primitive for resumable
+downloads: before re-fetching, check how much data you already have so you can request only the
+missing ranges.
+
+**Upstream model:** `store.remote().local(HashAndFormat::raw(hash))` returns a `LocalInfo` struct:
+- `is_complete()` — all requested data is locally available
+- `local_bytes()` — bytes already present on this node
+
+**Behavior for an unknown or not-yet-downloaded hash:**
+- Returns `IROH_STATUS_OK` with `is_complete=0, local_bytes=0` — not an error.
+
+#### Core API
+
+```rust
+/// Local availability info for a blob from the Remote API.
+pub struct CoreBlobLocalInfo {
+    /// True when all bytes are present locally.
+    pub is_complete: bool,
+    /// Number of bytes already held locally (may be less than total size).
+    pub local_bytes: u64,
+}
+
+impl CoreBlobsClient {
+    /// Check local availability via `store.remote().local(HashAndFormat::raw(hash))`.
+    /// Returns Ok even for unknown hashes — is_complete=false, local_bytes=0.
+    pub async fn blob_local_info(&self, hash_hex: String) -> Result<CoreBlobLocalInfo>;
+}
+```
+
+#### FFI API
+
+```c
+// ─── Blob Local Info (Phase 1d) ───
+
+// Check how many bytes of a blob are held locally.
+// Synchronous — writes directly to out params.
+// out_is_complete: 1 = fully available locally, 0 = partial or not present
+// out_local_bytes: number of bytes already held locally (0 if blob is unknown)
+//
+// Returns IROH_STATUS_OK even if the blob is not locally present (is_complete=0, local_bytes=0).
+// Returns IROH_STATUS_NOT_FOUND if the node handle is unknown.
+// Returns IROH_STATUS_INVALID_ARGUMENT if any pointer is NULL.
+// Returns IROH_STATUS_INTERNAL if the hash cannot be parsed.
+int32_t iroh_blobs_local_info(
+    iroh_runtime_t runtime,
+    iroh_node_t    node,
+    const uint8_t* hash_hex_ptr, uintptr_t hash_hex_len,
+    uint32_t*      out_is_complete,
+    uint64_t*      out_local_bytes
+);
+```
+
+### 3d.3 Implementation Notes
+
+**`ObserveProgress` delegation pattern:** `store.blobs().observe(hash)` is called once per
+invocation. For `blob_observe_snapshot`, awaiting the `ObserveProgress` directly (via its
+`IntoFuture` impl) yields the current `Bitfield` snapshot without subscribing to further updates.
+For `blob_observe_complete`, `.await_completion()` drives the stream to completion — internally
+it polls the stream until `bitfield.is_complete()` is true or the stream ends with an error.
+
+**`HashAndFormat` wrapper:** `blob_local_info` must wrap the hash as `HashAndFormat::raw(hash)`.
+The Remote API is format-aware; using the wrong format would query a different hash slot.
+
+**Comparison with `blob_status`:** Phase 1c added `blob_status` (not_found/partial/complete enum).
+The Phase 1d additions are complementary:
+- `blob_status` → fast enum check, no byte count for partial
+- `blob_local_info` → byte-accurate local count, useful for resumable transfer decisions
+- `blob_observe_snapshot` → same completeness/size info but from the bitfield stream (consistent
+  with `observe_complete`'s internal model)
+
+**`size` vs `local_bytes`:** `BlobObserveResult.size` is the *total* declared blob size (0 if
+unknown); `BlobLocalInfo.local_bytes` is the bytes *we have*. For a partial download these differ.
+
+### 3c.9 Phase 1c Implementation Notes
 
 **Blob Tags:** The upstream `iroh-blobs` `Tags` API is accessed via `store.tags()` which
 returns a `&Tags` reference. The `BlobStore` type already exposes this. Since `CoreBlobsClient`
