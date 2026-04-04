@@ -1,5 +1,5 @@
 [workspace]
-members = ["aster_transport_core", "aster_transport_ffi", "bindings/aster_python_rs"]
+members = ["core", "ffi", "bindings/python/rust"]
 resolver = "2"
 
 [workspace.dependencies]

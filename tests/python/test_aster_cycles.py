@@ -30,8 +30,8 @@ from aster_python.aster.contract.identity import (
 
 # ── Fixture loading ────────────────────────────────────────────────────────────
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_VECTORS_PATH = _REPO_ROOT / "tests" / "fixtures" / "canonical_test_vectors.json"
+
+_VECTORS_PATH = Path(__file__).parent / "fixtures" / "canonical_test_vectors.json"
 
 
 def _load_vectors() -> dict[str, dict]:
