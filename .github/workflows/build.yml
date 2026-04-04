@@ -4,6 +4,12 @@ on:
   push:
     tags: ["v*"]
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'ffi_spec/**'
+      - '*.md'
+      - 'README.md'
+      - 'LICENSE*'
   workflow_dispatch:
 
 permissions:

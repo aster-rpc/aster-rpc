@@ -3,7 +3,19 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'ffi_spec/**'
+      - '*.md'
+      - 'README.md'
+      - 'LICENSE*'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'ffi_spec/**'
+      - '*.md'
+      - 'README.md'
+      - 'LICENSE*'
   workflow_dispatch:
 
 permissions:
