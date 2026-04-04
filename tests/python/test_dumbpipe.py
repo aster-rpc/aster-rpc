@@ -8,6 +8,7 @@ These tests verify that:
 
 import asyncio
 import os
+import sys
 import tempfile
 
 import pytest
@@ -50,10 +51,14 @@ async def test_simple_pipe_send_recv():
         ep_conn, send, recv = await connect_pipe(addr)
         await send.write_all(b"Hello from Python dumbpipe!")
         await send.finish()
+        # Wait for listener to finish reading before closing the endpoint.
+        # Closing immediately after finish() can race with in-flight delivery,
+        # causing "connection lost" on the receiver side in slow environments.
+        await asyncio.sleep(0.5)
         await ep_conn.close()
 
     listener_task = asyncio.create_task(listener_side())
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(1.0)
     await connector_side()
 
     result = await asyncio.wait_for(listener_task, timeout=30)
@@ -116,7 +121,7 @@ async def test_empty_payload():
         await ep_conn.close()
 
     listener_task = asyncio.create_task(listener_side())
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(1.0)
     await connector_side()
 
     result = await asyncio.wait_for(listener_task, timeout=30)
@@ -142,11 +147,11 @@ async def test_large_payload():
         # Wait for listener to finish reading before closing the endpoint.
         # Closing immediately after finish() can race with in-flight delivery,
         # causing "connection lost" on the receiver side in slow environments.
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(1.0)
         await ep_conn.close()
 
     listener_task = asyncio.create_task(listener_side())
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(1.0)
     await connector_side()
 
     result = await asyncio.wait_for(listener_task, timeout=60)
@@ -210,11 +215,13 @@ async def test_raw_quic_to_dumbpipe():
         await send.write_all(b"test data")
         await send.finish()
         response = await recv.read_to_end(65536)
+        # Wait before closing to avoid race with in-flight delivery
+        await asyncio.sleep(0.5)
         await ep_raw.close()
         return response
 
     listener_task = asyncio.create_task(listener_side())
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(1.0)
     response = await asyncio.wait_for(raw_client(), timeout=30)
     await listener_task
     assert response == b"echo:test data"
@@ -263,7 +270,7 @@ async def test_tcp_forwarding():
         return result
 
     listener_task = asyncio.create_task(dumbpipe_listener())
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(1.0)
     result = await asyncio.wait_for(dumbpipe_connector(), timeout=30)
     await listener_task
 
@@ -277,6 +284,7 @@ async def test_tcp_forwarding():
 # ============================================================================
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix sockets not supported on Windows")
 async def test_unix_socket_forwarding():
     """Test Unix socket forwarding through dumbpipe."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -314,7 +322,7 @@ async def test_unix_socket_forwarding():
             return result
 
         listener_task = asyncio.create_task(dumbpipe_listener())
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(1.0)
         result = await asyncio.wait_for(dumbpipe_connector(), timeout=30)
         await listener_task
 
