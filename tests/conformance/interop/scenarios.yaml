@@ -1,0 +1,28 @@
+# Cross-language interop scenarios (placeholder)
+# These scenarios activate when the Java binding is available.
+# Spec: Aster-SPEC.md §13.2
+
+service: EchoService
+version: 1
+alpn: "aster/echo/1"
+
+scenarios:
+  - name: unary_echo_simple
+    description: "Simple unary echo round-trip"
+    pattern: unary
+    method: echo
+    request:
+      message: "hello from interop test"
+    expected_response:
+      message: "hello from interop test"
+    status: placeholder
+
+  - name: unary_echo_unicode
+    description: "Unicode payload round-trip"
+    pattern: unary
+    method: echo
+    request:
+      message: "こんにちは 🌍"
+    expected_response:
+      message: "こんにちは 🌍"
+    status: placeholder
