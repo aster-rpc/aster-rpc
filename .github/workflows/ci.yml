@@ -73,6 +73,31 @@ jobs:
           uv venv .venv
           source .venv/bin/activate
           uv pip install pytest pytest-asyncio pytest-timeout maturin
+
+          echo "=== Environment parity diagnostics ==="
+          uv --version
+          python -VV
+          uv pip freeze | grep -E '^(pyfory|zstandard|blake3|pytest|pytest-asyncio|pytest-timeout|maturin|cython|Cython)==' || true
+          python - <<'PY'
+          import importlib
+          import platform
+          import sys
+
+          print("python:", sys.version.replace("\n", " "))
+          print("platform:", platform.platform())
+
+          import pyfory
+          print("pyfory:", getattr(pyfory, "__version__", "unknown"))
+          print("pyfory.__file__:", pyfory.__file__)
+
+          try:
+              mod = importlib.import_module("pyfory.includes.libformat")
+              print("pyfory.includes.libformat:", getattr(mod, "__file__", "<built-in>"))
+              print("has CTypeId:", hasattr(mod, "CTypeId"))
+          except Exception as exc:
+              print("import pyfory.includes.libformat failed:", repr(exc))
+          PY
+
           maturin develop -m bindings/aster_python_rs/Cargo.toml
           pytest tests/python/ -v --timeout=60
         shell: bash
@@ -83,6 +108,13 @@ jobs:
           uv venv .venv
           .venv\Scripts\activate
           uv pip install pytest pytest-asyncio pytest-timeout maturin
+
+          Write-Host "=== Environment parity diagnostics ==="
+          uv --version
+          python -VV
+          uv pip freeze | Select-String -Pattern '^(pyfory|zstandard|blake3|pytest|pytest-asyncio|pytest-timeout|maturin|cython|Cython)=='
+          python -c "import importlib,platform,sys,pyfory; print('python:', sys.version.replace('\n',' ')); print('platform:', platform.platform()); print('pyfory:', getattr(pyfory,'__version__','unknown')); print('pyfory.__file__:', pyfory.__file__); mod = importlib.import_module('pyfory.includes.libformat'); print('pyfory.includes.libformat:', getattr(mod,'__file__','<built-in>')); print('has CTypeId:', hasattr(mod,'CTypeId'))"
+
           maturin develop -m bindings/aster_python_rs/Cargo.toml
           pytest tests/python/ -v --timeout=60
         shell: pwsh
