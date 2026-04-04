@@ -390,3 +390,131 @@ clients need them — without call-path involvement.
 key sorting is not SemVer sorting. Constraining version numbers to four-digit
 segments is an ugly workaround. In-memory sorting after a prefix scan is simpler,
 correct, and has no version number constraints.
+
+---
+
+## 8. Monetisation Strategy
+
+This section records the rationale behind the open/closed boundary and the
+commercial product strategy. It is not normative — it does not constrain
+implementations — but it informs which parts of the spec are intentionally left
+as extension points and why.
+
+### 8.1 Why the Registry Is Not a SaaS Hosting Play
+
+The registry is not a service to be hosted — it is the mesh itself. Every
+participant node replicates registry state via iroh-docs (CRDT), iroh-gossip
+(change notifications), and iroh-blobs (immutable contract bundles). There is no
+registry server to run, any more than there is a Git server embedded in the Git
+protocol. A "managed registry" offering would mean operating bootstrap
+infrastructure and sync peers, not controlling data.
+
+The correct analogy is Git and GitHub. GitHub did not win by hosting Git — it won
+by building the coordination layer, the social layer, and the developer experience
+around the decentralised protocol. The protocol stayed fully open. The business
+was the ecosystem.
+
+### 8.2 What Is Actually Centralised
+
+Exactly one element of Aster is structurally centralised: **the root key**.
+
+All trust flows from credentials signed by the offline root private key. Managing
+this key securely — HSM custody, key ceremony procedures, offline storage, audit
+logging, credential issuance on demand — is genuinely hard and genuinely
+expensive to do well. This is the natural anchor for a commercial product.
+
+**Aster Trust Authority** is a managed root key custody service. It holds the
+root private key in an HSM, runs the credential issuance workflow, tracks expiry,
+and provides the operational tooling (key ceremony, recovery procedures, audit
+exports) that enterprises need but do not want to own. Customers pay for the
+service and the operational guarantees, not for opaque code in their trust path.
+
+### 8.3 Enterprise Gateway (OIDC/SAML2)
+
+The trust spec defines `aster.role = gateway` as a first-class role. The
+enterprise gateway pattern uses this:
+
+1. The gateway node holds one EnrollmentCredential — minted offline by the root
+   key, once, as a standard node admission.
+2. External users authenticate to the gateway via enterprise IdP (OIDC/SAML2).
+3. The gateway proxies calls into the mesh, forwarding the user's identity as
+   a signed token presented to Gate 2 (`Authorize`).
+4. Each service's `Authorize` handler validates the token and mints an rcan with
+   the appropriate capabilities.
+
+Individual user identity never touches EnrollmentCredentials. The offline root
+key mints exactly one gateway credential. All user identity management stays in
+the OIDC layer where enterprise security teams expect it.
+
+The enterprise gateway product bundles:
+
+- OIDC/SAML2 integration with major IdPs (Okta, Azure AD, Google Workspace)
+- Session management and token refresh
+- Per-service RBAC derived from IdP group claims
+- Audit log of all calls routed through the gateway
+- Web dashboard for access policy management and real-time traffic visibility
+- SSO-controlled `channels/stable` promotion workflows
+
+This is buildable today against the spec as written. No spec changes are required
+for the gateway-as-proxy model.
+
+### 8.4 Spec-Compliant Commercial Routing Extensions
+
+§11.9 defines three endpoint selection strategies that all implementations MUST
+provide: `round_robin`, `least_load`, and `random`. It does not prohibit
+additional strategies. The `load` field on `EndpointLease` is opaque at the
+protocol level. The `metadata` map is application-defined.
+
+A commercial client implementation adds spec-compliant strategies on top of the
+mandatory three:
+
+| Strategy | Description |
+|---|---|
+| `session_affinity` | Remembers the `endpoint_id` holding an open session; bypasses §11.9 selection for reconnects to the same session. Required for session-scoped services at scale. |
+| `consistent_hash` | Routes by a caller-supplied key (user ID, tenant ID, etc.) to the same producer without explicit session tracking. |
+| `locality_aware` | Incorporates latency and topology signals (resolving open question Q18) to prefer nearby producers. |
+| Circuit breakers | Not in the spec; a pure commercial addition. Removes failing endpoints from the candidate set faster than lease expiry. |
+| Hedged requests | Fires to two endpoints simultaneously; takes the first response and cancels the second. Reduces tail latency under load. |
+| Adaptive load | Uses proprietary `metadata` fields that the commercial client and server negotiate out-of-band for richer load signals than the single `load` float. |
+
+Every one of these strategies is spec-compliant. A community implementation
+interoperates fully because the protocol and wire format are identical. The
+commercial client makes better routing decisions about which endpoint to dial.
+
+This is the gRPC/Envoy split — the protocol is fully open, the intelligent
+routing layer is the product.
+
+### 8.5 Licensing Boundary
+
+| Layer | License | Rationale |
+|---|---|---|
+| Transport runtime (`aster_transport_core`, bindings) | Apache 2.0 | Adoption driver; no central infrastructure to protect; compatible with Iroh crates |
+| Protocol spec | Open (CC-BY or CNCF donation) | Standard-setting; multi-language ecosystem requires an open spec |
+| CLI toolchain (`aster publish`, compatibility checking) | AGPL v3 | Strongest OSI-approved copyleft; AWS and Google maintain internal policies against AGPL use; dual-license available for proprietary embedding |
+| Trust Authority service | Commercial | Managed HSM custody; operational complexity is the product |
+| Enterprise gateway | Commercial | OIDC/SAML2 integration, dashboard, audit log |
+| Commercial routing client | Commercial | Spec-compliant extension strategies above §11.9 minimum |
+
+The AGPL toolchain requires a CLA from all external contributors to preserve the
+dual-licensing option.
+
+The open/closed line is drawn at **service boundaries and engineering depth**,
+not at feature gates on core protocol functionality. The community implementation
+is genuinely complete. The commercial products are operationally complex services
+or engineering-intensive routing implementations that are non-trivial to
+replicate from public documentation.
+
+### 8.6 Features That Are Not Viable Paid Products
+
+**IID verification.** Cloud provider IID checks are local cryptographic signature
+verification against public keys published by AWS, GCP, and Azure. The
+verification algorithm is fully documented. Any engineer can implement it from
+the cloud provider's documentation. Closing this code provides no durable moat
+and placing closed-source code in the trust path is a procurement blocker for
+security-conscious enterprise buyers.
+
+**The managed registry.** There is no registry server to host. Offering "bootstrap
+peers" or "sync infrastructure" is thin infrastructure, not a product.
+
+**Paid support.** Viable as an add-on to the Trust Authority or gateway
+relationships, not as a standalone revenue line for infrastructure software.

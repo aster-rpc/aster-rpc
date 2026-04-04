@@ -1,0 +1,316 @@
+"""
+aster.registry.publisher — RegistryPublisher for the Aster service registry.
+
+Spec references:
+- §11.6: Endpoint leases and health state machine
+- §11.8: Publication and advertisement flows
+
+The publisher writes EndpointLease + ArtifactRef entries to the registry doc
+and maintains a background refresh task. Graceful shutdown transitions through
+DRAINING state before deleting the lease and emitting ENDPOINT_DOWN gossip.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import TYPE_CHECKING
+
+from .keys import contract_key, lease_key, version_key, channel_key
+from .models import (
+    ArtifactRef,
+    EndpointLease,
+    STARTING,
+    DRAINING,
+)
+
+if TYPE_CHECKING:
+    from .gossip import RegistryGossip
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_LEASE_DURATION_S = 45
+_DEFAULT_REFRESH_INTERVAL_S = 15
+
+
+class RegistryPublisher:
+    """Publishes contracts and manages endpoint lifecycle in the registry.
+
+    Typical usage::
+
+        publisher = RegistryPublisher(doc, author_id, gossip, blobs)
+        await publisher.register_endpoint(contract_id, "MyService", version=1)
+        await publisher.set_health(READY)
+        # ... serve requests ...
+        await publisher.withdraw()
+    """
+
+    def __init__(
+        self,
+        doc: object,
+        author_id: str,
+        gossip: "RegistryGossip | None" = None,
+        blobs: object | None = None,
+        *,
+        lease_duration_s: int = _DEFAULT_LEASE_DURATION_S,
+        lease_refresh_interval_s: int = _DEFAULT_REFRESH_INTERVAL_S,
+    ) -> None:
+        """
+        Args:
+            doc:        ``DocHandle`` for the registry doc.
+            author_id:  The local author's ID for writing doc entries.
+            gossip:     Optional ``RegistryGossip`` for change notifications.
+            blobs:      Optional ``BlobsClient`` for contract blob upload.
+            lease_duration_s:        Lease TTL (default 45 s).
+            lease_refresh_interval_s: Background refresh cadence (default 15 s).
+        """
+        self._doc = doc
+        self._author_id = author_id
+        self._gossip = gossip
+        self._blobs = blobs
+        self._lease_duration_s = lease_duration_s
+        self._refresh_interval_s = lease_refresh_interval_s
+
+        # Current lease state (set when register_endpoint is called)
+        self._lease: EndpointLease | None = None
+        self._refresh_task: asyncio.Task | None = None
+
+    # ── Contract publication ───────────────────────────────────────────────────
+
+    async def publish_contract(
+        self,
+        contract_bytes: bytes,
+        service: str,
+        version: int,
+        *,
+        channel: str | None = None,
+        published_by: str = "",
+    ) -> str:
+        """Publish a contract to the registry doc and blob store.
+
+        Stores ``contract_bytes`` as a blob, writes an ArtifactRef at
+        ``contracts/{contract_id}``, writes a version pointer at
+        ``services/{name}/versions/v{version}``, and optionally updates a
+        channel alias. Emits CONTRACT_PUBLISHED gossip.
+
+        Args:
+            contract_bytes:  Canonical XLANG bytes of the ServiceContract.
+            service:         Service name.
+            version:         Version number.
+            channel:         Optional channel alias (e.g. "stable").
+            published_by:    Author descriptor (human-readable, not AuthorId).
+
+        Returns:
+            contract_id (64-char hex string).
+        """
+        import blake3  # type: ignore[import]
+
+        contract_id = blake3.blake3(contract_bytes).hexdigest()
+        collection_hash = contract_id   # single-blob collection for Phase 10
+
+        # Upload to blob store if available
+        if self._blobs is not None:
+            await self._blobs.add_bytes(contract_bytes)
+
+        now_ms = int(time.time() * 1000)
+        ref = ArtifactRef(
+            contract_id=contract_id,
+            collection_hash=collection_hash,
+            published_by=published_by or self._author_id,
+            published_at_epoch_ms=now_ms,
+        )
+        await self._doc.set_bytes(
+            self._author_id,
+            contract_key(contract_id),
+            ref.to_json().encode(),
+        )
+
+        # Version pointer (append-only by convention)
+        await self._doc.set_bytes(
+            self._author_id,
+            version_key(service, version),
+            contract_id.encode(),
+        )
+
+        # Optional channel alias
+        if channel is not None:
+            await self._doc.set_bytes(
+                self._author_id,
+                channel_key(service, channel),
+                contract_id.encode(),
+            )
+
+        # Gossip
+        if self._gossip is not None:
+            try:
+                await self._gossip.broadcast_contract_published(
+                    contract_id, service, version
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("gossip broadcast_contract_published failed: %s", exc)
+
+        logger.debug("Published contract %s for %s v%d", contract_id, service, version)
+        return contract_id
+
+    # ── Endpoint registration ──────────────────────────────────────────────────
+
+    async def register_endpoint(
+        self,
+        contract_id: str,
+        service: str,
+        version: int,
+        *,
+        endpoint_id: str,
+        alpn: str = "aster/1",
+        serialization_modes: list[str] | None = None,
+        direct_addrs: list[str] | None = None,
+        relay_url: str | None = None,
+        feature_flags: list[str] | None = None,
+        tags: list[str] | None = None,
+        policy_realm: str | None = None,
+        health_status: str = STARTING,
+        language_runtime: str | None = None,
+        aster_version: str = "0.2.0",
+    ) -> None:
+        """Write initial EndpointLease (health=STARTING) and start refresh.
+
+        Emits ENDPOINT_LEASE_UPSERTED gossip after writing the lease.
+        """
+        now_ms = int(time.time() * 1000)
+        self._lease = EndpointLease(
+            endpoint_id=endpoint_id,
+            contract_id=contract_id,
+            service=service,
+            version=version,
+            lease_expires_epoch_ms=now_ms + self._lease_duration_s * 1000,
+            lease_seq=1,
+            alpn=alpn,
+            serialization_modes=list(serialization_modes or ["fory-xlang"]),
+            feature_flags=list(feature_flags or []),
+            relay_url=relay_url,
+            direct_addrs=list(direct_addrs or []),
+            load=None,
+            language_runtime=language_runtime,
+            aster_version=aster_version,
+            policy_realm=policy_realm,
+            health_status=health_status,
+            tags=list(tags or []),
+            updated_at_epoch_ms=now_ms,
+        )
+        await self._write_lease()
+
+        # Start background refresh task
+        self._refresh_task = asyncio.create_task(self._refresh_loop())
+
+    async def _write_lease(self) -> None:
+        """Persist the current lease to the doc and emit gossip."""
+        assert self._lease is not None
+        lease = self._lease
+        now_ms = int(time.time() * 1000)
+        lease.updated_at_epoch_ms = now_ms
+        lease.lease_expires_epoch_ms = now_ms + self._lease_duration_s * 1000
+
+        await self._doc.set_bytes(
+            self._author_id,
+            lease_key(lease.service, lease.contract_id, lease.endpoint_id),
+            lease.to_json().encode(),
+        )
+        if self._gossip is not None:
+            try:
+                await self._gossip.broadcast_endpoint_lease_upserted(
+                    lease.endpoint_id,
+                    lease.service,
+                    lease.lease_seq,
+                    lease.contract_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("gossip broadcast_endpoint_lease_upserted failed: %s", exc)
+
+    # ── Health transitions ─────────────────────────────────────────────────────
+
+    async def set_health(self, status: str) -> None:
+        """Transition health state; bumps lease_seq and writes new lease row."""
+        if self._lease is None:
+            raise RuntimeError("No active lease — call register_endpoint first")
+        self._lease.health_status = status
+        self._lease.lease_seq += 1
+        await self._write_lease()
+        logger.debug(
+            "Health set to %s (seq=%d) for %s",
+            status,
+            self._lease.lease_seq,
+            self._lease.service,
+        )
+
+    # ── Background refresh ─────────────────────────────────────────────────────
+
+    async def _refresh_loop(self) -> None:
+        """Background task: refreshes the lease every ``lease_refresh_interval_s``."""
+        try:
+            while True:
+                await asyncio.sleep(self._refresh_interval_s)
+                if self._lease is None:
+                    break
+                self._lease.lease_seq += 1
+                await self._write_lease()
+                logger.debug(
+                    "Lease refreshed (seq=%d) for %s",
+                    self._lease.lease_seq,
+                    self._lease.service,
+                )
+        except asyncio.CancelledError:
+            pass
+
+    # ── Graceful withdraw ──────────────────────────────────────────────────────
+
+    async def withdraw(self, grace_period_s: float = 5.0) -> None:
+        """Graceful shutdown state machine.
+
+        1. set_health(DRAINING) — bumps lease_seq, writes updated lease
+        2. Wait ``grace_period_s`` for in-flight calls to drain
+        3. Delete the lease row from the doc
+        4. Broadcast ENDPOINT_DOWN gossip
+        5. Cancel the refresh background task
+        """
+        if self._lease is None:
+            return  # nothing to withdraw
+
+        # 1. Transition to DRAINING
+        await self.set_health(DRAINING)
+
+        # 2. Grace period
+        if grace_period_s > 0:
+            await asyncio.sleep(grace_period_s)
+
+        # 3. Delete lease — overwrite with tombstone sentinel.
+        #    iroh-docs has no true delete; b"null" signals deletion to readers.
+        lease = self._lease
+        await self._doc.set_bytes(
+            self._author_id,
+            lease_key(lease.service, lease.contract_id, lease.endpoint_id),
+            b"null",
+        )
+
+        # 4. ENDPOINT_DOWN gossip
+        if self._gossip is not None:
+            try:
+                await self._gossip.broadcast_endpoint_down(
+                    lease.endpoint_id, lease.service
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("gossip broadcast_endpoint_down failed: %s", exc)
+
+        # 5. Cancel refresh task
+        self._cancel_refresh()
+        self._lease = None
+        logger.debug("Withdrew endpoint %s from %s", lease.endpoint_id, lease.service)
+
+    def _cancel_refresh(self) -> None:
+        if self._refresh_task is not None and not self._refresh_task.done():
+            self._refresh_task.cancel()
+        self._refresh_task = None
+
+    async def close(self) -> None:
+        """Stop the background refresh task (without graceful withdraw)."""
+        self._cancel_refresh()
