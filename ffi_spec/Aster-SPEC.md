@@ -660,6 +660,7 @@ service AgentControl {
     version = 1;
     alpn = "aster/1";
     serialization = [xlang, native];    // ordered list of supported formats, producer preference order
+                                        // (client picks first producer-listed mode it also supports — see §6.2.1)
 
     rpc assign_task(TaskAssignment) returns (TaskAck) {
         timeout = 30.0;
@@ -900,7 +901,8 @@ StreamHeader {
     contract_id: string         // BLAKE3 of canonical contract bytes; authoritative compatibility key
     call_id: string             // UUID, unique per call
     deadline_epoch_ms: int64    // Absolute deadline (ms since Unix epoch), 0 = none
-    serialization_mode: uint8   // Selected mode for this call; must be supported by the advertised contract + endpoint lease
+    serialization_mode: uint8   // Selected mode for this call (see §6.2.1 for selection algorithm);
+                                // MUST be supported by the advertised contract + endpoint lease
     metadata_keys: list<string>
     metadata_values: list<string>
 }
@@ -913,16 +915,60 @@ call with `FAILED_PRECONDITION` if the referenced contract is unknown, disabled,
 or incompatible with the selected method or serialization mode.
 
 **Session-scoped streams:** When `method` is an empty string (`""`), the stream
-is a session-scoped stream (see session-scoped services addendum). The server
+is a session-scoped stream (see session-scoped services addendum).
+
+**Server-side validation (normative):** the server MUST verify that the
+`method` field on `StreamHeader` matches the discovered service's scope:
+
+- If `method == ""` but the resolved service has `scoped=SHARED`, the server
+  MUST reject the stream with `FAILED_PRECONDITION` (the client is attempting
+  to open a session against a non-session service).
+- If `method != ""` but the resolved service has `scoped=STREAM`, the server
+  MUST reject with `FAILED_PRECONDITION` (the client is calling a session
+  service as if it were stateless).
+
+This validation closes the footgun where a client that forgets to set
+`method` would otherwise silently attempt to open a session against a shared
+service.
+
+**session_id mapping (normative, see also addendum §8.2):** on a session
+stream, `StreamHeader.call_id` is the **session identifier** for the life of
+the stream. Each in-session CALL frame carries its own `call_id` in the
+`CallHeader`. The framework populates `CallContext.session_id` from
+`StreamHeader.call_id` (stable for the stream) and `CallContext.call_id`
+from `CallHeader.call_id` (per-call). On stateless streams, `session_id` is
+`None`.
+
+The server
 instantiates a per-stream service instance and enters a session loop. The
 `call_id` field serves as the session identifier. Per-call method dispatch uses
 `CALL` frames (bit 4) instead of the `StreamHeader.method` field.
 
-> **TODO (Phase 1 blocker):** The canonical contract encoding (§11.3) must be
-> resolved before the wire implementation ships. `contract_id` is a BLAKE3 hash
-> of canonical contract bytes, so the encoding determines the hash, which
-> determines what values appear in `StreamHeader.contract_id` on the wire. No
-> conformance test can be written until this is pinned down.
+`contract_id` is a BLAKE3 hash of canonical contract bytes. The canonical
+encoding is normatively defined in **Aster-ContractIdentity.md §11.3**
+("Canonical XLANG profile") — a stripped Fory XLANG byte stream with
+specific rules for integer encoding, optional fields, list headers, and
+discriminator zero-values. Both ends of a connection compute the same
+`contract_id` by following that specification byte-for-byte.
+
+#### 6.2.1 Serialization Mode Selection (normative)
+
+The `serialization` list on a `ServiceContract` is **ordered by producer
+preference**. The client selects a concrete `serialization_mode` for each
+stream using this algorithm:
+
+1. Let `producer_modes = contract.serialization` (producer's preference order,
+   e.g. `[XLANG, NATIVE]`).
+2. Let `client_modes` be the set of serialization modes the client supports.
+3. Walk `producer_modes` in order. Select the first mode that is in
+   `client_modes`.
+4. If no mode is shared, fail the call with `FAILED_PRECONDITION` — the
+   client and producer cannot agree on a serialization format.
+
+Producer preference wins on ties. Clients MUST NOT reorder by their own
+preference; this keeps routing deterministic and makes producer capacity
+planning predictable (a producer that lists `[XLANG, NATIVE]` knows it will
+be called with XLANG whenever the client supports it).
 
 ### 6.3 Stream Lifecycle per RPC Pattern
 
@@ -992,6 +1038,25 @@ Client                          Server
 clean completion with an explicit status. A `finish()` without a preceding
 trailer on a streaming RPC implies `OK`. A stream reset (QUIC `RESET_STREAM`)
 without a trailer indicates abnormal termination.
+
+**Session-scoped streams (see Aster-session-scoped-services.md §4.5–§4.6):**
+the rules above describe stateless (one-call-per-stream) RPC. Session
+streams diverge in two ways:
+
+1. **Client-origin TRAILER frames are permitted on session streams.** A
+   session client sends a TRAILER(status=OK) frame to signal end-of-input on
+   client-stream and bidi-stream calls inside the session (addendum §4.5
+   rule 3). Implementations MUST accept client-written TRAILER frames on
+   streams whose HEADER has `method == ""`. Stateless streams continue to
+   reject client-origin TRAILER frames.
+2. **In-session unary calls do NOT emit a trailer on success.** The response
+   payload frame alone signals success; errors use a trailer with non-OK
+   status instead of a response payload (addendum §4.6). This diverges from
+   stateless unary, which always emits a trailer.
+
+Stateless parsers that cannot reach a session dispatch path may reject
+client-origin TRAILER frames; session-aware parsers MUST accept them once
+`StreamHeader.method == ""` has been observed.
 
 ### 6.4 Status / Trailer Frame
 
@@ -1711,8 +1776,12 @@ consumers must:
 2. Filter results to entries written by `AuthorId`s in the appropriate ACL
    tier (`_aster/acl/writers` for service entries, `_aster/acl/admins` for
    ACL entries).
-3. Among trusted entries, select the one with the highest `lease_seq` or
-   most recent timestamp as appropriate.
+3. Among trusted entries, select the one with the highest `lease_seq`. If
+   two trusted entries share the same `lease_seq` (possible when multiple
+   writers are authorized for the same endpoint key), break the tie by
+   comparing `(lease_seq, updated_at_epoch_ms, AuthorId_hex)` lexicographically
+   and taking the largest. For non-lease keys (e.g. `services/{name}/meta`),
+   use `updated_at_epoch_ms` then `AuthorId_hex` as the tiebreak.
 
 This prevents untrusted authors from poisoning the registry by writing to
 well-known keys. The ACL tiers are cached locally and refreshed on gossip
@@ -1740,9 +1809,13 @@ Canonicalization rules:
 1. Emit canonical contract bytes in a deterministic form.
 1. Hash the canonical bytes with BLAKE3 and encode as lowercase hex.
 
-> **TODO:** Define the canonical contract encoding precisely. Options:
-> canonical Fory IDL text, canonical Aster manifest JSON/CBOR, or a canonical
-> descriptor binary derived from the IDL.
+The **canonical encoding is normatively defined in Aster-ContractIdentity.md
+§11.3** ("Canonical XLANG profile"), including the discriminator enum IDs,
+the byte-level encoding rules (ZigZag VARINT for int32/int64, NULL_FLAG for
+absent optional fields, list header `0x0C`, UTF-8 strings with length-prefix
+varints), zero-value conventions for unused discriminator companion fields,
+and the sort order for fields, methods, enum values, and union variants.
+Golden byte vectors are published in Appendix A of that document.
 
 ### 11.4 Contract Publication
 
@@ -2252,7 +2325,7 @@ transport abstraction).
 |7 |**Load metric format**           |Simple float vs. structured vs. opaque.                                                                                                                                                            |
 |8 |**Large schema blob threshold**  |Proposed 64KB. Validate against real-world IDL sizes.                                                                                                                                              |
 |9 |**Heartbeat clock source**       |Wall clock + skew tolerance, or logical clock?                                                                                                                                                     |
-|10|**Canonical contract encoding**  |Canonical Fory IDL text, canonical Aster manifest JSON/CBOR, or a canonical descriptor binary derived from the IDL. Blocking for registry correctness.                                             |
+|10|~~**Canonical contract encoding**~~ ✅ Resolved  |Resolved: canonical XLANG profile normatively defined in Aster-ContractIdentity.md §11.3 (stripped Fory XLANG byte stream with spec-pinned integer encoding, NULL_FLAG, sort orders, zero-value conventions). Golden vectors in Appendix A of that document.|
 |11|**Multi-registry federation**    |How do consumers reference services across registry namespace boundaries? Options: namespace federation, explicit cross-namespace lookup, or a root namespace acting as a directory of directories.|
 |12|**OTel span and metric schema**  |Define canonical span attribute names and metric names shared across all language implementations so traces and metrics are consistent regardless of which language emits them.                    |
 |13|**Channel promotion rules**      |Who can promote a `contract_id` from `canary` to `stable`? Should a compatibility report be a precondition for `stable` promotion? Define the approval workflow.                                   |

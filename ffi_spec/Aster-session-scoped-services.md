@@ -319,6 +319,15 @@ Client                                          Server
 3. The server sends a trailer frame with status `CANCELLED` (code 1).
 4. The server awaits the next `CALL` frame or `finish()`.
 
+**Race condition with in-flight writes.** At the moment CANCEL arrives, the
+server may have already queued or written an OK trailer (or an error trailer
+from the handler's own completion). The server is NOT required to retract
+that trailer. Instead, the framework guarantees that whenever the server
+receives a CANCEL frame for an active call, it will emit **exactly one
+trailer with status `CANCELLED`** to terminate that call — even if another
+trailer was emitted first. The client treats CANCELLED as the authoritative
+terminator (see §5.5).
+
 The handler is responsible for leaving `self` in a consistent state after
 cancellation. The framework delivers the cancellation signal but cannot
 guarantee cleanup — this is inherent to cancellation in any system. Developers
@@ -328,10 +337,19 @@ resources.
 ### 5.5 Client Behaviour on CANCEL
 
 After sending a `CANCEL` frame, the client must drain and discard any response
-frames from the server until it receives the `CANCELLED` trailer. This handles
-the race where the server has already written response frames before receiving
-the cancel. Once the trailer is received, the client releases the session lock
-and the next queued call may proceed.
+frames from the server until it receives a trailer whose status is
+`CANCELLED`. This handles two races:
+
+- The server may have already written response frames before processing the
+  cancel — the client drops them.
+- The server may have already written an OK (or other non-CANCELLED) trailer
+  before processing the cancel — the client drops that trailer too and keeps
+  reading until CANCELLED arrives.
+
+The CANCELLED trailer is authoritative: once the client reads it, the in-flight
+call is terminated (regardless of whether an earlier trailer claimed
+success). The client then releases the session lock and the next queued
+call may proceed.
 
 ### 5.6 CANCEL on Non-Session Streams
 

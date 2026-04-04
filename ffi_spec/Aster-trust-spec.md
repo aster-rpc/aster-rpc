@@ -1,3 +1,75 @@
+## 1. Trust Foundations
+
+This specification defines the authentication and authorization model for an
+Aster deployment. It sits between the transport layer (QUIC + Iroh, which
+provides per-endpoint identity) and the RPC framework (Aster-SPEC.md), and
+supplies the framework with **verified attributes** attached to each peer.
+
+### 1.1 Threat Model
+
+The spec assumes a semi-trusted network where:
+
+- Individual QUIC endpoints are cryptographically identified (Iroh EndpointId
+  = ed25519 public key) but endpoint identity **alone is not authorization**.
+- An attacker may observe gossip traffic, replay old messages, forge
+  timestamps, or attempt to register as a producer with a stolen or fabricated
+  credential.
+- The **root key is offline** — it is generated once, held securely
+  (hardware-backed where possible), and brought online only to sign enrollment
+  credentials or perform catastrophic recovery. The private root key **never**
+  touches a running mesh node.
+- Individual producer keys may be compromised; credential expiry bounds the
+  blast radius.
+
+### 1.2 Trust Anchors
+
+A deployment has exactly one **root public key**. All trust flows from
+credentials signed by its corresponding private key:
+
+| Credential type | Binds to | Consumer | Defined in |
+|-----------------|----------|----------|-----------|
+| `EnrollmentCredential` (producer) | Specific `EndpointId` | Producer mesh (§2) | §2.2 |
+| `ConsumerEnrollmentCredential` (policy) | Attribute set, reusable | Consumer admission (§3) | §3.1 |
+| `ConsumerEnrollmentCredential` (OTT) | One-time nonce | Consumer admission (§3) | §3.1 |
+
+Every credential carries: the root public key it is anchored to, an expiry,
+an attribute set (`aster.role`, `aster.allowed_cidrs`, cloud IID claims,
+application-specific keys), and an ed25519 signature covering the canonical
+concatenation of its fields.
+
+### 1.3 Gate Model
+
+Aster uses a layered admission model. Each gate runs at a different point in
+the connection lifecycle and may deny before subsequent gates even see the
+caller:
+
+- **Gate 0 — Connection-level admission (§3.3).** An iroh `EndpointHooks`
+  hook inspects incoming QUIC handshakes. Non-admission ALPNs are rejected
+  unless the remote EndpointId is already on the allowlist. Admission ALPNs
+  (`aster.producer_admission`, `aster.consumer_admission`) are always
+  accepted so credentials can be presented.
+- **Gate 1 — Credential admission (§2.4, §3.2).** The server reads the
+  presented credential, verifies the signature against the root public key,
+  checks expiry, checks endpoint-id binding (producers only) or nonce
+  consumption (OTT consumers only), and runs runtime checks (CIDR, IID). On
+  success, the peer is added to the admitted set and granted the credential's
+  attribute set.
+- **Gate 2 — Method-level capabilities.** RPC dispatch checks
+  `CapabilityRequirement` declared on the method (Aster-ContractIdentity.md
+  §11.3.3) against the attributes carried in `CallContext`. This is enforced
+  by framework interceptors, not the trust layer itself.
+
+### 1.4 Epochs and Replay Resistance
+
+All signed messages that travel over gossip carry an `epoch_ms` field (wall-clock
+milliseconds). Receivers drop messages outside a replay window (default ±30s).
+Producers actively detect clock drift against the mesh median and self-depart
+if their own clock skews beyond tolerance (§2.10). Replay resistance and drift
+detection are **not separable**: a badly-skewed clock will either reject valid
+messages or be dropped by peers.
+
+---
+
 ## 2. Producer Mesh
 
 ### 2.1 Bootstrap
@@ -535,18 +607,38 @@ sending a new `LeaseUpdate`.
 **Interaction with replay resistance**
 
 The ±30-second replay acceptance window (§2.6) and the ±5-second drift tolerance
-serve different purposes and are evaluated independently:
+serve different purposes and are evaluated in a specific **order**:
 
-- The **replay window** is a message-level check: "is this message's `epoch_ms`
-  recent enough to be non-stale?" It is evaluated on every message.
-- The **drift tolerance** is a peer-level check: "is this peer's clock close
-  enough to the mesh consensus to be trustworthy?" It is evaluated as a
-  rolling aggregate.
+1. **Replay window check first** (message-level): "is this message's
+   `epoch_ms` recent enough to be non-stale?" Messages failing this check are
+   dropped silently before any further processing. Evaluated on every message.
+2. **Drift isolation check second** (peer-level): "is this peer's clock
+   close enough to the mesh consensus to be trustworthy?" Evaluated as a
+   rolling aggregate across recent messages from the peer.
 
 A peer can pass the replay window check (its messages are within 30s of local
 time) while still failing the drift tolerance check (its offset is consistently
 >5s from the mesh median). The drift check catches systematic bias; the replay
 check catches individual stale messages.
+
+**Precedence for isolated peers.** When a peer is in the `drift_isolated`
+set, the handler still verifies signature + replay-window on messages from
+that peer (defence in depth), but **discards ContractPublished and LeaseUpdate
+payloads** because the peer's registry state may be corrupted by clock drift.
+`Introduce` and `Depart` messages from drift-isolated peers are still applied
+— membership churn is not time-sensitive. This rule prevents a drifting peer
+from poisoning the mesh's view of registry state while keeping its departure
+observable.
+
+**Interaction with deadline-skew tolerance.** Aster-SPEC.md §6.8.1 defines a
+per-call `deadline_epoch_ms` with its own skew tolerance (default 1s) for
+accepting deadlines from remote callers. A producer whose clock is within
+the 5s mesh drift tolerance may still routinely reject caller deadlines
+that are within 1s of the caller's clock. Operators SHOULD set the deadline
+skew tolerance ≥ the mesh drift tolerance (i.e. ≥5s). The framework emits
+a warning at startup if `deadline_skew_tolerance_ms < drift_tolerance_ms`,
+since this configuration will produce unexplained `DEADLINE_EXCEEDED`
+errors on clock-skewed producers that are otherwise mesh-healthy.
 
 **Summary of thresholds**
 
@@ -587,16 +679,30 @@ are permitted to reach services in this mesh.
 
 ```
 ConsumerEnrollmentCredential {
-    credential_type: enum { Policy, OTT }
+    credential_type: enum { Policy=0, OTT=1 }
     endpoint_id:     EndpointId?        // absent in Policy credentials
-    root_pubkey:     PublicKey
+    root_pubkey:     PublicKey          // 32 bytes
     expires_at:      int64              // epoch seconds
     attributes:      map<string,string> // same reserved keys as §2.2
     nonce:           binary?            // OTT only: 32-byte random, used-once
-    signature:       binary
-    // covers: credential_type || endpoint_id? || root_pubkey || expires_at || attributes || nonce?
+    signature:       binary             // 64-byte ed25519
 }
 ```
+
+**Canonical signing bytes (normative):**
+
+```
+u8(credential_type)                        // 0 = Policy, 1 = OTT
+|| u8(has_endpoint_id) || endpoint_id?     // 0x00 if absent; 0x01 || 32 bytes if present
+|| root_pubkey                             // 32 bytes
+|| u64_be(expires_at)                      // 8 bytes
+|| canonical_json(attributes)              // UTF-8, sorted keys
+|| u8(has_nonce) || nonce?                 // 0x00 if absent; 0x01 || 32 bytes if present
+```
+
+Both presence flags and length are signed; an attacker cannot flip Policy↔OTT,
+add/remove a nonce, or toggle endpoint_id binding without invalidating the
+signature.
 
 Reserved attribute keys are identical to §2.2 (`aster.role`, `aster.name`,
 `aster.allowed_cidrs`, `aster.iid_*`). For consumer credentials, `aster.role`
@@ -668,7 +774,7 @@ EndpointHooks allowlist so subsequent connections from that NodeID are accepted.
 3. If `endpoint_id` is set: it matches the QUIC peer identity established by
    the handshake.
 4. If `credential_type = OTT`: the nonce has not been consumed (checked against
-   the local nonce store).
+   the local nonce store — see §3.2.1 for scoping rules).
 
 **Runtime checks (conditional on credential attributes)**
 
@@ -703,6 +809,36 @@ not added to the allowlist, and no attributes are stored.
 The receiving node logs the refusal reason. As with producer admission (§2.4),
 no diagnostic information about the specific check failure is returned to the
 caller — this prevents oracle attacks against the nonce store or IID validation.
+
+#### 3.2.1 OTT Nonce Store Scope (normative)
+
+The nonce store is authoritative over **a single admission domain**, not the
+whole mesh. A deployment MUST choose one of the following scopes and document
+the choice:
+
+1. **Single admission endpoint** (simplest; RECOMMENDED for new deployments).
+   All consumer admission traffic is funneled through one endpoint (or an
+   HA-pair sharing a persistent store). The local nonce store is
+   authoritative. Operators pick this when they can colocate admission
+   behind a single logical service.
+
+2. **Mesh-gossiped consumption** (required for multi-endpoint admission).
+   When multiple producer endpoints accept consumer admissions, the first
+   endpoint to consume a nonce MUST broadcast a `NonceConsumed{nonce, sender,
+   epoch_ms}` `ProducerMessage` (type TBD, reserved in §2.6) over the
+   producer mesh. Other endpoints mark the nonce consumed on receipt. A
+   nonce that is observed concurrently on two endpoints (before gossip
+   propagates) is a **known limitation**: both endpoints admit the consumer.
+   Operators accept this small window (bounded by gossip propagation,
+   typically < 100ms) as the price of multi-endpoint admission.
+
+**Known limitation.** Without mesh-gossiped consumption, two admission
+endpoints holding separate local nonce stores will both accept the same OTT
+credential. This is a real security footgun. The spec does not choose for
+the operator because the right answer depends on the deployment's admission
+topology. The CLI (`aster trust configure`) SHOULD warn when `aster-trust`
+is configured with a nonce store scoped as `local` on a mesh with more than
+one producer endpoint accepting consumer admissions.
 
 -----
 
