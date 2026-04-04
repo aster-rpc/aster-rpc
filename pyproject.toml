@@ -9,9 +9,13 @@ description = "Python bindings for the Iroh peer-to-peer networking library"
 requires-python = ">=3.9"
 dependencies = [
     "blake3>=1.0.8",
+    "cryptography>=42",
     "pyfory==0.16.0",
     "zstandard>=0.25.0",
 ]
+
+[project.optional-dependencies]
+iid = ["PyJWT>=2.8"]
 
 [project.scripts]
 aster = "aster_python.aster.contract.cli:main"
