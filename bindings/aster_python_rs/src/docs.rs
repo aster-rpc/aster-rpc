@@ -140,11 +140,7 @@ impl DocHandle {
 
     /// Query all entries for an exact key, across all authors.
     /// Returns a list of DocEntry with metadata.
-    fn query_key_exact<'py>(
-        &self,
-        py: Python<'py>,
-        key: Vec<u8>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn query_key_exact<'py>(&self, py: Python<'py>, key: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.inner.clone();
         future_into_py(py, async move {
             let entries = doc.query_key_exact(key).await.map_err(err_to_py)?;

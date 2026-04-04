@@ -755,6 +755,186 @@ fn test_hook_after_connect_respond_invalid_invocation() {
     }
 }
 
+// ============================================================================
+// Phase 1c: Tag FFI Tests
+// ============================================================================
+
+#[test]
+fn test_tag_event_kind_values() {
+    // Ensure event kind discriminants match the documented ABI values.
+    assert_eq!(iroh_event_kind_t::IROH_EVENT_TAG_SET as u32, 36);
+    assert_eq!(iroh_event_kind_t::IROH_EVENT_TAG_GET as u32, 37);
+    assert_eq!(iroh_event_kind_t::IROH_EVENT_TAG_DELETED as u32, 38);
+    assert_eq!(iroh_event_kind_t::IROH_EVENT_TAG_LIST as u32, 39);
+}
+
+#[test]
+fn test_tags_set_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+        let name = b"my-tag";
+        let hash = b"aabbcc";
+        let status = iroh_tags_set(
+            runtime,
+            0,
+            name.as_ptr(),
+            name.len(),
+            hash.as_ptr(),
+            hash.len(),
+            0,
+            0,
+            ptr::null_mut(), // null out_operation -> INVALID_ARGUMENT
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_tags_set_null_name_ptr() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+        let hash = b"aabbcc";
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_tags_set(
+            runtime,
+            0,
+            ptr::null(),
+            0, // null name_ptr -> INVALID_ARGUMENT
+            hash.as_ptr(),
+            hash.len(),
+            0,
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_tags_set_unknown_node_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+        let name = b"my-tag";
+        let hash = b"aabbcc";
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_tags_set(
+            runtime,
+            999999, // unknown node
+            name.as_ptr(),
+            name.len(),
+            hash.as_ptr(),
+            hash.len(),
+            0,
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_tags_get_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+        let name = b"my-tag";
+        let status = iroh_tags_get(
+            runtime,
+            0,
+            name.as_ptr(),
+            name.len(),
+            0,
+            ptr::null_mut(), // null out_operation -> INVALID_ARGUMENT
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_tags_get_null_name_ptr() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_tags_get(
+            runtime,
+            0,
+            ptr::null(),
+            0, // null name_ptr -> INVALID_ARGUMENT
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_tags_delete_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+        let name = b"my-tag";
+        let status = iroh_tags_delete(
+            runtime,
+            0,
+            name.as_ptr(),
+            name.len(),
+            0,
+            ptr::null_mut(), // null out_operation -> INVALID_ARGUMENT
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_tags_list_prefix_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+        let prefix = b"prefix/";
+        let status = iroh_tags_list_prefix(
+            runtime,
+            0,
+            prefix.as_ptr(),
+            prefix.len(),
+            0,
+            ptr::null_mut(), // null out_operation -> INVALID_ARGUMENT
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
 #[test]
 fn test_hook_endpoint_config_with_hooks_creates_operation() {
     // Verify that iroh_endpoint_create with enable_hooks=1 accepts the config

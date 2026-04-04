@@ -22,10 +22,12 @@ try:
         IrohNode,
         # Blobs
         BlobsClient,
+        TagInfo,
         blobs_client,
         # Docs
         DocsClient,
         DocHandle,
+        DocEntry,
         docs_client,
         # Gossip
         GossipClient,
@@ -71,10 +73,12 @@ __all__ = [
     "IrohNode",
     # Blobs
     "BlobsClient",
+    "TagInfo",
     "blobs_client",
     # Docs
     "DocsClient",
     "DocHandle",
+    "DocEntry",
     "docs_client",
     # Gossip
     "GossipClient",
