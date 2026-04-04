@@ -1,0 +1,18 @@
+[build-system]
+requires      = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name    = "aster-cli"
+version = "0.1.0"
+description = "Aster RPC framework command-line tools"
+requires-python = ">=3.9"
+dependencies = [
+    "aster-python",
+]
+
+[project.scripts]
+aster = "aster_cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
