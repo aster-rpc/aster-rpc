@@ -423,3 +423,116 @@ Enrollment credential   →  Gate 1 (mesh join)    →  attributes on CallContex
 Token / attributes      →  Gate 2 (Authorize)    →  rcan with capability list
 rcan capability list    →  Gate 3 (dispatch)     →  handler runs or PERMISSION_DENIED
 ```
+
+-----
+
+### 2.10 Clock Drift Detection
+
+The `epoch_ms` field on every `ProducerMessage` (§2.6) is already load-bearing
+for replay resistance. If a producer's clock drifts, it either rejects valid
+messages from peers (because their `epoch_ms` falls outside its acceptance
+window) or sends messages that peers silently drop. Both failure modes are
+invisible and operationally catastrophic. This section formalizes how producers
+detect and respond to clock drift.
+
+**Timestamp tracking**
+
+Every producer MUST track the most recent `epoch_ms` received from each peer in
+its accepted producer set. No new message field is required — the existing
+`ProducerMessage.epoch_ms` is the data source.
+
+**LeaseUpdate frequency**
+
+Producers MUST send a `LeaseUpdate` message at least every 60 minutes. They
+SHOULD send one every 15 minutes. This serves as both a health heartbeat and
+fresh input for drift detection. A producer that has not sent a `LeaseUpdate`
+within 90 minutes MAY be treated as stale by peers.
+
+**Drift computation**
+
+When a producer receives a message from a peer, it computes the peer's apparent
+clock offset:
+
+```
+offset = peer.epoch_ms - local_wall_clock_ms
+```
+
+The producer maintains a sliding record of the most recent offset from each
+active peer. The **mesh median offset** is the median of all tracked peer
+offsets. A peer is considered **drifted** if its offset deviates from the mesh
+median by more than the configured tolerance.
+
+The default tolerance is **5000 ms** (5 seconds). Implementations SHOULD make
+this configurable (e.g., `ASTER_CLOCK_DRIFT_TOLERANCE_MS`).
+
+**Minimum peer count**
+
+Drift detection activates only when ≥3 active peers are being tracked. With
+fewer peers, the median is not statistically meaningful. Producers with fewer
+than 3 peers SHOULD log clock offset observations at debug level but MUST NOT
+take enforcement action.
+
+**Grace period**
+
+A freshly joined producer is exempt from drift enforcement for 60 seconds after
+joining the gossip channel. During this grace period, the node collects peer
+timestamps but does not evaluate itself or others against the tolerance. This
+prevents false positives during initial clock synchronization.
+
+**Self-monitoring (self-departure)**
+
+Each producer continuously compares its own clock against the mesh median. If
+the producer's own offset from the mesh median exceeds the tolerance:
+
+1. The producer logs an error: `"clock drift detected: local offset {offset}ms exceeds tolerance {tolerance}ms from mesh median"`.
+2. The producer broadcasts a `Depart` message.
+3. The producer shuts down its mesh participation.
+
+Self-departure is fail-fast: a drifted producer removes itself rather than
+silently corrupting the mesh. The producer process MAY remain running for
+other purposes (e.g., serving cached data) but MUST NOT send further gossip
+messages or accept new mesh connections.
+
+**Peer monitoring (peer isolation)**
+
+When a producer observes that another peer's offset deviates from the mesh
+median by more than the tolerance:
+
+1. The producer logs a warning: `"peer {endpoint_id} clock drift detected: offset {offset}ms exceeds tolerance {tolerance}ms from mesh median"`.
+2. The producer marks the peer as **drift-isolated**.
+3. While drift-isolated, the peer's `ContractPublished` and `LeaseUpdate`
+   messages are ignored (not applied to local state). `Introduce` messages
+   are still processed (they are idempotent and the drift may be transient).
+4. The isolation is lifted when the peer sends any message with an `epoch_ms`
+   that is within tolerance of the mesh median.
+
+Drift isolation is not deauthorization — the peer remains in the accepted set.
+It is a temporary quarantine that prevents stale or time-skewed data from
+propagating. The peer can recover by fixing its clock (e.g., NTP resync) and
+sending a new `LeaseUpdate`.
+
+**Interaction with replay resistance**
+
+The ±30-second replay acceptance window (§2.6) and the ±5-second drift tolerance
+serve different purposes and are evaluated independently:
+
+- The **replay window** is a message-level check: "is this message's `epoch_ms`
+  recent enough to be non-stale?" It is evaluated on every message.
+- The **drift tolerance** is a peer-level check: "is this peer's clock close
+  enough to the mesh consensus to be trustworthy?" It is evaluated as a
+  rolling aggregate.
+
+A peer can pass the replay window check (its messages are within 30s of local
+time) while still failing the drift tolerance check (its offset is consistently
+>5s from the mesh median). The drift check catches systematic bias; the replay
+check catches individual stale messages.
+
+**Summary of thresholds**
+
+| Threshold | Default | Configurable | Purpose |
+|-----------|---------|--------------|---------|
+| Replay acceptance window | ±30 s | Yes | Per-message staleness check |
+| Clock drift tolerance | ±5 s | Yes (`ASTER_CLOCK_DRIFT_TOLERANCE_MS`) | Per-peer systematic drift check |
+| LeaseUpdate interval | ≤60 min (SHOULD ≤15 min) | Yes | Heartbeat + drift data freshness |
+| Minimum peers for drift detection | 3 | No | Statistical validity of median |
+| Grace period after join | 60 s | No | Avoid false positives during bootstrap |
