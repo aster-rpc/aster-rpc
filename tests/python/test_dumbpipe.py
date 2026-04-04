@@ -139,6 +139,10 @@ async def test_large_payload():
         ep_conn, send, recv = await connect_pipe(addr)
         await send.write_all(payload)
         await send.finish()
+        # Wait for listener to finish reading before closing the endpoint.
+        # Closing immediately after finish() can race with in-flight delivery,
+        # causing "connection lost" on the receiver side in slow environments.
+        await asyncio.sleep(0.3)
         await ep_conn.close()
 
     listener_task = asyncio.create_task(listener_side())
