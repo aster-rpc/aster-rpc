@@ -357,7 +357,8 @@ fn test_endpoint_create_invalid_config() {
                 len: 0,
             },
             enable_discovery: 0,
-            reserved: 0,
+            enable_hooks: 0,
+            hook_timeout_ms: 0,
         };
         let status = iroh_endpoint_create(runtime, &config, 0, ptr::null_mut());
         assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
@@ -685,5 +686,102 @@ fn test_remote_info_struct_size() {
         info.struct_size = expected_size;
         info.connection_type = 2; // UdpDirect
         info.is_connected = 1;
+    }
+}
+
+// ============================================================================
+// Phase 1b: Hook Tests
+// ============================================================================
+
+#[test]
+fn test_hook_endpoint_config_fields() {
+    // Verify hooks fields are accessible in the config struct.
+    let config = common::hooks_endpoint_config();
+    assert_eq!(config.enable_hooks, 1);
+    assert_eq!(config.hook_timeout_ms, 2000);
+}
+
+#[test]
+fn test_hook_before_connect_respond_invalid_runtime() {
+    unsafe {
+        let status = iroh_hook_before_connect_respond(
+            999999,
+            1,
+            iroh_hook_decision_t::IROH_HOOK_DECISION_ALLOW,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+    }
+}
+
+#[test]
+fn test_hook_after_connect_respond_invalid_runtime() {
+    unsafe {
+        let status = iroh_hook_after_connect_respond(999999, 1);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+    }
+}
+
+#[test]
+fn test_hook_before_connect_respond_invalid_invocation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+        // No invocation with this ID exists — should be NOT_FOUND.
+        let status = iroh_hook_before_connect_respond(
+            runtime,
+            999999,
+            iroh_hook_decision_t::IROH_HOOK_DECISION_ALLOW,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_hook_after_connect_respond_invalid_invocation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(ptr::null(), &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+        // No invocation with this ID exists — should be NOT_FOUND.
+        let status = iroh_hook_after_connect_respond(runtime, 999999);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_hook_endpoint_config_with_hooks_creates_operation() {
+    // Verify that iroh_endpoint_create with enable_hooks=1 accepts the config
+    // and returns a valid operation handle. The actual hook drainer is async
+    // and tested end-to-end through the Python layer.
+    unsafe {
+        let config = common::default_runtime_config();
+        let mut runtime: iroh_runtime_t = 0;
+        let status = iroh_runtime_new(&config, &mut runtime);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+        let ep_config = common::hooks_endpoint_config();
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_endpoint_create(runtime, &ep_config, 0, &mut operation);
+        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        assert!(operation != 0, "Operation handle should be non-zero");
+
+        // Give the runtime a moment to process, then confirm hook responds
+        // with unknown invocations still return NOT_FOUND.
+        std::thread::sleep(Duration::from_millis(50));
+        let status = iroh_hook_before_connect_respond(
+            runtime,
+            999999,
+            iroh_hook_decision_t::IROH_HOOK_DECISION_ALLOW,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
     }
 }

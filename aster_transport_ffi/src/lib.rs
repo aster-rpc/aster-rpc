@@ -41,6 +41,7 @@ pub type iroh_recv_stream_t = u64;
 pub type iroh_node_t = u64;
 pub type iroh_operation_t = u64;
 pub type iroh_buffer_t = u64;
+pub type iroh_hook_invocation_t = u64; // Phase 1b: identifies a pending hook invocation
 
 /// Status codes
 #[repr(C)]
@@ -167,7 +168,8 @@ pub struct iroh_endpoint_config_t {
     pub alpns: iroh_bytes_list_t,
     pub relay_urls: iroh_bytes_list_t,
     pub enable_discovery: u32,
-    pub reserved: u32,
+    pub enable_hooks: u32,    // Phase 1b: 0 = disabled, 1 = enabled
+    pub hook_timeout_ms: u64, // Phase 1b: hook reply timeout; 0 = use default (5000ms)
 }
 
 #[repr(C)]
@@ -407,6 +409,21 @@ impl BufferRegistry {
 }
 
 // ============================================================================
+// Hook Invocation State - stores pending hook reply senders (Phase 1b)
+// ============================================================================
+
+/// Wraps the oneshot reply sender for a pending hook invocation.
+enum HookSender {
+    BeforeConnect(tokio::sync::oneshot::Sender<bool>),
+    AfterConnect(tokio::sync::oneshot::Sender<CoreAfterHandshakeDecision>),
+}
+
+struct HookInvocationState {
+    /// Consumed exactly once when the caller responds.
+    sender: std::sync::Mutex<Option<HookSender>>,
+}
+
+// ============================================================================
 // Bridge Runtime - Main FFI runtime
 // ============================================================================
 
@@ -432,6 +449,9 @@ struct BridgeRuntime {
 
     // Operation registry (for cancellation)
     operations: HandleRegistry<OperationState>,
+
+    // Hook invocation registry (Phase 1b)
+    hook_invocations: HandleRegistry<HookInvocationState>,
 
     // Buffer registry
     buffers: BufferRegistry,
@@ -476,6 +496,7 @@ impl BridgeRuntime {
             gossip_clients: HandleRegistry::new(),
             gossip_topics: HandleRegistry::new(),
             operations: HandleRegistry::new(),
+            hook_invocations: HandleRegistry::new(),
             buffers: BufferRegistry::new(),
         })
     }
@@ -624,6 +645,33 @@ fn alloc_bytes(bytes: Vec<u8>) -> iroh_bytes_t {
     let len = bytes.len();
     let ptr = Box::into_raw(bytes.into_boxed_slice()) as *mut u8;
     iroh_bytes_t { ptr, len }
+}
+
+/// Encode a before_connect hook payload as:
+/// [4 bytes LE: remote_id_len][remote_id bytes][4 bytes LE: alpn_len][alpn bytes]
+fn encode_hook_connect_payload(info: &CoreHookConnectInfo) -> Vec<u8> {
+    let id = info.remote_endpoint_id.as_bytes();
+    let alpn = &info.alpn;
+    let mut buf = Vec::with_capacity(8 + id.len() + alpn.len());
+    buf.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    buf.extend_from_slice(id);
+    buf.extend_from_slice(&(alpn.len() as u32).to_le_bytes());
+    buf.extend_from_slice(alpn);
+    buf
+}
+
+/// Encode an after_handshake hook payload as:
+/// [4 bytes LE: remote_id_len][remote_id bytes][4 bytes LE: alpn_len][alpn bytes][1 byte: is_alive]
+fn encode_hook_handshake_payload(info: &CoreHookHandshakeInfo) -> Vec<u8> {
+    let id = info.remote_endpoint_id.as_bytes();
+    let alpn = &info.alpn;
+    let mut buf = Vec::with_capacity(9 + id.len() + alpn.len());
+    buf.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    buf.extend_from_slice(id);
+    buf.extend_from_slice(&(alpn.len() as u32).to_le_bytes());
+    buf.extend_from_slice(alpn);
+    buf.push(info.is_alive as u8);
+    buf
 }
 
 // Helper to check if operation was cancelled
@@ -1280,6 +1328,13 @@ pub unsafe extern "C" fn iroh_endpoint_create(
 
     let cfg = unsafe { *config };
 
+    let enable_hooks = cfg.enable_hooks != 0;
+    let hook_timeout_ms = if cfg.hook_timeout_ms > 0 {
+        cfg.hook_timeout_ms
+    } else {
+        5000
+    };
+
     let core_config = CoreEndpointConfig {
         relay_mode: match cfg.relay_mode {
             0 => None,
@@ -1301,8 +1356,8 @@ pub unsafe extern "C" fn iroh_endpoint_create(
         secret_key: unsafe { read_bytes_opt(&cfg.secret_key) },
         enable_discovery: cfg.enable_discovery != 0,
         enable_monitoring: true, // Always enable monitoring for FFI endpoints
-        enable_hooks: false,     // Hooks not yet wired through FFI event queue
-        hook_timeout_ms: 5000,
+        enable_hooks,
+        hook_timeout_ms,
     };
 
     let (op_id, cancelled) = bridge.new_operation();
@@ -1318,6 +1373,13 @@ pub unsafe extern "C" fn iroh_endpoint_create(
 
         match CoreNetClient::create_with_config(core_config).await {
             Ok(endpoint) => {
+                // Take the hook receiver before inserting endpoint into the registry.
+                let hook_receiver = if enable_hooks {
+                    endpoint.take_hook_receiver()
+                } else {
+                    None
+                };
+
                 let handle = bridge2.endpoints.insert(endpoint);
                 bridge2.emit_simple(
                     iroh_event_kind_t::IROH_EVENT_ENDPOINT_CREATED,
@@ -1328,6 +1390,64 @@ pub unsafe extern "C" fn iroh_endpoint_create(
                     user_data,
                     0,
                 );
+
+                // Spawn background tasks to drain hook events and emit them to the queue.
+                if let Some(receiver) = hook_receiver {
+                    let CoreHookReceiver {
+                        before_connect_rx,
+                        after_handshake_rx,
+                    } = receiver;
+
+                    // before_connect drainer
+                    let bridge3 = bridge2.clone();
+                    tokio::spawn(async move {
+                        let mut rx = before_connect_rx;
+                        while let Some((info, reply_tx)) = rx.recv().await {
+                            let state = HookInvocationState {
+                                sender: std::sync::Mutex::new(Some(
+                                    HookSender::BeforeConnect(reply_tx),
+                                )),
+                            };
+                            let invocation_id = bridge3.hook_invocations.insert(state);
+                            let payload = encode_hook_connect_payload(&info);
+                            let event = EventInternal::new(
+                                iroh_event_kind_t::IROH_EVENT_HOOK_BEFORE_CONNECT,
+                                iroh_status_t::IROH_STATUS_OK,
+                                0,
+                                handle,
+                                invocation_id,
+                                user_data,
+                                0,
+                            );
+                            bridge3.emit_with_data(event, payload);
+                        }
+                    });
+
+                    // after_handshake drainer
+                    let bridge4 = bridge2.clone();
+                    tokio::spawn(async move {
+                        let mut rx = after_handshake_rx;
+                        while let Some((info, reply_tx)) = rx.recv().await {
+                            let state = HookInvocationState {
+                                sender: std::sync::Mutex::new(Some(
+                                    HookSender::AfterConnect(reply_tx),
+                                )),
+                            };
+                            let invocation_id = bridge4.hook_invocations.insert(state);
+                            let payload = encode_hook_handshake_payload(&info);
+                            let event = EventInternal::new(
+                                iroh_event_kind_t::IROH_EVENT_HOOK_AFTER_CONNECT,
+                                iroh_status_t::IROH_STATUS_OK,
+                                0,
+                                handle,
+                                invocation_id,
+                                user_data,
+                                0,
+                            );
+                            bridge4.emit_with_data(event, payload);
+                        }
+                    });
+                }
             }
             Err(e) => {
                 bridge2.emit_error(op_id, user_data, &e.to_string());
@@ -4068,4 +4188,82 @@ pub unsafe extern "C" fn iroh_connection_info(
     }
 
     iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// C FFI Functions - Hook Replies (Phase 1b)
+// ============================================================================
+
+/// Respond to a pending before_connect hook invocation.
+///
+/// `decision` is IROH_HOOK_DECISION_ALLOW (0) or IROH_HOOK_DECISION_DENY (1).
+/// Calling this consumes the invocation; a second call returns NOT_FOUND.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_hook_before_connect_respond(
+    runtime: iroh_runtime_t,
+    invocation: iroh_hook_invocation_t,
+    decision: iroh_hook_decision_t,
+) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let state = match bridge.hook_invocations.remove(invocation) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let sender = match state.sender.lock().ok().and_then(|mut g| g.take()) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    match sender {
+        HookSender::BeforeConnect(tx) => {
+            let allow = matches!(decision, iroh_hook_decision_t::IROH_HOOK_DECISION_ALLOW);
+            // Ignore send error — the hook may have timed out already.
+            let _ = tx.send(allow);
+            iroh_status_t::IROH_STATUS_OK as i32
+        }
+        HookSender::AfterConnect(_) => {
+            // Wrong invocation type.
+            iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32
+        }
+    }
+}
+
+/// Respond to a pending after_connect hook invocation (always accepts).
+///
+/// Calling this consumes the invocation; a second call returns NOT_FOUND.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_hook_after_connect_respond(
+    runtime: iroh_runtime_t,
+    invocation: iroh_hook_invocation_t,
+) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let state = match bridge.hook_invocations.remove(invocation) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let sender = match state.sender.lock().ok().and_then(|mut g| g.take()) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    match sender {
+        HookSender::AfterConnect(tx) => {
+            let _ = tx.send(CoreAfterHandshakeDecision::Accept);
+            iroh_status_t::IROH_STATUS_OK as i32
+        }
+        HookSender::BeforeConnect(_) => {
+            // Wrong invocation type.
+            iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32
+        }
+    }
 }
