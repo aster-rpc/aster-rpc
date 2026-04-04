@@ -26,6 +26,10 @@ python-source  = "bindings/python"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests/python"]
+# Retry integration tests that involve real network I/O up to 2 extra times
+# before counting them as failures.  Requires pytest-rerunfailures.
+reruns = 2
+reruns_delay = 2
 # Suppress known Cython warning from pyfory's internal pxd/enum mismatch.
 # pyfory 0.16.0 ships a cpdef enum in a .pxd file whose Python wrapper is
 # not importable from pyfory.includes.libformat.  Benign third-party issue.

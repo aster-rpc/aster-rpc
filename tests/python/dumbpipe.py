@@ -63,6 +63,14 @@ async def pipe_streams(
 
     local_reader: an asyncio StreamReader (or anything with .read(n))
     local_writer: an asyncio StreamWriter (or anything with .write()/drain()/close())
+
+    Half-close semantics:
+      When the QUIC recv stream ends (FIN), we must signal EOF to the local
+      service so it knows to flush its response.  asyncio.StreamWriter.close()
+      shuts the *entire* socket (both read and write sides), which would kill
+      local_reader before local_to_quic can read the response.  Instead we use
+      transport.write_eof() — a TCP half-close — to send FIN on the write side
+      while leaving the read side intact.
     """
 
     async def quic_to_local():
@@ -73,11 +81,18 @@ async def pipe_streams(
                     break
                 local_writer.write(chunk)
                 await local_writer.drain()
-        except Exception:
-            pass
         finally:
+            # Half-close the write side so the local service sees EOF and can
+            # flush its response.  local_to_quic can still read from local_reader
+            # because only the write direction is closed here.
             try:
-                local_writer.close()
+                transport = local_writer.transport
+                if transport.can_write_eof():
+                    transport.write_eof()
+                else:
+                    # Transport doesn't support half-close (e.g. some TLS
+                    # transports); full close is the only option.
+                    local_writer.close()
             except Exception:
                 pass
 
@@ -96,17 +111,12 @@ async def pipe_streams(
             except Exception:
                 pass
 
-    t_quic_to_local = asyncio.create_task(quic_to_local())
-    t_local_to_quic = asyncio.create_task(local_to_quic())
-    # Let both directions run to completion.
-    # Using FIRST_COMPLETED here can cancel the reverse direction too early,
-    # dropping response bytes in request/response forwarding scenarios.
-    await asyncio.gather(t_quic_to_local, t_local_to_quic, return_exceptions=True)
-    # Ensure finish / close are attempted
-    try:
-        await send.finish()
-    except Exception:
-        pass
+    await asyncio.gather(
+        asyncio.create_task(quic_to_local()),
+        asyncio.create_task(local_to_quic()),
+        return_exceptions=True,
+    )
+    # Full close of the local connection once both directions are done.
     try:
         local_writer.close()
     except Exception:
