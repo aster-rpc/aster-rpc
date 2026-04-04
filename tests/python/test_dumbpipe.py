@@ -118,6 +118,10 @@ async def test_empty_payload():
     async def connector_side():
         ep_conn, send, recv = await connect_pipe(addr)
         await send.finish()
+        # Wait for listener to observe EOF before closing endpoint.
+        # Closing immediately after finish() can race and surface as
+        # "connection lost" in slower CI environments.
+        await asyncio.sleep(0.5)
         await ep_conn.close()
 
     listener_task = asyncio.create_task(listener_side())
