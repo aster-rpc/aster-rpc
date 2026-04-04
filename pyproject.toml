@@ -13,6 +13,9 @@ dependencies = [
     "zstandard>=0.25.0",
 ]
 
+[project.scripts]
+aster = "aster_python.aster.contract.cli:main"
+
 [tool.maturin]
 module-name    = "aster_python._aster_python"
 manifest-path  = "bindings/aster_python_rs/Cargo.toml"
