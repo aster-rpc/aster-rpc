@@ -86,13 +86,17 @@ class RegistryPublisher:
         *,
         channel: str | None = None,
         published_by: str = "",
+        type_defs: dict | None = None,
     ) -> str:
         """Publish a contract to the registry doc and blob store.
 
-        Stores ``contract_bytes`` as a blob, writes an ArtifactRef at
-        ``contracts/{contract_id}``, writes a version pointer at
-        ``services/{name}/versions/v{version}``, and optionally updates a
-        channel alias. Emits CONTRACT_PUBLISHED gossip.
+        When ``type_defs`` is provided AND a blobs client is configured, all
+        collection entries (contract.bin, manifest.json, types/*.bin) are
+        uploaded individually via :func:`~aster.contract.publication.upload_collection`
+        and an ``"index"`` format ArtifactRef is written.
+
+        When ``type_defs`` is not provided (or no blobs client), a single-blob
+        upload is performed (``collection_hash == contract_id``).
 
         Args:
             contract_bytes:  Canonical XLANG bytes of the ServiceContract.
@@ -100,6 +104,7 @@ class RegistryPublisher:
             version:         Version number.
             channel:         Optional channel alias (e.g. "stable").
             published_by:    Author descriptor (human-readable, not AuthorId).
+            type_defs:       Optional dict of TypeDef objects for multi-file upload.
 
         Returns:
             contract_id (64-char hex string).
@@ -107,10 +112,38 @@ class RegistryPublisher:
         import blake3  # type: ignore[import]
 
         contract_id = blake3.blake3(contract_bytes).hexdigest()
-        collection_hash = contract_id   # single-blob collection for Phase 10
 
-        # Upload to blob store if available
-        if self._blobs is not None:
+        # Determine collection format and hash
+        collection_hash = contract_id       # default: single-blob
+        collection_format = "raw"
+
+        if self._blobs is not None and type_defs is not None:
+            # Multi-file collection upload
+            from aster_python.aster.contract.publication import (
+                build_collection as _build_collection,
+                upload_collection as _upload_collection,
+            )
+            from aster_python.aster.contract.identity import (
+                canonical_xlang_bytes as _canonical_xlang_bytes,
+                compute_contract_id as _compute_contract_id,
+                ServiceContract as _SC,
+            )
+            # Build entries: contract.bin first, then types, manifest last
+            # We have contract_bytes already; build a minimal collection
+            entries: list[tuple[str, bytes]] = [("contract.bin", contract_bytes)]
+            for fqn, td in type_defs.items():
+                from aster_python.aster.contract.identity import (
+                    canonical_xlang_bytes as _cb,
+                    compute_type_hash as _th,
+                )
+                td_bytes = _cb(td)
+                h_hex = _th(td_bytes).hex()
+                entries.append((f"types/{h_hex}.bin", td_bytes))
+
+            collection_hash = await _upload_collection(self._blobs, entries)
+            collection_format = "index"
+        elif self._blobs is not None:
+            # Single-blob upload
             await self._blobs.add_bytes(contract_bytes)
 
         now_ms = int(time.time() * 1000)
@@ -119,6 +152,7 @@ class RegistryPublisher:
             collection_hash=collection_hash,
             published_by=published_by or self._author_id,
             published_at_epoch_ms=now_ms,
+            collection_format=collection_format,
         )
         await self._doc.set_bytes(
             self._author_id,

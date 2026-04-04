@@ -56,15 +56,20 @@ class ArtifactRef:
     """Docs pointer to an immutable Iroh collection (§11.2.1).
 
     Stored at ``contracts/{contract_id}`` in the registry doc.
+
+    ``collection_format`` is ``"raw"`` for single-blob (Phase 10 default) or
+    ``"index"`` for multi-file collections built by ``publication.upload_collection``.
+    Old records without this field default to ``"raw"`` on deserialization.
     """
 
     contract_id: str                    # hex — BLAKE3 of ServiceContract
-    collection_hash: str                # hex — Iroh blob hash (contract.xlang)
+    collection_hash: str                # hex — Iroh blob hash of collection root
     provider_endpoint_id: str | None = None   # NodeId serving blobs ALPN
     relay_url: str | None = None
     ticket: str | None = None           # Optional bearer BlobTicket
     published_by: str = ""              # AuthorId who published
     published_at_epoch_ms: int = 0
+    collection_format: str = "raw"      # "raw" or "index" (multi-file)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -72,6 +77,8 @@ class ArtifactRef:
     @staticmethod
     def from_json(s: str | bytes) -> "ArtifactRef":
         data = json.loads(s)
+        # collection_format was added after initial Phase 10; default "raw" for old records.
+        data.setdefault("collection_format", "raw")
         return ArtifactRef(**data)
 
 

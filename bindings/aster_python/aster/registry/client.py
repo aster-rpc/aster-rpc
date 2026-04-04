@@ -324,8 +324,14 @@ class RegistryClient:
     async def fetch_contract(self, contract_id: str) -> bytes | None:
         """Fetch contract bytes from the blob store by contract_id.
 
-        Reads the ArtifactRef from the doc, then downloads the blob. Returns
-        None if not found locally. In Phase 10, contract_id == collection_hash.
+        Reads the ArtifactRef from the doc, then downloads the blob.  Handles
+        both collection formats:
+
+        ``"raw"``   — reads the single blob by ``collection_hash`` directly.
+        ``"index"`` — reads the collection index blob, then fetches
+                      ``contract.bin`` from it, and verifies the BLAKE3 hash.
+
+        Returns None if not found locally or if the blob store is not configured.
         """
         entries = await self._doc.query_key_exact(contract_key(contract_id))
         if self._acl is not None:
@@ -342,6 +348,18 @@ class RegistryClient:
         if self._blobs is None:
             return None
 
+        if getattr(ref, "collection_format", "raw") == "index":
+            # Multi-file collection: use publication.fetch_contract
+            from aster_python.aster.contract.publication import fetch_contract as _fetch
+            try:
+                return await _fetch(
+                    contract_id, self._blobs, collection_hash=ref.collection_hash
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("fetch_contract (index): failed for %s: %s", contract_id[:12], exc)
+                return None
+
+        # Single-blob ("raw") mode
         # Check local cache first (blob_local_info if available)
         try:
             local_info = await self._blobs.blob_local_info(ref.collection_hash)

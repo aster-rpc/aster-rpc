@@ -1,15 +1,33 @@
 """
-aster.contract.publication — Contract publication and fetch stubs.
+aster.contract.publication — Contract publication and fetch via Iroh blob store.
 
 Spec reference: Aster-ContractIdentity.md §11.5
 
-The collection layout logic (building the list of (name, bytes) pairs) is
-implemented as pure Python. The Iroh-dependent upload and fetch operations
-raise NotImplementedError until the transport layer is wired up.
+Two collection formats are supported:
+
+``"raw"``   — single-blob: the contract canonical bytes are stored as one blob;
+              ``collection_hash == contract_id``. Used by RegistryPublisher when
+              no multi-file layout is needed.
+
+``"index"`` — multi-file: all collection entries (contract.bin, manifest.json,
+              types/*.bin) are uploaded individually; a JSON collection index blob
+              maps entry names to their hashes.  ``collection_hash`` is the BLAKE3
+              hash of the index blob.
+
+The collection index blob format (JSON, UTF-8):
+    {
+      "version": 1,
+      "entries": [
+        {"name": "contract.bin", "hash": "<hex>", "size": <int>},
+        ...
+      ]
+    }
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import TYPE_CHECKING
 
 from aster_python.aster.contract.identity import (
@@ -22,7 +40,9 @@ from aster_python.aster.contract.identity import (
 from aster_python.aster.contract.manifest import ContractManifest
 
 if TYPE_CHECKING:
-    pass  # iroh types imported lazily to avoid hard dependency
+    pass  # iroh types imported lazily
+
+logger = logging.getLogger(__name__)
 
 
 # ── Collection layout ─────────────────────────────────────────────────────────
@@ -46,7 +66,7 @@ def build_collection(
         type_defs: Dict mapping FQN to TypeDef (from resolve_with_cycles).
 
     Returns:
-        List of (entry_name, raw_bytes) pairs.
+        List of (entry_name, raw_bytes) pairs in deterministic order.
     """
     entries: list[tuple[str, bytes]] = []
 
@@ -89,7 +109,85 @@ def build_collection(
     return entries
 
 
-# ── Publication stub ──────────────────────────────────────────────────────────
+# ── Multi-file collection upload ──────────────────────────────────────────────
+
+
+async def upload_collection(
+    blobs: object,
+    entries: list[tuple[str, bytes]],
+) -> str:
+    """Upload all collection entries and return the collection index hash.
+
+    For each ``(name, data)`` entry:
+    - Upload ``data`` as a raw blob → obtain ``hash_hex``.
+
+    Then build a JSON collection index that maps names to hashes, upload it,
+    and return its hash (``collection_hash``).
+
+    Args:
+        blobs:   A live ``BlobsClient``.
+        entries: ``[(name, bytes)]`` list from ``build_collection()``.
+
+    Returns:
+        ``collection_hash`` — hex hash of the collection index blob.
+    """
+    index_entries: list[dict] = []
+    for name, data in entries:
+        hash_hex = await blobs.add_bytes(data)
+        index_entries.append({"name": name, "hash": hash_hex, "size": len(data)})
+        logger.debug("upload_collection: %s → %s (%d bytes)", name, hash_hex[:12], len(data))
+
+    index = {"version": 1, "entries": index_entries}
+    index_bytes = json.dumps(index, separators=(",", ":"), sort_keys=False).encode("utf-8")
+    collection_hash = await blobs.add_bytes(index_bytes)
+    logger.debug(
+        "upload_collection: index blob → %s (%d entries)", collection_hash[:12], len(index_entries)
+    )
+    return collection_hash
+
+
+async def fetch_from_collection(
+    blobs: object,
+    collection_hash: str,
+    entry_name: str,
+) -> bytes | None:
+    """Fetch a named entry from a multi-file collection index.
+
+    Args:
+        blobs:           A live ``BlobsClient``.
+        collection_hash: Hash of the collection index blob.
+        entry_name:      The entry name (e.g. ``"contract.bin"``).
+
+    Returns:
+        The raw bytes of the entry, or ``None`` if not found.
+    """
+    try:
+        index_bytes = await blobs.read_to_bytes(collection_hash)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("fetch_from_collection: cannot read index %s: %s", collection_hash[:12], exc)
+        return None
+
+    try:
+        index = json.loads(index_bytes)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("fetch_from_collection: malformed index blob: %s", exc)
+        return None
+
+    for entry in index.get("entries", []):
+        if entry["name"] == entry_name:
+            try:
+                return await blobs.read_to_bytes(entry["hash"])
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "fetch_from_collection: cannot read entry %s: %s", entry_name, exc
+                )
+                return None
+
+    logger.debug("fetch_from_collection: entry %r not found in collection", entry_name)
+    return None
+
+
+# ── Publication ───────────────────────────────────────────────────────────────
 
 
 async def publish_contract(
@@ -97,59 +195,94 @@ async def publish_contract(
     type_defs: dict[str, TypeDef],
     blobs_client: object | None = None,
     docs_client: object | None = None,
-) -> str:
-    """Publish a contract to the Iroh blob/doc store.
+) -> tuple[str, str]:
+    """Publish a contract's full collection to the Iroh blob store.
 
-    The collection layout is built from ``build_collection()``. The actual
-    upload to Iroh blobs/docs requires a live connection and is stubbed out.
+    All entries from ``build_collection()`` are uploaded individually. The
+    collection index blob is uploaded last and its hash is returned.
 
     Args:
-        contract: The resolved ServiceContract.
-        type_defs: Dict mapping FQN to TypeDef.
-        blobs_client: An Iroh BlobsClient (or None for dry-run).
-        docs_client: An Iroh DocsClient (or None for dry-run).
+        contract:     The resolved ServiceContract.
+        type_defs:    Dict mapping FQN to TypeDef.
+        blobs_client: A live BlobsClient (or None for dry-run).
+        docs_client:  Unused; reserved for future docs integration.
 
     Returns:
-        The contract_id hex string.
-
-    Raises:
-        NotImplementedError: Always — Iroh upload not yet implemented.
+        ``(contract_id, collection_hash)`` — both are 64-char hex strings.
+        In dry-run mode (``blobs_client is None``), ``collection_hash == contract_id``.
     """
-    # Compute the collection entries (pure Python, no iroh dependency)
     entries = build_collection(contract, type_defs)
-
     contract_bytes = canonical_xlang_bytes(contract)
     contract_id = compute_contract_id(contract_bytes)
 
-    if blobs_client is None and docs_client is None:
-        # Dry-run mode: just return the contract_id
-        return contract_id
+    if blobs_client is None:
+        # Dry-run: return without uploading
+        return contract_id, contract_id
 
-    raise NotImplementedError(
-        "publish_contract: Iroh blob upload is not yet implemented. "
-        "The collection layout has been computed — connect an Iroh BlobsClient "
-        "to upload the following entries:\n"
-        + "\n".join(f"  {name}: {len(data)} bytes" for name, data in entries)
+    collection_hash = await upload_collection(blobs_client, entries)
+    logger.info(
+        "publish_contract: %s v%d uploaded (%d entries, collection_hash=%s)",
+        contract.name,
+        contract.version,
+        len(entries),
+        collection_hash[:12],
     )
+    return contract_id, collection_hash
+
+
+# ── Fetch + verification ──────────────────────────────────────────────────────
 
 
 async def fetch_contract(
     contract_id: str,
-    blobs_client: object | None = None,
-) -> ContractManifest:
-    """Fetch a contract manifest from the Iroh blob store by contract_id.
+    blobs_client: object,
+    collection_hash: str | None = None,
+) -> bytes | None:
+    """Fetch and verify contract bytes from the Iroh blob store.
+
+    Two modes:
+
+    ``collection_hash`` provided (multi-file, ``"index"`` format):
+        - Reads the collection index blob.
+        - Fetches ``contract.bin`` from the index.
+        - Verifies ``blake3(contract_bytes).hexdigest() == contract_id``.
+
+    ``collection_hash is None`` or equals ``contract_id`` (single-blob, ``"raw"``):
+        - Reads the blob directly by ``contract_id``.
 
     Args:
-        contract_id: 64-char hex string identifying the contract.
-        blobs_client: An Iroh BlobsClient.
+        contract_id:     64-char hex string identifying the contract.
+        blobs_client:    A live BlobsClient.
+        collection_hash: Hash of the collection index blob (multi-file mode) or
+                         ``None``/same as ``contract_id`` for single-blob mode.
 
     Returns:
-        The fetched ContractManifest.
+        The raw canonical contract bytes on success, or ``None`` if unavailable.
 
     Raises:
-        NotImplementedError: Always — Iroh fetch not yet implemented.
+        ValueError: if the fetched bytes fail the BLAKE3 hash check.
     """
-    raise NotImplementedError(
-        f"fetch_contract({contract_id!r}): Iroh blob fetch is not yet implemented. "
-        "Connect an Iroh BlobsClient to retrieve the contract manifest."
-    )
+    import blake3  # type: ignore[import]
+
+    if collection_hash is None or collection_hash == contract_id:
+        # Single-blob mode: the blob hash IS the contract_id.
+        try:
+            return await blobs_client.read_to_bytes(contract_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("fetch_contract: cannot read blob %s: %s", contract_id[:12], exc)
+            return None
+
+    # Multi-file index mode
+    contract_bytes = await fetch_from_collection(blobs_client, collection_hash, "contract.bin")
+    if contract_bytes is None:
+        return None
+
+    # Integrity check
+    actual_id = blake3.blake3(contract_bytes).hexdigest()
+    if actual_id != contract_id:
+        raise ValueError(
+            f"fetch_contract: hash mismatch for contract {contract_id[:12]}: "
+            f"got {actual_id[:12]}"
+        )
+
+    return contract_bytes

@@ -938,3 +938,180 @@ async def test_registry_doc_nothing_except_policy():
         assert expected_prefix in prefix_set, f"Missing prefix: {expected_prefix}"
 
     await node.shutdown()
+
+
+# ── Multi-file HashSeq collection builder + publication round-trip ─────────────
+
+
+@pytest.mark.asyncio
+async def test_upload_collection_and_fetch_entries():
+    """upload_collection stores all entries; fetch_from_collection retrieves each."""
+    from aster_python import IrohNode, blobs_client
+    from aster_python.aster.contract.publication import (
+        upload_collection,
+        fetch_from_collection,
+    )
+
+    node = await IrohNode.memory()
+    bc = blobs_client(node)
+
+    entries = [
+        ("contract.bin", b"canonical_contract_bytes"),
+        ("manifest.json", b'{"service":"TestSvc","version":1}'),
+        ("types/abc123.bin", b"type_def_bytes"),
+    ]
+
+    collection_hash = await upload_collection(bc, entries)
+    assert len(collection_hash) == 64  # BLAKE3 hex
+
+    # Fetch each entry back
+    for name, expected_bytes in entries:
+        fetched = await fetch_from_collection(bc, collection_hash, name)
+        assert fetched == expected_bytes, f"Entry {name!r} round-trip failed"
+
+    # Non-existent entry returns None
+    missing = await fetch_from_collection(bc, collection_hash, "does_not_exist.bin")
+    assert missing is None
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_upload_collection_index_is_content_addressed():
+    """Identical entries produce the same collection_hash."""
+    from aster_python import IrohNode, blobs_client
+    from aster_python.aster.contract.publication import upload_collection
+
+    node = await IrohNode.memory()
+    bc = blobs_client(node)
+
+    entries = [("a.bin", b"hello"), ("b.bin", b"world")]
+    h1 = await upload_collection(bc, entries)
+    h2 = await upload_collection(bc, entries)
+    assert h1 == h2
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_publication_round_trip():
+    """publish_contract → fetch_contract → verify BLAKE3 hash."""
+    from aster_python import IrohNode, blobs_client
+    from aster_python.aster.contract.publication import (
+        build_collection,
+        upload_collection,
+        fetch_contract,
+    )
+    from aster_python.aster.contract.identity import (
+        MethodDef,
+        MethodPattern,
+        ScopeKind,
+        ServiceContract,
+        canonical_xlang_bytes,
+        compute_contract_id,
+    )
+    import blake3
+
+    node = await IrohNode.memory()
+    bc = blobs_client(node)
+
+    # Build a minimal ServiceContract
+    contract = ServiceContract(
+        name="PublishTestSvc",
+        version=1,
+        methods=[
+            MethodDef(
+                name="ping",
+                pattern=MethodPattern.UNARY,
+                request_type=b"",
+                response_type=b"",
+                idempotent=True,
+                default_timeout=30,
+            )
+        ],
+        serialization_modes=["xlang"],
+        alpn="aster/1",
+        scoped=ScopeKind.SHARED,
+    )
+    type_defs = {}  # no custom types
+
+    contract_bytes = canonical_xlang_bytes(contract)
+    contract_id = compute_contract_id(contract_bytes)
+
+    # Upload the collection
+    entries = build_collection(contract, type_defs)
+    collection_hash = await upload_collection(bc, entries)
+
+    assert collection_hash != contract_id  # multi-file hash differs from contract_id
+
+    # Fetch and verify
+    fetched = await fetch_contract(contract_id, bc, collection_hash=collection_hash)
+    assert fetched is not None
+    assert fetched == contract_bytes
+
+    # Integrity: BLAKE3(fetched) == contract_id
+    assert blake3.blake3(fetched).hexdigest() == contract_id
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_publish_contract_full_collection_via_publisher():
+    """RegistryPublisher.publish_contract with type_defs stores multi-file collection."""
+    from aster_python import IrohNode, docs_client, blobs_client
+    from aster_python.aster.contract.identity import (
+        MethodDef,
+        MethodPattern,
+        ScopeKind,
+        ServiceContract,
+        canonical_xlang_bytes,
+        compute_contract_id,
+    )
+    from aster_python.aster.contract.publication import fetch_contract
+    import blake3
+
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+    bc = blobs_client(node)
+    doc = await dc.create()
+    author = await dc.create_author()
+
+    contract = ServiceContract(
+        name="FullPublishSvc",
+        version=2,
+        methods=[
+            MethodDef(
+                name="hello",
+                pattern=MethodPattern.UNARY,
+                request_type=b"",
+                response_type=b"",
+                idempotent=False,
+                default_timeout=10,
+            )
+        ],
+        serialization_modes=["xlang"],
+        alpn="aster/1",
+        scoped=ScopeKind.SHARED,
+    )
+    type_defs = {}
+
+    contract_bytes = canonical_xlang_bytes(contract)
+    contract_id = compute_contract_id(contract_bytes)
+
+    publisher = RegistryPublisher(doc, author, blobs=bc)
+    returned_cid = await publisher.publish_contract(
+        contract_bytes,
+        "FullPublishSvc",
+        version=2,
+        type_defs=type_defs,
+    )
+    assert returned_cid == contract_id
+
+    # Use RegistryClient.fetch_contract to retrieve the contract bytes
+    client = RegistryClient(doc, caller_alpn="aster/1", blobs=bc)
+    fetched = await client.fetch_contract(contract_id)
+    assert fetched is not None
+    assert blake3.blake3(fetched).hexdigest() == contract_id
+
+    await publisher.close()
+    await node.shutdown()

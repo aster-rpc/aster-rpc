@@ -358,7 +358,7 @@ Outstanding issue / blocker:
 **Publication (§11.4.3 — normative ordering):**
 - [x] Create `aster/contract/publication.py::publish_contract()` (iroh-dependent stub — raises NotImplementedError until Phase 10 integration)
 - [x] Build HashSeq collection: `build_collection()` returns `[(name, bytes)]` in `[manifest.json, contract.xlang, types/...]` order — pure Python, no iroh dependency
-- [ ] Multi-file HashSeq collection builder (wraps `BlobsClient` primitives) — deferred to Phase 10
+- [x] Multi-file HashSeq collection builder (wraps `BlobsClient` primitives) — implemented in `publication.py::upload_collection` (JSON index format)
 - [x] Startup verification call **before** any writes (fatal on mismatch) — implemented in `publish_contract()` stub
 - [x] Write order documented: (1) ArtifactRef, (2) version pointer, (3) optional aliases, (4) gossip, (5) endpoint leases LAST
 
@@ -400,7 +400,7 @@ Outstanding issue / blocker:
 - [x] Changing any type in graph → changes contract_id
 - [x] Manifest mismatch → fatal error with full diagnostic
 - [x] `aster contract gen` CLI produces committable manifest.json offline (no network access) — tested via `test_service_to_contract`
-- [ ] Publication round-trip: publish → fetch → verify — deferred to Phase 10 (requires iroh integration)
+- [x] Publication round-trip: publish → fetch → verify — implemented and tested (`test_publication_round_trip`, `test_publish_contract_full_collection_via_publisher`)
 
 ---
 
