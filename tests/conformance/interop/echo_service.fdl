@@ -1,0 +1,17 @@
+// Aster FDL — echo service for cross-language interop testing
+// Spec: Aster-SPEC.md §13.2; conformance placeholder for Java binding
+
+service EchoService {
+    version: 1
+    alpn: "aster/echo/1"
+
+    rpc echo(EchoRequest) returns (EchoResponse);
+}
+
+message EchoRequest {
+    message: string;
+}
+
+message EchoResponse {
+    message: string;
+}
