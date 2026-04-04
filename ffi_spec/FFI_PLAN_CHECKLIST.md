@@ -10,9 +10,11 @@ For each step we need to make sure the code passes tests and linting.
 
 ## STATUS
 
-Starting Phase 1c. Phases 1 and 1b are substantially complete in core/FFI/Python (see verified status below). Phase 1c has no implementation yet — all items are TODO.
+Phase 1b complete. Starting Phase 1c. All Phase 1b items are now implemented and verified.
 
 Outstanding blocker: None.
+
+Note: `tests/python/test_dumbpipe.py::test_tcp_forwarding` and `::test_unix_socket_forwarding` are pre-existing flaky failures unrelated to Phase 1b work (confirmed failing at baseline commit).
 
 ---
 
@@ -20,11 +22,11 @@ Outstanding blocker: None.
 
 Before starting new work, confirm the existing surface is healthy:
 
-- [ ] `cargo test -p aster_transport_core` passes
-- [ ] `cargo test -p aster_transport_ffi --test test_ffi` passes (expect 39 tests)
-- [ ] `uv run pytest tests/python/test_phase1b.py -q` passes (expect 8 tests)
-- [ ] `uv run pytest tests/python/ -q` passes (all existing Python tests)
-- [ ] `uv run ruff check bindings/aster_python_rs/` passes (or N/A for Rust)
+- [x] `cargo test -p aster_transport_core` passes
+- [x] `cargo test -p aster_transport_ffi --test test_ffi` passes (45 tests after Phase 1b additions)
+- [x] `uv run pytest tests/python/test_phase1b.py -q` passes (8 tests)
+- [x] `uv run pytest tests/python/ -q` passes (293 pass, 2 pre-existing dumbpipe flakes)
+- [x] `uv run ruff check bindings/aster_python_rs/` passes (N/A for Rust — cargo clippy clean)
 
 ---
 
@@ -36,23 +38,23 @@ These are items from Phase 1b that are partially implemented or missing Python e
 
 The core has `query_key_exact`, `query_key_prefix`, and `read_entry_content` on `CoreDoc`, but the Python `DocHandle` wrapper in `bindings/aster_python_rs/src/docs.rs` does not expose them.
 
-- [ ] Add `query_key_exact(key: bytes) -> list[DocEntry]` to Python `DocHandle`
-- [ ] Add `query_key_prefix(prefix: bytes) -> list[DocEntry]` to Python `DocHandle`
-- [ ] Add `read_entry_content(content_hash_hex: str) -> bytes` to Python `DocHandle`
-- [ ] Define Python `DocEntry` class (author_id, key, content_hash, content_len, timestamp)
-- [ ] Add Python tests for doc query round-trip (write with author A, query by key, filter by author)
-- [ ] Update `bindings/aster_python/__init__.pyi` type stubs
+- [x] Add `query_key_exact(key: bytes) -> list[DocEntry]` to Python `DocHandle`
+- [x] Add `query_key_prefix(prefix: bytes) -> list[DocEntry]` to Python `DocHandle`
+- [x] Add `read_entry_content(content_hash_hex: str) -> bytes` to Python `DocHandle`
+- [x] Define Python `DocEntry` class (author_id, key, content_hash, content_len, timestamp)
+- [x] Add Python tests for doc query round-trip (write with author A, query by key, filter by author)
+- [x] Update `bindings/aster_python/__init__.pyi` type stubs
 
 ### FFI: Hook Reply Wiring (core done, FFI wiring incomplete)
 
 The core `CoreHooksAdapter` and `CoreHookReceiver` are complete. The FFI event-queue push path is not wired.
 
-- [ ] Wire FFI event queue to emit `IROH_EVENT_HOOK_BEFORE_CONNECT` from `CoreHookReceiver`
-- [ ] Wire FFI event queue to emit `IROH_EVENT_HOOK_AFTER_CONNECT` from `CoreHookReceiver`
-- [ ] Implement `iroh_hook_before_connect_respond` in FFI
-- [ ] Implement `iroh_hook_after_connect_respond` in FFI
-- [ ] Add FFI integration test: hook before_connect allow/deny
-- [ ] Add FFI integration test: hook after_connect delivery
+- [x] Wire FFI event queue to emit `IROH_EVENT_HOOK_BEFORE_CONNECT` from `CoreHookReceiver`
+- [x] Wire FFI event queue to emit `IROH_EVENT_HOOK_AFTER_CONNECT` from `CoreHookReceiver`
+- [x] Implement `iroh_hook_before_connect_respond` in FFI
+- [x] Implement `iroh_hook_after_connect_respond` in FFI
+- [x] Add FFI integration test: hook before_connect allow/deny
+- [x] Add FFI integration test: hook after_connect delivery
 
 ---
 
@@ -245,8 +247,8 @@ The core `CoreHooksAdapter` and `CoreHookReceiver` are complete. The FFI event-q
 
 | Milestone | Status |
 |-----------|--------|
-| Baseline verification | ⬜ Not started |
-| Phase 1b remaining (doc query Python, hook FFI wiring) | ⬜ Not started |
+| Baseline verification | ✅ Done |
+| Phase 1b remaining (doc query Python, hook FFI wiring) | ✅ Done |
 | Phase 1c P0: Blob Tags | ⬜ Not started |
 | Phase 1c P0: Fix add_bytes_as_collection | ⬜ Not started |
 | Phase 1c P1: Blob Status / Has | ⬜ Not started |

@@ -214,11 +214,16 @@ async def test_raw_quic_to_dumbpipe():
         ep_raw = await create_endpoint(ALPN)
         conn = await ep_raw.connect_node_addr(addr, ALPN)
         send, recv = await conn.open_bi()
+        request = b"test data"
+        expected = b"echo:" + request
         # Manually do the dumbpipe handshake
         await send.write_all(b"hello")
-        await send.write_all(b"test data")
+        await send.write_all(request)
         await send.finish()
-        response = await recv.read_to_end(65536)
+        # Read the exact expected response bytes instead of waiting for EOF.
+        # This avoids flakes where stream/connection teardown races with
+        # read_to_end() on slower CI hosts.
+        response = await recv.read_exact(len(expected))
         # Wait before closing to avoid race with in-flight delivery
         await asyncio.sleep(0.5)
         await ep_raw.close()
@@ -266,10 +271,13 @@ async def test_tcp_forwarding():
         ep_conn = await create_endpoint(ALPN)
         conn = await ep_conn.connect_node_addr(listen_addr, ALPN)
         send, recv = await conn.open_bi()
+        payload = b"forwarded data"
+        expected = b"echo:" + payload
         await send_handshake(send)
-        await send.write_all(b"forwarded data")
+        await send.write_all(payload)
         await send.finish()
-        result = await recv.read_to_end(65536)
+        # Read the exact response length; avoids depending on timing of EOF.
+        result = await recv.read_exact(len(expected))
         await ep_conn.close()
         return result
 

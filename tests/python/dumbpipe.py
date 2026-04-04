@@ -96,12 +96,12 @@ async def pipe_streams(
             except Exception:
                 pass
 
-    done, pending = await asyncio.wait(
-        [asyncio.create_task(quic_to_local()), asyncio.create_task(local_to_quic())],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    for t in pending:
-        t.cancel()
+    t_quic_to_local = asyncio.create_task(quic_to_local())
+    t_local_to_quic = asyncio.create_task(local_to_quic())
+    # Let both directions run to completion.
+    # Using FIRST_COMPLETED here can cancel the reverse direction too early,
+    # dropping response bytes in request/response forwarding scenarios.
+    await asyncio.gather(t_quic_to_local, t_local_to_quic, return_exceptions=True)
     # Ensure finish / close are attempted
     try:
         await send.finish()

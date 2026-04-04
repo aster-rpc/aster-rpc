@@ -100,6 +100,14 @@ class BlobsClient:
 def blobs_client(node: IrohNode) -> BlobsClient: ...
 
 
+class DocEntry:
+    author_id: str
+    key: bytes
+    content_hash: str
+    content_len: int
+    timestamp: int
+
+
 class DocsClient:
     def create(self) -> Coroutine[Any, Any, "DocHandle"]: ...
     def create_author(self) -> Coroutine[Any, Any, str]: ...
@@ -114,6 +122,15 @@ class DocHandle:
     def get_exact(
         self, author_hex: str, key: bytes
     ) -> Coroutine[Any, Any, Optional[bytes]]: ...
+    def query_key_exact(
+        self, key: bytes
+    ) -> Coroutine[Any, Any, list["DocEntry"]]: ...
+    def query_key_prefix(
+        self, prefix: bytes
+    ) -> Coroutine[Any, Any, list["DocEntry"]]: ...
+    def read_entry_content(
+        self, content_hash_hex: str
+    ) -> Coroutine[Any, Any, bytes]: ...
     def share(self, mode: str) -> Coroutine[Any, Any, str]: ...
 
 

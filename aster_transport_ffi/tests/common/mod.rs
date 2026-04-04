@@ -34,6 +34,16 @@ pub fn empty_endpoint_config() -> aster_transport_ffi::iroh_endpoint_config_t {
             len: 0,
         },
         enable_discovery: 0,
-        reserved: 0,
+        enable_hooks: 0,
+        hook_timeout_ms: 0,
     }
+}
+
+/// Helper to create an endpoint config with hooks enabled
+#[cfg(test)]
+pub fn hooks_endpoint_config() -> aster_transport_ffi::iroh_endpoint_config_t {
+    let mut cfg = empty_endpoint_config();
+    cfg.enable_hooks = 1;
+    cfg.hook_timeout_ms = 2000;
+    cfg
 }
