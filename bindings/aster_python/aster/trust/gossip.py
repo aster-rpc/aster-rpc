@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import struct
 import time
-from typing import Callable
+from typing import Any, Callable
 
 from .mesh import (
     ClockDriftConfig,
@@ -333,6 +333,119 @@ def _handle_lease_update(
             registry_callback("lease_update", payload)
         except Exception as exc:  # noqa: BLE001
             logger.debug("gossip: malformed LeaseUpdate payload: %s", exc)
+
+
+# ── Lease heartbeat ──────────────────────────────────────────────────────────
+
+
+async def run_lease_heartbeat(
+    gossip_topic_handle: object,
+    sender: str,
+    signing_key_raw: bytes,
+    service_name: str,
+    version: int,
+    contract_id: str,
+    health_getter: "Callable[[], str]",
+    heartbeat_interval_ms: int = 900_000,
+    addressing_info: "dict[str, str] | None" = None,
+) -> None:
+    """Broadcast a signed LeaseUpdate message every ``heartbeat_interval_ms``.
+
+    This coroutine runs until cancelled.  Callers should wrap it with
+    ``asyncio.create_task`` and cancel the task on shutdown.
+
+    Args:
+        gossip_topic_handle: A ``GossipTopicHandle`` with a
+            ``broadcast(data: bytes) -> Coroutine`` method.
+        sender:              This node's endpoint_id (hex string).
+        signing_key_raw:     32-byte raw ed25519 private key seed.
+        service_name:        Service name to include in the LeaseUpdate payload.
+        version:             Service version.
+        contract_id:         Contract ID (64-char hex).
+        health_getter:       Zero-arg callable returning current health status
+                             string.  Called fresh on each heartbeat so state
+                             transitions are reflected immediately.
+        heartbeat_interval_ms: Broadcast cadence in milliseconds (default 15 min).
+        addressing_info:     Optional addressing metadata forwarded in the payload.
+    """
+    import asyncio
+
+    interval_s = heartbeat_interval_ms / 1000.0
+    try:
+        while True:
+            await asyncio.sleep(interval_s)
+            epoch_ms = int(time.time() * 1000)
+            payload = encode_lease_update_payload(
+                service_name=service_name,
+                version=version,
+                contract_id=contract_id,
+                health_status=health_getter(),
+                addressing_info=addressing_info,
+            )
+            msg = sign_producer_message(
+                msg_type=ProducerMessageType.LEASE_UPDATE,
+                payload=payload,
+                sender=sender,
+                epoch_ms=epoch_ms,
+                signing_key_raw=signing_key_raw,
+            )
+            # Serialize the signed envelope as JSON for the gossip wire.
+            import json as _json
+            wire = _json.dumps(
+                {
+                    "type": msg.type,
+                    "payload": msg.payload.hex(),
+                    "sender": msg.sender,
+                    "epoch_ms": msg.epoch_ms,
+                    "signature": msg.signature.hex(),
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            try:
+                await gossip_topic_handle.broadcast(wire)
+                logger.debug(
+                    "heartbeat: LeaseUpdate broadcast for %s v%d (epoch=%d)",
+                    service_name,
+                    version,
+                    epoch_ms,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("heartbeat: broadcast failed: %s", exc)
+    except asyncio.CancelledError:
+        pass
+
+
+def start_lease_heartbeat(
+    gossip_topic_handle: object,
+    sender: str,
+    signing_key_raw: bytes,
+    service_name: str,
+    version: int,
+    contract_id: str,
+    health_getter: "Callable[[], str]",
+    heartbeat_interval_ms: int = 900_000,
+    addressing_info: "dict[str, str] | None" = None,
+) -> "Any":
+    """Spawn ``run_lease_heartbeat`` as an asyncio background task.
+
+    Returns the ``asyncio.Task`` so the caller can cancel it on shutdown.
+    """
+    import asyncio
+
+    return asyncio.create_task(
+        run_lease_heartbeat(
+            gossip_topic_handle=gossip_topic_handle,
+            sender=sender,
+            signing_key_raw=signing_key_raw,
+            service_name=service_name,
+            version=version,
+            contract_id=contract_id,
+            health_getter=health_getter,
+            heartbeat_interval_ms=heartbeat_interval_ms,
+            addressing_info=addressing_info,
+        ),
+        name=f"lease-heartbeat-{service_name}-v{version}",
+    )
 
 
 # ── Payload serializers (JSON-based for Phase 12) ─────────────────────────────

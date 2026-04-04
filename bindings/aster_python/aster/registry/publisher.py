@@ -55,6 +55,10 @@ class RegistryPublisher:
         *,
         lease_duration_s: int = _DEFAULT_LEASE_DURATION_S,
         lease_refresh_interval_s: int = _DEFAULT_REFRESH_INTERVAL_S,
+        mesh_gossip_handle: object | None = None,
+        mesh_sender_id: str = "",
+        mesh_signing_key: bytes = b"",
+        mesh_heartbeat_interval_ms: int = 900_000,
     ) -> None:
         """
         Args:
@@ -62,8 +66,17 @@ class RegistryPublisher:
             author_id:  The local author's ID for writing doc entries.
             gossip:     Optional ``RegistryGossip`` for change notifications.
             blobs:      Optional ``BlobsClient`` for contract blob upload.
-            lease_duration_s:        Lease TTL (default 45 s).
-            lease_refresh_interval_s: Background refresh cadence (default 15 s).
+            lease_duration_s:          Lease TTL (default 45 s).
+            lease_refresh_interval_s:  Background refresh cadence (default 15 s).
+            mesh_gossip_handle:        Optional ``GossipTopicHandle`` for the
+                                       producer mesh.  When provided (together
+                                       with ``mesh_sender_id`` and
+                                       ``mesh_signing_key``), a signed
+                                       LeaseUpdate heartbeat is broadcast every
+                                       ``mesh_heartbeat_interval_ms``.
+            mesh_sender_id:            This node's endpoint_id hex string.
+            mesh_signing_key:          32-byte raw ed25519 private key seed.
+            mesh_heartbeat_interval_ms: Heartbeat cadence in ms (default 15 min).
         """
         self._doc = doc
         self._author_id = author_id
@@ -72,9 +85,16 @@ class RegistryPublisher:
         self._lease_duration_s = lease_duration_s
         self._refresh_interval_s = lease_refresh_interval_s
 
+        # Producer-mesh heartbeat params
+        self._mesh_gossip_handle = mesh_gossip_handle
+        self._mesh_sender_id = mesh_sender_id
+        self._mesh_signing_key = mesh_signing_key
+        self._mesh_heartbeat_interval_ms = mesh_heartbeat_interval_ms
+
         # Current lease state (set when register_endpoint is called)
         self._lease: EndpointLease | None = None
         self._refresh_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
 
     # ── Contract publication ───────────────────────────────────────────────────
 
@@ -120,13 +140,7 @@ class RegistryPublisher:
         if self._blobs is not None and type_defs is not None:
             # Multi-file collection upload
             from aster_python.aster.contract.publication import (
-                build_collection as _build_collection,
                 upload_collection as _upload_collection,
-            )
-            from aster_python.aster.contract.identity import (
-                canonical_xlang_bytes as _canonical_xlang_bytes,
-                compute_contract_id as _compute_contract_id,
-                ServiceContract as _SC,
             )
             # Build entries: contract.bin first, then types, manifest last
             # We have contract_bytes already; build a minimal collection
@@ -237,6 +251,25 @@ class RegistryPublisher:
         # Start background refresh task
         self._refresh_task = asyncio.create_task(self._refresh_loop())
 
+        # Start producer-mesh lease heartbeat if configured
+        if (
+            self._mesh_gossip_handle is not None
+            and self._mesh_sender_id
+            and self._mesh_signing_key
+        ):
+            from aster_python.aster.trust.gossip import start_lease_heartbeat
+
+            self._heartbeat_task = start_lease_heartbeat(
+                gossip_topic_handle=self._mesh_gossip_handle,
+                sender=self._mesh_sender_id,
+                signing_key_raw=self._mesh_signing_key,
+                service_name=service,
+                version=version,
+                contract_id=contract_id,
+                health_getter=lambda: self._lease.health_status if self._lease else "UNKNOWN",
+                heartbeat_interval_ms=self._mesh_heartbeat_interval_ms,
+            )
+
     async def _write_lease(self) -> None:
         """Persist the current lease to the doc and emit gossip."""
         assert self._lease is not None
@@ -344,7 +377,10 @@ class RegistryPublisher:
         if self._refresh_task is not None and not self._refresh_task.done():
             self._refresh_task.cancel()
         self._refresh_task = None
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        self._heartbeat_task = None
 
     async def close(self) -> None:
-        """Stop the background refresh task (without graceful withdraw)."""
+        """Stop the background refresh task and heartbeat (without graceful withdraw)."""
         self._cancel_refresh()

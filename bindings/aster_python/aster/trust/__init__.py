@@ -58,7 +58,9 @@ from .gossip import (
     encode_lease_update_payload,
     handle_producer_message,
     producer_message_signing_bytes,
+    run_lease_heartbeat,
     sign_producer_message,
+    start_lease_heartbeat,
     verify_producer_message,
 )
 from .hooks import ALPN_CONSUMER_ADMISSION, ALPN_PRODUCER_ADMISSION, MeshEndpointHook
@@ -142,6 +144,8 @@ __all__ = [
     "encode_depart_payload",
     "encode_contract_published_payload",
     "encode_lease_update_payload",
+    "run_lease_heartbeat",
+    "start_lease_heartbeat",
     # Phase 12: Drift
     "ClockDriftDetector",
 ]
