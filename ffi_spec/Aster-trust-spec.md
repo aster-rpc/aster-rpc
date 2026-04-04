@@ -33,9 +33,19 @@ credentials signed by its corresponding private key:
 | `ConsumerEnrollmentCredential` (OTT) | One-time nonce | Consumer admission (§3) | §3.1 |
 
 Every credential carries: the root public key it is anchored to, an expiry,
-an attribute set (`aster.role`, `aster.allowed_cidrs`, cloud IID claims,
-application-specific keys), and an ed25519 signature covering the canonical
-concatenation of its fields.
+an attribute set (`aster.role`, cloud IID claims, application-specific keys),
+and an ed25519 signature covering the canonical concatenation of its fields.
+
+**Network-level controls are out of scope.** The framework does not verify
+source IP addresses, enforce CIDR allowlists, or perform any filtering
+keyed on network topology. Iroh uses EndpointId (ed25519 public key) as the
+stable cryptographic peer identity; source IPs are ephemeral and may be
+relay-mediated, hole-punched, or multi-homed, so framework-level IP filtering
+is unreliable in an Iroh mesh. Operators who need network-level controls
+SHOULD enforce them at the network boundary (VPN, firewall, network policy)
+or via custom admission callbacks using application-namespaced attributes
+(e.g. `app.allowed_cidrs`) with their own runtime interpretation — the
+spec does not define semantics for such attributes.
 
 ### 1.3 Gate Model
 
@@ -51,13 +61,25 @@ caller:
 - **Gate 1 — Credential admission (§2.4, §3.2).** The server reads the
   presented credential, verifies the signature against the root public key,
   checks expiry, checks endpoint-id binding (producers only) or nonce
-  consumption (OTT consumers only), and runs runtime checks (CIDR, IID). On
+  consumption (OTT consumers only), and runs runtime checks (IID). On
   success, the peer is added to the admitted set and granted the credential's
   attribute set.
 - **Gate 2 — Method-level capabilities.** RPC dispatch checks
   `CapabilityRequirement` declared on the method (Aster-ContractIdentity.md
   §11.3.3) against the attributes carried in `CallContext`. This is enforced
   by framework interceptors, not the trust layer itself.
+
+**Scope: Gates 0 and 1 apply only to remote (network) calls.** They are
+connection-level constructs — Gate 0 is a hook on iroh QUIC handshakes,
+Gate 1 runs on an ALPN admission stream. In-process calls via `LocalTransport`
+(Aster-SPEC.md §8.3) have no connection to gate and no credential to verify:
+`CallContext.peer` is `None`, `CallContext.attributes` is empty, and
+Gates 0 and 1 are bypassed. Interceptors that implement Gate 2 MUST handle
+`peer is None` and empty attributes gracefully (canonical behavior: trust
+the in-process caller). This is by design — LocalTransport is for trusted
+in-process composition, not as an authentication boundary. Test harnesses
+MAY synthesize `peer` and attributes to exercise interceptor logic, but
+production code paths must not depend on this.
 
 ### 1.4 Epochs and Replay Resistance
 
@@ -180,11 +202,19 @@ Reserved keys:
 |---------------------|---------------------------------------------------------------------------------------------------|
 |`aster.role`         |Node role: `producer`, `gateway`, `consumer`                                                       |
 |`aster.name`         |Human-readable node name, e.g. `"payments-node-eu-1"`                                              |
-|`aster.allowed_cidrs`|Comma-separated CIDRs the source IP must match at least one of, e.g. `"10.0.4.0/24,192.168.1.0/24"`|
 |`aster.iid_provider` |Required IID provider: `aws`, `gcp`, `azure`                                                       |
 |`aster.iid_account`  |Expected cloud account or project ID                                                               |
 |`aster.iid_region`   |Expected cloud region (optional tightening)                                                        |
 |`aster.iid_role_arn` |Expected IAM role ARN (AWS-specific, optional)                                                     |
+
+**Source IP and network-level controls are deliberately absent.** See §1's
+"Network-level controls are out of scope" note. Iroh's connection model —
+relay-mediated paths, hole-punching, multi-homing — makes source-IP-based
+admission unreliable. Operators who need network-level filtering MUST
+implement it at the network boundary (VPN, firewall, NetworkPolicy) or via
+custom runtime callbacks using application-namespaced attributes (e.g.
+`app.allowed_cidrs`). The framework does not define semantics for such
+attributes and does not wire a runtime check against them.
 
 The `aster.role` attribute governs what the admitting node does after admission:
 
@@ -253,13 +283,6 @@ runtime checks (against live data at connection time). Both must pass.
 
 Runtime checks are only required if the corresponding attributes are present in
 the credential. Absence of an attribute means no check is performed.
-
-*Source IP restriction (`aster.allowed_cidrs`):*
-
-The admitting node checks the peer's observed source IP against the comma-separated
-list of CIDRs in the credential. The source IP is the address from the QUIC
-connection — it cannot be spoofed by the connecting node. The IP must fall within
-at least one listed CIDR; if it matches none, admission is refused.
 
 *IID verification (`aster.iid_provider` and related keys):*
 
@@ -357,10 +380,24 @@ The replay threat is not uniform across message types. `Introduce` replays are
 benign: re-admitting an already-admitted node is idempotent (§2.5). `Depart`
 and `LeaseUpdate` replays are genuine problems — a replayed `Depart` can
 falsely evict an active producer from peers' accepted sets, and a replayed
-`LeaseUpdate` can corrupt health and addressing state. The acceptance window
-is the primary defence. Implementations may additionally track recently seen
-`(sender, epoch_ms)` pairs to suppress exact duplicates within the window,
-but this is not a protocol requirement.
+`LeaseUpdate` can corrupt health and addressing state.
+
+**The acceptance window is the defence.** The spec does not require an
+additional in-band replay cache, for a simple reason: any attacker capable
+of injecting replays onto the gossip channel has already passed admission
+(they are an authorized producer) OR has compromised an admitted producer's
+local state (including its salt and likely its signing key). In the first
+case the mesh is intentionally admitting them; in the second case the
+attacker can forge arbitrary new messages, not just replay old ones, and
+a replay cache adds no security. In both cases the correct recovery is
+**salt rotation** (§2.3): the operator generates a new salt, distributes
+it out of band to trusted producers, and the mesh migrates to a new gossip
+topic the compromised node cannot derive. The ±30-second window bounds the
+blast radius of a pure-replay attacker to at most ~30 seconds of transient
+disruption per captured message before the message can no longer be
+replayed — acceptable degradation. Implementations MAY track recently seen
+`(sender, epoch_ms)` pairs as defence-in-depth, but this is optional and
+does not substitute for salt rotation as the recovery mechanism.
 
 iroh-gossip delivers raw bytes and the identity of the *forwarding neighbor* —
 not the original sender. Messages are relayed through intermediate nodes, so the
@@ -705,16 +742,16 @@ add/remove a nonce, or toggle endpoint_id binding without invalidating the
 signature.
 
 Reserved attribute keys are identical to §2.2 (`aster.role`, `aster.name`,
-`aster.allowed_cidrs`, `aster.iid_*`). For consumer credentials, `aster.role`
-SHOULD be set to `consumer`.
+`aster.iid_*`). For consumer credentials, `aster.role` SHOULD be set to
+`consumer`.
 
 **Policy credentials** (`credential_type = Policy`, no `endpoint_id`, no `nonce`)
 
 A policy credential is not bound to a specific NodeID. Instead, the embedded
-policy attributes (IID, CIDR) determine which nodes may use it.
+policy attributes (IID claims) determine which nodes may use it.
 
-- Any node whose source IP and/or IID satisfies the embedded policy may present
-  this credential and be admitted.
+- Any node whose IID satisfies the embedded policy may present this credential
+  and be admitted.
 - Multiple nodes may simultaneously hold and use the same policy credential;
   each is admitted independently and gets its own slot in the allowlist.
 - Policy credentials are suitable for auto-scaling consumer fleets where
@@ -731,6 +768,16 @@ consumed during admission, the credential cannot be used again.
   rejected.
 - OTT credentials are suitable for one-off integrations, short-lived access
   grants, or ephemeral consumers where NodeIDs are known in advance.
+
+**Nonce length is normative.** OTT credentials MUST carry exactly 32 bytes
+of nonce data. Admitting nodes MUST reject any OTT credential whose `nonce`
+field is not exactly 32 bytes long, treating it as a malformed credential
+(refusal logged, no diagnostic leaked to the caller per §3.2's refusal rules).
+Policy credentials MUST NOT carry a `nonce` field; a Policy credential
+presented with a nonce MUST be rejected as malformed. The nonce MUST be
+generated from a cryptographically secure random source (32 bytes of
+uniform randomness, e.g. `secrets.token_bytes(32)` in Python,
+`crypto/rand` in Go, `SecureRandom` in Java).
 
 **CLI workflow**
 
@@ -780,15 +827,13 @@ EndpointHooks allowlist so subsequent connections from that NodeID are accepted.
 
 Runtime checks follow the same attribute-driven logic as §2.4:
 
-- `aster.allowed_cidrs`: the peer's source IP must fall within at least one of
-  the listed CIDRs.
 - `aster.iid_*`: the IID the consumer attaches must satisfy the declared cloud
   account, provider, region, and role ARN constraints.
 
 If the corresponding attribute is absent, no check is performed for that
-dimension. A policy credential with no IID or CIDR attributes admits any peer
-that can reach the admission endpoint — operators MUST NOT issue such credentials
-for sensitive meshes.
+dimension. A policy credential with no IID attributes (and no `endpoint_id`
+binding) admits any peer that can reach the admission endpoint — operators
+MUST NOT issue such credentials for sensitive meshes.
 
 **On success**
 

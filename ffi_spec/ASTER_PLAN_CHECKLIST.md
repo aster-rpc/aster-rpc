@@ -38,7 +38,7 @@ Phase 1 bug fixed as prerequisite for Phase 8:
 
 Outstanding issue / blocker:
 - None for Phase 7 at this time.
-- Phase 9 is blocked on canonical test vectors from the Rust reference implementation (commit placeholder fixtures initially, populate when reference is available).
+- **Phase 9 is NOT blocked.** Python is the reference implementation; Phase 9 PRODUCES the first canonical byte vectors (Appendix A + rule-level micro-fixtures per §11.3.2). Vectors commit to `tests/fixtures/canonical_test_vectors.json` AND land in `Aster-ContractIdentity.md` Appendix A as "Python-reference v1". Cross-verification arrives when the Java binding is written. See `ASTER_SPEC_ISSUES.md` §B3 for the bootstrap protocol.
 - Phase 12 has two open design questions: rcan grant format + AdmissionRequest/Response `reason` field — tracked in plan §14.12.
 
 ## Pre-Requisites
@@ -281,6 +281,8 @@ Outstanding issue / blocker:
   - [ ] `write_list_header(w, n)` (`0x0C` then `<len_varint>`)
   - [ ] `write_null_flag(w)` (`0xFD` per Appendix A.2)
   - [ ] `write_present_flag(w)` (`0x00`)
+- [ ] Implement `normalize_identifier(s) -> str`: asserts `s.isidentifier()` (UAX #31), returns `unicodedata.normalize("NFC", s)`. Called on all identifier strings (method names, type names, package names, enum/union member names, role names) before encoding.
+- [ ] Implement mixed-script warning helper: detect Latin/Cyrillic/Greek script mixing in identifiers; emit `warnings.warn` at registration time (non-fatal).
 - [ ] No outer Fory header, no ref meta, no root type meta, no schema hash prefix
 
 **Type dataclasses (§11.3.3):**
@@ -299,14 +301,14 @@ Outstanding issue / blocker:
 - [ ] `write_enum_value_def(w, ev)`
 - [ ] `write_union_variant_def(w, uv)`
 - [ ] `write_type_def(w, t)` — sorts fields by id, enum_values by value, union_variants by id
-- [ ] `write_capability_requirement(w, cr)` — roles sorted ASCII lex
+- [ ] `write_capability_requirement(w, cr)` — roles NFC-normalized + sorted by Unicode codepoint
 - [ ] `write_method_def(w, m)` — handles optional `requires` with NULL_FLAG
-- [ ] `write_service_contract(w, c)` — sorts methods by name ASCII lex, handles optional `requires`
+- [ ] `write_service_contract(w, c)` — NFC-normalizes method names, sorts methods by Unicode codepoint, handles optional `requires`
 
 **Type graph + cycle breaking (§11.3.4 + Appendix B):**
 - [ ] `resolve_type_graph(service_class) -> dict[str, TypeDef]` via `typing.get_type_hints` + `inspect`
 - [ ] Implement Tarjan's SCC algorithm over type-reference graph
-- [ ] For each SCC size ≥ 2: lex-ordered spanning tree rooted at smallest name
+- [ ] For each SCC size ≥ 2: codepoint-ordered spanning tree rooted at NFC-codepoint-smallest fully-qualified name
 - [ ] Back-edges within SCC → encoded as SELF_REF with DFS position
 - [ ] Bottom-up hashing over condensation DAG
 - [ ] Validate against Appendix B fixtures: direct self-recursion, 2-type mutual, 3-cycle, diamond+back-edge
@@ -340,13 +342,37 @@ Outstanding issue / blocker:
 - [ ] Parse canonical bytes back into `ServiceContract` instance
 - [ ] Optional: verify each TypeDef hash matches manifest's type_hashes
 
-**Tests:**
+**Golden vector generation (Python IS the reference):**
+- [ ] Write `tools/gen_canonical_vectors.py` — constructs fixtures, runs encoder, emits `tests/fixtures/canonical_test_vectors.json` (hex bytes + BLAKE3 hex hashes)
+- [ ] Produce Appendix A composite vectors: A.2 (empty ServiceContract), A.3 (enum TypeDef), A.4 (TypeDef with TYPE_REF field), A.5 (MethodDef without requires), A.6 (MethodDef with requires)
+- [ ] Produce Appendix B cycle-breaking vectors: direct self-recursion, 2-type mutual, 3-cycle, diamond+back-edge
+- [ ] Produce rule-level micro-fixtures (one per §11.3.2 rule — see next block)
+- [ ] Commit vectors to `tests/fixtures/canonical_test_vectors.json`
+- [ ] Copy vectors into `Aster-ContractIdentity.md` Appendix A as "Python-reference v1, pending cross-verification (Java binding)"
+
+**Rule-level micro-fixtures (risk mitigation against locked-in bugs):**
+- [ ] ZigZag VARINT32 edges: values `0, 1, -1, INT32_MAX, INT32_MIN` — pin each byte
+- [ ] ZigZag VARINT64 edges: same five values for int64
+- [ ] Varint boundaries: `0x7F` (1 byte), `0x80` (2 bytes), `0x3FFF` (2 bytes), `0x4000` (3 bytes)
+- [ ] String encoding: empty string `""` vs absent string (NULL_FLAG)
+- [ ] Bytes encoding: empty bytes `b""` vs absent bytes
+- [ ] List encoding: empty list (header + length 0) vs absent list
+- [ ] `CapabilityRequirement` as `None` → NULL_FLAG byte + position locked
+- [ ] `CapabilityRequirement` present → presence flag + nested bytes locked
+- [ ] Zero-value conventions per TypeKind: PRIMITIVE, REF, SELF_REF, ANY (§11.3.3)
+- [ ] `container != MAP` → container_key_* fields zero-valued
+- [ ] Codepoint sort stability: two methods named `foo_bar` and `foo_baz` produce deterministic order
+- [ ] NFC normalization: method name `café` (NFC: 4 codepoints) and `café` (NFD: 5 codepoints, e + combining acute) normalize to identical canonical bytes → identical contract_id
+- [ ] Unicode identifier: Japanese method name `注文する` (`str.isidentifier()` → True) accepted; sorts deterministically by codepoint
+- [ ] Scope distinctness: identical ServiceContract except `scoped` → different `contract_id`
+
+**Tests (assertions over committed vectors):**
 - [ ] Hash stability (same input → same hash across runs)
-- [ ] Canonical byte vectors from Appendix A.2–A.6 (byte-equal + hash-equal)
-- [ ] Cycle-breaking from Appendix B (direct, mutual, 3-cycle, diamond)
-- [ ] Scope distinctness: SHARED vs STREAM → different contract_ids (session addendum Appendix A)
-- [ ] int32/int64 encoded as ZigZag VARINT (not fixed-width)
-- [ ] NULL_FLAG encoding for absent optional fields
+- [ ] Byte-equality + hash-equality against Appendix A.2–A.6 committed vectors
+- [ ] Byte-equality + hash-equality against Appendix B cycle-breaking vectors
+- [ ] All rule-level micro-fixtures pass byte-equality
+- [ ] int32/int64 encoded as ZigZag VARINT (not fixed-width) — asserted via micro-fixture
+- [ ] NULL_FLAG encoding for absent optional fields — asserted via micro-fixture
 - [ ] Changing any type in graph → changes contract_id
 - [ ] Manifest mismatch → fatal error with full diagnostic
 - [ ] `aster contract gen` CLI produces committable manifest.json offline (no network access)
@@ -435,7 +461,7 @@ Outstanding issue / blocker:
 - [ ] `EnrollmentCredential` dataclass (endpoint_id, root_pubkey, expires_at, attributes, signature)
 - [ ] `ConsumerEnrollmentCredential` dataclass with `credential_type: Literal["policy","ott"]`, optional endpoint_id, optional 32-byte nonce
 - [ ] `AdmissionResult` dataclass (admitted, attributes?, reason?)
-- [ ] Attribute conventions: reserve `aster.role`, `aster.name`, `aster.allowed_cidrs`, `aster.iid_provider`, `aster.iid_account`, `aster.iid_region`, `aster.iid_role_arn`
+- [ ] Attribute conventions: reserve `aster.role`, `aster.name`, `aster.iid_provider`, `aster.iid_account`, `aster.iid_region`, `aster.iid_role_arn` (no network-level controls — see Aster-trust-spec.md §1)
 
 **Signing:**
 - [ ] Create `aster/trust/signing.py`
@@ -447,14 +473,9 @@ Outstanding issue / blocker:
 **Admission (§2.4):**
 - [ ] Create `aster/trust/admission.py`
 - [ ] `check_offline(cred, peer_endpoint_id, nonce_store)` — signature, expiry, endpoint_id match, nonce (for OTT)
-- [ ] `check_runtime(cred, remote_info)` — CIDR + IID
+- [ ] `check_runtime(cred)` — IID only (no network-level checks in the normative spec)
 - [ ] `admit(cred, ctx)` — orchestrates offline + runtime
 - [ ] Refusal logging with reason (no oracle info leak to peer)
-
-**CIDR matching (post-handshake, Option A):**
-- [ ] Use `ipaddress` stdlib, comma-split `aster.allowed_cidrs`
-- [ ] Extract peer direct_addr via `NetClient.remote_info(node_id).direct_addresses` after handshake
-- [ ] If CIDR fails: close connection with QUIC-level reject
 
 **IID verification:**
 - [ ] Create `aster/trust/iid.py`
@@ -491,12 +512,15 @@ Outstanding issue / blocker:
 - [ ] Signature verify: valid → True; tampered → False
 - [ ] Expiry check: expired → fail
 - [ ] Wrong endpoint_id: fail
-- [ ] CIDR matching: in-range → True, out-of-range → False
 - [ ] IID verification (mocked): matching claims → True
 - [ ] OTT nonce: consumed once, second call → False
+- [ ] OTT credential with `len(nonce) != 32` is rejected as malformed (test with 16, 31, 33, 64 byte nonces)
+- [ ] Policy credential with a `nonce` field is rejected as malformed
 - [ ] Policy credential: reusable within expiry
 - [ ] `MeshEndpointHook`: reject unenrolled on non-admission ALPN; allow admission ALPN; allow admitted peer
 - [ ] CLI: `keygen` produces valid ed25519 pair; `sign` output verifies
+- [ ] LocalTransport bypass: Gate 0 not applied on `LocalTransport` calls (no connection to gate); `CallContext.peer is None`; `CallContext.attributes == {}`
+- [ ] Auth interceptor: when `peer is None`, canonical behavior is allow (in-process trust); document any custom interceptor that requires non-None peer
 
 ---
 
@@ -612,7 +636,7 @@ Outstanding issue / blocker:
 **Conformance:**
 - [ ] `tests/conformance/wire/` — stateless wire vectors: HEADER, CALL, TRAILER, COMPRESSED, size boundaries
 - [ ] `tests/conformance/wire/session_*.bin` — session vectors: HEADER method="", CALL, **CANCEL flags-only (1 byte)**, in-session unary no-trailer, client-stream EoI TRAILER
-- [ ] `tests/conformance/canonical/*.bin` + `.hashes.json` — canonical contract bytes + expected hashes (Appendix A.2–A.6)
+- [ ] `tests/conformance/canonical/*.bin` + `.hashes.json` — canonical contract bytes + expected hashes (Appendix A.2–A.6; sourced from `tests/fixtures/canonical_test_vectors.json` produced in Phase 9)
 - [ ] `tests/conformance/canonical/test_scope_distinctness.py` — SHARED vs STREAM → different contract_ids
 - [ ] `tests/conformance/interop/echo_service.fdl` + `scenarios.yaml` — cross-language interop fixture (placeholder if Rust reference not yet available)
 

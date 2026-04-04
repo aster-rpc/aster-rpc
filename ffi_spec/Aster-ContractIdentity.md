@@ -254,6 +254,27 @@ To avoid implementation drift, the following details are normative:
   future revision, the schema must use `fixed_int32` / `fixed_int64` explicitly.
 - **Strings must be encoded as UTF-8** in canonical bytes, even though general
   Fory XLANG may choose LATIN1 or UTF16 opportunistically.
+- **Strings that represent identifiers (method names, type names, package
+  names, enum/union member names, role names, and other programmer-visible
+  identifiers defined in §11.3.3) must be in Unicode Normalization Form C
+  (NFC) before encoding.** Unicode allows the same visual identifier to be
+  represented by multiple code-point sequences (e.g. `é` as one NFC
+  codepoint vs two NFD codepoints); without a pinned normal form, two
+  implementations would produce different canonical bytes for the same
+  source code. NFC is chosen because it is the form used by the web
+  platform and most filesystems. Application-defined attribute values and
+  free-text strings (descriptions, reasons, etc.) are NOT required to be
+  NFC-normalized — only identifiers participating in canonical hashing
+  are. Arbitrary string payloads are encoded verbatim.
+- **Identifiers MUST conform to Unicode UAX #31** (`XID_Start` followed by
+  zero or more `XID_Continue` codepoints — the same rule as Python's
+  `str.isidentifier()`, Java identifiers, Rust identifiers). This includes
+  method names, type names, package names, enum/union member names, and
+  role names in `CapabilityRequirement`. Implementations SHOULD warn on
+  registration of identifiers that mix Unicode scripts (e.g. Latin + Cyrillic)
+  or contain confusables, as a usability safeguard — but the framework does
+  not reject such identifiers, since `contract_id` already prevents any
+  structural confusion between distinct services.
 - **Hash-bearing `bytes` fields use standard XLANG bytes encoding** and must
   contain exactly 32 payload bytes when carrying a BLAKE3 digest.
 - **Enum fields serialize as their Fory XLANG enum encoding** (unsigned varint
@@ -411,7 +432,7 @@ message MethodDef {
 message ServiceContract {
     string name = 1;                // Wire service name
     int32 version = 2;              // Human-facing version label
-    list<MethodDef> methods = 3;    // Sorted by method name (lexicographic, ASCII)
+    list<MethodDef> methods = 3;    // Sorted by method name (Unicode codepoint, NFC-normalized)
     list<string> serialization_modes = 4; // Ordered by producer preference
     string alpn = 5;                // Always "aster/{wire_version}"
     ScopeKind scoped = 6;           // SHARED (default) or STREAM (session-scoped)
@@ -496,8 +517,9 @@ by a deterministic cycle-breaking rule over the type graph:
 - Any SCC of size 1 with no self-edge is handled normally and has no
   `SELF_REF` placeholder.
 - For every SCC that contains a cycle, choose a deterministic spanning tree by
-  visiting member types in lexicographic order of fully-qualified type name and
-  traversing outgoing edges in lexicographic order of referenced fully-qualified
+  visiting member types in Unicode-codepoint order of the NFC-normalized
+  fully-qualified type name, and traversing outgoing edges in Unicode-codepoint
+  order of the NFC-normalized referenced fully-qualified
   type name.
 - Any edge within the SCC that is **not** chosen as part of that spanning tree
   is encoded as `type_kind = SELF_REF` with `self_ref_name` set to the
@@ -791,6 +813,27 @@ ContractManifest {
 `published_by` and `published_at_epoch_ms` are written by the node at startup.
 None of these fields are inputs to `contract_id` — they live in the manifest
 blob (collection index 0), which is separate from `contract.xlang` (index 1).
+
+**`published_by` is a bundle-level attribute, not an identity-level
+attribute.** Two different authors can publish collections with the same
+`contract_id` — the canonical bytes and hence the identity are identical;
+only the packaging differs. This is by design:
+
+- The `contract_id` content-addresses the *contract definition*, not the
+  *publisher*. If two independent parties generate the same canonical
+  bytes, they have produced the same contract.
+- A consumer that needs to trust a specific publisher for a specific
+  contract MUST combine `contract_id` with the registry's ACL
+  (Aster-SPEC.md §11.2.3) — the registry ACL identifies which authors may
+  write ArtifactRefs to `contracts/{contract_id}`.
+- `published_by` is useful for audit trails and operational telemetry
+  ("who first published this bundle to this registry?") but is NOT a
+  routing input and MUST NOT be used as an authorization hint.
+
+Consumers that read `published_by` for any purpose beyond logging/audit
+should instead read the registry ACL (`_aster/acl/writers`) and verify
+that the AuthorId on the `ArtifactRef` docs entry is in the trusted set.
+That path is what actually gates publication.
 
 The `type_hashes` field allows a consumer to verify the type closure without
 walking the Merkle DAG. The authoritative type graph is encoded in the `TypeDef`
@@ -1104,12 +1147,12 @@ example.Book   → example.Author
 **SCC:** `{example.Author, example.Book}` — size 2, contains a cycle.
 
 **Spanning tree construction:**
-1. Sort members lexicographically: `example.Author`, `example.Book`.
-2. Start from `example.Author` (first in lex order).
-3. Traverse outgoing edges of `example.Author` in lex order of target:
+1. Sort members by Unicode codepoint (NFC-normalized): `example.Author`, `example.Book`.
+2. Start from `example.Author` (first in codepoint order).
+3. Traverse outgoing edges of `example.Author` in codepoint order of target:
    - Edge `example.Author → example.Book` → add to spanning tree. Visit
      `example.Book`.
-4. Traverse outgoing edges of `example.Book` in lex order of target:
+4. Traverse outgoing edges of `example.Book` in codepoint order of target:
    - Edge `example.Book → example.Author` → `example.Author` is already
      visited. This edge is **not** in the spanning tree.
 
@@ -1185,7 +1228,7 @@ example.Gamma → example.Alpha
    - Hash → `alpha_hash`.
 
 **Key property:** Exactly one edge in each cycle is broken. The choice is
-deterministic — any conforming implementation that follows the lexicographic
+deterministic — any conforming implementation that follows the Unicode-codepoint
 spanning tree algorithm will break the same edge (`Gamma → Alpha`) and produce
 identical hashes.
 

@@ -430,6 +430,29 @@ Rules:
   (`_aster/StreamHeader`, `_aster/RpcStatus`, etc.). Application packages must
   not use the `_aster` prefix.
 
+**Tag collisions are handled by the combination of Fory registration and
+content-addressed contract identity, not by first-wins/last-wins policy:**
+
+- **Within a process:** Fory registration fails fast on duplicate tags. If
+  two classes attempt to register the same tag in the same `ForyCodec`,
+  registration raises an error at startup. Developers see the conflict
+  immediately and rename or re-namespace.
+- **Across processes:** `contract_id` is a BLAKE3 hash over the canonical
+  bytes of the full type graph (§11.3). Two services that use the same tag
+  string but define the type with different fields produce different
+  `type_hash`es → different `contract_id`s → the registry routes them as
+  distinct services. Consumers that resolve on `contract_id` will only
+  connect to endpoints whose structural definition matches.
+- **Identical tag + identical structure:** by design, these are the same
+  type and are safely interchangeable. Content-addressed identity is what
+  makes this correct.
+
+The framework therefore does not define a collision-resolution policy —
+none is needed. Implementations MUST fail at registration time on
+intra-process duplicates; MUST NOT silently discard one of two registrations;
+and MUST NOT attempt cross-process deduplication by tag alone (tags are
+hints, `contract_id` is identity).
+
 #### 5.3.2 Tag Declaration
 
 **IDL-defined types** derive their tag automatically from the IDL package and
@@ -1480,6 +1503,36 @@ transport — an `AuthInterceptor` validating metadata tokens must fire whether
 the call crosses a network boundary or a module boundary. Skipping interceptors
 on local transport creates security gaps that only manifest in production.
 
+##### Trust model and `CallContext.peer`
+
+LocalTransport runs in a single process, with caller and callee in the same
+trust domain. Consequently:
+
+- **There is no remote peer.** `CallContext.peer` is `None` on every in-process
+  call. It is not a placeholder or synthesized identity — the absence of a
+  peer is part of the data model.
+- **No admission gate applies.** Gate 0 (connection-level admission via iroh
+  `EndpointHooks`, see Aster-trust-spec.md §3.3) is a hook on QUIC/iroh
+  connections, not on in-process function calls. LocalTransport bypasses
+  Gate 0 entirely because there is no connection to gate.
+- **`CallContext.attributes` is empty (`{}`)** unless explicitly populated
+  by a test harness. No credential presentation occurs on LocalTransport,
+  so no verified attributes exist.
+- **Interceptors MUST handle `peer is None` gracefully.** The canonical
+  behavior is "trust the in-process caller" — e.g. an `AuthInterceptor`
+  that normally validates a bearer token against `peer`'s expected identity
+  should return "allow" when `peer is None` rather than raising
+  `UNAUTHENTICATED`. Interceptors that genuinely require an authenticated
+  remote identity (rare) must document this and either fail fast with a
+  clear error message or be excluded from local chains by the test harness.
+- **Test harnesses MAY synthesize a `peer`** (e.g. `peer="test://alice"`)
+  to drive auth-interceptor test scenarios. This is a test-scoped feature;
+  production code paths must not rely on synthesized peers.
+
+In short: LocalTransport is appropriate for trusted in-process composition
+(embedded agents, unit tests, integration tests). It is not an
+authentication boundary.
+
 #### 8.3.3 Wire-Compatible Mode
 
 `LocalTransport` accepts a `wire_compatible: bool` flag (default: `False`).
@@ -1804,8 +1857,12 @@ Canonicalization rules:
 
 1. Parse the source contract into a language-neutral contract model.
 1. Remove comments and non-semantic formatting.
-1. Normalize scalar names, enum values, and serialization mode identifiers.
-1. Sort services, methods, fields, enums, and option keys lexicographically.
+1. Normalize identifiers (method names, type names, package names, enum/union
+   member names, role names) to Unicode NFC. Identifiers MUST conform to
+   UAX #31 (`XID_Start` + `XID_Continue` — same rule as Python/Java/Rust
+   identifiers).
+1. Sort services, methods, fields, enums, and option keys by Unicode
+   codepoint on the NFC-normalized name.
 1. Emit canonical contract bytes in a deterministic form.
 1. Hash the canonical bytes with BLAKE3 and encode as lowercase hex.
 

@@ -372,6 +372,13 @@ In-process transport using `asyncio.Queue`:
 2. Runs the full interceptor chain (not optional — §8.3.2).
 3. Supports `wire_compatible=True` mode for Fory round-trip testing.
 
+**Trust model (§8.3.2):** LocalTransport is for trusted in-process composition — no remote peer, no admission gate, no credential presentation.
+- `CallContext.peer` is **always `None`** on LocalTransport calls.
+- `CallContext.attributes` is **always `{}`** unless a test harness populates it.
+- Gates 0 and 1 (connection-level admission + credential verification) are bypassed — they apply only to remote iroh connections.
+- Interceptors MUST handle `peer is None` gracefully (canonical behavior: allow, since in-process callers are trusted).
+- Test harnesses MAY synthesize a `peer` (e.g. `peer="test://alice"`) for testing auth-interceptor logic, but this is a test-scoped feature.
+
 ### 5.4 Steps
 
 1. Define `Transport` protocol and `BidiChannel` in `transport/base.py`.
@@ -931,7 +938,7 @@ class TypeDef:
 @dataclass
 class CapabilityRequirement:
     kind: CapabilityKind                 # field=1: ROLE / ANY_OF / ALL_OF
-    roles: list[str]                     # field=2: sorted ASCII lex;
+    roles: list[str]                     # field=2: sorted Unicode codepoint (NFC);
                                          #   ROLE → list of length 1
                                          #   ANY_OF → caller needs at least one
                                          #   ALL_OF → caller needs all
@@ -952,7 +959,7 @@ class MethodDef:
 class ServiceContract:
     name: str                            # field=1
     version: int32                       # field=2
-    methods: list[MethodDef]             # field=3: sorted by name ASCII lex
+    methods: list[MethodDef]             # field=3: sorted by name (Unicode codepoint, NFC)
     serialization_modes: list[str]       # field=4
     alpn: str                            # field=5: "aster/{wire_version}"
     scoped: ScopeKind                    # field=6: SHARED or STREAM
@@ -961,7 +968,7 @@ class ServiceContract:
 
 **Fully-qualified type name** = `package + "." + name`. Used for cycle-breaking SELF_REF encoding.
 
-**Fully-qualified method name sort** is ASCII lexicographic — the spec requires ASCII-only method names.
+**Identifier rules (Aster-ContractIdentity.md §11.3.2.2):** method names, type names, package names, enum/union member names, and role names MUST conform to Unicode UAX #31 (`XID_Start` + `XID_Continue` — Python's `str.isidentifier()` implements this). Canonical form is **NFC-normalized**. Sort order is by Unicode codepoint on the NFC-normalized string. Implementations SHOULD warn on mixed-script identifiers.
 
 **Distinctness invariant (session addendum Appendix A):** two services identical except for `scoped` produce different `contract_id`s. This is critical because a session-scoped service has different runtime semantics than a stateless one.
 
@@ -983,7 +990,8 @@ The canonical encoder produces **stripped XLANG bytes** with these rules:
    - `type_kind=SELF_REF` → `type_primitive = "", type_ref = empty bytes`
    - `type_kind=ANY` → `type_primitive = "", type_ref = empty bytes, self_ref_name = ""`
    - `container != MAP` → `container_key_kind = PRIMITIVE (0), container_key_primitive = "", container_key_ref = empty bytes`
-10. **Sort order:** `TypeDef.fields` by `id`, `TypeDef.enum_values` by `value`, `TypeDef.union_variants` by `id`, `ServiceContract.methods` by `name` (ASCII lex), `CapabilityRequirement.roles` by ASCII lex.
+10. **Sort order:** `TypeDef.fields` by `id`, `TypeDef.enum_values` by `value`, `TypeDef.union_variants` by `id`, `ServiceContract.methods` by `name` (Unicode codepoint, NFC-normalized), `CapabilityRequirement.roles` by Unicode codepoint (NFC-normalized).
+11. **Identifier normalization:** before canonical encoding, all identifier strings (names) MUST be NFC-normalized and validated against UAX #31 (Python: `str.isidentifier()`).
 
 Implementation: `aster/contract/canonical.py` exposes primitive writers (`write_varint`, `write_zigzag_i32`, `write_zigzag_i64`, `write_string`, `write_bytes`, `write_bool`, `write_list_header`, `write_null_flag`) and dataclass-specific writers for each contract type.
 
@@ -993,7 +1001,7 @@ Bottom-up hashing requires breaking cycles. Naive self-reference (`type_kind="se
 
 1. **Build the reference graph** over TypeDefs.
 2. **Compute SCCs** (Strongly Connected Components — Tarjan's or Kosaraju's).
-3. **For each SCC of size ≥ 2**, compute a **lexicographic spanning tree** rooted at the alphabetically-smallest type name; edges within the SCC not in the tree become **SELF_REF** back-edges (encoded with the target type's position in the SCC's DFS order).
+3. **For each SCC of size ≥ 2**, compute a **codepoint-ordered spanning tree** rooted at the NFC-codepoint-smallest fully-qualified type name; edges within the SCC not in the tree become **SELF_REF** back-edges (encoded with the target type's position in the SCC's DFS order).
 4. **Hash bottom-up** over the condensation DAG (SCCs as super-nodes).
 5. **Within an SCC**, all member types get the same "cluster hash" suffix, then their own position-specific prefix — this is deterministic across implementations.
 
@@ -1113,13 +1121,13 @@ Uses Phase 1d FFI primitives (`blob_observe_complete`, `blob_local_info`) for ca
    - `write_enum_value_def(w, ev)` — 2 fields (name, value)
    - `write_union_variant_def(w, uv)` — 3 fields (name, id, type_ref)
    - `write_type_def(w, t)` — 6 fields (kind, package, name, fields[], enum_values[], union_variants[]); sorts fields by id, enum_values by value, union_variants by id
-   - `write_capability_requirement(w, cr)` — 2 fields (kind, roles[]); roles sorted ASCII lex
+   - `write_capability_requirement(w, cr)` — 2 fields (kind, roles[]); roles NFC-normalized + sorted by Unicode codepoint
    - `write_method_def(w, m)` — 7 fields (name, pattern, request_type, response_type, idempotent, default_timeout, requires?); NULL_FLAG when requires absent
-   - `write_service_contract(w, c)` — 7 fields (name, version, methods[], serialization_modes[], alpn, scoped, requires?); methods sorted by name ASCII lex
-5. Implement `load_canonical_test_vectors("tests/fixtures/canonical_test_vectors.json")` (fixture file to be produced by reference implementation; commit empty placeholder initially) and assert byte-equality + hash-equality for Appendix A.2–A.6 vectors.
+   - `write_service_contract(w, c)` — 7 fields (name, version, methods[], serialization_modes[], alpn, scoped, requires?); methods NFC-normalized + sorted by name (Unicode codepoint)
+5. **Produce canonical golden vectors.** Python is the reference implementation; Phase 9 generates the first set of vectors. Write `tools/gen_canonical_vectors.py` that constructs Appendix A fixture inputs (A.2–A.6) + rule-level micro-fixtures (one per §11.3.2 rule — varint edges, ZigZag boundaries, NULL_FLAG placement, sort stability, zero-value conventions, `scoped` SHARED/STREAM distinctness), runs the canonical encoder, and emits `tests/fixtures/canonical_test_vectors.json` with hex bytes + BLAKE3 hex hashes. Copy the vectors into `Aster-ContractIdentity.md` Appendix A as "Python-reference v1, pending cross-verification". Tests assert byte-equality + hash-equality against the committed file.
 6. Implement `resolve_type_graph(service_class) -> dict[type_name, TypeDef]`: walk method signatures via `typing.get_type_hints()` + `inspect`, construct TypeDefs.
 7. Implement SCC computation (Tarjan's) on the type-reference graph.
-8. Implement cycle-breaking: for each SCC of size ≥ 2, lex-order spanning tree → back-edges encoded as SELF_REF. Validate against Appendix B examples (direct recursion, 2-type mutual, 3-cycle, diamond+back-edge).
+8. Implement cycle-breaking: for each SCC of size ≥ 2, codepoint-ordered spanning tree (NFC-normalized names) → back-edges encoded as SELF_REF. Validate against Appendix B examples (direct recursion, 2-type mutual, 3-cycle, diamond+back-edge).
 9. Implement `compute_type_hash(type_def) -> bytes` (32 bytes) and `compute_contract_id(contract) -> str` (hex).
 10. Implement `ServiceContract` construction from `ServiceInfo` (Phase 4), including `scoped` field propagation from `@service(scoped=...)`.
 11. Implement `ContractManifest` construction.
@@ -1149,7 +1157,7 @@ Uses Phase 1d FFI primitives (`blob_observe_complete`, `blob_local_info`) for ca
 
 - **pyfory is NOT used for canonical encoding of `_aster/*` framework types.** This is custom code. pyfory is still used for user payload serialization (Phase 2).
 - **`blake3` PyPI package** — available.
-- **Reference test vectors:** `tests/fixtures/canonical_test_vectors.json` (produced by Rust reference impl; commit stub file initially, populate when reference is available).
+- **Reference test vectors:** Python IS the reference implementation. Phase 9 **produces** the first golden vectors for Appendix A (A.2–A.6) and commits them to `tests/fixtures/canonical_test_vectors.json` + `Aster-ContractIdentity.md` Appendix A. Java binding (future, post-Python) cross-verifies. See `ASTER_SPEC_ISSUES.md` §B3 for the bootstrap protocol and risk-mitigation micro-fixtures.
 
 ---
 
@@ -1507,10 +1515,12 @@ class RegistryGossip:
 ### 13.1 Trust Model in Brief
 
 - **Offline root key** (ed25519) signs **enrollment credentials**. The private root key never touches the mesh.
-- **Producer credentials** bind an `EndpointId` to a set of attributes (roles, CIDRs, IID claims) with a signed expiry.
+- **Producer credentials** bind an `EndpointId` to a set of attributes (roles, IID claims) with a signed expiry.
 - **Consumer credentials** are either `Policy` (reusable, attribute-gated) or `OTT` (one-time token, nonce-consumed).
 - **Gate 0** = connection-level admission: an iroh `EndpointHooks` implementation that inspects the `ALPN` and the remote EndpointId, admitting only peers whose credential has been verified.
 - **Gate 1** = app-level capability checks (enforced by interceptors in Phase 7; Phase 11 just provides the credentials).
+
+**Scope — Gates 0 and 1 apply only to remote iroh connections.** LocalTransport (Phase 3) runs in-process with no connection to gate and no credential to verify. `CallContext.peer` is `None` on LocalTransport, `CallContext.attributes` is empty, and both gates are bypassed by construction. See Aster-trust-spec.md §1.3 and Aster-SPEC.md §8.3.2.
 
 ### 13.2 Data Model
 
@@ -1521,8 +1531,7 @@ class EnrollmentCredential:
     endpoint_id: str              # hex — the producer's NodeId
     root_pubkey: bytes            # 32 — ed25519 public key of the root
     expires_at: int               # epoch seconds
-    attributes: dict[str, str]    # reserved: aster.role, aster.name,
-                                  #   aster.allowed_cidrs, aster.iid_*
+    attributes: dict[str, str]    # reserved: aster.role, aster.name, aster.iid_*
     signature: bytes              # 64 — ed25519(root_privkey, canonical(fields))
 
 
@@ -1560,13 +1569,12 @@ endpoint_id.encode('utf-8')
 |-----|---------|---------|
 | `aster.role` | Semantic role (producer, consumer, admin) | `"producer"` |
 | `aster.name` | Human-readable identifier | `"payments-svc"` |
-| `aster.allowed_cidrs` | Comma-separated CIDRs (runtime check) | `"10.0.0.0/8,192.168.1.0/24"` |
 | `aster.iid_provider` | Cloud provider for IID check | `"aws"` \| `"gcp"` \| `"azure"` |
 | `aster.iid_account` | Cloud account/project id | `"123456789012"` |
 | `aster.iid_region` | Cloud region | `"us-east-1"` |
 | `aster.iid_role_arn` | AWS role ARN (AWS-only) | `"arn:aws:iam::..."` |
 
-Additional namespaced keys (`aster.*`) are reserved. Non-`aster.*` keys are passed through to `CallContext.attributes`.
+Additional namespaced keys (`aster.*`) are reserved for future framework use. Non-`aster.*` keys are passed through to `CallContext.attributes`. **Network-level controls (CIDR, source-IP allowlists) are deliberately NOT part of the reserved attribute set** — see Aster-trust-spec.md §1 "Network-level controls are out of scope". Operators who need them MUST implement at the network boundary (VPN, firewall) or via application-namespaced custom attributes with their own admission callback.
 
 ### 13.4 Admission Checks (§2.4)
 
@@ -1577,8 +1585,7 @@ Additional namespaced keys (`aster.*`) are reserved. Non-`aster.*` keys are pass
 4. For OTT: nonce has not been consumed (check `NonceStore`).
 
 **Runtime checks (may hit network):**
-5. If `aster.allowed_cidrs` is set: peer's source IP (from Iroh `RemoteInfo.direct_addresses`) matches at least one CIDR.
-6. If `aster.iid_*` is set: fetch IID from cloud provider metadata endpoint (`169.254.169.254` for AWS), verify provider signature, compare claims.
+5. If `aster.iid_*` is set: fetch IID from cloud provider metadata endpoint (`169.254.169.254` for AWS), verify provider signature, compare claims.
 
 **Refusal logging (§2.4):** log refusal reason without leaking oracle info to the peer. Peer sees only `CONNECTION_REFUSED` at the QUIC layer.
 
@@ -1629,17 +1636,7 @@ class NonceStore:
 
 Phase 11 ships the JSON-file implementation; iroh-docs backend is a drop-in later.
 
-### 13.7 Known FFI Gap
-
-**Source IP for CIDR checks:** iroh's `HookConnectInfo` currently exposes only `remote_endpoint_id` and `alpn` — not the peer source IP. Two options:
-
-**Option A (recommended):** defer CIDR evaluation to **post-handshake**, reading the peer's `direct_addresses` via `NetClient.remote_info(node_id)` after the connection is established. If CIDR fails, close the connection.
-
-**Option B:** extend the FFI to surface peer source IP in `HookConnectInfo`. Small iroh-python FFI change; defer unless blocking.
-
-Phase 11 uses **Option A**.
-
-### 13.8 Module Layout
+### 13.7 Module Layout
 
 ```
 aster/trust/
@@ -1653,7 +1650,7 @@ aster/trust/
 └── cli.py              # `aster trust keygen`, `aster trust sign`
 ```
 
-### 13.9 Steps
+### 13.8 Steps
 
 1. Add `cryptography>=42` to `pyproject.toml` dependencies (ed25519).
 2. Implement `aster/trust/signing.py`:
@@ -1663,21 +1660,19 @@ aster/trust/
 3. Implement `EnrollmentCredential` + `ConsumerEnrollmentCredential` dataclasses.
 4. Implement `aster/trust/admission.py`:
    - `check_offline(cred, peer_endpoint_id, nonce_store) -> AdmissionResult`.
-   - `check_runtime(cred, remote_info) -> AdmissionResult` (CIDR + IID).
+   - `check_runtime(cred) -> AdmissionResult` (IID only — no network-level checks).
    - `admit(cred, ctx) -> AdmissionResult` (orchestrates both).
-5. Implement CIDR matching (`ipaddress` stdlib) — comma-split, check peer's `direct_addrs[0]`.
-6. Implement `aster/trust/iid.py` for AWS, GCP, Azure (async HTTP GET to metadata endpoints + JWKS signature verification). Mock-pluggable for tests.
-7. Implement `NonceStore` (file backend): atomic write with `os.replace`, fsync.
-8. Implement `MeshEndpointHook` wired to Iroh's `HookManager` (Phase 1b FFI).
-9. Implement `aster trust keygen` CLI: emits ed25519 root key pair to files, refuses if target exists.
-10. Implement `aster trust sign` CLI: offline credential signing from CLI-supplied fields.
-11. Implement ALPN constants: `ALPN_PRODUCER_ADMISSION = b"aster.producer_admission"`, `ALPN_CONSUMER_ADMISSION = b"aster.consumer_admission"`.
-12. Tests — see Exit Criteria.
+5. Implement `aster/trust/iid.py` for AWS, GCP, Azure (async HTTP GET to metadata endpoints + JWKS signature verification). Mock-pluggable for tests.
+6. Implement `NonceStore` (file backend): atomic write with `os.replace`, fsync.
+7. Implement `MeshEndpointHook` wired to Iroh's `HookManager` (Phase 1b FFI).
+8. Implement `aster trust keygen` CLI: emits ed25519 root key pair to files, refuses if target exists.
+9. Implement `aster trust sign` CLI: offline credential signing from CLI-supplied fields.
+10. Implement ALPN constants: `ALPN_PRODUCER_ADMISSION = b"aster.producer_admission"`, `ALPN_CONSUMER_ADMISSION = b"aster.consumer_admission"`.
+11. Tests — see Exit Criteria.
 
-### 13.10 Exit Criteria
+### 13.9 Exit Criteria
 
 - Valid credential passes offline checks; invalid signature / expired / wrong endpoint_id fails.
-- CIDR matching: `10.0.0.5` in `10.0.0.0/8` passes; `192.168.1.5` fails.
 - IID verification (mocked) passes with matching claims; fails otherwise.
 - OTT nonce consumable exactly once; second call returns False.
 - Policy credential reusable indefinitely (within expiry).
@@ -1685,7 +1680,7 @@ aster/trust/
 - `aster trust keygen` produces a valid ed25519 pair; `aster trust sign` produces credentials that verify.
 - Refusal logs contain reason; refused peer receives only QUIC-level reject.
 
-### 13.11 Pre-Requisites
+### 13.10 Pre-Requisites
 
 - `cryptography>=42` (ed25519) — add to `pyproject.toml`.
 - Iroh `HookManager` / `EndpointHooks` FFI (Phase 1b) — already done.
@@ -1971,7 +1966,7 @@ aster/trust/
 | Integration | `tests/python/test_aster_local.py` | LocalTransport parity |
 | Conformance | `tests/conformance/wire/` | Byte-level wire frames |
 | Conformance | `tests/conformance/canonical/` | Contract identity bytes + hashes |
-| Conformance | `tests/conformance/interop/` | Echo service + scenarios for Rust reference |
+| Conformance | `tests/conformance/interop/` | Echo service + scenarios for future Java binding |
 
 ### 15.2 Conformance Vectors
 
@@ -1989,8 +1984,8 @@ aster/trust/
 - Scope distinctness: two ServiceContracts identical except `scoped` → different `contract_id`s.
 
 **Interop (`tests/conformance/interop/`):**
-- `echo_service.fdl` + `scenarios.yaml` — runnable against Rust reference server.
-- Round-trip: Python client ↔ Rust server, Rust client ↔ Python server.
+- `echo_service.fdl` + `scenarios.yaml` — runnable against the future Java binding.
+- Round-trip: Python client ↔ Java server, Java client ↔ Python server (lands when Java binding exists).
 
 ### 15.3 `aster/testing/harness.py` — Test Harness
 
@@ -2038,17 +2033,17 @@ class AsterTestHarness:
 14. Write clock drift + self-departure + peer-isolation tests (Phase 12).
 15. Write admission RPC round-trip test (Phase 12).
 16. Implement `AsterTestHarness` with all three factories.
-17. Stand up cross-language interop fixtures (blocked on Rust reference availability — commit placeholder fixtures now).
+17. Stand up cross-language interop fixtures (structure ready; scenarios lie dormant until Java binding exists).
 
 ### 15.5 Exit Criteria
 
 - All RPC patterns work end-to-end over real Iroh connections.
 - LocalTransport produces identical wire bytes to IrohTransport when `wire_compatible=True`.
-- Canonical vectors match reference implementation byte-for-byte (once reference available).
+- Canonical vectors produced by Phase 9 are committed as "Python-reference v1"; rule-level micro-fixtures isolate each §11.3.2 rule.
 - All Appendix A + B fixture hashes match.
 - Session wire vectors include CANCEL flags-only (1-byte) frame.
 - Conformance vectors exist for: wire (stateless + session), canonical contract bytes, scope distinctness.
-- Cross-language interop harness in place (even if reference impl lands later).
+- Cross-language interop harness structure in place (scenarios activate when Java binding lands).
 
 ---
 
@@ -2112,8 +2107,8 @@ Phase 13: Testing & Conformance (ongoing throughout)
 | blake3 Python package | None | ✅ available |
 | zstandard Python package | None | ✅ available |
 | cryptography Python package (ed25519) | None | Phase 11 requirement |
-| Canonical test vectors from reference impl | Medium | Phase 9 blocker; commit stub fixtures initially |
-| Iroh source-IP in HookConnectInfo | Low | Phase 11 uses post-handshake `RemoteInfo` lookup instead |
+| Canonical test vectors | Low | Python IS the reference; Phase 9 produces the first set, Java binding cross-verifies |
+| Iroh source-IP availability | N/A | CIDR filtering removed from normative spec (IPs are unreliable in Iroh's relay/hole-punch model — see Aster-trust-spec.md §1) |
 
 ### 17.2 Dependencies to Add to `pyproject.toml`
 
@@ -2146,7 +2141,7 @@ aster = "aster.cli:main"                # `aster contract gen`, `aster trust ...
 | Registry is optional | Yes — services work with direct connect | ✅ Locked |
 | Trust is in scope as Phase 11+12 | Yes — decided 2026-04 | ✅ Locked |
 | Canonical encoder is custom code (not pyfory wrapper) | Yes — per §11.3.2 normative | ✅ Locked |
-| CIDR checks post-handshake (Option A) | Yes — no new FFI | ✅ Locked |
+| Network-level controls (CIDR, source-IP) | Out of scope — use network boundary (VPN/firewall) | ✅ Locked |
 | rcan grant format | **OPEN** — track upstream | ⚠️ Phase 12 TODO |
 | AdmissionRequest/Response schema details | **OPEN** — confirm with spec team | ⚠️ Phase 12 TODO |
 
