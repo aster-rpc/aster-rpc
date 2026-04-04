@@ -15,12 +15,12 @@ external ID assignment, no collision risk, no coordination required.
 
 **Storage model:** Immutable contract bundles are published as **Iroh
 collections** (HashSeq format). An Iroh collection is an ordered sequence of
-blob hashes; by convention the first element (index 0) is the application’s
+blob hashes; by convention the first element (index 0) is the application's
 metadata blob. Aster uses a `ContractManifest` JSON blob at index 0, which
 carries the name-to-hash mapping for all other members. iroh-docs stores
 lightweight `ArtifactRef` pointers that resolve to collection root hashes. This
 avoids simulating a filesystem hierarchy in docs keys for artifact storage and
-aligns with Iroh’s native content-addressed transfer primitives.
+aligns with Iroh's native content-addressed transfer primitives.
 
 ```text
 {namespace}/
@@ -67,7 +67,7 @@ aligns with Iroh’s native content-addressed transfer primitives.
         └── {other_contract_id}                  → Compatibility report / diff
 ```
 
-All entries are signed by their author’s keypair. The `AuthorId` on each entry
+All entries are signed by their author's keypair. The `AuthorId` on each entry
 is the cryptographic proof of who wrote it.
 
 **ArtifactRef** — each `contracts/{contract_id}` docs entry stores a small JSON
@@ -129,7 +129,7 @@ and service contract is serialized to a deterministic byte sequence using Fory
 XLANG, then hashed with BLAKE3. The hash *is* the identity.
 
 Types reference other types by hash, forming a Merkle DAG. A service contract
-references its method request/response types by hash. The contract’s own hash
+references its method request/response types by hash. The contract's own hash
 is therefore transitively dependent on every type in its closure — a change to
 any leaf type propagates upward automatically.
 
@@ -184,7 +184,7 @@ constrained subset of Fory XLANG called the **canonical XLANG profile**. This
 profile ensures byte-identical output from any conforming implementation:
 
 1. **Fields emitted in ascending field ID order.** This is an Aster-specific
-   canonicalization rule for hashing. It intentionally overrides Fory’s normal
+   canonicalization rule for hashing. It intentionally overrides Fory's normal
    struct field ordering algorithm so that identity depends on a smaller,
    simpler, explicitly specified rule.
 1. **Schema-consistent mode.** No per-object TypeDef metadata headers in the
@@ -199,6 +199,13 @@ profile ensures byte-identical output from any conforming implementation:
 
 With these constraints, the same `TypeDef` value produces identical bytes from
 any conforming Fory XLANG implementation.
+
+Important: this canonical serializer is **not** identical to stock Fory struct
+serialization. Aster reuses Fory's primitive, string, bytes, and collection
+wire encodings, but defines its own field-emission order and disables all
+optional framing features not explicitly listed here. Implementations must not
+hash the output of a generic `fory.serialize(...)` call unless that call is
+configured to match this profile exactly.
 
 #### 11.3.2.1 Canonical byte layout
 
@@ -219,8 +226,18 @@ and implementation-dependent framing removed or pinned as follows:
 
 Operationally, implementations should behave as if they are serializing the
 field values of a known message directly, in ascending field-ID order, using
-Fory’s primitive/container encodings with all optional metadata features turned
+Fory's primitive/container encodings with all optional metadata features turned
 off unless this profile explicitly requires them.
+
+For nested fields:
+
+- **Non-optional nested message fields** serialize as their field values only,
+  with no nested type meta and no nested null/reference flag.
+- **Optional nested message fields** serialize a single null/presence flag using
+  the ordinary XLANG nullable-field convention, followed by the nested field
+  values only when present.
+- **No nested value in canonical hashing writes runtime type metadata.** All
+  types are statically known from the framework-internal schema.
 
 #### 11.3.2.2 Primitive, string, bytes, and collection pinning
 
@@ -235,6 +252,11 @@ To avoid implementation drift, the following details are normative:
   Fory XLANG may choose LATIN1 or UTF16 opportunistically.
 - **Hash-bearing `bytes` fields use standard XLANG bytes encoding** and must
   contain exactly 32 payload bytes when carrying a BLAKE3 digest.
+- **Enum fields serialize as their Fory XLANG enum encoding** (unsigned varint
+  of the enum value). Discriminator fields (`TypeKind`, `ContainerKind`,
+  `TypeDefKind`, `MethodPattern`, `CapabilityKind`, `ScopeKind`) use enum
+  types rather than strings to eliminate case/spelling sensitivity and produce
+  more compact canonical bytes.
 - **Lists in the framework-internal schema are homogeneous, declared-type,
   non-null, non-ref-tracked lists.** Their canonical elements header is
   therefore the XLANG optimal header for that case (`0x0C`).
@@ -242,37 +264,103 @@ To avoid implementation drift, the following details are normative:
   likewise use statically known key/value types with nullability and ref
   tracking pinned by schema, not by runtime heuristics.**
 
-These rules mean canonical hashing is coupled not just to “Fory XLANG in
-general” but to a precisely pinned subset of it.
+For descriptor fields that act like discriminated unions by convention
+(`FieldDef.type_kind`, `FieldDef.container_key_kind`, etc.), unused companion
+fields are serialized using their ordinary zero values unless this spec states
+otherwise:
+
+- unused `string` fields serialize as the empty string `""`
+- unused `bytes` fields serialize as zero-length bytes
+- unused `bool` fields serialize as `false`
+- unused `enum` fields serialize as value `0` (the first variant)
+
+This is required because those fields are part of normal Fory messages, not a
+wire-level union construct.
+
+These rules mean canonical hashing is coupled not just to "Fory XLANG in
+general" but to a precisely pinned subset of it.
 
 ### 11.3.3 Framework-Internal Type Definitions
 
 These types live in the `_aster` reserved namespace and are used exclusively
 for registry storage and contract identity. They are not application-visible
-message types. They are defined using ordinary Fory IDL `message` syntax so
-they can be parsed by the stock Fory compiler and represented in the normal
-compiler IR.
+message types. They are defined using ordinary Fory IDL `message` and `enum`
+syntax so they can be parsed by the stock Fory compiler and represented in the
+normal compiler IR.
 
 ```
 // _aster/registry.fdl
 package _aster;
+
+// ── Discriminator enums ─────────────────────────────────────
+// Using enums instead of strings for discriminator fields ensures
+// that canonical hashing is not sensitive to string spelling/case
+// and produces more compact wire encoding (varint vs UTF-8 string).
+
+enum TypeKind [id=1] {
+    PRIMITIVE = 0;
+    REF = 1;
+    SELF_REF = 2;
+    ANY = 3;
+}
+
+enum ContainerKind [id=2] {
+    NONE = 0;
+    LIST = 1;
+    SET = 2;
+    MAP = 3;
+}
+
+enum TypeDefKind [id=3] {
+    MESSAGE = 0;
+    ENUM = 1;
+    UNION = 2;
+}
+
+enum MethodPattern [id=4] {
+    UNARY = 0;
+    SERVER_STREAM = 1;
+    CLIENT_STREAM = 2;
+    BIDI_STREAM = 3;
+}
+
+enum CapabilityKind [id=5] {
+    ROLE = 0;
+    ANY_OF = 1;
+    ALL_OF = 2;
+}
+
+enum ScopeKind [id=6] {
+    SHARED = 0;
+    STREAM = 1;
+}
 
 // ── Type atoms ──────────────────────────────────────────────
 
 message FieldDef {
     int32 id = 1;                   // Field number from IDL or code
     string name = 2;                // Canonical field name (snake_case)
-    string type_kind = 3;           // "primitive", "ref", "self_ref", "any"
-    string type_primitive = 4;      // e.g. "string", "int32", "bool" — set when type_kind = "primitive"
-    bytes type_ref = 5;             // BLAKE3 hash (32 bytes) of referenced TypeDef — set when type_kind = "ref"
-    string self_ref_name = 6;       // Local type name — set when type_kind = "self_ref"
+    TypeKind type_kind = 3;         // PRIMITIVE, REF, SELF_REF, ANY
+    string type_primitive = 4;      // e.g. "string", "int32", "bool" — set when type_kind = PRIMITIVE
+    bytes type_ref = 5;             // BLAKE3 hash (32 bytes) of referenced TypeDef — set when type_kind = REF
+    string self_ref_name = 6;       // Fully-qualified type name — set when type_kind = SELF_REF
     bool optional = 7;
     bool ref_tracked = 8;           // Fory `ref` modifier
-    string container = 9;           // "", "list", "set", "map"
-    string container_key_kind = 10; // For maps: "primitive" or "ref"
+    ContainerKind container = 9;    // NONE, LIST, SET, MAP
+    TypeKind container_key_kind = 10; // For maps: PRIMITIVE or REF
     string container_key_primitive = 11;
     bytes container_key_ref = 12;
 }
+
+// Canonical zero-value convention for discriminated fields:
+// - when type_kind = PRIMITIVE: type_ref = empty bytes, self_ref_name = ""
+// - when type_kind = REF: type_primitive = "", self_ref_name = ""
+// - when type_kind = SELF_REF: type_primitive = "", type_ref = empty bytes
+// - when type_kind = ANY: type_primitive = "", type_ref = empty bytes,
+//   self_ref_name = ""; the field's type identity is carried solely by the
+//   enum discriminator value ANY
+// - when container != MAP: container_key_kind = PRIMITIVE (zero value),
+//   container_key_primitive = "", container_key_ref = empty bytes
 
 message EnumValueDef {
     string name = 1;
@@ -286,34 +374,34 @@ message UnionVariantDef {
 }
 
 message TypeDef {
-    string kind = 1;                // "message", "enum", "union"
+    TypeDefKind kind = 1;           // MESSAGE, ENUM, UNION
     string package = 2;             // Dotted package name
     string name = 3;                // Unqualified type name
-    list<FieldDef> fields = 4;      // Sorted by field id. Present when kind = "message".
-    list<EnumValueDef> enum_values = 5;   // Sorted by value. Present when kind = "enum".
-    list<UnionVariantDef> union_variants = 6; // Sorted by id. Present when kind = "union".
+    list<FieldDef> fields = 4;      // Sorted by field id. Present when kind = MESSAGE.
+    list<EnumValueDef> enum_values = 5;   // Sorted by value. Present when kind = ENUM.
+    list<UnionVariantDef> union_variants = 6; // Sorted by id. Present when kind = UNION.
 }
 
 // ── Service contract ────────────────────────────────────────
 
 message CapabilityRequirement {
-    string kind = 1;               // "role", "any_of", "all_of"
-    list<string> roles = 2;        // Role strings. Single item for kind="role".
+    CapabilityKind kind = 1;       // ROLE, ANY_OF, ALL_OF
+    list<string> roles = 2;        // Role strings. Single item for kind=ROLE.
 }
 // kind semantics:
-//   "role"   — caller must hold exactly this one role (roles has one entry)
-//   "any_of" — caller must hold at least one of the listed roles
-//   "all_of" — caller must hold every listed role
+//   ROLE   — caller must hold exactly this one role (roles has one entry)
+//   ANY_OF — caller must hold at least one of the listed roles
+//   ALL_OF — caller must hold every listed role
 // Absent field (default) means no capability check is required for this method.
 
 message MethodDef {
     string name = 1;
-    string pattern = 2;            // "unary", "server_stream", "client_stream", "bidi_stream"
+    MethodPattern pattern = 2;     // UNARY, SERVER_STREAM, CLIENT_STREAM, BIDI_STREAM
     bytes request_type = 3;        // BLAKE3 hash of request TypeDef
     bytes response_type = 4;       // BLAKE3 hash of response TypeDef (stream item type for streaming)
     bool idempotent = 5;
     float64 default_timeout = 6;   // Seconds, 0 = none
-    CapabilityRequirement requires = 7;  // Optional. Absent = no capability check required.
+    optional CapabilityRequirement requires = 7;  // Optional. Absent = no capability check required.
 }
 
 message ServiceContract {
@@ -322,13 +410,17 @@ message ServiceContract {
     list<MethodDef> methods = 3;    // Sorted by method name (lexicographic, ASCII)
     list<string> serialization_modes = 4; // Ordered by producer preference
     string alpn = 5;                // Always "aster/{wire_version}"
-    string scoped = 6;              // "shared" (default) or "stream" (session-scoped)
-    CapabilityRequirement requires = 7;  // Optional service-level baseline. Effective
+    ScopeKind scoped = 6;           // SHARED (default) or STREAM (session-scoped)
+    optional CapabilityRequirement requires = 7;  // Optional service-level baseline. Effective
                                          // requirement for a method is the conjunction of
                                          // this field and the method's own requires field.
                                          // Absent on both = no rcan check for that method.
 }
 ```
+
+In the framework-internal schema, a `requires` field is explicitly marked
+`optional` because "no requirement" is represented as field absence, not as an
+empty `CapabilityRequirement` value.
 
 **Capability requirement evaluation**
 
@@ -341,14 +433,14 @@ caller must satisfy both independently:
 effective = conjunction(service.requires, method.requires)
 ```
 
-Evaluation of each `CapabilityRequirement` against the caller’s rcan
+Evaluation of each `CapabilityRequirement` against the caller's rcan
 `capability` list:
 
 |`kind`    |Satisfied when                                     |
 |----------|---------------------------------------------------|
-|`"role"`  |`capability` contains `roles[0]`                   |
-|`"any_of"`|`capability` contains at least one entry in `roles`|
-|`"all_of"`|`capability` contains every entry in `roles`       |
+|`ROLE`    |`capability` contains `roles[0]`                   |
+|`ANY_OF`  |`capability` contains at least one entry in `roles`|
+|`ALL_OF`  |`capability` contains every entry in `roles`       |
 
 The conjunction means both the service requirement and the method requirement
 must evaluate to satisfied. If either fails, the call is rejected with
@@ -358,12 +450,12 @@ Absence of a `requires` field (at either level) is treated as unconditionally
 satisfied — it contributes nothing to the conjunction. A method with no
 `requires` on either level requires no rcan at all.
 
-**Example:** service sets `requires = any_of("Admin", "Operator")`, method sets
-`requires = role("TaskManager")`. The effective requirement is: caller must hold
-at least one of `{Admin, Operator}` AND must hold `TaskManager`. An rcan
-carrying `["Admin", "TaskManager"]` passes. An rcan carrying only `["Admin"]`
-fails the method check. An rcan carrying only `["TaskManager"]` fails the
-service check.
+**Example:** service sets `requires = {kind: ANY_OF, roles: ["Admin", "Operator"]}`,
+method sets `requires = {kind: ROLE, roles: ["TaskManager"]}`. The effective
+requirement is: caller must hold at least one of `{Admin, Operator}` AND must
+hold `TaskManager`. An rcan carrying `["Admin", "TaskManager"]` passes. An rcan
+carrying only `["Admin"]` fails the method check. An rcan carrying only
+`["TaskManager"]` fails the service check.
 
 ### 11.3.4 Hashing Procedure
 
@@ -386,16 +478,29 @@ this starts from the standard Fory compiler IR (`Schema`/`Service`/`Message`/
 or through mutual recursion) cannot be hashed bottom-up. For self-referencing
 fields:
 
-- Set `type_kind = "self_ref"` and `self_ref_name` to the type's own
+- Set `type_kind = SELF_REF` and `self_ref_name` to the type's own
   `package + "." + name`.
 - All other (non-self) references are still resolved to hashes.
 - The `TypeDef` is then serialized and hashed normally. The self-reference
   placeholder is deterministic (same name → same bytes → same hash).
 
-Mutual recursion (A references B, B references A) is resolved by the same
-mechanism: both A and B use `self_ref` for the cycle edge. Which edge becomes
-the `self_ref` is determined by lexicographic ordering of the fully-qualified
-type name — the type that sorts later uses `self_ref` for the back-edge.
+Mutual recursion and larger recursive strongly-connected components are resolved
+by a deterministic cycle-breaking rule over the type graph:
+
+- Compute strongly connected components (SCCs) of the reachable named-type
+  graph.
+- Any SCC of size 1 with no self-edge is handled normally and has no
+  `SELF_REF` placeholder.
+- For every SCC that contains a cycle, choose a deterministic spanning tree by
+  visiting member types in lexicographic order of fully-qualified type name and
+  traversing outgoing edges in lexicographic order of referenced fully-qualified
+  type name.
+- Any edge within the SCC that is **not** chosen as part of that spanning tree
+  is encoded as `type_kind = SELF_REF` with `self_ref_name` set to the
+  referenced type's fully-qualified name.
+
+This general rule covers direct self-recursion, two-type mutual recursion, and
+longer cycles such as `A → B → C → A` without requiring special cases.
 
 **Step 4 — Build the `ServiceContract`.** Construct `MethodDef` entries with
 request/response type hashes. Sort methods by name. Serialize the
@@ -462,6 +567,11 @@ Interpretation note:
   part of contract identity; it must be lowered to a concrete
   `CapabilityRequirement { kind, roles }` value before canonical hashing.
 
+Stock Fory tooling can parse these options, but current compiler builds may emit
+warnings for unknown service- and method-level option names. Aster tooling is
+expected to consume those option key/value pairs from the parsed IR despite such
+warnings.
+
 For interoperability, the current DSL grammar is:
 
 ```text
@@ -480,13 +590,13 @@ Resolution:
 1. `TaskAck` has only primitive fields → serialize `TypeDef`, hash →
    `ack_hash`.
 1. Build `MethodDef`:
-   `{name: "assign_task", pattern: "unary", request_type: ta_hash, response_type: ack_hash, idempotent: true, default_timeout: 30.0, requires: {kind: "any_of", roles: ["TaskManager", "Admin"]}}`
+   `{name: "assign_task", pattern: UNARY, request_type: ta_hash, response_type: ack_hash, idempotent: true, default_timeout: 30.0, requires: {kind: ANY_OF, roles: ["TaskManager", "Admin"]}}`
 1. Build `ServiceContract`:
-   `{name: "AgentControl", version: 1, methods: [<above>], serialization_modes: ["xlang"], alpn: "aster/1"}`
+   `{name: "AgentControl", version: 1, methods: [<above>], serialization_modes: ["xlang"], alpn: "aster/1", scoped: SHARED}`
 1. Serialize → hash → `contract_id`.
 
 If `TaskAssignment` gains a new field, its hash changes, which changes
-`assign_task`’s `request_type`, which changes the `ServiceContract` hash.
+`assign_task`'s `request_type`, which changes the `ServiceContract` hash.
 The old and new contracts coexist as separate immutable entries.
 
 ### 11.3.6 Compatibility Detection
@@ -541,7 +651,7 @@ deployable artifact. It is never committed to the repository.
 git repo (committed)           build artifact (gitignored / generated)
 ────────────────────           ──────────────────────────────────────
 service.py  ─────────────────► .aster/manifest.json
-  (or service.fdl)               git_commit, git_tag, semver, ...
+  (or service.fdl)               vcs_revision, vcs_tag, semver, ...
                                  ↓ embedded at build time
                                service_node binary / wheel / container
                                  ↓ on startup
@@ -559,7 +669,7 @@ on top by interpreting selected option keys/values after parsing the normal
 Fory compiler IR. This keeps source files consumable by standard Fory tooling,
 with only advisory warnings for unknown options.
 
-**Credential separation.** Contract publication uses the node’s registry write
+**Credential separation.** Contract publication uses the node's registry write
 credential (the docs `NamespaceSecret` or an author key with write access) — the
 same credential used for endpoint lease writes. The offline root key (§2.1 of
 the trust spec) is not involved. Publication is a normal node operation, not an
@@ -576,11 +686,11 @@ aster contract gen --out .aster/manifest.json
 ```
 
 It reads the service definition from the current source tree, resolves the type
-graph, computes `contract_id`, captures the current `git_commit` and `git_tag`
+graph, computes `contract_id`, captures the current VCS revision and tag
 (if any), and writes `.aster/manifest.json`. Add `.aster/manifest.json` to
 `.gitignore`.
 
-The manifest is then embedded in the deployable artifact using the language’s
+The manifest is then embedded in the deployable artifact using the language's
 native resource embedding mechanism:
 
 |Language|Mechanism                                                                                                                                        |
@@ -648,14 +758,13 @@ ContractManifest {
     type_hashes: list<string>        // all TypeDef hashes (transitive closure)
     method_count: int32
     serialization_modes: list<string>
-    alpn: string
     deprecated: bool
 
-    // ── Git provenance (written by aster contract gen) ────
+    // ── Source provenance (written by aster contract gen) ──
     semver: string?                  // e.g. "2.1.0" — advisory, not enforced
-    git_commit: string?              // full SHA of the commit that produced this contract
-    git_tag: string?                 // e.g. "v2.1.0"
-    git_repo: string?                // repo URL for traceability
+    vcs_revision: string?            // full commit hash (e.g. git SHA) that produced this contract
+    vcs_tag: string?                 // e.g. "v2.1.0"
+    vcs_url: string?                 // repository URL for traceability
     changelog: string?               // short human note about what changed
 
     // ── Publication metadata (written at startup) ─────────
@@ -664,7 +773,7 @@ ContractManifest {
 }
 ```
 
-`git_*` and `semver` fields are written by `aster contract gen` at commit time.
+`vcs_*` and `semver` fields are written by `aster contract gen` at commit time.
 `published_by` and `published_at_epoch_ms` are written by the node at startup.
 None of these fields are inputs to `contract_id` — they live in the manifest
 blob (collection index 0), which is separate from `contract.xlang` (index 1).
