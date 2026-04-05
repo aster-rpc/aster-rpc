@@ -21,7 +21,7 @@ Rust workspace crates:
 
 - `aster_transport_core` (core transport)
 - `aster_transport_ffi` (FFI layer)
-- `aster_python_rs` (PyO3 Python extension)
+- `aster_rs` (PyO3 Python extension)
 
 Python packaging uses `maturin` (`pyproject.toml`), so wheel jobs compile Rust and produce Python artifacts.
 

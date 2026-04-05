@@ -17,7 +17,7 @@ from pathlib import Path
 import blake3
 import pytest
 
-from aster_python.aster.contract.identity import (
+from aster.contract.identity import (
     ContainerKind,
     FieldDef,
     TypeDef,

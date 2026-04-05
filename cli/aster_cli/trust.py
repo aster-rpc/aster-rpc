@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 
 def _keygen_command(args) -> int:
     """Generate an ed25519 root key pair and write to disk."""
-    from aster_python.aster.trust.signing import generate_root_keypair
+    from aster.trust.signing import generate_root_keypair
 
     out_key = os.path.expanduser(args.out_key)
 
@@ -66,11 +66,11 @@ def _keygen_command(args) -> int:
 
 def _sign_command(args) -> int:
     """Sign an enrollment credential offline."""
-    from aster_python.aster.trust.credentials import (
+    from aster.trust.credentials import (
         ConsumerEnrollmentCredential,
         EnrollmentCredential,
     )
-    from aster_python.aster.trust.signing import sign_credential
+    from aster.trust.signing import sign_credential
 
     # Load root private key
     root_key_path = os.path.expanduser(args.root_key)

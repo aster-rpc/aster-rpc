@@ -10,7 +10,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 
-from aster_python import create_endpoint, IrohError
+from aster import create_endpoint, IrohError
 
 
 ALPN = b"test/binding/conninfo/1"
@@ -19,7 +19,7 @@ ALPN = b"test/binding/conninfo/1"
 @pytest_asyncio.fixture
 async def live_connection():
     """An established QUIC connection with monitoring enabled."""
-    from aster_python import EndpointConfig, create_endpoint_with_config
+    from aster import EndpointConfig, create_endpoint_with_config
 
     cfg = EndpointConfig(alpns=[ALPN], enable_monitoring=True)
     ep_listen = await create_endpoint_with_config(cfg)

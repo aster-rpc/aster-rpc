@@ -17,14 +17,14 @@ from io import BytesIO
 
 import pytest
 
-from aster_python.aster.status import (
+from aster.status import (
     StatusCode,
     RpcError,
     NotFoundError,
     InvalidArgumentError,
 )
-from aster_python.aster.types import SerializationMode, RetryPolicy, ExponentialBackoff
-from aster_python.aster.framing import (
+from aster.types import SerializationMode, RetryPolicy, ExponentialBackoff
+from aster.framing import (
     COMPRESSED,
     TRAILER,
     HEADER,
@@ -36,7 +36,7 @@ from aster_python.aster.framing import (
     write_frame,
     read_frame,
 )
-from aster_python.aster.protocol import StreamHeader, CallHeader, RpcStatus, fory_tag
+from aster.protocol import StreamHeader, CallHeader, RpcStatus, fory_tag
 
 # ── In-memory async stream helpers ──────────────────────────────────────────
 

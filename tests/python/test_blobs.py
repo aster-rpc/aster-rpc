@@ -6,7 +6,7 @@ pytestmark = pytest.mark.asyncio
 
 async def test_blob_round_trip():
     """Store bytes, retrieve by hash, verify identical."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -25,7 +25,7 @@ async def test_blob_round_trip():
 
 async def test_blob_different_data_different_hash():
     """Different data should produce different hashes."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -39,7 +39,7 @@ async def test_blob_different_data_different_hash():
 
 async def test_blob_not_found():
     """Reading a non-existent hash should raise IrohError."""
-    from aster_python import IrohNode, IrohError, blobs_client
+    from aster import IrohNode, IrohError, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -54,7 +54,7 @@ async def test_blob_not_found():
 
 async def test_blob_empty_data():
     """Storing empty bytes should work."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -73,7 +73,7 @@ async def test_blob_empty_data():
 
 async def test_tag_set_and_get_round_trip():
     """Set a tag and retrieve it by name."""
-    from aster_python import IrohNode, TagInfo, blobs_client
+    from aster import IrohNode, TagInfo, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -93,7 +93,7 @@ async def test_tag_set_and_get_round_trip():
 
 async def test_tag_get_missing_returns_none():
     """tag_get returns None for a tag that was never set."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -106,7 +106,7 @@ async def test_tag_get_missing_returns_none():
 
 async def test_tag_delete_removes_tag():
     """Set a tag, delete it, then tag_get returns None."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -128,7 +128,7 @@ async def test_tag_delete_removes_tag():
 
 async def test_tag_delete_nonexistent_returns_zero():
     """Deleting a non-existent tag returns 0 (not an error)."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -141,7 +141,7 @@ async def test_tag_delete_nonexistent_returns_zero():
 
 async def test_tag_list_returns_expected_tags():
     """tag_list returns all set tags."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -161,7 +161,7 @@ async def test_tag_list_returns_expected_tags():
 
 async def test_tag_list_prefix_filters_correctly():
     """tag_list_prefix returns only tags matching the prefix."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -184,7 +184,7 @@ async def test_tag_list_prefix_filters_correctly():
 
 async def test_add_bytes_as_collection_creates_tag():
     """add_bytes_as_collection sets an aster-python/{name} tag for GC protection."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -203,7 +203,7 @@ async def test_add_bytes_as_collection_creates_tag():
 
 async def test_tag_delete_unpublishes_collection():
     """Deleting the aster-python tag makes it unpublished (tag is gone)."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -225,7 +225,7 @@ async def test_tag_delete_unpublishes_collection():
 
 async def test_blob_status_complete_after_add():
     """blob_status returns 'complete' after add_bytes."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -241,7 +241,7 @@ async def test_blob_status_complete_after_add():
 
 async def test_blob_status_not_found_for_unknown_hash():
     """blob_status returns 'not_found' for a hash that was never stored."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
     import hashlib
 
     node = await IrohNode.memory()
@@ -266,7 +266,7 @@ async def test_blob_status_not_found_for_unknown_hash():
 
 async def test_blob_has_true_after_add():
     """blob_has returns True for a blob that was just stored."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -279,7 +279,7 @@ async def test_blob_has_true_after_add():
 
 async def test_blob_has_false_for_unknown():
     """blob_has returns False for a hash not stored in this node."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node1 = await IrohNode.memory()
     node2 = await IrohNode.memory()
@@ -300,7 +300,7 @@ async def test_blob_has_false_for_unknown():
 
 async def test_blob_observe_snapshot_complete_after_add():
     """blob_observe_snapshot returns is_complete=True after add_bytes."""
-    from aster_python import IrohNode, BlobObserveResult, blobs_client
+    from aster import IrohNode, BlobObserveResult, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -318,7 +318,7 @@ async def test_blob_observe_snapshot_complete_after_add():
 
 async def test_blob_observe_snapshot_size_matches():
     """blob_observe_snapshot reports the correct byte size for the blob."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -334,7 +334,7 @@ async def test_blob_observe_snapshot_size_matches():
 
 async def test_blob_observe_complete_resolves_for_local_blob():
     """blob_observe_complete resolves immediately when blob is already fully local."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -349,7 +349,7 @@ async def test_blob_observe_complete_resolves_for_local_blob():
 
 async def test_blob_local_info_complete_after_add():
     """blob_local_info returns is_complete=True and correct local_bytes after add_bytes."""
-    from aster_python import IrohNode, BlobLocalInfo, blobs_client
+    from aster import IrohNode, BlobLocalInfo, blobs_client
 
     node = await IrohNode.memory()
     blobs = blobs_client(node)
@@ -367,7 +367,7 @@ async def test_blob_local_info_complete_after_add():
 
 async def test_blob_local_info_unknown_hash():
     """blob_local_info for a hash not in this node returns is_complete=False and local_bytes=0."""
-    from aster_python import IrohNode, blobs_client
+    from aster import IrohNode, blobs_client
 
     node1 = await IrohNode.memory()
     node2 = await IrohNode.memory()

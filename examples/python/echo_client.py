@@ -4,7 +4,7 @@ Usage: python echo_client.py <server_endpoint_id>
 """
 import asyncio
 import sys
-from aster_python import create_endpoint
+from aster import create_endpoint
 
 ALPN = b"example/echo/1"
 

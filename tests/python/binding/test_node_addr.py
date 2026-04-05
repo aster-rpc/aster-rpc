@@ -6,7 +6,7 @@ to_dict/from_dict), and edge cases like empty direct_addresses.
 """
 
 import pytest
-from aster_python import NodeAddr
+from aster import NodeAddr
 
 
 FAKE_ID = "a" * 64  # 64 hex chars is a plausible node ID format
@@ -134,6 +134,6 @@ def test_from_dict_missing_direct_addresses():
 
 
 def test_from_dict_missing_endpoint_id_raises():
-    from aster_python import IrohError
+    from aster import IrohError
     with pytest.raises((IrohError, Exception)):
         NodeAddr.from_dict({})

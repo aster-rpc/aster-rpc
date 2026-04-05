@@ -15,7 +15,7 @@ pytestmark = pytest.mark.asyncio
 
 async def test_node_id():
     """Test retrieving node ID."""
-    from aster_python import IrohNode
+    from aster import IrohNode
 
     node = await IrohNode.memory()
     node_id = node.node_id()
@@ -29,7 +29,7 @@ async def test_node_id():
 
 async def test_multiple_nodes():
     """Test creating multiple nodes simultaneously."""
-    from aster_python import IrohNode
+    from aster import IrohNode
 
     node1 = await IrohNode.memory()
     node2 = await IrohNode.memory()
@@ -45,7 +45,7 @@ async def test_multiple_nodes():
 
 async def test_persistent_node_creation():
     """Test creating a persistent node backed by FsStore."""
-    from aster_python import IrohNode
+    from aster import IrohNode
 
     with tempfile.TemporaryDirectory() as td:
         node = await IrohNode.persistent(td)
@@ -56,7 +56,7 @@ async def test_persistent_node_creation():
 
 async def test_node_addr_info_roundtrip():
     """Structured node addr can be serialized and deserialized."""
-    from aster_python import IrohNode, NodeAddr
+    from aster import IrohNode, NodeAddr
 
     node = await IrohNode.memory()
     addr = node.node_addr_info()

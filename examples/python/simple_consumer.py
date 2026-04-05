@@ -34,15 +34,15 @@ import time
 sys.path.insert(0, os.path.dirname(__file__))
 from _hello_service import HelloService, HelloRequest  # noqa: E402
 
-from aster_python import create_endpoint_with_config, EndpointConfig, NodeAddr
-from aster_python.aster.client import create_client
-from aster_python.aster.trust.consumer import (
+from aster import create_endpoint_with_config, EndpointConfig, NodeAddr
+from aster.client import create_client
+from aster.trust.consumer import (
     ConsumerAdmissionRequest,
     ConsumerAdmissionResponse,
     consumer_cred_to_json,
 )
-from aster_python.aster.trust.credentials import ConsumerEnrollmentCredential
-from aster_python.aster.trust.signing import sign_credential
+from aster.trust.credentials import ConsumerEnrollmentCredential
+from aster.trust.signing import sign_credential
 
 RPC_ALPN = b"aster/1"
 ADMISSION_ALPN = b"aster.consumer_admission"

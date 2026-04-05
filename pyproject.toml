@@ -3,9 +3,9 @@ requires      = ["maturin>=1.6,<2"]
 build-backend = "maturin"
 
 [project]
-name    = "aster-python"
+name    = "aster-rpc"
 version = "0.1.0"
-description = "Python bindings for the Iroh peer-to-peer networking library"
+description = "Aster RPC framework with Iroh P2P transport (Python bindings)"
 requires-python = ">=3.9"
 dependencies = [
     "blake3>=1.0.8",
@@ -19,7 +19,7 @@ dependencies = [
 iid = ["PyJWT>=2.8"]
 
 [tool.maturin]
-module-name    = "aster_python._aster_python"
+module-name    = "aster._aster"
 manifest-path  = "bindings/python/rust/Cargo.toml"
 features       = ["pyo3/extension-module"]
 python-source  = "bindings/python"

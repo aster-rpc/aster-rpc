@@ -1,5 +1,5 @@
 import pytest
-from aster_python._aster_python import DocEntry, IrohNode, docs_client
+from aster._aster import DocEntry, IrohNode, docs_client
 
 
 @pytest.mark.asyncio
@@ -242,7 +242,7 @@ async def test_query_and_filter_by_author():
 @pytest.mark.asyncio
 async def test_start_sync_empty_peers_does_not_raise():
     """start_sync with no peers is a valid no-op — doc enters sync mode."""
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -257,7 +257,7 @@ async def test_start_sync_empty_peers_does_not_raise():
 @pytest.mark.asyncio
 async def test_leave_after_start_sync_does_not_raise():
     """start_sync followed by leave completes without error."""
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -272,7 +272,7 @@ async def test_leave_after_start_sync_does_not_raise():
 @pytest.mark.asyncio
 async def test_leave_without_sync_does_not_raise():
     """leave on a doc that was never synced completes without error."""
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -292,7 +292,7 @@ async def test_leave_without_sync_does_not_raise():
 async def test_subscribe_receives_insert_local_event():
     """subscribe() delivers an insert_local event after set_bytes."""
     import asyncio
-    from aster_python import IrohNode, DocEvent, docs_client
+    from aster import IrohNode, DocEvent, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -319,7 +319,7 @@ async def test_subscribe_receives_insert_local_event():
 async def test_subscribe_insert_local_entry_fields():
     """insert_local event contains correct author, content_hash, and size."""
     import asyncio
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -347,7 +347,7 @@ async def test_subscribe_insert_local_entry_fields():
 async def test_subscribe_multiple_events_in_order():
     """Multiple writes produce multiple insert_local events in order."""
     import asyncio
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -380,7 +380,7 @@ async def test_subscribe_multiple_events_in_order():
 @pytest.mark.asyncio
 async def test_set_download_policy_everything_does_not_raise():
     """set_download_policy(everything) is a valid no-op."""
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -394,7 +394,7 @@ async def test_set_download_policy_everything_does_not_raise():
 @pytest.mark.asyncio
 async def test_download_policy_roundtrip():
     """set then get download policy returns the same mode and prefixes."""
-    from aster_python import IrohNode, DocDownloadPolicy, docs_client
+    from aster import IrohNode, DocDownloadPolicy, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -415,7 +415,7 @@ async def test_download_policy_roundtrip():
 @pytest.mark.asyncio
 async def test_download_policy_everything_except():
     """everything_except policy round-trips correctly."""
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -438,7 +438,7 @@ async def test_download_policy_everything_except():
 @pytest.mark.asyncio
 async def test_share_with_addr_returns_ticket():
     """share_with_addr returns a valid ticket string starting with 'doc'."""
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -454,7 +454,7 @@ async def test_share_with_addr_returns_ticket():
 @pytest.mark.asyncio
 async def test_share_with_addr_read_mode():
     """share_with_addr(read) produces a read-only ticket."""
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -476,7 +476,7 @@ async def test_share_with_addr_read_mode():
 async def test_join_and_subscribe_returns_doc_and_receiver():
     """join_and_subscribe returns a (DocHandle, DocEventReceiver) tuple."""
     import asyncio
-    from aster_python import IrohNode, DocHandle, DocEventReceiver, docs_client
+    from aster import IrohNode, DocHandle, DocEventReceiver, docs_client
 
     node1 = await IrohNode.memory()
     node2 = await IrohNode.memory()
@@ -506,7 +506,7 @@ async def test_join_and_subscribe_returns_doc_and_receiver():
 async def test_join_and_subscribe_receives_event_after_write():
     """Events from the remote writer appear via join_and_subscribe receiver."""
     import asyncio
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node1 = await IrohNode.memory()
     node2 = await IrohNode.memory()

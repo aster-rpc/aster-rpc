@@ -71,7 +71,7 @@ def _gen_command(args: argparse.Namespace) -> int:
     Returns:
         Exit code (0 for success).
     """
-    from aster_python.aster.contract.identity import (
+    from aster.contract.identity import (
         ServiceContract,
         build_type_graph,
         canonical_xlang_bytes,
@@ -79,8 +79,8 @@ def _gen_command(args: argparse.Namespace) -> int:
         compute_type_hash,
         resolve_with_cycles,
     )
-    from aster_python.aster.contract.manifest import ContractManifest
-    from aster_python.aster.decorators import _SERVICE_INFO_ATTR
+    from aster.contract.manifest import ContractManifest
+    from aster.decorators import _SERVICE_INFO_ATTR
 
     cls = _import_service_class(args.service)
 

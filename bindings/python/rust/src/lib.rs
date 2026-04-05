@@ -1,4 +1,4 @@
-//! aster_python - Python bindings for iroh using aster_transport_core.
+//! aster - Python bindings for iroh using aster_transport_core.
 //!
 //! Phase 2: This module is now registration-only.
 //! All actual wrapper logic has been moved to individual modules:
@@ -47,7 +47,7 @@ fn init_tokio_runtime() {
 }
 
 #[pymodule]
-fn _aster_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize tokio runtime for async operations
     init_tokio_runtime();
 

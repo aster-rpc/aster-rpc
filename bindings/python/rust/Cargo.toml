@@ -1,10 +1,10 @@
 [package]
-name    = "aster_python_rs"
+name    = "aster_rs"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name    = "_aster_python"
+name    = "_aster"
 crate-type = ["cdylib"]
 
 [dependencies]

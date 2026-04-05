@@ -46,13 +46,13 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from _hello_service import HelloService, HelloRequest, HelloResponse  # noqa: E402
 
-from aster_python import create_endpoint_with_config, EndpointConfig
-from aster_python.aster.registry.models import ServiceSummary
-from aster_python.aster.server import Server
-from aster_python.aster.trust.consumer import serve_consumer_admission
-from aster_python.aster.trust.hooks import MeshEndpointHook
-from aster_python.aster.trust.nonces import InMemoryNonceStore
-from aster_python.aster.trust.signing import generate_root_keypair
+from aster import create_endpoint_with_config, EndpointConfig
+from aster.registry.models import ServiceSummary
+from aster.server import Server
+from aster.trust.consumer import serve_consumer_admission
+from aster.trust.hooks import MeshEndpointHook
+from aster.trust.nonces import InMemoryNonceStore
+from aster.trust.signing import generate_root_keypair
 
 RPC_ALPN = b"aster/1"
 ADMISSION_ALPN = b"aster.consumer_admission"

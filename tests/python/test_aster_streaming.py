@@ -16,15 +16,15 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster_python.aster.codec import fory_tag
-from aster_python.aster.decorators import (
+from aster.codec import fory_tag
+from aster.decorators import (
     bidi_stream,
     client_stream,
     server_stream,
     service,
 )
-from aster_python.aster.testing import AsterTestHarness
-from aster_python.aster.types import SerializationMode
+from aster.testing import AsterTestHarness
+from aster.types import SerializationMode
 
 
 # ── Test types ────────────────────────────────────────────────────────────────

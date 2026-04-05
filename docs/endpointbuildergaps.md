@@ -2,7 +2,7 @@
 
 > **Sources:** `iroh/iroh/src/endpoint.rs` — `iroh::endpoint::Builder`
 >
-> This document is a developer reference for the iroh Endpoint builder options that exist in upstream Rust but are **not yet exposed** via the Python FFI (`aster_transport_core` → `bindings/aster_python_rs`). Use this to decide which options to prioritise for FFI exposure.
+> This document is a developer reference for the iroh Endpoint builder options that exist in upstream Rust but are **not yet exposed** via the Python FFI (`aster_transport_core` → `bindings/aster_rs`). Use this to decide which options to prioritise for FFI exposure.
 
 ---
 
@@ -18,7 +18,7 @@
 ## 1. How the Layers Connect
 
 ```
-Python bindings (bindings/aster_python_rs/src/net.rs)
+Python bindings (bindings/aster_rs/src/net.rs)
     └── EndpointConfig (Python dataclass)
             └── CoreEndpointConfig (aster_transport_core/src/lib.rs)
                     └── build_endpoint_config() → iroh::Endpoint::builder

@@ -16,7 +16,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 
-from aster_python import create_endpoint, IrohError, IrohConnection, IrohSendStream, IrohRecvStream
+from aster import create_endpoint, IrohError, IrohConnection, IrohSendStream, IrohRecvStream
 
 
 ALPN = b"test/binding/streams/1"
@@ -162,7 +162,7 @@ async def test_endpoint_close_is_clean():
 
 
 async def test_endpoint_addr_info_returns_node_addr():
-    from aster_python import NodeAddr
+    from aster import NodeAddr
     ep = await create_endpoint(ALPN)
     addr = ep.endpoint_addr_info()
     assert isinstance(addr, NodeAddr)

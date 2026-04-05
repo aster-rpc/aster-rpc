@@ -27,7 +27,7 @@ import sys
 
 def _keygen_root(args) -> int:
     """Generate an ed25519 root key pair and write to disk."""
-    from aster_python.aster.trust.signing import generate_root_keypair
+    from aster.trust.signing import generate_root_keypair
 
     out_path = os.path.expanduser(args.out)
 
@@ -63,7 +63,7 @@ def _keygen_root(args) -> int:
 
 async def _derive_node_id(secret_bytes: bytes) -> str:
     """Start a transient iroh endpoint to derive the NodeId from a secret key."""
-    from aster_python import create_endpoint_with_config, EndpointConfig
+    from aster import create_endpoint_with_config, EndpointConfig
 
     ep = await create_endpoint_with_config(
         EndpointConfig(secret_key=list(secret_bytes), alpns=[b"_keygen"])

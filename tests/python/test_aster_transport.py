@@ -16,19 +16,19 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster_python.aster.codec import fory_tag, ForyCodec, ForyConfig
-from aster_python.aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
-from aster_python.aster.protocol import StreamHeader, RpcStatus
-from aster_python.aster.types import SerializationMode
-from aster_python.aster.status import StatusCode
-from aster_python.aster.transport.base import (
+from aster.codec import fory_tag, ForyCodec, ForyConfig
+from aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
+from aster.protocol import StreamHeader, RpcStatus
+from aster.types import SerializationMode
+from aster.status import StatusCode
+from aster.transport.base import (
     Transport,
     BidiChannel,
     TransportError,
     ConnectionLostError,
 )
-from aster_python.aster.transport.iroh import IrohTransport
-from aster_python.aster.transport.local import LocalTransport, LocalBidiChannel
+from aster.transport.iroh import IrohTransport
+from aster.transport.local import LocalTransport, LocalBidiChannel
 
 
 # ── Test types ───────────────────────────────────────────────────────────────
@@ -465,7 +465,7 @@ class TestMemStreams:
     @pytest.mark.asyncio
     async def test_mem_send_stream(self):
         """MemSendStream collects written data."""
-        from aster_python.aster.transport.local import MemSendStream
+        from aster.transport.local import MemSendStream
         
         stream = MemSendStream()
         await stream.write_all(b"hello")
@@ -478,7 +478,7 @@ class TestMemStreams:
     @pytest.mark.asyncio
     async def test_mem_recv_stream_read_exact(self):
         """MemRecvStream.read_exact returns correct data."""
-        from aster_python.aster.transport.local import MemRecvStream
+        from aster.transport.local import MemRecvStream
         
         stream = MemRecvStream(b"hello world")
         data = await stream.read_exact(5)
@@ -490,7 +490,7 @@ class TestMemStreams:
     @pytest.mark.asyncio
     async def test_mem_recv_stream_stop(self):
         """MemRecvStream.stop() prevents further reads."""
-        from aster_python.aster.transport.local import MemRecvStream
+        from aster.transport.local import MemRecvStream
         
         stream = MemRecvStream(b"hello")
         stream.stop(0)
@@ -507,7 +507,7 @@ class TestLocalConnection:
 
     def test_local_connection_creation(self):
         """LocalConnection can be created."""
-        from aster_python.aster.transport.local import LocalConnection
+        from aster.transport.local import LocalConnection
         
         conn = LocalConnection()
         assert conn is not None
@@ -515,7 +515,7 @@ class TestLocalConnection:
 
     def test_local_connection_close(self):
         """LocalConnection.close() works."""
-        from aster_python.aster.transport.local import LocalConnection
+        from aster.transport.local import LocalConnection
         
         conn = LocalConnection()
         conn.close(0, b"test")
@@ -523,7 +523,7 @@ class TestLocalConnection:
 
     def test_local_connection_remote_id(self):
         """LocalConnection.remote_id() returns a string."""
-        from aster_python.aster.transport.local import LocalConnection
+        from aster.transport.local import LocalConnection
         
         conn = LocalConnection()
         assert conn.remote_id() == "local-connection"
@@ -541,7 +541,7 @@ class TestIrohTransportIntegration:
     @pytest.mark.asyncio
     async def test_iroh_transport_unary(self):
         """IrohTransport unary round-trip over a real in-memory Iroh connection."""
-        import aster_python
+        import aster
 
         alpn = b"aster/1"
         codec = ForyCodec(
@@ -549,8 +549,8 @@ class TestIrohTransportIntegration:
             types=[EchoRequest, EchoResponse],
         )
 
-        server_endpoint = await aster_python.create_endpoint(alpn)
-        client_endpoint = await aster_python.create_endpoint(alpn)
+        server_endpoint = await aster.create_endpoint(alpn)
+        client_endpoint = await aster.create_endpoint(alpn)
 
         async def server_side() -> None:
             conn = await server_endpoint.accept()

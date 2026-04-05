@@ -17,7 +17,7 @@ from typing import Optional
 
 import pytest
 
-from aster_python.aster.codec import (
+from aster.codec import (
     fory_tag,
     ForyCodec,
     ForyConfig,
@@ -25,9 +25,9 @@ from aster_python.aster.codec import (
     _walk_type_graph,
     _validate_xlang_tags,
 )
-from aster_python.aster.types import SerializationMode
-from aster_python.aster.protocol import StreamHeader, CallHeader, RpcStatus
-from aster_python.aster.status import StatusCode
+from aster.types import SerializationMode
+from aster.protocol import StreamHeader, CallHeader, RpcStatus
+from aster.status import StatusCode
 
 
 # ── Test types ───────────────────────────────────────────────────────────────
@@ -197,7 +197,7 @@ class TestForyCodecInit:
             def register_type(self, *args, **kwargs):
                 return None
 
-        monkeypatch.setattr("aster_python.aster.codec.pyfory.Fory", DummyFory)
+        monkeypatch.setattr("aster.codec.pyfory.Fory", DummyFory)
 
         ForyCodec(mode=SerializationMode.XLANG, types=[])
 
@@ -212,7 +212,7 @@ class TestForyCodecInit:
             def register_type(self, *args, **kwargs):
                 return None
 
-        monkeypatch.setattr("aster_python.aster.codec.pyfory.Fory", DummyFory)
+        monkeypatch.setattr("aster.codec.pyfory.Fory", DummyFory)
 
         ForyCodec(mode=SerializationMode.NATIVE, types=[])
 
@@ -227,7 +227,7 @@ class TestForyCodecInit:
             def register_type(self, *args, **kwargs):
                 return None
 
-        monkeypatch.setattr("aster_python.aster.codec.pyfory.Fory", DummyFory)
+        monkeypatch.setattr("aster.codec.pyfory.Fory", DummyFory)
 
         ForyCodec(
             mode=SerializationMode.XLANG,

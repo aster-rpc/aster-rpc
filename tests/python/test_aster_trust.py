@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from aster_python.aster.trust import (
+from aster.trust import (
     ALPN_CONSUMER_ADMISSION,
     ALPN_PRODUCER_ADMISSION,
     ConsumerEnrollmentCredential,
@@ -43,7 +43,7 @@ from aster_python.aster.trust import (
     sign_credential,
     verify_signature,
 )
-from aster_python.aster.trust.hooks import _ADMISSION_ALPNS
+from aster.trust.hooks import _ADMISSION_ALPNS
 
 
 # ── Key generation helpers ─────────────────────────────────────────────────────
@@ -430,7 +430,7 @@ async def test_in_memory_nonce_store_is_consumed():
 
 @pytest.mark.asyncio
 async def test_file_nonce_store_consume_once():
-    from aster_python.aster.trust.nonces import NonceStore
+    from aster.trust.nonces import NonceStore
 
     with tempfile.TemporaryDirectory() as d:
         store = NonceStore(Path(d) / "nonces.json")
@@ -441,7 +441,7 @@ async def test_file_nonce_store_consume_once():
 
 @pytest.mark.asyncio
 async def test_file_nonce_store_persists_across_instances():
-    from aster_python.aster.trust.nonces import NonceStore
+    from aster.trust.nonces import NonceStore
 
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "nonces.json"
@@ -458,7 +458,7 @@ async def test_file_nonce_store_persists_across_instances():
 
 @pytest.mark.asyncio
 async def test_file_nonce_store_missing_file_is_fresh():
-    from aster_python.aster.trust.nonces import NonceStore
+    from aster.trust.nonces import NonceStore
 
     with tempfile.TemporaryDirectory() as d:
         store = NonceStore(Path(d) / "subdir" / "nonces.json")
@@ -508,7 +508,7 @@ def test_mesh_hook_admission_alpns_in_frozenset():
 
 def test_cli_keygen_produces_valid_key_pair():
     from aster_cli.trust import _keygen_command
-    from aster_python.aster.trust.signing import load_private_key, load_public_key
+    from aster.trust.signing import load_private_key, load_public_key
 
     with tempfile.TemporaryDirectory() as d:
         key_path = Path(d) / "root.key"
@@ -645,7 +645,7 @@ def test_cli_sign_ott_credential():
 
 def test_local_transport_call_context_peer_is_none():
     """LocalTransport CallContext.peer is None — Gates 0 and 1 are bypassed."""
-    from aster_python.aster.interceptors import CallContext
+    from aster.interceptors import CallContext
 
     ctx = CallContext(service="TestService", method="DoSomething")
     assert ctx.peer is None
@@ -654,7 +654,7 @@ def test_local_transport_call_context_peer_is_none():
 
 def test_auth_interceptor_allows_when_peer_is_none():
     """Auth interceptor canonical behaviour: peer is None → allow (in-process trust)."""
-    from aster_python.aster.interceptors import AuthInterceptor, CallContext
+    from aster.interceptors import AuthInterceptor, CallContext
 
     interceptor = AuthInterceptor()
     ctx = CallContext(service="TestService", method="DoSomething")

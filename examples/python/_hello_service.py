@@ -7,9 +7,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aster_python.aster.codec import fory_tag
-from aster_python.aster.decorators import service, rpc
-from aster_python.aster.types import SerializationMode
+from aster.codec import fory_tag
+from aster.decorators import service, rpc
+from aster.types import SerializationMode
 
 
 @fory_tag("demo/HelloRequest")

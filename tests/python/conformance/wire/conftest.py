@@ -15,7 +15,7 @@ import io
 from pathlib import Path
 
 
-from aster_python.aster.framing import CANCEL, TRAILER, write_frame
+from aster.framing import CANCEL, TRAILER, write_frame
 
 _FIXTURES_DIR = Path(__file__).parent
 
