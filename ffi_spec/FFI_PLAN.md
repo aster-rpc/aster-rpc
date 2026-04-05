@@ -317,6 +317,9 @@ typedef enum iroh_event_kind_e {
     IROH_EVENT_GOSSIP_NEIGHBOR_DOWN = 54,
     IROH_EVENT_GOSSIP_LAGGED = 55,
     
+    // Aster custom-ALPN (Phase 1e)
+    IROH_EVENT_ASTER_ACCEPTED = 65,
+    
     // Generic
     IROH_EVENT_STRING_RESULT = 90,
     IROH_EVENT_BYTES_RESULT = 91,
@@ -2775,6 +2778,200 @@ an atomic variant; if not, subscribe immediately after import before yielding to
 
 ---
 
+## 3e. Phase 1e: Unified Aster Node — Custom ALPNs on the Shared iroh Router
+
+### Overview
+
+Aster requires blobs (contract publication), docs (service registry), and gossip (producer-mesh coordination) alongside its own ALPNs (`aster/1`, `aster.consumer_admission`, `aster.producer_admission`). Running these on separate iroh endpoints wastes relay bandwidth and creates multiple node IDs. Phase 1e unifies everything on **one endpoint, one node ID** by extending `CoreNode` to register custom-ALPN `ProtocolHandler` instances on iroh's `Router`, forwarding accepted connections to the host language via a bounded tokio channel.
+
+### 3e.1 Core API (`aster_transport_core`)
+
+```rust
+/// Queue-backed ProtocolHandler registered on the Router for each custom ALPN.
+/// Forwards accepted connections to a shared bounded channel.
+#[derive(Debug, Clone)]
+struct AsterQueueHandler {
+    alpn: Vec<u8>,
+    tx: mpsc::Sender<(Vec<u8>, Connection)>,
+}
+
+impl ProtocolHandler for AsterQueueHandler {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        let _ = self.tx.send((self.alpn.clone(), conn)).await;
+        Ok(())
+    }
+}
+
+impl CoreNode {
+    /// Create an in-memory node serving blobs + docs + gossip + custom ALPNs.
+    pub async fn memory_with_alpns(
+        aster_alpns: Vec<Vec<u8>>,
+        endpoint_config: Option<CoreEndpointConfig>,
+    ) -> Result<Self>;
+
+    /// Persistent (FsStore-backed) counterpart.
+    pub async fn persistent_with_alpns(
+        path: String,
+        aster_alpns: Vec<Vec<u8>>,
+        endpoint_config: Option<CoreEndpointConfig>,
+    ) -> Result<Self>;
+
+    /// Wait for the next incoming custom-ALPN connection. Returns
+    /// (alpn_bytes, connection). Returns Err once the node closes.
+    pub async fn accept_aster(&self) -> Result<(Vec<u8>, CoreConnection)>;
+
+    /// Take the hooks receiver (one-shot; None if not enabled / already taken).
+    pub fn take_hook_receiver(&self) -> Option<CoreHookReceiver>;
+}
+```
+
+The `endpoint_config` parameter enables the same `enable_hooks` / `enable_monitoring` / `secret_key` / `relay_mode` / `bind_addr` surface as `CoreNetClient::create_with_config`. The `alpns` field on the config is ignored — iroh's `Router::spawn()` calls `endpoint.set_alpns(...)` with the union of all registered protocol ALPNs automatically.
+
+### 3e.2 Concurrency Contract
+
+| Construct | Where it lives | Crosses FFI? |
+|-----------|----------------|:------------:|
+| iroh `Router` + its accept-loop task | tokio, inside CoreNode | No |
+| `AsterQueueHandler` ProtocolHandlers | tokio, inside CoreNode | No |
+| Bounded `mpsc::channel(256)` | tokio, inside CoreNode | No |
+| `async fn accept_aster()` | core, exposed as tokio-async method | Via existing bridge |
+| Returned `(Vec<u8>, CoreConnection)` | host language → used via existing IrohConnection | Yes (existing wrapper) |
+
+- **Channel**: Bounded (`mpsc::channel(256)`). Back-pressure inside `AsterQueueHandler::accept()` blocks the per-ALPN Router task only; blobs/docs/gossip remain unaffected.
+- **Receiver**: `tokio::sync::Mutex<mpsc::Receiver<...>>` — safe for multi-caller (calls serialize). Internal to Rust; never crosses FFI.
+- **Cancellation**: Mutex released on drop; unreceived `(alpn, conn)` remains queued for the next caller. No lost connections.
+- **Connection lifetime**: iroh `Connection` is `Arc`-backed `Clone`. The ProtocolHandler sends via the channel; Router drops its clone on return; the clone in the channel keeps the connection alive until `accept_aster()` hands it to the host.
+- **Shutdown**: `router.shutdown()` drains protocol handlers, drops senders → `recv()` returns None → `accept_aster()` returns Err. Then closes the endpoint.
+
+### 3e.3 FFI API
+
+**New event kind:**
+
+```c
+IROH_EVENT_ASTER_ACCEPTED = 65,
+```
+
+**New functions:**
+
+```c
+// Create a full node with blobs/docs/gossip + custom aster ALPNs.
+// Emits IROH_EVENT_NODE_CREATED with the node handle on success.
+iroh_status_t iroh_node_memory_with_alpns(
+    iroh_runtime_t runtime,
+    const uint8_t* const* alpns,      // array of pointers to ALPN byte strings
+    const size_t* alpn_lens,          // parallel array of lengths
+    size_t alpn_count,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+
+// Persistent variant (FsStore at `path`).
+iroh_status_t iroh_node_persistent_with_alpns(
+    iroh_runtime_t runtime,
+    const char* path,
+    const uint8_t* const* alpns,
+    const size_t* alpn_lens,
+    size_t alpn_count,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+
+// Pull the next aster-ALPN connection from the node's queue.
+// Long-poll: spawns a tokio task, emits IROH_EVENT_ASTER_ACCEPTED with:
+//   handle      = connection handle
+//   data_ptr/len = ALPN bytes
+//   buffer      = lease to release via iroh_buffer_release
+iroh_status_t iroh_node_accept_aster(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+
+// Take the hook receiver from the node (one-shot, like existing
+// iroh_endpoint_take_hook_receiver).
+iroh_status_t iroh_node_take_hook_receiver(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+```
+
+**Implementation** mirrors `iroh_accept` (ffi/src/lib.rs:1824): load runtime, look up node handle, `new_operation()`, `runtime.spawn()` an async task calling `core_node.accept_aster().await`, emit the completion event. Connection handle via `bridge.connections.insert(conn)`. ALPN bytes via existing variable-length payload path.
+
+### 3e.4 Memory Ownership
+
+- ALPN buffer in `IROH_EVENT_ASTER_ACCEPTED`: follows existing event-payload rules (§7.3) — host calls `iroh_buffer_release(event.buffer)` when done.
+- Connection handle: follows existing handle-lifetime rules (§7.4) — freed via `iroh_connection_close`.
+
+### 3e.5 Gate 0 Integration
+
+When any admission gate is active, the node is built with `enable_hooks=true` on the `CoreEndpointConfig`. iroh's endpoint hooks fire at the QUIC handshake layer — **before ALPN dispatch** — so Gate 0 (`MeshEndpointHook`, trust spec §3.3) gates *all* protocols (blobs, docs, gossip, aster/1, admission) uniformly.
+
+The host language takes the `HookReceiver` from the node and runs a hook loop that:
+1. Auto-accepts `before_connect` (the peer's EndpointId is not authenticated yet).
+2. Applies the `MeshEndpointHook` allowlist at `after_handshake` (authenticated peer ID).
+3. Admission ALPNs are always allowed (so unadmitted peers can present credentials).
+
+### 3e.6 Target-Language Usage Pattern
+
+**C (FFI):**
+```c
+// Create node with aster ALPNs
+const uint8_t* alpns[] = { (uint8_t*)"aster/1", (uint8_t*)"aster.consumer_admission" };
+size_t lens[] = { 7, 26 };
+iroh_node_memory_with_alpns(rt, alpns, lens, 2, 0, &op);
+// ... poll for IROH_EVENT_NODE_CREATED ...
+
+// Accept loop
+while (running) {
+    iroh_node_accept_aster(rt, node_handle, 0, &op);
+    // ... poll for IROH_EVENT_ASTER_ACCEPTED ...
+    // event.handle = connection, event.data_ptr/data_len = ALPN bytes
+    iroh_buffer_release(event.buffer);
+    // dispatch by ALPN ...
+}
+```
+
+**Python (PyO3):**
+```python
+node = await IrohNode.memory_with_alpns(
+    [b"aster/1", b"aster.consumer_admission"],
+    EndpointConfig(enable_hooks=True),
+)
+receiver = await node.take_hook_receiver()
+asyncio.create_task(hook.run_hook_loop(receiver))  # Gate 0
+while True:
+    alpn, conn = await node.accept_aster()
+    if alpn == b"aster/1":
+        asyncio.create_task(server.handle_connection(conn))
+    elif alpn == b"aster.consumer_admission":
+        asyncio.create_task(handle_consumer_admission(conn, ...))
+```
+
+**Java (FFM):**
+```java
+var op = arena.allocate(LAYOUT_OP);
+nativeBindings.iroh_node_memory_with_alpns(rt, alpnPtrs, alpnLens, 2, 0, op);
+long nodeHandle = poller.awaitResult(op).handle();
+
+// Accept loop (virtual thread)
+Thread.startVirtualThread(() -> {
+    while (running) {
+        var acceptOp = arena.allocate(LAYOUT_OP);
+        nativeBindings.iroh_node_accept_aster(rt, nodeHandle, 0, acceptOp);
+        var event = poller.awaitResult(acceptOp);
+        byte[] alpn = event.dataSlice();
+        long connHandle = event.handle();
+        nativeBindings.iroh_buffer_release(event.buffer());
+        dispatch(alpn, connHandle);
+    }
+});
+```
+
+---
+
 ## Implementation Order
 
 ### Phase 1 (Core + FFI) — ~2-3 weeks
@@ -2811,6 +3008,16 @@ an atomic variant; if not, subscribe immediately after import before yielding to
 8. **P2: Doc Import and Subscribe** — Add `join_and_subscribe` to core + Python + FFI
 9. Write integration tests for all Phase 1c features
 10. Update `Aster-ContractIdentity.md` §11.5 to reflect completed items
+
+### Phase 1e (Unified Aster Node) — ~1 week
+
+1. **Core**: Add `AsterQueueHandler`, `CoreNode::{memory,persistent}_with_alpns`, `accept_aster`, `take_hook_receiver`, `build_node_endpoint` helper
+2. **PyO3**: Expose `IrohNode.{memory,persistent}_with_alpns`, `accept_aster`, `take_hook_receiver`; add `NodeHookReceiver` + `NodeHookDecisionSender`
+3. **Python**: Rewrite `AsterServer` to use `IrohNode` with unified accept loop and Gate 0 hook wiring; add `.blobs/.docs/.gossip/.node` lazy properties
+4. **FFI**: Add `iroh_node_{memory,persistent}_with_alpns`, `iroh_node_accept_aster`, `iroh_node_take_hook_receiver`, `IROH_EVENT_ASTER_ACCEPTED`
+5. **Server**: Add `owns_endpoint` flag to `Server.__init__` so `AsterServer` can own the node lifecycle
+6. **Tests**: Core unit test (accept_aster round-trip), Python integration (unified node + blobs + RPC), Gate 0 enforcement test
+7. **Docs**: Update `FFI_PLAN.md` §3e
 
 ### Phase 2 (Python) — ~1 week
 

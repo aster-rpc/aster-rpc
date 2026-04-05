@@ -11,7 +11,7 @@ use iroh::endpoint::{
     presets, AfterHandshakeOutcome, BeforeConnectOutcome, Connection, ConnectionError,
     ConnectionInfo, Endpoint, EndpointHooks, PathInfo, RelayMode, VarInt, PortmapperConfig,
 };
-use iroh::protocol::Router;
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher};
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::Store as BlobStore;
@@ -735,8 +735,38 @@ fn build_endpoint_config(config: &CoreEndpointConfig) -> Result<iroh::endpoint::
 }
 
 // ============================================================================
-// CoreNode - Full iroh node with all protocols
+// CoreNode - Full iroh node with all protocols + custom Aster ALPN support
 // ============================================================================
+
+/// `ProtocolHandler` that forwards accepted connections on a given ALPN to a
+/// shared bounded mpsc channel. One instance is registered with the iroh
+/// `Router` per custom ALPN the node should listen on; they all share a
+/// single sender so the consumer sees a unified stream of
+/// `(alpn, Connection)` tuples via [`CoreNode::accept_aster`].
+///
+/// `iroh::endpoint::Connection` is `Arc`-backed `Clone`; `ProtocolHandler::accept`
+/// drops its reference once the future returns, so the clone we place on the
+/// channel is what keeps the connection alive until the consumer takes it.
+#[derive(Debug, Clone)]
+struct AsterQueueHandler {
+    alpn: Vec<u8>,
+    tx: mpsc::Sender<(Vec<u8>, Connection)>,
+}
+
+impl ProtocolHandler for AsterQueueHandler {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        // Bounded channel — if full, back-pressure blocks this per-ALPN
+        // handler task but leaves the Router's central accept loop and
+        // other protocol handlers (blobs/docs/gossip) free.
+        let _ = self.tx.send((self.alpn.clone(), conn)).await;
+        Ok(())
+    }
+}
+
+/// Internal capacity for the aster-accept queue. Generous for admission +
+/// RPC; if an aster consumer wedges, back-pressure only hits the per-ALPN
+/// Router task, not blobs/docs/gossip.
+const ASTER_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 pub struct CoreNode {
@@ -745,7 +775,6 @@ pub struct CoreNode {
 
 struct CoreNodeInner {
     endpoint: Endpoint,
-    #[allow(dead_code)]
     router: Router,
     #[allow(dead_code)]
     blobs: BlobsProtocol,
@@ -753,55 +782,143 @@ struct CoreNodeInner {
     gossip: Gossip,
     store: BlobStore,
     secret_key_bytes: Vec<u8>,
+    /// Receiver half of the aster-ALPN queue. Wrapped in a tokio Mutex so
+    /// `accept_aster(&self)` can pull from it across clones. Internal to
+    /// Rust — never crosses the FFI boundary.
+    aster_rx: Mutex<mpsc::Receiver<(Vec<u8>, Connection)>>,
+    /// Connection monitor (populated if enable_monitoring=true on the
+    /// endpoint config passed to a `_with_alpns` constructor).
+    #[allow(dead_code)]
+    monitor: Option<CoreMonitor>,
+    /// Hooks receiver — present iff enable_hooks=true. Same shape as
+    /// [`CoreNetClient::hook_receiver`]; takeable once via
+    /// [`CoreNode::take_hook_receiver`].
+    hook_receiver: Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
+}
+
+/// Build the iroh `Endpoint` for a `CoreNode`, optionally applying a
+/// `CoreEndpointConfig` so `enable_hooks` / `enable_monitoring` /
+/// `secret_key` / `relay_mode` / `bind_addr` etc. work on a full node the
+/// same way they work on a bare `CoreNetClient`. Returns the bound
+/// endpoint plus the monitor + hook-receiver channels the caller needs to
+/// expose to the host. The `alpns` field on the config is ignored — iroh's
+/// `Router::spawn()` overwrites `endpoint.set_alpns(...)` with the union of
+/// all registered protocol ALPNs.
+async fn build_node_endpoint(
+    config: Option<CoreEndpointConfig>,
+) -> Result<(
+    Endpoint,
+    Option<CoreMonitor>,
+    Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
+)> {
+    match config {
+        None => {
+            let endpoint = Endpoint::bind(presets::N0).await?;
+            endpoint.online().await;
+            Ok((endpoint, None, None))
+        }
+        Some(config) => {
+            let relay_mode = relay_mode_from_config(&config)?;
+            let mut builder = build_endpoint_config(&config)?;
+
+            let mut monitor = None;
+            let mut hook_receiver = None;
+
+            if config.enable_monitoring {
+                let (hook, mon) = CoreMonitor::new();
+                builder = builder.hooks(hook);
+                monitor = Some(mon);
+            }
+            if config.enable_hooks {
+                let (adapter, receiver) = CoreHooksAdapter::new(config.hook_timeout_ms);
+                builder = builder.hooks(adapter);
+                hook_receiver = Some(Arc::new(std::sync::Mutex::new(Some(receiver))));
+            }
+
+            let endpoint = builder.bind().await?;
+            if !matches!(relay_mode, RelayMode::Disabled) {
+                endpoint.online().await;
+            }
+            Ok((endpoint, monitor, hook_receiver))
+        }
+    }
 }
 
 impl CoreNode {
     pub async fn memory() -> Result<Self> {
-        let endpoint = Endpoint::bind(presets::N0).await?;
-        endpoint.online().await;
+        Self::memory_with_alpns(Vec::new(), None).await
+    }
+
+    /// In-memory node that serves blobs + docs + gossip AND accepts connections
+    /// on each entry in `aster_alpns`. When provided, `endpoint_config`'s
+    /// `enable_hooks` / `enable_monitoring` / `secret_key` / `relay_mode` /
+    /// `bind_addr` / `clear_*_transports` / `portmapper_config` settings are
+    /// applied to the endpoint builder (via the same path as
+    /// [`CoreNetClient::create_with_config`]). The `alpns` field on the config
+    /// is ignored here — the iroh `Router`'s `accept` registrations drive the
+    /// endpoint's ALPN list on `spawn()` (see iroh-0.97.0 protocol.rs:429).
+    pub async fn memory_with_alpns(
+        aster_alpns: Vec<Vec<u8>>,
+        endpoint_config: Option<CoreEndpointConfig>,
+    ) -> Result<Self> {
+        let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         let mem_store = MemStore::new();
         let store: BlobStore = (*mem_store).clone();
-        let blobs = BlobsProtocol::new(&store, None);
-        let gossip = Gossip::builder().spawn(endpoint.clone());
-        let docs = Docs::memory()
-            .spawn(endpoint.clone(), store.clone(), gossip.clone())
-            .await?;
-        let router = Router::builder(endpoint.clone())
-            .accept(BLOBS_ALPN, blobs.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
-            .accept(DOCS_ALPN, docs.clone())
-            .spawn();
-
-        let secret_key_bytes = endpoint.secret_key().to_bytes().to_vec();
-
-        Ok(Self {
-            inner: Arc::new(CoreNodeInner {
-                endpoint,
-                router,
-                blobs,
-                docs,
-                gossip,
-                store,
-                secret_key_bytes,
-            }),
-        })
+        Self::finalize(endpoint, store, aster_alpns, monitor, hook_receiver).await
     }
 
     pub async fn persistent(path: String) -> Result<Self> {
-        let endpoint = Endpoint::bind(presets::N0).await?;
-        endpoint.online().await;
+        Self::persistent_with_alpns(path, Vec::new(), None).await
+    }
+
+    /// Persistent (FsStore-backed) counterpart to [`Self::memory_with_alpns`].
+    /// The FsStore is loaded from `path` exactly as [`Self::persistent`] does.
+    pub async fn persistent_with_alpns(
+        path: String,
+        aster_alpns: Vec<Vec<u8>>,
+        endpoint_config: Option<CoreEndpointConfig>,
+    ) -> Result<Self> {
+        let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         let fs_store = FsStore::load(path).await?;
         let store: BlobStore = fs_store.into();
+        Self::finalize(endpoint, store, aster_alpns, monitor, hook_receiver).await
+    }
+
+    /// Shared tail of both constructors: wire blobs/docs/gossip protocols +
+    /// one `AsterQueueHandler` per entry in `aster_alpns` onto a Router, then
+    /// assemble `CoreNodeInner`.
+    async fn finalize(
+        endpoint: Endpoint,
+        store: BlobStore,
+        aster_alpns: Vec<Vec<u8>>,
+        monitor: Option<CoreMonitor>,
+        hook_receiver: Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
+    ) -> Result<Self> {
         let blobs = BlobsProtocol::new(&store, None);
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let docs = Docs::memory()
             .spawn(endpoint.clone(), store.clone(), gossip.clone())
             .await?;
-        let router = Router::builder(endpoint.clone())
+
+        let (aster_tx, aster_rx) = mpsc::channel::<(Vec<u8>, Connection)>(ASTER_QUEUE_CAPACITY);
+
+        let mut router_builder = Router::builder(endpoint.clone())
             .accept(BLOBS_ALPN, blobs.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
-            .accept(DOCS_ALPN, docs.clone())
-            .spawn();
+            .accept(DOCS_ALPN, docs.clone());
+        for alpn in &aster_alpns {
+            router_builder = router_builder.accept(
+                alpn.clone(),
+                AsterQueueHandler {
+                    alpn: alpn.clone(),
+                    tx: aster_tx.clone(),
+                },
+            );
+        }
+        // Drop the extra sender we created via .clone() above; only the
+        // handlers registered on the Router should keep the channel alive.
+        drop(aster_tx);
+        let router = router_builder.spawn();
 
         let secret_key_bytes = endpoint.secret_key().to_bytes().to_vec();
 
@@ -814,6 +931,9 @@ impl CoreNode {
                 gossip,
                 store,
                 secret_key_bytes,
+                aster_rx: Mutex::new(aster_rx),
+                monitor,
+                hook_receiver,
             }),
         })
     }
@@ -828,7 +948,36 @@ impl CoreNode {
         format!("{:?}", self.inner.endpoint.addr())
     }
     pub async fn close(&self) {
-        self.inner.endpoint.close().await;
+        // router.shutdown() drains protocol handlers (so in-flight
+        // AsterQueueHandler::accept futures resolve), drops handlers (closing
+        // the aster channel), then closes the endpoint. See iroh-0.97.0
+        // protocol.rs:490-495.
+        if let Err(err) = self.inner.router.shutdown().await {
+            debug!("CoreNode::close: router.shutdown join error: {err}");
+        }
+    }
+
+    /// Wait for the next incoming connection on any registered aster ALPN.
+    /// Returns `(alpn_bytes, connection)`. Returns Err once the node is
+    /// closed (all `AsterQueueHandler` senders dropped).
+    pub async fn accept_aster(&self) -> Result<(Vec<u8>, CoreConnection)> {
+        let mut rx = self.inner.aster_rx.lock().await;
+        match rx.recv().await {
+            Some((alpn, conn)) => Ok((alpn, CoreConnection::new(conn))),
+            None => Err(anyhow!("aster accept channel closed")),
+        }
+    }
+
+    /// Take the hooks receiver (one-shot). Returns `None` when the node was
+    /// built without `enable_hooks=true` or the receiver was already taken.
+    pub fn take_hook_receiver(&self) -> Option<CoreHookReceiver> {
+        self.inner.hook_receiver.as_ref()?.lock().ok()?.take()
+    }
+
+    /// Whether this node has hooks wired (i.e. built via a constructor that
+    /// was given an `endpoint_config` with `enable_hooks=true`).
+    pub fn has_hooks(&self) -> bool {
+        self.inner.hook_receiver.is_some()
     }
 
     pub fn export_secret_key(&self) -> Vec<u8> {
