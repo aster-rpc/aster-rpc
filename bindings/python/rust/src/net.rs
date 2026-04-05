@@ -172,6 +172,7 @@ impl EndpointConfig {
         proxy_url=None,
         proxy_from_env=false,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         alpns: Vec<Vec<u8>>,
         relay_mode: Option<String>,
