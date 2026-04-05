@@ -71,6 +71,8 @@ try:
         HookReceiver,
         HookRegistration,
         HookManager,
+        NodeHookReceiver,
+        NodeHookDecisionSender,
     )
 except ImportError as e:
     raise ImportError(
@@ -192,6 +194,8 @@ __all__ = [
     "HookReceiver",
     "HookRegistration",
     "HookManager",
+    "NodeHookReceiver",
+    "NodeHookDecisionSender",
     # ── Aster RPC framework ──
     "StatusCode",
     "RpcError",

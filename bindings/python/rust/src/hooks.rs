@@ -13,8 +13,11 @@
 //! 4. The hook receiver drains events and dispatches to Python callbacks
 
 use pyo3::prelude::*;
+use pyo3_async_runtimes::tokio::future_into_py;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+use aster_transport_core::{CoreAfterHandshakeDecision, CoreHookReceiver};
 
 /// Hook event types
 #[pyclass(from_py_object)]
@@ -248,6 +251,150 @@ impl HookManager {
     }
 }
 
+// =============================================================================
+// Real NodeHookReceiver — drains CoreHookReceiver channels.
+// =============================================================================
+//
+// The receiver above is a stub. This is the real thing, consumed by
+// IrohNode.take_hook_receiver() when built with enable_hooks=true.
+//
+// Design:
+//   * A background tokio task auto-accepts every `before_connect` request
+//     (the peer ID isn't authenticated yet; Gate 0 runs at after_handshake
+//     where we have the verified EndpointId).
+//   * `NodeHookReceiver.recv()` surfaces each `after_handshake` event as
+//     `(HookHandshakeInfo, NodeHookDecisionSender)` so Python can apply
+//     its allowlist decision asynchronously.
+//   * `NodeHookDecisionSender.send(HookDecision)` consumes the underlying
+//     `oneshot::Sender<CoreAfterHandshakeDecision>`.
+
+/// Single-use sender for an after-handshake decision. Wraps a oneshot
+/// channel that the corresponding `CoreHooksAdapter::after_handshake` is
+/// waiting on.
+#[pyclass]
+pub struct NodeHookDecisionSender {
+    tx: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<CoreAfterHandshakeDecision>>>>,
+}
+
+#[pymethods]
+impl NodeHookDecisionSender {
+    /// Send a decision (Allow or Deny). May only be called once per sender.
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        decision: Py<HookDecision>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let tx = self.tx.clone();
+        // Extract fields now (while we still have the GIL) so the async body
+        // doesn't need to re-acquire it.
+        let (is_allowed, error_code, reason) = {
+            let bound = decision.bind(py).borrow();
+            (bound.is_allowed, bound.error_code, bound.reason.clone())
+        };
+        future_into_py(py, async move {
+            let sender = tx
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("hook sender poisoned"))?
+                .take();
+            let Some(sender) = sender else {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "hook decision already sent",
+                ));
+            };
+            let core_decision = if is_allowed {
+                CoreAfterHandshakeDecision::Accept
+            } else {
+                CoreAfterHandshakeDecision::Reject {
+                    error_code: error_code.unwrap_or(403),
+                    reason: reason.unwrap_or_else(|| b"denied".to_vec()),
+                }
+            };
+            // If recv side dropped we swallow — the adapter defaults to Accept.
+            let _ = sender.send(core_decision);
+            Ok(())
+        })
+    }
+
+    /// Make the class callable as `await sender(decision)` for symmetry with
+    /// the existing stub API.
+    fn __call__<'py>(
+        &self,
+        py: Python<'py>,
+        decision: Py<HookDecision>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.send(py, decision)
+    }
+}
+
+/// Node-level hook receiver. Obtained via `IrohNode.take_hook_receiver()`.
+/// Call `recv()` in a loop to drain after-handshake events and make Gate 0
+/// decisions; `before_connect` is auto-accepted in the background task.
+#[pyclass]
+pub struct NodeHookReceiver {
+    /// Only the after_handshake side is exposed to Python. The
+    /// before_connect side is drained by `_before_connect_task`.
+    after_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(
+        aster_transport_core::CoreHookHandshakeInfo,
+        tokio::sync::oneshot::Sender<CoreAfterHandshakeDecision>,
+    )>>>,
+    /// Abort handle for the background before_connect drainer.
+    _before_connect_task: Arc<tokio::task::AbortHandle>,
+}
+
+impl NodeHookReceiver {
+    pub(crate) fn from_core(core: CoreHookReceiver) -> Self {
+        let CoreHookReceiver {
+            mut before_connect_rx,
+            after_handshake_rx,
+        } = core;
+
+        // Background task: always allow the before_connect step. The
+        // peer's EndpointId isn't authenticated here; Gate 0 gates at
+        // after_handshake where we have the verified remote id.
+        let task = tokio::spawn(async move {
+            while let Some((_info, reply_tx)) = before_connect_rx.recv().await {
+                let _ = reply_tx.send(true);
+            }
+        });
+        let abort = task.abort_handle();
+
+        Self {
+            after_rx: Arc::new(Mutex::new(after_handshake_rx)),
+            _before_connect_task: Arc::new(abort),
+        }
+    }
+}
+
+#[pymethods]
+impl NodeHookReceiver {
+    /// Await the next after-handshake event. Returns
+    /// `(HookHandshakeInfo, NodeHookDecisionSender)`, or `None` when the
+    /// underlying channel closes (node shut down).
+    fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.after_rx.clone();
+        future_into_py(py, async move {
+            let mut guard = rx.lock().await;
+            let Some((info, sender)) = guard.recv().await else {
+                return Python::attach(|py| Ok::<Py<PyAny>, PyErr>(py.None()));
+            };
+            let info_py = HookHandshakeInfo {
+                remote_endpoint_id: info.remote_endpoint_id,
+                alpn: info.alpn,
+                is_alive: info.is_alive,
+            };
+            let sender_py = NodeHookDecisionSender {
+                tx: Arc::new(std::sync::Mutex::new(Some(sender))),
+            };
+            Python::attach(|py| {
+                let info_obj: Py<PyAny> = Py::new(py, info_py)?.into_any();
+                let sender_obj: Py<PyAny> = Py::new(py, sender_py)?.into_any();
+                let tup = pyo3::types::PyTuple::new(py, &[info_obj, sender_obj])?;
+                Ok::<Py<PyAny>, PyErr>(tup.unbind().into())
+            })
+        })
+    }
+}
+
 /// Register the hooks types with the Python module.
 pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HookConnectInfo>()?;
@@ -256,5 +403,7 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HookReceiver>()?;
     m.add_class::<HookRegistration>()?;
     m.add_class::<HookManager>()?;
+    m.add_class::<NodeHookReceiver>()?;
+    m.add_class::<NodeHookDecisionSender>()?;
     Ok(())
 }

@@ -3,13 +3,18 @@ aster.high_level — Declarative ``AsterServer`` / ``AsterClient`` wrappers.
 
 Thin composition over the existing low-level primitives
 (:class:`aster.Server`, :func:`aster.trust.consumer.serve_consumer_admission`,
-:func:`aster.create_endpoint_with_config`, :func:`aster.client.create_client`)
-to give application code a one-line, declarative producer/consumer experience.
+:func:`aster.client.create_client`) to give application code a one-line,
+declarative producer/consumer experience.
+
+The ``AsterServer`` builds a single ``IrohNode`` serving blobs + docs +
+gossip + aster RPC + admission ALPNs on one endpoint, one node ID. Gate 0
+(connection-level admission hook, trust spec §3.3) is automatically wired
+when any admission flag is active.
 
 Example (producer)::
 
     async with AsterServer(services=[HelloService()], root_pubkey=pub) as srv:
-        print(srv.admission_addr_b64, srv.rpc_addr_b64)
+        print(srv.endpoint_addr_b64)
         await srv.serve()  # blocks until cancelled
 
 Example (consumer)::
@@ -17,7 +22,7 @@ Example (consumer)::
     async with AsterClient(
         root_pubkey=pub, root_privkey=priv, admission_addr=addr_b64,
     ) as c:
-        hello = c.client(HelloService)
+        hello = await c.client(HelloService)
         print((await hello.say_hello(HelloRequest(name="World"))).message)
 """
 from __future__ import annotations
@@ -31,7 +36,16 @@ from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-from . import create_endpoint_with_config, EndpointConfig, NodeAddr
+from . import (
+    IrohNode,
+    EndpointConfig,
+    NodeAddr,
+    create_endpoint_with_config,
+    net_client,
+    blobs_client,
+    docs_client,
+    gossip_client,
+)
 from .client import ServiceClient, create_client
 from .contract.identity import contract_id_from_service
 from .registry.models import ServiceSummary
@@ -67,20 +81,16 @@ RPC_ALPN: bytes = b"aster/1"
 class AsterServer:
     """High-level, declarative producer.
 
-    Wraps endpoint creation, ``ServiceSummary`` construction with per-spec
-    ``contract_id``, consumer admission, and the low-level :class:`Server`
-    behind one async context manager.
+    Builds a single :class:`IrohNode` that serves blobs + docs + gossip
+    (iroh built-in protocols) alongside aster RPC (``aster/1``) and any
+    enabled admission ALPNs — all on **one endpoint, one node ID**.
 
-    The flag matrix:
-
-    * ``allow_all_consumers=True`` and ``allow_all_producers=True`` →
-      no admission endpoints, no :class:`MeshEndpointHook`.
-    * ``allow_all_consumers=False`` → run ``aster.consumer_admission`` to
-      gate consumers against ``root_pubkey``.
-    * ``allow_all_producers=False`` → run ``aster.producer_admission`` to
-      gate peer producers (mesh join, §2.4). If no ``mesh_state`` is
-      provided, an ephemeral founding state is auto-created (random salt,
-      empty accepted-producer set, no persistence).
+    When any admission gate is active (``allow_all_consumers=False`` or
+    ``allow_all_producers=False``), the node is built with
+    ``enable_hooks=True`` and a background task runs the Gate 0
+    connection-level hook loop (``MeshEndpointHook.run_hook_loop``), which
+    gates *all* protocols (blobs, docs, gossip, aster/1, admission) at the
+    QUIC handshake layer.
     """
 
     def __init__(
@@ -126,9 +136,13 @@ class AsterServer:
 
         # Populated by start()
         self._started: bool = False
-        self._ep: Any | None = None
+        self._node: IrohNode | None = None
         self._service_summaries: list[ServiceSummary] = []
         self._server: Server | None = None
+        # Lazy caches for .blobs / .docs / .gossip
+        self._blobs: Any | None = None
+        self._docs: Any | None = None
+        self._gossip: Any | None = None
 
         # Populated by serve()
         self._serve_task: asyncio.Task | None = None
@@ -138,34 +152,42 @@ class AsterServer:
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Create endpoints and compute ``ServiceSummary`` list. Idempotent."""
+        """Create the unified node and compute ``ServiceSummary`` list. Idempotent."""
         if self._started:
             return
 
-        # One endpoint serves RPC + any enabled admission ALPN; the accept
-        # loop dispatches per connection by ALPN.
-        alpns: list[bytes] = [RPC_ALPN]
+        # Determine which aster ALPNs to register on the Router.
+        aster_alpns: list[bytes] = [RPC_ALPN]
+        gate0_needed = False
         if not self._allow_all_consumers:
-            alpns.append(ALPN_CONSUMER_ADMISSION)
+            aster_alpns.append(ALPN_CONSUMER_ADMISSION)
             if self._hook is None:
                 self._hook = MeshEndpointHook()
             if self._nonce_store is None:
                 self._nonce_store = InMemoryNonceStore()
+            gate0_needed = True
         if not self._allow_all_producers:
-            alpns.append(ALPN_PRODUCER_ADMISSION)
-        cfg = _clone_config_with_alpns(self._endpoint_config_template, alpns)
-        self._ep = await create_endpoint_with_config(cfg)
-        rpc_addr_b64 = base64.b64encode(
-            self._ep.endpoint_addr_info().to_bytes()
+            aster_alpns.append(ALPN_PRODUCER_ADMISSION)
+            if self._hook is None:
+                self._hook = MeshEndpointHook()
+            gate0_needed = True
+
+        # Build EndpointConfig so hooks (Gate 0) are installed when needed.
+        ep_cfg = _build_node_endpoint_config(
+            self._endpoint_config_template, enable_hooks=gate0_needed
+        )
+
+        self._node = await IrohNode.memory_with_alpns(aster_alpns, ep_cfg)
+        addr_b64 = base64.b64encode(
+            self._node.node_addr_info().to_bytes()
         ).decode()
 
-        # Auto-create an ephemeral MeshState if producer admission is enabled
-        # and no caller-supplied state was given.
+        # Auto-create ephemeral MeshState when producer admission is enabled.
         if not self._allow_all_producers and self._mesh_state is None:
             assert self._root_pubkey is not None
             self._mesh_state = make_ephemeral_mesh_state(self._root_pubkey)
 
-        # Build ServiceSummary list with per-spec contract_id for each service.
+        # Build ServiceSummary list with per-spec contract_id.
         summaries: list[ServiceSummary] = []
         for svc in self._services_in:
             svc_cls = svc if inspect.isclass(svc) else type(svc)
@@ -181,39 +203,51 @@ class AsterServer:
                     name=info.name,
                     version=info.version,
                     contract_id=cid,
-                    channels={self._channel_name: rpc_addr_b64},
+                    channels={self._channel_name: addr_b64},
                 )
             )
         self._service_summaries = summaries
 
-        # Construct the low-level Server. It borrows the shared endpoint —
-        # we (AsterServer) drive the accept loop; Server.handle_connection()
-        # is called per RPC-ALPN connection.
+        # Server borrows a NetClient view of the node. AsterServer owns the
+        # node lifecycle, so Server must NOT close the endpoint on its own.
         self._server = Server(
-            self._ep,
+            net_client(self._node),
             services=self._services_in,
             codec=self._codec,
             interceptors=self._interceptors,
+            owns_endpoint=False,
         )
 
         self._started = True
 
     def serve(self) -> asyncio.Task:
-        """Spawn the RPC and admission serve loops; return the aggregate task.
+        """Spawn the accept loop (+ Gate 0 hook loop); return an aggregate task.
 
-        Calling ``await server.serve()`` blocks until cancellation. The second
-        call returns the same task, so calling this inside a context manager
-        and then awaiting its result is safe.
+        ``await server.serve()`` blocks until cancellation. The second call
+        returns the same task (idempotent).
         """
         if self._serve_task is not None:
             return self._serve_task
         if not self._started:
             raise RuntimeError("AsterServer.serve() called before start()")
         assert self._server is not None
+        assert self._node is not None
 
-        subtasks: list[asyncio.Task] = [
-            asyncio.create_task(self._accept_loop(), name="aster-accept"),
-        ]
+        subtasks: list[asyncio.Task] = []
+
+        # Gate 0 hook loop: drain the after-handshake channel, apply the
+        # MeshEndpointHook allowlist for every connection. before_connect is
+        # auto-accepted inside NodeHookReceiver (the peer's endpoint ID
+        # isn't authenticated at that stage).
+        if self._hook is not None and self._node.has_hooks():
+            self._hook_loop_task = asyncio.create_task(
+                self._run_gate0(), name="aster-gate0"
+            )
+            subtasks.append(self._hook_loop_task)
+
+        subtasks.append(
+            asyncio.create_task(self._accept_loop(), name="aster-accept")
+        )
         self._subtasks = subtasks
 
         async def _wait_all() -> None:
@@ -222,27 +256,30 @@ class AsterServer:
         self._serve_task = asyncio.create_task(_wait_all(), name="aster-server-serve")
         return self._serve_task
 
+    async def _run_gate0(self) -> None:
+        """Take the hook receiver from the node and run the hook loop."""
+        assert self._node is not None
+        assert self._hook is not None
+        receiver = await self._node.take_hook_receiver()
+        if receiver is None:
+            logger.warning("AsterServer: hooks enabled but no receiver available")
+            return
+        await self._hook.run_hook_loop(receiver)
+
     async def _accept_loop(self) -> None:
-        """Single accept loop over the shared endpoint; dispatch per ALPN."""
-        assert self._ep is not None
+        """Pull from ``node.accept_aster()`` and dispatch per ALPN."""
+        assert self._node is not None
         assert self._server is not None
         services_snapshot = list(self._service_summaries)
         try:
             while True:
                 try:
-                    conn = await self._ep.accept()
+                    alpn, conn = await self._node.accept_aster()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("AsterServer: accept() failed: %s", exc)
+                    logger.warning("AsterServer: accept_aster failed: %s", exc)
                     continue
-
-                try:
-                    alpn = conn.connection_info().alpn
-                    if not isinstance(alpn, bytes):
-                        alpn = bytes(alpn)
-                except Exception:  # noqa: BLE001
-                    alpn = b""
 
                 if alpn == RPC_ALPN:
                     asyncio.create_task(
@@ -276,7 +313,6 @@ class AsterServer:
                         name="aster-producer-admission-conn",
                     )
                 else:
-                    # Unknown/disabled ALPN: close the connection.
                     try:
                         conn.close(0, b"unexpected alpn")
                     except Exception:  # noqa: BLE001
@@ -285,12 +321,11 @@ class AsterServer:
             pass
 
     async def close(self) -> None:
-        """Cancel serve loops and close endpoints. Safe to call multiple times."""
+        """Cancel serve loops and close the node. Safe to call multiple times."""
         if self._closed:
             return
         self._closed = True
 
-        # Cancel subtasks and the aggregate.
         for t in self._subtasks:
             t.cancel()
         if self._serve_task is not None:
@@ -300,18 +335,16 @@ class AsterServer:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # Close the RPC server (also closes the shared endpoint per server.py).
-        if self._server is not None:
+        # Close the node — this triggers router.shutdown() which closes all
+        # protocol handlers (including aster queue handlers) and the endpoint.
+        if self._node is not None:
             try:
-                await self._server.close()
+                await self._node.close()
             except Exception:
                 pass
 
     async def __aenter__(self) -> "AsterServer":
         await self.start()
-        # Spawn serve loops eagerly so the caller can just `await srv.serve()`
-        # or use the server without ever calling serve() explicitly (e.g., if
-        # another task drives shutdown).
         self.serve()
         return self
 
@@ -322,14 +355,12 @@ class AsterServer:
 
     @property
     def endpoint_addr_b64(self) -> str:
-        """Base64 ``NodeAddr`` of the shared endpoint — serves RPC and any
-        enabled admission ALPNs. Clients dial this using the ALPN they want.
-        """
+        """Base64 ``NodeAddr`` of the shared endpoint (one node ID for
+        RPC + admission + blobs + docs + gossip)."""
         self._require_started()
-        assert self._ep is not None
-        return base64.b64encode(self._ep.endpoint_addr_info().to_bytes()).decode()
+        assert self._node is not None
+        return base64.b64encode(self._node.node_addr_info().to_bytes()).decode()
 
-    # Per-ALPN aliases (same base64 string; returns None when the ALPN is off).
     @property
     def rpc_addr_b64(self) -> str:
         return self.endpoint_addr_b64
@@ -353,28 +384,61 @@ class AsterServer:
         return self.endpoint_addr_b64
 
     @property
-    def mesh_state(self) -> MeshState | None:
-        return self._mesh_state
-
-    @property
     def services(self) -> list[ServiceSummary]:
         self._require_started()
         return list(self._service_summaries)
 
     @property
-    def endpoint(self) -> Any:
-        """Escape hatch: the shared ``NetClient`` endpoint."""
-        self._require_started()
-        return self._ep
-
-    # Back-compat alias.
-    @property
-    def rpc_endpoint(self) -> Any:
-        return self.endpoint
+    def mesh_state(self) -> MeshState | None:
+        return self._mesh_state
 
     @property
     def root_pubkey(self) -> bytes | None:
         return self._root_pubkey
+
+    # ── Iroh protocol clients (lazy) ─────────────────────────────────────────
+
+    @property
+    def node(self) -> IrohNode:
+        """The underlying ``IrohNode`` (escape hatch for direct iroh access)."""
+        self._require_started()
+        assert self._node is not None
+        return self._node
+
+    @property
+    def blobs(self) -> Any:
+        """Blobs client backed by this node."""
+        self._require_started()
+        if self._blobs is None:
+            self._blobs = blobs_client(self._node)
+        return self._blobs
+
+    @property
+    def docs(self) -> Any:
+        """Docs client backed by this node."""
+        self._require_started()
+        if self._docs is None:
+            self._docs = docs_client(self._node)
+        return self._docs
+
+    @property
+    def gossip(self) -> Any:
+        """Gossip client backed by this node."""
+        self._require_started()
+        if self._gossip is None:
+            self._gossip = gossip_client(self._node)
+        return self._gossip
+
+    # Back-compat aliases
+    @property
+    def endpoint(self) -> Any:
+        """Escape hatch: the ``NetClient`` view of this node's endpoint."""
+        self._require_started()
+        return net_client(self._node)
+
+    @property
+    def rpc_endpoint(self) -> Any:
+        return self.endpoint
 
     def _require_started(self) -> None:
         if not self._started:
@@ -382,6 +446,8 @@ class AsterServer:
 
 
 # ── AsterClient ──────────────────────────────────────────────────────────────
+# TODO: upgrade to IrohNode.memory_with_alpns() when client-side blobs/docs/gossip
+# is needed (service discovery).
 
 
 class AsterClient:
@@ -424,12 +490,10 @@ class AsterClient:
 
         self._ep: Any | None = None
         self._services: list[ServiceSummary] = []
-        self._rpc_conns: dict[str, Any] = {}   # rpc_addr_b64 → IrohConnection
+        self._rpc_conns: dict[str, Any] = {}
         self._clients: list[ServiceClient] = []
         self._connected: bool = False
         self._closed: bool = False
-
-    # ── Lifecycle ────────────────────────────────────────────────────────────
 
     async def connect(self) -> None:
         """Create endpoint, run admission handshake, store services. Idempotent."""
@@ -441,7 +505,6 @@ class AsterClient:
         )
         self._ep = await create_endpoint_with_config(ep_config)
 
-        # Mint credential if not supplied.
         cred = self._credential
         if cred is None:
             assert self._root_privkey is not None
@@ -453,7 +516,6 @@ class AsterClient:
             )
             cred.signature = sign_credential(cred, self._root_privkey)
 
-        # Admission handshake.
         admission_node_addr = _coerce_node_addr(self._admission_addr_in)
         conn = await self._ep.connect_node_addr(admission_node_addr, ALPN_CONSUMER_ADMISSION)
         send, recv = await conn.open_bi()
@@ -485,7 +547,7 @@ class AsterClient:
         codec: Any | None = None,
         interceptors: list[Any] | None = None,
     ) -> ServiceClient:
-        """Return an RPC client for ``service_cls``, opening a channel conn on demand."""
+        """Return an RPC client for ``service_cls``."""
         if not self._connected:
             raise RuntimeError("AsterClient not connected; call connect() first")
 
@@ -496,7 +558,6 @@ class AsterClient:
                 f"(missing __aster_service_info__)"
             )
 
-        # Find matching service summary (by name + version).
         summary: ServiceSummary | None = None
         for s in self._services:
             if s.name == info.name and s.version == info.version:
@@ -536,7 +597,7 @@ class AsterClient:
             except Exception:
                 pass
         self._clients.clear()
-        self._rpc_conns.clear()  # IrohConnections close with the endpoint
+        self._rpc_conns.clear()
 
         if self._ep is not None:
             try:
@@ -551,14 +612,40 @@ class AsterClient:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
 
-    # ── Properties ───────────────────────────────────────────────────────────
-
     @property
     def services(self) -> list[ServiceSummary]:
         return list(self._services)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+
+def _build_node_endpoint_config(
+    template: EndpointConfig | None,
+    *,
+    enable_hooks: bool = False,
+) -> EndpointConfig | None:
+    """Build an EndpointConfig for IrohNode.memory_with_alpns.
+
+    Copies user-provided template fields and optionally force-enables hooks.
+    Returns None when no template and no hooks are needed (caller passes None
+    to the Rust side for the default presets::N0 path).
+    """
+    if template is None and not enable_hooks:
+        return None
+    kwargs: dict[str, Any] = {"alpns": []}  # Router sets ALPNs
+    if template is not None:
+        for attr in (
+            "relay_mode", "secret_key", "enable_monitoring",
+            "enable_hooks", "hook_timeout_ms",
+        ):
+            if hasattr(template, attr):
+                val = getattr(template, attr)
+                if val is not None:
+                    kwargs[attr] = val
+    if enable_hooks:
+        kwargs["enable_hooks"] = True
+    return EndpointConfig(**kwargs)
 
 
 def _clone_config_with_alpns(
@@ -573,13 +660,11 @@ def _clone_config_with_alpns(
             merged.append(a)
     if template is None:
         return EndpointConfig(alpns=merged)
-    # Start from the template's alpns, add ours.
     for a in list(template.alpns):
         if a not in seen:
             seen.add(a)
             merged.append(a)
     kwargs: dict[str, Any] = {"alpns": merged}
-    # Copy over optional fields if set on the template.
     for attr in ("relay_mode", "secret_key", "enable_monitoring", "enable_hooks", "hook_timeout_ms"):
         if hasattr(template, attr):
             val = getattr(template, attr)

@@ -143,6 +143,9 @@ pub enum iroh_event_kind_t {
     IROH_EVENT_HOOK_AFTER_CONNECT = 71,
     IROH_EVENT_HOOK_INVOCATION_RELEASED = 72,
 
+    // Aster custom-ALPN (Phase 1e)
+    IROH_EVENT_ASTER_ACCEPTED = 65,
+
     // Generic
     IROH_EVENT_STRING_RESULT = 90,
     IROH_EVENT_BYTES_RESULT = 91,
@@ -1881,6 +1884,134 @@ pub unsafe extern "C" fn iroh_accept(
 
     iroh_status_t::IROH_STATUS_OK as i32
 }
+
+// ============================================================================
+// Phase 1e: Unified Aster Node — custom ALPNs on the shared iroh Router
+// ============================================================================
+
+/// Create an in-memory node with blobs/docs/gossip + custom aster ALPNs.
+/// Emits IROH_EVENT_NODE_CREATED on success.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_node_memory_with_alpns(
+    runtime: iroh_runtime_t,
+    alpns: *const *const u8,
+    alpn_lens: *const usize,
+    alpn_count: usize,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    // Extract ALPN byte slices.
+    let aster_alpns: Vec<Vec<u8>> = (0..alpn_count)
+        .map(|i| unsafe {
+            let ptr = *alpns.add(i);
+            let len = *alpn_lens.add(i);
+            std::slice::from_raw_parts(ptr, len).to_vec()
+        })
+        .collect();
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match aster_transport_core::CoreNode::memory_with_alpns(aster_alpns, None).await {
+            Ok(node) => {
+                let handle = bridge2.nodes.insert(node);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_NODE_CREATED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    handle,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Pull the next incoming aster-ALPN connection from the node's queue.
+/// Long-poll: spawns a tokio task, emits IROH_EVENT_ASTER_ACCEPTED when a
+/// connection arrives. event.handle = connection_handle, event.data_ptr/len
+/// = ALPN bytes, event.buffer = lease to release via iroh_buffer_release.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_node_accept_aster(
+    runtime: iroh_runtime_t,
+    node: u64,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match node_arc.accept_aster().await {
+            Ok((alpn, conn)) => {
+                let conn_handle = bridge2.connections.insert(conn);
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_ASTER_ACCEPTED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    conn_handle,
+                    0,
+                    user_data,
+                    0,
+                );
+                // ALPN bytes go into the event payload (data_ptr/data_len).
+                bridge2.emit_with_data(event, alpn);
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
 
 #[no_mangle]
 pub unsafe extern "C" fn iroh_connection_remote_id(

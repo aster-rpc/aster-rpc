@@ -111,6 +111,7 @@ class Server:
         interceptors: list[Any] | None = None,
         max_concurrent_streams: int | None = None,
         registry: ServiceRegistry | None = None,
+        owns_endpoint: bool = True,
     ) -> None:
         """Initialize the server.
 
@@ -122,8 +123,12 @@ class Server:
             interceptors: List of interceptor instances to apply to all calls.
             max_concurrent_streams: Maximum concurrent streams per connection.
             registry: Optional ServiceRegistry. If not provided, creates one from services.
+            owns_endpoint: If True (default), ``close()`` also closes the endpoint.
+                Set False when the endpoint is managed externally (e.g. by
+                :class:`AsterServer`).
         """
         self._endpoint = endpoint
+        self._owns_endpoint = owns_endpoint
         self._interceptors = list(interceptors) if interceptors else []
         self._max_concurrent_streams = max_concurrent_streams
         self._service_instances: dict[tuple[str, int], Any] = {}
@@ -841,10 +846,11 @@ class Server:
                     pass
             self._connections.clear()
 
-        try:
-            await self._endpoint.close()
-        except Exception:
-            pass
+        if self._owns_endpoint:
+            try:
+                await self._endpoint.close()
+            except Exception:
+                pass
 
         self._shutdown_event.set()
         logger.info("Server closed")
