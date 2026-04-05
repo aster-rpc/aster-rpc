@@ -365,6 +365,15 @@ async def handle_admission_rpc(
         logger.warning("admission: malformed AdmissionRequest: %s", exc)
         return AdmissionResponse(accepted=False, reason="malformed request")
 
+    # Verify the credential's root_pubkey matches the mesh's trusted key.
+    if cred.root_pubkey != own_root_pubkey:
+        logger.warning(
+            "admission: untrusted root key from %s (got %s)",
+            cred.endpoint_id,
+            cred.root_pubkey.hex()[:12],
+        )
+        return AdmissionResponse(accepted=False, reason="untrusted root key")
+
     # Run offline admission checks (signature, expiry, endpoint_id match).
     result = await check_offline(cred, cred.endpoint_id, InMemoryNonceStore())
     if not result.admitted:
