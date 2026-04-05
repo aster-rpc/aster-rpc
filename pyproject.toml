@@ -12,6 +12,7 @@ dependencies = [
     "cryptography>=42",
     "pyfory==0.16.0",
     "zstandard>=0.25.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]

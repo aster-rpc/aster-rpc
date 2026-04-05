@@ -66,6 +66,8 @@ except ImportError as e:
         "Please build the extension with 'maturin develop' first."
     ) from e
 
+from .config import load_endpoint_config
+
 __version__ = "0.2.0"
 
 __all__ = [
@@ -108,6 +110,7 @@ __all__ = [
     "net_client",
     "create_endpoint",
     "create_endpoint_with_config",
+    "load_endpoint_config",
     # Hooks (Phase 1b)
     "HookConnectInfo",
     "HookHandshakeInfo",
