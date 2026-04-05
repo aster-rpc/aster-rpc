@@ -176,13 +176,20 @@ pub struct iroh_runtime_config_t {
 #[derive(Copy, Clone)]
 pub struct iroh_endpoint_config_t {
     pub struct_size: u32,
-    pub relay_mode: u32, // iroh_relay_mode_t
+    pub relay_mode: u32,           // 0=default, 1=custom, 2=disabled, 3=staging
     pub secret_key: iroh_bytes_t,
     pub alpns: iroh_bytes_list_t,
     pub relay_urls: iroh_bytes_list_t,
     pub enable_discovery: u32,
-    pub enable_hooks: u32,    // Phase 1b: 0 = disabled, 1 = enabled
-    pub hook_timeout_ms: u64, // Phase 1b: hook reply timeout; 0 = use default (5000ms)
+    pub enable_hooks: u32,         // Phase 1b: 0=disabled, 1=enabled
+    pub hook_timeout_ms: u64,      // Phase 1b: 0 = use default (5000ms)
+    // Phase 1d: endpoint builder gaps
+    pub bind_addr: iroh_bytes_t,           // socket addr string; empty = use default
+    pub clear_ip_transports: u32,          // 1 = relay-only mode
+    pub clear_relay_transports: u32,       // 1 = direct-IP-only mode
+    pub portmapper_config: u32,            // 0 = enabled (default), 1 = disabled
+    pub proxy_url: iroh_bytes_t,           // HTTP/SOCKS proxy URL string; empty = none
+    pub proxy_from_env: u32,               // 1 = read HTTP_PROXY/HTTPS_PROXY from env
 }
 
 #[repr(C)]
@@ -633,6 +640,10 @@ unsafe fn read_bytes_opt(b: &iroh_bytes_t) -> Option<Vec<u8>> {
     } else {
         Some(slice::from_raw_parts(b.ptr, b.len).to_vec())
     }
+}
+
+unsafe fn read_string_opt(b: &iroh_bytes_t) -> Option<String> {
+    read_bytes_opt(b).and_then(|v| String::from_utf8(v).ok())
 }
 
 unsafe fn read_string(b: &iroh_bytes_t) -> Result<String, i32> {
@@ -1357,6 +1368,7 @@ pub unsafe extern "C" fn iroh_endpoint_create(
             0 => None,
             1 => Some("custom".to_string()),
             2 => Some("disabled".to_string()),
+            3 => Some("staging".to_string()),
             _ => None,
         },
         relay_urls: unsafe { read_string_list(&cfg.relay_urls) },
@@ -1375,6 +1387,17 @@ pub unsafe extern "C" fn iroh_endpoint_create(
         enable_monitoring: true, // Always enable monitoring for FFI endpoints
         enable_hooks,
         hook_timeout_ms,
+        // Phase 1d fields: read from the C struct (added in iroh_endpoint_config_t).
+        bind_addr: unsafe { read_string_opt(&cfg.bind_addr) },
+        clear_ip_transports: cfg.clear_ip_transports != 0,
+        clear_relay_transports: cfg.clear_relay_transports != 0,
+        portmapper_config: match cfg.portmapper_config {
+            0 => None,           // 0 = enabled (default) → let build_endpoint_config use its default
+            1 => Some("disabled".to_string()),
+            _ => None,
+        },
+        proxy_url: unsafe { read_string_opt(&cfg.proxy_url) },
+        proxy_from_env: cfg.proxy_from_env != 0,
     };
 
     let (op_id, cancelled) = bridge.new_operation();
