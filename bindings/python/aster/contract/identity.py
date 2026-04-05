@@ -532,6 +532,53 @@ def compute_contract_id(contract_bytes: bytes) -> str:
     return blake3.blake3(contract_bytes).hexdigest()
 
 
+def contract_id_from_service(service_cls: type) -> str:
+    """Derive the per-spec ``contract_id`` for a ``@service``-decorated class.
+
+    Composes :func:`build_type_graph`, :func:`resolve_with_cycles`,
+    :meth:`ServiceContract.from_service_info`, :func:`canonical_xlang_bytes`
+    and :func:`compute_contract_id` into a single call so callers (examples,
+    high-level servers, clients) don't have to reassemble the pipeline.
+
+    Args:
+        service_cls: A class decorated with :func:`aster.decorators.service`.
+
+    Returns:
+        64-character hex BLAKE3 digest of the canonical ``ServiceContract``.
+
+    Raises:
+        TypeError: if ``service_cls`` has no ``__aster_service_info__``.
+    """
+    service_info = getattr(service_cls, "__aster_service_info__", None)
+    if service_info is None:
+        raise TypeError(
+            f"{service_cls!r} is not @service-decorated "
+            f"(missing __aster_service_info__)"
+        )
+
+    # 1. Collect root dataclass types from all method signatures.
+    root_types: list[type] = []
+    for method_info in service_info.methods.values():
+        if method_info.request_type is not None and isinstance(method_info.request_type, type):
+            root_types.append(method_info.request_type)
+        if method_info.response_type is not None and isinstance(method_info.response_type, type):
+            root_types.append(method_info.response_type)
+
+    # 2. Walk the type graph, resolve with cycles → TypeDef per FQN.
+    types = build_type_graph(root_types)
+    type_defs = resolve_with_cycles(types)
+
+    # 3. Derive type_hashes from the canonical TypeDef bytes.
+    type_hashes: dict[str, bytes] = {
+        fqn: compute_type_hash(canonical_xlang_bytes(td))
+        for fqn, td in type_defs.items()
+    }
+
+    # 4. Build ServiceContract and hash its canonical bytes.
+    contract = ServiceContract.from_service_info(service_info, type_hashes)
+    return compute_contract_id(canonical_xlang_bytes(contract))
+
+
 # ── Type graph construction ───────────────────────────────────────────────────
 
 # Mapping of Python primitive types to XLANG primitive names
