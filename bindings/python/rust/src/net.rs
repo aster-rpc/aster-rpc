@@ -135,7 +135,7 @@ pub struct EndpointConfig {
     /// Timeout in ms for hook replies (default 5000)
     #[pyo3(get, set)]
     pub hook_timeout_ms: u64,
-    /// Bind address e.g. "0.0.0.0:9000", "127.0.0.1:0", "[::]:0"
+    /// Bind address e.g. `"0.0.0.0:9000"`, `"127.0.0.1:0"`, `"[::]:0"`
     #[pyo3(get, set)]
     pub bind_addr: Option<String>,
     /// Relay-only mode: disable all direct IP (UDP/QUIC) transports
