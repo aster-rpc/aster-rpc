@@ -36,6 +36,18 @@ pub fn empty_endpoint_config() -> aster_transport_ffi::iroh_endpoint_config_t {
         enable_discovery: 0,
         enable_hooks: 0,
         hook_timeout_ms: 0,
+        bind_addr: aster_transport_ffi::iroh_bytes_t {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        clear_ip_transports: 0,
+        clear_relay_transports: 0,
+        portmapper_config: 0,
+        proxy_url: aster_transport_ffi::iroh_bytes_t {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        proxy_from_env: 0,
     }
 }
 

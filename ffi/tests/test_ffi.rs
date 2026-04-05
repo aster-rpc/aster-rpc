@@ -359,6 +359,18 @@ fn test_endpoint_create_invalid_config() {
             enable_discovery: 0,
             enable_hooks: 0,
             hook_timeout_ms: 0,
+            bind_addr: iroh_bytes_t {
+                ptr: ptr::null(),
+                len: 0,
+            },
+            clear_ip_transports: 0,
+            clear_relay_transports: 0,
+            portmapper_config: 0,
+            proxy_url: iroh_bytes_t {
+                ptr: ptr::null(),
+                len: 0,
+            },
+            proxy_from_env: 0,
         };
         let status = iroh_endpoint_create(runtime, &config, 0, ptr::null_mut());
         assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
