@@ -8,7 +8,7 @@ fail these tests before any network code is exercised.
 """
 
 import pytest
-from aster_python import (
+from aster import (
     IrohError,
     BlobNotFound,
     DocNotFound,

@@ -18,7 +18,7 @@ from pathlib import Path
 import blake3
 import pytest
 
-from aster_python.aster.contract.canonical import (
+from aster.contract.canonical import (
     NULL_FLAG,
     write_bytes_field,
     write_list_header,
@@ -29,7 +29,7 @@ from aster_python.aster.contract.canonical import (
     write_zigzag_i32,
     write_zigzag_i64,
 )
-from aster_python.aster.contract.identity import (
+from aster.contract.identity import (
     CapabilityKind,
     CapabilityRequirement,
     ContainerKind,
@@ -49,7 +49,7 @@ from aster_python.aster.contract.identity import (
     normalize_identifier,
     resolve_with_cycles,
 )
-from aster_python.aster.contract.manifest import (
+from aster.contract.manifest import (
     ContractManifest,
     FatalContractMismatch,
     verify_manifest_or_fatal,
@@ -637,8 +637,8 @@ def test_manifest_roundtrip(tmp_path):
 
 def test_service_to_contract():
     """ServiceInfo → ServiceContract (from @service decorated class)."""
-    from aster_python.aster.codec import fory_tag
-    from aster_python.aster.decorators import rpc, service
+    from aster.codec import fory_tag
+    from aster.decorators import rpc, service
 
     @fory_tag("test.contract/PingRequest")
     @dataclass

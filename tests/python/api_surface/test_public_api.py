@@ -1,8 +1,8 @@
 """
-API surface tests for aster_python.
+API surface tests for aster.
 
 These tests verify that every name listed in __all__ is:
-  - importable from aster_python
+  - importable from aster
   - the right kind (class, function, exception)
   - has the expected attributes for key types
 
@@ -13,8 +13,8 @@ changes, or __init__.py edits — before any protocol-level test would notice.
 
 import inspect
 import pytest
-import aster_python
-import aster_python as ap
+import aster
+import aster as ap
 
 
 # ---------------------------------------------------------------------------
@@ -23,16 +23,16 @@ import aster_python as ap
 
 def test_all_names_importable():
     missing = []
-    for name in aster_python.__all__:
-        if not hasattr(aster_python, name):
+    for name in aster.__all__:
+        if not hasattr(aster, name):
             missing.append(name)
     assert missing == [], f"Names in __all__ but not importable: {missing}"
 
 
 def test_no_name_in_all_is_none():
     nones = [
-        name for name in aster_python.__all__
-        if getattr(aster_python, name, "SENTINEL") is None
+        name for name in aster.__all__
+        if getattr(aster, name, "SENTINEL") is None
     ]
     assert nones == [], f"Names in __all__ resolved to None: {nones}"
 
@@ -174,5 +174,5 @@ def test_node_addr_has_serialization_methods():
 # ---------------------------------------------------------------------------
 
 def test_version_is_string():
-    assert isinstance(aster_python.__version__, str)
-    assert len(aster_python.__version__) > 0
+    assert isinstance(aster.__version__, str)
+    assert len(aster.__version__) > 0

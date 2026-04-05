@@ -22,12 +22,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from aster_python.aster.trust import (
+from aster.trust import (
     generate_root_keypair,
     run_lease_heartbeat,
     start_lease_heartbeat,
 )
-from aster_python.aster.trust.mesh import ProducerMessageType
+from aster.trust.mesh import ProducerMessageType
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -137,8 +137,8 @@ async def test_heartbeat_signature_is_valid():
         await asyncio.gather(task, return_exceptions=True)
 
     envelope = _decode_wire(wire)
-    from aster_python.aster.trust.mesh import ProducerMessage
-    from aster_python.aster.trust.gossip import verify_producer_message
+    from aster.trust.mesh import ProducerMessage
+    from aster.trust.gossip import verify_producer_message
 
     msg = ProducerMessage(
         type=envelope["type"],
@@ -251,7 +251,7 @@ async def test_registry_publisher_starts_heartbeat_on_register():
     doc = MagicMock()
     doc.set_bytes = AsyncMock()
 
-    from aster_python.aster.registry.publisher import RegistryPublisher
+    from aster.registry.publisher import RegistryPublisher
 
     publisher = RegistryPublisher(
         doc=doc,
@@ -290,7 +290,7 @@ async def test_registry_publisher_no_heartbeat_without_mesh_params():
     doc = MagicMock()
     doc.set_bytes = AsyncMock()
 
-    from aster_python.aster.registry.publisher import RegistryPublisher
+    from aster.registry.publisher import RegistryPublisher
 
     publisher = RegistryPublisher(doc=doc, author_id="author-2")
 
@@ -314,7 +314,7 @@ async def test_registry_publisher_close_cancels_heartbeat():
     doc = MagicMock()
     doc.set_bytes = AsyncMock()
 
-    from aster_python.aster.registry.publisher import RegistryPublisher
+    from aster.registry.publisher import RegistryPublisher
 
     publisher = RegistryPublisher(
         doc=doc,

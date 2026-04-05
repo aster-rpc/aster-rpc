@@ -28,7 +28,7 @@ from dumbpipe import (
     listen_unix,
     connect_unix,
 )
-from aster_python import create_endpoint, NodeAddr
+from aster import create_endpoint, NodeAddr
 
 pytestmark = pytest.mark.asyncio
 

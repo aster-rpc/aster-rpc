@@ -855,7 +855,7 @@ bundle.
 
 The publication and consumption procedures in §11.4 depend on iroh-blobs and
 iroh-docs capabilities that are not yet exposed in the Python bindings
-(`bindings/aster_python_rs/`) or the FFI layer. The following extensions are
+(`bindings/aster_rs/`) or the FFI layer. The following extensions are
 required before §11.4 can be fully implemented in any language other than Rust.
 
 **iroh-blobs extensions**

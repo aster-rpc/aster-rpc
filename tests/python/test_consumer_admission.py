@@ -22,17 +22,17 @@ import time
 
 import pytest
 
-from aster_python.aster.registry.models import ServiceSummary
-from aster_python.aster.trust.consumer import (
+from aster.registry.models import ServiceSummary
+from aster.trust.consumer import (
     ConsumerAdmissionRequest,
     ConsumerAdmissionResponse,
     consumer_cred_to_json,
     handle_consumer_admission_rpc,
 )
-from aster_python.aster.trust.credentials import ConsumerEnrollmentCredential
-from aster_python.aster.trust.hooks import MeshEndpointHook
-from aster_python.aster.trust.nonces import InMemoryNonceStore
-from aster_python.aster.trust.signing import generate_root_keypair, sign_credential
+from aster.trust.credentials import ConsumerEnrollmentCredential
+from aster.trust.hooks import MeshEndpointHook
+from aster.trust.nonces import InMemoryNonceStore
+from aster.trust.signing import generate_root_keypair, sign_credential
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -261,7 +261,7 @@ async def test_e2e_admission_returns_services_and_ticket():
     Node A: starts a consumer admission endpoint; publishes a fake service.
     Node B: presents a policy credential; receives services[] + registry_ticket.
     """
-    from aster_python import IrohNode, docs_client, create_endpoint_with_config, EndpointConfig
+    from aster import IrohNode, docs_client, create_endpoint_with_config, EndpointConfig
 
     # ── Node A setup ──────────────────────────────────────────────────────────
     node_a = await IrohNode.memory()
@@ -282,7 +282,7 @@ async def test_e2e_admission_returns_services_and_ticket():
     admitted_event = asyncio.Event()
 
     async def _serve():
-        from aster_python.aster.trust.consumer import handle_consumer_admission_rpc
+        from aster.trust.consumer import handle_consumer_admission_rpc
 
         conn = await ep_a.accept()
         peer_id = conn.remote_id()
@@ -342,7 +342,7 @@ async def test_e2e_admission_returns_services_and_ticket():
 @pytest.mark.asyncio
 async def test_e2e_admission_denied_with_wrong_key():
     """Credential signed with a different key is denied end-to-end."""
-    from aster_python import create_endpoint_with_config, EndpointConfig
+    from aster import create_endpoint_with_config, EndpointConfig
 
     _, server_pub = generate_root_keypair()   # server trusts this key
     priv_b, pub_b = generate_root_keypair()   # client uses a different key

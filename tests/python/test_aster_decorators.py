@@ -16,9 +16,9 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster_python.aster.codec import fory_tag
-from aster_python.aster.types import SerializationMode
-from aster_python.aster.decorators import (
+from aster.codec import fory_tag
+from aster.types import SerializationMode
+from aster.decorators import (
     service,
     rpc,
     server_stream,
@@ -26,7 +26,7 @@ from aster_python.aster.decorators import (
     bidi_stream,
     RpcPattern,
 )
-from aster_python.aster.service import (
+from aster.service import (
     ServiceRegistry,
     ServiceInfo,
     MethodInfo,

@@ -19,15 +19,15 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster_python.aster.codec import ForyCodec, fory_tag
-from aster_python.aster.decorators import (
+from aster.codec import ForyCodec, fory_tag
+from aster.decorators import (
     bidi_stream,
     client_stream,
     rpc,
     server_stream,
     service,
 )
-from aster_python.aster.framing import (
+from aster.framing import (
     CALL,
     CANCEL,
     HEADER,
@@ -35,16 +35,16 @@ from aster_python.aster.framing import (
     read_frame,
     write_frame,
 )
-from aster_python.aster.protocol import CallHeader, RpcStatus, StreamHeader
-from aster_python.aster.session import (
+from aster.protocol import CallHeader, RpcStatus, StreamHeader
+from aster.session import (
     SessionServer,
     _ByteQueue,
     _FakeRecvStream,
     _FakeSendStream,
     create_local_session,
 )
-from aster_python.aster.status import RpcError, StatusCode
-from aster_python.aster.types import SerializationMode
+from aster.status import RpcError, StatusCode
+from aster.types import SerializationMode
 
 
 # ── Shared test types ────────────────────────────────────────────────────────
@@ -510,9 +510,9 @@ async def test_stream_discriminator_mismatch_shared():
     shared_codec = ForyCodec(mode=SerializationMode.XLANG, types=[EchoReq, EchoResp])
 
     # Simulate what Server._handle_stream does for session discriminator check
-    from aster_python.aster.protocol import StreamHeader, RpcStatus
-    from aster_python.aster.framing import TRAILER, read_frame, write_frame
-    from aster_python.aster.status import StatusCode
+    from aster.protocol import StreamHeader, RpcStatus
+    from aster.framing import TRAILER, read_frame, write_frame
+    from aster.status import StatusCode
 
     service_info = SharedEcho.__aster_service_info__  # type: ignore[attr-defined]
 
@@ -557,7 +557,7 @@ async def test_stream_discriminator_mismatch_shared():
 @pytest.mark.timeout(30)
 async def test_local_session_parity():
     """Session unary returns same result as stateless create_local_client."""
-    from aster_python.aster.client import create_local_client
+    from aster.client import create_local_client
 
     # Stateless service for comparison
     @fory_tag("test.session/PReq")

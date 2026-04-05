@@ -5,13 +5,13 @@
 use pyo3::{create_exception, exceptions::PyException, prelude::*};
 
 // Base exception for all Iroh errors
-create_exception!(aster_python, IrohError, PyException);
+create_exception!(aster, IrohError, PyException);
 
 // Specific error types
-create_exception!(aster_python, BlobNotFound, IrohError);
-create_exception!(aster_python, DocNotFound, IrohError);
-create_exception!(aster_python, ConnectionError, IrohError);
-create_exception!(aster_python, TicketError, IrohError);
+create_exception!(aster, BlobNotFound, IrohError);
+create_exception!(aster, DocNotFound, IrohError);
+create_exception!(aster, ConnectionError, IrohError);
+create_exception!(aster, TicketError, IrohError);
 
 /// Convert any Display error to Python exception
 pub fn err_to_py(e: impl std::fmt::Display) -> PyErr {

@@ -18,7 +18,7 @@ import asyncio
 import sys
 from typing import Optional
 
-from aster_python import (
+from aster import (
     NetClient,
     IrohConnection,
     IrohSendStream,

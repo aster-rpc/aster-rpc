@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from aster_python.aster.registry import (
+from aster.registry import (
     DEGRADED,
     DRAINING,
     READY,
@@ -36,7 +36,7 @@ from aster_python.aster.registry import (
     RegistryGossip,
     RegistryPublisher,
 )
-from aster_python.aster.registry.keys import (
+from aster.registry.keys import (
     lease_key,
     lease_prefix,
     version_key,
@@ -687,7 +687,7 @@ async def test_registry_client_applies_nothing_except_policy():
 @pytest.mark.asyncio
 async def test_publish_and_resolve_single_node():
     """Publish contract + endpoint on one node, resolve from same doc handle."""
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -727,7 +727,7 @@ async def test_publish_and_resolve_single_node():
 @pytest.mark.asyncio
 async def test_publish_and_resolve_cross_node():
     """Publish + advertise on node A; resolve from node B (real doc sync)."""
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node_a = await IrohNode.memory()
     node_b = await IrohNode.memory()
@@ -788,7 +788,7 @@ async def test_publish_and_resolve_cross_node():
 @pytest.mark.asyncio
 async def test_withdraw_endpoint_down_gossip():
     """Graceful withdraw emits ENDPOINT_DOWN gossip; endpoint no longer resolved."""
-    from aster_python import IrohNode, docs_client, gossip_client
+    from aster import IrohNode, docs_client, gossip_client
 
     node_a = await IrohNode.memory()
     node_b = await IrohNode.memory()
@@ -861,7 +861,7 @@ async def test_withdraw_endpoint_down_gossip():
 @pytest.mark.asyncio
 async def test_acl_excludes_untrusted_author_entries():
     """Leases from untrusted authors are excluded from resolve results."""
-    from aster_python import IrohNode, docs_client
+    from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -923,7 +923,7 @@ async def test_acl_excludes_untrusted_author_entries():
 @pytest.mark.asyncio
 async def test_registry_doc_nothing_except_policy():
     """set_download_policy('nothing_except', REGISTRY_PREFIXES) round-trips."""
-    from aster_python import IrohNode, docs_client, DocDownloadPolicy
+    from aster import IrohNode, docs_client, DocDownloadPolicy
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -946,8 +946,8 @@ async def test_registry_doc_nothing_except_policy():
 @pytest.mark.asyncio
 async def test_upload_collection_and_fetch_entries():
     """upload_collection stores all entries; fetch_from_collection retrieves each."""
-    from aster_python import IrohNode, blobs_client
-    from aster_python.aster.contract.publication import (
+    from aster import IrohNode, blobs_client
+    from aster.contract.publication import (
         upload_collection,
         fetch_from_collection,
     )
@@ -979,8 +979,8 @@ async def test_upload_collection_and_fetch_entries():
 @pytest.mark.asyncio
 async def test_upload_collection_index_is_content_addressed():
     """Identical entries produce the same collection_hash."""
-    from aster_python import IrohNode, blobs_client
-    from aster_python.aster.contract.publication import upload_collection
+    from aster import IrohNode, blobs_client
+    from aster.contract.publication import upload_collection
 
     node = await IrohNode.memory()
     bc = blobs_client(node)
@@ -996,13 +996,13 @@ async def test_upload_collection_index_is_content_addressed():
 @pytest.mark.asyncio
 async def test_publication_round_trip():
     """publish_contract → fetch_contract → verify BLAKE3 hash."""
-    from aster_python import IrohNode, blobs_client
-    from aster_python.aster.contract.publication import (
+    from aster import IrohNode, blobs_client
+    from aster.contract.publication import (
         build_collection,
         upload_collection,
         fetch_contract,
     )
-    from aster_python.aster.contract.identity import (
+    from aster.contract.identity import (
         MethodDef,
         MethodPattern,
         ScopeKind,
@@ -1057,8 +1057,8 @@ async def test_publication_round_trip():
 @pytest.mark.asyncio
 async def test_publish_contract_full_collection_via_publisher():
     """RegistryPublisher.publish_contract with type_defs stores multi-file collection."""
-    from aster_python import IrohNode, docs_client, blobs_client
-    from aster_python.aster.contract.identity import (
+    from aster import IrohNode, docs_client, blobs_client
+    from aster.contract.identity import (
         MethodDef,
         MethodPattern,
         ScopeKind,
@@ -1066,7 +1066,7 @@ async def test_publish_contract_full_collection_via_publisher():
         canonical_xlang_bytes,
         compute_contract_id,
     )
-    from aster_python.aster.contract.publication import fetch_contract
+    from aster.contract.publication import fetch_contract
     import blake3
 
     node = await IrohNode.memory()

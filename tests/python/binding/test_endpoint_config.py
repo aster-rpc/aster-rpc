@@ -9,7 +9,7 @@ field mutation — without touching any network I/O.  They catch:
 """
 
 import pytest
-from aster_python import EndpointConfig
+from aster import EndpointConfig
 
 
 # ---------------------------------------------------------------------------

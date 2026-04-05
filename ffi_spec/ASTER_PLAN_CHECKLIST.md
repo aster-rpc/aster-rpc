@@ -18,24 +18,24 @@ Phase 6 is now implemented and verified. Client stub generation supports all fou
 
 Verification completed with uv:
 - `uv run pytest tests/python/test_aster_server.py tests/python/test_aster_transport.py -q` → **62 passed**
-- `ruff check bindings/aster_python/aster/server.py tests/python/test_aster_server.py tests/python/test_aster_transport.py ffi_spec/ASTER_PLAN_CHECKLIST.md` → **All checks passed**
+- `ruff check bindings/aster/aster/server.py tests/python/test_aster_server.py tests/python/test_aster_transport.py ffi_spec/ASTER_PLAN_CHECKLIST.md` → **All checks passed**
 
 Phase 6 verification completed with uv:
-- `uv run ruff check bindings/aster_python/aster/client.py tests/python/test_aster_server.py tests/python/test_aster_transport.py ffi_spec/ASTER_PLAN_CHECKLIST.md` → **All checks passed**
+- `uv run ruff check bindings/aster/aster/client.py tests/python/test_aster_server.py tests/python/test_aster_transport.py ffi_spec/ASTER_PLAN_CHECKLIST.md` → **All checks passed**
 - `uv run pytest tests/python/test_aster_server.py tests/python/test_aster_transport.py -q` → **67 passed**
 
 Phase 7 is now implemented and verified. The interceptor subsystem has been added under `aster/interceptors/`, including a shared `CallContext`, ordered request/response/error chain helpers, and standard deadline, auth, retry, circuit-breaker, audit, and metrics interceptors. Client stubs now apply retry/deadline/circuit-breaker behavior, LocalTransport enforces deadline-aware execution while still running the full interceptor chain, and server dispatch paths now run interceptor hooks around all RPC patterns.
 
 Phase 7 verification completed with uv:
 - `uv run pytest tests/python/test_aster_interceptors.py tests/python/test_aster_server.py tests/python/test_aster_transport.py -q` → **72 passed**
-- `uv run ruff check bindings/aster_python/aster/client.py bindings/aster_python/aster/server.py bindings/aster_python/aster/transport/local.py bindings/aster_python/aster/interceptors tests/python/test_aster_interceptors.py ffi_spec/ASTER_PLAN_CHECKLIST.md` → **All checks passed**
+- `uv run ruff check bindings/aster/aster/client.py bindings/aster/aster/server.py bindings/aster/aster/transport/local.py bindings/aster/aster/interceptors tests/python/test_aster_interceptors.py ffi_spec/ASTER_PLAN_CHECKLIST.md` → **All checks passed**
 
 Phase 8 is now implemented and verified. Session-scoped services are fully supported: `SessionServer` runs a per-stream instance loop with a frame-pump task that demultiplexes CALL/CANCEL/data frames; in-session unary success writes response-only (no trailer); errors write trailer-only; CANCEL cancels the in-flight handler and writes CANCELLED trailer with the session remaining open; `on_session_close()` fires on all termination paths; `create_local_session()` pipes bytes through `_ByteQueue`-backed fake streams for in-process testing; server discriminator validation rejects method/scope mismatches with FAILED_PRECONDITION.
 
 Phase 8 verification completed with uv:
 - `uv run pytest tests/python/test_aster_session.py -v --timeout=30` → **13 passed**
 - `uv run pytest tests/python/test_aster_server.py tests/python/test_aster_transport.py tests/python/test_aster_interceptors.py -q --timeout=30` → **72 passed** (no regressions)
-- `uv run ruff check bindings/aster_python/aster/session.py bindings/aster_python/aster/server.py bindings/aster_python/aster/decorators.py tests/python/test_aster_session.py` → **All checks passed**
+- `uv run ruff check bindings/aster/aster/session.py bindings/aster/aster/server.py bindings/aster/aster/decorators.py tests/python/test_aster_session.py` → **All checks passed**
 
 Outstanding notes for Phase 8:
 - `Connection drop → on_session_close fires` and `Server shutdown → on_session_close fires` are tested only through the LocalTransport path (fake stream EOF); real Iroh connection drop coverage requires integration tests with actual QUIC connections (deferred to Phase 13).
@@ -51,21 +51,21 @@ Phase 11 is now implemented and verified. The trust package (`aster/trust/`) pro
 
 Phase 11 verification completed with uv:
 - `uv run pytest tests/python/test_aster_trust.py -q --timeout=30` → **50 passed**
-- `uv run ruff check bindings/aster_python/aster/trust/ tests/python/test_aster_trust.py` → **All checks passed**
+- `uv run ruff check bindings/aster/aster/trust/ tests/python/test_aster_trust.py` → **All checks passed**
 - No regressions: interceptors (39 passed), registry (48 passed)
 
 Phase 12 is now implemented and verified. The producer mesh package (`aster/trust/mesh.py`, `gossip.py`, `drift.py`, `bootstrap.py`, `rcan.py`) provides signed gossip envelopes, clock drift detection, admission RPC, and bootstrap flows with 56 tests passing.
 
 Phase 12 verification completed with uv:
 - `uv run pytest tests/python/test_aster_mesh.py -q --timeout=30` → **56 passed**
-- `uv run ruff check bindings/aster_python/aster/trust/ tests/python/test_aster_mesh.py` → **All checks passed**
+- `uv run ruff check bindings/aster/aster/trust/ tests/python/test_aster_mesh.py` → **All checks passed**
 - Full suite: `uv run pytest tests/python/ -q --timeout=60` → **518 passed, 2 pre-existing dumbpipe failures**
 
 Phase 13 is now implemented and verified. The conformance suite adds `aster/testing/harness.py` (AsterTestHarness with create_local_pair/create_remote_pair/create_session_pair), six new test files (test_aster_canonical.py, test_aster_cycles.py, test_aster_drift.py, test_aster_unary.py, test_aster_streaming.py, test_aster_local.py), and a full conformance directory (tests/conformance/wire/, tests/conformance/canonical/, tests/conformance/interop/) with wire frame vectors, canonical scope-distinctness tests, and interop placeholder files.
 
 Phase 13 verification completed with uv:
 - `uv run pytest tests/python/test_aster_canonical.py tests/python/test_aster_cycles.py tests/python/test_aster_drift.py tests/python/test_aster_unary.py tests/python/test_aster_streaming.py tests/python/test_aster_local.py tests/conformance/ -q --timeout=30` → **80 passed**
-- `uv run ruff check bindings/aster_python/aster/testing/ tests/python/test_aster_canonical.py tests/python/test_aster_cycles.py tests/python/test_aster_drift.py tests/python/test_aster_unary.py tests/python/test_aster_streaming.py tests/python/test_aster_local.py tests/conformance/` → **All checks passed**
+- `uv run ruff check bindings/aster/aster/testing/ tests/python/test_aster_canonical.py tests/python/test_aster_cycles.py tests/python/test_aster_drift.py tests/python/test_aster_unary.py tests/python/test_aster_streaming.py tests/python/test_aster_local.py tests/conformance/` → **All checks passed**
 - Full suite: `uv run pytest tests/python/ tests/conformance/ --timeout=60` → **598 passed, 1 pre-existing dumbpipe failure**
 
 Outstanding issue / blocker:
@@ -94,7 +94,7 @@ Outstanding issue / blocker:
 
 ## Phase 1: Wire Protocol & Framing
 
-- [x] Create `bindings/aster_python/aster/` package directory
+- [x] Create `bindings/aster/aster/` package directory
 - [x] Create `aster/__init__.py` (public API re-exports)
 - [x] Create `aster/status.py` — `StatusCode` enum (codes 0–16)
 - [x] Create `aster/status.py` — `RpcError` exception hierarchy
@@ -362,7 +362,7 @@ Outstanding issue / blocker:
 **Offline CLI (§11.4.2):**
 - [x] Create `aster/contract/cli.py` with `aster contract gen --service MODULE:CLASS --out .aster/manifest.json`
 - [x] CLI imports service class, computes contract + all type hashes, writes manifest.json (no network, no credentials)
-- [x] Register as console script in `pyproject.toml`: `aster = "aster_python.aster.contract.cli:main"`
+- [x] Register as console script in `pyproject.toml`: `aster = "aster.contract.cli:main"`
 
 **Publication (§11.4.3 — normative ordering):**
 - [x] Create `aster/contract/publication.py::publish_contract()` (iroh-dependent stub — raises NotImplementedError until Phase 10 integration)
@@ -428,7 +428,7 @@ Phase 10 is now implemented and verified. The registry package (`aster/registry/
 
 Phase 10 verification completed with uv:
 - `uv run pytest tests/python/test_aster_registry.py -q --timeout=60` → **48 passed**
-- `uv run ruff check bindings/aster_python/aster/registry/ tests/python/test_aster_registry.py` → **All checks passed**
+- `uv run ruff check bindings/aster/aster/registry/ tests/python/test_aster_registry.py` → **All checks passed**
 - Full suite (excl. pre-existing dumbpipe flakes): `uv run pytest tests/python/ -q --timeout=60` → **364 passed, 2 pre-existing dumbpipe TCP/Unix failures unrelated to Phase 10**
 
 **Data model:**
@@ -506,7 +506,7 @@ Phase 11 is now implemented and verified. The trust package (`aster/trust/`) pro
 Phase 11 verification completed with uv:
 - `uv run pytest tests/python/test_aster_trust.py -q --timeout=30` → **50 passed**
 - `uv run pytest tests/python/test_aster_interceptors.py tests/python/test_aster_server.py -q --timeout=30` → **39 passed** (no regressions from CallContext.attributes addition)
-- `uv run ruff check bindings/aster_python/aster/trust/ tests/python/test_aster_trust.py` → **All checks passed**
+- `uv run ruff check bindings/aster/aster/trust/ tests/python/test_aster_trust.py` → **All checks passed**
 
 **Dependencies:**
 - [x] Add `cryptography>=42` to `pyproject.toml` (ed25519)
@@ -601,7 +601,7 @@ Phase 12 is now implemented and verified. The producer mesh package adds signed 
 
 Phase 12 verification completed with uv:
 - `uv run pytest tests/python/test_aster_mesh.py -q --timeout=30` → **56 passed**
-- `uv run ruff check bindings/aster_python/aster/trust/ tests/python/test_aster_mesh.py` → **All checks passed**
+- `uv run ruff check bindings/aster/aster/trust/ tests/python/test_aster_mesh.py` → **All checks passed**
 - Full suite: `uv run pytest tests/python/ -q --timeout=60` → **518 passed, 2 pre-existing dumbpipe failures unrelated to Phase 12**
 
 **Data model (§2.6):**

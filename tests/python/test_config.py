@@ -5,7 +5,7 @@ import os
 import textwrap
 import pytest
 
-from aster_python import load_endpoint_config, EndpointConfig
+from aster import load_endpoint_config, EndpointConfig
 
 
 # ---------------------------------------------------------------------------

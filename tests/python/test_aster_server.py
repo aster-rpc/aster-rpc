@@ -17,29 +17,29 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster_python.aster.codec import fory_tag, ForyCodec, ForyConfig
-from aster_python.aster.types import SerializationMode
-from aster_python.aster.status import StatusCode, RpcError
-from aster_python.aster.decorators import (
+from aster.codec import fory_tag, ForyCodec, ForyConfig
+from aster.types import SerializationMode
+from aster.status import StatusCode, RpcError
+from aster.decorators import (
     service,
     rpc,
     server_stream,
     client_stream,
     bidi_stream,
 )
-from aster_python.aster.server import (
+from aster.server import (
     ServerError,
     ServiceNotFoundError,
     MethodNotFoundError,
 )
-from aster_python.aster.client import (
+from aster.client import (
     ServiceClient,
     create_client,
     create_local_client,
     ClientError,
 )
-from aster_python.aster.transport.local import LocalTransport
-from aster_python.aster.transport.base import BidiChannel
+from aster.transport.local import LocalTransport
+from aster.transport.base import BidiChannel
 
 
 # ── Test types ───────────────────────────────────────────────────────────────
@@ -141,7 +141,7 @@ class TestServerInit:
         """Server can be created with service classes."""
         # We can't actually create a Server without a real endpoint,
         # but we can test that the constructor handles service classes
-        from aster_python.aster.service import ServiceRegistry
+        from aster.service import ServiceRegistry
         
         # Check that ServiceRegistry works with our test service
         registry = ServiceRegistry()
@@ -151,7 +151,7 @@ class TestServerInit:
 
     def test_registry_lookup(self):
         """Service registry can look up services."""
-        from aster_python.aster.service import ServiceRegistry
+        from aster.service import ServiceRegistry
         
         registry = ServiceRegistry()
         registry.register(TestEchoService)
@@ -169,7 +169,7 @@ class TestServerInit:
 
     def test_registry_method_lookup(self):
         """Service registry can look up methods."""
-        from aster_python.aster.service import ServiceRegistry
+        from aster.service import ServiceRegistry
         
         registry = ServiceRegistry()
         registry.register(TestEchoService)
@@ -194,7 +194,7 @@ class TestServiceDecorator:
 
     def test_stream_service_patterns(self):
         """Stream service has all RPC patterns."""
-        from aster_python.aster.service import ServiceRegistry
+        from aster.service import ServiceRegistry
         
         registry = ServiceRegistry()
         info = registry.register(TestStreamService)
@@ -213,7 +213,7 @@ class TestServiceDecorator:
 
     def test_method_types_extracted(self):
         """Method types are extracted from signatures."""
-        from aster_python.aster.service import ServiceRegistry
+        from aster.service import ServiceRegistry
         
         registry = ServiceRegistry()
         info = registry.register(TestEchoService)
@@ -569,7 +569,7 @@ class TestServiceClientBase:
 
     def test_client_timeout_conversion(self):
         """Timeout is converted to deadline_epoch_ms."""
-        from aster_python.aster.service import ServiceRegistry
+        from aster.service import ServiceRegistry
         
         registry = ServiceRegistry()
         info = registry.register(TestEchoService)

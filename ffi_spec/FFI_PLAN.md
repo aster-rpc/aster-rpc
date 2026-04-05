@@ -70,7 +70,7 @@ The plan replaces the current design with a **runtime + completion queue** archi
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Current repository reality:** Python is the special case here. `bindings/aster_python_rs`
+**Current repository reality:** Python is the special case here. `bindings/aster_rs`
 uses **PyO3 directly over `aster_transport_core`**, while Java/C/Zig-style foreign bindings are
 expected to consume the `aster_transport_ffi` C ABI.
 

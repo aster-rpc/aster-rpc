@@ -14,11 +14,11 @@ from dataclasses import dataclass
 
 import pytest
 
-from aster_python.aster.codec import fory_tag
-from aster_python.aster.decorators import service, rpc
-from aster_python.aster.status import StatusCode, RpcError
-from aster_python.aster.testing import AsterTestHarness
-from aster_python.aster.types import SerializationMode
+from aster.codec import fory_tag
+from aster.decorators import service, rpc
+from aster.status import StatusCode, RpcError
+from aster.testing import AsterTestHarness
+from aster.types import SerializationMode
 
 
 # ── Test types ────────────────────────────────────────────────────────────────

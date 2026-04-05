@@ -3,7 +3,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 
-from aster_python import (
+from aster import (
     create_endpoint,
     ConnectionInfo,
 )

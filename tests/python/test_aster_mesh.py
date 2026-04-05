@@ -28,7 +28,7 @@ import time
 
 import pytest
 
-from aster_python.aster.trust import (
+from aster.trust import (
     generate_root_keypair,
     sign_producer_message,
     verify_producer_message,
@@ -47,7 +47,7 @@ from aster_python.aster.trust import (
     AdmissionRequest,
     AdmissionResponse,
 )
-from aster_python.aster.trust.bootstrap import (
+from aster.trust.bootstrap import (
     handle_admission_rpc,
     apply_admission_response,
 )
@@ -653,8 +653,8 @@ async def test_self_departure_sets_mesh_dead():
 
 def _make_credential_json(endpoint_id: str, expires_future: bool = True) -> tuple[str, bytes, bytes]:
     """Return (cred_json, priv_raw, pub_raw) for a signed EnrollmentCredential."""
-    from aster_python.aster.trust import sign_credential
-    from aster_python.aster.trust.credentials import EnrollmentCredential
+    from aster.trust import sign_credential
+    from aster.trust.credentials import EnrollmentCredential
 
     priv, pub = make_keypair()
     expires_at = int(time.time()) + (3600 if expires_future else -3600)

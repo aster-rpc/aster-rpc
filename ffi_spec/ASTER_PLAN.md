@@ -2,7 +2,7 @@
 
 **Status:** Plan  
 **Date:** 2026-04-03  
-**Scope:** Layer the Aster RPC framework (spec v0.7.1) onto `bindings/aster_python`, using the existing transport bindings as the foundation.
+**Scope:** Layer the Aster RPC framework (spec v0.7.1) onto `bindings/aster`, using the existing transport bindings as the foundation.
 
 ---
 
@@ -32,7 +32,7 @@
 
 ### 1.1 What Exists (Transport — Layer 1)
 
-The `bindings/aster_python` package already provides a complete Layer 1 transport surface via PyO3 wrapping `aster_transport_core`:
+The `bindings/aster` package already provides a complete Layer 1 transport surface via PyO3 wrapping `aster_transport_core`:
 
 | Component | Module | Status |
 |-----------|--------|--------|
@@ -48,17 +48,17 @@ The `bindings/aster_python` package already provides a complete Layer 1 transpor
 | Hooks (`HookConnectInfo`, `HookHandshakeInfo`, `HookDecision`, etc.) | `hooks.rs` | ✅ Done |
 | Error types (`IrohError`, `BlobNotFound`, etc.) | `error.rs` | ✅ Done |
 
-The Rust-side crate is `bindings/aster_python_rs` with `lib.rs` as module registration only.
+The Rust-side crate is `bindings/aster_rs` with `lib.rs` as module registration only.
 
 ### 1.2 What Needs to Be Built (Layers 2–5)
 
 All RPC-layer code is **pure Python** — it uses the transport bindings but does not need new Rust/PyO3 code (except potentially for performance-critical Fory canonical encoding, which can be deferred).
 
 ```
-bindings/aster_python/
+bindings/aster/
 ├── __init__.py              # Existing: transport re-exports
 ├── __init__.pyi             # Existing: type stubs
-├── _aster_python.abi3.so    # Existing: compiled transport bindings
+├── _aster.abi3.so    # Existing: compiled transport bindings
 │
 │  ── NEW: Aster RPC Layer ──
 ├── aster/                   # NEW: Pure-Python RPC package
@@ -127,7 +127,7 @@ bindings/aster_python/
 │   codec.py (wraps pyfory)                                   │
 ├─────────────────────────────────────────────────────────────┤
 │ Layer 1: Transport (EXISTING)                               │
-│   aster_python._aster_python (PyO3/Rust)                    │
+│   aster._aster (PyO3/Rust)                    │
 │   IrohNode, NetClient, IrohConnection, streams, etc.        │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -2132,7 +2132,7 @@ aster = "aster.cli:main"                # `aster contract gen`, `aster trust ...
 | Decision | Recommendation | Status |
 |----------|---------------|--------|
 | All RPC layer code is pure Python (no new Rust) | Yes — transport FFI is sufficient | ✅ Locked |
-| Package location: `bindings/aster_python/aster/` | Yes — sub-package of existing binding | ✅ Locked |
+| Package location: `bindings/aster/aster/` | Yes — sub-package of existing binding | ✅ Locked |
 | pyfory version pin | Pin to 0.15.x until Fory 1.0 | ✅ Locked |
 | ALPN for Aster services | `aster/1` (core), `aster.producer_admission`, `aster.consumer_admission` | ✅ Spec-defined |
 | Session support included | Yes — Phase 8 | ✅ Locked |

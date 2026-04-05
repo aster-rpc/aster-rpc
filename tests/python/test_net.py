@@ -5,7 +5,7 @@ import struct
 import pytest
 import pytest_asyncio
 
-from aster_python import create_endpoint
+from aster import create_endpoint
 
 ALPN = b"test/echo/1"
 

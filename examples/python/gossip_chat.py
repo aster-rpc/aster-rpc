@@ -18,7 +18,7 @@ Usage (two-node local demo):
 import asyncio
 import json
 import os
-from aster_python import IrohNode, gossip_client
+from aster import IrohNode, gossip_client
 
 
 TOPIC = bytes(32)  # 32 zero bytes — must match the Rust peer's TopicId

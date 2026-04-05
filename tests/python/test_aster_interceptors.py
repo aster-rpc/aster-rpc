@@ -5,10 +5,10 @@ from dataclasses import dataclass
 
 import pytest
 
-from aster_python.aster.client import create_client, create_local_client
-from aster_python.aster.codec import ForyCodec, fory_tag
-from aster_python.aster.decorators import rpc, service
-from aster_python.aster.interceptors import (
+from aster.client import create_client, create_local_client
+from aster.codec import ForyCodec, fory_tag
+from aster.decorators import rpc, service
+from aster.interceptors import (
     AuditLogInterceptor,
     AuthInterceptor,
     CircuitBreakerInterceptor,
@@ -16,9 +16,9 @@ from aster_python.aster.interceptors import (
     MetricsInterceptor,
     RetryInterceptor,
 )
-from aster_python.aster.status import RpcError, StatusCode
-from aster_python.aster.transport.local import LocalTransport
-from aster_python.aster.types import RetryPolicy, SerializationMode
+from aster.status import RpcError, StatusCode
+from aster.transport.local import LocalTransport
+from aster.types import RetryPolicy, SerializationMode
 
 
 @fory_tag("test.interceptors/EchoRequest")

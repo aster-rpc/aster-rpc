@@ -28,7 +28,7 @@ Before starting new work, confirm the existing surface is healthy:
 - [x] `cargo test -p aster_transport_ffi --test test_ffi` passes (68 tests after Phase 1c.5 additions)
 - [x] `uv run pytest tests/python/test_phase1b.py -q` passes (8 tests)
 - [x] `uv run pytest tests/python/ -q` passes (320 pass, 0 failures)
-- [x] `uv run ruff check bindings/aster_python_rs/` passes (N/A for Rust — cargo clippy clean)
+- [x] `uv run ruff check bindings/aster_rs/` passes (N/A for Rust — cargo clippy clean)
 
 ---
 
@@ -38,14 +38,14 @@ These are items from Phase 1b that are partially implemented or missing Python e
 
 ### Python: Doc Query Methods (core done, Python missing)
 
-The core has `query_key_exact`, `query_key_prefix`, and `read_entry_content` on `CoreDoc`, but the Python `DocHandle` wrapper in `bindings/aster_python_rs/src/docs.rs` does not expose them.
+The core has `query_key_exact`, `query_key_prefix`, and `read_entry_content` on `CoreDoc`, but the Python `DocHandle` wrapper in `bindings/aster_rs/src/docs.rs` does not expose them.
 
 - [x] Add `query_key_exact(key: bytes) -> list[DocEntry]` to Python `DocHandle`
 - [x] Add `query_key_prefix(prefix: bytes) -> list[DocEntry]` to Python `DocHandle`
 - [x] Add `read_entry_content(content_hash_hex: str) -> bytes` to Python `DocHandle`
 - [x] Define Python `DocEntry` class (author_id, key, content_hash, content_len, timestamp)
 - [x] Add Python tests for doc query round-trip (write with author A, query by key, filter by author)
-- [x] Update `bindings/aster_python/__init__.pyi` type stubs
+- [x] Update `bindings/aster/__init__.pyi` type stubs
 
 ### FFI: Hook Reply Wiring (core done, FFI wiring incomplete)
 
@@ -78,7 +78,7 @@ The core `CoreHooksAdapter` and `CoreHookReceiver` are complete. The FFI event-q
 - [x] Add Rust unit test: tag_delete removes tag (covered by Python integration tests)
 - [x] Add Rust unit test: tag_list_prefix filters correctly (covered by Python integration tests)
 
-**Python (`bindings/aster_python_rs/src/blobs.rs`):**
+**Python (`bindings/aster_rs/src/blobs.rs`):**
 
 - [x] Add `TagInfo` Python class (name, hash, format)
 - [x] Expose `BlobsClient.tag_set(name, hash_hex, format)` as async method
@@ -91,7 +91,7 @@ The core `CoreHooksAdapter` and `CoreHookReceiver` are complete. The FFI event-q
 - [x] Add Python test: tag_set + tag_get round-trip
 - [x] Add Python test: tag_delete removes tag, tag_get returns None
 - [x] Add Python test: tag_list returns expected tags
-- [x] Update `bindings/aster_python/__init__.pyi` type stubs
+- [x] Update `bindings/aster/__init__.pyi` type stubs
 
 **FFI (`aster_transport_ffi`):**
 
@@ -288,7 +288,7 @@ See `FFI_PLAN.md §3d` for full specification.
 - [x] Expose `BlobsClient.blob_observe_complete(hash_hex)` → `None` (async, waits for completion)
 - [x] Add Python test: `blob_observe_snapshot` returns `is_complete=True` after `add_bytes`
 - [x] Add Python test: `blob_observe_complete` resolves for a locally complete blob
-- [x] Update `bindings/aster_python/__init__.pyi` type stubs
+- [x] Update `bindings/aster/__init__.pyi` type stubs
 
 **FFI:**
 
@@ -310,7 +310,7 @@ See `FFI_PLAN.md §3d` for full specification.
 - [x] Expose `BlobsClient.blob_local_info(hash_hex)` → `BlobLocalInfo`
 - [x] Add Python test: `blob_local_info` returns `is_complete=True` and correct `local_bytes` after `add_bytes`
 - [x] Add Python test: `blob_local_info` returns `is_complete=False` and `local_bytes=0` for unknown hash
-- [x] Update `bindings/aster_python/__init__.pyi` type stubs
+- [x] Update `bindings/aster/__init__.pyi` type stubs
 
 **FFI:**
 
@@ -330,7 +330,7 @@ See `FFI_PLAN.md §3d` for full specification.
 
 Phase 2 was implemented as part of earlier refactoring work. Verified complete on 2026-04-04.
 
-- [x] `aster_python_rs` depends on `aster_transport_core` as sole backend (no `aster_transport_ffi` dep)
+- [x] `aster_rs` depends on `aster_transport_core` as sole backend (no `aster_transport_ffi` dep)
 - [x] Legacy FFI-based implementation path removed — `lib.rs` is registration-only
 - [x] All wrappers consolidated into proper modules (node, net, blobs, docs, gossip, monitor, hooks, error)
 - [x] Full Phase 1 and Phase 1b surfaces exposed in Python

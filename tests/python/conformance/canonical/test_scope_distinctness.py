@@ -13,7 +13,7 @@ Spec reference: Aster-ContractIdentity.md §11; Aster-SPEC.md §13.2
 from __future__ import annotations
 
 
-from aster_python.aster.contract.identity import (
+from aster.contract.identity import (
     ServiceContract,
     ScopeKind,
     canonical_xlang_bytes,

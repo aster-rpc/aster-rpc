@@ -15,8 +15,8 @@ from __future__ import annotations
 import time
 
 
-from aster_python.aster.trust.drift import ClockDriftDetector
-from aster_python.aster.trust.mesh import ClockDriftConfig
+from aster.trust.drift import ClockDriftDetector
+from aster.trust.mesh import ClockDriftConfig
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

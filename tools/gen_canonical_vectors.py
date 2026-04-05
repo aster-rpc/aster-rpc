@@ -27,7 +27,7 @@ sys.path.insert(0, str(_repo_root / "bindings"))
 
 import blake3  # noqa: E402
 
-from aster_python.aster.contract.canonical import (  # noqa: E402
+from aster.contract.canonical import (  # noqa: E402
     write_bytes_field,
     write_list_header,
     write_optional_absent,
@@ -37,7 +37,7 @@ from aster_python.aster.contract.canonical import (  # noqa: E402
     write_zigzag_i32,
     write_zigzag_i64,
 )
-from aster_python.aster.contract.identity import (  # noqa: E402
+from aster.contract.identity import (  # noqa: E402
     CapabilityKind,
     CapabilityRequirement,
     ContainerKind,
