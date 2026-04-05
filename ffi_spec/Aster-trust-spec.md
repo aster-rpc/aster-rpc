@@ -842,7 +842,10 @@ MUST NOT issue such credentials for sensitive meshes.
    subsequent calls from this NodeID.
 3. If `credential_type = OTT`: the nonce is marked consumed and persisted. The
    credential cannot be reused regardless of expiry.
-4. The response includes the list of reachable services (service directory).
+4. A `ConsumerAdmissionResponse` is returned (§3.2.2) containing the node's
+   published service listing, a read-only registry doc ticket, and the
+   deployment root public key. Consumers MAY use this response to resolve
+   contract identifiers and join the registry doc without a further round-trip.
 
 **On failure**
 
@@ -884,6 +887,49 @@ the operator because the right answer depends on the deployment's admission
 topology. The CLI (`aster trust configure`) SHOULD warn when `aster-trust`
 is configured with a nonce store scoped as `local` on a mesh with more than
 one producer endpoint accepting consumer admissions.
+
+#### 3.2.2 ConsumerAdmissionResponse (normative)
+
+The response returned to a consumer on successful admission MUST contain the
+following fields:
+
+```
+ConsumerAdmissionResponse {
+    admitted:        bool                  // true on success
+    attributes:      map<string, string>   // verified attributes echo
+    services:        list[ServiceSummary]  // one entry per published service
+    registry_ticket: string               // read-only iroh-docs share ticket;
+                                          // empty if no registry doc operated
+    root_pubkey:     string               // hex-encoded ed25519 public key (32 bytes)
+    reason:          string               // empty on success — MUST NOT leak
+                                          // failure details (oracle protection)
+}
+
+ServiceSummary {
+    name:        string
+    version:     uint32
+    contract_id: string                   // BLAKE3 hex digest (§6.2)
+    channels:    map<string, string>      // channel name → contract_id
+}
+```
+
+`root_pubkey` is included so consumers can independently verify enrollment
+credentials and any future signed artifacts without an additional round-trip.
+
+`registry_ticket` is a read-only iroh-docs share ticket. Consumers that join
+the doc using this ticket can read the full registry namespace (§11.2),
+including all contracts, service aliases, and historical leases. This is the
+path for consumers that need to browse the full catalog or watch for newly
+published services. A consumer connecting to a known single service does not
+need to join the doc — `services` in the admission response is sufficient.
+
+If the node does not operate a registry doc, `registry_ticket` is empty.
+`services` still contains live summaries derived from the node's in-memory
+lease state.
+
+On **failure** the `admitted` field is `false` and `reason` is empty (no
+diagnostic leak). The connection is closed immediately after the response is
+sent; no partial state is written.
 
 -----
 

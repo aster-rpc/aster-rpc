@@ -52,6 +52,37 @@ class GossipEventType(IntEnum):
 
 
 @dataclass
+class ServiceSummary:
+    """Compact service descriptor returned in ConsumerAdmissionResponse (§3.2.2).
+
+    Provides enough information for a consumer to select a service and fetch
+    its contract without joining the registry doc.
+    """
+
+    name: str
+    version: int
+    contract_id: str                    # BLAKE3 hex digest
+    channels: dict[str, str]            # channel name → contract_id
+
+    def to_json_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "version": self.version,
+            "contract_id": self.contract_id,
+            "channels": self.channels,
+        }
+
+    @classmethod
+    def from_json_dict(cls, d: dict) -> "ServiceSummary":
+        return cls(
+            name=d["name"],
+            version=int(d["version"]),
+            contract_id=d["contract_id"],
+            channels=d.get("channels") or {},
+        )
+
+
+@dataclass
 class ArtifactRef:
     """Docs pointer to an immutable Iroh collection (§11.2.1).
 
