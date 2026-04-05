@@ -215,6 +215,36 @@ def main() -> None:
     from aster_cli.trust import register_trust_subparser, run_trust_command
     trust_parser = register_trust_subparser(subparsers)
 
+    # ``aster keygen`` subcommand group
+    from aster_cli.keygen import register_keygen_subparser, run_keygen_command
+    register_keygen_subparser(subparsers)
+
+    # ``aster authorize`` — sign a producer enrollment credential
+    auth_parser = subparsers.add_parser(
+        "authorize",
+        help="Sign a producer enrollment credential (offline)",
+    )
+    auth_parser.add_argument(
+        "--root-key", required=True, metavar="PATH",
+        help="Path to root key JSON (from 'aster keygen root')",
+    )
+    auth_parser.add_argument(
+        "--producer-id", required=True, metavar="NODE_ID",
+        help="Producer NodeId to bind to the credential",
+    )
+    auth_parser.add_argument(
+        "--attributes", default=None, metavar="JSON",
+        help='Optional JSON attributes, e.g. \'{"aster.role":"producer"}\'',
+    )
+    auth_parser.add_argument(
+        "--expires", default=None, metavar="ISO8601",
+        help="Expiry datetime in ISO 8601 (default: +30 days)",
+    )
+    auth_parser.add_argument(
+        "--out", default="enrollment.token", metavar="PATH",
+        help="Output path for the signed credential JSON (default: enrollment.token)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "contract":
@@ -224,6 +254,14 @@ def main() -> None:
             contract_parser.print_help()
             sys.exit(1)
     elif args.command == "trust":
+        sys.exit(run_trust_command(args))
+    elif args.command == "keygen":
+        sys.exit(run_keygen_command(args))
+    elif args.command == "authorize":
+        # Map to trust sign --type producer
+        args.endpoint_id = args.producer_id
+        args.type = "producer"
+        args.trust_command = "sign"
         sys.exit(run_trust_command(args))
     else:
         parser.print_help()

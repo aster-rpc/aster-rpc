@@ -1,0 +1,33 @@
+"""
+Shared HelloService definition used by simple_producer.py and simple_consumer.py.
+
+In production, this file would be the generated client library distributed to consumers.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from aster_python.aster.codec import fory_tag
+from aster_python.aster.decorators import service, rpc
+from aster_python.aster.types import SerializationMode
+
+
+@fory_tag("demo/HelloRequest")
+@dataclass
+class HelloRequest:
+    name: str = ""
+
+
+@fory_tag("demo/HelloResponse")
+@dataclass
+class HelloResponse:
+    message: str = ""
+
+
+@service(name="HelloService", version=1, serialization=[SerializationMode.XLANG])
+class HelloService:
+    """Simple greeting service — the canonical Aster Hello World."""
+
+    @rpc(timeout=10.0)
+    async def say_hello(self, req: HelloRequest) -> HelloResponse:
+        return HelloResponse(message=f"Hello, {req.name}! (from Aster)")
