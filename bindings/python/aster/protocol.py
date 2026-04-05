@@ -11,15 +11,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# Import fory_tag from codec.py to avoid duplication
-from aster.codec import fory_tag
+# Import aster_tag from codec.py to avoid duplication
+from aster.codec import aster_tag
 
 
 # ── Framework-internal protocol types ────────────────────────────────────────
 
 
 @dataclass
-@fory_tag("_aster/StreamHeader")
+@aster_tag("_aster/StreamHeader")
 class StreamHeader:
     """First frame on every QUIC stream (HEADER flag).
 
@@ -39,7 +39,7 @@ class StreamHeader:
 
 
 @dataclass
-@fory_tag("_aster/CallHeader")
+@aster_tag("_aster/CallHeader")
 class CallHeader:
     """Per-call header within a session stream (CALL flag).
 
@@ -55,7 +55,7 @@ class CallHeader:
 
 
 @dataclass
-@fory_tag("_aster/RpcStatus")
+@aster_tag("_aster/RpcStatus")
 class RpcStatus:
     """Trailing status frame (TRAILER flag).
 

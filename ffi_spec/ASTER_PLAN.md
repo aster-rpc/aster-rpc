@@ -285,7 +285,7 @@ class ForyCodec:
 def fory_type(tag: str):
     """Declare a canonical tag for XLANG type registration."""
     def decorator(cls):
-        cls.__fory_tag__ = tag
+        cls.__aster_tag__ = tag
         return cls
     return decorator
 ```
@@ -293,7 +293,7 @@ def fory_type(tag: str):
 ### 4.3 Steps
 
 1. Verify pyfory availability and XLANG/NATIVE/ROW mode support. Write a spike test.
-2. Implement `@fory_type(tag=...)` decorator that annotates classes with `__fory_tag__`.
+2. Implement `@fory_type(tag=...)` decorator that annotates classes with `__aster_tag__`.
 3. Implement `ForyCodec` wrapping pyfory for all three modes.
 4. Implement tag-based type registration: walk type graph, register with Fory, validate all types have tags (for XLANG).
 5. Implement compression: zstd compress/decompress for payloads exceeding threshold (default 4096 bytes).
@@ -895,7 +895,7 @@ class ScopeKind(IntEnum):          # enum id=6
 ### 11.3 Framework-Internal Types (§11.3.3 — spec-verbatim field IDs)
 
 ```python
-@fory_tag("_aster/FieldDef")
+@aster_tag("_aster/FieldDef")
 @dataclass
 class FieldDef:
     id: int32                            # field=1: field number from IDL/code
@@ -911,20 +911,20 @@ class FieldDef:
     container_key_primitive: str         # field=11: when container=MAP + key_kind=PRIMITIVE
     container_key_ref: bytes             # field=12: when container=MAP + key_kind=REF
 
-@fory_tag("_aster/EnumValueDef")
+@aster_tag("_aster/EnumValueDef")
 @dataclass
 class EnumValueDef:
     name: str                            # field=1
     value: int32                         # field=2
 
-@fory_tag("_aster/UnionVariantDef")
+@aster_tag("_aster/UnionVariantDef")
 @dataclass
 class UnionVariantDef:
     name: str                            # field=1
     id: int32                            # field=2
     type_ref: bytes                      # field=3: 32-byte BLAKE3 of variant TypeDef
 
-@fory_tag("_aster/TypeDef")
+@aster_tag("_aster/TypeDef")
 @dataclass
 class TypeDef:
     kind: TypeDefKind                    # field=1: MESSAGE / ENUM / UNION
@@ -934,7 +934,7 @@ class TypeDef:
     enum_values: list[EnumValueDef]      # field=5: sorted by value (ENUM only; else [])
     union_variants: list[UnionVariantDef]# field=6: sorted by id (UNION only; else [])
 
-@fory_tag("_aster/CapabilityRequirement")
+@aster_tag("_aster/CapabilityRequirement")
 @dataclass
 class CapabilityRequirement:
     kind: CapabilityKind                 # field=1: ROLE / ANY_OF / ALL_OF
@@ -943,7 +943,7 @@ class CapabilityRequirement:
                                          #   ANY_OF → caller needs at least one
                                          #   ALL_OF → caller needs all
 
-@fory_tag("_aster/MethodDef")
+@aster_tag("_aster/MethodDef")
 @dataclass
 class MethodDef:
     name: str                            # field=1
@@ -954,7 +954,7 @@ class MethodDef:
     default_timeout: float               # field=6: seconds; 0.0 = none
     requires: CapabilityRequirement | None  # field=7: optional; absent = no cap check
 
-@fory_tag("_aster/ServiceContract")
+@aster_tag("_aster/ServiceContract")
 @dataclass
 class ServiceContract:
     name: str                            # field=1
@@ -1113,7 +1113,7 @@ Uses Phase 1d FFI primitives (`blob_observe_complete`, `blob_local_info`) for ca
 
 1. Implement discriminator `IntEnum`s (`TypeKind`, `ContainerKind`, `TypeDefKind`, `MethodPattern`, `CapabilityKind`, `ScopeKind`) with spec-mandated IDs.
 2. Implement `aster/contract/canonical.py` — low-level writers: `write_varint`, `write_zigzag_i32/i64`, `write_string`, `write_bytes`, `write_bool`, `write_list_header(count)`, `write_null_flag`, `write_present_flag`.
-3. Implement dataclasses: `FieldDef`, `EnumValueDef`, `UnionVariantDef`, `TypeDef`, `CapabilityRequirement`, `MethodDef`, `ServiceContract`, with `@fory_tag` decorations (internal tags `_aster/*`).
+3. Implement dataclasses: `FieldDef`, `EnumValueDef`, `UnionVariantDef`, `TypeDef`, `CapabilityRequirement`, `MethodDef`, `ServiceContract`, with `@aster_tag` decorations (internal tags `_aster/*`).
 4. Implement per-type canonical writers (all fields emitted in spec field-ID order, with zero-value conventions for unused discriminator companions):
    - `write_field_def(w, f)` — 12 fields (id, name, type_kind, type_primitive, type_ref, self_ref_name, optional, ref_tracked, container, container_key_kind, container_key_primitive, container_key_ref)
    - `write_enum_value_def(w, ev)` — 2 fields (name, value)
@@ -1177,7 +1177,7 @@ Uses Phase 1d FFI primitives (`blob_observe_complete`, `blob_local_info`) for ca
 ### 12.2 Data Model (§11.2.1, §11.6, §11.7)
 
 ```python
-@fory_tag("_aster/ArtifactRef")
+@aster_tag("_aster/ArtifactRef")
 @dataclass
 class ArtifactRef:
     contract_id: str              # hex — the content address
@@ -1188,7 +1188,7 @@ class ArtifactRef:
     ticket: str | None            # BlobTicket for direct fetch
 
 
-@fory_tag("_aster/EndpointLease")
+@aster_tag("_aster/EndpointLease")
 @dataclass
 class EndpointLease:                     # field IDs follow Aster-SPEC.md §11.6
     endpoint_id: str                     # NodeId hex
@@ -1227,7 +1227,7 @@ class GossipEventType(IntEnum):   # all 6 are normative (§11.7)
     COMPATIBILITY_PUBLISHED  = 5
 
 
-@fory_tag("_aster/GossipEvent")
+@aster_tag("_aster/GossipEvent")
 @dataclass
 class GossipEvent:                       # flat structured shape per §11.7
     type: GossipEventType
@@ -1523,7 +1523,7 @@ class RegistryGossip:
 ### 13.2 Data Model
 
 ```python
-@fory_tag("_aster/EnrollmentCredential")
+@aster_tag("_aster/EnrollmentCredential")
 @dataclass
 class EnrollmentCredential:
     endpoint_id: str              # hex — the producer's NodeId
@@ -1533,7 +1533,7 @@ class EnrollmentCredential:
     signature: bytes              # 64 — ed25519(root_privkey, canonical(fields))
 
 
-@fory_tag("_aster/ConsumerEnrollmentCredential")
+@aster_tag("_aster/ConsumerEnrollmentCredential")
 @dataclass
 class ConsumerEnrollmentCredential:
     credential_type: str          # "policy" or "ott"
@@ -1709,7 +1709,7 @@ class ProducerMessageType(IntEnum):
     LEASE_UPDATE       = 4
 
 
-@fory_tag("_aster/ProducerMessage")
+@aster_tag("_aster/ProducerMessage")
 @dataclass
 class ProducerMessage:
     type: ProducerMessageType    # 1..4
@@ -1719,14 +1719,14 @@ class ProducerMessage:
     signature: bytes             # 64 — ed25519 over canonical signing bytes
 
 
-@fory_tag("_aster/IntroducePayload")
+@aster_tag("_aster/IntroducePayload")
 @dataclass
 class IntroducePayload:
     rcan: bytes                  # serialized rcan grant conveying "Producer" cap
                                  # (opaque bytes; rcan format TBD — see §14.12)
 
 
-@fory_tag("_aster/DepartPayload")
+@aster_tag("_aster/DepartPayload")
 @dataclass
 class DepartPayload:
     reason: str                  # human-readable, optional (empty string if none)
@@ -1734,7 +1734,7 @@ class DepartPayload:
     # reason string for operator visibility. Empty string = no reason.
 
 
-@fory_tag("_aster/ContractPublishedPayload")
+@aster_tag("_aster/ContractPublishedPayload")
 @dataclass
 class ContractPublishedPayload:
     service_name: str
@@ -1742,7 +1742,7 @@ class ContractPublishedPayload:
     contract_collection_hash: str    # hex — HashSeq root of the published bundle
 
 
-@fory_tag("_aster/LeaseUpdatePayload")
+@aster_tag("_aster/LeaseUpdatePayload")
 @dataclass
 class LeaseUpdatePayload:
     service_name: str

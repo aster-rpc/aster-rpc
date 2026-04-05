@@ -36,7 +36,7 @@ from aster.framing import (
     write_frame,
     read_frame,
 )
-from aster.protocol import StreamHeader, CallHeader, RpcStatus, fory_tag
+from aster.protocol import StreamHeader, CallHeader, RpcStatus, aster_tag
 
 # ── In-memory async stream helpers ──────────────────────────────────────────
 
@@ -419,35 +419,35 @@ class TestProtocolTypes:
 
 class TestForyTags:
     def test_stream_header_tag(self):
-        assert StreamHeader.__fory_tag__ == "_aster/StreamHeader"
+        assert StreamHeader.__aster_tag__ == "_aster/StreamHeader"
         assert StreamHeader.__fory_namespace__ == "_aster"
         assert StreamHeader.__fory_typename__ == "StreamHeader"
 
     def test_call_header_tag(self):
-        assert CallHeader.__fory_tag__ == "_aster/CallHeader"
+        assert CallHeader.__aster_tag__ == "_aster/CallHeader"
         assert CallHeader.__fory_namespace__ == "_aster"
         assert CallHeader.__fory_typename__ == "CallHeader"
 
     def test_rpc_status_tag(self):
-        assert RpcStatus.__fory_tag__ == "_aster/RpcStatus"
+        assert RpcStatus.__aster_tag__ == "_aster/RpcStatus"
         assert RpcStatus.__fory_namespace__ == "_aster"
         assert RpcStatus.__fory_typename__ == "RpcStatus"
 
-    def test_custom_fory_tag(self):
-        @fory_tag("myapp.pkg/MyType")
+    def test_custom_aster_tag(self):
+        @aster_tag("myapp.pkg/MyType")
         class MyType:
             pass
 
-        assert MyType.__fory_tag__ == "myapp.pkg/MyType"
+        assert MyType.__aster_tag__ == "myapp.pkg/MyType"
         assert MyType.__fory_namespace__ == "myapp.pkg"
         assert MyType.__fory_typename__ == "MyType"
 
-    def test_fory_tag_no_namespace(self):
-        @fory_tag("SimpleTag")
+    def test_aster_tag_no_namespace(self):
+        @aster_tag("SimpleTag")
         class Simple:
             pass
 
-        assert Simple.__fory_tag__ == "SimpleTag"
+        assert Simple.__aster_tag__ == "SimpleTag"
         assert Simple.__fory_namespace__ == ""
         assert Simple.__fory_typename__ == "SimpleTag"
 

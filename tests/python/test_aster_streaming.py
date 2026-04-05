@@ -16,7 +16,7 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster.codec import fory_tag
+from aster.codec import aster_tag
 from aster.decorators import (
     bidi_stream,
     client_stream,
@@ -30,33 +30,33 @@ from aster.types import SerializationMode
 # ── Test types ────────────────────────────────────────────────────────────────
 
 
-@fory_tag("test.streaming/CountRequest")
+@aster_tag("test.streaming/CountRequest")
 @dataclass
 class CountRequest:
     start: int = 0
     count: int = 5
 
 
-@fory_tag("test.streaming/CountItem")
+@aster_tag("test.streaming/CountItem")
 @dataclass
 class CountItem:
     value: int = 0
 
 
-@fory_tag("test.streaming/SumItem")
+@aster_tag("test.streaming/SumItem")
 @dataclass
 class SumItem:
     value: int = 0
 
 
-@fory_tag("test.streaming/SumResponse")
+@aster_tag("test.streaming/SumResponse")
 @dataclass
 class SumResponse:
     total: int = 0
     count: int = 0
 
 
-@fory_tag("test.streaming/EchoChunk")
+@aster_tag("test.streaming/EchoChunk")
 @dataclass
 class EchoChunk:
     text: str = ""

@@ -58,10 +58,10 @@ class ForyConfig:
         return kwargs
 
 
-# ── @fory_tag decorator ──────────────────────────────────────────────────────
+# ── @aster_tag decorator ──────────────────────────────────────────────────────
 
 
-def fory_tag(tag: str):
+def aster_tag(tag: str):
     """Attach a Fory XLANG type tag to a dataclass.
 
     The *tag* string is split on the last ``/`` into
@@ -69,7 +69,7 @@ def fory_tag(tag: str):
     the namespace is the empty string.
 
     For XLANG mode, every user-defined type that appears in an RPC
-    method signature **must** be decorated with ``@fory_tag``.
+    method signature **must** be decorated with ``@aster_tag``.
     """
 
     def decorator(cls):
@@ -80,7 +80,7 @@ def fory_tag(tag: str):
         else:
             cls.__fory_namespace__ = ""
             cls.__fory_typename__ = tag
-        cls.__fory_tag__ = tag
+        cls.__aster_tag__ = tag
         return cls
 
     return decorator
@@ -158,17 +158,17 @@ def _walk_type_graph(root_types: list[type]) -> list[type]:
 
 
 def _validate_xlang_tags(types: list[type]) -> None:
-    """Raise ``TypeError`` if any dataclass type lacks a ``@fory_tag``.
+    """Raise ``TypeError`` if any dataclass type lacks a ``@aster_tag``.
 
     Only called for XLANG mode where tag-based registration is required.
     """
     for tp in types:
         if not dataclasses.is_dataclass(tp):
             continue
-        if not hasattr(tp, "__fory_tag__"):
+        if not hasattr(tp, "__aster_tag__"):
             raise TypeError(
                 f"Type {tp.__qualname__} is used in XLANG mode but has no "
-                f"@fory_tag decorator. All types must be tagged for XLANG "
+                f"@aster_tag decorator. All types must be tagged for XLANG "
                 f"serialization."
             )
 
@@ -177,7 +177,7 @@ def _validate_xlang_tags(types: list[type]) -> None:
 
 # These are registered automatically by ForyCodec.
 # Import here to avoid circular imports — the types themselves are defined
-# in protocol.py which uses the fory_tag from this module (or its own copy).
+# in protocol.py which uses the aster_tag from this module (or its own copy).
 _INTERNAL_TYPES: list[type] | None = None
 
 
@@ -201,7 +201,7 @@ class ForyCodec:
     Args:
         mode: The serialization mode to use.
         types: User-defined types that will be serialized/deserialized.
-            For XLANG mode, all types must have ``@fory_tag`` decorators.
+            For XLANG mode, all types must have ``@aster_tag`` decorators.
             For NATIVE mode, tags are optional.
         compression_threshold: Payloads larger than this (in bytes) are
             zstd-compressed.  Set to ``-1`` to disable compression.
@@ -245,7 +245,7 @@ class ForyCodec:
 
         # Register all discovered types.
         for tp in all_types:
-            tag = getattr(tp, "__fory_tag__", None)
+            tag = getattr(tp, "__aster_tag__", None)
             if tag is not None:
                 ns = getattr(tp, "__fory_namespace__", "")
                 tn = getattr(tp, "__fory_typename__", tp.__name__)

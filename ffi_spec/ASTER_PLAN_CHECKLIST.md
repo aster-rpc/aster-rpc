@@ -105,9 +105,9 @@ Outstanding issue / blocker:
 - [x] Create `aster/framing.py` — `read_frame(recv_stream) -> (bytes, flags) | None`
 - [x] Create `aster/framing.py` — max frame size enforcement (16 MiB)
 - [x] Create `aster/framing.py` — zero-length frame rejection
-- [x] Create `aster/protocol.py` — `StreamHeader` dataclass with `@fory_tag`
-- [x] Create `aster/protocol.py` — `CallHeader` dataclass with `@fory_tag`
-- [x] Create `aster/protocol.py` — `RpcStatus` dataclass with `@fory_tag`
+- [x] Create `aster/protocol.py` — `StreamHeader` dataclass with `@aster_tag`
+- [x] Create `aster/protocol.py` — `CallHeader` dataclass with `@aster_tag`
+- [x] Create `aster/protocol.py` — `RpcStatus` dataclass with `@aster_tag`
 - [x] Tests: frame round-trip encoding/decoding
 - [x] Tests: flag parsing
 - [x] Tests: max-size rejection
@@ -117,7 +117,7 @@ Outstanding issue / blocker:
 
 ## Phase 2: Serialization Integration (Fory)
 
-- [x] Create `aster/codec.py` — `@fory_tag(tag)` decorator (namespace/typename split)
+- [x] Create `aster/codec.py` — `@aster_tag(tag)` decorator (namespace/typename split)
 - [x] Create `aster/codec.py` — `ForyCodec.__init__(mode, types)`
 - [x] Create `aster/codec.py` — `ForyCodec.encode(obj) -> bytes`
 - [x] Create `aster/codec.py` — `ForyCodec.decode(data, expected_type) -> Any`
@@ -167,7 +167,7 @@ Outstanding issue / blocker:
 - [x] Implement type introspection from method signatures (`typing.get_type_hints`, `inspect`)
 - [x] Implement eager Fory type validation at decoration time (XLANG mode)
 - [x] Tests: decorate a test service, verify `ServiceInfo` and `MethodInfo`
-- [x] Tests: missing `@fory_tag` raises `TypeError`
+- [x] Tests: missing `@aster_tag` raises `TypeError`
 - [x] Tests: `ServiceRegistry` lookup by name
 
 ---

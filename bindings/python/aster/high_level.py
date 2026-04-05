@@ -25,19 +25,26 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import logging
 import time
 from typing import Any, Iterable
+
+logger = logging.getLogger(__name__)
 
 from . import create_endpoint_with_config, EndpointConfig, NodeAddr
 from .client import ServiceClient, create_client
 from .contract.identity import contract_id_from_service
 from .registry.models import ServiceSummary
 from .server import Server
+from .trust.bootstrap import (
+    handle_producer_admission_connection,
+    make_ephemeral_mesh_state,
+)
 from .trust.consumer import (
     ConsumerAdmissionRequest,
     ConsumerAdmissionResponse,
     consumer_cred_to_json,
-    serve_consumer_admission,
+    handle_consumer_admission_connection,
 )
 from .trust.credentials import ConsumerEnrollmentCredential
 from .trust.hooks import (
@@ -45,6 +52,7 @@ from .trust.hooks import (
     ALPN_PRODUCER_ADMISSION,
     MeshEndpointHook,
 )
+from .trust.mesh import ClockDriftConfig, MeshState
 from .trust.nonces import InMemoryNonceStore
 from .trust.signing import sign_credential
 
@@ -63,14 +71,16 @@ class AsterServer:
     ``contract_id``, consumer admission, and the low-level :class:`Server`
     behind one async context manager.
 
-    The flag matrix (per design discussion):
+    The flag matrix:
 
     * ``allow_all_consumers=True`` and ``allow_all_producers=True`` →
-      no admission endpoint, no :class:`MeshEndpointHook`.
+      no admission endpoints, no :class:`MeshEndpointHook`.
     * ``allow_all_consumers=False`` → run ``aster.consumer_admission`` to
-      gate consumers.
-    * ``allow_all_producers=False`` → *reserved*; not yet wired on the
-      Python side. Raises :class:`NotImplementedError`.
+      gate consumers against ``root_pubkey``.
+    * ``allow_all_producers=False`` → run ``aster.producer_admission`` to
+      gate peer producers (mesh join, §2.4). If no ``mesh_state`` is
+      provided, an ephemeral founding state is auto-created (random salt,
+      empty accepted-producer set, no persistence).
     """
 
     def __init__(
@@ -87,20 +97,16 @@ class AsterServer:
         hook: MeshEndpointHook | None = None,
         nonce_store: Any | None = None,
         registry_ticket: str = "",
+        mesh_state: MeshState | None = None,
+        clock_drift_config: ClockDriftConfig | None = None,
+        persist_mesh_state: bool = False,
     ) -> None:
         if not services:
             raise ValueError("AsterServer requires at least one service")
-        if not allow_all_producers:
-            raise NotImplementedError(
-                "allow_all_producers=False is reserved: no serve_producer_admission "
-                "loop exists yet on the Python side (see "
-                "bindings/python/aster/trust/bootstrap.py:338 for the per-connection "
-                "handler). Leave allow_all_producers=True for now."
-            )
-        if not allow_all_consumers and root_pubkey is None:
+        if (not allow_all_consumers or not allow_all_producers) and root_pubkey is None:
             raise ValueError(
-                "root_pubkey is required when allow_all_consumers=False "
-                "(consumer admission needs the root key to verify credentials)"
+                "root_pubkey is required when admission is enabled "
+                "(allow_all_consumers=False or allow_all_producers=False)"
             )
 
         self._services_in: list = list(services)
@@ -114,11 +120,13 @@ class AsterServer:
         self._hook = hook
         self._nonce_store = nonce_store
         self._registry_ticket = registry_ticket
+        self._mesh_state = mesh_state
+        self._clock_drift_config = clock_drift_config
+        self._persist_mesh_state = persist_mesh_state
 
         # Populated by start()
         self._started: bool = False
-        self._rpc_ep: Any | None = None
-        self._admission_ep: Any | None = None
+        self._ep: Any | None = None
         self._service_summaries: list[ServiceSummary] = []
         self._server: Server | None = None
 
@@ -134,32 +142,28 @@ class AsterServer:
         if self._started:
             return
 
-        # Build RPC endpoint with RPC_ALPN merged in.
-        rpc_config = _clone_config_with_alpns(
-            self._endpoint_config_template, [RPC_ALPN]
-        )
-        self._rpc_ep = await create_endpoint_with_config(rpc_config)
-        rpc_addr_b64 = base64.b64encode(
-            self._rpc_ep.endpoint_addr_info().to_bytes()
-        ).decode()
-
-        # Build admission endpoint (if any gate is active).
-        needs_admission = not self._allow_all_consumers or not self._allow_all_producers
-        if needs_admission:
-            admission_alpns: list[bytes] = []
-            if not self._allow_all_consumers:
-                admission_alpns.append(ALPN_CONSUMER_ADMISSION)
-            if not self._allow_all_producers:
-                admission_alpns.append(ALPN_PRODUCER_ADMISSION)
-            admission_config = _clone_config_with_alpns(
-                self._endpoint_config_template, admission_alpns
-            )
-            self._admission_ep = await create_endpoint_with_config(admission_config)
-
+        # One endpoint serves RPC + any enabled admission ALPN; the accept
+        # loop dispatches per connection by ALPN.
+        alpns: list[bytes] = [RPC_ALPN]
+        if not self._allow_all_consumers:
+            alpns.append(ALPN_CONSUMER_ADMISSION)
             if self._hook is None:
                 self._hook = MeshEndpointHook()
             if self._nonce_store is None:
                 self._nonce_store = InMemoryNonceStore()
+        if not self._allow_all_producers:
+            alpns.append(ALPN_PRODUCER_ADMISSION)
+        cfg = _clone_config_with_alpns(self._endpoint_config_template, alpns)
+        self._ep = await create_endpoint_with_config(cfg)
+        rpc_addr_b64 = base64.b64encode(
+            self._ep.endpoint_addr_info().to_bytes()
+        ).decode()
+
+        # Auto-create an ephemeral MeshState if producer admission is enabled
+        # and no caller-supplied state was given.
+        if not self._allow_all_producers and self._mesh_state is None:
+            assert self._root_pubkey is not None
+            self._mesh_state = make_ephemeral_mesh_state(self._root_pubkey)
 
         # Build ServiceSummary list with per-spec contract_id for each service.
         summaries: list[ServiceSummary] = []
@@ -182,9 +186,11 @@ class AsterServer:
             )
         self._service_summaries = summaries
 
-        # Construct the low-level Server. It will close rpc_ep when we close it.
+        # Construct the low-level Server. It borrows the shared endpoint —
+        # we (AsterServer) drive the accept loop; Server.handle_connection()
+        # is called per RPC-ALPN connection.
         self._server = Server(
-            self._rpc_ep,
+            self._ep,
             services=self._services_in,
             codec=self._codec,
             interceptors=self._interceptors,
@@ -206,25 +212,8 @@ class AsterServer:
         assert self._server is not None
 
         subtasks: list[asyncio.Task] = [
-            asyncio.create_task(self._server.serve(), name="aster-rpc-serve")
+            asyncio.create_task(self._accept_loop(), name="aster-accept"),
         ]
-        if self._admission_ep is not None and not self._allow_all_consumers:
-            services_snapshot = list(self._service_summaries)
-            assert self._root_pubkey is not None
-            subtasks.append(
-                asyncio.create_task(
-                    serve_consumer_admission(
-                        self._admission_ep,
-                        root_pubkey=self._root_pubkey,
-                        hook=self._hook,
-                        nonce_store=self._nonce_store,
-                        services_getter=lambda: services_snapshot,
-                        registry_ticket_getter=lambda: self._registry_ticket,
-                    ),
-                    name="aster-consumer-admission",
-                )
-            )
-
         self._subtasks = subtasks
 
         async def _wait_all() -> None:
@@ -232,6 +221,68 @@ class AsterServer:
 
         self._serve_task = asyncio.create_task(_wait_all(), name="aster-server-serve")
         return self._serve_task
+
+    async def _accept_loop(self) -> None:
+        """Single accept loop over the shared endpoint; dispatch per ALPN."""
+        assert self._ep is not None
+        assert self._server is not None
+        services_snapshot = list(self._service_summaries)
+        try:
+            while True:
+                try:
+                    conn = await self._ep.accept()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("AsterServer: accept() failed: %s", exc)
+                    continue
+
+                try:
+                    alpn = conn.connection_info().alpn
+                    if not isinstance(alpn, bytes):
+                        alpn = bytes(alpn)
+                except Exception:  # noqa: BLE001
+                    alpn = b""
+
+                if alpn == RPC_ALPN:
+                    asyncio.create_task(
+                        self._server.handle_connection(conn),
+                        name="aster-rpc-conn",
+                    )
+                elif alpn == ALPN_CONSUMER_ADMISSION and not self._allow_all_consumers:
+                    assert self._root_pubkey is not None
+                    asyncio.create_task(
+                        handle_consumer_admission_connection(
+                            conn,
+                            root_pubkey=self._root_pubkey,
+                            hook=self._hook,
+                            nonce_store=self._nonce_store,
+                            services_getter=lambda: services_snapshot,
+                            registry_ticket_getter=lambda: self._registry_ticket,
+                        ),
+                        name="aster-consumer-admission-conn",
+                    )
+                elif alpn == ALPN_PRODUCER_ADMISSION and not self._allow_all_producers:
+                    assert self._root_pubkey is not None
+                    assert self._mesh_state is not None
+                    asyncio.create_task(
+                        handle_producer_admission_connection(
+                            conn,
+                            own_root_pubkey=self._root_pubkey,
+                            own_state=self._mesh_state,
+                            config=self._clock_drift_config,
+                            persist_state=self._persist_mesh_state,
+                        ),
+                        name="aster-producer-admission-conn",
+                    )
+                else:
+                    # Unknown/disabled ALPN: close the connection.
+                    try:
+                        conn.close(0, b"unexpected alpn")
+                    except Exception:  # noqa: BLE001
+                        pass
+        except asyncio.CancelledError:
+            pass
 
     async def close(self) -> None:
         """Cancel serve loops and close endpoints. Safe to call multiple times."""
@@ -249,17 +300,10 @@ class AsterServer:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # Close the RPC server (also closes rpc_ep per server.py).
+        # Close the RPC server (also closes the shared endpoint per server.py).
         if self._server is not None:
             try:
                 await self._server.close()
-            except Exception:
-                pass
-
-        # Close admission endpoint separately.
-        if self._admission_ep is not None:
-            try:
-                await self._admission_ep.close()
             except Exception:
                 pass
 
@@ -277,19 +321,40 @@ class AsterServer:
     # ── Properties ───────────────────────────────────────────────────────────
 
     @property
-    def rpc_addr_b64(self) -> str:
+    def endpoint_addr_b64(self) -> str:
+        """Base64 ``NodeAddr`` of the shared endpoint — serves RPC and any
+        enabled admission ALPNs. Clients dial this using the ALPN they want.
+        """
         self._require_started()
-        assert self._rpc_ep is not None
-        return base64.b64encode(self._rpc_ep.endpoint_addr_info().to_bytes()).decode()
+        assert self._ep is not None
+        return base64.b64encode(self._ep.endpoint_addr_info().to_bytes()).decode()
+
+    # Per-ALPN aliases (same base64 string; returns None when the ALPN is off).
+    @property
+    def rpc_addr_b64(self) -> str:
+        return self.endpoint_addr_b64
 
     @property
     def admission_addr_b64(self) -> str | None:
-        self._require_started()
-        if self._admission_ep is None:
+        if self._allow_all_consumers and self._allow_all_producers:
             return None
-        return base64.b64encode(
-            self._admission_ep.endpoint_addr_info().to_bytes()
-        ).decode()
+        return self.endpoint_addr_b64
+
+    @property
+    def consumer_admission_addr_b64(self) -> str | None:
+        if self._allow_all_consumers:
+            return None
+        return self.endpoint_addr_b64
+
+    @property
+    def producer_admission_addr_b64(self) -> str | None:
+        if self._allow_all_producers:
+            return None
+        return self.endpoint_addr_b64
+
+    @property
+    def mesh_state(self) -> MeshState | None:
+        return self._mesh_state
 
     @property
     def services(self) -> list[ServiceSummary]:
@@ -297,10 +362,15 @@ class AsterServer:
         return list(self._service_summaries)
 
     @property
-    def rpc_endpoint(self) -> Any:
-        """Escape hatch: the underlying RPC ``NetClient`` endpoint."""
+    def endpoint(self) -> Any:
+        """Escape hatch: the shared ``NetClient`` endpoint."""
         self._require_started()
-        return self._rpc_ep
+        return self._ep
+
+    # Back-compat alias.
+    @property
+    def rpc_endpoint(self) -> Any:
+        return self.endpoint
 
     @property
     def root_pubkey(self) -> bytes | None:

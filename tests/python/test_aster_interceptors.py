@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import pytest
 
 from aster.client import create_client, create_local_client
-from aster.codec import ForyCodec, fory_tag
+from aster.codec import ForyCodec, aster_tag
 from aster.decorators import rpc, service
 from aster.interceptors import (
     AuditLogInterceptor,
@@ -21,13 +21,13 @@ from aster.transport.local import LocalTransport
 from aster.types import RetryPolicy, SerializationMode
 
 
-@fory_tag("test.interceptors/EchoRequest")
+@aster_tag("test.interceptors/EchoRequest")
 @dataclass
 class EchoRequest:
     message: str = ""
 
 
-@fory_tag("test.interceptors/EchoResponse")
+@aster_tag("test.interceptors/EchoResponse")
 @dataclass
 class EchoResponse:
     message: str = ""

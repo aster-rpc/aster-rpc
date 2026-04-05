@@ -98,7 +98,7 @@ from .framing import (
 )
 from .protocol import StreamHeader, CallHeader, RpcStatus
 from .codec import (
-    fory_tag,
+    aster_tag,
     ForyCodec,
     ForyConfig,
     DEFAULT_COMPRESSION_THRESHOLD,
@@ -211,7 +211,7 @@ __all__ = [
     "StreamHeader",
     "CallHeader",
     "RpcStatus",
-    "fory_tag",
+    "aster_tag",
     "ForyCodec",
     "ForyConfig",
     "DEFAULT_COMPRESSION_THRESHOLD",
