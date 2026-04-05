@@ -637,14 +637,14 @@ def _get_fqn(cls: type) -> str:
 
 
 def _get_package_name(cls: type) -> str:
-    """Return the package name for a type, using fory_tag if available."""
+    """Return the package name for a type, using aster_tag if available."""
     if hasattr(cls, "__fory_namespace__") and cls.__fory_namespace__:
         return cls.__fory_namespace__
     return cls.__module__ or ""
 
 
 def _get_type_name(cls: type) -> str:
-    """Return the simple type name, using fory_tag if available."""
+    """Return the simple type name, using aster_tag if available."""
     if hasattr(cls, "__fory_typename__"):
         return cls.__fory_typename__
     return cls.__qualname__

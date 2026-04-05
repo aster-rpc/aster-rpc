@@ -19,7 +19,7 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster.codec import ForyCodec, fory_tag
+from aster.codec import ForyCodec, aster_tag
 from aster.decorators import (
     bidi_stream,
     client_stream,
@@ -50,13 +50,13 @@ from aster.types import SerializationMode
 # ── Shared test types ────────────────────────────────────────────────────────
 
 
-@fory_tag("test.session/Req")
+@aster_tag("test.session/Req")
 @dataclass
 class Req:
     value: int = 0
 
 
-@fory_tag("test.session/Resp")
+@aster_tag("test.session/Resp")
 @dataclass
 class Resp:
     result: int = 0
@@ -491,12 +491,12 @@ async def test_local_session_mid_call_call_rejection():
 async def test_stream_discriminator_mismatch_shared():
     """method='' on a shared service → FAILED_PRECONDITION trailer."""
 
-    @fory_tag("test.session/EchoReq")
+    @aster_tag("test.session/EchoReq")
     @dataclass
     class EchoReq:
         msg: str = ""
 
-    @fory_tag("test.session/EchoResp")
+    @aster_tag("test.session/EchoResp")
     @dataclass
     class EchoResp:
         msg: str = ""
@@ -560,12 +560,12 @@ async def test_local_session_parity():
     from aster.client import create_local_client
 
     # Stateless service for comparison
-    @fory_tag("test.session/PReq")
+    @aster_tag("test.session/PReq")
     @dataclass
     class PReq:
         x: int = 0
 
-    @fory_tag("test.session/PResp")
+    @aster_tag("test.session/PResp")
     @dataclass
     class PResp:
         y: int = 0

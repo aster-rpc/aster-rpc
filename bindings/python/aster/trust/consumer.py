@@ -267,7 +267,7 @@ async def serve_consumer_admission(
         while True:
             conn = await endpoint.accept()
             asyncio.create_task(
-                _handle_one_connection(
+                handle_consumer_admission_connection(
                     conn,
                     root_pubkey=root_pubkey,
                     hook=hook,
@@ -282,13 +282,13 @@ async def serve_consumer_admission(
         logger.error("serve_consumer_admission: unexpected error: %s", exc)
 
 
-async def _handle_one_connection(
+async def handle_consumer_admission_connection(
     conn: object,
     root_pubkey: bytes,
     hook: "MeshEndpointHook",
-    nonce_store: "NonceStoreProtocol | None",
-    services_getter: "Callable[[], list[ServiceSummary]] | None",
-    registry_ticket_getter: "Callable[[], str] | None",
+    nonce_store: "NonceStoreProtocol | None" = None,
+    services_getter: "Callable[[], list[ServiceSummary]] | None" = None,
+    registry_ticket_getter: "Callable[[], str] | None" = None,
 ) -> None:
     """Handle one consumer admission connection: read request, write response."""
     peer_node_id = conn.remote_id()

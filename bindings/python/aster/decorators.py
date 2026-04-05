@@ -496,7 +496,7 @@ def service(
         )
         setattr(cls, _SERVICE_INFO_ATTR, service_info)
 
-        # Validate all types in the service have @fory_tag for XLANG mode
+        # Validate all types in the service have @aster_tag for XLANG mode
         if SerializationMode.XLANG in serialization:
             # Capture caller's local variables AND globals to resolve types defined in any scope
             # (e.g., inside test methods, at module level, or imported)
@@ -693,7 +693,7 @@ def _get_type_hints_safe(func: Callable) -> dict[str, Any]:
 
 
 def _validate_xlang_tags_for_service(cls: type, service_info: Any, _caller_locals: dict | None = None, _caller_globals: dict | None = None) -> None:
-    """Validate that all types used in the service have @fory_tag for XLANG mode.
+    """Validate that all types used in the service have @aster_tag for XLANG mode.
 
     Args:
         cls: The service class.
@@ -704,7 +704,7 @@ def _validate_xlang_tags_for_service(cls: type, service_info: Any, _caller_local
             resolve types defined at module level (e.g., imported types).
 
     Raises:
-        TypeError: If a type lacks @fory_tag.
+        TypeError: If a type lacks @aster_tag.
     """
     import dataclasses
 
@@ -769,12 +769,12 @@ def _validate_xlang_tags_for_service(cls: type, service_info: Any, _caller_local
 
         # Check if it's a dataclass
         if dataclasses.is_dataclass(tp):
-            # Check if it has @fory_tag
-            if not hasattr(tp, "__fory_tag__"):
+            # Check if it has @aster_tag
+            if not hasattr(tp, "__aster_tag__"):
                 raise TypeError(
                     f"Type {tp.__qualname__} used in service {service_info.name} "
-                    f"has no @fory_tag decorator. All types used in XLANG mode "
-                    f"must be decorated with @fory_tag."
+                    f"has no @aster_tag decorator. All types used in XLANG mode "
+                    f"must be decorated with @aster_tag."
                 )
             # Recursively check fields
             for fld in dataclasses.fields(tp):

@@ -389,7 +389,7 @@ def _collect_service_types(service_class: type, service_info: ServiceInfo) -> se
             mod = sys.modules.get(module)
             if mod:
                 for _, obj in inspect.getmembers(mod, inspect.isclass):
-                    if hasattr(obj, "__fory_tag__"):
+                    if hasattr(obj, "__aster_tag__"):
                         request_response_types.add(obj)
 
     return request_response_types

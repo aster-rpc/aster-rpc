@@ -38,6 +38,12 @@ Quick start::
 """
 
 from .admission import admit, check_offline, check_runtime
+from .bootstrap import (
+    handle_admission_rpc,
+    handle_producer_admission_connection,
+    make_ephemeral_mesh_state,
+    serve_producer_admission,
+)
 from .credentials import (
     ATTR_IID_ACCOUNT,
     ATTR_IID_PROVIDER,
@@ -112,6 +118,11 @@ __all__ = [
     "admit",
     "check_offline",
     "check_runtime",
+    # Producer admission serve-loop
+    "handle_admission_rpc",
+    "handle_producer_admission_connection",
+    "serve_producer_admission",
+    "make_ephemeral_mesh_state",
     # IID
     "IIDBackend",
     "MockIIDBackend",

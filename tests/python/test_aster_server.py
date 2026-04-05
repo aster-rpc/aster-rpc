@@ -17,7 +17,7 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster.codec import fory_tag, ForyCodec, ForyConfig
+from aster.codec import aster_tag, ForyCodec, ForyConfig
 from aster.types import SerializationMode
 from aster.status import StatusCode, RpcError
 from aster.decorators import (
@@ -45,45 +45,45 @@ from aster.transport.base import BidiChannel
 # ── Test types ───────────────────────────────────────────────────────────────
 
 
-@fory_tag("test.server/EchoRequest")
+@aster_tag("test.server/EchoRequest")
 @dataclass
 class EchoRequest:
     message: str = ""
 
 
-@fory_tag("test.server/EchoResponse")
+@aster_tag("test.server/EchoResponse")
 @dataclass
 class EchoResponse:
     message: str = ""
     received_at_ms: int = 0
 
 
-@fory_tag("test.server/CounterRequest")
+@aster_tag("test.server/CounterRequest")
 @dataclass
 class CounterRequest:
     start: int = 0
     count: int = 5
 
 
-@fory_tag("test.server/CounterResponse")
+@aster_tag("test.server/CounterResponse")
 @dataclass
 class CounterResponse:
     value: int = 0
 
 
-@fory_tag("test.server/StreamingResponse")
+@aster_tag("test.server/StreamingResponse")
 @dataclass
 class StreamingResponse:
     item: int = 0
 
 
-@fory_tag("test.server/AggregateRequest")
+@aster_tag("test.server/AggregateRequest")
 @dataclass
 class AggregateRequest:
     value: int = 0
 
 
-@fory_tag("test.server/AggregateResponse")
+@aster_tag("test.server/AggregateResponse")
 @dataclass
 class AggregateResponse:
     total: int = 0

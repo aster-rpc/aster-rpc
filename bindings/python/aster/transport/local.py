@@ -169,7 +169,7 @@ class LocalTransport(Transport):
 
     Key features:
     - Full interceptor chain execution (not skippable per spec §8.3.2)
-    - wire_compatible mode for catching missing @fory_tag decorators (§8.3.3)
+    - wire_compatible mode for catching missing @aster_tag decorators (§8.3.3)
 
     Args:
         handler_registry: Callable that looks up handlers by (service, method).
@@ -178,7 +178,7 @@ class LocalTransport(Transport):
         codec: The ForyCodec instance for serialization.
         wire_compatible: If True, forces wire-compatible encoding even for local
             calls. This exercises the full serialization pipeline and will catch
-            missing @fory_tag decorators on types. Defaults to False.
+            missing @aster_tag decorators on types. Defaults to False.
         interceptors: List of Interceptor instances to run on every call.
     """
 

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import pytest
 
 from aster.client import create_local_client
-from aster.codec import ForyCodec, fory_tag
+from aster.codec import ForyCodec, aster_tag
 from aster.decorators import service, rpc
 from aster.testing import AsterTestHarness
 from aster.types import SerializationMode
@@ -29,13 +29,13 @@ from aster.types import SerializationMode
 # ── Test types ────────────────────────────────────────────────────────────────
 
 
-@fory_tag("test.local/Ping")
+@aster_tag("test.local/Ping")
 @dataclass
 class Ping:
     value: int = 0
 
 
-@fory_tag("test.local/Pong")
+@aster_tag("test.local/Pong")
 @dataclass
 class Pong:
     value: int = 0

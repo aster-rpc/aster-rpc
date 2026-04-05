@@ -45,7 +45,7 @@ pytestmark = pytest.mark.skipif(not HAS_PYFORY, reason="pyfory not installed")
 # ── Helper: create a Fory instance and register types ────────────────────────
 
 
-def fory_tag(tag: str):
+def aster_tag(tag: str):
     """Decorator to attach a Fory type tag (namespace/typename) to a class."""
 
     def decorator(cls):
@@ -56,7 +56,7 @@ def fory_tag(tag: str):
         else:
             cls.__fory_namespace__ = ""
             cls.__fory_typename__ = tag
-        cls.__fory_tag__ = tag
+        cls.__aster_tag__ = tag
         return cls
 
     return decorator
@@ -79,7 +79,7 @@ def create_fory(*types_to_register):
 
 
 @dataclass
-@fory_tag("spike.test/SimpleMessage")
+@aster_tag("spike.test/SimpleMessage")
 class SimpleMessage:
     name: str
     value: int
@@ -87,7 +87,7 @@ class SimpleMessage:
 
 
 @dataclass
-@fory_tag("spike.test/NestedMessage")
+@aster_tag("spike.test/NestedMessage")
 class NestedMessage:
     label: str
     inner: SimpleMessage
@@ -95,14 +95,14 @@ class NestedMessage:
 
 
 @dataclass
-@fory_tag("spike.test/ListMessage")
+@aster_tag("spike.test/ListMessage")
 class ListMessage:
     items: list  # list of strings
     scores: list  # list of ints
 
 
 @dataclass
-@fory_tag("spike.test/OptionalFields")
+@aster_tag("spike.test/OptionalFields")
 class OptionalFields:
     required_field: str
     optional_str: Optional[str]
@@ -110,7 +110,7 @@ class OptionalFields:
 
 
 @dataclass
-@fory_tag("spike.test/ManyFields")
+@aster_tag("spike.test/ManyFields")
 class ManyFields:
     """A type with many fields to test field-ordering determinism."""
 
@@ -572,8 +572,8 @@ class TestTypeRegistration:
     """Verify that type registration with namespace+typename works correctly."""
 
     def test_tag_preserved_in_decorator(self):
-        """The __fory_tag__ attribute is set by the decorator."""
-        assert SimpleMessage.__fory_tag__ == "spike.test/SimpleMessage"
+        """The __aster_tag__ attribute is set by the decorator."""
+        assert SimpleMessage.__aster_tag__ == "spike.test/SimpleMessage"
         assert SimpleMessage.__fory_namespace__ == "spike.test"
         assert SimpleMessage.__fory_typename__ == "SimpleMessage"
 

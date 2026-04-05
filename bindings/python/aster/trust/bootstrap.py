@@ -26,6 +26,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -390,4 +391,134 @@ async def handle_admission_rpc(
         salt=own_state.salt,
         accepted_producers=sorted(own_state.accepted_producers),
         reason="",
+    )
+
+
+# ── Server-side serve loop (symmetric with serve_consumer_admission) ─────────
+
+
+async def serve_producer_admission(
+    endpoint: object,
+    *,
+    own_root_pubkey: bytes,
+    own_state: MeshState,
+    config: ClockDriftConfig | None = None,
+    persist_state: bool = True,
+) -> None:
+    """Accept and process connections on ``aster.producer_admission`` until cancelled.
+
+    Mirrors :func:`aster.trust.consumer.serve_consumer_admission`. Runs as a
+    background task alongside the main server; each connection is handled in
+    its own :class:`asyncio.Task` so one slow peer cannot block others.
+
+    Wire format (newline-free JSON over a bidi-stream):
+
+      request  : ``{"credential_json": "<EnrollmentCredential JSON>", "iid_token": "..."}``
+      response : ``{"accepted": bool, "salt": "<hex>", "accepted_producers": [...], "reason": ""}``
+
+    Each accepted producer is added to ``own_state.accepted_producers`` (via
+    :func:`handle_admission_rpc`). If ``persist_state`` is True (the default),
+    the updated state is written to ``~/.aster/mesh_state.json``; set False
+    for ephemeral/in-memory meshes (tests, simple examples).
+
+    Args:
+        endpoint:        A ``NetClient`` bound to ``aster.producer_admission``.
+        own_root_pubkey: The 32-byte root public key this node trusts.
+        own_state:       This node's :class:`MeshState`; mutated on accept.
+        config:          Optional :class:`ClockDriftConfig` (future: drift checks).
+        persist_state:   If True (default), call ``_save_mesh_state`` on accept.
+    """
+    try:
+        while True:
+            conn = await endpoint.accept()
+            asyncio.create_task(
+                handle_producer_admission_connection(
+                    conn,
+                    own_root_pubkey=own_root_pubkey,
+                    own_state=own_state,
+                    config=config,
+                    persist_state=persist_state,
+                )
+            )
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.error("serve_producer_admission: unexpected error: %s", exc)
+
+
+async def handle_producer_admission_connection(
+    conn: object,
+    *,
+    own_root_pubkey: bytes,
+    own_state: MeshState,
+    config: ClockDriftConfig | None = None,
+    persist_state: bool = True,
+) -> None:
+    """Handle one producer admission connection: read request, write response."""
+    peer_node_id = conn.remote_id()
+    try:
+        send, recv = await conn.accept_bi()
+        raw = await recv.read_to_end(64 * 1024)
+        if not raw:
+            logger.warning("producer admission: empty request from %s", peer_node_id)
+            return
+
+        # Parse the AdmissionRequest wrapper and extract credential_json.
+        try:
+            wrapper = json.loads(raw)
+            cred_json = wrapper.get("credential_json") or ""
+        except (ValueError, AttributeError):
+            # Back-compat: accept raw credential JSON as well.
+            cred_json = raw.decode("utf-8", errors="replace")
+
+        # Temporarily skip persistence if requested; handle_admission_rpc always
+        # calls _save_mesh_state on accept, so we swap the module-level
+        # function in-process when persist_state is False.
+        if persist_state:
+            response = await handle_admission_rpc(
+                cred_json, own_state, own_root_pubkey, config
+            )
+        else:
+            _original = globals()["_save_mesh_state"]
+            globals()["_save_mesh_state"] = lambda _state: None
+            try:
+                response = await handle_admission_rpc(
+                    cred_json, own_state, own_root_pubkey, config
+                )
+            finally:
+                globals()["_save_mesh_state"] = _original
+
+        payload = {
+            "accepted": response.accepted,
+            "salt": response.salt.hex(),
+            "accepted_producers": list(response.accepted_producers),
+            "reason": "",  # oracle protection — never leak on wire
+        }
+        await send.write_all(json.dumps(payload, separators=(",", ":")).encode())
+        await send.finish()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "producer admission: error handling connection from %s: %s",
+            peer_node_id,
+            exc,
+        )
+
+
+def make_ephemeral_mesh_state(root_pubkey: bytes) -> MeshState:
+    """Build an in-memory founding :class:`MeshState` for a standalone producer.
+
+    Useful for ``AsterServer(allow_all_producers=False)`` when the caller
+    doesn't need persistent mesh state (e.g. single-node demos, tests).
+    Generates a fresh random salt and an empty accepted-producer set.
+    """
+    salt = secrets.token_bytes(32)
+    now_ms = int(time.time() * 1000)
+    return MeshState(
+        accepted_producers=set(),
+        salt=salt,
+        topic_id=derive_gossip_topic(root_pubkey, salt),
+        peer_offsets={},
+        drift_isolated=set(),
+        last_heartbeat_epoch_ms=now_ms,
+        mesh_joined_at_epoch_ms=now_ms,
     )

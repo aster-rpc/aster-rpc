@@ -240,6 +240,20 @@ class Server:
             self._serve_task = None
             self._shutdown_event.set()
 
+    async def handle_connection(self, incoming: Any) -> None:
+        """Handle a connection accepted elsewhere (e.g. a shared multi-ALPN loop).
+
+        Sets up the :class:`ConnectionContext` and tracks it for ``drain()`` /
+        ``close()``, then delegates to the same per-stream handling used by
+        :meth:`serve`. Call this when :class:`AsterServer` (or any higher
+        dispatcher) owns the accept loop on a shared endpoint and routes
+        connections by ALPN.
+        """
+        ctx = ConnectionContext(connection=incoming, server=self)
+        async with self._connections_lock:
+            self._connections.add(ctx)
+        await self._handle_connection(ctx)
+
     async def _handle_connection(self, ctx: ConnectionContext) -> None:
         """Handle a single client connection.
 
