@@ -124,17 +124,13 @@ class Server:
             registry: Optional ServiceRegistry. If not provided, creates one from services.
         """
         self._endpoint = endpoint
-        self._codec = codec or ForyCodec(
-            mode=SerializationMode.XLANG,
-            fory_config=fory_config,
-        )
         self._interceptors = list(interceptors) if interceptors else []
         self._max_concurrent_streams = max_concurrent_streams
         self._service_instances: dict[tuple[str, int], Any] = {}
         # For session-scoped services we store the class (not an instance)
         self._service_classes: dict[tuple[str, int], type] = {}
 
-        # Set up service registry
+        # Set up service registry first so we can collect types for the codec.
         if registry is not None:
             self._registry = registry
         elif isinstance(services, ServiceRegistry):
@@ -150,6 +146,24 @@ class Server:
                     self._service_instances[(info.name, info.version)] = svc
         else:
             self._registry = ServiceRegistry()
+
+        # Build codec after registry is populated so service types are registered.
+        if codec is not None:
+            self._codec = codec
+        else:
+            from aster_python.aster.client import _collect_service_types
+            all_types: list[type] = []
+            for svc_info in self._registry.get_all_services():
+                cls = self._service_classes.get((svc_info.name, svc_info.version))
+                if cls is not None:
+                    for t in _collect_service_types(cls, svc_info):
+                        if t not in all_types:
+                            all_types.append(t)
+            self._codec = ForyCodec(
+                mode=SerializationMode.XLANG,
+                types=all_types if all_types else None,
+                fory_config=fory_config,
+            )
 
         # Connection tracking
         self._connections: set[ConnectionContext] = set()
@@ -231,7 +245,7 @@ class Server:
 
         Accepts bidirectional streams and dispatches them to handlers.
         """
-        logger.debug("Connection opened from %s", ctx.connection.remote_endpoint_id())
+        logger.debug("Connection opened from %s", ctx.connection.remote_id())
 
         try:
             while not ctx.draining:
@@ -349,7 +363,7 @@ class Server:
                 all_interceptors = self._resolve_interceptors(service_info)
                 peer: str | None = None
                 try:
-                    peer = ctx.connection.remote_endpoint_id()
+                    peer = ctx.connection.remote_id()
                 except Exception:
                     peer = None
                 session_server = SessionServer(
@@ -446,13 +460,13 @@ class Server:
     ) -> Any:
         peer = None
         try:
-            peer = ctx.connection.remote_endpoint_id()
+            peer = ctx.connection.remote_id()
         except Exception:
             peer = None
         return build_call_context(
             service=header.service,
             method=header.method,
-            metadata=header.metadata,
+            metadata=dict(zip(header.metadata_keys, header.metadata_values)) if header.metadata_keys else None,
             deadline_epoch_ms=header.deadline_epoch_ms,
             peer=peer,
             is_streaming=method_info.pattern != "unary",

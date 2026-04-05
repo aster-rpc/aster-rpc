@@ -679,14 +679,13 @@ def _make_credential_json(endpoint_id: str, expires_future: bool = True) -> tupl
 async def test_admission_rpc_accepted():
     """Valid credential → accepted response with salt + accepted_producers."""
     endpoint_id = "new_node_" + "a" * 55
-    cred_json, _, _ = _make_credential_json(endpoint_id)
+    cred_json, _, root_pub = _make_credential_json(endpoint_id)
 
     state = make_mesh_state(
         accepted_producers={"founding_node_" + "x" * 50},
         salt=b"\xf0" * 32,
         topic_id=b"\x0f" * 32,
     )
-    _, root_pub = make_keypair()
 
     response = await handle_admission_rpc(
         request_json=cred_json,
