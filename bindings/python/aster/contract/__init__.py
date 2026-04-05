@@ -38,6 +38,7 @@ from aster.contract.identity import (
     canonical_xlang_bytes,
     compute_type_hash,
     compute_contract_id,
+    contract_id_from_service,
     build_type_graph,
     resolve_with_cycles,
 )
@@ -78,6 +79,7 @@ __all__ = [
     "canonical_xlang_bytes",
     "compute_type_hash",
     "compute_contract_id",
+    "contract_id_from_service",
     "build_type_graph",
     "resolve_with_cycles",
     # manifest

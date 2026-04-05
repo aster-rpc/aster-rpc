@@ -136,6 +136,7 @@ from .client import (
     ClientError,
     ClientTimeoutError,
 )
+from .high_level import AsterServer, AsterClient, RPC_ALPN
 from .interceptors import (
     CallContext,
     Interceptor,
@@ -249,4 +250,8 @@ __all__ = [
     "CircuitBreakerInterceptor",
     "AuditLogInterceptor",
     "MetricsInterceptor",
+    # ── High-level declarative API ──
+    "AsterServer",
+    "AsterClient",
+    "RPC_ALPN",
 ]
