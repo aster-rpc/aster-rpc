@@ -182,6 +182,8 @@ async def fetch_from_collection(
     Returns:
         The raw bytes of the entry, or ``None`` if not found.
     """
+    from aster.limits import MAX_COLLECTION_INDEX_ENTRIES
+
     try:
         index_bytes = await blobs.read_to_bytes(collection_hash)
     except Exception as exc:  # noqa: BLE001
@@ -194,7 +196,15 @@ async def fetch_from_collection(
         logger.debug("fetch_from_collection: malformed index blob: %s", exc)
         return None
 
-    for entry in index.get("entries", []):
+    entries_list = index.get("entries", [])
+    if len(entries_list) > MAX_COLLECTION_INDEX_ENTRIES:
+        logger.warning(
+            "fetch_from_collection: index has %d entries (limit %d), truncating",
+            len(entries_list), MAX_COLLECTION_INDEX_ENTRIES,
+        )
+        entries_list = entries_list[:MAX_COLLECTION_INDEX_ENTRIES]
+
+    for entry in entries_list:
         if entry["name"] == entry_name:
             try:
                 return await blobs.read_to_bytes(entry["hash"])

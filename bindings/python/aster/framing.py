@@ -110,8 +110,14 @@ async def write_frame(
 
 async def read_frame(
     stream: RecvStream,
+    timeout_s: float | None = None,
 ) -> tuple[bytes, int] | None:
     """Read a single frame from *stream*.
+
+    Args:
+        stream: The QUIC receive stream.
+        timeout_s: Optional read timeout in seconds. Defaults to
+            ``DEFAULT_FRAME_READ_TIMEOUT_S`` from limits.py. Pass 0 to disable.
 
     Returns:
         A ``(payload, flags)`` tuple, or ``None`` if the stream has ended
@@ -120,10 +126,24 @@ async def read_frame(
 
     Raises:
         FramingError: On wire-format violations (zero length, oversized frame).
+        asyncio.TimeoutError: If the read exceeds the timeout.
     """
+    import asyncio
+
+    from aster.limits import DEFAULT_FRAME_READ_TIMEOUT_S
+
+    if timeout_s is None:
+        timeout_s = DEFAULT_FRAME_READ_TIMEOUT_S
+
+    effective_timeout = timeout_s if timeout_s > 0 else None
+
     # Read the 4-byte length prefix.
     try:
-        length_bytes = await stream.read_exact(_LENGTH_SIZE)
+        length_bytes = await asyncio.wait_for(
+            stream.read_exact(_LENGTH_SIZE), timeout=effective_timeout
+        )
+    except asyncio.TimeoutError:
+        raise FramingError("frame read timed out waiting for length header")
     except Exception:
         # Stream ended or was reset — treat as clean EOF.
         return None
@@ -141,7 +161,15 @@ async def read_frame(
             f"frame size {frame_body_len} exceeds maximum {MAX_FRAME_SIZE}"
         )
 
-    body = await stream.read_exact(frame_body_len)
+    try:
+        body = await asyncio.wait_for(
+            stream.read_exact(frame_body_len), timeout=effective_timeout
+        )
+    except asyncio.TimeoutError:
+        raise FramingError(
+            f"frame read timed out waiting for {frame_body_len} bytes of body"
+        )
+
     if len(body) < frame_body_len:
         raise FramingError(
             f"incomplete frame: expected {frame_body_len} bytes, got {len(body)}"

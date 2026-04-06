@@ -103,8 +103,9 @@ async def _read_trailer(
     # Decode the RpcStatus
     codec = ForyCodec(mode=SerializationMode.XLANG)
     status = codec.decode(payload, RpcStatus)
-    
-    return status.code, status.message
+
+    from aster.limits import validate_status_message
+    return status.code, validate_status_message(status.message)
 
 
 # ── IrohTransport ───────────────────────────────────────────────────────────

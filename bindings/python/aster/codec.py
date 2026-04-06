@@ -247,8 +247,11 @@ class ForyCodec:
         self.mode = mode
         self.compression_threshold = compression_threshold
         self.fory_config = fory_config or ForyConfig()
+        from aster.limits import MAX_DECOMPRESSED_SIZE
+
         self._cctx = zstandard.ZstdCompressor()
         self._dctx = zstandard.ZstdDecompressor()
+        self._max_decompress = MAX_DECOMPRESSED_SIZE
 
         user_types = list(types) if types else []
 
@@ -441,7 +444,7 @@ class ForyCodec:
             expected_type: Optional expected type for validation.
         """
         if compressed:
-            data = self._dctx.decompress(data)
+            data = self._safe_decompress(data)
         return self.decode(data, expected_type)
 
     def compress(self, data: bytes) -> bytes:
@@ -449,8 +452,31 @@ class ForyCodec:
         return self._cctx.compress(data)
 
     def decompress(self, data: bytes) -> bytes:
-        """Decompress zstd-compressed bytes."""
-        return self._dctx.decompress(data)
+        """Decompress zstd-compressed bytes. Enforces MAX_DECOMPRESSED_SIZE."""
+        return self._safe_decompress(data)
+
+    def _safe_decompress(self, data: bytes) -> bytes:
+        """Decompress with size limit enforcement.
+
+        Uses streaming decompression to enforce the limit without trusting
+        the content-size header in the compressed data.
+        """
+        from aster.limits import LimitExceeded
+
+        reader = self._dctx.stream_reader(data)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = reader.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > self._max_decompress:
+                raise LimitExceeded(
+                    "decompressed payload", self._max_decompress, total
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     def encode_row_schema(self) -> bytes:
         """For ROW mode: serialize the schema for hoisting.

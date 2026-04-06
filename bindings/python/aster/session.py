@@ -261,7 +261,15 @@ class SessionServer:
                     return
 
                 # Build call context
-                metadata = dict(zip(call_header.metadata_keys, call_header.metadata_values))
+                from aster.limits import MAX_METADATA_ENTRIES, validate_metadata, LimitExceeded
+                _keys = call_header.metadata_keys or []
+                _vals = call_header.metadata_values or []
+                try:
+                    validate_metadata(_keys, _vals)
+                except LimitExceeded:
+                    _keys = _keys[:MAX_METADATA_ENTRIES]
+                    _vals = _vals[:MAX_METADATA_ENTRIES]
+                metadata = dict(zip(_keys, _vals))
                 call_ctx = build_call_context(
                     service=self._service_info.name,
                     method=method_name,

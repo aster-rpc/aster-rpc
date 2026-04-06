@@ -105,10 +105,15 @@ class ConsumerAdmissionResponse:
     def from_json(cls, raw: str | bytes) -> "ConsumerAdmissionResponse":
         from ..registry.models import ServiceSummary as _SS
 
+        from ..limits import MAX_SERVICES_IN_ADMISSION, MAX_CHANNELS_PER_SERVICE
+
         d = json.loads(raw)
+        raw_services = d.get("services") or []
+        if len(raw_services) > MAX_SERVICES_IN_ADMISSION:
+            raw_services = raw_services[:MAX_SERVICES_IN_ADMISSION]
         services = [
             _SS.from_json_dict(s) if isinstance(s, dict) else s
-            for s in (d.get("services") or [])
+            for s in raw_services
         ]
         return cls(
             admitted=bool(d["admitted"]),
@@ -141,8 +146,22 @@ def consumer_cred_to_json(cred: ConsumerEnrollmentCredential) -> str:
 
 def consumer_cred_from_json(s: str | bytes) -> ConsumerEnrollmentCredential:
     """Deserialise a ConsumerEnrollmentCredential from the wire JSON format."""
+    from ..limits import validate_hex_field
+
     d = json.loads(s)
-    nonce_hex = d.get("nonce")
+
+    # Validate hex field lengths before parsing
+    validate_hex_field("root_pubkey", d.get("root_pubkey", ""))
+    nonce_hex = d.get("nonce") or ""
+    if nonce_hex:
+        validate_hex_field("nonce", nonce_hex)
+    sig_hex = d.get("signature") or ""
+    if sig_hex:
+        validate_hex_field("signature", sig_hex)
+    eid = d.get("endpoint_id") or ""
+    if eid:
+        validate_hex_field("endpoint_id", eid)
+
     return ConsumerEnrollmentCredential(
         credential_type=d["credential_type"],
         root_pubkey=bytes.fromhex(d["root_pubkey"]),
@@ -150,7 +169,7 @@ def consumer_cred_from_json(s: str | bytes) -> ConsumerEnrollmentCredential:
         attributes=d.get("attributes") or {},
         endpoint_id=d.get("endpoint_id"),
         nonce=bytes.fromhex(nonce_hex) if nonce_hex else None,
-        signature=bytes.fromhex(d.get("signature") or ""),
+        signature=bytes.fromhex(sig_hex) if sig_hex else b"",
     )
 
 
