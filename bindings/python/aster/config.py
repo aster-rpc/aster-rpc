@@ -254,23 +254,32 @@ def _apply_env(data: dict) -> None:
 
 
 from dataclasses import dataclass, field as dc_field
-import json
+import json as _json
 import logging
 
 _config_logger = logging.getLogger(__name__)
+
+# Sensitive fields whose values are masked in print_config output.
+_MASKED_FIELDS = frozenset({"secret_key", "enrollment_credential_file"})
 
 
 @dataclass
 class AsterConfig:
     """Unified configuration for :class:`AsterServer`.
 
-    Combines trust (root key, admission policy), storage (memory vs
-    persistent), and networking (relay, bind address, etc.) into one
-    object.
+    Combines trust (root public key, admission policy), storage (memory vs
+    persistent), and networking (relay, bind address, etc.) into one object.
 
-    Three ways to get one:
+    **Trust model (Aster-trust-spec.md §1.1):** The root *private* key is
+    offline — it never touches a running node. Nodes receive only the root
+    *public* key (to verify credentials) and optionally an enrollment
+    credential (a pre-signed token for mesh join). The founding node of a
+    mesh needs no enrollment credential; it bootstraps the accepted-producer
+    set with just its own EndpointId.
 
-    1. **Auto from env** (the default when ``AsterServer`` gets no config)::
+    Three ways to get an ``AsterConfig``:
+
+    1. **Auto from env** (default when ``AsterServer`` gets no config)::
 
            config = AsterConfig.from_env()
 
@@ -280,19 +289,31 @@ class AsterConfig:
 
     3. **Inline** (testing, scripts)::
 
-           config = AsterConfig(root_pubkey=pub, root_privkey=priv)
+           config = AsterConfig(root_pubkey=pub)
     """
 
     # ── Trust ────────────────────────────────────────────────────────────
-    root_key_file: str | None = None
-    """Path to a JSON file with ``private_key`` and ``public_key`` hex fields.
-    Loaded lazily by :meth:`resolve_root_key`."""
 
     root_pubkey: bytes | None = None
-    """32-byte ed25519 public key (overrides root_key_file if set)."""
+    """32-byte ed25519 root public key (the deployment trust anchor).
+    Highest priority — overrides ``root_pubkey_file`` when set."""
 
-    root_privkey: bytes | None = None
-    """32-byte ed25519 private key seed (overrides root_key_file if set)."""
+    root_pubkey_file: str | None = None
+    """Path to a file containing the root public key.  Accepts either a
+    plain hex string or a JSON object with a ``"public_key"`` field."""
+
+    enrollment_credential_file: str | None = None
+    """Path to a JSON enrollment credential (pre-signed by the offline root
+    key).  Required when a node joins an existing producer mesh.  Not needed
+    for the founding node or for dev/ephemeral mode."""
+
+    allow_all_consumers: bool = False
+    """Skip consumer admission gate. Default: gate consumers."""
+
+    enrollment_credential_iid: str | None = None
+    """Cloud Instance Identity Document token.  Required when the enrollment
+    credential's policy includes ``aster.iid_*`` attributes (AWS/GCP/Azure).
+    Set via ``ASTER_ENROLLMENT_CREDENTIAL_IID``."""
 
     allow_all_consumers: bool = False
     """Skip consumer admission gate. Default: gate consumers."""
@@ -300,13 +321,25 @@ class AsterConfig:
     allow_all_producers: bool = True
     """Skip producer admission gate. Default: allow all producers."""
 
+    # ── Connect (consumer-side) ──────────────────────────────────────────
+
+    endpoint_addr: str | None = None
+    """Producer's endpoint address (base64 NodeAddr or EndpointId hex string).
+    The consumer dials this to reach RPC + admission + blobs/docs/gossip.
+    Set via ``ASTER_ENDPOINT_ADDR``."""
+
     # ── Storage ──────────────────────────────────────────────────────────
+
     storage_path: str | None = None
     """If set, use FsStore at this path; otherwise in-memory."""
 
     # ── Network (forwarded to EndpointConfig) ────────────────────────────
-    relay_mode: str | None = None
+
     secret_key: bytes | None = None
+    """32-byte node identity key. Determines the stable ``EndpointId``.
+    If unset, a fresh identity is generated each run (fine for dev)."""
+
+    relay_mode: str | None = None
     bind_addr: str | None = None
     enable_monitoring: bool = False
     enable_hooks: bool = False
@@ -317,45 +350,60 @@ class AsterConfig:
     proxy_url: str | None = None
     proxy_from_env: bool = False
 
-    # ── Lifecycle ────────────────────────────────────────────────────────
+    # ── Internal (not user-facing) ───────────────────────────────────────
 
-    def resolve_root_key(self) -> tuple[bytes | None, bytes | None]:
-        """Return ``(privkey, pubkey)``, loading from file if needed.
+    _sources: dict = dc_field(default_factory=dict, repr=False)
+    """Provenance tracker: maps field name → source string
+    (e.g. ``"ASTER_ROOT_PUBKEY_FILE"``, ``"aster.toml [trust]"``, ``"default"``)."""
+
+    _ephemeral_privkey: bytes | None = dc_field(default=None, repr=False)
+    """Transient private key generated in dev mode.  Used only by
+    ``simple_consumer`` to auto-mint a credential.  Never persisted,
+    never configurable.  ``None`` in production."""
+
+    # ── Resolve ──────────────────────────────────────────────────────────
+
+    def resolve_root_pubkey(self) -> bytes | None:
+        """Return the root public key, resolving from config sources.
 
         Resolution order:
-        1. Inline ``root_pubkey`` / ``root_privkey`` (highest priority).
-        2. ``root_key_file`` JSON (``{"private_key": "<hex>", "public_key": "<hex>"}``).
-        3. Generate an ephemeral keypair (with a log message).
+
+        1. Inline ``root_pubkey`` (highest priority).
+        2. ``root_pubkey_file`` (hex string or JSON with ``public_key``).
+        3. Generate an ephemeral keypair (dev mode only — logged).
+
+        The root *private* key never appears here. In dev mode, a transient
+        private key is stored on ``_ephemeral_privkey`` so the companion
+        ``simple_consumer`` example can auto-mint a credential; it is never
+        persisted or configurable.
         """
-        priv = self.root_privkey
-        pub = self.root_pubkey
+        if self.root_pubkey is not None:
+            return self.root_pubkey
 
-        if pub is not None:
-            return priv, pub
+        if self.root_pubkey_file:
+            pub = _load_pubkey_from_file(self.root_pubkey_file)
+            if pub is not None:
+                self.root_pubkey = pub
+                return pub
+            _config_logger.warning(
+                "Root pubkey file %s not found or invalid", self.root_pubkey_file
+            )
 
-        if self.root_key_file:
-            path = os.path.expanduser(self.root_key_file)
-            if os.path.exists(path):
-                with open(path) as f:
-                    kd = json.load(f)
-                priv = bytes.fromhex(kd["private_key"])
-                pub = bytes.fromhex(kd["public_key"])
-                _config_logger.info("Loaded root key from %s", path)
-                return priv, pub
-            _config_logger.warning("Root key file %s not found", path)
-
-        # No key configured and admission is needed — generate ephemeral.
+        # Dev mode: generate ephemeral keypair if admission is needed.
         if not self.allow_all_consumers or not self.allow_all_producers:
             from .trust.signing import generate_root_keypair
+
             priv, pub = generate_root_keypair()
+            self._ephemeral_privkey = priv  # transient, never persisted
+            self.root_pubkey = pub
+            self._sources["root_pubkey"] = "ephemeral (dev mode)"
             _config_logger.info(
                 "Generated ephemeral root key "
-                "(set ASTER_ROOT_KEY_FILE to persist)"
+                "(set ASTER_ROOT_PUBKEY_FILE for production)"
             )
-            return priv, pub
+            return pub
 
-        # Both gates off — no key needed.
-        return None, None
+        return None
 
     def to_endpoint_config(self) -> EndpointConfig | None:
         """Build an :class:`EndpointConfig` from the network fields.
@@ -388,85 +436,212 @@ class AsterConfig:
             proxy_from_env=self.proxy_from_env,
         )
 
+    # ── print_config ─────────────────────────────────────────────────────
+
+    def print_config(self, *, json: bool = False) -> str:
+        """Render the resolved configuration with provenance and masking.
+
+        Sensitive fields (``secret_key``, ``enrollment_credential_file``)
+        are masked.  ``root_pubkey`` is public and shown in full.
+
+        Args:
+            json: If True, return a JSON string; otherwise a human-readable table.
+
+        Returns:
+            The rendered config string (also printed to stdout).
+        """
+        sections = {
+            "trust": [
+                ("root_pubkey", self._fmt_bytes(self.root_pubkey, mask=False)),
+                ("root_pubkey_file", self.root_pubkey_file or "<not set>"),
+                ("enrollment_credential_file", self._fmt_masked(self.enrollment_credential_file)),
+                ("enrollment_credential_iid", self._fmt_masked(self.enrollment_credential_iid)),
+                ("allow_all_consumers", self.allow_all_consumers),
+                ("allow_all_producers", self.allow_all_producers),
+            ],
+            "connect": [
+                ("endpoint_addr", self.endpoint_addr or "<not set>"),
+            ],
+            "network": [
+                ("secret_key", self._fmt_bytes(self.secret_key, mask=True)),
+                ("relay_mode", self.relay_mode or "<default>"),
+                ("bind_addr", self.bind_addr or "<any>"),
+                ("enable_monitoring", self.enable_monitoring),
+                ("enable_hooks", self.enable_hooks),
+            ],
+            "storage": [
+                ("path", self.storage_path or "<in-memory>"),
+            ],
+        }
+
+        if json:
+            out: dict = {}
+            for section, fields in sections.items():
+                out[section] = {}
+                for name, value in fields:
+                    source = self._sources.get(name, "default")
+                    out[section][name] = {"value": value, "source": source}
+            text = _json.dumps(out, indent=2, default=str)
+        else:
+            lines = []
+            for section, fields in sections.items():
+                lines.append(f"  [{section}]")
+                for name, value in fields:
+                    source = self._sources.get(name, "default")
+                    lines.append(f"    {name:<28s}: {value!s:<36s} ({source})")
+            text = "\n".join(lines)
+
+        print(text)
+        return text
+
+    @staticmethod
+    def _fmt_bytes(val: bytes | None, *, mask: bool) -> str:
+        if val is None:
+            return "<not set>"
+        h = val.hex()
+        if mask:
+            return f"****...{h[-8:]}" if len(h) > 8 else "****"
+        return h
+
+    @staticmethod
+    def _fmt_masked(val: str | None) -> str:
+        if val is None:
+            return "<not set>"
+        return f"****...{val[-12:]}" if len(val) > 12 else "****"
+
     # ── Factory methods ──────────────────────────────────────────────────
 
     @classmethod
     def from_env(cls) -> "AsterConfig":
         """Build config from ``ASTER_*`` environment variables only."""
-        return cls._load(toml_data=None)
+        return cls._load(toml_data=None, toml_path=None)
 
     @classmethod
     def from_file(cls, path: str | Path) -> "AsterConfig":
         """Build config from a TOML file, with env-var overrides."""
         with Path(path).open("rb") as fh:
             raw = tomllib.load(fh)
-        return cls._load(toml_data=raw)
+        return cls._load(toml_data=raw, toml_path=str(path))
 
     @classmethod
-    def _load(cls, toml_data: dict | None) -> "AsterConfig":
+    def _load(cls, toml_data: dict | None, toml_path: str | None) -> "AsterConfig":
         kwargs: dict = {}
+        sources: dict[str, str] = {}
         env = os.environ
+        toml_label = toml_path or "aster.toml"
+
+        def _set(field: str, value, source: str) -> None:
+            kwargs[field] = value
+            sources[field] = source
 
         # ── Trust (TOML [trust] section) ─────────────────────────────────
         trust = (toml_data or {}).get("trust", {})
-        if "root_key_file" in trust:
-            kwargs["root_key_file"] = str(trust["root_key_file"])
+        if "root_pubkey" in trust:
+            raw = trust["root_pubkey"]
+            _set("root_pubkey", bytes.fromhex(raw), f"{toml_label} [trust]")
+        if "root_pubkey_file" in trust:
+            _set("root_pubkey_file", str(trust["root_pubkey_file"]), f"{toml_label} [trust]")
+        if "enrollment_credential" in trust:
+            _set("enrollment_credential_file", str(trust["enrollment_credential"]), f"{toml_label} [trust]")
+        if "enrollment_credential_iid" in trust:
+            _set("enrollment_credential_iid", str(trust["enrollment_credential_iid"]), f"{toml_label} [trust]")
         if "allow_all_consumers" in trust:
-            kwargs["allow_all_consumers"] = bool(trust["allow_all_consumers"])
+            _set("allow_all_consumers", bool(trust["allow_all_consumers"]), f"{toml_label} [trust]")
         if "allow_all_producers" in trust:
-            kwargs["allow_all_producers"] = bool(trust["allow_all_producers"])
+            _set("allow_all_producers", bool(trust["allow_all_producers"]), f"{toml_label} [trust]")
+
+        # ── Connect (TOML [connect] section) ─────────────────────────────
+        connect = (toml_data or {}).get("connect", {})
+        if "endpoint_addr" in connect:
+            _set("endpoint_addr", str(connect["endpoint_addr"]), f"{toml_label} [connect]")
 
         # ── Storage (TOML [storage] section) ─────────────────────────────
         storage = (toml_data or {}).get("storage", {})
         if "path" in storage:
-            kwargs["storage_path"] = str(storage["path"])
+            _set("storage_path", str(storage["path"]), f"{toml_label} [storage]")
 
         # ── Network (TOML [network] section) ─────────────────────────────
         network = (toml_data or {}).get("network", {})
-        _NET_FIELDS = (
-            "relay_mode", "bind_addr", "portmapper_config", "proxy_url",
-        )
+        _NET_FIELDS = ("relay_mode", "bind_addr", "portmapper_config", "proxy_url")
         for f in _NET_FIELDS:
             if f in network:
-                kwargs[f] = str(network[f]) if network[f] is not None else None
+                _set(f, str(network[f]) if network[f] is not None else None, f"{toml_label} [network]")
         _NET_BOOLS = (
             "enable_monitoring", "enable_hooks",
             "clear_ip_transports", "clear_relay_transports", "proxy_from_env",
         )
         for f in _NET_BOOLS:
             if f in network:
-                kwargs[f] = bool(network[f])
+                _set(f, bool(network[f]), f"{toml_label} [network]")
         if "hook_timeout_ms" in network:
-            kwargs["hook_timeout_ms"] = int(network["hook_timeout_ms"])
+            _set("hook_timeout_ms", int(network["hook_timeout_ms"]), f"{toml_label} [network]")
         if "secret_key" in network and network["secret_key"] is not None:
-            kwargs["secret_key"] = base64.b64decode(network["secret_key"])
+            _set("secret_key", base64.b64decode(network["secret_key"]), f"{toml_label} [network]")
 
         # ── Env overrides (always win) ───────────────────────────────────
-        if (v := env.get("ASTER_ROOT_KEY_FILE")) is not None:
-            kwargs["root_key_file"] = v.strip()
+        if (v := env.get("ASTER_ROOT_PUBKEY")) is not None:
+            _set("root_pubkey", bytes.fromhex(v.strip()), "ASTER_ROOT_PUBKEY")
+        if (v := env.get("ASTER_ROOT_PUBKEY_FILE")) is not None:
+            _set("root_pubkey_file", v.strip(), "ASTER_ROOT_PUBKEY_FILE")
+        if (v := env.get("ASTER_ENROLLMENT_CREDENTIAL")) is not None:
+            _set("enrollment_credential_file", v.strip(), "ASTER_ENROLLMENT_CREDENTIAL")
+        if (v := env.get("ASTER_ENROLLMENT_CREDENTIAL_IID")) is not None:
+            _set("enrollment_credential_iid", v.strip(), "ASTER_ENROLLMENT_CREDENTIAL_IID")
+        if (v := env.get("ASTER_ENDPOINT_ADDR")) is not None:
+            _set("endpoint_addr", v.strip(), "ASTER_ENDPOINT_ADDR")
         if (v := env.get("ASTER_ALLOW_ALL_CONSUMERS")) is not None:
-            kwargs["allow_all_consumers"] = _parse_bool(v, "ASTER_ALLOW_ALL_CONSUMERS")
+            _set("allow_all_consumers", _parse_bool(v, "ASTER_ALLOW_ALL_CONSUMERS"), "ASTER_ALLOW_ALL_CONSUMERS")
         if (v := env.get("ASTER_ALLOW_ALL_PRODUCERS")) is not None:
-            kwargs["allow_all_producers"] = _parse_bool(v, "ASTER_ALLOW_ALL_PRODUCERS")
+            _set("allow_all_producers", _parse_bool(v, "ASTER_ALLOW_ALL_PRODUCERS"), "ASTER_ALLOW_ALL_PRODUCERS")
         if (v := env.get("ASTER_STORAGE_PATH")) is not None:
-            kwargs["storage_path"] = v.strip() or None
-
-        # Network env vars (reuse existing names)
-        if (v := env.get("ASTER_RELAY_MODE")) is not None:
-            kwargs["relay_mode"] = v.strip() or None
+            _set("storage_path", v.strip() or None, "ASTER_STORAGE_PATH")
         if (v := env.get("ASTER_SECRET_KEY")) is not None:
-            kwargs["secret_key"] = base64.b64decode(v.strip()) if v.strip() else None
+            _set("secret_key", base64.b64decode(v.strip()) if v.strip() else None, "ASTER_SECRET_KEY")
+        if (v := env.get("ASTER_RELAY_MODE")) is not None:
+            _set("relay_mode", v.strip() or None, "ASTER_RELAY_MODE")
         if (v := env.get("ASTER_BIND_ADDR")) is not None:
-            kwargs["bind_addr"] = v.strip() or None
+            _set("bind_addr", v.strip() or None, "ASTER_BIND_ADDR")
         for f in _NET_BOOLS:
             var = f"ASTER_{f.upper()}"
             if (v := env.get(var)) is not None:
-                kwargs[f] = _parse_bool(v, var)
+                _set(f, _parse_bool(v, var), var)
         if (v := env.get("ASTER_HOOK_TIMEOUT_MS")) is not None:
-            kwargs["hook_timeout_ms"] = int(v)
+            _set("hook_timeout_ms", int(v), "ASTER_HOOK_TIMEOUT_MS")
         for f in ("portmapper_config", "proxy_url"):
             var = f"ASTER_{f.upper()}"
             if (v := env.get(var)) is not None:
-                kwargs[f] = v.strip() or None
+                _set(f, v.strip() or None, var)
 
-        return cls(**kwargs)
+        obj = cls(**{k: v for k, v in kwargs.items() if k != "_sources"})
+        obj._sources = sources
+        return obj
+
+
+def _load_pubkey_from_file(path: str) -> bytes | None:
+    """Load a root public key from a file.
+
+    Accepts either:
+    - A plain hex string (64 chars = 32 bytes).
+    - A JSON object with a ``"public_key"`` hex field.
+    """
+    expanded = os.path.expanduser(path)
+    if not os.path.exists(expanded):
+        return None
+    with open(expanded) as f:
+        content = f.read().strip()
+    # Try JSON first.
+    if content.startswith("{"):
+        try:
+            d = _json.loads(content)
+            return bytes.fromhex(d["public_key"])
+        except (KeyError, ValueError, _json.JSONDecodeError):
+            pass
+    # Try plain hex.
+    try:
+        raw = bytes.fromhex(content)
+        if len(raw) == 32:
+            return raw
+    except ValueError:
+        pass
+    _config_logger.warning("Could not parse root pubkey from %s", path)
+    return None

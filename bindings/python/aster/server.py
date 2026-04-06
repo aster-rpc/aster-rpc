@@ -289,7 +289,10 @@ class Server:
                     task.add_done_callback(ctx.stream_tasks.discard)
 
                 except Exception as e:
-                    if not ctx.draining:
+                    msg = str(e)
+                    if ctx.draining or "normal close" in msg or "code 0" in msg:
+                        logger.debug("Connection closed: %s", msg)
+                    else:
                         logger.error("Error accepting stream: %s", e)
                     break
 

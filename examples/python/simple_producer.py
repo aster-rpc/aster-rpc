@@ -2,36 +2,37 @@
 Simple Aster Hello World Producer.
 
 Uses the declarative :class:`AsterServer` to stand up an RPC endpoint
-serving HelloService, with consumer admission gated by a root key.
+serving HelloService. Configuration is automatic via ``ASTER_*`` env vars
+or an ``aster.toml`` file.
 
-Configuration is automatic — ``AsterServer`` reads ``ASTER_*`` environment
-variables (or an ``aster.toml`` file via :class:`AsterConfig`) so application
-code doesn't need to handle key loading, endpoint wiring, or admission setup.
+─── Dev mode (no prior setup) ─────────────────────────────────────────────────
 
-─── Quick start (no prior setup) ───────────────────────────────────────────────
-
+  # Terminal 1
   python simple_producer.py
+  → Generates ephemeral root key, opens consumer gate, prints endpoint address.
 
-  → Generates an ephemeral root key, prints the endpoint address.
-  → Copy the export lines into the consumer's terminal.
+  # Terminal 2
+  ASTER_ENDPOINT_ADDR=<printed above> python simple_consumer.py
 
-─── With a stable root key ──────────────────────────────────────────────────────
+─── Production mode ───────────────────────────────────────────────────────────
 
-  # 1. Generate once:
-  aster keygen root --out ~/.aster/root.key
+  # 1. Generate root keypair (operator's machine):
+  aster keygen root --out root.key
+  aster keygen pubkey --in root.key --out root_pub.key
 
-  # 2. Run producer:
-  ASTER_ROOT_KEY_FILE=~/.aster/root.key python simple_producer.py
+  # 2. Run producer with root public key:
+  ASTER_ROOT_PUBKEY_FILE=root_pub.key python simple_producer.py
 
-  # 3. Run consumer (other terminal):
-  ASTER_ROOT_KEY_FILE=~/.aster/root.key \\
-  ASTER_ADMISSION_ADDR=<printed above> \\
-  python simple_consumer.py
+  # 3. Mint consumer credential and run consumer:
+  aster authorize consumer --root-key root.key --type policy --out consumer.token
+  ASTER_ENDPOINT_ADDR=<printed> ASTER_ENROLLMENT_CREDENTIAL=consumer.token \\
+    python simple_consumer.py
 
 Environment variables (all optional):
-  ASTER_ROOT_KEY_FILE       Path to root key JSON. Ephemeral if unset.
+  ASTER_ROOT_PUBKEY_FILE    Path to root public key. Ephemeral if unset.
   ASTER_ALLOW_ALL_CONSUMERS If "true", skip consumer admission.
   ASTER_ALLOW_ALL_PRODUCERS If "true", skip producer admission (default).
+  ASTER_SECRET_KEY          Base64 node identity key (for stable EndpointId).
 """
 from __future__ import annotations
 
@@ -59,10 +60,12 @@ async def main() -> None:
         print(f"  endpoint_addr  : {srv.endpoint_addr_b64}")
         print("╠══════════════════════════════════════════════════════════════════╣")
         print("  Run consumer with:")
-        key_file = os.environ.get("ASTER_ROOT_KEY_FILE", "<path-to-root.key>")
-        print(f"    export ASTER_ROOT_KEY_FILE={key_file}")
-        print(f"    export ASTER_ADMISSION_ADDR={srv.endpoint_addr_b64}")
+        print(f"    export ASTER_ENDPOINT_ADDR={srv.endpoint_addr_b64}")
+        if not srv._allow_all_consumers:
+            print("    export ASTER_ENROLLMENT_CREDENTIAL=consumer.token")
         print("    python simple_consumer.py")
+        if srv._allow_all_consumers:
+            print("  (dev mode: consumer gate open — no credential needed)")
         print("╚══════════════════════════════════════════════════════════════════╝")
         print()
         print("  Waiting for connections... (Ctrl+C to stop)")

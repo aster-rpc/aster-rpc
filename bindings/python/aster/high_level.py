@@ -133,16 +133,31 @@ class AsterServer:
             else config.allow_all_producers
         )
 
-        # Resolve root key: inline > config file > ephemeral.
-        priv, pub = config.resolve_root_key()
+        # Resolve root public key: inline > config file > ephemeral (dev).
+        # The root private key is NEVER on a running node (trust spec §1.1).
+        pub = config.resolve_root_pubkey()
         self._root_pubkey = root_pubkey if root_pubkey is not None else pub
-        self._root_privkey = priv
+
+        # Dev mode: if using an ephemeral root key (no explicit pubkey file),
+        # auto-open the consumer gate so the quickstart works without
+        # credential files. In production (explicit root_pubkey_file),
+        # the default allow_all_consumers=False requires credentials.
+        if (
+            config._ephemeral_privkey is not None
+            and allow_all_consumers is None
+            and config.root_pubkey_file is None
+        ):
+            self._allow_all_consumers = True
+            logger.info(
+                "Dev mode: allow_all_consumers=True (ephemeral root key). "
+                "Set ASTER_ROOT_PUBKEY_FILE for production admission."
+            )
 
         if (not self._allow_all_consumers or not self._allow_all_producers) and self._root_pubkey is None:
             raise ValueError(
                 "root_pubkey is required when admission is enabled "
                 "(allow_all_consumers=False or allow_all_producers=False). "
-                "Set ASTER_ROOT_KEY_FILE or pass root_pubkey= explicitly."
+                "Set ASTER_ROOT_PUBKEY_FILE or pass root_pubkey= explicitly."
             )
 
         self._services_in: list = list(services)
@@ -180,10 +195,11 @@ class AsterServer:
             return
 
         # Determine which aster ALPNs to register on the Router.
-        aster_alpns: list[bytes] = [RPC_ALPN]
+        # Consumer admission is ALWAYS registered — even in open-gate mode
+        # the consumer uses it to discover services.
+        aster_alpns: list[bytes] = [RPC_ALPN, ALPN_CONSUMER_ADMISSION]
         gate0_needed = False
         if not self._allow_all_consumers:
-            aster_alpns.append(ALPN_CONSUMER_ADMISSION)
             if self._hook is None:
                 self._hook = MeshEndpointHook()
             if self._nonce_store is None:
@@ -309,16 +325,19 @@ class AsterServer:
                         self._server.handle_connection(conn),
                         name="aster-rpc-conn",
                     )
-                elif alpn == ALPN_CONSUMER_ADMISSION and not self._allow_all_consumers:
-                    assert self._root_pubkey is not None
+                elif alpn == ALPN_CONSUMER_ADMISSION:
+                    # Always handle consumer admission — even when
+                    # allow_all_consumers=True the consumer needs the
+                    # services list from the admission response.
                     asyncio.create_task(
                         handle_consumer_admission_connection(
                             conn,
-                            root_pubkey=self._root_pubkey,
+                            root_pubkey=self._root_pubkey or b"\x00" * 32,
                             hook=self._hook,
                             nonce_store=self._nonce_store,
                             services_getter=lambda: services_snapshot,
                             registry_ticket_getter=lambda: self._registry_ticket,
+                            allow_unenrolled=self._allow_all_consumers,
                         ),
                         name="aster-consumer-admission-conn",
                     )
@@ -469,46 +488,58 @@ class AsterServer:
 
 
 # ── AsterClient ──────────────────────────────────────────────────────────────
-# TODO: upgrade to IrohNode.memory_with_alpns() when client-side blobs/docs/gossip
-# is needed (service discovery).
 
 
 class AsterClient:
     """High-level, declarative consumer.
 
-    Wraps credential minting, the consumer admission handshake, and RPC
-    client construction behind one async context manager.
+    Reads configuration from :class:`AsterConfig` (env vars / TOML file)
+    just like :class:`AsterServer`.  In dev mode (no credentials, ephemeral
+    producer), ``AsterClient()`` with just ``ASTER_ENDPOINT_ADDR`` set is
+    enough.  In production, set ``ASTER_ENROLLMENT_CREDENTIAL`` to the
+    path of a pre-signed token from the operator.
 
-    ``admission_addr`` may be a :class:`NodeAddr`, a base64 ``NodeAddr``
-    string (as printed by :class:`AsterServer`), or raw ``NodeAddr.to_bytes()``
+    ``endpoint_addr`` may be a base64 ``NodeAddr`` string (as printed by
+    :class:`AsterServer`), an ``EndpointId`` hex string (when discovery is
+    enabled), a :class:`NodeAddr` object, or raw ``NodeAddr.to_bytes()``
     bytes.
     """
 
     def __init__(
         self,
         *,
-        root_pubkey: bytes,
-        admission_addr: NodeAddr | str | bytes,
-        root_privkey: bytes | None = None,
-        credential: ConsumerEnrollmentCredential | None = None,
-        credential_attributes: dict[str, str] | None = None,
-        credential_ttl_seconds: int = 3600,
-        endpoint_config: EndpointConfig | None = None,
+        config: "AsterConfig | None" = None,
+        # Inline overrides (take priority over config):
+        endpoint_addr: NodeAddr | str | bytes | None = None,
+        root_pubkey: bytes | None = None,
+        enrollment_credential_file: str | None = None,
+        # Internal wiring:
         channel_name: str = "rpc",
     ) -> None:
-        if credential is None and root_privkey is None:
-            raise ValueError(
-                "AsterClient requires either root_privkey (to mint a credential) "
-                "or a pre-built credential"
-            )
+        from .config import AsterConfig
 
-        self._root_pubkey = root_pubkey
-        self._root_privkey = root_privkey
-        self._credential = credential
-        self._credential_attributes = credential_attributes or {"aster.role": "consumer"}
-        self._credential_ttl = credential_ttl_seconds
-        self._admission_addr_in = admission_addr
-        self._endpoint_config_template = endpoint_config
+        if config is None:
+            config = AsterConfig.from_env()
+        self._config = config
+
+        # Resolve endpoint address: inline > config > error.
+        addr = endpoint_addr or config.endpoint_addr
+        if addr is None:
+            raise ValueError(
+                "AsterClient requires an endpoint address. "
+                "Set ASTER_ENDPOINT_ADDR or pass endpoint_addr= explicitly."
+            )
+        self._endpoint_addr_in = addr
+
+        # Root pubkey (for optional response validation).
+        pub = config.resolve_root_pubkey()
+        self._root_pubkey = root_pubkey if root_pubkey is not None else pub
+
+        # Enrollment credential: inline > config > None (skip admission).
+        self._enrollment_credential_file = (
+            enrollment_credential_file or config.enrollment_credential_file
+        )
+        self._enrollment_credential_iid = config.enrollment_credential_iid
         self._channel_name = channel_name
 
         self._ep: Any | None = None
@@ -519,39 +550,68 @@ class AsterClient:
         self._closed: bool = False
 
     async def connect(self) -> None:
-        """Create endpoint, run admission handshake, store services. Idempotent."""
+        """Create endpoint, run admission if credential present, store services.
+
+        Idempotent — second call is a no-op.
+        """
         if self._connected:
             return
 
+        # Build endpoint with the config's secret_key for stable NodeId.
+        ep_cfg = self._config.to_endpoint_config()
         ep_config = _clone_config_with_alpns(
-            self._endpoint_config_template, [ALPN_CONSUMER_ADMISSION, RPC_ALPN]
+            ep_cfg, [ALPN_CONSUMER_ADMISSION, RPC_ALPN]
         )
         self._ep = await create_endpoint_with_config(ep_config)
 
-        cred = self._credential
-        if cred is None:
-            assert self._root_privkey is not None
-            cred = ConsumerEnrollmentCredential(
-                credential_type="policy",
-                root_pubkey=self._root_pubkey,
-                expires_at=int(time.time()) + self._credential_ttl,
-                attributes=dict(self._credential_attributes),
-            )
-            cred.signature = sign_credential(cred, self._root_privkey)
+        # Always run the admission handshake — even when the consumer gate
+        # is open, the response carries the services list + registry ticket.
+        await self._run_admission()
+        self._connected = True
 
-        admission_node_addr = _coerce_node_addr(self._admission_addr_in)
-        conn = await self._ep.connect_node_addr(admission_node_addr, ALPN_CONSUMER_ADMISSION)
+    async def _run_admission(self) -> None:
+        """Connect via ``aster.consumer_admission`` to get services.
+
+        If an enrollment credential is configured, it's presented for
+        verification.  If not (dev mode / open gate), an empty credential
+        is sent — the producer auto-admits when ``allow_all_consumers=True``.
+        """
+        assert self._ep is not None
+
+        # Load credential from file if configured, else send empty request.
+        if self._enrollment_credential_file:
+            cred = _load_enrollment_credential(self._enrollment_credential_file)
+            cred_json = consumer_cred_to_json(cred)
+        else:
+            # No credential — dev mode / open-gate flow.  Send a minimal
+            # request that the producer's admission handler will auto-accept
+            # if allow_all_consumers=True.
+            cred_json = ""
+
+        iid_token = self._enrollment_credential_iid or ""
+
+        target = _coerce_node_addr(self._endpoint_addr_in)
+        conn = await self._ep.connect_node_addr(target, ALPN_CONSUMER_ADMISSION)
         send, recv = await conn.open_bi()
-        req = ConsumerAdmissionRequest(credential_json=consumer_cred_to_json(cred))
+        req = ConsumerAdmissionRequest(
+            credential_json=cred_json,
+            iid_token=iid_token,
+        )
         await send.write_all(req.to_json().encode())
         await send.finish()
         raw = await recv.read_to_end(64 * 1024)
         resp = ConsumerAdmissionResponse.from_json(raw)
         if not resp.admitted:
-            raise PermissionError("consumer admission denied")
+            raise PermissionError(
+                "consumer admission denied — set ASTER_ENROLLMENT_CREDENTIAL "
+                "to a valid enrollment token"
+            )
 
         self._services = list(resp.services)
-        self._connected = True
+        logger.info(
+            "Admitted — services: %s",
+            [s.name for s in self._services],
+        )
 
     async def _rpc_conn_for(self, rpc_addr_b64: str) -> Any:
         if rpc_addr_b64 in self._rpc_conns:
@@ -694,6 +754,31 @@ def _clone_config_with_alpns(
             if val is not None:
                 kwargs[attr] = val
     return EndpointConfig(**kwargs)
+
+
+def _load_enrollment_credential(path: str) -> ConsumerEnrollmentCredential:
+    """Load a pre-signed ConsumerEnrollmentCredential from a JSON file.
+
+    The JSON should have been created by ``aster authorize consumer`` (CLI)
+    and contains: credential_type, root_pubkey (hex), expires_at, attributes,
+    nonce (hex, OTT only), signature (hex).
+    """
+    import json as _json
+
+    expanded = os.path.expanduser(path)
+    with open(expanded) as f:
+        d = _json.load(f)
+    nonce_hex = d.get("nonce")
+    cred = ConsumerEnrollmentCredential(
+        credential_type=d.get("credential_type", "policy"),
+        root_pubkey=bytes.fromhex(d["root_pubkey"]),
+        expires_at=int(d["expires_at"]),
+        attributes=d.get("attributes", {}),
+        endpoint_id=d.get("endpoint_id"),
+        nonce=bytes.fromhex(nonce_hex) if nonce_hex else None,
+        signature=bytes.fromhex(d.get("signature", "")),
+    )
+    return cred
 
 
 def _coerce_node_addr(addr: NodeAddr | str | bytes) -> NodeAddr:
