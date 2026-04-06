@@ -165,6 +165,7 @@ async def handle_consumer_admission_rpc(
     nonce_store: "NonceStoreProtocol | None" = None,
     services: "list[ServiceSummary] | None" = None,
     registry_ticket: str = "",
+    allow_unenrolled: bool = False,
 ) -> ConsumerAdmissionResponse:
     """Server-side handler for the ``aster.consumer_admission`` ALPN.
 
@@ -180,6 +181,8 @@ async def handle_consumer_admission_rpc(
                           Pass ``None`` or ``[]`` when no services are published.
         registry_ticket:  Read-only iroh-docs share ticket for the registry doc;
                           empty string if this node does not operate a registry.
+        allow_unenrolled: When True, auto-admit peers that present an empty
+                          credential (dev mode / ``allow_all_consumers=True``).
 
     Returns:
         ``ConsumerAdmissionResponse`` — always returned, never raises.
@@ -195,6 +198,19 @@ async def handle_consumer_admission_rpc(
     except Exception as exc:  # noqa: BLE001
         logger.warning("consumer admission: malformed request from %s: %s", peer_node_id, exc)
         return _denied
+
+    # Dev mode / open gate: empty credential → auto-admit.
+    if not req.credential_json and allow_unenrolled:
+        if hook is not None:
+            hook.add_peer(peer_node_id)
+        logger.info("consumer admission: auto-admitted %s (open gate)", peer_node_id)
+        return ConsumerAdmissionResponse(
+            admitted=True,
+            attributes={},
+            services=list(services or []),
+            registry_ticket=registry_ticket,
+            root_pubkey=root_pubkey.hex(),
+        )
 
     try:
         cred = consumer_cred_from_json(req.credential_json)
@@ -224,7 +240,8 @@ async def handle_consumer_admission_rpc(
         logger.info("consumer admission: denied %s", peer_node_id)
         return _denied
 
-    hook.add_peer(peer_node_id)
+    if hook is not None:
+        hook.add_peer(peer_node_id)
     logger.info("consumer admission: admitted %s", peer_node_id)
 
     return ConsumerAdmissionResponse(
@@ -289,6 +306,7 @@ async def handle_consumer_admission_connection(
     nonce_store: "NonceStoreProtocol | None" = None,
     services_getter: "Callable[[], list[ServiceSummary]] | None" = None,
     registry_ticket_getter: "Callable[[], str] | None" = None,
+    allow_unenrolled: bool = False,
 ) -> None:
     """Handle one consumer admission connection: read request, write response."""
     peer_node_id = conn.remote_id()
@@ -305,6 +323,7 @@ async def handle_consumer_admission_connection(
         response = await handle_consumer_admission_rpc(
             raw.decode(),
             root_pubkey=root_pubkey,
+            allow_unenrolled=allow_unenrolled,
             hook=hook,
             peer_node_id=peer_node_id,
             nonce_store=nonce_store,
