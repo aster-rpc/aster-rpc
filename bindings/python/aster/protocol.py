@@ -11,15 +11,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# Import aster_tag from codec.py to avoid duplication
-from aster.codec import aster_tag
+# Import wire_type from codec.py to avoid duplication
+from aster.codec import wire_type
 
 
 # ── Framework-internal protocol types ────────────────────────────────────────
 
 
 @dataclass
-@aster_tag("_aster/StreamHeader")
+@wire_type("_aster/StreamHeader")
 class StreamHeader:
     """First frame on every QUIC stream (HEADER flag).
 
@@ -39,7 +39,7 @@ class StreamHeader:
 
 
 @dataclass
-@aster_tag("_aster/CallHeader")
+@wire_type("_aster/CallHeader")
 class CallHeader:
     """Per-call header within a session stream (CALL flag).
 
@@ -55,7 +55,7 @@ class CallHeader:
 
 
 @dataclass
-@aster_tag("_aster/RpcStatus")
+@wire_type("_aster/RpcStatus")
 class RpcStatus:
     """Trailing status frame (TRAILER flag).
 

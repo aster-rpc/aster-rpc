@@ -3,7 +3,7 @@ Phase 4 tests: Service Definition Layer.
 
 Tests cover:
 - Decorating a test service, verify ServiceInfo and MethodInfo
-- Missing @aster_tag raises TypeError
+- Missing @wire_type raises TypeError
 - ServiceRegistry lookup by name
 - All RPC patterns (unary, server_stream, client_stream, bidi_stream)
 """
@@ -16,7 +16,7 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster.codec import aster_tag
+from aster.codec import wire_type
 from aster.types import SerializationMode
 from aster.decorators import (
     service,
@@ -38,39 +38,39 @@ from aster.service import (
 # ── Test types ───────────────────────────────────────────────────────────────
 
 
-@aster_tag("test.decorators/EchoRequest")
+@wire_type("test.decorators/EchoRequest")
 @dataclass
 class EchoRequest:
     message: str = ""
 
 
-@aster_tag("test.decorators/EchoResponse")
+@wire_type("test.decorators/EchoResponse")
 @dataclass
 class EchoResponse:
     message: str = ""
     received_at_ms: int = 0
 
 
-@aster_tag("test.decorators/CounterRequest")
+@wire_type("test.decorators/CounterRequest")
 @dataclass
 class CounterRequest:
     start: int = 0
     count: int = 5
 
 
-@aster_tag("test.decorators/StreamingResponse")
+@wire_type("test.decorators/StreamingResponse")
 @dataclass
 class StreamingResponse:
     item: int = 0
 
 
-@aster_tag("test.decorators/AggregateRequest")
+@wire_type("test.decorators/AggregateRequest")
 @dataclass
 class AggregateRequest:
     value: int = 0
 
 
-@aster_tag("test.decorators/AggregateResponse")
+@wire_type("test.decorators/AggregateResponse")
 @dataclass
 class AggregateResponse:
     total: int = 0
@@ -79,13 +79,13 @@ class AggregateResponse:
 
 @dataclass
 class UntaggedRequest:
-    """A type WITHOUT @aster_tag — should fail XLANG registration."""
+    """A type WITHOUT @wire_type — should fail XLANG registration."""
     data: str = ""
 
 
 @dataclass
 class UntaggedResponse:
-    """A type WITHOUT @aster_tag — should fail XLANG registration."""
+    """A type WITHOUT @wire_type — should fail XLANG registration."""
     value: str = ""
 
 
@@ -391,7 +391,7 @@ class TestServiceDecorator:
 class TestXlangTagValidation:
     def test_untagged_request_type_raises(self):
         """Untagged request type raises TypeError at decoration time."""
-        with pytest.raises(TypeError, match="@aster_tag"):
+        with pytest.raises(TypeError, match="@wire_type"):
             @service(name="TestService", version=1)
             class TestService:
                 @rpc
@@ -400,7 +400,7 @@ class TestXlangTagValidation:
 
     def test_untagged_response_type_raises(self):
         """Untagged response type raises TypeError at decoration time."""
-        with pytest.raises(TypeError, match="@aster_tag"):
+        with pytest.raises(TypeError, match="@wire_type"):
             @service(name="TestService", version=1)
             class TestService:
                 @rpc
@@ -409,14 +409,14 @@ class TestXlangTagValidation:
 
     def test_nested_untagged_type_raises(self):
         """Nested untagged type raises TypeError at decoration time."""
-        @aster_tag("test.decorators/NestedRequest")
+        @wire_type("test.decorators/NestedRequest")
         @dataclass
         class NestedRequest:
             inner: UntaggedRequest = field(default_factory=UntaggedRequest)
 
-        print(f"NestedRequest has __aster_tag__: {hasattr(NestedRequest, '__aster_tag__')}")
+        print(f"NestedRequest has __wire_type__: {hasattr(NestedRequest, '__wire_type__')}")
         
-        with pytest.raises(TypeError, match="@aster_tag"):
+        with pytest.raises(TypeError, match="@wire_type"):
             @service(name="TestService", version=1)
             class TestService:
                 @rpc
@@ -424,7 +424,7 @@ class TestXlangTagValidation:
                     return EchoResponse(message="")
 
     def test_native_mode_skips_tag_validation(self):
-        """NATIVE mode does not require @aster_tag."""
+        """NATIVE mode does not require @wire_type."""
         @service(name="TestService", version=1, serialization=[SerializationMode.NATIVE])
         class TestService:
             @rpc

@@ -47,12 +47,12 @@ else
 fi
 
 # ── 3. Build the Python extension via uv ───────────────────────────
-step "uv run maturin develop"
+step "Build extension + regenerate stubs"
 if command -v uv &>/dev/null; then
-    if uv run maturin develop -m bindings/python/rust/Cargo.toml; then
+    if ./scripts/build.sh; then
         pass "Build OK"
     else
-        fail "maturin develop failed"
+        fail "build.sh failed"
     fi
 else
     echo "  ⚠ uv not found — skipping build step."

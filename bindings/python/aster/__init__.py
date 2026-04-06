@@ -80,7 +80,7 @@ except ImportError as e:
         "Please build the extension with 'maturin develop' first."
     ) from e
 
-from .config import load_endpoint_config
+from .config import load_endpoint_config, AsterConfig
 
 # ── Aster RPC framework ───────────────────────────────────────────────────────
 
@@ -100,7 +100,7 @@ from .framing import (
 )
 from .protocol import StreamHeader, CallHeader, RpcStatus
 from .codec import (
-    aster_tag,
+    wire_type,
     ForyCodec,
     ForyConfig,
     DEFAULT_COMPRESSION_THRESHOLD,
@@ -215,7 +215,7 @@ __all__ = [
     "StreamHeader",
     "CallHeader",
     "RpcStatus",
-    "aster_tag",
+    "wire_type",
     "ForyCodec",
     "ForyConfig",
     "DEFAULT_COMPRESSION_THRESHOLD",
@@ -255,6 +255,7 @@ __all__ = [
     "AuditLogInterceptor",
     "MetricsInterceptor",
     # ── High-level declarative API ──
+    "AsterConfig",
     "AsterServer",
     "AsterClient",
     "RPC_ALPN",

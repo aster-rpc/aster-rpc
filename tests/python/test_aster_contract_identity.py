@@ -637,15 +637,15 @@ def test_manifest_roundtrip(tmp_path):
 
 def test_service_to_contract():
     """ServiceInfo → ServiceContract (from @service decorated class)."""
-    from aster.codec import aster_tag
+    from aster.codec import wire_type
     from aster.decorators import rpc, service
 
-    @aster_tag("test.contract/PingRequest")
+    @wire_type("test.contract/PingRequest")
     @dataclass
     class PingRequest:
         message: str
 
-    @aster_tag("test.contract/PingResponse")
+    @wire_type("test.contract/PingResponse")
     @dataclass
     class PingResponse:
         reply: str

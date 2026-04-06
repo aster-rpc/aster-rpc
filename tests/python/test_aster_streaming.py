@@ -16,7 +16,7 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster.codec import aster_tag
+from aster.codec import wire_type
 from aster.decorators import (
     bidi_stream,
     client_stream,
@@ -30,33 +30,33 @@ from aster.types import SerializationMode
 # ── Test types ────────────────────────────────────────────────────────────────
 
 
-@aster_tag("test.streaming/CountRequest")
+@wire_type("test.streaming/CountRequest")
 @dataclass
 class CountRequest:
     start: int = 0
     count: int = 5
 
 
-@aster_tag("test.streaming/CountItem")
+@wire_type("test.streaming/CountItem")
 @dataclass
 class CountItem:
     value: int = 0
 
 
-@aster_tag("test.streaming/SumItem")
+@wire_type("test.streaming/SumItem")
 @dataclass
 class SumItem:
     value: int = 0
 
 
-@aster_tag("test.streaming/SumResponse")
+@wire_type("test.streaming/SumResponse")
 @dataclass
 class SumResponse:
     total: int = 0
     count: int = 0
 
 
-@aster_tag("test.streaming/EchoChunk")
+@wire_type("test.streaming/EchoChunk")
 @dataclass
 class EchoChunk:
     text: str = ""
