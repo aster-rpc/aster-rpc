@@ -33,13 +33,18 @@ Environment variables::
     # Storage
     ASTER_STORAGE_PATH=/var/lib/aster
 
-    # Network (same as before)
+    # Network
     ASTER_RELAY_MODE=default
     ASTER_SECRET_KEY=<base64>
     ASTER_BIND_ADDR=0.0.0.0:9000
     ASTER_ENABLE_MONITORING=false
     ASTER_ENABLE_HOOKS=false
     ASTER_HOOK_TIMEOUT_MS=5000
+
+    # Logging / observability
+    ASTER_LOG_FORMAT=json|text     # default: text
+    ASTER_LOG_LEVEL=debug|info|warning|error  # default: info
+    ASTER_LOG_MASK=true|false      # mask sensitive fields, default: true
 """
 
 from __future__ import annotations
@@ -350,6 +355,20 @@ class AsterConfig:
     proxy_url: str | None = None
     proxy_from_env: bool = False
 
+    # ── Logging / observability ─────────────────────────────────────────
+
+    log_format: str = "text"
+    """Log output format: ``"json"`` for structured (k8s/ELK) or ``"text"`` for dev.
+    Env: ``ASTER_LOG_FORMAT``. TOML: ``[logging] format``."""
+
+    log_level: str = "info"
+    """Log level: ``"debug"``, ``"info"``, ``"warning"``, ``"error"``.
+    Env: ``ASTER_LOG_LEVEL``. TOML: ``[logging] level``."""
+
+    log_mask: bool = True
+    """Mask sensitive fields in logs (keys, credentials, endpoint IDs).
+    Env: ``ASTER_LOG_MASK``. TOML: ``[logging] mask``."""
+
     # ── Identity file ────────────────────────────────────────────────────
 
     identity_file: str | None = None
@@ -645,6 +664,15 @@ class AsterConfig:
         if "secret_key" in network and network["secret_key"] is not None:
             _set("secret_key", base64.b64decode(network["secret_key"]), f"{toml_label} [network]")
 
+        # ── Logging (TOML [logging] section) ─────────────────────────────
+        log_sec = (toml_data or {}).get("logging", {})
+        if "format" in log_sec:
+            _set("log_format", str(log_sec["format"]).lower(), f"{toml_label} [logging]")
+        if "level" in log_sec:
+            _set("log_level", str(log_sec["level"]).lower(), f"{toml_label} [logging]")
+        if "mask" in log_sec:
+            _set("log_mask", bool(log_sec["mask"]), f"{toml_label} [logging]")
+
         # ── Env overrides (always win) ───────────────────────────────────
         if (v := env.get("ASTER_ROOT_PUBKEY")) is not None:
             _set("root_pubkey", bytes.fromhex(v.strip()), "ASTER_ROOT_PUBKEY")
@@ -680,6 +708,14 @@ class AsterConfig:
             var = f"ASTER_{f.upper()}"
             if (v := env.get(var)) is not None:
                 _set(f, v.strip() or None, var)
+
+        # Logging env overrides
+        if (v := env.get("ASTER_LOG_FORMAT")) is not None:
+            _set("log_format", v.strip().lower(), "ASTER_LOG_FORMAT")
+        if (v := env.get("ASTER_LOG_LEVEL")) is not None:
+            _set("log_level", v.strip().lower(), "ASTER_LOG_LEVEL")
+        if (v := env.get("ASTER_LOG_MASK")) is not None:
+            _set("log_mask", _parse_bool(v, "ASTER_LOG_MASK"), "ASTER_LOG_MASK")
 
         obj = cls(**{k: v for k, v in kwargs.items() if k != "_sources"})
         obj._sources = sources

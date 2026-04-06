@@ -326,6 +326,15 @@ impl NodeHookDecisionSender {
     }
 }
 
+type AfterHandshakeRx = Arc<
+    Mutex<
+        tokio::sync::mpsc::Receiver<(
+            aster_transport_core::CoreHookHandshakeInfo,
+            tokio::sync::oneshot::Sender<CoreAfterHandshakeDecision>,
+        )>,
+    >,
+>;
+
 /// Node-level hook receiver. Obtained via `IrohNode.take_hook_receiver()`.
 /// Call `recv()` in a loop to drain after-handshake events and make Gate 0
 /// decisions; `before_connect` is auto-accepted in the background task.
@@ -333,10 +342,7 @@ impl NodeHookDecisionSender {
 pub struct NodeHookReceiver {
     /// Only the after_handshake side is exposed to Python. The
     /// before_connect side is drained by `_before_connect_task`.
-    after_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(
-        aster_transport_core::CoreHookHandshakeInfo,
-        tokio::sync::oneshot::Sender<CoreAfterHandshakeDecision>,
-    )>>>,
+    after_rx: AfterHandshakeRx,
     /// Abort handle for the background before_connect drainer.
     _before_connect_task: Arc<tokio::task::AbortHandle>,
 }

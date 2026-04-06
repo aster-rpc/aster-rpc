@@ -2,7 +2,6 @@
 ///
 /// Translated from the byte-manipulation parts of `bindings/python/aster/framing.py`.
 /// Only synchronous encode/decode — async I/O stays in each language binding.
-
 use anyhow::{bail, Result};
 
 // Flag constants

@@ -13,25 +13,25 @@ Built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs), providin
 
 ### Prerequisites
 
-- Python ≥ 3.9
+- Python >= 3.9
 - Rust toolchain (for building from source)
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 
 ### Install from source
 
 ```bash
-git clone https://github.com/user/aster-python.git
-cd aster-python
+git clone https://github.com/emrul/iroh-python.git
+cd iroh-python
 
 # Using uv (recommended)
 uv venv
 uv pip install maturin pytest pytest-asyncio pytest-timeout
-uv run maturin develop -m bindings/aster_rs/Cargo.toml
+uv run maturin develop -m bindings/python/rust/Cargo.toml
 
 # Or using pip
 # python -m venv .venv && source .venv/bin/activate
 # pip install maturin pytest pytest-asyncio pytest-timeout
-# maturin develop -m bindings/aster_rs/Cargo.toml
+# maturin develop -m bindings/python/rust/Cargo.toml
 ```
 
 ### Optional: speed up local Rust builds with sccache
@@ -131,26 +131,59 @@ async def main():
 asyncio.run(main())
 ```
 
-## Running Tests
+## Developer Setup
+
+### Full setup (build + CLI)
 
 ```bash
+uv venv
+uv pip install maturin pytest pytest-asyncio pytest-timeout pytest-rerunfailures
+uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
+uv run maturin develop -m bindings/python/rust/Cargo.toml
+uv pip install -e cli/
+```
+
+Or use the build script which also regenerates type stubs:
+
+```bash
+./scripts/build.sh
+```
+
+### Running tests
+
+```bash
+# All tests
 uv run pytest tests/python/ -v --timeout=30
+
+# Unit tests only (no networking, fast)
+uv run pytest tests/python/ -v --timeout=30 -m "not network"
+
+# Single file
+uv run pytest tests/python/test_blobs.py -v --timeout=30
 ```
 
-## Run lint locally
+### Lint / format
 
 ```bash
-cargo fmt --manifest-path bindings/aster_rs/Cargo.toml --check
-cargo clippy --manifest-path bindings/aster_rs/Cargo.toml -- -D warnings
+cargo fmt --manifest-path bindings/python/rust/Cargo.toml
+cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings
 ```
 
-## Enable pre-push checks
+### Full validation (mirrors CI)
 
 ```bash
-./scripts/install-git-hooks.sh
+./scripts/validate.sh
 ```
 
-After that, every `git push` will run `cargo fmt --check` and `cargo clippy` before pushing.
+### Pre-push hook
+
+A pre-push hook runs `cargo fmt --check` and `cargo clippy` before allowing pushes, preventing CI lint failures:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This is checked into the repo at `.githooks/pre-push` — one-time setup per clone.
 
 ## API Overview
 
@@ -166,11 +199,11 @@ After that, every `git push` will run `cargo fmt --check` and `cargo clippy` bef
 ## Architecture
 
 ```
-Python:  IrohNode.memory() → node
-         blobs_client(node)  → BlobsClient
-         docs_client(node)   → DocsClient
-         gossip_client(node) → GossipClient
-         net_client(node)    → NetClient
+Python:  IrohNode.memory() -> node
+         blobs_client(node)  -> BlobsClient
+         docs_client(node)   -> DocsClient
+         gossip_client(node) -> GossipClient
+         net_client(node)    -> NetClient
 
 Rust:    Endpoint::bind(presets::N0)
          + Router (ALPN mux)
