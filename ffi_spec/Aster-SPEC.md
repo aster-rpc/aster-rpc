@@ -1,29 +1,15 @@
+---
+title: "Aster Specification"
+sidebar_label: "Core Specification"
+sidebar_position: 1
+description: "Complete Aster RPC framework specification — transport, serialization, wire protocol, service definitions, registry, and security"
+---
+
 # Aster Specification
 
-**Version:** 0.7.2-internal-draft
-**Status:** Design Phase
-**Last Updated:** 2026-04-04
-
------
-
-## Table of Contents
-
-1. [Overview](#1-overview)
-2. [Design Rationale: Why Not gRPC?](#2-design-rationale-why-not-grpc)
-3. [Architecture](#3-architecture)
-4. [Transport Layer — Iroh FFI](#4-transport-layer--iroh-ffi)
-5. [Serialization Layer — Apache Fory](#5-serialization-layer--apache-fory)
-6. [Wire Protocol](#6-wire-protocol)
-7. [Service Definition Layer](#7-service-definition-layer)
-8. [Client and Server APIs](#8-client-and-server-apis)
-9. [Interceptors and Middleware](#9-interceptors-and-middleware)
-10. [Connection Lifecycle](#10-connection-lifecycle)
-11. [Service Registry and Discovery](#11-service-registry-and-discovery)
-12. [Security and Access Control](#12-security-and-access-control)
-13. [Conformance and Interoperability](#13-conformance-and-interoperability)
-14. [Implementation Roadmap](#14-implementation-roadmap)
-15. [Package Structure](#15-package-structure)
-16. [Open Design Questions](#16-open-design-questions)
+**Version:** 0.7.2 (tracking toward 1.0)
+**Status:** Pre-release (0.1-alpha)
+**Last Updated:** 2026-04-06
 
 -----
 
@@ -135,7 +121,7 @@ matters, object-graph serialization is needed, or HTTP/2 is dead weight.
 
 ### 3.1 Layer Model
 
-```
+```text
 ┌───────────────────────────────────────────────────────┐
 │  Layer 4: Service Definition                          │
 │  Decorators / annotations / macros (per language)     │
@@ -163,10 +149,9 @@ matters, object-graph serialization is needed, or HTTP/2 is dead weight.
 └───────────────────────────────────────────────────────┘
 ```
 
-**Interoperability boundary:** Layers 1–3 must produce identical bytes across
-all language implementations. Layer 4 must produce identical wire behaviour but
-is implemented idiomatically per language. Layer 5 uses Iroh’s own wire
-protocols and is cross-language by construction.
+:::info Interoperability Boundary
+Layers 1--3 must produce identical bytes across all language implementations. Layer 4 must produce identical wire behaviour but is implemented idiomatically per language. Layer 5 uses Iroh’s own wire protocols and is cross-language by construction.
+:::
 
 ### 3.1.1 Ownership by Layer
 
@@ -255,7 +240,7 @@ and exposes only transport concerns — no service definitions, no request or
 response object models, no language-specific futures/promises/publishers, and
 no RPC API concepts beyond the raw transport substrate.
 
-```
+```text
 Endpoint:
     bind(config?) → Endpoint
     endpoint_id → EndpointId               # This endpoint's public key
@@ -344,9 +329,9 @@ type stubs (`.pyi`) as a reference blueprint.
 |JS/TS   |NAPI via `napi-rs` → native addon |`Promise` / async-await                |TODO  |
 
 
-> **TODO:** Evaluate UniFFI as a single-source generator for Python, Kotlin, and
-> Swift bindings from the same Rust crate. This could reduce maintenance burden
-> for Phases 3–4.
+<!-- TODO: Evaluate UniFFI as a single-source generator for Python, Kotlin, and
+Swift bindings from the same Rust crate. This could reduce maintenance burden
+for Phases 3-4. -->
 
 -----
 
@@ -413,7 +398,7 @@ implementation optimisation invisible to the wire format.
 Every type used in an XLANG service must carry a canonical tag. The tag format
 is:
 
-```
+```text
 "{dotted.package}/{TypeName}"
 ```
 
@@ -458,7 +443,7 @@ hints, `contract_id` is identity).
 **IDL-defined types** derive their tag automatically from the IDL package and
 struct name. No manual declaration is required:
 
-```
+```text
 // agent_control.fdl
 package aster.agent;
 
@@ -523,7 +508,7 @@ not require cross-language type identity.
 Implementations may use numeric type IDs internally for fast in-process Fory
 registration lookups. When needed, derive numeric IDs deterministically:
 
-```
+```python
 numeric_id = int.from_bytes(blake3(tag.encode("utf-8"))[:4], "little") & 0x7FFF_FFFF
 ```
 
@@ -629,7 +614,7 @@ senders — a receiver must handle both compressed and uncompressed frames.
 When cross-language interop is required, message types are defined in Fory IDL
 (`.fdl` files) and compiled with `foryc` to generate idiomatic code per language.
 
-```
+```text
 // agent_control.fdl
 package aster.kar.agent;
 
@@ -676,7 +661,7 @@ struct ApprovalResponse {
 
 Aster extends Fory IDL with service definition blocks:
 
-```
+```text
 // agent_control.fdl (continued)
 
 service AgentControl {
@@ -709,9 +694,9 @@ Code generation from service blocks is optional per language:
 - **No codegen:** Define everything in code, register types manually
   (useful for prototyping)
 
-> **TODO:** Implement the `foryc` service block extension. Currently Fory IDL
-> only defines data types. The service block syntax, parser, and per-language
-> code generators are new work.
+<!-- TODO: Implement the foryc service block extension. Currently Fory IDL
+only defines data types. The service block syntax, parser, and per-language
+code generators are new work. -->
 
 ### 5.9 Large Payloads and Blob Capability Responses
 
@@ -746,7 +731,7 @@ and large-object distribution.
 
 #### 5.9.1 Example IDL for Blob Capability Responses
 
-```
+```text
 // transfer.fdl
 
 enum FileTransferMode {
@@ -823,7 +808,7 @@ call; the transport path it establishes is separate.
 
 #### 5.10.2 Example IDL for Tunnels
 
-```
+```text
 // tunneling.fdl
 
 enum TunnelMode {
@@ -879,14 +864,16 @@ service EdgeTransport {
 
 ## 6. Wire Protocol
 
-**This section is the interoperability contract.** All language implementations
+:::warning Interoperability Contract
+This section is the interoperability contract. All language implementations
 must produce and consume bytes conforming to this specification.
+:::
 
 ### 6.1 Stream Framing
 
 Every message on a QUIC stream is framed as:
 
-```
+```text
 ┌─────────────┬──────────┬─────────────────────┐
 │ Length       │ Flags    │ Payload             │
 │ (4B LE u32) │ (1B)     │ (Length - 1 bytes)   │
@@ -916,7 +903,7 @@ The first frame on every QUIC stream must have the `HEADER` flag set. Its
 payload is always Fory XLANG-serialized (regardless of the service’s
 serialization mode) so any language can route it:
 
-```
+```text
 StreamHeader {
     service: string             // e.g. "AgentControl"
     method: string              // e.g. "assign_task"
@@ -997,7 +984,7 @@ be called with XLANG whenever the client supports it).
 
 **Unary (`@rpc`):**
 
-```
+```text
 Client                          Server
   ├─ [HEADER] StreamHeader ────►
   ├─ Request payload ──────────►
@@ -1010,7 +997,7 @@ Client                          Server
 
 **Server stream (`@server_stream`):**
 
-```
+```text
 Client                          Server
   ├─ [HEADER] StreamHeader ────►
   ├─ Request payload ──────────►
@@ -1027,7 +1014,7 @@ Client                          Server
 
 **Client stream (`@client_stream`):**
 
-```
+```text
 Client                          Server
   ├─ [HEADER] StreamHeader ────►
   ├─ Request frame 1 ──────────►
@@ -1041,7 +1028,7 @@ Client                          Server
 
 **Bidi stream (`@bidi_stream`):**
 
-```
+```text
 Client                          Server
   ├─ [HEADER] StreamHeader ────►
   ├─ Request frame 1 ──────────►
@@ -1085,7 +1072,7 @@ client-origin TRAILER frames; session-aware parsers MUST accept them once
 
 The trailer payload is always Fory XLANG-serialized:
 
-```
+```text
 RpcStatus {
     code: int32                 // StatusCode enum value
     message: string
@@ -1115,7 +1102,7 @@ patterns to be built above it.
 
 ### 6.5 Status Codes
 
-```
+```text
 OK                    = 0
 CANCELLED             = 1
 UNKNOWN               = 2
@@ -1143,7 +1130,7 @@ should not interpret. The framework forwards these codes faithfully in trailers
 and surfaces them to the caller, but never acts on them — no retry, no circuit
 breaker trip, no special logging. Examples:
 
-```
+```text
 APPROVAL_DENIED       = 100   // Human reviewer rejected an agent action
 BUDGET_EXCEEDED       = 101   // Step or token budget exhausted for this task
 CREDENTIAL_EXPIRED    = 102   // Upstream credential no longer valid
@@ -1159,7 +1146,7 @@ logic.
 
 Aster uses a **single ALPN identifier per wire protocol version**:
 
-```
+```text
 aster/1
 ```
 
@@ -1225,7 +1212,7 @@ semantics that only the application can know.
 
 Each RPC call carries an optional absolute deadline in the `StreamHeader`:
 
-```
+```text
 deadline_epoch_ms: int64    // Absolute deadline in milliseconds since Unix epoch.
                             // 0 = no deadline imposed by this caller.
 ```
@@ -1351,8 +1338,8 @@ Each language will use idiomatic patterns:
 - **Rust:** `#[aster::service]`, `#[rpc]` proc macros
 - **TypeScript:** `@AsterService`, `@Rpc` decorators
 
-> **TODO:** Write full language-specific service definition examples for each
-> target language once Python exemplar is stable.
+<!-- TODO: Write full language-specific service definition examples for each
+target language once Python exemplar is stable. -->
 
 ### 7.6 Language Ownership of Service Definitions
 
@@ -1601,7 +1588,7 @@ class Interceptor:
 
 **`CircuitBreakerInterceptor` state machine:**
 
-```
+```text
 CLOSED ──(failure threshold reached)──► OPEN
   ▲                                       │
   │                                       │ (timeout elapsed)
@@ -1627,7 +1614,7 @@ failures; circuit breaker handles sustained degradation of a downstream service.
 
 ### 10.1 Bootstrap Flow
 
-```
+```text
 1. Service starts → Iroh endpoint binds → EndpointId derived from secret key
 2. Service joins registry namespace → publishes EndpointLease
 3. Client resolves EndpointId via registry (see §11.8)
@@ -2075,8 +2062,8 @@ expressing wire or source compatibility, breaking changes, serialization mode
 differences, and field-level diffs. Consumers may use these to warn operators
 or gate channel promotions.
 
-> **TODO:** Define the compatibility report schema and whether reports are
-> normative inputs to resolution or advisory tooling artifacts.
+<!-- TODO: Define the compatibility report schema and whether reports are
+normative inputs to resolution or advisory tooling artifacts. -->
 
 `iroh-docs` is the source of truth; gossip loss must never create incorrect
 registry state. Consumers must ignore a lease update with a lower `lease_seq`
@@ -2119,7 +2106,7 @@ class RegistryEndpointHook:
 The registry namespace uses a three-tier ACL model stored within the namespace
 itself:
 
-```
+```text
 _aster/acl/admins    → list[AuthorId]   # Can modify ACL entries
 _aster/acl/writers   → list[AuthorId]   # Can publish/update services
 _aster/acl/readers   → list[AuthorId]   # Can sync namespace (read-only)
@@ -2170,16 +2157,16 @@ class RegistryPolicy:
 |RPC auth      |Metadata tokens (interceptor-level, application-defined)|
 
 
-> **TODO:** Design the writer admission handshake. When a new service wants to
-> publish to the registry, how does it request write access? Proposed: a
-> dedicated `_aster/admission_requests/{author_id}` key where the requester
-> writes a signed request, and an admin processes it (approve → add to writers,
-> deny → delete entry).
+<!-- TODO: Design the writer admission handshake. When a new service wants to
+publish to the registry, how does it request write access? Proposed: a
+dedicated _aster/admission_requests/{author_id} key where the requester
+writes a signed request, and an admin processes it (approve -> add to writers,
+deny -> delete entry). -->
 
-> **TODO:** Define key rotation. If an admin’s AuthorId is compromised, how is
-> it revoked and replaced? The ACL is a CRDT — removing an entry requires a
-> new write from another admin, but the compromised key could also write.
-> Consider a “revocation list” pattern or a quorum requirement for ACL changes.
+<!-- TODO: Define key rotation. If an admin’s AuthorId is compromised, how is
+it revoked and replaced? The ACL is a CRDT - removing an entry requires a
+new write from another admin, but the compromised key could also write.
+Consider a “revocation list” pattern or a quorum requirement for ACL changes. -->
 
 -----
 
@@ -2189,7 +2176,7 @@ class RegistryPolicy:
 
 A language-neutral test suite validates wire format compliance:
 
-```
+```text
 tests/
 ├── wire/
 │   ├── unary_request.bin           # Valid unary (header + payload)
@@ -2212,7 +2199,7 @@ Each language implementation runs this suite. Pass = interoperates.
 
 ### 13.2 Cross-Language CI Matrix
 
-```
+```text
          Server
          Py   Rust  JVM  .NET  Go   JS
 Client
@@ -2226,8 +2213,8 @@ JS       ✓    ✓     ✓    ✓     ✓    ✓
 
 Every cell is a CI job using the echo service as the minimal interop contract.
 
-> **TODO:** Build the conformance test suite. Start with byte-level wire format
-> tests (Phase 1), add echo-service interop tests (Phase 2+).
+<!-- TODO: Build the conformance test suite. Start with byte-level wire format
+tests (Phase 1), add echo-service interop tests (Phase 2+). -->
 
 -----
 
@@ -2293,7 +2280,7 @@ Every cell is a CI job using the echo service as the minimal interop contract.
 
 ## 15. Package Structure
 
-```
+```text
 Aster/
 ├── spec/
 │   ├── SPEC.md                         # This document

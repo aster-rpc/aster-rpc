@@ -1,6 +1,15 @@
+---
+title: "Aster Session-Scoped Services"
+sidebar_label: "Session-Scoped Services"
+sidebar_position: 4
+description: "Session-scoped service model for Aster -- per-stream instances, sequential call semantics, in-band cancellation, and wire protocol extensions"
+---
+
 # Aster Spec Addendum: Session-Scoped Services
 
-**Status:** Proposal
+**Version:** 0.7.2 (tracking toward 1.0)
+**Status:** Pre-release (0.1-alpha)
+**Last Updated:** 2026-04-06
 **Applies to:** Spec v0.7.1+
 **Sections affected:** §6.1, §6.3, §7, §8, §16
 
@@ -150,7 +159,7 @@ The first frame on a session stream uses the existing `HEADER` flag (bit 2,
 `0x04`). The `StreamHeader` payload carries the service and contract identity
 as usual. A new field signals session scoping:
 
-```
+```text
 StreamHeader {
     service: string
     method: string              // Empty string "" for session-scoped streams
@@ -174,7 +183,7 @@ After the initial `StreamHeader`, each call within the session is introduced by
 a **call header frame**. This is a lightweight frame with a new flag — bit 4
 (`0x10`): `CALL` — whose payload is always Fory XLANG-serialized:
 
-```
+```text
 CallHeader {
     method: string              // e.g. "assign_task"
     call_id: string             // Unique per call (for tracing)
@@ -201,7 +210,7 @@ alternates between call headers and their associated request/response frames.
 
 ### 4.4 Session Stream Lifecycle
 
-```
+```text
 Client                                          Server
   │                                               │
   ├─ [HEADER] StreamHeader (method="") ──────────►│  instantiate service class
@@ -281,7 +290,7 @@ A cancel frame is a frame with bit 5 (`0x20`): `CANCEL` set in the flags byte.
 The payload is empty (Length = 1, Flags only). Because calls are sequential,
 there is at most one call in flight — the cancel is unambiguous.
 
-```
+```text
 ┌─────────────┬──────────┐
 │ Length: 1    │ CANCEL   │
 │ (4B LE u32) │ (0x20)   │
@@ -290,7 +299,7 @@ there is at most one call in flight — the cancel is unambiguous.
 
 ### 5.3 Cancellation Lifecycle
 
-```
+```text
 Client                                          Server
   │                                               │
   ├─ [CALL] CallHeader (method="step_updates") ──►│  handler starts
@@ -328,11 +337,9 @@ trailer with status `CANCELLED`** to terminate that call — even if another
 trailer was emitted first. The client treats CANCELLED as the authoritative
 terminator (see §5.5).
 
-The handler is responsible for leaving `self` in a consistent state after
-cancellation. The framework delivers the cancellation signal but cannot
-guarantee cleanup — this is inherent to cancellation in any system. Developers
-should use `try/finally` (or language equivalent) in handlers that acquire
-resources.
+:::warning
+The handler is responsible for leaving `self` in a consistent state after cancellation. The framework delivers the cancellation signal but cannot guarantee cleanup -- this is inherent to cancellation in any system. Developers should use `try/finally` (or language equivalent) in handlers that acquire resources.
+:::
 
 ### 5.5 Client Behaviour on CANCEL
 
@@ -457,7 +464,7 @@ async with asyncio.TaskGroup() as tg:
 
 The server accept loop gains a branch for session-scoped services:
 
-```
+```text
 1. endpoint.accept() → Connection
 2. Per connection: loop on connection.accept_bi()
 3. Per stream: read first frame (HEADER flag)
@@ -607,9 +614,11 @@ Session streams use the same `aster/1` ALPN. No new ALPN is introduced.
   and a persistent stream — these are costs, even if small. Use session scoping
   only when shared mutable state across calls is a genuine requirement.
 
-- **Not concurrent within a session.** The sequential call model is a feature,
-  not a limitation. It eliminates an entire class of concurrency bugs on shared
-  instance state. Parallelism is achieved by opening multiple sessions.
+- **Not concurrent within a session.**
+
+:::info Design Decision
+The sequential call model within a session is a feature, not a limitation. It eliminates an entire class of concurrency bugs on shared instance state. Parallelism is achieved by opening multiple sessions.
+:::
 
 ### 10.2 Deferred to v2
 
@@ -646,7 +655,7 @@ ALPN (§6.6), or any existing flag semantics.
 
 ## Appendix B: Updated Flags Byte
 
-```
+```text
 Bit 0 (0x01): COMPRESSED   — payload is zstd-compressed
 Bit 1 (0x02): TRAILER      — trailing status frame
 Bit 2 (0x04): HEADER       — stream header (first frame on stream)

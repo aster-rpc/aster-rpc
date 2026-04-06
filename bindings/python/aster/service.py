@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from aster.contract.identity import CapabilityRequirement
 from aster.types import SerializationMode
 
 if TYPE_CHECKING:
@@ -46,6 +47,7 @@ class MethodInfo:
     timeout: float | None = None
     idempotent: bool = False
     serialization: SerializationMode | None = None
+    requires: CapabilityRequirement | None = None
 
 
 @dataclass
@@ -69,6 +71,7 @@ class ServiceInfo:
     serialization_modes: list[SerializationMode] = field(default_factory=list)
     interceptors: list[type] = field(default_factory=list)
     max_concurrent_streams: int | None = None
+    requires: CapabilityRequirement | None = None
 
     def get_method(self, method_name: str) -> MethodInfo | None:
         """Get a method by name.

@@ -267,6 +267,20 @@ class ForyCodec:
 
         self._registered_types = all_types
 
+        # §5.3.1: Detect duplicate wire_type tags before registration.
+        self._tag_to_type: dict[str, type] = {}
+        for tp in all_types:
+            tag = getattr(tp, "__wire_type__", None)
+            if tag is not None:
+                existing = self._tag_to_type.get(tag)
+                if existing is not None and existing is not tp:
+                    raise ValueError(
+                        f"Duplicate wire_type tag {tag!r}: already registered "
+                        f"to {existing.__qualname__}, cannot register "
+                        f"{tp.__qualname__} with the same tag"
+                    )
+                self._tag_to_type[tag] = tp
+
         # Create the Fory instance.
         self._fory = self._create_fory_instance()
 

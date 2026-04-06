@@ -31,7 +31,9 @@ import asyncio
 import base64
 import inspect
 import logging
+import os
 import time
+import warnings
 from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
@@ -259,6 +261,108 @@ class AsterServer:
                 )
             )
         self._service_summaries = summaries
+
+        # ── C11.4.3: Startup publication verification ────────────────────
+        # If .aster/manifest.json exists, verify that each service's live
+        # contract_id matches the committed manifest. Fatal on mismatch.
+        manifest_path = os.path.join(os.getcwd(), ".aster", "manifest.json")
+        if os.path.isfile(manifest_path):
+            import json as _json
+            from .contract.manifest import ContractManifest
+
+            try:
+                with open(manifest_path, encoding="utf-8") as f:
+                    manifest_data = _json.load(f)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to read manifest at {manifest_path}: {exc}"
+                ) from exc
+
+            # Support both single manifest and list of manifests
+            manifests_list = manifest_data if isinstance(manifest_data, list) else [manifest_data]
+            manifest_by_key: dict[tuple[str, int], ContractManifest] = {}
+            for md in manifests_list:
+                m = ContractManifest(**md)
+                manifest_by_key[(m.service, m.version)] = m
+
+            for summary in summaries:
+                key = (summary.name, summary.version)
+                manifest = manifest_by_key.get(key)
+                if manifest is None:
+                    continue  # Service not in manifest — skip
+                if summary.contract_id != manifest.contract_id:
+                    raise RuntimeError(
+                        f"Contract identity mismatch for {summary.name!r} "
+                        f"v{summary.version}:\n"
+                        f"  Expected (manifest): {manifest.contract_id}\n"
+                        f"  Actual (live):       {summary.contract_id}\n"
+                        f"  Manifest: {manifest_path}\n"
+                        f"  -> The service interface has changed without "
+                        f"updating the manifest.\n"
+                        f"     Rerun `aster contract gen` and commit the "
+                        f"updated manifest."
+                    )
+            logger.debug("Manifest verification passed for %d service(s)", len(manifest_by_key))
+
+        # ── Gate 3: capability interceptor & default-deny warning ────────
+        #
+        # Build a service_name -> ServiceInfo map for the CapabilityInterceptor
+        # and check whether any service has authorization configured.
+        from .interceptors.capability import CapabilityInterceptor
+
+        svc_map: dict[str, Any] = {}
+        any_has_requires = False
+        for svc in self._services_in:
+            svc_cls = svc if inspect.isclass(svc) else type(svc)
+            info = getattr(svc_cls, "__aster_service_info__", None)
+            if info is not None:
+                svc_map[info.name] = info
+                if info.requires is not None:
+                    any_has_requires = True
+                for mi in info.methods.values():
+                    if mi.requires is not None:
+                        any_has_requires = True
+
+        # Auto-wire the CapabilityInterceptor when trust is configured
+        # (Gate 0 enabled) or when any service declares requires.
+        has_auth_interceptor = any(
+            isinstance(i, CapabilityInterceptor) for i in self._interceptors
+        )
+        if (not self._allow_all_consumers or any_has_requires) and not has_auth_interceptor:
+            # Prepend so capability is checked before application interceptors.
+            self._interceptors.insert(0, CapabilityInterceptor(svc_map))
+
+        # S12.2: default-deny startup warning.
+        # When Gate 0 is disabled (allow_all_consumers=True), any service
+        # without explicit authorization is wide open.  Emit a warning so
+        # the developer knows.
+        if self._allow_all_consumers:
+            for svc in self._services_in:
+                svc_cls = svc if inspect.isclass(svc) else type(svc)
+                info = getattr(svc_cls, "__aster_service_info__", None)
+                if info is None:
+                    continue
+                svc_has_auth = info.requires is not None
+                if not svc_has_auth:
+                    svc_has_auth = any(
+                        mi.requires is not None for mi in info.methods.values()
+                    )
+                if not svc_has_auth:
+                    # Also check if user explicitly added an auth interceptor.
+                    from .interceptors.auth import AuthInterceptor
+                    has_explicit_auth = any(
+                        isinstance(i, AuthInterceptor) for i in self._interceptors
+                    )
+                    if not has_explicit_auth:
+                        warnings.warn(
+                            f"Service '{info.name}' has no authorization configured "
+                            f"and Gate 0 is disabled (allow_all_consumers=True). "
+                            f"All consumers can call this service without "
+                            f"authentication. Add @service(requires=...) or "
+                            f"configure an auth interceptor for production use.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
 
         # Server borrows a NetClient view of the node. AsterServer owns the
         # node lifecycle, so Server must NOT close the endpoint on its own.

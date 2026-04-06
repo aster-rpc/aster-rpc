@@ -19,8 +19,57 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import subprocess
 import sys
 import time
+
+
+def _git_revision() -> str | None:
+    """Return the current HEAD commit hash, or None if not in a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _git_tag() -> str | None:
+    """Return the exact tag on HEAD, or None if untagged / not a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--exact-match"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _git_remote_url() -> str | None:
+    """Return the 'origin' remote URL, or None."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 def _import_service_class(spec: str) -> type:
@@ -134,6 +183,11 @@ def _gen_command(args: argparse.Namespace) -> int:
     if not ser_modes:
         ser_modes = ["xlang"]
 
+    # Capture VCS info
+    vcs_revision = _git_revision()
+    vcs_tag = _git_tag()
+    vcs_url = _git_remote_url()
+
     # Build manifest
     manifest = ContractManifest(
         service=service_info.name,
@@ -147,9 +201,9 @@ def _gen_command(args: argparse.Namespace) -> int:
         scoped=scoped_str,
         deprecated=False,
         semver=getattr(args, "semver", None),
-        vcs_revision=None,
-        vcs_tag=None,
-        vcs_url=None,
+        vcs_revision=vcs_revision,
+        vcs_tag=vcs_tag,
+        vcs_url=vcs_url,
         changelog=None,
         published_by="",
         published_at_epoch_ms=int(time.time() * 1000),
@@ -169,6 +223,10 @@ def _gen_command(args: argparse.Namespace) -> int:
     print(f"  Contract ID: {contract_id}")
     print(f"  Types:       {len(type_defs)}")
     print(f"  Methods:     {len(contract.methods)}")
+    if vcs_revision:
+        print(f"  VCS revision: {vcs_revision[:12]}")
+    if vcs_tag:
+        print(f"  VCS tag:      {vcs_tag}")
 
     return 0
 

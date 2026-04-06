@@ -1,5 +1,15 @@
+---
+title: "Aster Contract Identity"
+sidebar_label: "Contract Identity"
+sidebar_position: 3
+description: "Content-addressed type definitions, canonical XLANG encoding, contract hashing, and publication procedures for Aster service contracts"
+---
+
 # Contract Identity via Content-Addressed Type Definitions
 
+**Version:** 0.7.2 (tracking toward 1.0)
+**Status:** Pre-release (0.1-alpha)
+**Last Updated:** 2026-04-06
 **Replaces:** §11.2 (namespace structure update), §11.3 (contract canonicalization),
 §11.4 (contract publication). **Resolves:** Open question #10 (canonical contract encoding).
 
@@ -200,12 +210,13 @@ profile ensures byte-identical output from any conforming implementation:
 With these constraints, the same `TypeDef` value produces identical bytes from
 any conforming Fory XLANG implementation.
 
-Important: this canonical serializer is **not** identical to stock Fory struct
-serialization. Aster reuses Fory's primitive, string, bytes, and collection
+:::warning
+This canonical serializer is **not** identical to stock Fory struct serialization. Aster reuses Fory's primitive, string, bytes, and collection
 wire encodings, but defines its own field-emission order and disables all
 optional framing features not explicitly listed here. Implementations must not
 hash the output of a generic `fory.serialize(...)` call unless that call is
 configured to match this profile exactly.
+:::
 
 #### 11.3.2.1 Canonical byte layout
 
@@ -313,7 +324,7 @@ message types. They are defined using ordinary Fory IDL `message` and `enum`
 syntax so they can be parsed by the stock Fory compiler and represented in the
 normal compiler IR.
 
-```
+```text
 // _aster/registry.fdl
 package _aster;
 
@@ -454,7 +465,7 @@ sources: the service-level `ServiceContract.requires` (baseline) and the
 method-level `MethodDef.requires` (refinement). The rule is additive — the
 caller must satisfy both independently:
 
-```
+```text
 effective = conjunction(service.requires, method.requires)
 ```
 
@@ -553,7 +564,7 @@ collection root hash.
 Given this FDL (valid stock Fory IDL syntax plus Aster-specific `option`
 entries that non-Aster tooling may ignore):
 
-```
+```text
 package aster.agent;
 
 message TaskAssignment {
@@ -650,10 +661,13 @@ The canonical XLANG profile is coupled to a specific Fory XLANG wire format
 version. Before Fory reaches 1.0 and guarantees binary stability, Aster must
 pin the Fory wire version used for canonical hashing.
 
-Rule: The Aster spec version determines the Fory wire version used for
+:::info
+The Aster spec version determines the Fory wire version used for
 canonical encoding. If the Fory wire format changes incompatibly, the Aster
-spec version must be bumped and all contract hashes recomputed. This is
-acceptable during the pre-1.0 phase of both projects. After Fory 1.0,
+spec version must be bumped and all contract hashes recomputed.
+:::
+
+This is acceptable during the pre-1.0 phase of both projects. After Fory 1.0,
 canonical encoding is stable indefinitely.
 
 |Aster Spec Version|Fory Wire Version|Status    |
@@ -673,7 +687,7 @@ source of truth and lives in version control. The manifest is generated from
 that source at commit time, carries git provenance, and is embedded in the
 deployable artifact. It is never committed to the repository.
 
-```
+```text
 git repo (committed)           build artifact (gitignored / generated)
 ────────────────────           ──────────────────────────────────────
 service.py  ─────────────────► .aster/manifest.json
@@ -1149,7 +1163,7 @@ message Book {
 ```
 
 **Type graph:**
-```
+```text
 example.Author → example.Book
 example.Book   → example.Author
 ```
@@ -1205,7 +1219,7 @@ message Gamma {
 ```
 
 **Type graph:**
-```
+```text
 example.Alpha → example.Beta
 example.Beta  → example.Gamma
 example.Gamma → example.Alpha
@@ -1262,7 +1276,7 @@ message C {
 ```
 
 **Type graph:**
-```
+```text
 example.A → example.B
 example.A → example.C
 example.B → example.C

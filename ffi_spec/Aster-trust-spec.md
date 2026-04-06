@@ -1,3 +1,18 @@
+---
+title: "Aster Trust & Security Specification"
+sidebar_label: "Trust & Security"
+sidebar_position: 2
+description: "Authentication, authorization, and trust model for Aster deployments — enrollment credentials, producer mesh, consumer admission, and access control gates"
+---
+
+# Aster Trust & Security Specification
+
+**Version:** 0.7.2 (tracking toward 1.0)
+**Status:** Pre-release (0.1-alpha)
+**Last Updated:** 2026-04-06
+
+-----
+
 ## 1. Trust Foundations
 
 This specification defines the authentication and authorization model for an
@@ -14,12 +29,12 @@ The spec assumes a semi-trusted network where:
 - An attacker may observe gossip traffic, replay old messages, forge
   timestamps, or attempt to register as a producer with a stolen or fabricated
   credential.
-- The **root key is offline** — it is generated once, held securely
-  (hardware-backed where possible), and brought online only to sign enrollment
-  credentials or perform catastrophic recovery. The private root key **never**
-  touches a running mesh node.
 - Individual producer keys may be compromised; credential expiry bounds the
   blast radius.
+
+:::danger Root Key Security
+The root key is offline -- it is generated once, held securely (hardware-backed where possible), and brought online only to sign enrollment credentials or perform catastrophic recovery. The private root key **never** touches a running mesh node.
+:::
 
 ### 1.2 Trust Anchors
 
@@ -36,7 +51,8 @@ Every credential carries: the root public key it is anchored to, an expiry,
 an attribute set (`aster.role`, cloud IID claims, application-specific keys),
 and an ed25519 signature covering the canonical concatenation of its fields.
 
-**Network-level controls are out of scope.** The framework does not verify
+:::note Network-Level Controls
+Network-level controls are out of scope. The framework does not verify
 source IP addresses, enforce CIDR allowlists, or perform any filtering
 keyed on network topology. Iroh uses EndpointId (ed25519 public key) as the
 stable cryptographic peer identity; source IPs are ephemeral and may be
@@ -46,6 +62,7 @@ SHOULD enforce them at the network boundary (VPN, firewall, network policy)
 or via custom admission callbacks using application-namespaced attributes
 (e.g. `app.allowed_cidrs`) with their own runtime interpretation — the
 spec does not define semantics for such attributes.
+:::
 
 ### 1.3 Gate Model
 
@@ -152,7 +169,7 @@ does not produce an error or duplicate entry.
 
 **CLI workflow**
 
-```
+```bash
 # One-time: generate the node's stable producer key
 aster keygen producer → node.key      # produces a stable NodeId
 
@@ -177,7 +194,7 @@ policy that runtime checks must satisfy.
 
 **Structure**
 
-```
+```text
 EnrollmentCredential {
     endpoint_id:  EndpointId        // the endpoint being authorized
     root_pubkey:  PublicKey         // the root key's public key
@@ -245,7 +262,7 @@ credential at connection time.
 
 The producer gossip topic ID is deterministic given the root public key and salt:
 
-```
+```text
 TopicId = blake3(root_public_key || "aster-producer-mesh" || salt)
 ```
 
@@ -354,7 +371,7 @@ requirement.
 
 Every message on the producer gossip channel has a common envelope:
 
-```
+```text
 ProducerMessage {
     type:      uint8
     payload:   binary
@@ -516,11 +533,9 @@ granting elevated capabilities to a node whose IID confirms it is running in a
 trusted cloud account. The enrollment credential does not bypass this gate; it
 is an input to it.
 
-> **Framework invariant:** If a service omits `Authorize`, the framework MUST
-> default-deny — callers receive `PERMISSION_DENIED` at session open time. A
-> service with no `Authorize` handler is not an open service; it is a broken
-> service. To create an open service, implement an explicit `allow_all`
-> authorizer that mints an rcan unconditionally.
+:::warning Framework Invariant
+If a service omits `Authorize`, the framework MUST default-deny -- callers receive `PERMISSION_DENIED` at session open time. A service with no `Authorize` handler is not an open service; it is a broken service. To create an open service, implement an explicit `allow_all` authorizer that mints an rcan unconditionally.
+:::
 
 **Gate 3 — Method dispatch (call time, every call)**
 
@@ -547,7 +562,7 @@ The service is the intentional bridge between the enrollment gates (operator
 trust) and Gate 3 (method-level enforcement). This keeps the framework generic
 and the policy in the service where the domain logic lives.
 
-```
+```text
 Consumer enrollment cred  →  Gate 0 (admission/EndpointHooks)  →  NodeID in allowlist + attrs on CallContext
 Producer enrollment cred  →  Gate 1 (mesh join)                →  attrs on CallContext
 Token / attrs             →  Gate 2 (Authorize)                →  rcan with capability list
@@ -583,7 +598,7 @@ within 90 minutes MAY be treated as stale by peers.
 When a producer receives a message from a peer, it computes the peer's apparent
 clock offset:
 
-```
+```text
 offset = peer.epoch_ms - local_wall_clock_ms
 ```
 
@@ -714,7 +729,7 @@ are permitted to reach services in this mesh.
 
 **Credential structure**
 
-```
+```text
 ConsumerEnrollmentCredential {
     credential_type: enum { Policy=0, OTT=1 }
     endpoint_id:     EndpointId?        // absent in Policy credentials
@@ -728,7 +743,7 @@ ConsumerEnrollmentCredential {
 
 **Canonical signing bytes (normative):**
 
-```
+```text
 u8(credential_type)                        // 0 = Policy, 1 = OTT
 || u8(has_endpoint_id) || endpoint_id?     // 0x00 if absent; 0x01 || 32 bytes if present
 || root_pubkey                             // 32 bytes
@@ -781,7 +796,7 @@ uniform randomness, e.g. `secrets.token_bytes(32)` in Python,
 
 **CLI workflow**
 
-```
+```bash
 # Policy credential: any node with matching IID in account 123456789012 may join
 aster authorize consumer --root-key ./root.key \
     --type policy \
@@ -893,7 +908,7 @@ one producer endpoint accepting consumer admissions.
 The response returned to a consumer on successful admission MUST contain the
 following fields:
 
-```
+```text
 ConsumerAdmissionResponse {
     admitted:        bool                  // true on success
     attributes:      map<string, string>   // verified attributes echo
@@ -939,10 +954,12 @@ Gate 0 is the mandatory connection filter for production Aster nodes. It is
 implemented via Iroh's `EndpointHooks` and runs before any application data is
 read from a connection.
 
-**Default posture is closed.** Production Aster nodes MUST configure
+:::danger Default Posture
+Production Aster nodes MUST configure
 `EndpointHooks` to reject connections from NodeIDs that are not in the admitted
 peer set, with the sole exception of the `aster.consumer_admission` ALPN (which
 must remain open to allow credential presentation).
+:::
 
 ```python
 class MeshEndpointHook:
@@ -983,9 +1000,9 @@ is the only control that prevents this class of access.
 can issue blob fetch requests by hash. Gate 2 and Gate 3 do not apply to blob
 fetches — they govern RPC sessions only.
 
-**Gate 0 is the only blob access control.** Operators who store sensitive blobs
-on Aster nodes MUST enforce Gate 0. Without Gate 0, any node that knows a blob
-hash and a NodeID can fetch the blob.
+:::warning
+Gate 0 is the only blob access control. Operators who store sensitive blobs on Aster nodes MUST enforce Gate 0. Without Gate 0, any node that knows a blob hash and a NodeID can fetch the blob.
+:::
 
 **Defense-in-depth with authenticated blob refs.** For blobs that must not be
 reachable even by admitted consumers without explicit authorization, use the

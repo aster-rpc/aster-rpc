@@ -47,6 +47,7 @@ from typing import (
     TypeVar,
 )
 
+from aster.contract.identity import CapabilityRequirement
 from aster.types import SerializationMode
 from aster.service import MethodInfo, ServiceInfo
 
@@ -159,10 +160,12 @@ class _RpcDecorator:
         timeout: float | None = None,
         idempotent: bool = False,
         serialization: SerializationMode | None = None,
+        requires: CapabilityRequirement | None = None,
     ):
         self._timeout = timeout
         self._idempotent = idempotent
         self._serialization = serialization
+        self._requires = requires
 
     def __call__(
         self,
@@ -170,6 +173,7 @@ class _RpcDecorator:
         timeout: float | None = None,
         idempotent: bool | None = None,
         serialization: SerializationMode | None = None,
+        requires: CapabilityRequirement | None = None,
         **kwargs: Any,
     ) -> Callable[P, Any]:
         # Handle @rpc(...) - return a new configured decorator instance.
@@ -178,13 +182,15 @@ class _RpcDecorator:
                 timeout=timeout if timeout is not None else self._timeout,
                 idempotent=idempotent if idempotent is not None else self._idempotent,
                 serialization=serialization if serialization is not None else self._serialization,
+                requires=requires if requires is not None else self._requires,
             )
-        
+
         # Get the method - merge options
         final_timeout = timeout if timeout is not None else self._timeout
         final_idempotent = idempotent if idempotent is not None else self._idempotent
         final_serial = serialization if serialization is not None else self._serialization
-        
+        final_requires = requires if requires is not None else self._requires
+
         if not asyncio.iscoroutinefunction(method):
             raise TypeError(
                 f"@rpc method {method.__name__} must be an async function"
@@ -198,6 +204,7 @@ class _RpcDecorator:
             timeout=final_timeout,
             idempotent=final_idempotent,
             serialization=final_serial,
+            requires=final_requires,
         )
         setattr(method, _METHOD_INFO_ATTR, method_info)
         return method
@@ -433,11 +440,13 @@ def _apply_bidi_stream_decorator(
 def service(
     name_or_cls=None,
     *,
+    name: str | None = None,
     version: int = 1,
     serialization: list[SerializationMode] | SerializationMode | None = None,
     scoped: str = "shared",
     interceptors: list[type] | None = None,
     max_concurrent_streams: int | None = None,
+    requires: CapabilityRequirement | None = None,
 ) -> Callable[[type], type] | type:
     """Class decorator to mark a class as an Aster RPC service.
 
@@ -445,11 +454,13 @@ def service(
 
         @service                                  # bare — name = class name
         @service("AgentControl")                  # explicit name
+        @service(name="AgentControl", version=2)  # keyword name
         @service(version=2, scoped="stream")      # keyword-only, name = class name
 
     Args:
         name_or_cls: Service name (str), or the class itself when used as
             bare ``@service`` without parentheses. Defaults to the class name.
+        name: Explicit service name (keyword-only alias for name_or_cls).
         version: The service version (default: 1).
         serialization: Supported serialization modes. Defaults to [XLANG].
         scoped: Service scope: "shared" or "stream". Default "shared".
@@ -459,6 +470,10 @@ def service(
     Returns:
         A decorator function (or the decorated class if used bare).
     """
+    # Merge positional name_or_cls with keyword name=
+    if name is not None and name_or_cls is None:
+        name_or_cls = name
+
     # @service (bare, no parens) — name_or_cls is the class itself
     if isinstance(name_or_cls, type):
         return _apply_service_decorator(
@@ -469,6 +484,7 @@ def service(
             scoped=scoped,
             interceptors=interceptors,
             max_concurrent_streams=max_concurrent_streams,
+            requires=requires,
         )
 
     # @service() or @service("Foo") or @service(name="Foo", version=2)
@@ -483,6 +499,7 @@ def service(
             scoped=scoped,
             interceptors=interceptors,
             max_concurrent_streams=max_concurrent_streams,
+            requires=requires,
         )
 
     return decorator
@@ -497,6 +514,7 @@ def _apply_service_decorator(
     scoped: str,
     interceptors: list[type] | None,
     max_concurrent_streams: int | None,
+    requires: CapabilityRequirement | None = None,
 ) -> type:
     """Internal: apply the @service decorator logic to a class."""
     if not isinstance(cls, type):
@@ -529,6 +547,7 @@ def _apply_service_decorator(
         serialization_modes=list(serialization),
         interceptors=list(interceptors) if interceptors else [],
         max_concurrent_streams=max_concurrent_streams,
+        requires=requires,
     )
     setattr(cls, _SERVICE_INFO_ATTR, service_info)
 

@@ -83,11 +83,39 @@ class ServiceClient:
         """The service version."""
         return self._service_info.version
 
+    # Default set of modes the client can handle.  Covers all standard modes.
+    _CLIENT_SUPPORTED_MODES: set[SerializationMode] = {
+        SerializationMode.XLANG,
+        SerializationMode.NATIVE,
+    }
+
     def _get_deadline(self, timeout: float | None) -> int:
         """Convert a timeout to deadline_epoch_ms."""
         if timeout is None:
             return 0
         return int((time.time() + timeout) * 1000)
+
+    def _resolve_serialization_mode(
+        self,
+        method_info: MethodInfo,
+        override: SerializationMode | None,
+    ) -> int:
+        """Resolve the serialization mode for a call per spec S6.2.1.
+
+        Priority:
+        1. Explicit per-call override
+        2. Method-level annotation
+        3. Negotiated from the producer's preference list
+        """
+        if override is not None:
+            return override.value
+        if method_info.serialization is not None:
+            return method_info.serialization.value
+        negotiated = _negotiate_serialization_mode(
+            self._service_info.serialization_modes,
+            self._CLIENT_SUPPORTED_MODES,
+        )
+        return negotiated.value
 
     def _build_context(
         self,
@@ -194,13 +222,7 @@ class ServiceClient:
     ) -> Any:
         """Make a unary RPC call."""
         deadline = self._get_deadline(timeout)
-        serialization_mode = (
-            serialization_override.value
-            if serialization_override
-            else method_info.serialization.value
-            if method_info.serialization
-            else self._service_info.serialization_modes[0].value
-        )
+        serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
         contract_id = getattr(self._service_info, "contract_id", "") or ""
         ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
 
@@ -227,13 +249,7 @@ class ServiceClient:
     ) -> AsyncIterator[Any]:
         """Make a server-streaming RPC call."""
         deadline = self._get_deadline(timeout)
-        serialization_mode = (
-            serialization_override.value
-            if serialization_override
-            else method_info.serialization.value
-            if method_info.serialization
-            else self._service_info.serialization_modes[0].value
-        )
+        serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
         contract_id = getattr(self._service_info, "contract_id", "") or ""
 
         ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
@@ -270,13 +286,7 @@ class ServiceClient:
     ) -> Any:
         """Make a client-streaming RPC call."""
         deadline = self._get_deadline(timeout)
-        serialization_mode = (
-            serialization_override.value
-            if serialization_override
-            else method_info.serialization.value
-            if method_info.serialization
-            else self._service_info.serialization_modes[0].value
-        )
+        serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
         contract_id = getattr(self._service_info, "contract_id", "") or ""
 
         ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
@@ -307,13 +317,7 @@ class ServiceClient:
     ) -> BidiChannel:
         """Make a bidirectional-streaming RPC call."""
         deadline = self._get_deadline(timeout)
-        serialization_mode = (
-            serialization_override.value
-            if serialization_override
-            else method_info.serialization.value
-            if method_info.serialization
-            else self._service_info.serialization_modes[0].value
-        )
+        serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
         contract_id = getattr(self._service_info, "contract_id", "") or ""
 
         ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
@@ -669,6 +673,26 @@ class RpcPattern:
     SERVER_STREAM = "server_stream"
     CLIENT_STREAM = "client_stream"
     BIDI_STREAM = "bidi_stream"
+
+
+def _negotiate_serialization_mode(
+    producer_modes: list[SerializationMode],
+    client_modes: set[SerializationMode],
+) -> SerializationMode:
+    """Select serialization mode per spec S6.2.1.
+
+    Walks the producer's preference list and picks the first mode the client
+    also supports. Falls back to the producer's first advertised mode if there
+    is no overlap (server will reject with INVALID_ARGUMENT if truly
+    unsupported).
+    """
+    for mode in producer_modes:
+        if mode in client_modes:
+            return mode
+    # Fallback: use producer's first preference
+    if producer_modes:
+        return producer_modes[0]
+    return SerializationMode.XLANG
 
 
 def time_sleep(delay: float):
