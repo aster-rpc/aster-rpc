@@ -37,6 +37,34 @@ from aster.transport.base import (
 if TYPE_CHECKING:
     import aster
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Keywords in exception messages that indicate a QUIC stream/connection reset.
+_RESET_KEYWORDS = (
+    "reset",
+    "stream reset",
+    "connection reset",
+    "RESET_STREAM",
+    "connection lost",
+    "connection closed",
+)
+
+
+def _map_transport_exception(exc: Exception) -> Exception:
+    """Map QUIC/Iroh transport exceptions to appropriate RpcError per spec S6.7.
+
+    QUIC RESET_STREAM and connection-level resets are mapped to
+    ``StatusCode.UNAVAILABLE`` so callers see a retriable error.
+    """
+    if isinstance(exc, RpcError):
+        return exc
+    msg = str(exc).lower()
+    if any(kw in msg for kw in _RESET_KEYWORDS) or isinstance(exc, (ConnectionError, ConnectionLostError)):
+        return RpcError(StatusCode.UNAVAILABLE, f"stream reset by peer: {exc}")
+    return exc
+
 
 # ── Helper functions ─────────────────────────────────────────────────────────
 
@@ -190,13 +218,19 @@ class IrohTransport(Transport):
 
             return response_payload
 
+        except RpcError:
+            try:
+                recv.stop(1)
+            except Exception:
+                pass
+            raise
         except Exception as e:
             # Ensure stream is stopped on error
             try:
                 recv.stop(1)
             except Exception:
                 pass
-            raise
+            raise _map_transport_exception(e) from e
         finally:
             # Close send side (if not already closed by finish())
             try:
@@ -283,15 +317,25 @@ class IrohTransport(Transport):
                         )
                     break
 
+                # §5.5.2: Consume ROW_SCHEMA frame (first frame in ROW mode)
+                if flags & ROW_SCHEMA:
+                    continue
+
                 compressed = bool(flags & COMPRESSED)
                 yield self._codec.decode_compressed(payload, compressed)
 
-        except Exception as e:
+        except RpcError:
             try:
                 recv.stop(1)
             except Exception:
                 pass
             raise
+        except Exception as e:
+            try:
+                recv.stop(1)
+            except Exception:
+                pass
+            raise _map_transport_exception(e) from e
 
     # ── Client Streaming ───────────────────────────────────────────────────
 
@@ -369,12 +413,18 @@ class IrohTransport(Transport):
 
             return response_payload
 
-        except Exception as e:
+        except RpcError:
             try:
                 recv.stop(1)
             except Exception:
                 pass
             raise
+        except Exception as e:
+            try:
+                recv.stop(1)
+            except Exception:
+                pass
+            raise _map_transport_exception(e) from e
 
     # ── Bidirectional Streaming ───────────────────────────────────────────
 
@@ -510,7 +560,11 @@ class IrohBidiChannel(BidiChannel):
                         dict(zip(status.detail_keys, status.detail_values)),
                     )
                 raise ConnectionLostError("stream ended after trailer")
-            
+
+            # §5.5.2: Consume ROW_SCHEMA frame (first frame in ROW mode)
+            if flags & ROW_SCHEMA:
+                continue
+
             compressed = bool(flags & COMPRESSED)
             return self._codec.decode_compressed(payload, compressed)
 

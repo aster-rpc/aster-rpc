@@ -2,6 +2,7 @@
 
 from aster.interceptors.audit import AuditLogInterceptor
 from aster.interceptors.auth import AuthInterceptor
+from aster.interceptors.capability import CapabilityInterceptor
 from aster.interceptors.base import (
     CallContext,
     Interceptor,
@@ -13,6 +14,7 @@ from aster.interceptors.base import (
     normalize_error,
 )
 from aster.interceptors.circuit_breaker import CircuitBreakerInterceptor
+from aster.interceptors.compression import CompressionInterceptor
 from aster.interceptors.deadline import DeadlineInterceptor
 from aster.interceptors.metrics import MetricsInterceptor
 from aster.interceptors.retry import RetryInterceptor
@@ -30,6 +32,8 @@ __all__ = [
     "AuthInterceptor",
     "RetryInterceptor",
     "CircuitBreakerInterceptor",
+    "CompressionInterceptor",
     "AuditLogInterceptor",
+    "CapabilityInterceptor",
     "MetricsInterceptor",
 ]

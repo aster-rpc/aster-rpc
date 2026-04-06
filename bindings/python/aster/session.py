@@ -738,6 +738,39 @@ class SessionStub:
         """Close the session (client-side)."""
         await self._send.finish()
 
+    async def cancel(self) -> None:
+        """Cancel the current in-flight call (SS5.5).
+
+        Sends a CANCEL frame on the session stream, then drains and
+        discards response frames until the server responds with a
+        TRAILER carrying StatusCode.CANCELLED.  This ensures the
+        session stream is left in a clean state for subsequent calls.
+        """
+        async with self._lock:
+            # Send CANCEL frame (empty payload)
+            await write_frame(self._send, b"", flags=CANCEL)
+
+            # Drain frames until we receive a CANCELLED trailer
+            while True:
+                frame = await read_frame(self._recv)
+                if frame is None:
+                    # Stream ended without a CANCELLED trailer
+                    break
+                payload, flags = frame
+                if flags & TRAILER:
+                    # Got the trailer — verify it's CANCELLED and stop draining
+                    try:
+                        status: RpcStatus = self._codec.decode(payload, RpcStatus)
+                        if status.code != StatusCode.CANCELLED:
+                            logger.debug(
+                                "Expected CANCELLED trailer after cancel, got code=%s",
+                                status.code,
+                            )
+                    except Exception:
+                        pass
+                    break
+                # Discard any data frames that arrive before the trailer
+
     async def _call_unary(self, method_info: MethodInfo, request: Any, metadata: dict | None = None, timeout: float | None = None) -> Any:
         async with self._lock:
             # Write CALL frame

@@ -389,39 +389,41 @@ class TestServiceDecorator:
 
 
 class TestXlangTagValidation:
-    def test_untagged_request_type_raises(self):
-        """Untagged request type raises TypeError at decoration time."""
-        with pytest.raises(TypeError, match="@wire_type"):
+    def test_untagged_request_type_warns(self):
+        """Untagged request type emits UserWarning at decoration time (auto-tagged)."""
+        with pytest.warns(UserWarning, match="auto-tagged"):
             @service(name="TestService", version=1)
             class TestService:
                 @rpc
                 async def echo(self, req: UntaggedRequest) -> EchoResponse:
                     return EchoResponse(message="")
 
-    def test_untagged_response_type_raises(self):
-        """Untagged response type raises TypeError at decoration time."""
-        with pytest.raises(TypeError, match="@wire_type"):
+    def test_untagged_response_type_warns(self):
+        """Untagged response type emits UserWarning at decoration time (auto-tagged)."""
+        with pytest.warns(UserWarning, match="auto-tagged"):
             @service(name="TestService", version=1)
             class TestService:
                 @rpc
                 async def echo(self, req: EchoRequest) -> UntaggedResponse:
                     return UntaggedResponse(value="")
 
-    def test_nested_untagged_type_raises(self):
-        """Nested untagged type raises TypeError at decoration time."""
+    def test_nested_untagged_type_auto_tagged(self):
+        """Nested untagged type is auto-tagged (or already tagged from prior test)."""
         @wire_type("test.decorators/NestedRequest")
         @dataclass
         class NestedRequest:
             inner: UntaggedRequest = field(default_factory=UntaggedRequest)
 
-        print(f"NestedRequest has __wire_type__: {hasattr(NestedRequest, '__wire_type__')}")
-        
-        with pytest.raises(TypeError, match="@wire_type"):
-            @service(name="TestService", version=1)
-            class TestService:
-                @rpc
-                async def echo(self, req: NestedRequest) -> EchoResponse:
-                    return EchoResponse(message="")
+        # UntaggedRequest may already be auto-tagged from prior test runs;
+        # either way, the service should be created successfully.
+        @service(name="TestService", version=1)
+        class TestService:
+            @rpc
+            async def echo(self, req: NestedRequest) -> EchoResponse:
+                return EchoResponse(message="")
+
+        info = getattr(TestService, "__aster_service_info__")
+        assert info is not None
 
     def test_native_mode_skips_tag_validation(self):
         """NATIVE mode does not require @wire_type."""

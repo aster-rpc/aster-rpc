@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from aster.codec import ForyCodec, ForyConfig
-from aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
+from aster.framing import HEADER, TRAILER, COMPRESSED, CANCEL, ROW_SCHEMA, write_frame, read_frame
 from aster.interceptors.base import (
     apply_error_interceptors,
     apply_request_interceptors,
@@ -502,13 +502,20 @@ class Server:
         recv: Any,
         expected_type: type | None,
     ) -> tuple[Any, int] | tuple[None, None]:
-        frame = await read_frame(recv)
-        if frame is None:
-            return None, None
-        payload, flags = frame
-        compressed = bool(flags & COMPRESSED)
-        request = self._codec.decode_compressed(payload, compressed, expected_type)
-        return request, flags
+        while True:
+            frame = await read_frame(recv)
+            if frame is None:
+                return None, None
+            payload, flags = frame
+            # §5.6 / §SS5.6: CANCEL on a non-session stream is ignored
+            if flags & CANCEL:
+                logger.warning(
+                    "CANCEL frame received on non-session stream; ignoring per spec §5.6"
+                )
+                continue
+            compressed = bool(flags & COMPRESSED)
+            request = self._codec.decode_compressed(payload, compressed, expected_type)
+            return request, flags
 
     async def _handle_unary(
         self,
@@ -590,6 +597,16 @@ class Server:
             if asyncio.iscoroutine(response_iter):
                 response_iter = await response_iter
 
+            # §5.5.2: ROW_SCHEMA hoisting — send schema frame before first data frame
+            row_schema_sent = False
+            if header.serialization_mode == SerializationMode.ROW.value:
+                try:
+                    schema_bytes = self._codec.encode_row_schema()
+                    await write_frame(send, schema_bytes, flags=ROW_SCHEMA)
+                    row_schema_sent = True
+                except (ValueError, NotImplementedError):
+                    pass  # Not in ROW mode or schema not available
+
             # Stream responses
             async for response in response_iter:
                 response = await apply_response_interceptors(interceptors, call_ctx, response)
@@ -637,6 +654,12 @@ class Server:
                 payload, flags = frame
                 if flags & TRAILER:
                     break
+                # §5.6 / §SS5.6: CANCEL on a non-session stream is ignored
+                if flags & CANCEL:
+                    logger.warning(
+                        "CANCEL frame received on non-session stream; ignoring per spec §5.6"
+                    )
+                    continue
 
                 compressed = bool(flags & COMPRESSED)
                 request = self._codec.decode_compressed(payload, compressed, method_info.request_type)
@@ -706,6 +729,14 @@ class Server:
                 self._bidi_reader(recv, method_info.request_type, request_queue, request_done, interceptors, call_ctx)
             )
 
+            # §5.5.2: ROW_SCHEMA hoisting — send schema frame before first data frame
+            if header.serialization_mode == SerializationMode.ROW.value:
+                try:
+                    schema_bytes = self._codec.encode_row_schema()
+                    await write_frame(send, schema_bytes, flags=ROW_SCHEMA)
+                except (ValueError, NotImplementedError):
+                    pass  # Not in ROW mode or schema not available
+
             # Stream responses from handler
             async for response in response_iter:
                 response = await apply_response_interceptors(interceptors, call_ctx, response)
@@ -751,6 +782,12 @@ class Server:
                 payload, flags = frame
                 if flags & TRAILER:
                     break
+                # §5.6 / §SS5.6: CANCEL on a non-session stream is ignored
+                if flags & CANCEL:
+                    logger.warning(
+                        "CANCEL frame received on non-session stream; ignoring per spec §5.6"
+                    )
+                    continue
 
                 compressed = bool(flags & COMPRESSED)
                 request = self._codec.decode_compressed(payload, compressed, request_type)
