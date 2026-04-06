@@ -58,18 +58,27 @@ class ForyConfig:
         return kwargs
 
 
-# ── @aster_tag decorator ──────────────────────────────────────────────────────
+# ── @wire_type decorator ─────────────────────────────────────────────────────
 
 
-def aster_tag(tag: str):
-    """Attach a Fory XLANG type tag to a dataclass.
+def wire_type(tag: str):
+    """Declare a stable wire identity for a dataclass.
 
     The *tag* string is split on the last ``/`` into
-    ``(__fory_namespace__, __fory_typename__)``.  If there is no ``/``
+    ``(namespace, typename)``.  If there is no ``/``
     the namespace is the empty string.
 
-    For XLANG mode, every user-defined type that appears in an RPC
-    method signature **must** be decorated with ``@aster_tag``.
+    Use ``@wire_type`` when you need explicit control over the wire
+    identity of a type (production services, cross-language compat).
+    If omitted, the ``@service`` decorator auto-derives a tag from the
+    module + class name at decoration time.
+
+    Example::
+
+        @wire_type("billing/Invoice")
+        @dataclass
+        class Invoice:
+            amount: float = 0.0
     """
 
     def decorator(cls):
@@ -80,10 +89,28 @@ def aster_tag(tag: str):
         else:
             cls.__fory_namespace__ = ""
             cls.__fory_typename__ = tag
-        cls.__aster_tag__ = tag
+        cls.__wire_type__ = tag
         return cls
 
     return decorator
+
+
+def _auto_apply_wire_type(cls: type) -> None:
+    """Apply a module-based default wire identity to a dataclass.
+
+    Default tag: ``{cls.__module__}.{cls.__qualname__}``
+
+    Module-based (not service-name-based) because:
+    - Globally unique without depending on which service uses the type
+    - Stable across service renames
+    - Same identity Python itself uses for pickling
+    """
+    module = cls.__module__ or ""
+    qualname = cls.__qualname__
+    tag = f"{module}.{qualname}" if module else qualname
+    cls.__wire_type__ = tag
+    cls.__fory_namespace__ = module
+    cls.__fory_typename__ = qualname
 
 
 # ── Type-graph walking ───────────────────────────────────────────────────────
@@ -158,17 +185,17 @@ def _walk_type_graph(root_types: list[type]) -> list[type]:
 
 
 def _validate_xlang_tags(types: list[type]) -> None:
-    """Raise ``TypeError`` if any dataclass type lacks a ``@aster_tag``.
+    """Raise ``TypeError`` if any dataclass type lacks a ``@wire_type``.
 
     Only called for XLANG mode where tag-based registration is required.
     """
     for tp in types:
         if not dataclasses.is_dataclass(tp):
             continue
-        if not hasattr(tp, "__aster_tag__"):
+        if not hasattr(tp, "__wire_type__"):
             raise TypeError(
                 f"Type {tp.__qualname__} is used in XLANG mode but has no "
-                f"@aster_tag decorator. All types must be tagged for XLANG "
+                f"@wire_type decorator. All types must be tagged for XLANG "
                 f"serialization."
             )
 
@@ -177,7 +204,7 @@ def _validate_xlang_tags(types: list[type]) -> None:
 
 # These are registered automatically by ForyCodec.
 # Import here to avoid circular imports — the types themselves are defined
-# in protocol.py which uses the aster_tag from this module (or its own copy).
+# in protocol.py which uses the wire_type from this module (or its own copy).
 _INTERNAL_TYPES: list[type] | None = None
 
 
@@ -201,7 +228,7 @@ class ForyCodec:
     Args:
         mode: The serialization mode to use.
         types: User-defined types that will be serialized/deserialized.
-            For XLANG mode, all types must have ``@aster_tag`` decorators.
+            For XLANG mode, all types must have ``@wire_type`` decorators.
             For NATIVE mode, tags are optional.
         compression_threshold: Payloads larger than this (in bytes) are
             zstd-compressed.  Set to ``-1`` to disable compression.
@@ -245,7 +272,7 @@ class ForyCodec:
 
         # Register all discovered types.
         for tp in all_types:
-            tag = getattr(tp, "__aster_tag__", None)
+            tag = getattr(tp, "__wire_type__", None)
             if tag is not None:
                 ns = getattr(tp, "__fory_namespace__", "")
                 tn = getattr(tp, "__fory_typename__", tp.__name__)

@@ -431,18 +431,25 @@ def _apply_bidi_stream_decorator(
 
 
 def service(
-    name: str,
+    name_or_cls=None,
     *,
     version: int = 1,
     serialization: list[SerializationMode] | SerializationMode | None = None,
     scoped: str = "shared",
     interceptors: list[type] | None = None,
     max_concurrent_streams: int | None = None,
-) -> Callable[[type], type]:
+) -> Callable[[type], type] | type:
     """Class decorator to mark a class as an Aster RPC service.
 
+    Supports three calling forms::
+
+        @service                                  # bare — name = class name
+        @service("AgentControl")                  # explicit name
+        @service(version=2, scoped="stream")      # keyword-only, name = class name
+
     Args:
-        name: The service name (e.g. "AgentControl").
+        name_or_cls: Service name (str), or the class itself when used as
+            bare ``@service`` without parentheses. Defaults to the class name.
         version: The service version (default: 1).
         serialization: Supported serialization modes. Defaults to [XLANG].
         scoped: Service scope: "shared" or "stream". Default "shared".
@@ -450,73 +457,105 @@ def service(
         max_concurrent_streams: Maximum concurrent streams for this service.
 
     Returns:
-        A decorator function that marks the class as a service and attaches
-        a ``__aster_service_info__`` attribute with the service metadata.
-
-    Example::
-
-        @service(name="EchoService", version=1)
-        class EchoService:
-            @rpc
-            async def echo(self, req: EchoRequest) -> EchoResponse:
-                return EchoResponse(message=req.message)
+        A decorator function (or the decorated class if used bare).
     """
+    # @service (bare, no parens) — name_or_cls is the class itself
+    if isinstance(name_or_cls, type):
+        return _apply_service_decorator(
+            name_or_cls,
+            name=name_or_cls.__name__,
+            version=version,
+            serialization=serialization,
+            scoped=scoped,
+            interceptors=interceptors,
+            max_concurrent_streams=max_concurrent_streams,
+        )
+
+    # @service() or @service("Foo") or @service(name="Foo", version=2)
+    name = name_or_cls  # str | None
+
+    def decorator(cls: type) -> type:
+        return _apply_service_decorator(
+            cls,
+            name=name if name is not None else cls.__name__,
+            version=version,
+            serialization=serialization,
+            scoped=scoped,
+            interceptors=interceptors,
+            max_concurrent_streams=max_concurrent_streams,
+        )
+
+    return decorator
+
+
+def _apply_service_decorator(
+    cls: type,
+    *,
+    name: str,
+    version: int,
+    serialization: list[SerializationMode] | SerializationMode | None,
+    scoped: str,
+    interceptors: list[type] | None,
+    max_concurrent_streams: int | None,
+) -> type:
+    """Internal: apply the @service decorator logic to a class."""
+    if not isinstance(cls, type):
+        raise TypeError("@service can only be applied to classes")
+
     if serialization is None:
         serialization = [SerializationMode.XLANG]
     elif isinstance(serialization, SerializationMode):
         serialization = [serialization]
 
-    def decorator(cls: type) -> type:
-        # Check that this is a class
-        if not isinstance(cls, type):
-            raise TypeError("@service can only be applied to classes")
+    # For session-scoped services, validate that __init__ accepts a 'peer' parameter
+    if scoped == "stream":
+        init_sig = inspect.signature(cls.__init__)
+        params = list(init_sig.parameters.keys())
+        if "peer" not in params:
+            raise TypeError(
+                f"@service(scoped='stream') class {cls.__name__}.__init__ "
+                f"must accept a 'peer' parameter"
+            )
 
-        # For session-scoped services, validate that __init__ accepts a 'peer' parameter
-        if scoped == "stream":
-            init_sig = inspect.signature(cls.__init__)
-            params = list(init_sig.parameters.keys())
-            if "peer" not in params:
-                raise TypeError(
-                    f"@service(scoped='stream') class {cls.__name__}.__init__ "
-                    f"must accept a 'peer' parameter"
-                )
+    # Scan all methods to collect type information
+    methods = _scan_service_methods(cls, serialization)
 
-        # Scan all methods to collect type information
-        methods = _scan_service_methods(cls, serialization)
+    # Store service info on the class
+    service_info = ServiceInfo(
+        name=name,
+        version=version,
+        scoped=scoped,
+        methods=methods,
+        serialization_modes=list(serialization),
+        interceptors=list(interceptors) if interceptors else [],
+        max_concurrent_streams=max_concurrent_streams,
+    )
+    setattr(cls, _SERVICE_INFO_ATTR, service_info)
 
-        # Store service info on the class
-        service_info = ServiceInfo(
-            name=name,
-            version=version,
-            scoped=scoped,
-            methods=methods,
-            serialization_modes=list(serialization),
-            interceptors=list(interceptors) if interceptors else [],
-            max_concurrent_streams=max_concurrent_streams,
-        )
-        setattr(cls, _SERVICE_INFO_ATTR, service_info)
-
-        # Validate all types in the service have @aster_tag for XLANG mode
-        if SerializationMode.XLANG in serialization:
-            # Capture caller's local variables AND globals to resolve types defined in any scope
-            # (e.g., inside test methods, at module level, or imported)
-            try:
-                caller_frame = inspect.currentframe()
-                if caller_frame is not None:
-                    # f_back gives us the frame of the code that called the decorator
-                    # (e.g., the test method body)
-                    caller_locals = caller_frame.f_back.f_locals
-                    caller_globals = caller_frame.f_back.f_globals
-                    _validate_xlang_tags_for_service(cls, service_info, _caller_locals=caller_locals, _caller_globals=caller_globals)
+    # Validate (and auto-tag) all types in the service for XLANG mode
+    if SerializationMode.XLANG in serialization:
+        try:
+            caller_frame = inspect.currentframe()
+            if caller_frame is not None:
+                # f_back.f_back: one for _apply_service_decorator, one for
+                # service() or decorator() — we want the original caller.
+                outer = caller_frame.f_back
+                if outer is not None:
+                    outer = outer.f_back
+                if outer is not None:
+                    _validate_xlang_tags_for_service(
+                        cls, service_info,
+                        _caller_locals=outer.f_locals,
+                        _caller_globals=outer.f_globals,
+                    )
                 else:
                     _validate_xlang_tags_for_service(cls, service_info)
-            finally:
-                # Clean up frame reference to avoid reference cycles
-                del caller_frame
+            else:
+                _validate_xlang_tags_for_service(cls, service_info)
+        finally:
+            del caller_frame
 
-        return cls
-
-    return decorator
+    return cls
 
 
 def _scan_service_methods(
@@ -693,7 +732,7 @@ def _get_type_hints_safe(func: Callable) -> dict[str, Any]:
 
 
 def _validate_xlang_tags_for_service(cls: type, service_info: Any, _caller_locals: dict | None = None, _caller_globals: dict | None = None) -> None:
-    """Validate that all types used in the service have @aster_tag for XLANG mode.
+    """Validate that all types used in the service have @wire_type for XLANG mode.
 
     Args:
         cls: The service class.
@@ -704,7 +743,7 @@ def _validate_xlang_tags_for_service(cls: type, service_info: Any, _caller_local
             resolve types defined at module level (e.g., imported types).
 
     Raises:
-        TypeError: If a type lacks @aster_tag.
+        TypeError: If a type lacks @wire_type.
     """
     import dataclasses
 
@@ -769,12 +808,16 @@ def _validate_xlang_tags_for_service(cls: type, service_info: Any, _caller_local
 
         # Check if it's a dataclass
         if dataclasses.is_dataclass(tp):
-            # Check if it has @aster_tag
-            if not hasattr(tp, "__aster_tag__"):
-                raise TypeError(
-                    f"Type {tp.__qualname__} used in service {service_info.name} "
-                    f"has no @aster_tag decorator. All types used in XLANG mode "
-                    f"must be decorated with @aster_tag."
+            # Auto-apply wire identity if not explicitly set via @wire_type
+            if not hasattr(tp, "__wire_type__"):
+                from .codec import _auto_apply_wire_type
+                _auto_apply_wire_type(tp)
+                import warnings
+                warnings.warn(
+                    f"Type {tp.__qualname__} auto-tagged as "
+                    f"'{tp.__module__}.{tp.__qualname__}'; "
+                    f"use @wire_type for stable wire identity",
+                    stacklevel=4,
                 )
             # Recursively check fields
             for fld in dataclasses.fields(tp):

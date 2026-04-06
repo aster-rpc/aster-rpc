@@ -18,7 +18,7 @@ from typing import Optional
 import pytest
 
 from aster.codec import (
-    aster_tag,
+    wire_type,
     ForyCodec,
     ForyConfig,
     DEFAULT_COMPRESSION_THRESHOLD,
@@ -34,7 +34,7 @@ from aster.status import StatusCode
 
 
 @dataclass
-@aster_tag("test.codec/SimpleMsg")
+@wire_type("test.codec/SimpleMsg")
 class SimpleMsg:
     name: str = ""
     value: int = 0
@@ -42,14 +42,14 @@ class SimpleMsg:
 
 
 @dataclass
-@aster_tag("test.codec/InnerMsg")
+@wire_type("test.codec/InnerMsg")
 class InnerMsg:
     label: str = ""
     score: int = 0
 
 
 @dataclass
-@aster_tag("test.codec/OuterMsg")
+@wire_type("test.codec/OuterMsg")
 class OuterMsg:
     title: str = ""
     inner: InnerMsg = field(default_factory=InnerMsg)
@@ -57,14 +57,14 @@ class OuterMsg:
 
 
 @dataclass
-@aster_tag("test.codec/ListMsg")
+@wire_type("test.codec/ListMsg")
 class ListMsg:
     items: list[str] = field(default_factory=list)
     values: list[int] = field(default_factory=list)
 
 
 @dataclass
-@aster_tag("test.codec/OptMsg")
+@wire_type("test.codec/OptMsg")
 class OptMsg:
     required: str = ""
     optional_str: Optional[str] = None
@@ -73,40 +73,40 @@ class OptMsg:
 
 @dataclass
 class UntaggedMsg:
-    """A type WITHOUT @aster_tag — should fail XLANG registration."""
+    """A type WITHOUT @wire_type — should fail XLANG registration."""
 
     data: str = ""
 
 
 @dataclass
-@aster_tag("test.codec/LargeMsg")
+@wire_type("test.codec/LargeMsg")
 class LargeMsg:
     """A type that can produce payloads larger than the compression threshold."""
 
     payload: str = ""
 
 
-# ── @aster_tag decorator tests ───────────────────────────────────────────────
+# ── @wire_type decorator tests ───────────────────────────────────────────────
 
 
 class TestForyTagDecorator:
     def test_tag_with_namespace(self):
-        assert SimpleMsg.__aster_tag__ == "test.codec/SimpleMsg"
+        assert SimpleMsg.__wire_type__ == "test.codec/SimpleMsg"
         assert SimpleMsg.__fory_namespace__ == "test.codec"
         assert SimpleMsg.__fory_typename__ == "SimpleMsg"
 
     def test_tag_without_namespace(self):
-        @aster_tag("PlainTag")
+        @wire_type("PlainTag")
         @dataclass
         class Plain:
             x: int = 0
 
-        assert Plain.__aster_tag__ == "PlainTag"
+        assert Plain.__wire_type__ == "PlainTag"
         assert Plain.__fory_namespace__ == ""
         assert Plain.__fory_typename__ == "PlainTag"
 
     def test_tag_with_deep_namespace(self):
-        @aster_tag("com.example.deep/MyType")
+        @wire_type("com.example.deep/MyType")
         @dataclass
         class Deep:
             x: int = 0
@@ -117,7 +117,7 @@ class TestForyTagDecorator:
     def test_tag_with_multiple_slashes(self):
         """Only the last / is used for splitting."""
 
-        @aster_tag("a/b/c/TypeName")
+        @wire_type("a/b/c/TypeName")
         @dataclass
         class Multi:
             x: int = 0
@@ -558,14 +558,14 @@ class TestCompressionRoundTrip:
 class TestRegistrationErrors:
     def test_untagged_type_xlang_raises_at_init(self):
         """Creating XLANG codec with untagged type raises TypeError immediately."""
-        with pytest.raises(TypeError, match="has no @aster_tag"):
+        with pytest.raises(TypeError, match="has no @wire_type"):
             ForyCodec(mode=SerializationMode.XLANG, types=[UntaggedMsg])
 
     def test_untagged_nested_type_xlang_raises(self):
         """An untagged type discovered via type graph walking raises TypeError."""
 
         @dataclass
-        @aster_tag("test.codec/WrapperMsg")
+        @wire_type("test.codec/WrapperMsg")
         class WrapperMsg:
             inner: UntaggedMsg = field(default_factory=UntaggedMsg)
 

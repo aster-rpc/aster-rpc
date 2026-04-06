@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from aster.codec import aster_tag
+from aster.codec import wire_type
 from aster.decorators import service, rpc
 from aster.status import StatusCode, RpcError
 from aster.testing import AsterTestHarness
@@ -24,13 +24,13 @@ from aster.types import SerializationMode
 # ── Test types ────────────────────────────────────────────────────────────────
 
 
-@aster_tag("test.unary/EchoRequest")
+@wire_type("test.unary/EchoRequest")
 @dataclass
 class EchoRequest:
     message: str = ""
 
 
-@aster_tag("test.unary/EchoResponse")
+@wire_type("test.unary/EchoResponse")
 @dataclass
 class EchoResponse:
     message: str = ""

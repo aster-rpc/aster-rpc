@@ -16,7 +16,7 @@ from typing import AsyncIterator
 
 import pytest
 
-from aster.codec import aster_tag, ForyCodec, ForyConfig
+from aster.codec import wire_type, ForyCodec, ForyConfig
 from aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
 from aster.protocol import StreamHeader, RpcStatus
 from aster.types import SerializationMode
@@ -34,45 +34,45 @@ from aster.transport.local import LocalTransport, LocalBidiChannel
 # ── Test types ───────────────────────────────────────────────────────────────
 
 
-@aster_tag("test.transport/EchoRequest")
+@wire_type("test.transport/EchoRequest")
 @dataclass
 class EchoRequest:
     message: str = ""
 
 
-@aster_tag("test.transport/EchoResponse")
+@wire_type("test.transport/EchoResponse")
 @dataclass
 class EchoResponse:
     message: str = ""
     received_at_ms: int = 0
 
 
-@aster_tag("test.transport/CounterRequest")
+@wire_type("test.transport/CounterRequest")
 @dataclass
 class CounterRequest:
     start: int = 0
     count: int = 5
 
 
-@aster_tag("test.transport/CounterResponse")
+@wire_type("test.transport/CounterResponse")
 @dataclass
 class CounterResponse:
     value: int = 0
 
 
-@aster_tag("test.transport/StreamingResponse")
+@wire_type("test.transport/StreamingResponse")
 @dataclass
 class StreamingResponse:
     item: int = 0
 
 
-@aster_tag("test.transport/AggregateRequest")
+@wire_type("test.transport/AggregateRequest")
 @dataclass
 class AggregateRequest:
     value: int = 0
 
 
-@aster_tag("test.transport/AggregateResponse")
+@wire_type("test.transport/AggregateResponse")
 @dataclass
 class AggregateResponse:
     total: int = 0
@@ -81,7 +81,7 @@ class AggregateResponse:
 
 @dataclass
 class UntaggedRequest:
-    """A type WITHOUT @aster_tag — should fail XLANG registration."""
+    """A type WITHOUT @wire_type — should fail XLANG registration."""
     data: str = ""
 
 
@@ -429,8 +429,8 @@ class TestWireCompatibleMode:
 
     def test_untagged_fails_xlang_validation(self):
         """XLANG mode validation catches untagged types."""
-        # XLANG mode requires @aster_tag - codec initialization should fail
-        with pytest.raises(TypeError, match="@aster_tag"):
+        # XLANG mode requires @wire_type - codec initialization should fail
+        with pytest.raises(TypeError, match="@wire_type"):
             ForyCodec(mode=SerializationMode.XLANG, types=[UntaggedRequest])
 
 

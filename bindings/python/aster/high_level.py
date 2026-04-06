@@ -44,7 +44,7 @@ from . import (
     net_client,
     blobs_client,
     docs_client,
-    gossip_client,
+    gossip_client, AsterConfig,
 )
 from .client import ServiceClient, create_client
 from .contract.identity import contract_id_from_service
@@ -97,10 +97,13 @@ class AsterServer:
         self,
         services: list,
         *,
-        endpoint_config: EndpointConfig | None = None,
+        config: "AsterConfig | None" = None,
+        # Inline overrides (take priority over config):
         root_pubkey: bytes | None = None,
-        allow_all_consumers: bool = False,
-        allow_all_producers: bool = True,
+        allow_all_consumers: bool | None = None,
+        allow_all_producers: bool | None = None,
+        endpoint_config: EndpointConfig | None = None,
+        # Internal wiring:
         channel_name: str = "rpc",
         codec: Any | None = None,
         interceptors: list[Any] | None = None,
@@ -113,17 +116,37 @@ class AsterServer:
     ) -> None:
         if not services:
             raise ValueError("AsterServer requires at least one service")
-        if (not allow_all_consumers or not allow_all_producers) and root_pubkey is None:
+
+        # Auto-load config from env if none provided.
+        from .config import AsterConfig
+        if config is None:
+            config = AsterConfig.from_env()
+        self._config = config
+
+        # Inline overrides win over config.
+        self._allow_all_consumers = (
+            allow_all_consumers if allow_all_consumers is not None
+            else config.allow_all_consumers
+        )
+        self._allow_all_producers = (
+            allow_all_producers if allow_all_producers is not None
+            else config.allow_all_producers
+        )
+
+        # Resolve root key: inline > config file > ephemeral.
+        priv, pub = config.resolve_root_key()
+        self._root_pubkey = root_pubkey if root_pubkey is not None else pub
+        self._root_privkey = priv
+
+        if (not self._allow_all_consumers or not self._allow_all_producers) and self._root_pubkey is None:
             raise ValueError(
                 "root_pubkey is required when admission is enabled "
-                "(allow_all_consumers=False or allow_all_producers=False)"
+                "(allow_all_consumers=False or allow_all_producers=False). "
+                "Set ASTER_ROOT_KEY_FILE or pass root_pubkey= explicitly."
             )
 
         self._services_in: list = list(services)
-        self._endpoint_config_template = endpoint_config
-        self._root_pubkey = root_pubkey
-        self._allow_all_consumers = allow_all_consumers
-        self._allow_all_producers = allow_all_producers
+        self._endpoint_config_template = endpoint_config or config.to_endpoint_config()
         self._channel_name = channel_name
         self._codec = codec
         self._interceptors = list(interceptors) if interceptors else []
