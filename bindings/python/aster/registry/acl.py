@@ -103,7 +103,18 @@ class RegistryACL:
         if target is None:
             return None
         raw = await self._doc.read_entry_content(target.content_hash)
-        return json.loads(raw)
+        result = json.loads(raw)
+        if not isinstance(result, list):
+            import logging
+            logging.getLogger(__name__).warning(
+                "ACL entry %s is not a list (got %s), treating as empty",
+                subkey, type(result).__name__,
+            )
+            return None
+        from aster.limits import MAX_ACL_LIST_SIZE
+        if len(result) > MAX_ACL_LIST_SIZE:
+            result = result[:MAX_ACL_LIST_SIZE]
+        return result
 
     # ── Admin operations ───────────────────────────────────────────────────────
 

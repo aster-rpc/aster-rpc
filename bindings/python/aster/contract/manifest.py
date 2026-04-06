@@ -106,7 +106,31 @@ class ContractManifest:
         Returns:
             ContractManifest instance.
         """
+        from aster.limits import (
+            MAX_MANIFEST_METHODS,
+            MAX_MANIFEST_TYPE_HASHES,
+            MAX_MANIFEST_FIELDS_PER_METHOD,
+        )
+
         data = json.loads(text)
+
+        # Validate and cap list sizes from untrusted input
+        if "methods" in data and len(data["methods"]) > MAX_MANIFEST_METHODS:
+            data["methods"] = data["methods"][:MAX_MANIFEST_METHODS]
+        if "type_hashes" in data and len(data["type_hashes"]) > MAX_MANIFEST_TYPE_HASHES:
+            data["type_hashes"] = data["type_hashes"][:MAX_MANIFEST_TYPE_HASHES]
+        for m in data.get("methods", []):
+            if "fields" in m and len(m["fields"]) > MAX_MANIFEST_FIELDS_PER_METHOD:
+                m["fields"] = m["fields"][:MAX_MANIFEST_FIELDS_PER_METHOD]
+
+        # Validate critical field types
+        if "version" in data:
+            data["version"] = int(data["version"])
+        if "method_count" in data:
+            data["method_count"] = int(data["method_count"])
+        if "type_count" in data:
+            data["type_count"] = int(data["type_count"])
+
         return cls(**data)
 
     @classmethod

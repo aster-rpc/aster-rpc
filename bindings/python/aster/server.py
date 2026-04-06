@@ -488,7 +488,7 @@ class Server:
         return build_call_context(
             service=header.service,
             method=header.method,
-            metadata=dict(zip(header.metadata_keys, header.metadata_values)) if header.metadata_keys else None,
+            metadata=_validated_metadata(header.metadata_keys, header.metadata_values),
             deadline_epoch_ms=header.deadline_epoch_ms,
             peer=peer,
             is_streaming=method_info.pattern != "unary",
@@ -901,3 +901,30 @@ class Server:
 
 
 _BIDI_EOF = object()
+
+
+def _validated_metadata(
+    keys: list[str] | None, values: list[str] | None
+) -> dict[str, str] | None:
+    """Build metadata dict from StreamHeader lists with security validation.
+
+    Enforces MAX_METADATA_ENTRIES and MAX_METADATA_TOTAL_BYTES from limits.py.
+    """
+    if not keys:
+        return None
+
+    from aster.limits import LimitExceeded, validate_metadata
+
+    vals = values or []
+    try:
+        validate_metadata(keys, vals)
+    except LimitExceeded as e:
+        import logging
+        logging.getLogger(__name__).warning("Metadata limit exceeded: %s", e)
+        # Truncate to the limit rather than rejecting the entire call
+        from aster.limits import MAX_METADATA_ENTRIES
+        keys = keys[:MAX_METADATA_ENTRIES]
+        vals = vals[:MAX_METADATA_ENTRIES]
+
+    return dict(zip(keys, vals))
+
