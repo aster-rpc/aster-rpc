@@ -264,6 +264,9 @@ class Server:
 
         Accepts bidirectional streams and dispatches them to handlers.
         """
+        from aster.health import get_connection_metrics
+        conn_metrics = get_connection_metrics()
+        conn_metrics.connection_opened()
         logger.debug("Connection opened from %s", ctx.connection.remote_id())
 
         try:
@@ -314,14 +317,19 @@ class Server:
                     except asyncio.CancelledError:
                         pass
 
+            conn_metrics.connection_closed()
             logger.debug("Connection closed")
 
     async def _handle_stream(self, ctx: ConnectionContext, send: Any, recv: Any) -> None:
         """Handle a single RPC stream.
 
+
         Reads the StreamHeader, dispatches to the appropriate handler,
         and manages the stream lifecycle.
         """
+        from aster.health import get_connection_metrics as _gcm
+        _stream_metrics = _gcm()
+        _stream_metrics.stream_opened()
         try:
             # Read the StreamHeader (first frame with HEADER flag)
             frame = await read_frame(recv)
@@ -424,20 +432,39 @@ class Server:
                 )
                 return
 
-            # Dispatch based on RPC pattern
+            # Dispatch based on RPC pattern — with logging context
+            from aster.logging import request_context
             pattern = method_info.pattern
-            
-            if pattern == "unary":
-                await self._handle_unary(ctx, send, recv, header, handler_method, method_info)
-            elif pattern == "server_stream":
-                await self._handle_server_stream(ctx, send, recv, header, handler_method, method_info)
-            elif pattern == "client_stream":
-                await self._handle_client_stream(ctx, send, recv, header, handler_method, method_info)
-            elif pattern == "bidi_stream":
-                await self._handle_bidi_stream(ctx, send, recv, header, handler_method, method_info)
-            else:
-                await self._write_error_trailer(
-                    send, StatusCode.INTERNAL, f"Unknown RPC pattern: {pattern}"
+            peer_id = ""
+            try:
+                peer_id = ctx.connection.remote_id()
+            except Exception:
+                pass
+
+            with request_context(
+                request_id=header.call_id or "",
+                service=header.service,
+                method=header.method,
+                peer=peer_id,
+            ):
+                t0 = time.monotonic()
+                if pattern == "unary":
+                    await self._handle_unary(ctx, send, recv, header, handler_method, method_info)
+                elif pattern == "server_stream":
+                    await self._handle_server_stream(ctx, send, recv, header, handler_method, method_info)
+                elif pattern == "client_stream":
+                    await self._handle_client_stream(ctx, send, recv, header, handler_method, method_info)
+                elif pattern == "bidi_stream":
+                    await self._handle_bidi_stream(ctx, send, recv, header, handler_method, method_info)
+                else:
+                    await self._write_error_trailer(
+                        send, StatusCode.INTERNAL, f"Unknown RPC pattern: {pattern}"
+                    )
+                    return
+                duration_ms = (time.monotonic() - t0) * 1000
+                logger.debug(
+                    "rpc completed",
+                    extra={"duration_ms": round(duration_ms, 1), "status_code": "OK"},
                 )
 
         except asyncio.CancelledError:
@@ -453,6 +480,8 @@ class Server:
         except Exception as e:
             logger.error("Stream handler error: %s", e)
             await self._write_error_trailer(send, StatusCode.INTERNAL, str(e))
+        finally:
+            _stream_metrics.stream_closed()
 
     def _get_handler_for_service(self, service_info: ServiceInfo) -> Any:
         """Get a handler instance for a service.

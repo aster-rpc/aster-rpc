@@ -1,7 +1,6 @@
 /// Fory XLANG canonical byte encoding primitives.
 ///
 /// Translated from `bindings/python/aster/contract/canonical.py`.
-
 /// Sentinel byte for an absent optional field.
 pub const NULL_FLAG: u8 = 0xFD;
 

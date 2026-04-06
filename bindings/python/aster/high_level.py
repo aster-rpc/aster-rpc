@@ -209,6 +209,14 @@ class AsterServer:
         if self._started:
             return
 
+        # Configure structured logging from config (idempotent)
+        from aster.logging import configure_logging
+        configure_logging(
+            format=self._config.log_format,
+            level=self._config.log_level,
+            mask=self._config.log_mask,
+        )
+
         # Determine which aster ALPNs to register on the Router.
         # Consumer admission is ALWAYS registered — even in open-gate mode
         # the consumer uses it to discover services.
@@ -380,7 +388,57 @@ class AsterServer:
             owns_endpoint=False,
         )
 
+        self._print_banner()
         self._started = True
+
+    def _print_banner(self) -> None:
+        """Print the startup banner with service info."""
+        import sys
+
+        # Only print banner when stderr is a terminal (not in tests/pipes)
+        if not sys.stderr.isatty():
+            return
+
+        C = "\033[36m"   # cyan
+        B = "\033[1m"    # bold
+        D = "\033[2m"    # dim
+        G = "\033[32m"   # green
+        Y = "\033[33m"   # yellow
+        R = "\033[0m"    # reset
+
+        banner = f"""{C}
+     ╭──────────────────────────────────────────╮
+     │{B}           _    ____ _____ _____ ____     {R}{C}│
+     │{B}          / \\  / ___|_   _| ____|  _ \\    {R}{C}│
+     │{B}         / _ \\ \\___ \\ | | |  _| | |_) |   {R}{C}│
+     │{B}        / ___ \\ ___) || | | |___|  _ <    {R}{C}│
+     │{B}       /_/   \\_\\____/ |_| |_____|_| \\_\\   {R}{C}│
+     │{D}          RPC after hostnames.            {R}{C}│
+     ╰──────────────────────────────────────────╯{R}
+"""
+        sys.stderr.write(banner)
+
+        # Service info
+        for s in self._service_summaries:
+            sys.stderr.write(f"  {G}●{R} {B}{s.name}{R} v{s.version}  {D}contract:{R} {s.contract_id[:16]}…\n")
+
+        # Endpoint
+        addr = base64.b64encode(
+            self._node.node_addr_info().to_bytes()
+        ).decode() if self._node else "?"
+        sys.stderr.write(f"  {D}endpoint:{R}  {addr[:48]}…\n")
+
+        # Mode
+        mode_parts = []
+        if self._allow_all_consumers:
+            mode_parts.append(f"{Y}open-gate{R}")
+        else:
+            mode_parts.append(f"{G}trusted{R}")
+        if self._registry_ticket:
+            mode_parts.append(f"{G}registry{R}")
+        sys.stderr.write(f"  {D}mode:{R}      {' '.join(mode_parts)}\n")
+        sys.stderr.write(f"  {D}log:{R}       ASTER_LOG_FORMAT=json|text  ASTER_LOG_LEVEL=debug|info|warn\n")
+        sys.stderr.write("\n")
 
     async def _publish_contracts(self) -> None:
         """Create a registry doc and publish each service's contract collection.

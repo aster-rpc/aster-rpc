@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Pre-push hook: runs cargo fmt + clippy to prevent CI lint failures.
+# Install: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+RESET='\033[0m'
+
+echo "pre-push: checking Rust lint..."
+
+if ! cargo fmt --manifest-path bindings/python/rust/Cargo.toml --check >/dev/null 2>&1; then
+    echo -e "${RED}pre-push: cargo fmt check failed${RESET}"
+    echo "  Run: cargo fmt --manifest-path bindings/python/rust/Cargo.toml"
+    exit 1
+fi
+
+if ! cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings 2>&1 | tail -1 | grep -q "Finished"; then
+    echo -e "${RED}pre-push: cargo clippy failed${RESET}"
+    echo "  Run: cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings"
+    exit 1
+fi
+
+echo -e "${GREEN}pre-push: lint OK${RESET}"
