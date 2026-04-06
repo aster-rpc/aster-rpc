@@ -103,7 +103,7 @@ consumers to fetch any member by its content hash.
 
 |Index|Logical name              |Content                                   |Required|
 |-----|--------------------------|------------------------------------------|--------|
-|0    |`manifest.json`           |`ContractManifest` JSON (metadata blob)   |Yes     |
+|0    |`manifest.json`           |`ContractManifest` JSON (metadata + method schemas)|Yes     |
 |1    |`contract.xlang`          |Canonical XLANG bytes of `ServiceContract`|Yes     |
 |2..N |`types/{type_hash}.xlang` |Canonical XLANG bytes of each `TypeDef`   |Yes     |
 |opt  |`schema.fdl`              |Human-readable Fory IDL source text       |No      |
@@ -807,7 +807,9 @@ ContractManifest {
     type_count: int32
     type_hashes: list<string>        // all TypeDef hashes (transitive closure)
     method_count: int32
+    methods: list<MethodDescriptor>  // full method schemas for dynamic invocation
     serialization_modes: list<string>
+    scoped: string                   // "shared" or "stream"
     deprecated: bool
 
     // ── Source provenance (written by aster contract gen) ──
@@ -821,12 +823,54 @@ ContractManifest {
     published_by: AuthorId           // set at publish time, not by aster contract gen
     published_at_epoch_ms: int64     // set at publish time
 }
+
+MethodDescriptor {
+    name: string                     // method name (NFC-normalized)
+    pattern: string                  // "unary" | "server_stream" | "client_stream" | "bidi_stream"
+    request_type: string             // human-readable type name (e.g. "HelloRequest")
+    response_type: string            // human-readable type name (e.g. "HelloResponse")
+    timeout: float64?                // default timeout in seconds, null if none
+    idempotent: bool
+    fields: list<FieldDescriptor>    // request type fields (empty if type info unavailable)
+}
+
+FieldDescriptor {
+    name: string                     // field name
+    type: string                     // type name (e.g. "str", "int", "list[str]", "MyType")
+    required: bool                   // true if no default value
+    default: any?                    // JSON-safe default value, null if required or non-serializable
+}
 ```
 
 `vcs_*` and `semver` fields are written by `aster contract gen` at commit time.
 `published_by` and `published_at_epoch_ms` are written by the node at startup.
 None of these fields are inputs to `contract_id` — they live in the manifest
 blob (collection index 0), which is separate from `contract.xlang` (index 1).
+
+#### 11.4.4.1 Dual-format design: `contract.xlang` vs `manifest.json`
+
+The same method and type information exists in two formats within the contract
+collection, serving different purposes:
+
+- **`contract.xlang`** (canonical XLANG bytes) is the **identity format**. It is
+  deterministically serialized and hashed to produce the `contract_id`. It is
+  **write-only** — implementations MUST NOT deserialize `contract.xlang` from
+  untrusted sources. The only valid operation on fetched `contract.xlang` bytes
+  is `blake3(bytes) == contract_id` verification.
+
+- **`manifest.json`** is the **readable format**. It contains the same method
+  signatures and field definitions as JSON, enabling dynamic clients, shells,
+  and tooling to inspect a contract without needing the language-specific type
+  definitions. It is the source for service discovery, autocomplete, and
+  schema-driven invocation.
+
+:::danger Security: never deserialize canonical bytes from untrusted peers
+The canonical XLANG encoding uses varints, length-prefixed strings, and nested
+structures. Deserializing these from an untrusted source creates attack surface
+for allocation bombs, out-of-bounds reads, and parser confusion attacks. The
+canonical format is designed exclusively for deterministic hashing — all
+human/machine-readable access goes through `manifest.json` (standard JSON).
+:::
 
 **`published_by` is a bundle-level attribute, not an identity-level
 attribute.** Two different authors can publish collections with the same

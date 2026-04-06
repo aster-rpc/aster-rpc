@@ -9,6 +9,8 @@ description = "Aster RPC framework command-line tools"
 requires-python = ">=3.9"
 dependencies = [
     "aster-python",
+    "prompt-toolkit>=3.0",
+    "rich>=13.0",
 ]
 
 [project.scripts]

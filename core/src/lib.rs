@@ -1,3 +1,8 @@
+pub mod canonical;
+pub mod contract;
+pub mod framing;
+pub mod signing;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

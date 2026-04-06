@@ -46,6 +46,15 @@ class ContractManifest:
     method_count: int = 0
     """Number of methods in the service."""
 
+    methods: list[dict] = field(default_factory=list)
+    """Method descriptors: [{name, pattern, request_type, response_type, timeout, idempotent, fields}].
+
+    Each entry provides enough information for dynamic invocation and shell
+    autocomplete without needing the Python type definitions locally.
+    ``fields`` is a list of ``{name, type, required, default}`` dicts describing
+    the request type's fields (empty if type info is unavailable).
+    """
+
     serialization_modes: list[str] = field(default_factory=list)
     """Supported serialization mode strings (e.g. ["xlang"])."""
 
@@ -121,6 +130,92 @@ class ContractManifest:
         """
         with open(path, "w", encoding="utf-8") as f:
             f.write(self.to_json())
+
+
+# ── Method extraction ─────────────────────────────────────────────────────────
+
+
+def extract_method_descriptors(service_info: object) -> list[dict]:
+    """Extract method descriptors from a ServiceInfo for manifest storage.
+
+    Introspects request types to extract field definitions (name, type, required,
+    default) so that dynamic clients and the shell can build payloads without
+    needing the Python types locally.
+
+    Args:
+        service_info: A ServiceInfo object from aster.service.
+
+    Returns:
+        List of method descriptor dicts, sorted by name.
+    """
+    import dataclasses
+    import inspect
+    from typing import get_type_hints
+
+    methods_out: list[dict] = []
+
+    for method_name, method_info in getattr(service_info, "methods", {}).items():
+        fields: list[dict] = []
+
+        # Extract fields from the request type
+        req_type = getattr(method_info, "request_type", None)
+        if req_type is not None and dataclasses.is_dataclass(req_type):
+            try:
+                hints = get_type_hints(req_type)
+            except Exception:
+                hints = {}
+
+            for f in dataclasses.fields(req_type):
+                ftype = hints.get(f.name, f.type)
+                type_name = _type_display_name(ftype)
+
+                has_default = (
+                    f.default is not dataclasses.MISSING
+                    or f.default_factory is not dataclasses.MISSING
+                )
+
+                default_val = None
+                if f.default is not dataclasses.MISSING:
+                    default_val = f.default
+                elif f.default_factory is not dataclasses.MISSING:
+                    # Don't call the factory — just note it has one
+                    default_val = None
+
+                fields.append({
+                    "name": f.name,
+                    "type": type_name,
+                    "required": not has_default,
+                    "default": default_val if _is_json_safe(default_val) else str(default_val),
+                })
+
+        resp_type = getattr(method_info, "response_type", None)
+
+        methods_out.append({
+            "name": method_name,
+            "pattern": getattr(method_info, "pattern", "unary"),
+            "request_type": _type_display_name(req_type) if req_type else "",
+            "response_type": _type_display_name(resp_type) if resp_type else "",
+            "timeout": getattr(method_info, "timeout", None),
+            "idempotent": getattr(method_info, "idempotent", False),
+            "fields": fields,
+        })
+
+    methods_out.sort(key=lambda m: m["name"])
+    return methods_out
+
+
+def _type_display_name(t: object) -> str:
+    """Human-readable name for a type."""
+    if t is None:
+        return ""
+    if hasattr(t, "__name__"):
+        return t.__name__
+    return str(t)
+
+
+def _is_json_safe(val: object) -> bool:
+    """Check if a value is safely JSON-serializable."""
+    return val is None or isinstance(val, (str, int, float, bool))
 
 
 # ── FatalContractMismatch ─────────────────────────────────────────────────────

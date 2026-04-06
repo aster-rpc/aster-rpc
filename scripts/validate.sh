@@ -10,6 +10,9 @@
 
 set -euo pipefail
 
+# Keep in sync with .github/workflows/ci.yml
+RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-1.94.1}"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BOLD='\033[1m'

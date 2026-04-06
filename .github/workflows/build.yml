@@ -17,15 +17,22 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.94.1"
+
+# Wheel builds stay on GitHub-hosted runners for manylinux container
+# reproducibility and PyPI publishing trust. Self-hosted runners are
+# used in ci.yml for testing.
 
 jobs:
+  # ── Lint (GitHub-hosted, mirrors ci.yml pinned toolchain) ──────────
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: rustfmt #, clippy
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
       - name: Cache Rust dependencies/build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -46,7 +53,9 @@ jobs:
         target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Cache Rust dependencies/build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -80,7 +89,9 @@ jobs:
             runner: macos-14
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Cache Rust dependencies/build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -106,7 +117,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Cache Rust dependencies/build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -132,7 +145,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Cache Rust dependencies/build artifacts
         uses: Swatinem/rust-cache@v2
         with:

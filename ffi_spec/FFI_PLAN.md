@@ -14,6 +14,7 @@
 4. [Phase 1b: Datagram Completion & Hooks & Monitoring](#3b-phase-1b-datagram-completion--hooks--monitoring)
 5. [Phase 1c: Registry & Publication Support](#3c-phase-1c-registry--publication-support)
 5d. [Phase 1d: Endpoint Builder Gaps](#3d-phase-1d-endpoint-builder-gaps)
+5f. [Phase 1f: Cross-Language Contract Identity, Framing & Signing](#3f-phase-1f-cross-language-contract-identity-framing--signing)
 6. [Phase 2: Python Bindings Update](#4-phase-2-python-bindings-update)
 7. [Phase 3: Java FFM Bindings](#5-phase-3-java-ffm-bindings)
 8. [C ABI Reference](#6-c-abi-reference)
@@ -2972,6 +2973,183 @@ Thread.startVirtualThread(() -> {
 
 ---
 
+## 3f. Phase 1f: Cross-Language Contract Identity, Framing & Signing
+
+### Overview
+
+**Why:** Every language binding must produce byte-identical output for contract identity hashes, wire framing, and credential signing bytes. If Python, Java, and Go each implement their own canonical serialization independently, subtle divergences (float rounding, key ordering, NFC normalization) are inevitable. A single authoritative Rust implementation called through the C ABI eliminates this class of bugs entirely.
+
+**What:** Six synchronous C FFI functions exposing:
+- Contract ID computation (BLAKE3 hash of canonical bytes from a `ServiceContract` JSON)
+- Canonical byte serialization for `ServiceContract`, `TypeDef`, and `MethodDef`
+- Wire frame encoding/decoding (length-prefixed with flags byte)
+- Credential signing bytes (producer and consumer enrollment)
+- General-purpose canonical JSON normalization (sorted keys, compact)
+
+**Pattern:** These are pure synchronous functions — no runtime handle, no event queue, no async. Data in, result out, status code returned. This is the simplest possible FFI pattern: the caller provides an output buffer, and the function writes to it.
+
+### Core API (Rust)
+
+The core logic lives in four modules under `core/src/`:
+
+| Module | Purpose |
+|--------|---------|
+| `core/src/canonical.rs` | Fory XLANG canonical byte encoding primitives (varint, zigzag, string, bytes, list, optional) |
+| `core/src/contract.rs` | Contract identity types (`ServiceContract`, `TypeDef`, `MethodDef`, `FieldDef`, etc.), canonical serialization, BLAKE3 hashing, Tarjan SCC for type dependency ordering |
+| `core/src/framing.rs` | Wire framing: `encode_frame` / `decode_frame` with length prefix and flags byte |
+| `core/src/signing.rs` | Credential signing bytes (`EnrollmentCredentialData`, `ConsumerEnrollmentCredentialData`), canonical JSON for attributes, ed25519 verification |
+
+**Key types:**
+
+- `ServiceContract` — name, version, methods, types, capabilities, scope config
+- `TypeDef` — message/enum/union type definition with fields and enum values
+- `MethodDef` — RPC method with pattern (unary/server-stream/client-stream/bidi), request/response types, capabilities
+- `FieldDef` — typed field within a TypeDef (supports primitives, refs, self-refs, containers)
+- `EnrollmentCredentialData` — producer credential with endpoint_id, root_pubkey, expires_at, attributes
+- `ConsumerEnrollmentCredentialData` — consumer credential with type code (policy/ott), optional endpoint_id, optional nonce
+- `CredentialData` — tagged enum (`"kind": "producer"` or `"kind": "consumer"`) for JSON dispatch
+
+**Key functions:**
+
+- `contract::compute_contract_id_from_json(json_str) -> Result<String>` — parse ServiceContract JSON, compute canonical bytes, return 64-char hex BLAKE3 hash
+- `contract::canonical_bytes_from_json(type_name, json_str) -> Result<Vec<u8>>` — parse JSON for named type, return canonical bytes
+- `framing::encode_frame(payload, flags) -> Result<Vec<u8>>` — encode `[4B LE length][flags][payload]`
+- `framing::decode_frame(data) -> Result<(payload, flags, consumed)>` — decode one frame from buffer
+- `signing::canonical_signing_bytes_from_json(json_str) -> Result<Vec<u8>>` — parse credential JSON (tagged by `"kind"`), produce signing bytes
+
+### C FFI API
+
+Six functions, all declared `extern "C"`, no runtime handle required:
+
+```c
+// Compute contract_id (64-char hex BLAKE3 hash) from ServiceContract JSON.
+int32_t aster_contract_id(
+    const uint8_t *json_ptr, size_t json_len,
+    uint8_t *out_buf, size_t *out_len);
+
+// Compute canonical bytes for "ServiceContract", "TypeDef", or "MethodDef".
+int32_t aster_canonical_bytes(
+    const uint8_t *type_name_ptr, size_t type_name_len,
+    const uint8_t *json_ptr, size_t json_len,
+    uint8_t *out_buf, size_t *out_len);
+
+// Encode a wire frame: [4B LE length][flags][payload].
+int32_t aster_frame_encode(
+    const uint8_t *payload_ptr, size_t payload_len,
+    uint8_t flags,
+    uint8_t *out_buf, size_t *out_len);
+
+// Decode a wire frame. Writes payload + flags.
+int32_t aster_frame_decode(
+    const uint8_t *data_ptr, size_t data_len,
+    uint8_t *out_payload, size_t *out_payload_len,
+    uint8_t *out_flags);
+
+// Compute canonical signing bytes from credential JSON (tagged by "kind").
+int32_t aster_signing_bytes(
+    const uint8_t *json_ptr, size_t json_len,
+    uint8_t *out_buf, size_t *out_len);
+
+// Canonical JSON normalization: sort keys recursively, compact output.
+int32_t aster_canonical_json(
+    const uint8_t *json_ptr, size_t json_len,
+    uint8_t *out_buf, size_t *out_len);
+```
+
+**Memory model:**
+- Caller provides output buffer and capacity via `(out_buf, *out_len)`.
+- On success: `*out_len` is set to actual bytes written, returns `IROH_STATUS_OK` (0).
+- On buffer too small: `*out_len` is set to required size, returns `IROH_STATUS_BUFFER_TOO_SMALL` (5). Caller retries with a larger buffer.
+- On error: stores diagnostic message in `LAST_ERROR` (retrievable via `iroh_last_error_message`), returns `IROH_STATUS_INTERNAL` (7) or `IROH_STATUS_INVALID_ARGUMENT` (1).
+- No runtime handle needed. No event queue interaction.
+
+### JSON Schema
+
+**ServiceContract JSON format:**
+
+```json
+{
+  "name": "MyService",
+  "version": "1.0.0",
+  "methods": [
+    {
+      "name": "GetItem",
+      "pattern": "unary",
+      "request_type": { "kind": "ref", "primitive": "", "ref": "<hex>", "self_ref_name": "" },
+      "response_type": { "kind": "primitive", "primitive": "string", "ref": "", "self_ref_name": "" },
+      "capabilities": [],
+      "scope": "shared",
+      "timeout_ms": null
+    }
+  ],
+  "types": [
+    {
+      "name": "Item",
+      "kind": "message",
+      "fields": [ ... ],
+      "enum_values": []
+    }
+  ],
+  "capabilities": [],
+  "scope_config": { "kind": "shared" }
+}
+```
+
+**CredentialData JSON format (tagged enum with `"kind"` field):**
+
+```json
+{
+  "kind": "producer",
+  "endpoint_id": "abc123...",
+  "root_pubkey": "aabb...<64 hex chars>",
+  "expires_at": 1700000000,
+  "attributes": {"role": "admin"}
+}
+```
+
+```json
+{
+  "kind": "consumer",
+  "credential_type": "ott",
+  "root_pubkey": "aabb...<64 hex chars>",
+  "expires_at": 1700000000,
+  "attributes": {},
+  "endpoint_id": "consumer-ep",
+  "nonce": "eeff...<64 hex chars>"
+}
+```
+
+**Hex encoding:** All byte-valued fields (`root_pubkey`, `nonce`, `type_ref`, `container_key_ref`) are hex-encoded strings in JSON. The core deserializes them to raw bytes internally.
+
+### Target Language Integration
+
+Each language builds its types natively, serializes to JSON, and passes the JSON string to the core via the C FFI. This means:
+
+- **Python (PyO3):** Exposed via the `_aster.contract` submodule. Python `dataclass` types serialize to JSON, call core, get back bytes or hex strings. Already implemented directly over `aster_transport_core` (not via C FFI).
+
+- **Java (Panama FFM):** Direct C function calls via `MethodHandle` downcalls. Java record types serialize to JSON via Jackson/Gson, pass byte arrays through the FFI, get back byte buffers. No JNI needed.
+
+- **Go (cgo):** Call the C functions directly via `#cgo LDFLAGS`. Go structs marshal to JSON via `encoding/json`, pass `[]byte` through the FFI.
+
+**Key design point:** The language binding never implements canonical serialization itself. It only needs to:
+1. Build a native type (dataclass / record / struct)
+2. Serialize to JSON
+3. Call the FFI function
+4. Read the output buffer
+
+This ensures byte-identical output across all languages.
+
+### Testing Strategy
+
+- **Golden test vectors** in `tests/python/fixtures/canonical_test_vectors.json` define expected canonical bytes and contract IDs for reference `ServiceContract` instances.
+- **Python consistency tests** serve as the reference implementation: they compute contract IDs and canonical bytes via the Python-accessible core API and compare against the golden vectors.
+- **Each language must produce identical bytes and hashes.** The Java and Go test suites should load the same golden vectors and verify their FFI calls produce matching output.
+- **Round-trip tests** for framing: `encode_frame` followed by `decode_frame` must recover the original payload and flags.
+- **Signing bytes tests**: verify producer and consumer signing bytes match expected byte patterns for known credential inputs.
+- **Canonical JSON tests**: verify that key reordering, nested object sorting, and compact serialization produce identical output regardless of input key order.
+
+---
+
 ## Implementation Order
 
 ### Phase 1 (Core + FFI) — ~2-3 weeks
@@ -3018,6 +3196,15 @@ Thread.startVirtualThread(() -> {
 5. **Server**: Add `owns_endpoint` flag to `Server.__init__` so `AsterServer` can own the node lifecycle
 6. **Tests**: Core unit test (accept_aster round-trip), Python integration (unified node + blobs + RPC), Gate 0 enforcement test
 7. **Docs**: Update `FFI_PLAN.md` §3e
+
+### Phase 1f (Cross-Language Contract Identity, Framing & Signing) — ~3 days
+
+1. **Core**: Implement `canonical.rs`, `contract.rs`, `framing.rs`, `signing.rs` in `aster_transport_core` (done)
+2. **FFI**: Add 6 synchronous C functions (`aster_contract_id`, `aster_canonical_bytes`, `aster_frame_encode`, `aster_frame_decode`, `aster_signing_bytes`, `aster_canonical_json`) to `aster_transport_ffi` (done)
+3. **Golden vectors**: Create `tests/python/fixtures/canonical_test_vectors.json` with reference contract IDs, canonical bytes, and signing bytes
+4. **Python tests**: Validate Python-side contract identity and signing against golden vectors
+5. **Java tests**: Load golden vectors, call FFI functions, verify byte-identical output
+6. **Docs**: Update `FFI_PLAN.md` §3f (done)
 
 ### Phase 2 (Python) — ~1 week
 

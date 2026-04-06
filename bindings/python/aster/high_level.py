@@ -304,6 +304,12 @@ class AsterServer:
                     )
             logger.debug("Manifest verification passed for %d service(s)", len(manifest_by_key))
 
+        # ── Contract publication to registry doc ─────────────────────────
+        # Create a registry doc, publish contract collections (with manifest
+        # including method schemas), and generate a read-only share ticket
+        # so consumers can discover full contract metadata.
+        await self._publish_contracts()
+
         # ── Gate 3: capability interceptor & default-deny warning ────────
         #
         # Build a service_name -> ServiceInfo map for the CapabilityInterceptor
@@ -375,6 +381,131 @@ class AsterServer:
         )
 
         self._started = True
+
+    async def _publish_contracts(self) -> None:
+        """Create a registry doc and publish each service's contract collection.
+
+        After publication, ``self._registry_ticket`` is set to the read-only
+        share ticket so consumer admission can return it.
+        """
+        assert self._node is not None
+
+        try:
+            dc = docs_client(self._node)
+            bc = blobs_client(self._node)
+
+            # Create the registry doc (producer owns the write capability)
+            registry_doc = await dc.create()
+            author_id = await dc.create_author()
+
+            for svc in self._services_in:
+                svc_cls = svc if inspect.isclass(svc) else type(svc)
+                info = getattr(svc_cls, "__aster_service_info__", None)
+                if info is None:
+                    continue
+
+                # Build the type graph and contract
+                from .contract.identity import (
+                    ServiceContract,
+                    build_type_graph,
+                    canonical_xlang_bytes,
+                    resolve_with_cycles,
+                    compute_type_hash,
+                )
+                from .contract.publication import build_collection, upload_collection
+                from .registry.keys import contract_key, version_key
+                from .registry.models import ArtifactRef
+
+                # Collect root types
+                root_types: list[type] = []
+                for mi in info.methods.values():
+                    if mi.request_type is not None:
+                        root_types.append(mi.request_type)
+                    if mi.response_type is not None:
+                        root_types.append(mi.response_type)
+
+                type_graph = build_type_graph(root_types)
+                type_defs = resolve_with_cycles(type_graph)
+
+                # Compute type hashes
+                type_hashes: dict[str, bytes] = {}
+                for fqn, td in type_defs.items():
+                    td_bytes = canonical_xlang_bytes(td)
+                    type_hashes[fqn] = compute_type_hash(td_bytes)
+
+                # Build ServiceContract and canonical bytes
+                contract = ServiceContract.from_service_info(info, type_hashes)
+                contract_bytes = canonical_xlang_bytes(contract)
+
+                import blake3 as _blake3
+                contract_id = _blake3.blake3(contract_bytes).hexdigest()
+
+                # Build collection with full method schemas
+                entries = build_collection(contract, type_defs, service_info=info)
+
+                # Upload to blob store
+                collection_hash = await upload_collection(bc, entries)
+
+                # Create a collection ticket so consumers can download all
+                # collection blobs (index + entries) in one transfer
+                blob_ticket = bc.create_collection_ticket(collection_hash)
+
+                # Write ArtifactRef to registry doc
+                import time as _time
+                ref = ArtifactRef(
+                    contract_id=contract_id,
+                    collection_hash=collection_hash,
+                    ticket=blob_ticket,
+                    published_by=author_id,
+                    published_at_epoch_ms=int(_time.time() * 1000),
+                    collection_format="index",
+                )
+                await registry_doc.set_bytes(
+                    author_id,
+                    contract_key(contract_id),
+                    ref.to_json().encode(),
+                )
+
+                # Also write the manifest JSON directly to the registry doc
+                # at a well-known key. This avoids the blob download round-trip
+                # for consumers that only need method schemas (like the shell).
+                manifest_data = None
+                for ename, edata in entries:
+                    if ename == "manifest.json":
+                        manifest_data = edata
+                        break
+                if manifest_data:
+                    from .registry.keys import version_key as _vk
+                    manifest_key = f"manifests/{contract_id}".encode()
+                    await registry_doc.set_bytes(
+                        author_id, manifest_key, manifest_data
+                    )
+
+                # Version pointer
+                await registry_doc.set_bytes(
+                    author_id,
+                    version_key(info.name, info.version),
+                    contract_id.encode(),
+                )
+
+                logger.debug(
+                    "Published contract %s for %s v%d (collection=%s)",
+                    contract_id[:12],
+                    info.name,
+                    info.version,
+                    collection_hash[:12],
+                )
+
+            # Generate read-only share ticket for consumers
+            self._registry_ticket = await registry_doc.share_with_addr("read")
+            logger.info(
+                "Registry doc ready — ticket length: %d", len(self._registry_ticket)
+            )
+
+        except Exception as exc:
+            # Publication failure is non-fatal — the server still works,
+            # consumers just won't get rich contract metadata
+            logger.warning("Contract publication failed (non-fatal): %s", exc)
 
     def serve(self) -> asyncio.Task:
         """Spawn the accept loop (+ Gate 0 hook loop); return an aggregate task.
@@ -677,8 +808,10 @@ class AsterClient:
         self._enrollment_credential_iid = config.enrollment_credential_iid
         self._channel_name = channel_name
 
+        self._node: Any | None = None
         self._ep: Any | None = None
         self._services: list[ServiceSummary] = []
+        self._registry_ticket: str = ""
         self._rpc_conns: dict[str, Any] = {}
         self._clients: list[ServiceClient] = []
         self._connected: bool = False
@@ -692,12 +825,17 @@ class AsterClient:
         if self._connected:
             return
 
-        # Build endpoint with the config's secret_key for stable NodeId.
+        # Build a full IrohNode so the consumer can join registry docs
+        # and fetch blobs. Previously this was a bare NetClient endpoint,
+        # but docs/blobs require a full node.
         ep_cfg = self._config.to_endpoint_config()
         ep_config = _clone_config_with_alpns(
             ep_cfg, [ALPN_CONSUMER_ADMISSION, RPC_ALPN]
         )
-        self._ep = await create_endpoint_with_config(ep_config)
+        self._node = await IrohNode.memory_with_alpns(
+            [ALPN_CONSUMER_ADMISSION, RPC_ALPN], ep_config
+        )
+        self._ep = net_client(self._node)
 
         # Always run the admission handshake — even when the consumer gate
         # is open, the response carries the services list + registry ticket.
@@ -744,9 +882,11 @@ class AsterClient:
             )
 
         self._services = list(resp.services)
+        self._registry_ticket = resp.registry_ticket or ""
         logger.info(
-            "Admitted — services: %s",
+            "Admitted — services: %s, registry_ticket: %s",
             [s.name for s in self._services],
+            bool(self._registry_ticket),
         )
 
     async def _rpc_conn_for(self, rpc_addr_b64: str) -> Any:
@@ -818,7 +958,12 @@ class AsterClient:
         self._clients.clear()
         self._rpc_conns.clear()
 
-        if self._ep is not None:
+        if self._node is not None:
+            try:
+                await self._node.shutdown()
+            except Exception:
+                pass
+        elif self._ep is not None:
             try:
                 await self._ep.close()
             except Exception:
@@ -834,6 +979,14 @@ class AsterClient:
     @property
     def services(self) -> list[ServiceSummary]:
         return list(self._services)
+
+    @property
+    def registry_ticket(self) -> str:
+        """Read-only Iroh docs share ticket for the registry doc.
+
+        Empty string if no registry doc was provided by the producer.
+        """
+        return self._registry_ticket
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

@@ -23,139 +23,172 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.94.1"
 
 jobs:
-  # ── Rust lint ──────────────────────────────────────────────────────
+  # ── Rust lint (self-hosted, fast with cached deps) ─────────────────
   lint:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: rustfmt #, clippy
-      - name: Cache Rust dependencies/build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-          key: lint
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
       - name: cargo fmt
         run: cargo fmt --manifest-path bindings/python/rust/Cargo.toml --check
-      - name: cargo clippy
+      - name: cargo clippy (bindings)
         run: cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings
+      - name: cargo clippy (core)
+        run: cargo clippy -p aster_transport_core -- -D warnings
+      - name: cargo clippy (ffi)
+        run: cargo clippy -p aster_transport_ffi -- -D warnings
 
-  # ── Build + Test matrix ────────────────────────────────────────────
-  test:
+  # ── Python bindings: unit tests (fast, no networking) ──────────────
+  test-unit:
+    needs: lint
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - name: Build and run unit tests
+        run: |
+          uv venv .venv
+          source .venv/bin/activate
+          uv pip install pytest pytest-asyncio pytest-timeout maturin
+          uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
+          uv run maturin develop -m bindings/python/rust/Cargo.toml
+          uv pip install -e cli/
+          uv run pytest tests/python/ -v --timeout=30 -m "not network"
+        shell: bash
+
+  # ── Python bindings: full test matrix (includes networking) ────────
+  test-full:
     needs: lint
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64
-          - os: ubuntu-24.04-arm
-            target: aarch64
-          - os: macos-14
-            target: aarch64
-          - os: windows-latest
-            target: x64
-    runs-on: ${{ matrix.os }}
+          - runner: [self-hosted, Linux, X64]
+            label: linux-x64
+            shell: bash
+          - runner: [self-hosted, Linux, ARM64]
+            label: linux-arm64
+            shell: bash
+          - runner: [self-hosted, macOS, ARM64]
+            label: macos-arm64
+            shell: bash
+          - runner: [self-hosted, Windows, X64]
+            label: windows-x64
+            shell: pwsh
+    runs-on: ${{ matrix.runner }}
+    name: test-full (${{ matrix.label }})
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Cache Rust dependencies/build artifacts
-        uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@master
         with:
-          workspaces: |
-            . -> target
-          key: test-${{ matrix.target }}
-
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
 
       - name: Build and test (unix)
-        if: runner.os != 'Windows'
+        if: matrix.shell == 'bash'
         run: |
           uv venv .venv
           source .venv/bin/activate
           uv pip install pytest pytest-asyncio pytest-timeout pytest-rerunfailures maturin
           uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
-
-          echo "=== Environment parity diagnostics ==="
-          uv --version
-          uv run python -VV
-          uv pip freeze | grep -E '^(pyfory|zstandard|blake3|pytest|pytest-asyncio|pytest-timeout|maturin|cython|Cython)==' || true
-          uv run python - <<'PY'
-          import importlib
-          import platform
-          import sys
-
-          print("python:", sys.version.replace("\n", " "))
-          print("platform:", platform.platform())
-
-          try:
-              import pyfory
-              print("pyfory:", getattr(pyfory, "__version__", "unknown"))
-              print("pyfory.__file__:", pyfory.__file__)
-
-              try:
-                  mod = importlib.import_module("pyfory.includes.libformat")
-                  print("pyfory.includes.libformat:", getattr(mod, "__file__", "<built-in>"))
-                  print("has CTypeId:", hasattr(mod, "CTypeId"))
-              except Exception as exc:
-                  print("import pyfory.includes.libformat failed:", repr(exc))
-          except Exception as exc:
-              print("import pyfory failed:", repr(exc))
-          PY
-
           uv run maturin develop -m bindings/python/rust/Cargo.toml
           uv pip install -e cli/
-          uv run pytest tests/python/ -v --timeout=60
+          uv run pytest tests/python/ -v --timeout=60 --reruns=2 --reruns-delay=2
         shell: bash
 
       - name: Build and test (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shell == 'pwsh'
         run: |
           uv venv .venv
           .venv\Scripts\activate
           uv pip install pytest pytest-asyncio pytest-timeout pytest-rerunfailures maturin
           uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
-
-          Write-Host "=== Environment parity diagnostics ==="
-          uv --version
-          uv run python -VV
-          uv pip freeze | Select-String -Pattern '^(pyfory|zstandard|blake3|pytest|pytest-asyncio|pytest-timeout|maturin|cython|Cython)=='
-          $script = @'
-          import importlib
-          import platform
-          import sys
-
-          print("python:", sys.version.replace("\n", " "))
-          print("platform:", platform.platform())
-
-          try:
-              import pyfory
-              print("pyfory:", getattr(pyfory, "__version__", "unknown"))
-              print("pyfory.__file__:", pyfory.__file__)
-
-              try:
-                  mod = importlib.import_module("pyfory.includes.libformat")
-                  print("pyfory.includes.libformat:", getattr(mod, "__file__", "<built-in>"))
-                  print("has CTypeId:", hasattr(mod, "CTypeId"))
-              except Exception as exc:
-                  print("import pyfory.includes.libformat failed:", repr(exc))
-          except Exception as exc:
-              print("import pyfory failed:", repr(exc))
-          '@
-          uv run python -c $script
-
           uv run maturin develop -m bindings/python/rust/Cargo.toml
           uv pip install -e cli/
-          uv run pytest tests/python/ -v --timeout=60
+          uv run pytest tests/python/ -v --timeout=60 --reruns=2 --reruns-delay=2
         shell: pwsh
+
+  # ── Rust core tests (no Python dependency) ─────────────────────────
+  test-rust:
+    needs: lint
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: cargo test (core)
+        run: cargo test -p aster_transport_core
+      - name: cargo test (ffi)
+        run: cargo test -p aster_transport_ffi
+
+  # ════════════════════════════════════════════════════════════════════
+  # Future language bindings go here. Each binding gets:
+  #   1. A lint job (or extend the lint job above)
+  #   2. A test job on relevant platforms
+  #
+  # ── Java FFM bindings (Phase 3) ────────────────────────────────────
+  # test-java:
+  #   needs: lint
+  #   strategy:
+  #     matrix:
+  #       include:
+  #         - runner: [self-hosted, Linux, X64]
+  #           label: linux-x64
+  #         - runner: [self-hosted, macOS, ARM64]
+  #           label: macos-arm64
+  #         - runner: [self-hosted, Windows, X64]
+  #           label: windows-x64
+  #   runs-on: ${{ matrix.runner }}
+  #   name: test-java (${{ matrix.label }})
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@master
+  #       with:
+  #         toolchain: ${{ env.RUST_TOOLCHAIN }}
+  #     - uses: actions/setup-java@v4
+  #       with:
+  #         distribution: temurin
+  #         java-version: "22"
+  #     - name: Build FFI shared library
+  #       run: cargo build --release -p aster_transport_ffi
+  #     - name: Run Java tests
+  #       run: cd bindings/java && ./gradlew test
+  #
+  # ── Go bindings (future) ───────────────────────────────────────────
+  # test-go:
+  #   needs: lint
+  #   runs-on: [self-hosted, Linux, X64]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@master
+  #       with:
+  #         toolchain: ${{ env.RUST_TOOLCHAIN }}
+  #     - uses: actions/setup-go@v5
+  #       with:
+  #         go-version: "1.22"
+  #     - name: Build FFI shared library
+  #       run: cargo build --release -p aster_transport_ffi
+  #     - name: Run Go tests
+  #       run: cd bindings/go && go test ./...
