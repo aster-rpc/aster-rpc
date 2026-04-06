@@ -30,6 +30,7 @@ That's it in dev mode. `AsterClient` reads configuration from `ASTER_*` environm
 ```python
 AsterClient(
     config=AsterConfig.from_env(),          # auto-loaded when omitted
+    peer="billing-consumer",               # optional: select from .aster-identity
     endpoint_addr="base64string...",        # override: producer's address
     root_pubkey=b'\x01\x02...',             # override: root public key
     enrollment_credential_file="cred.json", # override: credential path
@@ -37,26 +38,52 @@ AsterClient(
 )
 ```
 
-All arguments are optional when the corresponding `ASTER_*` env vars are set.
+All arguments are optional when the corresponding `ASTER_*` env vars or `.aster-identity` file are set.
 
-### Configuration resolution (each field: inline kwarg > env var > TOML > default)
+### `peer` parameter
 
-| What | Env var | Purpose |
-|------|---------|---------|
-| Producer address | `ASTER_ENDPOINT_ADDR` | **Required.** Base64 NodeAddr or EndpointId hex string. |
-| Enrollment credential | `ASTER_ENROLLMENT_CREDENTIAL` | Path to pre-signed token (production). Not needed in dev mode. |
+Selects a consumer peer entry from the `.aster-identity` file by name. When present, `AsterClient` loads the node secret key (for stable EndpointId), the root public key, and the signed enrollment credential from the identity file automatically.
+
+```python
+# With identity file:
+async with AsterClient(peer="billing-consumer") as c:
+    svc = await c.client(MyService)
+    ...
+```
+
+If `peer` is omitted, `AsterClient` auto-selects the first `[[peers]]` entry with `role = "consumer"`. If no `.aster-identity` file exists, the client runs in dev mode.
+
+### Configuration resolution (each field: inline kwarg > identity file > env var > TOML > default)
+
+| What | Source | Purpose |
+|------|--------|---------|
+| Producer address | `ASTER_ENDPOINT_ADDR` or `endpoint_addr=` | **Required.** Base64 NodeAddr or EndpointId hex string. |
+| Enrollment credential | `.aster-identity` `[[peers]]` entry or `ASTER_ENROLLMENT_CREDENTIAL` | Signed token for admission. Not needed in dev mode. |
+| Root public key | `.aster-identity` `root_pubkey` field, `ASTER_ROOT_PUBKEY`, or `ASTER_ROOT_PUBKEY_FILE` | For validating the producer's root key in the admission response. |
+| Node identity | `.aster-identity` `[node].secret_key` or `ASTER_SECRET_KEY` | 32-byte key for stable EndpointId. Ephemeral if unset. |
 | IID token | `ASTER_ENROLLMENT_CREDENTIAL_IID` | Cloud Instance Identity Document (when credential requires IID). |
-| Root public key | `ASTER_ROOT_PUBKEY` or `ASTER_ROOT_PUBKEY_FILE` | For validating the producer's root key in the admission response. |
-| Node identity | `ASTER_SECRET_KEY` | Base64 32-byte key for stable EndpointId. Ephemeral if unset. |
 
 ### Dev mode vs production
 
-**Dev mode** (no credential, producer has `allow_all_consumers=True`):
+**Dev mode** (no `.aster-identity`, producer has `allow_all_consumers=True`):
 ```bash
 ASTER_ENDPOINT_ADDR=<addr> python consumer.py
 ```
 
-**Production** (operator-issued credential):
+**Production with identity file** (recommended):
+```bash
+ASTER_ENDPOINT_ADDR=<addr> python consumer.py
+# .aster-identity in cwd provides the credential automatically
+```
+
+**Production in containers** (identity file at a custom path):
+```bash
+ASTER_IDENTITY_FILE=/etc/aster/.aster-identity \
+ASTER_ENDPOINT_ADDR=<addr> \
+python consumer.py
+```
+
+**Legacy approach** (credential file without identity file -- still supported):
 ```bash
 ASTER_ENDPOINT_ADDR=<addr> \
 ASTER_ENROLLMENT_CREDENTIAL=consumer.token \
@@ -231,14 +258,12 @@ except RpcError as e:
 
 ```python
 import asyncio
-from aster import AsterClient, AsterConfig
+from aster import AsterClient
 from my_services import HelloService, HelloRequest
 
 async def main():
-    # Config is auto-loaded from env, but you can also load from file:
-    # config = AsterConfig.from_file("aster.toml")
-
-    async with AsterClient() as c:
+    # peer= selects the consumer credential from .aster-identity
+    async with AsterClient(peer="billing-consumer") as c:
         print(f"Admitted! Services:")
         for s in c.services:
             print(f"  {s.name} v{s.version} (contract: {s.contract_id[:16]}...)")
@@ -251,10 +276,12 @@ asyncio.run(main())
 ```
 
 ```bash
-# Production: enrollment credential + stable node identity
+# Production: .aster-identity provides credential + node identity
+ASTER_ENDPOINT_ADDR=<producer addr> python consumer.py
+
+# Or in a container with a custom identity file path:
+ASTER_IDENTITY_FILE=/etc/aster/.aster-identity \
 ASTER_ENDPOINT_ADDR=<producer addr> \
-ASTER_ENROLLMENT_CREDENTIAL=consumer.token \
-ASTER_SECRET_KEY=<base64 node key> \
 python consumer.py
 ```
 

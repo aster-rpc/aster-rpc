@@ -106,22 +106,43 @@ ASTER_ENDPOINT_ADDR=<paste from producer output> python consumer.py
 
 The quickstart above runs in **dev mode** — ephemeral keys, open gates, no credential files. Everything works out of the box for local development.
 
-In **production**, you configure trust and admission:
+In **production**, you use the CLI profile system to manage trust and enroll nodes:
 
 ```bash
-# Operator's machine (offline):
-aster keygen root --out root.key
-aster keygen pubkey --in root.key --out root_pub.key
-aster authorize consumer --root-key root.key --type policy --out consumer.token
+# Operator's machine (one time):
+aster profile create prod
+aster keygen root --profile prod
+#   -> private key stored in OS keyring, public key saved to profile
 
-# Producer node:
-ASTER_ROOT_PUBKEY_FILE=root_pub.key python producer.py
+# Enroll the producer node:
+aster enroll node --profile prod --role producer --name billing-producer
+#   -> generates node key + signs credential -> writes .aster-identity
 
-# Consumer node:
-ASTER_ENDPOINT_ADDR=<producer addr> \
-ASTER_ENROLLMENT_CREDENTIAL=consumer.token \
-python consumer.py
+# Enroll the consumer node (can run on the same or different machine):
+aster enroll node --profile prod --role consumer --name billing-consumer
+#   -> adds a consumer peer entry to .aster-identity
 ```
+
+Then deploy the `.aster-identity` file alongside your code:
+
+```python
+# producer.py — loads node key + producer credential from .aster-identity
+async with AsterServer(services=[HelloService()], peer="billing-producer") as srv:
+    print(srv.endpoint_addr_b64)
+    await srv.serve()
+
+# consumer.py — loads consumer credential from .aster-identity
+async with AsterClient(peer="billing-consumer") as c:
+    hello = await c.client(HelloService)
+    resp = await hello.say_hello(HelloRequest(name="World"))
+```
+
+```bash
+# Consumer still needs to know where the producer is:
+ASTER_ENDPOINT_ADDR=<producer addr> python consumer.py
+```
+
+You can enroll the same node multiple times (e.g., as a producer in one mesh and a consumer in another) -- each `aster enroll node` call adds a `[[peers]]` entry to the `.aster-identity` file.
 
 See [Configuration](configuration.md) for the full list of environment variables and TOML settings, and [Trust](trust.md) for the security model.
 

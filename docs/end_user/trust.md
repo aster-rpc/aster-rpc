@@ -228,26 +228,40 @@ This is useful for integration tests and local demos. The ephemeral private key 
 
 ## Production workflow
 
-### Step 1: Generate the root keypair
+The production workflow uses the CLI profile system to manage root keys and the `.aster-identity` file to bundle node keys with enrollment credentials.
+
+### Step 1: Create an operator profile
 
 Run this once, on the operator's machine. Not on a server node.
 
 ```bash
-aster keygen root --out ~/.aster/root.key
+aster profile create prod
 ```
 
-This creates a JSON file with both the private and public keys:
+This creates an entry in `~/.aster/config.toml`. Profiles represent deployment meshes (dev, staging, prod). The operator machine is the only place that holds the root private key.
 
-```json
-{
-  "private_key": "abcdef0123456789...",
-  "public_key": "fedcba9876543210..."
-}
+### Step 2: Generate the root keypair
+
+```bash
+aster keygen root --profile prod
 ```
 
-Keep the **private key secret**. Extract the public key and distribute it to your nodes.
+This does three things:
 
-You can also do this in Python:
+1. Generates an ed25519 keypair.
+2. Stores the **private key** in the OS keyring (via the `keyring` package), scoped to the profile name.
+3. Saves the **public key** to the profile in `~/.aster/config.toml`.
+4. Also writes a JSON backup to `~/.aster/root.key` (0600 permissions).
+
+The keyring integration keeps the root private key out of plaintext files. Install the `keyring` package for this to work:
+
+```bash
+pip install keyring
+```
+
+If keyring is not available, `aster keygen root` still works but prints a warning. The fallback is to use the JSON file with `--root-key` when enrolling nodes.
+
+You can also generate keypairs programmatically:
 
 ```python
 from aster.trust.signing import generate_root_keypair
@@ -257,115 +271,162 @@ priv_bytes, pub_bytes = generate_root_keypair()
 # pub_bytes:  32-byte ed25519 public key -- distribute to nodes
 ```
 
-### Step 2: Distribute the public key
+### Step 3: Enroll nodes
 
-Copy the public key to each node. You can distribute it as:
+This is the key step. `aster enroll node` generates (or reuses) a node key, signs an enrollment credential with the root private key, and writes everything to a `.aster-identity` file.
 
-- A file containing just the hex-encoded public key (64 characters).
-- A JSON file with a `"public_key"` field (same format as `root.key`).
-- An environment variable: `ASTER_ROOT_PUBKEY=fedcba9876543210...`
-- A TOML config entry: `root_pubkey_file = "/etc/aster/root_pub.key"`
-
-The public key is not secret. It is safe to check it into version control, embed it in container images, or pass it through any channel.
-
-### Step 3: Sign enrollment credentials
-
-Use the CLI to mint credentials for each node. This is done offline, on the machine that holds the root private key.
-
-**For producers** (bound to a specific node):
+**Enroll a producer:**
 
 ```bash
-# First, generate a stable producer key to learn the NodeId:
-aster keygen producer --out ~/.aster/node.key
-# Output: node_id = abc123...
-
-# Then sign an enrollment credential for that NodeId:
-aster trust sign \
-    --root-key ~/.aster/root.key \
-    --endpoint-id abc123... \
-    --type producer \
-    --attributes '{"aster.role": "producer"}' \
-    --expires 2027-01-01T00:00:00Z \
-    --out producer-enrollment.json
+aster enroll node --profile prod --role producer --name billing-producer
 ```
 
-**For consumers (policy -- reusable)**:
+This creates `.aster-identity` in the current directory with:
+- A `[node]` section containing a fresh secret key and derived EndpointId.
+- A `[[peers]]` entry with the signed producer credential.
+
+**Enroll a consumer (on the same or different machine):**
 
 ```bash
-aster trust sign \
-    --root-key ~/.aster/root.key \
-    --type policy \
-    --attributes '{"aster.role": "consumer"}' \
-    --expires 2027-01-01T00:00:00Z \
-    --out consumer-policy.json
+aster enroll node --profile prod --role consumer --name billing-consumer
 ```
 
-**For consumers (OTT -- single-use)**:
+If `.aster-identity` already exists, the existing node key is reused and a new `[[peers]]` entry is added. This lets a single node participate in multiple meshes with different roles.
+
+**Options:**
 
 ```bash
-aster trust sign \
-    --root-key ~/.aster/root.key \
-    --type ott \
-    --attributes '{"aster.role": "consumer"}' \
-    --expires 2027-01-01T00:00:00Z \
-    --out consumer-ott.json
+aster enroll node \
+    --profile prod \
+    --role consumer \
+    --name analytics-consumer \
+    --type ott \                    # OTT (single-use) credential; default is "policy"
+    --expires 30d \                 # relative ("30d", "24h") or ISO 8601; default 30 days
+    --attributes "team=analytics" \ # comma-separated key=value pairs
+    --identity /path/to/.aster-identity  # use a specific identity file
 ```
 
-The OTT command generates a random 32-byte nonce automatically. The first node to present this credential is admitted; any subsequent presentation is rejected.
+The `--root-key` flag provides a fallback when keyring is unavailable:
 
-You can also sign credentials programmatically:
+```bash
+aster enroll node --root-key ~/.aster/root.key --role producer --name my-producer
+```
+
+### Step 4: Deploy identity files
+
+Copy the `.aster-identity` file to each node alongside the application code. The file has 0600 permissions and should be in `.gitignore`.
+
+**Producer node:**
 
 ```python
-import time
-from aster.trust.credentials import EnrollmentCredential
-from aster.trust.signing import sign_credential
+# producer.py
+from aster import AsterServer
 
-cred = EnrollmentCredential(
-    endpoint_id="abc123...",
-    root_pubkey=pub_bytes,
-    expires_at=int(time.time()) + 365 * 24 * 3600,  # 1 year
-    attributes={"aster.role": "producer"},
-)
-cred.signature = sign_credential(cred, priv_bytes)
+async with AsterServer(
+    services=[MyService()],
+    peer="billing-producer",  # selects the producer peer from .aster-identity
+) as srv:
+    print(srv.endpoint_addr_b64)
+    await srv.serve()
 ```
 
-### Step 4: Configure nodes
+**Consumer node:**
 
-Each node needs:
-- The root **public** key (to verify incoming credentials).
-- Optionally, its own enrollment credential (if joining an existing mesh as a non-founding producer).
-- Its admission policy (`allow_all_consumers`, `allow_all_producers`).
+```python
+# consumer.py
+from aster import AsterClient
 
-Example TOML for a production producer node:
-
-```toml
-[trust]
-root_pubkey_file = "/etc/aster/root_pub.key"
-allow_all_consumers = false
-allow_all_producers = false
-
-[network]
-secret_key = "base64-encoded-32-byte-key"
-bind_addr = "0.0.0.0:9000"
-
-[storage]
-path = "/var/lib/aster"
+async with AsterClient(peer="billing-consumer") as c:
+    svc = await c.client(MyService)
+    result = await svc.my_method(request)
 ```
-
-### Step 5: Distribute credentials to nodes
-
-Send each signed credential to the appropriate node. Configure nodes to find them:
 
 ```bash
-export ASTER_ENROLLMENT_CREDENTIAL=/etc/aster/enrollment.json
+ASTER_ENDPOINT_ADDR=<producer addr> python consumer.py
 ```
 
-Or in TOML:
+For containers and CI, use `ASTER_IDENTITY_FILE` to point to a non-default path:
+
+```bash
+ASTER_IDENTITY_FILE=/etc/aster/.aster-identity python producer.py
+```
+
+### The `.aster-identity` file format
 
 ```toml
-[trust]
-enrollment_credential = "/etc/aster/enrollment.json"
+# .aster-identity -- generated by `aster enroll node`
+
+[node]
+secret_key = "base64-encoded-32-byte-key"
+endpoint_id = "hex-encoded-ed25519-public-key"
+
+[[peers]]
+name = "billing-producer"
+role = "producer"
+type = "policy"
+root_pubkey = "hex-encoded-32-byte-root-public-key"
+endpoint_id = "hex-encoded-endpoint-id"
+expires_at = 1751500800
+signature = "hex-encoded-64-byte-ed25519-signature"
+
+  [peers.attributes]
+  "aster.role" = "producer"
 ```
+
+Key fields in each `[[peers]]` entry:
+
+| Field | Description |
+|-------|-------------|
+| `name` | Human label, used by `peer=` to select the right entry |
+| `role` | `"producer"` or `"consumer"` |
+| `type` | `"policy"` (reusable) or `"ott"` (single-use) |
+| `root_pubkey` | Hex root public key -- identifies which mesh this credential belongs to |
+| `endpoint_id` | Hex EndpointId this credential is bound to |
+| `expires_at` | Unix epoch seconds |
+| `nonce` | Hex 32-byte nonce (OTT credentials only) |
+| `signature` | Hex ed25519 signature over the credential |
+| `attributes` | Sub-table of key-value metadata |
+
+### Multi-mesh nodes
+
+A single `.aster-identity` file can hold peers from different meshes (identified by different `root_pubkey` values). This is useful when one node acts as a producer in one mesh and a consumer in another:
+
+```bash
+# Enroll as producer in the billing mesh:
+aster enroll node --profile billing --role producer --name billing-producer
+
+# Also enroll as consumer in the analytics mesh:
+aster enroll node --profile analytics --role consumer --name analytics-consumer
+```
+
+The `peer=` parameter in `AsterServer`/`AsterClient` selects the right entry by name.
+
+### Operator profile reference
+
+Profiles live in `~/.aster/config.toml`:
+
+```toml
+active_profile = "prod"
+
+[profiles.prod]
+root_pubkey = "hex-encoded-32-byte-root-public-key"
+
+[profiles.staging]
+root_pubkey = "hex-encoded-32-byte-root-public-key"
+```
+
+The root private key for each profile is stored in the OS keyring under the key `root_privkey:{profile_name}`.
+
+**CLI commands:**
+
+| Command | Description |
+|---------|-------------|
+| `aster profile create <name>` | Create a new empty profile |
+| `aster profile list` | List all profiles (active marked with `*`) |
+| `aster profile use <name>` | Set the active profile |
+| `aster profile show [name]` | Show profile details (default: active) |
+| `aster profile delete <name>` | Delete a profile and its keyring entry |
+| `aster keygen root [--profile name]` | Generate root keypair for a profile |
 
 The founding node of a mesh does not need an enrollment credential -- it bootstraps the mesh with just the root public key and its own EndpointId.
 

@@ -98,6 +98,7 @@ class AsterServer:
         services: list,
         *,
         config: "AsterConfig | None" = None,
+        peer: str | None = None,
         # Inline overrides (take priority over config):
         root_pubkey: bytes | None = None,
         allow_all_consumers: bool | None = None,
@@ -133,7 +134,19 @@ class AsterServer:
             else config.allow_all_producers
         )
 
-        # Resolve root public key: inline > config file > ephemeral (dev).
+        # Load identity file if present (.aster-identity).
+        self._peer_name = peer
+        secret_key_from_identity, peer_entry = config.load_identity(
+            peer_name=peer, role="producer"
+        )
+        if peer_entry and not root_pubkey:
+            # Root pubkey comes from the credential in the identity file.
+            root_pubkey = bytes.fromhex(peer_entry["root_pubkey"])
+        if secret_key_from_identity and not config.secret_key:
+            import base64 as _b64
+            config.secret_key = secret_key_from_identity
+
+        # Resolve root public key: inline > identity file > config file > ephemeral.
         # The root private key is NEVER on a running node (trust spec §1.1).
         pub = config.resolve_root_pubkey()
         self._root_pubkey = root_pubkey if root_pubkey is not None else pub
@@ -509,6 +522,7 @@ class AsterClient:
         self,
         *,
         config: "AsterConfig | None" = None,
+        peer: str | None = None,
         # Inline overrides (take priority over config):
         endpoint_addr: NodeAddr | str | bytes | None = None,
         root_pubkey: bytes | None = None,
@@ -521,6 +535,16 @@ class AsterClient:
         if config is None:
             config = AsterConfig.from_env()
         self._config = config
+        self._peer_name = peer
+
+        # Load identity file if present (.aster-identity).
+        secret_key_from_identity, peer_entry = config.load_identity(
+            peer_name=peer, role="consumer"
+        )
+        if secret_key_from_identity and not config.secret_key:
+            config.secret_key = secret_key_from_identity
+        if peer_entry and not root_pubkey:
+            root_pubkey = bytes.fromhex(peer_entry["root_pubkey"])
 
         # Resolve endpoint address: inline > config > error.
         addr = endpoint_addr or config.endpoint_addr
@@ -535,10 +559,17 @@ class AsterClient:
         pub = config.resolve_root_pubkey()
         self._root_pubkey = root_pubkey if root_pubkey is not None else pub
 
-        # Enrollment credential: inline > config > None (skip admission).
-        self._enrollment_credential_file = (
-            enrollment_credential_file or config.enrollment_credential_file
-        )
+        # Enrollment credential: identity file peer > inline > config > None.
+        if peer_entry and not enrollment_credential_file:
+            # The peer entry IS the credential — write it to a temp file
+            # that _load_enrollment_credential can read, or inline it.
+            self._inline_credential = peer_entry
+            self._enrollment_credential_file = None
+        else:
+            self._inline_credential = None
+            self._enrollment_credential_file = (
+                enrollment_credential_file or config.enrollment_credential_file
+            )
         self._enrollment_credential_iid = config.enrollment_credential_iid
         self._channel_name = channel_name
 
@@ -578,14 +609,15 @@ class AsterClient:
         """
         assert self._ep is not None
 
-        # Load credential from file if configured, else send empty request.
-        if self._enrollment_credential_file:
+        # Build credential from: inline peer entry > credential file > empty.
+        if self._inline_credential:
+            cred = _credential_from_peer_entry(self._inline_credential)
+            cred_json = consumer_cred_to_json(cred)
+        elif self._enrollment_credential_file:
             cred = _load_enrollment_credential(self._enrollment_credential_file)
             cred_json = consumer_cred_to_json(cred)
         else:
-            # No credential — dev mode / open-gate flow.  Send a minimal
-            # request that the producer's admission handler will auto-accept
-            # if allow_all_consumers=True.
+            # No credential — dev mode / open-gate flow.
             cred_json = ""
 
         iid_token = self._enrollment_credential_iid or ""
@@ -754,6 +786,20 @@ def _clone_config_with_alpns(
             if val is not None:
                 kwargs[attr] = val
     return EndpointConfig(**kwargs)
+
+
+def _credential_from_peer_entry(peer: dict) -> ConsumerEnrollmentCredential:
+    """Build a ConsumerEnrollmentCredential from a [[peers]] entry in .aster-identity."""
+    nonce_hex = peer.get("nonce")
+    return ConsumerEnrollmentCredential(
+        credential_type=peer.get("type", "policy"),
+        root_pubkey=bytes.fromhex(peer["root_pubkey"]),
+        expires_at=int(peer["expires_at"]),
+        attributes=peer.get("attributes", {}),
+        endpoint_id=peer.get("endpoint_id"),
+        nonce=bytes.fromhex(nonce_hex) if nonce_hex else None,
+        signature=bytes.fromhex(peer.get("signature", "")),
+    )
 
 
 def _load_enrollment_credential(path: str) -> ConsumerEnrollmentCredential:
