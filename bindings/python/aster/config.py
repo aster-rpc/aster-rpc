@@ -350,6 +350,14 @@ class AsterConfig:
     proxy_url: str | None = None
     proxy_from_env: bool = False
 
+    # ── Identity file ────────────────────────────────────────────────────
+
+    identity_file: str | None = None
+    """Path to ``.aster-identity`` TOML file.  When set, the node key and
+    enrollment credentials are loaded from this file.
+    Env: ``ASTER_IDENTITY_FILE``.  Default: looks for ``.aster-identity``
+    in the current working directory."""
+
     # ── Internal (not user-facing) ───────────────────────────────────────
 
     _sources: dict = dc_field(default_factory=dict, repr=False)
@@ -404,6 +412,65 @@ class AsterConfig:
             return pub
 
         return None
+
+    def load_identity(self, peer_name: str | None = None,
+                      role: str | None = None) -> tuple[bytes | None, dict | None]:
+        """Load a peer entry from the ``.aster-identity`` file.
+
+        Args:
+            peer_name: Select peer by ``name``.  If None, auto-selects by
+                ``role`` (first match).
+            role: Fallback selector when ``peer_name`` is None.
+                ``"producer"`` for AsterServer, ``"consumer"`` for AsterClient.
+
+        Returns:
+            ``(secret_key_bytes, peer_dict)`` or ``(None, None)`` when no
+            identity file is found.
+        """
+        import base64 as _b64
+
+        path = self._resolve_identity_path()
+        if path is None:
+            return None, None
+
+        if sys.version_info >= (3, 11):
+            import tomllib as _tl
+        else:
+            import tomli as _tl  # type: ignore[no-redef]
+
+        with open(path, "rb") as f:
+            data = _tl.load(f)
+
+        node = data.get("node", {})
+        secret_key_b64 = node.get("secret_key")
+        secret_key = _b64.b64decode(secret_key_b64) if secret_key_b64 else None
+
+        # Find the peer entry
+        peers = data.get("peers", [])
+        peer = None
+        if peer_name is not None:
+            for p in peers:
+                if p.get("name") == peer_name:
+                    peer = p
+                    break
+        elif role is not None:
+            for p in peers:
+                if p.get("role") == role:
+                    peer = p
+                    break
+        elif peers:
+            peer = peers[0]  # single peer → auto-select
+
+        return secret_key, peer
+
+    def _resolve_identity_path(self) -> str | None:
+        """Find the .aster-identity file."""
+        if self.identity_file:
+            expanded = os.path.expanduser(self.identity_file)
+            return expanded if os.path.exists(expanded) else None
+        # Default: look in cwd
+        default = os.path.join(os.getcwd(), ".aster-identity")
+        return default if os.path.exists(default) else None
 
     def to_endpoint_config(self) -> EndpointConfig | None:
         """Build an :class:`EndpointConfig` from the network fields.
@@ -589,6 +656,8 @@ class AsterConfig:
             _set("enrollment_credential_iid", v.strip(), "ASTER_ENROLLMENT_CREDENTIAL_IID")
         if (v := env.get("ASTER_ENDPOINT_ADDR")) is not None:
             _set("endpoint_addr", v.strip(), "ASTER_ENDPOINT_ADDR")
+        if (v := env.get("ASTER_IDENTITY_FILE")) is not None:
+            _set("identity_file", v.strip(), "ASTER_IDENTITY_FILE")
         if (v := env.get("ASTER_ALLOW_ALL_CONSUMERS")) is not None:
             _set("allow_all_consumers", _parse_bool(v, "ASTER_ALLOW_ALL_CONSUMERS"), "ASTER_ALLOW_ALL_CONSUMERS")
         if (v := env.get("ASTER_ALLOW_ALL_PRODUCERS")) is not None:

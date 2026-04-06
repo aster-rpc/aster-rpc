@@ -219,7 +219,15 @@ def main() -> None:
     from aster_cli.keygen import register_keygen_subparser, run_keygen_command
     register_keygen_subparser(subparsers)
 
-    # ``aster authorize`` — sign a producer enrollment credential
+    # ``aster profile`` subcommand group
+    from aster_cli.profile import register_profile_subparser
+    register_profile_subparser(subparsers)
+
+    # ``aster enroll`` subcommand group
+    from aster_cli.enroll import register_enroll_subparser
+    register_enroll_subparser(subparsers)
+
+    # ``aster authorize`` — sign a producer enrollment credential (legacy)
     auth_parser = subparsers.add_parser(
         "authorize",
         help="Sign a producer enrollment credential (offline)",
@@ -257,8 +265,14 @@ def main() -> None:
         sys.exit(run_trust_command(args))
     elif args.command == "keygen":
         sys.exit(run_keygen_command(args))
+    elif args.command == "profile":
+        from aster_cli.profile import run_profile_command
+        sys.exit(run_profile_command(args))
+    elif args.command == "enroll":
+        from aster_cli.enroll import run_enroll_command
+        sys.exit(run_enroll_command(args))
     elif args.command == "authorize":
-        # Map to trust sign --type producer
+        # Map to trust sign --type producer (legacy)
         args.endpoint_id = args.producer_id
         args.type = "producer"
         args.trust_command = "sign"

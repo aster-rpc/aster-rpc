@@ -26,38 +26,71 @@ import sys
 
 
 def _keygen_root(args) -> int:
-    """Generate an ed25519 root key pair and write to disk."""
+    """Generate an ed25519 root key pair.
+
+    Stores the private key in the OS keyring (if available) under the
+    active profile, and writes the public key to the profile config.
+    Also writes a JSON file to ``--out`` as a backup/export.
+    """
     from aster.trust.signing import generate_root_keypair
+    from aster_cli.credentials import store_root_privkey, has_keyring
+    from aster_cli.profile import _load_config, _save_config, _active_profile
 
-    out_path = os.path.expanduser(args.out)
+    profile_name = getattr(args, "profile", None) or os.environ.get("ASTER_PROFILE")
+    config = _load_config()
+    if profile_name is None:
+        profile_name = _active_profile(config)
 
-    if os.path.exists(out_path):
-        print(f"Error: key file already exists: {out_path}", file=sys.stderr)
-        print("Use a different path or remove the existing file.", file=sys.stderr)
-        return 1
+    # Ensure profile exists
+    profiles = config.setdefault("profiles", {})
+    if profile_name not in profiles:
+        profiles[profile_name] = {}
+        if not config.get("active_profile"):
+            config["active_profile"] = profile_name
+        print(f"Created profile '{profile_name}'.")
 
     priv_raw, pub_raw = generate_root_keypair()
     priv_hex = priv_raw.hex()
     pub_hex = pub_raw.hex()
 
-    out_dir = os.path.dirname(out_path) or "."
-    os.makedirs(out_dir, exist_ok=True)
+    # Store private key in keyring
+    stored_in_keyring = store_root_privkey(profile_name, priv_hex)
+    if stored_in_keyring:
+        print(f"  Root private key stored in OS keyring (profile: {profile_name})")
+    else:
+        print("  WARNING: keyring not available — private key NOT securely stored.")
+        print("  Install keyring: pip install keyring")
 
-    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump({"private_key": priv_hex, "public_key": pub_hex}, f, indent=2)
-            f.write("\n")
-    except BaseException:
+    # Store public key in profile config
+    profiles[profile_name]["root_pubkey"] = pub_hex
+    _save_config(config)
+    print(f"  Root public key saved to profile '{profile_name}'")
+
+    # Also write the JSON file (export/backup)
+    out_path = os.path.expanduser(args.out)
+    if not os.path.exists(out_path):
+        out_dir = os.path.dirname(out_path) or "."
+        os.makedirs(out_dir, exist_ok=True)
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.unlink(out_path)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, "w") as f:
+                json.dump({"private_key": priv_hex, "public_key": pub_hex}, f, indent=2)
+                f.write("\n")
+        except BaseException:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            raise
+        print(f"  Key pair also written to: {out_path}")
 
-    print(f"Root key pair written to: {out_path}")
+    print()
+    print(f"  Profile    : {profile_name}")
     print(f"  public_key : {pub_hex}")
-    print("  Keep the private key secret.")
+    if stored_in_keyring:
+        print("  private_key: **** (in keyring)")
+    else:
+        print(f"  private_key: {out_path}")
     return 0
 
 
@@ -127,7 +160,13 @@ def register_keygen_subparser(subparsers) -> None:
         "--out",
         default=os.path.expanduser("~/.aster/root.key"),
         metavar="PATH",
-        help="Output path for the key JSON (default: ~/.aster/root.key)",
+        help="Output path for the key JSON backup (default: ~/.aster/root.key)",
+    )
+    root_p.add_argument(
+        "--profile", "-p",
+        default=None,
+        metavar="NAME",
+        help="Profile to store the key in (default: active profile)",
     )
 
     # aster keygen producer
