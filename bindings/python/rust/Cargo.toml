@@ -15,5 +15,8 @@ aster_transport_core = { path = "../../../core" }
 pyo3        = { workspace = true }
 pyo3-async-runtimes = { workspace = true }
 
+# Serialization (needed for contract submodule JSON dispatch)
+serde_json  = "1"
+
 # Common dependencies
 tokio       = { workspace = true }

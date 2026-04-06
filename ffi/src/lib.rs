@@ -5488,3 +5488,220 @@ pub unsafe extern "C" fn iroh_hook_after_connect_respond(
         }
     }
 }
+
+// ============================================================================
+// Cross-language contract identity, framing & signing
+// ============================================================================
+//
+// Synchronous functions. No runtime handle required. No event queue.
+// Pure computation: data in → result out → status code returned.
+
+/// Helper: write `src` into caller-provided buffer `(out_buf, out_len)`.
+///
+/// On success sets `*out_len` to the number of bytes written and returns OK.
+/// If the buffer is too small, sets `*out_len` to the required size and
+/// returns BUFFER_TOO_SMALL.
+///
+/// Returns INVALID_ARGUMENT when any pointer is null.
+unsafe fn write_to_caller_buf(
+    src: &[u8],
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> iroh_status_t {
+    if out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT;
+    }
+    let capacity = *out_len;
+    if src.len() > capacity || out_buf.is_null() {
+        *out_len = src.len();
+        return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL;
+    }
+    std::ptr::copy_nonoverlapping(src.as_ptr(), out_buf, src.len());
+    *out_len = src.len();
+    iroh_status_t::IROH_STATUS_OK
+}
+
+/// Compute contract_id from a ServiceContract JSON string.
+/// Writes 64-byte hex string (no null terminator) to out_buf.
+/// On BUFFER_TOO_SMALL, sets `*out_len` to required size.
+#[no_mangle]
+pub unsafe extern "C" fn aster_contract_id(
+    json_ptr: *const u8,
+    json_len: usize,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if json_ptr.is_null() || out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let json_bytes = slice::from_raw_parts(json_ptr, json_len);
+    let json_str = match std::str::from_utf8(json_bytes) {
+        Ok(s) => s,
+        Err(e) => return set_last_error(format!("invalid UTF-8 in JSON input: {e}")),
+    };
+    match aster_transport_core::contract::compute_contract_id_from_json(json_str) {
+        Ok(hex_id) => write_to_caller_buf(hex_id.as_bytes(), out_buf, out_len) as i32,
+        Err(e) => set_last_error(e),
+    }
+}
+
+/// Compute canonical bytes for a named type from JSON.
+/// `type_name`: `"ServiceContract"`, `"TypeDef"`, or `"MethodDef"`.
+#[no_mangle]
+pub unsafe extern "C" fn aster_canonical_bytes(
+    type_name_ptr: *const u8,
+    type_name_len: usize,
+    json_ptr: *const u8,
+    json_len: usize,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if type_name_ptr.is_null() || json_ptr.is_null() || out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let type_name_bytes = slice::from_raw_parts(type_name_ptr, type_name_len);
+    let type_name = match std::str::from_utf8(type_name_bytes) {
+        Ok(s) => s,
+        Err(e) => return set_last_error(format!("invalid UTF-8 in type_name: {e}")),
+    };
+    let json_bytes = slice::from_raw_parts(json_ptr, json_len);
+    let json_str = match std::str::from_utf8(json_bytes) {
+        Ok(s) => s,
+        Err(e) => return set_last_error(format!("invalid UTF-8 in JSON input: {e}")),
+    };
+    match aster_transport_core::contract::canonical_bytes_from_json(type_name, json_str) {
+        Ok(bytes) => write_to_caller_buf(&bytes, out_buf, out_len) as i32,
+        Err(e) => set_last_error(e),
+    }
+}
+
+/// Encode a frame: `[4-byte LE length][flags][payload]`.
+#[no_mangle]
+pub unsafe extern "C" fn aster_frame_encode(
+    payload_ptr: *const u8,
+    payload_len: usize,
+    flags: u8,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    // payload_ptr may be null when payload_len == 0 (empty control frames)
+    let payload = if payload_len == 0 {
+        &[]
+    } else {
+        if payload_ptr.is_null() {
+            return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        }
+        slice::from_raw_parts(payload_ptr, payload_len)
+    };
+    match aster_transport_core::framing::encode_frame(payload, flags) {
+        Ok(frame) => write_to_caller_buf(&frame, out_buf, out_len) as i32,
+        Err(e) => set_last_error(e),
+    }
+}
+
+/// Decode a frame. Writes payload to `out_payload`, flags byte to `*out_flags`.
+///
+/// `*out_payload_len` must be set to the capacity of `out_payload` on entry.
+/// On success it is set to the actual payload length.
+/// On BUFFER_TOO_SMALL it is set to the required payload size.
+#[no_mangle]
+pub unsafe extern "C" fn aster_frame_decode(
+    data_ptr: *const u8,
+    data_len: usize,
+    out_payload: *mut u8,
+    out_payload_len: *mut usize,
+    out_flags: *mut u8,
+) -> i32 {
+    if data_ptr.is_null() || out_payload_len.is_null() || out_flags.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let data = slice::from_raw_parts(data_ptr, data_len);
+    match aster_transport_core::framing::decode_frame(data) {
+        Ok((payload, flags, _consumed)) => {
+            *out_flags = flags;
+            write_to_caller_buf(&payload, out_payload, out_payload_len) as i32
+        }
+        Err(e) => set_last_error(e),
+    }
+}
+
+/// Compute canonical signing bytes from credential JSON.
+///
+/// The JSON must contain a `"kind"` field (`"producer"` or `"consumer"`)
+/// to dispatch to the correct signing bytes format.
+#[no_mangle]
+pub unsafe extern "C" fn aster_signing_bytes(
+    json_ptr: *const u8,
+    json_len: usize,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if json_ptr.is_null() || out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let json_bytes = slice::from_raw_parts(json_ptr, json_len);
+    let json_str = match std::str::from_utf8(json_bytes) {
+        Ok(s) => s,
+        Err(e) => return set_last_error(format!("invalid UTF-8 in JSON input: {e}")),
+    };
+    match aster_transport_core::signing::canonical_signing_bytes_from_json(json_str) {
+        Ok(bytes) => write_to_caller_buf(&bytes, out_buf, out_len) as i32,
+        Err(e) => set_last_error(e),
+    }
+}
+
+/// Canonical JSON normalization: parse, sort all keys recursively, re-serialize compact.
+///
+/// This is a general-purpose canonical form — not specific to credentials or contracts.
+/// Useful for computing deterministic hashes of arbitrary JSON payloads.
+#[no_mangle]
+pub unsafe extern "C" fn aster_canonical_json(
+    json_ptr: *const u8,
+    json_len: usize,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if json_ptr.is_null() || out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let json_bytes = slice::from_raw_parts(json_ptr, json_len);
+    let json_str = match std::str::from_utf8(json_bytes) {
+        Ok(s) => s,
+        Err(e) => return set_last_error(format!("invalid UTF-8 in JSON input: {e}")),
+    };
+    // Parse into serde_json::Value, which uses BTreeMap for objects (sorted keys).
+    // Then re-serialize compact.
+    let value: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(format!("invalid JSON: {e}")),
+    };
+    let canonical = sort_json_value(&value);
+    let output = match serde_json::to_string(&canonical) {
+        Ok(s) => s,
+        Err(e) => return set_last_error(format!("JSON re-serialization failed: {e}")),
+    };
+    write_to_caller_buf(output.as_bytes(), out_buf, out_len) as i32
+}
+
+/// Recursively sort JSON object keys for canonical form.
+fn sort_json_value(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let sorted: serde_json::Map<String, Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), sort_json_value(v)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .collect();
+            Value::Object(sorted)
+        }
+        Value::Array(arr) => {
+            Value::Array(arr.iter().map(sort_json_value).collect())
+        }
+        other => other.clone(),
+    }
+}

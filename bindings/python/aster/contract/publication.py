@@ -51,12 +51,13 @@ logger = logging.getLogger(__name__)
 def build_collection(
     contract: ServiceContract,
     type_defs: dict[str, TypeDef],
+    service_info: object | None = None,
 ) -> list[tuple[str, bytes]]:
     """Build the list of (name, bytes) pairs for the contract collection.
 
     The collection contains:
     - ``contract.bin``: canonical bytes of the ServiceContract
-    - ``manifest.json``: JSON-serialized ContractManifest
+    - ``manifest.json``: JSON-serialized ContractManifest (includes method schemas)
     - For each TypeDef: ``types/<hex_hash>.bin``
 
     This is pure Python — no Iroh dependencies.
@@ -64,10 +65,13 @@ def build_collection(
     Args:
         contract: The resolved ServiceContract.
         type_defs: Dict mapping FQN to TypeDef (from resolve_with_cycles).
+        service_info: Optional ServiceInfo for extracting method field details.
 
     Returns:
         List of (entry_name, raw_bytes) pairs in deterministic order.
     """
+    from aster.contract.manifest import extract_method_descriptors
+
     entries: list[tuple[str, bytes]] = []
 
     # Canonical contract bytes
@@ -90,6 +94,23 @@ def build_collection(
     ser_modes = list(contract.serialization_modes)
     scoped_str = contract.scoped.name.lower()
 
+    # Extract method descriptors with field definitions
+    methods: list[dict] = []
+    if service_info is not None:
+        methods = extract_method_descriptors(service_info)
+    else:
+        # Fallback: basic method info from the ServiceContract (no field details)
+        for md in contract.methods:
+            methods.append({
+                "name": md.name,
+                "pattern": md.pattern.name.lower() if hasattr(md.pattern, "name") else str(md.pattern),
+                "request_type": md.request_type.hex() if isinstance(md.request_type, bytes) else str(md.request_type),
+                "response_type": md.response_type.hex() if isinstance(md.response_type, bytes) else str(md.response_type),
+                "timeout": md.default_timeout if md.default_timeout else None,
+                "idempotent": md.idempotent,
+                "fields": [],
+            })
+
     # Manifest JSON
     manifest = ContractManifest(
         service=contract.name,
@@ -99,6 +120,7 @@ def build_collection(
         type_count=len(type_defs),
         type_hashes=type_hashes_hex_sorted,
         method_count=len(contract.methods),
+        methods=methods,
         serialization_modes=ser_modes,
         scoped=scoped_str,
     )

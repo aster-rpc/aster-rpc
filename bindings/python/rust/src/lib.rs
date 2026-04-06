@@ -16,6 +16,7 @@
 use pyo3::prelude::*;
 
 mod blobs;
+mod contract;
 mod docs;
 mod error;
 mod gossip;
@@ -64,6 +65,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     gossip::register(py, m)?;
     hooks::register(py, m)?;
     monitor::register(py, m)?;
+    contract::register(py, m)?;
 
     Ok(())
 }

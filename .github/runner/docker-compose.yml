@@ -1,0 +1,54 @@
+# Docker Compose for self-hosted GitHub Actions runners.
+#
+# Usage:
+#   1. Generate a runner token from GitHub:
+#      Settings > Actions > Runners > New self-hosted runner
+#      Or via API: gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token
+#
+#   2. Copy .env.example to .env and fill in the values.
+#
+#   3. Run:
+#      docker compose -f .github/runner/docker-compose.yml up -d
+#
+# Each service is a separate runner instance. Deploy the relevant
+# service(s) on each machine in your home lab.
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  env_file: .env
+
+services:
+  # ── Deploy on: Ubuntu x86 machine ─────────────────────────────────
+  linux-x64:
+    <<: *common
+    container_name: aster-runner-linux-x64
+    environment:
+      RUNNER_NAME: aster-linux-x64
+      RUNNER_LABELS: Linux,X64
+    volumes:
+      - cargo-linux-x64:/cache/cargo
+      - sccache-linux-x64:/cache/sccache
+      - uv-linux-x64:/cache/uv
+
+  # ── Deploy on: OCI Ubuntu ARM machine ──────────────────────────────
+  linux-arm64:
+    <<: *common
+    container_name: aster-runner-linux-arm64
+    environment:
+      RUNNER_NAME: aster-linux-arm64
+      RUNNER_LABELS: Linux,ARM64
+    volumes:
+      - cargo-linux-arm64:/cache/cargo
+      - sccache-linux-arm64:/cache/sccache
+      - uv-linux-arm64:/cache/uv
+
+volumes:
+  cargo-linux-x64:
+  sccache-linux-x64:
+  uv-linux-x64:
+  cargo-linux-arm64:
+  sccache-linux-arm64:
+  uv-linux-arm64:

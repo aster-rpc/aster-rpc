@@ -1,10 +1,24 @@
 """Shared pytest fixtures for aster-python tests."""
+import pytest
 import pytest_asyncio
 
 from aster import IrohNode, create_endpoint
 
 
 ALPN = b"test/echo/1"
+
+# Network fixtures used below.  Any test that requests one of these is
+# automatically marked ``@pytest.mark.network`` so the CI fast-path
+# (``pytest -m "not network"``) can skip them.
+_NETWORK_FIXTURES = frozenset({"node", "node_pair", "endpoint_pair"})
+
+
+def pytest_collection_modifyitems(items):
+    """Auto-mark tests that use network fixtures."""
+    net_marker = pytest.mark.network
+    for item in items:
+        if _NETWORK_FIXTURES & set(item.fixturenames):
+            item.add_marker(net_marker)
 
 
 @pytest_asyncio.fixture

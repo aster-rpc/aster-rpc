@@ -34,6 +34,9 @@ reruns_delay = 2
 # Suppress known Cython warning from pyfory's internal pxd/enum mismatch.
 # pyfory 0.16.0 ships a cpdef enum in a .pxd file whose Python wrapper is
 # not importable from pyfory.includes.libformat.  Benign third-party issue.
+markers = [
+    "network: tests that require real network I/O (node pairs, gossip, etc.)",
+]
 filterwarnings = [
     "ignore:.*enum class CTypeId not importable from pyfory\\.includes\\.libformat.*:UserWarning",
 ]

@@ -16,4 +16,5 @@ anyhow = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
 getrandom = "0.2"
+serde_json = "1"
 cbindgen = { version = "0.24", optional = true }

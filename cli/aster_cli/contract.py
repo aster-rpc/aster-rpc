@@ -128,7 +128,7 @@ def _gen_command(args: argparse.Namespace) -> int:
         compute_type_hash,
         resolve_with_cycles,
     )
-    from aster.contract.manifest import ContractManifest
+    from aster.contract.manifest import ContractManifest, extract_method_descriptors
     from aster.decorators import _SERVICE_INFO_ATTR
 
     cls = _import_service_class(args.service)
@@ -188,6 +188,9 @@ def _gen_command(args: argparse.Namespace) -> int:
     vcs_tag = _git_tag()
     vcs_url = _git_remote_url()
 
+    # Extract method descriptors with field definitions
+    methods = extract_method_descriptors(service_info)
+
     # Build manifest
     manifest = ContractManifest(
         service=service_info.name,
@@ -197,6 +200,7 @@ def _gen_command(args: argparse.Namespace) -> int:
         type_count=len(type_defs),
         type_hashes=type_hashes_hex,
         method_count=len(contract.methods),
+        methods=methods,
         serialization_modes=ser_modes,
         scoped=scoped_str,
         deprecated=False,
@@ -285,6 +289,14 @@ def main() -> None:
     from aster_cli.enroll import register_enroll_subparser
     register_enroll_subparser(subparsers)
 
+    # ``aster shell`` subcommand
+    from aster_cli.shell import register_shell_subparser
+    register_shell_subparser(subparsers)
+
+    # ``aster blob``, ``aster service`` — CLI equivalents of shell commands
+    from aster_cli.shell.plugin import register_cli_subcommands
+    register_cli_subcommands(subparsers)
+
     # ``aster authorize`` — sign a producer enrollment credential (legacy)
     auth_parser = subparsers.add_parser(
         "authorize",
@@ -329,6 +341,9 @@ def main() -> None:
     elif args.command == "enroll":
         from aster_cli.enroll import run_enroll_command
         sys.exit(run_enroll_command(args))
+    elif args.command == "shell":
+        from aster_cli.shell import run_shell_command
+        sys.exit(run_shell_command(args))
     elif args.command == "authorize":
         # Map to trust sign --type producer (legacy)
         args.endpoint_id = args.producer_id
