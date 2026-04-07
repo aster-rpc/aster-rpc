@@ -5521,6 +5521,91 @@ unsafe fn write_to_caller_buf(
     iroh_status_t::IROH_STATUS_OK
 }
 
+// ============================================================================
+// Phase 1g: Transport Metrics FFI
+// ============================================================================
+
+/// Transport-layer metrics snapshot from the iroh endpoint.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct iroh_transport_metrics_t {
+    pub struct_size: u32,
+    pub send_ipv4: u64,
+    pub send_ipv6: u64,
+    pub send_relay: u64,
+    pub recv_data_ipv4: u64,
+    pub recv_data_ipv6: u64,
+    pub recv_data_relay: u64,
+    pub recv_datagrams: u64,
+    pub num_conns_direct: u64,
+    pub num_conns_opened: u64,
+    pub num_conns_closed: u64,
+    pub paths_direct: u64,
+    pub paths_relay: u64,
+    pub holepunch_attempts: u64,
+    pub relay_home_change: u64,
+    pub net_reports: u64,
+    pub net_reports_full: u64,
+}
+
+/// Snapshot current transport metrics from the iroh endpoint.
+///
+/// `endpoint_or_node` may be either an endpoint handle or a node handle.
+/// Writes the metrics into `out_metrics`.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_endpoint_transport_metrics(
+    runtime: iroh_runtime_t,
+    endpoint_or_node: u64,
+    out_metrics: *mut iroh_transport_metrics_t,
+) -> i32 {
+    if out_metrics.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let ep_arc = bridge.endpoints.get(endpoint_or_node).or_else(|| {
+        bridge
+            .nodes
+            .get(endpoint_or_node)
+            .map(|n| Arc::new(n.net_client()))
+    });
+
+    let client = match ep_arc {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let m = client.transport_metrics();
+    let out = &mut *out_metrics;
+    out.struct_size = std::mem::size_of::<iroh_transport_metrics_t>() as u32;
+    out.send_ipv4 = m.send_ipv4;
+    out.send_ipv6 = m.send_ipv6;
+    out.send_relay = m.send_relay;
+    out.recv_data_ipv4 = m.recv_data_ipv4;
+    out.recv_data_ipv6 = m.recv_data_ipv6;
+    out.recv_data_relay = m.recv_data_relay;
+    out.recv_datagrams = m.recv_datagrams;
+    out.num_conns_direct = m.num_conns_direct;
+    out.num_conns_opened = m.num_conns_opened;
+    out.num_conns_closed = m.num_conns_closed;
+    out.paths_direct = m.paths_direct;
+    out.paths_relay = m.paths_relay;
+    out.holepunch_attempts = m.holepunch_attempts;
+    out.relay_home_change = m.relay_home_change;
+    out.net_reports = m.net_reports;
+    out.net_reports_full = m.net_reports_full;
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+// ============================================================================
+// Phase 1f: Cross-Language Contract Identity, Framing & Signing
+// ============================================================================
+
 /// Compute contract_id from a ServiceContract JSON string.
 /// Writes 64-byte hex string (no null terminator) to out_buf.
 /// On BUFFER_TOO_SMALL, sets `*out_len` to required size.
