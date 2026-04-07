@@ -152,7 +152,11 @@ from .interceptors import (
     MetricsInterceptor,
 )
 
-__version__ = "0.2.0"
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("aster-rpc")
+except Exception:
+    __version__ = "0.0.0-dev"
 
 __all__ = [
     # ── Iroh native bindings ──
