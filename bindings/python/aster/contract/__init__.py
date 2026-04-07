@@ -3,23 +3,11 @@ aster.contract — Contract identity and publication for Aster RPC.
 
 Spec reference: Aster-ContractIdentity.md §11
 
-Provides content-addressed contract identity: Python types → canonical XLANG bytes
-→ BLAKE3 hash → Merkle DAG.
+Canonical encoding and BLAKE3 hashing are delegated to the Rust core
+via _aster.contract. The Python-side canonical.py is retained only as
+a reference for the encoding format — it is not used at runtime.
 """
 
-from aster.contract.canonical import (
-    CanonicalWriter,
-    write_varint,
-    write_zigzag_i32,
-    write_zigzag_i64,
-    write_string,
-    write_bytes_field,
-    write_bool,
-    write_float64,
-    write_list_header,
-    write_optional_absent,
-    write_optional_present_prefix,
-)
 from aster.contract.identity import (
     TypeKind,
     ContainerKind,
@@ -49,18 +37,6 @@ from aster.contract.manifest import (
 )
 
 __all__ = [
-    # canonical
-    "CanonicalWriter",
-    "write_varint",
-    "write_zigzag_i32",
-    "write_zigzag_i64",
-    "write_string",
-    "write_bytes_field",
-    "write_bool",
-    "write_float64",
-    "write_list_header",
-    "write_optional_absent",
-    "write_optional_present_prefix",
     # identity
     "TypeKind",
     "ContainerKind",

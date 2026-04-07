@@ -1356,3 +1356,120 @@ uniformly encodes all back-edges as SELF_REF. This is intentional — using the
 hash of `C` instead would change `A`'s hash depending on traversal order, which
 would break the determinism guarantee. The spanning tree determines which edges
 are REF vs SELF_REF, and that determination is fixed.
+
+---
+
+## Appendix B: Golden Vectors
+
+These are normative test vectors generated from the Python reference
+implementation. Every conforming implementation MUST produce byte-identical
+canonical output and identical BLAKE3 hashes for these inputs.
+
+The full machine-readable vectors are in `conformance/vectors/contract-identity.json`.
+
+### B.1 Minimal Unary Service
+
+**Input:**
+
+```
+ServiceContract {
+  name: "Echo", version: 1, scoped: SHARED (0),
+  methods: [
+    MethodDef { name: "echo", pattern: UNARY (0),
+      request_type: 00..00 (32 zero bytes),
+      response_type: 00..00 (32 zero bytes),
+      idempotent: false, default_timeout: 0.0,
+      requires: absent }
+  ],
+  serialization_modes: [], requires: absent
+}
+```
+
+**Canonical bytes (94 bytes):**
+
+```
+12 45 63 68 6f                            # string "Echo": varint(18)=0x12, "Echo"
+02                                         # zigzag(1) = 2
+01 0c                                      # list(1 method), 0x0C element header
+  12 65 63 68 6f                           #   string "echo"
+  00                                       #   pattern = UNARY (0)
+  20 00..00                                #   request_type: 32 zero bytes
+  20 00..00                                #   response_type: 32 zero bytes
+  00                                       #   idempotent = false
+  00 00 00 00 00 00 00 00                  #   default_timeout = 0.0 (float64 LE)
+  fd                                       #   requires: absent (NULL_FLAG)
+00 0c                                      # serialization_modes: empty list
+00                                         # scoped = SHARED (0)
+fd                                         # requires: absent (NULL_FLAG)
+```
+
+**Full hex:** `124563686f02010c126563686f00200000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000fd000c00fd`
+
+**BLAKE3:** `73ac6c9e70c7dcdd825221a4eb1d1ac9432d890685e65987f7d8d74c8d3191be`
+
+### B.2 Service with Capability Requirement
+
+**Input:**
+
+```
+ServiceContract {
+  name: "DataService", version: 1, scoped: SHARED,
+  methods: [
+    MethodDef { name: "get_record", pattern: UNARY,
+      request_type: 00..00, response_type: 00..00,
+      idempotent: true, default_timeout: 30000.0,
+      requires: CapabilityRequirement {
+        kind: ANY_OF (1),
+        roles: ["reader", "ai-reader"]  // sorted: "ai-reader", "reader"
+      }
+    }
+  ],
+  serialization_modes: [], requires: absent
+}
+```
+
+**Canonical bytes:** 127 bytes
+
+**Full hex:** `2e446174615365727669636502010c2a6765745f7265636f7264002000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000100000000004cdd400001020c2661692d7265616465721a726561646572000c00fd`
+
+**BLAKE3:** `868a03134159c5797f36016c8445febf2e703456f0eb98eb02fa7dbc0d69bf89`
+
+### B.3 Multi-Method Streaming Service
+
+**Input:**
+
+```
+ServiceContract {
+  name: "Analytics", version: 2, scoped: SHARED,
+  methods: [  // sorted by NFC name: query, upload, watch
+    MethodDef { name: "query", pattern: UNARY, idempotent: true, timeout: 0.0 },
+    MethodDef { name: "upload", pattern: CLIENT_STREAM (2), idempotent: false, timeout: 0.0 },
+    MethodDef { name: "watch", pattern: SERVER_STREAM (1), idempotent: false, timeout: 60000.0 },
+  ]
+}
+```
+
+**Canonical bytes:** 267 bytes
+
+**Full hex:** `26416e616c797469637304030c16717565727900200000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000010000000000000000fd1a75706c6f616402200000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000fd167761746368012000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000000000000004ced40fd000c00fd`
+
+**BLAKE3:** `4fcf7d24f1407d32ecda0526c5c087985086b5362ea8ed344c6838859c11d2d9`
+
+### B.4 Session-Scoped Service
+
+**Input:**
+
+```
+ServiceContract {
+  name: "ChatRoom", version: 1, scoped: STREAM (1),
+  methods: [
+    MethodDef { name: "send_message", pattern: UNARY, timeout: 5000.0 }
+  ]
+}
+```
+
+**Canonical bytes:** 106 bytes
+
+**Full hex:** `2243686174526f6f6d02010c3273656e645f6d6573736167650020000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000088b340fd000c01fd`
+
+**BLAKE3:** `e49ce2b5992b58dc06d348511e05ebdb1fcf7ec504e12a931611913c5ea76ace`

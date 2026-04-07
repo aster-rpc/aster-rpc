@@ -1,0 +1,41 @@
+# Aster conformance scenario: unary echo
+# Tests basic unary RPC with a simple request/response type.
+# Both server and client must produce identical wire bytes for the same types.
+
+name: unary-echo
+description: Basic unary RPC round-trip
+
+service:
+  name: Echo
+  version: 1
+  scope: shared
+
+wire_types:
+  - tag: "echo/EchoRequest"
+    fields:
+      message: string
+
+  - tag: "echo/EchoResponse"
+    fields:
+      reply: string
+
+methods:
+  - name: echo
+    pattern: unary
+    request_type: echo/EchoRequest
+    response_type: echo/EchoResponse
+
+calls:
+  - method: echo
+    request:
+      message: "Hello, World!"
+    expected_response:
+      reply: "Hello, World!"
+    expected_status: OK
+
+  - method: echo
+    request:
+      message: ""
+    expected_response:
+      reply: ""
+    expected_status: OK

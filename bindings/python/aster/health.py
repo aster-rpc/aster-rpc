@@ -198,6 +198,76 @@ def health_status(server: Any) -> dict[str, Any]:
     }
 
 
+def _prometheus_text(server: Any) -> str:
+    """Render metrics in Prometheus text exposition format.
+
+    See: https://prometheus.io/docs/instrumenting/exposition_formats/
+    """
+    lines: list[str] = []
+    uptime_s = time.monotonic() - _start_time
+    cm = _connection_metrics
+    am = _admission_metrics
+
+    # Uptime
+    lines.append("# HELP aster_uptime_seconds Server uptime in seconds")
+    lines.append("# TYPE aster_uptime_seconds gauge")
+    lines.append(f"aster_uptime_seconds {uptime_s:.1f}")
+
+    # Connections
+    lines.append("# HELP aster_connections_active Current active connections")
+    lines.append("# TYPE aster_connections_active gauge")
+    lines.append(f"aster_connections_active {cm.active_connections}")
+    lines.append("# HELP aster_connections_total Total connections since startup")
+    lines.append("# TYPE aster_connections_total counter")
+    lines.append(f"aster_connections_total {cm.total_connections}")
+
+    # Streams
+    lines.append("# HELP aster_streams_active Current active RPC streams")
+    lines.append("# TYPE aster_streams_active gauge")
+    lines.append(f"aster_streams_active {cm.active_streams}")
+    lines.append("# HELP aster_streams_total Total streams since startup")
+    lines.append("# TYPE aster_streams_total counter")
+    lines.append(f"aster_streams_total {cm.total_streams}")
+
+    # Admission
+    lines.append("# HELP aster_admission_consumer_admitted_total Consumer admissions granted")
+    lines.append("# TYPE aster_admission_consumer_admitted_total counter")
+    lines.append(f"aster_admission_consumer_admitted_total {am.consumer_admitted}")
+    lines.append("# HELP aster_admission_consumer_denied_total Consumer admissions denied")
+    lines.append("# TYPE aster_admission_consumer_denied_total counter")
+    lines.append(f"aster_admission_consumer_denied_total {am.consumer_denied}")
+    lines.append("# HELP aster_admission_producer_admitted_total Producer admissions granted")
+    lines.append("# TYPE aster_admission_producer_admitted_total counter")
+    lines.append(f"aster_admission_producer_admitted_total {am.producer_admitted}")
+
+    # RPC metrics (from MetricsInterceptor if available)
+    interceptors = getattr(server, "_interceptors", [])
+    for i in interceptors:
+        if hasattr(i, "snapshot"):
+            snap = i.snapshot()
+            lines.append("# HELP aster_rpc_started_total Total RPC calls started")
+            lines.append("# TYPE aster_rpc_started_total counter")
+            lines.append(f"aster_rpc_started_total {snap.get('started', 0)}")
+            lines.append("# HELP aster_rpc_completed_total Total RPC calls completed")
+            lines.append("# TYPE aster_rpc_completed_total counter")
+            lines.append(f'aster_rpc_completed_total{{status="ok"}} {snap.get("succeeded", 0)}')
+            lines.append(f'aster_rpc_completed_total{{status="error"}} {snap.get("failed", 0)}')
+            lines.append("# HELP aster_rpc_in_flight Current in-flight RPC calls")
+            lines.append("# TYPE aster_rpc_in_flight gauge")
+            lines.append(f"aster_rpc_in_flight {snap.get('in_flight', 0)}")
+            break
+
+    # Health
+    lines.append("# HELP aster_healthy Whether the server is healthy (1=yes, 0=no)")
+    lines.append("# TYPE aster_healthy gauge")
+    lines.append(f"aster_healthy {1 if check_health(server) else 0}")
+    lines.append("# HELP aster_ready Whether the server is ready (1=yes, 0=no)")
+    lines.append("# TYPE aster_ready gauge")
+    lines.append(f"aster_ready {1 if check_ready(server) else 0}")
+
+    return "\n".join(lines) + "\n"
+
+
 def ready_status(server: Any) -> dict[str, Any]:
     """Full readiness status for /readyz endpoint."""
     summaries = getattr(server, "_service_summaries", [])
@@ -323,8 +393,37 @@ class HealthServer:
                 body = ready_status(self._server_ref)
                 status = 200 if body["status"] == "ready" else 503
             elif path == "/metrics":
+                # Check Accept header for Prometheus text format
+                accept = ""
+                # We already consumed headers — check if path has a format hint
+                if "format=prometheus" in request_str or path == "/metrics/prometheus":
+                    response_body = _prometheus_text(self._server_ref)
+                    response = (
+                        f"HTTP/1.1 200 OK\r\n"
+                        f"Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                        f"Content-Length: {len(response_body)}\r\n"
+                        f"Connection: close\r\n"
+                        f"\r\n"
+                        f"{response_body}"
+                    )
+                    writer.write(response.encode())
+                    await writer.drain()
+                    return
                 body = metrics_snapshot(self._server_ref)
                 status = 200
+            elif path == "/metrics/prometheus":
+                response_body = _prometheus_text(self._server_ref)
+                response = (
+                    f"HTTP/1.1 200 OK\r\n"
+                    f"Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                    f"Content-Length: {len(response_body)}\r\n"
+                    f"Connection: close\r\n"
+                    f"\r\n"
+                    f"{response_body}"
+                )
+                writer.write(response.encode())
+                await writer.drain()
+                return
             else:
                 body = {"error": "not found"}
                 status = 404

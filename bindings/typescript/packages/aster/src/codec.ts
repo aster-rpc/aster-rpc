@@ -1,0 +1,170 @@
+/**
+ * Codec abstraction — serialization + optional zstd compression.
+ *
+ * Spec reference: S5.1 (serialization), S5.2 (compression)
+ *
+ * Provides:
+ * - JsonCodec: JSON over UTF-8 bytes (testing, development)
+ * - ForyCodec: @apache-fory/core XLANG (production cross-language)
+ * - Zstd compression for payloads > threshold
+ */
+
+import { MAX_DECOMPRESSED_SIZE } from './limits.js';
+
+/** Default compression threshold in bytes (4 KiB). */
+export const DEFAULT_COMPRESSION_THRESHOLD = 4096;
+
+/** Generic codec interface for serialization/deserialization. */
+export interface Codec {
+  encode(obj: unknown, hintType?: unknown): Uint8Array;
+  decode(payload: Uint8Array, hintType?: unknown): unknown;
+  encodeCompressed(obj: unknown): [data: Uint8Array, compressed: boolean];
+  decodeCompressed(payload: Uint8Array, compressed: boolean, hintType?: unknown): unknown;
+}
+
+// -- Zstd helpers (use node:zlib which has zstd since Node 21.7) --------------
+
+let _zstdAvailable: boolean | undefined;
+let _zstdCompress: ((data: Uint8Array) => Uint8Array) | undefined;
+let _zstdDecompress: ((data: Uint8Array, maxSize: number) => Uint8Array) | undefined;
+
+async function initZstd(): Promise<boolean> {
+  if (_zstdAvailable !== undefined) return _zstdAvailable;
+  try {
+    const zlib = await import('node:zlib');
+    if (typeof zlib.zstdCompressSync === 'function') {
+      _zstdCompress = (data) => new Uint8Array(zlib.zstdCompressSync(Buffer.from(data)));
+      _zstdDecompress = (data, maxSize) => {
+        const result = zlib.zstdDecompressSync(Buffer.from(data), { maxOutputLength: maxSize });
+        if (result.byteLength > maxSize) {
+          throw new Error(`decompressed size ${result.byteLength} exceeds limit ${maxSize}`);
+        }
+        return new Uint8Array(result);
+      };
+      _zstdAvailable = true;
+    } else {
+      _zstdAvailable = false;
+    }
+  } catch {
+    _zstdAvailable = false;
+  }
+  return _zstdAvailable;
+}
+
+// Try to init eagerly
+initZstd().catch(() => {});
+
+function zstdCompress(data: Uint8Array): Uint8Array | null {
+  return _zstdCompress ? _zstdCompress(data) : null;
+}
+
+function zstdDecompress(data: Uint8Array): Uint8Array {
+  if (!_zstdDecompress) {
+    throw new Error('zstd decompression not available (requires Node 21.7+)');
+  }
+  return _zstdDecompress(data, MAX_DECOMPRESSED_SIZE);
+}
+
+// -- JsonCodec ----------------------------------------------------------------
+
+/**
+ * Simple JSON codec for testing and development.
+ * Does not support cross-language Fory XLANG wire format.
+ */
+export class JsonCodec implements Codec {
+  private encoder = new TextEncoder();
+  private decoder = new TextDecoder();
+  private threshold: number;
+
+  constructor(compressionThreshold = DEFAULT_COMPRESSION_THRESHOLD) {
+    this.threshold = compressionThreshold;
+  }
+
+  encode(obj: unknown): Uint8Array {
+    return this.encoder.encode(JSON.stringify(obj));
+  }
+
+  decode(payload: Uint8Array): unknown {
+    return JSON.parse(this.decoder.decode(payload));
+  }
+
+  encodeCompressed(obj: unknown): [Uint8Array, boolean] {
+    const data = this.encode(obj);
+    if (data.byteLength > this.threshold && _zstdAvailable) {
+      const compressed = zstdCompress(data);
+      if (compressed && compressed.byteLength < data.byteLength) {
+        return [compressed, true];
+      }
+    }
+    return [data, false];
+  }
+
+  decodeCompressed(payload: Uint8Array, compressed: boolean): unknown {
+    if (compressed) {
+      const decompressed = zstdDecompress(payload);
+      return this.decode(decompressed);
+    }
+    return this.decode(payload);
+  }
+}
+
+// -- ForyCodec ----------------------------------------------------------------
+
+/**
+ * ForyCodec — cross-language serialization via @apache-fory/core.
+ *
+ * Wraps the Fory JS XLANG serializer for wire-compatible serialization
+ * with Python's pyfory.
+ *
+ * @example
+ * ```ts
+ * import Fory from '@apache-fory/core';
+ * const fory = new Fory({ compatible: true });
+ * const codec = new ForyCodec(fory);
+ * ```
+ */
+export class ForyCodec implements Codec {
+  readonly fory: any;
+  private threshold: number;
+  private serializers = new Map<string, { serialize: any; deserialize: any }>();
+
+  constructor(foryInstance: any, compressionThreshold = DEFAULT_COMPRESSION_THRESHOLD) {
+    this.fory = foryInstance;
+    this.threshold = compressionThreshold;
+  }
+
+  /** Register a type for serialization. */
+  registerType(typeInfo: any): void {
+    const { serialize, deserialize } = this.fory.registerSerializer(typeInfo);
+    const name = typeInfo?.options?.typeName ?? typeInfo?.tag ?? String(typeInfo);
+    this.serializers.set(name, { serialize, deserialize });
+  }
+
+  encode(obj: unknown, _hintType?: unknown): Uint8Array {
+    const result = this.fory.serialize(obj);
+    return new Uint8Array(result);
+  }
+
+  decode(payload: Uint8Array, _hintType?: unknown): unknown {
+    return this.fory.deserialize(payload);
+  }
+
+  encodeCompressed(obj: unknown): [Uint8Array, boolean] {
+    const data = this.encode(obj);
+    if (data.byteLength > this.threshold && _zstdAvailable) {
+      const compressed = zstdCompress(data);
+      if (compressed && compressed.byteLength < data.byteLength) {
+        return [compressed, true];
+      }
+    }
+    return [data, false];
+  }
+
+  decodeCompressed(payload: Uint8Array, compressed: boolean, hintType?: unknown): unknown {
+    if (compressed) {
+      const decompressed = zstdDecompress(payload);
+      return this.decode(decompressed, hintType);
+    }
+    return this.decode(payload, hintType);
+  }
+}

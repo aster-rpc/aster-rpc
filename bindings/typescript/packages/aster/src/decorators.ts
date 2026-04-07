@@ -1,0 +1,203 @@
+/**
+ * Service and method decorators for defining Aster RPC services.
+ *
+ * Spec reference: S7.1-7.4 (decorators), S7.6 (language ownership)
+ *
+ * Uses TC39 Stage 3 decorators (TS 5.0+). These compile away during
+ * TypeScript compilation -- no runtime decorator support needed.
+ *
+ * @example
+ * ```ts
+ * @Service({ name: "Echo", version: 1 })
+ * class EchoService {
+ *   @Rpc({ timeout: 30 })
+ *   async echo(req: EchoRequest): Promise<EchoResponse> {
+ *     return new EchoResponse({ reply: req.message });
+ *   }
+ *
+ *   @ServerStream()
+ *   async *watchItems(req: WatchRequest): AsyncGenerator<ItemUpdate> {
+ *     yield new ItemUpdate({ item: "one" });
+ *   }
+ * }
+ * ```
+ */
+
+import { RpcPattern } from './types.js';
+import type { SerializationMode } from './types.js';
+import {
+  SERVICE_INFO_KEY,
+  METHOD_INFO_KEY,
+  type ServiceInfo,
+  type MethodInfo,
+  type CapabilityRequirement,
+} from './service.js';
+
+// -- Service decorator --------------------------------------------------------
+
+export interface ServiceOptions {
+  name: string;
+  version?: number;
+  scoped?: 'shared' | 'stream';
+  serialization?: SerializationMode[];
+  requires?: CapabilityRequirement;
+}
+
+/**
+ * Decorate a class as an Aster RPC service.
+ *
+ * @example
+ * ```ts
+ * @Service({ name: "Echo", version: 1 })
+ * class EchoService { ... }
+ * ```
+ */
+export function Service(options: ServiceOptions) {
+  return function <T extends new (...args: any[]) => any>(
+    target: T,
+    _context: ClassDecoratorContext,
+  ): T {
+    // Collect methods that were decorated with @Rpc etc.
+    const methods = new Map<string, MethodInfo>();
+
+    // Scan prototype for method decorators
+    const proto = target.prototype;
+    const methodNames = Object.getOwnPropertyNames(proto).filter(
+      (n) => n !== 'constructor',
+    );
+    for (const name of methodNames) {
+      const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+      if (!descriptor || typeof descriptor.value !== 'function') continue;
+      const info: MethodInfo | undefined = descriptor.value[METHOD_INFO_KEY];
+      if (info) {
+        info.name = name;
+        info.handler = descriptor.value;
+        methods.set(name, info);
+      }
+    }
+
+    const serviceInfo: ServiceInfo = {
+      name: options.name,
+      version: options.version ?? 1,
+      scoped: options.scoped ?? 'shared',
+      methods,
+      serializationModes: options.serialization ?? [],
+      requires: options.requires,
+      instance: undefined,
+    };
+
+    (target as any)[SERVICE_INFO_KEY] = serviceInfo;
+    return target;
+  };
+}
+
+// -- Method decorators --------------------------------------------------------
+
+interface RpcOptions {
+  timeout?: number;
+  idempotent?: boolean;
+  serialization?: SerializationMode;
+  requires?: CapabilityRequirement;
+}
+
+function methodDecorator(pattern: RpcPattern, options?: RpcOptions) {
+  return function <T extends (...args: any[]) => any>(
+    target: T,
+    _context: ClassMethodDecoratorContext,
+  ): T {
+    const info: MethodInfo = {
+      name: '', // filled in by @Service
+      pattern,
+      requestType: undefined,
+      responseType: undefined,
+      timeout: options?.timeout,
+      idempotent: options?.idempotent ?? false,
+      serialization: options?.serialization,
+      requires: options?.requires,
+      handler: undefined, // filled in by @Service
+    };
+
+    (target as any)[METHOD_INFO_KEY] = info;
+    return target;
+  };
+}
+
+/**
+ * Mark a method as a unary RPC (single request, single response).
+ *
+ * @example
+ * ```ts
+ * @Rpc({ timeout: 30, idempotent: true })
+ * async getUser(req: GetUserRequest): Promise<User> { ... }
+ * ```
+ */
+export function Rpc(options?: RpcOptions) {
+  return methodDecorator(RpcPattern.UNARY, options);
+}
+
+/**
+ * Mark a method as a server-streaming RPC (single request, multiple responses).
+ * Method must be an async generator.
+ *
+ * @example
+ * ```ts
+ * @ServerStream()
+ * async *watchUpdates(req: WatchRequest): AsyncGenerator<Update> { ... }
+ * ```
+ */
+export function ServerStream(options?: RpcOptions) {
+  return methodDecorator(RpcPattern.SERVER_STREAM, options);
+}
+
+/**
+ * Mark a method as a client-streaming RPC (multiple requests, single response).
+ *
+ * @example
+ * ```ts
+ * @ClientStream()
+ * async uploadBatch(requests: AsyncIterable<Item>): Promise<BatchResult> { ... }
+ * ```
+ */
+export function ClientStream(options?: RpcOptions) {
+  return methodDecorator(RpcPattern.CLIENT_STREAM, options);
+}
+
+/**
+ * Mark a method as a bidirectional-streaming RPC.
+ *
+ * @example
+ * ```ts
+ * @BidiStream()
+ * async *chat(requests: AsyncIterable<Message>): AsyncGenerator<Message> { ... }
+ * ```
+ */
+export function BidiStream(options?: RpcOptions) {
+  return methodDecorator(RpcPattern.BIDI_STREAM, options);
+}
+
+// -- Wire type decorator ------------------------------------------------------
+
+/** Metadata key for wire type tag. */
+export const WIRE_TYPE_KEY = Symbol.for('aster.wire_type');
+
+/**
+ * Register a class as a Fory XLANG wire type.
+ *
+ * @example
+ * ```ts
+ * @WireType("billing/Invoice")
+ * class Invoice {
+ *   amount = 0;
+ *   currency = "USD";
+ * }
+ * ```
+ */
+export function WireType(tag: string) {
+  return function <T extends new (...args: any[]) => any>(
+    target: T,
+    _context: ClassDecoratorContext,
+  ): T {
+    (target as any)[WIRE_TYPE_KEY] = tag;
+    return target;
+  };
+}

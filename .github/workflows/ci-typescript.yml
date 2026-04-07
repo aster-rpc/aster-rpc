@@ -1,0 +1,87 @@
+name: CI (TypeScript)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bindings/typescript/**'
+      - 'core/**'
+      - 'conformance/**'
+  pull_request:
+    paths:
+      - 'bindings/typescript/**'
+      - 'core/**'
+      - 'conformance/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.94.1"
+
+jobs:
+  # ── Rust lint (NAPI-RS crate) ──────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - name: cargo fmt (NAPI)
+        run: cargo fmt -p aster-transport-napi --check
+      - name: cargo clippy (NAPI)
+        run: cargo clippy -p aster-transport-napi -- -D warnings
+
+  # ── TypeScript: typecheck + unit tests ─────────────────────────────
+  test:
+    needs: lint
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [20, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        working-directory: bindings/typescript
+        run: bun install
+
+      - name: Typecheck
+        working-directory: bindings/typescript/packages/aster
+        run: npx tsc --noEmit
+
+      - name: Run tests (bun + vitest)
+        working-directory: bindings/typescript/packages/aster
+        run: npx vitest run
+
+      - name: Validate conformance vectors
+        working-directory: bindings/typescript/packages/aster
+        run: npx vitest run ../../tests/unit/framing.test.ts
+
+  # ── NAPI-RS: cargo check ───────────────────────────────────────────
+  napi-check:
+    needs: lint
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: cargo check (NAPI crate)
+        run: cargo check -p aster-transport-napi

@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Aster contract identity golden vectors. Spec: Aster-ContractIdentity.md. Contract ID = BLAKE3(canonical_xlang_bytes(ServiceContract)). Generated from Python reference implementation 2026-04-07.",
+  "enums": {
+    "TypeKind": {"PRIMITIVE": 0, "REF": 1, "SELF_REF": 2, "ANY": 3},
+    "ContainerKind": {"NONE": 0, "LIST": 1, "SET": 2, "MAP": 3},
+    "TypeDefKind": {"MESSAGE": 0, "ENUM": 1, "UNION": 2},
+    "MethodPattern": {"UNARY": 0, "SERVER_STREAM": 1, "CLIENT_STREAM": 2, "BIDI_STREAM": 3},
+    "CapabilityKind": {"ROLE": 0, "ANY_OF": 1, "ALL_OF": 2},
+    "ScopeKind": {"SHARED": 0, "STREAM": 1}
+  },
+  "canonical_encoding": {
+    "integers": "zigzag varint (signed) or unsigned varint",
+    "strings": "varint((utf8_byte_length << 2) | 2) + UTF-8 bytes. Empty string = 0x02.",
+    "bytes": "varint(length) + raw bytes",
+    "booleans": "single byte: 0x00 = false, 0x01 = true",
+    "lists": "varint(count) + 0x0C element header + elements",
+    "optionals": "0xFD = absent, 0x00 prefix = present + value",
+    "floats": "IEEE 754 little-endian 8 bytes"
+  },
+  "identifier_normalization": {
+    "description": "All identifiers are NFC-normalized before canonical encoding",
+    "vectors": [
+      {"input": "cafe\u0301", "normalized": "caf\u00e9"},
+      {"input": "hello", "normalized": "hello"}
+    ]
+  },
+  "golden_vectors": [
+    {
+      "name": "minimal unary service",
+      "contract": {
+        "name": "Echo",
+        "version": 1,
+        "scoped": 0,
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": 0,
+            "request_type": "0000000000000000000000000000000000000000000000000000000000000000",
+            "response_type": "0000000000000000000000000000000000000000000000000000000000000000",
+            "idempotent": false,
+            "default_timeout": 0.0,
+            "requires": null
+          }
+        ],
+        "serialization_modes": [],
+        "requires": null
+      },
+      "expected_canonical_hex": "124563686f02010c126563686f00200000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000fd000c00fd",
+      "expected_canonical_length": 94,
+      "expected_blake3": "73ac6c9e70c7dcdd825221a4eb1d1ac9432d890685e65987f7d8d74c8d3191be"
+    },
+    {
+      "name": "service with capability requirement",
+      "note": "Tests CapabilityRequirement encoding (ANY_OF with two roles, sorted: ai-reader before reader)",
+      "contract": {
+        "name": "DataService",
+        "version": 1,
+        "scoped": 0,
+        "methods": [
+          {
+            "name": "get_record",
+            "pattern": 0,
+            "request_type": "0000000000000000000000000000000000000000000000000000000000000000",
+            "response_type": "0000000000000000000000000000000000000000000000000000000000000000",
+            "idempotent": true,
+            "default_timeout": 30000.0,
+            "requires": {"kind": 1, "roles": ["reader", "ai-reader"]}
+          }
+        ],
+        "serialization_modes": [],
+        "requires": null
+      },
+      "expected_canonical_hex": "2e446174615365727669636502010c2a6765745f7265636f7264002000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000100000000004cdd400001020c2661692d7265616465721a726561646572000c00fd",
+      "expected_canonical_length": 127,
+      "expected_blake3": "868a03134159c5797f36016c8445febf2e703456f0eb98eb02fa7dbc0d69bf89"
+    },
+    {
+      "name": "multi-method streaming service",
+      "note": "Tests method ordering (sorted by NFC name: query, upload, watch) and multiple streaming patterns",
+      "contract": {
+        "name": "Analytics",
+        "version": 2,
+        "scoped": 0,
+        "methods": [
+          {"name": "query", "pattern": 0, "request_type": "0000000000000000000000000000000000000000000000000000000000000000", "response_type": "0000000000000000000000000000000000000000000000000000000000000000", "idempotent": true, "default_timeout": 0.0, "requires": null},
+          {"name": "watch", "pattern": 1, "request_type": "0000000000000000000000000000000000000000000000000000000000000000", "response_type": "0000000000000000000000000000000000000000000000000000000000000000", "idempotent": false, "default_timeout": 60000.0, "requires": null},
+          {"name": "upload", "pattern": 2, "request_type": "0000000000000000000000000000000000000000000000000000000000000000", "response_type": "0000000000000000000000000000000000000000000000000000000000000000", "idempotent": false, "default_timeout": 0.0, "requires": null}
+        ],
+        "serialization_modes": [],
+        "requires": null
+      },
+      "expected_canonical_hex": "26416e616c797469637304030c16717565727900200000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000010000000000000000fd1a75706c6f616402200000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000fd167761746368012000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000000000000004ced40fd000c00fd",
+      "expected_canonical_length": 267,
+      "expected_blake3": "4fcf7d24f1407d32ecda0526c5c087985086b5362ea8ed344c6838859c11d2d9"
+    },
+    {
+      "name": "session-scoped service",
+      "note": "Tests ScopeKind.STREAM (1) encoding",
+      "contract": {
+        "name": "ChatRoom",
+        "version": 1,
+        "scoped": 1,
+        "methods": [
+          {"name": "send_message", "pattern": 0, "request_type": "0000000000000000000000000000000000000000000000000000000000000000", "response_type": "0000000000000000000000000000000000000000000000000000000000000000", "idempotent": false, "default_timeout": 5000.0, "requires": null}
+        ],
+        "serialization_modes": [],
+        "requires": null
+      },
+      "expected_canonical_hex": "2243686174526f6f6d02010c3273656e645f6d6573736167650020000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000088b340fd000c01fd",
+      "expected_canonical_length": 106,
+      "expected_blake3": "e49ce2b5992b58dc06d348511e05ebdb1fcf7ec504e12a931611913c5ea76ace"
+    }
+  ]
+}

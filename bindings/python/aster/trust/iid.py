@@ -113,12 +113,17 @@ class AWSIIDBackend:
 
         iid_url = "http://169.254.169.254/latest/dynamic/instance-identity/document"
         sig_url = "http://169.254.169.254/latest/dynamic/instance-identity/signature"
+        _MAX_IID_RESPONSE = 64 * 1024  # 64 KB — IID documents are small
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
                 doc_resp = await client.get(iid_url)
                 doc_resp.raise_for_status()
+                if len(doc_resp.content) > _MAX_IID_RESPONSE:
+                    return False, f"AWS IID response too large ({len(doc_resp.content)} bytes)"
                 sig_resp = await client.get(sig_url)
                 sig_resp.raise_for_status()
+                if len(sig_resp.content) > _MAX_IID_RESPONSE:
+                    return False, f"AWS IID signature too large ({len(sig_resp.content)} bytes)"
         except Exception as exc:  # noqa: BLE001
             return False, f"AWS metadata fetch failed: {exc}"
 

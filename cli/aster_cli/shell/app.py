@@ -81,6 +81,7 @@ class PeerConnection:
         self._manifests: dict[str, dict[str, Any]] = {}  # service name → manifest dict
         self._rpc_conns: dict[str, Any] = {}  # channel addr → IrohConnection
         self._transports: dict[str, Any] = {}  # service name → IrohTransport
+        self._type_factory: Any = None  # DynamicTypeFactory for typeless invocation
 
     async def connect(self) -> None:
         """Connect to the peer via consumer admission, then fetch contract manifests."""
@@ -95,6 +96,9 @@ class PeerConnection:
 
         # Try to fetch contract manifests from the registry/blobs
         await self._fetch_manifests()
+
+        # Synthesize types from manifests for dynamic invocation
+        self._synthesize_types()
 
     async def _fetch_manifests(self) -> None:
         """Fetch manifest.json for each service from the blob store.
@@ -124,32 +128,41 @@ class PeerConnection:
             # Join the registry doc (read-only) and wait for initial sync
             doc, event_receiver = await dc.join_and_subscribe(ticket)
 
-            # Wait for sync_finished event (the doc pulling entries from producer)
+            # Wait for sync with retry — the doc needs to pull entries from
+            # the producer. We try up to 3 times with increasing timeouts.
             import asyncio as _asyncio
-            try:
-                deadline = _asyncio.get_event_loop().time() + 5.0
-                while _asyncio.get_event_loop().time() < deadline:
-                    remaining = deadline - _asyncio.get_event_loop().time()
-                    if remaining <= 0:
-                        break
-                    try:
-                        event = await _asyncio.wait_for(
-                            event_receiver.recv(), timeout=min(remaining, 1.0)
-                        )
-                        kind = event.kind if hasattr(event, "kind") else str(event)
-                        logger.debug("Registry doc event: %s", kind)
-                        if kind == "sync_finished":
-                            # Sync done — give blob downloads a moment
-                            await _asyncio.sleep(0.3)
+
+            sync_done = False
+            for attempt in range(3):
+                timeout = 3.0 * (attempt + 1)  # 3s, 6s, 9s
+                try:
+                    deadline = _asyncio.get_event_loop().time() + timeout
+                    while _asyncio.get_event_loop().time() < deadline:
+                        remaining = deadline - _asyncio.get_event_loop().time()
+                        if remaining <= 0:
                             break
-                    except _asyncio.TimeoutError:
-                        # Check if entries are already available
-                        test_entries = await doc.query_key_prefix(b"contracts/")
-                        if test_entries:
-                            logger.debug("Entries found before sync_finished")
-                            break
-            except Exception as exc:
-                logger.debug("Sync wait interrupted: %s", exc)
+                        try:
+                            event = await _asyncio.wait_for(
+                                event_receiver.recv(), timeout=min(remaining, 1.0)
+                            )
+                            kind = event.kind if hasattr(event, "kind") else str(event)
+                            logger.debug("Registry doc event: %s", kind)
+                            if kind == "sync_finished":
+                                await _asyncio.sleep(0.3)
+                                sync_done = True
+                                break
+                        except _asyncio.TimeoutError:
+                            test_entries = await doc.query_key_prefix(b"contracts/")
+                            if test_entries:
+                                logger.debug("Entries found before sync_finished")
+                                sync_done = True
+                                break
+                except Exception as exc:
+                    logger.debug("Sync wait attempt %d interrupted: %s", attempt + 1, exc)
+
+                if sync_done:
+                    break
+                logger.debug("Sync attempt %d timed out, retrying...", attempt + 1)
 
             for svc in self._services:
                 try:
@@ -258,12 +271,36 @@ class PeerConnection:
             return await bc.read_to_bytes(blob_hash)
         raise RuntimeError("blob reading not available")
 
+    def _synthesize_types(self) -> None:
+        """Create dynamic dataclasses from manifest method schemas.
+
+        These are wire-compatible with the producer's types — same
+        @wire_type tag, same field names. Enables invocation without
+        having the producer's Python types locally installed.
+        """
+        from aster.dynamic import DynamicTypeFactory
+        import logging
+
+        logger = logging.getLogger(__name__)
+        self._type_factory = DynamicTypeFactory()
+
+        for svc_name, manifest in self._manifests.items():
+            methods = manifest.get("methods", [])
+            self._type_factory.register_from_manifest(methods)
+
+        if self._type_factory.type_count > 0:
+            logger.debug(
+                "Synthesized %d dynamic types from manifests",
+                self._type_factory.type_count,
+            )
+
     async def _get_transport(self, service_name: str) -> Any:
         """Get or create an IrohTransport for a service."""
         if service_name in self._transports:
             return self._transports[service_name]
 
-        from aster import IrohTransport, RPC_ALPN
+        from aster import IrohTransport, ForyCodec
+        from aster.types import SerializationMode
 
         # Find the service summary
         summary = None
@@ -287,22 +324,52 @@ class PeerConnection:
             self._rpc_conns[channel_addr] = conn
 
         conn = self._rpc_conns[channel_addr]
-        transport = IrohTransport(conn)
+
+        # Build a codec with synthesized types if available
+        codec = None
+        if self._type_factory and self._type_factory.type_count > 0:
+            try:
+                codec = ForyCodec(
+                    mode=SerializationMode.XLANG,
+                    types=self._type_factory.get_all_types(),
+                )
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).debug("Dynamic codec failed: %s", exc)
+
+        transport = IrohTransport(conn, codec=codec)
         self._transports[service_name] = transport
         return transport
+
+    def _get_method_meta(self, service: str, method: str) -> dict[str, Any] | None:
+        """Look up method metadata from the manifest."""
+        manifest = self._manifests.get(service, {})
+        for m in manifest.get("methods", []):
+            if m["name"] == method:
+                return m
+        return None
 
     async def invoke(
         self, service: str, method: str, payload: dict[str, Any]
     ) -> Any:
         """Invoke a unary RPC.
 
-        Note: For typed invocation, the request type must be importable.
-        For raw dict payloads, we pass them directly — the transport will
-        attempt to serialize via Fory. This works if the server accepts
-        dict-like payloads or if a codec adapter is registered.
+        If dynamic types are available (from manifest), builds a typed
+        request from the dict payload. Otherwise passes the dict directly.
         """
         transport = await self._get_transport(service)
-        return await transport.unary(service, method, payload)
+
+        # Try to build a typed request from the dynamic type factory
+        request: Any = payload
+        if self._type_factory:
+            meta = self._get_method_meta(service, method)
+            if meta and meta.get("request_wire_tag"):
+                try:
+                    request = self._type_factory.build_request(meta, payload)
+                except Exception:
+                    pass  # fall back to dict
+
+        return await transport.unary(service, method, request)
 
     async def server_stream(
         self, service: str, method: str, payload: dict[str, Any]
