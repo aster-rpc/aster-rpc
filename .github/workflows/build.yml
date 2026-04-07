@@ -64,7 +64,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Fix ownership of stale Docker artifacts
-        run: sudo chown -R "$(id -u):$(id -g)" . 2>/dev/null || true
+        run: |
+          sudo rm -rf "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/target" || true
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
