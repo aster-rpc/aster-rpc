@@ -206,6 +206,36 @@ pub struct CoreBlobLocalInfo {
 }
 
 // ============================================================================
+// Phase 1g: Transport Metrics (from iroh endpoint)
+// ============================================================================
+
+/// Snapshot of transport-layer metrics from the iroh endpoint.
+///
+/// These come from `endpoint.metrics()` which aggregates socket, net-report,
+/// and portmapper metrics. All counters are monotonically increasing.
+#[derive(Clone, Debug, Default)]
+pub struct CoreTransportMetrics {
+    // Socket layer
+    pub send_ipv4: u64,
+    pub send_ipv6: u64,
+    pub send_relay: u64,
+    pub recv_data_ipv4: u64,
+    pub recv_data_ipv6: u64,
+    pub recv_data_relay: u64,
+    pub recv_datagrams: u64,
+    pub num_conns_direct: u64,
+    pub num_conns_opened: u64,
+    pub num_conns_closed: u64,
+    pub paths_direct: u64,
+    pub paths_relay: u64,
+    pub holepunch_attempts: u64,
+    pub relay_home_change: u64,
+    // Net report
+    pub net_reports: u64,
+    pub net_reports_full: u64,
+}
+
+// ============================================================================
 // Phase 1b: Datagram Completion, Hooks & Monitoring Types
 // ============================================================================
 
@@ -1178,6 +1208,38 @@ impl CoreNetClient {
     /// Returns whether hooks are enabled for this endpoint.
     pub fn has_hooks(&self) -> bool {
         self.hook_receiver.is_some()
+    }
+
+    // ============================================================================
+    // Phase 1g: Transport Metrics
+    // ============================================================================
+
+    /// Snapshot current transport metrics from the iroh endpoint.
+    ///
+    /// Reads counters from `endpoint.metrics()` which includes socket-level
+    /// send/recv stats, path counts, holepunching, and net report metrics.
+    pub fn transport_metrics(&self) -> CoreTransportMetrics {
+        let m = self.endpoint.metrics();
+        let s = &m.socket;
+        let n = &m.net_report;
+        CoreTransportMetrics {
+            send_ipv4: s.send_ipv4.get(),
+            send_ipv6: s.send_ipv6.get(),
+            send_relay: s.send_relay.get(),
+            recv_data_ipv4: s.recv_data_ipv4.get(),
+            recv_data_ipv6: s.recv_data_ipv6.get(),
+            recv_data_relay: s.recv_data_relay.get(),
+            recv_datagrams: s.recv_datagrams.get(),
+            num_conns_direct: s.num_conns_direct.get(),
+            num_conns_opened: s.num_conns_opened.get(),
+            num_conns_closed: s.num_conns_closed.get(),
+            paths_direct: s.paths_direct.get(),
+            paths_relay: s.paths_relay.get(),
+            holepunch_attempts: s.holepunch_attempts.get(),
+            relay_home_change: s.relay_home_change.get(),
+            net_reports: n.reports.get(),
+            net_reports_full: n.reports_full.get(),
+        }
     }
 }
 

@@ -10,6 +10,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use aster_transport_core::{
     ConnectionType, ConnectionTypeDetail, CoreConnection, CoreConnectionInfo, CoreEndpointConfig,
     CoreNetClient, CoreNodeAddr, CoreRecvStream, CoreRemoteInfo, CoreSendStream,
+    CoreTransportMetrics,
 };
 
 use crate::error::err_to_py;
@@ -330,6 +331,71 @@ impl<'py> IntoPyObject<'py> for ClosedResult {
         d.set_item("code", self.code)?;
         d.set_item("reason", self.reason.map(PyBytesResult))?;
         Ok(d)
+    }
+}
+
+// ============================================================================
+// Phase 1g: Transport Metrics
+// ============================================================================
+
+/// Snapshot of transport-layer metrics from the iroh endpoint.
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+pub struct TransportMetrics {
+    #[pyo3(get)]
+    pub send_ipv4: u64,
+    #[pyo3(get)]
+    pub send_ipv6: u64,
+    #[pyo3(get)]
+    pub send_relay: u64,
+    #[pyo3(get)]
+    pub recv_data_ipv4: u64,
+    #[pyo3(get)]
+    pub recv_data_ipv6: u64,
+    #[pyo3(get)]
+    pub recv_data_relay: u64,
+    #[pyo3(get)]
+    pub recv_datagrams: u64,
+    #[pyo3(get)]
+    pub num_conns_direct: u64,
+    #[pyo3(get)]
+    pub num_conns_opened: u64,
+    #[pyo3(get)]
+    pub num_conns_closed: u64,
+    #[pyo3(get)]
+    pub paths_direct: u64,
+    #[pyo3(get)]
+    pub paths_relay: u64,
+    #[pyo3(get)]
+    pub holepunch_attempts: u64,
+    #[pyo3(get)]
+    pub relay_home_change: u64,
+    #[pyo3(get)]
+    pub net_reports: u64,
+    #[pyo3(get)]
+    pub net_reports_full: u64,
+}
+
+impl From<CoreTransportMetrics> for TransportMetrics {
+    fn from(m: CoreTransportMetrics) -> Self {
+        Self {
+            send_ipv4: m.send_ipv4,
+            send_ipv6: m.send_ipv6,
+            send_relay: m.send_relay,
+            recv_data_ipv4: m.recv_data_ipv4,
+            recv_data_ipv6: m.recv_data_ipv6,
+            recv_data_relay: m.recv_data_relay,
+            recv_datagrams: m.recv_datagrams,
+            num_conns_direct: m.num_conns_direct,
+            num_conns_opened: m.num_conns_opened,
+            num_conns_closed: m.num_conns_closed,
+            paths_direct: m.paths_direct,
+            paths_relay: m.paths_relay,
+            holepunch_attempts: m.holepunch_attempts,
+            relay_home_change: m.relay_home_change,
+            net_reports: m.net_reports,
+            net_reports_full: m.net_reports_full,
+        }
     }
 }
 
@@ -660,6 +726,15 @@ impl NetClient {
     fn has_hooks(&self) -> bool {
         self.inner.has_hooks()
     }
+
+    // ========================================================================
+    // Phase 1g: Transport Metrics
+    // ========================================================================
+
+    /// Snapshot current transport-layer metrics from the iroh endpoint.
+    fn transport_metrics(&self) -> TransportMetrics {
+        TransportMetrics::from(self.inner.transport_metrics())
+    }
 }
 
 // ============================================================================
@@ -705,6 +780,7 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EndpointConfig>()?;
     m.add_class::<ConnectionInfo>()?;
     m.add_class::<RemoteInfo>()?;
+    m.add_class::<TransportMetrics>()?;
     m.add_class::<NetClient>()?;
     m.add_class::<IrohConnection>()?;
     m.add_class::<IrohSendStream>()?;
