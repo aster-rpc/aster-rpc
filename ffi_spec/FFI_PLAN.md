@@ -15,6 +15,7 @@
 5. [Phase 1c: Registry & Publication Support](#3c-phase-1c-registry--publication-support)
 5d. [Phase 1d: Endpoint Builder Gaps](#3d-phase-1d-endpoint-builder-gaps)
 5f. [Phase 1f: Cross-Language Contract Identity, Framing & Signing](#3f-phase-1f-cross-language-contract-identity-framing--signing)
+5g. [Phase 1g: Per-Connection Metrics & Prometheus Export](#phase-1g-per-connection-metrics--prometheus-export--done)
 6. [Phase 2: Python Bindings Update](#4-phase-2-python-bindings-update)
 7. [Phase 3: Java FFM Bindings](#5-phase-3-java-ffm-bindings)
 8. [C ABI Reference](#6-c-abi-reference)
@@ -3359,6 +3360,62 @@ aster_connections_active 4
 4. **Python tests**: Validate Python-side contract identity and signing against golden vectors
 5. **Java tests**: Load golden vectors, call FFI functions, verify byte-identical output
 6. **Docs**: Update `FFI_PLAN.md` §3f (done)
+
+### Phase 1g (Per-Connection Metrics & Prometheus Export) — DONE
+
+Per-connection QUIC metrics and aggregate transport metrics in Prometheus format,
+supporting the HA routing scorer and operational dashboards.
+
+**Core (`core/src/lib.rs`):**
+
+Added to `CoreConnection`:
+
+| Method | Return | Source |
+|--------|--------|--------|
+| `rtt_ms()` | `f64` | `PathInfo::rtt()` (QUIC RTT) |
+| `bytes_sent()` | `u64` | `PathStats::udp_tx.bytes` |
+| `bytes_recv()` | `u64` | `PathStats::udp_rx.bytes` |
+| `congestion_window()` | `u64` | `PathStats::cwnd` |
+| `lost_packets()` | `u64` | `PathStats::lost_packets` |
+| `congestion_events()` | `u64` | `PathStats::congestion_events` |
+| `current_mtu()` | `u16` | `PathStats::current_mtu` |
+
+All read from the selected path's `PathStats` (from quinn/noq-proto). Zero-cost when not called.
+
+Added to `CoreNode`:
+
+| Method | Return | Description |
+|--------|--------|-------------|
+| `transport_metrics_prometheus()` | `String` | All endpoint-level counters in Prometheus text exposition format |
+
+Emits 16 metrics: `iroh_send_ipv4`, `iroh_send_ipv6`, `iroh_send_relay`, `iroh_recv_data_ipv4`, `iroh_recv_data_ipv6`, `iroh_recv_data_relay`, `iroh_recv_datagrams`, `iroh_conns_direct`, `iroh_conns_opened`, `iroh_conns_closed`, `iroh_paths_direct`, `iroh_paths_relay`, `iroh_holepunch_attempts`, `iroh_relay_home_change`, `iroh_net_reports`, `iroh_net_reports_full`.
+
+**Python (`bindings/python/rust/src/net.rs`, `node.rs`):**
+
+- `IrohConnection`: 7 new methods mirroring core (`rtt_ms`, `bytes_sent`, `bytes_recv`, `congestion_window`, `lost_packets`, `congestion_events`, `current_mtu`)
+- `IrohNode.transport_metrics_prometheus()` → `str`
+
+**TypeScript NAPI (`bindings/typescript/native/src/net.rs`, `node.rs`):**
+
+- `IrohConnection`: 7 new methods (same as Python; u64 returned as f64 for JS number safety)
+- `IrohNode.transportMetricsPrometheus()` → `string`
+
+**Usage (routing scorer):**
+
+```python
+conn = await transport.connect(node_id, alpn)
+rtt = conn.rtt_ms()          # feed to routing scorer
+cwnd = conn.congestion_window()  # detect congestion
+```
+
+**Usage (Prometheus scrape):**
+
+```python
+# In HealthServer /metrics/prometheus endpoint
+aster_metrics = format_aster_rpc_metrics()
+transport_metrics = node.transport_metrics_prometheus()
+return aster_metrics + "\n" + transport_metrics
+```
 
 ### Phase 2 (Python) — ~1 week
 

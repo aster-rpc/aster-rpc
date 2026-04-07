@@ -101,6 +101,50 @@ impl IrohConnection {
             .close(error_code as u64, reason.into_bytes())
             .map_err(to_napi_err)
     }
+
+    // ── Per-connection metrics (for routing / HA) ──
+
+    /// Current round-trip time in milliseconds for the selected path.
+    #[napi]
+    pub fn rtt_ms(&self) -> f64 {
+        self.inner.rtt_ms()
+    }
+
+    /// Total bytes sent on the selected path (UDP layer).
+    #[napi]
+    pub fn bytes_sent(&self) -> f64 {
+        self.inner.bytes_sent() as f64
+    }
+
+    /// Total bytes received on the selected path (UDP layer).
+    #[napi]
+    pub fn bytes_recv(&self) -> f64 {
+        self.inner.bytes_recv() as f64
+    }
+
+    /// Current congestion window size in bytes.
+    #[napi]
+    pub fn congestion_window(&self) -> f64 {
+        self.inner.congestion_window() as f64
+    }
+
+    /// Number of lost packets on the selected path.
+    #[napi]
+    pub fn lost_packets(&self) -> f64 {
+        self.inner.lost_packets() as f64
+    }
+
+    /// Number of congestion events on the selected path.
+    #[napi]
+    pub fn congestion_events(&self) -> f64 {
+        self.inner.congestion_events() as f64
+    }
+
+    /// Current path MTU in bytes.
+    #[napi]
+    pub fn current_mtu(&self) -> u32 {
+        self.inner.current_mtu() as u32
+    }
 }
 
 // ============================================================================

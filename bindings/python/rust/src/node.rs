@@ -169,6 +169,14 @@ impl IrohNode {
     fn export_secret_key(&self) -> Vec<u8> {
         self.inner.export_secret_key()
     }
+
+    /// Export all transport-level metrics in Prometheus text exposition format.
+    ///
+    /// Covers socket I/O, path counts, holepunching, relay, and net report
+    /// counters. Merge with Aster RPC metrics for a single scrape target.
+    fn transport_metrics_prometheus(&self) -> String {
+        self.inner.transport_metrics_prometheus()
+    }
 }
 
 impl From<CoreNode> for IrohNode {

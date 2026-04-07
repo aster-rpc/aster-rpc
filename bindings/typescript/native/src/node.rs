@@ -145,4 +145,10 @@ impl IrohNode {
         self.inner.clone().close().await;
         Ok(())
     }
+
+    /// Export all transport-level metrics in Prometheus text exposition format.
+    #[napi]
+    pub fn transport_metrics_prometheus(&self) -> String {
+        self.inner.transport_metrics_prometheus()
+    }
 }
