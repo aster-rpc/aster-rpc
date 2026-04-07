@@ -127,7 +127,10 @@ jobs:
         if: matrix.shell == 'pwsh'
         env:
           PYTHONIOENCODING: utf-8
+          TEMP: ${{ github.workspace }}\tmp
+          TMP: ${{ github.workspace }}\tmp
         run: |
+          New-Item -ItemType Directory -Path "$env:TEMP" -Force | Out-Null
           uv venv .venv
           .venv\Scripts\activate
           uv pip install pytest pytest-asyncio pytest-timeout pytest-rerunfailures maturin
