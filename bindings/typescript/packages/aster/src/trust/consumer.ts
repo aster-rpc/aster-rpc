@@ -17,7 +17,6 @@
  */
 
 import type { ConsumerEnrollmentCredential } from './credentials.js';
-import { hexToBytes } from './credentials.js';
 import { admit } from './admission.js';
 import type { MeshEndpointHook } from './hooks.js';
 import { MAX_ADMISSION_PAYLOAD_SIZE, MAX_SERVICES_IN_ADMISSION, validateHexField } from '../limits.js';
@@ -105,10 +104,6 @@ export async function performAdmission(
 }
 
 // ── Credential serialisation helpers ──────────────────────────────────────────
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-}
 
 /**
  * Serialise a ConsumerEnrollmentCredential to the wire JSON format.

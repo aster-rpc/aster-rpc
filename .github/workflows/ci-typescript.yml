@@ -16,6 +16,10 @@ on:
       - '.github/workflows/ci-typescript.yml'
   workflow_dispatch:
 
+concurrency:
+  group: ci-ts-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 

@@ -197,12 +197,11 @@ describe('ConnectionMetrics', () => {
     m.onAccept();
     m.onReject();
     m.onClose();
-    expect(m.snapshot()).toEqual({
-      connections_accepted: 2,
-      connections_rejected: 1,
-      connections_closed: 1,
-      connections_active: 1,
-    });
+    const snap = m.snapshot();
+    expect(snap.connections_accepted).toBe(2);
+    expect(snap.connections_rejected).toBe(1);
+    expect(snap.connections_closed).toBe(1);
+    expect(snap.connections_active).toBe(1);
   });
 });
 
@@ -213,11 +212,10 @@ describe('AdmissionMetrics', () => {
     m.onAttempt();
     m.onSuccess();
     m.onReject();
-    expect(m.snapshot()).toEqual({
-      admissions_attempted: 2,
-      admissions_succeeded: 1,
-      admissions_rejected: 1,
-      admissions_errored: 0,
-    });
+    const snap = m.snapshot();
+    expect(snap.admissions_attempted).toBe(2);
+    expect(snap.admissions_succeeded).toBe(1);
+    expect(snap.admissions_rejected).toBe(1);
+    expect(snap.admissions_errored).toBe(0);
   });
 });

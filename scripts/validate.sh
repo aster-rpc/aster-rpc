@@ -8,7 +8,7 @@
 #   3. uv run maturin develop (build the extension)
 #   4. uv run pytest tests/python/
 #   5. cargo fmt + clippy (TypeScript NAPI Rust)
-#   6. tsc --noEmit + vitest run (TypeScript)
+#   6. tsc --noEmit + vitest run (tests/typescript/)
 
 set -euo pipefail
 

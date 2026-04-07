@@ -20,10 +20,10 @@ let native: any;
 
 // Load synchronously at module level so skipIf works
 const candidates = [
-  resolve(__dirname, '../../native/aster-transport.darwin-arm64.node'),
-  resolve(__dirname, '../../native/aster-transport.darwin-x64.node'),
-  resolve(__dirname, '../../native/aster-transport.linux-x64-gnu.node'),
-  resolve(__dirname, '../../native/aster-transport.linux-arm64-gnu.node'),
+  resolve(__dirname, '../../../bindings/typescript/native/aster-transport.darwin-arm64.node'),
+  resolve(__dirname, '../../../bindings/typescript/native/aster-transport.darwin-x64.node'),
+  resolve(__dirname, '../../../bindings/typescript/native/aster-transport.linux-x64-gnu.node'),
+  resolve(__dirname, '../../../bindings/typescript/native/aster-transport.linux-arm64-gnu.node'),
 ];
 
 for (const path of candidates) {

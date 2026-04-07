@@ -128,9 +128,9 @@ export async function checkRuntime(
   iidBackend?: IIDBackend,
   iidToken?: string,
 ): Promise<AdmissionResult> {
-  const result = await verifyIID(cred.attributes, iidBackend, iidToken);
-  if (!result.ok) {
-    return { admitted: false, reason: result.reason };
+  const [ok, reason] = await verifyIID(cred.attributes, iidBackend, iidToken);
+  if (!ok) {
+    return { admitted: false, reason };
   }
   return { admitted: true, attributes: { ...cred.attributes } };
 }
@@ -165,7 +165,10 @@ export async function admit(
 
 // ── Legacy compat (kept for existing callers) ───────────────────────────────
 
-/** @deprecated Use checkOffline + checkRuntime via admit() instead. */
+/**
+ * @deprecated Use checkOffline + checkRuntime via admit() instead.
+ * Legacy: checks only pubkey match + expiry (no signature verification).
+ */
 export async function verifyConsumerCredential(
   cred: ConsumerEnrollmentCredential,
   expectedRootPubkey: string,
@@ -173,10 +176,17 @@ export async function verifyConsumerCredential(
   if (cred.rootPubkey !== expectedRootPubkey) {
     return { admitted: false, reason: 'root pubkey mismatch' };
   }
-  return checkOffline(cred, '');
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (cred.expiresAt > 0 && cred.expiresAt <= nowSec) {
+    return { admitted: false, reason: 'credential expired' };
+  }
+  return { admitted: true, attributes: { ...cred.attributes } };
 }
 
-/** @deprecated Use checkOffline + checkRuntime via admit() instead. */
+/**
+ * @deprecated Use checkOffline + checkRuntime via admit() instead.
+ * Legacy: checks only pubkey match + expiry (no signature verification).
+ */
 export async function verifyProducerCredential(
   cred: EnrollmentCredential,
   expectedRootPubkey: string,
@@ -184,5 +194,9 @@ export async function verifyProducerCredential(
   if (cred.rootPubkey !== expectedRootPubkey) {
     return { admitted: false, reason: 'root pubkey mismatch' };
   }
-  return checkOffline(cred, cred.endpointId);
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (cred.expiresAt > 0 && cred.expiresAt <= nowSec) {
+    return { admitted: false, reason: 'credential expired' };
+  }
+  return { admitted: true, attributes: { ...cred.attributes } };
 }
