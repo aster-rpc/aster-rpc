@@ -2,6 +2,7 @@ name: Build & Publish Wheels
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   pull_request:
     paths-ignore:
@@ -14,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,6 +26,30 @@ env:
 # used in ci.yml for testing.
 
 jobs:
+  # ── Compute version (build number for dev, clean for tags) ─────────
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      python_version: ${{ steps.ver.outputs.python_version }}
+      is_release: ${{ steps.ver.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute version
+        id: ver
+        run: |
+          BASE_VERSION=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "python_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "python_version=${BASE_VERSION}.dev${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Show version
+        run: |
+          echo "Version: ${{ steps.ver.outputs.python_version }}"
+          echo "Release: ${{ steps.ver.outputs.is_release }}"
+
   # ── Lint (GitHub-hosted, mirrors ci.yml pinned toolchain) ──────────
   lint:
     runs-on: ubuntu-latest
@@ -46,7 +72,7 @@ jobs:
 
   # ── Linux (x86_64 + aarch64) ──────────────────────────────────────
   linux:
-    needs: lint
+    needs: [lint, version]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -65,6 +91,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Stamp version
+        run: sed -i 's/^version.*=.*".*"/version = "${{ needs.version.outputs.python_version }}"/' pyproject.toml
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -78,7 +106,7 @@ jobs:
 
   # ── macOS (x86_64 + aarch64) ──────────────────────────────────────
   macos:
-    needs: lint
+    needs: [lint, version]
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -101,6 +129,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Stamp version
+        run: sed -i '' 's/^version.*=.*".*"/version = "${{ needs.version.outputs.python_version }}"/' pyproject.toml
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -113,7 +143,7 @@ jobs:
 
   # ── Windows (x86_64) ──────────────────────────────────────────────
   windows:
-    needs: lint
+    needs: [lint, version]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -129,6 +159,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Stamp version
+        run: (Get-Content pyproject.toml) -replace '^version\s*=\s*".*"', 'version = "${{ needs.version.outputs.python_version }}"' | Set-Content pyproject.toml
+        shell: pwsh
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -141,7 +174,7 @@ jobs:
 
   # ── Source distribution ────────────────────────────────────────────
   sdist:
-    needs: lint
+    needs: [lint, version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -154,6 +187,8 @@ jobs:
           workspaces: |
             . -> target
           key: sdist
+      - name: Stamp version
+        run: sed -i 's/^version.*=.*".*"/version = "${{ needs.version.outputs.python_version }}"/' pyproject.toml
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
@@ -179,3 +214,33 @@ jobs:
           merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # ── Publish to GitHub Packages (main + tags) ───────────────────────
+  publish-ghp:
+    name: Publish to GitHub Packages
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, windows, sdist, version]
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install twine
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: List artifacts
+        run: ls -lh dist/
+      - name: Publish to GitHub Packages
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          twine upload \
+            --repository-url https://ghp.pkg.github.com/${{ github.repository }} \
+            --skip-existing \
+            dist/*

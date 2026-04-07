@@ -1,4 +1,4 @@
-# Aster Trust Architecture — Identity, Enrollment, and Transparency
+ase# Aster Trust Architecture — Identity, Enrollment, and Transparency
 
 **Status:** Design draft  
 **Date:** 2026-04-07  

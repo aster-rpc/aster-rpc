@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Aster RPC framework command-line tools"
 requires-python = ">=3.9"
 dependencies = [
-    "aster-python",
+    "aster-rpc",
     "prompt-toolkit>=3.0",
     "rich>=13.0",
     "mcp>=1.0",
