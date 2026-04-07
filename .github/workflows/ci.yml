@@ -95,13 +95,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
-        if: runner.os != 'Windows'
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Ensure Rust toolchain (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: rustup default ${{ env.RUST_TOOLCHAIN }}
       - uses: actions/setup-python@v5
         if: runner.os == 'Linux'
         with:
@@ -127,10 +122,7 @@ jobs:
         if: matrix.shell == 'pwsh'
         env:
           PYTHONIOENCODING: utf-8
-          TEMP: ${{ github.workspace }}\tmp
-          TMP: ${{ github.workspace }}\tmp
         run: |
-          New-Item -ItemType Directory -Path "$env:TEMP" -Force | Out-Null
           uv venv .venv
           .venv\Scripts\activate
           uv pip install pytest pytest-asyncio pytest-timeout pytest-rerunfailures maturin

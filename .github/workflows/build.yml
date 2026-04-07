@@ -115,9 +115,9 @@ jobs:
     runs-on: [self-hosted, Windows, X64]
     steps:
       - uses: actions/checkout@v6
-      - name: Ensure Rust toolchain
-        shell: pwsh
-        run: rustup default ${{ env.RUST_TOOLCHAIN }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Stamp version
         run: (Get-Content pyproject.toml) -replace '^version\s*=\s*".*"', 'version = "${{ needs.version.outputs.python_version }}"' | Set-Content pyproject.toml
         shell: pwsh
