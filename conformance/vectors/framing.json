@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Aster wire framing test vectors. Spec S6.1. Frame layout: 4-byte LE u32 length + 1-byte flags + payload. Length = len(flags + payload) = len(payload) + 1.",
+  "format": {
+    "length_bytes": 4,
+    "length_encoding": "little-endian u32",
+    "flags_bytes": 1,
+    "max_frame_size": 16777216
+  },
+  "flag_definitions": {
+    "COMPRESSED":  "0x01",
+    "TRAILER":     "0x02",
+    "HEADER":      "0x04",
+    "ROW_SCHEMA":  "0x08",
+    "CALL":        "0x10",
+    "CANCEL":      "0x20"
+  },
+  "encode_vectors": [
+    {
+      "name": "simple payload no flags",
+      "payload_hex": "48656c6c6f",
+      "flags": 0,
+      "expected_wire_hex": "060000000048656c6c6f",
+      "note": "length = 5 (payload) + 1 (flags) = 6"
+    },
+    {
+      "name": "empty payload with TRAILER flag",
+      "payload_hex": "",
+      "flags": 2,
+      "expected_wire_hex": "0100000002",
+      "note": "length = 0 + 1 = 1; empty TRAILER is valid"
+    },
+    {
+      "name": "empty payload with CANCEL flag",
+      "payload_hex": "",
+      "flags": 32,
+      "expected_wire_hex": "0100000020",
+      "note": "length = 1; empty CANCEL is valid"
+    },
+    {
+      "name": "payload with HEADER flag",
+      "payload_hex": "deadbeef",
+      "flags": 4,
+      "expected_wire_hex": "0500000004deadbeef",
+      "note": "length = 4 + 1 = 5; HEADER flag"
+    },
+    {
+      "name": "payload with COMPRESSED flag",
+      "payload_hex": "aabbccdd",
+      "flags": 1,
+      "expected_wire_hex": "0500000001aabbccdd",
+      "note": "length = 4 + 1 = 5; COMPRESSED flag"
+    },
+    {
+      "name": "payload with HEADER|COMPRESSED flags",
+      "payload_hex": "0102030405060708",
+      "flags": 5,
+      "expected_wire_hex": "09000000050102030405060708",
+      "note": "length = 8 + 1 = 9; flags = 0x04 | 0x01 = 0x05"
+    },
+    {
+      "name": "single byte payload",
+      "payload_hex": "ff",
+      "flags": 0,
+      "expected_wire_hex": "0200000000ff",
+      "note": "length = 1 + 1 = 2"
+    },
+    {
+      "name": "CALL flag with payload",
+      "payload_hex": "cafe",
+      "flags": 16,
+      "expected_wire_hex": "0300000010cafe",
+      "note": "length = 2 + 1 = 3; CALL flag for session streams"
+    },
+    {
+      "name": "TRAILER with payload",
+      "payload_hex": "00",
+      "flags": 2,
+      "expected_wire_hex": "020000000200",
+      "note": "TRAILER with a 1-byte status payload"
+    }
+  ],
+  "decode_vectors": [
+    {
+      "name": "simple decode",
+      "wire_hex": "060000000048656c6c6f",
+      "expected_payload_hex": "48656c6c6f",
+      "expected_flags": 0
+    },
+    {
+      "name": "decode HEADER frame",
+      "wire_hex": "0500000004deadbeef",
+      "expected_payload_hex": "deadbeef",
+      "expected_flags": 4
+    },
+    {
+      "name": "decode empty TRAILER",
+      "wire_hex": "0100000002",
+      "expected_payload_hex": "",
+      "expected_flags": 2
+    }
+  ],
+  "error_vectors": [
+    {
+      "name": "zero length frame",
+      "wire_hex": "00000000",
+      "error": "zero-length frame"
+    },
+    {
+      "name": "empty payload without TRAILER or CANCEL",
+      "payload_hex": "",
+      "flags": 0,
+      "error": "zero-length payload is not permitted"
+    },
+    {
+      "name": "frame exceeds max size",
+      "description": "A frame with length > 16 MiB must be rejected",
+      "wire_length_value": 16777217,
+      "error": "frame size exceeds maximum"
+    }
+  ]
+}

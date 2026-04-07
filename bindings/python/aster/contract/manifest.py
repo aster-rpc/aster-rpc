@@ -214,14 +214,39 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
 
         resp_type = getattr(method_info, "response_type", None)
 
+        # Resolve forward references (strings) to actual classes
+        if isinstance(resp_type, str) and req_type is not None:
+            # Try to find the class in the same module as the request type
+            import sys
+            module = sys.modules.get(req_type.__module__)
+            if module:
+                resp_type = getattr(module, resp_type, resp_type)
+
+        # Extract response type fields for dynamic invocation
+        resp_fields: list[dict] = []
+        if resp_type is not None and dataclasses.is_dataclass(resp_type):
+            try:
+                resp_hints = get_type_hints(resp_type)
+            except Exception:
+                resp_hints = {}
+            for f in dataclasses.fields(resp_type):
+                ftype = resp_hints.get(f.name, f.type)
+                resp_fields.append({
+                    "name": f.name,
+                    "type": _type_display_name(ftype),
+                })
+
         methods_out.append({
             "name": method_name,
             "pattern": getattr(method_info, "pattern", "unary"),
             "request_type": _type_display_name(req_type) if req_type else "",
             "response_type": _type_display_name(resp_type) if resp_type else "",
+            "request_wire_tag": getattr(req_type, "__wire_type__", "") if req_type else "",
+            "response_wire_tag": getattr(resp_type, "__wire_type__", "") if resp_type else "",
             "timeout": getattr(method_info, "timeout", None),
             "idempotent": getattr(method_info, "idempotent", False),
             "fields": fields,
+            "response_fields": resp_fields,
         })
 
     methods_out.sort(key=lambda m: m["name"])

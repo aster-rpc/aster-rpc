@@ -298,7 +298,12 @@ def _handle_contract_published(
         import json
 
         try:
-            d = json.loads(msg.payload.decode("utf-8"))
+            from aster.limits import MAX_GOSSIP_PAYLOAD_SIZE
+            raw = msg.payload
+            if len(raw) > MAX_GOSSIP_PAYLOAD_SIZE:
+                logger.warning("gossip: payload too large (%d bytes), dropping", len(raw))
+                return
+            d = json.loads(raw.decode("utf-8"))
             payload.service_name = d["service_name"]
             payload.version = int(d["version"])
             payload.contract_collection_hash = d["contract_collection_hash"]
@@ -322,6 +327,10 @@ def _handle_lease_update(
         import json
 
         try:
+            from aster.limits import MAX_GOSSIP_PAYLOAD_SIZE
+            if len(msg.payload) > MAX_GOSSIP_PAYLOAD_SIZE:
+                logger.warning("gossip: LeaseUpdate payload too large (%d bytes)", len(msg.payload))
+                return
             d = json.loads(msg.payload.decode("utf-8"))
             payload = LeaseUpdatePayload(
                 service_name=d["service_name"],

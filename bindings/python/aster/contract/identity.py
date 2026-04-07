@@ -14,26 +14,11 @@ Provides:
 from __future__ import annotations
 
 import dataclasses
-import io
 import unicodedata
 import warnings
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, get_type_hints
-
-import blake3
-
-from aster.contract.canonical import (
-    write_bool,
-    write_bytes_field,
-    write_float64,
-    write_list_header,
-    write_optional_absent,
-    write_optional_present_prefix,
-    write_string,
-    write_varint,
-    write_zigzag_i32,
-)
 
 
 # ── Enum types (§11.3.3, fixed normative values) ─────────────────────────────
@@ -348,142 +333,14 @@ def _resolve_type_hash(tp: type | None, type_hashes: dict[str, bytes]) -> bytes:
     return b"\x00" * 32
 
 
-# ── Canonical serialization ───────────────────────────────────────────────────
-
-
-def _write_field_def(w: io.BytesIO, fd: FieldDef) -> None:
-    """Serialize a FieldDef in canonical order (fields 1–12)."""
-    write_zigzag_i32(w, fd.id)                       # field 1
-    write_string(w, fd.name)                           # field 2
-    write_varint(w, int(fd.type_kind))                 # field 3
-    write_string(w, fd.type_primitive)                 # field 4
-    write_bytes_field(w, fd.type_ref)                  # field 5
-    write_string(w, fd.self_ref_name)                  # field 6
-    write_bool(w, fd.optional)                         # field 7
-    write_bool(w, fd.ref_tracked)                      # field 8
-    write_varint(w, int(fd.container))                 # field 9
-    write_varint(w, int(fd.container_key_kind))        # field 10
-    write_string(w, fd.container_key_primitive)        # field 11
-    write_bytes_field(w, fd.container_key_ref)         # field 12
-
-
-def _write_enum_value_def(w: io.BytesIO, ev: EnumValueDef) -> None:
-    """Serialize an EnumValueDef in canonical order (fields 1–2)."""
-    write_string(w, ev.name)        # field 1
-    write_zigzag_i32(w, ev.value)   # field 2
-
-
-def _write_union_variant_def(w: io.BytesIO, uv: UnionVariantDef) -> None:
-    """Serialize a UnionVariantDef in canonical order (fields 1–3)."""
-    write_string(w, uv.name)        # field 1
-    write_zigzag_i32(w, uv.id)     # field 2
-    write_bytes_field(w, uv.type_ref)  # field 3
-
-
-def _write_type_def(w: io.BytesIO, td: TypeDef) -> None:
-    """Serialize a TypeDef in canonical order (fields 1–6)."""
-    write_varint(w, int(td.kind))   # field 1
-    write_string(w, td.package)     # field 2
-    write_string(w, td.name)        # field 3
-
-    # field 4: fields list (sorted by id)
-    sorted_fields = sorted(td.fields, key=lambda f: f.id)
-    write_list_header(w, len(sorted_fields))
-    for fd in sorted_fields:
-        _write_field_def(w, fd)
-
-    # field 5: enum_values list (sorted by value)
-    sorted_evs = sorted(td.enum_values, key=lambda e: e.value)
-    write_list_header(w, len(sorted_evs))
-    for ev in sorted_evs:
-        _write_enum_value_def(w, ev)
-
-    # field 6: union_variants list (sorted by id)
-    sorted_uvs = sorted(td.union_variants, key=lambda u: u.id)
-    write_list_header(w, len(sorted_uvs))
-    for uv in sorted_uvs:
-        _write_union_variant_def(w, uv)
-
-
-def _write_capability_requirement(w: io.BytesIO, cap: CapabilityRequirement) -> None:
-    """Serialize a CapabilityRequirement in canonical order (fields 1–2)."""
-    write_varint(w, int(cap.kind))   # field 1
-
-    # field 2: roles list (NFC-normalized, sorted by Unicode codepoint)
-    nfc_roles = sorted(
-        (unicodedata.normalize("NFC", r) for r in cap.roles),
-        key=lambda r: [ord(c) for c in r],
-    )
-    write_list_header(w, len(nfc_roles))
-    for role in nfc_roles:
-        write_string(w, role)
-
-
-def _write_method_def(w: io.BytesIO, md: MethodDef) -> None:
-    """Serialize a MethodDef in canonical order (fields 1–7)."""
-    write_string(w, md.name)                    # field 1
-    write_varint(w, int(md.pattern))            # field 2
-    write_bytes_field(w, md.request_type)       # field 3
-    write_bytes_field(w, md.response_type)      # field 4
-    write_bool(w, md.idempotent)                # field 5
-    write_float64(w, md.default_timeout)        # field 6
-
-    # field 7: requires (optional)
-    if md.requires is None:
-        write_optional_absent(w)
-    else:
-        write_optional_present_prefix(w)
-        _write_capability_requirement(w, md.requires)
-
-
-def _write_service_contract(w: io.BytesIO, sc: ServiceContract) -> None:
-    """Serialize a ServiceContract in canonical order (fields 1–6)."""
-    write_string(w, sc.name)           # field 1
-    write_zigzag_i32(w, sc.version)   # field 2
-
-    # field 3: methods list (sorted by NFC name)
-    sorted_methods = sorted(
-        sc.methods,
-        key=lambda m: unicodedata.normalize("NFC", m.name),
-    )
-    write_list_header(w, len(sorted_methods))
-    for md in sorted_methods:
-        _write_method_def(w, md)
-
-    # field 4: serialization_modes list
-    write_list_header(w, len(sc.serialization_modes))
-    for mode in sc.serialization_modes:
-        write_string(w, mode)
-
-    write_varint(w, int(sc.scoped))   # field 5
-
-    # field 6: requires (optional)
-    if sc.requires is None:
-        write_optional_absent(w)
-    else:
-        write_optional_present_prefix(w)
-        _write_capability_requirement(w, sc.requires)
-
-
-# ── Public canonical bytes API ────────────────────────────────────────────────
-
-# Dispatch table for the known types
-_WRITERS = {
-    FieldDef: _write_field_def,
-    EnumValueDef: _write_enum_value_def,
-    UnionVariantDef: _write_union_variant_def,
-    TypeDef: _write_type_def,
-    CapabilityRequirement: _write_capability_requirement,
-    MethodDef: _write_method_def,
-    ServiceContract: _write_service_contract,
-}
+# ── Canonical serialization (delegated to Rust core) ─────────────────────────
 
 
 def canonical_xlang_bytes(obj: Any) -> bytes:
     """Serialize an object to canonical XLANG bytes.
 
-    Supported types: FieldDef, EnumValueDef, UnionVariantDef, TypeDef,
-    CapabilityRequirement, MethodDef, ServiceContract.
+    Delegates to the Rust core implementation via ``_aster.contract``.
+    Supported types: ServiceContract, TypeDef, MethodDef.
 
     Args:
         obj: The object to serialize.
@@ -494,15 +351,93 @@ def canonical_xlang_bytes(obj: Any) -> bytes:
     Raises:
         TypeError: If the object type is not supported.
     """
-    writer = _WRITERS.get(type(obj))
-    if writer is None:
-        raise TypeError(
-            f"No canonical writer for type {type(obj).__name__}. "
-            f"Supported: {[t.__name__ for t in _WRITERS]}"
-        )
-    buf = io.BytesIO()
-    writer(buf, obj)
-    return buf.getvalue()
+    if isinstance(obj, ServiceContract):
+        return _canonical_bytes_via_rust("ServiceContract", obj)
+    if isinstance(obj, TypeDef):
+        return _canonical_bytes_via_rust("TypeDef", obj)
+    if isinstance(obj, MethodDef):
+        return _canonical_bytes_via_rust("MethodDef", obj)
+    raise TypeError(
+        f"No canonical writer for type {type(obj).__name__}. "
+        f"Supported: ServiceContract, TypeDef, MethodDef"
+    )
+
+
+def _canonical_bytes_via_rust(type_name: str, obj: Any) -> bytes:
+    """Serialize via Rust core: convert to JSON, pass to _aster.contract."""
+    import aster._aster as _native
+    json_str = _to_json(obj)
+    return bytes(_native.contract.canonical_bytes_from_json(type_name, json_str))
+
+
+_ENUM_TO_SERDE: dict[int, str] = {
+    # MethodPattern
+    0: "unary",
+    1: "server_stream",
+    2: "client_stream",
+    3: "bidi_stream",
+}
+
+_SCOPE_TO_SERDE: dict[int, str] = {
+    0: "shared",
+    1: "stream",
+}
+
+_CAP_TO_SERDE: dict[int, str] = {
+    0: "role",
+    1: "any_of",
+    2: "all_of",
+}
+
+
+def _to_json(obj: Any) -> str:
+    """Convert a contract dataclass to JSON for the Rust core (serde-compatible)."""
+    import json
+
+    _TYPEDEF_KIND_TO_SERDE = {0: "message", 1: "enum", 2: "union"}
+    _TYPEKIND_TO_SERDE = {0: "primitive", 1: "ref", 2: "self_ref", 3: "any"}
+    _CONTAINER_TO_SERDE = {0: "none", 1: "list", 2: "set", 3: "map"}
+
+    def _convert(o: Any, field_name: str = "", parent_type: str = "") -> Any:
+        if isinstance(o, bytes):
+            return o.hex()
+        if isinstance(o, CapabilityRequirement):
+            return {
+                "kind": _CAP_TO_SERDE.get(int(o.kind), str(o.kind)),
+                "roles": [_convert(r) for r in o.roles],
+            }
+        if dataclasses.is_dataclass(o) and not isinstance(o, type):
+            d = {}
+            type_name = type(o).__name__
+            for f in dataclasses.fields(o):
+                val = getattr(o, f.name)
+                d[f.name] = _convert(val, f.name, type_name)
+            return d
+        if isinstance(o, list):
+            return [_convert(item) for item in o]
+        if isinstance(o, (str, bool)):
+            return o
+        if isinstance(o, (int, float)):
+            if field_name == "pattern":
+                return _ENUM_TO_SERDE.get(int(o), int(o))
+            if field_name == "scoped":
+                return _SCOPE_TO_SERDE.get(int(o), int(o))
+            if field_name == "kind" and parent_type == "TypeDef":
+                return _TYPEDEF_KIND_TO_SERDE.get(int(o), int(o))
+            if field_name == "kind":
+                return _CAP_TO_SERDE.get(int(o), int(o))
+            if field_name == "container":
+                return _CONTAINER_TO_SERDE.get(int(o), int(o))
+            if field_name in ("type_kind", "container_key_kind"):
+                return _TYPEKIND_TO_SERDE.get(int(o), int(o))
+            return o
+        if o is None:
+            return None
+        if hasattr(o, "value"):
+            return o.value
+        return str(o)
+
+    return json.dumps(_convert(obj))
 
 
 # ── Hashing ───────────────────────────────────────────────────────────────────
@@ -511,25 +446,20 @@ def canonical_xlang_bytes(obj: Any) -> bytes:
 def compute_type_hash(canonical_bytes: bytes) -> bytes:
     """Compute BLAKE3 hash of canonical bytes, returning 32-byte digest.
 
-    Args:
-        canonical_bytes: The canonical serialization of a type.
-
-    Returns:
-        32-byte BLAKE3 digest.
+    Delegates to Rust core for the hash computation.
     """
-    return blake3.blake3(canonical_bytes).digest()
+    import aster._aster as _native
+    return bytes(_native.contract.compute_type_hash(canonical_bytes))
 
 
 def compute_contract_id(contract_bytes: bytes) -> str:
     """Compute BLAKE3 hash of contract bytes, returning 64-char hex string.
 
-    Args:
-        contract_bytes: The canonical serialization of a ServiceContract.
-
-    Returns:
-        64-character hex string (full 32-byte BLAKE3 digest as hex).
+    Delegates to Rust core for the hash computation.
     """
-    return blake3.blake3(contract_bytes).hexdigest()
+    import aster._aster as _native
+    digest = bytes(_native.contract.compute_type_hash(contract_bytes))
+    return digest.hex()
 
 
 def contract_id_from_service(service_cls: type) -> str:

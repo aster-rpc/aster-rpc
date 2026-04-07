@@ -668,6 +668,20 @@ class AsterServer:
         except asyncio.CancelledError:
             pass
 
+    async def drain(self, grace_period: float = 10.0) -> None:
+        """Graceful shutdown: stop accepting new connections, drain existing ones.
+
+        Compatible with Kubernetes ``preStop`` hooks and SIGTERM handling.
+        After drain completes, call ``close()`` to shut down the node.
+
+        Args:
+            grace_period: Seconds to wait for in-flight requests to complete.
+        """
+        logger.info("Draining server (grace_period=%.1fs)...", grace_period)
+        if self._server is not None:
+            await self._server.drain(grace_period)
+        logger.info("Drain complete")
+
     async def close(self) -> None:
         """Cancel serve loops and close the node. Safe to call multiple times."""
         if self._closed:
@@ -690,6 +704,45 @@ class AsterServer:
                 await self._node.close()
             except Exception:
                 pass
+
+    def install_signal_handlers(self, grace_period: float = 10.0) -> None:
+        """Install SIGTERM/SIGINT handlers for graceful shutdown.
+
+        Call after ``serve()`` to enable k8s-compatible shutdown:
+
+        - SIGTERM: drain → close (graceful)
+        - SIGINT (Ctrl+C): drain → close (graceful)
+        - Second SIGINT: immediate exit
+
+        Usage::
+
+            async with AsterServer(services=[...]) as srv:
+                srv.install_signal_handlers()
+                await srv.serve()
+        """
+        import signal
+
+        loop = asyncio.get_event_loop()
+        shutdown_count = 0
+
+        def _handle_signal(sig: int, frame: Any) -> None:
+            nonlocal shutdown_count
+            shutdown_count += 1
+            if shutdown_count > 1:
+                logger.warning("Forced exit (second signal)")
+                sys.exit(1)
+            logger.info("Received %s — draining...", signal.Signals(sig).name)
+            loop.create_task(self._graceful_shutdown(grace_period))
+
+        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
+
+    async def _graceful_shutdown(self, grace_period: float) -> None:
+        """Internal: drain then close."""
+        try:
+            await self.drain(grace_period)
+        finally:
+            await self.close()
 
     async def __aenter__(self) -> "AsterServer":
         await self.start()
@@ -874,6 +927,9 @@ class AsterClient:
         self._clients: list[ServiceClient] = []
         self._connected: bool = False
         self._closed: bool = False
+        self._reconnect_attempts: int = 0
+        self._max_reconnect_attempts: int = 5
+        self._reconnect_base_delay: float = 1.0  # seconds
 
     async def connect(self) -> None:
         """Create endpoint, run admission if credential present, store services.
@@ -884,21 +940,64 @@ class AsterClient:
             return
 
         # Build a full IrohNode so the consumer can join registry docs
-        # and fetch blobs. Previously this was a bare NetClient endpoint,
-        # but docs/blobs require a full node.
+        # and fetch blobs. Use persistent storage when configured — this
+        # preserves the node identity, joined docs, and downloaded blobs
+        # across restarts.
         ep_cfg = self._config.to_endpoint_config()
         ep_config = _clone_config_with_alpns(
             ep_cfg, [ALPN_CONSUMER_ADMISSION, RPC_ALPN]
         )
-        self._node = await IrohNode.memory_with_alpns(
-            [ALPN_CONSUMER_ADMISSION, RPC_ALPN], ep_config
-        )
+        storage = self._config.storage_path
+        if storage:
+            self._node = await IrohNode.persistent_with_alpns(
+                storage, [ALPN_CONSUMER_ADMISSION, RPC_ALPN], ep_config
+            )
+            logger.debug("Consumer node: persistent at %s", storage)
+        else:
+            self._node = await IrohNode.memory_with_alpns(
+                [ALPN_CONSUMER_ADMISSION, RPC_ALPN], ep_config
+            )
+            logger.debug("Consumer node: in-memory (set ASTER_STORAGE_PATH for persistence)")
         self._ep = net_client(self._node)
 
         # Always run the admission handshake — even when the consumer gate
         # is open, the response carries the services list + registry ticket.
         await self._run_admission()
         self._connected = True
+        self._reconnect_attempts = 0
+
+    async def reconnect(self) -> None:
+        """Reconnect after a connection drop.
+
+        Closes stale connections, re-runs admission, and rebuilds the
+        services list. Uses exponential backoff on repeated failures.
+        """
+        self._rpc_conns.clear()
+        self._clients.clear()
+        self._connected = False
+
+        for attempt in range(self._max_reconnect_attempts):
+            try:
+                delay = self._reconnect_base_delay * (2 ** attempt)
+                if attempt > 0:
+                    logger.info(
+                        "Reconnect attempt %d/%d (delay %.1fs)",
+                        attempt + 1, self._max_reconnect_attempts, delay,
+                    )
+                    await asyncio.sleep(delay)
+
+                await self._run_admission()
+                self._connected = True
+                self._reconnect_attempts = 0
+                logger.info("Reconnected successfully")
+                return
+
+            except Exception as exc:
+                logger.warning("Reconnect attempt %d failed: %s", attempt + 1, exc)
+
+        raise ConnectionError(
+            f"Failed to reconnect after {self._max_reconnect_attempts} attempts"
+        )
 
     async def _run_admission(self) -> None:
         """Connect via ``aster.consumer_admission`` to get services.

@@ -1,0 +1,41 @@
+# Aster conformance scenario: server streaming
+# Tests server-stream pattern where server yields multiple items.
+
+name: server-stream
+description: Server-streaming RPC round-trip
+
+service:
+  name: Counter
+  version: 1
+  scope: shared
+
+wire_types:
+  - tag: "counter/CountRequest"
+    fields:
+      count: int32
+
+  - tag: "counter/CountItem"
+    fields:
+      value: int32
+
+methods:
+  - name: count_up
+    pattern: server_stream
+    request_type: counter/CountRequest
+    response_type: counter/CountItem
+
+calls:
+  - method: count_up
+    request:
+      count: 3
+    expected_stream:
+      - value: 1
+      - value: 2
+      - value: 3
+    expected_status: OK
+
+  - method: count_up
+    request:
+      count: 0
+    expected_stream: []
+    expected_status: OK

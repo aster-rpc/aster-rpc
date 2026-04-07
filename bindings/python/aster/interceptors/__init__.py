@@ -17,6 +17,7 @@ from aster.interceptors.circuit_breaker import CircuitBreakerInterceptor
 from aster.interceptors.compression import CompressionInterceptor
 from aster.interceptors.deadline import DeadlineInterceptor
 from aster.interceptors.metrics import MetricsInterceptor
+from aster.interceptors.rate_limit import RateLimitInterceptor
 from aster.interceptors.retry import RetryInterceptor
 
 __all__ = [
@@ -36,4 +37,5 @@ __all__ = [
     "AuditLogInterceptor",
     "CapabilityInterceptor",
     "MetricsInterceptor",
+    "RateLimitInterceptor",
 ]

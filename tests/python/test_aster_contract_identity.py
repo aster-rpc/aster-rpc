@@ -574,6 +574,87 @@ def test_changing_type_changes_contract_id():
     assert id_base != id_modified
 
 
+# ── 14b. Version changes produce different contract IDs ──────────────────────
+
+
+def test_version_change_produces_different_contract_id():
+    """Same service name with different version numbers produce different contract IDs."""
+    v1 = ServiceContract(
+        name="UserService",
+        version=1,
+        methods=[
+            MethodDef(name="get_user", pattern=MethodPattern.UNARY,
+                      request_type=bytes(32), response_type=bytes(32),
+                      idempotent=True, default_timeout=0.0),
+        ],
+    )
+    v2 = ServiceContract(
+        name="UserService",
+        version=2,
+        methods=[
+            MethodDef(name="get_user", pattern=MethodPattern.UNARY,
+                      request_type=bytes(32), response_type=bytes(32),
+                      idempotent=True, default_timeout=0.0),
+        ],
+    )
+    id_v1 = compute_contract_id(canonical_xlang_bytes(v1))
+    id_v2 = compute_contract_id(canonical_xlang_bytes(v2))
+    assert id_v1 != id_v2, "Different versions must produce different contract IDs"
+
+
+def test_extra_method_produces_different_contract_id():
+    """Same service name+version but with an extra method produces different contract IDs."""
+    base = ServiceContract(
+        name="UserService",
+        version=2,
+        methods=[
+            MethodDef(name="get_user", pattern=MethodPattern.UNARY,
+                      request_type=bytes(32), response_type=bytes(32),
+                      idempotent=True, default_timeout=0.0),
+        ],
+    )
+    extended = ServiceContract(
+        name="UserService",
+        version=2,
+        methods=[
+            MethodDef(name="get_user", pattern=MethodPattern.UNARY,
+                      request_type=bytes(32), response_type=bytes(32),
+                      idempotent=True, default_timeout=0.0),
+            MethodDef(name="delete_user", pattern=MethodPattern.UNARY,
+                      request_type=bytes(32), response_type=bytes(32),
+                      idempotent=False, default_timeout=30000.0),
+        ],
+    )
+    id_base = compute_contract_id(canonical_xlang_bytes(base))
+    id_extended = compute_contract_id(canonical_xlang_bytes(extended))
+    assert id_base != id_extended, "Adding a method must change the contract ID"
+
+
+def test_method_signature_change_produces_different_contract_id():
+    """Changing a method's signature (e.g. idempotent flag) produces different contract IDs."""
+    original = ServiceContract(
+        name="UserService",
+        version=1,
+        methods=[
+            MethodDef(name="get_user", pattern=MethodPattern.UNARY,
+                      request_type=bytes(32), response_type=bytes(32),
+                      idempotent=True, default_timeout=0.0),
+        ],
+    )
+    modified = ServiceContract(
+        name="UserService",
+        version=1,
+        methods=[
+            MethodDef(name="get_user", pattern=MethodPattern.UNARY,
+                      request_type=bytes(32), response_type=bytes(32),
+                      idempotent=False, default_timeout=0.0),  # changed
+        ],
+    )
+    id_original = compute_contract_id(canonical_xlang_bytes(original))
+    id_modified = compute_contract_id(canonical_xlang_bytes(modified))
+    assert id_original != id_modified, "Changing method signature must change the contract ID"
+
+
 # ── 15. Manifest mismatch raises FatalContractMismatch ───────────────────────
 
 

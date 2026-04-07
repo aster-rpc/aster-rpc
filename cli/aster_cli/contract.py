@@ -131,16 +131,59 @@ def _gen_command(args: argparse.Namespace) -> int:
     from aster.contract.manifest import ContractManifest, extract_method_descriptors
     from aster.decorators import _SERVICE_INFO_ATTR
 
-    cls = _import_service_class(args.service)
+    # Support multiple --service args for multi-service manifests
+    service_specs = args.service  # list due to action="append"
+    all_manifests = []
 
-    # Get ServiceInfo from the decorated class
+    for spec in service_specs:
+        manifest = _gen_single_service(spec, args)
+        if manifest is None:
+            return 1
+        all_manifests.append(manifest)
+
+    # Write manifest(s)
+    import json as _json
+    out_path = args.out
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    if len(all_manifests) == 1:
+        all_manifests[0].save(out_path)
+    else:
+        # Multi-service: write as JSON array
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(_json.dumps([_json.loads(m.to_json()) for m in all_manifests], indent=2))
+
+    print(f"Contract manifest written to: {out_path}")
+    for m in all_manifests:
+        print(f"  {m.service} v{m.version}  contract_id={m.contract_id[:16]}...  methods={m.method_count}")
+
+    return 0
+
+
+def _gen_single_service(spec: str, args: argparse.Namespace) -> "ContractManifest | None":
+    """Generate a manifest for a single service class."""
+    from aster.contract.identity import (
+        ServiceContract,
+        build_type_graph,
+        canonical_xlang_bytes,
+        compute_contract_id,
+        compute_type_hash,
+        resolve_with_cycles,
+    )
+    from aster.contract.manifest import ContractManifest, extract_method_descriptors
+    from aster.decorators import _SERVICE_INFO_ATTR
+
+    cls = _import_service_class(spec)
+
     service_info = getattr(cls, _SERVICE_INFO_ATTR, None)
     if service_info is None:
         print(
             f"Error: Class {cls.__name__} is not decorated with @service.",
             file=sys.stderr,
         )
-        return 1
+        return None
 
     # Collect all root types from method signatures
     root_types: list[type] = []
@@ -213,26 +256,7 @@ def _gen_command(args: argparse.Namespace) -> int:
         published_at_epoch_ms=int(time.time() * 1000),
     )
 
-    # Create output directory if needed
-    out_path = args.out
-    out_dir = os.path.dirname(out_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-
-    # Write manifest
-    manifest.save(out_path)
-
-    print(f"Contract manifest written to: {out_path}")
-    print(f"  Service:     {service_info.name} v{service_info.version}")
-    print(f"  Contract ID: {contract_id}")
-    print(f"  Types:       {len(type_defs)}")
-    print(f"  Methods:     {len(contract.methods)}")
-    if vcs_revision:
-        print(f"  VCS revision: {vcs_revision[:12]}")
-    if vcs_tag:
-        print(f"  VCS tag:      {vcs_tag}")
-
-    return 0
+    return manifest
 
 
 def main() -> None:
@@ -257,8 +281,9 @@ def main() -> None:
     gen_parser.add_argument(
         "--service",
         required=True,
+        action="append",
         metavar="MODULE:CLASS",
-        help="Service class to generate the manifest for, e.g. my_module:MyService",
+        help="Service class to generate the manifest for (repeatable for multi-service)",
     )
     gen_parser.add_argument(
         "--out",
@@ -296,6 +321,10 @@ def main() -> None:
     # ``aster blob``, ``aster service`` — CLI equivalents of shell commands
     from aster_cli.shell.plugin import register_cli_subcommands
     register_cli_subcommands(subparsers)
+
+    # ``aster mcp`` subcommand
+    from aster_cli.mcp.server import register_mcp_subparser
+    register_mcp_subparser(subparsers)
 
     # ``aster authorize`` — sign a producer enrollment credential (legacy)
     auth_parser = subparsers.add_parser(
@@ -344,6 +373,9 @@ def main() -> None:
     elif args.command == "shell":
         from aster_cli.shell import run_shell_command
         sys.exit(run_shell_command(args))
+    elif args.command == "mcp":
+        from aster_cli.mcp.server import run_mcp_command
+        sys.exit(run_mcp_command(args))
     elif args.command == "authorize":
         # Map to trust sign --type producer (legacy)
         args.endpoint_id = args.producer_id

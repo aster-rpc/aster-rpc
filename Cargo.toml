@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "ffi", "bindings/python/rust"]
+members = ["core", "ffi", "bindings/python/rust", "bindings/typescript/native"]
 resolver = "2"
 
 [workspace.dependencies]
