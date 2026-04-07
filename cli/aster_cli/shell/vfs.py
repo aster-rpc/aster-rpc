@@ -28,6 +28,10 @@ class NodeKind(Enum):
     METHOD = "method"
     GOSSIP = "gossip"
     TOPIC = "topic"
+    # Directory hierarchy (aster.site)
+    ASTER = "aster"       # /aster — the directory root
+    HANDLE = "handle"     # /aster/<handle> — a user/org
+    README = "readme"     # /aster/<handle>/README.md
 
 
 @dataclass
@@ -221,5 +225,106 @@ async def ensure_loaded(node: VfsNode, connection: Any) -> None:
         await populate_service_methods(node, connection)
     elif node.kind == NodeKind.BLOBS:
         await populate_blobs(node, connection)
+    elif node.kind == NodeKind.ASTER:
+        await populate_handles(node, connection)
+    elif node.kind == NodeKind.HANDLE:
+        await populate_handle_services(node, connection)
     else:
         node.loaded = True
+
+
+# ── Directory VFS (aster.site) ──────────────────────────────────────────────
+
+
+def build_directory_root() -> VfsNode:
+    """Build the VFS root for directory mode (/aster/ hierarchy)."""
+    root = VfsNode(name="/", kind=NodeKind.ROOT, path="/")
+    aster = VfsNode(name="aster", kind=NodeKind.ASTER, path="/aster")
+    root.add_child(aster)
+    root.loaded = True
+    return root
+
+
+async def populate_handles(node: VfsNode, connection: Any) -> None:
+    """Populate /aster with handles from the directory."""
+    if node.loaded:
+        return
+
+    try:
+        handles = await connection.list_handles()
+        for h in handles:
+            name = h.get("handle") or h.get("pubkey_hash", "???")
+            handle_node = VfsNode(
+                name=name,
+                kind=NodeKind.HANDLE,
+                path=f"/aster/{name}",
+                metadata=h,
+            )
+            node.add_child(handle_node)
+    except Exception:
+        pass
+
+    node.loaded = True
+
+
+async def populate_handle_services(node: VfsNode, connection: Any) -> None:
+    """Populate /aster/<handle> with README + services."""
+    if node.loaded:
+        return
+
+    handle_name = node.name
+
+    try:
+        info = await connection.get_handle_info(handle_name)
+
+        # Add README.md
+        readme_text = info.get("readme", "")
+        if readme_text:
+            readme_node = VfsNode(
+                name="README.md",
+                kind=NodeKind.README,
+                path=f"{node.path}/README.md",
+                metadata={"content": readme_text},
+                loaded=True,
+            )
+            node.add_child(readme_node)
+
+        # Add services
+        services = info.get("services", [])
+        for svc in services:
+            svc_name = svc.get("name", "???")
+            published = svc.get("published", False)
+
+            if published:
+                display_name = svc_name
+            else:
+                # Unpublished: show hash + friendly name
+                short_hash = svc.get("contract_hash", "??????")[:10]
+                display_name = f"{short_hash}... ({svc_name})"
+
+            svc_node = VfsNode(
+                name=display_name,
+                kind=NodeKind.SERVICE,
+                path=f"{node.path}/{display_name}",
+                metadata=svc,
+            )
+
+            # Pre-populate methods if available
+            methods = svc.get("methods", [])
+            for m in methods:
+                m_name = m.get("name", str(m)) if isinstance(m, dict) else str(m)
+                m_node = VfsNode(
+                    name=m_name,
+                    kind=NodeKind.METHOD,
+                    path=f"{svc_node.path}/{m_name}",
+                    metadata=m if isinstance(m, dict) else {"name": m_name},
+                    loaded=True,
+                )
+                svc_node.add_child(m_node)
+            svc_node.loaded = True
+
+            node.add_child(svc_node)
+    except Exception:
+        pass
+
+    node.loaded = True
