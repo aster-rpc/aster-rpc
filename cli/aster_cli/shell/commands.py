@@ -489,7 +489,7 @@ class GenerateClientCommand(ShellCommand):
                     service_name = args[i]
                 i += 1
 
-        ctx.display.info(f"Generating {lang} client for {service_name} → {out}")
+        ctx.display.info(f"Generating {lang} client for {service_name} -> {out}")
         ctx.display.warning("Client generation is not yet wired — this is a placeholder")
         ctx.display.info(
             f"Will generate: {out}/{service_name.lower()}_client.{_lang_ext(lang)}"
@@ -776,11 +776,11 @@ def _method_signature(metadata: dict[str, Any]) -> str:
     req = metadata.get("request_type", "")
     resp = metadata.get("response_type", "")
     if req and resp:
-        return f"({req}) → {resp}"
+        return f"({req}) ->{resp}"
     elif req:
-        return f"({req}) → …"
+        return f"({req}) ->…"
     elif resp:
-        return f"() → {resp}"
+        return f"() ->{resp}"
     return ""
 
 

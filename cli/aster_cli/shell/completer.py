@@ -150,5 +150,5 @@ def _short_sig(metadata: dict) -> str:
     req = metadata.get("request_type", "")
     resp = metadata.get("response_type", "")
     if req and resp:
-        return f"({req}) → {resp}"
+        return f"({req}) ->{resp}"
     return ""

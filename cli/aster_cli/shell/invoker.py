@@ -96,7 +96,7 @@ async def invoke_method(
         if payload is None:
             return  # user cancelled
 
-    display.info(f"\u2192 {service_name}.{method_name}({_summarize_args(payload)})")
+    display.info(f"-> {service_name}.{method_name}({_summarize_args(payload)})")
 
     # Fire guide event
     if hasattr(ctx, "guide") and ctx.guide:
