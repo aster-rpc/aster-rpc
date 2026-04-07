@@ -17,7 +17,7 @@ jobs:
   ios:
     runs-on: [self-hosted, macOS, ARM64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -50,7 +50,7 @@ jobs:
   android:
     runs-on: [self-hosted, Linux, ARM64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}

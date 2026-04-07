@@ -29,6 +29,7 @@ from aster_cli.shell.plugin import CommandContext, get_command
 from aster_cli.shell.vfs import (
     NodeKind,
     build_root,
+    build_directory_root,
     ensure_loaded,
     resolve_path,
 )
@@ -544,6 +545,339 @@ class DemoConnection:
     def bidi_stream(
         self, service: str, method: str, values: Any
     ) -> Any:
+        async def _echo():
+            async for v in values:
+                yield {"echo": v}
+        return _echo()
+
+    async def close(self) -> None:
+        pass
+
+
+# ── Directory demo mode (aster.site) ────────────────────────────────────────
+
+
+class DirectoryDemoConnection:
+    """Offline demo simulating the aster.site directory experience.
+
+    Shows a browsable hierarchy of handles and published services.
+    """
+
+    # Simulated current user
+    MY_HANDLE = "emrul"
+    MY_PUBKEY_HASH = "a1b2c3d4e5f6"
+
+    # Simulated directory data
+    _HANDLES = [
+        {"handle": "emrul", "pubkey_hash": "a1b2c3d4e5f6", "registered": True},
+        {"handle": "acme-corp", "pubkey_hash": "f7e8d9c0b1a2", "registered": True},
+        {"handle": "alice-dev", "pubkey_hash": "1234abcd5678", "registered": True},
+        {"handle": None, "pubkey_hash": "7f3a2bc9de01", "registered": False},
+        {"handle": None, "pubkey_hash": "9e8d7c6b5a43", "registered": False},
+    ]
+
+    _HANDLE_INFO: dict[str, dict[str, Any]] = {
+        "emrul": {
+            "readme": (
+                "# emrul\n\n"
+                "Building distributed systems with Aster.\n\n"
+                "Services:\n"
+                "- TaskManager — async task queue for AI agent workflows\n"
+                "- InvoiceService — invoice lifecycle management\n"
+            ),
+            "services": [
+                {
+                    "name": "TaskManager",
+                    "published": True,
+                    "version": 3,
+                    "scoped": "session",
+                    "description": "Async task queue for AI agent workflows",
+                    "endpoints": 2,
+                    "methods": [
+                        {
+                            "name": "submitTask",
+                            "pattern": "unary",
+                            "request_type": "TaskRequest",
+                            "response_type": "TaskHandle",
+                            "timeout": 30.0,
+                            "fields": [
+                                {"name": "prompt", "type": "str", "required": True},
+                                {"name": "priority", "type": "int", "required": False, "default": 0},
+                                {"name": "tags", "type": "list[str]", "required": False},
+                            ],
+                        },
+                        {
+                            "name": "watchProgress",
+                            "pattern": "server_stream",
+                            "request_type": "TaskHandle",
+                            "response_type": "ProgressEvent",
+                            "timeout": None,
+                            "fields": [
+                                {"name": "task_id", "type": "str", "required": True},
+                            ],
+                        },
+                        {
+                            "name": "cancelTask",
+                            "pattern": "unary",
+                            "request_type": "CancelRequest",
+                            "response_type": "CancelResult",
+                            "timeout": 10.0,
+                            "fields": [
+                                {"name": "task_id", "type": "str", "required": True},
+                                {"name": "reason", "type": "str", "required": False},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "name": "InvoiceService",
+                    "published": False,
+                    "version": 1,
+                    "scoped": "shared",
+                    "contract_hash": "b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2",
+                    "description": "Invoice lifecycle management",
+                    "endpoints": 0,
+                    "methods": [
+                        {
+                            "name": "create",
+                            "pattern": "unary",
+                            "request_type": "InvoiceRequest",
+                            "response_type": "Invoice",
+                        },
+                        {
+                            "name": "list",
+                            "pattern": "server_stream",
+                            "request_type": "ListFilter",
+                            "response_type": "Invoice",
+                        },
+                    ],
+                },
+            ],
+        },
+        "acme-corp": {
+            "readme": (
+                "# acme-corp\n\n"
+                "Enterprise payment infrastructure.\n"
+            ),
+            "services": [
+                {
+                    "name": "PaymentGateway",
+                    "published": True,
+                    "version": 7,
+                    "scoped": "session",
+                    "description": "Process payments across multiple providers",
+                    "endpoints": 5,
+                    "methods": [
+                        {
+                            "name": "charge",
+                            "pattern": "unary",
+                            "request_type": "ChargeRequest",
+                            "response_type": "ChargeResult",
+                            "timeout": 30.0,
+                            "fields": [
+                                {"name": "amount_cents", "type": "int", "required": True},
+                                {"name": "currency", "type": "str", "required": True},
+                                {"name": "source_token", "type": "str", "required": True},
+                            ],
+                        },
+                        {
+                            "name": "refund",
+                            "pattern": "unary",
+                            "request_type": "RefundRequest",
+                            "response_type": "RefundResult",
+                            "timeout": 30.0,
+                        },
+                        {
+                            "name": "watchSettlements",
+                            "pattern": "server_stream",
+                            "request_type": "SettlementFilter",
+                            "response_type": "SettlementEvent",
+                            "timeout": None,
+                        },
+                    ],
+                },
+                {
+                    "name": "FraudDetector",
+                    "published": True,
+                    "version": 2,
+                    "scoped": "shared",
+                    "description": "Real-time transaction fraud scoring",
+                    "endpoints": 3,
+                    "methods": [
+                        {
+                            "name": "score",
+                            "pattern": "unary",
+                            "request_type": "Transaction",
+                            "response_type": "FraudScore",
+                            "timeout": 5.0,
+                        },
+                        {
+                            "name": "trainModel",
+                            "pattern": "client_stream",
+                            "request_type": "TrainingExample",
+                            "response_type": "TrainingResult",
+                            "timeout": 300.0,
+                        },
+                    ],
+                },
+            ],
+        },
+        "alice-dev": {
+            "readme": (
+                "# alice-dev\n\n"
+                "AI research tools and agent services.\n"
+            ),
+            "services": [
+                {
+                    "name": "DocumentSummarizer",
+                    "published": True,
+                    "version": 1,
+                    "scoped": "session",
+                    "description": "Summarize documents using LLM pipelines",
+                    "endpoints": 1,
+                    "methods": [
+                        {
+                            "name": "summarize",
+                            "pattern": "unary",
+                            "request_type": "SummarizeRequest",
+                            "response_type": "Summary",
+                            "timeout": 60.0,
+                            "fields": [
+                                {"name": "document", "type": "str", "required": True},
+                                {"name": "max_length", "type": "int", "required": False, "default": 500},
+                            ],
+                        },
+                        {
+                            "name": "streamSummary",
+                            "pattern": "server_stream",
+                            "request_type": "SummarizeRequest",
+                            "response_type": "SummaryChunk",
+                            "timeout": 120.0,
+                        },
+                    ],
+                },
+            ],
+        },
+        "7f3a2bc9de01": {
+            "readme": "",
+            "services": [
+                {
+                    "name": "WeatherAPI",
+                    "published": True,
+                    "version": 1,
+                    "scoped": "shared",
+                    "description": "Global weather data service",
+                    "endpoints": 1,
+                    "methods": [
+                        {
+                            "name": "getCurrent",
+                            "pattern": "unary",
+                            "request_type": "LocationQuery",
+                            "response_type": "WeatherData",
+                            "timeout": 10.0,
+                        },
+                    ],
+                },
+            ],
+        },
+        "9e8d7c6b5a43": {
+            "readme": "",
+            "services": [
+                {
+                    "name": "EchoService",
+                    "published": True,
+                    "version": 1,
+                    "scoped": "shared",
+                    "description": "Simple echo for testing connectivity",
+                    "endpoints": 1,
+                    "methods": [
+                        {
+                            "name": "echo",
+                            "pattern": "unary",
+                            "request_type": "EchoRequest",
+                            "response_type": "EchoResponse",
+                            "timeout": 5.0,
+                        },
+                    ],
+                },
+            ],
+        },
+    }
+
+    async def connect(self) -> None:
+        pass
+
+    async def list_handles(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "handle": h["handle"] or h["pubkey_hash"],
+                "pubkey_hash": h["pubkey_hash"],
+                "registered": h["registered"],
+            }
+            for h in self._HANDLES
+        ]
+
+    async def get_handle_info(self, handle: str) -> dict[str, Any]:
+        return self._HANDLE_INFO.get(handle, {"readme": "", "services": []})
+
+    # -- These support drill-down into services (reuses demo logic) --
+
+    async def list_services(self) -> list[dict[str, Any]]:
+        return []
+
+    async def get_contract(self, service_name: str) -> dict[str, Any] | None:
+        # Search all handles for the service
+        for info in self._HANDLE_INFO.values():
+            for svc in info.get("services", []):
+                if svc["name"] == service_name:
+                    return {
+                        "name": svc["name"],
+                        "version": svc.get("version", 1),
+                        "contract_id": svc.get("contract_hash", "demo-hash")[:16] + "...",
+                        "methods": svc.get("methods", []),
+                        "types": [
+                            {"name": m.get("request_type", "?"), "hash": "aabbccdd..."}
+                            for m in svc.get("methods", [])
+                            if m.get("request_type")
+                        ],
+                    }
+        return None
+
+    async def list_blobs(self) -> list[dict[str, Any]]:
+        return []
+
+    async def read_blob(self, blob_hash: str) -> bytes:
+        return b"(directory demo — no blob content)"
+
+    async def invoke(
+        self, service: str, method: str, payload: dict[str, Any]
+    ) -> Any:
+        await asyncio.sleep(0.05)
+        if service == "TaskManager" and method == "submitTask":
+            return {
+                "task_id": "tsk_demo_001",
+                "status": "queued",
+                "prompt": payload.get("prompt", ""),
+                "priority": payload.get("priority", 0),
+            }
+        return {"status": "ok", "service": service, "method": method, "args": payload}
+
+    async def server_stream(
+        self, service: str, method: str, payload: dict[str, Any]
+    ) -> Any:
+        async def _gen():
+            import time
+            for i in range(5):
+                await asyncio.sleep(0.1)
+                yield {"index": i, "timestamp": time.strftime("%H:%M:%S")}
+        return _gen()
+
+    async def client_stream(
+        self, service: str, method: str, values: list[Any]
+    ) -> Any:
+        return {"received": len(values), "status": "ok"}
+
+    def bidi_stream(self, service: str, method: str, values: Any) -> Any:
         async def _echo():
             async for v in values:
                 yield {"echo": v}

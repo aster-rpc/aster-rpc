@@ -30,7 +30,7 @@ jobs:
   lint:
     runs-on: [self-hosted, Linux, X64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -49,7 +49,7 @@ jobs:
     needs: lint
     runs-on: [self-hosted, Linux, X64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -93,7 +93,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     name: test-full (${{ matrix.label }})
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -134,7 +134,7 @@ jobs:
     needs: lint
     runs-on: [self-hosted, Linux, X64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -163,7 +163,7 @@ jobs:
   #   runs-on: ${{ matrix.runner }}
   #   name: test-java (${{ matrix.label }})
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
   #     - uses: dtolnay/rust-toolchain@master
   #       with:
   #         toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -181,7 +181,7 @@ jobs:
   #   needs: lint
   #   runs-on: [self-hosted, Linux, X64]
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
   #     - uses: dtolnay/rust-toolchain@master
   #       with:
   #         toolchain: ${{ env.RUST_TOOLCHAIN }}
