@@ -94,6 +94,9 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Stamp version
         run: sed -i '' 's/^version.*=.*".*"/version = "${{ needs.version.outputs.python_version }}"/' pyproject.toml
       - name: Build wheels
@@ -111,6 +114,12 @@ jobs:
     runs-on: [self-hosted, Windows, X64]
     steps:
       - uses: actions/checkout@v6
+      - name: Prefer Git Bash over WSL bash
+        shell: pwsh
+        run: echo "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Stamp version
         run: (Get-Content pyproject.toml) -replace '^version\s*=\s*".*"', 'version = "${{ needs.version.outputs.python_version }}"' | Set-Content pyproject.toml
         shell: pwsh

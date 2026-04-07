@@ -94,8 +94,11 @@ jobs:
     name: test-full (${{ matrix.label }})
     steps:
       - uses: actions/checkout@v6
+      - name: Prefer Git Bash over WSL bash (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - uses: dtolnay/rust-toolchain@master
-        if: runner.os == 'Linux'
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: actions/setup-python@v5
