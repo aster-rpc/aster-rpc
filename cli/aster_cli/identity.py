@@ -32,6 +32,10 @@ def _tomllib():
 def load_identity(path: str | Path) -> dict:
     """Load an .aster-identity TOML file.
 
+    Synthesizes ``aster.role`` and ``aster.name`` into each peer's
+    ``attributes`` from the top-level ``role`` and ``name`` fields so
+    callers always see a complete attributes dict.
+
     Returns:
         Dict with ``node`` (dict with ``secret_key``, ``endpoint_id``)
         and ``peers`` (list of dicts).
@@ -39,6 +43,12 @@ def load_identity(path: str | Path) -> dict:
     tomllib = _tomllib()
     with Path(path).open("rb") as f:
         data = tomllib.load(f)
+    for peer in data.get("peers", []):
+        attrs = peer.setdefault("attributes", {})
+        if "aster.role" not in attrs and "role" in peer:
+            attrs["aster.role"] = peer["role"]
+        if "aster.name" not in attrs and "name" in peer:
+            attrs["aster.name"] = peer["name"]
     return data
 
 
@@ -87,13 +97,13 @@ def _serialize_identity(data: dict) -> list[str]:
                 elif isinstance(val, bool):
                     lines.append(f'{field} = {"true" if val else "false"}')
 
-        # Attributes sub-table
-        attrs = peer.get("attributes", {})
+        # Attributes as inline table (omit aster.role/aster.name if redundant)
+        attrs = {k: v for k, v in peer.get("attributes", {}).items()
+                 if not (k == "aster.role" and v == peer.get("role"))
+                 and not (k == "aster.name" and v == peer.get("name"))}
         if attrs:
-            lines.append("")
-            lines.append("  [peers.attributes]")
-            for k, v in sorted(attrs.items()):
-                lines.append(f'  "{k}" = "{v}"')
+            pairs = ", ".join(f'"{k}" = "{v}"' for k, v in sorted(attrs.items()))
+            lines.append(f"attributes = {{ {pairs} }}")
 
         lines.append("")
 

@@ -70,6 +70,15 @@ def _active_profile(config: dict) -> str:
     return config.get("active_profile", "default")
 
 
+def print_active_profile_hint() -> None:
+    """Print the active profile name when multiple profiles exist."""
+    config = _load_config()
+    profiles = config.get("profiles", {})
+    if len(profiles) > 1:
+        active = _active_profile(config)
+        print(f"[profile: {active}]", file=sys.stderr)
+
+
 # ── Commands ─────────────────────────────────────────────────────────────
 
 

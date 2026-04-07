@@ -354,6 +354,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Show active profile hint when multiple profiles exist
+    if args.command and args.command != "profile":
+        from aster_cli.profile import print_active_profile_hint
+        print_active_profile_hint()
+
     if args.command == "contract":
         if args.contract_command == "gen":
             sys.exit(_gen_command(args))
