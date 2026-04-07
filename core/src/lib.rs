@@ -1053,6 +1053,84 @@ impl CoreNode {
             hook_receiver: None,
         }
     }
+
+    /// Export all transport-level metrics in Prometheus text exposition format.
+    ///
+    /// Covers socket I/O, path counts, holepunching, relay, and net report
+    /// counters from the iroh endpoint. Intended to be merged with Aster RPC
+    /// metrics on a single `/metrics/prometheus` scrape endpoint.
+    pub fn transport_metrics_prometheus(&self) -> String {
+        let m = self.inner.endpoint.metrics();
+        let s = &m.socket;
+        let n = &m.net_report;
+
+        format!(
+            "# HELP iroh_send_ipv4 Bytes sent via IPv4\n\
+             # TYPE iroh_send_ipv4 counter\n\
+             iroh_send_ipv4 {}\n\
+             # HELP iroh_send_ipv6 Bytes sent via IPv6\n\
+             # TYPE iroh_send_ipv6 counter\n\
+             iroh_send_ipv6 {}\n\
+             # HELP iroh_send_relay Bytes sent via relay\n\
+             # TYPE iroh_send_relay counter\n\
+             iroh_send_relay {}\n\
+             # HELP iroh_recv_data_ipv4 Bytes received via IPv4\n\
+             # TYPE iroh_recv_data_ipv4 counter\n\
+             iroh_recv_data_ipv4 {}\n\
+             # HELP iroh_recv_data_ipv6 Bytes received via IPv6\n\
+             # TYPE iroh_recv_data_ipv6 counter\n\
+             iroh_recv_data_ipv6 {}\n\
+             # HELP iroh_recv_data_relay Bytes received via relay\n\
+             # TYPE iroh_recv_data_relay counter\n\
+             iroh_recv_data_relay {}\n\
+             # HELP iroh_recv_datagrams Total datagrams received\n\
+             # TYPE iroh_recv_datagrams counter\n\
+             iroh_recv_datagrams {}\n\
+             # HELP iroh_conns_direct Direct connections\n\
+             # TYPE iroh_conns_direct gauge\n\
+             iroh_conns_direct {}\n\
+             # HELP iroh_conns_opened Total connections opened\n\
+             # TYPE iroh_conns_opened counter\n\
+             iroh_conns_opened {}\n\
+             # HELP iroh_conns_closed Total connections closed\n\
+             # TYPE iroh_conns_closed counter\n\
+             iroh_conns_closed {}\n\
+             # HELP iroh_paths_direct Direct paths active\n\
+             # TYPE iroh_paths_direct gauge\n\
+             iroh_paths_direct {}\n\
+             # HELP iroh_paths_relay Relay paths active\n\
+             # TYPE iroh_paths_relay gauge\n\
+             iroh_paths_relay {}\n\
+             # HELP iroh_holepunch_attempts Holepunch attempts\n\
+             # TYPE iroh_holepunch_attempts counter\n\
+             iroh_holepunch_attempts {}\n\
+             # HELP iroh_relay_home_change Relay home server changes\n\
+             # TYPE iroh_relay_home_change counter\n\
+             iroh_relay_home_change {}\n\
+             # HELP iroh_net_reports Net reports completed\n\
+             # TYPE iroh_net_reports counter\n\
+             iroh_net_reports {}\n\
+             # HELP iroh_net_reports_full Full net reports completed\n\
+             # TYPE iroh_net_reports_full counter\n\
+             iroh_net_reports_full {}\n",
+            s.send_ipv4.get(),
+            s.send_ipv6.get(),
+            s.send_relay.get(),
+            s.recv_data_ipv4.get(),
+            s.recv_data_ipv6.get(),
+            s.recv_data_relay.get(),
+            s.recv_datagrams.get(),
+            s.num_conns_direct.get(),
+            s.num_conns_opened.get(),
+            s.num_conns_closed.get(),
+            s.paths_direct.get(),
+            s.paths_relay.get(),
+            s.holepunch_attempts.get(),
+            s.relay_home_change.get(),
+            n.reports.get(),
+            n.reports_full.get(),
+        )
+    }
 }
 
 // ============================================================================
@@ -1348,6 +1426,82 @@ impl CoreConnection {
             alpn: info.alpn().to_vec(),
             is_connected: info.is_alive(),
         }
+    }
+
+    // ============================================================================
+    // Per-connection metrics (for routing / HA)
+    // ============================================================================
+
+    /// Current round-trip time in milliseconds for the selected path.
+    /// Returns 0.0 if no path is selected or RTT is not yet measured.
+    pub fn rtt_ms(&self) -> f64 {
+        self.inner
+            .to_info()
+            .selected_path()
+            .and_then(|p| p.rtt())
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0)
+    }
+
+    /// Total bytes sent on the selected path (UDP layer).
+    pub fn bytes_sent(&self) -> u64 {
+        self.inner
+            .to_info()
+            .selected_path()
+            .and_then(|p| p.stats())
+            .map(|s| s.udp_tx.bytes)
+            .unwrap_or(0)
+    }
+
+    /// Total bytes received on the selected path (UDP layer).
+    pub fn bytes_recv(&self) -> u64 {
+        self.inner
+            .to_info()
+            .selected_path()
+            .and_then(|p| p.stats())
+            .map(|s| s.udp_rx.bytes)
+            .unwrap_or(0)
+    }
+
+    /// Current congestion window size in bytes for the selected path.
+    /// Returns 0 if not available.
+    pub fn congestion_window(&self) -> u64 {
+        self.inner
+            .to_info()
+            .selected_path()
+            .and_then(|p| p.stats())
+            .map(|s| s.cwnd)
+            .unwrap_or(0)
+    }
+
+    /// Number of lost packets on the selected path.
+    pub fn lost_packets(&self) -> u64 {
+        self.inner
+            .to_info()
+            .selected_path()
+            .and_then(|p| p.stats())
+            .map(|s| s.lost_packets)
+            .unwrap_or(0)
+    }
+
+    /// Number of congestion events on the selected path.
+    pub fn congestion_events(&self) -> u64 {
+        self.inner
+            .to_info()
+            .selected_path()
+            .and_then(|p| p.stats())
+            .map(|s| s.congestion_events)
+            .unwrap_or(0)
+    }
+
+    /// Current path MTU in bytes.
+    pub fn current_mtu(&self) -> u16 {
+        self.inner
+            .to_info()
+            .selected_path()
+            .and_then(|p| p.stats())
+            .map(|s| s.current_mtu)
+            .unwrap_or(0)
     }
 }
 

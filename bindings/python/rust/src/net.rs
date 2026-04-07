@@ -599,6 +599,45 @@ impl IrohConnection {
     fn connection_info(&self) -> ConnectionInfo {
         ConnectionInfo::from(self.inner.connection_info())
     }
+
+    // ========================================================================
+    // Per-connection metrics (for routing / HA)
+    // ========================================================================
+
+    /// Current round-trip time in milliseconds for the selected path.
+    fn rtt_ms(&self) -> f64 {
+        self.inner.rtt_ms()
+    }
+
+    /// Total bytes sent on the selected path (UDP layer).
+    fn bytes_sent(&self) -> u64 {
+        self.inner.bytes_sent()
+    }
+
+    /// Total bytes received on the selected path (UDP layer).
+    fn bytes_recv(&self) -> u64 {
+        self.inner.bytes_recv()
+    }
+
+    /// Current congestion window size in bytes.
+    fn congestion_window(&self) -> u64 {
+        self.inner.congestion_window()
+    }
+
+    /// Number of lost packets on the selected path.
+    fn lost_packets(&self) -> u64 {
+        self.inner.lost_packets()
+    }
+
+    /// Number of congestion events on the selected path.
+    fn congestion_events(&self) -> u64 {
+        self.inner.congestion_events()
+    }
+
+    /// Current path MTU in bytes.
+    fn current_mtu(&self) -> u16 {
+        self.inner.current_mtu()
+    }
 }
 
 // ============================================================================
