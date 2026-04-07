@@ -98,10 +98,12 @@ jobs:
         if: runner.os != 'Windows'
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Ensure Rust toolchain (Windows)
+      - name: Add Rust to PATH and set toolchain (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: rustup default ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          echo "C:\Users\emrul\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          & "C:\Users\emrul\.cargo\bin\rustup.exe" default ${{ env.RUST_TOOLCHAIN }}
       - uses: actions/setup-python@v5
         if: runner.os == 'Linux'
         with:

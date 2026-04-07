@@ -115,9 +115,11 @@ jobs:
     runs-on: [self-hosted, Windows, X64]
     steps:
       - uses: actions/checkout@v6
-      - name: Ensure Rust toolchain
+      - name: Add Rust to PATH and set toolchain
         shell: pwsh
-        run: rustup default ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          echo "C:\Users\emrul\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          & "C:\Users\emrul\.cargo\bin\rustup.exe" default ${{ env.RUST_TOOLCHAIN }}
       - name: Alias python3 to python
         shell: pwsh
         run: |
