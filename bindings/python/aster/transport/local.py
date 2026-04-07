@@ -52,7 +52,6 @@ class CallRequest:
     metadata: dict[str, str] | None
     deadline_epoch_ms: int
     serialization_mode: int
-    contract_id: str
     response_queue: asyncio.Queue[Any]
     error_queue: asyncio.Queue[Exception]
     trailer_queue: asyncio.Queue[tuple[int, str]]
@@ -83,7 +82,7 @@ class LocalBidiChannel(BidiChannel):
         metadata: dict[str, str] | None,
         deadline_epoch_ms: int,
         serialization_mode: int,
-        contract_id: str,
+
         send_queue: asyncio.Queue[LocalBidiMessage],
         recv_queue: asyncio.Queue[LocalBidiMessage],
         trailer_queue: asyncio.Queue[tuple[int, str]],
@@ -94,7 +93,7 @@ class LocalBidiChannel(BidiChannel):
         self._metadata = metadata
         self._deadline_epoch_ms = deadline_epoch_ms
         self._serialization_mode = serialization_mode
-        self._contract_id = contract_id
+
         self._send_queue = send_queue
         self._recv_queue = recv_queue
         self._trailer_queue = trailer_queue
@@ -265,7 +264,7 @@ class LocalTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
+
     ) -> Any:
         """Perform a unary RPC call (in-process).
 
@@ -338,12 +337,12 @@ class LocalTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
+
     ) -> AsyncIterator[Any]:
         """Initiate a server-streaming RPC (in-process)."""
         return self._server_stream_impl(
             service, method, request, metadata,
-            deadline_epoch_ms, serialization_mode, contract_id,
+            deadline_epoch_ms, serialization_mode,
         )
 
     async def _server_stream_impl(
@@ -354,7 +353,7 @@ class LocalTransport(Transport):
         metadata: dict[str, str] | None,
         deadline_epoch_ms: int,
         serialization_mode: int,
-        contract_id: str,
+
     ) -> AsyncIterator[Any]:
         handler, types, pattern = self._registry(service, method)
         
@@ -404,7 +403,7 @@ class LocalTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
+
     ) -> Any:
         """Perform a client-streaming RPC (in-process)."""
         handler, types, pattern = self._registry(service, method)
@@ -457,7 +456,7 @@ class LocalTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
+
     ) -> BidiChannel:
         """Initiate a bidirectional-streaming RPC (in-process)."""
         send_queue: asyncio.Queue[LocalBidiMessage] = asyncio.Queue()
@@ -471,7 +470,6 @@ class LocalTransport(Transport):
             metadata=metadata,
             deadline_epoch_ms=deadline_epoch_ms,
             serialization_mode=serialization_mode,
-            contract_id=contract_id,
             send_queue=send_queue,
             recv_queue=recv_queue,
             trailer_queue=trailer_queue,

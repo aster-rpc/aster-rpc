@@ -382,7 +382,6 @@ class TestProtocolTypes:
             service="MyService",
             method="do_thing",
             version=1,
-            contract_id="abc123",
             call_id="call-1",
             deadline_epoch_ms=1000,
             serialization_mode=0,
@@ -482,7 +481,6 @@ class TestForySerializationRoundTrip:
             service="TestService",
             method="test_method",
             version=1,
-            contract_id="abc123def456",
             call_id="call-001",
             deadline_epoch_ms=1712000000000,
             serialization_mode=0,
@@ -498,7 +496,6 @@ class TestForySerializationRoundTrip:
         assert restored.service == original.service
         assert restored.method == original.method
         assert restored.version == original.version
-        assert restored.contract_id == original.contract_id
         assert restored.call_id == original.call_id
         assert restored.deadline_epoch_ms == original.deadline_epoch_ms
         assert restored.serialization_mode == original.serialization_mode
@@ -544,7 +541,7 @@ class TestForySerializationRoundTrip:
         f = self._create_fory(StreamHeader)
         h = StreamHeader(
             service="Svc", method="m", version=1,
-            contract_id="cid", call_id="c1",
+            call_id="c1",
         )
         b1 = f.serialize(h)
         b2 = f.serialize(h)

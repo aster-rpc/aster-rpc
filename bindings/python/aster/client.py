@@ -223,7 +223,7 @@ class ServiceClient:
         """Make a unary RPC call."""
         deadline = self._get_deadline(timeout)
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
-        contract_id = getattr(self._service_info, "contract_id", "") or ""
+
         ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
 
         async def invoke(current_request: Any) -> Any:
@@ -234,7 +234,7 @@ class ServiceClient:
                 metadata=ctx.metadata,
                 deadline_epoch_ms=deadline,
                 serialization_mode=serialization_mode,
-                contract_id=contract_id,
+
             )
 
         return await self._run_call_with_interceptors(ctx, request, invoke)
@@ -250,7 +250,7 @@ class ServiceClient:
         """Make a server-streaming RPC call."""
         deadline = self._get_deadline(timeout)
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
-        contract_id = getattr(self._service_info, "contract_id", "") or ""
+
 
         ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
 
@@ -263,7 +263,7 @@ class ServiceClient:
                 metadata=ctx.metadata,
                 deadline_epoch_ms=deadline,
                 serialization_mode=serialization_mode,
-                contract_id=contract_id,
+
             )
             try:
                 async for item in source:
@@ -287,7 +287,7 @@ class ServiceClient:
         """Make a client-streaming RPC call."""
         deadline = self._get_deadline(timeout)
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
-        contract_id = getattr(self._service_info, "contract_id", "") or ""
+
 
         ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
 
@@ -303,7 +303,7 @@ class ServiceClient:
                 metadata=ctx.metadata,
                 deadline_epoch_ms=deadline,
                 serialization_mode=serialization_mode,
-                contract_id=contract_id,
+
             )
 
         return await self._run_call_with_interceptors(ctx, None, invoke)
@@ -318,7 +318,7 @@ class ServiceClient:
         """Make a bidirectional-streaming RPC call."""
         deadline = self._get_deadline(timeout)
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
-        contract_id = getattr(self._service_info, "contract_id", "") or ""
+
 
         ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
         channel = self._transport.bidi_stream(
@@ -327,7 +327,6 @@ class ServiceClient:
             metadata=ctx.metadata,
             deadline_epoch_ms=deadline,
             serialization_mode=serialization_mode,
-            contract_id=contract_id,
         )
         if not self._interceptors:
             return channel

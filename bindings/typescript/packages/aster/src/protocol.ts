@@ -15,7 +15,6 @@ export class StreamHeader {
   service = '';
   method = '';
   version = 0;
-  contractId = '';
   callId = '';
   deadlineEpochMs = 0;
   serializationMode = 0;

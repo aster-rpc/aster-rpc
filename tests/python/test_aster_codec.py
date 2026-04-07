@@ -362,7 +362,6 @@ class TestXlangRoundTrip:
             service="TestSvc",
             method="do_thing",
             version=1,
-            contract_id="abc123",
             call_id="call-1",
             deadline_epoch_ms=1712000000000,
             serialization_mode=0,

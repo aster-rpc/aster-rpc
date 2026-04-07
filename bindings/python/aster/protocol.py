@@ -30,7 +30,6 @@ class StreamHeader:
     service: str = ""
     method: str = ""
     version: int = 0
-    contract_id: str = ""
     call_id: str = ""
     deadline_epoch_ms: int = 0
     serialization_mode: int = 0

@@ -41,7 +41,7 @@ class CdCommand(ShellCommand):
             ctx.display.error(f"no such path: {path}")
             return
 
-        if node.kind in (NodeKind.BLOB, NodeKind.METHOD):
+        if node.kind in (NodeKind.BLOB, NodeKind.METHOD, NodeKind.README):
             ctx.display.error(f"{path} is not a directory")
             return
 
@@ -111,6 +111,48 @@ class LsCommand(ShellCommand):
                 })
             ctx.display.blob_table(blobs)
 
+        elif node.kind == NodeKind.ASTER:
+            handles = []
+            for c in node.sorted_children():
+                await ensure_loaded(c, ctx.connection)
+                # Count non-README children as services
+                svc_count = sum(
+                    1 for ch in c.children.values() if ch.kind == NodeKind.SERVICE
+                )
+                handles.append({
+                    "name": c.name,
+                    "registered": c.metadata.get("registered", True),
+                    "service_count": svc_count,
+                    "description": "",
+                })
+            ctx.display.handle_listing(handles)
+
+        elif node.kind == NodeKind.HANDLE:
+            services = []
+            for c in node.sorted_children():
+                if c.kind == NodeKind.README:
+                    continue
+                await ensure_loaded(c, ctx.connection)
+                published = c.metadata.get("published", True)
+                services.append({
+                    "display_name": c.name,
+                    "name": c.metadata.get("name", c.name),
+                    "published": published,
+                    "method_count": len([ch for ch in c.children.values() if ch.kind == NodeKind.METHOD]),
+                    "version": c.metadata.get("version", 1),
+                    "endpoints": c.metadata.get("endpoints", 0),
+                    "description": c.metadata.get("description", ""),
+                })
+            # Show README hint if present
+            readme = node.child("README.md")
+            if readme:
+                ctx.display.info("README.md available — use: cat README.md")
+            ctx.display.handle_service_listing(services, node.name)
+
+        elif node.kind == NodeKind.README:
+            content = node.metadata.get("content", "")
+            ctx.display.readme_content(content)
+
         elif node.kind in (NodeKind.BLOB, NodeKind.METHOD):
             ctx.display.json_value(node.metadata)
 
@@ -132,7 +174,7 @@ class LsCommand(ShellCommand):
 class DescribeCommand(ShellCommand):
     name = "describe"
     description = "Show detailed contract info for a service"
-    contexts = ["/services", "/services/*"]
+    contexts = ["/services", "/services/*", "/aster/*/*"]
     cli_noun_verb = ("service", "describe")
 
     def get_arguments(self) -> list[Argument]:
@@ -172,21 +214,29 @@ class DescribeCommand(ShellCommand):
 @register
 class CatCommand(ShellCommand):
     name = "cat"
-    description = "Display blob content"
-    contexts = ["/blobs", "/blobs/*"]
+    description = "Display file or blob content"
+    contexts = []  # global — works in blobs and directory handle contexts
     cli_noun_verb = ("blob", "cat")
 
     def get_arguments(self) -> list[Argument]:
-        return [Argument(name="hash", description="Blob hash (or prefix)", positional=True)]
+        return [Argument(name="target", description="File name or blob hash", positional=True)]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        # Try resolving as a path first (e.g., "cat README.md" in a handle dir)
+        if args:
+            node, path = resolve_path(ctx.vfs_root, ctx.vfs_cwd, args[0])
+            if node and node.kind == NodeKind.README:
+                content = node.metadata.get("content", "")
+                ctx.display.readme_content(content)
+                return
+
         if not args:
             # If we're at a blob node, use that
             node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
             if node and node.kind == NodeKind.BLOB:
                 blob_hash = node.metadata.get("hash", node.name)
             else:
-                ctx.display.error("usage: cat <hash>")
+                ctx.display.error("usage: cat <target>")
                 return
         else:
             blob_hash = args[0]
@@ -203,14 +253,15 @@ class CatCommand(ShellCommand):
             else:
                 ctx.display.print(str(content))
         except Exception as e:
-            ctx.display.error(f"failed to read blob: {e}")
+            ctx.display.error(f"failed to read: {e}")
 
     def get_completions(self, ctx: CommandContext, partial: str) -> list[str]:
-        blobs_node = ctx.vfs_root.child("blobs")
-        if blobs_node is None:
+        # Complete file names in current dir
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        if node is None:
             return []
-        return [c.name for c in blobs_node.sorted_children()
-                if c.name.startswith(partial)]
+        return [c.name for c in node.sorted_children()
+                if c.name.lower().startswith(partial.lower())]
 
 
 @register
@@ -263,7 +314,7 @@ class SaveCommand(ShellCommand):
 class InvokeCommand(ShellCommand):
     name = "invoke"
     description = "Invoke an RPC method"
-    contexts = ["/services/*"]
+    contexts = ["/services/*", "/aster/*/*"]
     cli_noun_verb = ("service", "invoke")
 
     def get_arguments(self) -> list[Argument]:
@@ -317,7 +368,7 @@ class DirectInvokeCommand(ShellCommand):
 
     name = "./"
     description = "Direct method invocation"
-    contexts = ["/services/*"]
+    contexts = ["/services/*", "/aster/*/*"]
     hidden = True
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
@@ -739,6 +790,7 @@ def _kind_detail(node: VfsNode) -> str:
         NodeKind.BLOBS: "content-addressed storage",
         NodeKind.SERVICES: "RPC services",
         NodeKind.GOSSIP: "pub/sub topics",
+        NodeKind.ASTER: "service directory",
     }
     return details.get(node.kind, "")
 
