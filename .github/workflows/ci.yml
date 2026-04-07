@@ -81,33 +81,25 @@ jobs:
           - runner: [self-hosted, Linux, X64]
             label: linux-x64
             shell: bash
-            tool-cache: /tmp/runner-tool-cache
           - runner: [self-hosted, Linux, ARM64]
             label: linux-arm64
             shell: bash
-            tool-cache: /tmp/runner-tool-cache
           - runner: [self-hosted, macOS, ARM64]
             label: macos-arm64
             shell: bash
-            tool-cache: /tmp/runner-tool-cache
           - runner: [self-hosted, Windows, X64]
             label: windows-x64
             shell: pwsh
-            tool-cache: C:\runner-tool-cache
     runs-on: ${{ matrix.runner }}
     name: test-full (${{ matrix.label }})
-    env:
-      RUNNER_TOOL_CACHE: ${{ matrix.tool-cache }}
     steps:
       - uses: actions/checkout@v6
-      - name: Prefer Git Bash over WSL bash (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: echo "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - uses: dtolnay/rust-toolchain@master
+        if: runner.os == 'Linux'
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: actions/setup-python@v5
+        if: runner.os == 'Linux'
         with:
           python-version: "3.13"
       - name: Install uv
