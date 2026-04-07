@@ -18,17 +18,6 @@ from pathlib import Path
 import blake3
 import pytest
 
-from aster.contract.canonical import (
-    NULL_FLAG,
-    write_bytes_field,
-    write_list_header,
-    write_optional_absent,
-    write_optional_present_prefix,
-    write_string,
-    write_varint,
-    write_zigzag_i32,
-    write_zigzag_i64,
-)
 from aster.contract.identity import (
     CapabilityKind,
     CapabilityRequirement,
@@ -69,119 +58,10 @@ def _load_vectors() -> dict[str, dict]:
     return {v["id"]: v for v in data["vectors"]}
 
 
-def _w(fn, *args):
-    """Helper: call write_* fn into BytesIO, return bytes."""
-    buf = io.BytesIO()
-    fn(buf, *args)
-    return buf.getvalue()
 
-
-# ── 1. Varint encoding ────────────────────────────────────────────────────────
-
-
-def test_canonical_encoder_varint():
-    """Varint encoding of boundary values."""
-    assert _w(write_varint, 0) == bytes([0x00])
-    assert _w(write_varint, 127) == bytes([0x7F])
-    assert _w(write_varint, 128) == bytes([0x80, 0x01])
-    assert _w(write_varint, 16383) == bytes([0xFF, 0x7F])
-    assert _w(write_varint, 16384) == bytes([0x80, 0x80, 0x01])
-
-
-# ── 2. ZigZag i32 encoding ─────────────────────────────────────────────────────
-
-
-def test_canonical_encoder_zigzag_i32():
-    """ZigZag i32 encoding of key values."""
-    assert _w(write_zigzag_i32, 0) == bytes([0x00])
-    assert _w(write_zigzag_i32, 1) == bytes([0x02])
-    assert _w(write_zigzag_i32, -1) == bytes([0x01])
-    # INT32_MAX = 2147483647 → ZigZag = 4294967294 → LEB128
-    assert _w(write_zigzag_i32, 2147483647) == bytes([0xFE, 0xFF, 0xFF, 0xFF, 0x0F])
-    # INT32_MIN = -2147483648 → ZigZag = 4294967295 → LEB128
-    assert _w(write_zigzag_i32, -2147483648) == bytes([0xFF, 0xFF, 0xFF, 0xFF, 0x0F])
-
-
-# ── 3. ZigZag i64 encoding ─────────────────────────────────────────────────────
-
-
-def test_canonical_encoder_zigzag_i64():
-    """ZigZag i64 encoding of key values."""
-    assert _w(write_zigzag_i64, 0) == bytes([0x00])
-    assert _w(write_zigzag_i64, 1) == bytes([0x02])
-    assert _w(write_zigzag_i64, -1) == bytes([0x01])
-    # INT64_MAX = 9223372036854775807 → ZigZag = 18446744073709551614
-    expected_max = bytes([0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
-    assert _w(write_zigzag_i64, 9223372036854775807) == expected_max
-    # INT64_MIN = -9223372036854775808 → ZigZag = 18446744073709551615
-    expected_min = bytes([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
-    assert _w(write_zigzag_i64, -9223372036854775808) == expected_min
-
-
-# ── 4. String encoding ─────────────────────────────────────────────────────────
-
-
-def test_canonical_encoder_string():
-    """UTF-8 Fory XLANG string encoding."""
-    # Empty string: 0x02 then nothing
-    assert _w(write_string, "") == bytes([0x02])
-
-    # ASCII single char "a" (1 byte): header = (1<<2)|2 = 6 = 0x06
-    assert _w(write_string, "a") == bytes([0x06, 0x61])
-
-    # "xlang" (5 bytes): header = (5<<2)|2 = 22 = 0x16
-    assert _w(write_string, "xlang") == bytes([0x16]) + b"xlang"
-
-    # "EmptyService" (12 bytes): header = (12<<2)|2 = 50 = 0x32
-    assert _w(write_string, "EmptyService") == bytes([0x32]) + b"EmptyService"
-
-    # "aster/1" (7 bytes): header = (7<<2)|2 = 30 = 0x1E
-    assert _w(write_string, "aster/1") == bytes([0x1E]) + b"aster/1"
-
-
-# ── 5. Bytes field encoding ───────────────────────────────────────────────────
-
-
-def test_canonical_encoder_bytes():
-    """Bytes field encoding (hash fields)."""
-    # Empty bytes: varint(0) = 0x00
-    assert _w(write_bytes_field, b"") == bytes([0x00])
-
-    # 32-byte hash: varint(32) = 0x20 then 32 bytes
-    hash_32 = bytes(range(32))
-    encoded = _w(write_bytes_field, hash_32)
-    assert encoded[0:1] == bytes([0x20])
-    assert encoded[1:] == hash_32
-
-
-# ── 6. List header encoding ───────────────────────────────────────────────────
-
-
-def test_canonical_encoder_list_header():
-    """List header: varint(length) then 0x0C."""
-    # Empty list: varint(0) = 0x00 then 0x0C
-    assert _w(write_list_header, 0) == bytes([0x00, 0x0C])
-
-    # 3-element list: varint(3) = 0x03 then 0x0C
-    assert _w(write_list_header, 3) == bytes([0x03, 0x0C])
-
-    # 1-element list
-    assert _w(write_list_header, 1) == bytes([0x01, 0x0C])
-
-
-# ── 7. Optional encoding ──────────────────────────────────────────────────────
-
-
-def test_canonical_encoder_optional():
-    """NULL_FLAG for absent, 0x00 for present."""
-    buf = io.BytesIO()
-    write_optional_absent(buf)
-    assert buf.getvalue() == bytes([0xFD])
-    assert NULL_FLAG == 0xFD
-
-    buf = io.BytesIO()
-    write_optional_present_prefix(buf)
-    assert buf.getvalue() == bytes([0x00])
+# NOTE: Canonical encoding tests (varint, zigzag, string, bytes, list header,
+# optional) were removed — that code now lives only in Rust core
+# (core/src/canonical.rs) and is tested there.
 
 
 # ── 8. Hash stability ─────────────────────────────────────────────────────────
@@ -505,39 +385,15 @@ def test_vectors_B1_to_B4():
 
 
 def test_all_micro_fixtures():
-    """All rule-level micro-fixtures from the committed vectors."""
+    """Micro-fixture golden vectors exist and are loadable.
+
+    NOTE: The canonical encoding tests (varint, zigzag, string, etc.) that
+    previously verified these vectors were removed — that code now lives in
+    Rust core (core/src/canonical.rs) and is tested there.
+    """
     vecs = _load_vectors()
     micro_ids = [vid for vid in vecs if vid.startswith("micro.")]
     assert len(micro_ids) > 0, "Expected micro-fixture vectors in JSON"
-
-    # For each micro-fixture, verify that re-running the same computation
-    # produces the same bytes and hash.
-    # We spot-check a few specific ones.
-
-    # varint(0)
-    data = _w(write_varint, 0)
-    assert data.hex() == vecs["micro.varint.0"]["bytes_hex"]
-
-    # varint(128)
-    data = _w(write_varint, 128)
-    assert data.hex() == vecs["micro.varint.128"]["bytes_hex"]
-
-    # zigzag_i32(-1)
-    data = _w(write_zigzag_i32, -1)
-    assert data.hex() == vecs["micro.zigzag_i32.-1"]["bytes_hex"]
-
-    # string empty
-    data = _w(write_string, "")
-    assert data.hex() == vecs["micro.string.''"]['bytes_hex']
-
-    # list_header(0)
-    data = _w(write_list_header, 0)
-    assert data.hex() == vecs["micro.list_header.0"]["bytes_hex"]
-
-    # optional absent
-    buf = io.BytesIO()
-    write_optional_absent(buf)
-    assert buf.getvalue().hex() == vecs["micro.optional.absent"]["bytes_hex"]
 
 
 # ── 14. Changing type changes contract_id ─────────────────────────────────────

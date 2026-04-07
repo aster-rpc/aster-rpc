@@ -275,7 +275,7 @@ class TestSigningBytesConsistency:
     """Python canonical_signing_bytes == Rust canonical_signing_bytes_from_json."""
 
     def test_producer_credential(self):
-        from aster.trust.signing import canonical_signing_bytes
+        from aster.trust.signing import _canonical_signing_bytes as canonical_signing_bytes
         from aster.trust.credentials import EnrollmentCredential
 
         root_pubkey = bytes(range(32))
@@ -300,7 +300,7 @@ class TestSigningBytesConsistency:
         assert py_bytes == rust_bytes
 
     def test_consumer_credential_policy(self):
-        from aster.trust.signing import canonical_signing_bytes
+        from aster.trust.signing import _canonical_signing_bytes as canonical_signing_bytes
         from aster.trust.credentials import ConsumerEnrollmentCredential
 
         root_pubkey = bytes(range(32))
@@ -329,7 +329,7 @@ class TestSigningBytesConsistency:
         assert py_bytes == rust_bytes
 
     def test_consumer_credential_ott(self):
-        from aster.trust.signing import canonical_signing_bytes
+        from aster.trust.signing import _canonical_signing_bytes as canonical_signing_bytes
         from aster.trust.credentials import ConsumerEnrollmentCredential
 
         root_pubkey = bytes(range(32))
@@ -363,7 +363,7 @@ class TestCanonicalJsonConsistency:
     """Python canonical_json == Rust canonical_json."""
 
     def test_sorted_keys(self):
-        from aster.trust.signing import canonical_json as py_canonical_json
+        from aster.trust.signing import _canonical_json as py_canonical_json
 
         attrs = {"b": "2", "a": "1", "c": "3"}
         py_bytes = py_canonical_json(attrs)
@@ -372,7 +372,7 @@ class TestCanonicalJsonConsistency:
         assert py_bytes == rust_bytes
 
     def test_empty(self):
-        from aster.trust.signing import canonical_json as py_canonical_json
+        from aster.trust.signing import _canonical_json as py_canonical_json
 
         py_bytes = py_canonical_json({})
         rust_bytes = canonical_json("{}")

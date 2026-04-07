@@ -235,6 +235,9 @@ export {
 export {
   AllowAllPolicy,
   DenyAllPolicy,
+  MeshEndpointHook,
+  PRODUCER_ADMISSION_ALPN as HOOK_PRODUCER_ADMISSION_ALPN,
+  CONSUMER_ADMISSION_ALPN as HOOK_CONSUMER_ADMISSION_ALPN,
   type ConnectionPolicy,
   type HookDecision,
 } from './trust/hooks.js';
@@ -341,7 +344,13 @@ export {
 // Consumer admission
 export {
   performAdmission,
+  consumerCredToJson,
+  consumerCredFromJson,
+  handleConsumerAdmissionRpc,
+  handleConsumerAdmissionConnection,
+  serveConsumerAdmission,
   type ConsumerAdmissionRequest,
   type ConsumerAdmissionResponse,
+  type ConsumerAdmissionOpts,
   type ServiceSummary,
 } from './trust/consumer.js';
