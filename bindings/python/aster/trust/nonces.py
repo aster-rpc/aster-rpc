@@ -118,24 +118,24 @@ class NonceStore:
     def _save(self, consumed: set[str]) -> None:
         """Atomically write consumed nonces to file via rename."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        # Write to temp file in same directory, then rename
-        dirfd = os.open(str(self._path.parent), os.O_RDONLY)
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                dir=self._path.parent,
-                delete=False,
-                suffix=".tmp",
-            ) as tf:
-                json.dump({"consumed": sorted(consumed)}, tf)
-                tf.flush()
-                os.fsync(tf.fileno())
-                tmp_name = tf.name
-            os.replace(tmp_name, str(self._path))
-            # fsync the directory to ensure the rename is durable
-            os.fsync(dirfd)
-        finally:
-            os.close(dirfd)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=self._path.parent,
+            delete=False,
+            suffix=".tmp",
+        ) as tf:
+            json.dump({"consumed": sorted(consumed)}, tf)
+            tf.flush()
+            os.fsync(tf.fileno())
+            tmp_name = tf.name
+        os.replace(tmp_name, str(self._path))
+        # fsync the directory to ensure the rename is durable (not supported on Windows)
+        if hasattr(os, 'O_DIRECTORY'):
+            dirfd = os.open(str(self._path.parent), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
 
 
 class InMemoryNonceStore:
