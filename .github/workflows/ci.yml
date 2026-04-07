@@ -100,6 +100,10 @@ jobs:
       RUNNER_TOOL_CACHE: ${{ matrix.tool-cache }}
     steps:
       - uses: actions/checkout@v6
+      - name: Prefer Git Bash over WSL bash (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
