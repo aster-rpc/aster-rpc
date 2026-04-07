@@ -11,6 +11,36 @@ import type { ServiceRegistry, ServiceInfo, MethodInfo } from '../service.js';
 import type { AsterTransport, CallOptions, BidiChannel } from './base.js';
 
 /**
+ * In-memory receive stream for testing.
+ * Wraps a pre-filled buffer and exposes a read() interface.
+ */
+export class MemRecvStream {
+  private data: Uint8Array;
+  private pos = 0;
+
+  constructor(data: Uint8Array) {
+    this.data = data;
+  }
+
+  /**
+   * Read up to n bytes. Returns null at EOF.
+   */
+  read(n: number): Uint8Array | null {
+    if (this.pos >= this.data.byteLength) return null;
+    const slice = this.data.subarray(this.pos, this.pos + n);
+    this.pos += slice.byteLength;
+    return slice;
+  }
+
+  async readExact(n: number): Promise<Uint8Array> {
+    if (this.pos + n > this.data.byteLength) throw new Error('EOF');
+    const slice = this.data.subarray(this.pos, this.pos + n);
+    this.pos += n;
+    return slice;
+  }
+}
+
+/**
  * In-process transport that dispatches directly to registered services.
  *
  * @example
@@ -128,6 +158,11 @@ export class LocalTransport implements AsterTransport {
 
   async close(): Promise<void> {
     // Nothing to close for in-process transport
+  }
+
+  /** The remote endpoint ID (always 'local' for in-process transport). */
+  get remoteId(): string {
+    return 'local';
   }
 
   private resolve(service: string, method: string): [ServiceInfo, MethodInfo] {

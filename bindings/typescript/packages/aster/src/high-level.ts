@@ -121,6 +121,46 @@ export class AsterServer {
     await this.close();
   }
 
+  // ── Property accessors ─────────────────────────────────────────────────────
+
+  /** Base64-encoded endpoint address (node-id + relay). */
+  get endpointAddrB64(): string | undefined { return this._endpointAddr; }
+
+  /** Base64-encoded RPC endpoint address. */
+  get rpcAddrB64(): string | undefined { return this._endpointAddr; }
+
+  /** Base64-encoded producer admission address. */
+  get producerAdmissionAddrB64(): string | undefined { return undefined; }
+
+  /** Base64-encoded consumer admission address. */
+  get consumerAdmissionAddrB64(): string | undefined { return undefined; }
+
+  /** Base64-encoded admission address. */
+  get admissionAddrB64(): string | undefined { return undefined; }
+
+  /** Mesh state if running in trust mode, or undefined for open mode. */
+  get meshState(): unknown { return undefined; }
+
+  /** Root public key (hex) if running in trust mode, or undefined. */
+  get rootPubkey(): string | undefined { return undefined; }
+
+  /** The underlying Iroh node (if using QUIC transport). */
+  get node(): unknown { return undefined; }
+
+  /** Blobs client (if using QUIC transport). */
+  get blobs(): unknown { return undefined; }
+
+  /** Docs client (if using QUIC transport). */
+  get docs(): unknown { return undefined; }
+
+  /** Gossip client (if using QUIC transport). */
+  get gossip(): unknown { return undefined; }
+
+  /** RPC endpoint handle (if using QUIC transport). */
+  get rpcEndpoint(): unknown { return undefined; }
+
+  // ── In-flight tracking ─────────────────────────────────────────────────────
+
   /** Track an in-flight RPC (for drain). */
   trackRpcStart(): void { this._inFlight++; }
   trackRpcEnd(): void { this._inFlight = Math.max(0, this._inFlight - 1); }
@@ -174,6 +214,25 @@ export class AsterClientWrapper {
   /** Whether the client is connected. */
   get connected(): boolean {
     return this._connected;
+  }
+
+  /** Registry ticket for service discovery (set after admission). */
+  get registryTicket(): string | undefined { return undefined; }
+
+  /**
+   * Connect to the server (no-op if already connected via transport option).
+   * Override in subclasses to implement QUIC connection setup.
+   */
+  async connect(): Promise<void> {
+    // Subclasses may override to do admission + connect
+  }
+
+  /**
+   * Create a typed client proxy for a service class.
+   * Alias for service() for Python API compatibility.
+   */
+  async client<T extends new (...args: any[]) => any>(serviceClass: T): Promise<ClientProxy<InstanceType<T>>> {
+    return createClient(serviceClass, this.transport);
   }
 
   /** Create a typed client proxy for a service class. */

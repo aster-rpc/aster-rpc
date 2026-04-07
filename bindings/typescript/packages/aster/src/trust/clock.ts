@@ -113,6 +113,14 @@ export class ClockDriftTracker {
     return false;
   }
 
+  /**
+   * Track a peer's clock offset from a received timestamp.
+   * Alias for update() — tracks the offset and returns true if peer was newly isolated.
+   */
+  trackOffset(peerEndpointId: string, peerTimestampMs: number): boolean {
+    return this.update(peerEndpointId, peerTimestampMs);
+  }
+
   /** Check if a peer is currently isolated. */
   isIsolated(peerEndpointId: string): boolean {
     return this.isolated.has(peerEndpointId);

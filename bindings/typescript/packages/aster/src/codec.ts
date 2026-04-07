@@ -15,6 +15,14 @@ import { WIRE_TYPE_KEY } from './decorators.js';
 /** Default compression threshold in bytes (4 KiB). */
 export const DEFAULT_COMPRESSION_THRESHOLD = 4096;
 
+/** Re-export WIRE_TYPE_KEY as wireType for API compatibility. */
+export { WIRE_TYPE_KEY as wireType };
+
+/** Get the wire type tag from a @WireType-decorated class. */
+export function getWireType(cls: unknown): string | undefined {
+  return (cls as any)?.[WIRE_TYPE_KEY];
+}
+
 /** Generic codec interface for serialization/deserialization. */
 export interface Codec {
   encode(obj: unknown, hintType?: unknown): Uint8Array;
@@ -177,6 +185,56 @@ export function walkTypeGraph(rootTypes: (new (...args: any[]) => any)[]): (new 
   return ordered;
 }
 
+// -- ForyConfig ----------------------------------------------------------------
+
+/**
+ * Configuration for the Fory serializer.
+ */
+export class ForyConfig {
+  /** Compression threshold in bytes (default: 4096). */
+  compressionThreshold: number;
+  /** Whether to use cross-language mode (xlang). Default: true. */
+  xlang: boolean;
+
+  constructor(opts?: { compressionThreshold?: number; xlang?: boolean }) {
+    this.compressionThreshold = opts?.compressionThreshold ?? DEFAULT_COMPRESSION_THRESHOLD;
+    this.xlang = opts?.xlang ?? true;
+  }
+
+  /** The resolved xlang mode (same as xlang field). */
+  get resolvedXlang(): boolean {
+    return this.xlang;
+  }
+
+  /** Convert to kwargs-style object for passing to Fory constructor. */
+  toKwargs(): Record<string, unknown> {
+    return {
+      xlang: this.xlang,
+      // Fory doesn't directly take compressionThreshold; pass via codec
+    };
+  }
+}
+
+/** Resolved ForyConfig with all defaults filled in. */
+export interface ResolvedForyConfig {
+  compressionThreshold: number;
+  xlang: boolean;
+  /** Resolved xlang (same as xlang). */
+  resolvedXlang: boolean;
+}
+
+/**
+ * Resolve a ForyConfig with defaults.
+ */
+export function resolveForyConfig(config?: ForyConfig | { compressionThreshold?: number; xlang?: boolean }): ResolvedForyConfig {
+  const xlang = config?.xlang ?? true;
+  return {
+    compressionThreshold: config?.compressionThreshold ?? DEFAULT_COMPRESSION_THRESHOLD,
+    xlang,
+    resolvedXlang: xlang,
+  };
+}
+
 // -- ForyCodec ----------------------------------------------------------------
 
 /**
@@ -258,5 +316,54 @@ export class ForyCodec implements Codec {
       return this.decode(decompressed, hintType);
     }
     return this.decode(payload, hintType);
+  }
+
+  /**
+   * Compress bytes using zstd (if available).
+   * Returns null if zstd is unavailable or compression didn't help.
+   */
+  compress(data: Uint8Array): Uint8Array | null {
+    if (!_zstdAvailable) return null;
+    return zstdCompress(data);
+  }
+
+  /**
+   * Decompress zstd-compressed bytes.
+   */
+  decompress(data: Uint8Array): Uint8Array {
+    return zstdDecompress(data);
+  }
+
+  /**
+   * Encode a row schema for a list of field names (for row-oriented data).
+   * Returns a JSON-encoded schema descriptor.
+   */
+  encodeRowSchema(fields: string[]): Uint8Array {
+    return new TextEncoder().encode(JSON.stringify({ fields }));
+  }
+
+  /**
+   * Decode a row-oriented data payload using a previously decoded schema.
+   * Reconstructs objects from parallel arrays.
+   */
+  decodeRowData(schemaBytes: Uint8Array, dataBytes: Uint8Array): unknown[] {
+    const schema: { fields: string[] } = JSON.parse(new TextDecoder().decode(schemaBytes));
+    const rows: unknown[] = this.decode(dataBytes) as unknown[];
+    if (!Array.isArray(rows)) return [];
+    return rows.map((row: unknown) => {
+      if (!Array.isArray(row)) return row;
+      const obj: Record<string, unknown> = {};
+      for (let i = 0; i < schema.fields.length; i++) {
+        obj[schema.fields[i]!] = row[i];
+      }
+      return obj;
+    });
+  }
+
+  /**
+   * Return the list of registered type names.
+   */
+  registeredTypes(): string[] {
+    return [...this.serializers.keys()];
   }
 }

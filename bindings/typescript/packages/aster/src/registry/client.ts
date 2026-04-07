@@ -100,6 +100,34 @@ export class RegistryClient {
   }
 
   /**
+   * Resolve all endpoints for a service, returning leases from all known versions.
+   */
+  resolveAll(serviceName: string): EndpointLease[] {
+    return this.findEndpoints(serviceName);
+  }
+
+  /**
+   * Fetch a contract manifest by service name and version.
+   * Returns undefined if not locally known.
+   */
+  fetchContract(serviceName: string, version?: number): ContractManifest | undefined {
+    return this.getManifest(serviceName, version);
+  }
+
+  /**
+   * Register a change callback invoked whenever new manifests are added.
+   * Returns an unsubscribe function.
+   */
+  onChange(callback: (manifest: ContractManifest) => void): () => void {
+    this._changeCallbacks.push(callback);
+    return () => {
+      this._changeCallbacks = this._changeCallbacks.filter(cb => cb !== callback);
+    };
+  }
+
+  private _changeCallbacks: ((manifest: ContractManifest) => void)[] = [];
+
+  /**
    * Parse a manifest from a blob collection download.
    * The collection contains "manifest.json" as its first entry.
    */

@@ -40,4 +40,21 @@ export class RetryInterceptor implements Interceptor {
     const jitterAmount = base * jitter * (Math.random() * 2 - 1);
     return Math.max(0, Math.round(base + jitterAmount));
   }
+
+  /**
+   * Decide if a call should be retried.
+   * Returns true if the error is retryable, call is idempotent, and attempts remain.
+   */
+  shouldRetry(error: RpcError, attempt: number, idempotent = false): boolean {
+    if (!idempotent) return false;
+    if (!RETRYABLE_CODES.has(error.code)) return false;
+    return attempt < this.policy.maxAttempts;
+  }
+
+  /**
+   * Compute backoff duration in seconds for the given attempt number.
+   */
+  backoffSeconds(attempt: number): number {
+    return this.backoffMs(attempt) / 1000;
+  }
 }

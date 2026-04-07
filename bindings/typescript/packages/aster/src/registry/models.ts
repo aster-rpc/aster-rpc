@@ -14,6 +14,11 @@ export const HealthStatus = {
 
 export type HealthStatus = (typeof HealthStatus)[keyof typeof HealthStatus];
 
+/** Validate that a string is a valid HealthStatus value. */
+export function validate(value: string): value is HealthStatus {
+  return Object.values(HealthStatus).includes(value as HealthStatus);
+}
+
 /** Gossip event types. */
 export const GossipEventType = {
   CONTRACT_PUBLISHED: 0,

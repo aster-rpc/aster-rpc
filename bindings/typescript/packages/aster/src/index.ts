@@ -84,6 +84,10 @@ export {
   METHOD_INFO_KEY,
   getServiceInfo,
   ServiceRegistry,
+  getMethod,
+  hasMethod,
+  getDefaultRegistry,
+  setDefaultRegistry,
   type ServiceInfo,
   type MethodInfo,
   type CapabilityRequirement,
@@ -112,7 +116,11 @@ export {
   ForyCodec,
   DEFAULT_COMPRESSION_THRESHOLD,
   walkTypeGraph,
+  wireType,
+  resolveForyConfig,
   type Codec,
+  type ForyConfig,
+  type ResolvedForyConfig,
 } from './codec.js';
 
 // Transport
@@ -121,10 +129,18 @@ export {
   type CallOptions,
   type BidiChannel,
 } from './transport/base.js';
-export { LocalTransport } from './transport/local.js';
+export { LocalTransport, MemRecvStream } from './transport/local.js';
 
 // Client
-export { createClient, type AsterClient, type ClientOptions } from './client.js';
+export {
+  createClient,
+  createLocalClient,
+  timeSleep,
+  timeouts,
+  ServiceClient,
+  type AsterClient,
+  type ClientOptions,
+} from './client.js';
 
 // Interceptors
 export {
@@ -152,6 +168,9 @@ export {
   computeContractId,
   contractIdFromContract,
   contractIdFromJson,
+  contractIdFromService,
+  buildTypeGraph,
+  fromServiceInfo,
   setNativeContract,
   TypeKind as ContractTypeKind,
   ContainerKind,
@@ -173,11 +192,16 @@ export {
   verifyManifestOrFatal,
   manifestToJson,
   manifestFromJson,
+  extractMethodDescriptors,
+  saveManifest,
 } from './contract/manifest.js';
 export {
   type ArtifactRef,
   buildCollection,
   publishContract,
+  uploadCollection,
+  fetchFromCollection,
+  fetchContract,
 } from './contract/publication.js';
 
 // Dynamic type factory
@@ -187,6 +211,9 @@ export {
   type DynamicType,
 } from './dynamic.js';
 
+// Session-scoped services (extended)
+export { SessionStub, createSession, createLocalSession } from './session.js';
+
 // Transport implementations
 export { IrohTransport } from './transport/iroh.js';
 
@@ -194,7 +221,16 @@ export { IrohTransport } from './transport/iroh.js';
 export { SessionServer } from './session.js';
 
 // Configuration
-export { configFromEnv, configFromFile, loadIdentity, printConfig, type AsterConfig } from './config.js';
+export {
+  configFromEnv,
+  configFromFile,
+  loadEndpointConfig,
+  resolveRootPubkey,
+  toEndpointConfig,
+  loadIdentity,
+  printConfig,
+  type AsterConfig,
+} from './config.js';
 
 // Logging
 export {
@@ -207,7 +243,21 @@ export {
 } from './logging.js';
 
 // Health
-export { HealthServer, type HealthState, type HealthMetrics } from './health.js';
+export {
+  HealthServer,
+  ConnectionMetrics as HealthConnectionMetrics,
+  AdmissionMetrics as HealthAdmissionMetrics,
+  getConnectionMetrics,
+  getAdmissionMetrics,
+  resetMetrics,
+  checkHealth,
+  checkReady,
+  healthStatus,
+  readyStatus,
+  metricsSnapshot,
+  type HealthState,
+  type HealthMetrics,
+} from './health.js';
 
 // High-level API
 export {
@@ -220,6 +270,10 @@ export {
 // Trust & Security
 export {
   generateKeypair,
+  generateRootKeypair,
+  loadPrivateKey,
+  loadPublicKey,
+  verifySignature,
   sign,
   verify,
   ATTR_ROLE,
@@ -337,7 +391,7 @@ export {
   type BootstrapConfig,
 } from './trust/bootstrap.js';
 
-// Connection & Admission Metrics
+// Connection & Admission Metrics (from metrics.ts)
 export { ConnectionMetrics, AdmissionMetrics } from './metrics.js';
 
 // RPC Server (QUIC accept loop)
@@ -348,6 +402,7 @@ export {
   RegistryClient,
   registryKey,
   type RegistryArtifactRef,
+  type EndpointLease as RegistryEndpointLease,
 } from './registry/client.js';
 export {
   RegistryPublisher,
@@ -373,6 +428,7 @@ export {
 export {
   HealthStatus,
   GossipEventType,
+  validate as validateHealthStatus,
   isLeaseFresh,
   isLeaseRoutable,
   type ServiceSummary as RegistryServiceSummary,

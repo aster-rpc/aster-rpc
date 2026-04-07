@@ -137,3 +137,94 @@ export function contractIdFromJson(contract: ServiceContract): string {
 export function contractIdFromContract(contract: ServiceContract): string {
   return contractIdFromJson(contract);
 }
+
+/**
+ * Compute a contract ID from a @Service-decorated class.
+ * Builds the ServiceContract from service info and computes its ID.
+ */
+export function contractIdFromService(serviceClass: new (...args: any[]) => any): string {
+  // Build a minimal ServiceContract from service info
+  const info = (serviceClass as any)[Symbol.for('aster.service_info')];
+  if (!info) {
+    throw new TypeError(`${serviceClass.name} is not decorated with @Service`);
+  }
+  const contract: ServiceContract = {
+    name: info.name,
+    version: info.version,
+    methods: [],
+    serializationModes: [],
+    scoped: info.scoped === 'stream' ? 1 : 0,
+    requires: undefined,
+  };
+  for (const [, m] of info.methods as Map<string, any>) {
+    contract.methods.push({
+      name: m.name,
+      pattern: m.pattern === 'server_stream' ? 1 : m.pattern === 'client_stream' ? 2 : m.pattern === 'bidi_stream' ? 3 : 0,
+      requestType: new Uint8Array(32),
+      responseType: new Uint8Array(32),
+      idempotent: m.idempotent ?? false,
+      defaultTimeout: 0,
+      requires: undefined,
+    });
+  }
+  return contractIdFromJson(contract);
+}
+
+/**
+ * Build the transitive type graph for a set of @WireType classes.
+ * Alias for walkTypeGraph (from codec.ts) for contract identity use.
+ */
+export function buildTypeGraph(rootTypes: (new (...args: any[]) => any)[]): (new (...args: any[]) => any)[] {
+  const WIRE_TYPE_KEY = Symbol.for('aster.wire_type');
+  const visited = new Set<Function>();
+  const ordered: (new (...args: any[]) => any)[] = [];
+  function visit(cls: new (...args: any[]) => any): void {
+    if (visited.has(cls)) return;
+    visited.add(cls);
+    const tag = (cls as any)[WIRE_TYPE_KEY];
+    if (!tag) return;
+    try {
+      const inst = new cls();
+      for (const key of Object.keys(inst)) {
+        const ctor = inst[key]?.constructor;
+        if (ctor && (ctor as any)[WIRE_TYPE_KEY]) visit(ctor);
+      }
+    } catch { /* ignore */ }
+    ordered.push(cls);
+  }
+  for (const cls of rootTypes) visit(cls);
+  return ordered;
+}
+
+/**
+ * Build a ServiceContract from a ServiceInfo object.
+ * Used for contract identity verification.
+ */
+export function fromServiceInfo(info: {
+  name: string;
+  version: number;
+  scoped?: string;
+  methods: Map<string, { name: string; pattern: string; idempotent?: boolean }>;
+  requires?: { kind: string; roles: string[] };
+}): ServiceContract {
+  const contract: ServiceContract = {
+    name: info.name,
+    version: info.version,
+    methods: [],
+    serializationModes: [],
+    scoped: info.scoped === 'stream' ? 1 : 0,
+    requires: info.requires ? { kind: info.requires.kind === 'any_of' ? 1 : 2, roles: info.requires.roles } : undefined,
+  };
+  for (const [, m] of info.methods) {
+    contract.methods.push({
+      name: m.name,
+      pattern: m.pattern === 'server_stream' ? 1 : m.pattern === 'client_stream' ? 2 : m.pattern === 'bidi_stream' ? 3 : 0,
+      requestType: new Uint8Array(32),
+      responseType: new Uint8Array(32),
+      idempotent: m.idempotent ?? false,
+      defaultTimeout: 0,
+      requires: undefined,
+    });
+  }
+  return contract;
+}

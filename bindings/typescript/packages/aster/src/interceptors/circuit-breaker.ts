@@ -71,4 +71,38 @@ export class CircuitBreakerInterceptor implements Interceptor {
   get currentState(): State {
     return this.state;
   }
+
+  /**
+   * Pre-call gate check — throws if circuit is open.
+   * Alias for the logic in onRequest(), callable without a full call context.
+   */
+  beforeCall(): void {
+    if (this.state === 'open') {
+      if (Date.now() - this.lastFailure > this.resetTimeoutMs) {
+        this.state = 'half_open';
+        this.halfOpenCalls = 0;
+      } else {
+        throw new RpcError(StatusCode.UNAVAILABLE, 'circuit breaker is open');
+      }
+    }
+    if (this.state === 'half_open' && this.halfOpenCalls >= this.halfOpenMaxCalls) {
+      throw new RpcError(StatusCode.UNAVAILABLE, 'circuit breaker half-open limit reached');
+    }
+    if (this.state === 'half_open') this.halfOpenCalls++;
+  }
+
+  /** Record a successful call — resets the failure count. */
+  recordSuccess(): void {
+    if (this.state === 'half_open') this.state = 'closed';
+    this.failures = 0;
+  }
+
+  /** Record a failed call — may open the circuit. */
+  recordFailure(): void {
+    this.failures++;
+    this.lastFailure = Date.now();
+    if (this.failures >= this.failureThreshold) {
+      this.state = 'open';
+    }
+  }
 }
