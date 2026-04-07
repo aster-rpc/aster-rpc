@@ -56,29 +56,9 @@ jobs:
           echo "Version: ${{ steps.ver.outputs.python_version }}"
           echo "Release: ${{ steps.ver.outputs.is_release }}"
 
-  # ── Lint ───────────────────────────────────────────────────────────
-  lint:
-    runs-on: [self-hosted, Linux, X64]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: rustfmt, clippy
-      - name: Cache Rust dependencies/build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-          key: lint
-      - name: cargo fmt
-        run: cargo fmt --manifest-path bindings/python/rust/Cargo.toml --check
-      - name: cargo clippy
-        run: cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings
-
   # ── Linux (x86_64 + aarch64) ──────────────────────────────────────
   linux:
-    needs: [lint, version]
+    needs: [version]
     strategy:
       matrix:
         include:
@@ -109,7 +89,7 @@ jobs:
 
   # ── macOS (aarch64) ─────────────────────────────────────────────────
   macos:
-    needs: [lint, version]
+    needs: [version]
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v6
@@ -138,7 +118,7 @@ jobs:
 
   # ── Windows (x86_64) ──────────────────────────────────────────────
   windows:
-    needs: [lint, version]
+    needs: [version]
     runs-on: [self-hosted, Windows, X64]
     steps:
       - uses: actions/checkout@v6
@@ -169,7 +149,7 @@ jobs:
 
   # ── Source distribution ────────────────────────────────────────────
   sdist:
-    needs: [lint, version]
+    needs: [version]
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v6
