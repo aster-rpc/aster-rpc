@@ -35,8 +35,6 @@ from aster.trust import (
     MeshEndpointHook,
     MockIIDBackend,
     admit,
-    canonical_json,
-    canonical_signing_bytes,
     check_offline,
     check_runtime,
     generate_root_keypair,
@@ -45,6 +43,10 @@ from aster.trust import (
 )
 from aster.trust.hooks import _ADMISSION_ALPNS
 
+
+# Private imports for testing (public API removed — Rust core is authoritative)
+from aster.trust.signing import _canonical_json as canonical_json
+from aster.trust.signing import _canonical_signing_bytes as canonical_signing_bytes
 
 # ── Key generation helpers ─────────────────────────────────────────────────────
 

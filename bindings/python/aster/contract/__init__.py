@@ -4,8 +4,7 @@ aster.contract — Contract identity and publication for Aster RPC.
 Spec reference: Aster-ContractIdentity.md §11
 
 Canonical encoding and BLAKE3 hashing are delegated to the Rust core
-via _aster.contract. The Python-side canonical.py is retained only as
-a reference for the encoding format — it is not used at runtime.
+via _aster.contract (core/src/canonical.rs).
 """
 
 from aster.contract.identity import (

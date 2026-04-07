@@ -32,16 +32,20 @@ if TYPE_CHECKING:
     from .credentials import ConsumerEnrollmentCredential, EnrollmentCredential
 
 
-def canonical_json(attributes: dict[str, str]) -> bytes:
-    """Encode attributes as canonical JSON: UTF-8, sorted keys, no extra whitespace."""
+def _canonical_json(attributes: dict[str, str]) -> bytes:
+    """Encode attributes as canonical JSON: UTF-8, sorted keys, no extra whitespace.
+
+    NOTE: The authoritative implementation is in Rust core (core/src/signing.rs).
+    This Python copy exists only as a private helper for sign_credential/verify_signature.
+    """
     return json.dumps(attributes, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def canonical_signing_bytes(cred: "EnrollmentCredential | ConsumerEnrollmentCredential") -> bytes:
+def _canonical_signing_bytes(cred: "EnrollmentCredential | ConsumerEnrollmentCredential") -> bytes:
     """Produce the canonical byte sequence that is signed/verified.
 
-    Dispatches on credential type.  Both presence flags and payload lengths
-    are included, preventing type-flipping attacks.
+    NOTE: The authoritative implementation is in Rust core (core/src/signing.rs).
+    This Python copy exists only as a private helper for sign_credential/verify_signature.
     """
     from .credentials import EnrollmentCredential, ConsumerEnrollmentCredential
 
@@ -58,7 +62,7 @@ def _producer_signing_bytes(cred: "EnrollmentCredential") -> bytes:
         cred.endpoint_id.encode("utf-8"),
         cred.root_pubkey,
         struct.pack(">Q", cred.expires_at),
-        canonical_json(cred.attributes),
+        _canonical_json(cred.attributes),
     ]
     return b"".join(parts)
 
@@ -85,7 +89,7 @@ def _consumer_signing_bytes(cred: "ConsumerEnrollmentCredential") -> bytes:
         eid_part,
         cred.root_pubkey,
         struct.pack(">Q", cred.expires_at),
-        canonical_json(cred.attributes),
+        _canonical_json(cred.attributes),
         nonce_part,
     ]
     return b"".join(parts)
@@ -136,7 +140,7 @@ def sign_credential(
     field is NOT mutated — the caller assigns the return value.
     """
     privkey = load_private_key(root_privkey_raw)
-    msg = canonical_signing_bytes(cred)
+    msg = _canonical_signing_bytes(cred)
     return privkey.sign(msg)
 
 
@@ -158,7 +162,7 @@ def verify_signature(
     pubkey_bytes = root_pubkey_raw if root_pubkey_raw is not None else cred.root_pubkey
     try:
         pubkey = load_public_key(pubkey_bytes)
-        msg = canonical_signing_bytes(cred)
+        msg = _canonical_signing_bytes(cred)
         pubkey.verify(cred.signature, msg)
         return True
     except (InvalidSignature, Exception):  # noqa: BLE001
