@@ -49,7 +49,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: "1.2.15"
 
       - uses: actions/setup-node@v4
         with:
@@ -57,11 +57,11 @@ jobs:
 
       - name: Install dependencies
         working-directory: bindings/typescript
-        run: bun install --backend=hardlink
+        run: bun install
 
       - name: Typecheck
         working-directory: bindings/typescript/packages/aster
-        run: bun run typecheck
+        run: npx tsc --noEmit
 
       - name: Run tests (bun + vitest)
         working-directory: bindings/typescript/packages/aster
