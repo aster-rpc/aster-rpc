@@ -125,6 +125,8 @@ jobs:
 
       - name: Build and test (Windows)
         if: matrix.shell == 'pwsh'
+        env:
+          PYTHONIOENCODING: utf-8
         run: |
           uv venv .venv
           .venv\Scripts\activate
