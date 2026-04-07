@@ -49,6 +49,65 @@ export function buildCollection(
 }
 
 /**
+ * Upload a pre-built collection of [name, data] entries to the blob store.
+ * Returns the collection hash.
+ */
+export async function uploadCollection(
+  blobsClient: { addBytes(data: Uint8Array): Promise<string> },
+  entries: [name: string, data: Uint8Array][],
+): Promise<string> {
+  // Combine all entries into a single manifest+data blob (simplified)
+  const index = entries.map(([name, data]) => ({ name, size: data.byteLength }));
+  const header = new TextEncoder().encode(JSON.stringify(index) + '\n');
+  const chunks: Uint8Array[] = [header];
+  for (const [, data] of entries) chunks.push(data);
+  const total = chunks.reduce((s, c) => s + c.byteLength, 0);
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { combined.set(c, offset); offset += c.byteLength; }
+  return blobsClient.addBytes(combined);
+}
+
+/**
+ * Fetch a collection from the blob store by hash and parse the entries.
+ * Returns [name, data] pairs.
+ */
+export async function fetchFromCollection(
+  blobsClient: { read(hash: string): Promise<Uint8Array> },
+  collectionHash: string,
+): Promise<[name: string, data: Uint8Array][]> {
+  const combined = await blobsClient.read(collectionHash);
+  // Find the newline after the JSON header
+  let headerEnd = 0;
+  for (let i = 0; i < combined.byteLength; i++) {
+    if (combined[i] === 0x0a) { headerEnd = i + 1; break; }
+  }
+  const headerText = new TextDecoder().decode(combined.subarray(0, headerEnd));
+  const index: Array<{ name: string; size: number }> = JSON.parse(headerText);
+  const entries: [string, Uint8Array][] = [];
+  let pos = headerEnd;
+  for (const { name, size } of index) {
+    entries.push([name, combined.subarray(pos, pos + size)]);
+    pos += size;
+  }
+  return entries;
+}
+
+/**
+ * Fetch a contract manifest from the blob store by its collection hash.
+ */
+export async function fetchContract(
+  blobsClient: { read(hash: string): Promise<Uint8Array> },
+  collectionHash: string,
+): Promise<ContractManifest> {
+  const { manifestFromJson } = await import('./manifest.js');
+  const entries = await fetchFromCollection(blobsClient, collectionHash);
+  const manifestEntry = entries.find(([name]) => name === 'manifest.json');
+  if (!manifestEntry) throw new Error('collection does not contain manifest.json');
+  return manifestFromJson(new TextDecoder().decode(manifestEntry[1]));
+}
+
+/**
  * Publish a contract collection to the blob store.
  *
  * This is the high-level function called by AsterServer on startup.

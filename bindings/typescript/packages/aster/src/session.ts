@@ -14,6 +14,8 @@
  */
 
 import type { SendStream, RecvStream } from '@aster-rpc/transport';
+import { LocalTransport } from './transport/local.js';
+import { ServiceRegistry } from './service.js';
 import type { Codec } from './codec.js';
 import { JsonCodec } from './codec.js';
 import {
@@ -116,4 +118,54 @@ export class SessionServer {
       }
     }
   }
+}
+
+// ── Session stub ──────────────────────────────────────────────────────────────
+
+/**
+ * Client-side session stub — tracks an active session-scoped RPC stream.
+ */
+export class SessionStub {
+  private _cancelled = false;
+
+  constructor(
+    private readonly transport: { close?(): Promise<void> },
+    readonly sessionId: string,
+  ) {}
+
+  /** Cancel the session. */
+  async cancel(): Promise<void> {
+    this._cancelled = true;
+    if (this.transport.close) await this.transport.close();
+  }
+
+  get cancelled(): boolean {
+    return this._cancelled;
+  }
+}
+
+// ── Factory functions ─────────────────────────────────────────────────────────
+
+/**
+ * Create a session-scoped client connection to a remote service.
+ * Returns a SessionStub that can be used to cancel the session.
+ */
+export async function createSession(
+  transport: { close?(): Promise<void> },
+  sessionId?: string,
+): Promise<SessionStub> {
+  const id = sessionId ?? crypto.randomUUID?.() ?? `session-${Date.now()}`;
+  return new SessionStub(transport, id);
+}
+
+/**
+ * Create a local (in-process) session for testing.
+ * Uses LocalTransport under the hood.
+ */
+export async function createLocalSession(
+  registry: ServiceRegistry,
+  sessionId?: string,
+): Promise<SessionStub> {
+  const transport = new LocalTransport(registry);
+  return createSession(transport, sessionId);
 }

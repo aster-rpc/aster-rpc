@@ -81,6 +81,24 @@ export class RegistryGossip {
   }
 
   /**
+   * Broadcast a backwards-compatibility publication event.
+   * Used when a new service version is compatible with an older contract.
+   */
+  async broadcastCompatibilityPublished(
+    contractId: string,
+    service: string,
+    compatibleWithVersion: number,
+  ): Promise<void> {
+    await this.broadcast({
+      type: ET.CONTRACT_PUBLISHED,
+      contractId,
+      service,
+      version: compatibleWithVersion,
+      timestampMs: Date.now(),
+    });
+  }
+
+  /**
    * Listen for gossip events. Yields events as they arrive.
    * Silently skips malformed messages.
    */

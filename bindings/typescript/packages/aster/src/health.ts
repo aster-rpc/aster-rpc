@@ -9,6 +9,125 @@
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 
+// ── Singleton metrics stores ──────────────────────────────────────────────────
+
+/** Connection-level metrics (singleton). */
+export class ConnectionMetrics {
+  opened = 0;
+  closed = 0;
+  streamsOpened = 0;
+  streamsClosed = 0;
+
+  connectionOpened(): void { this.opened++; }
+  connectionClosed(): void { this.closed++; }
+  streamOpened(): void { this.streamsOpened++; }
+  streamClosed(): void { this.streamsClosed++; }
+
+  snapshot(): Record<string, number> {
+    return {
+      connections_opened: this.opened,
+      connections_closed: this.closed,
+      streams_active: this.streamsOpened - this.streamsClosed,
+      streams_total: this.streamsOpened,
+    };
+  }
+}
+
+/** Admission-level metrics (singleton). */
+export class AdmissionMetrics {
+  consumerAdmits = 0;
+  consumerDenies = 0;
+  consumerErrors = 0;
+  producerAdmits = 0;
+  producerDenies = 0;
+  producerErrors = 0;
+  lastAdmissionMs = 0;
+  totalAdmissionMs = 0;
+
+  recordConsumerAdmit(durationMs = 0): void {
+    this.consumerAdmits++;
+    this.lastAdmissionMs = durationMs;
+    this.totalAdmissionMs += durationMs;
+  }
+  recordConsumerDeny(): void { this.consumerDenies++; }
+  recordConsumerError(): void { this.consumerErrors++; }
+  recordProducerAdmit(durationMs = 0): void {
+    this.producerAdmits++;
+    this.lastAdmissionMs = durationMs;
+    this.totalAdmissionMs += durationMs;
+  }
+  recordProducerDeny(): void { this.producerDenies++; }
+  recordProducerError(): void { this.producerErrors++; }
+
+  snapshot(): Record<string, number> {
+    return {
+      consumer_admits: this.consumerAdmits,
+      consumer_denies: this.consumerDenies,
+      consumer_errors: this.consumerErrors,
+      producer_admits: this.producerAdmits,
+      producer_denies: this.producerDenies,
+      producer_errors: this.producerErrors,
+      last_admission_ms: this.lastAdmissionMs,
+    };
+  }
+}
+
+const _connectionMetrics = new ConnectionMetrics();
+const _admissionMetrics = new AdmissionMetrics();
+
+/** Get the singleton connection metrics instance. */
+export function getConnectionMetrics(): ConnectionMetrics {
+  return _connectionMetrics;
+}
+
+/** Get the singleton admission metrics instance. */
+export function getAdmissionMetrics(): AdmissionMetrics {
+  return _admissionMetrics;
+}
+
+/** Reset all singleton metrics. */
+export function resetMetrics(): void {
+  const cm = _connectionMetrics;
+  cm.opened = 0; cm.closed = 0; cm.streamsOpened = 0; cm.streamsClosed = 0;
+  const am = _admissionMetrics;
+  am.consumerAdmits = 0; am.consumerDenies = 0; am.consumerErrors = 0;
+  am.producerAdmits = 0; am.producerDenies = 0; am.producerErrors = 0;
+  am.lastAdmissionMs = 0; am.totalAdmissionMs = 0;
+}
+
+/** Check health of a server (returns true if running). */
+export function checkHealth(server: { running?: boolean }): boolean {
+  return server.running !== false;
+}
+
+/** Check readiness of a server (returns true if running and not draining). */
+export function checkReady(server: { running?: boolean; draining?: boolean }): boolean {
+  return server.running !== false && server.draining !== true;
+}
+
+/** Return health status as a JSON-serializable object. */
+export function healthStatus(server: { running?: boolean }): Record<string, unknown> {
+  return {
+    status: checkHealth(server) ? 'ok' : 'unhealthy',
+    uptime_s: 0,
+  };
+}
+
+/** Return readiness status as a JSON-serializable object. */
+export function readyStatus(server: { running?: boolean; draining?: boolean }): Record<string, unknown> {
+  return {
+    status: checkReady(server) ? 'ready' : 'not_ready',
+  };
+}
+
+/** Return a full metrics snapshot. */
+export function metricsSnapshot(_server?: unknown): Record<string, unknown> {
+  return {
+    connections: _connectionMetrics.snapshot(),
+    admission: _admissionMetrics.snapshot(),
+  };
+}
+
 export interface HealthState {
   isHealthy: () => boolean;
   isReady: () => boolean;

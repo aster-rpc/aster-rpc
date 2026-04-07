@@ -10,6 +10,32 @@ import { RpcPattern } from './types.js';
 import { RpcError, StatusCode } from './status.js';
 import { getServiceInfo } from './service.js';
 import type { AsterTransport, CallOptions } from './transport/base.js';
+import { LocalTransport } from './transport/local.js';
+import { ServiceRegistry } from './service.js';
+
+/**
+ * Typed service client wrapper — provides service metadata accessors
+ * alongside the proxy methods. Returned by createClient().
+ */
+export class ServiceClient<T extends object> {
+  readonly proxy: AsterClient<T>;
+  private readonly _name: string;
+  private readonly _version: number;
+
+  constructor(serviceClass: new (...args: any[]) => T, transport: AsterTransport, options?: ClientOptions) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.proxy = createClient(serviceClass as any, transport, options) as AsterClient<T>;
+    const info = getServiceInfo(serviceClass);
+    this._name = info?.name ?? serviceClass.name;
+    this._version = info?.version ?? 1;
+  }
+
+  /** The RPC service name. */
+  get serviceName(): string { return this._name; }
+
+  /** The RPC service version. */
+  get serviceVersion(): number { return this._version; }
+}
 
 /** Options for creating a client. */
 export interface ClientOptions {
@@ -44,6 +70,35 @@ export type AsterClient<T> = {
  * const result = await client.echo(new EchoRequest({ message: "hi" }));
  * ```
  */
+/**
+ * Create a typed client backed by an in-process LocalTransport (for testing).
+ */
+export function createLocalClient<T extends new (...args: any[]) => any>(
+  serviceClass: T,
+  registry: ServiceRegistry,
+  options?: ClientOptions,
+): AsterClient<InstanceType<T>> {
+  const transport = new LocalTransport(registry);
+  return createClient(serviceClass, transport, options);
+}
+
+/**
+ * Sleep for a given number of seconds (convenience for timeout tests).
+ */
+export async function timeSleep(seconds: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, seconds * 1000));
+}
+
+/**
+ * Build a CallOptions object with explicit timeout and metadata.
+ */
+export function timeouts(timeoutS: number, metadata?: Record<string, string>): CallOptions {
+  return {
+    deadlineEpochMs: Date.now() + timeoutS * 1000,
+    metadata,
+  };
+}
+
 export function createClient<T extends new (...args: any[]) => any>(
   serviceClass: T,
   transport: AsterTransport,

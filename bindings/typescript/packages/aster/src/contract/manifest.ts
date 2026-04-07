@@ -119,6 +119,26 @@ export function manifestToJson(manifest: ContractManifest): string {
   }, null, 2);
 }
 
+/**
+ * Extract method descriptors from a manifest for introspection.
+ * Returns a simplified record of method name → pattern.
+ */
+export function extractMethodDescriptors(manifest: ContractManifest): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const method of manifest.methods) {
+    result[method.name] = method.pattern ?? 'unary';
+  }
+  return result;
+}
+
+/**
+ * Save a manifest to a JSON file.
+ */
+export function saveManifest(manifest: ContractManifest, filePath: string): void {
+  const { writeFileSync } = require('node:fs');
+  writeFileSync(filePath, manifestToJson(manifest), 'utf-8');
+}
+
 /** Parse a manifest from JSON. */
 export function manifestFromJson(json: string): ContractManifest {
   const data = JSON.parse(json);

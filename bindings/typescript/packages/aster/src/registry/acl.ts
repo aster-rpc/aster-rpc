@@ -76,6 +76,26 @@ export class RegistryACL {
     this._restricted = true;
   }
 
+  /** Remove a writer from the ACL. */
+  removeWriter(authorId: string): void {
+    this.writers.delete(authorId);
+  }
+
+  /** Get all writers. */
+  getWriters(): string[] {
+    return [...this.writers];
+  }
+
+  /** Get all readers. */
+  getReaders(): string[] {
+    return [...this.readers];
+  }
+
+  /** Get all admins. */
+  getAdmins(): string[] {
+    return [...this.admins];
+  }
+
   /**
    * Reload ACL state from the registry doc.
    */

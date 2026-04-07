@@ -81,7 +81,8 @@ CLASS_MAP = {
     "InMemoryNonceStore": ["InMemoryNonceStore"],
     "MeshState": ["MeshState"],
     "AsterConfig": ["AsterConfig"],
-    "ContractManifest": ["ContractManifest"],
+    "ContractManifest": ["ContractManifest", "FatalContractMismatch"],
+    "ForyConfig": ["ForyConfig", "ResolvedForyConfig"],
     "EndpointLease": ["EndpointLease"],
     "ServiceSummary": ["ServiceSummary"],
     "RegistryClient": ["RegistryClient"],
@@ -167,13 +168,14 @@ METHOD_MAP = {
     # Transport local
     "remote_id": ["remoteId"],
     # Codec
-    "wire_type": ["wireType", "WIRE_TYPE_KEY"],
+    "wire_type": ["wireType", "WIRE_TYPE_KEY", "getWireType"],
     "resolved_xlang": ["resolvedXlang"],
     "to_kwargs": ["toKwargs"],
     "encode_row_schema": ["encodeRowSchema"],
     "decode_row_data": ["decodeRowData"],
     "registered_types": ["registeredTypes"],
     # Contract
+    "save": ["save", "saveManifest"],
     "contract_id_from_service": ["contractIdFromService"],
     "build_type_graph": ["buildTypeGraph", "walkTypeGraph"],
     "from_service_info": ["fromServiceInfo"],

@@ -247,4 +247,48 @@ function concatBytes(arrays: Uint8Array[]): Uint8Array {
   return result;
 }
 
+// ── Key utilities ─────────────────────────────────────────────────────────────
+
+/**
+ * Generate a root keypair (alias for generateKeypair).
+ * Returns [privateKey, publicKey] as raw 32-byte arrays.
+ */
+export async function generateRootKeypair(): Promise<[Uint8Array, Uint8Array]> {
+  return generateKeypair();
+}
+
+/**
+ * Load a raw 32-byte private key.
+ * Returns the key as-is (validates length).
+ */
+export function loadPrivateKey(privRaw: Uint8Array): Uint8Array {
+  if (privRaw.byteLength !== 32) {
+    throw new TypeError(`Invalid private key length: expected 32, got ${privRaw.byteLength}`);
+  }
+  return privRaw;
+}
+
+/**
+ * Load a raw 32-byte public key.
+ * Returns the key as-is (validates length).
+ */
+export function loadPublicKey(pubRaw: Uint8Array): Uint8Array {
+  if (pubRaw.byteLength !== 32) {
+    throw new TypeError(`Invalid public key length: expected 32, got ${pubRaw.byteLength}`);
+  }
+  return pubRaw;
+}
+
+/**
+ * Verify an ed25519 signature.
+ * Alias for the low-level `verify()` with a consistent signature.
+ */
+export async function verifySignature(
+  publicKey: Uint8Array,
+  message: Uint8Array,
+  signature: Uint8Array,
+): Promise<boolean> {
+  return verify(publicKey, message, signature);
+}
+
 export { hexToBytes, bytesToHex, concatBytes };

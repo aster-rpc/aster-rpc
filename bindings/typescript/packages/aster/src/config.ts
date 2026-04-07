@@ -291,6 +291,42 @@ function parseTomlValue(raw: string): unknown {
   return raw;
 }
 
+/**
+ * Load endpoint config from a file path (alias for configFromFile).
+ */
+export function loadEndpointConfig(filePath: string): AsterConfig {
+  return configFromFile(filePath);
+}
+
+/**
+ * Resolve the root public key from config (raw bytes or from file).
+ * Returns undefined if neither is set.
+ */
+export function resolveRootPubkey(config: AsterConfig): Uint8Array | undefined {
+  if (config.rootPubkey) return config.rootPubkey;
+  if (config.rootPubkeyFile) {
+    try {
+      const { readFileSync } = require('node:fs');
+      const hex = readFileSync(config.rootPubkeyFile, 'utf-8').trim();
+      return new Uint8Array(Buffer.from(hex, 'hex'));
+    } catch { return undefined; }
+  }
+  return undefined;
+}
+
+/**
+ * Convert AsterConfig to an endpoint-specific config subset.
+ * Returns the config fields relevant to network endpoint setup.
+ */
+export function toEndpointConfig(config: AsterConfig): Record<string, unknown> {
+  return {
+    secretKey: config.secretKey,
+    bindAddr: config.bindAddr,
+    relayMode: config.relayMode,
+    storagePath: config.storagePath,
+  };
+}
+
 /** Print resolved config (masks sensitive values). */
 export function printConfig(config: AsterConfig): void {
   const mask = (v: unknown) => v ? '****' : '<not set>';

@@ -85,6 +85,47 @@ export class DynamicTypeFactory {
     return this.types.get(wireTag);
   }
 
+  /** Get a type by wire tag (alias for get()). */
+  getType(wireTag: string): DynamicType | undefined {
+    return this.types.get(wireTag);
+  }
+
+  /** Return all synthesized types. */
+  getAllTypes(): DynamicType[] {
+    return [...this.types.values()];
+  }
+
+  /** Number of registered types. */
+  get typeCount(): number {
+    return this.types.size;
+  }
+
+  /**
+   * Register types from a manifest's method descriptors.
+   * Synthesizes request and response types for all methods.
+   */
+  registerFromManifest(manifest: { methods: ManifestMethod[] }): void {
+    for (const method of manifest.methods) {
+      this.synthesizeForMethod(method);
+    }
+  }
+
+  /**
+   * Build a request object for a method using default values.
+   * Returns an instance of the synthesized request type.
+   */
+  buildRequest(method: ManifestMethod, overrides?: Record<string, unknown>): unknown {
+    if (!method.requestWireTag) return overrides ?? {};
+    let type = this.types.get(method.requestWireTag);
+    if (!type && method.fields) {
+      type = createDynamicType(method.requestWireTag, method.fields);
+      this.types.set(method.requestWireTag, type);
+    }
+    if (!type) return overrides ?? {};
+    const instance = new (type as any)(overrides);
+    return instance;
+  }
+
   /** All synthesized types. */
   allTypes(): IterableIterator<[string, DynamicType]> {
     return this.types.entries();

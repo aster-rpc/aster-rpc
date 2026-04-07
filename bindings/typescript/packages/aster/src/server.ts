@@ -404,4 +404,23 @@ export class RpcServer {
     }
     this._connections.clear();
   }
+
+  /** The service registry used by this server. */
+  get serviceRegistry(): ServiceRegistry {
+    return this.registry;
+  }
+
+  /**
+   * Wait until the server is stopped (i.e., close() is called).
+   * Returns a promise that resolves when serving ends.
+   */
+  async waitUntilStopped(): Promise<void> {
+    return new Promise<void>(resolve => {
+      const check = (): void => {
+        if (!this._serving) { resolve(); return; }
+        setTimeout(check, 50);
+      };
+      check();
+    });
+  }
 }

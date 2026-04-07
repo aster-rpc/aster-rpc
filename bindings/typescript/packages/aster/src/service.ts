@@ -121,4 +121,34 @@ export class ServiceRegistry {
   get size(): number {
     return this._services.size;
   }
+
+  /** Get all registered services as an array. */
+  getAllServices(): ServiceInfo[] {
+    return [...this._services.values()];
+  }
+}
+
+/** Look up a method on a service info object. */
+export function getMethod(serviceInfo: ServiceInfo, methodName: string): MethodInfo | undefined {
+  return serviceInfo.methods.get(methodName);
+}
+
+/** Check if a service has a method. */
+export function hasMethod(serviceInfo: ServiceInfo, methodName: string): boolean {
+  return serviceInfo.methods.has(methodName);
+}
+
+// ── Default registry singleton ────────────────────────────────────────────────
+
+let _defaultRegistry: ServiceRegistry | undefined;
+
+/** Get the process-wide default registry (creates one if not set). */
+export function getDefaultRegistry(): ServiceRegistry {
+  if (!_defaultRegistry) _defaultRegistry = new ServiceRegistry();
+  return _defaultRegistry;
+}
+
+/** Set the process-wide default registry. */
+export function setDefaultRegistry(registry: ServiceRegistry): void {
+  _defaultRegistry = registry;
 }
