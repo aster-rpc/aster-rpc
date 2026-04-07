@@ -43,7 +43,6 @@ class Transport(Protocol):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
     ) -> Any:
         """Perform a unary RPC call.
 
@@ -54,7 +53,7 @@ class Transport(Protocol):
             metadata: Optional key/value pairs sent in StreamHeader.
             deadline_epoch_ms: Deadline for the call (Unix epoch ms).
             serialization_mode: Serialization mode (XLANG=0, NATIVE=1, ROW=2).
-            contract_id: The contract identity hash.
+
 
         Returns:
             The deserialized response message.
@@ -74,7 +73,6 @@ class Transport(Protocol):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
     ) -> AsyncIterator[Any]:
         """Initiate a server-streaming RPC.
 
@@ -85,7 +83,7 @@ class Transport(Protocol):
             metadata: Optional key/value pairs sent in StreamHeader.
             deadline_epoch_ms: Deadline for the call (Unix epoch ms).
             serialization_mode: Serialization mode.
-            contract_id: The contract identity hash.
+
 
         Yields:
             Deserialized response messages as they arrive.
@@ -105,7 +103,6 @@ class Transport(Protocol):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
     ) -> Any:
         """Perform a client-streaming RPC.
 
@@ -116,7 +113,7 @@ class Transport(Protocol):
             metadata: Optional key/value pairs sent in StreamHeader.
             deadline_epoch_ms: Deadline for the call (Unix epoch ms).
             serialization_mode: Serialization mode.
-            contract_id: The contract identity hash.
+
 
         Returns:
             The deserialized response message.
@@ -135,7 +132,6 @@ class Transport(Protocol):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
     ) -> BidiChannel:
         """Initiate a bidirectional-streaming RPC.
 
@@ -145,7 +141,7 @@ class Transport(Protocol):
             metadata: Optional key/value pairs sent in StreamHeader.
             deadline_epoch_ms: Deadline for the call (Unix epoch ms).
             serialization_mode: Serialization mode.
-            contract_id: The contract identity hash.
+
 
         Returns:
             A BidiChannel for sending and receiving messages.

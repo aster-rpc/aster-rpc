@@ -61,15 +61,15 @@ jobs:
 
       - name: Typecheck
         working-directory: bindings/typescript/packages/aster
-        run: bunx tsc --noEmit
+        run: bunx --bun tsc --noEmit
 
       - name: Run tests (bun + vitest)
         working-directory: bindings/typescript/packages/aster
-        run: bunx vitest run
+        run: bunx --bun vitest run
 
       - name: Validate conformance vectors
         working-directory: bindings/typescript/packages/aster
-        run: bunx vitest run ../../tests/unit/framing.test.ts
+        run: bunx --bun vitest run ../../tests/unit/framing.test.ts
 
   # ── NAPI-RS: cargo check ───────────────────────────────────────────
   napi-check:

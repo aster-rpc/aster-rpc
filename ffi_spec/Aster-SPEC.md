@@ -907,8 +907,7 @@ serialization mode) so any language can route it:
 StreamHeader {
     service: string             // e.g. "AgentControl"
     method: string              // e.g. "assign_task"
-    version: int32              // Human-facing service version label
-    contract_id: string         // BLAKE3 of canonical contract bytes; authoritative compatibility key
+    version: int32              // Service version; used with service name for dispatch
     call_id: string             // UUID, unique per call
     deadline_epoch_ms: int64    // Absolute deadline (ms since Unix epoch), 0 = none
     serialization_mode: uint8   // Selected mode for this call (see §6.2.1 for selection algorithm);
@@ -918,11 +917,17 @@ StreamHeader {
 }
 ```
 
-The `version` field is a human-facing routing hint. `contract_id` is the
-authoritative identity of the service contract and must match the published
-canonical contract selected during registry resolution. Servers must reject the
-call with `FAILED_PRECONDITION` if the referenced contract is unknown, disabled,
-or incompatible with the selected method or serialization mode.
+The server dispatches by `(service, method, version)`. The `version` field is
+mandatory and must match a registered service version. Servers must reject the
+call with `NOT_FOUND` if the `(service, version)` pair is unknown.
+
+**Rationale for omitting `contract_id`:** Contract identity verification happens
+during consumer admission (§10), where the producer advertises `ServiceSummary`
+entries containing `contract_id`. By the time a client sends RPCs, both sides
+have already agreed on which contracts are available. Repeating `contract_id`
+on every stream would add ~64 bytes per RPC for a check that is redundant with
+the admission handshake. The `(service, method, version)` triple is sufficient
+for dispatch and produces readable error messages and log entries.
 
 **Session-scoped streams:** When `method` is an empty string (`""`), the stream
 is a session-scoped stream (see session-scoped services addendum).

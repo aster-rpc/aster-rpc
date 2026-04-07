@@ -14,7 +14,6 @@ export interface CallOptions {
   metadata?: Record<string, string>;
   deadlineEpochMs?: number;
   serializationMode?: number;
-  contractId?: string;
   callId?: string;
 }
 

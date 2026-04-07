@@ -151,7 +151,7 @@ class IrohTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
+
     ) -> Any:
         """Perform a unary RPC call over Iroh QUIC.
 
@@ -172,7 +172,7 @@ class IrohTransport(Transport):
                 service=service,
                 method=method,
                 version=1,
-                contract_id=contract_id,
+
                 call_id=call_id,
                 deadline_epoch_ms=deadline_epoch_ms,
                 serialization_mode=serialization_mode,
@@ -250,7 +250,7 @@ class IrohTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
+
     ) -> AsyncIterator[Any]:
         """Initiate a server-streaming RPC.
 
@@ -262,7 +262,7 @@ class IrohTransport(Transport):
         """
         return self._server_stream_impl(
             service, method, request, metadata,
-            deadline_epoch_ms, serialization_mode, contract_id,
+            deadline_epoch_ms, serialization_mode,
         )
 
     async def _server_stream_impl(
@@ -273,7 +273,6 @@ class IrohTransport(Transport):
         metadata: dict[str, str] | None,
         deadline_epoch_ms: int,
         serialization_mode: int,
-        contract_id: str,
     ) -> AsyncIterator[Any]:
         call_id = str(uuid.uuid4())
         send, recv = await self._conn.open_bi()
@@ -285,7 +284,7 @@ class IrohTransport(Transport):
                 service=service,
                 method=method,
                 version=1,
-                contract_id=contract_id,
+
                 call_id=call_id,
                 deadline_epoch_ms=deadline_epoch_ms,
                 serialization_mode=serialization_mode,
@@ -349,7 +348,7 @@ class IrohTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
+
     ) -> Any:
         """Perform a client-streaming RPC.
 
@@ -370,7 +369,7 @@ class IrohTransport(Transport):
                 service=service,
                 method=method,
                 version=1,
-                contract_id=contract_id,
+
                 call_id=call_id,
                 deadline_epoch_ms=deadline_epoch_ms,
                 serialization_mode=serialization_mode,
@@ -437,7 +436,7 @@ class IrohTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
         serialization_mode: int = 0,
-        contract_id: str = "",
+
     ) -> BidiChannel:
         """Initiate a bidirectional-streaming RPC."""
         return IrohBidiChannel(
@@ -448,7 +447,6 @@ class IrohTransport(Transport):
             metadata=metadata,
             deadline_epoch_ms=deadline_epoch_ms,
             serialization_mode=serialization_mode,
-            contract_id=contract_id,
         )
 
 
@@ -471,7 +469,6 @@ class IrohBidiChannel(BidiChannel):
         metadata: dict[str, str] | None,
         deadline_epoch_ms: int,
         serialization_mode: int,
-        contract_id: str,
     ) -> None:
         self._conn = connection
         self._codec = codec
@@ -480,7 +477,6 @@ class IrohBidiChannel(BidiChannel):
         self._metadata = metadata
         self._deadline_epoch_ms = deadline_epoch_ms
         self._serialization_mode = serialization_mode
-        self._contract_id = contract_id
         self._send: "aster.IrohSendStream | None" = None
         self._recv: "aster.IrohRecvStream | None" = None
         self._header_written = False
@@ -516,7 +512,6 @@ class IrohBidiChannel(BidiChannel):
             service=self._service,
             method=self._method,
             version=1,
-            contract_id=self._contract_id,
             call_id=call_id,
             deadline_epoch_ms=self._deadline_epoch_ms,
             serialization_mode=self._serialization_mode,

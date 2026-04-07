@@ -164,9 +164,9 @@ export class RpcServer {
       }
 
       // Look up service
-      const svcInfo = this.registry.lookup(header.service);
+      const svcInfo = this.registry.lookup(header.service, header.version);
       if (!svcInfo) {
-        await this.writeErrorTrailer(send, StatusCode.NOT_FOUND, `service '${header.service}' not found`);
+        await this.writeErrorTrailer(send, StatusCode.NOT_FOUND, `service '${header.service}' v${header.version} not found`);
         return;
       }
 

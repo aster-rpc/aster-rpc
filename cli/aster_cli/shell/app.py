@@ -847,7 +847,7 @@ class DirectoryDemoConnection:
         return []
 
     async def read_blob(self, blob_hash: str) -> bytes:
-        return b"(directory demo — no blob content)"
+        return b"(directory demo -- no blob content)"
 
     async def invoke(
         self, service: str, method: str, payload: dict[str, Any]
@@ -955,25 +955,108 @@ async def _populate_from_connection(root, connection) -> tuple[int, int]:
     return svc_count, blob_count
 
 
+# ── Directory VFS population ─────────────────────────────────────────────────
+
+
+async def _populate_directory(root, connection) -> int:
+    """Pre-populate the /aster/ directory VFS. Returns handle count."""
+    aster_node = root.child("aster")
+    if not aster_node:
+        return 0
+
+    handle_count = 0
+    try:
+        from aster_cli.shell.vfs import VfsNode, NodeKind
+
+        handles = await connection.list_handles()
+        for h in handles:
+            name = h.get("handle") or h.get("pubkey_hash", "???")
+            handle_node = VfsNode(
+                name=name,
+                kind=NodeKind.HANDLE,
+                path=f"/aster/{name}",
+                metadata=h,
+            )
+            aster_node.add_child(handle_node)
+            handle_count += 1
+
+            # Pre-populate services for each handle
+            info = await connection.get_handle_info(name)
+
+            readme_text = info.get("readme", "")
+            if readme_text:
+                readme_node = VfsNode(
+                    name="README.md",
+                    kind=NodeKind.README,
+                    path=f"/aster/{name}/README.md",
+                    metadata={"content": readme_text},
+                    loaded=True,
+                )
+                handle_node.add_child(readme_node)
+
+            for svc in info.get("services", []):
+                svc_name = svc.get("name", "???")
+                published = svc.get("published", False)
+
+                if published:
+                    display_name = svc_name
+                else:
+                    short_hash = svc.get("contract_hash", "??????")[:10]
+                    display_name = f"{short_hash}... ({svc_name})"
+
+                svc_node = VfsNode(
+                    name=display_name,
+                    kind=NodeKind.SERVICE,
+                    path=f"/aster/{name}/{display_name}",
+                    metadata=svc,
+                )
+                for m in svc.get("methods", []):
+                    m_name = m.get("name", str(m)) if isinstance(m, dict) else str(m)
+                    m_node = VfsNode(
+                        name=m_name,
+                        kind=NodeKind.METHOD,
+                        path=f"/aster/{name}/{display_name}/{m_name}",
+                        metadata=m if isinstance(m, dict) else {"name": m_name},
+                        loaded=True,
+                    )
+                    svc_node.add_child(m_node)
+                svc_node.loaded = True
+                handle_node.add_child(svc_node)
+
+            handle_node.loaded = True
+
+        aster_node.loaded = True
+    except Exception:
+        aster_node.loaded = True
+
+    return handle_count
+
+
 # ── Shell REPL ────────────────────────────────────────────────────────────────
 
 async def _run_shell(
     connection: Any,
     peer_name: str,
     raw: bool = False,
+    directory_mode: bool = False,
 ) -> None:
     """Run the interactive shell REPL."""
     console = Console()
     display = Display(console=console, raw=raw)
 
-    # Build VFS
-    root = build_root()
+    if directory_mode:
+        root = build_directory_root()
+        handle_count = await _populate_directory(root, connection)
+        display.directory_welcome(peer_name, handle_count)
+    else:
+        # Build VFS
+        root = build_root()
 
-    # Pre-populate from connection
-    svc_count, blob_count = await _populate_from_connection(root, connection)
+        # Pre-populate from connection
+        svc_count, blob_count = await _populate_from_connection(root, connection)
 
-    # Welcome banner
-    display.welcome(peer_name, svc_count, blob_count)
+        # Welcome banner
+        display.welcome(peer_name, svc_count, blob_count)
 
     # ── Guided tour ───────────────────────────────────────────────────────
     from aster_cli.shell.guide import (
@@ -984,7 +1067,11 @@ async def _run_shell(
         mark_tour_complete,
     )
 
-    if is_first_time() and not raw:
+    if directory_mode:
+        # Directory mode has its own UX flow — skip the peer tour
+        guide = GuideManager(display)
+        guide.disable()
+    elif is_first_time() and not raw:
         guide = GuideManager(display, tour=DEFAULT_TOUR)
         guide.fire("connected")
     else:
@@ -992,7 +1079,10 @@ async def _run_shell(
         guide.disable()
 
     # Shell state
-    cwd = "/"
+    if directory_mode:
+        cwd = f"/aster/{peer_name}"
+    else:
+        cwd = "/"
     _last_ctrl_c = 0.0  # timestamp of last Ctrl+C for double-tap exit
 
     # Command context (mutable — cwd updates)
@@ -1129,6 +1219,7 @@ async def launch_shell(
     peer_addr: str | None = None,
     rcan_path: str | None = None,
     demo: bool = False,
+    demo2: bool = False,
 ) -> None:
     """Launch the interactive shell.
 
@@ -1136,7 +1227,18 @@ async def launch_shell(
         peer_addr: Address of the peer to connect to.
         rcan_path: Path to RCAN credential file.
         demo: If True, use demo connection (no real peer).
+        demo2: If True, use directory demo (aster.site browsing).
     """
+    if demo2:
+        connection = DirectoryDemoConnection()
+        peer_name = DirectoryDemoConnection.MY_HANDLE
+        await connection.connect()
+        try:
+            await _run_shell(connection, peer_name, directory_mode=True)
+        finally:
+            await connection.close()
+        return
+
     if demo or peer_addr is None:
         connection = DemoConnection()
         peer_name = "demo"
@@ -1177,6 +1279,11 @@ def register_shell_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="Launch in demo mode with sample data",
     )
     shell_parser.add_argument(
+        "--demo2",
+        action="store_true",
+        help=argparse.SUPPRESS,  # undocumented
+    )
+    shell_parser.add_argument(
         "--json",
         action="store_true",
         dest="raw_json",
@@ -1186,13 +1293,15 @@ def register_shell_subparser(subparsers: argparse._SubParsersAction) -> None:
 
 def run_shell_command(args: argparse.Namespace) -> int:
     """Execute the ``aster shell`` command."""
-    demo = args.demo or args.peer is None
+    demo2 = getattr(args, "demo2", False)
+    demo = args.demo or (args.peer is None and not demo2)
 
     try:
         asyncio.run(launch_shell(
             peer_addr=args.peer,
             rcan_path=args.rcan,
             demo=demo,
+            demo2=demo2,
         ))
     except KeyboardInterrupt:
         pass

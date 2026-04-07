@@ -235,6 +235,90 @@ class Display:
         )
         self.console.print()
 
+    def directory_welcome(self, handle: str, handle_count: int) -> None:
+        """Display the welcome banner for directory mode."""
+        self.console.print()
+        self.console.print(
+            Panel(
+                f"[bold]aster.site[/bold] [dim]— service directory[/dim]\n"
+                f"[dim]Logged in as[/dim] [bold cyan]{escape(handle)}[/bold cyan]"
+                f" [dim]({handle_count} handles in directory)[/dim]",
+                border_style="#61D6C2",
+                padding=(0, 2),
+            )
+        )
+        self.console.print()
+
+    def handle_listing(self, handles: list[dict[str, Any]]) -> None:
+        """Display a listing of handles in the directory."""
+        if self.raw:
+            self.console.print(json.dumps(handles, default=str), highlight=False)
+            return
+
+        for h in handles:
+            name = h.get("name", "?")
+            registered = h.get("registered", True)
+            svc_count = h.get("service_count", 0)
+            description = h.get("description", "")
+
+            if registered:
+                line = f"[bold cyan]{escape(name)}/[/bold cyan]"
+            else:
+                line = f"[dim]{escape(name)}/[/dim]"
+
+            detail_parts = []
+            if svc_count:
+                detail_parts.append(f"{svc_count} services")
+            if description:
+                detail_parts.append(description)
+            if detail_parts:
+                line += f"    [dim]{escape(' — '.join(detail_parts))}[/dim]"
+
+            self.console.print(f"  {line}")
+
+    def handle_service_listing(self, services: list[dict[str, Any]], handle: str) -> None:
+        """Display services within a handle's directory."""
+        if self.raw:
+            self.console.print(json.dumps(services, default=str), highlight=False)
+            return
+
+        table = Table(
+            title=f"[bold]{escape(handle)}[/bold]",
+            show_header=True,
+            header_style="bold",
+            box=None,
+            padding=(0, 2),
+        )
+        table.add_column("Service", style="cyan bold")
+        table.add_column("Methods", justify="right")
+        table.add_column("Version", justify="right", style="dim")
+        table.add_column("Endpoints", justify="right", style="dim")
+        table.add_column("Description", style="dim")
+
+        for svc in services:
+            name = svc.get("display_name", svc.get("name", "?"))
+            published = svc.get("published", True)
+            style = "" if published else "dim"
+
+            table.add_row(
+                Text(name, style=f"cyan bold {style}".strip()),
+                str(svc.get("method_count", "?")),
+                f"v{svc.get('version', '?')}",
+                str(svc.get("endpoints", 0)) if published else "-",
+                svc.get("description", ""),
+            )
+
+        self.console.print(table)
+
+    def readme_content(self, content: str) -> None:
+        """Display README.md content with basic markdown rendering."""
+        if self.raw:
+            self.console.print(content, highlight=False)
+            return
+
+        from rich.markdown import Markdown
+        self.console.print(Markdown(content))
+
 
 def _format_size(size_bytes: int) -> str:
     """Human-readable file size."""
