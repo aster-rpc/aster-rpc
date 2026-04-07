@@ -79,6 +79,24 @@ class RpcPattern:
     BIDI_STREAM = "bidi_stream"
 
 
+# ── Docstring helper ──────────────────────────────────────────────────────────
+
+
+def _first_paragraph(doc: str | None) -> str | None:
+    """Extract the first paragraph from a docstring, stripped and cleaned."""
+    if not doc:
+        return None
+    lines = doc.strip().splitlines()
+    paragraph: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped and paragraph:
+            break
+        if stripped:
+            paragraph.append(stripped)
+    return " ".join(paragraph) if paragraph else None
+
+
 # ── Decorator metadata storage ─────────────────────────────────────────────────
 
 # These are set on decorated classes and methods by the decorators.
@@ -151,7 +169,7 @@ class _Decorator:
 
 class _RpcDecorator:
     """Callable class for @rpc decorator.
-    
+
     Supports both @rpc (no parens) and @rpc() (with parens) syntax.
     """
 
@@ -161,11 +179,13 @@ class _RpcDecorator:
         idempotent: bool = False,
         serialization: SerializationMode | None = None,
         requires: CapabilityRequirement | None = None,
+        metadata: Any = None,
     ):
         self._timeout = timeout
         self._idempotent = idempotent
         self._serialization = serialization
         self._requires = requires
+        self._metadata = metadata
 
     def __call__(
         self,
@@ -174,6 +194,7 @@ class _RpcDecorator:
         idempotent: bool | None = None,
         serialization: SerializationMode | None = None,
         requires: CapabilityRequirement | None = None,
+        metadata: Any = None,
         **kwargs: Any,
     ) -> Callable[P, Any]:
         # Handle @rpc(...) - return a new configured decorator instance.
@@ -183,6 +204,7 @@ class _RpcDecorator:
                 idempotent=idempotent if idempotent is not None else self._idempotent,
                 serialization=serialization if serialization is not None else self._serialization,
                 requires=requires if requires is not None else self._requires,
+                metadata=metadata if metadata is not None else self._metadata,
             )
 
         # Get the method - merge options
@@ -190,11 +212,19 @@ class _RpcDecorator:
         final_idempotent = idempotent if idempotent is not None else self._idempotent
         final_serial = serialization if serialization is not None else self._serialization
         final_requires = requires if requires is not None else self._requires
+        final_metadata = metadata if metadata is not None else self._metadata
 
         if not asyncio.iscoroutinefunction(method):
             raise TypeError(
                 f"@rpc method {method.__name__} must be an async function"
             )
+
+        # Auto-capture from docstring if no explicit metadata
+        if final_metadata is None:
+            doc = _first_paragraph(method.__doc__)
+            if doc:
+                from aster.metadata import Metadata
+                final_metadata = Metadata(description=doc)
 
         method_info = MethodInfo(
             name=method.__name__,
@@ -205,6 +235,7 @@ class _RpcDecorator:
             idempotent=final_idempotent,
             serialization=final_serial,
             requires=final_requires,
+            metadata=final_metadata,
         )
         setattr(method, _METHOD_INFO_ATTR, method_info)
         return method
@@ -221,6 +252,7 @@ def server_stream(
     method_or_timeout: Callable[P, AsyncIterator[Any]] | float | None = None,
     timeout: float | None = None,
     serialization: SerializationMode | None = None,
+    metadata: Any = None,
 ) -> Callable[P, AsyncIterator[Any]]:
     """Decorator to mark a method as a server-streaming RPC.
 
@@ -249,14 +281,14 @@ def server_stream(
     # Handle @server_stream (no parens) - method is passed directly
     if callable(method_or_timeout):
         method = method_or_timeout
-        _apply_server_stream_decorator(method, timeout=timeout, serialization=serialization)
+        _apply_server_stream_decorator(method, timeout=timeout, serialization=serialization, metadata=metadata)
         return method
 
     # Handle @server_stream() or @server_stream(timeout=...)
     actual_timeout = method_or_timeout if method_or_timeout is not None else timeout
 
     def decorator(method: Callable[P, AsyncIterator[Any]]) -> Callable[P, AsyncIterator[Any]]:
-        _apply_server_stream_decorator(method, timeout=actual_timeout, serialization=serialization)
+        _apply_server_stream_decorator(method, timeout=actual_timeout, serialization=serialization, metadata=metadata)
         return method
 
     return decorator
@@ -266,6 +298,7 @@ def _apply_server_stream_decorator(
     method: Callable,
     timeout: float | None = None,
     serialization: SerializationMode | None = None,
+    metadata: Any = None,
 ) -> None:
     """Apply the server_stream decorator to a method."""
     if not inspect.isasyncgenfunction(method):
@@ -273,6 +306,13 @@ def _apply_server_stream_decorator(
             f"@server_stream method {method.__name__} must be an async generator "
             f"(use 'async def' with 'yield')"
         )
+
+    # Auto-capture from docstring if no explicit metadata
+    if metadata is None:
+        doc = _first_paragraph(method.__doc__)
+        if doc:
+            from aster.metadata import Metadata
+            metadata = Metadata(description=doc)
 
     method_info = MethodInfo(
         name=method.__name__,
@@ -282,6 +322,7 @@ def _apply_server_stream_decorator(
         timeout=timeout,
         idempotent=False,
         serialization=serialization,
+        metadata=metadata,
     )
     setattr(method, _METHOD_INFO_ATTR, method_info)
 
@@ -293,6 +334,7 @@ def client_stream(
     method_or_timeout: Callable[P, Any] | float | None = None,
     idempotent: bool = False,
     serialization: SerializationMode | None = None,
+    metadata: Any = None,
 ) -> Callable[P, Any] | Callable:
     """Decorator to mark a method as a client-streaming RPC.
 
@@ -323,14 +365,14 @@ def client_stream(
     # Handle @client_stream (no parens) - method is passed directly
     if callable(method_or_timeout):
         method = method_or_timeout
-        _apply_client_stream_decorator(method, idempotent=idempotent, serialization=serialization)
+        _apply_client_stream_decorator(method, idempotent=idempotent, serialization=serialization, metadata=metadata)
         return method
 
     # Handle @client_stream() or @client_stream(timeout=...)
     timeout = method_or_timeout
 
     def decorator(method: Callable[P, Any]) -> Callable[P, Any]:
-        _apply_client_stream_decorator(method, timeout=timeout, idempotent=idempotent, serialization=serialization)
+        _apply_client_stream_decorator(method, timeout=timeout, idempotent=idempotent, serialization=serialization, metadata=metadata)
         return method
 
     return decorator
@@ -341,12 +383,20 @@ def _apply_client_stream_decorator(
     timeout: float | None = None,
     idempotent: bool = False,
     serialization: SerializationMode | None = None,
+    metadata: Any = None,
 ) -> None:
     """Apply the client_stream decorator to a method."""
     if not asyncio.iscoroutinefunction(method):
         raise TypeError(
             f"@client_stream method {method.__name__} must be an async function"
         )
+
+    # Auto-capture from docstring if no explicit metadata
+    if metadata is None:
+        doc = _first_paragraph(method.__doc__)
+        if doc:
+            from aster.metadata import Metadata
+            metadata = Metadata(description=doc)
 
     method_info = MethodInfo(
         name=method.__name__,
@@ -356,6 +406,7 @@ def _apply_client_stream_decorator(
         timeout=timeout,
         idempotent=idempotent,
         serialization=serialization,
+        metadata=metadata,
     )
     setattr(method, _METHOD_INFO_ATTR, method_info)
 
@@ -367,6 +418,7 @@ def bidi_stream(
     method_or_timeout: Callable[P, AsyncIterator[Any]] | float | None = None,
     timeout: float | None = None,
     serialization: SerializationMode | None = None,
+    metadata: Any = None,
 ) -> Callable[P, AsyncIterator[Any]]:
     """Decorator to mark a method as a bidirectional-streaming RPC.
 
@@ -397,14 +449,14 @@ def bidi_stream(
     # Handle @bidi_stream (no parens) - method is passed directly
     if callable(method_or_timeout):
         method = method_or_timeout
-        _apply_bidi_stream_decorator(method, timeout=timeout, serialization=serialization)
+        _apply_bidi_stream_decorator(method, timeout=timeout, serialization=serialization, metadata=metadata)
         return method
 
     # Handle @bidi_stream() or @bidi_stream(timeout=...)
     actual_timeout = method_or_timeout if method_or_timeout is not None else timeout
 
     def decorator(method: Callable[P, AsyncIterator[Any]]) -> Callable[P, AsyncIterator[Any]]:
-        _apply_bidi_stream_decorator(method, timeout=actual_timeout, serialization=serialization)
+        _apply_bidi_stream_decorator(method, timeout=actual_timeout, serialization=serialization, metadata=metadata)
         return method
 
     return decorator
@@ -414,6 +466,7 @@ def _apply_bidi_stream_decorator(
     method: Callable,
     timeout: float | None = None,
     serialization: SerializationMode | None = None,
+    metadata: Any = None,
 ) -> None:
     """Apply the bidi_stream decorator to a method."""
     if not inspect.isasyncgenfunction(method):
@@ -421,6 +474,13 @@ def _apply_bidi_stream_decorator(
             f"@bidi_stream method {method.__name__} must be an async generator "
             f"(use 'async def' with 'yield')"
         )
+
+    # Auto-capture from docstring if no explicit metadata
+    if metadata is None:
+        doc = _first_paragraph(method.__doc__)
+        if doc:
+            from aster.metadata import Metadata
+            metadata = Metadata(description=doc)
 
     method_info = MethodInfo(
         name=method.__name__,
@@ -430,6 +490,7 @@ def _apply_bidi_stream_decorator(
         timeout=timeout,
         idempotent=False,
         serialization=serialization,
+        metadata=metadata,
     )
     setattr(method, _METHOD_INFO_ATTR, method_info)
 
@@ -447,6 +508,7 @@ def service(
     interceptors: list[type] | None = None,
     max_concurrent_streams: int | None = None,
     requires: CapabilityRequirement | None = None,
+    metadata: Any = None,
 ) -> Callable[[type], type] | type:
     """Class decorator to mark a class as an Aster RPC service.
 
@@ -485,6 +547,7 @@ def service(
             interceptors=interceptors,
             max_concurrent_streams=max_concurrent_streams,
             requires=requires,
+            metadata=metadata,
         )
 
     # @service() or @service("Foo") or @service(name="Foo", version=2)
@@ -500,6 +563,7 @@ def service(
             interceptors=interceptors,
             max_concurrent_streams=max_concurrent_streams,
             requires=requires,
+            metadata=metadata,
         )
 
     return decorator
@@ -515,6 +579,7 @@ def _apply_service_decorator(
     interceptors: list[type] | None,
     max_concurrent_streams: int | None,
     requires: CapabilityRequirement | None = None,
+    metadata: Any = None,
 ) -> type:
     """Internal: apply the @service decorator logic to a class."""
     if not isinstance(cls, type):
@@ -538,6 +603,13 @@ def _apply_service_decorator(
     # Scan all methods to collect type information
     methods = _scan_service_methods(cls, serialization)
 
+    # Auto-capture metadata from class docstring if not provided
+    if metadata is None:
+        doc = _first_paragraph(cls.__doc__)
+        if doc:
+            from aster.metadata import Metadata
+            metadata = Metadata(description=doc)
+
     # Store service info on the class
     service_info = ServiceInfo(
         name=name,
@@ -548,6 +620,7 @@ def _apply_service_decorator(
         interceptors=list(interceptors) if interceptors else [],
         max_concurrent_streams=max_concurrent_streams,
         requires=requires,
+        metadata=metadata,
     )
     setattr(cls, _SERVICE_INFO_ATTR, service_info)
 

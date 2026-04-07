@@ -59,7 +59,12 @@ impl IrohConnection {
     /// Read the next datagram.
     #[napi]
     pub async fn read_datagram(&self) -> Result<Buffer> {
-        let data = self.inner.clone().read_datagram().await.map_err(to_napi_err)?;
+        let data = self
+            .inner
+            .clone()
+            .read_datagram()
+            .await
+            .map_err(to_napi_err)?;
         Ok(Buffer::from(data))
     }
 
@@ -113,17 +118,17 @@ impl IrohBiStream {
     /// Take the send stream (can only be called once).
     #[napi]
     pub fn take_send(&mut self) -> Result<IrohSendStream> {
-        self.send.take().ok_or_else(|| {
-            napi::Error::from_reason("send stream already taken".to_string())
-        })
+        self.send
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("send stream already taken".to_string()))
     }
 
     /// Take the recv stream (can only be called once).
     #[napi]
     pub fn take_recv(&mut self) -> Result<IrohRecvStream> {
-        self.recv.take().ok_or_else(|| {
-            napi::Error::from_reason("recv stream already taken".to_string())
-        })
+        self.recv
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("recv stream already taken".to_string()))
     }
 }
 

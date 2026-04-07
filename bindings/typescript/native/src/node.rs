@@ -85,14 +85,21 @@ impl IrohNode {
     /// Take the hook receiver (one-shot). Returns null if hooks not enabled.
     #[napi]
     pub fn take_hook_receiver(&self) -> Option<NodeHookReceiver> {
-        self.inner.take_hook_receiver().map(NodeHookReceiver::from_core)
+        self.inner
+            .take_hook_receiver()
+            .map(NodeHookReceiver::from_core)
     }
 
     /// Accept the next incoming aster-ALPN connection.
     /// Returns [alpn, connection].
     #[napi]
     pub async fn accept_aster(&self) -> Result<IrohConnection> {
-        let (_alpn, conn) = self.inner.clone().accept_aster().await.map_err(to_napi_err)?;
+        let (_alpn, conn) = self
+            .inner
+            .clone()
+            .accept_aster()
+            .await
+            .map_err(to_napi_err)?;
         Ok(IrohConnection::from(conn))
     }
 
@@ -118,6 +125,18 @@ impl IrohNode {
     #[napi]
     pub fn add_node_addr(&self, other: &IrohNode) -> Result<()> {
         self.inner.add_node_addr(&other.inner).map_err(to_napi_err)
+    }
+
+    /// Connect to a remote node by its endpoint ID (hex) and ALPN.
+    /// Returns an IrohConnection for sending/receiving streams.
+    #[napi]
+    pub async fn connect(&self, node_id: String, alpn: Buffer) -> Result<IrohConnection> {
+        let net = self.inner.net_client();
+        let conn = net
+            .connect(node_id, alpn.to_vec())
+            .await
+            .map_err(to_napi_err)?;
+        Ok(IrohConnection::from(conn))
     }
 
     /// Gracefully shut down the node.

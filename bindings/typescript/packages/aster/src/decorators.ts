@@ -25,6 +25,7 @@
 
 import { RpcPattern } from './types.js';
 import type { SerializationMode } from './types.js';
+import type { Metadata } from './metadata.js';
 import {
   SERVICE_INFO_KEY,
   METHOD_INFO_KEY,
@@ -41,6 +42,7 @@ export interface ServiceOptions {
   scoped?: 'shared' | 'stream';
   serialization?: SerializationMode[];
   requires?: CapabilityRequirement;
+  metadata?: Metadata;
 }
 
 /**
@@ -83,6 +85,7 @@ export function Service(options: ServiceOptions) {
       methods,
       serializationModes: options.serialization ?? [],
       requires: options.requires,
+      metadata: options.metadata,
       instance: undefined,
     };
 
@@ -98,6 +101,7 @@ interface RpcOptions {
   idempotent?: boolean;
   serialization?: SerializationMode;
   requires?: CapabilityRequirement;
+  metadata?: Metadata;
 }
 
 function methodDecorator(pattern: RpcPattern, options?: RpcOptions) {
@@ -115,6 +119,7 @@ function methodDecorator(pattern: RpcPattern, options?: RpcOptions) {
       serialization: options?.serialization,
       requires: options?.requires,
       handler: undefined, // filled in by @Service
+      metadata: options?.metadata,
     };
 
     (target as any)[METHOD_INFO_KEY] = info;
@@ -180,6 +185,15 @@ export function BidiStream(options?: RpcOptions) {
 /** Metadata key for wire type tag. */
 export const WIRE_TYPE_KEY = Symbol.for('aster.wire_type');
 
+/** Metadata key for wire type field metadata. */
+export const WIRE_TYPE_FIELDS_KEY = Symbol.for('aster.wire_type_fields');
+
+/** Options for @WireType decorator. */
+export interface WireTypeOptions {
+  /** Field-level metadata (field name -> Metadata). */
+  metadata?: Record<string, Metadata>;
+}
+
 /**
  * Register a class as a Fory XLANG wire type.
  *
@@ -190,14 +204,25 @@ export const WIRE_TYPE_KEY = Symbol.for('aster.wire_type');
  *   amount = 0;
  *   currency = "USD";
  * }
+ *
+ * @WireType("billing/Invoice", {
+ *   metadata: { amount: new Metadata({ description: "Total in cents" }) }
+ * })
+ * class InvoiceWithDocs {
+ *   amount = 0;
+ *   currency = "USD";
+ * }
  * ```
  */
-export function WireType(tag: string) {
+export function WireType(tag: string, options?: WireTypeOptions) {
   return function <T extends new (...args: any[]) => any>(
     target: T,
     _context: ClassDecoratorContext,
   ): T {
     (target as any)[WIRE_TYPE_KEY] = tag;
+    if (options?.metadata) {
+      (target as any)[WIRE_TYPE_FIELDS_KEY] = options.metadata;
+    }
     return target;
   };
 }

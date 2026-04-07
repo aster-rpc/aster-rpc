@@ -93,26 +93,45 @@ impl BlobsClient {
     /// Set a tag.
     #[napi]
     pub async fn tag_set(&self, name: String, hash_hex: String, format: String) -> Result<()> {
-        self.inner.clone().tag_set(name, hash_hex, format).await.map_err(to_napi_err)
+        self.inner
+            .clone()
+            .tag_set(name, hash_hex, format)
+            .await
+            .map_err(to_napi_err)
     }
 
     /// Get a tag. Returns null if not found.
     #[napi]
     pub async fn tag_get(&self, name: String) -> Result<Option<String>> {
-        let info = self.inner.clone().tag_get(name).await.map_err(to_napi_err)?;
+        let info = self
+            .inner
+            .clone()
+            .tag_get(name)
+            .await
+            .map_err(to_napi_err)?;
         Ok(info.map(|t| t.hash))
     }
 
     /// Delete a tag. Returns number of tags deleted.
     #[napi]
     pub async fn tag_delete(&self, name: String) -> Result<u32> {
-        self.inner.clone().tag_delete(name).await.map(|n| n as u32).map_err(to_napi_err)
+        self.inner
+            .clone()
+            .tag_delete(name)
+            .await
+            .map(|n| n as u32)
+            .map_err(to_napi_err)
     }
 
     /// List tags with a given prefix.
     #[napi]
     pub async fn tag_list_prefix(&self, prefix: String) -> Result<Vec<String>> {
-        let tags = self.inner.clone().tag_list_prefix(prefix).await.map_err(to_napi_err)?;
+        let tags = self
+            .inner
+            .clone()
+            .tag_list_prefix(prefix)
+            .await
+            .map_err(to_napi_err)?;
         Ok(tags.into_iter().map(|t| t.name).collect())
     }
 
@@ -121,13 +140,68 @@ impl BlobsClient {
     /// Get blob status (complete/partial/missing).
     #[napi]
     pub async fn blob_status(&self, hash_hex: String) -> Result<String> {
-        let status = self.inner.clone().blob_status(hash_hex).await.map_err(to_napi_err)?;
+        let status = self
+            .inner
+            .clone()
+            .blob_status(hash_hex)
+            .await
+            .map_err(to_napi_err)?;
         Ok(format!("{:?}", status))
     }
 
     /// Wait for a blob download to complete.
     #[napi]
     pub async fn blob_observe_complete(&self, hash_hex: String) -> Result<()> {
-        self.inner.clone().blob_observe_complete(hash_hex).await.map_err(to_napi_err)
+        self.inner
+            .clone()
+            .blob_observe_complete(hash_hex)
+            .await
+            .map_err(to_napi_err)
     }
+
+    /// Get a snapshot of blob download progress.
+    /// Returns { isComplete: boolean, size: number }.
+    #[napi]
+    pub async fn blob_observe_snapshot(&self, hash_hex: String) -> Result<BlobObserveResult> {
+        let result = self
+            .inner
+            .clone()
+            .blob_observe_snapshot(hash_hex)
+            .await
+            .map_err(to_napi_err)?;
+        Ok(BlobObserveResult {
+            is_complete: result.is_complete,
+            size: result.size as f64,
+        })
+    }
+
+    /// Get local info for a blob.
+    /// Returns { isComplete: boolean, localBytes: number }.
+    #[napi]
+    pub async fn blob_local_info(&self, hash_hex: String) -> Result<BlobLocalInfo> {
+        let result = self
+            .inner
+            .clone()
+            .blob_local_info(hash_hex)
+            .await
+            .map_err(to_napi_err)?;
+        Ok(BlobLocalInfo {
+            is_complete: result.is_complete,
+            local_bytes: result.local_bytes as f64,
+        })
+    }
+}
+
+/// Blob observe result.
+#[napi(object)]
+pub struct BlobObserveResult {
+    pub is_complete: bool,
+    pub size: f64,
+}
+
+/// Blob local info.
+#[napi(object)]
+pub struct BlobLocalInfo {
+    pub is_complete: bool,
+    pub local_bytes: f64,
 }

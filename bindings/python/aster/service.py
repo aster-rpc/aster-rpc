@@ -17,6 +17,7 @@ from aster.types import SerializationMode
 
 if TYPE_CHECKING:
     from aster.decorators import MethodInfo as DecoratorMethodInfo
+    from aster.metadata import Metadata
 
 
 # Re-export MethodInfo and ServiceInfo from decorators for backward compatibility
@@ -48,6 +49,7 @@ class MethodInfo:
     idempotent: bool = False
     serialization: SerializationMode | None = None
     requires: CapabilityRequirement | None = None
+    metadata: Metadata | None = None
 
 
 @dataclass
@@ -72,6 +74,7 @@ class ServiceInfo:
     interceptors: list[type] = field(default_factory=list)
     max_concurrent_streams: int | None = None
     requires: CapabilityRequirement | None = None
+    metadata: Metadata | None = None
 
     def get_method(self, method_name: str) -> MethodInfo | None:
         """Get a method by name.

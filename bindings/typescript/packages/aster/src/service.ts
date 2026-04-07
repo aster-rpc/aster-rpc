@@ -6,6 +6,7 @@
  */
 
 import type { RpcPattern, SerializationMode } from './types.js';
+import type { Metadata } from './metadata.js';
 
 /** Capability requirement for method-level access control. */
 export interface CapabilityRequirement {
@@ -24,6 +25,7 @@ export interface MethodInfo {
   serialization: SerializationMode | undefined;
   requires: CapabilityRequirement | undefined;
   handler: ((...args: any[]) => any) | undefined;
+  metadata: Metadata | undefined;
 }
 
 /** Service metadata describing an RPC service. */
@@ -34,6 +36,7 @@ export interface ServiceInfo {
   methods: Map<string, MethodInfo>;
   serializationModes: SerializationMode[];
   requires: CapabilityRequirement | undefined;
+  metadata: Metadata | undefined;
   /** The actual service instance (set when registered with a Server). */
   instance: unknown;
 }

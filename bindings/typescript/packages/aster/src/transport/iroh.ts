@@ -18,7 +18,8 @@ import {
 } from '../framing.js';
 import { StreamHeader, RpcStatus } from '../protocol.js';
 import { StatusCode, RpcError } from '../status.js';
-import type { AsterTransport, CallOptions, BidiChannel } from './base.js';
+import type { AsterTransport, CallOptions } from './base.js';
+import type { BidiChannel } from './base.js';
 
 /** QUIC connection interface (matches NAPI IrohConnection). */
 interface QuicConnection {
@@ -170,12 +171,78 @@ export class IrohTransport implements AsterTransport {
   }
 
   bidiStream(
-    _service: string,
-    _method: string,
-    _opts?: CallOptions,
+    service: string,
+    method: string,
+    opts?: CallOptions,
   ): BidiChannel {
-    // Bidi is complex — defer to future implementation
-    throw new RpcError(StatusCode.UNIMPLEMENTED, 'bidi_stream over IrohTransport not yet implemented');
+    const codec = this.codec;
+    const conn = this.conn;
+    const writeHeader = this.writeHeader.bind(this);
+    const checkTrailer = this.checkTrailer.bind(this);
+
+    // Open the stream eagerly but return a channel object
+    let sendStream: QuicSendStream | undefined;
+    let recvStream: QuicRecvStream | undefined;
+    let streamReady: Promise<void>;
+    let receiveDone = false;
+
+    streamReady = (async () => {
+      const bi = await conn.openBi();
+      sendStream = bi.takeSend();
+      recvStream = bi.takeRecv();
+      await writeHeader(sendStream, service, method, opts);
+    })();
+
+    const channel: BidiChannel = {
+      async send(msg: unknown): Promise<void> {
+        await streamReady;
+        const [payload, compressed] = codec.encodeCompressed(msg);
+        await writeFrame(sendStream!, payload, compressed ? COMPRESSED : 0);
+      },
+
+      async *[Symbol.asyncIterator](): AsyncIterator<unknown> {
+        await streamReady;
+        while (!receiveDone) {
+          try {
+            const frame = await readFrame(recvStream!, 0);
+            if (!frame) { receiveDone = true; return; }
+            const [data, flags] = frame;
+            if (flags & TRAILER) {
+              checkTrailer(data);
+              receiveDone = true;
+              return;
+            }
+            yield codec.decode(data);
+          } catch (e) {
+            receiveDone = true;
+            throw mapTransportError(e);
+          }
+        }
+      },
+
+      async close(): Promise<void> {
+        await streamReady;
+        await sendStream!.finish();
+      },
+
+      async waitForTrailer(): Promise<[StatusCode, string]> {
+        await streamReady;
+        // Drain remaining frames until trailer
+        while (!receiveDone) {
+          const frame = await readFrame(recvStream!, 0);
+          if (!frame) return [StatusCode.OK, ''];
+          const [data, flags] = frame;
+          if (flags & TRAILER) {
+            if (data.length === 0) return [StatusCode.OK, ''];
+            const status = codec.decode(data) as RpcStatus;
+            return [status.code as StatusCode, status.message];
+          }
+        }
+        return [StatusCode.OK, ''];
+      },
+    };
+
+    return channel;
   }
 
   async close(): Promise<void> {
