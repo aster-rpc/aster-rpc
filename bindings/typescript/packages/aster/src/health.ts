@@ -18,8 +18,27 @@ export interface HealthState {
 export interface HealthMetrics {
   health: { status: string; uptimeS: number };
   ready: { status: string; services: number };
-  rpc: { started: number; succeeded: number; failed: number; inFlight: number };
-  connections: { active: number; total: number };
+  rpc: {
+    started: number;
+    succeeded: number;
+    failed: number;
+    inFlight: number;
+    totalDurationS: number;
+    lastDurationS: number;
+  };
+  connections: {
+    active: number;
+    total: number;
+    streamsActive: number;
+    streamsTotal: number;
+  };
+  admission: {
+    attempted: number;
+    succeeded: number;
+    rejected: number;
+    errored: number;
+    lastAdmissionMs: number;
+  };
 }
 
 /**
@@ -80,33 +99,68 @@ export class HealthServer {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(m ?? {}));
     } else if (url === '/metrics/prometheus') {
-      const m = this.state?.metrics();
       res.writeHead(200, { 'Content-Type': 'text/plain' });
-      if (m) {
-        const lines = [
-          `# HELP aster_rpc_started_total Total RPC calls started`,
-          `# TYPE aster_rpc_started_total counter`,
-          `aster_rpc_started_total ${m.rpc.started}`,
-          `# HELP aster_rpc_succeeded_total Total successful RPCs`,
-          `# TYPE aster_rpc_succeeded_total counter`,
-          `aster_rpc_succeeded_total ${m.rpc.succeeded}`,
-          `# HELP aster_rpc_failed_total Total failed RPCs`,
-          `# TYPE aster_rpc_failed_total counter`,
-          `aster_rpc_failed_total ${m.rpc.failed}`,
-          `# HELP aster_rpc_in_flight Current in-flight RPCs`,
-          `# TYPE aster_rpc_in_flight gauge`,
-          `aster_rpc_in_flight ${m.rpc.inFlight}`,
-          `# HELP aster_connections_active Active connections`,
-          `# TYPE aster_connections_active gauge`,
-          `aster_connections_active ${m.connections.active}`,
-        ];
-        res.end(lines.join('\n') + '\n');
-      } else {
-        res.end('');
-      }
+      res.end(this.renderPrometheus());
     } else {
       res.writeHead(404);
       res.end('not found');
     }
+  }
+
+  private renderPrometheus(): string {
+    const m = this.state?.metrics();
+    if (!m) return '';
+
+    const uptimeS = (Date.now() - this.startTime) / 1000;
+    const lines: string[] = [];
+
+    // Uptime
+    lines.push('# HELP aster_uptime_seconds Server uptime in seconds');
+    lines.push('# TYPE aster_uptime_seconds gauge');
+    lines.push(`aster_uptime_seconds ${uptimeS.toFixed(1)}`);
+
+    // RPC metrics
+    lines.push('# HELP aster_rpc_started_total Total RPC calls started');
+    lines.push('# TYPE aster_rpc_started_total counter');
+    lines.push(`aster_rpc_started_total ${m.rpc.started}`);
+    lines.push('# HELP aster_rpc_succeeded_total Total successful RPCs');
+    lines.push('# TYPE aster_rpc_succeeded_total counter');
+    lines.push(`aster_rpc_succeeded_total ${m.rpc.succeeded}`);
+    lines.push('# HELP aster_rpc_failed_total Total failed RPCs');
+    lines.push('# TYPE aster_rpc_failed_total counter');
+    lines.push(`aster_rpc_failed_total ${m.rpc.failed}`);
+    lines.push('# HELP aster_rpc_in_flight Current in-flight RPCs');
+    lines.push('# TYPE aster_rpc_in_flight gauge');
+    lines.push(`aster_rpc_in_flight ${m.rpc.inFlight}`);
+    lines.push('# HELP aster_rpc_duration_seconds_total Total RPC duration in seconds');
+    lines.push('# TYPE aster_rpc_duration_seconds_total counter');
+    lines.push(`aster_rpc_duration_seconds_total ${m.rpc.totalDurationS.toFixed(6)}`);
+
+    // Connection metrics
+    lines.push('# HELP aster_connections_active Active connections');
+    lines.push('# TYPE aster_connections_active gauge');
+    lines.push(`aster_connections_active ${m.connections.active}`);
+    lines.push('# HELP aster_connections_total Total connections accepted');
+    lines.push('# TYPE aster_connections_total counter');
+    lines.push(`aster_connections_total ${m.connections.total}`);
+    lines.push('# HELP aster_streams_active Active RPC streams');
+    lines.push('# TYPE aster_streams_active gauge');
+    lines.push(`aster_streams_active ${m.connections.streamsActive}`);
+    lines.push('# HELP aster_streams_total Total streams handled');
+    lines.push('# TYPE aster_streams_total counter');
+    lines.push(`aster_streams_total ${m.connections.streamsTotal}`);
+
+    // Admission metrics
+    lines.push('# HELP aster_admission_attempted_total Total admission attempts');
+    lines.push('# TYPE aster_admission_attempted_total counter');
+    lines.push(`aster_admission_attempted_total ${m.admission.attempted}`);
+    lines.push('# HELP aster_admission_succeeded_total Total successful admissions');
+    lines.push('# TYPE aster_admission_succeeded_total counter');
+    lines.push(`aster_admission_succeeded_total ${m.admission.succeeded}`);
+    lines.push('# HELP aster_admission_rejected_total Total rejected admissions');
+    lines.push('# TYPE aster_admission_rejected_total counter');
+    lines.push(`aster_admission_rejected_total ${m.admission.rejected}`);
+
+    return lines.join('\n') + '\n';
   }
 }

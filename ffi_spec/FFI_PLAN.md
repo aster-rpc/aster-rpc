@@ -3197,6 +3197,160 @@ This ensures byte-identical output across all languages.
 6. **Tests**: Core unit test (accept_aster round-trip), Python integration (unified node + blobs + RPC), Gate 0 enforcement test
 7. **Docs**: Update `FFI_PLAN.md` §3e
 
+### Phase 1g (Transport Metrics) — ~1 week
+
+Expose iroh transport-layer metrics through core → FFI → bindings so operators get visibility into the networking layer alongside the existing application-level metrics.
+
+**Upstream surface:** `endpoint.metrics()` returns `EndpointMetrics` implementing `MetricsGroupSet`. This contains sub-groups: `SocketMetrics`, `NetReportMetrics`, `PortmapMetrics`. Each group has named `Counter`, `Gauge`, and `Histogram` fields.
+
+**Core additions (`core/src/lib.rs`):**
+
+```rust
+/// Snapshot of transport-layer metrics from the iroh endpoint.
+pub struct CoreTransportMetrics {
+    // Socket layer
+    pub send_ipv4: u64,
+    pub send_ipv6: u64,
+    pub send_relay: u64,
+    pub recv_data_ipv4: u64,
+    pub recv_data_ipv6: u64,
+    pub recv_data_relay: u64,
+    pub recv_datagrams: u64,
+    pub num_conns_direct: u64,
+    pub num_conns_opened: u64,
+    pub num_conns_closed: u64,
+    pub paths_direct: u64,      // gauge
+    pub paths_relay: u64,       // gauge
+    pub holepunch_attempts: u64,
+    pub relay_home_change: u64,
+    // Net report
+    pub net_reports: u64,
+    pub net_reports_full: u64,
+}
+
+impl CoreNetClient {
+    /// Snapshot current transport metrics from the endpoint.
+    pub fn transport_metrics(&self) -> Result<CoreTransportMetrics>;
+}
+```
+
+**FFI additions (`ffi/src/lib.rs`):**
+
+```c
+typedef struct {
+    uint64_t send_ipv4;
+    uint64_t send_ipv6;
+    uint64_t send_relay;
+    uint64_t recv_data_ipv4;
+    uint64_t recv_data_ipv6;
+    uint64_t recv_data_relay;
+    uint64_t recv_datagrams;
+    uint64_t num_conns_direct;
+    uint64_t num_conns_opened;
+    uint64_t num_conns_closed;
+    int64_t  paths_direct;
+    int64_t  paths_relay;
+    uint64_t holepunch_attempts;
+    uint64_t relay_home_change;
+    uint64_t net_reports;
+    uint64_t net_reports_full;
+} iroh_transport_metrics_t;
+
+int32_t iroh_endpoint_transport_metrics(
+    iroh_handle_t endpoint,
+    iroh_transport_metrics_t* out_metrics
+);
+```
+
+**Python additions (`bindings/python/rust/src/net.rs`):**
+
+```python
+class TransportMetrics:
+    send_ipv4: int
+    send_ipv6: int
+    send_relay: int
+    recv_data_ipv4: int
+    recv_data_ipv6: int
+    recv_data_relay: int
+    recv_datagrams: int
+    num_conns_direct: int
+    num_conns_opened: int
+    num_conns_closed: int
+    paths_direct: int
+    paths_relay: int
+    holepunch_attempts: int
+    relay_home_change: int
+    net_reports: int
+    net_reports_full: int
+
+# On IrohNode or NetClient:
+def transport_metrics() -> TransportMetrics
+```
+
+**TypeScript additions (`bindings/typescript/native/`):**
+
+```typescript
+interface TransportMetrics {
+    sendIpv4: number;
+    sendIpv6: number;
+    sendRelay: number;
+    recvDataIpv4: number;
+    recvDataIpv6: number;
+    recvDataRelay: number;
+    recvDatagrams: number;
+    numConnsDirect: number;
+    numConnsOpened: number;
+    numConnsClosed: number;
+    pathsDirect: number;
+    pathsRelay: number;
+    holepunchAttempts: number;
+    relayHomeChange: number;
+    netReports: number;
+    netReportsFull: number;
+}
+
+// On IrohNode:
+transportMetrics(): TransportMetrics
+```
+
+**Health endpoint integration:**
+
+Both Python and TypeScript health servers (`/metrics/prometheus`) should include transport metrics alongside existing application-level metrics:
+
+```
+# Transport layer (from iroh endpoint)
+aster_transport_send_ipv4_total 12345
+aster_transport_send_relay_total 678
+aster_transport_paths_direct 3
+aster_transport_paths_relay 1
+aster_transport_holepunch_attempts_total 7
+...
+
+# Application layer (existing)
+aster_rpc_started_total 500
+aster_connections_active 4
+...
+```
+
+**Implementation steps:**
+1. **Core**: Add `CoreTransportMetrics` struct and `transport_metrics()` method on `CoreNetClient` that reads from `endpoint.metrics()`
+2. **FFI**: Add `iroh_transport_metrics_t` struct and `iroh_endpoint_transport_metrics()` C function
+3. **Python PyO3**: Add `TransportMetrics` class and `transport_metrics()` on `IrohNode`/`NetClient`
+4. **Python health**: Update `_prometheus_text()` in `health.py` to include transport metrics
+5. **TypeScript NAPI**: Add `transportMetrics()` on `IrohNode`
+6. **TypeScript health**: Update Prometheus endpoint to include transport metrics
+7. **Tests**: Verify non-zero counters after blob transfer or gossip exchange
+
+**Metrics parity gaps to close (Python ↔ TypeScript):**
+
+| Gap | Where | Fix |
+|-----|-------|-----|
+| RPC duration histogram | TS MetricsInterceptor | Add duration tracking (start time on request, record on response) |
+| Streams active/total | TS ConnectionMetrics | Add stream counters matching Python |
+| Uptime gauge | TS health.ts | Add `aster_uptime_seconds` to Prometheus output |
+| Admission last duration (ms) | TS AdmissionMetrics | Add `lastAdmissionMs` field |
+| OTel integration | TS MetricsInterceptor | Add optional `@opentelemetry/api` support (match Python pattern) |
+
 ### Phase 1f (Cross-Language Contract Identity, Framing & Signing) — ~3 days
 
 1. **Core**: Implement `canonical.rs`, `contract.rs`, `framing.rs`, `signing.rs` in `aster_transport_core` (done)

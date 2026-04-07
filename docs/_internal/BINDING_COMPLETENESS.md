@@ -190,6 +190,13 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 | Prometheus metrics (/metrics/prometheus) | done | done | |
 | Connection metrics | done | done | ConnectionMetrics with accept/reject/close counters |
 | Admission metrics | done | done | AdmissionMetrics with attempt/success/reject/error counters |
+| RPC duration histogram | done | — | Python: OTel histogram. TS: **missing** |
+| RPC in-flight gauge | done | done | |
+| Stream metrics (active/total) | done | — | Python: ConnectionMetrics. TS: **missing** |
+| Uptime gauge | done | — | Python: aster_uptime_seconds. TS: **missing** |
+| Admission last duration (ms) | done | — | Python: last_admission_ms. TS: **missing** |
+| OTel integration (optional) | done | — | Python: tracer + meter. TS: **missing** |
+| Transport metrics (iroh endpoint) | — | — | **Neither binding surfaces iroh-metrics yet.** See FFI_PLAN.md §1g |
 | Graceful drain (SIGTERM) | done | done | installSignalHandlers() |
 | Connection retry (exp backoff) | done | done | reconnect() |
 | Grafana dashboard template | done | — | |
@@ -214,4 +221,15 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 |-----|--------|--------|
 | ForyCodec wire compat validation | Can't interop with Python serialization | Medium |
 | Cross-language interop tests | Don't know if Python↔TS actually works | Medium |
+| RPC duration histogram | No latency visibility in TS | Small — add start time tracking in MetricsInterceptor |
+| Stream metrics (active/total) | No stream-level observability in TS | Small — add counters to ConnectionMetrics |
+| Uptime gauge | Missing from TS Prometheus output | Trivial — add to health.ts |
+| Admission last duration (ms) | No admission latency visibility in TS | Trivial — add field to AdmissionMetrics |
+| OTel integration | No distributed tracing in TS | Medium — add optional @opentelemetry/api support |
 | Grafana dashboard template | Observability template | Trivial (JSON file) |
+
+## Summary of Remaining Gaps (Both Bindings)
+
+| Gap | Impact | Effort |
+|-----|--------|--------|
+| Transport metrics (iroh endpoint) | No visibility into network layer (IPv4/IPv6/relay sends, holepunching, path counts) | Medium — requires core + FFI + binding work. See FFI_PLAN.md §1g |
