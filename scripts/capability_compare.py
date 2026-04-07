@@ -59,7 +59,7 @@ RUST_CORE_DUPLICATES = {
 CLASS_MAP = {
     "Server": ["RpcServer", "Server"],
     "AsterServer": ["AsterServer"],
-    "AsterClient": ["AsterClient"],
+    "AsterClient": ["AsterClientWrapper", "AsterClient"],
     "ServiceClient": ["ServiceClient"],
     "ForyCodec": ["ForyCodec", "JsonCodec"],
     "IrohTransport": ["IrohTransport"],
@@ -145,6 +145,54 @@ METHOD_MAP = {
     "rpc_addr_b64": ["rpcAddrB64"],
     "mesh_state": ["meshState"],
     "root_pubkey": ["rootPubkey"],
+    # IID — Python snake_case vs TS SCREAMING_CASE for acronyms
+    "get_iid_backend": ["getIIDBackend"],
+    "verify_iid": ["verifyIID"],
+    # Signing — Python name vs TS name
+    "generate_root_keypair": ["generateRootKeypair", "generateKeypair"],
+    "load_private_key": ["loadPrivateKey"],
+    "load_public_key": ["loadPublicKey"],
+    "verify_signature": ["verifySignature", "verify"],
+    "sign_credential": ["signCredential"],
+    # Session
+    "create_session": ["createSession"],
+    "create_local_session": ["createLocalSession"],
+    # Config
+    "load_endpoint_config": ["loadEndpointConfig", "configFromFile"],
+    "resolve_root_pubkey": ["resolveRootPubkey"],
+    "to_endpoint_config": ["toEndpointConfig"],
+    # Server / high-level
+    "wait_until_stopped": ["waitUntilStopped"],
+    "registry_ticket": ["registryTicket"],
+    # Transport local
+    "remote_id": ["remoteId"],
+    # Codec
+    "wire_type": ["wireType", "WIRE_TYPE_KEY"],
+    "resolved_xlang": ["resolvedXlang"],
+    "to_kwargs": ["toKwargs"],
+    "encode_row_schema": ["encodeRowSchema"],
+    "decode_row_data": ["decodeRowData"],
+    "registered_types": ["registeredTypes"],
+    # Contract
+    "contract_id_from_service": ["contractIdFromService"],
+    "build_type_graph": ["buildTypeGraph", "walkTypeGraph"],
+    "from_service_info": ["fromServiceInfo"],
+    "extract_method_descriptors": ["extractMethodDescriptors"],
+    # Registry
+    "broadcast_compatibility_published": ["broadcastCompatibilityPublished"],
+    "resolve_all": ["resolveAll"],
+    "fetch_contract": ["fetchContract"],
+    "on_change": ["onChange"],
+    # Dynamic
+    "register_from_manifest": ["registerFromManifest"],
+    "get_type": ["getType"],
+    "get_all_types": ["getAllTypes"],
+    "build_request": ["buildRequest"],
+    "type_count": ["typeCount"],
+    # Client extras
+    "create_local_client": ["createLocalClient"],
+    "time_sleep": ["timeSleep"],
+    "timeouts": ["timeouts"],
 }
 
 
