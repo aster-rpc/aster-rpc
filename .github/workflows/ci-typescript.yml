@@ -57,7 +57,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: bindings/typescript
-        run: bun install
+        run: bun install --backend=hardlink
 
       - name: Typecheck
         working-directory: bindings/typescript/packages/aster
