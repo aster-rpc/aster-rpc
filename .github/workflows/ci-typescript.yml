@@ -7,11 +7,13 @@ on:
       - 'bindings/typescript/**'
       - 'core/**'
       - 'conformance/**'
+      - '.github/workflows/ci-typescript.yml'
   pull_request:
     paths:
       - 'bindings/typescript/**'
       - 'core/**'
       - 'conformance/**'
+      - '.github/workflows/ci-typescript.yml'
   workflow_dispatch:
 
 permissions:
