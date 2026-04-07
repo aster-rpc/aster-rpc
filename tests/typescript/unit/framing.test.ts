@@ -96,7 +96,7 @@ describe('conformance vectors', () => {
 
   // Load conformance vectors
   it('loads framing vectors', async () => {
-    const path = resolve(__dirname, '../../../../conformance/vectors/framing.json');
+    const path = resolve(__dirname, '../../../conformance/vectors/framing.json');
     const raw = await readFile(path, 'utf-8');
     vectors = JSON.parse(raw);
     expect(vectors.encode_vectors.length).toBeGreaterThan(0);

@@ -226,18 +226,29 @@ export {
   ATTR_NAME,
   type EnrollmentCredential,
   type ConsumerEnrollmentCredential,
+  canonicalJson,
+  producerSigningBytes,
+  consumerSigningBytes,
+  credentialSigningBytes,
+  signCredential,
+  verifyCredentialSignature,
+  hexToBytes,
+  bytesToHex,
 } from './trust/credentials.js';
 export {
   verifyConsumerCredential,
   verifyProducerCredential,
+  checkOffline,
+  checkRuntime,
+  admit,
   type AdmissionResult,
+  type AdmitOptions,
 } from './trust/admission.js';
 export {
   AllowAllPolicy,
   DenyAllPolicy,
   MeshEndpointHook,
-  PRODUCER_ADMISSION_ALPN as HOOK_PRODUCER_ADMISSION_ALPN,
-  CONSUMER_ADMISSION_ALPN as HOOK_CONSUMER_ADMISSION_ALPN,
+  CONSUMER_ADMISSION_ALPN,
   type ConnectionPolicy,
   type HookDecision,
 } from './trust/hooks.js';
@@ -296,6 +307,35 @@ export {
   DEFAULT_CLOCK_DRIFT_CONFIG,
   type ClockDriftConfig,
 } from './trust/clock.js';
+
+// Producer mesh gossip
+export {
+  ProducerMessageType,
+  deriveGossipTopic,
+  producerMessageSigningBytes,
+  signProducerMessage,
+  verifyProducerMessage,
+  handleProducerMessage,
+  encodeIntroducePayload,
+  encodeDepartPayload,
+  encodeContractPublishedPayload,
+  encodeLeaseUpdatePayload,
+  startLeaseHeartbeat,
+  runLeaseHeartbeat,
+  type ProducerMessage,
+  type HandleMessageOptions,
+} from './trust/gossip.js';
+
+// Mesh bootstrap
+export {
+  startFoundingNode,
+  joinMesh,
+  applyAdmissionResponse,
+  handleAdmissionRpc,
+  handleProducerAdmissionConnection,
+  makeEphemeralMeshState,
+  type BootstrapConfig,
+} from './trust/bootstrap.js';
 
 // Connection & Admission Metrics
 export { ConnectionMetrics, AdmissionMetrics } from './metrics.js';

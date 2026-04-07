@@ -34,9 +34,9 @@ const require = createRequire(import.meta.url);
 
 // Load native addon
 const candidates = [
-  resolve(__dirname, '../../native/aster-transport.darwin-arm64.node'),
-  resolve(__dirname, '../../native/aster-transport.darwin-x64.node'),
-  resolve(__dirname, '../../native/aster-transport.linux-x64-gnu.node'),
+  resolve(__dirname, '../../../bindings/typescript/native/aster-transport.darwin-arm64.node'),
+  resolve(__dirname, '../../../bindings/typescript/native/aster-transport.darwin-x64.node'),
+  resolve(__dirname, '../../../bindings/typescript/native/aster-transport.linux-x64-gnu.node'),
 ];
 
 let native: any;
