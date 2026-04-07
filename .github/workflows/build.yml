@@ -118,11 +118,6 @@ jobs:
       - name: Ensure Rust toolchain
         shell: pwsh
         run: rustup default ${{ env.RUST_TOOLCHAIN }}
-      - name: Alias python3 to python
-        shell: pwsh
-        run: |
-          $pythonPath = (Get-Command python).Source | Split-Path
-          Copy-Item "$pythonPath\python.exe" "$pythonPath\python3.exe" -ErrorAction SilentlyContinue
       - name: Stamp version
         run: (Get-Content pyproject.toml) -replace '^version\s*=\s*".*"', 'version = "${{ needs.version.outputs.python_version }}"' | Set-Content pyproject.toml
         shell: pwsh
