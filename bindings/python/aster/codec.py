@@ -61,7 +61,7 @@ class ForyConfig:
 # ── @wire_type decorator ─────────────────────────────────────────────────────
 
 
-def wire_type(tag: str):
+def wire_type(tag: str, *, metadata: dict | None = None):
     """Declare a stable wire identity for a dataclass.
 
     The *tag* string is split on the last ``/`` into
@@ -73,9 +73,16 @@ def wire_type(tag: str):
     If omitted, the ``@service`` decorator auto-derives a tag from the
     module + class name at decoration time.
 
+    Args:
+        tag: Wire type tag (e.g., "billing/Invoice").
+        metadata: Optional dict mapping field names to Metadata objects
+            for describing individual fields to AI agents.
+
     Example::
 
-        @wire_type("billing/Invoice")
+        @wire_type("billing/Invoice", metadata={
+            "amount": Metadata(description="Total in cents (USD)"),
+        })
         @dataclass
         class Invoice:
             amount: float = 0.0
@@ -90,6 +97,8 @@ def wire_type(tag: str):
             cls.__fory_namespace__ = ""
             cls.__fory_typename__ = tag
         cls.__wire_type__ = tag
+        if metadata:
+            cls.__wire_type_field_metadata__ = metadata
         return cls
 
     return decorator

@@ -22,11 +22,7 @@ impl From<CoreGossipClient> for GossipClient {
 impl GossipClient {
     /// Subscribe to a gossip topic with initial peer IDs.
     #[napi]
-    pub async fn subscribe(
-        &self,
-        topic: Buffer,
-        peers: Vec<String>,
-    ) -> Result<GossipTopicHandle> {
+    pub async fn subscribe(&self, topic: Buffer, peers: Vec<String>) -> Result<GossipTopicHandle> {
         let inner = self
             .inner
             .clone()

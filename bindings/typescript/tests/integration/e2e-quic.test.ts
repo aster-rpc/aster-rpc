@@ -18,11 +18,15 @@ import {
   Service,
   Rpc,
   ServerStream,
+  ClientStream,
+  BidiStream,
   WireType,
   ServiceRegistry,
   RpcServer,
   JsonCodec,
   RpcPattern,
+  IrohTransport,
+  createClient,
 } from '@aster-rpc/aster';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -75,6 +79,22 @@ class PingService {
       yield { value: i };
     }
   }
+
+  @ClientStream()
+  async sum(reqs: AsyncIterable<{ value: number }>): Promise<{ total: number }> {
+    let total = 0;
+    for await (const req of reqs) {
+      total += req.value;
+    }
+    return { total };
+  }
+
+  @BidiStream()
+  async *echo(reqs: AsyncIterable<PingRequest>): AsyncGenerator<PingResponse> {
+    for await (const req of reqs) {
+      yield new PingResponse({ reply: `echo: ${req.message}` });
+    }
+  }
 }
 
 // -- E2E tests ----------------------------------------------------------------
@@ -114,21 +134,42 @@ describe('E2E: TS server + TS client over QUIC', () => {
   });
 
   it.skipIf(!available)('unary RPC over real QUIC', async () => {
-    // Connect client to server
     const serverEndpointId = serverNode.nodeId();
     const RPC_ALPN = Buffer.from('aster/1');
 
-    // Open connection from client to server
-    // Note: the client uses the NetClient pattern from the NAPI binding
-    // For now, we test the server accept loop works by verifying it starts
-    expect(rpcServer).toBeDefined();
-    expect(serverEndpointId).toBeTruthy();
-    expect(serverEndpointId.length).toBe(64); // hex endpoint ID
+    // Client connects to server
+    const conn = await clientNode.connect(serverEndpointId, RPC_ALPN);
+    const transport = new IrohTransport(conn);
+
+    // Make a real unary RPC call
+    const response = await transport.unary('PingService', 'ping', { message: 'hello' });
+
+    expect(response).toBeDefined();
+    expect((response as any).reply).toBe('pong: hello');
+
+    conn.close(0, 'done');
+  });
+
+  it.skipIf(!available)('server stream over real QUIC', async () => {
+    const serverEndpointId = serverNode.nodeId();
+    const RPC_ALPN = Buffer.from('aster/1');
+
+    const conn = await clientNode.connect(serverEndpointId, RPC_ALPN);
+    const transport = new IrohTransport(conn);
+
+    const items: number[] = [];
+    for await (const item of transport.serverStream('PingService', 'count', { n: 5 })) {
+      items.push((item as any).value);
+    }
+
+    expect(items).toEqual([1, 2, 3, 4, 5]);
+
+    conn.close(0, 'done');
   });
 
   it.skipIf(!available)('server node has correct ALPN', async () => {
     expect(serverNode.nodeId()).toBeTruthy();
-    expect(serverNode.hasHooks()).toBe(false); // no hooks by default
+    expect(serverNode.hasHooks()).toBe(false);
   });
 
   it.skipIf(!available)('client node can be created', async () => {
@@ -165,5 +206,117 @@ describe('E2E: TS server + TS client over QUIC', () => {
     const docs = serverNode.docsClient();
     const doc = await docs.create();
     expect(doc.docId()).toBeTruthy();
+  });
+
+  it.skipIf(!available)('docs createAuthor', async () => {
+    const docs = serverNode.docsClient();
+    const authorId = await docs.createAuthor();
+    expect(authorId).toBeTruthy();
+    expect(authorId.length).toBeGreaterThan(0);
+  });
+
+  it.skipIf(!available)('docs download policy get/set', async () => {
+    const docs = serverNode.docsClient();
+    const doc = await docs.create();
+
+    // Default should be 'everything'
+    const policy = await doc.getDownloadPolicy();
+    expect(policy).toBe('everything');
+
+    // Set a filtered policy
+    await doc.setDownloadPolicy('nothing_except:prefix1,prefix2');
+    const updated = await doc.getDownloadPolicy();
+    expect(updated).toBe('nothing_except:prefix1,prefix2');
+  });
+
+  it.skipIf(!available)('blobs observe snapshot', async () => {
+    const blobs = serverNode.blobsClient();
+    const hash = await blobs.addBytes(Buffer.from('observe test'));
+    const result = await blobs.blobObserveSnapshot(hash);
+    expect(result.isComplete).toBe(true);
+    expect(result.size).toBeGreaterThan(0);
+  });
+
+  it.skipIf(!available)('blobs local info', async () => {
+    const blobs = serverNode.blobsClient();
+    const hash = await blobs.addBytes(Buffer.from('local info test'));
+    const info = await blobs.blobLocalInfo(hash);
+    expect(info.isComplete).toBe(true);
+    expect(info.localBytes).toBeGreaterThan(0);
+  });
+
+  it.skipIf(!available)('client stream over real QUIC', async () => {
+    const serverEndpointId = serverNode.nodeId();
+    const RPC_ALPN = Buffer.from('aster/1');
+
+    const conn = await clientNode.connect(serverEndpointId, RPC_ALPN);
+    const transport = new IrohTransport(conn);
+
+    async function* values() {
+      yield { value: 10 };
+      yield { value: 20 };
+      yield { value: 30 };
+    }
+
+    const result = await transport.clientStream('PingService', 'sum', values());
+    expect((result as any).total).toBe(60);
+
+    conn.close(0, 'done');
+  });
+
+  it.skipIf(!available)('bidi stream over real QUIC', async () => {
+    const serverEndpointId = serverNode.nodeId();
+    const RPC_ALPN = Buffer.from('aster/1');
+
+    const conn = await clientNode.connect(serverEndpointId, RPC_ALPN);
+    const transport = new IrohTransport(conn);
+
+    const channel = transport.bidiStream('PingService', 'echo');
+
+    // Send messages
+    await channel.send({ message: 'hello' });
+    await channel.send({ message: 'world' });
+    await channel.close(); // Signal end of sends
+
+    // Collect responses
+    const replies: string[] = [];
+    for await (const msg of channel) {
+      replies.push((msg as any).reply);
+    }
+
+    expect(replies).toEqual(['echo: hello', 'echo: world']);
+
+    conn.close(0, 'done');
+  });
+
+  it.skipIf(!available)('docs subscribe receives insert event', async () => {
+    const docs = serverNode.docsClient();
+    const doc = await docs.create();
+    const authorId = await docs.createAuthor();
+
+    // Subscribe to events
+    const receiver = await doc.subscribe();
+
+    // Write a key — should trigger an insert_local event
+    await doc.setBytes(authorId, 'test-key', Buffer.from('test-value'));
+
+    // Receive the event
+    const event = await receiver.recv();
+    expect(event).toBeDefined();
+    expect(event!.kind).toBe('insert_local');
+    expect(event!.author).toBe(authorId);
+  });
+
+  it.skipIf(!available)('client connects and makes RPC via IrohTransport + createClient', async () => {
+    const serverEndpointId = serverNode.nodeId();
+    const RPC_ALPN = Buffer.from('aster/1');
+    const conn = await clientNode.connect(serverEndpointId, RPC_ALPN);
+    const transport = new IrohTransport(conn);
+
+    const client = createClient(PingService, transport);
+    const response = await client.ping(new PingRequest({ message: 'typed client' }));
+    expect((response as any).reply).toBe('pong: typed client');
+
+    conn.close(0, 'done');
   });
 });

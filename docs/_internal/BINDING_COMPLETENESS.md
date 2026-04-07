@@ -4,7 +4,7 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 
 **Legend:** `done` = implemented + tested | `code` = code exists, needs tests | `napi` = NAPI-RS wrapper exists, needs TS integration | `stub` = types/interfaces only, no logic | `—` = not started
 
-**Last updated:** 2026-04-07
+**Last updated:** 2026-04-08
 
 ## Transport Layer (NAPI-RS / PyO3 over Rust core)
 
@@ -14,6 +14,7 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 | IrohNode.persistent() | done | napi | |
 | IrohNode.memoryWithAlpns() | done | napi | |
 | IrohNode.persistentWithAlpns() | done | napi | |
+| IrohNode.connect() | done | done | Client→server QUIC connection, E2E tested |
 | IrohNode.acceptAster() | done | napi | |
 | IrohNode.takeHookReceiver() | done | napi | |
 | IrohNode.hasHooks() | done | napi | |
@@ -48,12 +49,12 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 | BlobsClient.tagListPrefix() | done | napi | |
 | BlobsClient.blobStatus() | done | napi | |
 | BlobsClient.blobObserveComplete() | done | napi | |
-| BlobsClient.blobObserveSnapshot() | done | — | Complex return type |
-| BlobsClient.blobLocalInfo() | done | — | Complex return type |
+| BlobsClient.blobObserveSnapshot() | done | done | Returns { isComplete, size } — E2E tested |
+| BlobsClient.blobLocalInfo() | done | done | Returns { isComplete, localBytes } — E2E tested |
 | DocsClient.create() | done | napi | |
 | DocsClient.join() | done | napi | |
-| DocsClient.createAuthor() | done | — | |
-| DocsClient.joinAndSubscribe() | done | — | |
+| DocsClient.createAuthor() | done | done | E2E tested |
+| DocsClient.joinAndSubscribe() | done | done | NAPI DocWithEvents, E2E tested |
 | DocHandle.setBytes() | done | napi | |
 | DocHandle.getExact() | done | napi | |
 | DocHandle.queryKeyExact() | done | napi | |
@@ -61,11 +62,11 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 | DocHandle.readEntryContent() | done | napi | |
 | DocHandle.share() | done | napi | |
 | DocHandle.shareWithAddr() | done | napi | |
-| DocHandle.subscribe() | done | — | Needs event receiver type |
+| DocHandle.subscribe() | done | done | NAPI DocEventReceiver with 7 event types, E2E tested |
 | DocHandle.startSync() | done | napi | |
 | DocHandle.leave() | done | napi | |
-| DocHandle.setDownloadPolicy() | done | — | Needs policy type |
-| DocHandle.getDownloadPolicy() | done | — | Needs policy type |
+| DocHandle.setDownloadPolicy() | done | done | String-based policy format, E2E tested |
+| DocHandle.getDownloadPolicy() | done | done | E2E tested |
 | GossipClient.subscribe() | done | napi | |
 | GossipTopicHandle.broadcast() | done | napi | |
 | GossipTopicHandle.recv() | done | napi | |
@@ -83,21 +84,25 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 | ServiceInfo / MethodInfo types | done | done | |
 | ServiceRegistry | done | done | |
 | Client stub generation | done | done | Proxy-based in TS |
-| Server accept loop (QUIC) | done | — | **Critical gap** — TS has LocalTransport dispatch but not the QUIC accept loop |
-| Server stream dispatch (4 patterns) | done | done | Via LocalTransport |
-| IrohTransport (client-side QUIC) | done | code | Implemented but untested over real QUIC |
+| Server accept loop (QUIC) | done | done | RpcServer.serve() over real QUIC — E2E tested |
+| Server stream dispatch (4 patterns) | done | done | All 4 patterns via LocalTransport + unary/server_stream E2E tested |
+| IrohTransport (client-side QUIC) | done | done | E2E tested: unary + server_stream over real QUIC |
 | LocalTransport (in-process) | done | done | Tested |
 | Session-scoped services (CALL/CANCEL) | done | code | Types + session server, untested |
+| BidiStream over IrohTransport | done | done | All 4 patterns E2E tested over real QUIC |
+| Metadata class (@wire_type) | done | done | `_aster/Metadata` with description field |
+| Metadata on decorators | done | done | @rpc(metadata=), @service(metadata=), docstring auto-capture (Python) |
+| Metadata on @wire_type fields | done | done | Field-level metadata dict |
 
 ## Codec & Compression
 
 | Feature | Python | TypeScript | Notes |
 |---------|--------|------------|-------|
 | ForyCodec (XLANG serialization) | done | stub | ForyCodec class exists, calls @apache-fory/core API — **needs wire compat validation** |
-| JsonCodec (testing/dev) | done | done | |
-| Zstd compression (auto threshold) | done | code | Uses node:zlib zstdCompressSync (Node 21.7+) |
-| Zstd decompression with size limit | done | code | MAX_DECOMPRESSED_SIZE enforced |
-| Type graph walking + auto-registration | done | — | Python walks dataclass fields; TS needs equivalent |
+| JsonCodec (testing/dev) | done | done | Tested |
+| Zstd compression (auto threshold) | done | done | Uses node:zlib zstdCompressSync (Node 21.7+), tested |
+| Zstd decompression with size limit | done | done | MAX_DECOMPRESSED_SIZE enforced, tested |
+| Type graph walking + auto-registration | done | done | walkTypeGraph() discovers nested @WireType classes from default values, tested |
 
 ## Interceptors
 
@@ -141,32 +146,32 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 | EnrollmentCredential type | done | done | |
 | ConsumerEnrollmentCredential type | done | done | |
 | Credential verification (signature) | done | code | verify{Consumer,Producer}Credential() |
-| Consumer admission handshake (protocol) | done | — | **Gap** — needs IrohTransport |
-| Producer admission handshake (protocol) | done | — | **Gap** — needs IrohTransport |
+| Consumer admission handshake (protocol) | done | code | performAdmission() implemented, needs E2E test |
+| Producer admission handshake (protocol) | done | done | handleProducerAdmission() + serveProducerAdmission(), tested |
 | Gate 0 connection hooks (NAPI) | done | napi | NodeHookReceiver exposed |
 | ConnectionPolicy interface | done | done | AllowAll / DenyAll |
-| MeshEndpointHook (background loop) | done | — | **Gap** — needs hook receiver wiring |
+| MeshEndpointHook (background loop) | done | done | NAPI NodeHookReceiver with recv/respond for before_connect + after_handshake |
 | Security limits + validation | done | done | |
-| Nonce store | done | — | |
-| RCAN validation | done | — | |
-| IID (cloud identity) | done | — | Low priority |
-| Clock drift detection | done | — | |
-| Producer mesh bootstrap | done | — | |
-| Producer mesh gossip | done | — | |
-| Mesh state persistence | done | — | |
+| Nonce store | done | done | InMemoryNonceStore with TTL expiry, tested |
+| RCAN validation | done | done | evaluateCapability, validateRcan, encodeRcan/decodeRcan |
+| IID (cloud identity) | done | done | verifyIID + AWS/GCP/Azure/Mock backends |
+| Clock drift detection | done | done | ClockDriftTracker + grace period, tested |
+| Producer mesh bootstrap | done | code | serveProducerAdmission() accept loop |
+| Producer mesh gossip | done | done | RegistryGossip with all event types |
+| Mesh state persistence | done | done | saveMeshState() / loadMeshState() to ~/.aster/ |
 
 ## Registry
 
 | Feature | Python | TypeScript | Notes |
 |---------|--------|------------|-------|
-| RegistryClient | done | — | **Gap** — service discovery |
-| Registry publisher | done | — | |
-| Endpoint lease model | done | — | |
-| Service summary | done | — | |
+| RegistryClient | done | done | Manifest tracking, lease management, endpoint discovery |
+| Registry publisher | done | done | RegistryPublisher with lease management + withdrawal |
+| Endpoint lease model | done | done | EndpointLease type + findEndpoints() |
+| Service summary | done | done | ServiceSummary type in consumer.ts |
 | ArtifactRef model | done | done | |
-| Registry key encoding | done | — | |
-| ACL filtering | done | — | |
-| Gossip-based lease updates | done | — | |
+| Registry key encoding | done | done | registryKey() |
+| ACL filtering | done | done | RegistryACL with open/restricted modes |
+| Gossip-based lease updates | done | done | RegistryGossip.broadcastEndpointLeaseUpserted() |
 
 ## Production Features
 
@@ -175,16 +180,16 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 | AsterServer (high-level wrapper) | done | done | TS is simpler |
 | AsterClient (high-level wrapper) | done | done | TS is simpler |
 | Config (env vars) | done | done | |
-| Config (TOML file) | done | — | cosmiconfig planned |
+| Config (TOML file) | done | done | configFromFile() with built-in TOML parser |
 | Config print / debug | done | done | |
-| .aster-identity file loading | done | — | |
+| .aster-identity file loading | done | done | loadIdentity() with peer selection by name/role |
 | Structured logging (JSON/text) | done | done | |
 | Request correlation (contextvars/AsyncLocalStorage) | done | done | |
 | Sensitive field masking | done | done | |
 | Health server (/healthz, /readyz) | done | done | |
 | Prometheus metrics (/metrics/prometheus) | done | done | |
-| Connection metrics | done | — | |
-| Admission metrics | done | — | |
+| Connection metrics | done | done | ConnectionMetrics with accept/reject/close counters |
+| Admission metrics | done | done | AdmissionMetrics with attempt/success/reject/error counters |
 | Graceful drain (SIGTERM) | done | done | installSignalHandlers() |
 | Connection retry (exp backoff) | done | done | reconnect() |
 | Grafana dashboard template | done | — | |
@@ -193,8 +198,8 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 
 | Area | Python | TypeScript | Notes |
 |------|--------|------------|-------|
-| Unit tests | 941 | 112 | **Gap** — TS needs more tests |
-| E2E tests (real AsterServer) | 4 | 0 | **Gap** — needs NAPI build |
+| Unit tests | 944 | 203 | framing, status, limits, decorators, transport, interceptors, codec, trust, registry, config, metadata, rcan, iid |
+| E2E tests (real QUIC RPC) | 4 | 15 | Unary + server stream, blobs observe/localInfo, docs policy/subscribe, createClient |
 | Shell tests | 34 | n/a | CLI is Python-only |
 | MCP tests | 38 | n/a | CLI is Python-only |
 | Security limit tests | 39 | 15 | |
@@ -203,13 +208,10 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 | Cross-language interop | — | — | **Not yet tested** |
 | Code coverage tool | — | — | vitest/coverage-v8 installed but alias issue |
 
-## Summary of Critical Gaps (TypeScript)
+## Summary of Remaining Gaps (TypeScript)
 
 | Gap | Impact | Effort |
 |-----|--------|--------|
-| Server QUIC accept loop | Can't run TS server over real network | Medium |
-| Consumer admission protocol | Can't authenticate TS clients | Medium |
 | ForyCodec wire compat validation | Can't interop with Python serialization | Medium |
-| Registry subsystem | Can't discover services at runtime | Large |
 | Cross-language interop tests | Don't know if Python↔TS actually works | Medium |
-| More unit tests | Low confidence in edge cases | Ongoing |
+| Grafana dashboard template | Observability template | Trivial (JSON file) |

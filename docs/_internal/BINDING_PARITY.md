@@ -49,8 +49,8 @@ Tracks whether each binding produces **wire-identical output** for spec-defined 
 |-------------|------|--------|------------|------|
 | Ed25519 canonical signing bytes | TS S3 | pass (Rust core) | impl (Rust core) | — |
 | Credential JSON canonical form | TS S3 | pass (Rust core) | impl (Rust core) | — |
-| Consumer admission handshake protocol | TS S5 | impl | — | — |
-| Producer admission handshake protocol | TS S6 | impl | — | — |
+| Consumer admission handshake protocol | TS S5 | impl | impl | — |
+| Producer admission handshake protocol | TS S6 | impl | impl | — |
 
 ## Session Protocol (Aster-session-scoped-services.md)
 

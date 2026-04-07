@@ -89,6 +89,9 @@ export {
   type CapabilityRequirement,
 } from './service.js';
 
+// Metadata
+export { Metadata } from './metadata.js';
+
 // Decorators
 export {
   Service,
@@ -98,7 +101,9 @@ export {
   BidiStream,
   WireType,
   WIRE_TYPE_KEY,
+  WIRE_TYPE_FIELDS_KEY,
   type ServiceOptions,
+  type WireTypeOptions,
 } from './decorators.js';
 
 // Codec
@@ -106,6 +111,7 @@ export {
   JsonCodec,
   ForyCodec,
   DEFAULT_COMPRESSION_THRESHOLD,
+  walkTypeGraph,
   type Codec,
 } from './codec.js';
 
@@ -188,7 +194,7 @@ export { IrohTransport } from './transport/iroh.js';
 export { SessionServer } from './session.js';
 
 // Configuration
-export { configFromEnv, printConfig, type AsterConfig } from './config.js';
+export { configFromEnv, configFromFile, loadIdentity, printConfig, type AsterConfig } from './config.js';
 
 // Logging
 export {
@@ -234,8 +240,62 @@ export {
 } from './trust/hooks.js';
 export {
   MeshState,
+  saveMeshState,
+  loadMeshState,
   type PeerService,
 } from './trust/mesh.js';
+
+// Producer admission
+export {
+  handleProducerAdmission,
+  serveProducerAdmission,
+  PRODUCER_ADMISSION_ALPN,
+  type ProducerAdmissionRequest,
+  type ProducerAdmissionResponse,
+  type ProducerAdmissionOptions,
+} from './trust/producer.js';
+
+// Nonce store
+export {
+  InMemoryNonceStore,
+  type NonceStore,
+} from './trust/nonce.js';
+
+// RCAN validation
+export {
+  evaluateCapability,
+  extractCallerRoles,
+  validateRcan,
+  encodeRcan,
+  decodeRcan,
+} from './trust/rcan.js';
+
+// IID (cloud identity)
+export {
+  verifyIID,
+  getIIDBackend,
+  MockIIDBackend,
+  AWSIIDBackend,
+  GCPIIDBackend,
+  AzureIIDBackend,
+  ATTR_IID_PROVIDER,
+  ATTR_IID_ACCOUNT,
+  ATTR_IID_REGION,
+  ATTR_IID_ROLE_ARN,
+  type IIDBackend,
+} from './trust/iid.js';
+
+// Clock drift
+export {
+  ClockDriftTracker,
+  computeDrift,
+  shouldIsolate,
+  DEFAULT_CLOCK_DRIFT_CONFIG,
+  type ClockDriftConfig,
+} from './trust/clock.js';
+
+// Connection & Admission Metrics
+export { ConnectionMetrics, AdmissionMetrics } from './metrics.js';
 
 // RPC Server (QUIC accept loop)
 export { RpcServer, type ServerOptions } from './server.js';
@@ -245,8 +305,38 @@ export {
   RegistryClient,
   registryKey,
   type RegistryArtifactRef,
-  type EndpointLease,
 } from './registry/client.js';
+export {
+  RegistryPublisher,
+  type RegistryPublisherOptions,
+} from './registry/publisher.js';
+export {
+  RegistryACL,
+} from './registry/acl.js';
+export {
+  RegistryGossip,
+} from './registry/gossip.js';
+export {
+  contractKey,
+  versionKey,
+  channelKey,
+  tagKey,
+  leaseKey,
+  leasePrefix,
+  aclKey,
+  configKey,
+  REGISTRY_PREFIXES,
+} from './registry/keys.js';
+export {
+  HealthStatus,
+  GossipEventType,
+  isLeaseFresh,
+  isLeaseRoutable,
+  type ServiceSummary as RegistryServiceSummary,
+  type ArtifactRef as RegistryArtifactModel,
+  type EndpointLease,
+  type GossipEvent,
+} from './registry/models.js';
 
 // Consumer admission
 export {

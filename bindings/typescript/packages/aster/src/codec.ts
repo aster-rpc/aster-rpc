@@ -10,6 +10,7 @@
  */
 
 import { MAX_DECOMPRESSED_SIZE } from './limits.js';
+import { WIRE_TYPE_KEY } from './decorators.js';
 
 /** Default compression threshold in bytes (4 KiB). */
 export const DEFAULT_COMPRESSION_THRESHOLD = 4096;
@@ -108,6 +109,74 @@ export class JsonCodec implements Codec {
   }
 }
 
+// -- Type graph walking -------------------------------------------------------
+
+/**
+ * Walk the type graph starting from root types, discovering nested @WireType
+ * classes by inspecting default values of instances.
+ *
+ * Returns all discovered types in dependency order (leaves first), suitable
+ * for registration with Fory. This is the TS equivalent of Python's
+ * `_walk_type_graph()`.
+ *
+ * Limitations (compared to Python's dataclass introspection):
+ * - Only discovers nested types whose default values are instances of @WireType classes
+ * - Types in arrays, optionals, or maps that default to empty/null must be registered explicitly
+ *
+ * @param rootTypes - Classes decorated with @WireType
+ * @returns All types in dependency order (leaves first)
+ */
+export function walkTypeGraph(rootTypes: (new (...args: any[]) => any)[]): (new (...args: any[]) => any)[] {
+  const visited = new Set<Function>();
+  const ordered: (new (...args: any[]) => any)[] = [];
+
+  function visit(cls: new (...args: any[]) => any): void {
+    if (visited.has(cls)) return;
+    visited.add(cls);
+
+    // Check this class has a wire type tag
+    const tag = (cls as any)[WIRE_TYPE_KEY];
+    if (!tag) return;
+
+    // Instantiate to discover fields and their default values
+    try {
+      const instance = new cls();
+      for (const key of Object.keys(instance)) {
+        const value = instance[key];
+        if (value === null || value === undefined) continue;
+
+        // Check if the value's constructor is a @WireType class
+        const ctor = value?.constructor;
+        if (ctor && ctor !== Object && ctor !== Array && ctor !== String &&
+            ctor !== Number && ctor !== Boolean && (ctor as any)[WIRE_TYPE_KEY]) {
+          visit(ctor as new (...args: any[]) => any);
+        }
+
+        // Check items in arrays for @WireType instances
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            const itemCtor = item?.constructor;
+            if (itemCtor && (itemCtor as any)[WIRE_TYPE_KEY]) {
+              visit(itemCtor as new (...args: any[]) => any);
+            }
+          }
+        }
+      }
+    } catch {
+      // If instantiation fails (e.g. required constructor args), skip walking fields
+    }
+
+    // Add after dependencies (leaves first)
+    ordered.push(cls);
+  }
+
+  for (const cls of rootTypes) {
+    visit(cls);
+  }
+
+  return ordered;
+}
+
 // -- ForyCodec ----------------------------------------------------------------
 
 /**
@@ -138,6 +207,29 @@ export class ForyCodec implements Codec {
     const { serialize, deserialize } = this.fory.registerSerializer(typeInfo);
     const name = typeInfo?.options?.typeName ?? typeInfo?.tag ?? String(typeInfo);
     this.serializers.set(name, { serialize, deserialize });
+  }
+
+  /**
+   * Walk the type graph from root types and register all discovered
+   * @WireType classes with Fory. Types are registered in dependency
+   * order (leaves first).
+   *
+   * @param rootTypes - Classes decorated with @WireType
+   * @param buildTypeInfo - Function that converts a class to a Fory typeInfo object.
+   *   Receives (cls, wireTag) and should return the object to pass to registerType().
+   */
+  registerTypeGraph(
+    rootTypes: (new (...args: any[]) => any)[],
+    buildTypeInfo: (cls: new (...args: any[]) => any, wireTag: string) => any,
+  ): void {
+    const types = walkTypeGraph(rootTypes);
+    for (const cls of types) {
+      const tag = (cls as any)[WIRE_TYPE_KEY];
+      if (tag && !this.serializers.has(tag)) {
+        const typeInfo = buildTypeInfo(cls, tag);
+        this.registerType(typeInfo);
+      }
+    }
   }
 
   encode(obj: unknown, _hintType?: unknown): Uint8Array {

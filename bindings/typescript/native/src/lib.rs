@@ -6,14 +6,14 @@
 
 use napi_derive::napi;
 
-mod error;
-mod node;
-mod net;
 mod blobs;
+mod contract;
 mod docs;
+mod error;
 mod gossip;
 mod hooks;
-mod contract;
+mod net;
+mod node;
 
 /// Module version (matches package.json).
 #[napi]

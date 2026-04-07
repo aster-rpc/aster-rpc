@@ -91,6 +91,206 @@ export function configFromEnv(): AsterConfig {
   };
 }
 
+/**
+ * Load config from a TOML file, then overlay env vars.
+ *
+ * Supports aster.toml with sections: [trust], [connect], [storage],
+ * [network], [logging], [health].
+ */
+export function configFromFile(filePath: string): AsterConfig {
+  const { readFileSync } = require('node:fs');
+  const text = readFileSync(filePath, 'utf-8');
+  const toml = parseSimpleToml(text);
+  const base = configFromEnv(); // env always wins
+
+  // Merge TOML values (only if env didn't set them)
+  const trust = toml.trust as Record<string, unknown> | undefined;
+  if (trust) {
+    if (!base.rootPubkey && trust.root_pubkey) {
+      base.rootPubkey = new Uint8Array(Buffer.from(trust.root_pubkey as string, 'hex'));
+    }
+    if (!base.rootPubkeyFile && trust.root_pubkey_file) {
+      base.rootPubkeyFile = trust.root_pubkey_file as string;
+    }
+    if (!base.enrollmentCredentialFile && trust.enrollment_credential) {
+      base.enrollmentCredentialFile = trust.enrollment_credential as string;
+    }
+    if (trust.allow_all_consumers !== undefined && !process.env.ASTER_ALLOW_ALL_CONSUMERS) {
+      base.allowAllConsumers = !!trust.allow_all_consumers;
+    }
+    if (trust.allow_all_producers !== undefined && !process.env.ASTER_ALLOW_ALL_PRODUCERS) {
+      base.allowAllProducers = !!trust.allow_all_producers;
+    }
+  }
+
+  const connect = toml.connect as Record<string, unknown> | undefined;
+  if (connect) {
+    if (!base.endpointAddr && connect.endpoint_addr) {
+      base.endpointAddr = connect.endpoint_addr as string;
+    }
+  }
+
+  const storage = toml.storage as Record<string, unknown> | undefined;
+  if (storage) {
+    if (!base.storagePath && storage.path) {
+      base.storagePath = storage.path as string;
+    }
+  }
+
+  const network = toml.network as Record<string, unknown> | undefined;
+  if (network) {
+    if (!base.secretKey && network.secret_key) {
+      base.secretKey = new Uint8Array(Buffer.from(network.secret_key as string, 'base64'));
+    }
+    if (!base.relayMode && network.relay_mode) {
+      base.relayMode = network.relay_mode as string;
+    }
+    if (!base.bindAddr && network.bind_addr) {
+      base.bindAddr = network.bind_addr as string;
+    }
+    if (network.enable_monitoring !== undefined && !process.env.ASTER_ENABLE_MONITORING) {
+      base.enableMonitoring = !!network.enable_monitoring;
+    }
+    if (network.enable_hooks !== undefined && !process.env.ASTER_ENABLE_HOOKS) {
+      base.enableHooks = !!network.enable_hooks;
+    }
+    if (network.hook_timeout_ms !== undefined && !process.env.ASTER_HOOK_TIMEOUT_MS) {
+      base.hookTimeoutMs = network.hook_timeout_ms as number;
+    }
+  }
+
+  const logging = toml.logging as Record<string, unknown> | undefined;
+  if (logging) {
+    if (!process.env.ASTER_LOG_FORMAT && logging.format) {
+      base.logFormat = logging.format as 'json' | 'text';
+    }
+    if (!process.env.ASTER_LOG_LEVEL && logging.level) {
+      base.logLevel = logging.level as any;
+    }
+    if (!process.env.ASTER_LOG_MASK && logging.mask !== undefined) {
+      base.logMask = !!logging.mask;
+    }
+  }
+
+  const health = toml.health as Record<string, unknown> | undefined;
+  if (health) {
+    if (!process.env.ASTER_HEALTH_PORT && health.port !== undefined) {
+      base.healthPort = health.port as number;
+    }
+    if (!process.env.ASTER_HEALTH_HOST && health.host) {
+      base.healthHost = health.host as string;
+    }
+  }
+
+  return base;
+}
+
+/**
+ * Load identity from a .aster-identity TOML file.
+ *
+ * Returns [secretKeyBytes, peerConfig] or null if not found.
+ */
+export function loadIdentity(
+  filePath?: string,
+  peerName?: string,
+  role?: string,
+): { secretKey: Uint8Array; peer: Record<string, unknown> } | null {
+  const { existsSync, readFileSync } = require('node:fs');
+  const { join } = require('node:path');
+
+  const path = filePath ?? join(process.cwd(), '.aster-identity');
+  if (!existsSync(path)) return null;
+
+  try {
+    const text = readFileSync(path, 'utf-8');
+    const data = parseSimpleToml(text);
+
+    // Extract node.secret_key
+    const node = data.node as Record<string, unknown> | undefined;
+    if (!node?.secret_key) return null;
+    const secretKey = new Uint8Array(Buffer.from(node.secret_key as string, 'base64'));
+
+    // Find matching peer
+    const peers = (data.peers ?? []) as Record<string, unknown>[];
+    let peer: Record<string, unknown> | undefined;
+
+    if (peerName) {
+      peer = peers.find(p => p.name === peerName);
+    } else if (role) {
+      peer = peers.find(p => p.role === role);
+    } else {
+      peer = peers[0];
+    }
+
+    return { secretKey, peer: peer ?? {} };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Minimal TOML parser for config files.
+ * Handles sections, strings, numbers, booleans. Not a full TOML parser.
+ */
+function parseSimpleToml(text: string): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  let currentSection: Record<string, unknown> = result;
+
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    // Array of tables [[name]]
+    const arrayMatch = trimmed.match(/^\[\[([^\]]+)\]\]$/);
+    if (arrayMatch) {
+      const name = arrayMatch[1]!;
+      if (!Array.isArray(result[name])) result[name] = [];
+      const entry: Record<string, unknown> = {};
+      (result[name] as Record<string, unknown>[]).push(entry);
+      currentSection = entry;
+      continue;
+    }
+
+    // Section header [name]
+    const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
+    if (sectionMatch) {
+      const name = sectionMatch[1]!;
+      result[name] = result[name] ?? {};
+      currentSection = result[name] as Record<string, unknown>;
+      continue;
+    }
+
+    // Key = value
+    const kvMatch = trimmed.match(/^(\w+)\s*=\s*(.+)$/);
+    if (kvMatch) {
+      const [, key, rawValue] = kvMatch;
+      currentSection[key!] = parseTomlValue(rawValue!.trim());
+    }
+  }
+
+  return result;
+}
+
+function parseTomlValue(raw: string): unknown {
+  // Quoted string
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    return raw.slice(1, -1);
+  }
+  // Boolean
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  // Number
+  const num = Number(raw);
+  if (!isNaN(num) && raw !== '') return num;
+  // Array (simple flat arrays)
+  if (raw.startsWith('[') && raw.endsWith(']')) {
+    const inner = raw.slice(1, -1).trim();
+    if (!inner) return [];
+    return inner.split(',').map(v => parseTomlValue(v.trim()));
+  }
+  return raw;
+}
+
 /** Print resolved config (masks sensitive values). */
 export function printConfig(config: AsterConfig): void {
   const mask = (v: unknown) => v ? '****' : '<not set>';
