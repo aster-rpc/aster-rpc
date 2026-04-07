@@ -4,13 +4,23 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths:
+      - 'core/**'
+      - 'ffi/**'
+      - 'bindings/python/rust/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'pyproject.toml'
+      - '.github/workflows/build.yml'
   pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - 'ffi_spec/**'
-      - '*.md'
-      - 'README.md'
-      - 'LICENSE*'
+    paths:
+      - 'core/**'
+      - 'ffi/**'
+      - 'bindings/python/rust/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'pyproject.toml'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 permissions:
@@ -21,14 +31,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.94.1"
 
-# Wheel builds stay on GitHub-hosted runners for manylinux container
-# reproducibility and PyPI publishing trust. Self-hosted runners are
-# used in ci.yml for testing.
-
 jobs:
   # ── Compute version (build number for dev, clean for tags) ─────────
   version:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     outputs:
       python_version: ${{ steps.ver.outputs.python_version }}
       is_release: ${{ steps.ver.outputs.is_release }}
@@ -50,9 +56,9 @@ jobs:
           echo "Version: ${{ steps.ver.outputs.python_version }}"
           echo "Release: ${{ steps.ver.outputs.is_release }}"
 
-  # ── Lint (GitHub-hosted, mirrors ci.yml pinned toolchain) ──────────
+  # ── Lint ───────────────────────────────────────────────────────────
   lint:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
@@ -73,21 +79,19 @@ jobs:
   # ── Linux (x86_64 + aarch64) ──────────────────────────────────────
   linux:
     needs: [lint, version]
-    runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - target: x86_64
+            runner: [self-hosted, Linux, X64]
+          - target: aarch64
+            runner: [self-hosted, Linux, ARM64]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Cache Rust dependencies/build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-          key: linux-${{ matrix.target }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -96,25 +100,17 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
           args: --release --out dist -m bindings/python/rust/Cargo.toml
-          manylinux: auto
+          manylinux: 2_28
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
           path: dist
 
-  # ── macOS (x86_64 + aarch64) ──────────────────────────────────────
+  # ── macOS (aarch64) ─────────────────────────────────────────────────
   macos:
     needs: [lint, version]
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            runner: macos-13
-          - target: aarch64-apple-darwin
-            runner: macos-14
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
@@ -125,7 +121,7 @@ jobs:
         with:
           workspaces: |
             . -> target
-          key: macos-${{ matrix.target }}
+          key: macos-aarch64
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -134,17 +130,16 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
           args: --release --out dist -m bindings/python/rust/Cargo.toml
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-macos-${{ matrix.target }}
+          name: wheels-macos-aarch64
           path: dist
 
   # ── Windows (x86_64) ──────────────────────────────────────────────
   windows:
     needs: [lint, version]
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
@@ -175,7 +170,7 @@ jobs:
   # ── Source distribution ────────────────────────────────────────────
   sdist:
     needs: [lint, version]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
@@ -202,7 +197,7 @@ jobs:
   # ── Publish to PyPI (only on tag push) ─────────────────────────────
   publish:
     name: Publish to PyPI
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux, macos, windows, sdist]
     permissions:
@@ -218,7 +213,7 @@ jobs:
   # ── Publish to GitHub Packages (main + tags) ───────────────────────
   publish-ghp:
     name: Publish to GitHub Packages
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     needs: [linux, macos, windows, sdist, version]
     permissions:
