@@ -67,7 +67,7 @@ pub struct CoreEndpointConfig {
     pub enable_hooks: bool,
     /// Timeout in ms for hook replies (default 5000)
     pub hook_timeout_ms: u64,
-    /// Bind address string e.g. "0.0.0.0:9000", "127.0.0.1:0", "[::]:0"
+    /// Bind address string e.g. "0.0.0.0:9000", "127.0.0.1:0", "`[::`]:0"
     pub bind_addr: Option<String>,
     /// Remove all direct IP (UDP/QUIC) transports; relay-only mode
     pub clear_ip_transports: bool,
