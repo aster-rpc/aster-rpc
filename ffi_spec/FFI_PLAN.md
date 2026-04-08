@@ -122,7 +122,7 @@ pub struct CoreEndpointConfig {
     pub relay_urls: Vec<String>,           // custom relay URLs
     pub alpns: Vec<Vec<u8>>,
     pub secret_key: Option<Vec<u8>>,
-    pub enable_discovery: bool,            // default true
+    pub enable_discovery: bool,            // default false (mDNS local discovery, opt-in)
     pub enable_monitoring: bool,           // Phase 1b
     pub enable_hooks: bool,                // Phase 1b
     pub hook_timeout_ms: u64,              // Phase 1b; default 5000

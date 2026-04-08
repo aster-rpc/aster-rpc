@@ -208,7 +208,7 @@ async def main():
         config=config,
     )
     async with server:
-        print(f"Listening on {server.endpoint_id}")
+        print(f"Listening on {server.address}")
         await server.serve()
 ```
 
@@ -233,7 +233,7 @@ from aster import AsterClient, AsterConfig
 
 async def main():
     config = AsterConfig(storage_path=".aster-data")
-    client = AsterClient(peer="math-consumer", config=config)
+    client = AsterClient(address="aster1...", config=config)  # from server.address
     async with client:
         math = await client.client(MathService)
         result = await math.add(AddRequest(a=3, b=5))
@@ -520,14 +520,14 @@ class TodoService:
 async def run_producer():
     config = AsterConfig(storage_path=".aster-data/producer")
     async with AsterServer(services=[TodoService()], peer="todo-producer", config=config) as server:
-        print(f"Producer: {server.endpoint_id}")
+        print(f"Producer: {server.address}")
         await server.serve()
 
 # ── Consumer ──
 
 async def run_consumer(producer_addr):
     config = AsterConfig(storage_path=".aster-data/consumer")
-    async with AsterClient(peer="todo-consumer", config=config) as client:
+    async with AsterClient(address=producer_addr, config=config) as client:
         todo = await client.client(TodoService)
 
         task = await todo.add_task(AddTaskRequest(title="Write docs"))

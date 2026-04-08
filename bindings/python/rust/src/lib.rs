@@ -40,18 +40,21 @@ impl<'py> IntoPyObject<'py> for PyBytesResult {
     }
 }
 
-/// Initialize the async runtime for tokio.
-fn init_tokio_runtime() {
-    use pyo3_async_runtimes::tokio::init as pyo3_asyncio_init;
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all();
-    pyo3_asyncio_init(builder);
+/// Initialize the tokio runtime. Called lazily on first node/endpoint creation,
+/// not at module import time — keeps `import _aster` fast.
+pub(crate) fn ensure_tokio_runtime() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        use pyo3_async_runtimes::tokio::init as pyo3_asyncio_init;
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        pyo3_asyncio_init(builder);
+    });
 }
 
 #[pymodule]
 fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Initialize tokio runtime for async operations
-    init_tokio_runtime();
 
     let py = m.py();
 

@@ -61,38 +61,6 @@ def _make_prompt(peer_name: str, cwd: str) -> HTML:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _dns_relay_lookup(endpoint_id_hex: str) -> str | None:
-    """Resolve relay URL for an endpoint via iroh DNS discovery.
-
-    Queries ``_iroh.<z32>.dns.iroh.link`` TXT record.
-    Returns the relay URL or None.
-    """
-    import subprocess
-
-    Z32 = "ybndrfg8ejkmcpqxot1uwisza345h769"
-
-    def _z32encode(data: bytes) -> str:
-        bits = "".join(f"{b:08b}" for b in data)
-        while len(bits) % 5:
-            bits += "0"
-        return "".join(Z32[int(bits[i:i + 5], 2)] for i in range(0, len(bits), 5))
-
-    try:
-        eid_bytes = bytes.fromhex(endpoint_id_hex)
-        z32 = _z32encode(eid_bytes)
-        name = f"_iroh.{z32}.dns.iroh.link"
-        result = subprocess.run(
-            ["dig", "+short", name, "TXT"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.strip().splitlines():
-            line = line.strip('"')
-            if line.startswith("relay="):
-                return line[len("relay="):]
-    except Exception:
-        pass
-    return None
-
 
 def _node_addr_to_b64(addr: Any) -> str:
     """Serialize a NodeAddr to a base64 string for _coerce_node_addr."""
@@ -217,18 +185,9 @@ def _resolve_peer_arg(peer_arg: str) -> tuple[str, str]:
                     if name == peer_arg:
                         eid = peer.get("endpoint_id")
                         if eid:
-                            try:
-                                from aster import NodeAddr
-                                # Use stored relay_url, or resolve via DNS
-                                relay = peer.get("relay_url") or _dns_relay_lookup(eid)
-                                na = NodeAddr(
-                                    endpoint_id=eid,
-                                    relay_url=relay,
-                                )
-                                addr_b64 = _node_addr_to_b64(na)
-                                return addr_b64, peer_arg
-                            except Exception:
-                                return eid, peer_arg
+                            # Return raw endpoint ID — AsterClient handles
+                            # NodeAddr construction (avoids loading native module here)
+                            return eid, peer_arg
                         print(
                             f"error: peer '{peer_arg}' found in .aster-identity "
                             f"but has no endpoint_id",
@@ -352,11 +311,21 @@ class PeerConnection:
         await self._aster_client.connect()
         self._services = list(self._aster_client.services)
 
-        # Try to fetch contract manifests from the registry/blobs
-        await self._fetch_manifests()
+        # Fetch manifests in the background — the shell is usable immediately
+        # with basic service info from the admission response. Manifests add
+        # rich metadata (field types, descriptions) and are merged in when ready.
+        self._manifest_task = asyncio.create_task(self._fetch_manifests_background())
 
-        # Synthesize types from manifests for dynamic invocation
-        self._synthesize_types()
+    async def _fetch_manifests_background(self) -> None:
+        """Fetch manifests and synthesize types, logging errors instead of raising."""
+        try:
+            await self._fetch_manifests()
+            self._synthesize_types()
+        except Exception:
+            import logging
+            logging.getLogger(__name__).debug(
+                "Background manifest fetch failed", exc_info=True,
+            )
 
     async def _fetch_manifests(self) -> None:
         """Fetch manifest.json for each service from the blob store.
@@ -779,16 +748,21 @@ class PeerConnection:
         return await gc.subscribe(list(topic_bytes), bootstrap)
 
     async def close(self) -> None:
-        """Close the connection and clean up."""
-        import asyncio as _aio
+        """Close the connection and clean up.
+
+        Fire-and-forget — the shell doesn't need to wait for graceful
+        QUIC teardown. The OS reclaims sockets on process exit anyway.
+        """
+        # Cancel background manifest fetch if still running
+        if hasattr(self, "_manifest_task") and not self._manifest_task.done():
+            self._manifest_task.cancel()
 
         self._transports.clear()
         self._rpc_conns.clear()
-        if self._aster_client:
-            try:
-                await _aio.wait_for(self._aster_client.close(), timeout=2.0)
-            except (_aio.TimeoutError, Exception):
-                pass
+
+        # Don't await graceful shutdown — just let the process exit.
+        # AsterClient.close() does node.shutdown() which waits for
+        # iroh protocols to drain, but the shell doesn't need that.
 
 
 # ── Offline / demo mode ──────────────────────────────────────────────────────
@@ -1641,11 +1615,29 @@ async def launch_shell(
         peer_name = "demo"
         await connection.connect()
     else:
-        # Try to resolve peer_addr as a name from .aster-identity
+        # Resolve peer name before heavy imports (instant — just reads .aster-identity)
         resolved_addr, friendly_name = _resolve_peer_arg(peer_addr)
-        connection = PeerConnection(peer_addr=resolved_addr, rcan_path=rcan_path)
-        await connection.connect()
         peer_name = friendly_name
+
+        # Animate a spinner during connect so the CLI feels responsive
+        connection = PeerConnection(peer_addr=resolved_addr, rcan_path=rcan_path)
+        connect_task = asyncio.create_task(connection.connect())
+
+        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        i = 0
+        while not connect_task.done():
+            sys.stderr.write(f"\r  {frames[i % len(frames)]} connecting to {peer_name}")
+            sys.stderr.flush()
+            i += 1
+            try:
+                await asyncio.wait_for(asyncio.shield(connect_task), timeout=0.08)
+                break
+            except asyncio.TimeoutError:
+                continue
+        sys.stderr.write("\r\033[K")
+
+        # Re-raise if connect failed
+        await connect_task
 
     try:
         await _run_shell(connection, peer_name)

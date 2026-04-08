@@ -124,13 +124,19 @@ export class AsterServer {
 
   // ── Property accessors ─────────────────────────────────────────────────────
 
-  /** Compact aster1... ticket string (when using QUIC transport). */
+  /**
+   * Connection address for this server (aster1... ticket).
+   * Pass this to `new AsterClient({ address: server.address })` or `aster shell`.
+   */
+  get address(): string | undefined { return this._ticket ?? this._endpointAddr; }
+
+  /** Compact aster1... ticket string — alias for `address`. */
   get ticket(): string | undefined { return this._ticket; }
 
-  /** Base64-encoded endpoint address (node-id + relay). */
+  /** Base64-encoded endpoint address (node-id + relay) — prefer `address`. */
   get endpointAddrB64(): string | undefined { return this._endpointAddr; }
 
-  /** Base64-encoded RPC endpoint address. */
+  /** Base64-encoded RPC endpoint address — prefer `address`. */
   get rpcAddrB64(): string | undefined { return this._endpointAddr; }
 
   /** Base64-encoded producer admission address. */
@@ -182,6 +188,9 @@ export class AsterServer {
 
 /** Options for AsterClient. */
 export interface AsterClientOptions {
+  /** Connection address (aster1... ticket, base64 NodeAddr, or hex EndpointId). */
+  address?: string;
+  /** @deprecated Use `address` instead. */
   endpointAddr?: string;
   transport?: AsterTransport;
   config?: Partial<AsterConfig>;
