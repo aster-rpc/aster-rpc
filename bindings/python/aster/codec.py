@@ -15,6 +15,7 @@ configurable threshold.
 from __future__ import annotations
 
 import dataclasses
+import enum
 import typing
 from dataclasses import dataclass, field
 from typing import Any, get_type_hints
@@ -144,13 +145,18 @@ def _unwrap_generic(tp: Any) -> list[Any]:
     return list(args)
 
 
+def _is_enum(tp: type) -> bool:
+    """Return True if *tp* is a user-defined Enum subclass."""
+    return isinstance(tp, type) and issubclass(tp, enum.Enum) and tp is not enum.Enum
+
+
 def _walk_type_graph(root_types: list[type]) -> list[type]:
     """Walk the type graph starting from *root_types* and return all
-    dataclass types that need Fory registration (in dependency order,
-    leaves first).
+    dataclass and enum types that need Fory registration (in dependency
+    order, leaves first).
 
     Primitives and generic containers (list, dict, set, etc.) are
-    skipped — only concrete dataclass types are collected.
+    skipped — only concrete dataclass and enum types are collected.
     """
     visited: set[type] = set()
     result: list[type] = []
@@ -171,6 +177,11 @@ def _walk_type_graph(root_types: list[type]) -> list[type]:
             return
 
         visited.add(tp)
+
+        # Enum types are leaf nodes — collect and return
+        if _is_enum(tp):
+            result.append(tp)
+            return
 
         if not dataclasses.is_dataclass(tp):
             return
@@ -193,12 +204,55 @@ def _walk_type_graph(root_types: list[type]) -> list[type]:
     return result
 
 
+def _coerce_enum_fields(obj: Any) -> None:
+    """Coerce raw primitive values to enum members in-place on a dataclass.
+
+    When a cross-language producer (e.g. TypeScript) serializes an enum as its
+    primitive value (string or int), the Python deserializer yields a plain
+    str/int.  This function walks the dataclass fields and converts them back
+    to the expected ``enum.Enum`` member.  Operates recursively on nested
+    dataclasses.
+    """
+    try:
+        hints = get_type_hints(type(obj))
+    except Exception:
+        return
+
+    for f in dataclasses.fields(obj):
+        value = getattr(obj, f.name)
+        field_type = hints.get(f.name, f.type)
+
+        # Unwrap Optional[X]
+        resolved = field_type
+        origin = getattr(field_type, "__origin__", None)
+        if origin is typing.Union:
+            args = [a for a in getattr(field_type, "__args__", ()) if a is not type(None)]
+            if len(args) == 1:
+                resolved = args[0]
+
+        if value is None:
+            continue
+
+        # If the field type is an enum and the value is a raw primitive, coerce
+        if isinstance(resolved, type) and issubclass(resolved, enum.Enum):
+            if not isinstance(value, enum.Enum):
+                try:
+                    object.__setattr__(obj, f.name, resolved(value))
+                except (ValueError, KeyError):
+                    pass  # leave as-is if value doesn't match any member
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            _coerce_enum_fields(value)
+
+
 def _validate_xlang_tags(types: list[type]) -> None:
     """Raise ``TypeError`` if any dataclass type lacks a ``@wire_type``.
 
     Only called for XLANG mode where tag-based registration is required.
+    Enum types are exempt — they are registered by module/qualname.
     """
     for tp in types:
+        if _is_enum(tp):
+            continue
         if not dataclasses.is_dataclass(tp):
             continue
         if not hasattr(tp, "__wire_type__"):
@@ -303,6 +357,11 @@ class ForyCodec:
                 ns = getattr(tp, "__fory_namespace__", "")
                 tn = getattr(tp, "__fory_typename__", tp.__name__)
                 self._fory.register_type(tp, namespace=ns, typename=tn)
+            elif _is_enum(tp):
+                # Enums: derive namespace/typename like auto wire_type
+                ns = tp.__module__ or ""
+                tn = tp.__qualname__
+                self._fory.register_type(tp, namespace=ns, typename=tn)
             elif mode == SerializationMode.NATIVE:
                 # NATIVE mode: register without tag
                 self._fory.register_type(tp)
@@ -380,6 +439,14 @@ class ForyCodec:
                 result = self._row_to_dataclass(row, expected_type)
         else:
             result = self._fory.deserialize(data)
+
+        # Coerce raw primitives (str/int) into enum members when the target
+        # type expects enums.  This handles cross-language interop where the
+        # producer (e.g. TypeScript) serializes enums as their primitive value
+        # because Fory JS lacks a native NAMED_ENUM wire type.
+        # TODO: add cross-language enum round-trip tests (Python ↔ TS)
+        if dataclasses.is_dataclass(result) and not isinstance(result, type):
+            _coerce_enum_fields(result)
 
         if expected_type is not None and not isinstance(result, expected_type):
             raise TypeError(

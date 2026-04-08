@@ -12,6 +12,7 @@ Tests cover:
 """
 
 from __future__ import annotations
+import enum
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -570,3 +571,129 @@ class TestRegistrationErrors:
 
         with pytest.raises(TypeError, match="UntaggedMsg"):
             ForyCodec(mode=SerializationMode.XLANG, types=[WrapperMsg])
+
+
+# ── Enum support tests ───────────────────────────────────────────────────
+
+
+class Color(enum.Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 3
+
+
+class Priority(enum.IntEnum):
+    LOW = 0
+    MEDIUM = 1
+    HIGH = 2
+
+
+@dataclass
+@wire_type("test.codec/EnumMsg")
+class EnumMsg:
+    color: Color = Color.RED
+    priority: Priority = Priority.LOW
+    label: str = ""
+
+
+@dataclass
+@wire_type("test.codec/OptionalEnumMsg")
+class OptionalEnumMsg:
+    color: Optional[Color] = None
+
+
+class Status(enum.Enum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+
+
+@dataclass
+@wire_type("test.codec/StatusMsg")
+class StatusMsg:
+    status: Status = Status.ACTIVE
+
+
+class TestEnumTypeGraphWalking:
+    def test_enum_discovered_in_type_graph(self):
+        """Enum types in dataclass fields are discovered by the type walker."""
+        types = _walk_type_graph([EnumMsg])
+        assert Color in types
+        assert Priority in types
+        assert EnumMsg in types
+
+    def test_enum_before_parent(self):
+        """Enum types appear before the dataclass that uses them (leaves first)."""
+        types = _walk_type_graph([EnumMsg])
+        assert types.index(Color) < types.index(EnumMsg)
+        assert types.index(Priority) < types.index(EnumMsg)
+
+    def test_optional_enum_discovered(self):
+        """Enum inside Optional[Enum] is unwrapped and discovered."""
+        types = _walk_type_graph([OptionalEnumMsg])
+        assert Color in types
+
+    def test_enum_not_rejected_by_xlang_validation(self):
+        """Enums don't need @wire_type — they should pass XLANG validation."""
+        types = _walk_type_graph([EnumMsg])
+        _validate_xlang_tags(types)  # should not raise
+
+
+class TestEnumCoercion:
+    """Test that raw primitives are coerced to enum members after deserialization.
+
+    This simulates cross-language interop where the producer (e.g. TypeScript)
+    serializes enums as their primitive value because Fory JS lacks NAMED_ENUM.
+    TODO: add true cross-language round-trip tests (Python <-> TS) when TS
+    binding tests are in place.
+    """
+
+    def test_coerce_int_enum(self):
+        from aster.codec import _coerce_enum_fields
+        msg = EnumMsg(color=Color.RED, priority=Priority.HIGH, label="test")
+        # Simulate what Fory deserializes from a TS producer
+        object.__setattr__(msg, "color", 1)       # raw int instead of Color.RED
+        object.__setattr__(msg, "priority", 2)     # raw int instead of Priority.HIGH
+        _coerce_enum_fields(msg)
+        assert msg.color is Color.RED
+        assert msg.priority is Priority.HIGH
+        assert msg.label == "test"
+
+    def test_coerce_string_enum(self):
+        from aster.codec import _coerce_enum_fields
+        msg = StatusMsg()
+        object.__setattr__(msg, "status", "inactive")
+        _coerce_enum_fields(msg)
+        assert msg.status is Status.INACTIVE
+
+    def test_coerce_optional_enum_none(self):
+        from aster.codec import _coerce_enum_fields
+        msg = OptionalEnumMsg(color=None)
+        _coerce_enum_fields(msg)
+        assert msg.color is None
+
+    def test_coerce_optional_enum_raw_value(self):
+        from aster.codec import _coerce_enum_fields
+        msg = OptionalEnumMsg()
+        object.__setattr__(msg, "color", 2)  # raw int for Color.GREEN
+        _coerce_enum_fields(msg)
+        assert msg.color is Color.GREEN
+
+    def test_coerce_invalid_value_left_as_is(self):
+        from aster.codec import _coerce_enum_fields
+        msg = EnumMsg()
+        object.__setattr__(msg, "color", 999)  # no such member
+        _coerce_enum_fields(msg)
+        assert msg.color == 999  # unchanged
+
+
+class TestEnumCodecRegistration:
+    def test_xlang_codec_with_enum_fields(self):
+        """XLANG codec can be created with types containing enum fields."""
+        codec = ForyCodec(mode=SerializationMode.XLANG, types=[EnumMsg])
+        assert Color in codec.registered_types
+        assert Priority in codec.registered_types
+
+    def test_native_codec_with_enum_fields(self):
+        """NATIVE codec can be created with types containing enum fields."""
+        codec = ForyCodec(mode=SerializationMode.NATIVE, types=[EnumMsg])
+        assert Color in codec.registered_types

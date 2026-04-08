@@ -33,6 +33,7 @@ export class AsterServer {
   readonly logger: AsterLogger;
   private health: HealthServer;
   private _endpointAddr?: string;
+  private _ticket?: string;
   private _running = false;
   private _draining = false;
   private _inFlight = 0;
@@ -123,6 +124,9 @@ export class AsterServer {
 
   // ── Property accessors ─────────────────────────────────────────────────────
 
+  /** Compact aster1... ticket string (when using QUIC transport). */
+  get ticket(): string | undefined { return this._ticket; }
+
   /** Base64-encoded endpoint address (node-id + relay). */
   get endpointAddrB64(): string | undefined { return this._endpointAddr; }
 
@@ -196,6 +200,7 @@ export class AsterClientWrapper {
   readonly config: AsterConfig;
   private backoff: ExponentialBackoff;
   private _connected = false;
+  private _gossipTopic = '';
 
   constructor(opts: AsterClientOptions) {
     this.config = { ...configFromEnv(), ...opts.config } as AsterConfig;
@@ -218,6 +223,14 @@ export class AsterClientWrapper {
 
   /** Registry ticket for service discovery (set after admission). */
   get registryTicket(): string | undefined { return undefined; }
+
+  /**
+   * Hex-encoded 32-byte gossip topic ID for the producer mesh.
+   *
+   * Only populated when the connecting consumer is the root node
+   * (endpoint_id == root_pubkey). Empty string otherwise.
+   */
+  get gossipTopic(): string { return this._gossipTopic; }
 
   /**
    * Connect to the server (no-op if already connected via transport option).

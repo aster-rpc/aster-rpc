@@ -14,6 +14,7 @@ mod gossip;
 mod hooks;
 mod net;
 mod node;
+mod ticket;
 
 /// Module version (matches package.json).
 #[napi]

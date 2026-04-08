@@ -68,6 +68,8 @@ def save_identity(path: str | Path, data: dict) -> None:
     os.chmod(tmp, 0o600)
     tmp.replace(p)
 
+    _ensure_gitignored(p)
+
 
 def _serialize_identity(data: dict) -> list[str]:
     """Serialize an identity dict to TOML lines."""
@@ -124,6 +126,38 @@ def add_peer(identity_data: dict, peer: dict) -> dict:
         peers[:] = [p for p in peers if p.get("name") != name]
     peers.append(peer)
     return identity_data
+
+
+def _ensure_gitignored(identity_path: Path) -> None:
+    """If inside a git repo, ensure .aster-identity is in .gitignore."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, cwd=identity_path.resolve().parent,
+        )
+        if result.returncode != 0:
+            return
+        repo_root = Path(result.stdout.strip())
+    except FileNotFoundError:
+        return  # git not installed
+
+    gitignore = repo_root / ".gitignore"
+    entry = ".aster-identity"
+
+    if gitignore.exists():
+        text = gitignore.read_text()
+        if entry in text.splitlines() or f"/{entry}" in text.splitlines():
+            return
+        if not text.endswith("\n"):
+            text += "\n"
+        text += f"\n# Aster node secret — do not commit\n{entry}\n"
+        gitignore.write_text(text)
+    else:
+        gitignore.write_text(f"# Aster node secret — do not commit\n{entry}\n")
+
+    print(f"Added {entry} to {gitignore}")
 
 
 def find_peer(identity_data: dict, name: str | None = None,

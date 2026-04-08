@@ -59,6 +59,244 @@ def _make_prompt(peer_name: str, cwd: str) -> HTML:
     )
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _dns_relay_lookup(endpoint_id_hex: str) -> str | None:
+    """Resolve relay URL for an endpoint via iroh DNS discovery.
+
+    Queries ``_iroh.<z32>.dns.iroh.link`` TXT record.
+    Returns the relay URL or None.
+    """
+    import subprocess
+
+    Z32 = "ybndrfg8ejkmcpqxot1uwisza345h769"
+
+    def _z32encode(data: bytes) -> str:
+        bits = "".join(f"{b:08b}" for b in data)
+        while len(bits) % 5:
+            bits += "0"
+        return "".join(Z32[int(bits[i:i + 5], 2)] for i in range(0, len(bits), 5))
+
+    try:
+        eid_bytes = bytes.fromhex(endpoint_id_hex)
+        z32 = _z32encode(eid_bytes)
+        name = f"_iroh.{z32}.dns.iroh.link"
+        result = subprocess.run(
+            ["dig", "+short", name, "TXT"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().splitlines():
+            line = line.strip('"')
+            if line.startswith("relay="):
+                return line[len("relay="):]
+    except Exception:
+        pass
+    return None
+
+
+def _node_addr_to_b64(addr: Any) -> str:
+    """Serialize a NodeAddr to a base64 string for _coerce_node_addr."""
+    import base64
+    return base64.b64encode(addr.to_bytes()).decode("ascii")
+
+
+def _load_root_secret_key(config: Any) -> bytes | None:
+    """Load the root private key for the shell's node identity.
+
+    Checks (in order):
+    1. OS keyring (via active profile from ``~/.aster/config.toml``)
+    2. ``config.root_pubkey_file`` (explicit config)
+    3. ``~/.aster/root.key`` (default file location)
+
+    Returns 32-byte secret key or None if unavailable.
+    """
+    import json as _json
+    import os
+
+    # 1) Try keyring — scoped by active profile
+    try:
+        from aster_cli.credentials import get_root_privkey, has_keyring
+        if has_keyring():
+            profile = _get_active_profile()
+            if profile:
+                hex_key = get_root_privkey(profile)
+                if hex_key:
+                    return bytes.fromhex(hex_key)
+    except Exception:
+        pass
+
+    # 2) Try file-based locations
+    candidates = []
+    if config.root_pubkey_file:
+        candidates.append(config.root_pubkey_file)
+    candidates.append("~/.aster/root.key")
+
+    for path in candidates:
+        expanded = os.path.expanduser(path)
+        if not os.path.exists(expanded):
+            continue
+        try:
+            with open(expanded) as f:
+                content = f.read().strip()
+            if content.startswith("{"):
+                d = _json.loads(content)
+                if "private_key" in d:
+                    return bytes.fromhex(d["private_key"])
+        except (ValueError, KeyError, _json.JSONDecodeError, OSError):
+            continue
+    return None
+
+
+def _get_active_profile() -> str | None:
+    """Read the active profile name from ``~/.aster/config.toml``."""
+    import os
+
+    config_path = os.path.expanduser("~/.aster/config.toml")
+    if not os.path.exists(config_path):
+        return None
+    try:
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            import tomli as tomllib  # type: ignore[no-redef]
+        with open(config_path, "rb") as f:
+            data = tomllib.load(f)
+        return data.get("active_profile")
+    except Exception:
+        return None
+
+
+def _resolve_peer_arg(peer_arg: str) -> tuple[str, str]:
+    """Resolve a peer argument to (endpoint_addr, friendly_name).
+
+    If ``peer_arg`` matches a peer name in ``.aster-identity``, returns
+    that peer's endpoint_id and the name.  Otherwise returns the raw
+    value as-is with a truncated display name.
+
+    Raises ``SystemExit`` with a helpful message if it looks like a name
+    but can't be resolved.
+    """
+    import os
+
+    # Handle compact aster1... ticket format
+    if peer_arg.startswith("aster1"):
+        try:
+            from aster import AsterTicket, NodeAddr
+            ticket = AsterTicket.from_string(peer_arg)
+            na = NodeAddr(
+                endpoint_id=ticket.endpoint_id,
+                direct_addresses=ticket.direct_addrs,
+            )
+            addr_b64 = _node_addr_to_b64(na)
+            display = f"{ticket.endpoint_id[:8]}... (ticket)"
+            return addr_b64, display
+        except Exception as exc:
+            print(f"error: invalid aster ticket: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    # Check if it looks like a name (short, no base64/hex, no special chars)
+    looks_like_name = (
+        len(peer_arg) < 64
+        and "=" not in peer_arg
+        and "\n" not in peer_arg
+        and not all(c in "0123456789abcdef" for c in peer_arg.lower())
+    )
+
+    if looks_like_name:
+        # Try loading .aster-identity
+        identity_path = os.path.join(os.getcwd(), ".aster-identity")
+        if os.path.exists(identity_path):
+            try:
+                from aster_cli.identity import load_identity
+                identity = load_identity(identity_path)
+                known_names = []
+                for peer in identity.get("peers", []):
+                    name = peer.get("name")
+                    if name:
+                        known_names.append(name)
+                    if name == peer_arg:
+                        eid = peer.get("endpoint_id")
+                        if eid:
+                            try:
+                                from aster import NodeAddr
+                                # Use stored relay_url, or resolve via DNS
+                                relay = peer.get("relay_url") or _dns_relay_lookup(eid)
+                                na = NodeAddr(
+                                    endpoint_id=eid,
+                                    relay_url=relay,
+                                )
+                                addr_b64 = _node_addr_to_b64(na)
+                                return addr_b64, peer_arg
+                            except Exception:
+                                return eid, peer_arg
+                        print(
+                            f"error: peer '{peer_arg}' found in .aster-identity "
+                            f"but has no endpoint_id",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
+                # Name not found — show available names
+                if known_names:
+                    names_str = ", ".join(known_names)
+                    print(
+                        f"error: peer '{peer_arg}' not found in .aster-identity\n"
+                        f"  known peers: {names_str}\n"
+                        f"  or pass an aster1... ticket / base64 NodeAddr / hex EndpointId directly",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"error: peer '{peer_arg}' not found — "
+                        f".aster-identity has no peer entries\n"
+                        f"  pass a base64 NodeAddr / hex EndpointId directly",
+                        file=sys.stderr,
+                    )
+                sys.exit(1)
+            except SystemExit:
+                raise
+            except Exception:
+                pass
+        else:
+            # No identity file and it looks like a name
+            print(
+                f"error: '{peer_arg}' looks like a peer name but no "
+                f".aster-identity file found in {os.getcwd()}\n"
+                f"  pass an aster1... ticket / base64 NodeAddr / hex EndpointId directly, or\n"
+                f"  run 'aster enroll node' to create an identity file",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Also try reverse lookup: even if it's a raw addr, find the name
+    friendly = _lookup_peer_name(peer_arg)
+    if friendly:
+        return peer_arg, friendly
+
+    # Fallback: truncated display
+    display = peer_arg[:16] + "…" if len(peer_arg) > 16 else peer_arg
+    return peer_arg, display
+
+
+def _lookup_peer_name(addr: str) -> str | None:
+    """Try to find a friendly name for an address from .aster-identity."""
+    import os
+
+    identity_path = os.path.join(os.getcwd(), ".aster-identity")
+    if not os.path.exists(identity_path):
+        return None
+    try:
+        from aster_cli.identity import load_identity
+        identity = load_identity(identity_path)
+        for peer in identity.get("peers", []):
+            eid = peer.get("endpoint_id", "")
+            # Check if the addr contains this endpoint_id (NodeAddr encodes it)
+            if eid and eid in addr:
+                return peer.get("name")
+    except Exception:
+        pass
+    return None
+
+
 # ── Connection adapter ────────────────────────────────────────────────────────
 
 class PeerConnection:
@@ -83,12 +321,31 @@ class PeerConnection:
         self._rpc_conns: dict[str, Any] = {}  # channel addr → IrohConnection
         self._transports: dict[str, Any] = {}  # service name → IrohTransport
         self._type_factory: Any = None  # DynamicTypeFactory for typeless invocation
+        self._registry_doc: Any = None  # DocHandle for the registry doc
+        self._registry_event_rx: Any = None  # DocEventReceiver for live events
+        self._artifact_refs: dict[str, dict[str, Any]] = {}  # contract_id → ArtifactRef dict
 
     async def connect(self) -> None:
         """Connect to the peer via consumer admission, then fetch contract manifests."""
         from aster import AsterClient
+        from aster.config import AsterConfig
+
+        # The shell needs its own node identity — not the service's.
+        # Use the root private key (if available) as the shell's secret_key.
+        # This gives the shell the root owner's identity, which services
+        # in the mesh will recognise as the trust anchor — free auth.
+        # Falls back to ephemeral if no root key is configured.
+        config = AsterConfig.from_env()
+        config.storage_path = None
+        # Set to a non-existent path to prevent CWD .aster-identity fallback
+        # (identity_file=None still searches CWD)
+        config.identity_file = "/dev/null/.aster-identity"
+
+        root_secret = _load_root_secret_key(config)
+        config.secret_key = root_secret  # None → ephemeral, which is fine
 
         self._aster_client = AsterClient(
+            config=config,
             endpoint_addr=self._peer_addr,
             enrollment_credential_file=self._rcan_path,
         )
@@ -128,6 +385,8 @@ class PeerConnection:
 
             # Join the registry doc (read-only) and wait for initial sync
             doc, event_receiver = await dc.join_and_subscribe(ticket)
+            self._registry_doc = doc
+            self._registry_event_rx = event_receiver
 
             # Wait for sync with retry — the doc needs to pull entries from
             # the producer. We try up to 3 times with increasing timeouts.
@@ -178,6 +437,7 @@ class PeerConnection:
                     entry = entries[0]
                     content = await doc.read_entry_content(entry.content_hash)
                     artifact = _json.loads(content)
+                    self._artifact_refs[svc.contract_id] = artifact
                     collection_hash = artifact.get("collection_hash", "")
 
                     if not collection_hash:
@@ -253,22 +513,71 @@ class PeerConnection:
         return None
 
     async def list_blobs(self) -> list[dict[str, Any]]:
-        """List blobs on the local node."""
-        if self._aster_client and self._aster_client._ep:
-            try:
-                from aster import blobs_client
-                bc = blobs_client(self._aster_client._ep)
-                tags = await bc.tag_list() if hasattr(bc, "tag_list") else []
-                return [{"hash": t.hash, "size": 0, "tag": t.name} for t in tags]
-            except Exception:
-                pass
-        return []
+        """List blobs: tags from the local store + collection entries from manifests."""
+        results: list[dict[str, Any]] = []
+        if not self._aster_client or not self._aster_client._node:
+            return results
+
+        from aster import blobs_client
+        bc = blobs_client(self._aster_client._node)
+
+        # 1) Named tags (GC-protected blobs)
+        try:
+            tags = await bc.tag_list()
+            for t in tags:
+                results.append({
+                    "hash": t.hash,
+                    "size": 0,
+                    "tag": t.name,
+                    "source": "tag",
+                })
+        except Exception:
+            pass
+
+        # 2) Collection entries from artifact refs (contract blobs)
+        seen = {r["hash"] for r in results}
+        for contract_id, artifact in self._artifact_refs.items():
+            coll_hash = artifact.get("collection_hash", "")
+            if not coll_hash or coll_hash in seen:
+                continue
+            # Find service name + version for this contract
+            svc = next(
+                (s for s in self._services if s.contract_id == contract_id),
+                None,
+            )
+            svc_name = svc.name if svc else contract_id[:12]
+            svc_ver = svc.version if svc else 1
+            results.append({
+                "hash": coll_hash,
+                "size": 0,
+                "tag": f"{svc_name}.v{svc_ver}",
+                "source": "collection",
+                "is_collection": True,
+            })
+            seen.add(coll_hash)
+
+        return results
+
+    async def list_collection_entries(self, collection_hash: str) -> list[dict[str, Any]]:
+        """List entries inside a HashSeq collection."""
+        if not self._aster_client or not self._aster_client._node:
+            return []
+        from aster import blobs_client
+        bc = blobs_client(self._aster_client._node)
+        try:
+            entries = await bc.list_collection(collection_hash)
+            return [
+                {"name": name, "hash": h, "size": size}
+                for name, h, size in entries
+            ]
+        except Exception:
+            return []
 
     async def read_blob(self, blob_hash: str) -> bytes:
         """Read blob content by hash."""
-        if self._aster_client and self._aster_client._ep:
+        if self._aster_client and self._aster_client._node:
             from aster import blobs_client
-            bc = blobs_client(self._aster_client._ep)
+            bc = blobs_client(self._aster_client._node)
             return await bc.read_to_bytes(blob_hash)
         raise RuntimeError("blob reading not available")
 
@@ -405,14 +714,80 @@ class PeerConnection:
             return transport.bidi_stream(service, method)
         return _start()
 
+    async def list_doc_entries(self) -> list[dict[str, Any]]:
+        """List all entries in the registry doc."""
+        if not self._registry_doc:
+            return []
+        try:
+            entries = await self._registry_doc.query_key_prefix(b"")
+            results = []
+            for e in entries:
+                key_str = e.key.decode("utf-8", errors="replace")
+                results.append({
+                    "key": key_str,
+                    "author": e.author_id[:12] + "…",
+                    "hash": e.content_hash[:16] + "…",
+                    "size": e.content_len,
+                    "timestamp": e.timestamp,
+                })
+            return results
+        except Exception:
+            return []
+
+    async def read_doc_entry(self, key: str) -> bytes | None:
+        """Read content of a registry doc entry by key."""
+        if not self._registry_doc:
+            return None
+        try:
+            entries = await self._registry_doc.query_key_exact(key.encode("utf-8"))
+            if not entries:
+                return None
+            return await self._registry_doc.read_entry_content(entries[0].content_hash)
+        except Exception:
+            return None
+
+    async def subscribe_gossip(self) -> Any:
+        """Subscribe to the producer mesh gossip topic.
+
+        The gossip topic is returned by the producer during consumer
+        admission — but only when the connecting node is the root key
+        holder.  Returns a GossipTopicHandle or raises.
+        """
+        if not self._aster_client or not self._aster_client._node:
+            raise RuntimeError("not connected")
+
+        topic_hex = self._aster_client.gossip_topic
+        if not topic_hex:
+            raise RuntimeError(
+                "gossip topic not available — the producer only shares it "
+                "with the root node. Connect with the root key to access gossip."
+            )
+
+        topic_bytes = bytes.fromhex(topic_hex)
+
+        from aster import gossip_client
+
+        # Need bootstrap peers — the producer we connected to
+        bootstrap = []
+        if self._aster_client._endpoint_addr_in:
+            from aster.high_level import _coerce_node_addr
+            addr = _coerce_node_addr(self._aster_client._endpoint_addr_in)
+            if addr.endpoint_id:
+                bootstrap.append(addr.endpoint_id)
+
+        gc = gossip_client(self._aster_client._node)
+        return await gc.subscribe(list(topic_bytes), bootstrap)
+
     async def close(self) -> None:
         """Close the connection and clean up."""
+        import asyncio as _aio
+
         self._transports.clear()
         self._rpc_conns.clear()
         if self._aster_client:
             try:
-                await self._aster_client.close()
-            except Exception:
+                await _aio.wait_for(self._aster_client.close(), timeout=2.0)
+            except (_aio.TimeoutError, Exception):
                 pass
 
 
@@ -500,10 +875,30 @@ class DemoConnection:
 
     async def list_blobs(self) -> list[dict[str, Any]]:
         return [
-            {"hash": "abc123def456789012345678", "size": 1258291},
-            {"hash": "deadbeef0123456789abcdef", "size": 340},
-            {"hash": "cafebabe9876543210fedcba", "size": 52428800},
+            {"hash": "abc123def456789012345678", "size": 0, "tag": "HelloWorld.v1", "source": "collection", "is_collection": True},
         ]
+
+    async def list_collection_entries(self, collection_hash: str) -> list[dict[str, Any]]:
+        return [
+            {"name": "manifest.json", "hash": "deadbeef0123456789abcdef", "size": 340},
+            {"name": "contract.bin", "hash": "cafebabe9876543210fedcba", "size": 1258291},
+            {"name": "types/HelloRequest.bin", "hash": "1234567890abcdef12345678", "size": 128},
+        ]
+
+    async def list_doc_entries(self) -> list[dict[str, Any]]:
+        return [
+            {"key": "contracts/a1b2c3d4…", "author": "7f3e9a1b2c…", "hash": "abc123def456…", "size": 256, "timestamp": 1712567890000},
+            {"key": "manifests/a1b2c3d4…", "author": "7f3e9a1b2c…", "hash": "deadbeef0123…", "size": 340, "timestamp": 1712567890000},
+            {"key": "versions/HelloWorld/v1", "author": "7f3e9a1b2c…", "hash": "cafebabe9876…", "size": 64, "timestamp": 1712567890000},
+        ]
+
+    async def read_doc_entry(self, key: str) -> bytes | None:
+        if "manifest" in key:
+            import json as _json
+            return _json.dumps({"service": "HelloWorld", "version": 1, "methods": [{"name": "sayHello"}]}, indent=2).encode()
+        if "versions" in key:
+            return b"a1b2c3d4e5f6"
+        return b'{"contract_id":"a1b2c3d4...","collection_hash":"abc123..."}'
 
     async def read_blob(self, blob_hash: str) -> bytes:
         if "deadbeef" in blob_hash:
@@ -1224,7 +1619,9 @@ async def launch_shell(
     """Launch the interactive shell.
 
     Args:
-        peer_addr: Address of the peer to connect to.
+        peer_addr: Address of the peer to connect to.  May be a base64
+                   NodeAddr string, an EndpointId hex, or a peer name
+                   from ``.aster-identity``.
         rcan_path: Path to RCAN credential file.
         demo: If True, use demo connection (no real peer).
         demo2: If True, use directory demo (aster.site browsing).
@@ -1244,10 +1641,11 @@ async def launch_shell(
         peer_name = "demo"
         await connection.connect()
     else:
-        connection = PeerConnection(peer_addr=peer_addr, rcan_path=rcan_path)
+        # Try to resolve peer_addr as a name from .aster-identity
+        resolved_addr, friendly_name = _resolve_peer_arg(peer_addr)
+        connection = PeerConnection(peer_addr=resolved_addr, rcan_path=rcan_path)
         await connection.connect()
-        # Extract short peer name from address
-        peer_name = peer_addr[:16] + "..." if len(peer_addr) > 16 else peer_addr
+        peer_name = friendly_name
 
     try:
         await _run_shell(connection, peer_name)
@@ -1304,6 +1702,8 @@ def run_shell_command(args: argparse.Namespace) -> int:
             demo2=demo2,
         ))
     except KeyboardInterrupt:
+        pass
+    except SystemExit:
         pass
 
     return 0

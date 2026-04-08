@@ -387,7 +387,8 @@ export async function makeEphemeralMeshState(rootPubkey?: Uint8Array): Promise<M
   const state = new MeshState();
   // Derive topic if rootPubkey provided (for gossip subscription)
   if (rootPubkey != null) {
-    await deriveGossipTopic(rootPubkey, new Uint8Array(salt));
+    const topicId = await deriveGossipTopic(rootPubkey, new Uint8Array(salt));
+    state.topicId = bytesToHex(topicId);
   }
   return state;
 }

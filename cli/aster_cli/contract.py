@@ -322,6 +322,10 @@ def main() -> None:
     from aster_cli.shell.plugin import register_cli_subcommands
     register_cli_subcommands(subparsers)
 
+    # ``aster init`` subcommand
+    from aster_cli.init import register_init_subparser
+    register_init_subparser(subparsers)
+
     # ``aster mcp`` subcommand
     from aster_cli.mcp.server import register_mcp_subparser
     register_mcp_subparser(subparsers)
@@ -378,6 +382,9 @@ def main() -> None:
     elif args.command == "shell":
         from aster_cli.shell import run_shell_command
         sys.exit(run_shell_command(args))
+    elif args.command == "init":
+        from aster_cli.init import run_init_command
+        sys.exit(run_init_command(args))
     elif args.command == "mcp":
         from aster_cli.mcp.server import run_mcp_command
         sys.exit(run_mcp_command(args))

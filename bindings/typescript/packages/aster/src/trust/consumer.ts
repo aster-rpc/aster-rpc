@@ -16,7 +16,7 @@
  * responds with one JSON line and closes the stream.
  */
 
-import type { ConsumerEnrollmentCredential } from './credentials.js';
+import { bytesToHex, type ConsumerEnrollmentCredential } from './credentials.js';
 import { admit } from './admission.js';
 import type { MeshEndpointHook } from './hooks.js';
 import { MAX_ADMISSION_PAYLOAD_SIZE, MAX_SERVICES_IN_ADMISSION, validateHexField } from '../limits.js';
@@ -45,6 +45,8 @@ export interface ConsumerAdmissionResponse {
   registryTicket?: string;
   attributes?: Record<string, string>;
   rootPubkey?: string;
+  /** Hex-encoded 32-byte gossip topic — only populated for root node. */
+  gossipTopic?: string;
 }
 
 /** Options for server-side consumer admission handlers. */
@@ -53,6 +55,8 @@ export interface ConsumerAdmissionOpts {
   services?: ServiceSummary[];
   registryTicket?: string;
   allowUnenrolled?: boolean;
+  /** Gossip topic ID (32 bytes). Included in response only for root node. */
+  gossipTopicId?: Uint8Array;
   logger?: { info(msg: string, ...args: unknown[]): void; warn(msg: string, ...args: unknown[]): void; error(msg: string, ...args: unknown[]): void };
 }
 
@@ -194,16 +198,27 @@ export async function handleConsumerAdmissionRpc(
     return denied;
   }
 
+  // Include gossip topic only when the connecting peer IS the root node
+  // (its endpoint_id == root_pubkey hex). This lets the operator's shell
+  // observe the producer mesh without exposing the topic to other consumers.
+  let topicForPeer = '';
+  if (opts.gossipTopicId && peerNodeId === rootPubkey) {
+    topicForPeer = bytesToHex(opts.gossipTopicId);
+    log.info('consumer admission: root node detected — including gossip topic');
+  }
+
   // Dev mode / open gate: empty credential -> auto-admit
   if (!req.credentialJson && opts.allowUnenrolled) {
     hook.addPeer(peerNodeId);
-    log.info(`consumer admission: auto-admitted ${peerNodeId} (open gate)`);
+    const role = topicForPeer ? 'root' : 'open gate';
+    log.info(`consumer admission: auto-admitted ${peerNodeId} (${role})`);
     return {
       admitted: true,
       attributes: {},
       services: opts.services ?? [],
       registryTicket: opts.registryTicket ?? '',
       rootPubkey,
+      gossipTopic: topicForPeer || undefined,
       reason: '',
     };
   }
@@ -246,6 +261,7 @@ export async function handleConsumerAdmissionRpc(
     services: opts.services ?? [],
     registryTicket: opts.registryTicket ?? '',
     rootPubkey,
+    gossipTopic: topicForPeer || undefined,
     reason: '',
   };
 }
@@ -255,7 +271,7 @@ export async function handleConsumerAdmissionRpc(
 /**
  * Handle one consumer admission connection: read request, write response.
  *
- * @param conn - A QUIC connection with acceptBi(), remoteId(), and close() methods.
+ * @param conn - A QUIC connection with acceptBi() and remoteId() methods.
  * @param rootPubkey - Hex-encoded root public key.
  * @param hook - MeshEndpointHook for peer admission tracking.
  * @param opts - Additional options.
@@ -264,7 +280,6 @@ export async function handleConsumerAdmissionConnection(
   conn: {
     acceptBi(): Promise<{ takeSend(): any; takeRecv(): any }>;
     remoteId(): string;
-    close(code: number, reason: Uint8Array): void;
   },
   rootPubkey: string,
   hook: MeshEndpointHook,
@@ -294,7 +309,7 @@ export async function handleConsumerAdmissionConnection(
     );
 
     // Serialise response — strip reason on wire (oracle protection)
-    const wireResponse = {
+    const wireResponse: Record<string, unknown> = {
       admitted: response.admitted,
       attributes: response.attributes ?? {},
       services: response.services ?? [],
@@ -302,17 +317,17 @@ export async function handleConsumerAdmissionConnection(
       rootPubkey: response.rootPubkey ?? '',
       reason: '', // never leak reason on wire
     };
+    if (response.gossipTopic) {
+      wireResponse.gossipTopic = response.gossipTopic;
+    }
 
     await send.writeAll(new TextEncoder().encode(JSON.stringify(wireResponse)));
     await send.finish();
+    // Don't conn.close() — let QUIC drain the streams naturally.
+    // Calling close() sends CONNECTION_CLOSE which kills in-flight
+    // data before the consumer can readToEnd().
   } catch (err) {
     log.warn(`consumer admission: error handling ${peerNodeId}: ${err}`);
-  } finally {
-    try {
-      conn.close(0, new TextEncoder().encode('done'));
-    } catch {
-      // ignore close errors
-    }
   }
 }
 

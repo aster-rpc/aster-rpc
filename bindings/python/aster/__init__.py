@@ -73,6 +73,8 @@ try:
         HookManager,
         NodeHookReceiver,
         NodeHookDecisionSender,
+        # Ticket
+        AsterTicket,
     )
 except ImportError as e:
     raise ImportError(
@@ -202,6 +204,7 @@ __all__ = [
     "HookManager",
     "NodeHookReceiver",
     "NodeHookDecisionSender",
+    "AsterTicket",
     # ── Aster RPC framework ──
     "StatusCode",
     "RpcError",

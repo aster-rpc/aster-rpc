@@ -153,6 +153,32 @@ impl BlobsClient {
         })
     }
 
+    /// Store a multi-file collection (HashSeq). Takes a list of (name, data) tuples.
+    /// Returns the collection hash (hex). The collection is auto-tagged for GC protection.
+    fn add_collection<'py>(
+        &self,
+        py: Python<'py>,
+        entries: Vec<(String, Vec<u8>)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            client.add_collection(entries).await.map_err(err_to_py)
+        })
+    }
+
+    /// List entries from a stored collection by its hash.
+    /// Returns a list of (name, hash_hex, size) tuples.
+    fn list_collection<'py>(
+        &self,
+        py: Python<'py>,
+        hash_hex: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            client.list_collection(hash_hex).await.map_err(err_to_py)
+        })
+    }
+
     /// Create a ticket for a Collection (HashSeq format), compatible with sendme.
     fn create_collection_ticket(&self, hash_hex: String) -> PyResult<String> {
         self.inner

@@ -154,6 +154,9 @@ pub struct EndpointConfig {
     /// Read proxy from HTTP_PROXY / HTTPS_PROXY environment variables
     #[pyo3(get, set)]
     pub proxy_from_env: bool,
+    /// Enable mDNS local network discovery (default: false)
+    #[pyo3(get, set)]
+    pub enable_local_discovery: bool,
 }
 
 #[pymethods]
@@ -172,6 +175,7 @@ impl EndpointConfig {
         portmapper_config=None,
         proxy_url=None,
         proxy_from_env=false,
+        enable_local_discovery=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -187,6 +191,7 @@ impl EndpointConfig {
         portmapper_config: Option<String>,
         proxy_url: Option<String>,
         proxy_from_env: bool,
+        enable_local_discovery: bool,
     ) -> Self {
         Self {
             relay_mode,
@@ -201,6 +206,7 @@ impl EndpointConfig {
             portmapper_config,
             proxy_url,
             proxy_from_env,
+            enable_local_discovery,
         }
     }
 }
@@ -212,7 +218,7 @@ impl From<&EndpointConfig> for CoreEndpointConfig {
             relay_urls: Vec::new(),
             alpns: config.alpns.clone(),
             secret_key: config.secret_key.clone(),
-            enable_discovery: true,
+            enable_discovery: config.enable_local_discovery,
             enable_monitoring: config.enable_monitoring,
             enable_hooks: config.enable_hooks,
             hook_timeout_ms: config.hook_timeout_ms,

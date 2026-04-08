@@ -150,7 +150,7 @@ mod tests {
     fn test_zigzag_i32_max() {
         let mut buf = Vec::new();
         write_zigzag_i32(&mut buf, i32::MAX); // 2147483647
-        // ZigZag(2147483647) = 4294967294 = 0xFFFF_FFFE
+                                              // ZigZag(2147483647) = 4294967294 = 0xFFFF_FFFE
         let mut expected = Vec::new();
         write_varint(&mut expected, 0xFFFF_FFFE);
         assert_eq!(buf, expected);
@@ -160,7 +160,7 @@ mod tests {
     fn test_zigzag_i32_min() {
         let mut buf = Vec::new();
         write_zigzag_i32(&mut buf, i32::MIN); // -2147483648
-        // ZigZag(-2147483648) = 4294967295 = 0xFFFF_FFFF
+                                              // ZigZag(-2147483648) = 4294967295 = 0xFFFF_FFFF
         let mut expected = Vec::new();
         write_varint(&mut expected, 0xFFFF_FFFF);
         assert_eq!(buf, expected);

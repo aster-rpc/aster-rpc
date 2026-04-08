@@ -82,8 +82,8 @@ pub fn canonical_json(attributes: &BTreeMap<String, String>) -> Vec<u8> {
 ///
 /// Format: `endpoint_id || root_pubkey_bytes(32) || u64_be(expires_at) || canonical_json(attributes)`
 pub fn producer_signing_bytes(cred: &EnrollmentCredentialData) -> Result<Vec<u8>> {
-    let root_pubkey_bytes = hex::decode(&cred.root_pubkey)
-        .map_err(|e| anyhow!("invalid hex in root_pubkey: {e}"))?;
+    let root_pubkey_bytes =
+        hex::decode(&cred.root_pubkey).map_err(|e| anyhow!("invalid hex in root_pubkey: {e}"))?;
     if root_pubkey_bytes.len() != 32 {
         bail!(
             "root_pubkey must be 32 bytes, got {}",
@@ -113,8 +113,8 @@ pub fn consumer_signing_bytes(cred: &ConsumerEnrollmentCredentialData) -> Result
         other => bail!("unknown credential_type: {other}"),
     };
 
-    let root_pubkey_bytes = hex::decode(&cred.root_pubkey)
-        .map_err(|e| anyhow!("invalid hex in root_pubkey: {e}"))?;
+    let root_pubkey_bytes =
+        hex::decode(&cred.root_pubkey).map_err(|e| anyhow!("invalid hex in root_pubkey: {e}"))?;
     if root_pubkey_bytes.len() != 32 {
         bail!(
             "root_pubkey must be 32 bytes, got {}",
@@ -146,8 +146,8 @@ pub fn consumer_signing_bytes(cred: &ConsumerEnrollmentCredentialData) -> Result
     // optional nonce
     match &cred.nonce {
         Some(nonce_hex) => {
-            let nonce_bytes = hex::decode(nonce_hex)
-                .map_err(|e| anyhow!("invalid hex in nonce: {e}"))?;
+            let nonce_bytes =
+                hex::decode(nonce_hex).map_err(|e| anyhow!("invalid hex in nonce: {e}"))?;
             if nonce_bytes.len() != 32 {
                 bail!("nonce must be 32 bytes, got {}", nonce_bytes.len());
             }
@@ -165,8 +165,8 @@ pub fn consumer_signing_bytes(cred: &ConsumerEnrollmentCredentialData) -> Result
 /// Deserialize a JSON string as a [`CredentialData`] and dispatch to the
 /// appropriate signing bytes function.
 pub fn canonical_signing_bytes_from_json(json_str: &str) -> Result<Vec<u8>> {
-    let cred: CredentialData =
-        serde_json::from_str(json_str).map_err(|e| anyhow!("failed to parse credential JSON: {e}"))?;
+    let cred: CredentialData = serde_json::from_str(json_str)
+        .map_err(|e| anyhow!("failed to parse credential JSON: {e}"))?;
     match cred {
         CredentialData::Producer(ref p) => producer_signing_bytes(p),
         CredentialData::Consumer(ref c) => consumer_signing_bytes(c),

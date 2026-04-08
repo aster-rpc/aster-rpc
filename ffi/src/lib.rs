@@ -3201,6 +3201,154 @@ pub unsafe extern "C" fn iroh_blobs_add_bytes_as_collection(
     iroh_status_t::IROH_STATUS_OK as i32
 }
 
+/// Store a multi-file collection (HashSeq).
+///
+/// `entries_json` is a UTF-8 JSON string: `[["name1","base64data1"],["name2","base64data2"]]`
+/// Each entry's data is base64-encoded. The result (collection hash hex) is emitted as
+/// `IROH_EVENT_BLOB_COLLECTION_ADDED` with the hash string in the event data buffer.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_blobs_add_collection(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    entries_json: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let blobs = node_arc.blobs_client();
+    let json_str = match unsafe { read_string(&entries_json) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    // Parse JSON array of [name, base64_data] pairs
+    let parsed: Vec<(String, String)> = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(_) => return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32,
+    };
+
+    use base64::Engine;
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(parsed.len());
+    for (name, b64_data) in parsed {
+        match base64::engine::general_purpose::STANDARD.decode(&b64_data) {
+            Ok(data) => entries.push((name, data)),
+            Err(_) => return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32,
+        }
+    }
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match blobs.add_collection(entries).await {
+            Ok(hash) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_BLOB_COLLECTION_ADDED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, hash.into_bytes());
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// List entries from a stored collection.
+///
+/// `hash_hex` is the collection hash. The result is emitted as
+/// `IROH_EVENT_BLOB_READ` with a JSON string:
+/// `[["name1","hash_hex1",size1],["name2","hash_hex2",size2]]`
+#[no_mangle]
+pub unsafe extern "C" fn iroh_blobs_list_collection(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    hash_hex: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let blobs = node_arc.blobs_client();
+    let hash_str = match unsafe { read_string(&hash_hex) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match blobs.list_collection(hash_str).await {
+            Ok(entries) => {
+                let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_BLOB_READ,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, json.into_bytes());
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
 /// Create a ticket for a Collection (HashSeq format), compatible with sendme.
 /// Writes the ticket string into the caller-provided buffer.
 #[no_mangle]
@@ -5768,6 +5916,204 @@ pub unsafe extern "C" fn aster_canonical_json(
         Ok(s) => s,
         Err(e) => return set_last_error(format!("JSON re-serialization failed: {e}")),
     };
+    write_to_caller_buf(output.as_bytes(), out_buf, out_len) as i32
+}
+
+// ============================================================================
+// AsterTicket — compact ticket encode/decode
+// ============================================================================
+
+/// Encode an AsterTicket to a base58 string (``aster1<base58>``).
+///
+/// # Parameters
+/// - `endpoint_id_hex`: 64-char hex endpoint ID
+/// - `relay_addr_ptr/len`: relay "ip:port" string (NULL/0 for none)
+/// - `direct_addrs_json_ptr/len`: JSON array of "ip:port" strings (NULL/0 for none)
+/// - `credential_type_ptr/len`: credential type string: "open", "consumer_rcan",
+///   "enrollment", "registry" (NULL/0 for none)
+/// - `credential_data_ptr/len`: credential payload bytes (NULL/0 for none)
+/// - `out_buf/out_len`: output buffer for the aster1... string
+#[no_mangle]
+pub unsafe extern "C" fn aster_ticket_encode(
+    endpoint_id_hex_ptr: *const u8,
+    endpoint_id_hex_len: usize,
+    relay_addr_ptr: *const u8,
+    relay_addr_len: usize,
+    direct_addrs_json_ptr: *const u8,
+    direct_addrs_json_len: usize,
+    credential_type_ptr: *const u8,
+    credential_type_len: usize,
+    credential_data_ptr: *const u8,
+    credential_data_len: usize,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if endpoint_id_hex_ptr.is_null() || out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let hex_str = match std::str::from_utf8(slice::from_raw_parts(
+        endpoint_id_hex_ptr,
+        endpoint_id_hex_len,
+    )) {
+        Ok(s) => s,
+        Err(e) => return set_last_error(format!("invalid endpoint_id UTF-8: {e}")),
+    };
+    let id_bytes = match hex::decode(hex_str) {
+        Ok(b) => b,
+        Err(e) => return set_last_error(format!("invalid endpoint_id hex: {e}")),
+    };
+    if id_bytes.len() != 32 {
+        return set_last_error("endpoint_id must be 32 bytes (64 hex chars)");
+    }
+    let mut endpoint_id = [0u8; 32];
+    endpoint_id.copy_from_slice(&id_bytes);
+
+    let relay: Option<std::net::SocketAddr> = if !relay_addr_ptr.is_null() && relay_addr_len > 0 {
+        let s = match std::str::from_utf8(slice::from_raw_parts(relay_addr_ptr, relay_addr_len)) {
+            Ok(s) => s,
+            Err(e) => return set_last_error(format!("invalid relay addr UTF-8: {e}")),
+        };
+        match s.parse() {
+            Ok(a) => Some(a),
+            Err(e) => return set_last_error(format!("invalid relay addr: {e}")),
+        }
+    } else {
+        None
+    };
+
+    let direct_addrs: Vec<std::net::SocketAddr> =
+        if !direct_addrs_json_ptr.is_null() && direct_addrs_json_len > 0 {
+            let s = match std::str::from_utf8(slice::from_raw_parts(
+                direct_addrs_json_ptr,
+                direct_addrs_json_len,
+            )) {
+                Ok(s) => s,
+                Err(e) => return set_last_error(format!("invalid direct_addrs UTF-8: {e}")),
+            };
+            let arr: Vec<String> = match serde_json::from_str(s) {
+                Ok(a) => a,
+                Err(e) => return set_last_error(format!("invalid direct_addrs JSON: {e}")),
+            };
+            let mut addrs = Vec::with_capacity(arr.len());
+            for a in &arr {
+                match a.parse() {
+                    Ok(sa) => addrs.push(sa),
+                    Err(e) => return set_last_error(format!("bad direct addr '{}': {e}", a)),
+                }
+            }
+            addrs
+        } else {
+            vec![]
+        };
+
+    let credential = if !credential_type_ptr.is_null() && credential_type_len > 0 {
+        let ctype = match std::str::from_utf8(slice::from_raw_parts(
+            credential_type_ptr,
+            credential_type_len,
+        )) {
+            Ok(s) => s,
+            Err(e) => return set_last_error(format!("invalid credential_type UTF-8: {e}")),
+        };
+        let cdata = if !credential_data_ptr.is_null() && credential_data_len > 0 {
+            slice::from_raw_parts(credential_data_ptr, credential_data_len).to_vec()
+        } else {
+            vec![]
+        };
+        use aster_transport_core::ticket::TicketCredential;
+        match ctype {
+            "open" => Some(TicketCredential::Open),
+            "consumer_rcan" => Some(TicketCredential::ConsumerRcan(cdata)),
+            "enrollment" => Some(TicketCredential::Enrollment(cdata)),
+            "registry" => {
+                if cdata.len() != 64 {
+                    return set_last_error("registry credential requires exactly 64 bytes");
+                }
+                let mut ns = [0u8; 32];
+                let mut rc = [0u8; 32];
+                ns.copy_from_slice(&cdata[..32]);
+                rc.copy_from_slice(&cdata[32..]);
+                Some(TicketCredential::Registry {
+                    namespace_id: ns,
+                    read_cap: rc,
+                })
+            }
+            _ => return set_last_error(format!("unknown credential type '{ctype}'")),
+        }
+    } else {
+        None
+    };
+
+    let ticket = aster_transport_core::ticket::AsterTicket {
+        endpoint_id,
+        relay,
+        direct_addrs,
+        credential,
+    };
+
+    match ticket.to_base58_string() {
+        Ok(s) => write_to_caller_buf(s.as_bytes(), out_buf, out_len) as i32,
+        Err(e) => set_last_error(e),
+    }
+}
+
+/// Decode an AsterTicket from a base58 string (``aster1<base58>``).
+///
+/// Writes a JSON object to `out_buf`:
+/// ```json
+/// {
+///   "endpoint_id": "hex...",
+///   "relay_addr": "ip:port" | null,
+///   "direct_addrs": ["ip:port", ...],
+///   "credential_type": "open" | "consumer_rcan" | "enrollment" | "registry" | null,
+///   "credential_data_hex": "hex..." | null
+/// }
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn aster_ticket_decode(
+    ticket_ptr: *const u8,
+    ticket_len: usize,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if ticket_ptr.is_null() || out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let ticket_str = match std::str::from_utf8(slice::from_raw_parts(ticket_ptr, ticket_len)) {
+        Ok(s) => s,
+        Err(e) => return set_last_error(format!("invalid ticket UTF-8: {e}")),
+    };
+    let ticket = match aster_transport_core::ticket::AsterTicket::from_base58_str(ticket_str) {
+        Ok(t) => t,
+        Err(e) => return set_last_error(format!("ticket decode failed: {e}")),
+    };
+
+    use aster_transport_core::ticket::TicketCredential;
+    let (cred_type, cred_hex): (Option<&str>, Option<String>) = match &ticket.credential {
+        None => (None, None),
+        Some(TicketCredential::Open) => (Some("open"), None),
+        Some(TicketCredential::ConsumerRcan(v)) => (Some("consumer_rcan"), Some(hex::encode(v))),
+        Some(TicketCredential::Enrollment(v)) => (Some("enrollment"), Some(hex::encode(v))),
+        Some(TicketCredential::Registry {
+            namespace_id,
+            read_cap,
+        }) => {
+            let mut data = Vec::with_capacity(64);
+            data.extend_from_slice(namespace_id);
+            data.extend_from_slice(read_cap);
+            (Some("registry"), Some(hex::encode(data)))
+        }
+    };
+
+    let json = serde_json::json!({
+        "endpoint_id": hex::encode(ticket.endpoint_id),
+        "relay_addr": ticket.relay.map(|a| a.to_string()),
+        "direct_addrs": ticket.direct_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        "credential_type": cred_type,
+        "credential_data_hex": cred_hex,
+    });
+
+    let output = json.to_string();
     write_to_caller_buf(output.as_bytes(), out_buf, out_len) as i32
 }
 

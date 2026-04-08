@@ -70,6 +70,41 @@ impl BlobsClient {
             .map_err(to_napi_err)
     }
 
+    /// Store a multi-file collection (HashSeq). Takes an array of [name, data] pairs.
+    /// Returns the collection hash hex. The collection is auto-tagged for GC protection.
+    #[napi]
+    pub async fn add_collection(&self, entries: Vec<(String, Buffer)>) -> Result<String> {
+        let core_entries: Vec<(String, Vec<u8>)> = entries
+            .into_iter()
+            .map(|(name, data)| (name, data.to_vec()))
+            .collect();
+        self.inner
+            .clone()
+            .add_collection(core_entries)
+            .await
+            .map_err(to_napi_err)
+    }
+
+    /// List entries from a stored collection by its hash.
+    /// Returns an array of { name, hash, size } objects.
+    #[napi]
+    pub async fn list_collection(&self, hash_hex: String) -> Result<Vec<CollectionEntry>> {
+        let entries = self
+            .inner
+            .clone()
+            .list_collection(hash_hex)
+            .await
+            .map_err(to_napi_err)?;
+        Ok(entries
+            .into_iter()
+            .map(|(name, hash, size)| CollectionEntry {
+                name,
+                hash,
+                size: size as f64,
+            })
+            .collect())
+    }
+
     /// Create a collection ticket from hash (sync).
     #[napi]
     pub fn create_collection_ticket(&self, hash_hex: String) -> Result<String> {
@@ -204,4 +239,12 @@ pub struct BlobObserveResult {
 pub struct BlobLocalInfo {
     pub is_complete: bool,
     pub local_bytes: f64,
+}
+
+/// A single entry in a collection.
+#[napi(object)]
+pub struct CollectionEntry {
+    pub name: String,
+    pub hash: String,
+    pub size: f64,
 }

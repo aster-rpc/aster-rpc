@@ -21,6 +21,8 @@ export interface PeerService {
 export class MeshState {
   private peers = new Map<string, PeerService[]>();
   private _acceptedProducers = new Set<string>();
+  /** Hex-encoded 32-byte gossip topic ID for the producer mesh. */
+  topicId = '';
 
   /** Add a peer to the accepted set (used by producer admission). */
   addPeer(peerEndpointId: string): void {
@@ -74,6 +76,7 @@ export class MeshState {
       peers: Object.fromEntries(
         [...this.peers.entries()].map(([k, v]) => [k, v]),
       ),
+      topic_id: this.topicId,
     };
   }
 
@@ -90,6 +93,7 @@ export class MeshState {
         state.peers.set(k, v);
       }
     }
+    state.topicId = (data.topic_id as string) ?? '';
     return state;
   }
 }

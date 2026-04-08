@@ -5,28 +5,19 @@ Spec reference: Aster-ContractIdentity.md §11.5
 
 Two collection formats are supported:
 
-``"raw"``   — single-blob: the contract canonical bytes are stored as one blob;
-              ``collection_hash == contract_id``. Used by RegistryPublisher when
-              no multi-file layout is needed.
+``"raw"``      — single-blob: the contract canonical bytes are stored as one blob;
+                 ``collection_hash == contract_id``. Used by RegistryPublisher when
+                 no multi-file layout is needed.
 
-``"index"`` — multi-file: all collection entries (contract.bin, manifest.json,
-              types/*.bin) are uploaded individually; a JSON collection index blob
-              maps entry names to their hashes.  ``collection_hash`` is the BLAKE3
-              hash of the index blob.
-
-The collection index blob format (JSON, UTF-8):
-    {
-      "version": 1,
-      "entries": [
-        {"name": "contract.bin", "hash": "<hex>", "size": <int>},
-        ...
-      ]
-    }
+``"hashseq"``  — multi-file: all collection entries (contract.bin, manifest.json,
+                 types/*.bin) are stored as individual blobs and wrapped in a native
+                 iroh ``Collection`` (HashSeq format).  The HashSeq blob is
+                 auto-tagged for GC protection.  ``collection_hash`` is the BLAKE3
+                 hash of the HashSeq blob.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -136,33 +127,30 @@ def build_collection(
 async def upload_collection(
     blobs: object,
     entries: list[tuple[str, bytes]],
+    tag_prefix: str | None = None,
 ) -> str:
-    """Upload all collection entries and return the collection index hash.
+    """Upload all collection entries as a native iroh HashSeq collection.
 
-    For each ``(name, data)`` entry:
-    - Upload ``data`` as a raw blob → obtain ``hash_hex``.
+    Uses ``blobs.add_collection(entries)`` which stores each entry as a
+    raw blob, builds a native iroh ``Collection`` (HashSeq), and sets a
+    persistent tag for GC protection — all in a single Rust call.
 
-    Then build a JSON collection index that maps names to hashes, upload it,
-    and return its hash (``collection_hash``).
+    The ``tag_prefix`` parameter is accepted for backwards compatibility
+    but is ignored; GC protection is handled natively by HashSeq tagging.
 
     Args:
-        blobs:   A live ``BlobsClient``.
-        entries: ``[(name, bytes)]`` list from ``build_collection()``.
+        blobs:      A live ``BlobsClient``.
+        entries:    ``[(name, bytes)]`` list from ``build_collection()``.
+        tag_prefix: Deprecated — ignored. HashSeq handles GC natively.
 
     Returns:
-        ``collection_hash`` — hex hash of the collection index blob.
+        ``collection_hash`` — hex hash of the HashSeq collection blob.
     """
-    index_entries: list[dict] = []
-    for name, data in entries:
-        hash_hex = await blobs.add_bytes(data)
-        index_entries.append({"name": name, "hash": hash_hex, "size": len(data)})
-        logger.debug("upload_collection: %s → %s (%d bytes)", name, hash_hex[:12], len(data))
-
-    index = {"version": 1, "entries": index_entries}
-    index_bytes = json.dumps(index, separators=(",", ":"), sort_keys=False).encode("utf-8")
-    collection_hash = await blobs.add_bytes(index_bytes)
+    collection_hash = await blobs.add_collection(entries)
     logger.debug(
-        "upload_collection: index blob → %s (%d entries)", collection_hash[:12], len(index_entries)
+        "upload_collection: HashSeq collection → %s (%d entries)",
+        collection_hash[:12],
+        len(entries),
     )
     return collection_hash
 
@@ -172,42 +160,29 @@ async def fetch_from_collection(
     collection_hash: str,
     entry_name: str,
 ) -> bytes | None:
-    """Fetch a named entry from a multi-file collection index.
+    """Fetch a named entry from a native iroh HashSeq collection.
+
+    Uses ``blobs.list_collection(hash)`` to enumerate the collection's
+    entries, finds the one matching ``entry_name``, and reads it.
 
     Args:
         blobs:           A live ``BlobsClient``.
-        collection_hash: Hash of the collection index blob.
+        collection_hash: Hash of the HashSeq collection blob.
         entry_name:      The entry name (e.g. ``"contract.bin"``).
 
     Returns:
         The raw bytes of the entry, or ``None`` if not found.
     """
-    from aster.limits import MAX_COLLECTION_INDEX_ENTRIES
-
     try:
-        index_bytes = await blobs.read_to_bytes(collection_hash)
+        entries_list = await blobs.list_collection(collection_hash)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("fetch_from_collection: cannot read index %s: %s", collection_hash[:12], exc)
+        logger.debug("fetch_from_collection: cannot list collection %s: %s", collection_hash[:12], exc)
         return None
 
-    try:
-        index = json.loads(index_bytes)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("fetch_from_collection: malformed index blob: %s", exc)
-        return None
-
-    entries_list = index.get("entries", [])
-    if len(entries_list) > MAX_COLLECTION_INDEX_ENTRIES:
-        logger.warning(
-            "fetch_from_collection: index has %d entries (limit %d), truncating",
-            len(entries_list), MAX_COLLECTION_INDEX_ENTRIES,
-        )
-        entries_list = entries_list[:MAX_COLLECTION_INDEX_ENTRIES]
-
-    for entry in entries_list:
-        if entry["name"] == entry_name:
+    for name, entry_hash, _size in entries_list:
+        if name == entry_name:
             try:
-                return await blobs.read_to_bytes(entry["hash"])
+                return await blobs.read_to_bytes(entry_hash)
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "fetch_from_collection: cannot read entry %s: %s", entry_name, exc
@@ -273,9 +248,9 @@ async def fetch_contract(
 
     Two modes:
 
-    ``collection_hash`` provided (multi-file, ``"index"`` format):
-        - Reads the collection index blob.
-        - Fetches ``contract.bin`` from the index.
+    ``collection_hash`` provided (multi-file, HashSeq format):
+        - Lists the collection entries via ``blobs.list_collection()``.
+        - Fetches ``contract.bin`` from the collection.
         - Verifies ``blake3(contract_bytes).hexdigest() == contract_id``.
 
     ``collection_hash is None`` or equals ``contract_id`` (single-blob, ``"raw"``):
@@ -284,8 +259,8 @@ async def fetch_contract(
     Args:
         contract_id:     64-char hex string identifying the contract.
         blobs_client:    A live BlobsClient.
-        collection_hash: Hash of the collection index blob (multi-file mode) or
-                         ``None``/same as ``contract_id`` for single-blob mode.
+        collection_hash: Hash of the HashSeq collection blob (multi-file mode)
+                         or ``None``/same as ``contract_id`` for single-blob mode.
 
     Returns:
         The raw canonical contract bytes on success, or ``None`` if unavailable.
