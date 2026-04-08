@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from aster_cli.join import cmd_join, cmd_status, cmd_verify
+from aster_cli.publish import cmd_publish, cmd_unpublish
 from aster_cli.shell.plugin import (
     Argument,
     CommandContext,
@@ -505,6 +507,101 @@ class RefreshCommand(ShellCommand):
         # Reset loaded flags so next ls/cd will re-fetch
         _reset_loaded(ctx.vfs_root)
         ctx.display.success("Cache cleared — next listing will fetch fresh data")
+
+
+@register
+class JoinShellCommand(ShellCommand):
+    name = "join"
+    description = "Claim an Aster handle"
+    contexts = []
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        parsed = argparse.Namespace(
+            command="join",
+            handle=args[0] if args else None,
+            email=args[1] if len(args) > 1 else None,
+            announcements=False,
+            demo=True,
+        )
+        cmd_join(parsed)
+
+
+@register
+class VerifyShellCommand(ShellCommand):
+    name = "verify"
+    description = "Verify a pending handle claim"
+    contexts = []
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        parsed = argparse.Namespace(
+            command="verify",
+            code=args[0] if args else None,
+            resend="--resend" in args,
+            demo=True,
+        )
+        cmd_verify(parsed)
+
+
+@register
+class WhoamiShellCommand(ShellCommand):
+    name = "whoami"
+    description = "Show local identity state"
+    contexts = []
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        cmd_status(argparse.Namespace(command="whoami", raw_json=False))
+
+
+@register
+class StatusShellCommand(ShellCommand):
+    name = "status"
+    description = "Alias for whoami"
+    contexts = []
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        cmd_status(argparse.Namespace(command="status", raw_json=False))
+
+
+@register
+class PublishShellCommand(ShellCommand):
+    name = "publish"
+    description = "Mark a local service as published in preview mode"
+    contexts = ["/services", "/services/*", "/aster/*", "/aster/*/*"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        target = args[0] if args else (node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None)
+        if not target:
+            ctx.display.error("usage: publish <MODULE:CLASS|service>")
+            return
+        cmd_publish(argparse.Namespace(command="publish", target=target, manifest=".aster/manifest.json", semver=None))
+
+
+@register
+class UnpublishShellCommand(ShellCommand):
+    name = "unpublish"
+    description = "Remove a local published marker"
+    contexts = ["/services", "/services/*", "/aster/*", "/aster/*/*"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        service = args[0] if args else (node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None)
+        if not service:
+            ctx.display.error("usage: unpublish <service>")
+            return
+        cmd_unpublish(argparse.Namespace(command="unpublish", service=service))
 
 
 @register

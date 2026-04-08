@@ -18,9 +18,25 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 ASTER_DIR = Path(os.path.expanduser("~/.aster"))
 CONFIG_PATH = ASTER_DIR / "config.toml"
+
+DEFAULT_ASTER_SERVICE = {
+    "enabled": True,
+    "node_id": "",
+    "relay": "",
+    "offline_banner": True,
+}
+DEFAULT_PROFILE_FIELDS = {
+    "handle": "",
+    "handle_status": "unregistered",
+    "handle_claimed_at": "",
+    "email": "",
+    "signer": "local",
+    "published_services": "",
+}
 
 
 def _load_config() -> dict:
@@ -35,28 +51,62 @@ def _load_config() -> dict:
             sys.exit(1)
 
     if not CONFIG_PATH.exists():
-        return {"active_profile": "default", "profiles": {}}
+        return _normalize_config({"active_profile": "default", "profiles": {}})
     with CONFIG_PATH.open("rb") as f:
-        return tomllib.load(f)
+        return _normalize_config(tomllib.load(f))
+
+
+def _normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(profile)
+    for key, value in DEFAULT_PROFILE_FIELDS.items():
+        normalized.setdefault(key, value)
+    return normalized
+
+
+def _normalize_config(data: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(data)
+    normalized.setdefault("active_profile", "default")
+    profiles = normalized.setdefault("profiles", {})
+    for name, profile in list(profiles.items()):
+        profiles[name] = _normalize_profile(profile if isinstance(profile, dict) else {})
+    aster_service = normalized.setdefault("aster_service", {})
+    for key, value in DEFAULT_ASTER_SERVICE.items():
+        aster_service.setdefault(key, value)
+    return normalized
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        items = ", ".join(_toml_value(item) for item in value)
+        return f"[{items}]"
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _save_config(data: dict) -> None:
     """Write config to ~/.aster/config.toml with 0600 permissions."""
     ASTER_DIR.mkdir(parents=True, exist_ok=True)
+    data = _normalize_config(data)
 
     lines = []
     lines.append(f'active_profile = "{data.get("active_profile", "default")}"')
     lines.append("")
 
+    aster_service = data.get("aster_service", {})
+    if aster_service:
+        lines.append("[aster_service]")
+        for key, value in aster_service.items():
+            lines.append(f"{key} = {_toml_value(value)}")
+        lines.append("")
+
     for name, profile in data.get("profiles", {}).items():
         lines.append(f"[profiles.{name}]")
         for key, value in profile.items():
-            if isinstance(value, str):
-                lines.append(f'{key} = "{value}"')
-            elif isinstance(value, bool):
-                lines.append(f"{key} = {'true' if value else 'false'}")
-            elif isinstance(value, (int, float)):
-                lines.append(f"{key} = {value}")
+            lines.append(f"{key} = {_toml_value(value)}")
         lines.append("")
 
     content = "\n".join(lines)
@@ -68,6 +118,57 @@ def _save_config(data: dict) -> None:
 
 def _active_profile(config: dict) -> str:
     return config.get("active_profile", "default")
+
+
+def get_active_profile_name(config: dict | None = None) -> str:
+    config = _load_config() if config is None else _normalize_config(config)
+    return _active_profile(config)
+
+
+def get_active_profile(config: dict | None = None) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    config = _load_config() if config is None else _normalize_config(config)
+    name = _active_profile(config)
+    profiles = config.setdefault("profiles", {})
+    profile = profiles.setdefault(name, {})
+    profiles[name] = _normalize_profile(profile)
+    return name, profiles[name], config
+
+
+def update_active_profile(**updates: Any) -> tuple[str, dict[str, Any]]:
+    name, profile, config = get_active_profile()
+    for key, value in updates.items():
+        profile[key] = value
+    config["profiles"][name] = profile
+    _save_config(config)
+    return name, profile
+
+
+def update_aster_service(**updates: Any) -> dict[str, Any]:
+    config = _load_config()
+    aster_service = config.setdefault("aster_service", {})
+    for key, value in updates.items():
+        aster_service[key] = value
+    _save_config(config)
+    return aster_service
+
+
+def get_aster_service_config(config: dict | None = None) -> dict[str, Any]:
+    config = _load_config() if config is None else _normalize_config(config)
+    return dict(config.get("aster_service", {}))
+
+
+def get_published_services(profile: dict[str, Any] | None = None) -> list[str]:
+    if profile is None:
+        _name, profile, _config = get_active_profile()
+    raw = str(profile.get("published_services", "")).strip()
+    if not raw:
+        return []
+    return [item for item in (part.strip() for part in raw.split(",")) if item]
+
+
+def set_published_services(services: list[str]) -> tuple[str, dict[str, Any]]:
+    services = sorted(set(services))
+    return update_active_profile(published_services=",".join(services))
 
 
 def print_active_profile_hint() -> None:
