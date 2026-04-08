@@ -20,3 +20,6 @@ aster = "aster_cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.setuptools.package-data]
+aster_cli = ["templates/llm/*.md"]

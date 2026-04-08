@@ -41,9 +41,10 @@ class CdCommand(ShellCommand):
             ctx.display.error(f"no such path: {path}")
             return
 
-        if node.kind in (NodeKind.BLOB, NodeKind.METHOD, NodeKind.README):
+        if node.kind in (NodeKind.BLOB, NodeKind.METHOD, NodeKind.README, NodeKind.DOC_ENTRY):
             ctx.display.error(f"{path} is not a directory")
             return
+        # Collections are cd-able — they have children (entries)
 
         # Lazy-load children
         await ensure_loaded(node, ctx.connection)
@@ -108,8 +109,32 @@ class LsCommand(ShellCommand):
                 blobs.append({
                     "hash": c.metadata.get("hash", c.name),
                     "size": c.metadata.get("size", "?"),
+                    "tag": c.metadata.get("tag", ""),
+                    "source": c.metadata.get("source", ""),
+                    "is_collection": c.kind == NodeKind.COLLECTION,
                 })
             ctx.display.blob_table(blobs)
+
+        elif node.kind == NodeKind.COLLECTION:
+            await ensure_loaded(node, ctx.connection)
+            entries = []
+            for c in node.sorted_children():
+                entries.append({
+                    "name": c.name,
+                    "hash": c.metadata.get("hash", "?"),
+                    "size": c.metadata.get("size", 0),
+                })
+            ctx.display.collection_entry_table(entries)
+
+        elif node.kind == NodeKind.DOCS:
+            entries = []
+            for c in node.sorted_children():
+                entries.append(c.metadata)
+            ctx.display.doc_entry_table(entries)
+
+        elif node.kind == NodeKind.GOSSIP:
+            ctx.display.info("Gossip topics — use 'tail' to listen to the producer mesh")
+            ctx.display.print("  [cyan]mesh[/cyan]    [dim]producer mesh topic (derived from root key + salt)[/dim]")
 
         elif node.kind == NodeKind.ASTER:
             handles = []
@@ -153,7 +178,18 @@ class LsCommand(ShellCommand):
             content = node.metadata.get("content", "")
             ctx.display.readme_content(content)
 
-        elif node.kind in (NodeKind.BLOB, NodeKind.METHOD):
+        elif node.kind == NodeKind.COLLECTION:
+            await ensure_loaded(node, ctx.connection)
+            entries = []
+            for c in node.sorted_children():
+                entries.append({
+                    "name": c.name,
+                    "hash": c.metadata.get("hash", "?"),
+                    "size": c.metadata.get("size", 0),
+                })
+            ctx.display.collection_entry_table(entries)
+
+        elif node.kind in (NodeKind.BLOB, NodeKind.METHOD, NodeKind.DOC_ENTRY):
             ctx.display.json_value(node.metadata)
 
         else:
@@ -222,36 +258,59 @@ class CatCommand(ShellCommand):
         return [Argument(name="target", description="File name or blob hash", positional=True)]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        # Try resolving as a path first (e.g., "cat README.md" in a handle dir)
+        # Resolve target — either from arg or current directory
         if args:
             node, path = resolve_path(ctx.vfs_root, ctx.vfs_cwd, args[0])
-            if node and node.kind == NodeKind.README:
-                content = node.metadata.get("content", "")
-                ctx.display.readme_content(content)
-                return
-
-        if not args:
-            # If we're at a blob node, use that
-            node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
-            if node and node.kind == NodeKind.BLOB:
-                blob_hash = node.metadata.get("hash", node.name)
-            else:
-                ctx.display.error("usage: cat <target>")
-                return
         else:
+            node, path = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+
+        if node is None and not args:
+            ctx.display.error("usage: cat <target>")
+            return
+
+        # Handle known node types
+        if node and node.kind == NodeKind.README:
+            content = node.metadata.get("content", "")
+            ctx.display.readme_content(content)
+            return
+
+        if node and node.kind == NodeKind.DOC_ENTRY:
+            key = node.metadata.get("key", node.name)
+            try:
+                content = await ctx.connection.read_doc_entry(key)
+                if content is None:
+                    ctx.display.error(f"no content for doc entry: {key}")
+                    return
+                _display_bytes(ctx.display, content)
+            except Exception as e:
+                ctx.display.error(f"failed to read doc entry: {e}")
+            return
+
+        if node and node.kind == NodeKind.COLLECTION:
+            # Show collection entries instead of raw binary
+            await ensure_loaded(node, ctx.connection)
+            entries = []
+            for c in node.sorted_children():
+                entries.append({
+                    "name": c.name,
+                    "hash": c.metadata.get("hash", "?"),
+                    "size": c.metadata.get("size", 0),
+                })
+            ctx.display.collection_entry_table(entries)
+            return
+
+        # Resolve blob hash — prefer full hash from VFS metadata
+        if node and node.kind == NodeKind.BLOB:
+            blob_hash = node.metadata.get("hash", node.name)
+        elif args:
             blob_hash = args[0]
+        else:
+            ctx.display.error("usage: cat <target>")
+            return
 
         try:
             content = await ctx.connection.read_blob(blob_hash)
-            if isinstance(content, bytes):
-                try:
-                    text = content.decode("utf-8")
-                    ctx.display.print(text)
-                except UnicodeDecodeError:
-                    ctx.display.info(f"(binary data, {len(content)} bytes)")
-                    ctx.display.print(content.hex()[:200] + ("…" if len(content) > 100 else ""))
-            else:
-                ctx.display.print(str(content))
+            _display_bytes(ctx.display, content)
         except Exception as e:
             ctx.display.error(f"failed to read: {e}")
 
@@ -634,6 +693,145 @@ class SessionCommand(ShellCommand):
                 and c.name.lower().startswith(partial.lower())]
 
 
+# ── Gossip + docs live commands ───────────────────────────────────────────────
+
+
+@register
+class TailCommand(ShellCommand):
+    name = "tail"
+    description = "Live-stream gossip messages (Ctrl-C to stop)"
+    contexts = ["/gossip"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import asyncio
+        import time
+
+        ctx.display.info("Subscribing to producer mesh gossip topic…")
+
+        try:
+            topic = await ctx.connection.subscribe_gossip()
+        except Exception as e:
+            ctx.display.error(f"failed to subscribe: {e}")
+            return
+
+        ctx.display.success("Subscribed — listening for messages (Ctrl-C to stop)")
+        ctx.display.print()
+
+        try:
+            while True:
+                try:
+                    event_type, data = await asyncio.wait_for(topic.recv(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                ts = time.strftime("%H:%M:%S")
+
+                if event_type == "received":
+                    # Try to decode as JSON (Aster producer messages are JSON)
+                    if data:
+                        try:
+                            text = bytes(data).decode("utf-8")
+                            parsed = json.loads(text)
+                            ctx.display.print(f"[dim]{ts}[/dim] [green]msg[/green] ", end="")
+                            ctx.display.json_value(parsed)
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            ctx.display.print(
+                                f"[dim]{ts}[/dim] [green]msg[/green] "
+                                f"[dim]({len(data)} bytes)[/dim] {bytes(data).hex()[:40]}…"
+                            )
+                    else:
+                        ctx.display.print(f"[dim]{ts}[/dim] [green]msg[/green] [dim](empty)[/dim]")
+
+                elif event_type == "neighbor_up":
+                    peer_id = bytes(data).hex()[:16] if data else "?"
+                    ctx.display.print(f"[dim]{ts}[/dim] [cyan]+ neighbor[/cyan] {peer_id}…")
+
+                elif event_type == "neighbor_down":
+                    peer_id = bytes(data).hex()[:16] if data else "?"
+                    ctx.display.print(f"[dim]{ts}[/dim] [yellow]- neighbor[/yellow] {peer_id}…")
+
+                elif event_type == "lagged":
+                    ctx.display.print(f"[dim]{ts}[/dim] [yellow]lagged[/yellow] (missed messages)")
+
+                else:
+                    ctx.display.print(f"[dim]{ts}[/dim] [dim]{event_type}[/dim]")
+
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            ctx.display.print()
+            ctx.display.info("Stopped listening")
+        except Exception as e:
+            ctx.display.error(f"gossip error: {e}")
+
+
+@register
+class WatchCommand(ShellCommand):
+    name = "watch"
+    description = "Watch live doc events (Ctrl-C to stop)"
+    contexts = ["/docs"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import asyncio
+        import time
+
+        if not hasattr(ctx.connection, '_registry_event_rx') or not ctx.connection._registry_event_rx:
+            ctx.display.error("no registry doc subscription available")
+            return
+
+        rx = ctx.connection._registry_event_rx
+        ctx.display.success("Watching registry doc events (Ctrl-C to stop)")
+        ctx.display.print()
+
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(rx.recv(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                if event is None:
+                    ctx.display.info("subscription ended")
+                    break
+
+                ts = time.strftime("%H:%M:%S")
+                kind = event.kind
+
+                if kind in ("insert_local", "insert_remote"):
+                    entry = event.entry
+                    if entry:
+                        key_str = bytes(entry.key).decode("utf-8", errors="replace")
+                        author = entry.author_id[:12]
+                        source = f" [dim]from {event.from_peer[:12]}…[/dim]" if event.from_peer else ""
+                        ctx.display.print(
+                            f"[dim]{ts}[/dim] [green]{kind}[/green] "
+                            f"[cyan]{key_str}[/cyan] [dim]by {author}…[/dim]{source}"
+                        )
+                    else:
+                        ctx.display.print(f"[dim]{ts}[/dim] [green]{kind}[/green]")
+
+                elif kind == "content_ready":
+                    ctx.display.print(
+                        f"[dim]{ts}[/dim] [blue]content_ready[/blue] {event.hash or '?'}"
+                    )
+
+                elif kind in ("neighbor_up", "neighbor_down"):
+                    color = "cyan" if kind == "neighbor_up" else "yellow"
+                    peer = event.peer[:16] if event.peer else "?"
+                    ctx.display.print(f"[dim]{ts}[/dim] [{color}]{kind}[/{color}] {peer}…")
+
+                elif kind == "sync_finished":
+                    peer = event.peer[:16] if event.peer else "?"
+                    ctx.display.print(f"[dim]{ts}[/dim] [green]sync_finished[/green] {peer}…")
+
+                else:
+                    ctx.display.print(f"[dim]{ts}[/dim] [dim]{kind}[/dim]")
+
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            ctx.display.print()
+            ctx.display.info("Stopped watching")
+        except Exception as e:
+            ctx.display.error(f"watch error: {e}")
+
+
 # ── CLI-mapped blob commands ──────────────────────────────────────────────────
 
 
@@ -713,10 +911,11 @@ def _complete_path(ctx: CommandContext, partial: str, dirs_only: bool = False) -
     prefix_lower = prefix.lower()
     results = []
     for c in node.sorted_children():
-        if dirs_only and c.kind in (NodeKind.BLOB, NodeKind.METHOD):
+        if dirs_only and c.kind in (NodeKind.BLOB, NodeKind.METHOD, NodeKind.DOC_ENTRY):
             continue
+        # Collections are directories
         if c.name.lower().startswith(prefix_lower):
-            suffix = "/" if c.kind not in (NodeKind.BLOB, NodeKind.METHOD) else ""
+            suffix = "/" if c.kind not in (NodeKind.BLOB, NodeKind.METHOD, NodeKind.DOC_ENTRY) else ""
             results.append(c.name + suffix)
     return results
 
@@ -784,11 +983,30 @@ def _method_signature(metadata: dict[str, Any]) -> str:
     return ""
 
 
+def _display_bytes(display: Any, content: Any) -> None:
+    """Display bytes content, trying UTF-8 text then hex."""
+    if isinstance(content, bytes):
+        try:
+            text = content.decode("utf-8")
+            # Try to pretty-print JSON
+            try:
+                parsed = json.loads(text)
+                display.json_value(parsed)
+            except (json.JSONDecodeError, ValueError):
+                display.print(text)
+        except UnicodeDecodeError:
+            display.info(f"(binary data, {len(content)} bytes)")
+            display.print(content.hex()[:200] + ("…" if len(content) > 100 else ""))
+    else:
+        display.print(str(content))
+
+
 def _kind_detail(node: VfsNode) -> str:
     """Short detail string for a top-level directory."""
     details = {
         NodeKind.BLOBS: "content-addressed storage",
         NodeKind.SERVICES: "RPC services",
+        NodeKind.DOCS: "registry documents",
         NodeKind.GOSSIP: "pub/sub topics",
         NodeKind.ASTER: "service directory",
     }

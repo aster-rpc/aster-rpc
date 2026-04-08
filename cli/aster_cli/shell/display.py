@@ -148,13 +148,61 @@ class Display:
         table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
         table.add_column("Hash", style="yellow")
         table.add_column("Size", justify="right")
+        table.add_column("Tag", style="dim")
 
         for b in blobs:
             hash_str = b.get("hash", "?")
             size = b.get("size", "?")
-            if isinstance(size, int):
+            tag = b.get("tag", "")
+            is_coll = b.get("is_collection", False)
+            if isinstance(size, int) and size > 0:
                 size = _format_size(size)
-            table.add_row(hash_str, str(size))
+            elif size == 0:
+                size = ""
+            # Show collections like directories (cyan + trailing /)
+            if is_coll:
+                tag = f"[bold cyan]{escape(tag)}/[/bold cyan]"
+            table.add_row(hash_str, str(size), tag)
+
+        self.console.print(table)
+
+    def collection_entry_table(self, entries: list[dict[str, Any]]) -> None:
+        """Display entries inside a HashSeq collection."""
+        if self.raw:
+            self.console.print(json.dumps(entries, default=str), highlight=False)
+            return
+
+        table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+        table.add_column("Name", style="green")
+        table.add_column("Size", justify="right")
+        table.add_column("Hash", style="dim")
+
+        for e in entries:
+            size = e.get("size", 0)
+            size_str = _format_size(size) if isinstance(size, int) and size > 0 else ""
+            table.add_row(e.get("name", "?"), size_str, e.get("hash", "?"))
+
+        self.console.print(table)
+
+    def doc_entry_table(self, entries: list[dict[str, Any]]) -> None:
+        """Display a table of doc entries."""
+        if self.raw:
+            self.console.print(json.dumps(entries, default=str), highlight=False)
+            return
+
+        table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+        table.add_column("Key", style="cyan")
+        table.add_column("Size", justify="right")
+        table.add_column("Author", style="dim")
+        table.add_column("Hash", style="dim")
+
+        for e in entries:
+            key = e.get("key", "?")
+            size = e.get("size", 0)
+            size_str = _format_size(size) if isinstance(size, int) and size > 0 else ""
+            author = e.get("author", "?")
+            hash_val = e.get("hash", "?")
+            table.add_row(key, size_str, author, hash_val)
 
         self.console.print(table)
 

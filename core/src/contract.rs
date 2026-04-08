@@ -166,35 +166,35 @@ fn hex_to_bytes(s: &str) -> Vec<u8> {
 // ── Canonical serialization functions ────────────────────────────────────────
 
 fn write_field_def(buf: &mut Vec<u8>, fd: &FieldDef) {
-    write_zigzag_i32(buf, fd.id);                              // field 1
-    write_string(buf, &fd.name);                               // field 2
-    write_varint(buf, fd.type_kind as u64);                    // field 3
-    write_string(buf, &fd.type_primitive);                     // field 4
-    write_bytes_field(buf, &hex_to_bytes(&fd.type_ref));       // field 5
-    write_string(buf, &fd.self_ref_name);                      // field 6
-    write_bool(buf, fd.optional);                              // field 7
-    write_bool(buf, fd.ref_tracked);                           // field 8
-    write_varint(buf, fd.container as u64);                    // field 9
-    write_varint(buf, fd.container_key_kind as u64);           // field 10
-    write_string(buf, &fd.container_key_primitive);            // field 11
+    write_zigzag_i32(buf, fd.id); // field 1
+    write_string(buf, &fd.name); // field 2
+    write_varint(buf, fd.type_kind as u64); // field 3
+    write_string(buf, &fd.type_primitive); // field 4
+    write_bytes_field(buf, &hex_to_bytes(&fd.type_ref)); // field 5
+    write_string(buf, &fd.self_ref_name); // field 6
+    write_bool(buf, fd.optional); // field 7
+    write_bool(buf, fd.ref_tracked); // field 8
+    write_varint(buf, fd.container as u64); // field 9
+    write_varint(buf, fd.container_key_kind as u64); // field 10
+    write_string(buf, &fd.container_key_primitive); // field 11
     write_bytes_field(buf, &hex_to_bytes(&fd.container_key_ref)); // field 12
 }
 
 fn write_enum_value_def(buf: &mut Vec<u8>, ev: &EnumValueDef) {
-    write_string(buf, &ev.name);      // field 1
-    write_zigzag_i32(buf, ev.value);  // field 2
+    write_string(buf, &ev.name); // field 1
+    write_zigzag_i32(buf, ev.value); // field 2
 }
 
 fn write_union_variant_def(buf: &mut Vec<u8>, uv: &UnionVariantDef) {
-    write_string(buf, &uv.name);                          // field 1
-    write_zigzag_i32(buf, uv.id);                         // field 2
-    write_bytes_field(buf, &hex_to_bytes(&uv.type_ref));  // field 3
+    write_string(buf, &uv.name); // field 1
+    write_zigzag_i32(buf, uv.id); // field 2
+    write_bytes_field(buf, &hex_to_bytes(&uv.type_ref)); // field 3
 }
 
 fn write_type_def(buf: &mut Vec<u8>, td: &TypeDef) {
-    write_varint(buf, td.kind as u64);  // field 1
-    write_string(buf, &td.package);     // field 2
-    write_string(buf, &td.name);        // field 3
+    write_varint(buf, td.kind as u64); // field 1
+    write_string(buf, &td.package); // field 2
+    write_string(buf, &td.name); // field 3
 
     // field 4: fields list (sorted by id ascending)
     let mut sorted_fields: Vec<&FieldDef> = td.fields.iter().collect();
@@ -222,7 +222,7 @@ fn write_type_def(buf: &mut Vec<u8>, td: &TypeDef) {
 }
 
 fn write_capability_requirement(buf: &mut Vec<u8>, cap: &CapabilityRequirement) {
-    write_varint(buf, cap.kind as u64);  // field 1
+    write_varint(buf, cap.kind as u64); // field 1
 
     // field 2: roles list (NFC-normalized, sorted by Unicode codepoint)
     let mut nfc_roles: Vec<String> = cap
@@ -242,12 +242,12 @@ fn write_capability_requirement(buf: &mut Vec<u8>, cap: &CapabilityRequirement) 
 }
 
 pub fn write_method_def(buf: &mut Vec<u8>, md: &MethodDef) {
-    write_string(buf, &md.name);                               // field 1
-    write_varint(buf, md.pattern as u64);                      // field 2
-    write_bytes_field(buf, &hex_to_bytes(&md.request_type));   // field 3
-    write_bytes_field(buf, &hex_to_bytes(&md.response_type));  // field 4
-    write_bool(buf, md.idempotent);                            // field 5
-    write_float64(buf, md.default_timeout);                    // field 6
+    write_string(buf, &md.name); // field 1
+    write_varint(buf, md.pattern as u64); // field 2
+    write_bytes_field(buf, &hex_to_bytes(&md.request_type)); // field 3
+    write_bytes_field(buf, &hex_to_bytes(&md.response_type)); // field 4
+    write_bool(buf, md.idempotent); // field 5
+    write_float64(buf, md.default_timeout); // field 6
 
     // field 7: requires (optional)
     match &md.requires {
@@ -260,8 +260,8 @@ pub fn write_method_def(buf: &mut Vec<u8>, md: &MethodDef) {
 }
 
 fn write_service_contract(buf: &mut Vec<u8>, sc: &ServiceContract) {
-    write_string(buf, &sc.name);          // field 1
-    write_zigzag_i32(buf, sc.version);    // field 2
+    write_string(buf, &sc.name); // field 1
+    write_zigzag_i32(buf, sc.version); // field 2
 
     // field 3: methods list (sorted by NFC-normalized name, Unicode codepoint order)
     let mut sorted_methods: Vec<&MethodDef> = sc.methods.iter().collect();
@@ -376,11 +376,7 @@ pub fn tarjan_scc(graph: &HashMap<String, HashSet<String>>) -> Vec<Vec<String>> 
         sccs: Vec<Vec<String>>,
     }
 
-    fn strongconnect(
-        v: &str,
-        graph: &HashMap<String, HashSet<String>>,
-        state: &mut State,
-    ) {
+    fn strongconnect(v: &str, graph: &HashMap<String, HashSet<String>>, state: &mut State) {
         state.index.insert(v.to_string(), state.index_counter);
         state.lowlink.insert(v.to_string(), state.index_counter);
         state.index_counter += 1;
@@ -940,14 +936,8 @@ mod tests {
     #[test]
     fn test_scc_no_cycles() {
         let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
-        graph.insert(
-            "A".to_string(),
-            vec!["B".to_string()].into_iter().collect(),
-        );
-        graph.insert(
-            "B".to_string(),
-            vec!["C".to_string()].into_iter().collect(),
-        );
+        graph.insert("A".to_string(), vec!["B".to_string()].into_iter().collect());
+        graph.insert("B".to_string(), vec!["C".to_string()].into_iter().collect());
         graph.insert("C".to_string(), HashSet::new());
 
         let sccs = tarjan_scc(&graph);

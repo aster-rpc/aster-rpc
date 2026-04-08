@@ -28,6 +28,10 @@ class NodeKind(Enum):
     METHOD = "method"
     GOSSIP = "gossip"
     TOPIC = "topic"
+    COLLECTION = "collection"  # HashSeq collection (browsable like a dir)
+    DOCS = "docs"
+    DOC = "doc"
+    DOC_ENTRY = "doc_entry"
     # Directory hierarchy (aster.site)
     ASTER = "aster"       # /aster — the directory root
     HANDLE = "handle"     # /aster/<handle> — a user/org
@@ -76,6 +80,7 @@ def build_root() -> VfsNode:
 
     root.add_child(VfsNode(name="blobs", kind=NodeKind.BLOBS, path="/blobs"))
     root.add_child(VfsNode(name="services", kind=NodeKind.SERVICES, path="/services"))
+    root.add_child(VfsNode(name="docs", kind=NodeKind.DOCS, path="/docs"))
     root.add_child(VfsNode(name="gossip", kind=NodeKind.GOSSIP, path="/gossip"))
 
     root.loaded = True
@@ -199,15 +204,75 @@ async def populate_blobs(node: VfsNode, connection: Any) -> None:
         blobs = await connection.list_blobs()
         for blob in blobs:
             hash_str = blob.get("hash", str(blob)) if isinstance(blob, dict) else str(blob)
-            short = hash_str[:12] + "…" if len(hash_str) > 12 else hash_str
+            tag = blob.get("tag", "")
+            is_collection = blob.get("is_collection", False)
+            # Use tag as display name if available, otherwise short hash
+            display = tag if tag else (hash_str[:12] + "…" if len(hash_str) > 12 else hash_str)
+            kind = NodeKind.COLLECTION if is_collection else NodeKind.BLOB
             blob_node = VfsNode(
-                name=short,
-                kind=NodeKind.BLOB,
-                path=f"/blobs/{short}",
+                name=display,
+                kind=kind,
+                path=f"/blobs/{display}",
                 metadata=blob if isinstance(blob, dict) else {"hash": hash_str},
-                loaded=True,
+                loaded=not is_collection,  # collections need lazy loading
             )
             node.add_child(blob_node)
+    except Exception:
+        pass
+
+    node.loaded = True
+
+
+async def populate_collection(node: VfsNode, connection: Any) -> None:
+    """Populate a collection node with its HashSeq entries."""
+    if node.loaded:
+        return
+
+    coll_hash = node.metadata.get("hash", "")
+    if not coll_hash:
+        node.loaded = True
+        return
+
+    try:
+        entries = await connection.list_collection_entries(coll_hash)
+        for entry in entries:
+            name = entry.get("name", "?")
+            entry_node = VfsNode(
+                name=name,
+                kind=NodeKind.BLOB,
+                path=f"{node.path}/{name}",
+                metadata=entry,
+                loaded=True,
+            )
+            node.add_child(entry_node)
+    except Exception:
+        pass
+
+    node.loaded = True
+
+
+async def populate_docs(node: VfsNode, connection: Any) -> None:
+    """Populate /docs with registry doc entries.
+
+    Args:
+        node: The /docs VfsNode.
+        connection: The active connection to query.
+    """
+    if node.loaded:
+        return
+
+    try:
+        entries = await connection.list_doc_entries()
+        for entry in entries:
+            key = entry.get("key", "?")
+            entry_node = VfsNode(
+                name=key,
+                kind=NodeKind.DOC_ENTRY,
+                path=f"/docs/{key}",
+                metadata=entry,
+                loaded=True,
+            )
+            node.add_child(entry_node)
     except Exception:
         pass
 
@@ -225,6 +290,10 @@ async def ensure_loaded(node: VfsNode, connection: Any) -> None:
         await populate_service_methods(node, connection)
     elif node.kind == NodeKind.BLOBS:
         await populate_blobs(node, connection)
+    elif node.kind == NodeKind.COLLECTION:
+        await populate_collection(node, connection)
+    elif node.kind == NodeKind.DOCS:
+        await populate_docs(node, connection)
     elif node.kind == NodeKind.ASTER:
         await populate_handles(node, connection)
     elif node.kind == NodeKind.HANDLE:

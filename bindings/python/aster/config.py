@@ -124,6 +124,7 @@ def load_endpoint_config(
         "portmapper_config": None,
         "proxy_url": None,
         "proxy_from_env": False,
+        "local_discovery": False,
     }
 
     if path is not None:
@@ -146,6 +147,7 @@ def load_endpoint_config(
         portmapper_config=data["portmapper_config"],
         proxy_url=data["proxy_url"],
         proxy_from_env=data["proxy_from_env"],
+        enable_local_discovery=data["local_discovery"],
     )
 
 
@@ -187,6 +189,7 @@ def _merge_toml(data: dict, raw: dict, source: str) -> None:
         "clear_ip_transports",
         "clear_relay_transports",
         "proxy_from_env",
+        "local_discovery",
     )
     for field in _BOOL_FIELDS:
         if field in raw:
@@ -235,6 +238,7 @@ def _apply_env(data: dict) -> None:
         "clear_ip_transports",
         "clear_relay_transports",
         "proxy_from_env",
+        "local_discovery",
     )
     for field in _BOOL_FIELDS:
         var = f"ASTER_{field.upper()}"
@@ -354,6 +358,10 @@ class AsterConfig:
     portmapper_config: str | None = None
     proxy_url: str | None = None
     proxy_from_env: bool = False
+    local_discovery: bool = False
+    """Enable mDNS local network discovery. Nodes on the same LAN can find
+    each other without relay servers. Default off.
+    Env: ``ASTER_LOCAL_DISCOVERY``. TOML: ``[network] local_discovery``."""
 
     # ── Logging / observability ─────────────────────────────────────────
 
@@ -503,6 +511,7 @@ class AsterConfig:
             self.enable_monitoring, self.enable_hooks,
             self.clear_ip_transports, self.clear_relay_transports,
             self.portmapper_config, self.proxy_url, self.proxy_from_env,
+            self.local_discovery,
             self.hook_timeout_ms != 5000,
         ])
         if not has_custom:
@@ -520,6 +529,7 @@ class AsterConfig:
             portmapper_config=self.portmapper_config,
             proxy_url=self.proxy_url,
             proxy_from_env=self.proxy_from_env,
+            enable_local_discovery=self.local_discovery,
         )
 
     # ── print_config ─────────────────────────────────────────────────────
@@ -655,6 +665,7 @@ class AsterConfig:
         _NET_BOOLS = (
             "enable_monitoring", "enable_hooks",
             "clear_ip_transports", "clear_relay_transports", "proxy_from_env",
+            "local_discovery",
         )
         for f in _NET_BOOLS:
             if f in network:

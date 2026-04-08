@@ -24,6 +24,7 @@ mod hooks;
 mod monitor;
 mod net;
 mod node;
+mod ticket;
 
 /// Wrapper to convert Vec<u8> to Python bytes via IntoPyObject.
 /// In pyo3 0.28, Vec<u8> converts to list[int], but we want bytes.
@@ -66,6 +67,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     hooks::register(py, m)?;
     monitor::register(py, m)?;
     contract::register(py, m)?;
+    ticket::register(py, m)?;
 
     Ok(())
 }

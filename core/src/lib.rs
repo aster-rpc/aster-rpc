@@ -2,6 +2,7 @@ pub mod canonical;
 pub mod contract;
 pub mod framing;
 pub mod signing;
+pub mod ticket;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -9,12 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Result};
-use url::Url;
 use bytes::Bytes;
 use iroh::address_lookup::memory::MemoryLookup;
+use iroh::address_lookup::MdnsAddressLookup;
 use iroh::endpoint::{
     presets, AfterHandshakeOutcome, BeforeConnectOutcome, Connection, ConnectionError,
-    ConnectionInfo, Endpoint, EndpointHooks, PathInfo, RelayMode, VarInt, PortmapperConfig,
+    ConnectionInfo, Endpoint, EndpointHooks, PathInfo, PortmapperConfig, RelayMode, VarInt,
 };
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher};
@@ -40,6 +41,7 @@ use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::StreamExt;
 use tracing::debug;
+use url::Url;
 
 // ============================================================================
 // Core Types - FFI-safe wrappers
@@ -86,7 +88,7 @@ impl Default for CoreEndpointConfig {
             relay_urls: Vec::new(),
             alpns: Vec::new(),
             secret_key: None,
-            enable_discovery: true,
+            enable_discovery: false,
             enable_monitoring: false,
             enable_hooks: false,
             hook_timeout_ms: 5000,
@@ -871,6 +873,14 @@ async fn build_node_endpoint(
             }
 
             let endpoint = builder.bind().await?;
+
+            if config.enable_discovery {
+                let mdns = MdnsAddressLookup::builder()
+                    .build(endpoint.id())
+                    .map_err(|e| anyhow!("mDNS init failed: {e}"))?;
+                endpoint.address_lookup()?.add(mdns);
+            }
+
             if !matches!(relay_mode, RelayMode::Disabled) {
                 endpoint.online().await;
             }
@@ -1186,6 +1196,14 @@ impl CoreNetClient {
         }
 
         let endpoint = builder.bind().await?;
+
+        if config.enable_discovery {
+            let mdns = MdnsAddressLookup::builder()
+                .build(endpoint.id())
+                .map_err(|e| anyhow!("mDNS init failed: {e}"))?;
+            endpoint.address_lookup()?.add(mdns);
+        }
+
         if !matches!(relay_mode, RelayMode::Disabled) {
             endpoint.online().await;
         }
@@ -1692,6 +1710,72 @@ impl CoreBlobsClient {
         drop(temp_collection);
 
         Ok(hash_str)
+    }
+
+    /// Store a multi-file collection (HashSeq).
+    ///
+    /// Each `(name, data)` pair is stored as a raw blob, then a `Collection`
+    /// is built from the `(name, hash)` pairs and stored as a HashSeq blob.
+    /// A persistent tag is set with `BlobFormat::HashSeq` so the collection
+    /// (and all its children) are protected from GC.
+    ///
+    /// Returns the collection hash (hex).
+    pub async fn add_collection(&self, entries: Vec<(String, Vec<u8>)>) -> Result<String> {
+        // Store each entry as a raw blob, keeping TempTags alive
+        let mut temp_tags = Vec::with_capacity(entries.len());
+        let mut name_hash_pairs: Vec<(String, Hash)> = Vec::with_capacity(entries.len());
+        for (name, data) in &entries {
+            let temp = self.store.add_slice(data).await?;
+            let hash = temp.hash;
+            name_hash_pairs.push((name.clone(), hash));
+            temp_tags.push(temp);
+        }
+
+        // Build a Collection from the name/hash pairs
+        let collection: Collection = name_hash_pairs.into_iter().collect();
+
+        // Store the collection itself (produces a HashSeq blob)
+        let temp_collection = collection.store(&self.store).await?;
+        let collection_hash = temp_collection.hash();
+        let hash_str = collection_hash.to_string();
+
+        // Set a persistent named tag so the collection survives GC
+        let tag_name = format!("aster-collection/{}", &hash_str[..16]);
+        self.store
+            .tags()
+            .set(
+                tag_name.as_bytes(),
+                HashAndFormat {
+                    hash: collection_hash,
+                    format: BlobFormat::HashSeq,
+                },
+            )
+            .await?;
+
+        // TempTags drop here — the persistent named tag now protects all data.
+        drop(temp_tags);
+        drop(temp_collection);
+
+        Ok(hash_str)
+    }
+
+    /// List entries from a stored collection.
+    ///
+    /// Loads the `Collection` by hash, reads the size of each child blob,
+    /// and returns `Vec<(name, hash_hex, size)>`.
+    pub async fn list_collection(&self, hash_hex: String) -> Result<Vec<(String, String, u64)>> {
+        let hash = hash_hex.parse::<Hash>()?;
+        let collection = Collection::load(hash, &self.store).await?;
+        let mut result = Vec::new();
+        for (name, blob_hash) in collection.iter() {
+            let size = match self.store.blobs().status(*blob_hash).await? {
+                iroh_blobs::api::proto::BlobStatus::Complete { size } => size,
+                iroh_blobs::api::proto::BlobStatus::Partial { size } => size.unwrap_or(0),
+                iroh_blobs::api::proto::BlobStatus::NotFound => 0,
+            };
+            result.push((name.clone(), blob_hash.to_string(), size));
+        }
+        Ok(result)
     }
 
     // ── Tag methods ──────────────────────────────────────────────────────────

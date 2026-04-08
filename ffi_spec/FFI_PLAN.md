@@ -151,6 +151,16 @@ impl CoreBlobsClient {
     /// Returns the collection hash (hex).
     pub async fn add_bytes_as_collection(&self, name: String, data: Vec<u8>) -> Result<String>;
 
+    /// Store a multi-file collection (HashSeq).
+    /// Each (name, data) pair is stored as a raw blob, then wrapped in a Collection.
+    /// A persistent HashSeq tag is set for GC protection.
+    /// Returns the collection hash (hex).
+    pub async fn add_collection(&self, entries: Vec<(String, Vec<u8>)>) -> Result<String>;
+
+    /// List entries from a stored collection.
+    /// Returns Vec<(name, hash_hex, size)>.
+    pub async fn list_collection(&self, hash_hex: String) -> Result<Vec<(String, String, u64)>>;
+
     /// Create a ticket for a Collection (HashSeq format), compatible with sendme.
     pub fn create_collection_ticket(&self, hash_hex: String) -> Result<String>;
 
@@ -163,6 +173,10 @@ impl CoreBlobsClient {
 }
 ```
 
+**FFI C ABI functions:**
+- `iroh_blobs_add_collection(runtime, node, entries_json, user_data, out_operation)` — entries_json is `[["name","base64data"],...]`; emits `IROH_EVENT_BLOB_COLLECTION_ADDED`
+- `iroh_blobs_list_collection(runtime, node, hash_hex, user_data, out_operation)` — emits `IROH_EVENT_BLOB_READ` with JSON `[["name","hash_hex",size],...]`
+
 **Interoperability matrix:**
 
 | Sender | Receiver | `create_ticket` (Raw) | `create_collection_ticket` (HashSeq) |
@@ -172,7 +186,7 @@ impl CoreBlobsClient {
 | sendme | Python   | N/A (sendme always uses HashSeq) | ✅ `download_blob` auto-detects |
 
 **Language binding requirements:**
-- All language bindings MUST expose `add_bytes_as_collection`, `create_collection_ticket`, and the format-aware `download_blob`
+- All language bindings MUST expose `add_bytes_as_collection`, `add_collection`, `list_collection`, `create_collection_ticket`, and the format-aware `download_blob`
 - The `download_blob` method MUST auto-detect `BlobFormat::HashSeq` from the ticket and extract Collection contents
 - The existing `add_bytes` + `create_ticket` (Raw format) remain available for Python-to-Python or internal use
 
@@ -3438,3 +3452,42 @@ return aster_metrics + "\n" + transport_metrics
    5. Write JUnit tests
    6. Write integration tests matching the Python test scenarios
    7. Document Java API with Javadoc
+
+## 3h. Phase 1h: Compact Aster Ticket Format
+
+**Status:** Implemented  
+**Date:** 2026-04-08  
+**Spec:** `docs/_internal/COMPACT_TICKET_FORMAT.md`
+
+### Overview
+
+Compact binary encoding for endpoint addresses + optional credentials, replacing verbose base64 NodeAddr strings. Wire format max 256 bytes, string format `aster1<base58>`.
+
+### Core (`core/src/ticket.rs`)
+
+- `AsterTicket` struct: `endpoint_id`, `relay`, `direct_addrs`, `credential`
+- `TicketCredential` enum: `Open` (0x00), `ConsumerRcan` (0x01), `Enrollment` (0x02), `Registry` (0x03)
+- `encode() -> Vec<u8>`: serialize to compact binary
+- `decode(bytes) -> AsterTicket`: deserialize
+- `to_base58_string() -> String`: `aster1<base58>` encoding
+- `from_base58_str(s) -> AsterTicket`: parse `aster1<base58>` string
+
+### FFI (`ffi/src/lib.rs`)
+
+```c
+int32_t aster_ticket_encode(
+    const uint8_t *endpoint_id_hex, size_t endpoint_id_hex_len,
+    const uint8_t *relay_addr, size_t relay_addr_len,
+    const uint8_t *direct_addrs_json, size_t direct_addrs_json_len,
+    const uint8_t *credential_type, size_t credential_type_len,
+    const uint8_t *credential_data, size_t credential_data_len,
+    uint8_t *out_buf, size_t *out_len
+);
+
+int32_t aster_ticket_decode(
+    const uint8_t *ticket_str, size_t ticket_len,
+    uint8_t *out_buf, size_t *out_len
+);
+```
+
+Both are synchronous. `aster_ticket_encode` writes the `aster1...` string to `out_buf`. `aster_ticket_decode` writes a JSON object with `endpoint_id`, `relay_addr`, `direct_addrs`, `credential_type`, `credential_data_hex`.

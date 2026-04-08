@@ -389,23 +389,25 @@ class TestServiceDecorator:
 
 
 class TestXlangTagValidation:
-    def test_untagged_request_type_warns(self):
-        """Untagged request type emits UserWarning at decoration time (auto-tagged)."""
-        with pytest.warns(UserWarning, match="auto-tagged"):
-            @service(name="TestService", version=1)
-            class TestService:
-                @rpc
-                async def echo(self, req: UntaggedRequest) -> EchoResponse:
-                    return EchoResponse(message="")
+    def test_untagged_request_type_auto_tagged_silently(self):
+        """Untagged request type is auto-tagged at decoration time without warning."""
+        @service(name="TestService", version=1)
+        class TestService:
+            @rpc
+            async def echo(self, req: UntaggedRequest) -> EchoResponse:
+                return EchoResponse(message="")
 
-    def test_untagged_response_type_warns(self):
-        """Untagged response type emits UserWarning at decoration time (auto-tagged)."""
-        with pytest.warns(UserWarning, match="auto-tagged"):
-            @service(name="TestService", version=1)
-            class TestService:
-                @rpc
-                async def echo(self, req: EchoRequest) -> UntaggedResponse:
-                    return UntaggedResponse(value="")
+        assert hasattr(UntaggedRequest, "__wire_type__")
+
+    def test_untagged_response_type_auto_tagged_silently(self):
+        """Untagged response type is auto-tagged at decoration time without warning."""
+        @service(name="TestService", version=1)
+        class TestService:
+            @rpc
+            async def echo(self, req: EchoRequest) -> UntaggedResponse:
+                return UntaggedResponse(value="")
+
+        assert hasattr(UntaggedResponse, "__wire_type__")
 
     def test_nested_untagged_type_auto_tagged(self):
         """Nested untagged type is auto-tagged (or already tagged from prior test)."""

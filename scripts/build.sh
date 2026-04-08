@@ -11,7 +11,13 @@ set -euo pipefail
 MANIFEST="bindings/python/rust/Cargo.toml"
 STUB="bindings/python/aster/_aster.pyi"
 
-uv run maturin develop -m "$MANIFEST" "$@"
+WHEEL_DIR="bindings/python/target/wheels"
+
+# Build wheel, then install it — single cargo compilation
+uv run maturin build -m "$MANIFEST" --out "$WHEEL_DIR" "$@"
+uv pip install "$WHEEL_DIR"/aster_rpc-*.whl --force-reinstall --no-deps
+
+echo "✓ Wheel(s) in $WHEEL_DIR"
 
 # Regenerate native-module type stub from the live compiled module.
 uv run python -c "

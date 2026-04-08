@@ -81,25 +81,26 @@ class ConsumerAdmissionResponse:
     services: list["ServiceSummary"] = field(default_factory=list)
     registry_ticket: str = ""
     root_pubkey: str = ""        # hex-encoded 32-byte ed25519 public key
+    gossip_topic: str = ""       # hex-encoded 32-byte topic — only for root node
     reason: str = ""             # MUST be empty in wire response (§3.2.2)
 
     def to_json(self) -> str:
         from ..registry.models import ServiceSummary as _SS  # avoid circular at module level
 
-        return json.dumps(
-            {
-                "admitted": self.admitted,
-                "attributes": self.attributes,
-                "services": [
-                    s.to_json_dict() if isinstance(s, _SS) else s
-                    for s in self.services
-                ],
-                "registry_ticket": self.registry_ticket,
-                "root_pubkey": self.root_pubkey,
-                "reason": "",   # never leak reason on wire
-            },
-            separators=(",", ":"),
-        )
+        d = {
+            "admitted": self.admitted,
+            "attributes": self.attributes,
+            "services": [
+                s.to_json_dict() if isinstance(s, _SS) else s
+                for s in self.services
+            ],
+            "registry_ticket": self.registry_ticket,
+            "root_pubkey": self.root_pubkey,
+            "reason": "",   # never leak reason on wire
+        }
+        if self.gossip_topic:
+            d["gossip_topic"] = self.gossip_topic
+        return json.dumps(d, separators=(",", ":"))
 
     @classmethod
     def from_json(cls, raw: str | bytes) -> "ConsumerAdmissionResponse":
@@ -121,6 +122,7 @@ class ConsumerAdmissionResponse:
             services=services,
             registry_ticket=d.get("registry_ticket") or "",
             root_pubkey=d.get("root_pubkey") or "",
+            gossip_topic=d.get("gossip_topic") or "",
             reason="",
         )
 
@@ -185,6 +187,7 @@ async def handle_consumer_admission_rpc(
     services: "list[ServiceSummary] | None" = None,
     registry_ticket: str = "",
     allow_unenrolled: bool = False,
+    gossip_topic_id: bytes | None = None,
 ) -> ConsumerAdmissionResponse:
     """Server-side handler for the ``aster.consumer_admission`` ALPN.
 
@@ -221,18 +224,28 @@ async def handle_consumer_admission_rpc(
     from aster.health import get_admission_metrics
     _adm = get_admission_metrics()
 
+    # Include gossip topic only when the connecting peer IS the root node
+    # (its endpoint_id == root_pubkey hex). This lets the operator's shell
+    # observe the producer mesh without exposing the topic to other consumers.
+    _topic_for_peer = ""
+    if gossip_topic_id and peer_node_id == root_pubkey.hex():
+        _topic_for_peer = gossip_topic_id.hex()
+        logger.debug("consumer admission: root node detected — including gossip topic")
+
     # Dev mode / open gate: empty credential → auto-admit.
     if not req.credential_json and allow_unenrolled:
         if hook is not None:
             hook.add_peer(peer_node_id)
         _adm.record_consumer_admit()
-        logger.info("consumer admission: auto-admitted %s (open gate)", peer_node_id)
+        _role = "root" if _topic_for_peer else "open gate"
+        logger.info("consumer admission: auto-admitted %s (%s)", peer_node_id, _role)
         return ConsumerAdmissionResponse(
             admitted=True,
             attributes={},
             services=list(services or []),
             registry_ticket=registry_ticket,
             root_pubkey=root_pubkey.hex(),
+            gossip_topic=_topic_for_peer,
         )
 
     try:
@@ -275,6 +288,7 @@ async def handle_consumer_admission_rpc(
         services=list(services or []),
         registry_ticket=registry_ticket,
         root_pubkey=root_pubkey.hex(),
+        gossip_topic=_topic_for_peer,
     )
 
 
@@ -332,6 +346,7 @@ async def handle_consumer_admission_connection(
     services_getter: "Callable[[], list[ServiceSummary]] | None" = None,
     registry_ticket_getter: "Callable[[], str] | None" = None,
     allow_unenrolled: bool = False,
+    gossip_topic_getter: "Callable[[], bytes | None] | None" = None,
 ) -> None:
     """Handle one consumer admission connection: read request, write response."""
     peer_node_id = conn.remote_id()
@@ -344,6 +359,7 @@ async def handle_consumer_admission_connection(
 
         services = services_getter() if services_getter is not None else []
         ticket = registry_ticket_getter() if registry_ticket_getter is not None else ""
+        topic = gossip_topic_getter() if gossip_topic_getter is not None else None
 
         response = await handle_consumer_admission_rpc(
             raw.decode(),
@@ -354,14 +370,13 @@ async def handle_consumer_admission_connection(
             nonce_store=nonce_store,
             services=services,
             registry_ticket=ticket,
+            gossip_topic_id=topic,
         )
 
         await send.write_all(response.to_json().encode())
         await send.finish()
+        # Don't conn.close() — let QUIC drain the streams naturally.
+        # Calling close() sends CONNECTION_CLOSE which kills in-flight
+        # data before the consumer can read_to_end().
     except Exception as exc:  # noqa: BLE001
         logger.warning("consumer admission: error handling %s: %s", peer_node_id, exc)
-    finally:
-        try:
-            conn.close(0, b"done")
-        except Exception:  # noqa: BLE001
-            pass

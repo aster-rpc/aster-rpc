@@ -74,6 +74,7 @@ class ServiceInfo:
     interceptors: list[type] = field(default_factory=list)
     max_concurrent_streams: int | None = None
     requires: CapabilityRequirement | None = None
+    public: bool = False
     metadata: Metadata | None = None
 
     def get_method(self, method_name: str) -> MethodInfo | None:

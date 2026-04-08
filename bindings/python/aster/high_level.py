@@ -244,9 +244,9 @@ class AsterServer:
             self._node.node_addr_info().to_bytes()
         ).decode()
 
-        # Auto-create ephemeral MeshState when producer admission is enabled.
-        if not self._allow_all_producers and self._mesh_state is None:
-            assert self._root_pubkey is not None
+        # Auto-create ephemeral MeshState. Even when allow_all_producers=True
+        # we need the topic_id so the root node's shell can observe gossip.
+        if self._mesh_state is None and self._root_pubkey is not None:
             self._mesh_state = make_ephemeral_mesh_state(self._root_pubkey)
 
         # Build ServiceSummary list with per-spec contract_id.
@@ -356,6 +356,8 @@ class AsterServer:
                 info = getattr(svc_cls, "__aster_service_info__", None)
                 if info is None:
                     continue
+                if info.public:
+                    continue
                 svc_has_auth = info.requires is not None
                 if not svc_has_auth:
                     svc_has_auth = any(
@@ -422,11 +424,27 @@ class AsterServer:
         for s in self._service_summaries:
             sys.stderr.write(f"  {G}●{R} {B}{s.name}{R} v{s.version}  {D}contract:{R} {s.contract_id[:16]}…\n")
 
-        # Endpoint
-        addr = base64.b64encode(
-            self._node.node_addr_info().to_bytes()
-        ).decode() if self._node else "?"
-        sys.stderr.write(f"  {D}endpoint:{R}  {addr[:48]}…\n")
+        # Endpoint — show compact aster1... ticket as primary format
+        if self._node:
+            try:
+                from . import AsterTicket
+                addr_info = self._node.node_addr_info()
+                t = AsterTicket(
+                    endpoint_id=addr_info.endpoint_id,
+                    direct_addrs=addr_info.direct_addresses or [],
+                )
+                compact = t.to_string()
+            except Exception:
+                compact = None
+            addr_b64 = base64.b64encode(
+                self._node.node_addr_info().to_bytes()
+            ).decode()
+        else:
+            compact = None
+            addr_b64 = "?"
+        if compact:
+            sys.stderr.write(f"  {D}ticket:{R}    {compact}\n")
+        sys.stderr.write(f"  {D}endpoint:{R}  {addr_b64[:48]}…\n")
 
         # Mode
         mode_parts = []
@@ -501,7 +519,8 @@ class AsterServer:
                 # Build collection with full method schemas
                 entries = build_collection(contract, type_defs, service_info=info)
 
-                # Upload to blob store
+                # Upload to blob store as a native HashSeq collection.
+                # GC protection is handled automatically by the HashSeq tag.
                 collection_hash = await upload_collection(bc, entries)
 
                 # Create a collection ticket so consumers can download all
@@ -644,6 +663,10 @@ class AsterServer:
                             services_getter=lambda: services_snapshot,
                             registry_ticket_getter=lambda: self._registry_ticket,
                             allow_unenrolled=self._allow_all_consumers,
+                            gossip_topic_getter=lambda: (
+                                self._mesh_state.topic_id
+                                if self._mesh_state else None
+                            ),
                         ),
                         name="aster-consumer-admission-conn",
                     )
@@ -761,6 +784,24 @@ class AsterServer:
         self._require_started()
         assert self._node is not None
         return base64.b64encode(self._node.node_addr_info().to_bytes()).decode()
+
+    @property
+    def ticket(self) -> str:
+        """Compact ``aster1...`` ticket string for this server's endpoint.
+
+        Contains the endpoint ID and direct addresses.  Relay URL is
+        omitted because the ticket format uses resolved IP:port, not
+        full relay URLs.
+        """
+        self._require_started()
+        assert self._node is not None
+        from . import AsterTicket
+        addr_info = self._node.node_addr_info()
+        t = AsterTicket(
+            endpoint_id=addr_info.endpoint_id,
+            direct_addrs=addr_info.direct_addresses or [],
+        )
+        return t.to_string()
 
     @property
     def rpc_addr_b64(self) -> str:
@@ -923,6 +964,7 @@ class AsterClient:
         self._ep: Any | None = None
         self._services: list[ServiceSummary] = []
         self._registry_ticket: str = ""
+        self._gossip_topic: str = ""
         self._rpc_conns: dict[str, Any] = {}
         self._clients: list[ServiceClient] = []
         self._connected: bool = False
@@ -959,6 +1001,11 @@ class AsterClient:
             )
             logger.debug("Consumer node: in-memory (set ASTER_STORAGE_PATH for persistence)")
         self._ep = net_client(self._node)
+
+        logger.debug(
+            "Consumer node ready: endpoint_id=%s",
+            self._node.node_addr_info().endpoint_id[:16] + "…",
+        )
 
         # Always run the admission handshake — even when the consumer gate
         # is open, the response carries the services list + registry ticket.
@@ -1040,10 +1087,12 @@ class AsterClient:
 
         self._services = list(resp.services)
         self._registry_ticket = resp.registry_ticket or ""
+        self._gossip_topic = resp.gossip_topic or ""
         logger.info(
-            "Admitted — services: %s, registry_ticket: %s",
+            "Admitted — services: %s, registry_ticket: %s, gossip_topic: %s",
             [s.name for s in self._services],
             bool(self._registry_ticket),
+            bool(self._gossip_topic),
         )
 
     async def _rpc_conn_for(self, rpc_addr_b64: str) -> Any:
@@ -1145,6 +1194,15 @@ class AsterClient:
         """
         return self._registry_ticket
 
+    @property
+    def gossip_topic(self) -> str:
+        """Hex-encoded 32-byte gossip topic ID for the producer mesh.
+
+        Only populated when the connecting consumer is the root node
+        (endpoint_id == root_pubkey). Empty string otherwise.
+        """
+        return self._gossip_topic
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -1166,7 +1224,7 @@ def _build_node_endpoint_config(
     if template is not None:
         for attr in (
             "relay_mode", "secret_key", "enable_monitoring",
-            "enable_hooks", "hook_timeout_ms",
+            "enable_hooks", "hook_timeout_ms", "enable_local_discovery",
         ):
             if hasattr(template, attr):
                 val = getattr(template, attr)
@@ -1194,7 +1252,8 @@ def _clone_config_with_alpns(
             seen.add(a)
             merged.append(a)
     kwargs: dict[str, Any] = {"alpns": merged}
-    for attr in ("relay_mode", "secret_key", "enable_monitoring", "enable_hooks", "hook_timeout_ms"):
+    for attr in ("relay_mode", "secret_key", "enable_monitoring", "enable_hooks",
+                  "hook_timeout_ms", "enable_local_discovery"):
         if hasattr(template, attr):
             val = getattr(template, attr)
             if val is not None:
@@ -1245,6 +1304,19 @@ def _coerce_node_addr(addr: NodeAddr | str | bytes) -> NodeAddr:
     if isinstance(addr, NodeAddr):
         return addr
     if isinstance(addr, str):
+        # Compact aster1... ticket format
+        if addr.startswith("aster1"):
+            from . import AsterTicket
+            ticket = AsterTicket.from_string(addr)
+            return NodeAddr(
+                endpoint_id=ticket.endpoint_id,
+                relay_url=None,  # ticket stores resolved IP:port, not relay URL
+                direct_addresses=ticket.direct_addrs,
+            )
+        # 128-char hex string → bare endpoint ID (no relay/direct addrs)
+        if len(addr) == 128 and all(c in "0123456789abcdef" for c in addr.lower()):
+            return NodeAddr(endpoint_id=addr)
+        # Otherwise assume base64-encoded NodeAddr bytes
         return NodeAddr.from_bytes(base64.b64decode(addr))
     if isinstance(addr, (bytes, bytearray)):
         return NodeAddr.from_bytes(bytes(addr))

@@ -72,9 +72,12 @@ export function Service(options: ServiceOptions) {
       if (!descriptor || typeof descriptor.value !== 'function') continue;
       const info: MethodInfo | undefined = descriptor.value[METHOD_INFO_KEY];
       if (info) {
-        info.name = name;
+        // Use explicit name from @Rpc({name: "..."}) if set, else method name
+        if (!info.name) {
+          info.name = name;
+        }
         info.handler = descriptor.value;
-        methods.set(name, info);
+        methods.set(info.name, info);
       }
     }
 
@@ -97,6 +100,8 @@ export function Service(options: ServiceOptions) {
 // -- Method decorators --------------------------------------------------------
 
 interface RpcOptions {
+  /** Override wire name (defaults to the method name). */
+  name?: string;
   timeout?: number;
   idempotent?: boolean;
   serialization?: SerializationMode;
@@ -110,7 +115,7 @@ function methodDecorator(pattern: RpcPattern, options?: RpcOptions) {
     _context: ClassMethodDecoratorContext,
   ): T {
     const info: MethodInfo = {
-      name: '', // filled in by @Service
+      name: options?.name ?? '', // explicit name or filled in by @Service
       pattern,
       requestType: undefined,
       responseType: undefined,
