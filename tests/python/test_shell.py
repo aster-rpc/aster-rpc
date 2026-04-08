@@ -8,6 +8,7 @@ import json
 import pytest
 
 from aster_cli.shell.app import DemoConnection, _populate_from_connection
+from aster_cli.handle_validation import validate_handle
 from aster_cli.shell.commands import _parse_call_args
 from aster_cli.shell.display import Display, _format_size
 from aster_cli.shell.plugin import (
@@ -141,6 +142,8 @@ class TestPlugins:
         names = {c.name for c in cmds}
         assert "describe" in names
         assert "invoke" in names
+        assert "join" in names
+        assert "whoami" in names
 
     def test_describe_not_valid_at_root(self):
         cmd = get_command("describe")
@@ -245,6 +248,21 @@ class TestArgParsing:
         assert result["_positional"] == "World"
 
 
+class TestHandleValidation:
+    def test_valid_handle(self):
+        assert validate_handle("alice-dev") == (True, "available")
+
+    def test_reserved_handle(self):
+        ok, reason = validate_handle("admin")
+        assert not ok
+        assert "reserved" in reason
+
+    def test_numeric_handle_rejected(self):
+        ok, reason = validate_handle("12345")
+        assert not ok
+        assert "numeric" in reason
+
+
 # ── Display tests ─────────────────────────────────────────────────────────────
 
 
@@ -282,7 +300,8 @@ class TestDemoConnection:
     @pytest.mark.asyncio
     async def test_list_blobs(self, demo_conn):
         blobs = await demo_conn.list_blobs()
-        assert len(blobs) == 3
+        assert len(blobs) == 1
+        assert blobs[0]["is_collection"] is True
 
     @pytest.mark.asyncio
     async def test_read_blob(self, demo_conn):

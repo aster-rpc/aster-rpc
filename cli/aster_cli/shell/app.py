@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import sys
 from pathlib import Path
 from typing import Any
@@ -1173,6 +1174,59 @@ class DirectoryDemoConnection:
         },
     }
 
+    def __init__(self) -> None:
+        from aster_cli.join import get_local_identity_state
+        from aster_cli.profile import get_published_services
+
+        state = get_local_identity_state()
+        self.my_handle = state["handle"] or state["display_handle"].lstrip("@")
+        self.my_pubkey_hash = (state["root_pubkey"] or self.MY_PUBKEY_HASH)[:12]
+        self._handles = copy.deepcopy(self._HANDLES)
+        self._handle_info = copy.deepcopy(self._HANDLE_INFO)
+
+        local_services = []
+        published_names = set(get_published_services(state["profile"]))
+        manifest_path = Path(".aster/manifest.json")
+        if manifest_path.exists():
+            try:
+                import json as _json
+
+                payload = _json.loads(manifest_path.read_text())
+                manifests = payload if isinstance(payload, list) else [payload]
+                for manifest in manifests:
+                    methods = []
+                    for method in manifest.get("methods", []):
+                        methods.append({
+                            "name": method.get("name", "?"),
+                            "pattern": method.get("pattern", "unary"),
+                            "request_type": method.get("request_type", "?"),
+                            "response_type": method.get("response_type", "?"),
+                            "timeout": method.get("timeout"),
+                            "fields": method.get("fields", []),
+                        })
+                    service_name = manifest.get("service", "UnknownService")
+                    local_services.append({
+                        "name": service_name,
+                        "published": service_name in published_names,
+                        "version": manifest.get("version", 1),
+                        "scoped": manifest.get("scoped", "shared"),
+                        "description": "Local manifest",
+                        "endpoints": 1 if service_name in published_names else 0,
+                        "contract_hash": manifest.get("contract_id", ""),
+                        "methods": methods,
+                    })
+            except Exception:
+                local_services = []
+
+        info = self._handle_info.setdefault(self.my_handle, {"readme": "", "services": []})
+        info["services"] = local_services + info.get("services", [])
+        if not any((h.get("handle") or h.get("pubkey_hash")) == self.my_handle for h in self._handles):
+            self._handles.insert(0, {
+                "handle": self.my_handle,
+                "pubkey_hash": self.my_pubkey_hash,
+                "registered": bool(state["handle"]) and state["handle_status"] in {"pending", "verified"},
+            })
+
     async def connect(self) -> None:
         pass
 
@@ -1183,11 +1237,11 @@ class DirectoryDemoConnection:
                 "pubkey_hash": h["pubkey_hash"],
                 "registered": h["registered"],
             }
-            for h in self._HANDLES
+            for h in self._handles
         ]
 
     async def get_handle_info(self, handle: str) -> dict[str, Any]:
-        return self._HANDLE_INFO.get(handle, {"readme": "", "services": []})
+        return self._handle_info.get(handle, {"readme": "", "services": []})
 
     # -- These support drill-down into services (reuses demo logic) --
 
@@ -1408,10 +1462,35 @@ async def _run_shell(
     peer_name: str,
     raw: bool = False,
     directory_mode: bool = False,
+    air_gapped: bool = False,
 ) -> None:
     """Run the interactive shell REPL."""
     console = Console()
     display = Display(console=console, raw=raw)
+    from rich.panel import Panel
+    from aster_cli.join import get_local_identity_state
+
+    state = get_local_identity_state()
+
+    if not raw:
+        banner_lines = []
+        if air_gapped:
+            banner_lines.append("[bold]Air-gapped mode[/bold] [dim](@aster service disabled for this session)[/dim]")
+        if not state["root_pubkey"]:
+            banner_lines.append("No identity configured.")
+            banner_lines.append("[dim]Run `aster keygen root` or `aster join --demo` to get started.[/dim]")
+        elif state["handle_status"] == "pending":
+            banner_lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [dim]pending verification[/dim]")
+            banner_lines.append("[dim]Run `verify 123456` in demo mode, or finish verification once the service client is wired.[/dim]")
+        elif state["handle_status"] == "verified":
+            banner_lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [dim]verified[/dim]")
+        else:
+            banner_lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [dim]not registered[/dim]")
+            banner_lines.append("[dim]Run `join --demo` to preview the registration flow.[/dim]")
+        display.console.print()
+        display.console.print(
+            Panel("\n".join(banner_lines), border_style="blue", padding=(0, 2))
+        )
 
     if directory_mode:
         root = build_directory_root()
@@ -1589,6 +1668,8 @@ async def launch_shell(
     rcan_path: str | None = None,
     demo: bool = False,
     demo2: bool = False,
+    air_gapped: bool = False,
+    raw: bool = False,
 ) -> None:
     """Launch the interactive shell.
 
@@ -1602,10 +1683,10 @@ async def launch_shell(
     """
     if demo2:
         connection = DirectoryDemoConnection()
-        peer_name = DirectoryDemoConnection.MY_HANDLE
+        peer_name = connection.my_handle
         await connection.connect()
         try:
-            await _run_shell(connection, peer_name, directory_mode=True)
+            await _run_shell(connection, peer_name, raw=raw, directory_mode=True, air_gapped=air_gapped)
         finally:
             await connection.close()
         return
@@ -1640,7 +1721,7 @@ async def launch_shell(
         await connect_task
 
     try:
-        await _run_shell(connection, peer_name)
+        await _run_shell(connection, peer_name, raw=raw, air_gapped=air_gapped)
     finally:
         await connection.close()
 
@@ -1674,6 +1755,11 @@ def register_shell_subparser(subparsers: argparse._SubParsersAction) -> None:
         help=argparse.SUPPRESS,  # undocumented
     )
     shell_parser.add_argument(
+        "--air-gapped",
+        action="store_true",
+        help="Disable @aster service features for this shell session",
+    )
+    shell_parser.add_argument(
         "--json",
         action="store_true",
         dest="raw_json",
@@ -1692,6 +1778,8 @@ def run_shell_command(args: argparse.Namespace) -> int:
             rcan_path=args.rcan,
             demo=demo,
             demo2=demo2,
+            air_gapped=args.air_gapped,
+            raw=args.raw_json,
         ))
     except KeyboardInterrupt:
         pass
