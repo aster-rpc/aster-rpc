@@ -246,6 +246,7 @@ node_modules/
 **/_internal/*/
 
 CLAUDE.md
+AGENTS.md
 .claude/
 /bindings/python/aster/lib_aster.dylib.dSYM/
 aster-docs/
