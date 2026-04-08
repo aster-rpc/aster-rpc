@@ -29,16 +29,35 @@ remote agents. An agent could be a CI runner, an IoT sensor, an AI
 worker, or a service on your colleague's laptop across the world.
 
 In under an hour you'll have:
-- Live log streaming from remote agents
-- Metric ingestion at thousands of points per second
-- An interactive remote shell — bidirectional, real-time
-- Per-agent sessions with heartbeat and capability tracking
-- Role-based access: operators deploy, agents report — scoped by capability
+- Agents that check in, push metrics, and stream logs
+- Operators that watch, issue commands, and control access
 - A TypeScript agent talking to the Python control plane
 
 Everything runs peer-to-peer. No infrastructure beyond a relay for
 NAT traversal (self-hostable). Once peers find each other, traffic
 flows direct.
+
+```mermaid
+graph LR
+    subgraph "Control Plane (Python)"
+        MC["MissionControl (shared)<br/>status · logs · metrics"]
+        AS["AgentSession (per-connection)<br/>register · heartbeat · commands"]
+    end
+
+    A1[Python Agent] -->|QUIC| MC
+    A1 -->|QUIC| AS
+    A2[TypeScript Agent] -->|QUIC| MC
+    A2 -->|QUIC| AS
+    OP[Operator CLI] -->|QUIC| MC
+    OP -->|QUIC| AS
+
+    R{{Relay}} -.->|NAT traversal| A1
+    R -.->|NAT traversal| A2
+```
+
+> Aster uses [Iroh's public relays](https://iroh.computer) for discovery
+> and NAT traversal by default. Point to your own with a single
+> environment variable: `IROH_RELAY_URL=https://relay.yourcompany.com`.
 
 ---
 
@@ -87,6 +106,7 @@ if __name__ == "__main__":
 ```bash
 # Terminal 1: start the control plane
 python control.py
+# → Ticket: aster1Qm...
 
 # Terminal 2: connect and inspect
 aster shell aster1Qm...
@@ -94,14 +114,22 @@ aster shell aster1Qm...
 > ./getStatus agent_id="edge-node-7"
 ```
 
+Or skip the shell entirely — call it straight from the command line:
+
+```bash
+aster call aster1Qm... MissionControl.getStatus '{"agent_id": "edge-node-7"}' --json
+```
+
 **What just happened:**
 - `@service` + `@rpc` defined a typed RPC contract
-- `@wire_type` made the types serializable across languages — a TypeScript
-  client can call this without any code generation or shared schema files
-- `AsterServer` created an encrypted QUIC endpoint, published the contract
-  to a content-addressed registry, and started listening
+- `@wire_type` made the types serializable across languages — no `.proto`
+  files, no separate schema to maintain
+- `AsterServer` created an encrypted QUIC endpoint and started listening —
+  clients discover the service contract on connect
 - `aster shell` connected, discovered the service, and invoked it — with
   tab completion and typed responses
+- `aster call` invoked it non-interactively — Aster isn't just a library,
+  it's a platform with a first-class CLI
 
 ---
 
@@ -127,7 +155,15 @@ class TailRequest:
 
 @service(name="MissionControl", version=1)
 class MissionControl:
+    def __init__(self):
+        self._log_queue = asyncio.Queue()   # just a regular Python queue
+
     # ... getStatus from Chapter 1 ...
+
+    @rpc()
+    async def submitLog(self, entry: LogEntry) -> None:
+        """Agents call this to push log entries."""
+        await self._log_queue.put(entry)
 
     @server_stream()
     async def tailLogs(self, req: TailRequest):
@@ -154,6 +190,8 @@ class MissionControl:
 - The client receives items as they're yielded — no polling, no websockets
 - Under the hood: a single QUIC stream, with Aster framing, flowing until
   either side closes it
+- Agents push entries via `submitLog` — it's just a regular `asyncio.Queue`
+  under the hood. Aster services are plain Python classes with plain state
 
 ---
 
@@ -211,7 +249,9 @@ async with AsterClient(endpoint_addr="aster1Qm...") as client:
 ```
 
 The proxy client discovers methods from the contract and sends dicts over
-the wire. Great for scripting and prototyping.
+the wire. Great for scripting, prototyping, and generic gateways — if
+you're building a dashboard that talks to any Aster service without
+knowing its types at compile time, the proxy is your best friend.
 
 > **Proxy vs Typed client** — For production, import the same types the
 > producer uses and swap `client.proxy(...)` for `create_client(...)`:
@@ -235,66 +275,14 @@ the wire. Great for scripting and prototyping.
 
 ---
 
-## Chapter 4: Remote Shell (5 min)
+## Chapter 4: Agent Sessions & Remote Commands (5 min)
 
-**Goal:** Bidirectional streaming — send commands, receive output in real time.
+**Goal:** Each agent gets its own session — register, heartbeat, and
+execute commands. This is where per-agent state and bidi streaming meet.
 
-```python
-@wire_type("mission/ShellInput")
-@dataclass
-class ShellInput:
-    command: str = ""
-
-@wire_type("mission/ShellOutput")
-@dataclass
-class ShellOutput:
-    stdout: str = ""
-    stderr: str = ""
-    exit_code: int = -1    # -1 means still running
-
-@service(name="MissionControl", version=1)
-class MissionControl:
-    # ... previous methods ...
-
-    @bidi_stream()
-    async def remoteShell(self, commands):
-        """Interactive command execution — send commands, receive output."""
-        async for cmd in commands:
-            proc = await asyncio.create_subprocess_shell(
-                cmd.command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            yield ShellOutput(
-                stdout=stdout.decode(),
-                stderr=stderr.decode(),
-                exit_code=proc.returncode,
-            )
-```
-
-```bash
-# In the shell:
-> ./remoteShell
-bidi> command="df -h"
-← {"stdout": "Filesystem  Size  Used ...", "exit_code": 0}
-bidi> command="uptime"
-← {"stdout": " 14:32  up 3 days ...", "exit_code": 0}
-> end
-```
-
-**What just happened:**
-- Bidi streaming: both sides send and receive concurrently on one stream
-- Each command flows to the producer, output flows back — all multiplexed
-- This pattern works for interactive sessions, collaborative editing,
-  game state sync, or any real-time bidirectional protocol
-
----
-
-## Chapter 5: Agent Sessions (5 min)
-
-**Goal:** Per-connection state — track which agents are online, their
-capabilities, and heartbeat status.
+`MissionControl` is a shared service — one instance, all clients see the
+same state. But each agent needs its own identity, capabilities, and
+command channel. That's a session-scoped service:
 
 ```python
 @wire_type("mission/Heartbeat")
@@ -310,6 +298,18 @@ class Assignment:
     task_id: str = ""
     command: str = ""
 
+@wire_type("mission/Command")
+@dataclass
+class Command:
+    command: str = ""
+
+@wire_type("mission/CommandResult")
+@dataclass
+class CommandResult:
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int = -1    # -1 means still running
+
 @service(name="AgentSession", version=1, scoped="session")
 class AgentSession:
     """Session-scoped: one instance per connected agent."""
@@ -323,7 +323,6 @@ class AgentSession:
         """Agent announces itself and gets an assignment."""
         self._agent_id = hb.agent_id
         self._capabilities = hb.capabilities
-        # Assign work based on capabilities
         if "gpu" in hb.capabilities:
             return Assignment(task_id="train-42", command="python train.py")
         return Assignment(task_id="idle", command="sleep 60")
@@ -333,20 +332,54 @@ class AgentSession:
         """Periodic check-in — update load, maybe get new work."""
         self._capabilities = hb.capabilities
         return Assignment(task_id="continue", command="")
+
+    @bidi_stream()
+    async def runCommand(self, commands):
+        """Execute commands on this agent — stream in, results stream back."""
+        async for cmd in commands:
+            proc = await asyncio.create_subprocess_shell(
+                cmd.command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            yield CommandResult(
+                stdout=stdout.decode(),
+                stderr=stderr.decode(),
+                exit_code=proc.returncode,
+            )
+```
+
+```bash
+# Operator connects and runs commands on a specific agent's session:
+aster shell aster1Qm...
+> cd services/AgentSession
+> ./runCommand
+bidi> command="df -h"
+← {"stdout": "Filesystem  Size  Used ...", "exit_code": 0}
+bidi> command="uptime"
+← {"stdout": " 14:32  up 3 days ...", "exit_code": 0}
+> end
 ```
 
 **What just happened:**
-- `scoped="session"` creates a fresh `AgentSession` instance per connection
-- State like `self._agent_id` is private to that agent's session
+- `scoped="session"` creates a fresh `AgentSession` per connection — each
+  agent gets its own identity, capabilities, and command channel
+- `runCommand` uses bidi streaming: commands flow in, results flow back,
+  all on a single multiplexed QUIC stream
+- State like `self._agent_id` is private to that agent's session — no
+  hand-rolled connection maps
 - When the agent disconnects, the session is cleaned up automatically
-- Compare with `MissionControl` (shared) — one instance, all clients see
-  the same state
+
+Two service types, two different lifetimes:
+- **`MissionControl`** (shared) — fleet-wide: status, logs, metrics
+- **`AgentSession`** (session) — per-agent: register, heartbeat, commands
 
 ---
 
-## Chapter 6: Auth & Capabilities (5 min)
+## Chapter 5: Auth & Capabilities (5 min)
 
-**Goal:** Not every caller should be able to deploy or open a remote shell.
+**Goal:** Not every caller should be able to deploy or run commands on agents.
 Define roles, compose requirements, and issue scoped credentials.
 
 ### Step 1: Generate a root key
@@ -372,11 +405,10 @@ from aster import any_of, all_of
 
 class Role(str, Enum):
     """Capabilities that can be granted to consumers."""
-    STATUS = "ops.status"      # read service status
-    LOGS   = "ops.logs"        # tail live logs
-    DEPLOY = "ops.deploy"      # trigger deployments
-    ADMIN  = "ops.admin"       # remote shell, config changes
-    INGEST = "ops.ingest"      # push metrics (agents)
+    STATUS  = "ops.status"      # read service status
+    LOGS    = "ops.logs"        # tail live logs
+    ADMIN   = "ops.admin"       # run commands on agents
+    INGEST  = "ops.ingest"      # push metrics (agents)
 ```
 
 Apply requirements to methods. Simple cases take a single role;
@@ -389,12 +421,6 @@ class MissionControl:
     @rpc(requires=Role.STATUS)
     async def getStatus(self, req: StatusRequest) -> StatusResponse: ...
 
-    @rpc(requires=all_of(Role.DEPLOY, Role.STATUS))
-    async def deploy(self, req: DeployRequest) -> DeployResponse:
-        """Deploy requires BOTH deploy permission AND status access
-        (because deploy reads current state before acting)."""
-        ...
-
     @server_stream(requires=any_of(Role.LOGS, Role.ADMIN))
     async def tailLogs(self, req: TailRequest):
         """Log access for log viewers OR admins — either role works."""
@@ -405,9 +431,15 @@ class MissionControl:
         """Agents push metrics — scoped to the ingest role."""
         ...
 
+@service(name="AgentSession", version=1, scoped="session")
+class AgentSession:
+
+    @rpc(requires=Role.INGEST)
+    async def register(self, hb: Heartbeat) -> Assignment: ...
+
     @bidi_stream(requires=Role.ADMIN)
-    async def remoteShell(self, commands):
-        """Remote shell is admin-only."""
+    async def runCommand(self, commands):
+        """Command execution is admin-only."""
         ...
 ```
 
@@ -418,7 +450,10 @@ config = AsterConfig(
     root_pubkey_file="~/.aster/root.key",
     allow_all_consumers=False,   # require credentials
 )
-async with AsterServer(services=[MissionControl()], config=config) as srv:
+async with AsterServer(
+    services=[MissionControl(), AgentSession()],
+    config=config,
+) as srv:
     print(srv.ticket)
     await srv.serve()
 ```
@@ -426,15 +461,15 @@ async with AsterServer(services=[MissionControl()], config=config) as srv:
 ### Step 4: Enroll agents
 
 ```bash
-# Issue a credential for an edge agent — status, logs, and ingest only
+# Issue a credential for an edge agent — status and ingest only
 aster enroll consumer --name "edge-node-7" \
-    --capabilities ops.status,ops.logs,ops.ingest \
+    --capabilities ops.status,ops.ingest \
     --root-key ~/.aster/root.key \
     --output edge-node-7.cred
 
-# Issue an operator credential — full access
+# Issue an operator credential — full access including admin
 aster enroll consumer --name "ops-team" \
-    --capabilities ops.status,ops.logs,ops.deploy,ops.admin \
+    --capabilities ops.status,ops.logs,ops.admin,ops.ingest \
     --root-key ~/.aster/root.key \
     --output ops-team.cred
 ```
@@ -448,38 +483,38 @@ async with AsterClient(
     credential_file="edge-node-7.cred",
 ) as client:
     mc = client.proxy("MissionControl")
+    agent = client.proxy("AgentSession")
     
-    await mc.getStatus(...)      # ✓ has ops.status
-    await mc.ingestMetrics(...)  # ✓ has ops.ingest
-    await mc.remoteShell(...)    # ✗ AccessDenied — missing ops.admin
+    await mc.getStatus(...)        # ✓ has ops.status
+    await mc.ingestMetrics(...)    # ✓ has ops.ingest
+    await agent.runCommand(...)    # ✗ AccessDenied — missing ops.admin
 ```
 
 ```bash
 # Or from the CLI — the shell respects credentials too
 aster shell aster1Qm... --credential ops-team.cred
-> cd services/MissionControl
-> ./remoteShell              # ✓ ops-team has ops.admin
+> cd services/AgentSession
+> ./runCommand               # ✓ ops-team has ops.admin
 ```
 
 **What just happened:**
 - `aster trust keygen` created the root of trust — one command
 - `aster enroll consumer` issued scoped credentials — no CA infrastructure
 - `requires=Role.ADMIN` — Aster checks at the method level, no auth middleware to write
-- `all_of(A, B)` — caller must have BOTH capabilities
-- `any_of(A, B)` — caller must have at LEAST ONE
-- The edge agent can push metrics but can't open a shell. The ops team can do both.
+- `any_of(A, B)` — caller must have at LEAST ONE (log viewers OR admins can tail)
+- The edge agent can push metrics but can't run commands. The ops team can do both.
   That's the entire access control model — defined in code, enforced at the wire level
 
 ---
 
-## Chapter 7: Publishing Your Service (5 min)
+## Chapter 6: Publishing Your Service (5 min)
 
 **Goal:** Share your service with your team so anyone can discover and
 connect to it.
 
-So far you've been passing around `aster1Qm...` tickets — long opaque
-strings. That works for development, but when your teammate asks "how
-do I connect to Mission Control?", you want a better answer.
+So far you've been passing around tickets — those `aster1Qm...` strings.
+That works for development, but when your teammate asks "how do I
+connect to Mission Control?", you want a better answer.
 
 ```bash
 # Publish to the Aster registry
@@ -511,12 +546,12 @@ aster contract inspect yourteam/MissionControl
 # MissionControl v1 (blake3:a7f2c1...)
 # ├── getStatus(StatusRequest) → StatusResponse          [rpc]
 # ├── tailLogs(TailRequest) → stream LogEntry            [server_stream]
-# ├── ingestMetrics(stream MetricPoint) → IngestResult   [client_stream]
-# └── remoteShell(stream ShellInput) ↔ stream ShellOutput [bidi_stream]
+# └── ingestMetrics(stream MetricPoint) → IngestResult   [client_stream]
 #
 # AgentSession v1 (blake3:e3b0c4...)  [session-scoped]
 # ├── register(Heartbeat) → Assignment                   [rpc]
-# └── heartbeat(Heartbeat) → Assignment                  [rpc]
+# ├── heartbeat(Heartbeat) → Assignment                  [rpc]
+# └── runCommand(stream Command) ↔ stream CommandResult  [bidi_stream]
 ```
 
 And generate a typed client in their language:
@@ -542,13 +577,13 @@ aster contract gen yourteam/MissionControl --lang typescript --output ./generate
 
 ---
 
-## Chapter 8: Cross-Language — TypeScript Agent (5 min)
+## Chapter 7: Cross-Language — TypeScript Agent (5 min)
 
 **Goal:** Your teammate wants to send metrics from their TypeScript
 application. They don't have your Python source — just the published
 contract.
 
-Using the generated client from Chapter 7:
+Using the generated client from Chapter 6:
 
 ```typescript
 // agent.ts — using the generated types
@@ -591,6 +626,12 @@ const status = await mc.getStatus({ agentId: "ts-worker-1" });
   TypeScript consumer agree on the protocol without sharing a repo
 - The proxy client is still there for quick exploration
 
+> **"But there's no .proto file — how does TypeScript know what Python
+> sent?"** — The `@wire_type` decorator registers each type's schema in
+> Aster's content-addressed registry. `aster contract gen` pulls that
+> metadata and generates native types in any supported language. The
+> registry is the shared schema — you just never had to write it by hand.
+
 ---
 
 ## Appendix: Running the Benchmarks
@@ -599,7 +640,7 @@ const status = await mc.getStatus({ agentId: "ts-worker-1" });
 cd examples/mission-control
 python bench/benchmark.py
 
-# Output:
+# Example output (local loopback, Apple M2, illustrative):
 # ┌─────────────────────────────────┐
 # │ Mission Control Benchmark       │
 # ├──────────────┬──────────────────┤
@@ -616,23 +657,21 @@ python bench/benchmark.py
 
 ## What's Next?
 
-This guide covered the core workflow: define services, stream data, manage
-sessions, lock down access, publish, and go cross-language. But there's
-a lot more under the hood.
+You just built a working control plane with four RPC patterns, session-scoped
+agents, capability-based auth, published discovery, and cross-language
+interop. That's a real system — not a demo.
 
-Aster provides built-in **observability**, **load balancing**, **fail-over**,
-and **high availability** — all built on a solid distributed foundation
-using content-addressed data, CRDTs, and gossip protocols. You didn't
-need any of that to get started, but it's there when you're ready to go
-to production.
+There's more to Aster that you didn't need today but will want in
+production: built-in observability, load balancing, fail-over, and
+high availability — all on a distributed foundation using
+content-addressed data, CRDTs, and gossip protocols.
 
-- **Add interceptors** — retry, circuit-breaking, rate limiting, deadlines,
-  and compression as composable middleware
-- **Scale out** — run multiple producers behind Aster's built-in load
-  balancing with automatic fail-over
-- **Distribute artifacts** — push build outputs, model weights, or config
-  bundles to agents using content-addressed blobs
-- **Shared state** — sync configuration across your fleet with CRDT
-  documents that survive network partitions
+Next guides in the series:
+- **Hardening for Production** — interceptors for retry, circuit-breaking,
+  rate limiting, and deadlines
+- **Scaling Out** — multiple producers with automatic fail-over
+- **Artifact Distribution** — push builds and model weights to agents
+  with content-addressed blobs
+- **Shared Fleet State** — CRDT documents that sync across your fleet
 
 The full source for this example is in `examples/mission-control/`.
