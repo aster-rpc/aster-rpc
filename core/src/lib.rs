@@ -18,7 +18,7 @@ use iroh::endpoint::{
     ConnectionInfo, Endpoint, EndpointHooks, PathInfo, PortmapperConfig, RelayMode, VarInt,
 };
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher};
+use iroh::{EndpointAddr, EndpointId, RelayMap, RelayUrl, SecretKey, TransportAddr, Watcher};
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::Store as BlobStore;
 use iroh_blobs::format::collection::Collection;
@@ -715,7 +715,12 @@ fn relay_mode_from_config(config: &CoreEndpointConfig) -> Result<RelayMode> {
         None | Some("default") => Ok(RelayMode::Default),
         Some("disabled") => Ok(RelayMode::Disabled),
         Some("staging") => Ok(RelayMode::Staging),
-        Some("custom") if !config.relay_urls.is_empty() => Ok(RelayMode::Default),
+        Some("custom") if !config.relay_urls.is_empty() => {
+            let urls: Vec<&str> = config.relay_urls.iter().map(|s| s.as_str()).collect();
+            let relay_map = RelayMap::try_from_iter(urls)
+                .map_err(|e| anyhow!("invalid relay_urls: {e}"))?;
+            Ok(RelayMode::Custom(relay_map))
+        }
         Some("custom") if config.relay_urls.is_empty() => {
             Err(anyhow!("custom relay_mode requires at least one relay_url"))
         }

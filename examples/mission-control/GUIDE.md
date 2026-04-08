@@ -1,35 +1,51 @@
-# Mission Control — Build a P2P Ops Platform with Aster
+# Mission Control
 
-> You'll go from zero to a working peer-to-peer operations platform in 30 minutes.
-> No servers to provision. No cloud accounts. No DNS. Just your code and a
-> cryptographic identity.
+> You need two services to talk. So you set up a load balancer, provision
+> TLS certs, write protobuf schemas, compile them, configure a service mesh,
+> deploy to Kubernetes, and pray the health checks converge before the
+> demo tomorrow.
+>
+> Or: you write one Python file and run it.
 
----
+```python
+@service(name="MissionControl", version=1)
+class MissionControl:
+    @rpc()
+    async def getStatus(self, req: StatusRequest) -> StatusResponse:
+        return StatusResponse(agent_id=req.agent_id, status="running")
+```
 
-## What we're building
+```bash
+python control.py          # that's the server
+aster shell aster1Qm...   # that's the client — tab completion, typed responses
+```
 
-**Mission Control** — a lightweight control plane for managing remote agents.
-An agent could be a CI runner, an IoT sensor, an AI worker, or a service
-running on your colleague's laptop across the world.
+No YAML. No protobuf compilation. No port numbers. No cloud account.
+Encrypted, authenticated, works across NATs, and your TypeScript
+colleague can call it too.
 
-By the end of this guide you'll have:
-- A control plane that agents connect to over encrypted QUIC
+This guide builds **Mission Control** — a control plane for managing
+remote agents. An agent could be a CI runner, an IoT sensor, an AI
+worker, or a service on your colleague's laptop across the world.
+
+In under an hour you'll have:
 - Live log streaming from remote agents
 - Metric ingestion at thousands of points per second
 - An interactive remote shell — bidirectional, real-time
 - Per-agent sessions with heartbeat and capability tracking
-- Role-based access: operators deploy, agents report, viewers watch
-- Cross-language interop: Python agents talking to TypeScript control planes
+- Role-based access: operators deploy, agents report — scoped by capability
+- A TypeScript agent talking to the Python control plane
 
-Everything runs peer-to-peer. The only infrastructure is a relay server
-(which can be self-hosted) for NAT traversal. Once peers discover each other,
-traffic flows directly.
+Everything runs peer-to-peer. No infrastructure beyond a relay for
+NAT traversal (self-hostable). Once peers find each other, traffic
+flows direct.
 
 ---
 
 ## Chapter 1: Your First Agent Check-In (5 min)
 
-**Goal:** Define a service, start it, call it from the CLI.
+**Goal:** The full working version of what you just saw — define a service,
+start it, call it.
 
 ```python
 # control.py
@@ -80,20 +96,19 @@ aster shell aster1Qm...
 
 **What just happened:**
 - `@service` + `@rpc` defined a typed RPC contract
-- `@wire_type` made the types serializable across languages
+- `@wire_type` made the types serializable across languages — a TypeScript
+  client can call this without any code generation or shared schema files
 - `AsterServer` created an encrypted QUIC endpoint, published the contract
   to a content-addressed registry, and started listening
 - `aster shell` connected, discovered the service, and invoked it — with
   tab completion and typed responses
 
-No YAML. No protobuf compilation. No port numbers. One file.
-
 ---
 
 ## Chapter 2: Live Log Streaming (5 min)
 
-**Goal:** Add a server-streaming method — the agent pushes logs, the
-control plane streams them to operators.
+**Goal:** Agents push logs into the control plane. Operators tail them
+in real time using server streaming.
 
 ```python
 @wire_type("mission/LogEntry")
@@ -196,8 +211,20 @@ async with AsterClient(endpoint_addr="aster1Qm...") as client:
 ```
 
 The proxy client discovers methods from the contract and sends dicts over
-the wire. Great for scripting and prototyping. Later (Chapter 7) we'll
-switch to a **typed client** for production safety.
+the wire. Great for scripting and prototyping.
+
+> **Proxy vs Typed client** — For production, import the same types the
+> producer uses and swap `client.proxy(...)` for `create_client(...)`:
+>
+> ```python
+> from aster import create_client
+> mc = create_client(MissionControl, client.transport("MissionControl"))
+> result = await mc.ingestMetrics(metric_stream())   # IDE autocomplete, type checking
+> print(result.accepted)                              # not result['accepted']
+> ```
+>
+> Same wire protocol, same contract — just with type safety. Use the proxy
+> for scripts and exploration, the typed client for production services.
 
 **What just happened:**
 - Client streaming sends many messages, gets one response at the end
@@ -322,8 +349,22 @@ class AgentSession:
 **Goal:** Not every caller should be able to deploy or open a remote shell.
 Define roles, compose requirements, and issue scoped credentials.
 
-First, define your roles as an enum — this keeps capability strings
-consistent and discoverable:
+### Step 1: Generate a root key
+
+The root key is the trust anchor for your entire deployment. Keep it
+offline — you'll use it to sign credentials, not to run services.
+
+```bash
+# One-time setup — generates an Ed25519 keypair
+aster trust keygen --output ~/.aster/root.key
+
+# Output:
+# Root key generated: ~/.aster/root.key
+# Public key: ed25519:b3a4f1...
+# ⚠ Store this key securely — it controls who can join your network
+```
+
+### Step 2: Define roles in code
 
 ```python
 from enum import Enum
@@ -338,7 +379,7 @@ class Role(str, Enum):
     INGEST = "ops.ingest"      # push metrics (agents)
 ```
 
-Now apply requirements to methods. Simple cases take a single role;
+Apply requirements to methods. Simple cases take a single role;
 complex cases compose with `any_of` / `all_of`:
 
 ```python
@@ -370,7 +411,7 @@ class MissionControl:
         ...
 ```
 
-Running with auth enabled:
+### Step 3: Start the control plane with auth
 
 ```python
 config = AsterConfig(
@@ -378,157 +419,177 @@ config = AsterConfig(
     allow_all_consumers=False,   # require credentials
 )
 async with AsterServer(services=[MissionControl()], config=config) as srv:
+    print(srv.ticket)
     await srv.serve()
 ```
 
-Enrolling an agent with specific roles:
+### Step 4: Enroll agents
 
 ```bash
-# Operator (has root key) issues a credential:
+# Issue a credential for an edge agent — status, logs, and ingest only
 aster enroll consumer --name "edge-node-7" \
     --capabilities ops.status,ops.logs,ops.ingest \
+    --root-key ~/.aster/root.key \
     --output edge-node-7.cred
 
-# Give edge-node-7.cred to the agent. It can now:
-#   ✓ getStatus     (has ops.status)
-#   ✓ tailLogs      (has ops.logs — satisfies any_of)
-#   ✓ ingestMetrics (has ops.ingest)
-#   ✗ deploy        (missing ops.deploy — fails all_of)
-#   ✗ remoteShell   (missing ops.admin)
+# Issue an operator credential — full access
+aster enroll consumer --name "ops-team" \
+    --capabilities ops.status,ops.logs,ops.deploy,ops.admin \
+    --root-key ~/.aster/root.key \
+    --output ops-team.cred
+```
+
+### Step 5: Connect with credentials
+
+```python
+# agent.py — connecting with a scoped credential
+async with AsterClient(
+    endpoint_addr="aster1Qm...",
+    credential_file="edge-node-7.cred",
+) as client:
+    mc = client.proxy("MissionControl")
+    
+    await mc.getStatus(...)      # ✓ has ops.status
+    await mc.ingestMetrics(...)  # ✓ has ops.ingest
+    await mc.remoteShell(...)    # ✗ AccessDenied — missing ops.admin
+```
+
+```bash
+# Or from the CLI — the shell respects credentials too
+aster shell aster1Qm... --credential ops-team.cred
+> cd services/MissionControl
+> ./remoteShell              # ✓ ops-team has ops.admin
 ```
 
 **What just happened:**
-- Roles are just strings — the enum keeps them organized and typo-free
-- `requires=Role.ADMIN` — caller must have this capability
+- `aster trust keygen` created the root of trust — one command
+- `aster enroll consumer` issued scoped credentials — no CA infrastructure
+- `requires=Role.ADMIN` — Aster checks at the method level, no auth middleware to write
 - `all_of(A, B)` — caller must have BOTH capabilities
 - `any_of(A, B)` — caller must have at LEAST ONE
-- The root key holder issues credentials scoped to specific roles
-- Aster checks at the method level — no auth middleware to write
-- Composition lets you express real authorization policies:
-  "deploy needs both deploy AND status" is a single line
+- The edge agent can push metrics but can't open a shell. The ops team can do both.
+  That's the entire access control model — defined in code, enforced at the wire level
 
 ---
 
-## Chapter 7: Typed Client (5 min)
+## Chapter 7: Publishing Your Service (5 min)
 
-**Goal:** Graduate from the proxy client to a typed client for production.
+**Goal:** Share your service with your team so anyone can discover and
+connect to it.
 
-In Chapters 2-4 we used `client.proxy("MissionControl")` — dicts in,
-dicts out. That's great for prototyping, but for production you want
-type safety, IDE autocomplete, and compile-time checks.
+So far you've been passing around `aster1Qm...` tickets — long opaque
+strings. That works for development, but when your teammate asks "how
+do I connect to Mission Control?", you want a better answer.
 
-```python
-# typed_agent.py — import the same types the producer uses
-from types import StatusRequest, StatusResponse, MetricPoint, IngestResult
-from aster import AsterClient, create_client
+```bash
+# Publish to the Aster registry
+aster publish --name yourteam/MissionControl
 
-async with AsterClient(endpoint_addr="aster1Qm...") as client:
-    # Typed client — methods have full type signatures
-    mc = create_client(MissionControl, client.transport("MissionControl"))
-    
-    # IDE knows: getStatus(StatusRequest) -> StatusResponse
-    status = await mc.getStatus(StatusRequest(agent_id="edge-7"))
-    print(status.uptime_secs)   # autocomplete works
-    
-    # IDE knows: ingestMetrics(AsyncIterable[MetricPoint]) -> IngestResult
-    result = await mc.ingestMetrics(metric_stream())
-    print(result.accepted)      # typed, not result['accepted']
+# Output:
+# Published: yourteam/MissionControl v1
+# Contract hash: blake3:a7f2c1...
+# Consumers can connect with:
+#   aster shell yourteam/MissionControl
+```
+
+Now anyone on your team can:
+
+```bash
+# Connect by name — no ticket needed
+aster shell yourteam/MissionControl
+> cd services/MissionControl
+> ./getStatus agent_id="edge-node-7"
+```
+
+They can also inspect the contract before writing a single line of code:
+
+```bash
+# See what's available
+aster contract inspect yourteam/MissionControl
+
+# Output:
+# MissionControl v1 (blake3:a7f2c1...)
+# ├── getStatus(StatusRequest) → StatusResponse          [rpc]
+# ├── tailLogs(TailRequest) → stream LogEntry            [server_stream]
+# ├── ingestMetrics(stream MetricPoint) → IngestResult   [client_stream]
+# └── remoteShell(stream ShellInput) ↔ stream ShellOutput [bidi_stream]
+#
+# AgentSession v1 (blake3:e3b0c4...)  [session-scoped]
+# ├── register(Heartbeat) → Assignment                   [rpc]
+# └── heartbeat(Heartbeat) → Assignment                  [rpc]
+```
+
+And generate a typed client in their language:
+
+```bash
+# Generate TypeScript types + client from the published contract
+aster contract gen yourteam/MissionControl --lang typescript --output ./generated/
+
+# Output:
+# Generated: ./generated/mission-control.ts
+#   - 6 wire types
+#   - 2 service clients (MissionControl, AgentSession)
 ```
 
 **What just happened:**
-- `create_client(ServiceClass, transport)` builds a typed proxy
-- Same wire protocol, same contract — just with type information
-- Your IDE catches `mc.getStatu()` (typo) at edit time, not runtime
-- The proxy client and typed client are interchangeable — same wire format
-
-**When to use which:**
-- **Proxy client** — scripts, CLI tools, exploratory work, cross-language
-  consumers that don't share types
-- **Typed client** — production services, same-language consumers, anything
-  where you want compile-time safety
-
+- `aster publish` gave your service a human-readable name backed by a
+  content-addressed contract hash — the name is convenient, the hash is
+  the source of truth
+- `aster contract inspect` lets consumers explore the API without reading
+  your source code
+- `aster contract gen` produces typed clients in any supported language —
+  no shared repo, no protobuf files, no copy-pasting type definitions
 
 ---
 
 ## Chapter 8: Cross-Language — TypeScript Agent (5 min)
 
-**Goal:** Write an agent in TypeScript that connects to the Python
-control plane.
+**Goal:** Your teammate wants to send metrics from their TypeScript
+application. They don't have your Python source — just the published
+contract.
+
+Using the generated client from Chapter 7:
 
 ```typescript
-// agent.ts
-import { AsterClient, Service, Rpc, WireType } from '@aster-rpc/aster';
+// agent.ts — using the generated types
+import { AsterClient, createClient } from '@aster-rpc/aster';
+import { MissionControl, AgentSession, Heartbeat, MetricPoint } from './generated/mission-control';
 
-@WireType("mission/Heartbeat")
-class Heartbeat {
-  agentId = "";
-  capabilities: string[] = [];
-  loadAvg = 0;
-}
-
-@WireType("mission/MetricPoint")
-class MetricPoint {
-  name = "";
-  value = 0;
-  timestamp = 0;
-  tags: Record<string, string> = {};
-}
-
-const client = new AsterClient({ endpoint: "aster1Qm..." });
+const client = new AsterClient({ endpoint: "yourteam/MissionControl" });
 await client.connect();
 
-// Same contract, different language — proxy client
-const session = client.proxy("AgentSession");
+// Typed clients — same pattern as Python's create_client()
+const session = createClient(AgentSession, client.transport("AgentSession"));
 const assignment = await session.register(
   new Heartbeat({ agentId: "ts-worker-1", capabilities: ["gpu", "arm64"] })
 );
 console.log(`Assigned: ${assignment.taskId}`);
 
-// Stream metrics from TypeScript to Python
-const mc = client.proxy("MissionControl");
-await mc.ingestMetrics(async function*() {
+// Stream metrics from TypeScript to the Python control plane
+const mc = createClient(MissionControl, client.transport("MissionControl"));
+const result = await mc.ingestMetrics(async function*() {
   for (let i = 0; i < 1000; i++) {
     yield new MetricPoint({ name: "gpu.temp", value: 72 + Math.random() * 10 });
   }
 }());
+console.log(`Accepted: ${result.accepted}`);
+```
+
+Or if they just want to explore first — no codegen needed:
+
+```typescript
+// Quick and dirty — proxy client, no generated types
+const mc = client.proxy("MissionControl");
+const status = await mc.getStatus({ agentId: "ts-worker-1" });
 ```
 
 **What just happened:**
-- Same `@wire_type` tags → same wire format → full interop
-- TypeScript agent talks to Python control plane with zero glue code
-- The contract hash is identical regardless of implementation language
-
----
-
-## Beyond RPC: What Else Can You Do?
-
-Aster is built on [iroh](https://iroh.computer), which gives you more than
-just RPC:
-
-**Content-addressed blobs** — distribute build artifacts, model weights,
-or config bundles to agents. The hash IS the address — fetch once, verify
-forever.
-
-```python
-# Upload a deployment artifact
-blob_hash = await blobs.add_bytes(artifact_data)
-# Any agent with the hash can fetch it — verified, deduplicated
-```
-
-**Collaborative documents** — shared state that syncs across peers using
-CRDTs. Use it for distributed config, feature flags, or service registries
-that survive partitions.
-
-**Gossip pub/sub** — broadcast messages to all producers in a mesh.
-Used internally for producer coordination, but available for your own
-real-time fanout needs.
-
-**Port forwarding** — tunnel TCP or UDP through the encrypted QUIC
-connection. Expose a debug port, forward a database connection, or
-bridge legacy services into the mesh.
-
-**File transfer** — send files between peers using the blob store.
-Content-addressed, resumable, and verified.
+- Your teammate never saw your Python source code
+- `aster contract gen` gave them typed clients generated from the
+  published contract — full autocomplete, type checking, no guesswork
+- Same wire format, same contract hash — the Python producer and
+  TypeScript consumer agree on the protocol without sharing a repo
+- The proxy client is still there for quick exploration
 
 ---
 
@@ -555,10 +616,23 @@ python bench/benchmark.py
 
 ## What's Next?
 
-- **Publish your service** to [aster.site](https://aster.site) and get a
-  short, shareable address: `yourname/MissionControl`
-- **Add more agents** — they discover each other through the mesh
-- **Deploy to production** — the same code runs locally, on a server,
-  or at the edge. No infrastructure changes.
+This guide covered the core workflow: define services, stream data, manage
+sessions, lock down access, publish, and go cross-language. But there's
+a lot more under the hood.
+
+Aster provides built-in **observability**, **load balancing**, **fail-over**,
+and **high availability** — all built on a solid distributed foundation
+using content-addressed data, CRDTs, and gossip protocols. You didn't
+need any of that to get started, but it's there when you're ready to go
+to production.
+
+- **Add interceptors** — retry, circuit-breaking, rate limiting, deadlines,
+  and compression as composable middleware
+- **Scale out** — run multiple producers behind Aster's built-in load
+  balancing with automatic fail-over
+- **Distribute artifacts** — push build outputs, model weights, or config
+  bundles to agents using content-addressed blobs
+- **Shared state** — sync configuration across your fleet with CRDT
+  documents that survive network partitions
 
 The full source for this example is in `examples/mission-control/`.

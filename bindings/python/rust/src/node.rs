@@ -8,6 +8,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 
 use aster_transport_core::CoreNode;
 
+use crate::ensure_tokio_runtime;
 use crate::error::err_to_py;
 use crate::hooks::NodeHookReceiver;
 use crate::net::{EndpointConfig, IrohConnection, NodeAddr};
@@ -30,6 +31,7 @@ impl IrohNode {
     /// Create an in-memory Iroh node with all protocols.
     #[staticmethod]
     fn memory<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        ensure_tokio_runtime();
         future_into_py(py, async move {
             CoreNode::memory()
                 .await
@@ -41,6 +43,7 @@ impl IrohNode {
     /// Create a persistent Iroh node backed by an FsStore at the given path.
     #[staticmethod]
     fn persistent<'py>(py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        ensure_tokio_runtime();
         future_into_py(py, async move {
             CoreNode::persistent(path)
                 .await
@@ -62,6 +65,7 @@ impl IrohNode {
         aster_alpns: Vec<Vec<u8>>,
         endpoint_config: Option<&EndpointConfig>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        ensure_tokio_runtime();
         let core_cfg = endpoint_config.map(|c| c.into());
         future_into_py(py, async move {
             CoreNode::memory_with_alpns(aster_alpns, core_cfg)
@@ -80,6 +84,7 @@ impl IrohNode {
         aster_alpns: Vec<Vec<u8>>,
         endpoint_config: Option<&EndpointConfig>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        ensure_tokio_runtime();
         let core_cfg = endpoint_config.map(|c| c.into());
         future_into_py(py, async move {
             CoreNode::persistent_with_alpns(path, aster_alpns, core_cfg)

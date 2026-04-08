@@ -796,6 +796,7 @@ pub fn net_client(node: &IrohNode) -> NetClient {
 /// Supports both connect and accept.
 #[pyfunction]
 pub fn create_endpoint<'py>(py: Python<'py>, alpn: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+    crate::ensure_tokio_runtime();
     future_into_py(py, async move {
         let client = CoreNetClient::create(alpn).await.map_err(err_to_py)?;
         Ok(NetClient::from(client))
@@ -807,6 +808,7 @@ pub fn create_endpoint_with_config<'py>(
     py: Python<'py>,
     config: EndpointConfig,
 ) -> PyResult<Bound<'py, PyAny>> {
+    crate::ensure_tokio_runtime();
     let config = CoreEndpointConfig::from(&config);
     future_into_py(py, async move {
         let client = CoreNetClient::create_with_config(config)

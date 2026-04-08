@@ -415,7 +415,9 @@ class AsterServer:
      │{B}         / _ \\ \\___ \\ | | |  _| | |_) |   {R}{C}│
      │{B}        / ___ \\ ___) || | | |___|  _ <    {R}{C}│
      │{B}       /_/   \\_\\____/ |_| |_____|_| \\_\\   {R}{C}│
-     │{D}          RPC after hostnames.            {R}{C}│
+     │{D}              RPC after hostnames.        {R}{C}│
+     │{D}         Copyright © 2026 Emrul Islam.    {R}{C}│
+     │{D}              All rights reserved.        {R}{C}│
      ╰──────────────────────────────────────────╯{R}
 """
         sys.stderr.write(banner)
@@ -778,30 +780,50 @@ class AsterServer:
     # ── Properties ───────────────────────────────────────────────────────────
 
     @property
-    def endpoint_addr_b64(self) -> str:
-        """Base64 ``NodeAddr`` of the shared endpoint (one node ID for
-        RPC + admission + blobs + docs + gossip)."""
-        self._require_started()
-        assert self._node is not None
-        return base64.b64encode(self._node.node_addr_info().to_bytes()).decode()
+    def address(self) -> str:
+        """Connection address for this server (``aster1...`` ticket).
 
-    @property
-    def ticket(self) -> str:
-        """Compact ``aster1...`` ticket string for this server's endpoint.
-
-        Contains the endpoint ID and direct addresses.  Relay URL is
-        omitted because the ticket format uses resolved IP:port, not
-        full relay URLs.
+        Pass this to ``AsterClient(address=...)`` or ``aster shell``
+        to connect.  Includes relay address (if available) and direct
+        addresses for LAN connectivity.
         """
         self._require_started()
         assert self._node is not None
         from . import AsterTicket
         addr_info = self._node.node_addr_info()
+
+        # Resolve relay URL to IP:port for the ticket
+        relay_addr = None
+        if addr_info.relay_url:
+            relay_addr = _resolve_relay_addr(addr_info.relay_url)
+
         t = AsterTicket(
             endpoint_id=addr_info.endpoint_id,
+            relay_addr=relay_addr,
             direct_addrs=addr_info.direct_addresses or [],
         )
         return t.to_string()
+
+    @property
+    def endpoint_id(self) -> str:
+        """Hex endpoint ID of this server's node."""
+        self._require_started()
+        assert self._node is not None
+        return self._node.node_id()
+
+    # ── Back-compat aliases ──────────────────────────────────────────────
+
+    @property
+    def ticket(self) -> str:
+        """Alias for :attr:`address`."""
+        return self.address
+
+    @property
+    def endpoint_addr_b64(self) -> str:
+        """Base64 ``NodeAddr`` — prefer :attr:`address` instead."""
+        self._require_started()
+        assert self._node is not None
+        return base64.b64encode(self._node.node_addr_info().to_bytes()).decode()
 
     @property
     def rpc_addr_b64(self) -> str:
@@ -910,7 +932,9 @@ class AsterClient:
         *,
         config: "AsterConfig | None" = None,
         peer: str | None = None,
-        # Inline overrides (take priority over config):
+        # Connection address (aster1... ticket, base64 NodeAddr, or hex EndpointId):
+        address: str | None = None,
+        # Back-compat alias for address:
         endpoint_addr: NodeAddr | str | bytes | None = None,
         root_pubkey: bytes | None = None,
         enrollment_credential_file: str | None = None,
@@ -933,8 +957,8 @@ class AsterClient:
         if peer_entry and not root_pubkey:
             root_pubkey = bytes.fromhex(peer_entry["root_pubkey"])
 
-        # Resolve endpoint address: inline > config > error.
-        addr = endpoint_addr or config.endpoint_addr
+        # Resolve endpoint address: address > endpoint_addr > config > error.
+        addr = address or endpoint_addr or config.endpoint_addr
         if addr is None:
             raise ValueError(
                 "AsterClient requires an endpoint address. "
@@ -1204,6 +1228,30 @@ class AsterClient:
         return self._gossip_topic
 
 
+def _resolve_relay_addr(relay_url: str) -> str | None:
+    """Resolve a relay URL (e.g. ``https://relay.iroh.network``) to ``ip:port``.
+
+    Uses stdlib DNS resolution — no subprocess. Returns None on failure.
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(relay_url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if not host:
+            return None
+        infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        if infos:
+            # Use first result — (family, type, proto, canonname, sockaddr)
+            addr = infos[0][4]
+            return f"{addr[0]}:{addr[1]}"
+    except (socket.gaierror, OSError, ValueError):
+        pass
+    return None
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -1313,8 +1361,8 @@ def _coerce_node_addr(addr: NodeAddr | str | bytes) -> NodeAddr:
                 relay_url=None,  # ticket stores resolved IP:port, not relay URL
                 direct_addresses=ticket.direct_addrs,
             )
-        # 128-char hex string → bare endpoint ID (no relay/direct addrs)
-        if len(addr) == 128 and all(c in "0123456789abcdef" for c in addr.lower()):
+        # 64-char hex string → bare endpoint ID (32 bytes, no relay/direct addrs)
+        if len(addr) == 64 and all(c in "0123456789abcdef" for c in addr.lower()):
             return NodeAddr(endpoint_id=addr)
         # Otherwise assume base64-encoded NodeAddr bytes
         return NodeAddr.from_bytes(base64.b64decode(addr))
