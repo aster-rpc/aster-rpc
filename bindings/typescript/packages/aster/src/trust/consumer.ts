@@ -6,10 +6,10 @@
  * Client side (performAdmission):
  *   1. Open a stream on the admission ALPN
  *   2. Send a ConsumerAdmissionRequest (credential + optional IID token)
- *   3. Receive a ConsumerAdmissionResponse (services list + registry ticket)
+ *   3. Receive a ConsumerAdmissionResponse (services list + registry namespace)
  *
  * Server side (handleConsumerAdmissionRpc, serveConsumerAdmission):
- *   Verify credential, admit peer, return response with services + registry ticket.
+ *   Verify credential, admit peer, return response with services + registry namespace.
  *
  * Wire format: newline-delimited JSON over a QUIC bidi-stream on
  * aster.consumer_admission ALPN. Client sends one JSON line; server
@@ -22,7 +22,13 @@ import type { MeshEndpointHook } from './hooks.js';
 import { MAX_ADMISSION_PAYLOAD_SIZE, MAX_SERVICES_IN_ADMISSION, validateHexField } from '../limits.js';
 import type { NonceStore } from './nonce.js';
 
-/** Service summary returned in admission response. */
+/**
+ * Service summary returned in admission response.
+ *
+ * NOTE: Wire format uses snake_case keys (contract_id) for Python interop.
+ * The camelCase interface fields here need mapping when parsing from wire.
+ * TODO: Add proper wire-format mapping for ServiceSummary (pre-existing gap).
+ */
 export interface ServiceSummary {
   name: string;
   version: number;
@@ -42,7 +48,7 @@ export interface ConsumerAdmissionResponse {
   admitted: boolean;
   reason?: string;
   services: ServiceSummary[];
-  registryTicket?: string;
+  registryNamespace?: string;
   attributes?: Record<string, string>;
   rootPubkey?: string;
   /** Hex-encoded 32-byte gossip topic — only populated for root node. */
@@ -53,7 +59,7 @@ export interface ConsumerAdmissionResponse {
 export interface ConsumerAdmissionOpts {
   nonceStore?: NonceStore;
   services?: ServiceSummary[];
-  registryTicket?: string;
+  registryNamespace?: string;
   allowUnenrolled?: boolean;
   /** Gossip topic ID (32 bytes). Included in response only for root node. */
   gossipTopicId?: Uint8Array;
@@ -68,7 +74,7 @@ export interface ConsumerAdmissionOpts {
  * @param connection - The QUIC connection to the producer (admission ALPN)
  * @param credential - The consumer enrollment credential
  * @param iidToken - Optional cloud instance identity token
- * @returns The admission response with services and registry ticket
+ * @returns The admission response with services and registry namespace
  */
 export async function performAdmission(
   connection: { openBi(): Promise<{ takeSend(): any; takeRecv(): any }> },
@@ -79,12 +85,12 @@ export async function performAdmission(
   const send = bi.takeSend();
   const recv = bi.takeRecv();
 
-  // Build and send request
-  const request: ConsumerAdmissionRequest = {
-    credentialJson: JSON.stringify(credential),
-    iidToken,
+  // Build and send request (snake_case keys for Python interop)
+  const wireRequest = {
+    credential_json: JSON.stringify(credential),
+    iid_token: iidToken ?? '',
   };
-  const reqBytes = new TextEncoder().encode(JSON.stringify(request));
+  const reqBytes = new TextEncoder().encode(JSON.stringify(wireRequest));
   if (reqBytes.byteLength > MAX_ADMISSION_PAYLOAD_SIZE) {
     throw new Error(`admission request too large: ${reqBytes.byteLength} > ${MAX_ADMISSION_PAYLOAD_SIZE}`);
   }
@@ -93,11 +99,18 @@ export async function performAdmission(
   await send.writeAll(reqBytes);
   await send.finish();
 
-  // Read response
+  // Read response (snake_case keys from Python wire format)
   const respBytes = await recv.readToEnd(MAX_ADMISSION_PAYLOAD_SIZE);
-  const response: ConsumerAdmissionResponse = JSON.parse(
-    new TextDecoder().decode(respBytes),
-  );
+  const d = JSON.parse(new TextDecoder().decode(respBytes));
+  const response: ConsumerAdmissionResponse = {
+    admitted: d.admitted,
+    reason: d.reason,
+    services: d.services ?? [],
+    registryNamespace: d.registry_namespace ?? d.registryNamespace ?? '',
+    attributes: d.attributes ?? {},
+    rootPubkey: d.root_pubkey ?? d.rootPubkey ?? '',
+    gossipTopic: d.gossip_topic ?? d.gossipTopic,
+  };
 
   // Validate
   if (response.services && response.services.length > MAX_SERVICES_IN_ADMISSION) {
@@ -167,7 +180,7 @@ export function consumerCredFromJson(json: string): ConsumerEnrollmentCredential
  * @param rootPubkey - The server's root public key (hex string, 64 chars).
  * @param hook - MeshEndpointHook; addPeer is called on successful admission.
  * @param peerNodeId - QUIC peer identity from the connection handshake.
- * @param opts - Additional options (nonceStore, services, registryTicket, allowUnenrolled, logger).
+ * @param opts - Additional options (nonceStore, services, registryNamespace, allowUnenrolled, logger).
  * @returns ConsumerAdmissionResponse — always returned, never throws.
  */
 export async function handleConsumerAdmissionRpc(
@@ -216,7 +229,7 @@ export async function handleConsumerAdmissionRpc(
       admitted: true,
       attributes: {},
       services: opts.services ?? [],
-      registryTicket: opts.registryTicket ?? '',
+      registryNamespace: opts.registryNamespace ?? '',
       rootPubkey,
       gossipTopic: topicForPeer || undefined,
       reason: '',
@@ -259,7 +272,7 @@ export async function handleConsumerAdmissionRpc(
     admitted: true,
     attributes: result.attributes ?? {},
     services: opts.services ?? [],
-    registryTicket: opts.registryTicket ?? '',
+    registryNamespace: opts.registryNamespace ?? '',
     rootPubkey,
     gossipTopic: topicForPeer || undefined,
     reason: '',
@@ -308,17 +321,18 @@ export async function handleConsumerAdmissionConnection(
       opts,
     );
 
-    // Serialise response — strip reason on wire (oracle protection)
+    // Serialise response — snake_case keys for Python interop.
+    // Strip reason on wire (oracle protection).
     const wireResponse: Record<string, unknown> = {
       admitted: response.admitted,
       attributes: response.attributes ?? {},
       services: response.services ?? [],
-      registryTicket: response.registryTicket ?? '',
-      rootPubkey: response.rootPubkey ?? '',
+      registry_namespace: response.registryNamespace ?? '',
+      root_pubkey: response.rootPubkey ?? '',
       reason: '', // never leak reason on wire
     };
     if (response.gossipTopic) {
-      wireResponse.gossipTopic = response.gossipTopic;
+      wireResponse.gossip_topic = response.gossipTopic;
     }
 
     await send.writeAll(new TextEncoder().encode(JSON.stringify(wireResponse)));

@@ -1,5 +1,6 @@
 [workspace]
 members = ["core", "ffi", "bindings/python/rust", "bindings/typescript/native"]
+exclude = ["core/fuzz"]
 resolver = "2"
 
 [workspace.dependencies]

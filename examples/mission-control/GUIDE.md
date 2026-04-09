@@ -507,130 +507,132 @@ aster shell aster1Qm... --credential ops-team.cred
 
 ---
 
-## Chapter 6: Publishing Your Service (5 min)
+## Chapter 6: Generating Typed Clients (5 min)
 
-**Goal:** Share your service with your team so anyone can discover and
-connect to it.
+**Goal:** Your teammate wants to write a Python script that calls Mission
+Control — without importing your source code. Generate a typed client
+directly from the running service.
 
-So far you've been passing around tickets — those `aster1Qm...` strings.
-That works for development, but when your teammate asks "how do I
-connect to Mission Control?", you want a better answer.
+So far you've been using the shell to explore. But for production code,
+you want typed clients with IDE autocomplete and compile-time checking.
+
+### Option A: Generate from a running service
 
 ```bash
-# Publish to the Aster registry
-aster publish --name yourteam/MissionControl
+# Generate a Python client from the live control plane
+aster contract gen-client aster1Qm... --out ./clients --package mission_control
 
 # Output:
-# Published: yourteam/MissionControl v1
-# Contract hash: blake3:a7f2c1...
-# Consumers can connect with:
-#   aster shell yourteam/MissionControl
+# Generated 5 files
+#   ./clients/mission_control/types/mission_control_v1.py
+#   ./clients/mission_control/types/agent_session_v1.py
+#   ./clients/mission_control/services/mission_control_v1.py
+#   ./clients/mission_control/services/agent_session_v1.py
+#   ...
 ```
 
-Now anyone on your team can:
+### Option B: Generate from an exported manifest
+
+If the producer shared a `.aster.json` file (from `aster contract export`):
 
 ```bash
-# Connect by name — no ticket needed
-aster shell yourteam/MissionControl
+aster contract gen-client ./MissionControl.aster.json --out ./clients --package mission_control
+```
+
+Either way, you get a typed client:
+
+```python
+# consumer.py — typed client, no producer source code needed
+from aster import AsterClient
+from mission_control.services.mission_control_v1 import MissionControlClient
+from mission_control.types.mission_control_v1 import StatusRequest
+
+async def main():
+    client = AsterClient(address="aster1Qm...")
+    await client.connect()
+
+    mc = await MissionControlClient.from_connection(client)
+    resp = await mc.getStatus(StatusRequest(agent_id="edge-node-7"))
+    print(f"Status: {resp.status}, uptime: {resp.uptime_secs}s")
+```
+
+Or explore interactively first, then generate when you're ready:
+
+```bash
+# Explore in the shell — no codegen needed
+aster shell aster1Qm...
 > cd services/MissionControl
 > ./getStatus agent_id="edge-node-7"
-```
+{"agent_id": "edge-node-7", "status": "running", "uptime_secs": 3600}
 
-They can also inspect the contract before writing a single line of code:
-
-```bash
-# See what's available
-aster contract inspect yourteam/MissionControl
-
-# Output:
-# MissionControl v1 (blake3:a7f2c1...)
-# ├── getStatus(StatusRequest) → StatusResponse          [rpc]
-# ├── tailLogs(TailRequest) → stream LogEntry            [server_stream]
-# └── ingestMetrics(stream MetricPoint) → IngestResult   [client_stream]
-#
-# AgentSession v1 (blake3:e3b0c4...)  [session-scoped]
-# ├── register(Heartbeat) → Assignment                   [rpc]
-# ├── heartbeat(Heartbeat) → Assignment                  [rpc]
-# └── runCommand(stream Command) ↔ stream CommandResult  [bidi_stream]
-```
-
-And generate a typed client in their language:
-
-```bash
-# Generate TypeScript types + client from the published contract
-aster contract gen yourteam/MissionControl --lang typescript --output ./generated/
-
-# Output:
-# Generated: ./generated/mission-control.ts
-#   - 6 wire types
-#   - 2 service clients (MissionControl, AgentSession)
+# Happy with the API? Generate a client:
+> generate-client --out ./clients --package mission_control
+Generated 5 files
 ```
 
 **What just happened:**
-- `aster publish` gave your service a human-readable name backed by a
-  content-addressed contract hash — the name is convenient, the hash is
-  the source of truth
-- `aster contract inspect` lets consumers explore the API without reading
-  your source code
-- `aster contract gen` produces typed clients in any supported language —
-  no shared repo, no protobuf files, no copy-pasting type definitions
+- `aster contract gen-client` pulled the contract from the running service
+  and generated typed Python clients — no `.proto` files, no shared repo
+- The generated client has `from_connection()` which wires up the
+  transport, codec, and type registration automatically
+- Every generated class carries a `_contract_id` so the consumer can
+  detect when the producer has been updated
+- The same command works from a `.aster.json` export file — the producer
+  doesn't even need to be running
 
 ---
 
 ## Chapter 7: Cross-Language — TypeScript Agent (5 min)
 
 **Goal:** Your teammate wants to send metrics from their TypeScript
-application. They don't have your Python source — just the published
-contract.
+application. They don't have your Python source — just the ticket.
 
-Using the generated client from Chapter 6:
+Generate a TypeScript client the same way:
+
+```bash
+# Generate TypeScript types + client from the running service
+aster contract gen-client aster1Qm... --out ./generated --package mission_control --lang typescript
+```
+
+> **Note:** TypeScript client generation is coming soon. For now, the
+> proxy client works out of the box — no codegen needed:
 
 ```typescript
-// agent.ts — using the generated types
-import { AsterClient, createClient } from '@aster-rpc/aster';
-import { MissionControl, AgentSession, Heartbeat, MetricPoint } from './generated/mission-control';
+import { AsterClient } from '@aster-rpc/aster';
 
-const client = new AsterClient({ endpoint: "yourteam/MissionControl" });
+const client = new AsterClient({ address: "aster1Qm..." });
 await client.connect();
 
-// Typed clients — same pattern as Python's create_client()
-const session = createClient(AgentSession, client.transport("AgentSession"));
-const assignment = await session.register(
-  new Heartbeat({ agentId: "ts-worker-1", capabilities: ["gpu", "arm64"] })
-);
-console.log(`Assigned: ${assignment.taskId}`);
+// Proxy client — discovers methods from the contract
+const mc = client.proxy("MissionControl");
+const status = await mc.getStatus({ agentId: "ts-worker-1" });
+console.log(`Status: ${status.agentId} is ${status.status}`);
 
 // Stream metrics from TypeScript to the Python control plane
-const mc = createClient(MissionControl, client.transport("MissionControl"));
 const result = await mc.ingestMetrics(async function*() {
   for (let i = 0; i < 1000; i++) {
-    yield new MetricPoint({ name: "gpu.temp", value: 72 + Math.random() * 10 });
+    yield { name: "gpu.temp", value: 72 + Math.random() * 10 };
   }
 }());
 console.log(`Accepted: ${result.accepted}`);
 ```
 
-Or if they just want to explore first — no codegen needed:
-
-```typescript
-// Quick and dirty — proxy client, no generated types
-const mc = client.proxy("MissionControl");
-const status = await mc.getStatus({ agentId: "ts-worker-1" });
-```
-
 **What just happened:**
 - Your teammate never saw your Python source code
-- `aster contract gen` gave them typed clients generated from the
-  published contract — full autocomplete, type checking, no guesswork
+- The proxy client discovered the contract on connect and built method
+  stubs dynamically — full RPC, no codegen required
 - Same wire format, same contract hash — the Python producer and
   TypeScript consumer agree on the protocol without sharing a repo
-- The proxy client is still there for quick exploration
+- When TypeScript codegen lands, `--lang typescript` will produce the
+  same typed client experience as Python
 
 > **"But there's no .proto file — how does TypeScript know what Python
 > sent?"** — The `@wire_type` decorator registers each type's schema in
-> Aster's content-addressed registry. `aster contract gen` pulls that
-> metadata and generates native types in any supported language. The
-> registry is the shared schema — you just never had to write it by hand.
+> Aster's content-addressed contract. The contract is published with the
+> service and discovered on connect. `aster contract gen-client` pulls
+> that metadata and generates native types in any supported language.
+> The contract is the shared schema — you just never had to write it
+> by hand.
 
 ---
 

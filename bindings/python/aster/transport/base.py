@@ -222,34 +222,6 @@ class BidiChannel:
         ...
 
 
-class BidiChannelManager(ABC):
-    """Abstract base class for BidiChannel implementations.
-
-    Subclasses must implement the abstract methods to provide the actual
-    send/recv/close mechanics.
-    """
-
-    @abstractmethod
-    async def send(self, msg: Any) -> None:
-        """Send a message."""
-        ...
-
-    @abstractmethod
-    async def recv(self) -> Any:
-        """Receive a message."""
-        ...
-
-    @abstractmethod
-    async def close(self) -> None:
-        """Close the channel."""
-        ...
-
-    @abstractmethod
-    async def wait_for_trailer(self) -> tuple[int, str]:
-        """Wait for trailer."""
-        ...
-
-
 # ── Transport Errors ────────────────────────────────────────────────────────
 
 

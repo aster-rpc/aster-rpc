@@ -1466,14 +1466,8 @@ fn test_blobs_observe_snapshot_null_out_args() {
         let mut size: u64 = 0;
 
         // null hash pointer
-        let status = iroh_blobs_observe_snapshot(
-            runtime,
-            0,
-            ptr::null(),
-            0,
-            &mut is_complete,
-            &mut size,
-        );
+        let status =
+            iroh_blobs_observe_snapshot(runtime, 0, ptr::null(), 0, &mut is_complete, &mut size);
         assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
 
         // null out_is_complete
@@ -1536,25 +1530,12 @@ fn test_blobs_observe_complete_null_out_operation() {
 
         // null hash pointer
         let mut operation: iroh_operation_t = 0;
-        let status = iroh_blobs_observe_complete(
-            runtime,
-            0,
-            ptr::null(),
-            0,
-            0,
-            &mut operation,
-        );
+        let status = iroh_blobs_observe_complete(runtime, 0, ptr::null(), 0, 0, &mut operation);
         assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
 
         // null out_operation
-        let status = iroh_blobs_observe_complete(
-            runtime,
-            0,
-            hash.as_ptr(),
-            hash.len(),
-            0,
-            ptr::null_mut(),
-        );
+        let status =
+            iroh_blobs_observe_complete(runtime, 0, hash.as_ptr(), hash.len(), 0, ptr::null_mut());
         assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
 
         iroh_runtime_close(runtime);

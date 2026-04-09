@@ -76,22 +76,6 @@ def evaluate_capability(
 # ── Opaque grant helpers (stub) ─────────────────────────────────────────────
 
 
-def encode_rcan(rcan_data: bytes) -> bytes:
-    """Encode rcan grant data for inclusion in IntroducePayload.
-
-    Currently a pass-through (opaque bytes).
-    """
-    return rcan_data
-
-
-def decode_rcan(rcan_bytes: bytes) -> bytes:
-    """Decode rcan grant bytes from IntroducePayload.
-
-    Currently a pass-through (opaque bytes).
-    """
-    return rcan_bytes
-
-
 def validate_rcan(rcan_bytes: bytes) -> tuple[bool, str | None]:
     """Validate an rcan grant.
 

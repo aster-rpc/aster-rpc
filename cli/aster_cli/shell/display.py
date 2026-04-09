@@ -146,23 +146,23 @@ class Display:
             return
 
         table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
-        table.add_column("Hash", style="yellow")
+        table.add_column("Name")
         table.add_column("Size", justify="right")
-        table.add_column("Tag", style="dim")
+        table.add_column("Hash", style="dim")
 
         for b in blobs:
             hash_str = b.get("hash", "?")
-            size = b.get("size", "?")
+            short_hash = hash_str[:16] + "…" if len(hash_str) > 16 else hash_str
+            size = b.get("size", 0)
             tag = b.get("tag", "")
             is_coll = b.get("is_collection", False)
             if isinstance(size, int) and size > 0:
-                size = _format_size(size)
-            elif size == 0:
-                size = ""
+                size_str = _format_size(size)
+            else:
+                size_str = ""
             # Show collections like directories (cyan + trailing /)
-            if is_coll:
-                tag = f"[bold cyan]{escape(tag)}/[/bold cyan]"
-            table.add_row(hash_str, str(size), tag)
+            name = f"[bold cyan]{escape(tag)}/[/bold cyan]" if is_coll else (tag or short_hash)
+            table.add_row(name, size_str, short_hash)
 
         self.console.print(table)
 

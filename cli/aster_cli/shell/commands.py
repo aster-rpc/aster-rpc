@@ -619,19 +619,18 @@ class GenerateClientCommand(ShellCommand):
         ]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        # Determine service
-        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
-        if node and node.kind == NodeKind.SERVICE:
-            service_name = node.name
-        elif args:
-            service_name = args[0]
-        else:
-            ctx.display.error("usage: generate-client [--lang python] [--out ./clients/] <service>")
-            return
+        from aster_cli.codegen import generate_python_clients, format_usage_snippet
 
-        # Parse --lang and --out from args
+        # Determine which services to generate for
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        target_service = None
+        if node and node.kind == NodeKind.SERVICE:
+            target_service = node.name
+
+        # Parse args
         lang = "python"
         out = "./clients/"
+        package = None
         i = 0
         while i < len(args):
             if args[i] == "--lang" and i + 1 < len(args):
@@ -640,16 +639,45 @@ class GenerateClientCommand(ShellCommand):
             elif args[i] == "--out" and i + 1 < len(args):
                 out = args[i + 1]
                 i += 2
+            elif args[i] == "--package" and i + 1 < len(args):
+                package = args[i + 1]
+                i += 2
             else:
-                if args[i] != service_name:
-                    service_name = args[i]
+                target_service = args[i]
                 i += 1
 
-        ctx.display.info(f"Generating {lang} client for {service_name} -> {out}")
-        ctx.display.warning("Client generation is not yet wired — this is a placeholder")
-        ctx.display.info(
-            f"Will generate: {out}/{service_name.lower()}_client.{_lang_ext(lang)}"
-        )
+        if lang != "python":
+            ctx.display.error(f"Only 'python' is supported for now (got '{lang}')")
+            return
+
+        # Get manifests from connection
+        manifests = ctx.connection.get_manifests()
+        if not manifests:
+            ctx.display.error("No manifests available — wait for service discovery to complete")
+            return
+
+        # Filter to target service if specified
+        if target_service:
+            if target_service not in manifests:
+                ctx.display.error(f"No manifest for '{target_service}'")
+                return
+            manifests = {target_service: manifests[target_service]}
+
+        # Namespace: --package flag, peer name, or endpoint_id prefix
+        namespace = package or ctx.peer_name or ctx.connection.get_peer_display()
+        # Sanitize: only keep alphanumeric + underscores
+        import re
+        namespace = re.sub(r"[^a-zA-Z0-9_]", "_", namespace).strip("_") or "aster_client"
+        source = f"{namespace}/{next(iter(manifests))}" if len(manifests) == 1 else namespace
+
+        generated = generate_python_clients(manifests, out, namespace, source)
+
+        ctx.display.info(f"Generated {len(generated)} files")
+        for f in generated:
+            ctx.display.print(f"  [dim]{f}[/dim]")
+
+        address = getattr(ctx.connection, '_peer_addr', '')
+        ctx.display.print(format_usage_snippet(out, namespace, manifests, address))
 
 
 # ── Session subshell ──────────────────────────────────────────────────────────

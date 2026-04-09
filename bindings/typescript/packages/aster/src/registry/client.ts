@@ -2,7 +2,7 @@
  * Registry client — service discovery via Iroh docs + blobs.
  *
  * Reads contract manifests from the registry document (joined via
- * the registry ticket from admission), discovers available services,
+ * the registry namespace from admission), discovers available services,
  * and downloads contract collections from the blob store.
  */
 
@@ -35,7 +35,7 @@ export interface EndpointLease {
  * Registry client — discovers services from the registry document.
  *
  * Usage:
- * 1. Join the registry doc using the ticket from admission
+ * 1. Join the registry doc using the namespace ID from admission
  * 2. Read contract entries
  * 3. Download manifests from blob collections
  */

@@ -179,20 +179,20 @@ pub struct iroh_runtime_config_t {
 #[derive(Copy, Clone)]
 pub struct iroh_endpoint_config_t {
     pub struct_size: u32,
-    pub relay_mode: u32,           // 0=default, 1=custom, 2=disabled, 3=staging
+    pub relay_mode: u32, // 0=default, 1=custom, 2=disabled, 3=staging
     pub secret_key: iroh_bytes_t,
     pub alpns: iroh_bytes_list_t,
     pub relay_urls: iroh_bytes_list_t,
     pub enable_discovery: u32,
-    pub enable_hooks: u32,         // Phase 1b: 0=disabled, 1=enabled
-    pub hook_timeout_ms: u64,      // Phase 1b: 0 = use default (5000ms)
+    pub enable_hooks: u32,    // Phase 1b: 0=disabled, 1=enabled
+    pub hook_timeout_ms: u64, // Phase 1b: 0 = use default (5000ms)
     // Phase 1d: endpoint builder gaps
-    pub bind_addr: iroh_bytes_t,           // socket addr string; empty = use default
-    pub clear_ip_transports: u32,          // 1 = relay-only mode
-    pub clear_relay_transports: u32,       // 1 = direct-IP-only mode
-    pub portmapper_config: u32,            // 0 = enabled (default), 1 = disabled
-    pub proxy_url: iroh_bytes_t,           // HTTP/SOCKS proxy URL string; empty = none
-    pub proxy_from_env: u32,               // 1 = read HTTP_PROXY/HTTPS_PROXY from env
+    pub bind_addr: iroh_bytes_t, // socket addr string; empty = use default
+    pub clear_ip_transports: u32, // 1 = relay-only mode
+    pub clear_relay_transports: u32, // 1 = direct-IP-only mode
+    pub portmapper_config: u32,  // 0 = enabled (default), 1 = disabled
+    pub proxy_url: iroh_bytes_t, // HTTP/SOCKS proxy URL string; empty = none
+    pub proxy_from_env: u32,     // 1 = read HTTP_PROXY/HTTPS_PROXY from env
 }
 
 #[repr(C)]
@@ -1395,7 +1395,7 @@ pub unsafe extern "C" fn iroh_endpoint_create(
         clear_ip_transports: cfg.clear_ip_transports != 0,
         clear_relay_transports: cfg.clear_relay_transports != 0,
         portmapper_config: match cfg.portmapper_config {
-            0 => None,           // 0 = enabled (default) → let build_endpoint_config use its default
+            0 => None, // 0 = enabled (default) → let build_endpoint_config use its default
             1 => Some("disabled".to_string()),
             _ => None,
         },
@@ -5651,11 +5651,7 @@ pub unsafe extern "C" fn iroh_hook_after_connect_respond(
 /// returns BUFFER_TOO_SMALL.
 ///
 /// Returns INVALID_ARGUMENT when any pointer is null.
-unsafe fn write_to_caller_buf(
-    src: &[u8],
-    out_buf: *mut u8,
-    out_len: *mut usize,
-) -> iroh_status_t {
+unsafe fn write_to_caller_buf(src: &[u8], out_buf: *mut u8, out_len: *mut usize) -> iroh_status_t {
     if out_len.is_null() {
         return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT;
     }
@@ -5930,7 +5926,7 @@ pub unsafe extern "C" fn aster_canonical_json(
 /// - `relay_addr_ptr/len`: relay "ip:port" string (NULL/0 for none)
 /// - `direct_addrs_json_ptr/len`: JSON array of "ip:port" strings (NULL/0 for none)
 /// - `credential_type_ptr/len`: credential type string: "open", "consumer_rcan",
-///   "enrollment", "registry" (NULL/0 for none)
+///   "enrollment", "registry_read" (NULL/0 for none)
 /// - `credential_data_ptr/len`: credential payload bytes (NULL/0 for none)
 /// - `out_buf/out_len`: output buffer for the aster1... string
 #[no_mangle]
@@ -6025,18 +6021,13 @@ pub unsafe extern "C" fn aster_ticket_encode(
             "open" => Some(TicketCredential::Open),
             "consumer_rcan" => Some(TicketCredential::ConsumerRcan(cdata)),
             "enrollment" => Some(TicketCredential::Enrollment(cdata)),
-            "registry" => {
-                if cdata.len() != 64 {
-                    return set_last_error("registry credential requires exactly 64 bytes");
+            "registry_read" => {
+                if cdata.len() != 32 {
+                    return set_last_error("registry_read credential requires exactly 32 bytes");
                 }
                 let mut ns = [0u8; 32];
-                let mut rc = [0u8; 32];
                 ns.copy_from_slice(&cdata[..32]);
-                rc.copy_from_slice(&cdata[32..]);
-                Some(TicketCredential::Registry {
-                    namespace_id: ns,
-                    read_cap: rc,
-                })
+                Some(TicketCredential::RegistryRead(ns))
             }
             _ => return set_last_error(format!("unknown credential type '{ctype}'")),
         }
@@ -6065,7 +6056,7 @@ pub unsafe extern "C" fn aster_ticket_encode(
 ///   "endpoint_id": "hex...",
 ///   "relay_addr": "ip:port" | null,
 ///   "direct_addrs": ["ip:port", ...],
-///   "credential_type": "open" | "consumer_rcan" | "enrollment" | "registry" | null,
+///   "credential_type": "open" | "consumer_rcan" | "enrollment" | "registry_read" | null,
 ///   "credential_data_hex": "hex..." | null
 /// }
 /// ```
@@ -6094,14 +6085,8 @@ pub unsafe extern "C" fn aster_ticket_decode(
         Some(TicketCredential::Open) => (Some("open"), None),
         Some(TicketCredential::ConsumerRcan(v)) => (Some("consumer_rcan"), Some(hex::encode(v))),
         Some(TicketCredential::Enrollment(v)) => (Some("enrollment"), Some(hex::encode(v))),
-        Some(TicketCredential::Registry {
-            namespace_id,
-            read_cap,
-        }) => {
-            let mut data = Vec::with_capacity(64);
-            data.extend_from_slice(namespace_id);
-            data.extend_from_slice(read_cap);
-            (Some("registry"), Some(hex::encode(data)))
+        Some(TicketCredential::RegistryRead(namespace_id)) => {
+            (Some("registry_read"), Some(hex::encode(namespace_id)))
         }
     };
 
@@ -6130,9 +6115,7 @@ fn sort_json_value(value: &serde_json::Value) -> serde_json::Value {
                 .collect();
             Value::Object(sorted)
         }
-        Value::Array(arr) => {
-            Value::Array(arr.iter().map(sort_json_value).collect())
-        }
+        Value::Array(arr) => Value::Array(arr.iter().map(sort_json_value).collect()),
         other => other.clone(),
     }
 }

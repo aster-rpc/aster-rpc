@@ -20,7 +20,7 @@ pub struct AsterTicketInfo {
     pub relay_addr: Option<String>,
     /// Direct addresses as ["ip:port", ...].
     pub direct_addrs: Vec<String>,
-    /// Credential type: "open", "consumer_rcan", "enrollment", "registry", or null.
+    /// Credential type: "open", "consumer_rcan", "enrollment", "registry_read", or null.
     pub credential_type: Option<String>,
     /// Credential data as hex string, or null.
     pub credential_data_hex: Option<String>,
@@ -95,21 +95,16 @@ fn info_to_core(info: &AsterTicketInfo) -> Result<CoreTicket> {
             let data = decode_cred_hex(&info.credential_data_hex)?;
             Some(TicketCredential::Enrollment(data))
         }
-        Some("registry") => {
+        Some("registry_read") => {
             let data = decode_cred_hex(&info.credential_data_hex)?;
-            if data.len() != 64 {
+            if data.len() != 32 {
                 return Err(napi::Error::from_reason(
-                    "registry credential_data must be exactly 64 bytes",
+                    "registry_read credential_data must be exactly 32 bytes (namespace_id)",
                 ));
             }
-            let mut namespace_id = [0u8; 32];
-            let mut read_cap = [0u8; 32];
-            namespace_id.copy_from_slice(&data[..32]);
-            read_cap.copy_from_slice(&data[32..64]);
-            Some(TicketCredential::Registry {
-                namespace_id,
-                read_cap,
-            })
+            let mut ns = [0u8; 32];
+            ns.copy_from_slice(&data);
+            Some(TicketCredential::RegistryRead(ns))
         }
         Some(other) => {
             return Err(napi::Error::from_reason(format!(
@@ -144,14 +139,8 @@ fn core_to_info(core: &CoreTicket) -> AsterTicketInfo {
         Some(TicketCredential::Enrollment(v)) => {
             (Some("enrollment".to_string()), Some(hex::encode(v)))
         }
-        Some(TicketCredential::Registry {
-            namespace_id,
-            read_cap,
-        }) => {
-            let mut data = Vec::with_capacity(64);
-            data.extend_from_slice(namespace_id);
-            data.extend_from_slice(read_cap);
-            (Some("registry".to_string()), Some(hex::encode(data)))
+        Some(TicketCredential::RegistryRead(ns)) => {
+            (Some("registry_read".to_string()), Some(hex::encode(ns)))
         }
     };
 

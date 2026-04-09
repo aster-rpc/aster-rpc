@@ -199,6 +199,46 @@ impl BlobsClient {
         })
     }
 
+    /// Download a blob by hash from a specific node, bypassing ticket parsing.
+    /// `format` should be "raw" or "hash_seq".
+    fn download_hash<'py>(
+        &self,
+        py: Python<'py>,
+        hash_hex: String,
+        node_id_hex: String,
+        format: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            let data = client
+                .download_hash(hash_hex, node_id_hex, format)
+                .await
+                .map_err(err_to_py)?;
+            Ok(PyBytesResult(data))
+        })
+    }
+
+    /// Download a collection by hash from a specific node, returning (name, data) pairs.
+    fn download_collection_hash<'py>(
+        &self,
+        py: Python<'py>,
+        hash_hex: String,
+        node_id_hex: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            let files = client
+                .download_collection_hash(hash_hex, node_id_hex)
+                .await
+                .map_err(err_to_py)?;
+            let result: Vec<(String, PyBytesResult)> = files
+                .into_iter()
+                .map(|(name, data)| (name, PyBytesResult(data)))
+                .collect();
+            Ok(result)
+        })
+    }
+
     // ── Tag methods ──────────────────────────────────────────────────────────
 
     /// Set a named tag. `format` must be "raw" or "hash_seq".

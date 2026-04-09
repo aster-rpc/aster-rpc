@@ -230,8 +230,8 @@ export class AsterClientWrapper {
     return this._connected;
   }
 
-  /** Registry ticket for service discovery (set after admission). */
-  get registryTicket(): string | undefined { return undefined; }
+  /** Registry namespace ID for service discovery (set after admission). */
+  get registryNamespace(): string | undefined { return undefined; }
 
   /**
    * Hex-encoded 32-byte gossip topic ID for the producer mesh.

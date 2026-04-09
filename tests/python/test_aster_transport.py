@@ -499,36 +499,6 @@ class TestMemStreams:
             await stream.read_exact(5)
 
 
-# ── LocalConnection tests ───────────────────────────────────────────────────
-
-
-class TestLocalConnection:
-    """Test LocalConnection helper class."""
-
-    def test_local_connection_creation(self):
-        """LocalConnection can be created."""
-        from aster.transport.local import LocalConnection
-        
-        conn = LocalConnection()
-        assert conn is not None
-        assert conn._closed is False
-
-    def test_local_connection_close(self):
-        """LocalConnection.close() works."""
-        from aster.transport.local import LocalConnection
-        
-        conn = LocalConnection()
-        conn.close(0, b"test")
-        assert conn._closed is True
-
-    def test_local_connection_remote_id(self):
-        """LocalConnection.remote_id() returns a string."""
-        from aster.transport.local import LocalConnection
-        
-        conn = LocalConnection()
-        assert conn.remote_id() == "local-connection"
-
-
 # ── Integration tests with real Iroh (skipped if no connection) ───────────
 
 

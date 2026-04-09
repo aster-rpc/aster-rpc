@@ -37,11 +37,9 @@ pub enum TicketCredential {
     ConsumerRcan(Vec<u8>),
     /// Enrollment credential (JSON payload).
     Enrollment(Vec<u8>),
-    /// Registry reference: namespace_id + read_cap.
-    Registry {
-        namespace_id: [u8; 32],
-        read_cap: [u8; 32],
-    },
+    /// Registry read capability: the namespace public key (32 bytes).
+    /// Knowing the namespace ID grants read access to the doc.
+    RegistryRead([u8; 32]),
 }
 
 impl TicketCredential {
@@ -50,7 +48,7 @@ impl TicketCredential {
             Self::Open => 0x00,
             Self::ConsumerRcan(_) => 0x01,
             Self::Enrollment(_) => 0x02,
-            Self::Registry { .. } => 0x03,
+            Self::RegistryRead(_) => 0x03,
         }
     }
 
@@ -58,15 +56,7 @@ impl TicketCredential {
         match self {
             Self::Open => vec![],
             Self::ConsumerRcan(v) | Self::Enrollment(v) => v.clone(),
-            Self::Registry {
-                namespace_id,
-                read_cap,
-            } => {
-                let mut out = Vec::with_capacity(64);
-                out.extend_from_slice(namespace_id);
-                out.extend_from_slice(read_cap);
-                out
-            }
+            Self::RegistryRead(ns) => ns.to_vec(),
         }
     }
 
@@ -76,15 +66,13 @@ impl TicketCredential {
             0x01 => Ok(Self::ConsumerRcan(payload.to_vec())),
             0x02 => Ok(Self::Enrollment(payload.to_vec())),
             0x03 => {
-                ensure!(payload.len() == 64, "registry credential must be 64 bytes");
-                let mut namespace_id = [0u8; 32];
-                let mut read_cap = [0u8; 32];
-                namespace_id.copy_from_slice(&payload[..32]);
-                read_cap.copy_from_slice(&payload[32..64]);
-                Ok(Self::Registry {
-                    namespace_id,
-                    read_cap,
-                })
+                ensure!(
+                    payload.len() == 32,
+                    "registry_read credential must be 32 bytes"
+                );
+                let mut ns = [0u8; 32];
+                ns.copy_from_slice(payload);
+                Ok(Self::RegistryRead(ns))
             }
             _ => bail!("unknown credential type 0x{:02x}", type_byte),
         }
@@ -143,7 +131,7 @@ impl AsterTicket {
 
         // type bitfield: 2 bits per address
         if count > 0 {
-            let bitfield_bytes = ((count as usize) * 2 + 7) / 8;
+            let bitfield_bytes = ((count as usize) * 2).div_ceil(8);
             let bitfield_start = buf.len();
             buf.resize(buf.len() + bitfield_bytes, 0);
 
@@ -254,7 +242,7 @@ impl AsterTicket {
 
         let mut direct_addrs = Vec::with_capacity(count);
         if count > 0 {
-            let bitfield_bytes = (count * 2 + 7) / 8;
+            let bitfield_bytes = (count * 2).div_ceil(8);
             ensure!(
                 pos + bitfield_bytes <= bytes.len(),
                 "truncated type bitfield"
@@ -453,19 +441,14 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_registry() {
+    fn roundtrip_registry_read() {
         let mut ns = [0u8; 32];
-        let mut cap = [0u8; 32];
         ns[0] = 0xAA;
-        cap[31] = 0xBB;
         let ticket = AsterTicket {
             endpoint_id: sample_endpoint_id(),
             relay: None,
             direct_addrs: vec![],
-            credential: Some(TicketCredential::Registry {
-                namespace_id: ns,
-                read_cap: cap,
-            }),
+            credential: Some(TicketCredential::RegistryRead(ns)),
         };
         let wire = ticket.encode().unwrap();
         let decoded = AsterTicket::decode(&wire).unwrap();

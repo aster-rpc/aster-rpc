@@ -205,7 +205,7 @@ class TestAdmissionServicesCap:
         raw = json.dumps({
             "admitted": True,
             "services": services,
-            "registry_ticket": "",
+            "registry_namespace": "",
             "root_pubkey": "",
         })
         resp = ConsumerAdmissionResponse.from_json(raw)
