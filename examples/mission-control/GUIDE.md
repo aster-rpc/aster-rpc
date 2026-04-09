@@ -492,6 +492,8 @@ config = AsterConfig(
 )
 async with AsterServer(
     services=[MissionControl(), AgentSession()],
+    identity=".aster-identity",
+    peer="mission-control",
     config=config,
 ) as srv:
     print(srv.address)

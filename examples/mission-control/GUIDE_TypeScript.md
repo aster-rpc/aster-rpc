@@ -537,6 +537,8 @@ class AgentSession {
 ```typescript
 const server = new AsterServer({
     services: [new MissionControl(), new AgentSession()],
+    identity: ".aster-identity",
+    peer: "mission-control",
     config: {
         rootPubkeyFile: "~/.aster/root.pub",
     },
