@@ -277,7 +277,9 @@ async def test_e2e_admission_returns_services_and_ticket():
     # Admission endpoint for node A (separate bare endpoint on consumer_admission ALPN)
     ep_a = await create_endpoint_with_config(EndpointConfig(alpns=[CONSUMER_ALPN]))
     ep_a_addr = ep_a.endpoint_addr_info()
-    ticket_a = await doc_a.share("read")
+    # share() enables sync engine; doc_id() returns the hex namespace
+    await doc_a.share("read")
+    ticket_a = doc_a.doc_id()
 
     admitted_event = asyncio.Event()
 

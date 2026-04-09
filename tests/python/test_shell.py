@@ -42,7 +42,9 @@ def root():
 @pytest.fixture
 def demo_conn():
     conn = DemoConnection()
-    asyncio.get_event_loop().run_until_complete(conn.connect())
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(conn.connect())
+    loop.close()
     return conn
 
 
