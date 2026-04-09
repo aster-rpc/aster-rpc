@@ -51,7 +51,7 @@ from aster.interceptors.base import (
 from aster.protocol import CallHeader, RpcStatus, StreamHeader
 from aster.service import ServiceInfo, MethodInfo
 from aster.status import RpcError, StatusCode
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 
 logger = logging.getLogger(__name__)
 
@@ -178,8 +178,8 @@ class SessionServer:
         peer: str | None = None,
     ) -> None:
         """Drive the session lifecycle for one stream."""
-        session_id = stream_header.call_id or str(uuid.uuid4())
-        serialization_mode = stream_header.serialization_mode
+        session_id = stream_header.callId or str(uuid.uuid4())
+        serialization_mode = stream_header.serializationMode
 
         # Instantiate the service class with peer= kwarg
         try:
@@ -262,8 +262,8 @@ class SessionServer:
 
                 # Build call context
                 from aster.limits import MAX_METADATA_ENTRIES, validate_metadata, LimitExceeded
-                _keys = call_header.metadata_keys or []
-                _vals = call_header.metadata_values or []
+                _keys = call_header.metadataKeys or []
+                _vals = call_header.metadataValues or []
                 try:
                     validate_metadata(_keys, _vals)
                 except LimitExceeded:
@@ -274,12 +274,12 @@ class SessionServer:
                     service=self._service_info.name,
                     method=method_name,
                     metadata=metadata,
-                    deadline_epoch_ms=call_header.deadline_epoch_ms,
+                    deadline_epoch_ms=call_header.deadlineEpochMs,
                     peer=peer,
                     is_streaming=method_info.pattern != "unary",
                     pattern=method_info.pattern,
                     idempotent=method_info.idempotent,
-                    call_id=call_header.call_id or None,
+                    call_id=call_header.callId or None,
                     session_id=session_id,
                 )
 
@@ -873,10 +873,10 @@ class SessionStub:
         meta_vals = list((metadata or {}).values())
         call_header = CallHeader(
             method=method_info.name,
-            call_id=str(uuid.uuid4()),
-            deadline_epoch_ms=0,
-            metadata_keys=meta_keys,
-            metadata_values=meta_vals,
+            callId=str(uuid.uuid4()),
+            deadlineEpochMs=0,
+            metadataKeys=meta_keys,
+            metadataValues=meta_vals,
         )
         payload = self._codec.encode(call_header)
         await write_frame(self._send, payload, flags=CALL)

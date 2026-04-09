@@ -249,7 +249,7 @@ async def test_blob_status_not_found_for_unknown_hash():
 
     # Use a valid-looking BLAKE3 hash that isn't stored
     # BLAKE3 hashes are 32 bytes; base32-encoded they are 52 chars
-    fake_hash = "a" * 52  # not valid base32 — will cause parse error, so use add+delete trick
+    fake_hash = "a" * 52  # not valid base32 -- will cause parse error, so use add+delete trick
     # Instead use a real hash format from a different data that we never stored:
     # We'll add data, get the hash, then create a node that never stored it
     node2 = await IrohNode.memory()
@@ -341,7 +341,7 @@ async def test_blob_observe_complete_resolves_for_local_blob():
 
     hash_hex = await blobs.add_bytes(b"already complete data")
 
-    # Should resolve without error — blob is already complete
+    # Should resolve without error -- blob is already complete
     await blobs.blob_observe_complete(hash_hex)
 
     await node.shutdown()

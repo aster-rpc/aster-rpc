@@ -44,7 +44,7 @@ from aster.session import (
     create_local_session,
 )
 from aster.status import RpcError, StatusCode
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 
 
 # ── Shared test types ────────────────────────────────────────────────────────
@@ -308,7 +308,7 @@ async def test_local_session_cancel_mid_call():
     status = slow_codec.decode(payload, RpcStatus)
     assert status.code == StatusCode.CANCELLED
 
-    # Session is still usable — issue another call
+    # Session is still usable -- issue another call
     call_header2 = CallHeader(method="fast", call_id="call-fast")
     await write_frame(c_send, slow_codec.encode(call_header2), flags=CALL)
     await write_frame(c_send, slow_codec.encode(Req(value=3)), flags=0)

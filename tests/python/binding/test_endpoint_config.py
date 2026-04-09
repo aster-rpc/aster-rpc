@@ -1,8 +1,8 @@
 """
 Binding-layer tests for EndpointConfig.
 
-These tests exercise the PyO3 object directly — constructor, field access,
-field mutation — without touching any network I/O.  They catch:
+These tests exercise the PyO3 object directly -- constructor, field access,
+field mutation -- without touching any network I/O.  They catch:
   - Wrong PyO3 field names or types
   - Missing keyword arguments
   - Default value drift between Rust and Python

@@ -129,6 +129,10 @@ def cmd_enroll_node(args) -> int:
     expires_at = _parse_expires(args.expires)
     attributes = _parse_attributes(args.attributes)
 
+    # --capabilities sets aster.role (comma-separated capability list)
+    if hasattr(args, 'capabilities') and args.capabilities:
+        attributes["aster.role"] = args.capabilities
+
     if role == "producer":
         from aster.trust.credentials import EnrollmentCredential
         attributes.setdefault("aster.role", "producer")
@@ -226,6 +230,8 @@ def register_enroll_subparser(subparsers) -> None:
                         help='Signer type: "local" (default), future: "kms", "remote"')
     node_p.add_argument("--identity", "-i", default=None,
                         help="Existing .aster-identity file to add peer to")
+    node_p.add_argument("--capabilities", "-c", default=None,
+                        help="Comma-separated capabilities (e.g., ops.status,ops.logs)")
     node_p.add_argument("--out", "-o", default=".aster-identity",
                         help="Output path (default: .aster-identity)")
 

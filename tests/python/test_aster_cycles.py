@@ -1,7 +1,7 @@
 """
 tests/python/test_aster_cycles.py
 
-Phase 13 conformance tests: cycle-breaking golden vectors B.1–B.4.
+Phase 13 conformance tests: cycle-breaking golden vectors B.1--B.4.
 
 Tests that recursive and mutually-recursive TypeDef graphs produce stable
 canonical bytes and hashes.  Vectors are loaded from the committed JSON fixture.
@@ -194,7 +194,7 @@ def test_vector_B2_author_references_book(vectors):
 
 
 def test_vector_B3_gamma_three_type_cycle(vectors):
-    """B.3: Gamma — first in a three-type cycle (Gamma → Alpha → Beta → Gamma)."""
+    """B.3: Gamma -- first in a three-type cycle (Gamma → Alpha → Beta → Gamma)."""
     td_gamma = TypeDef(
         kind=TypeDefKind.MESSAGE,
         package="example",

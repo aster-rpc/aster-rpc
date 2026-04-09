@@ -22,6 +22,24 @@ from aster.trust.rcan import evaluate_capability
 logger = logging.getLogger(__name__)
 
 
+def _normalize_requirement(req: Any) -> CapabilityRequirement | None:
+    """Normalize a requires= value to a CapabilityRequirement.
+
+    Accepts:
+    - None -> None
+    - CapabilityRequirement -> pass through
+    - str or str enum -> wrap as ROLE requirement
+    """
+    if req is None:
+        return None
+    if isinstance(req, CapabilityRequirement):
+        return req
+    if isinstance(req, str):
+        from aster.contract.identity import CapabilityKind
+        return CapabilityRequirement(kind=CapabilityKind.ROLE, roles=[str(req)])
+    return req
+
+
 class CapabilityInterceptor(Interceptor):
     """Enforces capability requirements on incoming RPC calls.
 
@@ -40,12 +58,12 @@ class CapabilityInterceptor(Interceptor):
             return request
 
         # Service-level baseline requirement.
-        svc_req: CapabilityRequirement | None = svc_info.requires
+        svc_req = _normalize_requirement(svc_info.requires)
         # Method-level requirement.
-        method_req: CapabilityRequirement | None = None
+        method_req = None
         method_info = svc_info.get_method(ctx.method)
         if method_info is not None:
-            method_req = method_info.requires
+            method_req = _normalize_requirement(method_info.requires)
 
         # No requirements at all -- pass through.
         if svc_req is None and method_req is None:

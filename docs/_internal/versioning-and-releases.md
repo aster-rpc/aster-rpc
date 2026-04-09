@@ -290,10 +290,86 @@ When a track is bumped, what else needs to happen:
 | Track 4 (CLI) | 0.1.0 | 0.1.0 |
 
 **Action items:**
-- [ ] Fix `__init__.py` version to use `importlib.metadata` instead of hardcoded string
-- [ ] Set up GitHub Packages publishing in CI
-- [ ] Add build number stamping to CI
-- [ ] Create version bump script (bumps all files in a track)
+- [x] Fix `__init__.py` version to use `importlib.metadata` instead of hardcoded string
+- [x] Set up PyPI trusted publishing in CI (`build.yml`)
+- [ ] Add build number stamping to CI for dev builds
+- [x] Create version bump script (`scripts/release.sh`)
+
+---
+
+## How to do a release
+
+### Prerequisites (one-time)
+
+1. **PyPI trusted publishing** configured at https://pypi.org/manage/project/aster-rpc/settings/publishing/
+   - Owner: `emrul`, Repo: `aster-rpc`, Workflow: `build.yml`, Environment: `pypi`
+2. **GitHub environment** `pypi` created on the repo (Settings > Environments)
+3. **Release script** at `scripts/release.sh`
+
+### Regular push (no release)
+
+```bash
+git push origin main
+```
+
+CI runs tests and builds wheels. Wheels are uploaded as GitHub Actions
+artifacts (downloadable from the run page). **Nothing is published to
+PyPI.** This is the normal dev cycle.
+
+### Publishing a release
+
+```bash
+./scripts/release.sh
+```
+
+The script will:
+
+1. Show current versions across all tracks
+2. Ask: patch / minor / major / custom
+3. Preview which files will change
+4. Update all version source-of-truth files (Cargo.toml, pyproject.toml, package.json)
+5. Commit and tag (`v{VERSION}` + `core-v{VERSION}`)
+6. Tell you to push
+
+Then push:
+
+```bash
+git push origin main --tags
+```
+
+This triggers the `build.yml` workflow which:
+
+- Builds wheels on Linux (x86_64 + aarch64), macOS (aarch64), Windows (x86_64)
+- Builds the sdist
+- Creates a GitHub Release with all wheel artifacts
+- **Publishes to PyPI** via trusted publishing (OIDC, no token needed)
+
+### Version bump examples
+
+```bash
+# Patch release (0.1.0 -> 0.1.1)
+./scripts/release.sh
+
+# Specific version
+./scripts/release.sh 0.2.0
+
+# Pre-release (if needed)
+./scripts/release.sh 0.2.0rc1
+```
+
+### What gets published where
+
+| Trigger | GitHub Actions artifacts | GitHub Release | PyPI |
+|---------|------------------------|----------------|------|
+| Push to `main` | Yes | No | No |
+| Tag `v*` | Yes | Yes | Yes |
+
+### Post-release checklist
+
+- [ ] Verify the release appears on PyPI: https://pypi.org/project/aster-rpc/
+- [ ] Verify `pip install aster-rpc=={VERSION}` works in a clean venv
+- [ ] Update the docs site version badge (if applicable)
+- [ ] Announce (if warranted)
 
 ---
 

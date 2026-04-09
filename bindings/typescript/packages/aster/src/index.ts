@@ -228,8 +228,13 @@ export {
   resolveRootPubkey,
   toEndpointConfig,
   loadIdentity,
+  loadIdentityFile,
+  findPeer,
+  getProducerTokens,
+  parseSimpleToml,
   printConfig,
   type AsterConfig,
+  type IdentityData,
 } from './config.js';
 
 // Logging
@@ -263,9 +268,24 @@ export {
 export {
   AsterServer,
   AsterClientWrapper,
+  ProxyClient,
   type AsterServerOptions,
   type AsterClientOptions,
 } from './high-level.js';
+
+// @aster endpoint registration
+export {
+  loadProducerTokens,
+  resolveAsterAddress,
+  startRegistrationLoop,
+  type ProducerTokenEntry,
+  type NodeInfo,
+  type RegistrationLoopOptions,
+  type RegistrationTransport,
+} from './registration.js';
+
+// Capability helpers
+export { anyOf, allOf } from './capabilities.js';
 
 // Trust & Security
 export {
@@ -450,3 +470,18 @@ export {
   type ConsumerAdmissionOpts,
   type ServiceSummary,
 } from './trust/consumer.js';
+
+// Delegated admission (aster.admission ALPN)
+export {
+  verifyAttestation,
+  verifyToken,
+  verifyProofOfPossession,
+  buildChallengeBytes,
+  handleDelegatedAdmissionConnection,
+  type SigningKeyAttestation,
+  type EnrollmentToken,
+  type DelegatedAdmissionPolicy,
+  type DelegatedAdmissionResult,
+  type BiStream,
+  type AdmissionConnection,
+} from './trust/delegated.js';

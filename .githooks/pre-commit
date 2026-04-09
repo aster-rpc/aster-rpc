@@ -1,0 +1,13 @@
+#!/bin/sh
+# Pre-commit hook: reject non-ASCII characters in Python source.
+# Import check runs but doesn't block (native module may not be built).
+
+# 1. Non-ASCII check (blocking)
+python3 scripts/check-ascii.py || exit 1
+
+# 2. Import check (warning only -- native module may not be built)
+python3 -c "from aster import AsterServer, AsterClient, service, rpc, wire_type, any_of, all_of, SerializationMode" 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "WARNING: Python aster import check failed (native module not built?)"
+    echo "Run './scripts/build.sh' then retry if this is unexpected."
+fi

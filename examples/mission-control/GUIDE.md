@@ -114,11 +114,17 @@ aster shell aster1Qm...
 > ./getStatus agent_id="edge-node-7"
 ```
 
-Or skip the shell entirely — call it straight from the command line:
+Or skip the shell entirely -- call it straight from the command line:
 
 ```bash
-aster call aster1Qm... MissionControl.getStatus '{"agent_id": "edge-node-7"}' --json
+aster call aster1Qm... MissionControl.getStatus '{"agent_id": "edge-node-7"}'
 ```
+
+> **`aster shell` vs `aster call`:** Use `aster shell` for interactive
+> exploration -- browsing services, tab-completing methods, streaming.
+> Use `aster call` for scripting and one-shot invocations. Both use
+> JSON serialization under the hood. For production code, use generated
+> typed clients (Chapter 6).
 
 **What just happened:**
 - `@service` + `@rpc` defined a typed RPC contract
@@ -139,6 +145,9 @@ aster call aster1Qm... MissionControl.getStatus '{"agent_id": "edge-node-7"}' --
 in real time using server streaming.
 
 ```python
+from collections.abc import AsyncIterator
+from aster import server_stream
+
 @wire_type("mission/LogEntry")
 @dataclass
 class LogEntry:
@@ -171,7 +180,7 @@ class MissionControl:
         await self._log_queue.put(entry)
 
     @server_stream()
-    async def tailLogs(self, req: TailRequest):
+    async def tailLogs(self, req: TailRequest) -> AsyncIterator[LogEntry]:
         """Stream log entries as they arrive."""
         while True:
             entry = await self._log_queue.get()
@@ -190,12 +199,17 @@ class MissionControl:
 # Ctrl+C to stop
 ```
 
+> **Tip:** `tailLogs` blocks until a log entry arrives. If the queue is
+> empty, the client waits. Submit a log entry from another terminal
+> (or via `aster call ... MissionControl.submitLog '{"message":"test"}'`)
+> to see it appear in the stream. Press Ctrl+C to stop.
+
 **What just happened:**
 - `@server_stream` turns an async generator into a streaming RPC
-- The client receives items as they're yielded — no polling, no websockets
+- The client receives items as they're yielded -- no polling, no websockets
 - Under the hood: a single QUIC stream, with Aster framing, flowing until
   either side closes it
-- Agents push entries via `submitLog` — it's just a regular `asyncio.Queue`
+- Agents push entries via `submitLog` -- it's just a regular `asyncio.Queue`
   under the hood. Aster services are plain Python classes with plain state
 
 ---
@@ -225,7 +239,7 @@ class MissionControl:
     # ... previous methods ...
 
     @client_stream()
-    async def ingestMetrics(self, stream) -> IngestResult:
+    async def ingestMetrics(self, stream: AsyncIterator[MetricPoint]) -> IngestResult:
         """Receive a stream of metric points from an agent."""
         accepted = 0
         async for point in stream:
@@ -328,7 +342,8 @@ class CommandResult:
 class AgentSession:
     """Session-scoped: one instance per connected agent."""
 
-    def __init__(self):
+    def __init__(self, peer: str | None = None):
+        self._peer = peer
         self._agent_id = ""
         self._capabilities = []
 
@@ -348,7 +363,7 @@ class AgentSession:
         return Assignment(task_id="continue", command="")
 
     @bidi_stream()
-    async def runCommand(self, commands):
+    async def runCommand(self, commands: AsyncIterator[Command]) -> AsyncIterator[CommandResult]:
         """Execute commands on this agent — stream in, results stream back."""
         async for cmd in commands:
             proc = await asyncio.create_subprocess_shell(
@@ -396,6 +411,16 @@ Two service types, two different lifetimes:
 **Goal:** Not every caller should be able to deploy or run commands on agents.
 Define roles, compose requirements, and issue scoped credentials.
 
+The auth flow has three steps:
+1. **Define** -- declare which capabilities each method requires (in code)
+2. **Issue** -- create credentials with specific capabilities (CLI)
+3. **Connect** -- present the credential on connect; the framework enforces access
+
+The credential carries an `aster.role` attribute with a comma-separated
+list of capabilities. The server's `CapabilityInterceptor` checks this
+list against each method's `requires` declaration. No middleware to
+write, no token parsing -- it's declarative.
+
 ### Step 1: Generate a root key
 
 The root key is the trust anchor for your entire deployment. Keep it
@@ -403,7 +428,7 @@ offline — you'll use it to sign credentials, not to run services.
 
 ```bash
 # One-time setup — generates an Ed25519 keypair
-aster trust keygen --output ~/.aster/root.key
+aster trust keygen --out-key ~/.aster/root.key
 
 # Output:
 # Root key generated: ~/.aster/root.key
@@ -436,12 +461,12 @@ class MissionControl:
     async def getStatus(self, req: StatusRequest) -> StatusResponse: ...
 
     @server_stream(requires=any_of(Role.LOGS, Role.ADMIN))
-    async def tailLogs(self, req: TailRequest):
+    async def tailLogs(self, req: TailRequest) -> AsyncIterator[LogEntry]:
         """Log access for log viewers OR admins — either role works."""
         ...
 
     @client_stream(requires=Role.INGEST)
-    async def ingestMetrics(self, stream) -> IngestResult:
+    async def ingestMetrics(self, stream: AsyncIterator[MetricPoint]) -> IngestResult:
         """Agents push metrics — scoped to the ingest role."""
         ...
 
@@ -452,7 +477,7 @@ class AgentSession:
     async def register(self, hb: Heartbeat) -> Assignment: ...
 
     @bidi_stream(requires=Role.ADMIN)
-    async def runCommand(self, commands):
+    async def runCommand(self, commands: AsyncIterator[Command]) -> AsyncIterator[CommandResult]:
         """Command execution is admin-only."""
         ...
 ```
@@ -475,17 +500,17 @@ async with AsterServer(
 ### Step 4: Enroll agents
 
 ```bash
-# Issue a credential for an edge agent — status and ingest only
-aster enroll consumer --name "edge-node-7" \
+# Issue a credential for an edge agent -- status and ingest only
+aster enroll node --role consumer --name "edge-node-7" \
     --capabilities ops.status,ops.ingest \
     --root-key ~/.aster/root.key \
-    --output edge-node-7.cred
+    --out edge-node-7.cred
 
-# Issue an operator credential — full access including admin
-aster enroll consumer --name "ops-team" \
+# Issue an operator credential -- full access including admin
+aster enroll node --role consumer --name "ops-team" \
     --capabilities ops.status,ops.logs,ops.admin,ops.ingest \
     --root-key ~/.aster/root.key \
-    --output ops-team.cred
+    --out ops-team.cred
 ```
 
 ### Step 5: Connect with credentials
@@ -515,14 +540,14 @@ asyncio.run(main())
 
 ```bash
 # Or from the CLI — the shell respects credentials too
-aster shell aster1Qm... --credential ops-team.cred
+aster shell aster1Qm... --rcan ops-team.cred
 > cd services/AgentSession
 > ./runCommand               # ✓ ops-team has ops.admin
 ```
 
 **What just happened:**
 - `aster trust keygen` created the root of trust — one command
-- `aster enroll consumer` issued scoped credentials — no CA infrastructure
+- `aster enroll node --role consumer` issued scoped credentials — no CA infrastructure
 - `requires=Role.ADMIN` — Aster checks at the method level, no auth middleware to write
 - `any_of(A, B)` — caller must have at LEAST ONE (log viewers OR admins can tail)
 - The edge agent can push metrics but can't run commands. The ops team can do both.

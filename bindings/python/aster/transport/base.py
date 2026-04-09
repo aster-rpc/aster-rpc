@@ -190,10 +190,11 @@ class BidiChannel:
         """Receive the next message from the stream.
 
         Returns:
-            The deserialized message.
+            The deserialized message, or None if the stream ended cleanly
+            (OK trailer received).
 
         Raises:
-            RpcError: On protocol errors.
+            RpcError: On protocol errors or non-OK trailer status.
         """
         ...
 

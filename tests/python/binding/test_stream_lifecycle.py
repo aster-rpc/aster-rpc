@@ -90,13 +90,13 @@ async def test_write_after_finish_raises(connected_pair):
 
 
 async def test_finish_is_idempotent(connected_pair):
-    """Calling finish() twice should not panic — at most raise a clean error."""
+    """Calling finish() twice should not panic -- at most raise a clean error."""
     conn, send, recv, rconn, rsend, rrecv = connected_pair
     await send.finish()
     try:
         await send.finish()
     except (IrohError, Exception):
-        pass  # acceptable — what's NOT acceptable is a Rust panic
+        pass  # acceptable -- what's NOT acceptable is a Rust panic
 
 
 # ---------------------------------------------------------------------------

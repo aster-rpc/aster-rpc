@@ -125,7 +125,7 @@ class TestStatusMessageValidation:
 class TestDecompressionBomb:
     def test_normal_decompression(self):
         from aster.codec import ForyCodec
-        from aster.types import SerializationMode
+        from aster.rpc_types import SerializationMode
 
         codec = ForyCodec(mode=SerializationMode.XLANG)
         data = b"x" * 1000
@@ -136,7 +136,7 @@ class TestDecompressionBomb:
     def test_max_output_size_enforced(self):
         """Verify that decompression beyond MAX_DECOMPRESSED_SIZE is rejected."""
         from aster.codec import ForyCodec
-        from aster.types import SerializationMode
+        from aster.rpc_types import SerializationMode
 
         codec = ForyCodec(mode=SerializationMode.XLANG)
         # Create a payload significantly larger than the limit

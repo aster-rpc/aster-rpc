@@ -106,7 +106,7 @@ async def _delayed(coro_fn, delay):
 
 
 async def test_empty_payload():
-    """Empty payload should work — just handshake + finish."""
+    """Empty payload should work -- just handshake + finish."""
     ep_listen, addr = await create_listener()
 
     async def listener_side():
@@ -196,7 +196,7 @@ async def test_wrong_handshake_rejected():
 
 
 # ============================================================================
-# Raw QUIC interop — verify a raw endpoint can talk dumbpipe protocol
+# Raw QUIC interop -- verify a raw endpoint can talk dumbpipe protocol
 # ============================================================================
 
 

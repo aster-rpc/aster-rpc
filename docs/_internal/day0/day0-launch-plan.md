@@ -454,6 +454,40 @@ with a regression test.
 
 ---
 
+## Phase 3b: Legal — Privacy Policy and Terms of Service
+
+The `aster join` command collects a handle (username) and email address
+and sends them to the `@aster` registry service. This requires:
+
+1. **Privacy Policy** — published at aster.dev/privacy (or similar)
+   - What data is collected (handle, email, endpoint_id)
+   - How it's used (handle verification, service discovery)
+   - How long it's retained
+   - How to request deletion
+
+2. **Terms of Service** — published at aster.dev/terms
+   - Acceptable use of the registry
+   - Handle reservation rules
+   - Limitation of liability
+
+3. **CLI consent gate** — `aster join` must display a consent prompt
+   before sending any data:
+   ```
+   By continuing, you agree to the Aster Privacy Policy
+   (https://aster.dev/privacy) and Terms of Service
+   (https://aster.dev/terms).
+
+   Continue? [y/N]
+   ```
+
+4. **Docs site** — no cookies, no tracking, no analytics → no consent
+   needed. If analytics are added later, revisit.
+
+The PP and ToS do not need to be complex for Day 0 — they need to exist
+and be linked from the CLI. The content can be refined post-launch.
+
+---
+
 ## Phase 4: What NOT to do
 
 - **Do not add features.** The scope is the guide. Nothing else.

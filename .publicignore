@@ -1,0 +1,26 @@
+# Files and directories excluded from the public mirror.
+# Used by .github/workflows/mirror-public.yml
+
+# Internal design docs and AI context
+docs/_internal/
+ffi_spec/
+AGENTS.md
+CLAUDE.md
+.claude/
+
+# Credential and identity files
+*.cred
+*.key
+.aster-identity
+
+# Fory source (large, not ours)
+docs/_internal/fory/
+
+# FFI and future bindings (not shipped in Day 0)
+ffi/
+bindings/java/
+
+# CI workflows (private repo runs CI; public repo is read-only mirror)
+.github/workflows/
+.githooks/
+scripts/check-ascii.py

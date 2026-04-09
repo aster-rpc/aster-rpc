@@ -64,7 +64,9 @@ Tracks whether each binding produces **wire-identical output** for spec-defined 
 
 | Test | Status |
 |------|--------|
-| Python server + TypeScript client (unary) | not tested |
-| TypeScript server + Python client (unary) | not tested |
-| Python server + TypeScript client (streaming) | not tested |
-| Fory XLANG wire compat (pyfory ↔ @apache-fory/core) | not tested |
+| Python server + TypeScript client (unary, JSON mode) | pass |
+| TypeScript server + Python client (unary, JSON mode) | impl |
+| Python server + TypeScript client (streaming, JSON mode) | pass |
+| Python server + TypeScript proxy client | pass |
+| Fory XLANG wire compat (pyfory ↔ @apache-fory/core) | not compatible (JS Fory lacks xlang encode) |
+| JSON serialization mode (mode 3) cross-language | pass |

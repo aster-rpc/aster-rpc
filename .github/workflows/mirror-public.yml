@@ -1,0 +1,46 @@
+name: Mirror to public repo
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Filter internal files
+        run: |
+          # Remove files listed in .publicignore
+          while IFS= read -r pattern; do
+            [[ "$pattern" =~ ^#.*$ || -z "$pattern" ]] && continue
+            pattern=$(echo "$pattern" | xargs)
+            [ -z "$pattern" ] && continue
+            rm -rf $pattern 2>/dev/null || true
+          done < .publicignore
+
+          # Remove the mirror config itself
+          rm -f .publicignore
+          rm -f .github/workflows/mirror-public.yml
+
+          # Clean up empty directories
+          find . -type d -empty -delete 2>/dev/null || true
+
+      - name: Push to public repo
+        env:
+          PUBLIC_REPO_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+        run: |
+          git config user.name "Emrul Islam"
+          git config user.email "emrul@aster.dev"
+
+          # Stage filtered state
+          git add -A
+          git commit -m "Mirror from private repo" --allow-empty || true
+
+          # Push to public repo
+          git remote add public https://x-access-token:${PUBLIC_REPO_TOKEN}@github.com/aster-rpc/aster-rpc.git || true
+          git push public main --force

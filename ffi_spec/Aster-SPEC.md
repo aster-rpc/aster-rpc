@@ -345,16 +345,25 @@ interoperability.
 
 |Protocol         |Fory Family        |Cross-Language                                      |Schema Evolution            |Use Case                                                                                                |
 |-----------------|-------------------|----------------------------------------------------|----------------------------|--------------------------------------------------------------------------------------------------------|
-|`XLANG` (default)|Xlang Serialization|Yes — Java, Python, C++, Go, JS, Rust, Scala, Kotlin|Via content-addressed registry (§11.3)|Cross-language services. Object graphs, shared refs, polymorphism.                                      |
-|`NATIVE`         |Language-specific  |No — single language only                           |Via content-addressed registry (§11.3)|Maximum performance within one language. Python: pickle replacement. JVM: JDK serialization replacement.|
-|`ROW`            |Row Format         |Yes — Java, Python, C++, Rust                       |N/A                         |Zero-copy random access, partial deserialization, Arrow integration.                                    |
+|`XLANG` (default)|Xlang Serialization|Yes -- Java, Python, C++, Go, JS, Rust, Scala, Kotlin|Via content-addressed registry (§11.3)|Cross-language services. Object graphs, shared refs, polymorphism.                                      |
+|`NATIVE`         |Language-specific  |No -- single language only                           |Via content-addressed registry (§11.3)|Maximum performance within one language. Python: pickle replacement. JVM: JDK serialization replacement.|
+|`ROW`            |Row Format         |Yes -- Java, Python, C++, Rust                       |N/A                         |Zero-copy random access, partial deserialization, Arrow integration.                                    |
+|`JSON`           |UTF-8 JSON         |Yes -- all languages                                 |Via content-addressed registry (§11.3)|Universal cross-language interop. Used by bindings where Fory XLANG is not yet stable (e.g., TypeScript).|
 
 `NATIVE_COMPATIBLE` and `SerializationMode.JAVA` do not exist in Aster. Schema
 evolution is handled by the content-addressed contract registry (§11.3): each
 type version produces a distinct hash, so different schema versions coexist as
 separate immutable artifacts. Fory's `compatible` mode (which embeds per-field
-metadata in every payload) is not used — the registry provides the same
+metadata in every payload) is not used -- the registry provides the same
 forward/backward evolution guarantees without per-payload overhead.
+
+**JSON mode (mode 3).** All frames on a stream -- including the `StreamHeader`
+and `RpcStatus` trailer -- are UTF-8 JSON objects. One JSON object per frame;
+the frame length prefix defines boundaries. Field names use camelCase matching
+the protocol type definitions. JSON mode is accepted by all servers alongside
+their declared Fory modes. It is intended for language bindings where the Fory
+XLANG implementation is not yet production-ready. Clients that support Fory
+XLANG should prefer it for performance; JSON mode is a universal fallback.
 
 ### 5.2 Protocol Selection
 
@@ -382,7 +391,7 @@ The wire protocol carries the protocol mode in the `StreamHeader` (see §6.2)
 so the receiver knows how to deserialize.
 
 **Cross-language enforcement:** If client and server are different languages,
-only `XLANG` and `ROW` protocols are permitted. `NATIVE` is always
+only `XLANG`, `ROW`, and `JSON` protocols are permitted. `NATIVE` is always
 single-language. The framework detects language mismatch during connection
 handshake (via metadata exchange) and rejects incompatible protocol selections
 with `INVALID_ARGUMENT`.
@@ -900,20 +909,21 @@ Every message on a QUIC stream is framed as:
 ### 6.2 Stream Header
 
 The first frame on every QUIC stream must have the `HEADER` flag set. Its
-payload is always Fory XLANG-serialized (regardless of the service’s
-serialization mode) so any language can route it:
+payload is Fory XLANG-serialized or JSON-encoded (the server sniffs the first
+byte: `0x7B` = JSON, `0x02` = Fory XLANG). Field names use camelCase across
+all languages:
 
 ```text
 StreamHeader {
     service: string             // e.g. "AgentControl"
-    method: string              // e.g. "assign_task"
+    method: string              // e.g. "assignTask"
     version: int32              // Service version; used with service name for dispatch
-    call_id: string             // UUID, unique per call
-    deadline_epoch_ms: int64    // Absolute deadline (ms since Unix epoch), 0 = none
-    serialization_mode: uint8   // Selected mode for this call (see §6.2.1 for selection algorithm);
-                                // MUST be supported by the advertised contract + endpoint lease
-    metadata_keys: list<string>
-    metadata_values: list<string>
+    callId: string              // UUID, unique per call
+    deadlineEpochMs: int64      // Absolute deadline (ms since Unix epoch), 0 = none
+    serializationMode: uint8    // Selected mode for this call (see §6.2.1 for selection algorithm);
+                                // 0 = XLANG, 1 = NATIVE, 2 = ROW, 3 = JSON
+    metadataKeys: list<string>
+    metadataValues: list<string>
 }
 ```
 
@@ -947,16 +957,16 @@ This validation closes the footgun where a client that forgets to set
 service.
 
 **session_id mapping (normative, see also addendum §8.2):** on a session
-stream, `StreamHeader.call_id` is the **session identifier** for the life of
-the stream. Each in-session CALL frame carries its own `call_id` in the
+stream, `StreamHeader.callId` is the **session identifier** for the life of
+the stream. Each in-session CALL frame carries its own `callId` in the
 `CallHeader`. The framework populates `CallContext.session_id` from
-`StreamHeader.call_id` (stable for the stream) and `CallContext.call_id`
-from `CallHeader.call_id` (per-call). On stateless streams, `session_id` is
+`StreamHeader.callId` (stable for the stream) and `CallContext.call_id`
+from `CallHeader.callId` (per-call). On stateless streams, `session_id` is
 `None`.
 
 The server
 instantiates a per-stream service instance and enters a session loop. The
-`call_id` field serves as the session identifier. Per-call method dispatch uses
+`callId` field serves as the session identifier. Per-call method dispatch uses
 `CALL` frames (bit 4) instead of the `StreamHeader.method` field.
 
 `contract_id` is a BLAKE3 hash of canonical contract bytes. The canonical
@@ -1075,14 +1085,16 @@ client-origin TRAILER frames; session-aware parsers MUST accept them once
 
 ### 6.4 Status / Trailer Frame
 
-The trailer payload is always Fory XLANG-serialized:
+The trailer payload uses the same serialization mode as the stream's payload
+frames (Fory XLANG or JSON, matching the `serializationMode` in the
+`StreamHeader`):
 
 ```text
 RpcStatus {
     code: int32                 // StatusCode enum value
     message: string
-    detail_keys: list<string>
-    detail_values: list<string>
+    detailKeys: list<string>
+    detailValues: list<string>
 }
 ```
 

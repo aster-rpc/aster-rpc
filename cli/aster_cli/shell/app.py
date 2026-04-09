@@ -616,7 +616,7 @@ class PeerConnection:
             return self._transports[service_name]
 
         from aster import IrohTransport, ForyCodec
-        from aster.types import SerializationMode
+        from aster.rpc_types import SerializationMode
 
         # Find the service summary
         summary = None

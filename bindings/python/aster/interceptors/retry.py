@@ -6,7 +6,7 @@ import random
 
 from aster.interceptors.base import CallContext, Interceptor
 from aster.status import RpcError, StatusCode
-from aster.types import RetryPolicy
+from aster.rpc_types import RetryPolicy
 
 
 class RetryInterceptor(Interceptor):

@@ -253,6 +253,6 @@ CLAUDE.md
 AGENTS.md
 .claude/
 /bindings/python/aster/lib_aster.dylib.dSYM/
-aster-docs/
-aster-website/
+aster-docs
+aster-website
 scripts/check-ascii.py

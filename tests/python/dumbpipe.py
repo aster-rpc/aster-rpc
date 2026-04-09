@@ -1,5 +1,5 @@
 """
-Python implementation of dumbpipe — network-level compatible with the Rust version.
+Python implementation of dumbpipe -- network-level compatible with the Rust version.
 
 Protocol:
   - ALPN: b"DUMBPIPEV0"
@@ -69,7 +69,7 @@ async def pipe_streams(
       service so it knows to flush its response.  asyncio.StreamWriter.close()
       shuts the *entire* socket (both read and write sides), which would kill
       local_reader before local_to_quic can read the response.  Instead we use
-      transport.write_eof() — a TCP half-close — to send FIN on the write side
+      transport.write_eof() -- a TCP half-close -- to send FIN on the write side
       while leaving the read side intact.
     """
 
@@ -344,7 +344,7 @@ async def connect_unix(
 async def create_listener() -> tuple[NetClient, NodeAddr]:
     """Create a dumbpipe listener endpoint.
 
-    Returns (endpoint, node_addr) — the caller can pass node_addr to a connector.
+    Returns (endpoint, node_addr) -- the caller can pass node_addr to a connector.
     """
     ep = await create_endpoint(ALPN)
     addr = ep.endpoint_addr_info()

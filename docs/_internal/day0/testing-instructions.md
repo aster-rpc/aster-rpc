@@ -1,76 +1,7 @@
-# Day 0 Testing Setup
-
-**Date:** 2026-04-09
-
-## Goal
-
-An agent (human or LLM) follows the Mission Control GUIDE.md in a clean
-environment and reports what breaks. No dev dependencies, no existing
-config, no shared state with the developer's machine.
-
-## Part 1: What you (the developer) set up
-
-### 1a. Build fresh wheels
-
-```bash
-cd /Users/emrul/dev/emrul/iroh-python
-./scripts/build.sh
-```
-
-This produces:
-- `bindings/python/target/wheels/aster_rpc-*.whl` (the framework)
-- `cli/` (the CLI package, installed as editable or from source)
-
-### 1b. Create the isolated test environment
-
-```bash
-# Create a temp home so ~/.aster/ is isolated
-export DAY0_HOME=$(mktemp -d)
-export HOME=$DAY0_HOME
-export XDG_CONFIG_HOME=$DAY0_HOME/.config
-
-# Create and activate a clean venv
-uv venv $DAY0_HOME/venv
-source $DAY0_HOME/venv/bin/activate
-
-# Install the framework and CLI from local wheels
-uv pip install /Users/emrul/dev/emrul/iroh-python/bindings/python/target/wheels/aster_rpc-*.whl
-uv pip install /Users/emrul/dev/emrul/iroh-python/cli/
-
-# Verify clean state
-echo "Home: $HOME"
-ls -la ~/.aster 2>/dev/null || echo "Clean — no .aster directory"
-which aster
-aster --help
-```
-
-### 1c. Verify the install
-
-```bash
-python -c "from aster import AsterServer, AsterClient, service, rpc, wire_type; print('Import OK')"
-aster --help
-```
-
-Both should succeed. If either fails, the wheel or CLI install is broken.
-
-### 1d. Cleanup (after testing)
-
-```bash
-deactivate
-rm -rf $DAY0_HOME
-unset DAY0_HOME
-export HOME=~  # restore
-```
 
 ---
 
-## Part 2: Instructions for the testing agent
-
-Copy everything below this line and give it to the agent (human or LLM).
-
----
-
-# Day 0 Test Plan — Mission Control Guide
+# Day 0 Test Plan -- Mission Control Guide
 
 You are testing the Aster RPC framework by following the Mission Control
 guide. Your environment is a clean Python 3.13 install with `aster-rpc`
@@ -82,7 +13,7 @@ files, no credentials.
 - Python 3.13 with `aster` and `aster-cli` installed
 - Clean home directory (no `~/.aster/`)
 - Two terminal windows available (one for server, one for client)
-- The guide is at: `examples/mission-control/GUIDE.md`
+- The guide is at: `GUIDE.md` (in your working directory)
 
 ## What to test
 
@@ -196,7 +127,7 @@ Expected: returns CommandResult with stdout.
 **Generate root key:**
 
 ```bash
-aster trust keygen --output ~/.aster/root.key
+aster trust keygen --out-key ~/.aster/root.key
 ```
 
 **Update control.py** with auth config as shown in the guide.
@@ -204,22 +135,22 @@ aster trust keygen --output ~/.aster/root.key
 **Enroll agents:**
 
 ```bash
-aster enroll consumer --name "edge-node-7" \
+aster enroll node --role consumer --name "edge-node-7" \
     --capabilities ops.status,ops.ingest \
     --root-key ~/.aster/root.key \
-    --output edge-node-7.cred
+    --out edge-node-7.cred
 
-aster enroll consumer --name "ops-team" \
+aster enroll node --role consumer --name "ops-team" \
     --capabilities ops.status,ops.logs,ops.admin,ops.ingest \
     --root-key ~/.aster/root.key \
-    --output ops-team.cred
+    --out ops-team.cred
 ```
 
 **Test access control:**
 
 ```bash
-# Edge agent — should be able to call getStatus but not tailLogs
-aster shell <address> --credential edge-node-7.cred
+# Edge agent -- should be able to call getStatus but not tailLogs
+aster shell <address> --rcan edge-node-7.cred
 cd services/MissionControl
 ./getStatus agent_id="test"
 # Should succeed
@@ -229,8 +160,8 @@ cd services/MissionControl
 ```
 
 ```bash
-# Ops team — should have full access
-aster shell <address> --credential ops-team.cred
+# Ops team -- should have full access
+aster shell <address> --rcan ops-team.cred
 cd services/AgentSession
 ./runCommand
 > command="echo admin"
@@ -239,7 +170,7 @@ cd services/AgentSession
 
 **Report:**
 - [ ] `aster trust keygen` generates key
-- [ ] `aster enroll consumer` creates credential files
+- [ ] `aster enroll node --role consumer` creates credential files
 - [ ] Server starts with `allow_all_consumers=False`
 - [ ] Edge credential: getStatus works, tailLogs denied
 - [ ] Ops credential: all methods work including admin
@@ -268,7 +199,7 @@ print(StatusRequest(agent_id='test'))
 - [ ] Types have correct fields and defaults
 - [ ] (Bonus) Making an actual RPC call via generated client works
 
-## Chapter 7: Cross-Language (TypeScript)
+## Chapter 7: Cross-Language
 
 Skip if TypeScript environment is not available. Otherwise:
 
@@ -296,3 +227,5 @@ Report any of:
 
 Share your results as a checklist. Mark each item PASS/FAIL. For FAILs,
 include the exact error output and what step you were on.
+
+

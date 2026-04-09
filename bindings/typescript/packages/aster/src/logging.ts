@@ -76,6 +76,7 @@ export class AsterLogger {
   debug(msg: string, fields?: Record<string, unknown>): void { this.log('debug', msg, fields); }
   info(msg: string, fields?: Record<string, unknown>): void { this.log('info', msg, fields); }
   warning(msg: string, fields?: Record<string, unknown>): void { this.log('warning', msg, fields); }
+  warn(msg: string, fields?: Record<string, unknown>): void { this.log('warning', msg, fields); }
   error(msg: string, fields?: Record<string, unknown>): void { this.log('error', msg, fields); }
 
   private log(level: LogLevel, msg: string, fields?: Record<string, unknown>): void {

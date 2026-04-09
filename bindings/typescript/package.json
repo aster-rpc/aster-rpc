@@ -10,5 +10,9 @@
     "@vitest/coverage-v8": "^3.2.0",
     "typescript": "^6.0.2",
     "vitest": "^3.2.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/tokenizer": "^0.0.4",
+    "@apache-fory/core": "link:../../docs/_internal/fory/javascript/packages/core"
   }
 }

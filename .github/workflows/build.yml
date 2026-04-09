@@ -184,6 +184,29 @@ jobs:
             --title "${{ github.ref_name }}" \
             --generate-notes
 
+  # ── Publish to PyPI (tags only, trusted publishing) ────────────────
+  pypi:
+    name: Publish to PyPI
+    runs-on: [self-hosted, Linux, X64]
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, windows, sdist, version]
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - name: List artifacts
+        run: ls -lh dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
   # ── Upload dev wheels to run artifacts (main pushes) ───────────────
   # Dev builds are available as downloadable artifacts from the Actions run.
   # Tagged releases get a proper GitHub Release above.

@@ -26,7 +26,7 @@ from aster.framing import (
 )
 from aster.protocol import StreamHeader, RpcStatus
 from aster.status import StatusCode, RpcError
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 from aster.transport.base import (
     Transport,
     BidiChannel,
@@ -135,6 +135,13 @@ class IrohTransport(Transport):
             mode=SerializationMode.XLANG,
             fory_config=fory_config,
         )
+        # Auto-detect JSON mode from codec type
+        from aster.json_codec import JsonProxyCodec
+        self._default_serialization_mode = (
+            SerializationMode.JSON.value
+            if isinstance(self._codec, JsonProxyCodec)
+            else SerializationMode.XLANG.value
+        )
 
     async def close(self) -> None:
         """Close the underlying Iroh connection."""
@@ -150,7 +157,7 @@ class IrohTransport(Transport):
         *,
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
-        serialization_mode: int = 0,
+        serialization_mode: int | None = None,
 
     ) -> Any:
         """Perform a unary RPC call over Iroh QUIC.
@@ -173,11 +180,11 @@ class IrohTransport(Transport):
                 method=method,
                 version=1,
 
-                call_id=call_id,
-                deadline_epoch_ms=deadline_epoch_ms,
-                serialization_mode=serialization_mode,
-                metadata_keys=keys,
-                metadata_values=values,
+                callId=call_id,
+                deadlineEpochMs=deadline_epoch_ms,
+                serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
+                metadataKeys=keys,
+                metadataValues=values,
             )
 
             header_bytes = self._codec.encode(header)
@@ -204,7 +211,7 @@ class IrohTransport(Transport):
                         raise RpcError(
                             StatusCode(status.code),
                             status.message,
-                            dict(zip(status.detail_keys, status.detail_values)),
+                            dict(zip(status.detailKeys, status.detailValues)),
                         )
                     break
                 
@@ -249,7 +256,7 @@ class IrohTransport(Transport):
         *,
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
-        serialization_mode: int = 0,
+        serialization_mode: int | None = None,
 
     ) -> AsyncIterator[Any]:
         """Initiate a server-streaming RPC.
@@ -285,11 +292,11 @@ class IrohTransport(Transport):
                 method=method,
                 version=1,
 
-                call_id=call_id,
-                deadline_epoch_ms=deadline_epoch_ms,
-                serialization_mode=serialization_mode,
-                metadata_keys=keys,
-                metadata_values=values,
+                callId=call_id,
+                deadlineEpochMs=deadline_epoch_ms,
+                serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
+                metadataKeys=keys,
+                metadataValues=values,
             )
             header_bytes = self._codec.encode(header)
             await write_frame(send, header_bytes, flags=HEADER)
@@ -313,7 +320,7 @@ class IrohTransport(Transport):
                         raise RpcError(
                             StatusCode(status.code),
                             status.message,
-                            dict(zip(status.detail_keys, status.detail_values)),
+                            dict(zip(status.detailKeys, status.detailValues)),
                         )
                     break
 
@@ -347,7 +354,7 @@ class IrohTransport(Transport):
         *,
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
-        serialization_mode: int = 0,
+        serialization_mode: int | None = None,
 
     ) -> Any:
         """Perform a client-streaming RPC.
@@ -370,11 +377,11 @@ class IrohTransport(Transport):
                 method=method,
                 version=1,
 
-                call_id=call_id,
-                deadline_epoch_ms=deadline_epoch_ms,
-                serialization_mode=serialization_mode,
-                metadata_keys=keys,
-                metadata_values=values,
+                callId=call_id,
+                deadlineEpochMs=deadline_epoch_ms,
+                serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
+                metadataKeys=keys,
+                metadataValues=values,
             )
             header_bytes = self._codec.encode(header)
             await write_frame(send, header_bytes, flags=HEADER)
@@ -402,7 +409,7 @@ class IrohTransport(Transport):
                         raise RpcError(
                             StatusCode(status.code),
                             status.message,
-                            dict(zip(status.detail_keys, status.detail_values)),
+                            dict(zip(status.detailKeys, status.detailValues)),
                         )
                     break
 
@@ -435,7 +442,7 @@ class IrohTransport(Transport):
         *,
         metadata: dict[str, str] | None = None,
         deadline_epoch_ms: int = 0,
-        serialization_mode: int = 0,
+        serialization_mode: int | None = None,
 
     ) -> BidiChannel:
         """Initiate a bidirectional-streaming RPC."""
@@ -445,8 +452,8 @@ class IrohTransport(Transport):
             service=service,
             method=method,
             metadata=metadata,
-            deadline_epoch_ms=deadline_epoch_ms,
-            serialization_mode=serialization_mode,
+            deadlineEpochMs=deadline_epoch_ms,
+            serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
         )
 
 
@@ -512,11 +519,11 @@ class IrohBidiChannel(BidiChannel):
             service=self._service,
             method=self._method,
             version=1,
-            call_id=call_id,
+            callId=call_id,
             deadline_epoch_ms=self._deadline_epoch_ms,
             serialization_mode=self._serialization_mode,
-            metadata_keys=keys,
-            metadata_values=values,
+            metadataKeys=keys,
+            metadataValues=values,
         )
         header_bytes = self._codec.encode(header)
         await write_frame(self._send, header_bytes, flags=HEADER)
@@ -553,9 +560,11 @@ class IrohBidiChannel(BidiChannel):
                     raise RpcError(
                         StatusCode(status.code),
                         status.message,
-                        dict(zip(status.detail_keys, status.detail_values)),
+                        dict(zip(status.detailKeys, status.detailValues)),
                     )
-                raise ConnectionLostError("stream ended after trailer")
+                # Clean end-of-stream: return None so callers can use
+                # `while (msg := await ch.recv()) is not None:`
+                return None
 
             # §5.5.2: Consume ROW_SCHEMA frame (first frame in ROW mode)
             if flags & ROW_SCHEMA:

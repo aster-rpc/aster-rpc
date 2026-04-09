@@ -26,7 +26,7 @@ from aster.codec import (
     _walk_type_graph,
     _validate_xlang_tags,
 )
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 from aster.protocol import StreamHeader, CallHeader, RpcStatus
 from aster.status import StatusCode
 
@@ -74,7 +74,7 @@ class OptMsg:
 
 @dataclass
 class UntaggedMsg:
-    """A type WITHOUT @wire_type — should fail XLANG registration."""
+    """A type WITHOUT @wire_type -- should fail XLANG registration."""
 
     data: str = ""
 
@@ -633,7 +633,7 @@ class TestEnumTypeGraphWalking:
         assert Color in types
 
     def test_enum_not_rejected_by_xlang_validation(self):
-        """Enums don't need @wire_type — they should pass XLANG validation."""
+        """Enums don't need @wire_type -- they should pass XLANG validation."""
         types = _walk_type_graph([EnumMsg])
         _validate_xlang_tags(types)  # should not raise
 

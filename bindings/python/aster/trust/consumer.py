@@ -24,7 +24,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 from .admission import admit
 from .credentials import ConsumerEnrollmentCredential

@@ -245,7 +245,7 @@ def test_filter_skips_draining():
 
 def test_filter_skips_stale_lease():
     client = _make_client(lease_duration_s=10)
-    old_ms = int(time.time() * 1000) - 30_000  # 30 s ago — stale for 10 s lease
+    old_ms = int(time.time() * 1000) - 30_000  # 30 s ago -- stale for 10 s lease
     leases = [_make_lease(updated_at_epoch_ms=old_ms)]
     filtered = client._apply_mandatory_filters(leases)
     assert filtered == []
@@ -772,7 +772,7 @@ async def test_publish_and_resolve_cross_node():
             if content_ready_count >= 3:
                 break
 
-    # Node B resolves — content is now locally available
+    # Node B resolves -- content is now locally available
     client = RegistryClient(doc_b, caller_alpn="aster/1")
     lease = await client.resolve("CrossSvc", version=1)
     assert lease.endpoint_id == node_a.node_id()

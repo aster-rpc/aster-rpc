@@ -24,7 +24,7 @@ from aster.decorators import (
     service,
 )
 from aster.testing import AsterTestHarness
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 
 
 # ── Test types ────────────────────────────────────────────────────────────────

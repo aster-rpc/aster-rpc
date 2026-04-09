@@ -24,7 +24,7 @@ import pyfory
 import pyfory.format as pyfory_format
 import zstandard
 
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 
 # ── Default compression threshold ────────────────────────────────────────────
 

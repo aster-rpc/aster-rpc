@@ -18,7 +18,7 @@ from aster.codec import wire_type
 from aster.decorators import service, rpc
 from aster.status import StatusCode, RpcError
 from aster.testing import AsterTestHarness
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 
 
 # ── Test types ────────────────────────────────────────────────────────────────

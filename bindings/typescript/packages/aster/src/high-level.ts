@@ -14,30 +14,63 @@ import { configFromEnv } from './config.js';
 import { createLogger, type AsterLogger } from './logging.js';
 import { HealthServer } from './health.js';
 import { DEFAULT_BACKOFF, type ExponentialBackoff } from './types.js';
+import { JsonCodec } from './codec.js';
+import { RpcServer } from './server.js';
+import { handleConsumerAdmissionConnection, type ConsumerAdmissionOpts, type ServiceSummary } from './trust/consumer.js';
+import { handleDelegatedAdmissionConnection, type DelegatedAdmissionPolicy } from './trust/delegated.js';
+import { MeshEndpointHook } from './trust/hooks.js';
+import { PeerAttributeStore } from './peer-store.js';
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const ALPN_CONSUMER_ADMISSION = 'aster.consumer_admission';
+const ALPN_DELEGATED_ADMISSION = 'aster.admission';
+const RPC_ALPN = 'aster/1';
+
+// ── AsterServer ──────────────────────────────────────────────────────────────
 
 /** Options for AsterServer. */
 export interface AsterServerOptions {
   services: object[];
   config?: Partial<AsterConfig>;
+  /** Allow all consumers without credentials (dev mode). Default: true. */
+  allowAllConsumers?: boolean;
   interceptors?: unknown[];
 }
 
 /**
  * High-level Aster RPC server.
  *
- * Wraps service registration, endpoint creation, health, and shutdown.
+ * Creates an IrohNode, serves RPC over QUIC, handles consumer admission,
+ * and prints a startup banner.
+ *
+ * @example
+ * ```ts
+ * const server = new AsterServer({
+ *   services: [new MissionControl()],
+ * });
+ * await server.start();
+ * console.log(server.address);
+ * await server.serve();
+ * ```
  */
 export class AsterServer {
   readonly registry: ServiceRegistry;
   readonly config: AsterConfig;
   readonly logger: AsterLogger;
   private health: HealthServer;
-  private _endpointAddr?: string;
-  private _ticket?: string;
+  private _node: any = null;
+  private _rpcServer: RpcServer | null = null;
+  private _hook: MeshEndpointHook;
+  private _peerStore: PeerAttributeStore;
+  private _delegationPolicies: Map<string, DelegatedAdmissionPolicy> = new Map();
   private _running = false;
-  private _draining = false;
-  private _inFlight = 0;
+  private _closed = false;
+  private _allowAllConsumers: boolean;
   private _signalHandlers: (() => void)[] = [];
+  private _serviceSummaries: ServiceSummary[] = [];
+  private _servePromise: Promise<void> | null = null;
+  private _admissionAbort: AbortController | null = null;
 
   constructor(opts: AsterServerOptions) {
     this.config = { ...configFromEnv(), ...opts.config } as AsterConfig;
@@ -51,140 +84,285 @@ export class AsterServer {
       port: this.config.healthPort,
       host: this.config.healthHost,
     });
+    this._hook = new MeshEndpointHook();
+    this._peerStore = new PeerAttributeStore();
+    this._allowAllConsumers = opts.allowAllConsumers ?? true;
 
     for (const svc of opts.services) {
       this.registry.register(svc);
     }
   }
 
-  /** Start the server (create node, publish contracts, start health). */
+  /**
+   * Create the IrohNode and prepare for serving. Idempotent.
+   */
   async start(): Promise<void> {
-    this.logger.info('starting AsterServer', { services: this.registry.size });
+    if (this._node) return;
+
+    // Load native addon
+    const native = await loadNative();
+    if (!native) {
+      throw new Error(
+        'Aster native addon not found. Build with: cd native && npx napi build --release --platform',
+      );
+    }
+
+    // Create node with RPC + admission ALPNs
+    const alpns = [
+      Buffer.from(RPC_ALPN),
+      Buffer.from(ALPN_CONSUMER_ADMISSION),
+      Buffer.from(ALPN_DELEGATED_ADMISSION),
+    ];
+    this._node = await native.IrohNode.memoryWithAlpns(alpns);
+
+    // Build service summaries for admission response
+    this._serviceSummaries = [];
+    for (const info of this.registry.getAllServices()) {
+      this._serviceSummaries.push({
+        name: info.name,
+        version: info.version,
+        contractId: '',
+        pattern: info.scoped ?? 'shared',
+        methods: Object.keys(info.methods),
+      });
+    }
+
+    // Create the RPC server (uses JsonCodec for cross-language compat)
+    this._rpcServer = new RpcServer({
+      registry: this.registry,
+      codec: new JsonCodec(),
+      logger: this.logger,
+    });
+
     await this.health.start();
     this._running = true;
-    this.logger.info('AsterServer started');
+    this._printBanner();
   }
 
-  /** The endpoint address for clients to connect to. */
-  get endpointAddr(): string | undefined {
-    return this._endpointAddr;
+  /**
+   * Start accepting connections. Blocks until close() is called.
+   */
+  async serve(): Promise<void> {
+    if (!this._node || !this._rpcServer) {
+      throw new Error('AsterServer.serve() called before start()');
+    }
+
+    // Install signal handlers for graceful shutdown
+    this._installSignalHandlers();
+
+    // Start admission handler in background
+    this._admissionAbort = new AbortController();
+    const admissionPromise = this._admissionLoop();
+
+    // Start delegated admission loop if policies exist
+    const delegatedPromise = this._delegationPolicies.size > 0
+      ? this._delegatedAdmissionLoop()
+      : Promise.resolve();
+
+    // Start RPC server
+    const rpcPromise = this._rpcServer.serve(this._node);
+
+    this._servePromise = Promise.all([admissionPromise, delegatedPromise, rpcPromise]).then(() => {});
+    try {
+      await this._servePromise;
+    } catch (e) {
+      if (!this._closed) throw e;
+    }
   }
 
-  get running(): boolean {
-    return this._running;
+  /**
+   * Stop accepting connections and close the node.
+   */
+  async close(): Promise<void> {
+    if (this._closed) return;
+    this._closed = true;
+    this._running = false;
+
+    // Remove signal handlers
+    for (const cleanup of this._signalHandlers) cleanup();
+    this._signalHandlers = [];
+
+    if (this._admissionAbort) {
+      this._admissionAbort.abort();
+    }
+    if (this._rpcServer) {
+      await this._rpcServer.close();
+    }
+    await this.health.stop();
+    if (this._node) {
+      try { await this._node.close(); } catch { /* ignore */ }
+    }
+    this.logger.info('AsterServer stopped');
   }
 
-  get draining(): boolean {
-    return this._draining;
+  /** The aster1... connection address for clients. */
+  get address(): string {
+    if (!this._node) throw new Error('Server not started');
+    try {
+      const native = loadNativeSync();
+      if (native) {
+        const nodeAddr = JSON.parse(this._node.nodeAddr());
+        const info: any = {
+          endpointId: nodeAddr.endpoint_id || this._node.nodeId(),
+          relayAddr: null,
+          directAddrs: nodeAddr.direct_addresses || [],
+        };
+        return native.asterTicketToString(info);
+      }
+    } catch { /* fallback */ }
+    return this._node.nodeId();
   }
 
-  /** Create a local (in-process) transport for testing. */
+  /** Hex endpoint ID of this server's node. */
+  get endpointId(): string {
+    if (!this._node) throw new Error('Server not started');
+    return this._node.nodeId();
+  }
+
+  /** Whether the server is running. */
+  get running(): boolean { return this._running; }
+
+  /** List of services hosted by this server. */
+  get services(): ServiceSummary[] { return [...this._serviceSummaries]; }
+
+  /** Create a local in-process transport for testing. */
   localTransport(): LocalTransport {
     return new LocalTransport(this.registry);
   }
 
-  /**
-   * Install signal handlers for graceful shutdown (SIGTERM, SIGINT).
-   * When a signal arrives, drain() is called automatically.
-   */
-  installSignalHandlers(): void {
-    const handler = () => {
-      this.logger.info('signal received, draining...');
-      this.drain().catch(e => this.logger.error('drain error', { error: String(e) }));
+  // ── Admission loop ──────────────────────────────────────────────────────
+
+  private async _admissionLoop(): Promise<void> {
+    if (!this._node) return;
+
+    while (this._running && !this._closed) {
+      try {
+        // Accept connections on the consumer admission ALPN
+        const conn = await this._node.acceptAster();
+        this._handleAdmission(conn).catch(e => {
+          this.logger.error('admission error', { error: String(e) });
+        });
+      } catch (e) {
+        if (this._closed) return;
+        this.logger.error('admission accept error', { error: String(e) });
+      }
+    }
+  }
+
+  private async _handleAdmission(conn: any): Promise<void> {
+    const opts: ConsumerAdmissionOpts = {
+      services: this._serviceSummaries,
+      allowUnenrolled: this._allowAllConsumers,
+      logger: this.logger,
     };
-    process.on('SIGTERM', handler);
-    process.on('SIGINT', handler);
-    this._signalHandlers.push(
-      () => { process.removeListener('SIGTERM', handler); },
-      () => { process.removeListener('SIGINT', handler); },
+    await handleConsumerAdmissionConnection(
+      conn,
+      '', // rootPubkey -- empty for open gate
+      this._hook,
+      opts,
     );
   }
 
-  /**
-   * Graceful drain: stop accepting new connections, wait for in-flight
-   * RPCs to complete (up to timeoutS seconds), then shut down.
-   */
-  async drain(timeoutS = 30): Promise<void> {
-    if (this._draining) return;
-    this._draining = true;
-    this.logger.info('draining', { timeout_s: timeoutS, in_flight: this._inFlight });
+  // ── Delegated admission loop ─────────────────────────────────────────────
 
-    // Wait for in-flight RPCs to complete
-    const deadline = Date.now() + timeoutS * 1000;
-    while (this._inFlight > 0 && Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 100));
+  private async _delegatedAdmissionLoop(): Promise<void> {
+    if (!this._node) return;
+
+    while (this._running && !this._closed) {
+      try {
+        const conn = await this._node.acceptAster();
+        const policy = this._delegationPolicies.values().next().value;
+        if (!policy) continue;
+        handleDelegatedAdmissionConnection(
+          conn,
+          { policy, hook: this._hook, peerStore: this._peerStore },
+        ).catch(e => {
+          this.logger.error('delegated admission error', { error: String(e) });
+        });
+      } catch (e) {
+        if (this._closed) return;
+        this.logger.error('delegated admission accept error', { error: String(e) });
+      }
     }
-
-    if (this._inFlight > 0) {
-      this.logger.warning('drain timeout, cancelling remaining RPCs', { in_flight: this._inFlight });
-    }
-
-    await this.close();
   }
 
-  // ── Property accessors ─────────────────────────────────────────────────────
+  // ── Signal handling ─────────────────────────────────────────────────────
 
-  /**
-   * Connection address for this server (aster1... ticket).
-   * Pass this to `new AsterClient({ address: server.address })` or `aster shell`.
-   */
-  get address(): string | undefined { return this._ticket ?? this._endpointAddr; }
+  private _installSignalHandlers(): void {
+    if (typeof process === 'undefined') return;
 
-  /** Compact aster1... ticket string — alias for `address`. */
-  get ticket(): string | undefined { return this._ticket; }
+    const shutdown = async () => {
+      this.logger.info('Server shutting down...');
+      await this.close();
+    };
 
-  /** Base64-encoded endpoint address (node-id + relay) — prefer `address`. */
-  get endpointAddrB64(): string | undefined { return this._endpointAddr; }
+    const handler = () => { shutdown(); };
+    process.on('SIGTERM', handler);
+    process.on('SIGINT', handler);
 
-  /** Base64-encoded RPC endpoint address — prefer `address`. */
-  get rpcAddrB64(): string | undefined { return this._endpointAddr; }
+    this._signalHandlers.push(
+      () => { process.off('SIGTERM', handler); },
+      () => { process.off('SIGINT', handler); },
+    );
+  }
 
-  /** Base64-encoded producer admission address. */
-  get producerAdmissionAddrB64(): string | undefined { return undefined; }
+  // ── Banner ──────────────────────────────────────────────────────────────
 
-  /** Base64-encoded consumer admission address. */
-  get consumerAdmissionAddrB64(): string | undefined { return undefined; }
+  private _printBanner(): void {
+    if (typeof process !== 'undefined' && !process.stderr?.isTTY) return;
 
-  /** Base64-encoded admission address. */
-  get admissionAddrB64(): string | undefined { return undefined; }
+    const C = '\x1b[36m';
+    const B = '\x1b[1m';
+    const D = '\x1b[2m';
+    const G = '\x1b[32m';
+    const Y = '\x1b[33m';
+    const W = '\x1b[37m';
+    const R = '\x1b[0m';
 
-  /** Mesh state if running in trust mode, or undefined for open mode. */
-  get meshState(): unknown { return undefined; }
+    const w = (s: string) => process.stderr.write(s);
 
-  /** Root public key (hex) if running in trust mode, or undefined. */
-  get rootPubkey(): string | undefined { return undefined; }
+    w(`\n${C}${B}`);
+    w(`        _    ____ _____ _____ ____\n`);
+    w(`       / \\  / ___|_   _| ____|  _ \\\n`);
+    w(`      / _ \\ \\___ \\ | | |  _| | |_) |\n`);
+    w(`     / ___ \\ ___) || | | |___|  _ <\n`);
+    w(`    /_/   \\_\\____/ |_| |_____|_| \\_\\\n`);
+    w(`${R}\n`);
+    w(`    ${D}RPC after hostnames.${R}\n\n`);
 
-  /** The underlying Iroh node (if using QUIC transport). */
-  get node(): unknown { return undefined; }
+    // Services table
+    if (this._serviceSummaries.length > 0) {
+      const maxName = Math.max(...this._serviceSummaries.map(s => s.name.length));
+      for (const s of this._serviceSummaries) {
+        const name = s.name.padEnd(maxName);
+        w(`    ${G}\u25cf${R} ${B}${name}${R}  ${D}v${s.version}${R}\n`);
+      }
+      w('\n');
+    }
 
-  /** Blobs client (if using QUIC transport). */
-  get blobs(): unknown { return undefined; }
+    // Endpoint
+    try {
+      w(`    ${D}endpoint:${R}  ${this.address}\n`);
+    } catch { /* not started yet */ }
 
-  /** Docs client (if using QUIC transport). */
-  get docs(): unknown { return undefined; }
+    // Mode
+    const mode = this._allowAllConsumers ? `${Y}open-gate${R}` : `${G}trusted${R}`;
+    w(`    ${D}mode:${R}      ${mode}\n`);
 
-  /** Gossip client (if using QUIC transport). */
-  get gossip(): unknown { return undefined; }
+    // Log
+    const logFormat = this.config.logFormat || 'text';
+    const logLevel = this.config.logLevel || 'info';
+    w(`    ${D}log:${R}       ASTER_LOG_FORMAT=${W}${logFormat}${R}  ASTER_LOG_LEVEL=${W}${logLevel}${R}\n`);
 
-  /** RPC endpoint handle (if using QUIC transport). */
-  get rpcEndpoint(): unknown { return undefined; }
+    // Runtime
+    w(`    ${D}runtime:${R}   aster-rpc (typescript)  iroh 0.97\n`);
 
-  // ── In-flight tracking ─────────────────────────────────────────────────────
-
-  /** Track an in-flight RPC (for drain). */
-  trackRpcStart(): void { this._inFlight++; }
-  trackRpcEnd(): void { this._inFlight = Math.max(0, this._inFlight - 1); }
-
-  /** Graceful shutdown. */
-  async close(): Promise<void> {
-    this._running = false;
-    this._draining = false;
-    for (const cleanup of this._signalHandlers) cleanup();
-    this._signalHandlers = [];
-    await this.health.stop();
-    this.logger.info('AsterServer stopped');
+    // Copyright
+    w(`\n    ${D}Copyright \u00a9 2026 Emrul Islam. All rights reserved.${R}\n\n`);
   }
 }
+
+// ── AsterClient ──────────────────────────────────────────────────────────────
 
 /** Options for AsterClient. */
 export interface AsterClientOptions {
@@ -233,26 +411,15 @@ export class AsterClientWrapper {
   /** Registry namespace ID for service discovery (set after admission). */
   get registryNamespace(): string | undefined { return undefined; }
 
-  /**
-   * Hex-encoded 32-byte gossip topic ID for the producer mesh.
-   *
-   * Only populated when the connecting consumer is the root node
-   * (endpoint_id == root_pubkey). Empty string otherwise.
-   */
+  /** Hex-encoded 32-byte gossip topic ID for the producer mesh. */
   get gossipTopic(): string { return this._gossipTopic; }
 
-  /**
-   * Connect to the server (no-op if already connected via transport option).
-   * Override in subclasses to implement QUIC connection setup.
-   */
+  /** Connect to the server (no-op if already connected via transport option). */
   async connect(): Promise<void> {
     // Subclasses may override to do admission + connect
   }
 
-  /**
-   * Create a typed client proxy for a service class.
-   * Alias for service() for Python API compatibility.
-   */
+  /** Create a typed client proxy for a service class. */
   async client<T extends new (...args: any[]) => any>(serviceClass: T): Promise<ClientProxy<InstanceType<T>>> {
     return createClient(serviceClass, this.transport);
   }
@@ -263,11 +430,20 @@ export class AsterClientWrapper {
   }
 
   /**
-   * Reconnect with exponential backoff.
+   * Create a dynamic proxy client for a service.
    *
-   * @param connectFn - Function that creates a new transport.
-   * @param maxAttempts - Maximum number of reconnection attempts (default 5).
+   * @example
+   * ```ts
+   * const mc = client.proxy("MissionControl");
+   * const result = await mc.getStatus({ agentId: "edge-1" });
+   * console.log(result.status);
+   * ```
    */
+  proxy(serviceName: string): ProxyClient {
+    return new ProxyClient(serviceName, this.transport);
+  }
+
+  /** Reconnect with exponential backoff. */
   async reconnect(
     connectFn: () => Promise<AsterTransport>,
     maxAttempts = 5,
@@ -293,4 +469,66 @@ export class AsterClientWrapper {
     this._connected = false;
     await this.transport.close();
   }
+}
+
+// ── ProxyClient ──────────────────────────────────────────────────────────────
+
+/**
+ * Dynamic proxy client -- invokes RPC methods without local type definitions.
+ *
+ * Created via `AsterClientWrapper.proxy("ServiceName")`. Methods are
+ * dispatched dynamically -- any method name called on the proxy becomes
+ * a unary RPC call.
+ */
+export class ProxyClient {
+  constructor(
+    private readonly serviceName: string,
+    private readonly transport: AsterTransport,
+  ) {
+    return new Proxy(this, {
+      get(target, prop: string) {
+        if (prop in target || typeof prop === 'symbol') {
+          return (target as any)[prop];
+        }
+        return async (payload?: unknown) => {
+          const result = await target.transport.unary(
+            target.serviceName,
+            prop,
+            payload ?? {},
+          );
+          return result;
+        };
+      },
+    });
+  }
+}
+
+// ── Native addon loader ──────────────────────────────────────────────────────
+
+let _native: any = null;
+
+function loadNativeSync(): any {
+  if (_native) return _native;
+  try {
+    // Try common locations
+    const candidates = [
+      '@aster-rpc/transport',
+      '../../../native/aster-transport.darwin-arm64.node',
+      '../../../native/aster-transport.darwin-x64.node',
+      '../../../native/aster-transport.linux-x64-gnu.node',
+      '../../../native/aster-transport.linux-arm64-gnu.node',
+      '../../../native/aster-transport.win32-x64-msvc.node',
+    ];
+    for (const path of candidates) {
+      try {
+        _native = require(path);
+        return _native;
+      } catch { /* next */ }
+    }
+  } catch { /* fallback */ }
+  return null;
+}
+
+async function loadNative(): Promise<any> {
+  return loadNativeSync();
 }

@@ -23,7 +23,7 @@ from aster.status import (
     NotFoundError,
     InvalidArgumentError,
 )
-from aster.types import SerializationMode, RetryPolicy, ExponentialBackoff
+from aster.rpc_types import SerializationMode, RetryPolicy, ExponentialBackoff
 from aster.framing import (
     COMPRESSED,
     TRAILER,
@@ -78,7 +78,7 @@ class EmptyRecvStream:
 
 class TestStatusCode:
     def test_all_codes_exist(self):
-        """All 17 status codes (0–16) are defined."""
+        """All 17 status codes (0--16) are defined."""
         assert len(StatusCode) == 17
         assert StatusCode.OK == 0
         assert StatusCode.UNAUTHENTICATED == 16

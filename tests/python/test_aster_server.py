@@ -18,7 +18,7 @@ from typing import AsyncIterator
 import pytest
 
 from aster.codec import wire_type, ForyCodec, ForyConfig
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 from aster.status import StatusCode, RpcError
 from aster.decorators import (
     service,

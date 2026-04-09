@@ -88,7 +88,7 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 | Server stream dispatch (4 patterns) | done | done | All 4 patterns via LocalTransport + unary/server_stream E2E tested |
 | IrohTransport (client-side QUIC) | done | done | E2E tested: unary + server_stream over real QUIC |
 | LocalTransport (in-process) | done | done | Tested |
-| Session-scoped services (CALL/CANCEL) | done | code | Types + session server, untested |
+| Session-scoped services (CALL/CANCEL) | done | code | Types + session server, scoped="session" alias added |
 | BidiStream over IrohTransport | done | done | All 4 patterns E2E tested over real QUIC |
 | Metadata class (@wire_type) | done | done | `_aster/Metadata` with description field |
 | Metadata on decorators | done | done | @rpc(metadata=), @service(metadata=), docstring auto-capture (Python) |
@@ -146,7 +146,8 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 | EnrollmentCredential type | done | done | |
 | ConsumerEnrollmentCredential type | done | done | |
 | Credential verification (signature) | done | code | verify{Consumer,Producer}Credential() |
-| Consumer admission handshake (protocol) | done | code | performAdmission() implemented, needs E2E test |
+| Consumer admission handshake (protocol) | done | done | performAdmission() + handleConsumerAdmissionConnection() wired in AsterServer |
+| Delegated admission (aster.admission ALPN) | done | done | handleDelegatedAdmissionConnection() + PeerAttributeStore |
 | Producer admission handshake (protocol) | done | done | handleProducerAdmission() + serveProducerAdmission(), tested |
 | Gate 0 connection hooks (NAPI) | done | napi | NodeHookReceiver exposed |
 | ConnectionPolicy interface | done | done | AllowAll / DenyAll |
@@ -177,8 +178,8 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 
 | Feature | Python | TypeScript | Notes |
 |---------|--------|------------|-------|
-| AsterServer (high-level wrapper) | done | done | TS is simpler |
-| AsterClient (high-level wrapper) | done | done | TS is simpler |
+| AsterServer (high-level wrapper) | done | done | Full parity: IrohNode, admission, banner, address, signal handling |
+| AsterClient (high-level wrapper) | done | done | proxy() + reconnect() |
 | Config (env vars) | done | done | |
 | Config (TOML file) | done | done | configFromFile() with built-in TOML parser |
 | Config print / debug | done | done | |
@@ -219,7 +220,10 @@ Tracks feature/behavior/capability implementation across bindings. Unlike `BINDI
 
 | Gap | Impact | Effort |
 |-----|--------|--------|
-| ForyCodec wire compat validation | Can't interop with Python serialization | Medium |
-| Cross-language interop tests | Don't know if Python↔TS actually works | Medium |
-| Transport metrics (TS NAPI wrapper) | Python has it, TS needs NAPI `transportMetrics()` | Small — mirror Python PyO3 pattern |
-| Grafana dashboard template | Observability template | Trivial (JSON file) |
+| Fory XLANG encode from JS | JS Fory can't produce xlang-compatible output; JSON mode used instead | Blocked on Fory JS |
+| Producer token loading from .aster-identity | TS server can't auto-register with @aster | Small |
+| @aster endpoint registration loop | TS server doesn't heartbeat endpoints | Small |
+| Contract publication (registry doc + blobs) | TS server doesn't publish manifests to registry | Medium |
+| Transport metrics (TS NAPI wrapper) | Python has it, TS needs NAPI wrapper | Small |
+| Cross-language E2E tests (automated) | Manual verification only | Medium |
+| Grafana dashboard template | Observability template | Trivial |
