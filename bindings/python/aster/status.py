@@ -10,32 +10,54 @@ from enum import IntEnum
 
 
 class StatusCode(IntEnum):
-    """Aster RPC status codes (semantically identical to gRPC codes 0–16)."""
+    """RPC status codes (semantically identical to gRPC codes 0-16).
 
-    OK = 0
-    CANCELLED = 1
-    UNKNOWN = 2
-    INVALID_ARGUMENT = 3
-    DEADLINE_EXCEEDED = 4
-    NOT_FOUND = 5
-    ALREADY_EXISTS = 6
-    PERMISSION_DENIED = 7
-    RESOURCE_EXHAUSTED = 8
-    FAILED_PRECONDITION = 9
-    ABORTED = 10
-    OUT_OF_RANGE = 11
-    UNIMPLEMENTED = 12
-    INTERNAL = 13
-    UNAVAILABLE = 14
-    DATA_LOSS = 15
-    UNAUTHENTICATED = 16
+    Use these to inspect errors returned by the server::
+
+        try:
+            resp = await svc.get_status(req)
+        except RpcError as e:
+            if e.code == StatusCode.NOT_FOUND:
+                print("Service not found")
+            elif e.code == StatusCode.PERMISSION_DENIED:
+                print("Missing required capability")
+    """
+
+    OK = 0                    #: Success.
+    CANCELLED = 1             #: The call was cancelled by the client.
+    UNKNOWN = 2               #: Unknown error (server bug or unhandled exception).
+    INVALID_ARGUMENT = 3      #: Client sent an invalid request.
+    DEADLINE_EXCEEDED = 4     #: The call timed out.
+    NOT_FOUND = 5             #: Requested resource does not exist.
+    ALREADY_EXISTS = 6        #: Resource already exists (e.g., duplicate create).
+    PERMISSION_DENIED = 7     #: Caller lacks required capability.
+    RESOURCE_EXHAUSTED = 8    #: Rate limit or quota exceeded.
+    FAILED_PRECONDITION = 9   #: Precondition not met (e.g., wrong state).
+    ABORTED = 10              #: Operation aborted (e.g., concurrency conflict).
+    OUT_OF_RANGE = 11         #: Value outside valid range.
+    UNIMPLEMENTED = 12        #: Method not implemented by the server.
+    INTERNAL = 13             #: Internal server error.
+    UNAVAILABLE = 14          #: Server temporarily unavailable (retry later).
+    DATA_LOSS = 15            #: Unrecoverable data loss.
+    UNAUTHENTICATED = 16      #: No valid credentials provided.
 
 
 class RpcError(Exception):
-    """Base exception for Aster RPC errors.
+    """Exception raised when an RPC call fails.
+
+    Catch this in client code to handle server-side errors::
+
+        from aster import RpcError, StatusCode
+
+        try:
+            resp = await svc.my_method(request)
+        except RpcError as e:
+            print(f"RPC failed: {e.code.name} — {e.message}")
+            if e.details:
+                print(f"Details: {e.details}")
 
     Attributes:
-        code: The ``StatusCode`` describing the failure category.
+        code: The :class:`StatusCode` describing the failure category.
         message: A human-readable error description.
         details: Arbitrary string key/value pairs carrying extra context.
     """

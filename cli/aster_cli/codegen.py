@@ -40,6 +40,39 @@ _PY_DEFAULTS: dict[str, str] = {
     "bytes": 'b""',
 }
 
+_OPTIONAL_FIELD_HINTS: dict[str, str] = {
+    "bio": "Optional[str]",
+    "display_name": "Optional[str]",
+    "rate_limit": "Optional[str]",
+    "recovery_codes": "Optional[list[str]]",
+    "replacement": "Optional[str]",
+    "scope_node_id": "Optional[str]",
+    "url": "Optional[str]",
+}
+
+_KNOWN_WIRE_TYPES: dict[str, tuple[str, list[dict[str, Any]]]] = {
+    "DelegationStatement": (
+        "aster/DelegationStatement",
+        [
+            {"name": "authority", "type": "str", "required": False, "default": "consumer"},
+            {"name": "mode", "type": "str", "required": False, "default": "open"},
+            {"name": "token_ttl", "type": "int", "required": False, "default": 300},
+            {"name": "rate_limit", "type": "Optional", "required": False, "default": None},
+            {"name": "roles", "type": "list[str]", "required": False, "default": None},
+        ],
+    ),
+    "SigningKeyAttestation": (
+        "aster/SigningKeyAttestation",
+        [
+            {"name": "signing_pubkey", "type": "str", "required": False, "default": ""},
+            {"name": "key_id", "type": "str", "required": False, "default": ""},
+            {"name": "valid_from", "type": "int", "required": False, "default": 0},
+            {"name": "valid_until", "type": "int", "required": False, "default": 0},
+            {"name": "root_signature", "type": "str", "required": False, "default": ""},
+        ],
+    ),
+}
+
 
 def _to_snake_case(name: str) -> str:
     """Convert CamelCase to snake_case."""
@@ -119,6 +152,19 @@ def _py_default_str(type_name: str, default: Any) -> str | None:
     return None
 
 
+def _field_py_type(field: dict[str, Any], known_types: dict[str, str]) -> str:
+    raw_type = field.get("type", "str")
+    if str(raw_type).lower() == "optional":
+        hinted = _OPTIONAL_FIELD_HINTS.get(field.get("name", ""))
+        if hinted:
+            return hinted
+    elem_type_name = field.get("element_type", "")
+    if elem_type_name and str(raw_type).lower().startswith("list"):
+        elem_cls = known_types.get(elem_type_name, elem_type_name)
+        return f"list[{elem_cls}]"
+    return _py_type_str(raw_type, known_types)
+
+
 # ── Type collection ──────────────────────────────────────────────────────────
 
 
@@ -162,6 +208,10 @@ def collect_types(
             elem_fields = f.get("element_fields", [])
             if elem_tag:
                 _ensure_type(elem_tag, elem_name, elem_fields, service)
+            field_type = f.get("type", "")
+            if isinstance(field_type, str) and field_type in _KNOWN_WIRE_TYPES:
+                wire_tag, nested_fields = _KNOWN_WIRE_TYPES[field_type]
+                _ensure_type(wire_tag, field_type, nested_fields, service)
 
     for svc_name, manifest in manifests.items():
         for method in manifest.get("methods", []):
@@ -239,13 +289,7 @@ def _gen_type_class(rec: _TypeRecord, known_types: dict[str, str]) -> str:
     for f in rec.fields:
         fname = f["name"]
         raw_type = f.get("type", "str")
-        # If this is a list field with a known element type, use list[ElementType]
-        elem_type_name = f.get("element_type", "")
-        if elem_type_name and raw_type.lower().startswith("list"):
-            elem_cls = known_types.get(elem_type_name, elem_type_name)
-            ftype_str = f"list[{elem_cls}]"
-        else:
-            ftype_str = _py_type_str(raw_type, known_types)
+        ftype_str = _field_py_type(f, known_types)
         default = _py_default_str(raw_type, f.get("default"))
 
         if default is not None:
@@ -305,6 +349,9 @@ def _gen_service_client(
                 elem_type = f.get("element_type", "")
                 if elem_type:
                     _add_ref(elem_type)
+                field_type = f.get("type", "")
+                if isinstance(field_type, str) and field_type in known_types:
+                    _add_ref(field_type)
     lines.append(f"    _wire_types: list[type] = [{', '.join(type_refs)}]")
     lines.append("")
 
@@ -547,6 +594,9 @@ def _collect_shared_imports(
                     seen.add(name)
             # Check field type names
             type_name = f.get("type", "")
+            if type_name in shared_names and type_name not in seen:
+                imports.append((type_name, _to_snake_case(type_name)))
+                seen.add(type_name)
             m = re.match(r"list\[(.+)\]", type_name, re.IGNORECASE)
             if m:
                 inner = m.group(1)
@@ -569,6 +619,7 @@ def _collect_service_type_imports(
     version = manifest.get("version", 1)
     svc_types_module = _to_snake_case(svc_name) + f"_v{version}"
     shared_names = {r.display_name: r for r in shared_types}
+    known_display_names = {r.display_name for r in all_types.values()}
 
     def _add_import(display_name: str) -> None:
         if not display_name or display_name in seen or display_name in ("None", "Any"):
@@ -587,6 +638,11 @@ def _collect_service_type_imports(
         for field_list_key in ("fields", "response_fields"):
             for f in method.get(field_list_key, []):
                 _add_import(f.get("element_type", ""))
+                field_type = f.get("type", "")
+                if isinstance(field_type, str):
+                    cleaned = field_type.removeprefix("Optional[").removesuffix("]")
+                    if cleaned in known_display_names:
+                        _add_import(cleaned)
 
     return imports
 

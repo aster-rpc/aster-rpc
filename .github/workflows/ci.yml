@@ -152,6 +152,36 @@ jobs:
       - name: cargo test (ffi)
         run: cargo test -p aster_transport_ffi
 
+  # ── API docs generation ──────────────────────────────────────────
+  docs:
+    needs: test-unit
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - name: Build and generate docs
+        run: |
+          uv venv .venv
+          source .venv/bin/activate
+          uv pip install maturin pdoc
+          uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
+          uv run maturin develop -m bindings/python/rust/Cargo.toml
+          uv run pdoc --no-include-undocumented -o docs/python aster.public
+        shell: bash
+      - name: Upload docs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-docs-python
+          path: docs/python/
+
   # ════════════════════════════════════════════════════════════════════
   # Future language bindings go here. Each binding gets:
   #   1. A lint job (or extend the lint job above)

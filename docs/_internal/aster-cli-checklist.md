@@ -48,6 +48,12 @@ framework, and follow-up CLI integration.
 - [x] Registered top-level `aster publish`
 - [x] Registered top-level `aster unpublish`
 - [x] Registered top-level `aster discover`
+- [x] Registered top-level `aster visibility`
+- [x] Registered top-level `aster update-service`
+- [x] Registered top-level `aster access grant`
+- [x] Registered top-level `aster access revoke`
+- [x] Registered top-level `aster access list`
+- [x] Registered top-level `aster access delegation`
 - [x] Implemented local-only `status` / `whoami`
 - [x] Implemented preview `join --demo`
 - [x] Implemented preview `verify --demo`
@@ -69,6 +75,13 @@ framework, and follow-up CLI integration.
   - [x] `status`
   - [x] `publish`
   - [x] `unpublish`
+  - [x] `discover`
+  - [x] `access`
+  - [x] `grant`
+  - [x] `revoke`
+  - [x] `visibility`
+  - [x] `update-service`
+  - [x] `delegation`
 - [x] Added `--air-gapped` to `aster shell`
 - [x] Added shell startup identity banner for local states
 - [x] Added air-gapped banner treatment at shell startup
@@ -101,6 +114,13 @@ framework, and follow-up CLI integration.
   - [x] `aster join` against a dev `@aster` node
   - [x] `aster status` against a dev `@aster` node
   - [x] `aster discover` against a dev `@aster` node
+  - [x] `aster publish` against a dev `@aster` node
+  - [x] `aster update-service` against a dev `@aster` node
+  - [x] `aster visibility` against a dev `@aster` node
+  - [x] `aster access delegation` against a dev `@aster` node
+  - [x] `aster access list` against a dev `@aster` node
+  - [x] `aster access grant` against a dev `@aster` node
+  - [x] `aster access revoke` against a dev `@aster` node
 
 ## Todo
 
@@ -108,14 +128,14 @@ framework, and follow-up CLI integration.
 
 - [x] Replace preview-only `join --demo` flow with real `@aster` RPC client flow
 - [x] Implement registry/service client resolver for `@aster`
-- [ ] Call `check_availability` before handle claim
-- [ ] Handle “taken” / “reserved” / “invalid” responses with correct CLI UX
+- [x] Call `check_availability` before handle claim
+- [x] Handle “taken” / “reserved” / “invalid” responses with correct CLI UX
 - [x] Sign `join` payloads with the root key
-- [ ] Call real `join`
-- [ ] Persist pending state from real server response
+- [x] Call real `join`
+- [x] Persist pending state from real server response
 - [x] Sign `verify` payloads with the root key
-- [ ] Call real `verify`
-- [ ] Call real `resend_verification`
+- [x] Call real `verify`
+- [x] Call real `resend_verification`
 - [ ] Surface server error cases:
   - [ ] invalid code
   - [ ] code expired
@@ -138,16 +158,17 @@ framework, and follow-up CLI integration.
 - [ ] Cache `handle_status` locally with TTL
 - [ ] Show online/offline indicator from real `@aster` reachability
 - [x] Distinguish local-only state from confirmed remote state in output
-- [ ] Optionally add `--json` structured output for the new identity commands
+- [x] Optionally add `--json` structured output for the new identity commands
 
 ### Shell UX
 
-- [ ] Refresh shell banner immediately after `join`
-- [ ] Refresh shell banner immediately after `verify`
-- [ ] Refresh shell banner after `publish` / `unpublish`
-- [ ] Add `discover` command in the shell
+- [x] Refresh shell banner/VFS state after `join`
+- [x] Refresh shell banner/VFS state after `verify`
+- [x] Refresh shell banner/VFS state after `publish` / `unpublish`
+- [x] Add `discover` command in the shell
 - [x] Add top-level CLI `aster discover`
-- [ ] Add richer shell banners for all documented states:
+- [x] Add shell commands for access grant/list/revoke and owner mutations
+- [ ] Add richer shell banners for all documented states: (these could even look like badges or on/off switches as similar to 'mode' in the producer server banner)
   - [ ] State A: no root key
   - [ ] State B: root key, unregistered
   - [ ] State C: pending verification
@@ -161,7 +182,9 @@ framework, and follow-up CLI integration.
 - [x] Replace local preview publish marker flow with real `publish` RPC
 - [x] Reuse `aster contract gen` pipeline end-to-end for publish requests
 - [x] Build signed publish payload
-- [ ] Post manifest to `@aster`
+- [x] Post manifest to `@aster`
+- [x] Implement real `set_visibility` RPC
+- [x] Implement real `update_service` RPC
 - [ ] Store returned `delegation_pubkey`
 - [x] Implement real `unpublish` RPC
 - [ ] Show first-publish recovery code guidance if that behavior remains in scope
@@ -169,16 +192,19 @@ framework, and follow-up CLI integration.
 
 ### Access Control Commands
 
-- [ ] Add top-level CLI `aster access grant`
-- [ ] Add top-level CLI `aster access revoke`
-- [ ] Add top-level CLI `aster access list`
-- [ ] Add top-level CLI `aster access public`
-- [ ] Add top-level CLI `aster access private`
+- [x] Add top-level CLI `aster access grant`
+- [x] Add top-level CLI `aster access revoke`
+- [x] Add top-level CLI `aster access list`
+- [x] Add top-level CLI `aster access delegation`
+- [x] Add top-level CLI `aster access public`
+- [x] Add top-level CLI `aster access private`
 - [ ] Wire shell commands:
-  - [ ] `grant`
-  - [ ] `revoke`
-  - [ ] `access`
-- [ ] Integrate those commands with real `@aster` RPC methods
+  - [x] `grant`
+  - [x] `revoke`
+  - [x] `access`
+  - [x] `public`
+  - [x] `private`
+- [x] Integrate those commands with real `@aster` RPC methods
 
 ### VFS / Directory
 
@@ -209,15 +235,18 @@ framework, and follow-up CLI integration.
 - [ ] `@aster` service methods available and stable:
   - [x] `check_availability`
   - [x] `join`
-  - [ ] `verify`
-  - [ ] `resend_verification`
+  - [x] `verify`
+  - [x] `resend_verification`
   - [x] `handle_status`
-  - [ ] `publish`
-  - [ ] `unpublish`
+  - [x] `publish`
+  - [x] `set_visibility`
+  - [x] `update_service`
+  - [x] `unpublish`
   - [x] `discover`
-  - [ ] `grant_access`
-  - [ ] `revoke_access`
-  - [ ] `list_access`
+  - [x] `grant_access`
+  - [x] `revoke_access`
+  - [x] `list_access`
+  - [x] `update_delegation`
 - [ ] Framework support available and stable:
   - [x] signed request helpers
   - [ ] delegated enrollment / `delegation_pubkey`
@@ -229,4 +258,6 @@ framework, and follow-up CLI integration.
 - Current `join` / `verify` / `publish` / `unpublish` implementations now target the live `@aster` service by default and keep `--demo` as an explicit fallback.
 - `status` now opportunistically syncs against remote `handle_status` and updates local state.
 - `discover` now talks to the live `PublicationService`.
+- `publish` now derives the Day 0 directory `contract_id` from canonical manifest JSON, matching the live service validator.
+- `grant_access` now includes `scope_node_id: null` in signed payloads so signature verification matches server-side dataclass canonicalization.
 - Current shell banner work is local-state driven; it does not yet talk to `@aster`.

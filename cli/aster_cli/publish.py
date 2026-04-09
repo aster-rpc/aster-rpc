@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import importlib
+import json
 from pathlib import Path
 from typing import Any
+
+import blake3
+from aster.contract.manifest import ContractManifest
 
 from aster_cli.aster_service import (
     build_signed_envelope,
@@ -75,6 +78,15 @@ def _roles_from_args(args: argparse.Namespace) -> list[str]:
     return ["consumer"]
 
 
+def _canonical_manifest_json(manifest: dict[str, Any]) -> str:
+    return ContractManifest.from_json(json.dumps(manifest)).to_json(indent=None)
+
+
+def _directory_contract_id(manifest: dict[str, Any]) -> tuple[str, str]:
+    manifest_json = _canonical_manifest_json(manifest)
+    return manifest_json, blake3.blake3(manifest_json.encode("utf-8")).hexdigest()
+
+
 def _build_publish_payload(
     *,
     handle: str,
@@ -87,17 +99,16 @@ def _build_publish_payload(
     token_ttl = parse_duration_seconds(args.token_ttl, default=300)
     now = now_epoch_seconds()
     delegation_mode = "closed" if args.closed else "open"
-    visibility = "private" if args.private else "public"
+    manifest_json, contract_id = _directory_contract_id(manifest)
 
     payload = {
         "action": "publish",
         "handle": handle,
         "service_name": service_name,
-        "contract_id": manifest["contract_id"],
-        "manifest_json": canonical_payload_json(manifest),
+        "contract_id": contract_id,
+        "manifest_json": manifest_json,
         "description": args.description,
         "status": args.status,
-        "visibility": visibility,
         "endpoints": [
             {
                 "node_id": endpoint_id,
@@ -191,6 +202,7 @@ async def _publish_remote(
     endpoint_id: str,
 ) -> int:
     runtime = await open_aster_service(getattr(args, "aster", None))
+    result = None
     try:
         publication_client = await runtime.publication_client()
         payload = _build_publish_payload(
@@ -204,7 +216,22 @@ async def _publish_remote(
             payload,
             root_key_file=getattr(args, "root_key", None),
         )
-        await publication_client.publish(runtime.signed_request(envelope))
+        result = await publication_client.publish(runtime.signed_request(envelope))
+        if getattr(args, "private", False) or getattr(args, "public", False):
+            visibility = "private" if getattr(args, "private", False) else "public"
+            visibility_payload = {
+                "action": "set_visibility",
+                "handle": handle,
+                "service_name": service_name,
+                "visibility": visibility,
+                "timestamp": now_epoch_seconds(),
+                "nonce": generate_nonce(),
+            }
+            visibility_envelope = build_signed_envelope(
+                visibility_payload,
+                root_key_file=getattr(args, "root_key", None),
+            )
+            await publication_client.set_visibility(runtime.signed_request(visibility_envelope))
     finally:
         await runtime.close()
 
@@ -214,6 +241,14 @@ async def _publish_remote(
         published.append(service_name)
         set_published_services(published)
     print(f"Published @{handle}/{service_name}.")
+    if result is not None and getattr(result, "first_publish", False):
+        recovery_codes = getattr(result, "recovery_codes", None) or []
+        if recovery_codes:
+            print("Recovery codes:")
+            for code in recovery_codes:
+                print(f"  {code}")
+        else:
+            print("First publish complete.")
     return 0
 
 
@@ -266,6 +301,87 @@ async def _unpublish_remote(args: argparse.Namespace, *, handle: str) -> int:
         published.remove(args.service)
         set_published_services(published)
     print(f"Unpublished @{handle}/{args.service}.")
+    return 0
+
+
+def cmd_set_visibility(args: argparse.Namespace) -> int:
+    _profile_name, profile, _config = get_active_profile()
+    handle = str(profile.get("handle", "")).strip()
+    if not handle:
+        print("Error: no handle configured.")
+        return 1
+
+    try:
+        return asyncio.run(_set_visibility_remote(args, handle=handle))
+    except Exception as exc:
+        print(f"Error: {exc}")
+        return 1
+
+
+async def _set_visibility_remote(args: argparse.Namespace, *, handle: str) -> int:
+    runtime = await open_aster_service(getattr(args, "aster", None))
+    try:
+        publication_client = await runtime.publication_client()
+        payload = {
+            "action": "set_visibility",
+            "handle": handle,
+            "service_name": args.service,
+            "visibility": args.visibility,
+            "timestamp": now_epoch_seconds(),
+            "nonce": generate_nonce(),
+        }
+        envelope = build_signed_envelope(
+            payload,
+            root_key_file=getattr(args, "root_key", None),
+        )
+        await publication_client.set_visibility(runtime.signed_request(envelope))
+    finally:
+        await runtime.close()
+
+    print(f"Set @{handle}/{args.service} visibility to {args.visibility}.")
+    return 0
+
+
+def cmd_update_service(args: argparse.Namespace) -> int:
+    _profile_name, profile, _config = get_active_profile()
+    handle = str(profile.get("handle", "")).strip()
+    if not handle:
+        print("Error: no handle configured.")
+        return 1
+    if args.description is None and args.status is None and args.replacement is None:
+        print("Error: update-service requires at least one of --description, --status, or --replacement.")
+        return 1
+
+    try:
+        return asyncio.run(_update_service_remote(args, handle=handle))
+    except Exception as exc:
+        print(f"Error: {exc}")
+        return 1
+
+
+async def _update_service_remote(args: argparse.Namespace, *, handle: str) -> int:
+    runtime = await open_aster_service(getattr(args, "aster", None))
+    try:
+        publication_client = await runtime.publication_client()
+        payload = {
+            "action": "update_service",
+            "handle": handle,
+            "service_name": args.service,
+            "description": args.description,
+            "status": args.status,
+            "replacement": args.replacement,
+            "timestamp": now_epoch_seconds(),
+            "nonce": generate_nonce(),
+        }
+        envelope = build_signed_envelope(
+            payload,
+            root_key_file=getattr(args, "root_key", None),
+        )
+        await publication_client.update_service(runtime.signed_request(envelope))
+    finally:
+        await runtime.close()
+
+    print(f"Updated @{handle}/{args.service}.")
     return 0
 
 
@@ -374,6 +490,25 @@ def register_publish_subparser(subparsers: argparse._SubParsersAction) -> None:
     unpublish_parser.add_argument("--root-key", default=None, help="Path to root key JSON backup")
     unpublish_parser.add_argument("--demo", action="store_true", help="Run the local preview flow only")
 
+    visibility_parser = subparsers.add_parser("visibility", help="Change service visibility on @aster")
+    visibility_parser.add_argument("service", help="Service name")
+    visibility_parser.add_argument("visibility", choices=["public", "private"], help="Target visibility")
+    visibility_parser.add_argument("--aster", default=None, help="Override @aster service address")
+    visibility_parser.add_argument("--root-key", default=None, help="Path to root key JSON backup")
+
+    update_service_parser = subparsers.add_parser("update-service", help="Update published service metadata")
+    update_service_parser.add_argument("service", help="Service name")
+    update_service_parser.add_argument("--description", default=None, help="New description or empty string")
+    update_service_parser.add_argument(
+        "--status",
+        choices=["experimental", "stable", "deprecated"],
+        default=None,
+        help="Updated lifecycle status",
+    )
+    update_service_parser.add_argument("--replacement", default=None, help="Replacement @handle/Service pointer")
+    update_service_parser.add_argument("--aster", default=None, help="Override @aster service address")
+    update_service_parser.add_argument("--root-key", default=None, help="Path to root key JSON backup")
+
     discover_parser = subparsers.add_parser("discover", help="Search published services on @aster")
     discover_parser.add_argument("query", nargs="?", default="", help="Search query or @handle")
     discover_parser.add_argument("--aster", default=None, help="Override @aster service address")
@@ -387,6 +522,10 @@ def run_publish_command(args: argparse.Namespace) -> int:
         return cmd_publish(args)
     if args.command == "unpublish":
         return cmd_unpublish(args)
+    if args.command == "visibility":
+        return cmd_set_visibility(args)
+    if args.command == "update-service":
+        return cmd_update_service(args)
     if args.command == "discover":
         return cmd_discover(args)
     return 1

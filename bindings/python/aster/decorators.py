@@ -168,9 +168,32 @@ class _Decorator:
 
 
 class _RpcDecorator:
-    """Callable class for @rpc decorator.
+    """Mark an async method as a unary RPC endpoint.
 
-    Supports both @rpc (no parens) and @rpc() (with parens) syntax.
+    Supports ``@rpc`` (no parens) and ``@rpc(...)`` (with options).
+
+    Args:
+        timeout: Default timeout in seconds. Clients can override per-call.
+        idempotent: If ``True``, the method is safe to retry on failure.
+        requires: Capability requirement for authorization (e.g., a role enum).
+        serialization: Override the service-level serialization mode.
+
+    Examples::
+
+        @service(name="Calculator", version=1)
+        class Calculator:
+
+            @rpc
+            async def add(self, req: AddRequest) -> AddResponse:
+                return AddResponse(result=req.a + req.b)
+
+            @rpc(timeout=5.0, idempotent=True)
+            async def multiply(self, req: MulRequest) -> MulResponse:
+                return MulResponse(result=req.a * req.b)
+
+            @rpc(requires=Role.ADMIN)
+            async def reset(self, req: ResetRequest) -> ResetResponse:
+                ...
     """
 
     def __init__(

@@ -95,7 +95,7 @@ class MissionControl:
 
 async def main():
     async with AsterServer(services=[MissionControl()]) as srv:
-        print(srv.ticket)       # compact aster1... address
+        print(srv.address)       # compact aster1... address
         await srv.serve()
 
 if __name__ == "__main__":
@@ -454,7 +454,7 @@ async with AsterServer(
     services=[MissionControl(), AgentSession()],
     config=config,
 ) as srv:
-    print(srv.ticket)
+    print(srv.address)
     await srv.serve()
 ```
 

@@ -1518,15 +1518,15 @@ async def _run_shell(
             banner_lines.append("[bold]Air-gapped mode[/bold] [dim](@aster service disabled for this session)[/dim]")
         if not state["root_pubkey"]:
             banner_lines.append("No identity configured.")
-            banner_lines.append("[dim]Run `aster keygen root` or `aster join --demo` to get started.[/dim]")
+            banner_lines.append("[dim]Run `aster keygen root` or `join <handle> <email>` to get started.[/dim]")
         elif state["handle_status"] == "pending":
             banner_lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [dim]pending verification[/dim]")
-            banner_lines.append("[dim]Run `verify 123456` in demo mode, or finish verification once the service client is wired.[/dim]")
+            banner_lines.append("[dim]Run `verify <code>` or `status` to check for auto-verification.[/dim]")
         elif state["handle_status"] == "verified":
             banner_lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [dim]verified[/dim]")
         else:
             banner_lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [dim]not registered[/dim]")
-            banner_lines.append("[dim]Run `join --demo` to preview the registration flow.[/dim]")
+            banner_lines.append("[dim]Run `join <handle> <email>` to register this identity.[/dim]")
         display.console.print()
         display.console.print(
             Panel("\n".join(banner_lines), border_style="blue", padding=(0, 2))

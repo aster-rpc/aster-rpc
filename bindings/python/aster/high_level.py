@@ -117,6 +117,36 @@ class AsterServer:
         clock_drift_config: ClockDriftConfig | None = None,
         persist_mesh_state: bool = False,
     ) -> None:
+        """Create an Aster RPC server.
+
+        Args:
+            services: List of ``@service``-decorated class instances to serve.
+                At least one is required.
+            config: Optional :class:`AsterConfig` for trust, storage, and
+                networking settings. If omitted, settings are loaded from
+                environment variables and defaults.
+            peer: Optional peer name for this server (used in config lookup
+                and identity file resolution).
+            root_pubkey: 32-byte ed25519 public key for the trust anchor.
+                Overrides ``config.root_pubkey`` if both are set.
+            allow_all_consumers: If ``True``, skip consumer admission
+                (open gate). Overrides ``config.allow_all_consumers``.
+            allow_all_producers: If ``True``, skip producer admission.
+                Overrides ``config.allow_all_producers``.
+            endpoint_config: Low-level iroh endpoint configuration.
+
+        Example::
+
+            @service(name="MyService", version=1)
+            class MyService:
+                @rpc()
+                async def hello(self, req: HelloRequest) -> HelloResponse:
+                    return HelloResponse(message=f"Hello {req.name}")
+
+            async with AsterServer(services=[MyService()]) as srv:
+                print(srv.address)
+                await srv.serve()
+        """
         if not services:
             raise ValueError("AsterServer requires at least one service")
 
@@ -749,7 +779,7 @@ class AsterServer:
             except Exception:
                 pass
 
-    def install_signal_handlers(self, grace_period: float = 10.0) -> None:
+    def _install_signal_handlers(self, grace_period: float = 10.0) -> None:
         """Install SIGTERM/SIGINT handlers for graceful shutdown.
 
         Call after ``serve()`` to enable k8s-compatible shutdown:
@@ -833,50 +863,48 @@ class AsterServer:
     # ── Back-compat aliases ──────────────────────────────────────────────
 
     @property
-    def ticket(self) -> str:
-        """Alias for :attr:`address`."""
+    def _ticket(self) -> str:
+        """Alias for :attr:`address` (internal back-compat)."""
         return self.address
 
+    # Back-compat alias — used in tests
     @property
     def endpoint_addr_b64(self) -> str:
-        """Base64 ``NodeAddr`` — prefer :attr:`address` instead."""
         self._require_started()
         assert self._node is not None
         return base64.b64encode(self._node.node_addr_info().to_bytes()).decode()
 
     @property
-    def rpc_addr_b64(self) -> str:
+    def _rpc_addr_b64(self) -> str:
         return self.endpoint_addr_b64
 
     @property
-    def admission_addr_b64(self) -> str | None:
+    def _admission_addr_b64(self) -> str | None:
         if self._allow_all_consumers and self._allow_all_producers:
             return None
         return self.endpoint_addr_b64
 
     @property
-    def consumer_admission_addr_b64(self) -> str | None:
+    def _consumer_admission_addr_b64(self) -> str | None:
         if self._allow_all_consumers:
             return None
         return self.endpoint_addr_b64
 
     @property
-    def producer_admission_addr_b64(self) -> str | None:
+    def _producer_admission_addr_b64(self) -> str | None:
         if self._allow_all_producers:
             return None
         return self.endpoint_addr_b64
 
     @property
     def services(self) -> list[ServiceSummary]:
+        """List of services hosted by this server."""
         self._require_started()
         return list(self._service_summaries)
 
     @property
-    def mesh_state(self) -> MeshState | None:
-        return self._mesh_state
-
-    @property
     def root_pubkey(self) -> bytes | None:
+        """The 32-byte ed25519 trust anchor public key, or ``None``."""
         return self._root_pubkey
 
     # ── Iroh protocol clients (lazy) ─────────────────────────────────────────
@@ -920,7 +948,7 @@ class AsterServer:
         return net_client(self._node)
 
     @property
-    def rpc_endpoint(self) -> Any:
+    def _rpc_endpoint(self) -> Any:
         return self.endpoint
 
     def _require_started(self) -> None:
@@ -960,6 +988,36 @@ class AsterClient:
         # Internal wiring:
         channel_name: str = "rpc",
     ) -> None:
+        """Create an Aster RPC client.
+
+        Args:
+            config: Optional :class:`AsterConfig`. If omitted, settings are
+                loaded from environment variables.
+            peer: Peer name for identity file lookup.
+            address: The server's address. Accepts:
+                - ``aster1...`` compact ticket (recommended)
+                - Base64-encoded ``NodeAddr``
+                - Hex ``EndpointId`` (requires discovery)
+            endpoint_addr: Alias for *address* (back-compat).
+            root_pubkey: 32-byte ed25519 public key of the server's trust
+                anchor. Required for credential-based admission.
+            enrollment_credential_file: Path to a pre-signed enrollment
+                credential (``.cred`` file from ``aster enroll``).
+
+        Example::
+
+            # Dev mode — open gate, no credentials
+            client = AsterClient(address="aster1...")
+            await client.connect()
+
+            # Production — with credential
+            client = AsterClient(
+                address="aster1...",
+                root_pubkey=pub_key,
+                enrollment_credential_file="my-agent.cred",
+            )
+            await client.connect()
+        """
         from .config import AsterConfig
 
         if config is None:

@@ -244,6 +244,7 @@ cython_debug/
 lib_aster_python.dylib.dSYM/
 node_modules/
 **/_internal/*/
+!**/_internal/day0/
 
 CLAUDE.md
 AGENTS.md

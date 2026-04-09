@@ -744,6 +744,10 @@ def main() -> None:
     from aster_cli.publish import register_publish_subparser
     register_publish_subparser(subparsers)
 
+    # Access-control commands
+    from aster_cli.access import register_access_subparser
+    register_access_subparser(subparsers)
+
     # ``aster shell`` subcommand
     from aster_cli.shell import register_shell_subparser
     register_shell_subparser(subparsers)
@@ -820,9 +824,12 @@ def main() -> None:
     elif args.command in {"join", "verify", "status", "whoami"}:
         from aster_cli.join import run_join_command
         sys.exit(run_join_command(args))
-    elif args.command in {"publish", "unpublish", "discover"}:
+    elif args.command in {"publish", "unpublish", "discover", "visibility", "update-service"}:
         from aster_cli.publish import run_publish_command
         sys.exit(run_publish_command(args))
+    elif args.command == "access":
+        from aster_cli.access import run_access_command
+        sys.exit(run_access_command(args))
     elif args.command == "shell":
         from aster_cli.shell import run_shell_command
         sys.exit(run_shell_command(args))
