@@ -266,9 +266,22 @@ export class AsterServer {
       allowUnenrolled: this._allowAllConsumers,
       logger: this.logger,
     };
+    // Resolve root pubkey from config (either raw bytes or from file)
+    const rootKeyHex = (() => {
+      if (this.config.rootPubkey) return Buffer.from(this.config.rootPubkey).toString('hex');
+      if (this.config.rootPubkeyFile) {
+        try {
+          const { readFileSync } = require('node:fs');
+          const expanded = this.config.rootPubkeyFile.replace(/^~/, process.env.HOME ?? '');
+          const hex = readFileSync(expanded, 'utf-8').trim();
+          return hex;
+        } catch (e: any) { this.logger.warn(`failed to read rootPubkeyFile: ${e.message}`); return ''; }
+      }
+      return '';
+    })();
     await handleConsumerAdmissionConnection(
       adapted,
-      '', // rootPubkey -- empty for open gate
+      rootKeyHex,
       this._hook,
       opts,
     );
@@ -398,26 +411,26 @@ export interface AsterClientOptions {
  * Supports reconnection with exponential backoff.
  */
 export class AsterClientWrapper {
-  private transport: AsterTransport;
+  private transport!: AsterTransport;
   readonly config: AsterConfig;
   private backoff: ExponentialBackoff;
   private _connected = false;
   private _gossipTopic = '';
+  private _address: string | undefined;
+  private _node: any = null;
+  private _services: ServiceSummary[] = [];
+  private _registryNamespace = '';
 
   constructor(opts: AsterClientOptions) {
     this.config = { ...configFromEnv(), ...opts.config } as AsterConfig;
     if (opts.identity) {
       this.config.identityFile = opts.identity;
     }
+    this._address = opts.address ?? opts.endpointAddr as string | undefined;
     this.backoff = opts.retryBackoff ?? DEFAULT_BACKOFF;
     if (opts.transport) {
       this.transport = opts.transport;
       this._connected = true;
-    } else {
-      throw new Error(
-        'AsterClient requires a transport. Use localTransport() for testing ' +
-        'or IrohTransport for production.',
-      );
     }
   }
 
@@ -426,15 +439,68 @@ export class AsterClientWrapper {
     return this._connected;
   }
 
+  /** Services discovered during admission. */
+  get services(): ServiceSummary[] { return [...this._services]; }
+
   /** Registry namespace ID for service discovery (set after admission). */
-  get registryNamespace(): string | undefined { return undefined; }
+  get registryNamespace(): string | undefined { return this._registryNamespace || undefined; }
 
   /** Hex-encoded 32-byte gossip topic ID for the producer mesh. */
   get gossipTopic(): string { return this._gossipTopic; }
 
-  /** Connect to the server (no-op if already connected via transport option). */
+  /**
+   * Connect to the server via consumer admission, then open an RPC transport.
+   *
+   * If the client was created with a transport, this is a no-op.
+   * If created with an address, it performs the full admission handshake.
+   */
   async connect(): Promise<void> {
-    // Subclasses may override to do admission + connect
+    if (this._connected) return;
+    if (!this._address) {
+      throw new Error(
+        'AsterClient requires an address or transport. ' +
+        'Pass address="aster1..." or transport=new IrohTransport(conn).',
+      );
+    }
+
+    const native = await loadNative();
+    if (!native) {
+      throw new Error('Aster native addon not found.');
+    }
+
+    // Create an in-memory client node
+    this._node = await native.IrohNode.memory();
+
+    // Parse the address to get the endpoint ID
+    let endpointId: string;
+    if (this._address.startsWith('aster1')) {
+      try {
+        const parsed = native.asterTicketFromString(this._address);
+        endpointId = parsed.endpointId;
+      } catch {
+        // Ticket contains only nodeId -- decode it
+        const decoded = native.asterTicketDecode(Buffer.from(this._address));
+        endpointId = decoded.endpointId;
+      }
+    } else {
+      // Treat as raw hex endpoint ID
+      endpointId = this._address;
+    }
+
+    // Consumer admission
+    const admissionConn = await this._node.connect(endpointId, Buffer.from(ALPN_CONSUMER_ADMISSION));
+    const { performAdmission: doAdmission } = await import('./trust/consumer.js');
+    const admissionResponse = await doAdmission(admissionConn, {} as any);
+
+    this._services = admissionResponse.services ?? [];
+    this._registryNamespace = admissionResponse.registryNamespace ?? '';
+    this._gossipTopic = admissionResponse.gossipTopic ?? '';
+
+    // Open RPC connection and create transport
+    const rpcConn = await this._node.connect(endpointId, Buffer.from(RPC_ALPN));
+    const { IrohTransport: IrohTx } = await import('./transport/iroh.js');
+    this.transport = new IrohTx(rpcConn);
+    this._connected = true;
   }
 
   /** Create a typed client proxy for a service class. */
