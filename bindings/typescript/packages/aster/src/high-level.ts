@@ -144,6 +144,12 @@ export class AsterServer {
     await this.health.start();
     this._running = true;
     this._printBanner();
+
+    // Always log startup info (visible even when stderr is not a TTY)
+    const serviceNames = this._serviceSummaries.map(s => s.name).join(', ');
+    this.logger.info(
+      `server starting runtime=typescript services=[${serviceNames}] mode=${this._allowAllConsumers ? 'open-gate' : 'trusted'}`,
+    );
   }
 
   /**
@@ -273,8 +279,12 @@ export class AsterServer {
         try {
           const { readFileSync } = require('node:fs');
           const expanded = this.config.rootPubkeyFile.replace(/^~/, process.env.HOME ?? '');
-          const hex = readFileSync(expanded, 'utf-8').trim();
-          return hex;
+          const raw = readFileSync(expanded, 'utf-8').trim();
+          // Support both raw hex and JSON {"public_key": "hex"} format
+          if (raw.startsWith('{')) {
+            try { return JSON.parse(raw).public_key; } catch { /* fall through */ }
+          }
+          return raw;
         } catch (e: any) { this.logger.warn(`failed to read rootPubkeyFile: ${e.message}`); return ''; }
       }
       return '';
@@ -471,24 +481,38 @@ export class AsterClientWrapper {
     // Create an in-memory client node
     this._node = await native.IrohNode.memory();
 
-    // Parse the address to get the endpoint ID
+    // Parse the address to get the endpoint ID and optional address hints
     let endpointId: string;
+    let directAddrs: string[] | undefined;
+    let relayUrl: string | undefined;
+
     if (this._address.startsWith('aster1')) {
       try {
         const parsed = native.asterTicketFromString(this._address);
         endpointId = parsed.endpointId;
+        directAddrs = parsed.directAddrs?.length ? parsed.directAddrs : undefined;
+        relayUrl = parsed.relayAddr || undefined;
       } catch {
-        // Ticket contains only nodeId -- decode it
         const decoded = native.asterTicketDecode(Buffer.from(this._address));
         endpointId = decoded.endpointId;
+        directAddrs = decoded.directAddrs?.length ? decoded.directAddrs : undefined;
+        relayUrl = decoded.relayAddr || undefined;
       }
     } else {
       // Treat as raw hex endpoint ID
       endpointId = this._address;
     }
 
+    // Helper: connect using full address info when available, else bare endpoint ID
+    const doConnect = (alpn: Buffer) => {
+      if (directAddrs || relayUrl) {
+        return this._node.connectNodeAddr(endpointId, alpn, directAddrs, relayUrl);
+      }
+      return this._node.connect(endpointId, alpn);
+    };
+
     // Consumer admission
-    const admissionConn = await this._node.connect(endpointId, Buffer.from(ALPN_CONSUMER_ADMISSION));
+    const admissionConn = await doConnect(Buffer.from(ALPN_CONSUMER_ADMISSION));
     const { performAdmission: doAdmission } = await import('./trust/consumer.js');
     const admissionResponse = await doAdmission(admissionConn, {} as any);
 
@@ -497,7 +521,7 @@ export class AsterClientWrapper {
     this._gossipTopic = admissionResponse.gossipTopic ?? '';
 
     // Open RPC connection and create transport
-    const rpcConn = await this._node.connect(endpointId, Buffer.from(RPC_ALPN));
+    const rpcConn = await doConnect(Buffer.from(RPC_ALPN));
     const { IrohTransport: IrohTx } = await import('./transport/iroh.js');
     this.transport = new IrohTx(rpcConn);
     this._connected = true;

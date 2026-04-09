@@ -133,23 +133,23 @@ def method_to_tool_definition(
 
     # Add meta-parameters for streaming patterns
     if pattern == "server_stream":
-        properties["_max_items"] = {
+        properties["aster_max_items"] = {
             "type": "integer",
             "description": "Maximum number of stream items to collect (default: 100)",
             "default": 100,
         }
-        properties["_timeout"] = {
+        properties["aster_timeout"] = {
             "type": "number",
             "description": "Timeout in seconds for stream collection (default: 30)",
             "default": 30.0,
         }
     elif pattern == "client_stream":
-        properties["_items"] = {
+        properties["aster_items"] = {
             "type": "array",
             "description": "List of items to send as a client stream",
             "items": {"type": "object"},
         }
-        required.append("_items")
+        required.append("aster_items")
 
     input_schema: dict[str, Any] = {
         "type": "object",

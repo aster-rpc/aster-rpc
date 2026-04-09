@@ -261,14 +261,14 @@ class SessionServer:
                     return
 
                 # Build call context
-                from aster.limits import MAX_METADATA_ENTRIES, validate_metadata, LimitExceeded
+                from aster.limits import validate_metadata, LimitExceeded
                 _keys = call_header.metadataKeys or []
                 _vals = call_header.metadataValues or []
                 try:
                     validate_metadata(_keys, _vals)
-                except LimitExceeded:
-                    _keys = _keys[:MAX_METADATA_ENTRIES]
-                    _vals = _vals[:MAX_METADATA_ENTRIES]
+                except LimitExceeded as exc:
+                    await _write_trailer(send, self._codec, StatusCode.RESOURCE_EXHAUSTED, str(exc))
+                    return
                 metadata = dict(zip(_keys, _vals))
                 call_ctx = build_call_context(
                     service=self._service_info.name,

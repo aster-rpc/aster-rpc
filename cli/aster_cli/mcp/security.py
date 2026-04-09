@@ -27,16 +27,16 @@ class ToolFilter:
     Usage::
 
         filt = ToolFilter(
-            allow=["HelloService:*", "StatusService:*"],
+            allow=["HelloService.*", "StatusService.*"],
             deny=["*:delete_*", "*:admin_*"],
-            confirm=["DataService:write_*"],
+            confirm=["DataService.write_*"],
         )
 
-        if filt.is_visible("HelloService:say_hello"):
+        if filt.is_visible("HelloService.say_hello"):
             # include in tools/list
 
-        if filt.needs_confirmation("DataService:write_record"):
-            approved = await filt.confirm_call("DataService:write_record", {"id": 1})
+        if filt.needs_confirmation("DataService.write_record"):
+            approved = await filt.confirm_call("DataService.write_record", {"id": 1})
     """
 
     def __init__(

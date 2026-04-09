@@ -419,7 +419,12 @@ export function resolveRootPubkey(config: AsterConfig): Uint8Array | undefined {
   if (config.rootPubkeyFile) {
     try {
       const { readFileSync } = require('node:fs');
-      const hex = readFileSync(config.rootPubkeyFile, 'utf-8').trim();
+      const raw = readFileSync(config.rootPubkeyFile, 'utf-8').trim();
+      // Support both raw hex and JSON {"public_key": "hex"} format
+      let hex = raw;
+      if (raw.startsWith('{')) {
+        try { hex = JSON.parse(raw).public_key; } catch { /* fall through */ }
+      }
       return new Uint8Array(Buffer.from(hex, 'hex'));
     } catch { return undefined; }
   }

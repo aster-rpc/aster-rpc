@@ -69,6 +69,7 @@ export async function checkOffline(
   // 1. Structural validation
   const { ok, reason: structReason } = validateStructure(cred);
   if (!ok) {
+    console.log(`[DEBUG] admission checkOffline: structure failed: ${structReason}`);
     return { admitted: false, reason: structReason };
   }
 
@@ -84,25 +85,23 @@ export async function checkOffline(
     return { admitted: false, reason: `credential expired (expiresAt=${cred.expiresAt}, now=${nowSec})` };
   }
 
-  // 4. Endpoint ID binding
+  // 4. Endpoint ID binding (only for OTT credentials; policy credentials are not bound)
   if (!('credentialType' in cred)) {
     // EnrollmentCredential — strict binding
     const producer = cred as EnrollmentCredential;
     if (producer.endpointId !== peerEndpointId) {
       return { admitted: false, reason: `endpoint ID mismatch: credential=${producer.endpointId}, peer=${peerEndpointId}` };
     }
-  } else {
-    // ConsumerEnrollmentCredential — optional binding
-    const consumer = cred as ConsumerEnrollmentCredential;
-    if (consumer.endpointId != null && consumer.endpointId !== peerEndpointId) {
-      return { admitted: false, reason: `OTT endpoint ID mismatch: credential=${consumer.endpointId}, peer=${peerEndpointId}` };
-    }
   }
+  // For policy credentials, endpoint_id is informational only — no binding check
 
   // 5. OTT nonce consumption
   if ('credentialType' in cred) {
     const consumer = cred as ConsumerEnrollmentCredential;
     if (consumer.credentialType === 'ott') {
+      if (consumer.endpointId != null && consumer.endpointId !== peerEndpointId) {
+        return { admitted: false, reason: `OTT endpoint ID mismatch: credential=${consumer.endpointId}, peer=${peerEndpointId}` };
+      }
       if (!nonceStore) {
         return { admitted: false, reason: 'OTT credential presented but no nonceStore configured' };
       }

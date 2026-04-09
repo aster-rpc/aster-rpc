@@ -96,7 +96,7 @@ class TestMethodToToolDefinition:
             "response_type": "Resp",
             "fields": [{"name": "id", "type": "int", "required": True}],
         })
-        assert tool["name"] == "Svc:do_thing"
+        assert tool["name"] == "Svc.do_thing"
         assert "unary" in tool["description"]
         assert tool["inputSchema"]["properties"]["id"]["type"] == "integer"
         assert "id" in tool["inputSchema"]["required"]
@@ -107,8 +107,8 @@ class TestMethodToToolDefinition:
             "pattern": "server_stream",
             "fields": [],
         })
-        assert "_max_items" in tool["inputSchema"]["properties"]
-        assert "_timeout" in tool["inputSchema"]["properties"]
+        assert "aster_max_items" in tool["inputSchema"]["properties"]
+        assert "aster_timeout" in tool["inputSchema"]["properties"]
 
     def test_client_stream_adds_items_param(self):
         tool = method_to_tool_definition("Svc", {
@@ -116,8 +116,8 @@ class TestMethodToToolDefinition:
             "pattern": "client_stream",
             "fields": [],
         })
-        assert "_items" in tool["inputSchema"]["properties"]
-        assert "_items" in tool["inputSchema"]["required"]
+        assert "aster_items" in tool["inputSchema"]["properties"]
+        assert "aster_items" in tool["inputSchema"]["required"]
 
     def test_optional_field_not_required(self):
         tool = method_to_tool_definition("Svc", {
@@ -151,8 +151,8 @@ class TestServiceToToolDefinitions:
             ],
         })
         names = [t["name"] for t in tools]
-        assert "Hello:greet" in names
-        assert "Hello:stream" in names
+        assert "Hello.greet" in names
+        assert "Hello.stream" in names
 
     def test_bidi_stream_excluded(self):
         tools = service_to_tool_definitions({
@@ -163,8 +163,8 @@ class TestServiceToToolDefinitions:
             ],
         })
         names = [t["name"] for t in tools]
-        assert "Chat:unary_m" in names
-        assert "Chat:bidi_m" not in names
+        assert "Chat.unary_m" in names
+        assert "Chat.bidi_m" not in names
 
     def test_empty_methods(self):
         tools = service_to_tool_definitions({"name": "Empty", "methods": []})
@@ -181,32 +181,32 @@ class TestServiceToToolDefinitions:
 class TestToolFilter:
     def test_no_filters_all_visible(self):
         filt = ToolFilter()
-        assert filt.is_visible("Anything:any_method")
+        assert filt.is_visible("Anything.any_method")
 
     def test_deny_hides(self):
-        filt = ToolFilter(deny=["*:delete_*"])
-        assert filt.is_visible("Svc:get_data")
-        assert not filt.is_visible("Svc:delete_record")
+        filt = ToolFilter(deny=["*.delete_*"])
+        assert filt.is_visible("Svc.get_data")
+        assert not filt.is_visible("Svc.delete_record")
 
     def test_allow_restricts(self):
-        filt = ToolFilter(allow=["Hello*:*"])
-        assert filt.is_visible("HelloService:say_hello")
-        assert not filt.is_visible("OtherService:get_data")
+        filt = ToolFilter(allow=["Hello*.*"])
+        assert filt.is_visible("HelloService.say_hello")
+        assert not filt.is_visible("OtherService.get_data")
 
     def test_deny_wins_over_allow(self):
-        filt = ToolFilter(allow=["Svc:*"], deny=["Svc:delete_*"])
-        assert filt.is_visible("Svc:get_data")
-        assert not filt.is_visible("Svc:delete_record")
+        filt = ToolFilter(allow=["Svc.*"], deny=["Svc.delete_*"])
+        assert filt.is_visible("Svc.get_data")
+        assert not filt.is_visible("Svc.delete_record")
 
     def test_confirm_patterns(self):
-        filt = ToolFilter(confirm=["*:write_*", "*:admin_*"])
-        assert filt.needs_confirmation("Svc:write_record")
-        assert filt.needs_confirmation("Svc:admin_reset")
-        assert not filt.needs_confirmation("Svc:get_data")
+        filt = ToolFilter(confirm=["*.write_*", "*.admin_*"])
+        assert filt.needs_confirmation("Svc.write_record")
+        assert filt.needs_confirmation("Svc.admin_reset")
+        assert not filt.needs_confirmation("Svc.get_data")
 
     def test_no_confirm_patterns(self):
         filt = ToolFilter()
-        assert not filt.needs_confirmation("Anything:any")
+        assert not filt.needs_confirmation("Anything.any")
 
     def test_has_filters(self):
         assert not ToolFilter().has_filters
@@ -215,15 +215,15 @@ class TestToolFilter:
         assert ToolFilter(confirm=["*"]).has_filters
 
     def test_multiple_allow(self):
-        filt = ToolFilter(allow=["Hello:*", "Status:*"])
-        assert filt.is_visible("Hello:greet")
-        assert filt.is_visible("Status:check")
-        assert not filt.is_visible("Other:method")
+        filt = ToolFilter(allow=["Hello.*", "Status.*"])
+        assert filt.is_visible("Hello.greet")
+        assert filt.is_visible("Status.check")
+        assert not filt.is_visible("Other.method")
 
     def test_wildcard_patterns(self):
-        filt = ToolFilter(deny=["Admin*:*"])
-        assert not filt.is_visible("AdminService:anything")
-        assert filt.is_visible("UserService:anything")
+        filt = ToolFilter(deny=["Admin*.*"])
+        assert not filt.is_visible("AdminService.anything")
+        assert filt.is_visible("UserService.anything")
 
 
 # ── Server setup tests ────────────────────────────────────────────────────────
@@ -265,12 +265,12 @@ class TestAsterMcpServer:
         from aster_cli.shell.app import DemoConnection
 
         conn = DemoConnection()
-        filt = ToolFilter(deny=["*:sync"])
+        filt = ToolFilter(deny=["*.sync"])
         server = AsterMcpServer(conn, tool_filter=filt)
         await server.setup()
 
         names = server.tool_names
-        assert "FileStore:sync" not in names
+        assert "FileStore.sync" not in names
 
     @pytest.mark.asyncio
     async def test_bidi_stream_excluded(self):
@@ -283,4 +283,4 @@ class TestAsterMcpServer:
 
         names = server.tool_names
         # FileStore has a bidi_stream "sync" method -- should be excluded
-        assert "FileStore:sync" not in names
+        assert "FileStore.sync" not in names

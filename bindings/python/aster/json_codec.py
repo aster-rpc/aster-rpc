@@ -91,12 +91,16 @@ def _normalize_keys(d: dict) -> dict:
     return {_camel_to_snake(k): v for k, v in d.items()}
 
 
-def json_decode(data: bytes, expected_type: type | None = None) -> Any:
+def json_decode(data: bytes | str, expected_type: type | None = None) -> Any:
     """Deserialize JSON bytes into a dataclass instance or plain dict.
 
     If expected_type is a dataclass, constructs an instance from the JSON.
     Handles nested @wire_type dataclasses and Optional fields.
     """
+    # Explicit UTF-8 decode to avoid Python's detect_encoding
+    # misidentifying short byte sequences as UTF-32
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data).decode("utf-8")
     raw = json.loads(data)
 
     if expected_type is None or not dataclasses.is_dataclass(expected_type):
