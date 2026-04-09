@@ -102,6 +102,7 @@ class AsterServer:
         *,
         config: "AsterConfig | None" = None,
         peer: str | None = None,
+        identity: str | None = None,
         # Inline overrides (take priority over config):
         root_pubkey: bytes | None = None,
         allow_all_consumers: bool | None = None,
@@ -128,6 +129,8 @@ class AsterServer:
                 environment variables and defaults.
             peer: Optional peer name for this server (used in config lookup
                 and identity file resolution).
+            identity: Path to ``.aster-identity`` file (default: auto-detected
+                from CWD). Overrides ``config.identity_file``.
             root_pubkey: 32-byte ed25519 public key for the trust anchor.
                 Overrides ``config.root_pubkey`` if both are set.
             allow_all_consumers: If ``True``, skip consumer admission
@@ -155,6 +158,8 @@ class AsterServer:
         from .config import AsterConfig
         if config is None:
             config = AsterConfig.from_env()
+        if identity is not None:
+            config.identity_file = identity
         self._config = config
 
         # Inline overrides win over config.
@@ -1228,6 +1233,7 @@ class AsterClient:
         *,
         config: "AsterConfig | None" = None,
         peer: str | None = None,
+        identity: str | None = None,
         # Connection address (aster1... ticket, base64 NodeAddr, or hex EndpointId):
         address: str | None = None,
         # Back-compat alias for address:
@@ -1243,6 +1249,8 @@ class AsterClient:
             config: Optional :class:`AsterConfig`. If omitted, settings are
                 loaded from environment variables.
             peer: Peer name for identity file lookup.
+            identity: Path to ``.aster-identity`` file (default: auto-detected
+                from CWD). Overrides ``config.identity_file``.
             address: The server's address. Accepts:
                 - ``aster1...`` compact ticket (recommended)
                 - Base64-encoded ``NodeAddr``
@@ -1271,6 +1279,8 @@ class AsterClient:
 
         if config is None:
             config = AsterConfig.from_env()
+        if identity is not None:
+            config.identity_file = identity
         self._config = config
         self._peer_name = peer
 
