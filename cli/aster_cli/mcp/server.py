@@ -109,17 +109,23 @@ class AsterMcpServer:
         tool_def: dict[str, Any],
         method_meta: dict[str, Any],
     ) -> None:
-        """Register a single tool with the FastMCP server."""
+        """Register a single tool with the FastMCP server.
+
+        Builds a handler function whose parameter names and type hints
+        match the manifest fields, so FastMCP generates an accurate
+        JSON Schema (instead of generic **kwargs).
+        """
+        import inspect
+
         service_name = tool_name.split(".")[0]
         method_name = tool_name.split(".", 1)[1] if "." in tool_name else tool_name
         pattern = method_meta.get("pattern", "unary")
 
-        async def handler(**kwargs: Any) -> str:
-            return await self._handle_call(
-                service_name, method_name, pattern, kwargs
-            )
+        # Build typed handler so FastMCP infers the correct inputSchema
+        handler = _build_typed_handler(
+            self, service_name, method_name, pattern, tool_def,
+        )
 
-        # FastMCP add_tool with explicit schema
         self._mcp.add_tool(
             fn=handler,
             name=tool_name,
@@ -199,6 +205,96 @@ class AsterMcpServer:
     @property
     def tool_names(self) -> list[str]:
         return sorted(self._tools.keys())
+
+
+_FIELD_TYPE_MAP = {
+    "str": str, "string": str,
+    "int": int, "integer": int, "int32": int, "int64": int,
+    "float": float, "double": float, "number": float,
+    "bool": bool, "boolean": bool,
+}
+
+
+def _build_typed_handler(
+    server: AsterMcpServer,
+    service_name: str,
+    method_name: str,
+    pattern: str,
+    tool_def: dict[str, Any],
+) -> Any:
+    """Build an async handler with typed parameters from the tool inputSchema.
+
+    FastMCP inspects the handler's signature to generate JSON Schema.
+    By creating a function with explicit parameter names and type hints,
+    the MCP tools/list response includes field-level detail instead of
+    a generic **kwargs blob.
+    """
+    import inspect
+
+    # Extract field info from the inputSchema
+    schema = tool_def.get("inputSchema", {})
+    properties = schema.get("properties", {})
+    required_set = set(schema.get("required", []))
+
+    # Filter out internal meta-params that we add ourselves
+    field_params = {
+        k: v for k, v in properties.items()
+        if not k.startswith("_")
+    }
+
+    # Build inspect.Parameter list
+    params = [
+        inspect.Parameter("self_unused", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+    ]
+    annotations: dict[str, Any] = {}
+
+    for fname, fschema in field_params.items():
+        json_type = fschema.get("type", "string")
+        py_type = _FIELD_TYPE_MAP.get(json_type, str)
+        default = fschema.get("default", inspect.Parameter.empty)
+        if fname not in required_set and default is inspect.Parameter.empty:
+            default = None
+
+        params.append(inspect.Parameter(
+            fname,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=default,
+            annotation=py_type,
+        ))
+        annotations[fname] = py_type
+
+    # Add streaming meta-params back
+    for meta_name in ("_max_items", "_timeout", "_items"):
+        if meta_name in properties:
+            meta_schema = properties[meta_name]
+            json_type = meta_schema.get("type", "string")
+            py_type = _FIELD_TYPE_MAP.get(json_type, Any)
+            default = meta_schema.get("default", inspect.Parameter.empty)
+            params.append(inspect.Parameter(
+                meta_name,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=default,
+                annotation=py_type,
+            ))
+
+    # If no fields were found, fall back to **kwargs
+    if len(params) == 1:
+        async def fallback_handler(**kwargs: Any) -> str:
+            return await server._handle_call(service_name, method_name, pattern, kwargs)
+        return fallback_handler
+
+    # Remove the self_unused placeholder
+    params = params[1:]
+
+    # Build the handler dynamically
+    async def typed_handler(**kwargs: Any) -> str:
+        return await server._handle_call(service_name, method_name, pattern, kwargs)
+
+    # Patch the signature so FastMCP sees the real fields
+    typed_handler.__signature__ = inspect.Signature(params)
+    typed_handler.__annotations__ = annotations
+
+    return typed_handler
 
 
 async def _collect_stream(stream: Any, max_items: int) -> Any:
