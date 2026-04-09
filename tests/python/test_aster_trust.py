@@ -672,7 +672,9 @@ def test_auth_interceptor_allows_when_peer_is_none():
         return result
 
     # Should complete without raising
-    asyncio.get_event_loop().run_until_complete(run())
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(run())
+    loop.close()
 
 
 # ── Canonical signing bytes determinism ───────────────────────────────────────
