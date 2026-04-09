@@ -1,5 +1,5 @@
 """
-aster.status — Status codes and RPC error hierarchy.
+aster.status -- Status codes and RPC error hierarchy.
 
 Spec reference: §6.5 (status codes)
 """
@@ -52,7 +52,7 @@ class RpcError(Exception):
         try:
             resp = await svc.my_method(request)
         except RpcError as e:
-            print(f"RPC failed: {e.code.name} — {e.message}")
+            print(f"RPC failed: {e.code.name} -- {e.message}")
             if e.details:
                 print(f"Details: {e.details}")
 

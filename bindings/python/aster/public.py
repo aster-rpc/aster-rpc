@@ -1,5 +1,5 @@
 """
-Aster RPC — Public API Reference
+Aster RPC -- Public API Reference
 =================================
 
 This module re-exports the public API surface for documentation.
@@ -51,12 +51,12 @@ Decorators
 
 Use these to define RPC services:
 
-- :func:`service` — Declare a class as an RPC service
-- :func:`rpc` — Mark a method as a unary RPC endpoint
-- :func:`server_stream` — Mark a method as server-streaming
-- :func:`client_stream` — Mark a method as client-streaming
-- :func:`bidi_stream` — Mark a method as bidirectional streaming
-- :func:`wire_type` — Register a dataclass for cross-language serialization
+- :func:`service` -- Declare a class as an RPC service
+- :func:`rpc` -- Mark a method as a unary RPC endpoint
+- :func:`server_stream` -- Mark a method as server-streaming
+- :func:`client_stream` -- Mark a method as client-streaming
+- :func:`bidi_stream` -- Mark a method as bidirectional streaming
+- :func:`wire_type` -- Register a dataclass for cross-language serialization
 
 Error Handling
 --------------
@@ -70,6 +70,7 @@ from aster.codec import wire_type
 from aster.status import RpcError, StatusCode
 from aster.config import AsterConfig
 from aster.interceptors import CallContext
+from aster.capabilities import any_of, all_of
 
 
 __all__ = [
@@ -81,6 +82,8 @@ __all__ = [
     "client_stream",
     "bidi_stream",
     "wire_type",
+    "any_of",
+    "all_of",
     "RpcError",
     "StatusCode",
     "AsterConfig",

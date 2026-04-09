@@ -1,5 +1,5 @@
 """
-aster_cli.profile — Operator profile management.
+aster_cli.profile -- Operator profile management.
 
 Profiles are stored in ``~/.aster/config.toml`` and represent deployment
 meshes (dev, staging, prod). Each profile holds the root public key;
@@ -111,8 +111,11 @@ def _save_config(data: dict) -> None:
 
     content = "\n".join(lines)
     tmp = CONFIG_PATH.with_suffix(".tmp")
-    tmp.write_text(content)
-    os.chmod(tmp, 0o600)
+    tmp.write_text(content, encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass  # Windows may not support Unix permissions
     tmp.replace(CONFIG_PATH)
 
 

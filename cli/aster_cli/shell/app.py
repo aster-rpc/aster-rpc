@@ -1,5 +1,5 @@
 """
-aster_cli.shell.app — Shell REPL entry point and CLI wiring.
+aster_cli.shell.app -- Shell REPL entry point and CLI wiring.
 
 Usage::
 
@@ -84,7 +84,7 @@ def _load_root_secret_key(config: Any) -> bytes | None:
     import json as _json
     import os
 
-    # 1) Try keyring — scoped by active profile
+    # 1) Try keyring -- scoped by active profile
     try:
         from aster_cli.credentials import get_root_privkey, has_keyring
         if has_keyring():
@@ -188,7 +188,7 @@ def _resolve_peer_arg(peer_arg: str) -> tuple[str, str]:
                     if name == peer_arg:
                         eid = peer.get("endpoint_id")
                         if eid:
-                            # Return raw endpoint ID — AsterClient handles
+                            # Return raw endpoint ID -- AsterClient handles
                             # NodeAddr construction (avoids loading native module here)
                             return eid, peer_arg
                         print(
@@ -197,7 +197,7 @@ def _resolve_peer_arg(peer_arg: str) -> tuple[str, str]:
                             file=sys.stderr,
                         )
                         sys.exit(1)
-                # Name not found — show available names
+                # Name not found -- show available names
                 if known_names:
                     names_str = ", ".join(known_names)
                     print(
@@ -208,7 +208,7 @@ def _resolve_peer_arg(peer_arg: str) -> tuple[str, str]:
                     )
                 else:
                     print(
-                        f"error: peer '{peer_arg}' not found — "
+                        f"error: peer '{peer_arg}' not found -- "
                         f".aster-identity has no peer entries\n"
                         f"  pass a base64 NodeAddr / hex EndpointId directly",
                         file=sys.stderr,
@@ -292,10 +292,10 @@ class PeerConnection:
         from aster import AsterClient
         from aster.config import AsterConfig
 
-        # The shell needs its own node identity — not the service's.
+        # The shell needs its own node identity -- not the service's.
         # Use the root private key (if available) as the shell's secret_key.
         # This gives the shell the root owner's identity, which services
-        # in the mesh will recognise as the trust anchor — free auth.
+        # in the mesh will recognise as the trust anchor -- free auth.
         # Falls back to ephemeral if no root key is configured.
         config = AsterConfig.from_env()
         config.storage_path = None
@@ -314,7 +314,7 @@ class PeerConnection:
         await self._aster_client.connect()
         self._services = list(self._aster_client.services)
 
-        # Fetch manifests in the background — the shell is usable immediately
+        # Fetch manifests in the background -- the shell is usable immediately
         # with basic service info from the admission response. Manifests add
         # rich metadata (field types, descriptions) and are merged in when ready.
         self._manifest_task = asyncio.create_task(self._fetch_manifests_background())
@@ -344,7 +344,7 @@ class PeerConnection:
         namespace = self._aster_client.registry_namespace if self._aster_client else ""
 
         if not namespace or not self._aster_client._node:
-            logger.debug("No registry namespace or node — skipping manifest fetch")
+            logger.debug("No registry namespace or node -- skipping manifest fetch")
             return
 
         try:
@@ -363,7 +363,7 @@ class PeerConnection:
             self._registry_doc = doc
             self._registry_event_rx = event_receiver
 
-            # Wait for sync with retry — the doc needs to pull entries from
+            # Wait for sync with retry -- the doc needs to pull entries from
             # the producer. We try up to 3 times with increasing timeouts.
             import asyncio as _asyncio
 
@@ -590,7 +590,7 @@ class PeerConnection:
     def _synthesize_types(self) -> None:
         """Create dynamic dataclasses from manifest method schemas.
 
-        These are wire-compatible with the producer's types — same
+        These are wire-compatible with the producer's types -- same
         @wire_type tag, same field names. Enables invocation without
         having the producer's Python types locally installed.
         """
@@ -756,7 +756,7 @@ class PeerConnection:
         """Subscribe to the producer mesh gossip topic.
 
         The gossip topic is returned by the producer during consumer
-        admission — but only when the connecting node is the root key
+        admission -- but only when the connecting node is the root key
         holder.  Returns a GossipTopicHandle or raises.
         """
         if not self._aster_client or not self._aster_client._node:
@@ -765,7 +765,7 @@ class PeerConnection:
         topic_hex = self._aster_client.gossip_topic
         if not topic_hex:
             raise RuntimeError(
-                "gossip topic not available — the producer only shares it "
+                "gossip topic not available -- the producer only shares it "
                 "with the root node. Connect with the root key to access gossip."
             )
 
@@ -773,7 +773,7 @@ class PeerConnection:
 
         from aster import gossip_client
 
-        # Need bootstrap peers — the producer we connected to
+        # Need bootstrap peers -- the producer we connected to
         bootstrap = []
         if self._aster_client._endpoint_addr_in:
             from aster.high_level import _coerce_node_addr
@@ -787,7 +787,7 @@ class PeerConnection:
     async def close(self) -> None:
         """Close the connection and clean up.
 
-        Fire-and-forget — the shell doesn't need to wait for graceful
+        Fire-and-forget -- the shell doesn't need to wait for graceful
         QUIC teardown. The OS reclaims sockets on process exit anyway.
         """
         # Cancel background manifest fetch if still running
@@ -797,7 +797,7 @@ class PeerConnection:
         self._transports.clear()
         self._rpc_conns.clear()
 
-        # Don't await graceful shutdown — just let the process exit.
+        # Don't await graceful shutdown -- just let the process exit.
         # AsterClient.close() does node.shutdown() which waits for
         # iroh protocols to drain, but the shell doesn't need that.
 
@@ -1184,8 +1184,8 @@ class DirectoryDemoConnection:
                 "# emrul\n\n"
                 "Building distributed systems with Aster.\n\n"
                 "Services:\n"
-                "- TaskManager — async task queue for AI agent workflows\n"
-                "- InvoiceService — invoice lifecycle management\n"
+                "- TaskManager -- async task queue for AI agent workflows\n"
+                "- InvoiceService -- invoice lifecycle management\n"
             ),
             "services": [
                 {
@@ -1768,7 +1768,7 @@ async def _run_shell(
     )
 
     if directory_mode:
-        # Directory mode has its own UX flow — skip the peer tour
+        # Directory mode has its own UX flow -- skip the peer tour
         guide = GuideManager(display)
         guide.disable()
     elif is_first_time() and not raw:
@@ -1785,7 +1785,7 @@ async def _run_shell(
         cwd = "/"
     _last_ctrl_c = 0.0  # timestamp of last Ctrl+C for double-tap exit
 
-    # Command context (mutable — cwd updates)
+    # Command context (mutable -- cwd updates)
     ctx = CommandContext(
         vfs_cwd=cwd,
         vfs_root=root,
@@ -1981,7 +1981,7 @@ async def launch_shell(
         peer_name = "demo"
         await connection.connect()
     else:
-        # Resolve peer name before heavy imports (instant — just reads .aster-identity)
+        # Resolve peer name before heavy imports (instant -- just reads .aster-identity)
         resolved_addr, friendly_name = _resolve_peer_arg(peer_addr)
         peer_name = friendly_name
 

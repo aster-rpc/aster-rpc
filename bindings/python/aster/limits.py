@@ -1,8 +1,8 @@
 """
-aster.limits — Security limits for the Aster RPC framework.
+aster.limits -- Security limits for the Aster RPC framework.
 
 All size caps, entry limits, and validation constants live here.
-Import from this module — never hardcode limits elsewhere.
+Import from this module -- never hardcode limits elsewhere.
 
 These limits protect against:
   - Allocation bombs (oversized strings, lists, compressed payloads)

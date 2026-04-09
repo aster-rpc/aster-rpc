@@ -1,5 +1,5 @@
 """
-aster.transport.base — Transport protocol and BidiChannel.
+aster.transport.base -- Transport protocol and BidiChannel.
 
 Spec reference: §8.3.1 (Transport protocol)
 

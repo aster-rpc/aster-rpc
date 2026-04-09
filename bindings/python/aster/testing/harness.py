@@ -1,5 +1,5 @@
 """
-aster.testing.harness — AsterTestHarness factory class.
+aster.testing.harness -- AsterTestHarness factory class.
 
 Spec reference: Aster-SPEC.md §13.2; Plan: §15.3
 """

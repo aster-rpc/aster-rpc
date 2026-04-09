@@ -1,5 +1,5 @@
 """
-aster_cli.main — Entry point for the ``aster`` CLI.
+aster_cli.main -- Entry point for the ``aster`` CLI.
 
 Delegates to subcommand modules:
   aster contract gen ...   → aster_cli.contract

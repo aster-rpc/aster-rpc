@@ -1,5 +1,5 @@
 """
-aster.trust.rcan — rcan capability evaluation and grant serialization.
+aster.trust.rcan -- rcan capability evaluation and grant serialization.
 
 Provides:
 - ``evaluate_capability``: runtime check of a caller's roles against a
@@ -13,7 +13,7 @@ from __future__ import annotations
 from aster.contract.identity import CapabilityKind, CapabilityRequirement
 
 
-# ── Capability evaluation (Gate 3 — method-level access control) ────────────
+# ── Capability evaluation (Gate 3 -- method-level access control) ────────────
 
 
 def _extract_caller_roles(caller_attributes: dict[str, str]) -> set[str]:
@@ -54,7 +54,7 @@ def evaluate_capability(
     if requirement.kind == CapabilityKind.ROLE:
         # ROLE: caller must have the single required role.
         if not requirement.roles:
-            return True  # vacuously satisfied — no role demanded
+            return True  # vacuously satisfied -- no role demanded
         return requirement.roles[0] in caller_roles
 
     if requirement.kind == CapabilityKind.ANY_OF:
@@ -69,7 +69,7 @@ def evaluate_capability(
             return True
         return set(requirement.roles) <= caller_roles
 
-    # Unknown kind — fail closed.
+    # Unknown kind -- fail closed.
     return False
 
 

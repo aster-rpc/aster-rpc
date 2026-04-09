@@ -1,5 +1,5 @@
 """
-aster.protocol — Wire-protocol dataclasses.
+aster.protocol -- Wire-protocol dataclasses.
 
 Spec reference: §6.2 (StreamHeader), §6.4 (RpcStatus/trailer)
 

@@ -1,4 +1,4 @@
-"""aster.client — Aster RPC client stub generation.
+"""aster.client -- Aster RPC client stub generation.
 
 Spec reference: §8.2 (Client API), §8.3 (Local client)
 

@@ -1,7 +1,7 @@
 """
-aster.decorators — Service and method decorators for defining Aster RPC services.
+aster.decorators -- Service and method decorators for defining Aster RPC services.
 
-Spec reference: §7.1–7.4 (Python decorators), §7.6 (language ownership)
+Spec reference: §7.1--7.4 (Python decorators), §7.6 (language ownership)
 
 This module provides the decorator-based service definition layer that allows
 developers to define RPC services with type-safe method signatures.
@@ -549,7 +549,7 @@ def service(
 
     Supports three calling forms::
 
-        @service                                  # bare — name = class name
+        @service                                  # bare -- name = class name
         @service("AgentControl")                  # explicit name
         @service(name="AgentControl", version=2)  # keyword name
         @service(version=2, scoped="stream")      # keyword-only, name = class name
@@ -571,7 +571,7 @@ def service(
     if name is not None and name_or_cls is None:
         name_or_cls = name
 
-    # @service (bare, no parens) — name_or_cls is the class itself
+    # @service (bare, no parens) -- name_or_cls is the class itself
     if isinstance(name_or_cls, type):
         return _apply_service_decorator(
             name_or_cls,
@@ -669,7 +669,7 @@ def _apply_service_decorator(
             caller_frame = inspect.currentframe()
             if caller_frame is not None:
                 # f_back.f_back: one for _apply_service_decorator, one for
-                # service() or decorator() — we want the original caller.
+                # service() or decorator() -- we want the original caller.
                 outer = caller_frame.f_back
                 if outer is not None:
                     outer = outer.f_back
@@ -795,6 +795,12 @@ def _extract_types_from_signature(
         if response_annotation is inspect.Signature.empty:
             raise TypeError(
                 f"Method {method_name} has no return type annotation"
+            )
+        if response_annotation is None or response_annotation is type(None):
+            raise TypeError(
+                f"Method {method_name} returns None -- Aster RPC methods must "
+                f"return a @wire_type dataclass, not None. Define a response "
+                f"type (e.g., -> MyResponse) even if it has no fields."
             )
         response_type = _unwrap_async_iterator(response_annotation)
     else:

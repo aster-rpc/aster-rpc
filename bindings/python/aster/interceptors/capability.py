@@ -1,4 +1,4 @@
-"""Capability interceptor — Gate 3 method-level access control.
+"""Capability interceptor -- Gate 3 method-level access control.
 
 Evaluates ``CapabilityRequirement`` from the service and method definitions
 against the caller's admission attributes (``CallContext.attributes``).
@@ -36,7 +36,7 @@ class CapabilityInterceptor(Interceptor):
     async def on_request(self, ctx: CallContext, request: object) -> object:
         svc_info = self._service_map.get(ctx.service)
         if svc_info is None:
-            # Service not known to this interceptor — pass through.
+            # Service not known to this interceptor -- pass through.
             return request
 
         # Service-level baseline requirement.
@@ -47,7 +47,7 @@ class CapabilityInterceptor(Interceptor):
         if method_info is not None:
             method_req = method_info.requires
 
-        # No requirements at all — pass through.
+        # No requirements at all -- pass through.
         if svc_req is None and method_req is None:
             return request
 

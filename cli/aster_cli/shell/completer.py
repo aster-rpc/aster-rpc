@@ -1,5 +1,5 @@
 """
-aster_cli.shell.completer — Context-aware tab completion for the shell.
+aster_cli.shell.completer -- Context-aware tab completion for the shell.
 
 Provides prompt_toolkit Completer that queries the VFS and plugin
 registry to offer context-sensitive suggestions.

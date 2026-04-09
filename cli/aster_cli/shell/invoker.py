@@ -1,5 +1,5 @@
 """
-aster_cli.shell.invoker — Dynamic RPC invocation from the shell.
+aster_cli.shell.invoker -- Dynamic RPC invocation from the shell.
 
 Invokes service methods by name, handling:
   - Argument building from key=value pairs or interactive prompting
@@ -219,7 +219,7 @@ async def _handle_bidi(
                         parts = line.strip().split("=", 1)
                         value = {parts[0]: parts[1]}
                     else:
-                        display.error("invalid JSON — enter a JSON value or key=value")
+                        display.error("invalid JSON -- enter a JSON value or key=value")
                         continue
                 await send_queue.put(value)
         finally:

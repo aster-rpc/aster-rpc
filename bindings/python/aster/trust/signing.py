@@ -1,5 +1,5 @@
 """
-aster.trust.signing — Canonical signing bytes and ed25519 helpers.
+aster.trust.signing -- Canonical signing bytes and ed25519 helpers.
 
 Spec reference: Aster-trust-spec.md §2.2, §2.4.
 
@@ -137,7 +137,7 @@ def sign_credential(
     """Sign a credential with the root private key.
 
     Returns the 64-byte ed25519 signature.  The credential's ``signature``
-    field is NOT mutated — the caller assigns the return value.
+    field is NOT mutated -- the caller assigns the return value.
     """
     privkey = load_private_key(root_privkey_raw)
     msg = _canonical_signing_bytes(cred)

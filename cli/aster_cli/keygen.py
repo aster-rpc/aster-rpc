@@ -1,5 +1,5 @@
 """
-aster_cli.keygen — Key generation commands.
+aster_cli.keygen -- Key generation commands.
 
 Commands:
   aster keygen root [--out PATH]
@@ -58,7 +58,7 @@ def _keygen_root(args) -> int:
     if stored_in_keyring:
         print(f"  Root private key stored in OS keyring (profile: {profile_name})")
     else:
-        print("  WARNING: keyring not available — private key NOT securely stored.")
+        print("  WARNING: keyring not available -- private key NOT securely stored.")
         print("  Install keyring: pip install keyring")
 
     # Store public key in profile config
@@ -144,7 +144,7 @@ def _keygen_producer(args) -> int:
     print(f"Producer key written to: {out_path}")
     print(f"  node_id : {node_id}")
     print()
-    print("Next step — sign an enrollment token for this producer:")
+    print("Next step -- sign an enrollment token for this producer:")
     print(f"  aster authorize --root-key <root.key> --producer-id {node_id} --out enrollment.token")
     return 0
 

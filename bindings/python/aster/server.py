@@ -1,5 +1,5 @@
 """
-aster.server — Aster RPC server implementation.
+aster.server -- Aster RPC server implementation.
 
 Spec reference: §8.1 (Server API), §8.2 (Server accept loop)
 
@@ -358,7 +358,7 @@ class Server:
                 )
                 return
 
-            # Validate header — service name is always required; method may be ""
+            # Validate header -- service name is always required; method may be ""
             # for session streams
             if not header.service:
                 await self._write_error_trailer(
@@ -435,7 +435,7 @@ class Server:
                 )
                 return
 
-            # Dispatch based on RPC pattern — with logging context
+            # Dispatch based on RPC pattern -- with logging context
             from aster.logging import request_context
             pattern = method_info.pattern
             peer_id = ""
@@ -636,7 +636,7 @@ class Server:
             if asyncio.iscoroutine(response_iter):
                 response_iter = await response_iter
 
-            # §5.5.2: ROW_SCHEMA hoisting — send schema frame before first data frame
+            # §5.5.2: ROW_SCHEMA hoisting -- send schema frame before first data frame
             row_schema_sent = False
             if header.serialization_mode == SerializationMode.ROW.value:
                 try:
@@ -768,7 +768,7 @@ class Server:
                 self._bidi_reader(recv, method_info.request_type, request_queue, request_done, interceptors, call_ctx)
             )
 
-            # §5.5.2: ROW_SCHEMA hoisting — send schema frame before first data frame
+            # §5.5.2: ROW_SCHEMA hoisting -- send schema frame before first data frame
             if header.serialization_mode == SerializationMode.ROW.value:
                 try:
                     schema_bytes = self._codec.encode_row_schema()

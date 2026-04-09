@@ -1,5 +1,5 @@
 """
-aster.transport — Transport abstraction layer.
+aster.transport -- Transport abstraction layer.
 
 This package provides the transport abstraction that decouples the RPC
 layer from the underlying transport mechanism. Two transports are provided:

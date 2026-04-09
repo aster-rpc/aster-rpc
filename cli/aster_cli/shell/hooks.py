@@ -1,5 +1,5 @@
 """
-aster_cli.shell.hooks — Extension hooks for the shell.
+aster_cli.shell.hooks -- Extension hooks for the shell.
 
 Provides the hook protocol and registry for plugging in:
   - Input builders (construct RPC payloads from user intent)
@@ -126,7 +126,7 @@ class FieldSchema:
 
 @dataclass
 class MethodSchema:
-    """Full schema for a method — everything a hook needs to build input or render output."""
+    """Full schema for a method -- everything a hook needs to build input or render output."""
 
     service_name: str
     method_name: str
@@ -140,7 +140,7 @@ class MethodSchema:
 
 
 # Type alias for the ask function
-AskFn = Any  # Callable[[str], Awaitable[str | None]] — avoid complex type for 3.9
+AskFn = Any  # Callable[[str], Awaitable[str | None]] -- avoid complex type for 3.9
 
 
 # ── Hook registry ─────────────────────────────────────────────────────────────

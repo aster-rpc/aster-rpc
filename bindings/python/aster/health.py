@@ -1,11 +1,11 @@
 """
-aster.health — Health checking, readiness probes, and operational metrics.
+aster.health -- Health checking, readiness probes, and operational metrics.
 
 Provides three capabilities:
 
-1. **Health/readiness status** — for Kubernetes probes and load balancers.
-2. **Connection-level metrics** — active connections, streams in flight.
-3. **Admission metrics** — admit/deny counts, latency.
+1. **Health/readiness status** -- for Kubernetes probes and load balancers.
+2. **Connection-level metrics** -- active connections, streams in flight.
+3. **Admission metrics** -- admit/deny counts, latency.
 
 The health server is **disabled by default** (port=0). Enable it explicitly::
 
@@ -327,7 +327,7 @@ class HealthServer:
             host: Bind address. Default ``127.0.0.1`` (localhost only).
                   Set to ``0.0.0.0`` to expose externally (e.g., for k8s probes
                   from a sidecar).
-            port: Port to listen on. Default ``0`` (disabled — must be set
+            port: Port to listen on. Default ``0`` (disabled -- must be set
                   explicitly to enable). Common choices: 8080, 9090.
         """
         self._server_ref = server
@@ -395,7 +395,7 @@ class HealthServer:
             elif path == "/metrics":
                 # Check Accept header for Prometheus text format
                 accept = ""
-                # We already consumed headers — check if path has a format hint
+                # We already consumed headers -- check if path has a format hint
                 if "format=prometheus" in request_str or path == "/metrics/prometheus":
                     response_body = _prometheus_text(self._server_ref)
                     response = (

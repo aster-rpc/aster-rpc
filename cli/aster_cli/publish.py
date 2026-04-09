@@ -81,14 +81,14 @@ def remove_producer_token(service_name: str, *, identity_file: str | None = None
 def _load_manifest_file(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     return data if isinstance(data, list) else [data]
 
 
 def _write_manifest_file(path: Path, manifests: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: Any = manifests[0] if len(manifests) == 1 else manifests
-    path.write_text(json.dumps(payload, indent=2) + "\n")
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def _merge_manifest(path: Path, manifest: Any) -> dict[str, Any]:

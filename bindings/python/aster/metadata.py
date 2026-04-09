@@ -1,10 +1,10 @@
 """
-aster.metadata — Extensible metadata for services, methods, and fields.
+aster.metadata -- Extensible metadata for services, methods, and fields.
 
 Provides semantic documentation that AI agents (via MCP) and humans
 can use to understand what services do and how to populate request fields.
 
-Metadata is NON-CANONICAL — it does NOT affect contract identity (BLAKE3 hash)
+Metadata is NON-CANONICAL -- it does NOT affect contract identity (BLAKE3 hash)
 and does NOT appear in the wire protocol.
 """
 

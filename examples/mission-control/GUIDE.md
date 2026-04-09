@@ -106,7 +106,7 @@ if __name__ == "__main__":
 ```bash
 # Terminal 1: start the control plane
 python control.py
-# → Ticket: aster1Qm...
+# → aster1Qm...
 
 # Terminal 2: connect and inspect
 aster shell aster1Qm...
@@ -147,6 +147,11 @@ class LogEntry:
     message: str = ""
     agent_id: str = ""
 
+@wire_type("mission/SubmitLogResult")
+@dataclass
+class SubmitLogResult:
+    accepted: bool = True
+
 @wire_type("mission/TailRequest")
 @dataclass
 class TailRequest:
@@ -161,7 +166,7 @@ class MissionControl:
     # ... getStatus from Chapter 1 ...
 
     @rpc()
-    async def submitLog(self, entry: LogEntry) -> None:
+    async def submitLog(self, entry: LogEntry) -> SubmitLogResult:
         """Agents call this to push log entries."""
         await self._log_queue.put(entry)
 
@@ -234,18 +239,27 @@ no types needed on the consumer side:
 
 ```python
 # agent.py — proxy client (good for prototyping)
+import asyncio
 from aster import AsterClient
 
-async with AsterClient(endpoint_addr="aster1Qm...") as client:
+async def main():
+    client = AsterClient(address="aster1Qm...")
+    await client.connect()
     mc = client.proxy("MissionControl")
-    
+
     # Stream 10,000 metrics — the proxy accepts dicts
     async def metrics():
         for i in range(10_000):
+            from random import random
+            from time import time
             yield {"name": "cpu.usage", "value": random(), "timestamp": time()}
-    
+
     result = await mc.ingestMetrics(metrics())
     print(f"Accepted: {result['accepted']}")
+
+    await client.close()
+
+asyncio.run(main())
 ```
 
 The proxy client discovers methods from the contract and sends dicts over
@@ -253,18 +267,18 @@ the wire. Great for scripting, prototyping, and generic gateways — if
 you're building a dashboard that talks to any Aster service without
 knowing its types at compile time, the proxy is your best friend.
 
-> **Proxy vs Typed client** — For production, import the same types the
-> producer uses and swap `client.proxy(...)` for `create_client(...)`:
+> **Proxy vs Typed client** — For production, generate a typed client
+> with `aster contract gen-client` and use `from_connection()`:
 >
 > ```python
-> from aster import create_client
-> mc = create_client(MissionControl, client.transport("MissionControl"))
+> from mission_control.services.mission_control_v1 import MissionControlClient
+> mc = await MissionControlClient.from_connection(client)
 > result = await mc.ingestMetrics(metric_stream())   # IDE autocomplete, type checking
 > print(result.accepted)                              # not result['accepted']
 > ```
 >
 > Same wire protocol, same contract — just with type safety. Use the proxy
-> for scripts and exploration, the typed client for production services.
+> for scripts and exploration, the generated client for production services.
 
 **What just happened:**
 - Client streaming sends many messages, gets one response at the end
@@ -478,16 +492,25 @@ aster enroll consumer --name "ops-team" \
 
 ```python
 # agent.py — connecting with a scoped credential
-async with AsterClient(
-    endpoint_addr="aster1Qm...",
-    credential_file="edge-node-7.cred",
-) as client:
+import asyncio
+from aster import AsterClient
+
+async def main():
+    client = AsterClient(
+        address="aster1Qm...",
+        enrollment_credential_file="edge-node-7.cred",
+    )
+    await client.connect()
     mc = client.proxy("MissionControl")
     agent = client.proxy("AgentSession")
-    
-    await mc.getStatus(...)        # ✓ has ops.status
-    await mc.ingestMetrics(...)    # ✓ has ops.ingest
-    await agent.runCommand(...)    # ✗ AccessDenied — missing ops.admin
+
+    await mc.getStatus({"agent_id": "test"})     # ✓ has ops.status
+    await mc.ingestMetrics(...)                   # ✓ has ops.ingest
+    # await agent.runCommand(...)                 # ✗ AccessDenied — missing ops.admin
+
+    await client.close()
+
+asyncio.run(main())
 ```
 
 ```bash

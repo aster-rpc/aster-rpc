@@ -1,5 +1,5 @@
 """
-aster.logging — Production-grade structured logging for the Aster RPC framework.
+aster.logging -- Production-grade structured logging for the Aster RPC framework.
 
 Provides:
   - JSON structured logging (default in production) or human-readable (dev)
@@ -11,7 +11,7 @@ Provides:
 Configuration:
   ASTER_LOG_FORMAT   = "json" | "text"     (default: "text")
   ASTER_LOG_LEVEL    = "debug" | "info" | "warning" | "error"  (default: "info")
-  ASTER_LOG_MASK     = "true" | "false"    (default: "true") — mask sensitive fields
+  ASTER_LOG_MASK     = "true" | "false"    (default: "true") -- mask sensitive fields
 
 Usage::
 
@@ -189,7 +189,7 @@ class TextFormatter(logging.Formatter):
 
     Output format::
 
-        12:00:00.123 INFO  aster.server — connection opened [service=Hello method=sayHello]
+        12:00:00.123 INFO  aster.server -- connection opened [service=Hello method=sayHello]
     """
 
     _LEVEL_COLORS = {

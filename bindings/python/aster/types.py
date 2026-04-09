@@ -1,5 +1,5 @@
 """
-aster.types — Shared types used across the Aster RPC framework.
+aster.types -- Shared types used across the Aster RPC framework.
 
 Spec reference: §5.1 (serialization modes)
 """
@@ -26,7 +26,7 @@ class ExponentialBackoff:
         initial_ms: Initial delay in milliseconds.
         max_ms: Maximum delay in milliseconds.
         multiplier: Multiplicative factor applied after each attempt.
-        jitter: Random jitter factor (0.0–1.0) added to each delay.
+        jitter: Random jitter factor (0.0--1.0) added to each delay.
     """
 
     initial_ms: int = 100

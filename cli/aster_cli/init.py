@@ -1,5 +1,5 @@
 """
-aster_cli.init — ``aster init`` command.
+aster_cli.init -- ``aster init`` command.
 
 Generates project scaffolding files:
 - ``aster init --ai`` writes an ``AGENTS_aster.md`` guide for AI coding

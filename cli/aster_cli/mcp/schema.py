@@ -1,5 +1,5 @@
 """
-aster_cli.mcp.schema — Convert Aster manifest schemas to MCP/JSON Schema.
+aster_cli.mcp.schema -- Convert Aster manifest schemas to MCP/JSON Schema.
 
 Maps FieldSchema (from contract manifests) to JSON Schema properties,
 and method descriptors to MCP Tool definitions. Pure functions, no I/O.

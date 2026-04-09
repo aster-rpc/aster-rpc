@@ -1,8 +1,8 @@
 """
-aster.interceptors.metrics — Metrics interceptor with OpenTelemetry integration.
+aster.interceptors.metrics -- Metrics interceptor with OpenTelemetry integration.
 
 Provides RED metrics (Rate, Errors, Duration) and distributed tracing.
-OpenTelemetry is an optional dependency — metrics degrade gracefully to
+OpenTelemetry is an optional dependency -- metrics degrade gracefully to
 in-memory counters when OTel is not installed.
 
 Usage::
@@ -42,9 +42,9 @@ class MetricsInterceptor(Interceptor):
     """Collects RED metrics and creates OTel spans for each RPC call.
 
     Metrics collected:
-      - ``aster.rpc.started`` — counter, labels: service, method, pattern
-      - ``aster.rpc.completed`` — counter, labels: service, method, status
-      - ``aster.rpc.duration`` — histogram (seconds), labels: service, method
+      - ``aster.rpc.started`` -- counter, labels: service, method, pattern
+      - ``aster.rpc.completed`` -- counter, labels: service, method, status
+      - ``aster.rpc.duration`` -- histogram (seconds), labels: service, method
 
     Tracing:
       - One span per RPC call: ``{service}/{method}``
@@ -88,7 +88,7 @@ class MetricsInterceptor(Interceptor):
                 unit="s",
             )
         except Exception:
-            pass  # OTel not installed — use fallback counters
+            pass  # OTel not installed -- use fallback counters
 
         # Track start times per call_id for duration calculation
         self._call_starts: dict[str, float] = {}

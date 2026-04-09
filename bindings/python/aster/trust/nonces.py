@@ -1,5 +1,5 @@
 """
-aster.trust.nonces — One-shot nonce store for OTT credentials.
+aster.trust.nonces -- One-shot nonce store for OTT credentials.
 
 Spec reference: Aster-trust-spec.md §3.1, §3.2.1.
 
@@ -30,7 +30,7 @@ _DEFAULT_PATH = Path.home() / ".aster" / "nonces.json"
 
 @runtime_checkable
 class NonceStoreProtocol(Protocol):
-    """Interface for nonce stores — file, docs, or mock backends."""
+    """Interface for nonce stores -- file, docs, or mock backends."""
 
     async def consume(self, nonce: bytes) -> bool:
         """Atomically mark nonce as used.

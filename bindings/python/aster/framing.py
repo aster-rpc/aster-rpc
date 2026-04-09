@@ -1,5 +1,5 @@
 """
-aster.framing — Wire-level frame read/write.
+aster.framing -- Wire-level frame read/write.
 
 Spec reference: §6.1 (stream framing)
 
@@ -24,12 +24,12 @@ from typing import Protocol, runtime_checkable
 
 # ── Flag constants ───────────────────────────────────────────────────────────
 
-COMPRESSED: int = 0x01   # Bit 0 — payload is zstd-compressed
-TRAILER: int = 0x02      # Bit 1 — trailing status frame
-HEADER: int = 0x04       # Bit 2 — stream header (first frame)
-ROW_SCHEMA: int = 0x08   # Bit 3 — Fory row schema frame
-CALL: int = 0x10         # Bit 4 — per-call header in a session stream
-CANCEL: int = 0x20       # Bit 5 — cancel current call in a session stream
+COMPRESSED: int = 0x01   # Bit 0 -- payload is zstd-compressed
+TRAILER: int = 0x02      # Bit 1 -- trailing status frame
+HEADER: int = 0x04       # Bit 2 -- stream header (first frame)
+ROW_SCHEMA: int = 0x08   # Bit 3 -- Fory row schema frame
+CALL: int = 0x10         # Bit 4 -- per-call header in a session stream
+CANCEL: int = 0x20       # Bit 5 -- cancel current call in a session stream
 
 # ── Limits ───────────────────────────────────────────────────────────────────
 
@@ -145,7 +145,7 @@ async def read_frame(
     except asyncio.TimeoutError:
         raise FramingError("frame read timed out waiting for length header")
     except Exception:
-        # Stream ended or was reset — treat as clean EOF.
+        # Stream ended or was reset -- treat as clean EOF.
         return None
 
     if len(length_bytes) < _LENGTH_SIZE:

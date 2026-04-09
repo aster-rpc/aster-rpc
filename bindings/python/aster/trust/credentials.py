@@ -1,11 +1,11 @@
 """
-aster.trust.credentials — Enrollment credential data classes.
+aster.trust.credentials -- Enrollment credential data classes.
 
 Spec reference: Aster-trust-spec.md §2.2.
 
 Two credential types:
-  EnrollmentCredential           — producer (bound to endpoint_id)
-  ConsumerEnrollmentCredential   — consumer (policy or OTT)
+  EnrollmentCredential           -- producer (bound to endpoint_id)
+  ConsumerEnrollmentCredential   -- consumer (policy or OTT)
 
 Reserved attribute keys (aster.*):
   aster.role, aster.name
@@ -27,8 +27,8 @@ class EnrollmentCredential:
     canonical signing bytes (see ``signing.canonical_signing_bytes``).
     """
 
-    endpoint_id: str                    # hex — the producer's NodeId
-    root_pubkey: bytes                  # 32 bytes — ed25519 public key
+    endpoint_id: str                    # hex -- the producer's NodeId
+    root_pubkey: bytes                  # 32 bytes -- ed25519 public key
     expires_at: int                     # epoch seconds
     attributes: dict[str, str] = field(default_factory=dict)
     signature: bytes = b""              # 64 bytes after signing; empty before
@@ -51,7 +51,7 @@ class ConsumerEnrollmentCredential:
     """
 
     credential_type: Literal["policy", "ott"]
-    root_pubkey: bytes                  # 32 bytes — ed25519 public key
+    root_pubkey: bytes                  # 32 bytes -- ed25519 public key
     expires_at: int                     # epoch seconds
     attributes: dict[str, str] = field(default_factory=dict)
     endpoint_id: str | None = None      # None for Policy; optional for OTT
@@ -70,7 +70,7 @@ class AdmissionResult:
 
     admitted: bool
     attributes: dict[str, str] | None = None
-    reason: str | None = None           # internal logging only — never sent to peer
+    reason: str | None = None           # internal logging only -- never sent to peer
 
 
 # ── Reserved attribute key constants ─────────────────────────────────────────

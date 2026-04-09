@@ -1,5 +1,5 @@
 """
-aster_cli.mcp.server — MCP server that exposes Aster services as tools.
+aster_cli.mcp.server -- MCP server that exposes Aster services as tools.
 
 Connects to an Aster peer, discovers services from contract manifests,
 and exposes each method as an MCP tool over stdio. AI agents (Claude, etc.)
@@ -243,8 +243,8 @@ async def launch_mcp_server(
         server.tool_count,
     )
 
-    # Print tool summary to stderr (not stdout — that's for MCP protocol)
-    sys.stderr.write(f"\nAster MCP Gateway — {server.tool_count} tools\n")
+    # Print tool summary to stderr (not stdout -- that's for MCP protocol)
+    sys.stderr.write(f"\nAster MCP Gateway -- {server.tool_count} tools\n")
     for name in server.tool_names:
         sys.stderr.write(f"  {name}\n")
     sys.stderr.write("\n")

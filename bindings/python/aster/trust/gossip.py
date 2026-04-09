@@ -1,13 +1,13 @@
 """
-aster.trust.gossip — Producer mesh gossip: signing, verification, and dispatch.
+aster.trust.gossip -- Producer mesh gossip: signing, verification, and dispatch.
 
-Spec reference: Aster-trust-spec.md §2.3, §2.6.  Plan: ASTER_PLAN.md §14.2–14.6.
+Spec reference: Aster-trust-spec.md §2.3, §2.6.  Plan: ASTER_PLAN.md §14.2--14.6.
 
-Canonical signing bytes (normative — §2.6, ASTER_PLAN.md §14.2):
+Canonical signing bytes (normative -- §2.6, ASTER_PLAN.md §14.2):
 
     u8(type) || payload || sender.encode('utf-8') || u64_be(epoch_ms)
 
-Do NOT reorder ``epoch_ms`` before ``sender+payload`` — the spec fixes this
+Do NOT reorder ``epoch_ms`` before ``sender+payload`` -- the spec fixes this
 byte order and any deviation breaks cross-implementation verification.
 
 Topic derivation (§2.3):
@@ -178,7 +178,7 @@ async def handle_producer_message(
     # ── 2. Sender membership check ────────────────────────────────────────────
     if msg.sender not in state.accepted_producers:
         logger.warning(
-            "gossip: SECURITY ALERT — message from non-accepted sender %s; "
+            "gossip: SECURITY ALERT -- message from non-accepted sender %s; "
             "possible salt leak or deauthorized node still subscribed",
             msg.sender,
         )
@@ -187,9 +187,9 @@ async def handle_producer_message(
     # ── 3. Signature verification ─────────────────────────────────────────────
     peer_pubkey = peer_pubkeys.get(msg.sender)
     if peer_pubkey is None:
-        # Cannot verify — no public key on file for this sender.
+        # Cannot verify -- no public key on file for this sender.
         logger.warning(
-            "gossip: SECURITY ALERT — no public key for accepted sender %s; "
+            "gossip: SECURITY ALERT -- no public key for accepted sender %s; "
             "dropping message",
             msg.sender,
         )
@@ -197,7 +197,7 @@ async def handle_producer_message(
 
     if not verify_producer_message(msg, peer_pubkey):
         logger.warning(
-            "gossip: SECURITY ALERT — invalid signature from accepted sender %s",
+            "gossip: SECURITY ALERT -- invalid signature from accepted sender %s",
             msg.sender,
         )
         return
@@ -220,7 +220,7 @@ async def handle_producer_message(
                 )
                 state.drift_isolated.add(msg.sender)
         else:
-            # Fresh acceptable message — recover from isolation if present
+            # Fresh acceptable message -- recover from isolation if present
             if msg.sender in state.drift_isolated:
                 logger.info(
                     "gossip: peer %s recovered from drift isolation",
@@ -232,7 +232,7 @@ async def handle_producer_message(
         self_offset_estimate = 0  # We just sent, so our offset is near zero
         if drift_detector.self_in_drift(self_offset_estimate) and not state.mesh_dead:
             logger.error(
-                "gossip: self-departure triggered — local clock deviates from "
+                "gossip: self-departure triggered -- local clock deviates from "
                 "mesh median; broadcasting Depart and suppressing further sends"
             )
             state.mesh_dead = True
@@ -265,7 +265,7 @@ def _handle_introduce(msg: ProducerMessage, state: MeshState) -> None:
         )
         return
     state.accepted_producers.add(msg.sender)
-    logger.info("gossip: Introduce accepted — %s joined the mesh", msg.sender)
+    logger.info("gossip: Introduce accepted -- %s joined the mesh", msg.sender)
 
 
 def _handle_depart(
@@ -278,7 +278,7 @@ def _handle_depart(
     state.peer_offsets.pop(msg.sender, None)
     if drift_detector is not None:
         drift_detector.remove_peer(msg.sender)
-    logger.info("gossip: Depart — %s left the mesh", msg.sender)
+    logger.info("gossip: Depart -- %s left the mesh", msg.sender)
 
 
 def _handle_contract_published(
@@ -462,7 +462,7 @@ def start_lease_heartbeat(
 
 def encode_introduce_payload(rcan: bytes) -> bytes:
     """Encode IntroducePayload.  The rcan grant is stored as raw bytes."""
-    # Use rcan bytes directly as payload — opaque pass-through.
+    # Use rcan bytes directly as payload -- opaque pass-through.
     return rcan
 
 

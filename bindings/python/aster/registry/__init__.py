@@ -1,5 +1,5 @@
 """
-aster.registry — Aster service registry (Phase 10).
+aster.registry -- Aster service registry (Phase 10).
 
 Provides a docs-based registry for publishing service contracts, advertising
 live endpoints, and resolving services by name/version/channel.

@@ -1,5 +1,5 @@
 """
-aster.registry.keys — Key-schema helpers for the Aster service registry.
+aster.registry.keys -- Key-schema helpers for the Aster service registry.
 
 All keys are UTF-8 encoded bytes suitable for iroh-docs set_bytes/query calls.
 
@@ -62,7 +62,7 @@ def config_key(subkey: str) -> bytes:
     return f"_aster/config/{subkey}".encode()
 
 
-# Registry download-policy prefixes — all key namespaces that a registry
+# Registry download-policy prefixes -- all key namespaces that a registry
 # client should sync (applied via set_download_policy "nothing_except").
 REGISTRY_PREFIXES: list[bytes] = [
     b"contracts/",

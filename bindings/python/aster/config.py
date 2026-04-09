@@ -1,5 +1,5 @@
 """
-Aster configuration — endpoint, trust, and storage.
+Aster configuration -- endpoint, trust, and storage.
 
 Three layers, each overriding the previous:
 
@@ -258,7 +258,7 @@ def _apply_env(data: dict) -> None:
 
 
 # ============================================================================
-# AsterConfig — unified configuration for AsterServer
+# AsterConfig -- unified configuration for AsterServer
 # ============================================================================
 
 
@@ -280,7 +280,7 @@ class AsterConfig:
     persistent), and networking (relay, bind address, etc.) into one object.
 
     **Trust model (Aster-trust-spec.md §1.1):** The root *private* key is
-    offline — it never touches a running node. Nodes receive only the root
+    offline -- it never touches a running node. Nodes receive only the root
     *public* key (to verify credentials) and optionally an enrollment
     credential (a pre-signed token for mesh join). The founding node of a
     mesh needs no enrollment credential; it bootstraps the accepted-producer
@@ -305,7 +305,7 @@ class AsterConfig:
 
     root_pubkey: bytes | None = None
     """32-byte ed25519 root public key (the deployment trust anchor).
-    Highest priority — overrides ``root_pubkey_file`` when set."""
+    Highest priority -- overrides ``root_pubkey_file`` when set."""
 
     root_pubkey_file: str | None = None
     """Path to a file containing the root public key.  Accepts either a
@@ -405,7 +405,7 @@ class AsterConfig:
 
         1. Inline ``root_pubkey`` (highest priority).
         2. ``root_pubkey_file`` (hex string or JSON with ``public_key``).
-        3. Generate an ephemeral keypair (dev mode only — logged).
+        3. Generate an ephemeral keypair (dev mode only -- logged).
 
         The root *private* key never appears here. In dev mode, a transient
         private key is stored on ``_ephemeral_privkey`` so the companion

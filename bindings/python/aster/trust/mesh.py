@@ -1,5 +1,5 @@
 """
-aster.trust.mesh — Producer mesh data model.
+aster.trust.mesh -- Producer mesh data model.
 
 Spec reference: Aster-trust-spec.md §2.1, §2.6.  Plan: ASTER_PLAN.md §14.2.
 
@@ -19,7 +19,7 @@ from typing import Any
 
 
 class ProducerMessageType(IntEnum):
-    """Message type discriminator (§2.6 — normative; types 0-127 reserved)."""
+    """Message type discriminator (§2.6 -- normative; types 0-127 reserved)."""
 
     INTRODUCE = 1
     DEPART = 2
@@ -56,7 +56,7 @@ class IntroducePayload:
     ships with opaque bytes.
     """
 
-    rcan: bytes                 # opaque — rcan grant bytes
+    rcan: bytes                 # opaque -- rcan grant bytes
 
 
 @dataclass
@@ -77,7 +77,7 @@ class ContractPublishedPayload:
 
     service_name: str
     version: int
-    contract_collection_hash: str   # hex — HashSeq root of the published bundle
+    contract_collection_hash: str   # hex -- HashSeq root of the published bundle
 
 
 @dataclass
@@ -191,4 +191,4 @@ class AdmissionResponse:
     accepted: bool
     salt: bytes = b""
     accepted_producers: list[str] = field(default_factory=list)
-    reason: str = ""    # logging only — not exposed to peer in production
+    reason: str = ""    # logging only -- not exposed to peer in production

@@ -1,5 +1,5 @@
 """
-aster.registry.models — Data classes for the Aster service registry.
+aster.registry.models -- Data classes for the Aster service registry.
 
 Spec references:
 - ArtifactRef:    Aster-SPEC.md §11.2.1
@@ -93,8 +93,8 @@ class ArtifactRef:
     Old records without this field default to ``"raw"`` on deserialization.
     """
 
-    contract_id: str                    # hex — BLAKE3 of ServiceContract
-    collection_hash: str                # hex — Iroh blob hash of collection root
+    contract_id: str                    # hex -- BLAKE3 of ServiceContract
+    collection_hash: str                # hex -- Iroh blob hash of collection root
     provider_endpoint_id: str | None = None   # NodeId serving blobs ALPN
     relay_url: str | None = None
     ticket: str | None = None           # Optional bearer BlobTicket
@@ -131,7 +131,7 @@ class EndpointLease:
     feature_flags: list[str]
     relay_url: str | None
     direct_addrs: list[str]             # "ip:port" strings
-    load: float | None                  # 0.0–1.0
+    load: float | None                  # 0.0--1.0
     language_runtime: str | None        # "python/3.13", "rust/1.80", etc.
     aster_version: str                  # e.g. "0.8.0"
     policy_realm: str | None

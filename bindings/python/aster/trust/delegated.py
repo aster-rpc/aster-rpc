@@ -1,5 +1,5 @@
 """
-aster.trust.delegated — Delegated admission via @aster-issued enrollment tokens.
+aster.trust.delegated -- Delegated admission via @aster-issued enrollment tokens.
 
 Implements the ``aster.admission`` ALPN handler (Aster-trust-spec §3a).
 
@@ -11,7 +11,7 @@ Protocol:
   5. Service verifies: proof of possession
   6. Service admits with: {handle, roles}
 
-All crypto is ed25519. No network calls — verification uses cached
+All crypto is ed25519. No network calls -- verification uses cached
 attestations and the @aster root pubkey received at publish time.
 """
 
@@ -68,7 +68,7 @@ class DelegatedAdmissionPolicy:
     target_handle: str
     target_service: str
     target_contract_id: str
-    aster_root_pubkey: str  # hex — the trust anchor
+    aster_root_pubkey: str  # hex -- the trust anchor
 
 
 @dataclass
@@ -189,7 +189,7 @@ def verify_token(
             "enrollment token has expired",
         )
 
-    # Service binding — all three must match
+    # Service binding -- all three must match
     if token.target_handle != policy.target_handle:
         raise RpcError(StatusCode.PERMISSION_DENIED, "token targets a different handle")
     if token.target_service != policy.target_service:

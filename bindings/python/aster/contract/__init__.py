@@ -1,5 +1,5 @@
 """
-aster.contract — Contract identity and publication for Aster RPC.
+aster.contract -- Contract identity and publication for Aster RPC.
 
 Spec reference: Aster-ContractIdentity.md §11
 

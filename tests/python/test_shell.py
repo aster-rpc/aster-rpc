@@ -63,9 +63,11 @@ def ctx(root, demo_conn):
 
 @pytest.fixture
 def populated_ctx(root, demo_conn):
-    svc_count, blob_count = asyncio.get_event_loop().run_until_complete(
+    loop = asyncio.new_event_loop()
+    svc_count, blob_count = loop.run_until_complete(
         _populate_from_connection(root, demo_conn)
     )
+    loop.close()
     console = Console(file=open("/dev/null", "w"))
     display = Display(console=console)
     return CommandContext(
