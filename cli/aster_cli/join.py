@@ -27,6 +27,7 @@ from aster_cli.profile import (
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _DEMO_VERIFICATION_CODE = "123456"
+STATUS_REMOTE_TIMEOUT_SECONDS = 1.5
 
 
 def now_iso() -> str:
@@ -86,6 +87,65 @@ def _prompt(prompt: str, default: str | None = None) -> str:
     return value or (default or "")
 
 
+def apply_remote_identity_state(state: dict[str, Any], remote: dict[str, Any]) -> dict[str, Any]:
+    """Merge a real handle_status response into local state and config."""
+    state["remote"] = remote
+    state["handle"] = remote.get("handle", state["handle"])
+    state["handle_status"] = remote.get("status", state["handle_status"])
+    state["display_handle"] = f"@{state['handle']}" if state["handle"] else state["display_handle"]
+    profile_updates = {
+        "handle": state["handle"],
+        "handle_status": state["handle_status"],
+        "handle_claimed_at": remote.get("registered_at", state["profile"].get("handle_claimed_at", "")),
+    }
+    if remote.get("display_name") is not None:
+        profile_updates["display_name"] = remote.get("display_name")
+    if remote.get("bio") is not None:
+        profile_updates["bio"] = remote.get("bio")
+    if remote.get("url") is not None:
+        profile_updates["url"] = remote.get("url")
+    update_active_profile(**profile_updates)
+    return state
+
+
+def build_status_lines(state: dict[str, Any], remote_error: str | None = None) -> list[str]:
+    """Render human-readable status output lines."""
+    lines = [
+        f"Profile: {state['profile_name']}",
+        f"Identity: {state['display_handle']}",
+        f"Handle status: {state['handle_status']}",
+        f"Root pubkey: {state['root_pubkey'] or '<not configured>'}",
+    ]
+    if state["handle"]:
+        lines.append(f"Handle: @{state['handle']}")
+    if state["email"]:
+        lines.append(f"Email: {state['email']}")
+    lines.append(f"@aster service: {'disabled (air-gapped)' if state['air_gapped'] else 'enabled'}")
+    claimed_at = state["profile"].get("handle_claimed_at", "")
+    if claimed_at:
+        lines.append(f"Claimed at: {claimed_at}")
+
+    remote = state.get("remote")
+    if remote:
+        lines.append("Remote: reachable")
+        email_masked = remote.get("email_masked", "")
+        if email_masked:
+            lines.append(f"Remote email: {email_masked}")
+        display_name = remote.get("display_name")
+        if display_name:
+            lines.append(f"Display name: {display_name}")
+        services_published = remote.get("services_published")
+        if services_published is not None:
+            lines.append(f"Published services: {services_published}")
+        recovery_codes_remaining = remote.get("recovery_codes_remaining")
+        if recovery_codes_remaining is not None:
+            lines.append(f"Recovery codes remaining: {recovery_codes_remaining}")
+    elif remote_error:
+        lines.append(f"Remote: unavailable ({remote_error})")
+
+    return lines
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     state = get_local_identity_state()
     remote_error = None
@@ -95,27 +155,17 @@ def cmd_status(args: argparse.Namespace) -> int:
         and not state["air_gapped"]
     ):
         try:
-            remote = asyncio.run(_fetch_remote_status(args))
+            remote = asyncio.run(
+                asyncio.wait_for(
+                    _fetch_remote_status(args),
+                    timeout=STATUS_REMOTE_TIMEOUT_SECONDS,
+                )
+            )
         except Exception as exc:
             remote = None
             remote_error = str(exc)
         if remote is not None:
-            state["remote"] = remote
-            state["handle"] = remote.get("handle", state["handle"])
-            state["handle_status"] = remote.get("status", state["handle_status"])
-            state["display_handle"] = f"@{state['handle']}" if state["handle"] else state["display_handle"]
-            profile_updates = {
-                "handle": state["handle"],
-                "handle_status": state["handle_status"],
-                "handle_claimed_at": remote.get("registered_at", state["profile"].get("handle_claimed_at", "")),
-            }
-            if remote.get("display_name") is not None:
-                profile_updates["display_name"] = remote.get("display_name")
-            if remote.get("bio") is not None:
-                profile_updates["bio"] = remote.get("bio")
-            if remote.get("url") is not None:
-                profile_updates["url"] = remote.get("url")
-            update_active_profile(**profile_updates)
+            apply_remote_identity_state(state, remote)
 
     if getattr(args, "raw_json", False):
         payload = {
@@ -134,22 +184,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
         return 0
 
-    print(f"Profile: {state['profile_name']}")
-    print(f"Identity: {state['display_handle']}")
-    print(f"Handle status: {state['handle_status']}")
-    print(f"Root pubkey: {state['root_pubkey'] or '<not configured>'}")
-    if state["handle"]:
-        print(f"Handle: @{state['handle']}")
-    if state["email"]:
-        print(f"Email: {state['email']}")
-    print(f"@aster service: {'disabled (air-gapped)' if state['air_gapped'] else 'enabled'}")
-    claimed_at = state["profile"].get("handle_claimed_at", "")
-    if claimed_at:
-        print(f"Claimed at: {claimed_at}")
-    if "remote" in state:
-        print("Remote: reachable")
-    elif remote_error:
-        print(f"Remote: unavailable ({remote_error})")
+    for line in build_status_lines(state, remote_error):
+        print(line)
     return 0
 
 

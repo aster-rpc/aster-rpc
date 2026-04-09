@@ -21,11 +21,61 @@ from aster_cli.aster_service import (
     open_aster_service,
     parse_duration_seconds,
 )
+from aster_cli.identity import load_identity, save_identity
 from aster_cli.profile import get_active_profile, get_published_services, set_published_services
 
 
 def _manifest_path(path: str | None = None) -> Path:
     return Path(path or ".aster/manifest.json")
+
+
+def _identity_path(path: str | None = None) -> Path:
+    return Path(path or ".aster-identity")
+
+
+def store_producer_token(
+    service_name: str,
+    token: str,
+    *,
+    contract_id: str,
+    identity_file: str | None = None,
+) -> Path:
+    path = _identity_path(identity_file)
+    if path.exists():
+        data = load_identity(path)
+    else:
+        data = {"node": {}, "peers": []}
+    published = data.setdefault("published_services", {})
+    published[service_name] = {
+        "producer_token": token.strip(),
+        "contract_id": contract_id,
+        "service_name": service_name,
+    }
+    save_identity(path, data)
+    return path
+
+
+def load_producer_token(service_name: str, *, identity_file: str | None = None) -> str | None:
+    path = _identity_path(identity_file)
+    if not path.exists():
+        return None
+    data = load_identity(path)
+    entry = data.get("published_services", {}).get(service_name, {})
+    token = str(entry.get("producer_token", "")).strip()
+    return token or None
+
+
+def remove_producer_token(service_name: str, *, identity_file: str | None = None) -> bool:
+    path = _identity_path(identity_file)
+    if not path.exists():
+        return False
+    data = load_identity(path)
+    published = data.get("published_services", {})
+    if service_name not in published:
+        return False
+    del published[service_name]
+    save_identity(path, data)
+    return True
 
 
 def _load_manifest_file(path: Path) -> list[dict[str, Any]]:
@@ -235,12 +285,24 @@ async def _publish_remote(
     finally:
         await runtime.close()
 
+    producer_token = str(getattr(result, "producer_token", "") or "").strip()
+    if not producer_token:
+        raise RuntimeError("publish succeeded but @aster did not return a producer token")
+
+    token_path = store_producer_token(
+        service_name,
+        producer_token,
+        contract_id=str(getattr(result, "contract_id", "") or payload["contract_id"]),
+        identity_file=getattr(args, "identity_file", None),
+    )
+
     _profile_name, profile, _config = get_active_profile()
     published = get_published_services(profile)
     if service_name not in published:
         published.append(service_name)
         set_published_services(published)
     print(f"Published @{handle}/{service_name}.")
+    print(f"Stored producer token in {token_path}.")
     if result is not None and getattr(result, "first_publish", False):
         recovery_codes = getattr(result, "recovery_codes", None) or []
         if recovery_codes:
@@ -266,6 +328,7 @@ def cmd_unpublish(args: argparse.Namespace) -> int:
             return 1
         published.remove(args.service)
         set_published_services(published)
+        remove_producer_token(args.service, identity_file=getattr(args, "identity_file", None))
         print(f"Removed local published marker for {args.service}.")
         return 0
 
@@ -300,7 +363,10 @@ async def _unpublish_remote(args: argparse.Namespace, *, handle: str) -> int:
     if args.service in published:
         published.remove(args.service)
         set_published_services(published)
+    removed_token = remove_producer_token(args.service, identity_file=getattr(args, "identity_file", None))
     print(f"Unpublished @{handle}/{args.service}.")
+    if removed_token:
+        print("Removed stored producer token.")
     return 0
 
 
@@ -488,6 +554,7 @@ def register_publish_subparser(subparsers: argparse._SubParsersAction) -> None:
     unpublish_parser.add_argument("service", help="Service name")
     unpublish_parser.add_argument("--aster", default=None, help="Override @aster service address")
     unpublish_parser.add_argument("--root-key", default=None, help="Path to root key JSON backup")
+    unpublish_parser.add_argument("--identity-file", default=None, help="Path to .aster-identity")
     unpublish_parser.add_argument("--demo", action="store_true", help="Run the local preview flow only")
 
     visibility_parser = subparsers.add_parser("visibility", help="Change service visibility on @aster")

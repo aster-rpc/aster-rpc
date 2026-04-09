@@ -28,6 +28,7 @@ from aster_cli.shell.plugin import (
 from aster_cli.shell.vfs import (
     NodeKind,
     VfsNode,
+    ensure_directory_handle,
     ensure_loaded,
     resolve_path,
 )
@@ -45,6 +46,9 @@ class CdCommand(ShellCommand):
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
         target = args[0] if args else "/"
         node, path = resolve_path(ctx.vfs_root, ctx.vfs_cwd, target)
+
+        if node is None and path.startswith("/aster/@"):
+            node = await ensure_directory_handle(ctx.vfs_root, path.split("/")[-1], ctx.connection)
 
         if node is None:
             ctx.display.error(f"no such path: {path}")
@@ -238,7 +242,10 @@ class DescribeCommand(ShellCommand):
 
         # Fetch contract details
         try:
-            contract = await ctx.connection.get_contract(service_name)
+            if node and node.kind == NodeKind.SERVICE and node.metadata.get("contract"):
+                contract = node.metadata.get("contract")
+            else:
+                contract = await ctx.connection.get_contract(service_name)
             if contract is None:
                 ctx.display.error(f"no contract found for {service_name}")
                 return

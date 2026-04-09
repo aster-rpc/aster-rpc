@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from argparse import Namespace
 
 import pytest
 
 from aster.trust.signing import generate_root_keypair
-from aster_cli import access, aster_service, join, profile, publish
+from aster_cli import access, aster_service, contract, identity, join, profile, publish
 
 
 @pytest.fixture
@@ -268,6 +269,60 @@ def test_cmd_publish_requires_description(monkeypatch, isolated_profile, tmp_pat
     assert rc == 1
 
 
+def test_fetch_manifests_from_directory_ref(monkeypatch):
+    captured = {}
+
+    class FakePublicationClient:
+        __module__ = "fakepkg.services.publication_service_v1"
+
+        async def get_manifest(self, request):
+            captured["request"] = request
+            return type(
+                "Result",
+                (),
+                {
+                    "manifest_json": json.dumps(
+                        {
+                            "service": "ShellTestService",
+                            "version": 1,
+                            "contract_id": "abc123",
+                            "methods": [],
+                        }
+                    )
+                },
+            )()
+
+    class FakeRuntime:
+        async def publication_client(self):
+            return FakePublicationClient()
+
+        async def close(self):
+            captured["closed"] = True
+
+    class FakeTypesModule:
+        class GetManifestRequest:
+            def __init__(self, *, handle, service_name):
+                self.handle = handle
+                self.service_name = service_name
+
+    async def fake_open_aster_service(addr):
+        captured["addr"] = addr
+        return FakeRuntime()
+
+    monkeypatch.setattr(contract.importlib, "import_module", lambda name: FakeTypesModule)
+    monkeypatch.setattr("aster_cli.aster_service.open_aster_service", fake_open_aster_service)
+
+    manifests = asyncio.run(
+        contract._fetch_manifests_from_directory_ref("@alice/ShellTestService", "aster1test")
+    )
+
+    assert manifests["ShellTestService"]["contract_id"] == "abc123"
+    assert captured["addr"] == "aster1test"
+    assert captured["request"].handle == "alice"
+    assert captured["request"].service_name == "ShellTestService"
+    assert captured["closed"] is True
+
+
 def test_cmd_discover_dispatch(monkeypatch):
     captured = {}
 
@@ -526,3 +581,212 @@ def test_cmd_status_remote_sync(monkeypatch, isolated_profile, capsys):
     _name, prof, _config = profile.get_active_profile()
     assert prof["handle"] == "alice-test"
     assert prof["handle_status"] == "verified"
+
+
+def test_build_status_lines_include_remote_details(isolated_profile):
+    _write_profile(root_pubkey="ab" * 32, handle="alice-test", handle_status="verified", email="alice@example.com")
+    state = join.get_local_identity_state()
+    state["remote"] = {
+        "email_masked": "a***@example.com",
+        "display_name": "Alice",
+        "services_published": 2,
+        "recovery_codes_remaining": 5,
+    }
+
+    lines = join.build_status_lines(state)
+
+    assert "Remote: reachable" in lines
+    assert "Remote email: a***@example.com" in lines
+    assert "Display name: Alice" in lines
+    assert "Published services: 2" in lines
+    assert "Recovery codes remaining: 5" in lines
+
+
+def test_producer_token_store_round_trip(isolated_profile):
+    identity_path = isolated_profile[0] / "node.identity"
+    identity.save_identity(identity_path, {"node": {"endpoint_id": "node123"}, "peers": []})
+
+    token_path = publish.store_producer_token(
+        "TaskManager",
+        "tok_123",
+        contract_id="abc123",
+        identity_file=str(identity_path),
+    )
+
+    assert token_path.exists()
+    loaded = identity.load_identity(identity_path)
+    assert loaded["published_services"]["TaskManager"]["producer_token"] == "tok_123"
+    assert publish.load_producer_token("TaskManager", identity_file=str(identity_path)) == "tok_123"
+    assert publish.remove_producer_token("TaskManager", identity_file=str(identity_path)) is True
+    assert publish.load_producer_token("TaskManager", identity_file=str(identity_path)) is None
+    assert identity.load_identity(identity_path)["peers"] == []
+
+
+def test_publish_remote_stores_producer_token(monkeypatch, isolated_profile, capsys):
+    _write_profile(root_pubkey="ab" * 32, handle="alice-test", handle_status="verified")
+    identity_path = isolated_profile[0] / "node.identity"
+    identity.save_identity(identity_path, {"node": {"endpoint_id": "node123"}, "peers": [{"name": "dev"}]})
+
+    captured = {"visibility_calls": 0}
+
+    class FakePublicationClient:
+        async def publish(self, request):
+            captured["publish_request"] = request
+            return type(
+                "Result",
+                (),
+                {
+                    "producer_token": "prod-token-xyz",
+                    "first_publish": False,
+                },
+            )()
+
+        async def set_visibility(self, request):
+            captured["visibility_calls"] += 1
+
+    class FakeRuntime:
+        async def publication_client(self):
+            return FakePublicationClient()
+
+        def signed_request(self, envelope):
+            return envelope
+
+        async def close(self):
+            captured["closed"] = True
+
+    async def fake_open_aster_service(addr):
+        captured["addr"] = addr
+        return FakeRuntime()
+
+    monkeypatch.setattr(publish, "open_aster_service", fake_open_aster_service)
+    monkeypatch.setattr(
+        publish,
+        "build_signed_envelope",
+        lambda payload, root_key_file=None: type("Envelope", (), {"payload": payload})(),
+    )
+
+    rc = asyncio.run(
+        publish._publish_remote(
+            Namespace(
+                aster="aster1example",
+                root_key=None,
+                identity_file=str(identity_path),
+                private=False,
+                public=False,
+                endpoint_ttl="5m",
+                token_ttl="5m",
+                closed=False,
+                description="Task queue",
+                status="experimental",
+                relay="",
+                rate_limit=None,
+                role=[],
+            ),
+            handle="alice-test",
+            service_name="TaskManager",
+            manifest_dict={
+                "service": "TaskManager",
+                "version": 1,
+                "contract_id": "c" * 64,
+                "canonical_encoding": "fory-xlang/0.15",
+                "type_count": 0,
+                "type_hashes": [],
+                "method_count": 0,
+                "methods": [],
+                "serialization_modes": [],
+                "scoped": "shared",
+                "deprecated": False,
+                "semver": None,
+                "vcs_revision": None,
+                "vcs_tag": None,
+                "vcs_url": None,
+                "changelog": None,
+                "published_by": "",
+                "published_at_epoch_ms": 0,
+            },
+            endpoint_id="node123",
+        )
+        )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Stored producer token" in out
+    stored = identity.load_identity(identity_path)
+    assert stored["published_services"]["TaskManager"]["producer_token"] == "prod-token-xyz"
+    assert stored["peers"][0]["published_services"]["TaskManager"]["contract_id"] == captured["publish_request"].payload["contract_id"]
+
+
+def test_unpublish_remote_removes_producer_token(monkeypatch, isolated_profile, capsys):
+    _write_profile(root_pubkey="ab" * 32, handle="alice-test", handle_status="verified", published_services="TaskManager")
+    identity_path = isolated_profile[0] / "node.identity"
+    identity.save_identity(identity_path, {"node": {"endpoint_id": "node123"}, "peers": [{"name": "dev"}]})
+    publish.store_producer_token(
+        "TaskManager",
+        "prod-token-xyz",
+        contract_id="c" * 64,
+        identity_file=str(identity_path),
+    )
+
+    class FakePublicationClient:
+        async def unpublish(self, request):
+            return None
+
+    class FakeRuntime:
+        async def publication_client(self):
+            return FakePublicationClient()
+
+        def signed_request(self, envelope):
+            return envelope
+
+        async def close(self):
+            return None
+
+    async def fake_open_aster_service(addr):
+        return FakeRuntime()
+
+    monkeypatch.setattr(publish, "open_aster_service", fake_open_aster_service)
+    monkeypatch.setattr(
+        publish,
+        "build_signed_envelope",
+        lambda payload, root_key_file=None: type("Envelope", (), {"payload": payload})(),
+    )
+
+    rc = asyncio.run(
+        publish._unpublish_remote(
+            Namespace(
+                aster="aster1example",
+                root_key=None,
+                identity_file=str(identity_path),
+                service="TaskManager",
+            ),
+            handle="alice-test",
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Removed stored producer token." in out
+    assert publish.load_producer_token("TaskManager", identity_file=str(identity_path)) is None
+
+
+def test_identity_load_exposes_published_services_on_peers(tmp_path):
+    identity_path = tmp_path / ".aster-identity"
+    identity.save_identity(
+        identity_path,
+        {
+            "node": {"endpoint_id": "node123"},
+            "peers": [{"name": "dev"}],
+            "published_services": {
+                "TaskManager": {
+                    "producer_token": "tok_123",
+                    "contract_id": "abc123",
+                    "service_name": "TaskManager",
+                }
+            },
+        },
+    )
+
+    loaded = identity.load_identity(identity_path)
+
+    assert loaded["published_services"]["TaskManager"]["producer_token"] == "tok_123"
+    assert loaded["peers"][0]["published_services"]["TaskManager"]["contract_id"] == "abc123"

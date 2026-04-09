@@ -91,6 +91,7 @@ def build_call_context(
     idempotent: bool = False,
     call_id: str | None = None,
     session_id: str | None = None,
+    attributes: dict[str, str] | None = None,
 ) -> CallContext:
     return CallContext(
         service=service,
@@ -99,6 +100,7 @@ def build_call_context(
         session_id=session_id,
         peer=peer,
         metadata=dict(metadata or {}),
+        attributes=dict(attributes or {}),
         deadline=deadline_from_epoch_ms(deadline_epoch_ms),
         is_streaming=is_streaming,
         pattern=pattern,

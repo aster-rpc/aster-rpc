@@ -347,9 +347,10 @@ class Display:
             name = svc.get("display_name", svc.get("name", "?"))
             published = svc.get("published", True)
             style = "" if published else "dim"
+            marker = "●" if published else "⬡"
 
             table.add_row(
-                Text(name, style=f"cyan bold {style}".strip()),
+                Text(f"{marker} {name}", style=f"cyan bold {style}".strip()),
                 str(svc.get("method_count", "?")),
                 f"v{svc.get('version', '?')}",
                 str(svc.get("endpoints", 0)) if published else "-",

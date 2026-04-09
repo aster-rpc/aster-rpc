@@ -494,13 +494,18 @@ def _gen_client_command(args: argparse.Namespace) -> int:
         # Source is a local .aster.json export file
         manifests = _load_manifests_for_codegen(source)
         namespace = args.package or Path(source).stem.replace(".aster", "").replace(".", "_") or "local"
+    elif source.startswith("@") and "/" in source:
+        manifests = asyncio.run(
+            _fetch_manifests_from_directory_ref(source, getattr(args, "aster", None))
+        )
+        namespace = args.package or _namespace_from_directory_ref(source)
     elif source.startswith("aster1"):
         # Source is a live node ticket — connect, fetch manifests, disconnect
         manifests = asyncio.run(_fetch_manifests_from_node(source))
         namespace = args.package or source[6:14]  # first 8 chars after "aster1"
     else:
         print(f"Error: unrecognised source '{source}'", file=sys.stderr)
-        print("  Use a .aster.json file path or an aster1... ticket", file=sys.stderr)
+        print("  Use a .aster.json file path, an aster1... ticket, or @handle/Service", file=sys.stderr)
         return 1
 
     if not manifests:
@@ -548,6 +553,12 @@ def _load_manifests_for_codegen(filepath: str) -> dict[str, dict]:
         manifests[svc_name] = manifest
 
     return manifests
+
+
+def _namespace_from_directory_ref(source: str) -> str:
+    """Derive a stable package namespace from ``@handle/Service``."""
+    handle, service = source.split("/", 1)
+    return f"{handle.lstrip('@')}_{service}"
 
 
 async def _fetch_manifests_from_node(ticket: str) -> dict[str, dict]:
@@ -603,6 +614,36 @@ async def _fetch_manifests_from_node(ticket: str) -> dict[str, dict]:
     return manifests
 
 
+async def _fetch_manifests_from_directory_ref(
+    source: str,
+    explicit_aster: str | None = None,
+) -> dict[str, dict]:
+    """Fetch a manifest from the live @aster directory by ``@handle/Service``."""
+    from aster_cli.aster_service import open_aster_service
+
+    if "/" not in source or not source.startswith("@"):
+        raise ValueError(f"invalid directory ref: {source!r}")
+
+    handle, service_name = source[1:].split("/", 1)
+    runtime = await open_aster_service(explicit_aster)
+    try:
+        publication_client = await runtime.publication_client()
+        types_mod = importlib.import_module(
+            publication_client.__module__.replace(".services.", ".types.")
+        )
+        result = await publication_client.get_manifest(
+            types_mod.GetManifestRequest(handle=handle, service_name=service_name)
+        )
+    finally:
+        await runtime.close()
+
+    manifest_json = getattr(result, "manifest_json", "") or ""
+    if not manifest_json:
+        return {}
+    manifest = _json.loads(manifest_json)
+    return {manifest.get("service", service_name): manifest}
+
+
 def main() -> None:
     """Entry point for the ``aster`` CLI."""
     parser = argparse.ArgumentParser(
@@ -652,7 +693,7 @@ def main() -> None:
         metavar="SOURCE",
         help=(
             "Manifest source: path to .aster.json file, "
-            "aster1... ticket to a live node, or @handle/Service (future)"
+            "aster1... ticket to a live node, or @handle/Service"
         ),
     )
     gen_client_parser.add_argument(
@@ -672,6 +713,12 @@ def main() -> None:
         default="python",
         metavar="LANG",
         help="Target language (default: python)",
+    )
+    gen_client_parser.add_argument(
+        "--aster",
+        default=None,
+        metavar="ADDR",
+        help="Override @aster service address for @handle/Service sources",
     )
 
     # ``aster contract export``

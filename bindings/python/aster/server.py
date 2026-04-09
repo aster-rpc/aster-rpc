@@ -36,6 +36,7 @@ from aster.service import ServiceRegistry, ServiceInfo, MethodInfo
 
 if TYPE_CHECKING:
     import aster
+    from aster.peer_store import PeerAttributeStore
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,7 @@ class Server:
         max_concurrent_streams: int | None = None,
         registry: ServiceRegistry | None = None,
         owns_endpoint: bool = True,
+        peer_store: "PeerAttributeStore | None" = None,
     ) -> None:
         """Initialize the server.
 
@@ -129,6 +131,7 @@ class Server:
         """
         self._endpoint = endpoint
         self._owns_endpoint = owns_endpoint
+        self._peer_store = peer_store
         self._interceptors = list(interceptors) if interceptors else []
         self._max_concurrent_streams = max_concurrent_streams
         self._service_instances: dict[tuple[str, int], Any] = {}
@@ -514,6 +517,12 @@ class Server:
             peer = ctx.connection.remote_id()
         except Exception:
             peer = None
+
+        # Look up admission attributes for this peer
+        attributes = {}
+        if self._peer_store is not None and peer:
+            attributes = self._peer_store.get_attributes(peer)
+
         return build_call_context(
             service=header.service,
             method=header.method,
@@ -524,6 +533,7 @@ class Server:
             pattern=method_info.pattern,
             idempotent=method_info.idempotent,
             call_id=header.call_id or None,
+            attributes=attributes,
         )
 
     async def _decode_request_frame(
