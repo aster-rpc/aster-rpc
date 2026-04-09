@@ -1,10 +1,10 @@
 """
-aster_cli.mcp.security — Tool visibility filtering and human-in-the-loop confirmation.
+aster_cli.mcp.security -- Tool visibility filtering and human-in-the-loop confirmation.
 
 Three layers of security for MCP tool exposure:
 
 1. Credential-based: methods the credential's role can't access don't appear.
-   (Handled upstream by the producer's CapabilityInterceptor — the MCP server
+   (Handled upstream by the producer's CapabilityInterceptor -- the MCP server
    only sees methods it's admitted for.)
 
 2. Allow/deny globs: local patterns that filter tools AFTER capability checks.

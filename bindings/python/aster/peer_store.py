@@ -1,5 +1,5 @@
 """
-aster.peer_store — Per-peer admission attribute store.
+aster.peer_store -- Per-peer admission attribute store.
 
 Bridges the gap between admission (where attributes are determined)
 and RPC dispatch (where attributes are needed for authorization).

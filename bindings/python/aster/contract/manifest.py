@@ -1,5 +1,5 @@
 """
-aster.contract.manifest — ContractManifest and verification.
+aster.contract.manifest -- ContractManifest and verification.
 
 Spec reference: Aster-ContractIdentity.md §11.4
 
@@ -208,7 +208,7 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
                 if f.default is not dataclasses.MISSING:
                     default_val = f.default
                 elif f.default_factory is not dataclasses.MISSING:
-                    # Don't call the factory — just note it has one
+                    # Don't call the factory -- just note it has one
                     default_val = None
 
                 field_info_req: dict[str, Any] = {

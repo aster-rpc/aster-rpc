@@ -1,5 +1,5 @@
 """
-aster_cli.shell.plugin — Plugin system for shell commands.
+aster_cli.shell.plugin -- Plugin system for shell commands.
 
 Every interactive shell command is a plugin that can also be invoked
 as a CLI subcommand (e.g., ``ls`` at /blobs ↔ ``aster blob ls``).
@@ -42,7 +42,7 @@ class ShellCommand(ABC):
     and optionally as a CLI subcommand.
     """
 
-    # Command metadata — set by subclasses
+    # Command metadata -- set by subclasses
     name: str = ""
     description: str = ""
     contexts: list[str] = []  # glob patterns for valid VFS paths

@@ -1,5 +1,5 @@
 """
-aster.interceptors.rate_limit — Token bucket rate limiter for RPC calls.
+aster.interceptors.rate_limit -- Token bucket rate limiter for RPC calls.
 
 Limits request rate per service, per method, or per peer. Rejects requests
 that exceed the limit with RESOURCE_EXHAUSTED status.

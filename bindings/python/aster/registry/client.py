@@ -1,5 +1,5 @@
 """
-aster.registry.client — RegistryClient for the Aster service registry.
+aster.registry.client -- RegistryClient for the Aster service registry.
 
 Spec references:
 - §11.8: Client resolution flow
@@ -17,9 +17,9 @@ Mandatory filters (§11.9, normative order):
   5. policy_realm compatible (if caller configures one)
 
 Ranking strategies (after filters):
-  round_robin  — stateful round-robin (default)
-  least_load   — lowest lease.load (fallback to round_robin if unavailable)
-  random       — uniform random selection
+  round_robin  -- stateful round-robin (default)
+  least_load   -- lowest lease.load (fallback to round_robin if unavailable)
+  random       -- uniform random selection
 
 READY preferred over DEGRADED within each strategy.
 """
@@ -327,8 +327,8 @@ class RegistryClient:
         Reads the ArtifactRef from the doc, then downloads the blob.  Handles
         both collection formats:
 
-        ``"raw"``   — reads the single blob by ``collection_hash`` directly.
-        ``"index"`` — reads the collection index blob, then fetches
+        ``"raw"``   -- reads the single blob by ``collection_hash`` directly.
+        ``"index"`` -- reads the collection index blob, then fetches
                       ``contract.bin`` from it, and verifies the BLAKE3 hash.
 
         Returns None if not found locally or if the blob store is not configured.

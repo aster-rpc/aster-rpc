@@ -1,12 +1,12 @@
 """
-aster.trust.drift — Clock drift detection for the producer mesh.
+aster.trust.drift -- Clock drift detection for the producer mesh.
 
 Spec reference: Aster-trust-spec.md §2.10.  Plan: ASTER_PLAN.md §14.7.
 
 Every ProducerMessage carries an ``epoch_ms`` field.  Receivers compute
 ``offset = now_ms - msg.epoch_ms`` for each peer and maintain a running
 mesh-median offset.  A peer whose offset deviates from the median by more than
-``drift_tolerance_ms`` is *isolated* — ContractPublished / LeaseUpdate messages
+``drift_tolerance_ms`` is *isolated* -- ContractPublished / LeaseUpdate messages
 from that peer are skipped until the peer recovers (i.e. sends a fresh message
 whose offset is within tolerance).
 
@@ -95,7 +95,7 @@ class ClockDriftDetector:
         ``drift_tolerance_ms``.
 
         Returns False if the median is unavailable (too few peers) or if the
-        grace period has not yet elapsed — in those cases, no isolation decision
+        grace period has not yet elapsed -- in those cases, no isolation decision
         is made.
         """
         if self._in_grace_period():

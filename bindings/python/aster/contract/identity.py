@@ -1,5 +1,5 @@
 """
-aster.contract.identity — Contract identity types, canonical serialization, and hashing.
+aster.contract.identity -- Contract identity types, canonical serialization, and hashing.
 
 Spec reference: Aster-ContractIdentity.md §11.3
 
@@ -952,10 +952,10 @@ def resolve_with_cycles(types: dict[str, type]) -> dict[str, TypeDef]:
         if fqn not in graph:
             graph[fqn] = set()
 
-    # Find SCCs (returned in reverse topological order — leaves first)
+    # Find SCCs (returned in reverse topological order -- leaves first)
     sccs = _tarjan_scc(graph)
 
-    # Process SCCs in order (leaves first — correct for bottom-up hashing)
+    # Process SCCs in order (leaves first -- correct for bottom-up hashing)
     type_hashes: dict[str, bytes] = {}
     type_defs: dict[str, TypeDef] = {}
 

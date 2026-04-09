@@ -1,5 +1,5 @@
 """
-aster.transport.local — In-process transport using asyncio.Queue.
+aster.transport.local -- In-process transport using asyncio.Queue.
 
 Spec reference: §8.3.2 (LocalTransport interceptors), §8.3.3 (wire-compatible mode)
 
@@ -510,7 +510,7 @@ class LocalTransport(Transport):
             if asyncio.iscoroutine(response_iter):
                 response_iter = await self._await_with_deadline(ctx, response_iter)
             
-            # Message loop — asyncio.Queue is NOT an async iterator,
+            # Message loop -- asyncio.Queue is NOT an async iterator,
             # so we use get() in a loop instead.
             while True:
                 try:

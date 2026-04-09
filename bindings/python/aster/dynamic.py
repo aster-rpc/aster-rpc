@@ -1,5 +1,5 @@
 """
-aster.dynamic — Dynamic type synthesis from contract manifests.
+aster.dynamic -- Dynamic type synthesis from contract manifests.
 
 Enables invocation of Aster services without needing local Python type
 definitions. Reads method schemas from manifests and synthesizes
@@ -92,7 +92,7 @@ class DynamicTypeFactory:
 
     Synthesized types have the same ``@wire_type`` tag, field names, and
     field types as the original producer-side types. Fory XLANG serializes
-    them identically — the server sees a valid request.
+    them identically -- the server sees a valid request.
     """
 
     def __init__(self) -> None:

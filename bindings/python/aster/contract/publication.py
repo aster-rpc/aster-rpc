@@ -1,15 +1,15 @@
 """
-aster.contract.publication — Contract publication and fetch via Iroh blob store.
+aster.contract.publication -- Contract publication and fetch via Iroh blob store.
 
 Spec reference: Aster-ContractIdentity.md §11.5
 
 Two collection formats are supported:
 
-``"raw"``      — single-blob: the contract canonical bytes are stored as one blob;
+``"raw"``      -- single-blob: the contract canonical bytes are stored as one blob;
                  ``collection_hash == contract_id``. Used by RegistryPublisher when
                  no multi-file layout is needed.
 
-``"hashseq"``  — multi-file: all collection entries (contract.bin, manifest.json,
+``"hashseq"``  -- multi-file: all collection entries (contract.bin, manifest.json,
                  types/*.bin) are stored as individual blobs and wrapped in a native
                  iroh ``Collection`` (HashSeq format).  The HashSeq blob is
                  auto-tagged for GC protection.  ``collection_hash`` is the BLAKE3
@@ -51,7 +51,7 @@ def build_collection(
     - ``manifest.json``: JSON-serialized ContractManifest (includes method schemas)
     - For each TypeDef: ``types/<hex_hash>.bin``
 
-    This is pure Python — no Iroh dependencies.
+    This is pure Python -- no Iroh dependencies.
 
     Args:
         contract: The resolved ServiceContract.
@@ -133,7 +133,7 @@ async def upload_collection(
 
     Uses ``blobs.add_collection(entries)`` which stores each entry as a
     raw blob, builds a native iroh ``Collection`` (HashSeq), and sets a
-    persistent tag for GC protection — all in a single Rust call.
+    persistent tag for GC protection -- all in a single Rust call.
 
     The ``tag_prefix`` parameter is accepted for backwards compatibility
     but is ignored; GC protection is handled natively by HashSeq tagging.
@@ -141,10 +141,10 @@ async def upload_collection(
     Args:
         blobs:      A live ``BlobsClient``.
         entries:    ``[(name, bytes)]`` list from ``build_collection()``.
-        tag_prefix: Deprecated — ignored. HashSeq handles GC natively.
+        tag_prefix: Deprecated -- ignored. HashSeq handles GC natively.
 
     Returns:
-        ``collection_hash`` — hex hash of the HashSeq collection blob.
+        ``collection_hash`` -- hex hash of the HashSeq collection blob.
     """
     collection_hash = await blobs.add_collection(entries)
     logger.debug(
@@ -214,7 +214,7 @@ async def publish_contract(
         docs_client:  Unused; reserved for future docs integration.
 
     Returns:
-        ``(contract_id, collection_hash)`` — both are 64-char hex strings.
+        ``(contract_id, collection_hash)`` -- both are 64-char hex strings.
         In dry-run mode (``blobs_client is None``), ``collection_hash == contract_id``.
     """
     entries = build_collection(contract, type_defs)

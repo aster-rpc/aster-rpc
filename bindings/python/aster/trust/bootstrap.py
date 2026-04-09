@@ -1,12 +1,12 @@
 """
-aster.trust.bootstrap — Producer mesh bootstrap (founding node + join).
+aster.trust.bootstrap -- Producer mesh bootstrap (founding node + join).
 
 Spec reference: Aster-trust-spec.md §2.1, §2.5.  Plan: ASTER_PLAN.md §14.5.
 
 Provides helpers for:
 
 handle_admission_rpc()
-    Server-side handler for ``aster.producer_admission`` ALPN — verifies a
+    Server-side handler for ``aster.producer_admission`` ALPN -- verifies a
     joining producer's credential and updates the mesh state.
 
 serve_producer_admission()
@@ -182,7 +182,7 @@ async def handle_admission_rpc(
     # Run offline admission checks (signature, expiry, endpoint_id match).
     result = await check_offline(cred, cred.endpoint_id, InMemoryNonceStore())
     if not result.admitted:
-        logger.info("admission: rejected %s — %s", cred.endpoint_id, result.reason)
+        logger.info("admission: rejected %s -- %s", cred.endpoint_id, result.reason)
         return AdmissionResponse(accepted=False, reason=result.reason or "admission check failed")
 
     # Accept: add to mesh state and return salt + current accepted producers.
@@ -296,7 +296,7 @@ async def handle_producer_admission_connection(
             "accepted": response.accepted,
             "salt": response.salt.hex(),
             "accepted_producers": list(response.accepted_producers),
-            "reason": "",  # oracle protection — never leak on wire
+            "reason": "",  # oracle protection -- never leak on wire
         }
         await send.write_all(json.dumps(payload, separators=(",", ":")).encode())
         await send.finish()

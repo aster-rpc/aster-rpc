@@ -1,14 +1,14 @@
 """
-aster.trust.admission — Admission checks for enrollment credentials.
+aster.trust.admission -- Admission checks for enrollment credentials.
 
 Spec reference: Aster-trust-spec.md §2.4, §3.2.
 
 Two-phase admission:
-  1. check_offline  — signature, expiry, endpoint_id binding, nonce (no network)
-  2. check_runtime  — IID verification (one HTTP call to metadata endpoint)
+  1. check_offline  -- signature, expiry, endpoint_id binding, nonce (no network)
+  2. check_runtime  -- IID verification (one HTTP call to metadata endpoint)
 
 ``admit()`` orchestrates both phases. Refusal is logged with reason; the peer
-sees only a QUIC-level connection close — no diagnostic is leaked.
+sees only a QUIC-level connection close -- no diagnostic is leaked.
 
 Structural validation (also enforced here):
   - OTT nonce must be exactly 32 bytes; malformed → rejected
@@ -39,7 +39,7 @@ async def check_offline(
     peer_endpoint_id: str,
     nonce_store: "NonceStoreProtocol | None" = None,
 ) -> AdmissionResult:
-    """Offline admission checks — no network calls.
+    """Offline admission checks -- no network calls.
 
     Checks (all required to pass):
       1. Structural validity (nonce length, policy-vs-OTT constraints)

@@ -1,5 +1,5 @@
 """
-aster.trust — Trust Foundations (Phases 11 & 12).
+aster.trust -- Trust Foundations (Phases 11 & 12).
 
 Provides offline root-key authorization, enrollment credentials, Gate 0
 connection-level admission filtering, producer mesh gossip, and clock drift
@@ -104,7 +104,7 @@ __all__ = [
     "ATTR_IID_ACCOUNT",
     "ATTR_IID_REGION",
     "ATTR_IID_ROLE_ARN",
-    # Signing (canonical_json/canonical_signing_bytes removed — use Rust core)
+    # Signing (canonical_json/canonical_signing_bytes removed -- use Rust core)
     "generate_root_keypair",
     "load_private_key",
     "load_public_key",

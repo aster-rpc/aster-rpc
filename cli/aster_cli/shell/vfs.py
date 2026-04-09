@@ -1,5 +1,5 @@
 """
-aster_cli.shell.vfs — Virtual filesystem for navigating a peer.
+aster_cli.shell.vfs -- Virtual filesystem for navigating a peer.
 
 The VFS presents a peer's resources as a navigable tree::
 
@@ -34,8 +34,8 @@ class NodeKind(Enum):
     DOC = "doc"
     DOC_ENTRY = "doc_entry"
     # Directory hierarchy (aster.site)
-    ASTER = "aster"       # /aster — the directory root
-    HANDLE = "handle"     # /aster/<handle> — a user/org
+    ASTER = "aster"       # /aster -- the directory root
+    HANDLE = "handle"     # /aster/<handle> -- a user/org
     README = "readme"     # /aster/<handle>/README.md
 
 
@@ -156,7 +156,7 @@ async def populate_services(node: VfsNode, connection: Any) -> None:
             )
             node.add_child(svc_node)
     except Exception:
-        # Connection may not support list_services yet — use empty
+        # Connection may not support list_services yet -- use empty
         pass
 
     node.loaded = True
@@ -187,7 +187,7 @@ async def populate_service_methods(node: VfsNode, connection: Any) -> None:
                 )
                 node.add_child(method_node)
             node.loaded = True
-        # If methods is empty, don't mark as loaded — manifest may still be fetching
+        # If methods is empty, don't mark as loaded -- manifest may still be fetching
     except Exception:
         pass
 

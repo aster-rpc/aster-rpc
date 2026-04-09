@@ -1,5 +1,5 @@
 """
-aster.session — Session-scoped service support (Phase 8).
+aster.session -- Session-scoped service support (Phase 8).
 
 Spec reference: Aster-session-scoped-services.md
 
@@ -79,7 +79,7 @@ class _ByteQueue:
         while len(self._buf) < n:
             chunk = await self._queue.get()
             if chunk is None:
-                # EOF — return whatever we have (may be < n, caller detects short read)
+                # EOF -- return whatever we have (may be < n, caller detects short read)
                 return self._buf
             self._buf += chunk
         result = self._buf[:n]
@@ -766,7 +766,7 @@ class SessionStub:
                     break
                 payload, flags = frame
                 if flags & TRAILER:
-                    # Got the trailer — verify it's CANCELLED and stop draining
+                    # Got the trailer -- verify it's CANCELLED and stop draining
                     try:
                         status: RpcStatus = self._codec.decode(payload, RpcStatus)
                         if status.code != StatusCode.CANCELLED:
@@ -785,7 +785,7 @@ class SessionStub:
             await self._write_call_frame(method_info, metadata)
             # Write request payload
             await _write_response(self._send, self._codec, request)
-            # Read response — success is a plain payload frame (no trailer)
+            # Read response -- success is a plain payload frame (no trailer)
             frame = await read_frame(self._recv)
             if frame is None:
                 raise RpcError(StatusCode.UNAVAILABLE, "Session stream ended")

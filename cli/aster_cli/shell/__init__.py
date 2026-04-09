@@ -1,5 +1,5 @@
 """
-aster_cli.shell — Interactive shell for exploring Aster peers.
+aster_cli.shell -- Interactive shell for exploring Aster peers.
 
 Usage::
 

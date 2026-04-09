@@ -1,10 +1,10 @@
 """
-aster — Aster RPC framework + Iroh P2P networking bindings for Python.
+aster -- Aster RPC framework + Iroh P2P networking bindings for Python.
 
 This package provides:
 
   1. Low-level Iroh bindings: QUIC endpoints, content-addressed blobs,
-     CRDT docs, gossip — all exposed as async Python APIs.
+     CRDT docs, gossip -- all exposed as async Python APIs.
 
   2. The Aster RPC framework: contract-first RPC with Fory xlang
      serialization, consumer/producer admission, and a service registry.
@@ -142,6 +142,7 @@ from .client import (
     ClientTimeoutError,
 )
 from .high_level import AsterServer, AsterClient, RPC_ALPN
+from .capabilities import any_of, all_of
 from .health import HealthServer, check_health, check_ready, metrics_snapshot
 from .interceptors import (
     CallContext,

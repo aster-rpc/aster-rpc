@@ -1,5 +1,5 @@
 """
-aster.transport.iroh — Iroh-based remote transport.
+aster.transport.iroh -- Iroh-based remote transport.
 
 Spec reference: §8.3.1 (Transport protocol)
 

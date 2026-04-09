@@ -1,5 +1,5 @@
 """
-aster_cli.shell.guide — First-time guided tour system.
+aster_cli.shell.guide -- First-time guided tour system.
 
 Provides step-by-step hints for new users, triggered by their actions.
 The tour state is persisted in ~/.aster/config.toml under [shell] so
@@ -32,7 +32,7 @@ class TourStep:
 
 @dataclass
 class Tour:
-    """A guided tour — a sequence of steps shown to first-time users."""
+    """A guided tour -- a sequence of steps shown to first-time users."""
 
     name: str
     steps: list[TourStep] = field(default_factory=list)

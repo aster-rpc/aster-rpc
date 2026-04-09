@@ -1,5 +1,5 @@
 """
-aster.trust.iid — Instance Identity Document (IID) verification.
+aster.trust.iid -- Instance Identity Document (IID) verification.
 
 Spec reference: Aster-trust-spec.md §2.4 (runtime checks).
 
@@ -48,7 +48,7 @@ class IIDBackend(Protocol):
                 local metadata endpoint (for self-verification).
 
         Returns:
-            (ok, reason) — ``ok=True`` on success; ``reason`` is a logging
+            (ok, reason) -- ``ok=True`` on success; ``reason`` is a logging
             string on failure (not sent to peer).
         """
         ...
@@ -113,7 +113,7 @@ class AWSIIDBackend:
 
         iid_url = "http://169.254.169.254/latest/dynamic/instance-identity/document"
         sig_url = "http://169.254.169.254/latest/dynamic/instance-identity/signature"
-        _MAX_IID_RESPONSE = 64 * 1024  # 64 KB — IID documents are small
+        _MAX_IID_RESPONSE = 64 * 1024  # 64 KB -- IID documents are small
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
                 doc_resp = await client.get(iid_url)
@@ -131,7 +131,7 @@ class AWSIIDBackend:
         doc = _json.loads(doc_resp.text)
         # Signature is base64 of PKCS1v15(SHA256, document_bytes)
         # Full RSA verification against Amazon's cert deferred to production implementation
-        # — requires fetching Amazon's EC2 instance identity certificate.
+        # -- requires fetching Amazon's EC2 instance identity certificate.
 
         # Claim checks
         expected_account = attributes.get(ATTR_IID_ACCOUNT)
@@ -144,7 +144,7 @@ class AWSIIDBackend:
 
 
 class GCPIIDBackend:
-    """GCP Instance Identity Token verification (stub — deferred)."""
+    """GCP Instance Identity Token verification (stub -- deferred)."""
 
     async def verify(
         self,
@@ -155,7 +155,7 @@ class GCPIIDBackend:
 
 
 class AzureIIDBackend:
-    """Azure Attested Document verification (stub — deferred)."""
+    """Azure Attested Document verification (stub -- deferred)."""
 
     async def verify(
         self,
@@ -192,11 +192,11 @@ async def verify_iid(
     If no ``backend`` is supplied, the factory is called based on
     ``aster.iid_provider``.  Pass a ``MockIIDBackend`` in tests.
 
-    Returns (ok, reason) — reason is logged, never sent to peer.
+    Returns (ok, reason) -- reason is logged, never sent to peer.
     """
     provider = attributes.get(ATTR_IID_PROVIDER)
     if provider is None:
-        # No IID attribute — skip
+        # No IID attribute -- skip
         return True, None
     if backend is None:
         backend = get_iid_backend(provider)

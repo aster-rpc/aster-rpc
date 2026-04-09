@@ -1,5 +1,5 @@
 """
-aster_cli.enroll — ``aster enroll node`` command.
+aster_cli.enroll -- ``aster enroll node`` command.
 
 The main operator workflow: reads the root private key from keyring (or
 ``--root-key`` file), generates or reuses a node keypair, signs an
@@ -28,7 +28,7 @@ from pathlib import Path
 def _derive_endpoint_id(secret_key_bytes: bytes) -> str:
     """Derive the EndpointId (ed25519 public key hex) from a 32-byte secret key.
 
-    Pure cryptographic operation — no iroh runtime needed.
+    Pure cryptographic operation -- no iroh runtime needed.
     """
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -82,7 +82,7 @@ def _parse_attributes(attrs_str: str | None) -> dict[str, str]:
     return result
 
 
-    # _get_root_privkey and _get_root_pubkey removed — replaced by
+    # _get_root_privkey and _get_root_pubkey removed -- replaced by
     # the CredentialSigner protocol in signer.py.
 
 
@@ -96,7 +96,7 @@ def cmd_enroll_node(args) -> int:
     name = args.name
     identity_path = Path(args.identity or args.out or ".aster-identity")
 
-    # ── Resolve signer (pluggable — local keyring/file by default) ───────
+    # ── Resolve signer (pluggable -- local keyring/file by default) ───────
     signer = resolve_signer(
         profile_name,
         root_key_file=args.root_key,

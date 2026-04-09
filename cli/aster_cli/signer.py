@@ -1,17 +1,17 @@
 """
-aster_cli.signer — Pluggable credential signing protocol.
+aster_cli.signer -- Pluggable credential signing protocol.
 
 The ``CredentialSigner`` protocol defines the interface for signing
 enrollment credentials. The CLI resolves a signer based on the operator
 profile's ``signer`` field (default: ``"local"``).
 
 Built-in signers:
-  ``local``  — reads the root private key from OS keyring or fallback file.
+  ``local``  -- reads the root private key from OS keyring or fallback file.
 
 Future signers (enterprise):
-  ``kms``    — AWS KMS / Azure Key Vault / GCP Cloud KMS.
-  ``remote`` — HTTP call to a signing service.
-  ``offline``— two-step: export unsigned → import signed.
+  ``kms``    -- AWS KMS / Azure Key Vault / GCP Cloud KMS.
+  ``remote`` -- HTTP call to a signing service.
+  ``offline``-- two-step: export unsigned → import signed.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ class CredentialSigner(Protocol):
 
     Implementations receive the raw credential object and return the
     64-byte ed25519 signature. The signing key is an implementation
-    detail — it may come from keyring, a file, a KMS API, or an HSM.
+    detail -- it may come from keyring, a file, a KMS API, or an HSM.
     """
 
     def sign(self, credential: object, root_pubkey: bytes) -> bytes:

@@ -1,5 +1,5 @@
 """
-aster.registry.acl — ACL enforcement for the Aster service registry.
+aster.registry.acl -- ACL enforcement for the Aster service registry.
 
 Spec reference: Aster-SPEC.md §11.2.3.
 
@@ -76,7 +76,7 @@ class RegistryACL:
         """
         writers = await self._read_list("writers")
         if writers is None:
-            # No ACL configured — remain open
+            # No ACL configured -- remain open
             return
         readers = await self._read_list("readers") or []
         admins = await self._read_list("admins") or []

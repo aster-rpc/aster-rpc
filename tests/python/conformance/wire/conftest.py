@@ -42,7 +42,9 @@ def _generate_fixture(filename: str, payload: bytes, flags: int) -> None:
         await write_frame(send, payload, flags=flags)
         return send.getvalue()
 
-    raw = asyncio.get_event_loop().run_until_complete(_write())
+    loop = asyncio.new_event_loop()
+    raw = loop.run_until_complete(_write())
+    loop.close()
     path.write_bytes(raw)
 
 

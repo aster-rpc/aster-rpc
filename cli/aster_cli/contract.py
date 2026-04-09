@@ -1,5 +1,5 @@
 """
-aster_cli.contract — Offline ``aster contract`` command-line interface.
+aster_cli.contract -- Offline ``aster contract`` command-line interface.
 
 Subcommands::
 
@@ -195,7 +195,7 @@ def _gen_single_service(spec: str, args: argparse.Namespace) -> "ContractManifes
     type_graph = build_type_graph(root_types)
     type_defs = resolve_with_cycles(type_graph)
 
-    # Compute type hashes (already done in resolve_with_cycles — re-compute for manifest)
+    # Compute type hashes (already done in resolve_with_cycles -- re-compute for manifest)
     type_hashes: dict[str, bytes] = {}
     for fqn, td in type_defs.items():
         td_bytes = canonical_xlang_bytes(td)
@@ -262,7 +262,7 @@ def _gen_single_service(spec: str, args: argparse.Namespace) -> "ContractManifes
 _ASTER_CONTRACT_VERSION = "1"
 _CONTRACTS_DIR = Path(os.path.expanduser("~/.aster/contracts"))
 
-# Fixed key order for deterministic output — methods and types sorted
+# Fixed key order for deterministic output -- methods and types sorted
 # alphabetically, all dict keys in a stable order so `diff` is meaningful.
 _METHOD_KEY_ORDER = [
     "name", "pattern", "request_type", "response_type",
@@ -476,6 +476,47 @@ def _verify_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def _call_command(args: argparse.Namespace) -> int:
+    """Execute ``aster call <address> Service.Method '{json}'``."""
+    import asyncio
+
+    address = args.address
+    method_spec = args.method
+    payload_json = args.payload
+
+    # Parse Service.Method
+    if "." not in method_spec:
+        print(f"Error: method must be Service.Method (got '{method_spec}')", file=sys.stderr)
+        return 1
+    service_name, method_name = method_spec.rsplit(".", 1)
+
+    # Parse JSON payload
+    try:
+        payload = _json.loads(payload_json)
+    except _json.JSONDecodeError as e:
+        print(f"Error: invalid JSON payload: {e}", file=sys.stderr)
+        return 1
+
+    async def _run() -> int:
+        from aster.high_level import AsterClient
+
+        client = AsterClient(address=address)
+        try:
+            await client.connect()
+            proxy = client.proxy(service_name)
+            method = getattr(proxy, method_name)
+            result = await method(payload)
+            print(_json.dumps(result, indent=2, default=str))
+            return 0
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            await client.close()
+
+    return asyncio.run(_run())
+
+
 def _gen_client_command(args: argparse.Namespace) -> int:
     """Execute ``aster contract gen-client``."""
     import asyncio
@@ -500,7 +541,7 @@ def _gen_client_command(args: argparse.Namespace) -> int:
         )
         namespace = args.package or _namespace_from_directory_ref(source)
     elif source.startswith("aster1"):
-        # Source is a live node ticket — connect, fetch manifests, disconnect
+        # Source is a live node ticket -- connect, fetch manifests, disconnect
         manifests = asyncio.run(_fetch_manifests_from_node(source))
         namespace = args.package or source[6:14]  # first 8 chars after "aster1"
     else:
@@ -799,9 +840,36 @@ def main() -> None:
     from aster_cli.shell import register_shell_subparser
     register_shell_subparser(subparsers)
 
-    # ``aster blob``, ``aster service`` — CLI equivalents of shell commands
+    # ``aster blob``, ``aster service`` -- CLI equivalents of shell commands
     from aster_cli.shell.plugin import register_cli_subcommands
     register_cli_subcommands(subparsers)
+
+    # ``aster call`` -- one-shot RPC invocation
+    call_parser = subparsers.add_parser(
+        "call",
+        help="Invoke an RPC method on a remote service.",
+    )
+    call_parser.add_argument(
+        "address",
+        metavar="ADDRESS",
+        help="Server address (aster1... ticket)",
+    )
+    call_parser.add_argument(
+        "method",
+        metavar="SERVICE.METHOD",
+        help="Service and method (e.g., MissionControl.getStatus)",
+    )
+    call_parser.add_argument(
+        "payload",
+        nargs="?",
+        default="{}",
+        metavar="JSON",
+        help='JSON payload (default: {})',
+    )
+    call_parser.add_argument(
+        "--json", dest="json_output", action="store_true",
+        help="Output raw JSON (default)",
+    )
 
     # ``aster init`` subcommand
     from aster_cli.init import register_init_subparser
@@ -811,7 +879,7 @@ def main() -> None:
     from aster_cli.mcp.server import register_mcp_subparser
     register_mcp_subparser(subparsers)
 
-    # ``aster authorize`` — sign a producer enrollment credential (legacy)
+    # ``aster authorize`` -- sign a producer enrollment credential (legacy)
     auth_parser = subparsers.add_parser(
         "authorize",
         help="Sign a producer enrollment credential (offline)",
@@ -858,6 +926,8 @@ def main() -> None:
         else:
             contract_parser.print_help()
             sys.exit(1)
+    elif args.command == "call":
+        sys.exit(_call_command(args))
     elif args.command == "trust":
         sys.exit(run_trust_command(args))
     elif args.command == "keygen":

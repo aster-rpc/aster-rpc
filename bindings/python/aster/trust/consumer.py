@@ -1,17 +1,17 @@
 """
-aster.trust.consumer — Consumer admission handler and wire types.
+aster.trust.consumer -- Consumer admission handler and wire types.
 
 Spec reference: Aster-trust-spec.md §3.2, §3.2.2.
 
 Two actors:
 
   Server (producer node)
-    ``handle_consumer_admission_rpc`` — verifies credential, admits peer,
+    ``handle_consumer_admission_rpc`` -- verifies credential, admits peer,
     returns ``ConsumerAdmissionResponse`` with services + registry_namespace.
 
   Client (consumer node)
-    ``ConsumerAdmissionRequest`` — the wire message to send.
-    ``ConsumerAdmissionResponse.from_json`` — parse the server's reply.
+    ``ConsumerAdmissionRequest`` -- the wire message to send.
+    ``ConsumerAdmissionResponse.from_json`` -- parse the server's reply.
 
 Wire format: newline-delimited JSON over a QUIC bidi-stream on
 ``aster.consumer_admission`` ALPN.  The client sends one JSON line; the
@@ -81,7 +81,7 @@ class ConsumerAdmissionResponse:
     services: list["ServiceSummary"] = field(default_factory=list)
     registry_namespace: str = ""   # 64-char hex namespace_id
     root_pubkey: str = ""        # hex-encoded 32-byte ed25519 public key
-    gossip_topic: str = ""       # hex-encoded 32-byte topic — only for root node
+    gossip_topic: str = ""       # hex-encoded 32-byte topic -- only for root node
     reason: str = ""             # MUST be empty in wire response (§3.2.2)
 
     def to_json(self) -> str:
@@ -195,7 +195,7 @@ async def handle_consumer_admission_rpc(
         request_json:     JSON-serialised ``ConsumerAdmissionRequest``.
         root_pubkey:      The server's root public key (32 bytes) used to
                           verify the credential's signature.
-        hook:             ``MeshEndpointHook`` — ``add_peer`` is called on
+        hook:             ``MeshEndpointHook`` -- ``add_peer`` is called on
                           successful admission.
         peer_node_id:     QUIC peer identity from the connection handshake.
         nonce_store:      Required when accepting OTT credentials.
@@ -207,7 +207,7 @@ async def handle_consumer_admission_rpc(
                           credential (dev mode / ``allow_all_consumers=True``).
 
     Returns:
-        ``ConsumerAdmissionResponse`` — always returned, never raises.
+        ``ConsumerAdmissionResponse`` -- always returned, never raises.
         On failure ``admitted=False`` and ``reason=""`` (no oracle leak).
     """
     _denied = ConsumerAdmissionResponse(
@@ -230,7 +230,7 @@ async def handle_consumer_admission_rpc(
     _topic_for_peer = ""
     if gossip_topic_id and peer_node_id == root_pubkey.hex():
         _topic_for_peer = gossip_topic_id.hex()
-        logger.debug("consumer admission: root node detected — including gossip topic")
+        logger.debug("consumer admission: root node detected -- including gossip topic")
 
     # Dev mode / open gate: empty credential → auto-admit.
     if not req.credential_json and allow_unenrolled:
@@ -343,7 +343,7 @@ async def handle_consumer_admission_connection(
 
         await send.write_all(response.to_json().encode())
         await send.finish()
-        # Don't conn.close() — let QUIC drain the streams naturally.
+        # Don't conn.close() -- let QUIC drain the streams naturally.
         # Calling close() sends CONNECTION_CLOSE which kills in-flight
         # data before the consumer can read_to_end().
     except Exception as exc:  # noqa: BLE001

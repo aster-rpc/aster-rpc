@@ -1,5 +1,5 @@
 """
-aster_cli.mcp — MCP (Model Context Protocol) server for Aster services.
+aster_cli.mcp -- MCP (Model Context Protocol) server for Aster services.
 
 Exposes Aster RPC services as MCP tools, enabling AI agents to discover
 and call services dynamically with full type information and capability-based

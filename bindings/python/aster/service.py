@@ -1,7 +1,7 @@
 """
-aster.service — Service registry and metadata types.
+aster.service -- Service registry and metadata types.
 
-Spec reference: §7.1–7.4 (Python decorators)
+Spec reference: §7.1--7.4 (Python decorators)
 
 This module provides the service registry for looking up services and methods,
 and the metadata types (ServiceInfo, MethodInfo) that describe service interfaces.

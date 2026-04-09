@@ -1,7 +1,7 @@
 """
-aster.codec — Fory serialization codec.
+aster.codec -- Fory serialization codec.
 
-Spec reference: §5.1–5.6 (serialization protocols), §5.3 (XLANG tags), §5.5 (ROW mode)
+Spec reference: §5.1--5.6 (serialization protocols), §5.3 (XLANG tags), §5.5 (ROW mode)
 
 Wraps Apache Fory (pyfory) to provide three serialization modes:
 - XLANG: Cross-language, tag-based type registration
@@ -75,18 +75,51 @@ def wire_type(tag: str, *, metadata: dict | None = None):
     module + class name at decoration time.
 
     Args:
-        tag: Wire type tag (e.g., "billing/Invoice").
-        metadata: Optional dict mapping field names to Metadata objects
+        tag: Wire type tag (e.g., ``"billing/Invoice"``).
+        metadata: Optional dict mapping field names to ``Metadata`` objects
             for describing individual fields to AI agents.
 
     Example::
 
-        @wire_type("billing/Invoice", metadata={
-            "amount": Metadata(description="Total in cents (USD)"),
-        })
+        @wire_type("billing/Invoice")
         @dataclass
         class Invoice:
+            customer: str = ""
             amount: float = 0.0
+            paid: bool = False
+
+    Serialization rules:
+
+    - **Supported field types:** ``str``, ``int``, ``float``, ``bool``,
+      ``bytes``, ``list[T]``, ``dict[str, V]``, ``Optional[T]``,
+      and other ``@wire_type`` dataclasses.
+
+    - **Use ``Optional[T]`` for nullable fields, NOT ``T | None``.**
+      The Fory serializer does not support PEP 604 union syntax.
+      This will fail at runtime::
+
+          bio: str | None = None          # WRONG -- Fory can't serialize this
+
+      Use this instead::
+
+          bio: Optional[str] = None       # CORRECT
+
+    - **Every field must have a default value.** Fory XLANG needs defaults
+      for cross-language compatibility. Use ``""`` for strings, ``0`` for
+      ints, ``False`` for bools, and ``field(default_factory=list)`` for
+      collections.
+
+    - **``@rpc`` methods must return a ``@wire_type`` dataclass, not None.**
+      Even if your response has no fields, define an empty response type::
+
+          @wire_type("myapp/AckResult")
+          @dataclass
+          class AckResult:
+              ok: bool = True
+
+    - **Generic wrapper types** (e.g., ``SignedRequest[T]``) are supported.
+      The ``@wire_type`` tag is on the outer class; the type parameter is
+      resolved at manifest extraction time.
     """
 
     def decorator(cls):
@@ -156,7 +189,7 @@ def _walk_type_graph(root_types: list[type]) -> list[type]:
     order, leaves first).
 
     Primitives and generic containers (list, dict, set, etc.) are
-    skipped — only concrete dataclass and enum types are collected.
+    skipped -- only concrete dataclass and enum types are collected.
     """
     visited: set[type] = set()
     result: list[type] = []
@@ -178,7 +211,7 @@ def _walk_type_graph(root_types: list[type]) -> list[type]:
 
         visited.add(tp)
 
-        # Enum types are leaf nodes — collect and return
+        # Enum types are leaf nodes -- collect and return
         if _is_enum(tp):
             result.append(tp)
             return
@@ -248,7 +281,7 @@ def _validate_xlang_tags(types: list[type]) -> None:
     """Raise ``TypeError`` if any dataclass type lacks a ``@wire_type``.
 
     Only called for XLANG mode where tag-based registration is required.
-    Enum types are exempt — they are registered by module/qualname.
+    Enum types are exempt -- they are registered by module/qualname.
     """
     for tp in types:
         if _is_enum(tp):
@@ -266,7 +299,7 @@ def _validate_xlang_tags(types: list[type]) -> None:
 # ── Framework-internal types ─────────────────────────────────────────────────
 
 # These are registered automatically by ForyCodec.
-# Import here to avoid circular imports — the types themselves are defined
+# Import here to avoid circular imports -- the types themselves are defined
 # in protocol.py which uses the wire_type from this module (or its own copy).
 _INTERNAL_TYPES: list[type] | None = None
 

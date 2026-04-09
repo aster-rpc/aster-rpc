@@ -255,3 +255,4 @@ AGENTS.md
 /bindings/python/aster/lib_aster.dylib.dSYM/
 aster-docs/
 aster-website/
+scripts/check-ascii.py

@@ -1,5 +1,5 @@
 """
-aster_cli.shell.display — Rich terminal output for the shell.
+aster_cli.shell.display -- Rich terminal output for the shell.
 
 Handles all presentation: tables, JSON syntax highlighting, trees,
 progress bars, streaming output, and status messages.
@@ -288,7 +288,7 @@ class Display:
         self.console.print()
         self.console.print(
             Panel(
-                f"[bold]aster.site[/bold] [dim]— service directory[/dim]\n"
+                f"[bold]aster.site[/bold] [dim]-- service directory[/dim]\n"
                 f"[dim]Logged in as[/dim] [bold cyan]{escape(handle)}[/bold cyan]"
                 f" [dim]({handle_count} handles in directory)[/dim]",
                 border_style="#61D6C2",
@@ -320,7 +320,7 @@ class Display:
             if description:
                 detail_parts.append(description)
             if detail_parts:
-                line += f"    [dim]{escape(' — '.join(detail_parts))}[/dim]"
+                line += f"    [dim]{escape(' -- '.join(detail_parts))}[/dim]"
 
             self.console.print(f"  {line}")
 

@@ -1,11 +1,11 @@
 """
-aster.trust.hooks — Gate 0 connection-level access control.
+aster.trust.hooks -- Gate 0 connection-level access control.
 
 Spec reference: Aster-trust-spec.md §3.3.
 
 ``MeshEndpointHook`` maintains the admitted-peer allowlist and implements
 the connection-time access-control decision.  Admission ALPNs are always
-allowed — they carry credential presentation; after successful admission,
+allowed -- they carry credential presentation; after successful admission,
 the server calls ``add_peer(endpoint_id)``.
 
 The hook integrates with Iroh's HookManager (Phase 1b FFI) via a background
@@ -88,7 +88,7 @@ class MeshEndpointHook:
             remote_endpoint_id: NodeId of the connecting peer (from handshake).
             alpn:                ALPN negotiated for this connection.
         """
-        # Admission ALPNs are always open — credential presentation
+        # Admission ALPNs are always open -- credential presentation
         if alpn in _ADMISSION_ALPNS:
             return True
         # Admitted peers are always allowed

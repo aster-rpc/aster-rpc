@@ -1,5 +1,5 @@
 """
-aster.high_level — Declarative ``AsterServer`` / ``AsterClient`` wrappers.
+aster.high_level -- Declarative ``AsterServer`` / ``AsterClient`` wrappers.
 
 Thin composition over the existing low-level primitives
 (:class:`aster.Server`, :func:`aster.trust.consumer.handle_consumer_admission_rpc`,
@@ -86,7 +86,7 @@ class AsterServer:
 
     Builds a single :class:`IrohNode` that serves blobs + docs + gossip
     (iroh built-in protocols) alongside aster RPC (``aster/1``) and any
-    enabled admission ALPNs — all on **one endpoint, one node ID**.
+    enabled admission ALPNs -- all on **one endpoint, one node ID**.
 
     When any admission gate is active (``allow_all_consumers=False`` or
     ``allow_all_producers=False``), the node is built with
@@ -262,7 +262,7 @@ class AsterServer:
         )
 
         # Determine which aster ALPNs to register on the Router.
-        # Consumer admission is ALWAYS registered — even in open-gate mode
+        # Consumer admission is ALWAYS registered -- even in open-gate mode
         # the consumer uses it to discover services.
         aster_alpns: list[bytes] = [RPC_ALPN, ALPN_CONSUMER_ADMISSION]
         gate0_needed = False
@@ -341,7 +341,7 @@ class AsterServer:
                 key = (summary.name, summary.version)
                 manifest = manifest_by_key.get(key)
                 if manifest is None:
-                    continue  # Service not in manifest — skip
+                    continue  # Service not in manifest -- skip
                 if summary.contract_id != manifest.contract_id:
                     raise RuntimeError(
                         f"Contract identity mismatch for {summary.name!r} "
@@ -642,11 +642,11 @@ class AsterServer:
             await registry_doc.share_with_addr("read")
             self._registry_namespace = registry_doc.doc_id()
             logger.debug(
-                "Registry doc ready — namespace: %s", self._registry_namespace[:16]
+                "Registry doc ready -- namespace: %s", self._registry_namespace[:16]
             )
 
         except Exception as exc:
-            # Publication failure is non-fatal — the server still works,
+            # Publication failure is non-fatal -- the server still works,
             # consumers just won't get rich contract metadata
             logger.warning("Contract publication failed (non-fatal): %s", exc)
 
@@ -743,7 +743,7 @@ class AsterServer:
                         name="aster-rpc-conn",
                     )
                 elif alpn == ALPN_CONSUMER_ADMISSION:
-                    # Always handle consumer admission — even when
+                    # Always handle consumer admission -- even when
                     # allow_all_consumers=True the consumer needs the
                     # services list from the admission response.
                     asyncio.create_task(
@@ -813,7 +813,7 @@ class AsterServer:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # Close the node — this triggers router.shutdown() which closes all
+        # Close the node -- this triggers router.shutdown() which closes all
         # protocol handlers (including aster queue handlers) and the endpoint.
         if self._node is not None:
             try:
@@ -953,7 +953,7 @@ class AsterServer:
         # to discover @aster via DNS TXT record in production.
         aster_addr = self._resolve_aster_address()
         if not aster_addr:
-            logger.debug("No @aster address configured — skipping registration")
+            logger.debug("No @aster address configured -- skipping registration")
             return
 
         aster_client = AsterClient(address=aster_addr)
@@ -968,7 +968,7 @@ class AsterServer:
             # For each published service with a token, call register_endpoint
             for svc_name, token in self._producer_tokens.items():
                 try:
-                    # Use the dynamic invoke path — we don't have generated
+                    # Use the dynamic invoke path -- we don't have generated
                     # types for @aster's PublicationService
                     import json as _json
                     request = {
@@ -1017,7 +1017,7 @@ class AsterServer:
         if addr:
             return addr
 
-        # Identity file — the peer entry may have aster_service config
+        # Identity file -- the peer entry may have aster_service config
         _, peer_entry = self._config.load_identity(
             peer_name=self._peer_name, role="producer"
         )
@@ -1054,7 +1054,7 @@ class AsterServer:
             if shutdown_count > 1:
                 logger.warning("Forced exit (second signal)")
                 sys.exit(1)
-            logger.info("Received %s — draining...", signal.Signals(sig).name)
+            logger.info("Received %s -- draining...", signal.Signals(sig).name)
             loop.create_task(self._graceful_shutdown(grace_period))
 
         signal.signal(signal.SIGTERM, _handle_signal)
@@ -1116,7 +1116,7 @@ class AsterServer:
         """Alias for :attr:`address` (internal back-compat)."""
         return self.address
 
-    # Back-compat alias — used in tests
+    # Back-compat alias -- used in tests
     @property
     def endpoint_addr_b64(self) -> str:
         self._require_started()
@@ -1255,11 +1255,11 @@ class AsterClient:
 
         Example::
 
-            # Dev mode — open gate, no credentials
+            # Dev mode -- open gate, no credentials
             client = AsterClient(address="aster1...")
             await client.connect()
 
-            # Production — with credential
+            # Production -- with credential
             client = AsterClient(
                 address="aster1...",
                 root_pubkey=pub_key,
@@ -1298,7 +1298,7 @@ class AsterClient:
 
         # Enrollment credential: identity file peer > inline > config > None.
         if peer_entry and not enrollment_credential_file:
-            # The peer entry IS the credential — write it to a temp file
+            # The peer entry IS the credential -- write it to a temp file
             # that _load_enrollment_credential can read, or inline it.
             self._inline_credential = peer_entry
             self._enrollment_credential_file = None
@@ -1326,13 +1326,13 @@ class AsterClient:
     async def connect(self) -> None:
         """Create endpoint, run admission if credential present, store services.
 
-        Idempotent — second call is a no-op.
+        Idempotent -- second call is a no-op.
         """
         if self._connected:
             return
 
         # Build a full IrohNode so the consumer can join registry docs
-        # and fetch blobs. Use persistent storage when configured — this
+        # and fetch blobs. Use persistent storage when configured -- this
         # preserves the node identity, joined docs, and downloaded blobs
         # across restarts.
         ep_cfg = self._config.to_endpoint_config()
@@ -1357,7 +1357,7 @@ class AsterClient:
             self._node.node_addr_info().endpoint_id[:16] + "…",
         )
 
-        # Always run the admission handshake — even when the consumer gate
+        # Always run the admission handshake -- even when the consumer gate
         # is open, the response carries the services list + registry ticket.
         await self._run_admission()
         self._connected = True
@@ -1401,7 +1401,7 @@ class AsterClient:
 
         If an enrollment credential is configured, it's presented for
         verification.  If not (dev mode / open gate), an empty credential
-        is sent — the producer auto-admits when ``allow_all_consumers=True``.
+        is sent -- the producer auto-admits when ``allow_all_consumers=True``.
         """
         assert self._ep is not None
 
@@ -1413,7 +1413,7 @@ class AsterClient:
             cred = _load_enrollment_credential(self._enrollment_credential_file)
             cred_json = consumer_cred_to_json(cred)
         else:
-            # No credential — dev mode / open-gate flow.
+            # No credential -- dev mode / open-gate flow.
             cred_json = ""
 
         iid_token = self._enrollment_credential_iid or ""
@@ -1431,7 +1431,7 @@ class AsterClient:
         resp = ConsumerAdmissionResponse.from_json(raw)
         if not resp.admitted:
             raise PermissionError(
-                "consumer admission denied — set ASTER_ENROLLMENT_CREDENTIAL "
+                "consumer admission denied -- set ASTER_ENROLLMENT_CREDENTIAL "
                 "to a valid enrollment token"
             )
 
@@ -1439,7 +1439,7 @@ class AsterClient:
         self._registry_namespace = resp.registry_namespace or ""
         self._gossip_topic = resp.gossip_topic or ""
         logger.info(
-            "Admitted — services: %s, registry_namespace: %s, gossip_topic: %s",
+            "Admitted -- services: %s, registry_namespace: %s, gossip_topic: %s",
             [s.name for s in self._services],
             bool(self._registry_namespace),
             bool(self._gossip_topic),
@@ -1544,6 +1544,40 @@ class AsterClient:
         """
         return self._registry_namespace
 
+    def proxy(self, service_name: str) -> "ProxyClient":
+        """Create a dynamic proxy client for a service.
+
+        The proxy discovers methods from the service contract and builds
+        method stubs at runtime. No local type definitions needed -- call
+        methods with dicts and receive dicts back::
+
+            mc = client.proxy("MissionControl")
+            result = await mc.getStatus({"agent_id": "edge-1"})
+            print(result["status"])
+
+        Args:
+            service_name: The service name (e.g., ``"MissionControl"``).
+
+        Returns:
+            A :class:`ProxyClient` with method stubs for each RPC method.
+        """
+        if not self._connected:
+            raise RuntimeError("AsterClient not connected; call connect() first")
+
+        summary = None
+        for s in self._services:
+            if s.name == service_name:
+                summary = s
+                break
+        if summary is None:
+            available = [s.name for s in self._services]
+            raise ValueError(
+                f"Service '{service_name}' not found. "
+                f"Available: {available}"
+            )
+
+        return ProxyClient(service_name=service_name, aster_client=self)
+
     @property
     def gossip_topic(self) -> str:
         """Hex-encoded 32-byte gossip topic ID for the producer mesh.
@@ -1557,7 +1591,7 @@ class AsterClient:
 def _resolve_relay_addr(relay_url: str) -> str | None:
     """Resolve a relay URL (e.g. ``https://relay.iroh.network``) to ``ip:port``.
 
-    Uses stdlib DNS resolution — no subprocess. Returns None on failure.
+    Uses stdlib DNS resolution -- no subprocess. Returns None on failure.
     """
     import socket
     from urllib.parse import urlparse
@@ -1570,7 +1604,7 @@ def _resolve_relay_addr(relay_url: str) -> str | None:
             return None
         infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
         if infos:
-            # Use first result — (family, type, proto, canonname, sockaddr)
+            # Use first result -- (family, type, proto, canonname, sockaddr)
             addr = infos[0][4]
             return f"{addr[0]}:{addr[1]}"
     except (socket.gaierror, OSError, ValueError):
@@ -1695,3 +1729,87 @@ def _coerce_node_addr(addr: NodeAddr | str | bytes) -> NodeAddr:
     if isinstance(addr, (bytes, bytearray)):
         return NodeAddr.from_bytes(bytes(addr))
     raise TypeError(f"unsupported admission_addr type: {type(addr).__name__}")
+
+
+# ── ProxyClient ──────────────────────────────────────────────────────────────
+
+
+class ProxyClient:
+    """Dynamic proxy client that invokes RPC methods without local type definitions.
+
+    Created via ``AsterClient.proxy("ServiceName")``. Methods are discovered
+    from the service contract and accept/return dicts::
+
+        mc = client.proxy("MissionControl")
+        result = await mc.getStatus({"agent_id": "edge-1"})
+        print(result["status"])
+
+    For streaming methods, use the explicit stream helpers::
+
+        async for entry in mc.server_stream("tailLogs", {"level": "warn"}):
+            print(entry)
+    """
+
+    def __init__(self, service_name: str, aster_client: AsterClient) -> None:
+        self._service_name = service_name
+        self._client = aster_client
+        self._transport = None
+        self._codec = None
+
+    async def _ensure_transport(self) -> None:
+        if self._transport is not None:
+            return
+
+        from .transport.iroh import IrohTransport
+        from .codec import ForyCodec
+
+        summary = None
+        for s in self._client._services:
+            if s.name == self._service_name:
+                summary = s
+                break
+        if summary is None:
+            raise RuntimeError(f"{self._service_name} not found")
+
+        rpc_addr = summary.channels.get("rpc", "")
+        if not rpc_addr:
+            raise RuntimeError(f"{self._service_name} has no rpc channel")
+
+        conn = await self._client._rpc_conn_for(rpc_addr)
+        self._codec = ForyCodec()
+        self._transport = IrohTransport(conn, codec=self._codec)
+
+    def __getattr__(self, method_name: str) -> "_ProxyMethod":
+        if method_name.startswith("_"):
+            raise AttributeError(method_name)
+        return _ProxyMethod(self, method_name)
+
+
+class _ProxyMethod:
+    """Bound proxy method -- callable as ``await proxy.methodName(args)``."""
+
+    def __init__(self, proxy: ProxyClient, method_name: str) -> None:
+        self._proxy = proxy
+        self._method_name = method_name
+
+    async def __call__(self, payload: dict | None = None, **kwargs: Any) -> Any:
+        """Invoke as a unary RPC. Pass a dict or keyword arguments."""
+        await self._proxy._ensure_transport()
+
+        # Build payload from dict or kwargs
+        if payload is None:
+            payload = kwargs
+        elif kwargs:
+            payload = {**payload, **kwargs}
+
+        result = await self._proxy._transport.unary(
+            self._proxy._service_name,
+            self._method_name,
+            payload or {},
+        )
+
+        # Convert dataclass result to dict for proxy UX
+        import dataclasses
+        if dataclasses.is_dataclass(result) and not isinstance(result, type):
+            return dataclasses.asdict(result)
+        return result

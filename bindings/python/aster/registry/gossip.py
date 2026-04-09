@@ -1,5 +1,5 @@
 """
-aster.registry.gossip — Gossip layer for the Aster service registry.
+aster.registry.gossip -- Gossip layer for the Aster service registry.
 
 Spec reference: Aster-SPEC.md §11.7.
 

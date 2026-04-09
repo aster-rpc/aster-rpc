@@ -1,5 +1,5 @@
 """
-aster_cli.shell.commands — Built-in shell commands.
+aster_cli.shell.commands -- Built-in shell commands.
 
 Each command is a plugin: usable interactively and (where applicable)
 as ``aster <noun> <verb>`` from the command line.
@@ -57,12 +57,12 @@ class CdCommand(ShellCommand):
         if node.kind in (NodeKind.BLOB, NodeKind.METHOD, NodeKind.README, NodeKind.DOC_ENTRY):
             ctx.display.error(f"{path} is not a directory")
             return
-        # Collections are cd-able — they have children (entries)
+        # Collections are cd-able -- they have children (entries)
 
         # Lazy-load children
         await ensure_loaded(node, ctx.connection)
 
-        # Update cwd — the caller reads ctx.vfs_cwd after execute
+        # Update cwd -- the caller reads ctx.vfs_cwd after execute
         ctx.vfs_cwd = path  # type: ignore[misc]
 
     def get_completions(self, ctx: CommandContext, partial: str) -> list[str]:
@@ -74,7 +74,7 @@ class LsCommand(ShellCommand):
     name = "ls"
     description = "List contents of the current or specified path"
     contexts = []  # global
-    cli_noun_verb = None  # ls is context-dependent — mapped per noun below
+    cli_noun_verb = None  # ls is context-dependent -- mapped per noun below
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
         target = args[0] if args else "."
@@ -146,7 +146,7 @@ class LsCommand(ShellCommand):
             ctx.display.doc_entry_table(entries)
 
         elif node.kind == NodeKind.GOSSIP:
-            ctx.display.info("Gossip topics — use 'tail' to listen to the producer mesh")
+            ctx.display.info("Gossip topics -- use 'tail' to listen to the producer mesh")
             ctx.display.print("  [cyan]mesh[/cyan]    [dim]producer mesh topic (derived from root key + salt)[/dim]")
 
         elif node.kind == NodeKind.ASTER:
@@ -184,7 +184,7 @@ class LsCommand(ShellCommand):
             # Show README hint if present
             readme = node.child("README.md")
             if readme:
-                ctx.display.info("README.md available — use: cat README.md")
+                ctx.display.info("README.md available -- use: cat README.md")
             ctx.display.handle_service_listing(services, node.name)
 
         elif node.kind == NodeKind.README:
@@ -267,14 +267,14 @@ class DescribeCommand(ShellCommand):
 class CatCommand(ShellCommand):
     name = "cat"
     description = "Display file or blob content"
-    contexts = []  # global — works in blobs and directory handle contexts
+    contexts = []  # global -- works in blobs and directory handle contexts
     cli_noun_verb = ("blob", "cat")
 
     def get_arguments(self) -> list[Argument]:
         return [Argument(name="target", description="File name or blob hash", positional=True)]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        # Resolve target — either from arg or current directory
+        # Resolve target -- either from arg or current directory
         if args:
             node, path = resolve_path(ctx.vfs_root, ctx.vfs_cwd, args[0])
         else:
@@ -315,7 +315,7 @@ class CatCommand(ShellCommand):
             ctx.display.collection_entry_table(entries)
             return
 
-        # Resolve blob hash — prefer full hash from VFS metadata
+        # Resolve blob hash -- prefer full hash from VFS metadata
         if node and node.kind == NodeKind.BLOB:
             blob_hash = node.metadata.get("hash", node.name)
         elif args:
@@ -520,7 +520,7 @@ class RefreshCommand(ShellCommand):
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
         # Reset loaded flags so next ls/cd will re-fetch
         _reset_loaded(ctx.vfs_root)
-        ctx.display.success("Cache cleared — next listing will fetch fresh data")
+        ctx.display.success("Cache cleared -- next listing will fetch fresh data")
 
 
 @register
@@ -990,7 +990,7 @@ class GenerateClientCommand(ShellCommand):
         # Get manifests from connection
         manifests = ctx.connection.get_manifests()
         if not manifests:
-            ctx.display.error("No manifests available — wait for service discovery to complete")
+            ctx.display.error("No manifests available -- wait for service discovery to complete")
             return
 
         # Filter to target service if specified
@@ -1058,7 +1058,7 @@ class SessionCommand(ShellCommand):
 
         ctx.display.print()
         ctx.display.print(f"[bold cyan]Session opened: {service_name}[/bold cyan]")
-        ctx.display.info("This is a dedicated session — state persists across calls.")
+        ctx.display.info("This is a dedicated session -- state persists across calls.")
         ctx.display.info("Type 'end' to close the session and return to the main shell.")
         ctx.display.print()
 
@@ -1176,7 +1176,7 @@ class TailCommand(ShellCommand):
             ctx.display.error(f"failed to subscribe: {e}")
             return
 
-        ctx.display.success("Subscribed — listening for messages (Ctrl-C to stop)")
+        ctx.display.success("Subscribed -- listening for messages (Ctrl-C to stop)")
         ctx.display.print()
 
         try:
@@ -1303,7 +1303,7 @@ class BlobLsCommand(ShellCommand):
     description = "List blobs (CLI: aster blob ls)"
     contexts = ["/blobs"]
     cli_noun_verb = ("blob", "ls")
-    hidden = True  # hidden in interactive mode — use ls instead
+    hidden = True  # hidden in interactive mode -- use ls instead
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
         # Navigate to /blobs and list

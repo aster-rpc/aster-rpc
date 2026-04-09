@@ -1,5 +1,5 @@
 """
-aster.registry.publisher — RegistryPublisher for the Aster service registry.
+aster.registry.publisher -- RegistryPublisher for the Aster service registry.
 
 Spec references:
 - §11.6: Endpoint leases and health state machine
@@ -299,7 +299,7 @@ class RegistryPublisher:
     async def set_health(self, status: str) -> None:
         """Transition health state; bumps lease_seq and writes new lease row."""
         if self._lease is None:
-            raise RuntimeError("No active lease — call register_endpoint first")
+            raise RuntimeError("No active lease -- call register_endpoint first")
         self._lease.health_status = status
         self._lease.lease_seq += 1
         await self._write_lease()
@@ -334,7 +334,7 @@ class RegistryPublisher:
     async def withdraw(self, grace_period_s: float = 5.0) -> None:
         """Graceful shutdown state machine.
 
-        1. set_health(DRAINING) — bumps lease_seq, writes updated lease
+        1. set_health(DRAINING) -- bumps lease_seq, writes updated lease
         2. Wait ``grace_period_s`` for in-flight calls to drain
         3. Delete the lease row from the doc
         4. Broadcast ENDPOINT_DOWN gossip
@@ -350,7 +350,7 @@ class RegistryPublisher:
         if grace_period_s > 0:
             await asyncio.sleep(grace_period_s)
 
-        # 3. Delete lease — overwrite with tombstone sentinel.
+        # 3. Delete lease -- overwrite with tombstone sentinel.
         #    iroh-docs has no true delete; b"null" signals deletion to readers.
         lease = self._lease
         await self._doc.set_bytes(
