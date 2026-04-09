@@ -431,9 +431,10 @@ offline — you'll use it to sign credentials, not to run services.
 aster trust keygen --out-key ~/.aster/root.key
 
 # Output:
-# Root key generated: ~/.aster/root.key
-# Public key: ed25519:b3a4f1...
-# ⚠ Store this key securely — it controls who can join your network
+# Root private key written to: ~/.aster/root.key
+# Root public key written to:  ~/.aster/root.pub
+# Public key: b3a4f1...
+# Keep root.key secret. Share root.pub with nodes that need to verify credentials.
 ```
 
 ### Step 2: Define roles in code
@@ -486,7 +487,7 @@ class AgentSession:
 
 ```python
 config = AsterConfig(
-    root_pubkey_file="~/.aster/root.key",
+    root_pubkey_file="~/.aster/root.pub",
     allow_all_consumers=False,   # require credentials
 )
 async with AsterServer(

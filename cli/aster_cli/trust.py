@@ -48,7 +48,7 @@ def _keygen_command(args) -> int:
     out_dir = os.path.dirname(out_key) or "."
     os.makedirs(out_dir, exist_ok=True)
 
-    # Write private key with restricted permissions
+    # Write private key with restricted permissions (root.key)
     fd = os.open(out_key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w") as f:
@@ -58,9 +58,20 @@ def _keygen_command(args) -> int:
         os.unlink(out_key)
         raise
 
-    print(f"Root key pair written to: {out_key}")
+    # Write public key separately (root.pub) for safe distribution
+    pub_path = out_key.rsplit(".", 1)[0] + ".pub" if "." in out_key else out_key + ".pub"
+    if not os.path.exists(pub_path):
+        with open(pub_path, "w", encoding="utf-8") as f:
+            json.dump({"public_key": pub_hex}, f, indent=2)
+            f.write("\n")
+        print(f"Root private key written to: {out_key}")
+        print(f"Root public key written to:  {pub_path}")
+    else:
+        print(f"Root key pair written to: {out_key}")
+        print(f"  (public key file already exists: {pub_path})")
+
     print(f"  Public key:  {pub_hex}")
-    print("Keep the private key secret. The public key is shared with peers.")
+    print("Keep root.key secret. Share root.pub with nodes that need to verify credentials.")
     return 0
 
 
