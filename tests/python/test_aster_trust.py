@@ -529,6 +529,15 @@ def test_cli_keygen_produces_valid_key_pair():
         assert len(priv_raw) == 32
         assert len(pub_raw) == 32
 
+        # Verify .pub file was also created with public key only
+        pub_path = Path(d) / "root.pub"
+        assert pub_path.exists()
+        with open(pub_path) as f:
+            pub_data = json.load(f)
+        assert "public_key" in pub_data
+        assert "private_key" not in pub_data
+        assert pub_data["public_key"] == key_data["public_key"]
+
         # Verify key pair is consistent: sign something and verify
         privkey = load_private_key(priv_raw)
         pubkey = load_public_key(pub_raw)

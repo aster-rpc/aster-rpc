@@ -82,7 +82,15 @@ def _keygen_root(args) -> int:
             except OSError:
                 pass
             raise
-        print(f"  Key pair also written to: {out_path}")
+        print(f"  Private key written to: {out_path}")
+
+    # Write public key separately (root.pub) for safe distribution
+    pub_path = out_path.rsplit(".", 1)[0] + ".pub" if "." in out_path else out_path + ".pub"
+    if not os.path.exists(pub_path):
+        with open(pub_path, "w", encoding="utf-8") as f:
+            json.dump({"public_key": pub_hex}, f, indent=2)
+            f.write("\n")
+        print(f"  Public key written to:  {pub_path}")
 
     print()
     print(f"  Profile    : {profile_name}")
@@ -91,6 +99,8 @@ def _keygen_root(args) -> int:
         print("  private_key: **** (in keyring)")
     else:
         print(f"  private_key: {out_path}")
+    print()
+    print("Keep root.key secret. Share root.pub with nodes that need to verify credentials.")
     return 0
 
 
