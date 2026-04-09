@@ -27,7 +27,7 @@ from mcp.types import TextContent
 
 from aster_cli.mcp.schema import method_to_tool_definition, service_to_tool_definitions
 from aster_cli.mcp.security import ToolFilter
-from aster_cli.shell.app import DemoConnection, PeerConnection
+from aster_cli.shell.app import PeerConnection
 from aster_cli.shell.invoker import _to_serializable
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ class AsterMcpServer:
             instructions=(
                 "This MCP server exposes Aster RPC services as tools. "
                 "Each tool corresponds to a method on a remote service. "
-                "Tool names are formatted as ServiceName:method_name. "
+                "Tool names are formatted as ServiceName.method_name. "
                 "Call tools with the required parameters as described in their schemas."
             ),
         )
@@ -64,6 +64,10 @@ class AsterMcpServer:
     async def setup(self) -> None:
         """Connect to peer, discover services, register tools."""
         await self._connection.connect()
+
+        # Wait for manifest fetch so we get method-level detail
+        if hasattr(self._connection, "wait_for_manifests"):
+            await self._connection.wait_for_manifests()
 
         services = await self._connection.list_services()
         tool_count = 0
@@ -81,7 +85,7 @@ class AsterMcpServer:
                 # Store method metadata for invocation
                 method_meta = None
                 for m in svc.get("methods", []):
-                    if f"{svc['name']}:{m['name']}" == tool_name:
+                    if f"{svc['name']}.{m['name']}" == tool_name:
                         method_meta = m
                         break
 
@@ -106,8 +110,8 @@ class AsterMcpServer:
         method_meta: dict[str, Any],
     ) -> None:
         """Register a single tool with the FastMCP server."""
-        service_name = tool_name.split(":")[0]
-        method_name = tool_name.split(":")[1] if ":" in tool_name else tool_name
+        service_name = tool_name.split(".")[0]
+        method_name = tool_name.split(".", 1)[1] if "." in tool_name else tool_name
         pattern = method_meta.get("pattern", "unary")
 
         async def handler(**kwargs: Any) -> str:
@@ -130,7 +134,7 @@ class AsterMcpServer:
         arguments: dict[str, Any],
     ) -> str:
         """Handle an MCP tool call by invoking the Aster service."""
-        tool_name = f"{service_name}:{method_name}"
+        tool_name = f"{service_name}.{method_name}"
 
         # Human-in-the-loop confirmation
         if self._filter.needs_confirmation(tool_name):
@@ -211,9 +215,8 @@ async def _collect_stream(stream: Any, max_items: int) -> Any:
 
 
 async def launch_mcp_server(
-    peer_addr: str | None = None,
+    peer_addr: str,
     rcan_path: str | None = None,
-    demo: bool = False,
     allow: list[str] | None = None,
     deny: list[str] | None = None,
     confirm: list[str] | None = None,
@@ -221,17 +224,13 @@ async def launch_mcp_server(
     """Launch the MCP server.
 
     Args:
-        peer_addr: Aster peer address (base64 NodeAddr).
+        peer_addr: Aster peer address (aster1... ticket or base64 NodeAddr).
         rcan_path: Path to enrollment credential.
-        demo: Use DemoConnection instead of real peer.
         allow: Glob patterns for allowed tools.
         deny: Glob patterns for denied tools.
         confirm: Glob patterns requiring human approval.
     """
-    if demo or peer_addr is None:
-        connection = DemoConnection()
-    else:
-        connection = PeerConnection(peer_addr=peer_addr, rcan_path=rcan_path)
+    connection = PeerConnection(peer_addr=peer_addr, rcan_path=rcan_path)
 
     tool_filter = ToolFilter(allow=allow, deny=deny, confirm=confirm)
 
@@ -263,9 +262,8 @@ def register_mcp_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     mcp_parser.add_argument(
         "peer",
-        nargs="?",
-        default=None,
-        help="Peer address to connect to (omit for demo mode)",
+        metavar="ADDRESS",
+        help="Peer address (aster1... ticket)",
     )
     mcp_parser.add_argument(
         "--rcan",
@@ -274,23 +272,18 @@ def register_mcp_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="Path to enrollment credential (scoped AI agent credential)",
     )
     mcp_parser.add_argument(
-        "--demo",
-        action="store_true",
-        help="Launch with demo data (no live peer)",
-    )
-    mcp_parser.add_argument(
         "--allow",
         action="append",
         default=[],
         metavar="PATTERN",
-        help="Glob pattern for allowed tools (e.g., 'HelloService:*')",
+        help="Glob pattern for allowed tools (e.g., 'HelloService.*')",
     )
     mcp_parser.add_argument(
         "--deny",
         action="append",
         default=[],
         metavar="PATTERN",
-        help="Glob pattern for denied tools (e.g., '*:delete_*')",
+        help="Glob pattern for denied tools (e.g., '*.delete_*')",
     )
     mcp_parser.add_argument(
         "--confirm",
@@ -303,13 +296,10 @@ def register_mcp_subparser(subparsers: argparse._SubParsersAction) -> None:
 
 def run_mcp_command(args: argparse.Namespace) -> int:
     """Execute the ``aster mcp`` command."""
-    demo = args.demo or args.peer is None
-
     try:
         asyncio.run(launch_mcp_server(
             peer_addr=args.peer,
             rcan_path=args.rcan,
-            demo=demo,
             allow=args.allow or None,
             deny=args.deny or None,
             confirm=args.confirm or None,

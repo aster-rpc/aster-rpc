@@ -16,6 +16,7 @@ import asyncio
 import copy
 import json
 import sys
+import time
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
@@ -259,6 +260,76 @@ def _lookup_peer_name(addr: str) -> str | None:
     return None
 
 
+# ── Manifest cache ───────────────────────────────────────────────────────────
+
+_MANIFEST_CACHE_DIR = Path("~/.aster/cache/manifests").expanduser()
+_MANIFEST_CACHE_MAX_AGE_DAYS = 30
+
+
+def _load_cached_manifests(services: list[Any]) -> dict[str, dict[str, Any]]:
+    """Load cached manifests for services that have a contract_id."""
+    result: dict[str, dict[str, Any]] = {}
+    if not _MANIFEST_CACHE_DIR.exists():
+        return result
+    for svc in services:
+        cid = svc.contract_id if hasattr(svc, "contract_id") else ""
+        if not cid:
+            continue
+        cache_file = _MANIFEST_CACHE_DIR / f"{cid}.json"
+        if cache_file.exists():
+            try:
+                age_days = (time.time() - cache_file.stat().st_mtime) / 86400
+                if age_days > _MANIFEST_CACHE_MAX_AGE_DAYS:
+                    cache_file.unlink(missing_ok=True)
+                    continue
+                manifest = json.loads(cache_file.read_text(encoding="utf-8"))
+                result[svc.name] = manifest
+            except Exception:
+                pass
+    return result
+
+
+def _save_manifests_to_cache(
+    manifests: dict[str, dict[str, Any]],
+    services: list[Any],
+) -> None:
+    """Cache manifests keyed by contract_id."""
+    if not manifests:
+        return
+    try:
+        _MANIFEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # Build name→contract_id map
+        cid_map = {
+            s.name: s.contract_id
+            for s in services
+            if hasattr(s, "contract_id") and s.contract_id
+        }
+        for name, manifest in manifests.items():
+            cid = cid_map.get(name, "")
+            if not cid:
+                continue
+            cache_file = _MANIFEST_CACHE_DIR / f"{cid}.json"
+            cache_file.write_text(
+                json.dumps(manifest, indent=2, default=str),
+                encoding="utf-8",
+            )
+    except Exception:
+        pass  # caching is best-effort
+
+
+def _prune_manifest_cache() -> None:
+    """Remove cached manifests older than 30 days."""
+    if not _MANIFEST_CACHE_DIR.exists():
+        return
+    cutoff = time.time() - (_MANIFEST_CACHE_MAX_AGE_DAYS * 86400)
+    try:
+        for f in _MANIFEST_CACHE_DIR.iterdir():
+            if f.suffix == ".json" and f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 # ── Connection adapter ────────────────────────────────────────────────────────
 
 class PeerConnection:
@@ -319,10 +390,41 @@ class PeerConnection:
         # rich metadata (field types, descriptions) and are merged in when ready.
         self._manifest_task = asyncio.create_task(self._fetch_manifests_background())
 
+    async def wait_for_manifests(self, timeout: float = 20.0) -> None:
+        """Wait for background manifest fetch to complete (for MCP / non-interactive use)."""
+        if hasattr(self, "_manifest_task") and not self._manifest_task.done():
+            try:
+                await asyncio.wait_for(self._manifest_task, timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+
     async def _fetch_manifests_background(self) -> None:
-        """Fetch manifests and synthesize types, logging errors instead of raising."""
+        """Fetch manifests and synthesize types, logging errors instead of raising.
+
+        Uses a local cache (~/.aster/cache/manifests/) keyed by contract_id.
+        Cached manifests older than 30 days are pruned on each run.
+        """
         try:
-            await self._fetch_manifests()
+            # Prune stale cache entries
+            _prune_manifest_cache()
+
+            # Try loading from cache first
+            cached = _load_cached_manifests(self._services)
+            if cached:
+                self._manifests.update(cached)
+                import logging
+                logging.getLogger(__name__).debug(
+                    "Loaded %d manifests from cache", len(cached),
+                )
+
+            # Fetch any missing manifests from the network
+            missing = [s for s in self._services if s.name not in self._manifests]
+            if missing:
+                await self._fetch_manifests()
+
+            # Cache newly fetched manifests
+            _save_manifests_to_cache(self._manifests, self._services)
+
             self._synthesize_types()
         except Exception:
             import logging
