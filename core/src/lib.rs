@@ -519,7 +519,7 @@ impl CoreMonitor {
 
         // Store connection info
         {
-            let mut inner = map.write().expect("poisoned");
+            let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
             let entry = inner.entry(remote_id.clone()).or_default();
             entry.connections.insert(conn_id, conn.clone());
             entry.aggregate.last_update = SystemTime::now();
@@ -532,14 +532,14 @@ impl CoreMonitor {
             let remote_id = remote_id.clone();
             async move {
                 if let Some((_, stats)) = conn.closed().await {
-                    let mut inner = map.write().expect("poisoned");
+                    let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
                     let entry = inner.entry(remote_id).or_default();
                     entry.connections.remove(&conn_id);
                     entry.aggregate.last_update = SystemTime::now();
                     entry.aggregate.total_bytes_sent += stats.udp_tx.bytes;
                     entry.aggregate.total_bytes_received += stats.udp_rx.bytes;
                 } else {
-                    let mut inner = map.write().expect("poisoned");
+                    let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
                     let entry = inner.entry(remote_id).or_default();
                     entry.connections.remove(&conn_id);
                     entry.aggregate.last_update = SystemTime::now();
@@ -553,7 +553,7 @@ impl CoreMonitor {
             async move {
                 let mut path_updates = conn.paths().stream();
                 while let Some(paths) = path_updates.next().await {
-                    let mut inner = map.write().expect("poisoned");
+                    let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
                     let entry = inner.entry(remote_id.clone()).or_default();
                     for path in paths {
                         entry.aggregate.update_from_path(&path);
@@ -565,7 +565,7 @@ impl CoreMonitor {
 
     /// Query information about a specific remote endpoint.
     pub fn remote_info(&self, node_id: &str) -> Option<CoreRemoteInfo> {
-        let inner = self.map.read().expect("poisoned");
+        let inner = self.map.read().unwrap_or_else(|e| e.into_inner());
         inner
             .get(node_id)
             .map(|entry| entry.to_core_remote_info(node_id))
@@ -573,7 +573,7 @@ impl CoreMonitor {
 
     /// Get all known remote endpoints.
     pub fn remote_info_iter(&self) -> Vec<CoreRemoteInfo> {
-        let inner = self.map.read().expect("poisoned");
+        let inner = self.map.read().unwrap_or_else(|e| e.into_inner());
         inner
             .iter()
             .map(|(id, entry)| entry.to_core_remote_info(id))
