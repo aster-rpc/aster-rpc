@@ -1771,7 +1771,10 @@ class ProxyClient:
         if summary is None:
             raise RuntimeError(f"{self._service_name} not found")
 
-        rpc_addr = summary.channels.get("rpc", "")
+        rpc_addr = summary.channels.get("rpc", "") if hasattr(summary, 'channels') and summary.channels else ""
+        if not rpc_addr:
+            # Fall back to the default RPC address (same endpoint as admission)
+            rpc_addr = self._client._endpoint_addr_in if hasattr(self._client, '_endpoint_addr_in') else ""
         if not rpc_addr:
             raise RuntimeError(f"{self._service_name} has no rpc channel")
 

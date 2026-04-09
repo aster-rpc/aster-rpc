@@ -363,26 +363,26 @@ class TestXlangRoundTrip:
             service="TestSvc",
             method="do_thing",
             version=1,
-            call_id="call-1",
-            deadline_epoch_ms=1712000000000,
-            serialization_mode=0,
-            metadata_keys=["k1"],
-            metadata_values=["v1"],
+            callId="call-1",
+            deadlineEpochMs=1712000000000,
+            serializationMode=0,
+            metadataKeys=["k1"],
+            metadataValues=["v1"],
         )
         data = codec.encode(header)
         restored = codec.decode(data, StreamHeader)
         assert restored.service == header.service
         assert restored.method == header.method
         assert restored.version == header.version
-        assert restored.metadata_keys == header.metadata_keys
+        assert restored.metadataKeys == header.metadataKeys
 
     def test_rpc_status_round_trip(self):
         codec = ForyCodec(mode=SerializationMode.XLANG, types=[])
         status = RpcStatus(
             code=StatusCode.INTERNAL,
             message="something broke",
-            detail_keys=["trace"],
-            detail_values=["abc"],
+            detailKeys=["trace"],
+            detailValues=["abc"],
         )
         data = codec.encode(status)
         restored = codec.decode(data, RpcStatus)
