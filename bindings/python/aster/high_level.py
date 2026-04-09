@@ -443,6 +443,11 @@ class AsterServer:
         self._print_banner()
         self._started = True
 
+        # Always log startup info (visible even when stderr is not a TTY)
+        service_names = ", ".join(s.name for s in self._service_summaries)
+        mode = "open-gate" if self._allow_all_consumers else "trusted"
+        logger.info("server starting runtime=python services=[%s] mode=%s", service_names, mode)
+
     def _print_banner(self) -> None:
         """Print the startup banner with service info."""
         import sys

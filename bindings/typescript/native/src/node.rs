@@ -139,6 +139,29 @@ impl IrohNode {
         Ok(IrohConnection::from(conn))
     }
 
+    /// Connect to a remote node using full address info (endpoint ID + relay + direct addrs).
+    /// This is needed when nodes can't discover each other via relay (e.g. local connections).
+    #[napi]
+    pub async fn connect_node_addr(
+        &self,
+        endpoint_id: String,
+        alpn: Buffer,
+        direct_addrs: Option<Vec<String>>,
+        relay_url: Option<String>,
+    ) -> Result<IrohConnection> {
+        let net = self.inner.net_client();
+        let addr = aster_transport_core::CoreNodeAddr {
+            endpoint_id,
+            relay_url,
+            direct_addresses: direct_addrs.unwrap_or_default(),
+        };
+        let conn = net
+            .connect_node_addr(addr, alpn.to_vec())
+            .await
+            .map_err(to_napi_err)?;
+        Ok(IrohConnection::from(conn))
+    }
+
     /// Gracefully shut down the node.
     #[napi]
     pub async fn close(&self) -> Result<()> {

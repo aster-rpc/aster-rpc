@@ -323,10 +323,18 @@ export async function handleConsumerAdmissionConnection(
 
     // Serialise response — snake_case keys for Python interop.
     // Strip reason on wire (oracle protection).
+    // Convert ServiceSummary to snake_case for wire compat
+    const wireServices = (response.services ?? []).map((s: any) => ({
+      name: s.name,
+      version: s.version,
+      contract_id: s.contractId ?? s.contract_id ?? '',
+      pattern: s.pattern,
+      methods: s.methods,
+    }));
     const wireResponse: Record<string, unknown> = {
       admitted: response.admitted,
       attributes: response.attributes ?? {},
-      services: response.services ?? [],
+      services: wireServices,
       registry_namespace: response.registryNamespace ?? '',
       root_pubkey: response.rootPubkey ?? '',
       reason: '', // never leak reason on wire

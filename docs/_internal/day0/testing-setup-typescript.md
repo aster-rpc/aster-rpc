@@ -13,8 +13,10 @@ existing config, no shared state with the developer's machine.
 ### 1a. Build fresh Python wheels (needed for CLI tools)
 
 ```bash
+
 cd /Users/emrul/dev/emrul/iroh-python
 ./scripts/build.sh
+
 ```
 
 This produces:

@@ -75,7 +75,7 @@ export HOME=~  # restore
 
 ```bash
 
-minimax --allowedTools "Bash(**) Read(**) Write($HOME/**) Edit($HOME/**)" \
+minimax --dangerously-skip-permissions --allow-dangerously-skip-permissions \
     --system-prompt "You are a QA tester. Your working directory is $HOME. All files you need are here. Do NOT explore other directories.
       Follow testing-instructions.md against GUIDE.md. Create all code files in ~/day0-test/. Use background processes for the server. Report
       PASS/FAIL for each checklist item." \

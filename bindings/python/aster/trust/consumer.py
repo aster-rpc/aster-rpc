@@ -61,6 +61,8 @@ class ConsumerAdmissionRequest:
 
     @classmethod
     def from_json(cls, raw: str | bytes) -> "ConsumerAdmissionRequest":
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            raw = bytes(raw).decode("utf-8")
         d = json.loads(raw)
         return cls(
             credential_json=d["credential_json"],
@@ -108,6 +110,10 @@ class ConsumerAdmissionResponse:
 
         from ..limits import MAX_SERVICES_IN_ADMISSION, MAX_CHANNELS_PER_SERVICE
 
+        # Explicit UTF-8 decode to avoid Python's detect_encoding
+        # misidentifying short byte sequences as UTF-32
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            raw = bytes(raw).decode("utf-8")
         d = json.loads(raw)
         raw_services = d.get("services") or []
         if len(raw_services) > MAX_SERVICES_IN_ADMISSION:

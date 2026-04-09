@@ -452,8 +452,8 @@ class IrohTransport(Transport):
             service=service,
             method=method,
             metadata=metadata,
-            deadlineEpochMs=deadline_epoch_ms,
-            serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
+            deadline_epoch_ms=deadline_epoch_ms,
+            serialization_mode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
         )
 
 

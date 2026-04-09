@@ -149,9 +149,9 @@ class AsterMcpServer:
                 return json.dumps({"error": "Call denied by operator"})
 
         # Strip meta-parameters
-        max_items = arguments.pop("_max_items", 100)
-        timeout = arguments.pop("_timeout", 30.0)
-        items = arguments.pop("_items", None)
+        max_items = arguments.pop("aster_max_items", 100)
+        timeout = arguments.pop("aster_timeout", 30.0)
+        items = arguments.pop("aster_items", None)
 
         try:
             if pattern == "unary":
@@ -237,9 +237,10 @@ def _build_typed_handler(
     required_set = set(schema.get("required", []))
 
     # Filter out internal meta-params that we add ourselves
+    _META_PARAMS = {"aster_max_items", "aster_timeout", "aster_items"}
     field_params = {
         k: v for k, v in properties.items()
-        if not k.startswith("_")
+        if k not in _META_PARAMS
     }
 
     # Build inspect.Parameter list
@@ -264,7 +265,7 @@ def _build_typed_handler(
         annotations[fname] = py_type
 
     # Add streaming meta-params back
-    for meta_name in ("_max_items", "_timeout", "_items"):
+    for meta_name in ("aster_max_items", "aster_timeout", "aster_items"):
         if meta_name in properties:
             meta_schema = properties[meta_name]
             json_type = meta_schema.get("type", "string")
