@@ -405,7 +405,7 @@ pub fn tarjan_scc(graph: &HashMap<String, HashSet<String>>) -> Vec<Vec<String>> 
         if state.lowlink[v] == state.index[v] {
             let mut scc: Vec<String> = Vec::new();
             loop {
-                let w = state.stack.pop().unwrap();
+                let w = state.stack.pop().expect("Tarjan SCC invariant: stack must be non-empty when lowlink == index");
                 state.on_stack.insert(w.clone(), false);
                 scc.push(w.clone());
                 if w == v {

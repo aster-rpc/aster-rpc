@@ -3,7 +3,7 @@
 This document describes Aster's threat model, what we've hardened, what
 we proactively do on every commit, and what remains open.
 
-**Last updated:** 2026-04-06
+**Last updated:** 2026-04-09
 
 ## Threat Model
 
@@ -149,6 +149,45 @@ security review via `scripts/security-review.sh` (installed as
 
 These tests run in CI on every push.
 
+### Rust Static Analysis & Fuzzing (added 2026-04-09)
+
+**Toolchain:**
+
+| Tool | Purpose | How to run |
+|------|---------|------------|
+| `cargo clippy` | Lint + correctness warnings | `cargo clippy --workspace -- -D warnings` |
+| `cargo deny` | Dependency advisories, licenses, bans, sources | `cargo deny check` (config: `deny.toml`) |
+| `cargo fuzz` | libFuzzer-based fuzzing of Rust parsing code | `cd core && cargo +nightly fuzz run <target>` |
+
+**cargo deny results (2026-04-09):**
+- 0 known vulnerabilities (advisories clean)
+- 0 license violations
+- 0 unknown sources
+- Warnings only: ~15 duplicate crate versions (iroh transitive deps — ed25519-dalek, curve25519-dalek, digest, sha2 etc.) and 3 unmaintained transitive deps (`atomic-polyfill`, `paste`, `proc-macro-error`)
+
+**Fuzz targets (in `core/fuzz/fuzz_targets/`):**
+
+| Target | What it fuzzes | Initial run |
+|--------|---------------|-------------|
+| `fuzz_ticket_decode` | `AsterTicket::decode(bytes)` — binary ticket parser | 133K runs, 0 crashes |
+| `fuzz_base58_ticket` | `AsterTicket::from_base58_str(s)` — base58 ticket parser | 145K runs, 0 crashes |
+| `fuzz_decode_frame` | `decode_frame(bytes)` — wire frame parser | 136K runs, 0 crashes |
+
+For meaningful coverage, run each target for at least 1 hour:
+```bash
+cd core && cargo +nightly fuzz run fuzz_ticket_decode -- -max_total_time=3600
+```
+
+**Rust code fixes (2026-04-09):**
+
+| Issue | Location | Fix |
+|-------|----------|-----|
+| `unwrap()` panic risk in Tarjan SCC | `core/src/contract.rs:408` | Replaced with `expect()` with invariant description |
+| `expect("poisoned")` on RwLock | `core/src/lib.rs` (6 instances) | Replaced with `unwrap_or_else(\|e\| e.into_inner())` — recovers from poisoned locks since this is monitoring data |
+| Duplicate `ed25519-dalek` versions | `core/Cargo.toml` | Upgraded from v2 to v3.0.0-pre.1 to match iroh's version, eliminating duplicate crypto crate tree |
+| Manual `div_ceil` reimplementation | `core/src/ticket.rs` (2 instances) | Replaced with `.div_ceil()` per clippy |
+| FFI out of sync with core | `ffi/src/lib.rs` | Updated `TicketCredential::Registry` → `RegistryRead` to match core |
+
 ### Audit Methodology
 
 Defined in `docs/_internal/audit-methodology.md`. Key principles:
@@ -185,6 +224,11 @@ Defined in `docs/_internal/audit-methodology.md`. Key principles:
 | M6 | `interceptors/` | RateLimitInterceptor | Medium | Token-bucket or sliding-window rate limiter per peer. Interceptor skeleton exists; policy configuration TBD. |
 | M7 | `server.py` | Graceful drain on SIGTERM | Medium | Server should stop accepting new connections and drain in-flight RPCs before shutdown. |
 | M8 | `transport/iroh.py` | Connection retry backoff | Medium | Consumer reconnect uses fixed delay; should use exponential backoff with jitter. |
+| R1 | `ffi/src/lib.rs` | Missing `// SAFETY:` comments on unsafe blocks | Low | ~247 unsafe blocks have null/length checks but lack formal safety documentation. |
+| R2 | Rust deps | Unmaintained transitive deps | Low | `atomic-polyfill`, `paste`, `proc-macro-error` — all from iroh's dep tree, not actionable by us. |
+| R3 | Rust deps | Duplicate crypto crate versions | Low | iroh uses pre-release ed25519-dalek/curve25519-dalek; will resolve when those crates stabilize. |
+| R4 | `core/fuzz/` | Extended fuzzing runs | Medium | Initial 10s smoke tests passed; need 1hr+ runs per target for real coverage. |
+| R5 | CI | Wire cargo-deny + clippy into GitHub Actions | Medium | `deny.toml` and fuzz targets exist; not yet in CI pipeline. |
 
 ## Fory XLANG — What It Gives Us and What It Doesn't
 
