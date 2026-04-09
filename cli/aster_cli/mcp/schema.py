@@ -175,7 +175,7 @@ def method_to_tool_definition(
     ).strip()
 
     return {
-        "name": f"{service_name}:{method_name}",
+        "name": f"{service_name}.{method_name}",
         "description": description,
         "inputSchema": input_schema,
     }
