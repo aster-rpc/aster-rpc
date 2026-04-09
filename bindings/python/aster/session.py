@@ -999,8 +999,8 @@ async def create_session(
         service=service_info.name,
         method="",
         version=service_info.version,
-        call_id=session_id,
-        serialization_mode=service_info.serialization_modes[0].value if service_info.serialization_modes else 0,
+        callId=session_id,
+        serializationMode=service_info.serialization_modes[0].value if service_info.serialization_modes else 0,
     )
     header_payload = codec.encode(header)
     await write_frame(send, header_payload, flags=HEADER)
@@ -1074,8 +1074,8 @@ def create_local_session(
         service=service_info.name,
         method="",
         version=service_info.version,
-        call_id=session_id,
-        serialization_mode=(
+        callId=session_id,
+        serializationMode=(
             service_info.serialization_modes[0].value
             if service_info.serialization_modes
             else 0

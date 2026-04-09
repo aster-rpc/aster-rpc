@@ -181,8 +181,8 @@ async def test_local_session_unary_no_trailer():
         service="CounterService",
         method="",
         version=1,
-        call_id="sess-001",
-        serialization_mode=SerializationMode.XLANG.value,
+        callId="sess-001",
+        serializationMode=SerializationMode.XLANG.value,
     )
     server = SessionServer(
         service_class=CounterService,
@@ -192,7 +192,7 @@ async def test_local_session_unary_no_trailer():
     srv_task = asyncio.create_task(server.run(stream_header, s_send, s_recv, peer="test"))
 
     # Write a CALL frame for 'add'
-    call_header = CallHeader(method="add", call_id="call-001")
+    call_header = CallHeader(method="add", callId="call-001")
     await write_frame(c_send, codec.encode(call_header), flags=CALL)
     # Write request
     await write_frame(c_send, codec.encode(Req(value=7)), flags=0)
@@ -224,8 +224,8 @@ async def test_local_session_unary_error_trailer_only():
         service="CounterService",
         method="",
         version=1,
-        call_id="sess-002",
-        serialization_mode=SerializationMode.XLANG.value,
+        callId="sess-002",
+        serializationMode=SerializationMode.XLANG.value,
     )
     server = SessionServer(
         service_class=CounterService,
@@ -234,7 +234,7 @@ async def test_local_session_unary_error_trailer_only():
     )
     srv_task = asyncio.create_task(server.run(stream_header, s_send, s_recv, peer="test"))
 
-    call_header = CallHeader(method="fail", call_id="call-err")
+    call_header = CallHeader(method="fail", callId="call-err")
     await write_frame(c_send, codec.encode(call_header), flags=CALL)
     await write_frame(c_send, codec.encode(Req(value=0)), flags=0)
 
@@ -279,8 +279,8 @@ async def test_local_session_cancel_mid_call():
         service="SlowService",
         method="",
         version=1,
-        call_id="sess-cancel",
-        serialization_mode=SerializationMode.XLANG.value,
+        callId="sess-cancel",
+        serializationMode=SerializationMode.XLANG.value,
     )
     server = SessionServer(
         service_class=SlowService,
@@ -290,7 +290,7 @@ async def test_local_session_cancel_mid_call():
     srv_task = asyncio.create_task(server.run(stream_header, s_send, s_recv, peer="test"))
 
     # Start the slow call
-    call_header = CallHeader(method="slow", call_id="call-slow")
+    call_header = CallHeader(method="slow", callId="call-slow")
     await write_frame(c_send, slow_codec.encode(call_header), flags=CALL)
     await write_frame(c_send, slow_codec.encode(Req(value=0)), flags=0)
 
@@ -309,7 +309,7 @@ async def test_local_session_cancel_mid_call():
     assert status.code == StatusCode.CANCELLED
 
     # Session is still usable -- issue another call
-    call_header2 = CallHeader(method="fast", call_id="call-fast")
+    call_header2 = CallHeader(method="fast", callId="call-fast")
     await write_frame(c_send, slow_codec.encode(call_header2), flags=CALL)
     await write_frame(c_send, slow_codec.encode(Req(value=3)), flags=0)
 
@@ -447,8 +447,8 @@ async def test_local_session_mid_call_call_rejection():
         service="BlockingService",
         method="",
         version=1,
-        call_id="sess-block",
-        serialization_mode=SerializationMode.XLANG.value,
+        callId="sess-block",
+        serializationMode=SerializationMode.XLANG.value,
     )
     server = SessionServer(
         service_class=BlockingService,
@@ -458,14 +458,14 @@ async def test_local_session_mid_call_call_rejection():
     srv_task = asyncio.create_task(server.run(stream_header, s_send, s_recv, peer="test"))
 
     # Start first (blocking) call
-    await write_frame(c_send, b_codec.encode(CallHeader(method="block", call_id="c1")), flags=CALL)
+    await write_frame(c_send, b_codec.encode(CallHeader(method="block", callId="c1")), flags=CALL)
     await write_frame(c_send, b_codec.encode(Req(value=0)), flags=0)
 
     # Give server time to start the handler
     await asyncio.sleep(0.05)
 
     # Send a second CALL before the first completes
-    await write_frame(c_send, b_codec.encode(CallHeader(method="block", call_id="c2")), flags=CALL)
+    await write_frame(c_send, b_codec.encode(CallHeader(method="block", callId="c2")), flags=CALL)
 
     # The second CALL should trigger a FAILED_PRECONDITION after cancel
     # First the blocking call gets cancelled → CANCELLED trailer
@@ -527,8 +527,8 @@ async def test_stream_discriminator_mismatch_shared():
         service="SharedEcho",
         method="",  # session discriminator on a shared service
         version=1,
-        call_id="bad",
-        serialization_mode=SerializationMode.XLANG.value,
+        callId="bad",
+        serializationMode=SerializationMode.XLANG.value,
     )
     header_payload = shared_codec.encode(bad_header)
     await write_frame(c_send, header_payload, flags=HEADER)
