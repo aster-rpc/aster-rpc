@@ -125,6 +125,15 @@ class TestPlugins:
         assert "invoke" in commands
         assert "cat" in commands
         assert "save" in commands
+        assert "discover" in commands
+        assert "access" in commands
+        assert "grant" in commands
+        assert "revoke" in commands
+        assert "visibility" in commands
+        assert "update-service" in commands
+        assert "delegation" in commands
+        assert "public" in commands
+        assert "private" in commands
 
     def test_get_command(self):
         assert get_command("ls") is not None
@@ -144,6 +153,12 @@ class TestPlugins:
         assert "invoke" in names
         assert "join" in names
         assert "whoami" in names
+        assert "publish" in names
+        assert "access" in names
+        assert "grant" in names
+        assert "revoke" in names
+        assert "public" in names
+        assert "private" in names
 
     def test_describe_not_valid_at_root(self):
         cmd = get_command("describe")

@@ -10,8 +10,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from aster_cli.access import (
+    cmd_access_delegation,
+    cmd_access_grant,
+    cmd_access_list,
+    cmd_access_public_private,
+    cmd_access_revoke,
+)
 from aster_cli.join import cmd_join, cmd_status, cmd_verify
-from aster_cli.publish import cmd_publish, cmd_unpublish
+from aster_cli.publish import cmd_discover, cmd_publish, cmd_set_visibility, cmd_unpublish, cmd_update_service
 from aster_cli.shell.plugin import (
     Argument,
     CommandContext,
@@ -523,9 +530,12 @@ class JoinShellCommand(ShellCommand):
             handle=args[0] if args else None,
             email=args[1] if len(args) > 1 else None,
             announcements=False,
-            demo=True,
+            demo=not hasattr(ctx.connection, "_peer_addr"),
+            aster=getattr(ctx.connection, "_peer_addr", None),
+            root_key=None,
         )
         cmd_join(parsed)
+        _after_mutation(ctx)
 
 
 @register
@@ -541,9 +551,12 @@ class VerifyShellCommand(ShellCommand):
             command="verify",
             code=args[0] if args else None,
             resend="--resend" in args,
-            demo=True,
+            demo=not hasattr(ctx.connection, "_peer_addr"),
+            aster=getattr(ctx.connection, "_peer_addr", None),
+            root_key=None,
         )
         cmd_verify(parsed)
+        _after_mutation(ctx)
 
 
 @register
@@ -555,7 +568,7 @@ class WhoamiShellCommand(ShellCommand):
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
         import argparse
 
-        cmd_status(argparse.Namespace(command="whoami", raw_json=False))
+        cmd_status(argparse.Namespace(command="whoami", raw_json=False, local_only=False, aster=getattr(ctx.connection, "_peer_addr", None), root_key=None))
 
 
 @register
@@ -567,13 +580,13 @@ class StatusShellCommand(ShellCommand):
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
         import argparse
 
-        cmd_status(argparse.Namespace(command="status", raw_json=False))
+        cmd_status(argparse.Namespace(command="status", raw_json=False, local_only=False, aster=getattr(ctx.connection, "_peer_addr", None), root_key=None))
 
 
 @register
 class PublishShellCommand(ShellCommand):
     name = "publish"
-    description = "Mark a local service as published in preview mode"
+    description = "Publish a service to @aster"
     contexts = ["/services", "/services/*", "/aster/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
@@ -584,13 +597,37 @@ class PublishShellCommand(ShellCommand):
         if not target:
             ctx.display.error("usage: publish <MODULE:CLASS|service>")
             return
-        cmd_publish(argparse.Namespace(command="publish", target=target, manifest=".aster/manifest.json", semver=None))
+        cmd_publish(
+            argparse.Namespace(
+                command="publish",
+                target=target,
+                manifest=".aster/manifest.json",
+                semver=None,
+                aster=getattr(ctx.connection, "_peer_addr", None),
+                root_key=None,
+                identity_file=None,
+                endpoint_id=None,
+                relay="",
+                endpoint_ttl="5m",
+                description=node.metadata.get("description", "") if node and node.kind == NodeKind.SERVICE else "",
+                status=node.metadata.get("status", "experimental") if node and node.kind == NodeKind.SERVICE else "experimental",
+                public=True,
+                private=False,
+                open=True,
+                closed=False,
+                token_ttl="5m",
+                rate_limit=None,
+                role=[],
+                demo=not hasattr(ctx.connection, "_peer_addr"),
+            )
+        )
+        _after_mutation(ctx)
 
 
 @register
 class UnpublishShellCommand(ShellCommand):
     name = "unpublish"
-    description = "Remove a local published marker"
+    description = "Unpublish a service"
     contexts = ["/services", "/services/*", "/aster/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
@@ -601,7 +638,300 @@ class UnpublishShellCommand(ShellCommand):
         if not service:
             ctx.display.error("usage: unpublish <service>")
             return
-        cmd_unpublish(argparse.Namespace(command="unpublish", service=service))
+        cmd_unpublish(
+            argparse.Namespace(
+                command="unpublish",
+                service=service,
+                aster=getattr(ctx.connection, "_peer_addr", None),
+                root_key=None,
+                demo=not hasattr(ctx.connection, "_peer_addr"),
+            )
+        )
+        _after_mutation(ctx)
+
+
+@register
+class DiscoverShellCommand(ShellCommand):
+    name = "discover"
+    description = "Search published services on @aster"
+    contexts = []
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        cmd_discover(
+            argparse.Namespace(
+                command="discover",
+                query=args[0] if args else "",
+                aster=getattr(ctx.connection, "_peer_addr", None),
+                limit=20,
+                offset=0,
+                raw_json=False,
+            )
+        )
+
+
+@register
+class AccessListShellCommand(ShellCommand):
+    name = "access"
+    description = "List access grants for a published service"
+    contexts = ["/services/*", "/aster/*/*"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        service = args[0] if args else (node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None)
+        if not service:
+            ctx.display.error("usage: access <service>")
+            return
+        cmd_access_list(
+            argparse.Namespace(
+                access_command="list",
+                service=service,
+                aster=getattr(ctx.connection, "_peer_addr", None),
+                root_key=None,
+                raw_json=False,
+            )
+        )
+
+
+@register
+class GrantShellCommand(ShellCommand):
+    name = "grant"
+    description = "Grant a consumer access to a service"
+    contexts = ["/services/*", "/aster/*/*"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        service = node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None
+        if len(args) < 1:
+            ctx.display.error("usage: grant <consumer> [service]")
+            return
+        consumer = args[0]
+        if len(args) > 1:
+            service = args[1]
+        if not service:
+            ctx.display.error("usage: grant <consumer> <service>")
+            return
+        cmd_access_grant(
+            argparse.Namespace(
+                access_command="grant",
+                service=service,
+                consumer=consumer,
+                role="consumer",
+                scope="handle",
+                scope_node_id=None,
+                aster=getattr(ctx.connection, "_peer_addr", None),
+                root_key=None,
+            )
+        )
+        _after_mutation(ctx)
+
+
+@register
+class RevokeShellCommand(ShellCommand):
+    name = "revoke"
+    description = "Revoke a consumer's access to a service"
+    contexts = ["/services/*", "/aster/*/*"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        service = node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None
+        if len(args) < 1:
+            ctx.display.error("usage: revoke <consumer> [service]")
+            return
+        consumer = args[0]
+        if len(args) > 1:
+            service = args[1]
+        if not service:
+            ctx.display.error("usage: revoke <consumer> <service>")
+            return
+        cmd_access_revoke(
+            argparse.Namespace(
+                access_command="revoke",
+                service=service,
+                consumer=consumer,
+                aster=getattr(ctx.connection, "_peer_addr", None),
+                root_key=None,
+            )
+        )
+        _after_mutation(ctx)
+
+
+@register
+class VisibilityShellCommand(ShellCommand):
+    name = "visibility"
+    description = "Change visibility for a published service"
+    contexts = ["/services/*", "/aster/*/*"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        service = node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None
+        if not args:
+            ctx.display.error("usage: visibility <public|private> [service]")
+            return
+        visibility = args[0]
+        if len(args) > 1:
+            service = args[1]
+        if visibility not in {"public", "private"} or not service:
+            ctx.display.error("usage: visibility <public|private> [service]")
+            return
+        cmd_set_visibility(
+            argparse.Namespace(
+                command="visibility",
+                service=service,
+                visibility=visibility,
+                aster=getattr(ctx.connection, "_peer_addr", None),
+                root_key=None,
+            )
+        )
+        _after_mutation(ctx)
+
+
+@register
+class UpdateServiceShellCommand(ShellCommand):
+    name = "update-service"
+    description = "Update published service metadata"
+    contexts = ["/services/*", "/aster/*/*"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        service = node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None
+        if not service:
+            ctx.display.error("usage: update-service [service] [--description ...] [--status ...] [--replacement ...]")
+            return
+        description = None
+        status = None
+        replacement = None
+        remaining: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--description" and i + 1 < len(args):
+                description = args[i + 1]
+                i += 2
+            elif args[i] == "--status" and i + 1 < len(args):
+                status = args[i + 1]
+                i += 2
+            elif args[i] == "--replacement" and i + 1 < len(args):
+                replacement = args[i + 1]
+                i += 2
+            else:
+                remaining.append(args[i])
+                i += 1
+        if remaining:
+            service = remaining[0]
+        cmd_update_service(
+            argparse.Namespace(
+                command="update-service",
+                service=service,
+                description=description,
+                status=status,
+                replacement=replacement,
+                aster=getattr(ctx.connection, "_peer_addr", None),
+                root_key=None,
+            )
+        )
+        _after_mutation(ctx)
+
+
+@register
+class DelegationShellCommand(ShellCommand):
+    name = "delegation"
+    description = "Update a service's delegated access mode"
+    contexts = ["/services/*", "/aster/*/*"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        service = node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None
+        if not service:
+            ctx.display.error("usage: delegation [service] [--open|--closed]")
+            return
+        mode = "open"
+        remaining: list[str] = []
+        for arg in args:
+            if arg == "--closed":
+                mode = "closed"
+            elif arg == "--open":
+                mode = "open"
+            else:
+                remaining.append(arg)
+        if remaining:
+            service = remaining[0]
+        cmd_access_delegation(
+            argparse.Namespace(
+                access_command="delegation",
+                service=service,
+                open=mode == "open",
+                closed=mode == "closed",
+                token_ttl="5m",
+                rate_limit=None,
+                role=[],
+                aster=getattr(ctx.connection, "_peer_addr", None),
+                root_key=None,
+            )
+        )
+        _after_mutation(ctx)
+
+
+@register
+class PublicShellCommand(ShellCommand):
+    name = "public"
+    description = "Make a published service discoverable"
+    contexts = ["/services/*", "/aster/*/*"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        service = args[0] if args else (node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None)
+        if not service:
+            ctx.display.error("usage: public [service]")
+            return
+        cmd_access_public_private(
+            argparse.Namespace(
+                access_command="public",
+                service=service,
+                aster=getattr(ctx.connection, "_peer_addr", None),
+                root_key=None,
+            )
+        )
+        _after_mutation(ctx)
+
+
+@register
+class PrivateShellCommand(ShellCommand):
+    name = "private"
+    description = "Hide a published service from discovery"
+    contexts = ["/services/*", "/aster/*/*"]
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> None:
+        import argparse
+
+        node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
+        service = args[0] if args else (node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None)
+        if not service:
+            ctx.display.error("usage: private [service]")
+            return
+        cmd_access_public_private(
+            argparse.Namespace(
+                access_command="private",
+                service=service,
+                aster=getattr(ctx.connection, "_peer_addr", None),
+                root_key=None,
+            )
+        )
+        _after_mutation(ctx)
 
 
 @register
@@ -1138,11 +1468,18 @@ def _kind_detail(node: VfsNode) -> str:
     return details.get(node.kind, "")
 
 
+def _after_mutation(ctx: CommandContext) -> None:
+    """Refresh shell state after local or remote mutating commands."""
+    _reset_loaded(ctx.vfs_root)
+
+
 def _reset_loaded(node: VfsNode) -> None:
     """Recursively clear loaded flags."""
+    children = list(node.children.values())
     node.loaded = node.kind == NodeKind.ROOT  # keep root loaded
-    node.children.clear() if node.kind != NodeKind.ROOT else None
-    for child in node.children.values():
+    if node.kind != NodeKind.ROOT:
+        node.children.clear()
+    for child in children:
         _reset_loaded(child)
 
 

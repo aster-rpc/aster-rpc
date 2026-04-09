@@ -14,7 +14,26 @@ from aster.status import RpcError, StatusCode
 
 @dataclass
 class CallContext:
-    """Context describing a single RPC invocation."""
+    """Context for a single RPC call, available to interceptors and handlers.
+
+    Passed to every interceptor in the chain. Read ``service`` and ``method``
+    to know which RPC is being called. Use ``metadata`` to pass headers
+    between client and server. Check ``remaining_seconds`` for deadline
+    awareness.
+
+    Attributes:
+        service: The service name (e.g., ``"MissionControl"``).
+        method: The method name (e.g., ``"getStatus"``).
+        call_id: Unique ID for this call (auto-generated UUID).
+        peer: Remote peer identifier (endpoint ID hex).
+        metadata: Key/value headers sent with the call.
+        attributes: Enrollment attributes from the consumer's credential.
+        deadline: Absolute deadline as epoch timestamp, or ``None``.
+        is_streaming: ``True`` for streaming RPC patterns.
+        pattern: RPC pattern (``"unary"``, ``"server_stream"``, etc.).
+        idempotent: ``True`` if the method is safe to retry.
+        attempt: Current retry attempt number (starts at 1).
+    """
 
     service: str
     method: str
@@ -22,7 +41,7 @@ class CallContext:
     session_id: str | None = None
     peer: str | None = None
     metadata: dict[str, str] = field(default_factory=dict)
-    attributes: dict[str, str] = field(default_factory=dict)  # Phase 11: enrollment attrs
+    attributes: dict[str, str] = field(default_factory=dict)
     deadline: float | None = None
     is_streaming: bool = False
     pattern: str | None = None

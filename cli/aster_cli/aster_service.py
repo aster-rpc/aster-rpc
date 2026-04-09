@@ -180,6 +180,7 @@ class AsterServiceRuntime:
         self._types_signed_request: type[Any] | None = None
         self._profile_client_cls: type[Any] | None = None
         self._publication_client_cls: type[Any] | None = None
+        self._access_client_cls: type[Any] | None = None
         self._clients: dict[str, Any] = {}
 
     async def connect(self) -> None:
@@ -223,6 +224,9 @@ class AsterServiceRuntime:
             publication_mod = importlib.import_module(
                 f"{package_name}.services.publication_service_v1"
             )
+            access_mod = importlib.import_module(
+                f"{package_name}.services.access_service_v1"
+            )
         except Exception:
             with contextlib.suppress(ValueError):
                 sys.path.remove(temp_dir)
@@ -234,6 +238,7 @@ class AsterServiceRuntime:
         self._types_signed_request = signed_mod.SignedRequest
         self._profile_client_cls = profile_mod.ProfileServiceClient
         self._publication_client_cls = publication_mod.PublicationServiceClient
+        self._access_client_cls = access_mod.AccessServiceClient
         self._loaded = True
 
     async def close(self) -> None:
@@ -278,6 +283,15 @@ class AsterServiceRuntime:
                 self._peer._aster_client
             )
         return self._clients["publication"]
+
+    async def access_client(self) -> Any:
+        if "access" not in self._clients:
+            if self._access_client_cls is None or self._peer is None:
+                raise RuntimeError("runtime clients not loaded")
+            self._clients["access"] = await self._access_client_cls.from_connection(
+                self._peer._aster_client
+            )
+        return self._clients["access"]
 
 
 async def open_aster_service(explicit_address: str | None = None) -> AsterServiceRuntime:

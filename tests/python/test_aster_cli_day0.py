@@ -6,7 +6,7 @@ from argparse import Namespace
 import pytest
 
 from aster.trust.signing import generate_root_keypair
-from aster_cli import aster_service, join, profile, publish
+from aster_cli import access, aster_service, join, profile, publish
 
 
 @pytest.fixture
@@ -178,6 +178,54 @@ def test_cmd_publish_real_dispatch(monkeypatch, isolated_profile, tmp_path):
     assert captured["manifest_dict"]["contract_id"] == "c" * 64
 
 
+def test_build_publish_payload_matches_day0_schema():
+    manifest = {
+        "service": "TaskManager",
+        "version": 1,
+        "contract_id": "c" * 64,
+        "canonical_encoding": "fory-xlang/0.15",
+        "type_count": 0,
+        "type_hashes": [],
+        "method_count": 0,
+        "methods": [],
+        "serialization_modes": [],
+        "scoped": "shared",
+        "deprecated": False,
+        "semver": None,
+        "vcs_revision": None,
+        "vcs_tag": None,
+        "vcs_url": None,
+        "changelog": None,
+        "published_by": "",
+        "published_at_epoch_ms": 0,
+    }
+    payload = publish._build_publish_payload(
+        handle="alice-test",
+        service_name="TaskManager",
+        manifest=manifest,
+        args=Namespace(
+            endpoint_ttl="5m",
+            token_ttl="5m",
+            closed=False,
+            private=False,
+            description="Task queue",
+            status="experimental",
+            relay="",
+            rate_limit=None,
+            role=[],
+        ),
+        endpoint_id="node123",
+    )
+
+    assert payload["action"] == "publish"
+    assert payload["handle"] == "alice-test"
+    assert payload["service_name"] == "TaskManager"
+    assert "visibility" not in payload
+    assert payload["delegation"]["mode"] == "open"
+    assert payload["endpoints"][0]["node_id"] == "node123"
+    assert payload["contract_id"] != manifest["contract_id"]
+
+
 def test_cmd_publish_requires_description(monkeypatch, isolated_profile, tmp_path):
     _write_profile(root_pubkey="ab" * 32, handle="alice-test", handle_status="verified")
 
@@ -248,6 +296,197 @@ def test_cmd_discover_dispatch(monkeypatch):
         "limit": 5,
         "offset": 10,
         "raw_json": True,
+    }
+
+
+def test_cmd_access_grant_dispatch(monkeypatch, isolated_profile):
+    _write_profile(root_pubkey="ab" * 32, handle="alice-test", handle_status="verified")
+    captured = {}
+
+    async def fake_grant_remote(args, *, handle):
+        captured["handle"] = handle
+        captured["service"] = args.service
+        captured["consumer"] = args.consumer
+        captured["role"] = args.role
+        return 0
+
+    monkeypatch.setattr(access, "_grant_remote", fake_grant_remote)
+
+    rc = access.cmd_access_grant(
+        Namespace(
+            service="TaskManager",
+            consumer="bob-test",
+            role="consumer",
+            scope="handle",
+            scope_node_id=None,
+            aster=None,
+            root_key=None,
+        )
+    )
+
+    assert rc == 0
+    assert captured == {
+        "handle": "alice-test",
+        "service": "TaskManager",
+        "consumer": "bob-test",
+        "role": "consumer",
+    }
+
+
+def test_cmd_access_list_dispatch(monkeypatch, isolated_profile):
+    _write_profile(root_pubkey="ab" * 32, handle="alice-test", handle_status="verified")
+    captured = {}
+
+    async def fake_list_remote(args, *, handle):
+        captured["handle"] = handle
+        captured["service"] = args.service
+        captured["raw_json"] = args.raw_json
+        return 0
+
+    monkeypatch.setattr(access, "_list_remote", fake_list_remote)
+
+    rc = access.cmd_access_list(
+        Namespace(
+            service="TaskManager",
+            aster=None,
+            root_key=None,
+            raw_json=True,
+        )
+    )
+
+    assert rc == 0
+    assert captured == {
+        "handle": "alice-test",
+        "service": "TaskManager",
+        "raw_json": True,
+    }
+
+
+def test_cmd_set_visibility_dispatch(monkeypatch, isolated_profile):
+    _write_profile(root_pubkey="ab" * 32, handle="alice-test", handle_status="verified")
+    captured = {}
+
+    async def fake_set_visibility_remote(args, *, handle):
+        captured["handle"] = handle
+        captured["service"] = args.service
+        captured["visibility"] = args.visibility
+        return 0
+
+    monkeypatch.setattr(publish, "_set_visibility_remote", fake_set_visibility_remote)
+
+    rc = publish.cmd_set_visibility(
+        Namespace(
+            command="visibility",
+            service="TaskManager",
+            visibility="private",
+            aster=None,
+            root_key=None,
+        )
+    )
+
+    assert rc == 0
+    assert captured == {
+        "handle": "alice-test",
+        "service": "TaskManager",
+        "visibility": "private",
+    }
+
+
+def test_cmd_update_service_dispatch(monkeypatch, isolated_profile):
+    _write_profile(root_pubkey="ab" * 32, handle="alice-test", handle_status="verified")
+    captured = {}
+
+    async def fake_update_service_remote(args, *, handle):
+        captured["handle"] = handle
+        captured["service"] = args.service
+        captured["description"] = args.description
+        captured["status"] = args.status
+        captured["replacement"] = args.replacement
+        return 0
+
+    monkeypatch.setattr(publish, "_update_service_remote", fake_update_service_remote)
+
+    rc = publish.cmd_update_service(
+        Namespace(
+            command="update-service",
+            service="TaskManager",
+            description="New description",
+            status="stable",
+            replacement=None,
+            aster=None,
+            root_key=None,
+        )
+    )
+
+    assert rc == 0
+    assert captured == {
+        "handle": "alice-test",
+        "service": "TaskManager",
+        "description": "New description",
+        "status": "stable",
+        "replacement": None,
+    }
+
+
+def test_cmd_access_delegation_dispatch(monkeypatch, isolated_profile):
+    _write_profile(root_pubkey="ab" * 32, handle="alice-test", handle_status="verified")
+    captured = {}
+
+    async def fake_delegation_remote(args, *, handle):
+        captured["handle"] = handle
+        captured["service"] = args.service
+        captured["closed"] = args.closed
+        captured["roles"] = args.role
+        return 0
+
+    monkeypatch.setattr(access, "_delegation_remote", fake_delegation_remote)
+
+    rc = access.cmd_access_delegation(
+        Namespace(
+            access_command="delegation",
+            service="TaskManager",
+            open=False,
+            closed=True,
+            token_ttl="10m",
+            rate_limit=None,
+            role=["consumer"],
+            aster=None,
+            root_key=None,
+        )
+    )
+
+    assert rc == 0
+    assert captured == {
+        "handle": "alice-test",
+        "service": "TaskManager",
+        "closed": True,
+        "roles": ["consumer"],
+    }
+
+
+def test_cmd_access_public_private_dispatch(monkeypatch):
+    captured = {}
+
+    def fake_set_visibility(args):
+        captured["service"] = args.service
+        captured["visibility"] = args.visibility
+        return 0
+
+    monkeypatch.setattr("aster_cli.publish.cmd_set_visibility", fake_set_visibility)
+
+    rc = access.cmd_access_public_private(
+        Namespace(
+            access_command="private",
+            service="TaskManager",
+            aster="aster1example",
+            root_key="/tmp/root.key",
+        )
+    )
+
+    assert rc == 0
+    assert captured == {
+        "service": "TaskManager",
+        "visibility": "private",
     }
 
 
