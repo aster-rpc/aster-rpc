@@ -120,7 +120,7 @@ async def invoke_method(
                 display.rpc_result(_to_serializable(result), elapsed_ms=elapsed)
 
         elif pattern == "server_stream":
-            stream = ctx.connection.server_stream(service_name, method_name, payload)
+            stream = await ctx.connection.server_stream(service_name, method_name, payload)
             await _display_stream(ctx, stream, t0)
 
         elif pattern == "client_stream":
