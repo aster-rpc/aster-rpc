@@ -33,6 +33,10 @@ const RPC_ALPN = 'aster/1';
 export interface AsterServerOptions {
   services: object[];
   config?: Partial<AsterConfig>;
+  /** Path to .aster-identity file. Overrides config.identityFile. */
+  identity?: string;
+  /** Peer name for identity file lookup. */
+  peer?: string;
   /** Allow all consumers without credentials (dev mode). Default: true. */
   allowAllConsumers?: boolean;
   interceptors?: unknown[];
@@ -74,6 +78,9 @@ export class AsterServer {
 
   constructor(opts: AsterServerOptions) {
     this.config = { ...configFromEnv(), ...opts.config } as AsterConfig;
+    if (opts.identity) {
+      this.config.identityFile = opts.identity;
+    }
     this.logger = createLogger({
       format: this.config.logFormat,
       level: this.config.logLevel,
@@ -201,11 +208,10 @@ export class AsterServer {
     try {
       const native = loadNativeSync();
       if (native) {
-        const nodeAddr = JSON.parse(this._node.nodeAddr());
         const info: any = {
-          endpointId: nodeAddr.endpoint_id || this._node.nodeId(),
-          relayAddr: null,
-          directAddrs: nodeAddr.direct_addresses || [],
+          endpointId: this._node.nodeId(),
+          relayAddr: undefined,
+          directAddrs: [],
         };
         return native.asterTicketToString(info);
       }
@@ -250,13 +256,18 @@ export class AsterServer {
   }
 
   private async _handleAdmission(conn: any): Promise<void> {
+    // Adapt NAPI connection to the interface handleConsumerAdmissionConnection expects
+    const adapted = {
+      acceptBi: () => conn.acceptBi(),
+      remoteId: () => conn.remoteNodeId?.() ?? conn.remoteId?.() ?? 'unknown',
+    };
     const opts: ConsumerAdmissionOpts = {
       services: this._serviceSummaries,
       allowUnenrolled: this._allowAllConsumers,
       logger: this.logger,
     };
     await handleConsumerAdmissionConnection(
-      conn,
+      adapted,
       '', // rootPubkey -- empty for open gate
       this._hook,
       opts,
@@ -372,6 +383,10 @@ export interface AsterClientOptions {
   endpointAddr?: string;
   transport?: AsterTransport;
   config?: Partial<AsterConfig>;
+  /** Path to .aster-identity file. Overrides config.identityFile. */
+  identity?: string;
+  /** Peer name for identity file lookup. */
+  peer?: string;
   /** Retry configuration for reconnection. */
   retryBackoff?: ExponentialBackoff;
 }
@@ -391,6 +406,9 @@ export class AsterClientWrapper {
 
   constructor(opts: AsterClientOptions) {
     this.config = { ...configFromEnv(), ...opts.config } as AsterConfig;
+    if (opts.identity) {
+      this.config.identityFile = opts.identity;
+    }
     this.backoff = opts.retryBackoff ?? DEFAULT_BACKOFF;
     if (opts.transport) {
       this.transport = opts.transport;
@@ -509,23 +527,56 @@ let _native: any = null;
 
 function loadNativeSync(): any {
   if (_native) return _native;
+
+  const { resolve } = require('node:path');
+  const { existsSync } = require('node:fs');
+
+  const platforms = [
+    'aster-transport.darwin-arm64.node',
+    'aster-transport.darwin-x64.node',
+    'aster-transport.linux-x64-gnu.node',
+    'aster-transport.linux-arm64-gnu.node',
+    'aster-transport.win32-x64-msvc.node',
+  ];
+
+  // 1. Try the workspace package
   try {
-    // Try common locations
-    const candidates = [
-      '@aster-rpc/transport',
-      '../../../native/aster-transport.darwin-arm64.node',
-      '../../../native/aster-transport.darwin-x64.node',
-      '../../../native/aster-transport.linux-x64-gnu.node',
-      '../../../native/aster-transport.linux-arm64-gnu.node',
-      '../../../native/aster-transport.win32-x64-msvc.node',
-    ];
-    for (const path of candidates) {
+    _native = require('@aster-rpc/transport');
+    return _native;
+  } catch { /* next */ }
+
+  // 2. Try ASTER_NATIVE_PATH env var
+  const envPath = process.env.ASTER_NATIVE_PATH;
+  if (envPath) {
+    for (const name of platforms) {
+      const full = resolve(envPath, name);
+      if (existsSync(full)) { _native = require(full); return _native; }
+    }
+  }
+
+  // 3. Try common workspace layouts relative to this file
+  const searchDirs: string[] = [];
+  try {
+    const { dirname } = require('node:path');
+    // When loaded from packages/aster/src/
+    const thisDir = typeof __dirname !== 'undefined'
+      ? __dirname
+      : dirname(new URL(import.meta.url).pathname);
+    searchDirs.push(resolve(thisDir, '../../../native'));    // packages/aster/src -> native
+    searchDirs.push(resolve(thisDir, '../../native'));       // packages/aster -> native
+    searchDirs.push(resolve(process.cwd(), 'bindings/typescript/native')); // repo root
+    searchDirs.push(resolve(process.cwd(), 'node_modules/@aster-rpc/transport')); // linked
+  } catch { /* ignore */ }
+
+  for (const dir of searchDirs) {
+    for (const name of platforms) {
+      const full = resolve(dir, name);
       try {
-        _native = require(path);
-        return _native;
+        if (existsSync(full)) { _native = require(full); return _native; }
       } catch { /* next */ }
     }
-  } catch { /* fallback */ }
+  }
+
   return null;
 }
 
