@@ -18,7 +18,7 @@ Sub-modules are also available directly::
 
     from aster.server import Server
     from aster.client import create_client
-    from aster.trust.consumer import serve_consumer_admission
+    from aster.trust.consumer import handle_consumer_admission_rpc
 """
 
 # ── Native bindings (iroh transport layer) ───────────────────────────────────

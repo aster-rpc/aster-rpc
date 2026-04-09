@@ -267,6 +267,27 @@ impl DocsClient {
             Ok((DocHandle::from(doc), DocEventReceiver::from(receiver)))
         })
     }
+
+    /// Join a doc by namespace ID (hex) and subscribe to events.
+    ///
+    /// Use this instead of ``join_and_subscribe`` when you already know the
+    /// peer address (e.g., after consumer admission) and only have the
+    /// namespace ID, not a full ``DocTicket`` string.
+    fn join_and_subscribe_namespace<'py>(
+        &self,
+        py: Python<'py>,
+        namespace_id_hex: String,
+        peer_node_id_hex: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            let (doc, receiver) = client
+                .join_and_subscribe_namespace(namespace_id_hex, peer_node_id_hex)
+                .await
+                .map_err(err_to_py)?;
+            Ok((DocHandle::from(doc), DocEventReceiver::from(receiver)))
+        })
+    }
 }
 
 // ============================================================================

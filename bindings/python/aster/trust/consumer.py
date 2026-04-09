@@ -7,7 +7,7 @@ Two actors:
 
   Server (producer node)
     ``handle_consumer_admission_rpc`` — verifies credential, admits peer,
-    returns ``ConsumerAdmissionResponse`` with services + registry_ticket.
+    returns ``ConsumerAdmissionResponse`` with services + registry_namespace.
 
   Client (consumer node)
     ``ConsumerAdmissionRequest`` — the wire message to send.
@@ -79,7 +79,7 @@ class ConsumerAdmissionResponse:
     admitted: bool
     attributes: dict[str, str] = field(default_factory=dict)
     services: list["ServiceSummary"] = field(default_factory=list)
-    registry_ticket: str = ""
+    registry_namespace: str = ""   # 64-char hex namespace_id
     root_pubkey: str = ""        # hex-encoded 32-byte ed25519 public key
     gossip_topic: str = ""       # hex-encoded 32-byte topic — only for root node
     reason: str = ""             # MUST be empty in wire response (§3.2.2)
@@ -94,7 +94,7 @@ class ConsumerAdmissionResponse:
                 s.to_json_dict() if isinstance(s, _SS) else s
                 for s in self.services
             ],
-            "registry_ticket": self.registry_ticket,
+            "registry_namespace": self.registry_namespace,
             "root_pubkey": self.root_pubkey,
             "reason": "",   # never leak reason on wire
         }
@@ -120,7 +120,7 @@ class ConsumerAdmissionResponse:
             admitted=bool(d["admitted"]),
             attributes=d.get("attributes") or {},
             services=services,
-            registry_ticket=d.get("registry_ticket") or "",
+            registry_namespace=d.get("registry_namespace") or d.get("registry_ticket") or "",
             root_pubkey=d.get("root_pubkey") or "",
             gossip_topic=d.get("gossip_topic") or "",
             reason="",
@@ -185,7 +185,7 @@ async def handle_consumer_admission_rpc(
     peer_node_id: str,
     nonce_store: "NonceStoreProtocol | None" = None,
     services: "list[ServiceSummary] | None" = None,
-    registry_ticket: str = "",
+    registry_namespace: str = "",
     allow_unenrolled: bool = False,
     gossip_topic_id: bytes | None = None,
 ) -> ConsumerAdmissionResponse:
@@ -201,7 +201,7 @@ async def handle_consumer_admission_rpc(
         nonce_store:      Required when accepting OTT credentials.
         services:         List of ``ServiceSummary`` to include in the response.
                           Pass ``None`` or ``[]`` when no services are published.
-        registry_ticket:  Read-only iroh-docs share ticket for the registry doc;
+        registry_namespace: 64-char hex namespace_id for the registry doc;
                           empty string if this node does not operate a registry.
         allow_unenrolled: When True, auto-admit peers that present an empty
                           credential (dev mode / ``allow_all_consumers=True``).
@@ -243,7 +243,7 @@ async def handle_consumer_admission_rpc(
             admitted=True,
             attributes={},
             services=list(services or []),
-            registry_ticket=registry_ticket,
+            registry_namespace=registry_namespace,
             root_pubkey=root_pubkey.hex(),
             gossip_topic=_topic_for_peer,
         )
@@ -286,56 +286,13 @@ async def handle_consumer_admission_rpc(
         admitted=True,
         attributes=result.attributes or {},
         services=list(services or []),
-        registry_ticket=registry_ticket,
+        registry_namespace=registry_namespace,
         root_pubkey=root_pubkey.hex(),
         gossip_topic=_topic_for_peer,
     )
 
 
-# ── Listener helper ───────────────────────────────────────────────────────────
-
-
-async def serve_consumer_admission(
-    endpoint: object,
-    root_pubkey: bytes,
-    hook: "MeshEndpointHook",
-    nonce_store: "NonceStoreProtocol | None" = None,
-    services_getter: "Callable[[], list[ServiceSummary]] | None" = None,
-    registry_ticket_getter: "Callable[[], str] | None" = None,
-) -> None:
-    """Accept and process connections on ``aster.consumer_admission`` until cancelled.
-
-    Runs as a background task alongside the main server.  Each connection is
-    handled in its own ``asyncio.Task`` so one slow consumer cannot block others.
-
-    Args:
-        endpoint:               A ``NetClient`` (from ``create_endpoint_with_config``)
-                                bound to the ``aster.consumer_admission`` ALPN.
-        root_pubkey:            The server's root public key (32 bytes).
-        hook:                   ``MeshEndpointHook`` allowlist manager.
-        nonce_store:            Required for OTT credentials.
-        services_getter:        Callable returning current ``list[ServiceSummary]``.
-                                Called fresh for every admission.
-        registry_ticket_getter: Callable returning the current doc share ticket.
-                                Called fresh for every admission.
-    """
-    try:
-        while True:
-            conn = await endpoint.accept()
-            asyncio.create_task(
-                handle_consumer_admission_connection(
-                    conn,
-                    root_pubkey=root_pubkey,
-                    hook=hook,
-                    nonce_store=nonce_store,
-                    services_getter=services_getter,
-                    registry_ticket_getter=registry_ticket_getter,
-                )
-            )
-    except asyncio.CancelledError:
-        pass
-    except Exception as exc:  # noqa: BLE001
-        logger.error("serve_consumer_admission: unexpected error: %s", exc)
+# ── Connection handler ───────────────────────────────────────────────────────
 
 
 async def handle_consumer_admission_connection(
@@ -344,7 +301,7 @@ async def handle_consumer_admission_connection(
     hook: "MeshEndpointHook",
     nonce_store: "NonceStoreProtocol | None" = None,
     services_getter: "Callable[[], list[ServiceSummary]] | None" = None,
-    registry_ticket_getter: "Callable[[], str] | None" = None,
+    registry_namespace_getter: "Callable[[], str] | None" = None,
     allow_unenrolled: bool = False,
     gossip_topic_getter: "Callable[[], bytes | None] | None" = None,
 ) -> None:
@@ -358,7 +315,7 @@ async def handle_consumer_admission_connection(
             return
 
         services = services_getter() if services_getter is not None else []
-        ticket = registry_ticket_getter() if registry_ticket_getter is not None else ""
+        namespace = registry_namespace_getter() if registry_namespace_getter is not None else ""
         topic = gossip_topic_getter() if gossip_topic_getter is not None else None
 
         response = await handle_consumer_admission_rpc(
@@ -369,7 +326,7 @@ async def handle_consumer_admission_connection(
             peer_node_id=peer_node_id,
             nonce_store=nonce_store,
             services=services,
-            registry_ticket=ticket,
+            registry_namespace=namespace,
             gossip_topic_id=topic,
         )
 

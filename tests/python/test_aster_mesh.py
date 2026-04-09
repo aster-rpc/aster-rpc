@@ -49,7 +49,6 @@ from aster.trust import (
 )
 from aster.trust.bootstrap import (
     handle_admission_rpc,
-    apply_admission_response,
 )
 
 
@@ -725,12 +724,7 @@ async def test_admission_rpc_rejected_expired_credential():
     assert response.accepted is False
 
 
-def test_apply_admission_response_raises_on_rejection(tmp_path, monkeypatch):
-    """apply_admission_response raises RuntimeError if response.accepted is False."""
-    monkeypatch.setenv("ASTER_MESH_STATE_DIR", str(tmp_path))
-    response = AdmissionResponse(accepted=False, reason="test rejection")
-    with pytest.raises(RuntimeError, match="Admission refused"):
-        apply_admission_response(response, own_endpoint_id="node1")
+    # test_apply_admission_response removed — function was dead code
 
 
 # ─────────────────────────────────────────────────────────────────────────────

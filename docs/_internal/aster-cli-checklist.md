@@ -1,7 +1,7 @@
 # Aster CLI Identity / Publish Checklist
 
 **Status:** Active working checklist  
-**Last updated:** 2026-04-08  
+**Last updated:** 2026-04-09  
 **Scope:** CLI and shell work for identity, join, publish, and directory UX
 
 This checklist is intentionally implementation-oriented. It tracks what is
@@ -13,6 +13,11 @@ framework, and follow-up CLI integration.
 ### Foundation
 
 - [x] Added shared config/profile helpers for active profile access and mutation
+- [x] Added shared `@aster` CLI helper layer for:
+  - [x] service address resolution
+  - [x] root key loading
+  - [x] runtime typed-client generation from live manifests
+  - [x] signed request envelope construction
 - [x] Extended local config handling for profile-level handle state:
   - [x] `handle`
   - [x] `handle_status`
@@ -42,12 +47,18 @@ framework, and follow-up CLI integration.
 - [x] Registered top-level `aster verify`
 - [x] Registered top-level `aster publish`
 - [x] Registered top-level `aster unpublish`
+- [x] Registered top-level `aster discover`
 - [x] Implemented local-only `status` / `whoami`
 - [x] Implemented preview `join --demo`
 - [x] Implemented preview `verify --demo`
 - [x] Implemented preview `verify --resend --demo`
-- [x] Implemented preview `publish`
-- [x] Implemented preview `unpublish`
+- [x] Switched `aster join` to real networked flow by default
+- [x] Switched `aster verify` to real networked flow by default
+- [x] Switched `aster publish` to real networked flow by default
+- [x] Switched `aster unpublish` to real networked flow by default
+- [x] Added real networked `aster discover`
+- [x] Kept explicit preview/demo mode for `join`, `verify`, `publish`, and `unpublish`
+- [x] Added Day 0 publish flags for description, visibility, delegation mode, token TTL, rate limit, endpoint TTL, and endpoint identity override
 
 ### Shell Integration
 
@@ -72,26 +83,37 @@ framework, and follow-up CLI integration.
 ### Tests / Verification
 
 - [x] Added test coverage for handle validation
+- [x] Added targeted CLI tests for:
+  - [x] signed envelope construction
+  - [x] service address resolution
+  - [x] real command dispatch without `--demo`
+  - [x] publish argument validation
 - [x] Updated shell command registration expectations
 - [x] Kept shell test suite green after wiring new commands
+- [x] Verified `uv run pytest tests/python/test_aster_cli_day0.py -v`
 - [x] Verified `uv run pytest tests/python/test_shell.py -v`
 - [x] Smoke-tested:
   - [x] `aster status`
   - [x] `aster join --demo`
   - [x] `aster verify --demo`
+- [x] Smoke-tested generated client `PublicationService.discover(...)` against live Day 0 `@aster`
+- [x] Smoke-tested live CLI flow:
+  - [x] `aster join` against a dev `@aster` node
+  - [x] `aster status` against a dev `@aster` node
+  - [x] `aster discover` against a dev `@aster` node
 
 ## Todo
 
 ### CLI: Real Join / Verify Networking
 
-- [ ] Replace preview-only `join --demo` flow with real `@aster` RPC client flow
-- [ ] Implement registry/service client resolver for `@aster`
+- [x] Replace preview-only `join --demo` flow with real `@aster` RPC client flow
+- [x] Implement registry/service client resolver for `@aster`
 - [ ] Call `check_availability` before handle claim
 - [ ] Handle “taken” / “reserved” / “invalid” responses with correct CLI UX
-- [ ] Sign `join` payloads with the root key
+- [x] Sign `join` payloads with the root key
 - [ ] Call real `join`
 - [ ] Persist pending state from real server response
-- [ ] Sign `verify` payloads with the root key
+- [x] Sign `verify` payloads with the root key
 - [ ] Call real `verify`
 - [ ] Call real `resend_verification`
 - [ ] Surface server error cases:
@@ -103,19 +125,19 @@ framework, and follow-up CLI integration.
 
 ### CLI: Root-Key and Signing UX
 
-- [ ] Reuse canonical signed-request encoding expected by the `@aster` service
-- [ ] Add nonce generation for signed requests
-- [ ] Add timestamp generation for signed requests
-- [ ] Load root private key from keyring/file in one shared helper for identity commands
+- [x] Reuse canonical signed-request encoding expected by the `@aster` service
+- [x] Add nonce generation for signed requests
+- [x] Add timestamp generation for signed requests
+- [x] Load root private key from keyring/file in one shared helper for identity commands
 - [ ] Make `aster join` auto-create the root key in the final non-demo flow
-- [ ] Decide whether `aster join` should ever require an explicit `--demo`, or infer preview mode when the service client is absent
+- [x] Decide whether `aster join` should ever require an explicit `--demo`, or infer preview mode when the service client is absent
 
 ### CLI: Status / Whoami
 
 - [ ] Add non-blocking `handle_status` call on shell startup
 - [ ] Cache `handle_status` locally with TTL
 - [ ] Show online/offline indicator from real `@aster` reachability
-- [ ] Distinguish local-only state from confirmed remote state in output
+- [x] Distinguish local-only state from confirmed remote state in output
 - [ ] Optionally add `--json` structured output for the new identity commands
 
 ### Shell UX
@@ -124,7 +146,7 @@ framework, and follow-up CLI integration.
 - [ ] Refresh shell banner immediately after `verify`
 - [ ] Refresh shell banner after `publish` / `unpublish`
 - [ ] Add `discover` command in the shell
-- [ ] Add top-level CLI `aster discover`
+- [x] Add top-level CLI `aster discover`
 - [ ] Add richer shell banners for all documented states:
   - [ ] State A: no root key
   - [ ] State B: root key, unregistered
@@ -136,12 +158,12 @@ framework, and follow-up CLI integration.
 
 ### Publish: Real Integration
 
-- [ ] Replace local preview publish marker flow with real `publish` RPC
-- [ ] Reuse `aster contract gen` pipeline end-to-end for publish requests
-- [ ] Build signed publish payload
+- [x] Replace local preview publish marker flow with real `publish` RPC
+- [x] Reuse `aster contract gen` pipeline end-to-end for publish requests
+- [x] Build signed publish payload
 - [ ] Post manifest to `@aster`
 - [ ] Store returned `delegation_pubkey`
-- [ ] Implement real `unpublish` RPC
+- [x] Implement real `unpublish` RPC
 - [ ] Show first-publish recovery code guidance if that behavior remains in scope
 - [ ] Add real shell refresh of `/aster/<handle>` after publish/unpublish
 
@@ -185,25 +207,26 @@ framework, and follow-up CLI integration.
 ## Cross-Agent Dependencies
 
 - [ ] `@aster` service methods available and stable:
-  - [ ] `check_availability`
-  - [ ] `join`
+  - [x] `check_availability`
+  - [x] `join`
   - [ ] `verify`
   - [ ] `resend_verification`
-  - [ ] `handle_status`
+  - [x] `handle_status`
   - [ ] `publish`
   - [ ] `unpublish`
-  - [ ] `discover`
+  - [x] `discover`
   - [ ] `grant_access`
   - [ ] `revoke_access`
   - [ ] `list_access`
 - [ ] Framework support available and stable:
-  - [ ] signed request helpers
+  - [x] signed request helpers
   - [ ] delegated enrollment / `delegation_pubkey`
   - [ ] admission-handler integration for `@aster`-signed tokens
   - [ ] handle-based connect / resolution path if owned by framework
 
 ## Notes
 
-- Current `join` / `verify` implementation is deliberately preview-only unless `--demo` is used.
-- Current `publish` / `unpublish` implementation updates local preview state only.
+- Current `join` / `verify` / `publish` / `unpublish` implementations now target the live `@aster` service by default and keep `--demo` as an explicit fallback.
+- `status` now opportunistically syncs against remote `handle_status` and updates local state.
+- `discover` now talks to the live `PublicationService`.
 - Current shell banner work is local-state driven; it does not yet talk to `@aster`.

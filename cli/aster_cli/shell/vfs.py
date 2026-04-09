@@ -173,8 +173,9 @@ async def populate_service_methods(node: VfsNode, connection: Any) -> None:
 
     try:
         contract = await connection.get_contract(node.name)
-        if contract and hasattr(contract, "methods"):
-            for method in contract.methods:
+        methods = contract.get("methods", []) if isinstance(contract, dict) else getattr(contract, "methods", [])
+        if methods:
+            for method in methods:
                 m_name = method.get("name", str(method)) if isinstance(method, dict) else str(method)
                 method_node = VfsNode(
                     name=m_name,
@@ -184,10 +185,10 @@ async def populate_service_methods(node: VfsNode, connection: Any) -> None:
                     loaded=True,
                 )
                 node.add_child(method_node)
+            node.loaded = True
+        # If methods is empty, don't mark as loaded — manifest may still be fetching
     except Exception:
         pass
-
-    node.loaded = True
 
 
 async def populate_blobs(node: VfsNode, connection: Any) -> None:
@@ -220,7 +221,10 @@ async def populate_blobs(node: VfsNode, connection: Any) -> None:
     except Exception:
         pass
 
-    node.loaded = True
+    # Only mark loaded if children were found; otherwise retry later
+    # after background manifest fetch populates artifact_refs.
+    if node.children:
+        node.loaded = True
 
 
 async def populate_collection(node: VfsNode, connection: Any) -> None:

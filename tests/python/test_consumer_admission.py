@@ -4,7 +4,7 @@ End-to-end tests for the consumer admission flow (§3.2, §3.2.2).
 Proves the Y.2 Dynamic Client Flow from Aster-E2E-flow.md:
   1. Node A publishes a contract and starts a consumer admission listener.
   2. Node B presents a consumer credential over aster.consumer_admission.
-  3. Node B receives ConsumerAdmissionResponse with services[] and registry_ticket.
+  3. Node B receives ConsumerAdmissionResponse with services[] and registry_namespace.
   4. Node B joins the registry doc and resolves the service.
 
 Also tests unit-level behaviour:
@@ -103,7 +103,7 @@ def test_response_roundtrip_admitted():
         admitted=True,
         attributes={"aster.role": "reader"},
         services=[svc],
-        registry_ticket="ticket_abc",
+        registry_namespace="ticket_abc",
         root_pubkey="e" * 64,
     )
     resp2 = ConsumerAdmissionResponse.from_json(resp.to_json())
@@ -111,7 +111,7 @@ def test_response_roundtrip_admitted():
     assert resp2.attributes == {"aster.role": "reader"}
     assert len(resp2.services) == 1
     assert resp2.services[0].name == "X"
-    assert resp2.registry_ticket == "ticket_abc"
+    assert resp2.registry_namespace == "ticket_abc"
     assert resp2.root_pubkey == "e" * 64
 
 
@@ -120,7 +120,7 @@ def test_response_roundtrip_denied():
     resp2 = ConsumerAdmissionResponse.from_json(resp.to_json())
     assert resp2.admitted is False
     assert resp2.services == []
-    assert resp2.registry_ticket == ""
+    assert resp2.registry_namespace == ""
 
 
 def test_response_reason_not_in_wire():
@@ -160,13 +160,13 @@ async def test_handle_rpc_policy_admitted():
         hook=hook,
         peer_node_id="peer_abc",
         services=[svc],
-        registry_ticket="ticket_xyz",
+        registry_namespace="ticket_xyz",
     )
     assert resp.admitted is True
     assert "peer_abc" in hook.admitted
     assert len(resp.services) == 1
     assert resp.services[0].name == "Svc"
-    assert resp.registry_ticket == "ticket_xyz"
+    assert resp.registry_namespace == "ticket_xyz"
     assert resp.root_pubkey == pub_raw.hex()
 
 
@@ -259,7 +259,7 @@ async def test_e2e_admission_returns_services_and_ticket():
     Y.2 Dynamic Client Flow end-to-end (§3.2 + §3.2.2):
 
     Node A: starts a consumer admission endpoint; publishes a fake service.
-    Node B: presents a policy credential; receives services[] + registry_ticket.
+    Node B: presents a policy credential; receives services[] + registry_namespace.
     """
     from aster import IrohNode, docs_client, create_endpoint_with_config, EndpointConfig
 
@@ -294,7 +294,7 @@ async def test_e2e_admission_returns_services_and_ticket():
             hook=hook_a,
             peer_node_id=peer_id,
             services=services_a,
-            registry_ticket=ticket_a,
+            registry_namespace=ticket_a,
         )
         await send.write_all(resp.to_json().encode())
         await send.finish()
@@ -323,7 +323,7 @@ async def test_e2e_admission_returns_services_and_ticket():
     assert resp_b.admitted is True
     assert len(resp_b.services) == 1
     assert resp_b.services[0].name == "GreetService"
-    assert resp_b.registry_ticket == ticket_a
+    assert resp_b.registry_namespace == ticket_a
     assert resp_b.root_pubkey == pub_raw.hex()
     assert resp_b.reason == ""
 
@@ -332,7 +332,8 @@ async def test_e2e_admission_returns_services_and_ticket():
     node_b.add_node_addr(node_a)
     node_a.add_node_addr(node_b)
     dc_b = docs_client(node_b)
-    doc_b, _ = await dc_b.join_and_subscribe(resp_b.registry_ticket)
+    peer_id_a = node_a.node_addr_info().endpoint_id
+    doc_b, _ = await dc_b.join_and_subscribe_namespace(resp_b.registry_namespace, peer_id_a)
     assert doc_b is not None
 
     await ep_a.close()

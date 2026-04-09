@@ -606,31 +606,3 @@ class MemRecvStream:
         self._stopped = True
         self._stop_code = code
 
-
-class LocalConnection:
-    """A paired connection for LocalTransport testing.
-
-    Provides the same interface as IrohConnection but uses queues.
-    """
-
-    def __init__(self) -> None:
-        self._bi_queue: asyncio.Queue[tuple[MemSendStream, MemRecvStream]] = asyncio.Queue()
-        self._closed = False
-
-    async def open_bi(self) -> tuple[MemSendStream, MemRecvStream]:
-        """Open a bidirectional stream."""
-        # For local testing, we create paired send/recv streams
-        # that share the same buffer
-        send = MemSendStream()
-        recv = MemRecvStream(b"")  # Will be updated when data is written
-        return send, recv
-
-    async def accept_bi(self) -> tuple[MemSendStream, MemRecvStream]:
-        """Accept a bidirectional stream."""
-        return await self._bi_queue.get()
-
-    def close(self, code: int, reason: bytes) -> None:
-        self._closed = True
-
-    def remote_id(self) -> str:
-        return "local-connection"

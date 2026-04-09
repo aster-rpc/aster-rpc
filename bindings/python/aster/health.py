@@ -181,7 +181,7 @@ def check_ready(server: Any) -> bool:
     Returns True if:
     - Server is started
     - At least one service is registered
-    - Contract publication has completed (registry_ticket is set)
+    - Contract publication has completed (registry_namespace is set)
     """
     if not check_health(server):
         return False
@@ -271,7 +271,7 @@ def _prometheus_text(server: Any) -> str:
 def ready_status(server: Any) -> dict[str, Any]:
     """Full readiness status for /readyz endpoint."""
     summaries = getattr(server, "_service_summaries", [])
-    has_registry = bool(getattr(server, "_registry_ticket", ""))
+    has_registry = bool(getattr(server, "_registry_namespace", ""))
     return {
         "status": "ready" if check_ready(server) else "not_ready",
         "services": len(summaries),

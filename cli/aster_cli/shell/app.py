@@ -331,7 +331,7 @@ class PeerConnection:
     async def _fetch_manifests(self) -> None:
         """Fetch manifest.json for each service from the blob store.
 
-        The registry doc (accessed via registry_ticket) maps contract_ids
+        The registry doc (accessed via registry_namespace) maps contract_ids
         to ArtifactRefs which point to blob collections containing manifest.json.
         If registry is unavailable, manifests will be empty (basic service info only).
         """
@@ -339,10 +339,10 @@ class PeerConnection:
         import logging
 
         logger = logging.getLogger(__name__)
-        ticket = self._aster_client.registry_ticket if self._aster_client else ""
+        namespace = self._aster_client.registry_namespace if self._aster_client else ""
 
-        if not ticket or not self._aster_client._node:
-            logger.debug("No registry ticket or node — skipping manifest fetch")
+        if not namespace or not self._aster_client._node:
+            logger.debug("No registry namespace or node — skipping manifest fetch")
             return
 
         try:
@@ -354,7 +354,10 @@ class PeerConnection:
             dc = docs_client(self._aster_client._node)
 
             # Join the registry doc (read-only) and wait for initial sync
-            doc, event_receiver = await dc.join_and_subscribe(ticket)
+            remote_node_id = self._get_remote_node_id() or ""
+            doc, event_receiver = await dc.join_and_subscribe_namespace(
+                namespace, remote_node_id
+            )
             self._registry_doc = doc
             self._registry_event_rx = event_receiver
 
@@ -411,35 +414,53 @@ class PeerConnection:
                     collection_hash = artifact.get("collection_hash", "")
 
                     if not collection_hash:
+                        logger.debug("No collection_hash for %s", svc.name)
                         continue
 
-                    # Download the entire collection via the collection ticket.
-                    # This fetches the index blob + all referenced entry blobs.
-                    blob_ticket = artifact.get("ticket")
-                    if blob_ticket:
+                    # Download collection by hash from the remote peer.
+                    # We already know the remote node_id from the connection.
+                    remote_node_id = self._get_remote_node_id()
+                    if remote_node_id:
                         try:
-                            await bc.download_blob(blob_ticket)
-                            logger.debug("Downloaded collection via ticket")
+                            files = await bc.download_collection_hash(
+                                collection_hash, remote_node_id
+                            )
+                            total_size = sum(len(data) for _, data in files)
+                            artifact["size"] = total_size
+                            for name, data in files:
+                                if name == "manifest.json":
+                                    manifest = _json.loads(data)
+                                    self._manifests[svc.name] = manifest
+                                    logger.debug(
+                                        "Fetched manifest for %s: %d methods",
+                                        svc.name,
+                                        len(manifest.get("methods", [])),
+                                    )
+                                    break
                         except Exception as dl_exc:
-                            logger.debug("Collection download failed: %s", dl_exc)
-
-                    # Fetch manifest.json from the blob collection
-                    manifest_bytes = await fetch_from_collection(
-                        bc, collection_hash, "manifest.json"
-                    )
-                    if manifest_bytes:
-                        manifest = _json.loads(manifest_bytes)
-                        self._manifests[svc.name] = manifest
-                        logger.debug(
-                            "Fetched manifest for %s: %d methods",
-                            svc.name,
-                            len(manifest.get("methods", [])),
+                            logger.debug("Collection download failed for %s: %s", svc.name, dl_exc)
+                    else:
+                        # Fallback: try reading from local store
+                        manifest_bytes = await fetch_from_collection(
+                            bc, collection_hash, "manifest.json"
                         )
+                        if manifest_bytes:
+                            manifest = _json.loads(manifest_bytes)
+                            self._manifests[svc.name] = manifest
                 except Exception as exc:
                     logger.debug("Failed to fetch manifest for %s: %s", svc.name, exc)
 
         except Exception as exc:
             logger.debug("Registry manifest fetch failed: %s", exc)
+
+    def _get_remote_node_id(self) -> str | None:
+        """Get the remote peer's endpoint ID (node_id hex)."""
+        try:
+            from aster.high_level import _coerce_node_addr
+            addr = _coerce_node_addr(self._aster_client._endpoint_addr_in)
+            return addr.endpoint_id or None
+        except Exception:
+            return None
 
     async def list_services(self) -> list[dict[str, Any]]:
         """List services from admission, enriched with manifest data."""
@@ -482,6 +503,19 @@ class PeerConnection:
                 }
         return None
 
+    def get_manifests(self) -> dict[str, dict[str, Any]]:
+        """Get all fetched manifests: service_name -> manifest dict."""
+        return dict(self._manifests)
+
+    def get_peer_display(self) -> str:
+        """Get the peer's display name (handle or endpoint_id prefix)."""
+        try:
+            from aster.high_level import _coerce_node_addr
+            addr = _coerce_node_addr(self._aster_client._endpoint_addr_in)
+            return addr.endpoint_id[:8] if addr.endpoint_id else "unknown"
+        except Exception:
+            return "unknown"
+
     async def list_blobs(self) -> list[dict[str, Any]]:
         """List blobs: tags from the local store + collection entries from manifests."""
         results: list[dict[str, Any]] = []
@@ -519,7 +553,7 @@ class PeerConnection:
             svc_ver = svc.version if svc else 1
             results.append({
                 "hash": coll_hash,
-                "size": 0,
+                "size": artifact.get("size", 0),
                 "tag": f"{svc_name}.v{svc_ver}",
                 "source": "collection",
                 "is_collection": True,
@@ -1346,7 +1380,10 @@ async def _populate_from_connection(root, connection) -> tuple[int, int]:
                         loaded=True,
                     )
                     svc_node.add_child(m_node)
-                svc_node.loaded = True
+                # Only mark loaded if methods were populated;
+                # otherwise let ensure_loaded retry after manifest fetch
+                if methods:
+                    svc_node.loaded = True
 
                 services_node.add_child(svc_node)
                 svc_count += 1
@@ -1371,7 +1408,10 @@ async def _populate_from_connection(root, connection) -> tuple[int, int]:
                 )
                 blobs_node.add_child(blob_node)
                 blob_count += 1
-            blobs_node.loaded = True
+            # Only mark loaded if we found blobs; otherwise let
+            # ensure_loaded retry after manifest fetch populates artifact_refs
+            if blob_count > 0:
+                blobs_node.loaded = True
         except Exception:
             blobs_node.loaded = True
 

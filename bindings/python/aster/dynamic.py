@@ -108,6 +108,10 @@ class DynamicTypeFactory:
                      response_wire_tag + response_fields.
         """
         for method in methods:
+            # Synthesize element types first (needed before the parent type)
+            for field_list in (method.get("fields", []), method.get("response_fields", [])):
+                self._synthesize_element_types(field_list)
+
             # Synthesize request type
             req_tag = method.get("request_wire_tag", "")
             req_name = method.get("request_type", "")
@@ -128,6 +132,17 @@ class DynamicTypeFactory:
                 self._types[resp_tag] = resp_cls
                 logger.debug("Synthesized response type: %s (%s)", resp_name, resp_tag)
 
+    def _synthesize_element_types(self, fields: list[dict[str, Any]]) -> None:
+        """Pre-synthesize element types for list[X] fields."""
+        for f in fields:
+            elem_tag = f.get("element_wire_tag", "")
+            elem_name = f.get("element_type", "")
+            elem_fields = f.get("element_fields", [])
+            if elem_tag and elem_name and elem_tag not in self._types:
+                elem_cls = self._synthesize_type(elem_tag, elem_name, elem_fields)
+                self._types[elem_tag] = elem_cls
+                logger.debug("Synthesized element type: %s (%s)", elem_name, elem_tag)
+
     def _synthesize_type(
         self, tag: str, name: str, fields: list[dict[str, Any]]
     ) -> type:
@@ -135,7 +150,12 @@ class DynamicTypeFactory:
         # Build field specifications for make_dataclass
         dc_fields: list[tuple[str, type, Any]] = []
         for f in fields:
-            py_type = _resolve_type(f.get("type", "str"))
+            elem_tag = f.get("element_wire_tag", "")
+            if elem_tag and elem_tag in self._types:
+                # Parameterized list: list[ElementType]
+                py_type = list[self._types[elem_tag]]
+            else:
+                py_type = _resolve_type(f.get("type", "str"))
             default = _resolve_default(f.get("type", "str"), f.get("default"))
             dc_fields.append((f["name"], py_type, dataclasses.field(default=default)))
 

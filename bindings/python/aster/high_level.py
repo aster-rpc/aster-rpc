@@ -2,7 +2,7 @@
 aster.high_level — Declarative ``AsterServer`` / ``AsterClient`` wrappers.
 
 Thin composition over the existing low-level primitives
-(:class:`aster.Server`, :func:`aster.trust.consumer.serve_consumer_admission`,
+(:class:`aster.Server`, :func:`aster.trust.consumer.handle_consumer_admission_rpc`,
 :func:`aster.client.create_client`) to give application code a one-line,
 declarative producer/consumer experience.
 
@@ -112,7 +112,7 @@ class AsterServer:
         interceptors: list[Any] | None = None,
         hook: MeshEndpointHook | None = None,
         nonce_store: Any | None = None,
-        registry_ticket: str = "",
+        registry_namespace: str = "",
         mesh_state: MeshState | None = None,
         clock_drift_config: ClockDriftConfig | None = None,
         persist_mesh_state: bool = False,
@@ -182,7 +182,7 @@ class AsterServer:
         self._interceptors = list(interceptors) if interceptors else []
         self._hook = hook
         self._nonce_store = nonce_store
-        self._registry_ticket = registry_ticket
+        self._registry_namespace = registry_namespace
         self._mesh_state = mesh_state
         self._clock_drift_config = clock_drift_config
         self._persist_mesh_state = persist_mesh_state
@@ -396,6 +396,7 @@ class AsterServer:
     def _print_banner(self) -> None:
         """Print the startup banner with service info."""
         import sys
+        import os
 
         # Only print banner when stderr is a terminal (not in tests/pipes)
         if not sys.stderr.isatty():
@@ -406,27 +407,31 @@ class AsterServer:
         D = "\033[2m"    # dim
         G = "\033[32m"   # green
         Y = "\033[33m"   # yellow
+        W = "\033[37m"   # white
         R = "\033[0m"    # reset
+        w = sys.stderr.write
 
-        banner = f"""{C}
-     ╭──────────────────────────────────────────╮
-     │{B}           _    ____ _____ _____ ____     {R}{C}│
-     │{B}          / \\  / ___|_   _| ____|  _ \\    {R}{C}│
-     │{B}         / _ \\ \\___ \\ | | |  _| | |_) |   {R}{C}│
-     │{B}        / ___ \\ ___) || | | |___|  _ <    {R}{C}│
-     │{B}       /_/   \\_\\____/ |_| |_____|_| \\_\\   {R}{C}│
-     │{D}              RPC after hostnames.        {R}{C}│
-     │{D}         Copyright © 2026 Emrul Islam.    {R}{C}│
-     │{D}              All rights reserved.        {R}{C}│
-     ╰──────────────────────────────────────────╯{R}
-"""
-        sys.stderr.write(banner)
+        # ── Banner ────────────────────────────────────────────────────────
+        w(f"\n{C}{B}")
+        w(f"        _    ____ _____ _____ ____\n")
+        w(f"       / \\  / ___|_   _| ____|  _ \\\n")
+        w(f"      / _ \\ \\___ \\ | | |  _| | |_) |\n")
+        w(f"     / ___ \\ ___) || | | |___|  _ <\n")
+        w(f"    /_/   \\_\\____/ |_| |_____|_| \\_\\\n")
+        w(f"{R}\n")
+        w(f"    {D}RPC after hostnames.{R}\n\n")
 
-        # Service info
-        for s in self._service_summaries:
-            sys.stderr.write(f"  {G}●{R} {B}{s.name}{R} v{s.version}  {D}contract:{R} {s.contract_id[:16]}…\n")
+        # ── Services table ────────────────────────────────────────────────
+        if self._service_summaries:
+            # Find max name length for alignment
+            max_name = max(len(s.name) for s in self._service_summaries)
+            for s in self._service_summaries:
+                name_pad = s.name.ljust(max_name)
+                w(f"    {G}●{R} {B}{name_pad}{R}  {D}v{s.version}{R}  {D}{s.contract_id}{R}\n")
+            w("\n")
 
-        # Endpoint — show compact aster1... ticket as primary format
+        # ── Endpoint ─────────────────────────────────────────────────────
+        compact = None
         if self._node:
             try:
                 from . import AsterTicket
@@ -437,34 +442,46 @@ class AsterServer:
                 )
                 compact = t.to_string()
             except Exception:
-                compact = None
-            addr_b64 = base64.b64encode(
-                self._node.node_addr_info().to_bytes()
-            ).decode()
-        else:
-            compact = None
-            addr_b64 = "?"
-        if compact:
-            sys.stderr.write(f"  {D}ticket:{R}    {compact}\n")
-        sys.stderr.write(f"  {D}endpoint:{R}  {addr_b64[:48]}…\n")
+                pass
 
-        # Mode
+        if compact:
+            w(f"    {D}endpoint:{R}  {compact}\n")
+
+        # ── Mode ──────────────────────────────────────────────────────────
         mode_parts = []
         if self._allow_all_consumers:
             mode_parts.append(f"{Y}open-gate{R}")
         else:
             mode_parts.append(f"{G}trusted{R}")
-        if self._registry_ticket:
+        if self._registry_namespace:
             mode_parts.append(f"{G}registry{R}")
-        sys.stderr.write(f"  {D}mode:{R}      {' '.join(mode_parts)}\n")
-        sys.stderr.write(f"  {D}log:{R}       ASTER_LOG_FORMAT=json|text  ASTER_LOG_LEVEL=debug|info|warn\n")
-        sys.stderr.write("\n")
+        w(f"    {D}mode:{R}      {' '.join(mode_parts)}\n")
+
+        # ── Logging ───────────────────────────────────────────────────────
+        log_format = os.environ.get("ASTER_LOG_FORMAT", "text")
+        log_level = os.environ.get("ASTER_LOG_LEVEL", "info")
+        w(f"    {D}log:{R}       ASTER_LOG_FORMAT={W}{log_format}{R}  ASTER_LOG_LEVEL={W}{log_level}{R}\n")
+
+        # ── Versions ──────────────────────────────────────────────────────
+        try:
+            from importlib.metadata import version as _pkg_version
+            aster_ver = _pkg_version("aster-rpc")
+        except Exception:
+            aster_ver = "?"
+
+        # Read iroh version from the native module
+        iroh_ver = "0.97"  # pinned in Cargo.toml
+
+        w(f"    {D}runtime:{R}   aster-rpc {aster_ver} (python)  iroh {iroh_ver}\n")
+
+        # ── Copyright ─────────────────────────────────────────────────────
+        w(f"\n    {D}Copyright \u00a9 2026 Emrul Islam. All rights reserved.{R}\n\n")
 
     async def _publish_contracts(self) -> None:
         """Create a registry doc and publish each service's contract collection.
 
-        After publication, ``self._registry_ticket`` is set to the read-only
-        share ticket so consumer admission can return it.
+        After publication, ``self._registry_namespace`` is set to the 64-char
+        hex namespace_id so consumer admission can return it.
         """
         assert self._node is not None
 
@@ -575,10 +592,12 @@ class AsterServer:
                     collection_hash[:12],
                 )
 
-            # Generate read-only share ticket for consumers
-            self._registry_ticket = await registry_doc.share_with_addr("read")
-            logger.info(
-                "Registry doc ready — ticket length: %d", len(self._registry_ticket)
+            # share() enables the sync engine on the server side so consumers
+            # can replicate this doc.  We only need the namespace_id on the wire.
+            await registry_doc.share_with_addr("read")
+            self._registry_namespace = registry_doc.doc_id()
+            logger.debug(
+                "Registry doc ready — namespace: %s", self._registry_namespace[:16]
             )
 
         except Exception as exc:
@@ -663,7 +682,7 @@ class AsterServer:
                             hook=self._hook,
                             nonce_store=self._nonce_store,
                             services_getter=lambda: services_snapshot,
-                            registry_ticket_getter=lambda: self._registry_ticket,
+                            registry_namespace_getter=lambda: self._registry_namespace,
                             allow_unenrolled=self._allow_all_consumers,
                             gossip_topic_getter=lambda: (
                                 self._mesh_state.topic_id
@@ -987,7 +1006,7 @@ class AsterClient:
         self._node: Any | None = None
         self._ep: Any | None = None
         self._services: list[ServiceSummary] = []
-        self._registry_ticket: str = ""
+        self._registry_namespace: str = ""
         self._gossip_topic: str = ""
         self._rpc_conns: dict[str, Any] = {}
         self._clients: list[ServiceClient] = []
@@ -1110,12 +1129,12 @@ class AsterClient:
             )
 
         self._services = list(resp.services)
-        self._registry_ticket = resp.registry_ticket or ""
+        self._registry_namespace = resp.registry_namespace or ""
         self._gossip_topic = resp.gossip_topic or ""
         logger.info(
-            "Admitted — services: %s, registry_ticket: %s, gossip_topic: %s",
+            "Admitted — services: %s, registry_namespace: %s, gossip_topic: %s",
             [s.name for s in self._services],
-            bool(self._registry_ticket),
+            bool(self._registry_namespace),
             bool(self._gossip_topic),
         )
 
@@ -1211,12 +1230,12 @@ class AsterClient:
         return list(self._services)
 
     @property
-    def registry_ticket(self) -> str:
-        """Read-only Iroh docs share ticket for the registry doc.
+    def registry_namespace(self) -> str:
+        """64-char hex namespace_id for the registry doc.
 
         Empty string if no registry doc was provided by the producer.
         """
-        return self._registry_ticket
+        return self._registry_namespace
 
     @property
     def gossip_topic(self) -> str:

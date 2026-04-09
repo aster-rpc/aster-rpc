@@ -476,6 +476,133 @@ def _verify_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def _gen_client_command(args: argparse.Namespace) -> int:
+    """Execute ``aster contract gen-client``."""
+    import asyncio
+    from aster_cli.codegen import generate_python_clients, format_usage_snippet
+
+    source = args.source
+    lang = args.lang
+    out = args.out
+
+    if lang != "python":
+        print(f"Error: only 'python' is supported (got '{lang}')", file=sys.stderr)
+        return 1
+
+    # Determine source type and load manifests
+    if os.path.isfile(source):
+        # Source is a local .aster.json export file
+        manifests = _load_manifests_for_codegen(source)
+        namespace = args.package or Path(source).stem.replace(".aster", "").replace(".", "_") or "local"
+    elif source.startswith("aster1"):
+        # Source is a live node ticket — connect, fetch manifests, disconnect
+        manifests = asyncio.run(_fetch_manifests_from_node(source))
+        namespace = args.package or source[6:14]  # first 8 chars after "aster1"
+    else:
+        print(f"Error: unrecognised source '{source}'", file=sys.stderr)
+        print("  Use a .aster.json file path or an aster1... ticket", file=sys.stderr)
+        return 1
+
+    if not manifests:
+        print("Error: no manifests found", file=sys.stderr)
+        return 1
+
+    # Sanitize namespace
+    import re
+    namespace = re.sub(r"[^a-zA-Z0-9_]", "_", namespace).strip("_") or "aster_client"
+
+    generated = generate_python_clients(manifests, out, namespace, source)
+
+    print(f"Generated {len(generated)} files")
+    for f in generated:
+        print(f"  {f}")
+    print(format_usage_snippet(out, namespace, manifests, source if source.startswith("aster1") else ""))
+
+    return 0
+
+
+def _load_manifests_for_codegen(filepath: str) -> dict[str, dict]:
+    """Load manifests from a .aster.json export or manifest.json file."""
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = _json.load(f)
+
+    # Handle both single manifest and array of manifests
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict) and "service" in data:
+        items = [data]
+    elif isinstance(data, dict) and "methods" in data:
+        items = [data]
+    else:
+        print(f"Warning: unrecognised manifest format in {filepath}", file=sys.stderr)
+        return {}
+
+    manifests = {}
+    for item in items:
+        # .aster.json exports have a "contract" wrapper
+        if "contract" in item:
+            manifest = item["contract"]
+        else:
+            manifest = item
+        svc_name = manifest.get("service", "UnknownService")
+        manifests[svc_name] = manifest
+
+    return manifests
+
+
+async def _fetch_manifests_from_node(ticket: str) -> dict[str, dict]:
+    """Connect to a live node, fetch all manifests, and return them."""
+    from aster.high_level import AsterClient, _coerce_node_addr
+    from aster import docs_client, blobs_client
+    from aster.registry.keys import contract_key
+    import asyncio
+
+    client = AsterClient(address=ticket)
+    await client.connect()
+
+    bc = blobs_client(client._node)
+    dc = docs_client(client._node)
+    ns = client.registry_namespace
+    addr = _coerce_node_addr(client._endpoint_addr_in)
+    peer_id = addr.endpoint_id
+
+    doc, rx = await dc.join_and_subscribe_namespace(ns, peer_id)
+
+    # Wait for sync
+    for _ in range(25):
+        try:
+            event = await asyncio.wait_for(rx.recv(), timeout=2.0)
+            if hasattr(event, "kind") and event.kind == "sync_finished":
+                await asyncio.sleep(0.3)
+                break
+        except asyncio.TimeoutError:
+            entries = await doc.query_key_prefix(b"contracts/")
+            if entries:
+                break
+
+    manifests: dict[str, dict] = {}
+    for svc in client._services:
+        try:
+            key = contract_key(svc.contract_id)
+            entries = await doc.query_key_exact(key)
+            if not entries:
+                continue
+            content = await doc.read_entry_content(entries[0].content_hash)
+            artifact = _json.loads(content)
+            ch = artifact.get("collection_hash", "")
+            if not ch:
+                continue
+            files = await bc.download_collection_hash(ch, peer_id)
+            for name, data in files:
+                if name == "manifest.json":
+                    manifests[svc.name] = _json.loads(data)
+                    break
+        except Exception as exc:
+            print(f"Warning: failed to fetch manifest for {svc.name}: {exc}", file=sys.stderr)
+
+    return manifests
+
+
 def main() -> None:
     """Entry point for the ``aster`` CLI."""
     parser = argparse.ArgumentParser(
@@ -513,6 +640,38 @@ def main() -> None:
         default=None,
         metavar="VERSION",
         help="Optional semantic version string to embed in the manifest",
+    )
+
+    # ``aster contract gen-client``
+    gen_client_parser = contract_subparsers.add_parser(
+        "gen-client",
+        help="Generate a typed client library from a manifest or live node.",
+    )
+    gen_client_parser.add_argument(
+        "source",
+        metavar="SOURCE",
+        help=(
+            "Manifest source: path to .aster.json file, "
+            "aster1... ticket to a live node, or @handle/Service (future)"
+        ),
+    )
+    gen_client_parser.add_argument(
+        "--out",
+        required=True,
+        metavar="DIR",
+        help="Output directory for generated client files",
+    )
+    gen_client_parser.add_argument(
+        "--package",
+        default=None,
+        metavar="NAME",
+        help="Package/module name (default: derived from source)",
+    )
+    gen_client_parser.add_argument(
+        "--lang",
+        default="python",
+        metavar="LANG",
+        help="Target language (default: python)",
     )
 
     # ``aster contract export``
@@ -643,6 +802,8 @@ def main() -> None:
             sys.exit(_import_command(args))
         elif args.contract_command == "verify":
             sys.exit(_verify_command(args))
+        elif args.contract_command == "gen-client":
+            sys.exit(_gen_client_command(args))
         else:
             contract_parser.print_help()
             sys.exit(1)
@@ -659,7 +820,7 @@ def main() -> None:
     elif args.command in {"join", "verify", "status", "whoami"}:
         from aster_cli.join import run_join_command
         sys.exit(run_join_command(args))
-    elif args.command in {"publish", "unpublish"}:
+    elif args.command in {"publish", "unpublish", "discover"}:
         from aster_cli.publish import run_publish_command
         sys.exit(run_publish_command(args))
     elif args.command == "shell":

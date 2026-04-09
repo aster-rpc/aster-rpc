@@ -55,7 +55,6 @@ pub(crate) fn ensure_tokio_runtime() {
 
 #[pymodule]
 fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
-
     let py = m.py();
 
     // Register error types first (needed by other modules)

@@ -22,7 +22,7 @@ pub struct AsterTicket {
     /// Direct addresses as ["ip:port", ...].
     #[pyo3(get, set)]
     pub direct_addrs: Vec<String>,
-    /// Credential type: "open", "consumer_rcan", "enrollment", "registry", or None.
+    /// Credential type: "open", "consumer_rcan", "enrollment", "registry_read", or None.
     #[pyo3(get, set)]
     pub credential_type: Option<String>,
     /// Credential data bytes (payload), or None.
@@ -139,25 +139,20 @@ impl AsterTicket {
                 let data = self.credential_data.clone().unwrap_or_default();
                 Some(TicketCredential::Enrollment(data))
             }
-            Some("registry") => {
+            Some("registry_read") => {
                 let data = self.credential_data.as_ref().ok_or_else(|| {
                     pyo3::exceptions::PyValueError::new_err(
-                        "registry credential requires 64 bytes of data (namespace_id + read_cap)",
+                        "registry_read credential requires 32 bytes (namespace_id)",
                     )
                 })?;
-                if data.len() != 64 {
+                if data.len() != 32 {
                     return Err(pyo3::exceptions::PyValueError::new_err(
-                        "registry credential_data must be exactly 64 bytes",
+                        "registry_read credential_data must be exactly 32 bytes",
                     ));
                 }
-                let mut namespace_id = [0u8; 32];
-                let mut read_cap = [0u8; 32];
-                namespace_id.copy_from_slice(&data[..32]);
-                read_cap.copy_from_slice(&data[32..64]);
-                Some(TicketCredential::Registry {
-                    namespace_id,
-                    read_cap,
-                })
+                let mut ns = [0u8; 32];
+                ns.copy_from_slice(data);
+                Some(TicketCredential::RegistryRead(ns))
             }
             Some(other) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -185,14 +180,8 @@ impl AsterTicket {
             Some(TicketCredential::Enrollment(v)) => {
                 (Some("enrollment".to_string()), Some(v.clone()))
             }
-            Some(TicketCredential::Registry {
-                namespace_id,
-                read_cap,
-            }) => {
-                let mut data = Vec::with_capacity(64);
-                data.extend_from_slice(namespace_id);
-                data.extend_from_slice(read_cap);
-                (Some("registry".to_string()), Some(data))
+            Some(TicketCredential::RegistryRead(ns)) => {
+                (Some("registry_read".to_string()), Some(ns.to_vec()))
             }
         };
 

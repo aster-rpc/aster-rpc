@@ -428,15 +428,24 @@ class ForyCodec:
         Raises:
             TypeError: If *expected_type* is given and the result doesn't match.
         """
+        # Unwrap generic aliases (e.g., SignedRequest[JoinPayload] -> SignedRequest)
+        # so isinstance() checks don't fail with "Subscripted generics cannot be
+        # used with class and instance checks".
+        check_type = expected_type
+        if check_type is not None:
+            origin = getattr(check_type, "__origin__", None)
+            if origin is not None and isinstance(origin, type):
+                check_type = origin
+
         if self.mode == SerializationMode.ROW and self._row_encoder is not None:
             row = pyfory_format.RowData(self._row_schema, data)
             result = self._row_encoder.from_row(row)
             if (
-                expected_type is not None
-                and dataclasses.is_dataclass(expected_type)
-                and not isinstance(result, expected_type)
+                check_type is not None
+                and dataclasses.is_dataclass(check_type)
+                and not isinstance(result, check_type)
             ):
-                result = self._row_to_dataclass(row, expected_type)
+                result = self._row_to_dataclass(row, check_type)
         else:
             result = self._fory.deserialize(data)
 
@@ -448,9 +457,9 @@ class ForyCodec:
         if dataclasses.is_dataclass(result) and not isinstance(result, type):
             _coerce_enum_fields(result)
 
-        if expected_type is not None and not isinstance(result, expected_type):
+        if check_type is not None and not isinstance(result, check_type):
             raise TypeError(
-                f"Expected {expected_type.__qualname__}, "
+                f"Expected {(expected_type or check_type).__qualname__}, "
                 f"got {type(result).__qualname__}"
             )
         return result

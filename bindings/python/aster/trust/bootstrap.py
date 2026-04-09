@@ -3,24 +3,21 @@ aster.trust.bootstrap — Producer mesh bootstrap (founding node + join).
 
 Spec reference: Aster-trust-spec.md §2.1, §2.5.  Plan: ASTER_PLAN.md §14.5.
 
-Two startup modes:
+Provides helpers for:
 
-start_founding_node()
-    The first producer in a new mesh.  Generates a random 32-byte salt, derives
-    the gossip topic, initializes MeshState, and prints a bootstrap ticket for
-    subsequent nodes to present.
+handle_admission_rpc()
+    Server-side handler for ``aster.producer_admission`` ALPN — verifies a
+    joining producer's credential and updates the mesh state.
 
-join_mesh()
-    A subsequent producer.  Dials the bootstrap peer over the
-    ``aster.producer_admission`` ALPN, presents its credential, receives salt
-    and accepted_producers, then subscribes to the gossip topic.
+serve_producer_admission()
+    Accept loop that dispatches incoming admission connections.
 
-Both modes persist state to ``~/.aster/`` for crash recovery.
+make_ephemeral_mesh_state()
+    Build an in-memory founding MeshState for single-node / test scenarios.
 
 Environment variables:
     ASTER_ENROLLMENT        Path to JSON-serialized EnrollmentCredential.
     ASTER_ROOT_KEY          Path to 32-byte raw ed25519 private key file.
-    ASTER_BOOTSTRAP_TICKET  NodeAddr ticket string for subsequent node join.
     ASTER_MESH_STATE_DIR    Override for the state directory (default ~/.aster).
 """
 
@@ -137,199 +134,6 @@ def _save_mesh_state(state: MeshState) -> None:
     logger.debug("bootstrap: mesh_state saved → %s", path)
 
 
-def _load_mesh_state() -> MeshState | None:
-    """Load MeshState from ``~/.aster/mesh_state.json``, or return None."""
-    path = _state_path("mesh_state.json")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path) as fh:
-            d = json.load(fh)
-        return MeshState.from_json_dict(d)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("bootstrap: failed to load mesh_state.json: %s", exc)
-        return None
-
-
-def start_founding_node(
-    enrollment_path: str | None = None,
-    config: ClockDriftConfig | None = None,
-    force_new_salt: bool = False,
-) -> MeshState:
-    """Start the founding node of a new producer mesh.
-
-    Steps (§2.1):
-    1. Load own enrollment credential; verify offline.
-    2. Load or generate producer signing key.
-    3. Load or generate 32-byte salt.
-    4. Derive topic_id = blake3(root_pubkey + b"aster-producer-mesh" + salt).
-    5. Initialize MeshState with {self} as the only accepted producer.
-    6. Persist state.
-    7. Print bootstrap ticket to stdout.
-
-    Returns:
-        The initialized MeshState.
-    """
-    from .admission import check_offline
-    from .nonces import InMemoryNonceStore
-
-    # 1. Load and verify credential.
-    cred = _load_enrollment_credential(enrollment_path)
-    # check_offline is async; use asyncio.run for the synchronous bootstrap path.
-    import asyncio as _asyncio
-
-    _result = _asyncio.run(check_offline(cred, cred.endpoint_id, InMemoryNonceStore()))
-    if not _result.admitted:
-        raise RuntimeError(f"Founding node credential invalid: {_result.reason}")
-
-    # 2. Producer signing key (load/generate; used by caller for signing gossip messages).
-    _load_or_generate_producer_key()
-
-    # 3. Salt.
-    if force_new_salt:
-        salt = secrets.token_bytes(32)
-        salt_path = _state_path("mesh_salt")
-        os.makedirs(_state_dir(), exist_ok=True)
-        with open(salt_path, "wb") as fh:
-            fh.write(salt)
-    else:
-        salt = _load_or_generate_salt()
-
-    # 4. Topic derivation.
-    topic_id = derive_gossip_topic(cred.root_pubkey, salt)
-
-    # 5. MeshState.
-    now_ms = int(time.time() * 1000)
-    state = MeshState(
-        accepted_producers={cred.endpoint_id},
-        salt=salt,
-        topic_id=topic_id,
-        peer_offsets={},
-        drift_isolated=set(),
-        last_heartbeat_epoch_ms=now_ms,
-        mesh_joined_at_epoch_ms=now_ms,
-    )
-
-    # 6. Persist.
-    _save_mesh_state(state)
-
-    # 7. Print bootstrap ticket.
-    ticket = cred.endpoint_id
-    print("Aster producer mesh started.")
-    print(f"  endpoint_id : {cred.endpoint_id}")
-    print(f"  topic_id    : {topic_id.hex()}")
-    print(f"  salt        : {salt.hex()}")
-    print(f"  Bootstrap ticket: {ticket}")
-    print("Pass this ticket via ASTER_BOOTSTRAP_TICKET to subsequent nodes.")
-
-    return state
-
-
-def join_mesh(
-    enrollment_path: str | None = None,
-    bootstrap_ticket: str | None = None,
-    config: ClockDriftConfig | None = None,
-) -> MeshState | None:
-    """Join an existing producer mesh.
-
-    Steps (§2.5):
-    1. Load own credential + bootstrap ticket.
-    2. Build an AdmissionRequest.
-    3. Return a MeshState configured with the bootstrap response.
-       (The actual QUIC dial is performed by the caller using the iroh transport;
-        this function handles the credential packaging + state setup.)
-
-    In the full runtime flow the caller would:
-      - Use iroh NetClient to open a bidi stream with ALPN aster.producer_admission.
-      - Send the AdmissionRequest JSON.
-      - Receive the AdmissionResponse JSON.
-      - Call ``apply_admission_response()`` to finalize MeshState.
-
-    For tests / CLI use, this function returns the AdmissionRequest that the
-    caller should send, plus a commit function.
-
-    Returns:
-        AdmissionRequest to be sent to the bootstrap peer.
-    """
-    ticket = bootstrap_ticket or os.environ.get("ASTER_BOOTSTRAP_TICKET")
-    if not ticket:
-        raise RuntimeError(
-            "Set ASTER_BOOTSTRAP_TICKET to the bootstrap endpoint_id ticket"
-        )
-
-    cred = _load_enrollment_credential(enrollment_path)
-
-    # Serialize credential to JSON for the request.
-    cred_json = json.dumps(
-        {
-            "endpoint_id": cred.endpoint_id,
-            "root_pubkey": cred.root_pubkey.hex(),
-            "expires_at": cred.expires_at,
-            "attributes": cred.attributes,
-            "signature": cred.signature.hex(),
-        },
-        separators=(",", ":"),
-    )
-
-    req = AdmissionRequest(credential_json=cred_json)
-    logger.info(
-        "bootstrap: prepared AdmissionRequest for bootstrap peer %s", ticket
-    )
-    return req
-
-
-def apply_admission_response(
-    response: AdmissionResponse,
-    own_endpoint_id: str,
-) -> MeshState:
-    """Finalize MeshState after receiving a successful AdmissionResponse.
-
-    Args:
-        response:         The AdmissionResponse from the bootstrap peer.
-        own_endpoint_id:  This node's endpoint ID.
-
-    Returns:
-        Initialized and persisted MeshState ready for gossip subscription.
-
-    Raises:
-        RuntimeError: if ``response.accepted`` is False.
-    """
-    if not response.accepted:
-        raise RuntimeError(
-            f"Admission refused: {response.reason or '(no reason provided)'}"
-        )
-
-    # Load root pubkey from own credential.
-    cred = _load_enrollment_credential()
-    topic_id = derive_gossip_topic(cred.root_pubkey, response.salt)
-
-    now_ms = int(time.time() * 1000)
-    accepted = set(response.accepted_producers) | {own_endpoint_id}
-    state = MeshState(
-        accepted_producers=accepted,
-        salt=response.salt,
-        topic_id=topic_id,
-        peer_offsets={},
-        drift_isolated=set(),
-        last_heartbeat_epoch_ms=now_ms,
-        mesh_joined_at_epoch_ms=now_ms,
-    )
-
-    # Persist salt + state.
-    salt_path = _state_path("mesh_salt")
-    os.makedirs(_state_dir(), exist_ok=True)
-    with open(salt_path, "wb") as fh:
-        fh.write(response.salt)
-    _save_mesh_state(state)
-
-    logger.info(
-        "bootstrap: joined mesh with %d accepted producers, topic %s",
-        len(accepted),
-        topic_id.hex(),
-    )
-    return state
-
-
 async def handle_admission_rpc(
     request_json: str,
     own_state: MeshState,
@@ -394,7 +198,7 @@ async def handle_admission_rpc(
     )
 
 
-# ── Server-side serve loop (symmetric with serve_consumer_admission) ─────────
+# ── Server-side serve loop ────────────────────────────────────────────────────
 
 
 async def serve_producer_admission(
@@ -407,7 +211,7 @@ async def serve_producer_admission(
 ) -> None:
     """Accept and process connections on ``aster.producer_admission`` until cancelled.
 
-    Mirrors :func:`aster.trust.consumer.serve_consumer_admission`. Runs as a
+    Runs as a
     background task alongside the main server; each connection is handled in
     its own :class:`asyncio.Task` so one slow peer cannot block others.
 

@@ -31,7 +31,7 @@ use iroh_docs::api::Doc;
 use iroh_docs::engine::LiveEvent;
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::{DownloadPolicy, FilterKind, Query};
-use iroh_docs::{AuthorId, DocTicket, ALPN as DOCS_ALPN};
+use iroh_docs::{AuthorId, Capability, DocTicket, NamespaceId, ALPN as DOCS_ALPN};
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
@@ -717,8 +717,8 @@ fn relay_mode_from_config(config: &CoreEndpointConfig) -> Result<RelayMode> {
         Some("staging") => Ok(RelayMode::Staging),
         Some("custom") if !config.relay_urls.is_empty() => {
             let urls: Vec<&str> = config.relay_urls.iter().map(|s| s.as_str()).collect();
-            let relay_map = RelayMap::try_from_iter(urls)
-                .map_err(|e| anyhow!("invalid relay_urls: {e}"))?;
+            let relay_map =
+                RelayMap::try_from_iter(urls).map_err(|e| anyhow!("invalid relay_urls: {e}"))?;
             Ok(RelayMode::Custom(relay_map))
         }
         Some("custom") if config.relay_urls.is_empty() => {
@@ -1939,6 +1939,67 @@ impl CoreBlobsClient {
         }
     }
 
+    /// Download a blob by hash from a specific node, bypassing ticket parsing.
+    /// `format` should be "raw" or "hash_seq".
+    pub async fn download_hash(
+        &self,
+        hash_hex: String,
+        node_id_hex: String,
+        format: String,
+    ) -> Result<Vec<u8>> {
+        let hash: Hash = hash_hex.parse()?;
+        let node_id: EndpointId = node_id_hex.parse()?;
+        let blob_format = if format == "hash_seq" {
+            BlobFormat::HashSeq
+        } else {
+            BlobFormat::Raw
+        };
+        let haf = HashAndFormat {
+            hash,
+            format: blob_format,
+        };
+        Downloader::new(&self.store, &self.endpoint)
+            .download(haf, vec![node_id])
+            .await?;
+
+        if blob_format == BlobFormat::HashSeq {
+            let collection = Collection::load(hash, &self.store).await?;
+            let mut result = Vec::new();
+            for (_name, blob_hash) in collection.iter() {
+                let bytes = self.store.get_bytes(*blob_hash).await?;
+                result.extend_from_slice(&bytes);
+            }
+            Ok(result)
+        } else {
+            Ok(self.store.get_bytes(hash).await?.to_vec())
+        }
+    }
+
+    /// Download a collection by hash from a specific node, returning (name, data) pairs.
+    pub async fn download_collection_hash(
+        &self,
+        hash_hex: String,
+        node_id_hex: String,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let hash: Hash = hash_hex.parse()?;
+        let node_id: EndpointId = node_id_hex.parse()?;
+        let haf = HashAndFormat {
+            hash,
+            format: BlobFormat::HashSeq,
+        };
+        Downloader::new(&self.store, &self.endpoint)
+            .download(haf, vec![node_id])
+            .await?;
+
+        let collection = Collection::load(hash, &self.store).await?;
+        let mut files = Vec::new();
+        for (name, blob_hash) in collection.iter() {
+            let bytes = self.store.get_bytes(*blob_hash).await?;
+            files.push((name.clone(), bytes.to_vec()));
+        }
+        Ok(files)
+    }
+
     /// Download a collection and return list of (name, data) pairs.
     pub async fn download_collection(&self, ticket_str: String) -> Result<Vec<(String, Vec<u8>)>> {
         let ticket = BlobTicket::deserialize(&ticket_str)?;
@@ -2016,6 +2077,63 @@ impl CoreDocsClient {
             }
         }
         let (doc, stream) = self.inner.api().import_and_subscribe(ticket).await?;
+        let core_doc = CoreDoc {
+            doc,
+            store: self.store.clone(),
+        };
+        let receiver = CoreDocEventReceiver {
+            inner: Arc::new(Mutex::new(Box::pin(stream))),
+        };
+        Ok((core_doc, receiver))
+    }
+
+    /// Join a doc by namespace ID (hex) without a full DocTicket.
+    ///
+    /// `peer_node_id_hex` is the endpoint ID of the peer to sync from.
+    /// Constructs a DocTicket internally from the namespace ID + peer address,
+    /// avoiding the DocTicket serialization/deserialization round-trip on the wire.
+    pub async fn join_and_subscribe_namespace(
+        &self,
+        namespace_id_hex: String,
+        peer_node_id_hex: String,
+    ) -> Result<(CoreDoc, CoreDocEventReceiver)> {
+        let ns_bytes = hex::decode(&namespace_id_hex)?;
+        if ns_bytes.len() != 32 {
+            return Err(anyhow!("namespace_id must be 32 bytes (64 hex chars)"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&ns_bytes);
+        let ns_id = NamespaceId::from(arr);
+        let capability = Capability::Read(ns_id);
+
+        // Look up the peer's full address info from the endpoint.
+        let peer_id: EndpointId = peer_node_id_hex.parse()?;
+
+        // Construct a DocTicket with the peer's address so the docs
+        // protocol can find and sync from it.
+        let peer_addr = if let Some(info) = self.endpoint.remote_info(peer_id).await {
+            let addr =
+                EndpointAddr::from_parts(info.id(), info.into_addrs().map(|a| a.into_addr()));
+            if let Ok(lookup) = self.endpoint.address_lookup() {
+                let mem = MemoryLookup::new();
+                mem.add_endpoint_info(addr.clone());
+                lookup.add(mem);
+            }
+            addr
+        } else {
+            // Fallback: use the peer's ID with our relay URL so the docs
+            // protocol can at least try reaching the peer via relay.
+            let our_addr = self.endpoint.addr();
+            let mut addrs: Vec<TransportAddr> = Vec::new();
+            for url in our_addr.relay_urls() {
+                addrs.push(TransportAddr::Relay(url.clone()));
+            }
+            EndpointAddr::from_parts(peer_id, addrs)
+        };
+
+        let ticket = DocTicket::new(capability, vec![peer_addr]);
+        let (doc, stream) = self.inner.api().import_and_subscribe(ticket).await?;
+
         let core_doc = CoreDoc {
             doc,
             store: self.store.clone(),

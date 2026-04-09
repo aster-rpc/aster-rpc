@@ -281,7 +281,8 @@ async def _prompt_for_args(
             value = value.strip()
 
             if not value and default is not None:
-                value = default
+                result[name] = default
+                continue
             elif not value and not required:
                 continue
             elif not value:

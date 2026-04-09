@@ -181,8 +181,14 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
     for method_name, method_info in getattr(service_info, "methods", {}).items():
         fields: list[dict] = []
 
-        # Extract fields from the request type
+        # Extract fields from the request type.
+        # Unwrap generic aliases (e.g., SignedRequest[PayloadT] -> SignedRequest)
+        # so we can access @wire_type and dataclass fields.
         req_type = getattr(method_info, "request_type", None)
+        if isinstance(req_type, str):
+            req_type = _resolve_type_by_name(req_type)
+        if req_type is not None:
+            req_type = _unwrap_generic(req_type)
         if req_type is not None and dataclasses.is_dataclass(req_type):
             try:
                 hints = get_type_hints(req_type)
@@ -205,22 +211,39 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
                     # Don't call the factory — just note it has one
                     default_val = None
 
-                fields.append({
+                field_info_req: dict[str, Any] = {
                     "name": f.name,
                     "type": type_name,
                     "required": not has_default,
                     "default": default_val if _is_json_safe(default_val) else str(default_val),
-                })
+                }
+                elem_type = _extract_list_element_type(ftype)
+                if elem_type is not None and dataclasses.is_dataclass(elem_type):
+                    field_info_req["element_wire_tag"] = getattr(elem_type, "__wire_type__", "")
+                    field_info_req["element_type"] = _type_display_name(elem_type)
+                    try:
+                        elem_hints = get_type_hints(elem_type)
+                    except Exception:
+                        elem_hints = {}
+                    field_info_req["element_fields"] = [
+                        {"name": ef.name, "type": _type_display_name(elem_hints.get(ef.name, ef.type))}
+                        for ef in dataclasses.fields(elem_type)
+                    ]
+                fields.append(field_info_req)
 
         resp_type = getattr(method_info, "response_type", None)
 
-        # Resolve forward references (strings) to actual classes
-        if isinstance(resp_type, str) and req_type is not None:
-            # Try to find the class in the same module as the request type
-            import sys
-            module = sys.modules.get(req_type.__module__)
-            if module:
-                resp_type = getattr(module, resp_type, resp_type)
+        # Resolve forward references (strings) to actual classes.
+        # When `from __future__ import annotations` is used, type hints
+        # are strings. The response type might be in any imported module
+        # (e.g., JoinResult in identity.py, not common.py where
+        # SignedRequest lives). Search loaded modules for the class.
+        if isinstance(resp_type, str):
+            resp_type = _resolve_type_by_name(resp_type, req_type)
+
+        # Unwrap generic aliases for response type too
+        if resp_type is not None:
+            resp_type = _unwrap_generic(resp_type)
 
         # Extract response type fields for dynamic invocation
         resp_fields: list[dict] = []
@@ -231,10 +254,26 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
                 resp_hints = {}
             for f in dataclasses.fields(resp_type):
                 ftype = resp_hints.get(f.name, f.type)
-                resp_fields.append({
+                field_info: dict[str, Any] = {
                     "name": f.name,
                     "type": _type_display_name(ftype),
-                })
+                }
+                # For list[X] fields, store the element type's wire_tag
+                # so dynamic clients can synthesize the element type too.
+                elem_type = _extract_list_element_type(ftype)
+                if elem_type is not None and dataclasses.is_dataclass(elem_type):
+                    field_info["element_wire_tag"] = getattr(elem_type, "__wire_type__", "")
+                    field_info["element_type"] = _type_display_name(elem_type)
+                    # Store element fields recursively
+                    try:
+                        elem_hints = get_type_hints(elem_type)
+                    except Exception:
+                        elem_hints = {}
+                    field_info["element_fields"] = [
+                        {"name": ef.name, "type": _type_display_name(elem_hints.get(ef.name, ef.type))}
+                        for ef in dataclasses.fields(elem_type)
+                    ]
+                resp_fields.append(field_info)
 
         methods_out.append({
             "name": method_name,
@@ -251,6 +290,53 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
 
     methods_out.sort(key=lambda m: m["name"])
     return methods_out
+
+
+def _resolve_type_by_name(name: str, hint_type: type | None = None) -> type | str:
+    """Resolve a string type name to an actual class.
+
+    Searches the hint type's module first, then all loaded modules.
+    Returns the original string if resolution fails.
+    """
+    import sys
+    import dataclasses
+
+    # Try the hint type's module first
+    if hint_type is not None and hasattr(hint_type, "__module__"):
+        mod = sys.modules.get(hint_type.__module__)
+        if mod is not None:
+            candidate = getattr(mod, name, None)
+            if candidate is not None and (isinstance(candidate, type) or dataclasses.is_dataclass(candidate)):
+                return candidate
+
+    # Search loaded modules for a dataclass with this name
+    for mod in sys.modules.values():
+        if mod is None:
+            continue
+        candidate = getattr(mod, name, None)
+        if candidate is not None and dataclasses.is_dataclass(candidate):
+            return candidate
+
+    return name
+
+
+def _unwrap_generic(t: object) -> type:
+    """Unwrap a generic alias (e.g., SignedRequest[Payload]) to its origin class."""
+    origin = getattr(t, "__origin__", None)
+    if origin is not None and isinstance(origin, type):
+        return origin
+    return t
+
+
+def _extract_list_element_type(t: object) -> type | None:
+    """Extract the element type from list[X], or None if not a parameterized list."""
+    import typing
+    origin = getattr(t, "__origin__", None)
+    if origin is list:
+        args = getattr(t, "__args__", ())
+        if args:
+            return args[0]
+    return None
 
 
 def _type_display_name(t: object) -> str:
