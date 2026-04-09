@@ -241,7 +241,7 @@ async def test_query_and_filter_by_author():
 
 @pytest.mark.asyncio
 async def test_start_sync_empty_peers_does_not_raise():
-    """start_sync with no peers is a valid no-op — doc enters sync mode."""
+    """start_sync with no peers is a valid no-op -- doc enters sync mode."""
     from aster import IrohNode, docs_client
 
     node = await IrohNode.memory()
@@ -301,7 +301,7 @@ async def test_subscribe_receives_insert_local_event():
 
     receiver = await doc.subscribe()
 
-    # Write a key — this should produce an insert_local event.
+    # Write a key -- this should produce an insert_local event.
     await doc.set_bytes(author, b"sub-key", b"sub-value")
 
     event = await asyncio.wait_for(receiver.recv(), timeout=10.0)
@@ -523,7 +523,7 @@ async def test_join_and_subscribe_receives_event_after_write():
 
     doc2, receiver = await dc2.join_and_subscribe(ticket)
 
-    # Write from node1 — node2's receiver should eventually see InsertRemote
+    # Write from node1 -- node2's receiver should eventually see InsertRemote
     await doc1.set_bytes(author1, b"remote-key", b"remote-value")
 
     # Receive events until we see insert_remote (may come after sync_finished etc.)

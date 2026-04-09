@@ -17,18 +17,22 @@ from aster.contract.identity import CapabilityKind, CapabilityRequirement
 
 
 def _extract_caller_roles(caller_attributes: dict[str, str]) -> set[str]:
-    """Extract the set of roles from caller admission attributes.
+    """Extract the set of roles/capabilities from caller admission attributes.
 
-    The ``aster.role`` attribute may be:
-    - A comma-separated string (e.g. ``"admin,editor"``).
-    - Already a list (if the admission layer passed one through).
+    The canonical key is ``aster.role``. Its value is a comma-separated
+    list of capability strings (e.g., ``"ops.status,ops.logs,ops.admin"``).
+
+    Set by:
+    - ``aster enroll node --capabilities ops.status,ops.logs``
+    - ``aster trust sign --attr aster.role=ops.status,ops.logs``
+    - Delegated admission tokens (``token.roles`` joined with ``,``)
 
     Returns a set of stripped, non-empty role strings.
     """
     raw = caller_attributes.get("aster.role", "")
     if isinstance(raw, list):
         return {r.strip() for r in raw if r.strip()}
-    if isinstance(raw, str):
+    if isinstance(raw, str) and raw:
         return {r.strip() for r in raw.split(",") if r.strip()}
     return set()
 

@@ -60,7 +60,7 @@ def _load_vectors() -> dict[str, dict]:
 
 
 # NOTE: Canonical encoding tests (varint, zigzag, string, bytes, list header,
-# optional) were removed — that code now lives only in Rust core
+# optional) were removed -- that code now lives only in Rust core
 # (core/src/canonical.rs) and is tested there.
 
 
@@ -108,7 +108,7 @@ def test_scope_distinctness():
 
 def test_nfc_normalization():
     """NFC-normalized identifiers via normalize_identifier → stable identity."""
-    # "café" — both NFC and NFD forms
+    # "café" -- both NFC and NFD forms
     nfc_name = "caf\u00e9"         # precomposed é (U+00E9)
     nfd_name = "cafe\u0301"        # decomposed e + combining acute
 
@@ -119,7 +119,7 @@ def test_nfc_normalization():
     assert norm_nfc == norm_nfd, "NFC and NFD identifiers should normalize to same string"
     assert norm_nfc == nfc_name   # NFC form is canonical
 
-    # Build contracts using the normalized names — they should be identical
+    # Build contracts using the normalized names -- they should be identical
     sc_nfc = ServiceContract(
         name=norm_nfc, version=1, methods=[], serialization_modes=["xlang"],
         scoped=ScopeKind.SHARED,
@@ -134,7 +134,7 @@ def test_nfc_normalization():
            compute_contract_id(canonical_xlang_bytes(sc_nfd))
 
 
-# ── 11. Golden vectors A.2–A.6 ───────────────────────────────────────────────
+# ── 11. Golden vectors A.2--A.6 ───────────────────────────────────────────────
 
 
 def test_vectors_A2_to_A6():
@@ -225,7 +225,7 @@ def test_vectors_A2_to_A6():
     assert blake3.blake3(data).hexdigest() == vecs["A.6"]["hash_hex"], "A.6 hash mismatch"
 
 
-# ── 12. Golden vectors B.1–B.4 ───────────────────────────────────────────────
+# ── 12. Golden vectors B.1--B.4 ───────────────────────────────────────────────
 
 
 def _make_treenode_typedef() -> TypeDef:
@@ -388,7 +388,7 @@ def test_all_micro_fixtures():
     """Micro-fixture golden vectors exist and are loadable.
 
     NOTE: The canonical encoding tests (varint, zigzag, string, etc.) that
-    previously verified these vectors were removed — that code now lives in
+    previously verified these vectors were removed -- that code now lives in
     Rust core (core/src/canonical.rs) and is tested there.
     """
     vecs = _load_vectors()
@@ -627,7 +627,7 @@ def test_service_to_contract():
     assert len(contract_id) == 64
 
 
-# ── 17. normalize_identifier — valid ─────────────────────────────────────────
+# ── 17. normalize_identifier -- valid ─────────────────────────────────────────
 
 
 def test_normalize_identifier_valid():
@@ -643,7 +643,7 @@ def test_normalize_identifier_valid():
     assert normalize_identifier(nfd) == nfc
 
 
-# ── 18. normalize_identifier — invalid ───────────────────────────────────────
+# ── 18. normalize_identifier -- invalid ───────────────────────────────────────
 
 
 def test_normalize_identifier_invalid():

@@ -30,11 +30,11 @@ class StreamHeader:
     service: str = ""
     method: str = ""
     version: int = 0
-    call_id: str = ""
-    deadline_epoch_ms: int = 0
-    serialization_mode: int = 0
-    metadata_keys: list[str] = field(default_factory=list)
-    metadata_values: list[str] = field(default_factory=list)
+    callId: str = ""
+    deadlineEpochMs: int = 0
+    serializationMode: int = 0
+    metadataKeys: list[str] = field(default_factory=list)
+    metadataValues: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -47,10 +47,10 @@ class CallHeader:
     """
 
     method: str = ""
-    call_id: str = ""
-    deadline_epoch_ms: int = 0
-    metadata_keys: list[str] = field(default_factory=list)
-    metadata_values: list[str] = field(default_factory=list)
+    callId: str = ""
+    deadlineEpochMs: int = 0
+    metadataKeys: list[str] = field(default_factory=list)
+    metadataValues: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -64,5 +64,5 @@ class RpcStatus:
 
     code: int = 0
     message: str = ""
-    detail_keys: list[str] = field(default_factory=list)
-    detail_values: list[str] = field(default_factory=list)
+    detailKeys: list[str] = field(default_factory=list)
+    detailValues: list[str] = field(default_factory=list)

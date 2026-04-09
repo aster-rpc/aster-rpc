@@ -1,5 +1,5 @@
 """
-Tests for aster.metadata — Metadata type, decorator integration, and
+Tests for aster.metadata -- Metadata type, decorator integration, and
 contract identity independence.
 
 Key invariant: Metadata MUST NOT affect contract identity (BLAKE3 hash).
@@ -108,7 +108,7 @@ class TestMetadataDoesNotAffectContractId:
         id1 = compute_contract_id(canonical_xlang_bytes(c1))
         id2 = compute_contract_id(canonical_xlang_bytes(c2))
 
-        # Same structure, different metadata — same contract ID
+        # Same structure, different metadata -- same contract ID
         assert id1 == id2, (
             f"Field metadata changed contract ID! "
             f"plain={id1[:16]}... annotated={id2[:16]}..."

@@ -3,7 +3,7 @@ Spike tests for Apache Fory (pyfory 0.16.0) serialization determinism.
 
 These tests validate the highest-risk pre-requisite for the Aster RPC framework:
 whether pyfory produces deterministic, byte-identical output across multiple
-serialization calls, different field orderings, and different Python processes —
+serialization calls, different field orderings, and different Python processes --
 which is required for content-addressed contract identity (BLAKE3 hashing of
 canonical bytes).
 
@@ -227,7 +227,7 @@ class TestRoundTrip:
         assert restored.optional_int is None
 
 
-# ── Test 3: DETERMINISM — Same value, same bytes ────────────────────────────
+# ── Test 3: DETERMINISM -- Same value, same bytes ────────────────────────────
 
 
 class TestDeterminism:
@@ -328,7 +328,7 @@ class TestDeterminism:
         assert bytes_1 == bytes_2
 
 
-# ── Test 4: DETERMINISM — Same bytes across fresh Fory instances ────────────
+# ── Test 4: DETERMINISM -- Same bytes across fresh Fory instances ────────────
 
 
 class TestCrossInstanceDeterminism:
@@ -360,7 +360,7 @@ class TestCrossInstanceDeterminism:
             assert r == results[0], f"Fresh instance {i} diverged"
 
 
-# ── Test 5: DETERMINISM — Cross-process ─────────────────────────────────────
+# ── Test 5: DETERMINISM -- Cross-process ─────────────────────────────────────
 
 
 class TestCrossProcessDeterminism:
@@ -686,7 +686,7 @@ class TestCanonicalEdgeCases:
 
     def test_float_nan_determinism(self):
         """
-        NaN is tricky — there are multiple NaN representations.
+        NaN is tricky -- there are multiple NaN representations.
         This test checks if pyfory handles it deterministically.
         """
         f = create_fory(ManyFields)
@@ -703,7 +703,7 @@ class TestCanonicalEdgeCases:
         assert bytes_1 == bytes_2, "NaN serialization is non-deterministic"
 
 
-# ── Test 11: Diagnostic — dump serialization details ────────────────────────
+# ── Test 11: Diagnostic -- dump serialization details ────────────────────────
 
 
 class TestDiagnostic:

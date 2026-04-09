@@ -18,7 +18,7 @@ from aster.interceptors import (
 )
 from aster.status import RpcError, StatusCode
 from aster.transport.local import LocalTransport
-from aster.types import RetryPolicy, SerializationMode
+from aster.rpc_types import RetryPolicy, SerializationMode
 
 
 @wire_type("test.interceptors/EchoRequest")

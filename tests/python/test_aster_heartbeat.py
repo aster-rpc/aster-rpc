@@ -208,7 +208,7 @@ async def test_heartbeat_cancel_does_not_raise():
         version=1,
         contract_id="d" * 64,
         health_getter=lambda: "READY",
-        heartbeat_interval_ms=10_000,  # long interval — won't fire before cancel
+        heartbeat_interval_ms=10_000,  # long interval -- won't fire before cancel
     )
 
     await asyncio.sleep(0.01)

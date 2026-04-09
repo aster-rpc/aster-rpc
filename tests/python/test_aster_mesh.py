@@ -1,5 +1,5 @@
 """
-tests/python/test_aster_mesh.py — Phase 12: Producer Mesh & Clock Drift tests.
+tests/python/test_aster_mesh.py -- Phase 12: Producer Mesh & Clock Drift tests.
 
 Covers:
 - ProducerMessage sign/verify round-trip
@@ -81,7 +81,7 @@ def now_ms() -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §1 — Signing bytes canonical order
+# §1 -- Signing bytes canonical order
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_signing_bytes_order():
@@ -113,7 +113,7 @@ def test_signing_bytes_different_types_differ():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §2 — Sign / verify round-trip
+# §2 -- Sign / verify round-trip
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_sign_verify_introduce():
@@ -219,7 +219,7 @@ def test_verify_empty_signature_fails():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §3 — Topic derivation
+# §3 -- Topic derivation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_topic_derivation_deterministic():
@@ -255,7 +255,7 @@ def test_topic_derivation_known_vector():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §4 — ClockDriftDetector
+# §4 -- ClockDriftDetector
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_drift_detector_no_peers_returns_none():
@@ -290,7 +290,7 @@ def test_drift_detector_median_high_even():
 def test_peer_in_drift_false_during_grace():
     """No drift decisions during grace period."""
     cfg = ClockDriftConfig(min_peers_for_median=3, grace_period_ms=60_000, drift_tolerance_ms=5_000)
-    # Join 10 seconds ago — still in grace
+    # Join 10 seconds ago -- still in grace
     det = ClockDriftDetector(cfg, mesh_joined_at_epoch_ms=now_ms() - 10_000)
     det._peer_offsets = {"a": 0, "b": 0, "c": 10_000}  # c is way off
     assert det.peer_in_drift("c") is False
@@ -350,7 +350,7 @@ def test_remove_peer():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §5 — handle_producer_message dispatch
+# §5 -- handle_producer_message dispatch
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
@@ -416,7 +416,7 @@ async def test_replay_window_drops_old_message(signed_env):
 
     orig_count = len(state.accepted_producers)
     await handle_producer_message(msg, state, cfg, peer_pubkeys)
-    # State unchanged — message was dropped
+    # State unchanged -- message was dropped
     assert len(state.accepted_producers) == orig_count
 
 
@@ -547,7 +547,7 @@ async def test_depart_processed_even_for_isolated_peer():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §6 — Peer drift isolation + recovery
+# §6 -- Peer drift isolation + recovery
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -602,7 +602,7 @@ async def test_peer_recovery_from_isolation():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §7 — Self-departure
+# §7 -- Self-departure
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_self_departure_triggered_on_large_skew():
@@ -616,7 +616,7 @@ def test_self_departure_triggered_on_large_skew():
 
 def test_self_departure_suppressed_during_grace():
     cfg = ClockDriftConfig(min_peers_for_median=3, grace_period_ms=60_000, drift_tolerance_ms=5_000)
-    # Join 10s ago — still in grace
+    # Join 10s ago -- still in grace
     det = ClockDriftDetector(cfg, mesh_joined_at_epoch_ms=now_ms() - 10_000)
     det._peer_offsets = {"a": 0, "b": 100, "c": 200}
     assert det.self_in_drift(8_000) is False
@@ -647,7 +647,7 @@ async def test_self_departure_sets_mesh_dead():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §8 — Admission RPC
+# §8 -- Admission RPC
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_credential_json(endpoint_id: str, expires_future: bool = True) -> tuple[str, bytes, bytes]:
@@ -724,11 +724,11 @@ async def test_admission_rpc_rejected_expired_credential():
     assert response.accepted is False
 
 
-    # test_apply_admission_response removed — function was dead code
+    # test_apply_admission_response removed -- function was dead code
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §9 — Payload encode/decode
+# §9 -- Payload encode/decode
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_encode_depart_payload_round_trip():
@@ -768,7 +768,7 @@ def test_encode_introduce_payload_pass_through():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §10 — MeshState serialization
+# §10 -- MeshState serialization
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_mesh_state_round_trip_json():
@@ -804,7 +804,7 @@ def test_mesh_state_empty_round_trip():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §11 — ClockDriftConfig env overrides
+# §11 -- ClockDriftConfig env overrides
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_clock_drift_config_env_override(monkeypatch):
@@ -825,7 +825,7 @@ def test_clock_drift_config_defaults():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §12 — 3-peer median drift example (integration-style)
+# §12 -- 3-peer median drift example (integration-style)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_three_peer_median_drift_detection():
@@ -851,7 +851,7 @@ def test_three_peer_median_drift_detection():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §13 — Admission response round-trip (bootstrap flow)
+# §13 -- Admission response round-trip (bootstrap flow)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_admission_response_accepted_fields():

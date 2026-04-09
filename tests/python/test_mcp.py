@@ -282,5 +282,5 @@ class TestAsterMcpServer:
         await server.setup()
 
         names = server.tool_names
-        # FileStore has a bidi_stream "sync" method — should be excluded
+        # FileStore has a bidi_stream "sync" method -- should be excluded
         assert "FileStore:sync" not in names

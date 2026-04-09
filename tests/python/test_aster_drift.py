@@ -168,7 +168,7 @@ def test_self_in_drift_true_when_self_is_outlier():
     det.track_offset("peer_a", now_ms - 10)
     det.track_offset("peer_b", now_ms - 10)
 
-    # Self estimate is 500 ms — far outside tolerance
+    # Self estimate is 500 ms -- far outside tolerance
     assert det.self_in_drift(500) is True
 
 
@@ -179,7 +179,7 @@ def test_self_in_drift_false_when_self_is_within_tolerance():
     det.track_offset("peer_a", now_ms - 20)
     det.track_offset("peer_b", now_ms - 30)
 
-    # Self offset of 25 ms is within 100 ms of the median (~20–30 ms)
+    # Self offset of 25 ms is within 100 ms of the median (~20--30 ms)
     assert det.self_in_drift(25) is False
 
 

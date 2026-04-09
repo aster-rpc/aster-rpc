@@ -185,16 +185,26 @@ export function configFromFile(filePath: string): AsterConfig {
   return base;
 }
 
+/** Parsed identity data from a .aster-identity TOML file. */
+export interface IdentityData {
+  node: Record<string, unknown>;
+  peers: Record<string, unknown>[];
+  published_services: Record<string, Record<string, unknown>>;
+}
+
 /**
- * Load identity from a .aster-identity TOML file.
+ * Load and parse an .aster-identity TOML file.
  *
- * Returns [secretKeyBytes, peerConfig] or null if not found.
+ * Synthesizes ``aster.role`` and ``aster.name`` into each peer's
+ * ``attributes`` from the top-level ``role`` and ``name`` fields.
+ * Merges the top-level ``[published_services.*]`` into each peer's
+ * ``published_services`` so callers always see a complete peer dict.
+ *
+ * Returns the full parsed identity or null if the file doesn't exist.
  */
-export function loadIdentity(
+export function loadIdentityFile(
   filePath?: string,
-  peerName?: string,
-  role?: string,
-): { secretKey: Uint8Array; peer: Record<string, unknown> } | null {
+): IdentityData | null {
   const { existsSync, readFileSync } = require('node:fs');
   const { join } = require('node:path');
 
@@ -205,34 +215,108 @@ export function loadIdentity(
     const text = readFileSync(path, 'utf-8');
     const data = parseSimpleToml(text);
 
-    // Extract node.secret_key
-    const node = data.node as Record<string, unknown> | undefined;
-    if (!node?.secret_key) return null;
-    const secretKey = new Uint8Array(Buffer.from(node.secret_key as string, 'base64'));
-
-    // Find matching peer
+    const node = (data.node ?? {}) as Record<string, unknown>;
     const peers = (data.peers ?? []) as Record<string, unknown>[];
-    let peer: Record<string, unknown> | undefined;
+    const publishedServices = (data.published_services ?? {}) as Record<string, Record<string, unknown>>;
 
-    if (peerName) {
-      peer = peers.find(p => p.name === peerName);
-    } else if (role) {
-      peer = peers.find(p => p.role === role);
-    } else {
-      peer = peers[0];
+    // Synthesize aster.role / aster.name into attributes, merge published_services
+    for (const peer of peers) {
+      const attrs = (peer.attributes ?? {}) as Record<string, unknown>;
+      if (!('aster.role' in attrs) && peer.role) {
+        attrs['aster.role'] = peer.role;
+      }
+      if (!('aster.name' in attrs) && peer.name) {
+        attrs['aster.name'] = peer.name;
+      }
+      peer.attributes = attrs;
+
+      // Each peer gets the top-level published_services as default
+      if (!peer.published_services) {
+        peer.published_services = publishedServices;
+      }
     }
 
-    return { secretKey, peer: peer ?? {} };
+    return { node, peers, published_services: publishedServices };
   } catch {
     return null;
   }
 }
 
 /**
- * Minimal TOML parser for config files.
- * Handles sections, strings, numbers, booleans. Not a full TOML parser.
+ * Load identity from a .aster-identity TOML file.
+ *
+ * Returns secretKey + matching peer, or null if not found.
+ * This is the simple convenience wrapper; use loadIdentityFile()
+ * for full access to published_services and all peers.
  */
-function parseSimpleToml(text: string): Record<string, unknown> {
+export function loadIdentity(
+  filePath?: string,
+  peerName?: string,
+  role?: string,
+): { secretKey: Uint8Array; peer: Record<string, unknown> } | null {
+  const identity = loadIdentityFile(filePath);
+  if (!identity) return null;
+
+  const node = identity.node;
+  if (!node?.secret_key) return null;
+  const secretKey = new Uint8Array(Buffer.from(node.secret_key as string, 'base64'));
+
+  // Find matching peer
+  let peer: Record<string, unknown> | undefined;
+  if (peerName) {
+    peer = identity.peers.find(p => p.name === peerName);
+  } else if (role) {
+    peer = identity.peers.find(p => p.role === role);
+  } else {
+    peer = identity.peers[0];
+  }
+
+  return { secretKey, peer: peer ?? {} };
+}
+
+/**
+ * Find a peer entry by name or role from parsed identity data.
+ */
+export function findPeer(
+  identity: IdentityData,
+  name?: string,
+  role?: string,
+): Record<string, unknown> | undefined {
+  for (const peer of identity.peers) {
+    if (name !== undefined && peer.name === name) return peer;
+    if (name === undefined && role !== undefined && peer.role === role) return peer;
+  }
+  return undefined;
+}
+
+/**
+ * Extract producer tokens from a peer's published_services.
+ *
+ * Returns a map of service name to token data (entries that
+ * have a ``producer_token`` field).
+ */
+export function getProducerTokens(
+  peer: Record<string, unknown>,
+): Record<string, Record<string, unknown>> {
+  const published = peer.published_services as Record<string, Record<string, unknown>> | undefined;
+  if (!published || typeof published !== 'object') return {};
+
+  const tokens: Record<string, Record<string, unknown>> = {};
+  for (const [svcName, entry] of Object.entries(published)) {
+    if (entry && typeof entry === 'object' && entry.producer_token) {
+      tokens[svcName] = entry;
+    }
+  }
+  return tokens;
+}
+
+/**
+ * Minimal TOML parser for config files.
+ * Handles sections (including dotted like [a.b]), array-of-tables,
+ * strings, numbers, booleans, inline tables, and simple arrays.
+ * Not a full TOML parser.
+ */
+export function parseSimpleToml(text: string): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   let currentSection: Record<string, unknown> = result;
 
@@ -251,12 +335,25 @@ function parseSimpleToml(text: string): Record<string, unknown> {
       continue;
     }
 
-    // Section header [name]
+    // Section header [name] or [name.subkey]
     const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
     if (sectionMatch) {
       const name = sectionMatch[1]!;
-      result[name] = result[name] ?? {};
-      currentSection = result[name] as Record<string, unknown>;
+      const dotIdx = name.indexOf('.');
+      if (dotIdx !== -1) {
+        // Dotted section: [parent.child] → result.parent.child = {}
+        const parent = name.slice(0, dotIdx);
+        const child = name.slice(dotIdx + 1);
+        if (!result[parent] || typeof result[parent] !== 'object' || Array.isArray(result[parent])) {
+          result[parent] = {};
+        }
+        const parentObj = result[parent] as Record<string, unknown>;
+        parentObj[child] = parentObj[child] ?? {};
+        currentSection = parentObj[child] as Record<string, unknown>;
+      } else {
+        result[name] = result[name] ?? {};
+        currentSection = result[name] as Record<string, unknown>;
+      }
       continue;
     }
 
@@ -282,6 +379,21 @@ function parseTomlValue(raw: string): unknown {
   // Number
   const num = Number(raw);
   if (!isNaN(num) && raw !== '') return num;
+  // Inline table { key = "val", ... }
+  if (raw.startsWith('{') && raw.endsWith('}')) {
+    const inner = raw.slice(1, -1).trim();
+    if (!inner) return {};
+    const obj: Record<string, unknown> = {};
+    // Split on commas not inside quotes
+    for (const pair of inner.split(',')) {
+      const eqIdx = pair.indexOf('=');
+      if (eqIdx === -1) continue;
+      const k = pair.slice(0, eqIdx).trim().replace(/^["']|["']$/g, '');
+      const v = pair.slice(eqIdx + 1).trim();
+      obj[k] = parseTomlValue(v);
+    }
+    return obj;
+  }
   // Array (simple flat arrays)
   if (raw.startsWith('[') && raw.endsWith(']')) {
     const inner = raw.slice(1, -1).trim();

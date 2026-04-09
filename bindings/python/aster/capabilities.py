@@ -30,6 +30,7 @@ def any_of(*roles: str) -> CapabilityRequirement:
     """Require ANY ONE of the listed roles (OR logic).
 
     The caller is admitted if they have at least one of the specified roles.
+    Accepts plain strings or str enum values.
 
     Example::
 
@@ -38,7 +39,7 @@ def any_of(*roles: str) -> CapabilityRequirement:
     """
     return CapabilityRequirement(
         kind=CapabilityKind.ANY_OF,
-        roles=list(roles),
+        roles=[str(r) for r in roles],
     )
 
 
@@ -46,6 +47,7 @@ def all_of(*roles: str) -> CapabilityRequirement:
     """Require ALL of the listed roles (AND logic).
 
     The caller is admitted only if they have every specified role.
+    Accepts plain strings or str enum values.
 
     Example::
 
@@ -54,5 +56,5 @@ def all_of(*roles: str) -> CapabilityRequirement:
     """
     return CapabilityRequirement(
         kind=CapabilityKind.ALL_OF,
-        roles=list(roles),
+        roles=[str(r) for r in roles],
     )

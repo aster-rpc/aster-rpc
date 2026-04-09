@@ -80,7 +80,7 @@ async def test_gossip_broadcast_recv(node_pair):
     node1.add_node_addr(node2)
     node2.add_node_addr(node1)
 
-    # Both subscribe concurrently — subscribe_and_join blocks until a peer connects,
+    # Both subscribe concurrently -- subscribe_and_join blocks until a peer connects,
     # so we need them to run in parallel.
     topic1, topic2 = await asyncio.wait_for(
         asyncio.gather(
@@ -93,7 +93,7 @@ async def test_gossip_broadcast_recv(node_pair):
     # Broadcast from node1
     await topic1.broadcast(payload)
 
-    # Receive on node2 — skip neighbor events until we get a "received"
+    # Receive on node2 -- skip neighbor events until we get a "received"
     received_data = None
     for _ in range(20):
         event_type, data = await asyncio.wait_for(topic2.recv(), timeout=10)

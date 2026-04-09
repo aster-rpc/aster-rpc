@@ -1,7 +1,7 @@
 """
 tests/python/test_aster_canonical.py
 
-Phase 13 conformance tests: canonical encoding golden vectors A.2–A.6.
+Phase 13 conformance tests: canonical encoding golden vectors A.2--A.6.
 
 Each vector is tested as a separate parametrized test case to allow pinpointing
 failures.  Vectors are loaded from the committed JSON fixture file.
@@ -47,7 +47,7 @@ def _load_vectors() -> dict[str, dict]:
     return {v["id"]: v for v in data["vectors"]}
 
 
-# ── A.2–A.6 parametrized tests ─────────────────────────────────────────────────
+# ── A.2--A.6 parametrized tests ─────────────────────────────────────────────────
 
 
 @pytest.fixture(scope="module")

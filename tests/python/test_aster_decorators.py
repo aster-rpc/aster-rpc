@@ -17,7 +17,7 @@ from typing import AsyncIterator
 import pytest
 
 from aster.codec import wire_type
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 from aster.decorators import (
     service,
     rpc,
@@ -79,13 +79,13 @@ class AggregateResponse:
 
 @dataclass
 class UntaggedRequest:
-    """A type WITHOUT @wire_type — should fail XLANG registration."""
+    """A type WITHOUT @wire_type -- should fail XLANG registration."""
     data: str = ""
 
 
 @dataclass
 class UntaggedResponse:
-    """A type WITHOUT @wire_type — should fail XLANG registration."""
+    """A type WITHOUT @wire_type -- should fail XLANG registration."""
     value: str = ""
 
 

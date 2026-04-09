@@ -8,7 +8,7 @@ These tests verify that every name listed in __all__ is:
 
 They run in milliseconds with zero network I/O.  Their purpose is to catch
 accidental removals or renames caused by Rust refactors, PyO3 registration
-changes, or __init__.py edits — before any protocol-level test would notice.
+changes, or __init__.py edits -- before any protocol-level test would notice.
 """
 
 import inspect

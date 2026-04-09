@@ -26,7 +26,7 @@ from aster.interceptors.circuit_breaker import CircuitBreakerInterceptor
 from aster.interceptors.deadline import DeadlineInterceptor
 from aster.interceptors.retry import RetryInterceptor
 from aster.status import RpcError
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 from aster.transport.base import Transport, BidiChannel
 from aster.service import ServiceInfo, MethodInfo, ServiceRegistry
 

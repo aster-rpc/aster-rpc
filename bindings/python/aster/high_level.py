@@ -1761,7 +1761,7 @@ class ProxyClient:
             return
 
         from .transport.iroh import IrohTransport
-        from .codec import ForyCodec
+        from .json_codec import JsonProxyCodec
 
         summary = None
         for s in self._client._services:
@@ -1776,7 +1776,9 @@ class ProxyClient:
             raise RuntimeError(f"{self._service_name} has no rpc channel")
 
         conn = await self._client._rpc_conn_for(rpc_addr)
-        self._codec = ForyCodec()
+        # Proxy uses JSON mode -- no type registration needed.
+        # The server sniffs JSON frames and decodes accordingly.
+        self._codec = JsonProxyCodec()
         self._transport = IrohTransport(conn, codec=self._codec)
 
     def __getattr__(self, method_name: str) -> "_ProxyMethod":
@@ -1792,24 +1794,126 @@ class _ProxyMethod:
         self._proxy = proxy
         self._method_name = method_name
 
-    async def __call__(self, payload: dict | None = None, **kwargs: Any) -> Any:
-        """Invoke as a unary RPC. Pass a dict or keyword arguments."""
+    async def __call__(self, payload: Any = None, **kwargs: Any) -> Any:
+        """Invoke the RPC method.
+
+        Automatically detects the pattern:
+        - Pass a dict or kwargs -> unary RPC
+        - Pass an async iterator/generator -> client streaming
+        """
         await self._proxy._ensure_transport()
+        import dataclasses
+        import collections.abc
+
+        # Detect client streaming: payload is an async iterator
+        if isinstance(payload, collections.abc.AsyncIterator) or (
+            hasattr(payload, "__aiter__") and not isinstance(payload, (dict, str, bytes))
+        ):
+            result = await self._proxy._transport.client_stream(
+                self._proxy._service_name,
+                self._method_name,
+                payload,
+            )
+            if dataclasses.is_dataclass(result) and not isinstance(result, type):
+                return dataclasses.asdict(result)
+            return result
 
         # Build payload from dict or kwargs
         if payload is None:
             payload = kwargs
-        elif kwargs:
+        elif isinstance(payload, dict) and kwargs:
             payload = {**payload, **kwargs}
 
         result = await self._proxy._transport.unary(
             self._proxy._service_name,
             self._method_name,
-            payload or {},
+            payload if isinstance(payload, dict) else (payload or {}),
         )
 
         # Convert dataclass result to dict for proxy UX
-        import dataclasses
         if dataclasses.is_dataclass(result) and not isinstance(result, type):
             return dataclasses.asdict(result)
         return result
+
+    async def stream(self, payload: dict | None = None, **kwargs: Any) -> Any:
+        """Invoke as server-streaming RPC. Returns an async iterator.
+
+        Usage::
+
+            async for entry in mc.tailLogs.stream({"level": "warn"}):
+                print(entry)
+        """
+        await self._proxy._ensure_transport()
+
+        if payload is None:
+            payload = kwargs
+        elif isinstance(payload, dict) and kwargs:
+            payload = {**payload, **kwargs}
+
+        async for item in self._proxy._transport.server_stream(
+            self._proxy._service_name,
+            self._method_name,
+            payload or {},
+        ):
+            import dataclasses
+            if dataclasses.is_dataclass(item) and not isinstance(item, type):
+                yield dataclasses.asdict(item)
+            else:
+                yield item
+
+    def bidi(self) -> "_ProxyBidiChannel":
+        """Open a bidirectional streaming RPC. Returns a channel.
+
+        Usage::
+
+            channel = mc.runCommand.bidi()
+            await channel.open()
+            await channel.send({"command": "echo hello"})
+            async for result in channel:
+                print(result)
+            await channel.close()
+        """
+        return _ProxyBidiChannel(self._proxy, self._method_name)
+
+
+class _ProxyBidiChannel:
+    """Bidirectional streaming channel for the proxy client."""
+
+    def __init__(self, proxy: ProxyClient, method_name: str) -> None:
+        self._proxy = proxy
+        self._method_name = method_name
+        self._channel: Any = None
+
+    async def open(self) -> None:
+        """Open the bidi stream."""
+        await self._proxy._ensure_transport()
+        self._channel = self._proxy._transport.bidi_stream(
+            self._proxy._service_name,
+            self._method_name,
+        )
+
+    async def send(self, payload: dict) -> None:
+        """Send a message on the bidi stream."""
+        if self._channel is None:
+            await self.open()
+        await self._channel.send(payload)
+
+    async def close(self) -> None:
+        """Close the send side of the bidi stream."""
+        if self._channel is not None:
+            await self._channel.close()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._channel is None:
+            raise StopAsyncIteration
+        try:
+            item = await self._channel.__anext__()
+            import dataclasses
+            if dataclasses.is_dataclass(item) and not isinstance(item, type):
+                return dataclasses.asdict(item)
+            return item
+        except StopAsyncIteration:
+            raise

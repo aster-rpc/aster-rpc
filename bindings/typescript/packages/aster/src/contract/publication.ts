@@ -81,7 +81,7 @@ export async function fetchFromCollection(
  * Fetch a contract manifest from the blob store by its collection hash.
  */
 export async function fetchContract(
-  blobsClient: { read(hash: string): Promise<Uint8Array> },
+  blobsClient: { listCollection(hash: string): Promise<Array<{ name: string; hash: string; size: number }>>; read(hash: string): Promise<Uint8Array> },
   collectionHash: string,
 ): Promise<ContractManifest> {
   const { manifestFromJson } = await import('./manifest.js');

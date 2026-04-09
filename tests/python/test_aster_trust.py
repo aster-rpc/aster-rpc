@@ -44,7 +44,7 @@ from aster.trust import (
 from aster.trust.hooks import _ADMISSION_ALPNS
 
 
-# Private imports for testing (public API removed — Rust core is authoritative)
+# Private imports for testing (public API removed -- Rust core is authoritative)
 from aster.trust.signing import _canonical_json as canonical_json
 from aster.trust.signing import _canonical_signing_bytes as canonical_signing_bytes
 
@@ -266,7 +266,7 @@ async def test_ott_nonce_wrong_length_rejected():
         # Validation happens at structural level via nonce_store.consume
         with pytest.raises(ValueError, match="32 bytes"):
             await store.consume(bad_nonce)
-        # check_offline also calls nonce_store.consume — must propagate error
+        # check_offline also calls nonce_store.consume -- must propagate error
         result = await check_offline(cred, "peer", store)
         assert result.admitted is False, f"Should reject nonce of length {bad_len}"
 
@@ -293,7 +293,7 @@ async def test_policy_with_nonce_rejected():
 async def test_policy_credential_reusable():
     """Policy credentials are reusable within expiry."""
     cred, _, _ = _make_signed_consumer_cred("policy")
-    # Call check_offline multiple times — no nonce_store needed
+    # Call check_offline multiple times -- no nonce_store needed
     for _ in range(5):
         result = await check_offline(cred, "any_peer")
         assert result.admitted is True
@@ -646,7 +646,7 @@ def test_cli_sign_ott_credential():
 
 
 def test_local_transport_call_context_peer_is_none():
-    """LocalTransport CallContext.peer is None — Gates 0 and 1 are bypassed."""
+    """LocalTransport CallContext.peer is None -- Gates 0 and 1 are bypassed."""
     from aster.interceptors import CallContext
 
     ctx = CallContext(service="TestService", method="DoSomething")

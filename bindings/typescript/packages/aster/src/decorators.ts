@@ -39,7 +39,7 @@ import {
 export interface ServiceOptions {
   name: string;
   version?: number;
-  scoped?: 'shared' | 'stream';
+  scoped?: 'shared' | 'session' | 'stream';
   serialization?: SerializationMode[];
   requires?: CapabilityRequirement;
   metadata?: Metadata;
@@ -81,10 +81,13 @@ export function Service(options: ServiceOptions) {
       }
     }
 
+    // Accept "session" as alias for "stream"
+    const scoped = options.scoped === 'session' ? 'stream' : (options.scoped ?? 'shared');
+
     const serviceInfo: ServiceInfo = {
       name: options.name,
       version: options.version ?? 1,
-      scoped: options.scoped ?? 'shared',
+      scoped,
       methods,
       serializationModes: options.serialization ?? [],
       requires: options.requires,

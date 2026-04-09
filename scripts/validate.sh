@@ -114,6 +114,37 @@ else
     echo "  Install with: curl -fsSL https://bun.sh/install | bash"
 fi
 
+# ── 7. Python static analysis (non-blocking) ─────────────────────
+step "Python import check"
+if uv run python -c "from aster import AsterServer, AsterClient, service, rpc, wire_type, any_of, all_of, SerializationMode" 2>&1; then
+    pass "Import check OK"
+else
+    fail "Import check failed -- broken import in aster package"
+fi
+
+step "ASCII check (no Unicode dashes in Python source)"
+if python3 scripts/check-ascii.py bindings/python/aster/*.py bindings/python/aster/**/*.py cli/aster_cli/*.py cli/aster_cli/**/*.py 2>/dev/null; then
+    pass "ASCII check OK"
+else
+    echo "  ⚠ Non-ASCII characters found (see above). Fix before committing."
+fi
+
+step "Dead code check (vulture)"
+if command -v vulture &>/dev/null || uv run vulture --version &>/dev/null 2>&1; then
+    uv run vulture bindings/python/aster/ cli/aster_cli/ --min-confidence 80 2>&1 || true
+    pass "Vulture scan complete (review any findings above)"
+else
+    echo "  ⚠ vulture not installed -- skipping dead code check"
+fi
+
+step "Pyright (Python type check -- warnings only)"
+if command -v pyright &>/dev/null || uv run pyright --version &>/dev/null 2>&1; then
+    uv run pyright bindings/python/aster/__init__.py bindings/python/aster/public.py 2>&1 || true
+    pass "Pyright scan complete"
+else
+    echo "  ⚠ pyright not installed -- skipping type check"
+fi
+
 if command -v sccache &>/dev/null; then
     step "sccache stats"
     sccache --show-stats || true

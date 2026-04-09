@@ -28,7 +28,7 @@ from aster.interceptors.base import (
 )
 from aster.interceptors.deadline import DeadlineInterceptor
 from aster.status import StatusCode, RpcError
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 from aster.transport.base import (
     Transport,
     BidiChannel,

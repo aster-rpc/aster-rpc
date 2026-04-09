@@ -264,7 +264,7 @@ export class IrohTransport implements AsterTransport {
       version: 1,
       callId: opts?.callId ?? crypto.randomUUID(),
       deadlineEpochMs: opts?.deadlineEpochMs ?? 0,
-      serializationMode: opts?.serializationMode ?? 0,
+      serializationMode: opts?.serializationMode ?? (this.codec instanceof JsonCodec ? 3 : 0),
       metadataKeys: keys,
       metadataValues: values,
     });

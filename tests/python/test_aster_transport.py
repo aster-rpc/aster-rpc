@@ -19,7 +19,7 @@ import pytest
 from aster.codec import wire_type, ForyCodec, ForyConfig
 from aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
 from aster.protocol import StreamHeader, RpcStatus
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 from aster.status import StatusCode
 from aster.transport.base import (
     Transport,
@@ -81,7 +81,7 @@ class AggregateResponse:
 
 @dataclass
 class UntaggedRequest:
-    """A type WITHOUT @wire_type — should fail XLANG registration."""
+    """A type WITHOUT @wire_type -- should fail XLANG registration."""
     data: str = ""
 
 

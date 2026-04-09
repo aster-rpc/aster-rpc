@@ -48,7 +48,7 @@ from typing import (
 )
 
 from aster.contract.identity import CapabilityRequirement
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 from aster.service import MethodInfo, ServiceInfo
 
 if typing.TYPE_CHECKING:
@@ -281,6 +281,7 @@ def server_stream(
     name: str | None = None,
     timeout: float | None = None,
     serialization: SerializationMode | None = None,
+    requires: CapabilityRequirement | None = None,
     metadata: Any = None,
 ) -> Callable[P, AsyncIterator[Any]]:
     """Decorator to mark a method as a server-streaming RPC.
@@ -310,14 +311,14 @@ def server_stream(
     # Handle @server_stream (no parens) - method is passed directly
     if callable(method_or_timeout):
         method = method_or_timeout
-        _apply_server_stream_decorator(method, name=name, timeout=timeout, serialization=serialization, metadata=metadata)
+        _apply_server_stream_decorator(method, name=name, timeout=timeout, serialization=serialization, requires=requires, metadata=metadata)
         return method
 
     # Handle @server_stream() or @server_stream(timeout=...)
     actual_timeout = method_or_timeout if method_or_timeout is not None else timeout
 
     def decorator(method: Callable[P, AsyncIterator[Any]]) -> Callable[P, AsyncIterator[Any]]:
-        _apply_server_stream_decorator(method, name=name, timeout=actual_timeout, serialization=serialization, metadata=metadata)
+        _apply_server_stream_decorator(method, name=name, timeout=actual_timeout, serialization=serialization, requires=requires, metadata=metadata)
         return method
 
     return decorator
@@ -328,6 +329,7 @@ def _apply_server_stream_decorator(
     name: str | None = None,
     timeout: float | None = None,
     serialization: SerializationMode | None = None,
+    requires: CapabilityRequirement | None = None,
     metadata: Any = None,
 ) -> None:
     """Apply the server_stream decorator to a method."""
@@ -352,6 +354,7 @@ def _apply_server_stream_decorator(
         timeout=timeout,
         idempotent=False,
         serialization=serialization,
+        requires=requires,
         metadata=metadata,
     )
     setattr(method, _METHOD_INFO_ATTR, method_info)
@@ -365,6 +368,7 @@ def client_stream(
     name: str | None = None,
     idempotent: bool = False,
     serialization: SerializationMode | None = None,
+    requires: CapabilityRequirement | None = None,
     metadata: Any = None,
 ) -> Callable[P, Any] | Callable:
     """Decorator to mark a method as a client-streaming RPC.
@@ -396,14 +400,14 @@ def client_stream(
     # Handle @client_stream (no parens) - method is passed directly
     if callable(method_or_timeout):
         method = method_or_timeout
-        _apply_client_stream_decorator(method, name=name, idempotent=idempotent, serialization=serialization, metadata=metadata)
+        _apply_client_stream_decorator(method, name=name, idempotent=idempotent, serialization=serialization, requires=requires, metadata=metadata)
         return method
 
     # Handle @client_stream() or @client_stream(timeout=...)
     timeout = method_or_timeout
 
     def decorator(method: Callable[P, Any]) -> Callable[P, Any]:
-        _apply_client_stream_decorator(method, name=name, timeout=timeout, idempotent=idempotent, serialization=serialization, metadata=metadata)
+        _apply_client_stream_decorator(method, name=name, timeout=timeout, idempotent=idempotent, serialization=serialization, requires=requires, metadata=metadata)
         return method
 
     return decorator
@@ -415,6 +419,7 @@ def _apply_client_stream_decorator(
     timeout: float | None = None,
     idempotent: bool = False,
     serialization: SerializationMode | None = None,
+    requires: CapabilityRequirement | None = None,
     metadata: Any = None,
 ) -> None:
     """Apply the client_stream decorator to a method."""
@@ -438,6 +443,7 @@ def _apply_client_stream_decorator(
         timeout=timeout,
         idempotent=idempotent,
         serialization=serialization,
+        requires=requires,
         metadata=metadata,
     )
     setattr(method, _METHOD_INFO_ATTR, method_info)
@@ -451,6 +457,7 @@ def bidi_stream(
     name: str | None = None,
     timeout: float | None = None,
     serialization: SerializationMode | None = None,
+    requires: CapabilityRequirement | None = None,
     metadata: Any = None,
 ) -> Callable[P, AsyncIterator[Any]]:
     """Decorator to mark a method as a bidirectional-streaming RPC.
@@ -482,14 +489,14 @@ def bidi_stream(
     # Handle @bidi_stream (no parens) - method is passed directly
     if callable(method_or_timeout):
         method = method_or_timeout
-        _apply_bidi_stream_decorator(method, name=name, timeout=timeout, serialization=serialization, metadata=metadata)
+        _apply_bidi_stream_decorator(method, name=name, timeout=timeout, serialization=serialization, requires=requires, metadata=metadata)
         return method
 
     # Handle @bidi_stream() or @bidi_stream(timeout=...)
     actual_timeout = method_or_timeout if method_or_timeout is not None else timeout
 
     def decorator(method: Callable[P, AsyncIterator[Any]]) -> Callable[P, AsyncIterator[Any]]:
-        _apply_bidi_stream_decorator(method, name=name, timeout=actual_timeout, serialization=serialization, metadata=metadata)
+        _apply_bidi_stream_decorator(method, name=name, timeout=actual_timeout, serialization=serialization, requires=requires, metadata=metadata)
         return method
 
     return decorator
@@ -500,6 +507,7 @@ def _apply_bidi_stream_decorator(
     name: str | None = None,
     timeout: float | None = None,
     serialization: SerializationMode | None = None,
+    requires: CapabilityRequirement | None = None,
     metadata: Any = None,
 ) -> None:
     """Apply the bidi_stream decorator to a method."""
@@ -524,6 +532,7 @@ def _apply_bidi_stream_decorator(
         timeout=timeout,
         idempotent=False,
         serialization=serialization,
+        requires=requires,
         metadata=metadata,
     )
     setattr(method, _METHOD_INFO_ATTR, method_info)
@@ -627,6 +636,10 @@ def _apply_service_decorator(
         serialization = [SerializationMode.XLANG]
     elif isinstance(serialization, SerializationMode):
         serialization = [serialization]
+
+    # Accept "session" as an alias for "stream" (user-facing name)
+    if scoped == "session":
+        scoped = "stream"
 
     # For session-scoped services, validate that __init__ accepts a 'peer' parameter
     if scoped == "stream":
@@ -833,8 +846,10 @@ def _unwrap_async_iterator(tp: Any) -> Any:
             return tp
         return tp
 
-    # AsyncIterator[T]
-    if origin is AsyncIterator or origin is AsyncGenerator:
+    # AsyncIterator[T] -- check both typing and collections.abc origins
+    # (in Python 3.9+, typing.AsyncIterator[T].__origin__ is collections.abc.AsyncIterator)
+    import collections.abc as _cabc
+    if origin in (AsyncIterator, AsyncGenerator, _cabc.AsyncIterator, _cabc.AsyncGenerator):
         args = getattr(tp, "__args__", ())
         if args:
             return args[0]

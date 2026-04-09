@@ -31,7 +31,7 @@ from aster.interceptors.base import (
 )
 from aster.protocol import StreamHeader, RpcStatus
 from aster.status import StatusCode, RpcError
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 from aster.service import ServiceRegistry, ServiceInfo, MethodInfo
 
 if TYPE_CHECKING:
@@ -311,8 +311,8 @@ class Server:
             async with self._connections_lock:
                 self._connections.discard(ctx)
 
-            # Cancel all stream tasks
-            for task in ctx.stream_tasks:
+            # Cancel all stream tasks (copy to avoid set-changed-during-iteration)
+            for task in list(ctx.stream_tasks):
                 if not task.done():
                     task.cancel()
                     try:
@@ -348,9 +348,15 @@ class Server:
                 )
                 return
 
-            # Decode the StreamHeader
+            # Decode the StreamHeader.
+            # Sniff: JSON starts with '{' (0x7B), Fory XLANG starts with
+            # 0x02. Accept both for cross-language interop.
             try:
-                header = self._codec.decode(payload, StreamHeader)
+                if payload and payload[0:1] == b'{':
+                    from aster.json_codec import json_decode
+                    header = json_decode(payload, StreamHeader)
+                else:
+                    header = self._codec.decode(payload, StreamHeader)
             except Exception as e:
                 logger.error("Failed to decode StreamHeader: %s", e)
                 await self._write_error_trailer(
@@ -418,11 +424,14 @@ class Server:
                 )
                 return
 
-            # Validate serialization mode
-            if header.serialization_mode not in [m.value for m in service_info.serialization_modes]:
+            # Validate serialization mode.
+            # JSON (mode 3) is always accepted for cross-language interop.
+            accepted_modes = [m.value for m in service_info.serialization_modes]
+            accepted_modes.append(SerializationMode.JSON.value)
+            if header.serializationMode not in accepted_modes:
                 await self._write_error_trailer(
                     send, StatusCode.INVALID_ARGUMENT,
-                    f"Unsupported serialization mode: {header.serialization_mode}"
+                    f"Unsupported serialization mode: {header.serializationMode}"
                 )
                 return
 
@@ -445,7 +454,7 @@ class Server:
                 pass
 
             with request_context(
-                request_id=header.call_id or "",
+                request_id=header.callId or "",
                 service=header.service,
                 method=header.method,
                 peer=peer_id,
@@ -526,13 +535,13 @@ class Server:
         return build_call_context(
             service=header.service,
             method=header.method,
-            metadata=_validated_metadata(header.metadata_keys, header.metadata_values),
-            deadline_epoch_ms=header.deadline_epoch_ms,
+            metadata=_validated_metadata(header.metadataKeys, header.metadataValues),
+            deadline_epoch_ms=header.deadlineEpochMs,
             peer=peer,
             is_streaming=method_info.pattern != "unary",
             pattern=method_info.pattern,
             idempotent=method_info.idempotent,
-            call_id=header.call_id or None,
+            call_id=header.callId or None,
             attributes=attributes,
         )
 
@@ -540,6 +549,7 @@ class Server:
         self,
         recv: Any,
         expected_type: type | None,
+        serialization_mode: int = 0,
     ) -> tuple[Any, int] | tuple[None, None]:
         while True:
             frame = await read_frame(recv)
@@ -553,8 +563,24 @@ class Server:
                 )
                 continue
             compressed = bool(flags & COMPRESSED)
-            request = self._codec.decode_compressed(payload, compressed, expected_type)
+            if serialization_mode == SerializationMode.JSON.value:
+                from aster.json_codec import json_decode
+                if compressed:
+                    from aster.json_codec import safe_decompress
+                    payload = safe_decompress(payload)
+                request = json_decode(payload, expected_type)
+            else:
+                request = self._codec.decode_compressed(payload, compressed, expected_type)
             return request, flags
+
+    def _encode_response(
+        self, response: Any, serialization_mode: int = 0
+    ) -> tuple[bytes, bool]:
+        """Encode a response payload, respecting the stream's serialization mode."""
+        if serialization_mode == SerializationMode.JSON.value:
+            from aster.json_codec import json_encode
+            return json_encode(response), False
+        return self._codec.encode_compressed(response)
 
     async def _handle_unary(
         self,
@@ -570,7 +596,7 @@ class Server:
         interceptors = self._resolve_interceptors(self._registry.lookup(header.service, header.version))
         try:
             # Read the request frame
-            request, flags = await self._decode_request_frame(recv, method_info.request_type)
+            request, flags = await self._decode_request_frame(recv, method_info.request_type, header.serializationMode)
             if request is None:
                 await self._write_error_trailer(send, StatusCode.UNAVAILABLE, "Stream ended")
                 return
@@ -587,12 +613,12 @@ class Server:
             response = await apply_response_interceptors(interceptors, call_ctx, response)
 
             # Encode and write response
-            response_payload, response_compressed = self._codec.encode_compressed(response)
+            response_payload, response_compressed = self._encode_response(response, header.serializationMode)
             response_flags = COMPRESSED if response_compressed else 0
             await write_frame(send, response_payload, response_flags)
 
             # Write trailer
-            await self._write_ok_trailer(send)
+            await self._write_ok_trailer(send, header.serializationMode)
 
             await send.finish()
 
@@ -622,7 +648,7 @@ class Server:
         interceptors = self._resolve_interceptors(self._registry.lookup(header.service, header.version))
         try:
             # Read the request frame
-            request, flags = await self._decode_request_frame(recv, method_info.request_type)
+            request, flags = await self._decode_request_frame(recv, method_info.request_type, header.serializationMode)
             if request is None:
                 await self._write_error_trailer(send, StatusCode.UNAVAILABLE, "Stream ended")
                 return
@@ -638,7 +664,7 @@ class Server:
 
             # §5.5.2: ROW_SCHEMA hoisting -- send schema frame before first data frame
             row_schema_sent = False
-            if header.serialization_mode == SerializationMode.ROW.value:
+            if header.serializationMode == SerializationMode.ROW.value:
                 try:
                     schema_bytes = self._codec.encode_row_schema()
                     await write_frame(send, schema_bytes, flags=ROW_SCHEMA)
@@ -649,12 +675,12 @@ class Server:
             # Stream responses
             async for response in response_iter:
                 response = await apply_response_interceptors(interceptors, call_ctx, response)
-                response_payload, response_compressed = self._codec.encode_compressed(response)
+                response_payload, response_compressed = self._encode_response(response, header.serializationMode)
                 response_flags = COMPRESSED if response_compressed else 0
                 await write_frame(send, response_payload, response_flags)
 
             # Write trailer
-            await self._write_ok_trailer(send)
+            await self._write_ok_trailer(send, header.serializationMode)
             await send.finish()
 
         except asyncio.CancelledError:
@@ -701,7 +727,14 @@ class Server:
                     continue
 
                 compressed = bool(flags & COMPRESSED)
-                request = self._codec.decode_compressed(payload, compressed, method_info.request_type)
+                if header.serializationMode == SerializationMode.JSON.value:
+                    from aster.json_codec import json_decode
+                    if compressed:
+                        import zstandard
+                        payload = zstandard.ZstdDecompressor().decompress(payload)
+                    request = json_decode(payload, method_info.request_type)
+                else:
+                    request = self._codec.decode_compressed(payload, compressed, method_info.request_type)
                 request = await apply_request_interceptors(interceptors, call_ctx, request)
                 requests.append(request)
 
@@ -715,12 +748,12 @@ class Server:
             response = await apply_response_interceptors(interceptors, call_ctx, response)
 
             # Encode and write response
-            response_payload, response_compressed = self._codec.encode_compressed(response)
+            response_payload, response_compressed = self._encode_response(response, header.serializationMode)
             response_flags = COMPRESSED if response_compressed else 0
             await write_frame(send, response_payload, response_flags)
 
             # Write trailer
-            await self._write_ok_trailer(send)
+            await self._write_ok_trailer(send, header.serializationMode)
             await send.finish()
 
         except asyncio.CancelledError:
@@ -765,11 +798,11 @@ class Server:
 
             # Start reader task
             reader_task = asyncio.create_task(
-                self._bidi_reader(recv, method_info.request_type, request_queue, request_done, interceptors, call_ctx)
+                self._bidi_reader(recv, method_info.request_type, request_queue, request_done, interceptors, call_ctx, header.serializationMode)
             )
 
             # §5.5.2: ROW_SCHEMA hoisting -- send schema frame before first data frame
-            if header.serialization_mode == SerializationMode.ROW.value:
+            if header.serializationMode == SerializationMode.ROW.value:
                 try:
                     schema_bytes = self._codec.encode_row_schema()
                     await write_frame(send, schema_bytes, flags=ROW_SCHEMA)
@@ -779,12 +812,12 @@ class Server:
             # Stream responses from handler
             async for response in response_iter:
                 response = await apply_response_interceptors(interceptors, call_ctx, response)
-                response_payload, response_compressed = self._codec.encode_compressed(response)
+                response_payload, response_compressed = self._encode_response(response, header.serializationMode)
                 response_flags = COMPRESSED if response_compressed else 0
                 await write_frame(send, response_payload, response_flags)
 
             # Write trailer
-            await self._write_ok_trailer(send)
+            await self._write_ok_trailer(send, header.serializationMode)
             await send.finish()
 
             # Wait for reader to finish
@@ -810,6 +843,7 @@ class Server:
         request_done: asyncio.Event,
         interceptors: list[Any],
         call_ctx: Any,
+        serialization_mode: int = 0,
     ) -> None:
         """Read inbound bidi request frames and feed the handler iterator."""
         try:
@@ -829,7 +863,14 @@ class Server:
                     continue
 
                 compressed = bool(flags & COMPRESSED)
-                request = self._codec.decode_compressed(payload, compressed, request_type)
+                if serialization_mode == SerializationMode.JSON.value:
+                    from aster.json_codec import json_decode
+                    if compressed:
+                        import zstandard
+                        payload = zstandard.ZstdDecompressor().decompress(payload)
+                    request = json_decode(payload, request_type)
+                else:
+                    request = self._codec.decode_compressed(payload, compressed, request_type)
                 request = await apply_request_interceptors(interceptors, call_ctx, request)
                 await request_queue.put(request)
 
@@ -841,19 +882,28 @@ class Server:
             await request_queue.put(_BIDI_EOF)
             request_done.set()
 
-    async def _write_ok_trailer(self, send: Any) -> None:
+    async def _write_ok_trailer(self, send: Any, serialization_mode: int = 0) -> None:
         """Write an OK status trailer."""
         status = RpcStatus(code=StatusCode.OK, message="")
-        payload = self._codec.encode(status)
+        if serialization_mode == SerializationMode.JSON.value:
+            from aster.json_codec import json_encode
+            payload = json_encode({"code": 0, "message": "", "detailKeys": [], "detailValues": []})
+        else:
+            payload = self._codec.encode(status)
         await write_frame(send, payload, flags=TRAILER)
 
     async def _write_error_trailer(
-        self, send: Any, code: StatusCode, message: str
+        self, send: Any, code: StatusCode, message: str,
+        serialization_mode: int = 0,
     ) -> None:
         """Write an error status trailer."""
         try:
-            status = RpcStatus(code=code, message=message)
-            payload = self._codec.encode(status)
+            if serialization_mode == SerializationMode.JSON.value:
+                from aster.json_codec import json_encode
+                payload = json_encode({"code": code.value, "message": message, "detailKeys": [], "detailValues": []})
+            else:
+                status = RpcStatus(code=code, message=message)
+                payload = self._codec.encode(status)
             await write_frame(send, payload, flags=TRAILER)
             await send.finish()
         except Exception as e:
@@ -895,8 +945,8 @@ class Server:
 
         # Cancel remaining stream handlers
         async with self._connections_lock:
-            for ctx in self._connections:
-                for task in ctx.stream_tasks:
+            for ctx in list(self._connections):
+                for task in list(ctx.stream_tasks):
                     if not task.done():
                         task.cancel()
 

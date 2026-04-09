@@ -16,6 +16,7 @@ class SerializationMode(IntEnum):
     XLANG = 0
     NATIVE = 1
     ROW = 2
+    JSON = 3
 
 
 @dataclass

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from aster.contract.identity import CapabilityRequirement
-from aster.types import SerializationMode
+from aster.rpc_types import SerializationMode
 
 if TYPE_CHECKING:
     from aster.decorators import MethodInfo as DecoratorMethodInfo
