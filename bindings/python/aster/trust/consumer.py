@@ -304,6 +304,7 @@ async def handle_consumer_admission_connection(
     registry_namespace_getter: "Callable[[], str] | None" = None,
     allow_unenrolled: bool = False,
     gossip_topic_getter: "Callable[[], bytes | None] | None" = None,
+    peer_store: "Any | None" = None,
 ) -> None:
     """Handle one consumer admission connection: read request, write response."""
     peer_node_id = conn.remote_id()
@@ -329,6 +330,16 @@ async def handle_consumer_admission_connection(
             registry_namespace=namespace,
             gossip_topic_id=topic,
         )
+
+        # Store admission attributes for the RPC dispatch path
+        if peer_store is not None and response.admitted:
+            from aster.peer_store import PeerAdmission
+            peer_store.admit(PeerAdmission(
+                endpoint_id=peer_node_id,
+                handle=response.attributes.get("aster.name", ""),
+                attributes=response.attributes,
+                admission_path="consumer_admission",
+            ))
 
         await send.write_all(response.to_json().encode())
         await send.finish()

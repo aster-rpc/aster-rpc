@@ -34,6 +34,7 @@ import logging
 import os
 import time
 import warnings
+from pathlib import Path
 from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,10 @@ class AsterServer:
         self._interceptors = list(interceptors) if interceptors else []
         self._hook = hook
         self._nonce_store = nonce_store
+
+        # Admission → dispatch bridge: stores per-peer attributes
+        from aster.peer_store import PeerAttributeStore
+        self._peer_store = PeerAttributeStore()
         self._registry_namespace = registry_namespace
         self._mesh_state = mesh_state
         self._clock_drift_config = clock_drift_config
@@ -231,6 +236,15 @@ class AsterServer:
         self._serve_task: asyncio.Task | None = None
         self._subtasks: list[asyncio.Task] = []
         self._closed: bool = False
+
+        # Producer service tokens for @aster endpoint registration.
+        self._producer_tokens: dict[str, dict] = {}  # service_name -> token dict
+        self._load_producer_tokens()
+
+        # Delegation policies for aster.admission ALPN.
+        # Built from published_services entries that have aster_root_pubkey.
+        self._delegation_policies: dict[str, Any] = {}  # service_name -> policy
+        self._load_delegation_policies()
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -418,6 +432,7 @@ class AsterServer:
             codec=self._codec,
             interceptors=self._interceptors,
             owns_endpoint=False,
+            peer_store=self._peer_store,
         )
 
         self._print_banner()
@@ -663,10 +678,36 @@ class AsterServer:
         subtasks.append(
             asyncio.create_task(self._accept_loop(), name="aster-accept")
         )
+
+        # Delegated admission loop: accept connections on aster.admission
+        # ALPN for @aster-issued enrollment tokens.
+        if self._delegation_policies:
+            subtasks.append(
+                asyncio.create_task(
+                    self._delegated_admission_loop(), name="aster-delegated-admission"
+                )
+            )
+
+        # Auto-register endpoints with @aster for published services.
+        # Requires producer service tokens (from `aster publish`).
+        if self._producer_tokens:
+            subtasks.append(
+                asyncio.create_task(
+                    self._aster_registration_loop(), name="aster-registration"
+                )
+            )
+
         self._subtasks = subtasks
 
         async def _wait_all() -> None:
-            await asyncio.gather(*subtasks, return_exceptions=True)
+            try:
+                await asyncio.gather(*subtasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                # Graceful shutdown on Ctrl+C / task cancellation
+                logger.info("Server shutting down...")
+                for t in subtasks:
+                    t.cancel()
+                await asyncio.gather(*subtasks, return_exceptions=True)
 
         self._serve_task = asyncio.create_task(_wait_all(), name="aster-server-serve")
         return self._serve_task
@@ -714,6 +755,7 @@ class AsterServer:
                             services_getter=lambda: services_snapshot,
                             registry_namespace_getter=lambda: self._registry_namespace,
                             allow_unenrolled=self._allow_all_consumers,
+                            peer_store=self._peer_store,
                             gossip_topic_getter=lambda: (
                                 self._mesh_state.topic_id
                                 if self._mesh_state else None
@@ -778,6 +820,213 @@ class AsterServer:
                 await self._node.close()
             except Exception:
                 pass
+
+    # ── @aster endpoint registration ──────────────────────────────────────
+
+    def _load_producer_tokens(self) -> None:
+        """Load producer service tokens from .aster-identity [published_services.*]."""
+        _, peer_entry = self._config.load_identity(
+            peer_name=self._peer_name, role="producer"
+        )
+        if not peer_entry:
+            return
+
+        # The identity loader returns the raw peer dict. Published services
+        # are stored as [published_services.<ServiceName>] sections in the
+        # .aster-identity TOML file.
+        published = peer_entry.get("published_services", {})
+        if not isinstance(published, dict):
+            return
+
+        for svc_name, token_data in published.items():
+            if isinstance(token_data, dict) and token_data.get("producer_token"):
+                self._producer_tokens[svc_name] = token_data
+                logger.debug("Loaded producer token for %s", svc_name)
+
+    def _load_delegation_policies(self) -> None:
+        """Build DelegatedAdmissionPolicy for each published service with aster_root_pubkey."""
+        from aster.trust.delegated import DelegatedAdmissionPolicy
+
+        _, peer_entry = self._config.load_identity(
+            peer_name=self._peer_name, role="producer"
+        )
+        if not peer_entry:
+            return
+
+        published = peer_entry.get("published_services", {})
+        if not isinstance(published, dict):
+            return
+
+        # Match published services to the services we're hosting
+        for svc_name, pub_data in published.items():
+            if not isinstance(pub_data, dict):
+                continue
+            aster_root_pubkey = pub_data.get("aster_root_pubkey", "")
+            contract_id = pub_data.get("contract_id", "")
+            handle = pub_data.get("handle", peer_entry.get("handle", ""))
+            if aster_root_pubkey and contract_id:
+                self._delegation_policies[svc_name] = DelegatedAdmissionPolicy(
+                    target_handle=handle,
+                    target_service=svc_name,
+                    target_contract_id=contract_id,
+                    aster_root_pubkey=aster_root_pubkey,
+                )
+                logger.debug("Delegation policy loaded for %s", svc_name)
+
+    async def _delegated_admission_loop(self) -> None:
+        """Accept connections on aster.admission ALPN and verify delegated tokens."""
+        from aster.trust.delegated import handle_delegated_admission_connection
+
+        assert self._node is not None
+        ALPN_DELEGATED = b"aster.admission"
+
+        try:
+            while not self._closed:
+                try:
+                    conn = await self._node.accept_aster(ALPN_DELEGATED)
+                except asyncio.CancelledError:
+                    return
+                except Exception as exc:
+                    logger.debug("delegated admission accept error: %s", exc)
+                    continue
+
+                # Determine which policy applies based on connection metadata
+                # For now, use the first available policy (single-service producer)
+                # or match by peer request content
+                policy = next(iter(self._delegation_policies.values()), None)
+                if policy is None:
+                    logger.warning("delegated admission: no policy configured")
+                    continue
+
+                asyncio.create_task(
+                    handle_delegated_admission_connection(
+                        conn,
+                        policy=policy,
+                        hook=self._hook,
+                        peer_store=self._peer_store,
+                    )
+                )
+        except asyncio.CancelledError:
+            pass
+
+    async def _aster_registration_loop(self) -> None:
+        """Background loop: register endpoints with @aster for published services.
+
+        Connects to @aster, registers each service's endpoint, then
+        re-registers periodically before TTL expiry.
+        """
+        import json as _json
+
+        # Wait a moment for the server to be fully ready
+        await asyncio.sleep(2)
+
+        ttl = 300  # 5 minutes
+        interval = ttl * 0.75  # re-register at 75% of TTL
+
+        while not self._closed:
+            try:
+                await self._register_endpoints_with_aster(ttl)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning("@aster registration failed: %s", exc)
+
+            # Wait before re-registering
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+
+    async def _register_endpoints_with_aster(self, ttl: int) -> None:
+        """One-shot registration of all published service endpoints."""
+        if not self._node or not self._producer_tokens:
+            return
+
+        # Build our endpoint info
+        addr_info = self._node.node_addr_info()
+        node_id = addr_info.endpoint_id
+        relay = addr_info.relay_url or ""
+        direct_addrs = addr_info.direct_addresses or []
+
+        # Resolve @aster address from identity file or profile config.
+        # The token itself contains the root_pubkey which can be used
+        # to discover @aster via DNS TXT record in production.
+        aster_addr = self._resolve_aster_address()
+        if not aster_addr:
+            logger.debug("No @aster address configured — skipping registration")
+            return
+
+        aster_client = AsterClient(address=aster_addr)
+
+        try:
+            await aster_client.connect()
+        except Exception as exc:
+            logger.debug("Could not connect to @aster: %s", exc)
+            return
+
+        try:
+            # For each published service with a token, call register_endpoint
+            for svc_name, token in self._producer_tokens.items():
+                try:
+                    # Use the dynamic invoke path — we don't have generated
+                    # types for @aster's PublicationService
+                    import json as _json
+                    request = {
+                        "producer_token": _json.dumps(token),
+                        "node_id": node_id,
+                        "relay": relay,
+                        "direct_addrs": direct_addrs,
+                        "ttl": ttl,
+                    }
+
+                    # Invoke register_endpoint on PublicationService
+                    conn = await aster_client._rpc_conn_for(
+                        next(
+                            (s.channels.get("rpc", "") for s in aster_client._services
+                             if s.name == "PublicationService"),
+                            ""
+                        )
+                    )
+                    from .transport.iroh import IrohTransport
+                    transport = IrohTransport(conn, codec=self._codec)
+                    resp = await transport.unary(
+                        "PublicationService", "register_endpoint", request
+                    )
+                    logger.info(
+                        "Registered endpoint with @aster: %s (%s)",
+                        svc_name, node_id[:12],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to register %s with @aster: %s",
+                        svc_name, exc,
+                    )
+        finally:
+            await aster_client.close()
+
+    def _resolve_aster_address(self) -> str | None:
+        """Resolve the @aster service address for endpoint registration.
+
+        Checks (in order):
+        1. ASTER_SERVICE_ADDRESS env var
+        2. aster_service.address in the identity file's peer entry
+        3. DNS TXT record on aster.site (future)
+        """
+        # Env var override
+        addr = os.environ.get("ASTER_SERVICE_ADDRESS", "")
+        if addr:
+            return addr
+
+        # Identity file — the peer entry may have aster_service config
+        _, peer_entry = self._config.load_identity(
+            peer_name=self._peer_name, role="producer"
+        )
+        if peer_entry:
+            addr = peer_entry.get("aster_service", "")
+            if addr:
+                return addr
+
+        return None
 
     def _install_signal_handlers(self, grace_period: float = 10.0) -> None:
         """Install SIGTERM/SIGINT handlers for graceful shutdown.

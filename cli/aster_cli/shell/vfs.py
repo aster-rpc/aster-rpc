@@ -14,6 +14,7 @@ Nodes are lazily populated from the live connection.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -401,3 +402,27 @@ async def populate_handle_services(node: VfsNode, connection: Any) -> None:
         pass
 
     node.loaded = True
+
+
+async def ensure_directory_handle(root: VfsNode, handle_name: str, connection: Any) -> VfsNode | None:
+    """Create a /aster/@handle node on demand for direct navigation."""
+    aster_node = root.child("aster")
+    if aster_node is None:
+        return None
+
+    existing = aster_node.child(handle_name)
+    if existing is not None:
+        return existing
+
+    with contextlib.suppress(Exception):
+        info = await connection.get_handle_info(handle_name)
+        if info.get("services") or info.get("readme", "") or handle_name.startswith("@"):
+            handle_node = VfsNode(
+                name=handle_name,
+                kind=NodeKind.HANDLE,
+                path=f"/aster/{handle_name}",
+                metadata={"handle": handle_name, "registered": True},
+            )
+            aster_node.add_child(handle_node)
+            return handle_node
+    return None

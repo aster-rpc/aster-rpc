@@ -7,7 +7,12 @@ import json
 
 import pytest
 
-from aster_cli.shell.app import DemoConnection, _populate_from_connection
+from aster_cli.shell.app import (
+    DemoConnection,
+    _build_identity_banner_lines,
+    _populate_directory,
+    _populate_from_connection,
+)
 from aster_cli.handle_validation import validate_handle
 from aster_cli.shell.commands import _parse_call_args
 from aster_cli.shell.display import Display, _format_size
@@ -237,6 +242,48 @@ class TestCommands:
         await ls.execute([], populated_ctx)
 
 
+class TestDirectoryMode:
+    @pytest.mark.asyncio
+    async def test_populate_directory_continues_after_handle_error(self):
+        from aster_cli.shell.vfs import build_directory_root
+
+        class FakeDirectoryConnection:
+            async def list_handles(self):
+                return [
+                    {"handle": "@current", "registered": False},
+                    {"handle": "@remote", "registered": True},
+                ]
+
+            async def get_handle_info(self, handle):
+                if handle == "@current":
+                    raise RuntimeError("not registered")
+                return {
+                    "readme": "",
+                    "services": [
+                        {
+                            "name": "ShellTestService",
+                            "published": True,
+                            "version": 1,
+                            "description": "remote service",
+                            "endpoints": 0,
+                            "methods": [{"name": "ping"}],
+                        }
+                    ],
+                }
+
+        root = build_directory_root()
+        count = await _populate_directory(root, FakeDirectoryConnection())
+        aster_node = root.child("aster")
+
+        assert count == 2
+        assert aster_node is not None
+        assert "@current" in aster_node.children
+        assert "@remote" in aster_node.children
+        remote_node = aster_node.child("@remote")
+        assert remote_node is not None
+        assert "ShellTestService" in remote_node.children
+
+
 # ── Argument parsing tests ────────────────────────────────────────────────────
 
 
@@ -294,6 +341,35 @@ class TestDisplay:
         # Should not crash
         display.info("test")
         display.json_value({"key": "value"})
+
+
+class TestIdentityBanner:
+    def test_verified_banner_with_remote(self):
+        lines = _build_identity_banner_lines(
+            {
+                "root_pubkey": "ab" * 32,
+                "display_handle": "@alice-test",
+                "handle_status": "verified",
+                "remote": {"status": "verified"},
+            },
+            remote_error=None,
+            air_gapped=False,
+        )
+        assert any("verified" in line for line in lines)
+        assert any("Remote connected" in line for line in lines)
+
+    def test_air_gapped_banner(self):
+        lines = _build_identity_banner_lines(
+            {
+                "root_pubkey": "ab" * 32,
+                "display_handle": "@alice-test",
+                "handle_status": "pending",
+            },
+            remote_error=None,
+            air_gapped=True,
+        )
+        assert any("Air-gapped" in line for line in lines)
+        assert any("Remote: disabled" in line for line in lines)
 
 
 # ── Demo connection tests ────────────────────────────────────────────────────

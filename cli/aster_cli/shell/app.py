@@ -14,7 +14,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
@@ -961,6 +963,202 @@ class DemoConnection:
 # ── Directory demo mode (aster.site) ────────────────────────────────────────
 
 
+class DirectoryConnection:
+    """Live directory connection backed by the Day 0 @aster service."""
+
+    def __init__(self, address: str) -> None:
+        from aster_cli.join import get_local_identity_state
+
+        self._address = address
+        self._runtime = None
+        self._publication_client = None
+        self._types_mod = None
+        self._handle_cache: dict[str, dict[str, Any]] = {}
+        self._contract_cache: dict[str, dict[str, Any]] = {}
+        state = get_local_identity_state()
+        self.my_handle = state["handle"] or state["display_handle"]
+        self._state = state
+
+    async def connect(self) -> None:
+        from aster_cli.aster_service import open_aster_service
+
+        self._runtime = await open_aster_service(self._address)
+        self._publication_client = await self._runtime.publication_client()
+        self._types_mod = __import__(
+            self._publication_client.__module__.replace(".services.", ".types."),
+            fromlist=["*"],
+        )
+
+    async def close(self) -> None:
+        if self._runtime is not None:
+            await self._runtime.close()
+
+    async def list_handles(self) -> list[dict[str, Any]]:
+        handles: list[dict[str, Any]] = []
+        current_name = self.my_handle if str(self.my_handle).startswith("@") else f"@{self.my_handle}"
+        handles.append(
+            {
+                "handle": current_name,
+                "pubkey_hash": str(self._state.get("root_pubkey", ""))[:12],
+                "registered": bool(self._state.get("handle")),
+                "service_count": len(self._local_manifest_services()),
+                "description": "current user",
+            }
+        )
+
+        if self._publication_client is None or self._types_mod is None:
+            return handles
+
+        result = await self._publication_client.list_directory_handles(
+            self._types_mod.ListDirectoryHandlesRequest(limit=20)
+        )
+        for entry in getattr(result, "handles", []):
+            handle = f"@{getattr(entry, 'handle', '')}".rstrip("@")
+            if not handle or handle == current_name:
+                continue
+            handles.append(
+                {
+                    "handle": handle,
+                    "pubkey_hash": "",
+                    "registered": True,
+                    "service_count": getattr(entry, "service_count", 0),
+                    "description": getattr(entry, "display_name", None) or "",
+                    "registered_at": getattr(entry, "registered_at", ""),
+                    "last_published_at": getattr(entry, "last_published_at", None),
+                }
+            )
+        return handles
+
+    async def get_handle_info(self, handle: str) -> dict[str, Any]:
+        normalized = handle.lstrip("@")
+        if normalized in self._handle_cache:
+            return self._handle_cache[normalized]
+
+        services: list[dict[str, Any]] = []
+        if self._publication_client is not None and self._types_mod is not None:
+            try:
+                result = await self._publication_client.list_services(
+                    self._types_mod.ListServicesRequest(handle=normalized)
+                )
+            except Exception:
+                result = None
+            for service in getattr(result, "services", []) if result is not None else []:
+                service_name = getattr(service, "service_name", "")
+                try:
+                    manifest_result = await self._publication_client.get_manifest(
+                        self._types_mod.GetManifestRequest(
+                            handle=normalized,
+                            service_name=service_name,
+                        )
+                    )
+                    manifest = json.loads(getattr(manifest_result, "manifest_json", "{}") or "{}")
+                except Exception:
+                    manifest = {}
+                contract = {
+                    "name": service_name,
+                    "version": getattr(service, "version", manifest.get("version", 1)),
+                    "contract_id": getattr(service, "contract_id", manifest.get("contract_id", "")),
+                    "methods": manifest.get("methods", []),
+                    "types": [],
+                }
+                svc_record = {
+                    "name": service_name,
+                    "published": True,
+                    "version": getattr(service, "version", manifest.get("version", 1)),
+                    "scoped": manifest.get("scoped", "shared"),
+                    "description": getattr(service, "description", ""),
+                    "endpoints": getattr(service, "endpoint_count", 0),
+                    "contract_hash": getattr(service, "contract_id", manifest.get("contract_id", "")),
+                    "status": getattr(service, "status", ""),
+                    "visibility": getattr(service, "visibility", ""),
+                    "delegation_mode": getattr(service, "delegation_mode", ""),
+                    "published_at": getattr(service, "published_at", ""),
+                    "methods": manifest.get("methods", []),
+                    "contract": contract,
+                }
+                self._contract_cache[f"{normalized}/{service_name}"] = contract
+                self._contract_cache[service_name] = contract
+                services.append(svc_record)
+
+        if normalized == str(self._state.get("handle", "")).strip():
+            published_names = {svc["name"] for svc in services}
+            for manifest in self._local_manifest_services():
+                if manifest["name"] in published_names:
+                    continue
+                services.append(manifest)
+                self._contract_cache[f"{normalized}/{manifest['name']}"] = manifest["contract"]
+                self._contract_cache[manifest["name"]] = manifest["contract"]
+
+        info = {"readme": "", "services": services}
+        self._handle_cache[normalized] = info
+        return info
+
+    async def get_contract(self, service_name: str) -> dict[str, Any] | None:
+        return self._contract_cache.get(service_name)
+
+    async def list_services(self) -> list[dict[str, Any]]:
+        return []
+
+    async def list_blobs(self) -> list[dict[str, Any]]:
+        return []
+
+    async def read_blob(self, blob_hash: str) -> bytes:
+        return b"(directory mode -- no blob content)"
+
+    async def invoke(self, service: str, method: str, payload: dict[str, Any]) -> Any:
+        return {"status": "not_implemented_in_directory_mode", "service": service, "method": method, "args": payload}
+
+    async def server_stream(self, service: str, method: str, payload: dict[str, Any]) -> Any:
+        async def _gen():
+            if False:
+                yield None
+        return _gen()
+
+    def bidi_stream(self, service: str, method: str, values: Any) -> Any:
+        async def _gen():
+            if False:
+                yield None
+        return _gen()
+
+    def _local_manifest_services(self) -> list[dict[str, Any]]:
+        from aster_cli.profile import get_published_services
+
+        local_services = []
+        published_names = set(get_published_services(self._state["profile"]))
+        manifest_path = Path(".aster/manifest.json")
+        if not manifest_path.exists():
+            return local_services
+
+        try:
+            payload = json.loads(manifest_path.read_text())
+            manifests = payload if isinstance(payload, list) else [payload]
+            for manifest in manifests:
+                service_name = manifest.get("service", "UnknownService")
+                contract = {
+                    "name": service_name,
+                    "version": manifest.get("version", 1),
+                    "contract_id": manifest.get("contract_id", ""),
+                    "methods": manifest.get("methods", []),
+                    "types": [],
+                }
+                local_services.append(
+                    {
+                        "name": service_name,
+                        "published": service_name in published_names,
+                        "version": manifest.get("version", 1),
+                        "scoped": manifest.get("scoped", "shared"),
+                        "description": "Local manifest",
+                        "endpoints": 1 if service_name in published_names else 0,
+                        "contract_hash": manifest.get("contract_id", ""),
+                        "methods": manifest.get("methods", []),
+                        "contract": contract,
+                    }
+                )
+        except Exception:
+            return []
+        return local_services
+
+
 class DirectoryDemoConnection:
     """Offline demo simulating the aster.site directory experience.
 
@@ -1444,7 +1642,10 @@ async def _populate_directory(root, connection) -> int:
             handle_count += 1
 
             # Pre-populate services for each handle
-            info = await connection.get_handle_info(name)
+            try:
+                info = await connection.get_handle_info(name)
+            except Exception:
+                info = {"readme": "", "services": []}
 
             readme_text = info.get("readme", "")
             if readme_text:
@@ -1508,25 +1709,36 @@ async def _run_shell(
     console = Console()
     display = Display(console=console, raw=raw)
     from rich.panel import Panel
-    from aster_cli.join import get_local_identity_state
+    from aster_cli.join import (
+        STATUS_REMOTE_TIMEOUT_SECONDS,
+        _fetch_remote_status,
+        apply_remote_identity_state,
+        get_local_identity_state,
+    )
 
     state = get_local_identity_state()
+    remote_error: str | None = None
+    if state["root_pubkey"] and not air_gapped:
+        aster_addr = getattr(connection, "_address", None) or getattr(connection, "_peer_addr", None)
+        try:
+            remote = await asyncio.wait_for(
+                _fetch_remote_status(
+                    SimpleNamespace(aster=aster_addr, root_key=None)
+                ),
+                timeout=STATUS_REMOTE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            remote = None
+            remote_error = str(exc)
+        if remote is not None:
+            apply_remote_identity_state(state, remote)
 
     if not raw:
-        banner_lines = []
-        if air_gapped:
-            banner_lines.append("[bold]Air-gapped mode[/bold] [dim](@aster service disabled for this session)[/dim]")
-        if not state["root_pubkey"]:
-            banner_lines.append("No identity configured.")
-            banner_lines.append("[dim]Run `aster keygen root` or `join <handle> <email>` to get started.[/dim]")
-        elif state["handle_status"] == "pending":
-            banner_lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [dim]pending verification[/dim]")
-            banner_lines.append("[dim]Run `verify <code>` or `status` to check for auto-verification.[/dim]")
-        elif state["handle_status"] == "verified":
-            banner_lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [dim]verified[/dim]")
-        else:
-            banner_lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [dim]not registered[/dim]")
-            banner_lines.append("[dim]Run `join <handle> <email>` to register this identity.[/dim]")
+        banner_lines = _build_identity_banner_lines(
+            state,
+            remote_error=remote_error,
+            air_gapped=air_gapped,
+        )
         display.console.print()
         display.console.print(
             Panel("\n".join(banner_lines), border_style="blue", padding=(0, 2))
@@ -1692,6 +1904,39 @@ async def _run_shell(
             pass  # non-critical
 
 
+def _build_identity_banner_lines(
+    state: dict[str, Any],
+    *,
+    remote_error: str | None,
+    air_gapped: bool,
+) -> list[str]:
+    """Build shell startup identity banner lines."""
+    lines: list[str] = []
+    if air_gapped:
+        lines.append("[bold]Air-gapped[/bold] [dim]@aster lookups disabled for this session[/dim]")
+
+    if not state["root_pubkey"]:
+        lines.append("[bold]Identity not configured[/bold]")
+        lines.append("[dim]Run `aster keygen root` or `join <handle> <email>` to get started.[/dim]")
+    elif state["handle_status"] == "pending":
+        lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [yellow]pending verification[/yellow]")
+        lines.append("[dim]Run `verify <code>` or `status` to check for auto-verification.[/dim]")
+    elif state["handle_status"] == "verified":
+        lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [green]verified[/green]")
+    else:
+        lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [yellow]not registered[/yellow]")
+        lines.append("[dim]Run `join <handle> <email>` to register this identity.[/dim]")
+
+    if air_gapped:
+        lines.append("[dim]Remote: disabled[/dim]")
+    elif remote_error:
+        lines.append(f"[yellow]Remote offline[/yellow] [dim]{remote_error}[/dim]")
+    elif state.get("remote"):
+        lines.append("[green]Remote connected[/green] [dim]identity synced with @aster[/dim]")
+
+    return lines
+
+
 def _tokenize(text: str) -> list[str]:
     """Simple shell-like tokenization respecting quotes."""
     import shlex
@@ -1722,7 +1967,7 @@ async def launch_shell(
         demo2: If True, use directory demo (aster.site browsing).
     """
     if demo2:
-        connection = DirectoryDemoConnection()
+        connection = DirectoryConnection(peer_addr) if peer_addr else DirectoryDemoConnection()
         peer_name = connection.my_handle
         await connection.connect()
         try:

@@ -149,14 +149,14 @@ framework, and follow-up CLI integration.
 - [x] Add nonce generation for signed requests
 - [x] Add timestamp generation for signed requests
 - [x] Load root private key from keyring/file in one shared helper for identity commands
-- [ ] Make `aster join` auto-create the root key in the final non-demo flow
+- [x] Make `aster join` auto-create the root key in the final non-demo flow
 - [x] Decide whether `aster join` should ever require an explicit `--demo`, or infer preview mode when the service client is absent
 
 ### CLI: Status / Whoami
 
 - [ ] Add non-blocking `handle_status` call on shell startup
 - [ ] Cache `handle_status` locally with TTL
-- [ ] Show online/offline indicator from real `@aster` reachability
+- [x] Show online/offline indicator from real `@aster` reachability
 - [x] Distinguish local-only state from confirmed remote state in output
 - [x] Optionally add `--json` structured output for the new identity commands
 
@@ -168,13 +168,13 @@ framework, and follow-up CLI integration.
 - [x] Add `discover` command in the shell
 - [x] Add top-level CLI `aster discover`
 - [x] Add shell commands for access grant/list/revoke and owner mutations
-- [ ] Add richer shell banners for all documented states: (these could even look like badges or on/off switches as similar to 'mode' in the producer server banner)
-  - [ ] State A: no root key
-  - [ ] State B: root key, unregistered
-  - [ ] State C: pending verification
-  - [ ] State D: verified
-  - [ ] State E: offline
-  - [ ] State F: air-gapped
+- [x] Add richer shell banners for all documented states: (these could even look like badges or on/off switches as similar to 'mode' in the producer server banner)
+  - [x] State A: no root key
+  - [x] State B: root key, unregistered
+  - [x] State C: pending verification
+  - [x] State D: verified
+  - [x] State E: offline
+  - [x] State F: air-gapped
 - [ ] Decide whether preview/demo commands should print via shell display rather than plain stdout
 
 ### Publish: Real Integration
@@ -183,10 +183,12 @@ framework, and follow-up CLI integration.
 - [x] Reuse `aster contract gen` pipeline end-to-end for publish requests
 - [x] Build signed publish payload
 - [x] Post manifest to `@aster`
+- [x] Store returned producer token locally for producer startup
 - [x] Implement real `set_visibility` RPC
 - [x] Implement real `update_service` RPC
 - [ ] Store returned `delegation_pubkey`
 - [x] Implement real `unpublish` RPC
+- [x] Remove stored producer token on unpublish
 - [ ] Show first-publish recovery code guidance if that behavior remains in scope
 - [ ] Add real shell refresh of `/aster/<handle>` after publish/unpublish
 
@@ -208,19 +210,19 @@ framework, and follow-up CLI integration.
 
 ### VFS / Directory
 
-- [ ] Build real `/aster/<handle>` VFS integration backed by registry responses
-- [ ] Merge local + published services correctly outside demo mode
-- [ ] Show `● published` / `⬡ local` consistently in listings
-- [ ] Resolve and browse other handles from real directory data
-- [ ] Cache discovered handles/services with TTL
-- [ ] Make `refresh` invalidate and repopulate real `@aster` cache data
+- [x] Build real `/aster/<handle>` VFS integration backed by directory responses
+- [x] Merge local + published services correctly outside demo mode for `@currentuser`
+- [x] Show `● published` / `⬡ local` consistently in listings
+- [x] Resolve and browse other handles from real directory data
+- [x] Cache discovered handles/services for the active directory session
+- [x] Make `refresh` invalidate and repopulate real `@aster` cache data
 
 ### Contract / Resolution
 
-- [ ] Extend contract/client generation to accept `@handle/ServiceName`
+- [x] Extend contract/client generation to accept `@handle/ServiceName`
 - [ ] Implement handle-based resolution for `aster shell`
 - [ ] Implement handle-based resolution for `aster call` if/when that command is added
-- [ ] Support manifest fetch from `@aster`
+- [x] Support manifest fetch from `@aster`
 
 ### Cleanup / Refactor
 
@@ -261,3 +263,5 @@ framework, and follow-up CLI integration.
 - `publish` now derives the Day 0 directory `contract_id` from canonical manifest JSON, matching the live service validator.
 - `grant_access` now includes `scope_node_id: null` in signed payloads so signature verification matches server-side dataclass canonicalization.
 - Current shell banner work is local-state driven; it does not yet talk to `@aster`.
+- `aster shell <peer> --demo2` now uses the live `list_directory_handles` endpoint when a peer is provided, and falls back to the old offline directory demo only when no peer is passed.
+- Direct `cd /aster/@handle` now works even if that handle is not in the current root listing.

@@ -43,12 +43,16 @@ def load_identity(path: str | Path) -> dict:
     tomllib = _tomllib()
     with Path(path).open("rb") as f:
         data = tomllib.load(f)
+    data.setdefault("node", {})
+    data.setdefault("peers", [])
+    published_services = data.get("published_services", {})
     for peer in data.get("peers", []):
         attrs = peer.setdefault("attributes", {})
         if "aster.role" not in attrs and "role" in peer:
             attrs["aster.role"] = peer["role"]
         if "aster.name" not in attrs and "name" in peer:
             attrs["aster.name"] = peer["name"]
+        peer.setdefault("published_services", published_services)
     return data
 
 
@@ -63,6 +67,7 @@ def save_identity(path: str | Path, data: dict) -> None:
     content = "\n".join(lines) + "\n"
 
     p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
     tmp.write_text(content)
     os.chmod(tmp, 0o600)
@@ -107,6 +112,17 @@ def _serialize_identity(data: dict) -> list[str]:
             pairs = ", ".join(f'"{k}" = "{v}"' for k, v in sorted(attrs.items()))
             lines.append(f"attributes = {{ {pairs} }}")
 
+        lines.append("")
+
+    published_services = data.get("published_services", {})
+    for service_name, entry in sorted(published_services.items()):
+        if not isinstance(entry, dict):
+            continue
+        lines.append(f"[published_services.{service_name}]")
+        for field in ("producer_token", "contract_id", "service_name"):
+            if field in entry:
+                val = entry[field]
+                lines.append(f'{field} = "{val}"')
         lines.append("")
 
     return lines

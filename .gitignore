@@ -246,6 +246,9 @@ node_modules/
 **/_internal/*/
 !**/_internal/day0/
 
+.aster/
+.aster-identity
+
 CLAUDE.md
 AGENTS.md
 .claude/
