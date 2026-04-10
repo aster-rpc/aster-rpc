@@ -1359,12 +1359,15 @@ def _complete_path(ctx: CommandContext, partial: str, dirs_only: bool = False) -
     if "/" in partial and not partial.endswith("/"):
         parent_path = partial.rsplit("/", 1)[0] or "/"
         prefix = partial.rsplit("/", 1)[1]
+        path_prefix = partial.rsplit("/", 1)[0] + "/"
     elif partial.endswith("/"):
         parent_path = partial.rstrip("/") or "/"
         prefix = ""
+        path_prefix = partial if partial.endswith("/") else partial + "/"
     else:
         parent_path = "."
         prefix = partial
+        path_prefix = ""
 
     node, _path = resolve_path(ctx.vfs_root, ctx.vfs_cwd, parent_path)
     if node is None:
@@ -1375,10 +1378,9 @@ def _complete_path(ctx: CommandContext, partial: str, dirs_only: bool = False) -
     for c in node.sorted_children():
         if dirs_only and c.kind in (NodeKind.BLOB, NodeKind.METHOD, NodeKind.DOC_ENTRY):
             continue
-        # Collections are directories
         if c.name.lower().startswith(prefix_lower):
             suffix = "/" if c.kind not in (NodeKind.BLOB, NodeKind.METHOD, NodeKind.DOC_ENTRY) else ""
-            results.append(c.name + suffix)
+            results.append(path_prefix + c.name + suffix)
     return results
 
 
@@ -1418,14 +1420,22 @@ def _parse_call_args(args: list[str]) -> dict[str, Any]:
         else:
             positional.append(arg.strip("'\""))
 
+    # If we have both key=value pairs and leftover positional args,
+    # the positional args are likely unquoted values that shlex split.
+    # Merge them into the last key's value.
+    if positional and result:
+        last_key = list(result.keys())[-1]
+        current = str(result[last_key])
+        result[last_key] = current + " " + " ".join(positional)
+
     # If only positional args, store under numeric keys
     if positional and not result:
         if len(positional) == 1:
-            # Single positional → try as raw value
             try:
                 return {"_positional": json.loads(positional[0])}
             except (json.JSONDecodeError, ValueError):
                 return {"_positional": positional[0]}
+        # Could be unquoted key=value that was split, or just loose args
         for i, v in enumerate(positional):
             result[f"_arg{i}"] = v
 

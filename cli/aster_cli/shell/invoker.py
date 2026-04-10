@@ -28,9 +28,9 @@ def _build_method_schema(
     request_fields = [
         FieldSchema(
             name=f.get("name", ""),
-            type_name=f.get("type", "str"),
+            type_name=f.get("kind", "") or f.get("type", "str"),
             required=f.get("required", True),
-            default=f.get("default"),
+            default=f.get("default_value") if f.get("default_kind") == "value" else f.get("default"),
             description=f.get("description", ""),
         )
         for f in fields
