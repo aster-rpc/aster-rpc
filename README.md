@@ -1,144 +1,201 @@
-# aster-python
+# Aster
 
-Python bindings for the [Iroh](https://iroh.computer) peer-to-peer networking library.
+**Peer-to-peer RPC framework + control-plane CLI, built on [Iroh](https://iroh.computer).**
 
-Built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs), providing async/await access to Iroh's full protocol suite:
+Write a service in Python or TypeScript, get a typed client in another language, talk to it from anywhere on the public internet without a CA, port-forwarding, or central server. Aster handles the trust, transport, and contract identity for you.
 
-- **QUIC networking** — NAT-traversing connections with bi-directional streams and datagrams
-- **Blobs** — Content-addressed storage with BLAKE3 hashing
-- **Docs** — Collaborative CRDT documents that sync across peers
-- **Gossip** — Topic-based pub-sub messaging
+- **Website**: [aster.site](https://aster.site)
+- **Docs**: [docs.aster.site](https://docs.aster.site)
+- **Quickstart**: [Mission Control in 30 minutes](https://docs.aster.site/quickstart/mission-control)
 
-## Quick Start
+---
+
+## Install the CLI
+
+The Aster CLI (`aster`) gives you a control plane for your services: connect to a peer, browse its contracts, call methods, stream logs, manage credentials, generate typed clients, and more.
+
+### One-line install (recommended)
+
+```bash
+curl -LsSf https://aster.site/install.sh | sh
+```
+
+This installs [`uv`](https://docs.astral.sh/uv/) (if not already present) and then runs `uv tool install aster-cli`. The result is the `aster` command on your `PATH`, with everything isolated in its own environment so it never conflicts with your system Python.
+
+### Verify the installer first (security-conscious)
+
+```bash
+curl -LsSfO https://aster.site/install.sh
+shasum -a 256 install.sh
+# Expected: 27536761d65bd03df2a770ef124121f531406fb56861d7049c9e7c30668d8a5c
+sh install.sh
+```
+
+The expected hash is published on [aster.site](https://aster.site) and updated with every release. If the hash doesn't match, **don't run the script** — it may have been tampered with.
+
+### Already have `uv`?
+
+```bash
+uv tool install aster-cli
+```
+
+### Already have `pip`?
+
+```bash
+pip install aster-cli
+```
+
+We strongly recommend `uv tool install` over `pip install --user` because it isolates the CLI from your system Python.
+
+### Platforms
+
+- **Linux** (x86_64, aarch64) — full support
+- **macOS** (Intel, Apple Silicon) — full support
+- **Windows** — install via `pip install aster-cli` (no `install.sh` yet; PRs welcome)
+
+### Verify
+
+```bash
+aster --version
+aster --help
+aster shell --demo      # interactive demo, no network needed
+```
+
+---
+
+## Use Aster from Python
+
+```bash
+pip install aster-rpc
+# or: uv add aster-rpc
+```
+
+Define a service:
+
+```python
+from dataclasses import dataclass
+from aster import service, rpc, wire_type, AsterServer
+
+@wire_type("hello/Request")
+@dataclass
+class Request:
+    name: str = ""
+
+@wire_type("hello/Response")
+@dataclass
+class Response:
+    message: str = ""
+
+@service(name="HelloService", version=1)
+class HelloService:
+    @rpc()
+    async def greet(self, req: Request) -> Response:
+        return Response(message=f"Hello, {req.name}!")
+
+async def main():
+    async with AsterServer(services=[HelloService()]) as srv:
+        print(srv.address)  # Share this aster1... ticket
+        await srv.serve()
+```
+
+Call it from another machine:
+
+```python
+from aster import AsterClient
+
+async def main():
+    client = AsterClient(address="aster1...")
+    await client.connect()
+    hello = client.proxy("HelloService")
+    result = await hello.greet({"name": "World"})
+    print(result["message"])
+```
+
+That's a working RPC service running on Iroh's NAT-traversing QUIC transport, with content-addressed contract identity. No port forwarding, no TLS certificate, no shared schema file.
+
+For the full guide, see [docs.aster.site/quickstart/mission-control](https://docs.aster.site/quickstart/mission-control).
+
+---
+
+## Use Aster from TypeScript / Bun
+
+```bash
+bun add @aster-rpc/aster
+```
+
+```typescript
+import { Service, Rpc, WireType, AsterServer, AsterClientWrapper } from "@aster-rpc/aster";
+
+@WireType("hello/Request")
+class Request { name: string = ""; }
+
+@WireType("hello/Response")
+class Response { message: string = ""; }
+
+@Service({ name: "HelloService", version: 1 })
+class HelloService {
+  @Rpc()
+  async greet(req: Request): Promise<Response> {
+    return { message: `Hello, ${req.name}!` };
+  }
+}
+
+const srv = new AsterServer({ services: [new HelloService()] });
+await srv.start();
+console.log(srv.address);
+await srv.serve();
+```
+
+---
+
+## What's in this repo
+
+```
+aster-rpc/                          PyPI: aster-rpc          (Python bindings + RPC framework)
+@aster-rpc/aster                    npm:  @aster-rpc/aster   (TypeScript bindings + RPC framework)
+aster-cli                           PyPI: aster-cli          (the `aster` command)
+
+bindings/python/                    Python binding source (PyO3 + Python)
+bindings/typescript/                TypeScript binding source (NAPI-RS + TypeScript)
+bindings/java/                      Java binding (in progress)
+bindings/go/                        Go binding (in progress)
+
+cli/                                CLI source (the `aster` command)
+core/                               Shared Rust core (iroh wrapper)
+ffi/                                C FFI for non-Python language bindings
+
+examples/python/                    Python examples (mission_control, etc.)
+examples/typescript/                TypeScript examples
+examples/mission-control/           Mission Control walkthrough (the quickstart)
+
+docs/_internal/                     Implementation flows, design notes, perf
+                                    investigation. Not published.
+ffi_spec/                           Wire-protocol specification documents
+conformance/                        Cross-language conformance vectors
+tests/                              Unit + integration tests for all bindings
+```
+
+---
+
+## Building from source
+
+You only need this if you're contributing to Aster itself. Most users should `pip install aster-rpc`.
 
 ### Prerequisites
 
-- Python >= 3.9
-- Rust toolchain (for building from source)
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- Python ≥ 3.9
+- Rust toolchain (1.94+ recommended)
+- [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`
+- For TypeScript binding: [`bun`](https://bun.sh/) or Node.js 20+
 
-### Install from source
+### Python binding
 
 ```bash
 git clone https://github.com/emrul/iroh-python.git
 cd iroh-python
 
-# Using uv (recommended)
-uv venv
-uv pip install maturin pytest pytest-asyncio pytest-timeout
-uv run maturin develop -m bindings/python/rust/Cargo.toml
-
-# Or using pip
-# python -m venv .venv && source .venv/bin/activate
-# pip install maturin pytest pytest-asyncio pytest-timeout
-# maturin develop -m bindings/python/rust/Cargo.toml
-```
-
-### Optional: speed up local Rust builds with sccache
-
-```bash
-# macOS
-brew install sccache
-
-# one-off shell session
-export RUSTC_WRAPPER=sccache
-sccache --start-server || true
-```
-
-You can also use `./scripts/validate.sh`, which now auto-enables `sccache` when installed and prints cache stats at the end.
-
-### Usage
-
-#### Store and retrieve blobs
-
-```python
-import asyncio
-from aster import IrohNode, blobs_client
-
-async def main():
-    node = await IrohNode.memory()
-    blobs = blobs_client(node)
-
-    hash_str = await blobs.add_bytes(b"Hello, Iroh!")
-    data = await blobs.read_to_bytes(hash_str)
-    print(data)  # b"Hello, Iroh!"
-
-    await node.shutdown()
-
-asyncio.run(main())
-```
-
-#### QUIC echo server & client
-
-```python
-import asyncio
-from aster import create_endpoint
-
-ALPN = b"iroh/echo/1"
-
-async def main():
-    server = await create_endpoint(ALPN)
-    client = await create_endpoint(ALPN)
-
-    server_id = await server.endpoint_id()
-    conn = await client.connect(server_id, ALPN)
-
-    send, recv = await conn.open_bi()
-    await send.write_all(b"ping")
-    await send.finish()
-
-    server_conn = await server.accept()
-    s_recv, s_send = await server_conn.accept_bi()
-    data = await s_recv.read_to_end(1024)
-    await s_send.write_all(data)
-    await s_send.finish()
-
-    reply = await recv.read_to_end(1024)
-    print(reply)  # b"ping"
-
-asyncio.run(main())
-```
-
-#### Gossip messaging
-
-```python
-import asyncio
-from aster import IrohNode, gossip_client
-
-TOPIC = bytes(range(32))
-
-async def main():
-    node1 = await IrohNode.memory()
-    node2 = await IrohNode.memory()
-    node1.add_node_addr(node2)
-    node2.add_node_addr(node1)
-
-    g1, g2 = gossip_client(node1), gossip_client(node2)
-    id1, id2 = await node1.node_id(), await node2.node_id()
-
-    t1, t2 = await asyncio.gather(
-        g1.subscribe(TOPIC, [id2]),
-        g2.subscribe(TOPIC, [id1]),
-    )
-
-    await t1.broadcast(b"hello from node1")
-    event_type, data = await t2.recv()
-    print(data)  # b"hello from node1"
-
-    await node1.shutdown()
-    await node2.shutdown()
-
-asyncio.run(main())
-```
-
-## Developer Setup
-
-### Full setup (build + CLI)
-
-```bash
 uv venv
 uv pip install maturin pytest pytest-asyncio pytest-timeout pytest-rerunfailures
-uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
 uv run maturin develop -m bindings/python/rust/Cargo.toml
 uv pip install -e cli/
 ```
@@ -149,68 +206,95 @@ Or use the build script which also regenerates type stubs:
 ./scripts/build.sh
 ```
 
-### Running tests
+### Optional: speed up Rust builds with sccache
 
 ```bash
-# All tests
+brew install sccache       # macOS
+# or: cargo install sccache
+
+export RUSTC_WRAPPER=sccache
+sccache --start-server || true
+```
+
+`./scripts/validate.sh` auto-enables `sccache` when installed and prints cache stats at the end.
+
+### TypeScript binding
+
+```bash
+cd bindings/typescript
+bun install
+bun run build
+```
+
+### Run tests
+
+```bash
+# Python: all tests (some need network, may take a few minutes)
 uv run pytest tests/python/ -v --timeout=30
 
-# Unit tests only (no networking, fast)
+# Python: unit tests only (fast)
 uv run pytest tests/python/ -v --timeout=30 -m "not network"
 
 # Single file
 uv run pytest tests/python/test_blobs.py -v --timeout=30
+
+# TypeScript
+cd bindings/typescript && bun test
+
+# Cross-language matrix (Python ↔ TypeScript)
+bash tests/integration/mission_control/run_matrix.sh
 ```
 
 ### Lint / format
 
 ```bash
+# Rust
 cargo fmt --manifest-path bindings/python/rust/Cargo.toml
 cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings
-```
 
-### Full validation (mirrors CI)
-
-```bash
+# Full validation (mirrors CI)
 ./scripts/validate.sh
 ```
 
 ### Pre-push hook
 
-A pre-push hook runs `cargo fmt --check` and `cargo clippy` before allowing pushes, preventing CI lint failures:
+A pre-push hook runs `cargo fmt --check` and `cargo clippy` before allowing pushes:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-This is checked into the repo at `.githooks/pre-push` — one-time setup per clone.
+Checked into the repo at `.githooks/pre-push` — one-time setup per clone.
 
-## API Overview
-
-| Class / Function | Description |
-|---|---|
-| `IrohNode.memory()` | Create an in-memory Iroh node |
-| `blobs_client(node)` | Get blob storage client |
-| `docs_client(node)` | Get CRDT documents client |
-| `gossip_client(node)` | Get gossip pub-sub client |
-| `net_client(node)` | Get low-level QUIC networking client |
-| `create_endpoint(alpn)` | Create a bare QUIC endpoint |
+---
 
 ## Architecture
 
 ```
-Python:  IrohNode.memory() -> node
-         blobs_client(node)  -> BlobsClient
-         docs_client(node)   -> DocsClient
-         gossip_client(node) -> GossipClient
-         net_client(node)    -> NetClient
-
-Rust:    Endpoint::bind(presets::N0)
-         + Router (ALPN mux)
-         + BlobsProtocol (iroh-blobs 0.99)
-         + Docs (iroh-docs 0.97)
-         + Gossip (iroh-gossip 0.97)
+┌──────────────────────────────────────────────────────────────────────┐
+│  Application code (Python / TypeScript / Java / Go)                  │
+├──────────────────────────────────────────────────────────────────────┤
+│  Aster RPC framework                                                 │
+│    @service / @rpc decorators, codegen, interceptors,                │
+│    contract identity, session-scoped services, capabilities          │
+├──────────────────────────────────────────────────────────────────────┤
+│  Wire protocol                                                       │
+│    Stream framing, codec (Fory XLANG / JSON), trailers, deadlines    │
+├──────────────────────────────────────────────────────────────────────┤
+│  Trust layer (Gate 0/1/3)                                            │
+│    ed25519 root key, OTT/policy credentials, peer admission,         │
+│    role-based capabilities, optional @aster delegated auth           │
+├──────────────────────────────────────────────────────────────────────┤
+│  Iroh QUIC transport                                                 │
+│    NAT traversal, P2P discovery, blobs, docs, gossip                 │
+└──────────────────────────────────────────────────────────────────────┘
 ```
+
+The Python binding is built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs); the TypeScript binding uses [NAPI-RS](https://napi.rs/). Both share the same Rust core (`core/` + iroh crates), so a Python client and a TypeScript server (or vice versa) speak the same wire protocol byte-for-byte.
+
+For implementation details, see [`docs/_internal/implementation_flows/INDEX.md`](docs/_internal/implementation_flows/INDEX.md).
+
+---
 
 ## License
 
