@@ -282,14 +282,14 @@
 | # | Requirement | Status | Implementation | Notes |
 |---|------------|--------|---------------|-------|
 | 2.1 | Core idea: new instance per QUIC stream | PASS | `session.py:SessionServer.run()` instantiates `self._service_class(peer=peer)` | Per-stream instance creation |
-| 2.2 | Scoping modes: "shared" (default) and "stream" | PASS | `decorators.py:service(scoped="stream")`, `service.py:ServiceInfo.scoped` | Both modes supported |
+| 2.2 | Scoping modes: "shared" (default) and "stream" | PASS | `decorators.py:service(scoped="session")`, `service.py:ServiceInfo.scoped` | Both modes supported |
 | 2.3 | Sequential call semantics (one call at a time) | PASS | `session.py:SessionServer._session_loop()` processes CALL frames sequentially | No concurrent dispatch within session |
 
 ### SS3 Service Definition
 
 | # | Requirement | Status | Implementation | Notes |
 |---|------------|--------|---------------|-------|
-| 3.1 | Decorator surface: @service(scoped="stream") | PASS | `decorators.py:service()` accepts `scoped` parameter | Validates `__init__` accepts `peer` parameter for stream-scoped |
+| 3.1 | Decorator surface: @service(scoped="session") | PASS | `decorators.py:service()` accepts `scoped` parameter | Validates `__init__` accepts `peer` parameter for stream-scoped |
 | 3.1a | All four RPC patterns within session | PASS | `session.py` dispatches unary, server_stream, client_stream, bidi_stream | Pattern-specific dispatch methods |
 | 3.2 | Lifecycle hooks: __init__(peer), on_session_close() | PASS | `session.py:SessionServer.run()` calls `__init__(peer=peer)` and `on_session_close()` in finally block | on_session_close called regardless of exit reason |
 

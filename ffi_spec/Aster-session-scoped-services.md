@@ -92,7 +92,7 @@ from aster import SerializationMode
 from dataclasses import dataclass
 from typing import AsyncIterator
 
-@service(name="AgentControl", version=1, scoped="stream",
+@service(name="AgentControl", version=1, scoped="session",
          serialization=[SerializationMode.XLANG])
 class AgentControlSession:
 
@@ -174,7 +174,7 @@ StreamHeader {
 ```
 
 When `method` is an empty string and the service's contract declares
-`scoped="stream"`, the server treats this as a session stream. The `call_id`
+`scoped="session"`, the server treats this as a session stream. The `call_id`
 serves as the session identifier for logging and tracing.
 
 ### 4.2 Per-Call Header
@@ -470,7 +470,7 @@ The server accept loop gains a branch for session-scoped services:
 3. Per stream: read first frame (HEADER flag)
 4. Read StreamHeader:
    a. If method != "" → stateless dispatch (existing behaviour)
-   b. If method == "" and service is scoped="stream":
+   b. If method == "" and service is scoped="session":
       i.   Instantiate service class: impl = ServiceClass(peer=remote_endpoint_id)
       ii.  Enter session loop:
            - Read next frame
@@ -643,7 +643,7 @@ The sequential call model within a session is a feature, not a limitation. It el
 | `StreamHeader.method = ""` | Convention  | Signals session-scoped stream (vs. single-RPC stream)|
 
 **Changes to contract identity (§11.3):** `ServiceContract` gains a `scoped`
-field (field 6). A session-scoped service (`scoped = "stream"`) and a shared
+field (field 6). A session-scoped service (`scoped = "session"`) and a shared
 service (`scoped = "shared"`) with otherwise identical methods produce
 **different `contract_id` values**. This prevents a client from accidentally
 connecting to a scoped endpoint with a stateless stub or vice versa.

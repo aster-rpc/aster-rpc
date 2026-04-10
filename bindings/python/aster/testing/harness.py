@@ -94,10 +94,10 @@ class AsterTestHarness:
         implementation: object,
         wire_compatible: bool = True,
     ) -> tuple[Any, Any]:
-        """Create an in-process session pair for scoped='stream' services.
+        """Create an in-process session pair for scoped='session' services.
 
         Args:
-            service_class: A class decorated with @service(scoped='stream').
+            service_class: A class decorated with @service(scoped='session').
             implementation: The implementation class or an instance (class is used).
             wire_compatible: If True, exercises full serialization pipeline.
 

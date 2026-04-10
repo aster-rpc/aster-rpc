@@ -75,7 +75,7 @@ class MathService:
 - `name` (str): Service name (default: class name)
 - `version` (int): Version number (default: 1)
 - `serialization` (SerializationMode | list): `XLANG` (default), `NATIVE`, or `ROW`
-- `scoped` (str): `"shared"` (default, singleton) or `"stream"` (one instance per client connection)
+- `scoped` (str): `"shared"` (default, singleton) or `"session"` (one instance per client connection; legacy alias `"stream"` is still accepted)
 
 ### RPC Patterns
 
@@ -136,10 +136,10 @@ async def process(self, req: Request) -> Response: ...
 
 ### Session-Scoped Services
 
-Use `scoped="stream"` for per-connection state:
+Use `scoped="session"` for per-connection state:
 
 ```python
-@service(name="SessionService", version=1, scoped="stream")
+@service(name="SessionService", version=1, scoped="session")
 class SessionService:
     def __init__(self, peer=None):
         self.peer = peer  # endpoint ID of the connected client

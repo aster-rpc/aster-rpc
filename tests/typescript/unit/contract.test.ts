@@ -109,7 +109,7 @@ describe('contract JSON serialization', () => {
 
   it('handles session-scoped', () => {
     const contract: ServiceContract = {
-      name: 'Chat', version: 1, scoped: ScopeKind.STREAM,
+      name: 'Chat', version: 1, scoped: ScopeKind.SESSION,
       methods: [], serializationModes: [],
     };
     expect(canonicalXlangBytes(contract).length).toBeGreaterThan(0);

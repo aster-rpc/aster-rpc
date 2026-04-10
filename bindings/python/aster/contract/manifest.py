@@ -60,7 +60,7 @@ class ContractManifest:
     """Supported serialization mode strings (e.g. ["xlang"])."""
 
     scoped: str = "shared"
-    """Service scope: "shared" or "stream"."""
+    """Service scope: "shared" or "session"."""
 
     deprecated: bool = False
     """Whether this contract version is deprecated."""

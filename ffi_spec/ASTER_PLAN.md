@@ -439,7 +439,7 @@ class MethodInfo:
 class ServiceInfo:
     name: str
     version: int
-    scoped: str  # "shared" or "stream"
+    scoped: str  # "shared" or "session"
     methods: dict[str, MethodInfo]
     serialization_modes: list[SerializationMode]
     interceptors: list[type]
@@ -502,7 +502,7 @@ class Server:
 3. Per stream:
    a. Read first frame (HEADER flag) → StreamHeader
    b. Validate: service exists, method exists, contract_id matches, serialization_mode supported
-   c. If method == "" and scoped == "stream" → session dispatch (Phase 8)
+   c. If method == "" and scoped == "session" → session dispatch (Phase 8)
    d. Else → stateless dispatch:
       - Run interceptor chain on_request
       - Call handler
@@ -687,7 +687,7 @@ class Interceptor(ABC):
 ### 10.1 Service Definition
 
 ```python
-@service(name="AgentControl", version=1, scoped="stream",
+@service(name="AgentControl", version=1, scoped="session",
          serialization=[SerializationMode.XLANG])
 class AgentControlSession:
     def __init__(self, peer: EndpointId):
@@ -707,9 +707,9 @@ class AgentControlSession:
 ### 10.2 Wire Protocol
 
 **Stream discriminator (§4.1):**
-- `StreamHeader.method == ""` + service's `scoped == "stream"` → session mode.
+- `StreamHeader.method == ""` + service's `scoped == "session"` → session mode.
 - `StreamHeader.call_id` is the **session_id** for the life of the stream (§8.2).
-- Server MUST reject streams where this combination is mismatched (e.g. method=="" on a non-session service, or method!="" on a `scoped="stream"` service) with `FAILED_PRECONDITION`.
+- Server MUST reject streams where this combination is mismatched (e.g. method=="" on a non-session service, or method!="" on a `scoped="session"` service) with `FAILED_PRECONDITION`.
 
 **Per-call framing (§4.2–4.5):**
 - Each call begins with a `CALL` frame (flag `0x10`) whose payload is a Fory-encoded `CallHeader` carrying `call_id`, `method`, optional `metadata`, optional `deadline_epoch_ms` (int64, 0 = no deadline).
@@ -750,7 +750,7 @@ async def create_session(
 class SessionServer:
     """Per-stream server session loop (§7.2)."""
     async def run(self, instance: Any, stream_header: StreamHeader):
-        # 1. Validate method=="" and service.scoped=="stream"
+        # 1. Validate method=="" and service.scoped=="session"
         # 2. Populate CallContext.session_id = stream_header.call_id
         # 3. Loop: read CALL frame → dispatch handler → on completion loop again
         # 4. On stream EOF / error / reset: call instance.on_session_close()
@@ -793,8 +793,8 @@ Do not wait for a trailer on successful unary — the response payload is the te
 
 ### 10.6 Steps
 
-1. Extend `@service` decorator to accept `scoped: Literal["shared", "stream"]` (default `"shared"`). Reflect into `ServiceInfo.scoped`.
-2. Validate `service_class.__init__` signature accepts `peer` parameter when `scoped="stream"`.
+1. Extend `@service` decorator to accept `scoped: Literal["shared", "session"]` (default `"shared"`). Reflect into `ServiceInfo.scoped`.
+2. Validate `service_class.__init__` signature accepts `peer` parameter when `scoped="session"`.
 3. Implement `CallHeader` Fory type + reader (Phase 1 dataclass exists; add `read_call_header(recv)` helper).
 4. Server-side stream router: inspect `StreamHeader.method` + service's `scoped` → dispatch to `SessionServer.run()` or existing stateless dispatch. Reject mismatches with `FAILED_PRECONDITION`.
 5. Implement `SessionServer.run()` loop: instantiate `service_class(peer=verified_endpoint_id)`, read CALL frames, dispatch to handlers with populated `CallContext` (session_id from StreamHeader, per-call context from CallHeader).
@@ -1034,7 +1034,7 @@ class ContractManifest:
     type_hashes: list[str]        # hex, in publish order
     method_count: int
     serialization_modes: list[str]
-    scoped: str                   # "shared" | "stream"
+    scoped: str                   # "shared" | "session"
     deprecated: bool
     # Provenance (written by `aster contract gen` — optional)
     semver: str | None            # e.g. "1.2.3"
@@ -2007,7 +2007,7 @@ class AsterTestHarness:
 
     async def create_session_pair(
         self,
-        service_class: type,  # scoped="stream"
+        service_class: type,  # scoped="session"
         implementation: object,
         wire_compatible: bool = True,
     ) -> tuple[Any, Server]: ...
@@ -2086,7 +2086,7 @@ Phase 13: Testing & Conformance (ongoing throughout)
 - Phase 13 (Testing) runs continuously.
 
 **Cross-phase couplings:**
-- **Phase 8 ⇄ Phase 9:** `ServiceContract.scoped` field is Phase 9 but is driven by Phase 8's `scoped="stream"` decorator. Two services identical except `scoped` MUST hash to different `contract_id`s.
+- **Phase 8 ⇄ Phase 9:** `ServiceContract.scoped` field is Phase 9 but is driven by Phase 8's `scoped="session"` decorator. Two services identical except `scoped` MUST hash to different `contract_id`s.
 - **Phase 9 → Phase 10:** Phase 10's `publish_contract()` delegates to Phase 9; registry publishes ArtifactRefs that resolve via Phase 9 hashes.
 - **Phase 10 → Phase 12:** Gossip events `ContractPublished` and `LeaseUpdate` forward into the registry handler. Phase 12 without Phase 10 still works (producer mesh alone), but the registry benefits from mesh signing.
 

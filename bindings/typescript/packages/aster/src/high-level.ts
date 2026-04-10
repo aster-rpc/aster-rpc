@@ -13,7 +13,7 @@ import type { AsterConfig } from './config.js';
 import { configFromEnv } from './config.js';
 import { createLogger, type AsterLogger } from './logging.js';
 import { HealthServer } from './health.js';
-import { DEFAULT_BACKOFF, type ExponentialBackoff } from './types.js';
+import { DEFAULT_BACKOFF, RpcScope, type ExponentialBackoff } from './types.js';
 import { JsonCodec } from './codec.js';
 import { RpcServer } from './server.js';
 import { handleConsumerAdmissionConnection, performAdmission, type ConsumerAdmissionOpts, type ServiceSummary } from './trust/consumer.js';
@@ -381,7 +381,7 @@ export class AsterServer {
       // yet XLANG-compliant. Cross-language consumers reading the manifest
       // must use SerializationMode.JSON (3) for any call to this server.
       serializationModes: ['json'],
-      scoped: info.scoped === 'stream' ? 'stream' : 'shared',
+      scoped: (info.scoped === RpcScope.SESSION || info.scoped === 'stream') ? RpcScope.SESSION : RpcScope.SHARED,
       deprecated: false,
     };
   }

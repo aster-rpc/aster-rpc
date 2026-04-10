@@ -561,7 +561,7 @@ def service(
         @service                                  # bare -- name = class name
         @service("AgentControl")                  # explicit name
         @service(name="AgentControl", version=2)  # keyword name
-        @service(version=2, scoped="stream")      # keyword-only, name = class name
+        @service(version=2, scoped="session")     # keyword-only, name = class name
 
     Args:
         name_or_cls: Service name (str), or the class itself when used as
@@ -569,7 +569,8 @@ def service(
         name: Explicit service name (keyword-only alias for name_or_cls).
         version: The service version (default: 1).
         serialization: Supported serialization modes. Defaults to [XLANG].
-        scoped: Service scope: "shared" or "stream". Default "shared".
+        scoped: Service scope: "shared" or "session". Default "shared".
+            The legacy alias "stream" is still accepted on input.
         interceptors: List of interceptor classes to apply to all methods.
         max_concurrent_streams: Maximum concurrent streams for this service.
 
@@ -637,17 +638,17 @@ def _apply_service_decorator(
     elif isinstance(serialization, SerializationMode):
         serialization = [serialization]
 
-    # Accept "session" as an alias for "stream" (user-facing name)
-    if scoped == "session":
-        scoped = "stream"
+    # Accept the legacy "stream" alias on input but canonicalize to "session".
+    if scoped == "stream":
+        scoped = "session"
 
     # For session-scoped services, validate that __init__ accepts a 'peer' parameter
-    if scoped == "stream":
+    if scoped == "session":
         init_sig = inspect.signature(cls.__init__)
         params = list(init_sig.parameters.keys())
         if "peer" not in params:
             raise TypeError(
-                f"@service(scoped='stream') class {cls.__name__}.__init__ "
+                f"@service(scoped='session') class {cls.__name__}.__init__ "
                 f"must accept a 'peer' parameter"
             )
 

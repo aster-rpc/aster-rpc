@@ -26,7 +26,7 @@ to be invoked as one-shot bidi calls bypasses that contract. It also hides
 the absence of a real TS session client (see B5) — ts-ts auth currently
 appears green only because the server is too permissive.
 
-**Fix sketch:** When the dispatched method belongs to a `scoped: 'stream'`
+**Fix sketch:** When the dispatched method belongs to a `scoped: 'session'`
 service, refuse the call with `FAILED_PRECONDITION` ("session protocol
 required") unless the StreamHeader was opened in session mode. The session
 protocol path should hand off to `SessionServer.handleSession`.

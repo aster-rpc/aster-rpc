@@ -809,7 +809,7 @@ ContractManifest {
     method_count: int32
     methods: list<MethodDescriptor>  // full method schemas for dynamic invocation
     serialization_modes: list<string>
-    scoped: string                   // "shared" or "stream"
+    scoped: string                   // "shared" or "session"
     deprecated: bool
 
     // ── Source provenance (written by aster contract gen) ──

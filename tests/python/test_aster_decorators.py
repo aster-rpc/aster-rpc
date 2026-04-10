@@ -313,9 +313,9 @@ class TestServiceDecorator:
         assert SerializationMode.XLANG in info.serialization_modes
         assert SerializationMode.NATIVE in info.serialization_modes
 
-    def test_service_scoped_stream(self):
-        """@service with scoped='stream' requires peer in __init__."""
-        @service(name="TestService", version=1, scoped="stream")
+    def test_service_scoped_session(self):
+        """@service with scoped='session' requires peer in __init__."""
+        @service(name="TestService", version=1, scoped="session")
         class TestService:
             def __init__(self, peer=None):
                 self.peer = peer
@@ -325,16 +325,30 @@ class TestServiceDecorator:
                 return EchoResponse(message=req.message)
 
         info = getattr(TestService, "__aster_service_info__")
-        assert info.scoped == "stream"
+        assert info.scoped == "session"
 
-    def test_service_scoped_stream_missing_peer(self):
-        """@service(scoped='stream') without peer in __init__ raises TypeError."""
+    def test_service_scoped_session_missing_peer(self):
+        """@service(scoped='session') without peer in __init__ raises TypeError."""
         with pytest.raises(TypeError, match="must accept a 'peer' parameter"):
-            @service(name="TestService2", version=1, scoped="stream")
+            @service(name="TestService2", version=1, scoped="session")
             class TestService2:
                 @rpc
                 async def echo(self, req: EchoRequest) -> EchoResponse:
                     return EchoResponse(message=req.message)
+
+    def test_service_scoped_stream_alias(self):
+        """The legacy 'stream' alias is still accepted on input but stored as 'session'."""
+        @service(name="TestServiceStreamAlias", version=1, scoped="stream")
+        class TestService:
+            def __init__(self, peer=None):
+                self.peer = peer
+
+            @rpc
+            async def echo(self, req: EchoRequest) -> EchoResponse:
+                return EchoResponse(message=req.message)
+
+        info = getattr(TestService, "__aster_service_info__")
+        assert info.scoped == "session"
 
     def test_service_method_extraction(self):
         """@service extracts method info from decorated methods."""

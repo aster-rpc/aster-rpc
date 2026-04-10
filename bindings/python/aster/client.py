@@ -26,7 +26,7 @@ from aster.interceptors.circuit_breaker import CircuitBreakerInterceptor
 from aster.interceptors.deadline import DeadlineInterceptor
 from aster.interceptors.retry import RetryInterceptor
 from aster.status import RpcError
-from aster.rpc_types import SerializationMode
+from aster.rpc_types import RpcScope, SerializationMode
 from aster.transport.base import Transport, BidiChannel
 from aster.service import ServiceInfo, MethodInfo, ServiceRegistry
 
@@ -452,7 +452,7 @@ def create_client(
     # create_client is sync -- callers using AsterClient.client() get the
     # async dispatch automatically; direct callers should use create_session
     # explicitly when working with session-scoped services.
-    if service_info.scoped == "stream":
+    if service_info.scoped == RpcScope.SESSION:
         raise ClientError(
             f"{service_class.__name__} is session-scoped and cannot be created "
             f"via create_client(). Use aster.session.create_session() (async) "

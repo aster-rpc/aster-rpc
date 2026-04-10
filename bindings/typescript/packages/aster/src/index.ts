@@ -37,6 +37,7 @@ export {
 export {
   SerializationMode,
   RpcPattern,
+  RpcScope,
   RPC_ALPN,
   DEFAULT_BACKOFF,
   DEFAULT_RETRY,

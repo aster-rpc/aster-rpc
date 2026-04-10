@@ -17,7 +17,13 @@ export const ContainerKind = { NONE: 0, LIST: 1, SET: 2, MAP: 3 } as const;
 export const TypeDefKind = { MESSAGE: 0, ENUM: 1, UNION: 2 } as const;
 export const MethodPattern = { UNARY: 0, SERVER_STREAM: 1, CLIENT_STREAM: 2, BIDI_STREAM: 3 } as const;
 export const CapabilityKind = { ROLE: 0, ANY_OF: 1, ALL_OF: 2 } as const;
-export const ScopeKind = { SHARED: 0, STREAM: 1 } as const;
+export const ScopeKind = {
+  SHARED: 0,
+  SESSION: 1,
+  /** Legacy alias kept for back-compat with code that imported ScopeKind.STREAM.
+   *  Resolves to the same integer (1), so contract ids are unaffected. */
+  STREAM: 1,
+} as const;
 
 // -- Data types ---------------------------------------------------------------
 
@@ -50,7 +56,7 @@ export interface ServiceContract {
 const PATTERN_NAMES: Record<number, string> = {
   0: 'unary', 1: 'server_stream', 2: 'client_stream', 3: 'bidi_stream',
 };
-const SCOPE_NAMES: Record<number, string> = { 0: 'shared', 1: 'stream' };
+const SCOPE_NAMES: Record<number, string> = { 0: 'shared', 1: 'session' };
 const CAP_NAMES: Record<number, string> = { 0: 'role', 1: 'any_of', 2: 'all_of' };
 
 function hex(data: Uint8Array): string {
@@ -153,7 +159,8 @@ export function contractIdFromService(serviceClass: new (...args: any[]) => any)
     version: info.version,
     methods: [],
     serializationModes: [],
-    scoped: info.scoped === 'stream' ? 1 : 0,
+    // Accept both the canonical 'session' value and the legacy 'stream' alias.
+    scoped: (info.scoped === 'session' || info.scoped === 'stream') ? 1 : 0,
     requires: undefined,
   };
   for (const [, m] of info.methods as Map<string, any>) {
@@ -212,7 +219,8 @@ export function fromServiceInfo(info: {
     version: info.version,
     methods: [],
     serializationModes: [],
-    scoped: info.scoped === 'stream' ? 1 : 0,
+    // Accept both the canonical 'session' value and the legacy 'stream' alias.
+    scoped: (info.scoped === 'session' || info.scoped === 'stream') ? 1 : 0,
     requires: info.requires ? { kind: info.requires.kind === 'any_of' ? 1 : 2, roles: info.requires.roles } : undefined,
   };
   for (const [, m] of info.methods) {

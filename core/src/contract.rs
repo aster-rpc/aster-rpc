@@ -70,7 +70,12 @@ pub enum CapabilityKind {
 pub enum ScopeKind {
     #[default]
     Shared = 0,
-    Stream = 1,
+    /// One service instance per client connection, all calls multiplexed
+    /// onto a single bidirectional QUIC stream. Wire serde produces
+    /// "session"; the legacy spelling "stream" is accepted on input via
+    /// the deserialize alias.
+    #[serde(alias = "stream")]
+    Session = 1,
 }
 
 // ── Structs ──────────────────────────────────────────────────────────────────
@@ -405,7 +410,10 @@ pub fn tarjan_scc(graph: &HashMap<String, HashSet<String>>) -> Vec<Vec<String>> 
         if state.lowlink[v] == state.index[v] {
             let mut scc: Vec<String> = Vec::new();
             loop {
-                let w = state.stack.pop().expect("Tarjan SCC invariant: stack must be non-empty when lowlink == index");
+                let w = state
+                    .stack
+                    .pop()
+                    .expect("Tarjan SCC invariant: stack must be non-empty when lowlink == index");
                 state.on_stack.insert(w.clone(), false);
                 scc.push(w.clone());
                 if w == v {
@@ -911,13 +919,13 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_stream() {
+    fn test_scope_session() {
         let sc = ServiceContract {
             name: "ScopeTest".to_string(),
             version: 1,
             methods: vec![],
             serialization_modes: vec!["xlang".to_string()],
-            scoped: ScopeKind::Stream,
+            scoped: ScopeKind::Session,
             requires: None,
         };
         let bytes = canonical_xlang_bytes_service_contract(&sc);

@@ -59,6 +59,9 @@ class CapabilityKind(IntEnum):
 
 class ScopeKind(IntEnum):
     SHARED = 0
+    SESSION = 1
+    # Legacy alias kept for back-compat with code that imported ScopeKind.STREAM.
+    # Resolves to the same integer (1), so contract ids are unaffected.
     STREAM = 1
 
 
@@ -226,9 +229,15 @@ class ServiceContract:
         if type_hashes is None:
             type_hashes = {}
 
-        # Map scoped string to ScopeKind
+        # Map scoped string to ScopeKind. Accept both the canonical "session"
+        # value and the legacy "stream" alias on input so older callers keep
+        # working.
         scoped_str = getattr(service_info, "scoped", "shared")
-        scoped = ScopeKind.STREAM if scoped_str == "stream" else ScopeKind.SHARED
+        scoped = (
+            ScopeKind.SESSION
+            if scoped_str in ("session", "stream")
+            else ScopeKind.SHARED
+        )
 
         # Map serialization modes
         ser_modes: list[str] = []
@@ -380,7 +389,7 @@ _ENUM_TO_SERDE: dict[int, str] = {
 
 _SCOPE_TO_SERDE: dict[int, str] = {
     0: "shared",
-    1: "stream",
+    1: "session",
 }
 
 _CAP_TO_SERDE: dict[int, str] = {

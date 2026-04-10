@@ -243,7 +243,7 @@ Outstanding issue / blocker:
 **Decorator / service metadata:**
 - [x] Extend `@service` decorator to accept `scoped: Literal["shared", "stream"]` (default `"shared"`)
 - [x] Propagate `scoped` into `ServiceInfo` (Phase 4) so Phase 9 can read it
-- [x] Validate `service_class.__init__` accepts `peer` parameter when `scoped="stream"`
+- [x] Validate `service_class.__init__` accepts `peer` parameter when `scoped="session"`
 
 **Wire protocol:**
 - [x] Implement `CallHeader` read helper `read_call_header(recv) -> CallHeader` (Phase 1 dataclass exists)
@@ -703,7 +703,7 @@ Phase 12 verification completed with uv:
 - [x] Create `aster/testing/harness.py::AsterTestHarness`
 - [x] `create_local_pair(service_class, implementation, wire_compatible)` — LocalTransport
 - [x] `create_remote_pair(service_class, implementation)` — returns (client, Server, IrohConnection, endpoint, endpoint); uses bare QUIC endpoints (full IrohNode integration deferred)
-- [x] `create_session_pair(service_class, implementation, wire_compatible)` — for scoped="stream" services
+- [x] `create_session_pair(service_class, implementation, wire_compatible)` — for scoped="session" services
 
 **Unit tests:**
 - [x] `tests/python/test_aster_framing.py` — frame round-trip (incl. **CANCEL flags-only**)

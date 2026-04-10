@@ -51,7 +51,7 @@ class EchoService {
   }
 }
 
-@Service({ name: 'Chat', version: 1, scoped: 'stream' })
+@Service({ name: 'Chat', version: 1, scoped: 'session' })
 class ChatService {
   @BidiStream()
   async *chat(requests: AsyncIterable<EchoRequest>): AsyncGenerator<EchoResponse> {
@@ -102,7 +102,7 @@ describe('@Service', () => {
 
   it('supports session-scoped services', () => {
     const info = getServiceInfo(ChatService)!;
-    expect(info.scoped).toBe('stream');
+    expect(info.scoped).toBe('session');
     expect(info.methods.get('chat')!.pattern).toBe(RpcPattern.BIDI_STREAM);
   });
 });
