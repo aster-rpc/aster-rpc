@@ -1146,6 +1146,98 @@ async def create_session(
     )
 
 
+class SessionProxyClient:
+    """Dynamic proxy client for a session-scoped service.
+
+    Created via ``AsterClient.session("ServiceName")``. Works with dicts
+    instead of typed dataclasses. Maintains a lock for one-call-at-a-time
+    (spec requirement).
+    """
+
+    def __init__(self, send: Any, recv: Any, codec: Any, session_id: str) -> None:
+        self._send = send
+        self._recv = recv
+        self._codec = codec
+        self._session_id = session_id
+        self._lock = asyncio.Lock()
+
+    async def call(self, method: str, request: dict | None = None) -> dict | Any:
+        """Call a unary method on this session."""
+        async with self._lock:
+            call_header = CallHeader(
+                method=method,
+                callId=str(uuid.uuid4()),
+                deadlineEpochMs=0,
+            )
+            payload = self._codec.encode(call_header)
+            await write_frame(self._send, payload, flags=CALL)
+
+            req_payload = self._codec.encode(request or {})
+            await write_frame(self._send, req_payload, flags=0)
+
+            frame = await read_frame(self._recv)
+            if frame is None:
+                raise RpcError(StatusCode.UNAVAILABLE, "Session stream ended")
+            resp_payload, flags = frame
+            if flags & TRAILER:
+                status = self._codec.decode(resp_payload, RpcStatus)
+                raise RpcError(StatusCode(status.code), status.message)
+            return self._codec.decode(resp_payload)
+
+    async def close(self) -> None:
+        """Close the session."""
+        try:
+            await self._send.finish()
+        except Exception:
+            pass
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        async def method_stub(request: dict | None = None, **kwargs: Any) -> dict | Any:
+            if kwargs and request is None:
+                request = kwargs
+            return await self.call(name, request)
+
+        method_stub.__name__ = name
+        return method_stub
+
+
+async def create_proxy_session(
+    service_name: str,
+    connection: Any,
+    codec: Any = None,
+    aster_client: Any = None,
+) -> SessionProxyClient:
+    """Open a session-scoped proxy connection to a remote service.
+
+    Like create_session() but works without local type definitions.
+    Uses JSON codec by default.
+    """
+    if codec is None:
+        from aster.json_codec import JsonProxyCodec
+        codec = JsonProxyCodec()
+
+    send, recv = await connection.open_bi()
+    session_id = str(uuid.uuid4())
+
+    from aster.json_codec import JsonProxyCodec
+    ser_mode = SerializationMode.JSON.value if isinstance(codec, JsonProxyCodec) else 0
+
+    header = StreamHeader(
+        service=service_name,
+        method="",
+        version=1,
+        callId=session_id,
+        serializationMode=ser_mode,
+    )
+    header_payload = codec.encode(header)
+    await write_frame(send, header_payload, flags=HEADER)
+
+    return SessionProxyClient(send=send, recv=recv, codec=codec, session_id=session_id)
+
+
 def create_local_session(
     service_class: type,
     service_class_impl_class: type | None = None,
