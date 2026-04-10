@@ -1508,6 +1508,17 @@ class AsterClient:
 
         conn = await self._rpc_conn_for(summary.channels[channel_key])
 
+        # If the server advertises JSON-only (e.g. the TypeScript binding,
+        # whose Fory implementation is not yet XLANG-compliant), pick the
+        # JSON proxy codec automatically -- otherwise the typed Fory client
+        # would send Fory bytes the server can't decode and the call would
+        # fail with an opaque "Expected RpcStatus, got NoneType".
+        if codec is None:
+            modes = list(getattr(summary, "serialization_modes", None) or [])
+            if modes and "xlang" not in modes and "json" in modes:
+                from aster.json_codec import JsonProxyCodec
+                codec = JsonProxyCodec()
+
         # Session-scoped services use the session protocol (one bidi stream
         # with method multiplexing). Dispatch to create_session.
         if info.scoped == "stream":

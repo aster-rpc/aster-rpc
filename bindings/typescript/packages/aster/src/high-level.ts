@@ -159,6 +159,10 @@ export class AsterServer {
         pattern: info.scoped ?? 'shared',
         methods: Object.keys(info.methods),
         channels: { rpc: rpcAddr },
+        // TS binding only speaks JSON until @apache-fory/core JS becomes
+        // XLANG-compliant. Cross-language consumers see this and pick the
+        // matching codec.
+        serializationModes: ['json'],
       });
     }
 
@@ -373,7 +377,10 @@ export class AsterServer {
       typeHashes: [],
       methodCount: methods.length,
       methods,
-      serializationModes: ['xlang'],
+      // The TypeScript binding only speaks JSON on the wire — Fory JS is not
+      // yet XLANG-compliant. Cross-language consumers reading the manifest
+      // must use SerializationMode.JSON (3) for any call to this server.
+      serializationModes: ['json'],
       scoped: info.scoped === 'stream' ? 'stream' : 'shared',
       deprecated: false,
     };

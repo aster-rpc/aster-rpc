@@ -164,6 +164,19 @@ export class RpcServer {
         return;
       }
 
+      // Sniff the first byte: '{' (0x7B) means JSON, anything else is binary
+      // (Fory XLANG). The TypeScript binding only speaks JSON because Fory JS
+      // is not yet XLANG-compliant — refuse binary requests with a clear,
+      // JSON-encoded error trailer the peer can decode either way.
+      if (!payload || payload[0] !== 0x7b /* '{' */) {
+        await this.writeErrorTrailer(
+          send,
+          StatusCode.INVALID_ARGUMENT,
+          'this server only supports JSON serialization (mode 3); resend the StreamHeader as JSON',
+        );
+        return;
+      }
+
       const header = this.codec.decode(payload) as StreamHeader;
 
       if (!header.service) {

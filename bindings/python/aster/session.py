@@ -1009,12 +1009,24 @@ async def create_session(
     send, recv = await connection.open_bi()
     session_id = str(uuid.uuid4())
 
+    # Pick the wire serialization mode from the codec being used. If the
+    # caller passed a JsonProxyCodec (e.g. because the server only speaks
+    # JSON), the StreamHeader must declare mode 3 so the server takes the
+    # JSON path; otherwise the service's declared mode wins.
+    from aster.json_codec import JsonProxyCodec
+    if isinstance(codec, JsonProxyCodec):
+        ser_mode = SerializationMode.JSON.value
+    elif service_info.serialization_modes:
+        ser_mode = service_info.serialization_modes[0].value
+    else:
+        ser_mode = 0
+
     header = StreamHeader(
         service=service_info.name,
         method="",
         version=service_info.version,
         callId=session_id,
-        serializationMode=service_info.serialization_modes[0].value if service_info.serialization_modes else 0,
+        serializationMode=ser_mode,
     )
     header_payload = codec.encode(header)
     await write_frame(send, header_payload, flags=HEADER)
