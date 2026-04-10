@@ -1050,12 +1050,52 @@ function _proxyMethod(serviceName: string, methodName: string, transport: AsterT
     return transport.serverStream(serviceName, methodName, payload ?? {});
   };
 
-  // .bidi() — bidirectional streaming
-  fn.bidi = () => {
-    return transport.bidiStream(serviceName, methodName);
+  // .bidi() — bidirectional streaming. Returns a lazy wrapper so callers
+  // can do `const ch = m.bidi(); await ch.open(); await ch.send(...)` —
+  // mirrors Python's _ProxyBidiChannel behaviour. Opening eagerly here
+  // would force every call site to handle the connect failure synchronously.
+  fn.bidi = (): ProxyBidiChannel => {
+    return new ProxyBidiChannel(serviceName, methodName, transport);
   };
 
   return fn;
+}
+
+/**
+ * Lazy bidi-stream wrapper used by ProxyClient. Opens the underlying
+ * transport channel on first .open() / .send() / iteration.
+ */
+export class ProxyBidiChannel {
+  private _channel: import('./transport/base.js').BidiChannel | null = null;
+
+  constructor(
+    private readonly serviceName: string,
+    private readonly methodName: string,
+    private readonly transport: AsterTransport,
+  ) {}
+
+  async open(): Promise<void> {
+    if (this._channel) return;
+    this._channel = this.transport.bidiStream(this.serviceName, this.methodName);
+  }
+
+  async send(payload: unknown): Promise<void> {
+    if (!this._channel) await this.open();
+    await this._channel!.send(payload);
+  }
+
+  async close(): Promise<void> {
+    if (this._channel) await this._channel.close();
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<unknown> {
+    if (!this._channel) {
+      // Open on the fly so `for await` after `await ch.send()` (which
+      // already opened) and `for await` without an explicit open both work.
+      this._channel = this.transport.bidiStream(this.serviceName, this.methodName);
+    }
+    return this._channel[Symbol.asyncIterator]();
+  }
 }
 
 // ── Native addon loader ──────────────────────────────────────────────────────
