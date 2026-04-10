@@ -75,46 +75,42 @@ async def test_ch1_unary(mc) -> None:
         fail("Ch1 getStatus", str(e))
 
 
-async def test_ch2_streaming(mc) -> None:
-    """Chapter 2: submitLog (unary) + tailLogs (server stream).
-
-    Verifies the documented use case: an operator opens tailLogs, an agent
-    submits a log entry, and the operator receives that exact entry on the
-    live stream.
-    """
-    # 2a: submitLog
+async def test_ch2a_submit_log(mc) -> None:
+    """Chapter 2a: submitLog returns {accepted: true}."""
     try:
         r = await mc.submitLog({
             "timestamp": time.time(),
             "level": "info",
-            "message": "ch2 first log",
+            "message": "ch2 standalone submit",
             "agent_id": "edge-7",
         })
         if not (r is True or (isinstance(r, dict) and r.get("accepted") is True)):
-            fail("Ch2 submitLog", f"unexpected response: {r}")
+            fail("Ch2a submitLog", f"unexpected response: {r}")
             return
-        ok("Ch2 submitLog accepted")
+        ok("Ch2a submitLog accepted")
     except Exception as e:
-        fail("Ch2 submitLog", str(e))
-        return
+        fail("Ch2a submitLog", str(e))
 
-    # 2b: tailLogs receives a live entry. Submit a unique marker AFTER the
-    # stream is open and consume until we see it (drain any queued entries
-    # from earlier in the test).
-    marker = f"ch2-marker-{time.time()}"
-    found_marker = asyncio.Event()
+
+async def test_ch2b_tail_logs(mc) -> None:
+    """Chapter 2b: tailLogs receives a live entry.
+
+    Per the guide: open tailLogs, submit a log entry, the stream receives
+    that exact entry. The first entry the stream yields MUST be the one
+    we just submitted -- no draining past unexpected entries.
+    """
+    expected_msg = f"ch2-tail-{time.time()}"
     received: list[Any] = []
+    first_entry = asyncio.Event()
 
     async def consume() -> None:
         try:
             async for entry in mc.tailLogs.stream({"level": "info"}):
                 received.append(entry)
-                msg = entry.get("message") if isinstance(entry, dict) else None
-                if msg == marker:
-                    found_marker.set()
-                    break
+                first_entry.set()
+                break
         except Exception:
-            pass
+            first_entry.set()
 
     task = asyncio.create_task(consume())
     await asyncio.sleep(0.3)  # let the stream open
@@ -122,19 +118,19 @@ async def test_ch2_streaming(mc) -> None:
         await mc.submitLog({
             "timestamp": time.time(),
             "level": "info",
-            "message": marker,
+            "message": expected_msg,
             "agent_id": "edge-7",
         })
     except Exception as e:
         task.cancel()
-        fail("Ch2 tailLogs setup", f"submitLog failed: {e}")
+        fail("Ch2b tailLogs setup", f"submitLog failed: {e}")
         return
 
     try:
-        await asyncio.wait_for(found_marker.wait(), timeout=5.0)
+        await asyncio.wait_for(first_entry.wait(), timeout=5.0)
     except asyncio.TimeoutError:
         task.cancel()
-        fail("Ch2 tailLogs", f"marker {marker!r} not received within 5s (got {len(received)} entries)")
+        fail("Ch2b tailLogs", "no entry received within 5s")
         return
 
     task.cancel()
@@ -142,7 +138,21 @@ async def test_ch2_streaming(mc) -> None:
         await task
     except (asyncio.CancelledError, Exception):
         pass
-    ok(f"Ch2 tailLogs received live marker ({marker})")
+
+    if not received:
+        fail("Ch2b tailLogs", "stream returned no entries")
+        return
+    entry = received[0]
+    if not isinstance(entry, dict):
+        fail("Ch2b tailLogs", f"expected dict, got {type(entry).__name__}")
+        return
+    actual_msg = entry.get("message")
+    if actual_msg != expected_msg:
+        fail("Ch2b tailLogs", f"first entry was {actual_msg!r}, expected {expected_msg!r} -- "
+             f"this means the stream is yielding stale/buffered entries instead of "
+             f"the entry submitted after the stream was opened")
+        return
+    ok(f"Ch2b tailLogs received live entry ({expected_msg})")
 
 
 async def test_ch3_client_stream(mc) -> None:
@@ -312,18 +322,21 @@ async def test_ch5_ops_credential(address: str, ops_cred: str) -> None:
     except Exception as e:
         fail("Ch5 ops getStatus", str(e))
 
-    # tailLogs (verifies any_of(LOGS, ADMIN) with comma-separated role parsing)
+    # tailLogs: open stream, submit entry, verify the first received entry
+    # is the one we just submitted. This catches the any_of(LOGS, ADMIN)
+    # role-parsing bug AND any silent buffering issues.
+    expected_msg = f"ops-tail-{time.time()}"
     received: list[Any] = []
-    consume_done = asyncio.Event()
+    first_entry = asyncio.Event()
 
     async def consume() -> None:
         try:
             async for entry in mc.tailLogs.stream({"level": "info"}):
                 received.append(entry)
-                if len(received) >= 1:
-                    break
-        finally:
-            consume_done.set()
+                first_entry.set()
+                break
+        except Exception:
+            first_entry.set()
 
     task = asyncio.create_task(consume())
     await asyncio.sleep(0.3)
@@ -331,27 +344,32 @@ async def test_ch5_ops_credential(address: str, ops_cred: str) -> None:
         await mc.submitLog({
             "timestamp": time.time(),
             "level": "info",
-            "message": "ops auth marker",
+            "message": expected_msg,
             "agent_id": "ops",
         })
-    except Exception:
-        pass
-
-    try:
-        await asyncio.wait_for(consume_done.wait(), timeout=5.0)
-    except asyncio.TimeoutError:
+    except Exception as e:
         task.cancel()
-        fail("Ch5 ops tailLogs", "no entry received within 5s")
+        fail("Ch5 ops tailLogs setup", f"submitLog failed: {e}")
     else:
-        task.cancel()
         try:
-            await task
-        except Exception:
-            pass
-        if received:
-            ok("Ch5 ops tailLogs → OK (entry received)")
+            await asyncio.wait_for(first_entry.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            fail("Ch5 ops tailLogs", "no entry received within 5s")
         else:
-            fail("Ch5 ops tailLogs", "stream opened but no entries")
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+            if not received:
+                fail("Ch5 ops tailLogs", "stream returned no entries")
+            else:
+                actual = received[0].get("message") if isinstance(received[0], dict) else None
+                if actual == expected_msg:
+                    ok(f"Ch5 ops tailLogs -> OK ({expected_msg})")
+                else:
+                    fail("Ch5 ops tailLogs", f"first entry was {actual!r}, expected {expected_msg!r}")
 
     await client.close()
 
@@ -467,7 +485,12 @@ async def run_dev_mode(address: str, work_dir: str | None) -> None:
 
     mc = client.proxy("MissionControl")
     await test_ch1_unary(mc)
-    await test_ch2_streaming(mc)
+    # Ch2b BEFORE Ch2a so Ch2a's submit doesn't pollute Ch2b's tailLogs queue.
+    # Each test must be order-independent of the others; we run Ch2b first
+    # because it's the more sensitive of the two (it asserts on the *first*
+    # entry the stream yields).
+    await test_ch2b_tail_logs(mc)
+    await test_ch2a_submit_log(mc)
     await test_ch3_client_stream(mc)
 
     # Ch4 needs the typed AgentSession class
