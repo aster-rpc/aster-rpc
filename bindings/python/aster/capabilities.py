@@ -23,7 +23,19 @@ etc. to define method-level access control::
 
 from __future__ import annotations
 
+import enum
+
 from aster.contract.identity import CapabilityKind, CapabilityRequirement
+
+
+def _role_value(r: str | enum.Enum) -> str:
+    """Extract the string value from a role, handling str enums correctly.
+
+    str(Role.LOGS) returns "Role.LOGS" in Python 3.11+, but we need "ops.logs".
+    """
+    if isinstance(r, enum.Enum):
+        return str(r.value)
+    return str(r)
 
 
 def any_of(*roles: str) -> CapabilityRequirement:
@@ -36,10 +48,13 @@ def any_of(*roles: str) -> CapabilityRequirement:
 
         @rpc(requires=any_of("ops.logs", "ops.admin"))
         async def tail_logs(self, req): ...
+
+        @rpc(requires=any_of(Role.LOGS, Role.ADMIN))
+        async def tail_logs(self, req): ...
     """
     return CapabilityRequirement(
         kind=CapabilityKind.ANY_OF,
-        roles=[str(r) for r in roles],
+        roles=[_role_value(r) for r in roles],
     )
 
 
@@ -53,8 +68,11 @@ def all_of(*roles: str) -> CapabilityRequirement:
 
         @rpc(requires=all_of("ops.status", "ops.admin"))
         async def admin_status(self, req): ...
+
+        @rpc(requires=all_of(Role.STATUS, Role.ADMIN))
+        async def admin_status(self, req): ...
     """
     return CapabilityRequirement(
         kind=CapabilityKind.ALL_OF,
-        roles=[str(r) for r in roles],
+        roles=[_role_value(r) for r in roles],
     )

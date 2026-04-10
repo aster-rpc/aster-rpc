@@ -520,8 +520,8 @@ class IrohBidiChannel(BidiChannel):
             method=self._method,
             version=1,
             callId=call_id,
-            deadline_epoch_ms=self._deadline_epoch_ms,
-            serialization_mode=self._serialization_mode,
+            deadlineEpochMs=self._deadline_epoch_ms,
+            serializationMode=self._serialization_mode,
             metadataKeys=keys,
             metadataValues=values,
         )

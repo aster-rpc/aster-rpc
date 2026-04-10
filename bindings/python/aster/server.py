@@ -459,6 +459,20 @@ class Server:
                 method=header.method,
                 peer=peer_id,
             ):
+                # Run authorization-style interceptors BEFORE pattern dispatch.
+                # CallContext-only interceptors (CapabilityInterceptor, deadline,
+                # metrics, rate-limit) execute here and can reject the stream
+                # before any frames are read. This guarantees auth checks fire
+                # on every pattern, including bidi/client streams that might
+                # never produce a request frame.
+                pre_call_ctx = self._build_call_context(header, method_info, ctx)
+                pre_interceptors = self._resolve_interceptors(service_info)
+                try:
+                    await apply_request_interceptors(pre_interceptors, pre_call_ctx, None)
+                except RpcError as auth_err:
+                    await self._write_error_trailer(send, auth_err.code, auth_err.message)
+                    return
+
                 t0 = time.monotonic()
                 if pattern == "unary":
                     await self._handle_unary(ctx, send, recv, header, handler_method, method_info)
@@ -777,7 +791,10 @@ class Server:
         handler_method: Any,
         method_info: MethodInfo,
     ) -> None:
-        """Handle a bidirectional-streaming RPC call."""
+        """Handle a bidirectional-streaming RPC call.
+
+        Auth interceptors already ran in handle_stream() before dispatch.
+        """
         call_ctx = self._build_call_context(header, method_info, conn_ctx)
         interceptors = self._resolve_interceptors(self._registry.lookup(header.service, header.version))
         try:

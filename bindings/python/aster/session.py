@@ -283,6 +283,20 @@ class SessionServer:
                     session_id=session_id,
                 )
 
+                # Run authorization-style interceptors BEFORE dispatching the
+                # method. This is the session-server equivalent of the upfront
+                # check in server.py -- without it, session-scoped services
+                # bypass Gate 3 capability checks entirely.
+                if self._interceptors:
+                    from aster.interceptors.base import apply_request_interceptors
+                    try:
+                        await apply_request_interceptors(self._interceptors, call_ctx, None)
+                    except RpcError as auth_err:
+                        await _write_trailer(send, self._codec, auth_err.code, auth_err.message)
+                        # Continue the session loop -- the client may make
+                        # other calls that pass auth.
+                        continue
+
                 pattern = method_info.pattern
 
                 if pattern == "unary":

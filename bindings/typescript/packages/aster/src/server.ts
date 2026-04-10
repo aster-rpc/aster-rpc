@@ -85,6 +85,9 @@ export class RpcServer {
   private _serving = false;
   private _connections = new Set<ServerConnection>();
 
+  /** Mark the server as serving (enables handleConnection loops). */
+  setServing(value = true): void { this._serving = value; }
+
   constructor(opts: ServerOptions) {
     this.registry = opts.registry;
     this.codec = opts.codec ?? new JsonCodec();
@@ -114,7 +117,7 @@ export class RpcServer {
   }
 
   /** Handle a single connection (accept streams in a loop). */
-  private async handleConnection(conn: ServerConnection): Promise<void> {
+  async handleConnection(conn: ServerConnection): Promise<void> {
     const peerId = conn.remoteNodeId();
     this.logger.debug('connection opened', { peer: peerId });
 
@@ -232,6 +235,21 @@ export class RpcServer {
       return;
     }
 
+    // Run authorization-style interceptors BEFORE pattern dispatch.
+    // CallContext-only interceptors (CapabilityInterceptor, deadline, metrics,
+    // rate-limit) execute here and can reject the stream before any frames
+    // are read. This guarantees auth checks fire on every pattern, including
+    // bidi streams that might never produce a request frame.
+    try {
+      await applyRequestInterceptors(this.interceptors, callCtx, null);
+    } catch (e) {
+      if (e instanceof RpcError) {
+        await this.writeErrorTrailer(send, e.code, e.message);
+        return;
+      }
+      throw e;
+    }
+
     switch (methodInfo.pattern) {
       case RpcPattern.UNARY:
         await this.handleUnary(svcInfo, methodInfo, handler, callCtx, send, recv);
@@ -344,6 +362,9 @@ export class RpcServer {
     svcInfo: ServiceInfo, _methodInfo: MethodInfo, handler: Function,
     _callCtx: CallContext, send: ServerSendStream, recv: ServerRecvStream,
   ): Promise<void> {
+    // Auth interceptors already ran in dispatchRpc() before this method.
+    // No need to run them again here.
+
     // Create request iterable from incoming frames
     const self = this;
     async function* requestIter() {

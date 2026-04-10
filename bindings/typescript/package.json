@@ -3,7 +3,9 @@
   "name": "aster-typescript-workspace",
   "workspaces": [
     "packages/transport",
-    "packages/aster"
+    "packages/aster",
+    "../../examples/typescript/missionControl",
+    "../../tests/integration/mission_control"
   ],
   "devDependencies": {
     "@napi-rs/cli": "^3.6.0",

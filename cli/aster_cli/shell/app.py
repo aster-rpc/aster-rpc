@@ -767,6 +767,27 @@ class PeerConnection:
                 return m
         return None
 
+    def _check_session_scope(self, service: str, method: str) -> None:
+        """Raise a clear error if the service is session-scoped.
+
+        Session-scoped services need a persistent session stream -- the shell's
+        per-call invocation model can't drive them. Use a generated typed
+        client instead.
+        """
+        manifest = self._manifests.get(service, {})
+        scoped = manifest.get("scoped", "shared")
+        if scoped in ("session", "stream"):
+            raise RuntimeError(
+                f"{service}.{method}: {service!r} is session-scoped and cannot be "
+                f"invoked from the shell. Session-scoped services need a persistent "
+                f"session stream that holds per-connection state. Use a generated "
+                f"typed client instead:\n"
+                f"  aster contract gen-client <address> --out ./clients --package my_app\n"
+                f"  # then in Python:\n"
+                f"  from my_app.services.{service.lower()}_v1 import {service}Client\n"
+                f"  stub = await {service}Client.from_connection(client)"
+            )
+
     async def invoke(
         self, service: str, method: str, payload: dict[str, Any]
     ) -> Any:
@@ -775,6 +796,7 @@ class PeerConnection:
         If dynamic types are available (from manifest), builds a typed
         request from the dict payload. Otherwise passes the dict directly.
         """
+        self._check_session_scope(service, method)
         transport = await self._get_transport(service)
 
         # Try to build a typed request from the dynamic type factory
@@ -793,6 +815,7 @@ class PeerConnection:
         self, service: str, method: str, payload: dict[str, Any]
     ) -> Any:
         """Start a server-streaming RPC."""
+        self._check_session_scope(service, method)
         transport = await self._get_transport(service)
         return transport.server_stream(service, method, payload)
 
@@ -800,6 +823,7 @@ class PeerConnection:
         self, service: str, method: str, values: list[Any]
     ) -> Any:
         """Send a client-streaming RPC."""
+        self._check_session_scope(service, method)
         transport = await self._get_transport(service)
 
         async def _iter():
@@ -816,6 +840,7 @@ class PeerConnection:
         Note: bidi_stream returns a BidiChannel, not an async iterator.
         The invoker handles the read/write loop.
         """
+        self._check_session_scope(service, method)
         # We need async transport setup, so return a coroutine wrapper
         async def _start():
             transport = await self._get_transport(service)

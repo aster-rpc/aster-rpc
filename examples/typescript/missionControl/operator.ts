@@ -28,7 +28,7 @@ console.log("Tailing logs (Ctrl+C to stop)...");
 for await (const entry of mc.tailLogs.stream({ level: "info" })) {
   const e = entry as Record<string, unknown>;
   const level = String(e.level ?? "?").padStart(5);
-  const agent = e.agentId ?? e.agent_id ?? "";
+  const agent = e.agent_id ?? "";
   const msg = e.message ?? "";
   console.log(`  [${level}] ${agent}: ${msg}`);
 }

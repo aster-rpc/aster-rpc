@@ -36,7 +36,9 @@ def _normalize_requirement(req: Any) -> CapabilityRequirement | None:
         return req
     if isinstance(req, str):
         from aster.contract.identity import CapabilityKind
-        return CapabilityRequirement(kind=CapabilityKind.ROLE, roles=[str(req)])
+        import enum
+        value = req.value if isinstance(req, enum.Enum) else str(req)
+        return CapabilityRequirement(kind=CapabilityKind.ROLE, roles=[value])
     return req
 
 

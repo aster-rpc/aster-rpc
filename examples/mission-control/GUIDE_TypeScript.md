@@ -26,6 +26,15 @@ No YAML. No protobuf compilation. No port numbers. No cloud account.
 Encrypted, authenticated, works across NATs, and your Python
 colleague can call it too.
 
+**What you're replacing:** Traditional RPC means writing `.proto` files,
+compiling them, setting up TLS certificates, configuring a reverse proxy
+or service mesh so clients can find your service, managing certificate
+rotation, and repeating all of that for every new service. With Aster you
+get mTLS-grade mutual authentication (no CA infrastructure), gRPC-style
+streaming RPCs (no `.proto` compilation), and peer-to-peer connectivity
+(no port forwarding or load balancers). Your Python teammate calls your
+TypeScript service without installing anything from your repo.
+
 This guide builds **Mission Control** — a control plane for managing
 remote agents. An agent could be a CI runner, an IoT sensor, an AI
 worker, or a service on your colleague's laptop across the world.
@@ -619,8 +628,9 @@ you want typed clients with IDE autocomplete and compile-time checking.
 ### Option A: Generate from a running service
 
 ```bash
-# Generate a TypeScript client from the live control plane
-aster contract gen-client aster1Qm... --out ./clients --package mission_control --lang typescript
+# Generate a Python client from the live control plane
+# (TypeScript codegen coming soon — use the proxy client for now)
+aster contract gen-client aster1Qm... --out ./clients --package mission_control --lang python
 
 # Output:
 # Generated 5 files
@@ -636,24 +646,24 @@ aster contract gen-client aster1Qm... --out ./clients --package mission_control 
 If the producer shared a `.aster.json` file (from `aster contract export`):
 
 ```bash
-aster contract gen-client ./MissionControl.aster.json --out ./clients --package mission_control --lang typescript
+aster contract gen-client ./MissionControl.aster.json --out ./clients --package mission_control --lang python
 ```
 
-Either way, you get a typed client:
+Either way, you get typed client code. Today this generates Python; TypeScript
+codegen is coming soon. In the meantime, the **proxy client** gives you the
+same functionality without codegen:
 
 ```typescript
-// consumer.ts — typed client, no producer source code needed
+// consumer.ts — proxy client, no codegen needed
 import { AsterClientWrapper } from '@aster-rpc/aster';
-import { MissionControlClient } from './mission_control/services/mission_control_v1';
-import { StatusRequest } from './mission_control/types/mission_control_v1';
 
 async function main() {
     const client = new AsterClientWrapper({ address: "aster1Qm..." });
     await client.connect();
 
-    const mc = await MissionControlClient.fromConnection(client);
-    const resp = await mc.getStatus(new StatusRequest({ agent_id: "edge-node-7" }));
-    console.log(`Status: ${resp.status}, uptime: ${resp.uptime_secs}s`);
+    const mc = client.proxy("MissionControl");
+    const resp = await mc.getStatus({ agent_id: "edge-node-7" });
+    console.log(`Status: ${(resp as any).status}, uptime: ${(resp as any).uptime_secs}s`);
 }
 
 main();
@@ -669,13 +679,14 @@ aster shell aster1Qm...
 {"agent_id": "edge-node-7", "status": "running", "uptime_secs": 3600}
 
 # Happy with the API? Generate a client:
-> generate-client --out ./clients --package mission_control --lang typescript
+> generate-client --out ./clients --package mission_control --lang python
 Generated 5 files
 ```
 
 **What just happened:**
 - `aster contract gen-client` pulled the contract from the running service
-  and generated typed TypeScript clients — no `.proto` files, no shared repo
+  and generated typed clients — no `.proto` files, no shared repo
+  (Python codegen works today; TypeScript codegen is coming soon)
 - The generated client has `fromConnection()` which wires up the
   transport, codec, and type registration automatically
 - Every generated class carries a `_contract_id` so the consumer can

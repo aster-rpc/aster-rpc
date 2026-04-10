@@ -1,0 +1,9 @@
+{
+  "name": "@aster-tests/mission-control",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@aster-rpc/aster": "workspace:*"
+  }
+}
