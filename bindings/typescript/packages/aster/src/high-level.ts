@@ -1228,28 +1228,9 @@ class SessionProxyClient {
       throw RpcError.fromStatus(status.code as StatusCode, status.message);
     }
 
-    const response = this._codec.decode(respPayload);
-
-    // The TS session server sends an OK trailer after each unary response.
-    // Python's session server does not. Drain one more frame if it's a
-    // TRAILER; if it's a CALL or EOF that means the next call is starting
-    // and we leave the stream alone.
-    try {
-      const next = await readFrame(this._recv, 2);
-      if (next) {
-        const [nPayload, nFlags] = next;
-        if ((nFlags & TRAILER) && nPayload.length > 0) {
-          const st = this._codec.decode(nPayload) as RpcStatus;
-          if (st.code !== StatusCode.OK) {
-            throw RpcError.fromStatus(st.code as StatusCode, st.message);
-          }
-        }
-      }
-    } catch {
-      // Timeout or stream ended -- fine, no trailer to drain
-    }
-
-    return response;
+    // Spec: session unary has no success trailer. The response frame is
+    // the complete response. Both Python and TS servers follow this rule.
+    return this._codec.decode(respPayload);
   }
 }
 

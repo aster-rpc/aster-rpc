@@ -603,7 +603,23 @@ class SessionServer:
                     break
 
                 if flags & TRAILER:
-                    # EoI: client sent TRAILER(OK)
+                    # EoI must be TRAILER with status=OK. A non-OK trailer
+                    # (corruption, confused client) must not be silently
+                    # accepted as clean end-of-input.
+                    try:
+                        eoi_status = self._codec.decode(payload, RpcStatus)
+                        if eoi_status.code != StatusCode.OK:
+                            await _write_trailer(
+                                send, self._codec, StatusCode.INTERNAL,
+                                f"client sent non-OK EoI trailer (code={eoi_status.code})",
+                            )
+                            return None
+                    except Exception:
+                        await _write_trailer(
+                            send, self._codec, StatusCode.INTERNAL,
+                            "malformed EoI trailer",
+                        )
+                        return None
                     break
 
                 compressed = bool(flags & COMPRESSED)
@@ -668,7 +684,10 @@ class SessionServer:
             if asyncio.iscoroutine(response_iter):
                 response_iter = await response_iter
 
+            reader_error: Exception | None = None
+
             async def reader() -> None:
+                nonlocal reader_error
                 try:
                     while True:
                         frame = await frame_q.get()
@@ -686,7 +705,10 @@ class SessionServer:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.debug("Session bidi reader error: %s", e)
+                    # Record the error so the dispatch loop can surface it
+                    # instead of returning OK on partial data.
+                    reader_error = e
+                    logger.warning("Session bidi reader error: %s", e)
                 finally:
                     await request_queue.put(_BIDI_EOF)
 
@@ -699,14 +721,28 @@ class SessionServer:
                         return None
                     await _write_response(send, self._codec, response)
 
-                await _write_ok_trailer(send, self._codec)
-                return None
-            finally:
+                # Wait for reader to finish so we can check its error state
                 reader_task.cancel()
                 try:
                     await reader_task
                 except (asyncio.CancelledError, Exception):
                     pass
+
+                if reader_error is not None:
+                    await _write_trailer(
+                        send, self._codec, StatusCode.INTERNAL,
+                        f"bidi stream reader error: {reader_error}",
+                    )
+                else:
+                    await _write_ok_trailer(send, self._codec)
+                return None
+            finally:
+                if not reader_task.done():
+                    reader_task.cancel()
+                    try:
+                        await reader_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
         except asyncio.CancelledError:
             try:
