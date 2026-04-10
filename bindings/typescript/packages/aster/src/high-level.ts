@@ -81,6 +81,7 @@ export class AsterServer {
   private _serviceSummaries: ServiceSummary[] = [];
   private _registryNamespace = '';
   private _servePromise: Promise<void> | null = null;
+  private _gate0Promise: Promise<void> | null = null;
   private _admissionAbort: AbortController | null = null;
 
   constructor(opts: AsterServerOptions) {
@@ -126,14 +127,23 @@ export class AsterServer {
     const { setNativeContract } = await import('./contract/identity.js');
     setNativeContract(native);
 
-    // Create node with RPC + admission ALPNs
+    // Create node with RPC + admission ALPNs.
+    //
+    // Gate 0 hooks must be enabled whenever any admission gate is active
+    // (allow_all_consumers=false). Without enable_hooks=true, the
+    // before_connect callbacks never fire and the admitted-set is
+    // unenforced — every connection is allowed regardless of admission.
     const alpns = [
       Buffer.from(RPC_ALPN),
       Buffer.from(ALPN_CONSUMER_ADMISSION),
       Buffer.from(ALPN_PRODUCER_ADMISSION),
       Buffer.from(ALPN_DELEGATED_ADMISSION),
     ];
-    this._node = await native.IrohNode.memoryWithAlpns(alpns);
+    const gate0Needed = !this._allowAllConsumers;
+    const endpointConfig = gate0Needed
+      ? { enableHooks: true, hookTimeoutMs: 5000 }
+      : undefined;
+    this._node = await native.IrohNode.memoryWithAlpns(alpns, endpointConfig);
 
     // Build service summaries for admission response
     // Encode the server's own node ID as the RPC channel address
@@ -361,6 +371,16 @@ export class AsterServer {
     // Enable RPC server connection handling
     this._rpcServer.setServing(true);
 
+    // Spawn the Gate 0 hook loop if hooks are enabled. This polls
+    // before_connect events from iroh and applies the MeshEndpointHook's
+    // allow/deny decisions. Without this, the admitted-set is never
+    // consulted and every connection passes the QUIC handshake.
+    if (this._node.hasHooks?.()) {
+      this._gate0Promise = this._runGate0().catch(e => {
+        this.logger.error('gate0 hook loop failed', { error: String(e) });
+      });
+    }
+
     // Single accept loop with ALPN routing (matches Python's _accept_loop)
     this._servePromise = this._acceptLoop();
     try {
@@ -368,6 +388,43 @@ export class AsterServer {
     } catch (e) {
       if (!this._closed) throw e;
     }
+  }
+
+  /**
+   * Run the Gate 0 hook loop.
+   *
+   * Pulls before_connect events from the native receiver and dispatches
+   * each one through MeshEndpointHook.shouldAllow(). The native binding
+   * uses an event-id + respond-by-id API; this method adapts it to the
+   * callback-shape that runHookLoop expects.
+   */
+  private async _runGate0(): Promise<void> {
+    if (!this._node) return;
+    const receiver = this._node.takeHookReceiver();
+    if (receiver == null) {
+      this.logger.warn('Gate 0: hooks enabled but no receiver available');
+      return;
+    }
+
+    // Adapt the native (event_id, respond_connect) API to the callback
+    // shape MeshEndpointHook.runHookLoop expects.
+    const adaptedReceiver = {
+      recvBeforeConnect: async () => {
+        const event = await receiver.recvBeforeConnect();
+        if (event == null) return null;
+        return {
+          info: {
+            remoteEndpointId: event.info.remoteEndpointId,
+            alpn: new Uint8Array(event.info.alpn),
+          },
+          respond: async (decision: { allow: boolean }) => {
+            receiver.respondConnect(event.eventId, decision.allow);
+          },
+        };
+      },
+    };
+
+    await this._hook.runHookLoop(adaptedReceiver);
   }
 
   /**
