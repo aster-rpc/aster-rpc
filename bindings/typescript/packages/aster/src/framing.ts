@@ -17,8 +17,23 @@
  * - Payload is the serialized bytes.
  */
 
-import type { SendStream, RecvStream } from '@aster-rpc/transport';
 import { MAX_FRAME_SIZE, DEFAULT_FRAME_READ_TIMEOUT_S } from './limits.js';
+
+// -- Stream protocol abstractions ---------------------------------------------
+//
+// Minimal interfaces that let framing work with both real Iroh QUIC streams
+// (from @aster-rpc/transport) and in-memory buffers (for testing). Mirrors
+// the SendStream/RecvStream protocols in bindings/python/aster/framing.py.
+
+/** Minimal async send-stream interface (matches IrohSendStream from NAPI). */
+export interface SendStream {
+  writeAll(data: Uint8Array): Promise<void>;
+}
+
+/** Minimal async recv-stream interface (matches IrohRecvStream from NAPI). */
+export interface RecvStream {
+  readExact(n: number): Promise<Uint8Array>;
+}
 
 // -- Flag constants -----------------------------------------------------------
 

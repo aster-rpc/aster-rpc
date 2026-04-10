@@ -3,25 +3,28 @@
   "version": "0.1.0-alpha.0",
   "description": "Aster RPC framework for TypeScript — P2P services with type safety, streaming, and trust",
   "type": "module",
-  "main": "./src/index.ts",
-  "types": "./src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./src/index.ts",
-      "types": "./src/index.ts"
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "tsc"
   },
   "dependencies": {
-    "@aster-rpc/transport": "workspace:*"
+    "@aster-rpc/transport": "0.1.0-alpha.0"
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
@@ -32,8 +35,26 @@
     "node": ">=20.0.0"
   },
   "license": "Apache-2.0",
+  "homepage": "https://github.com/aster-rpc/aster-rpc",
   "repository": {
     "type": "git",
-    "url": "https://github.com/user/aster"
+    "url": "git+https://github.com/aster-rpc/aster-rpc.git",
+    "directory": "bindings/typescript/packages/aster"
+  },
+  "bugs": {
+    "url": "https://github.com/aster-rpc/aster-rpc/issues"
+  },
+  "keywords": [
+    "iroh",
+    "p2p",
+    "rpc",
+    "quic",
+    "aster",
+    "streaming",
+    "framework"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }

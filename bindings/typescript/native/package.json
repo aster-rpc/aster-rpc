@@ -1,7 +1,40 @@
 {
-  "name": "@aster-rpc/transport-native",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@aster-rpc/transport",
+  "version": "0.1.0-alpha.0",
+  "description": "Iroh P2P transport bindings for Aster RPC (NAPI-RS native addon)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "package.json",
+    "README.md"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aster-rpc/aster-rpc.git",
+    "directory": "bindings/typescript/native"
+  },
+  "homepage": "https://github.com/aster-rpc/aster-rpc",
+  "bugs": {
+    "url": "https://github.com/aster-rpc/aster-rpc/issues"
+  },
+  "keywords": [
+    "iroh",
+    "p2p",
+    "quic",
+    "rpc",
+    "aster",
+    "napi"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "napi": {
     "binaryName": "aster-transport",
     "targets": [
@@ -11,5 +44,19 @@
       "aarch64-unknown-linux-gnu",
       "x86_64-pc-windows-msvc"
     ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "optionalDependencies": {
+    "@aster-rpc/transport-darwin-arm64": "0.1.0-alpha.0",
+    "@aster-rpc/transport-darwin-x64": "0.1.0-alpha.0",
+    "@aster-rpc/transport-linux-x64-gnu": "0.1.0-alpha.0",
+    "@aster-rpc/transport-linux-arm64-gnu": "0.1.0-alpha.0",
+    "@aster-rpc/transport-win32-x64-msvc": "0.1.0-alpha.0"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.6.0"
   }
 }
