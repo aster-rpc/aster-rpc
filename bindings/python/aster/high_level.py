@@ -1599,7 +1599,7 @@ class AsterClient:
         return self._registry_namespace
 
     def proxy(self, service_name: str) -> "ProxyClient":
-        """Create a dynamic proxy client for a service.
+        """Create a dynamic proxy client for a shared (stream-per-call) service.
 
         The proxy discovers methods from the service contract and builds
         method stubs at runtime. No local type definitions needed -- call
@@ -1609,28 +1609,88 @@ class AsterClient:
             result = await mc.getStatus({"agent_id": "edge-1"})
             print(result["status"])
 
+        For session-scoped services, use :meth:`session` instead.
+
         Args:
             service_name: The service name (e.g., ``"MissionControl"``).
 
         Returns:
             A :class:`ProxyClient` with method stubs for each RPC method.
+
+        Raises:
+            TypeError: If the service is session-scoped (use ``session()``).
         """
         if not self._connected:
             raise RuntimeError("AsterClient not connected; call connect() first")
 
-        summary = None
-        for s in self._services:
-            if s.name == service_name:
-                summary = s
-                break
-        if summary is None:
-            available = [s.name for s in self._services]
-            raise ValueError(
-                f"Service '{service_name}' not found. "
-                f"Available: {available}"
+        summary = self._find_service(service_name)
+
+        if getattr(summary, "pattern", "shared") == "session":
+            raise TypeError(
+                f"'{service_name}' is session-scoped. "
+                f"Use 'await client.session(\"{service_name}\")' instead of "
+                f"'client.proxy(\"{service_name}\")'."
             )
 
         return ProxyClient(service_name=service_name, aster_client=self)
+
+    async def session(self, service_name: str) -> "SessionProxyClient":
+        """Create a dynamic proxy client for a session-scoped service.
+
+        Opens a single bidirectional QUIC stream and multiplexes calls
+        over it. Maintains a lock to ensure one call in flight at a time
+        (spec requirement). Call methods with dicts, receive dicts::
+
+            agent = await client.session("AgentSession")
+            result = await agent.register({"agent_id": "edge-1"})
+            print(result["assignment"])
+            await agent.close()
+
+        For shared (stream-per-call) services, use :meth:`proxy` instead.
+
+        Args:
+            service_name: The service name (e.g., ``"AgentSession"``).
+
+        Returns:
+            A session proxy with method stubs. Must be closed when done.
+        """
+        if not self._connected:
+            raise RuntimeError("AsterClient not connected; call connect() first")
+
+        summary = self._find_service(service_name)
+
+        channel_key = self._channel_name
+        if channel_key not in summary.channels:
+            channel_key = next(iter(summary.channels), self._channel_name)
+
+        conn = await self._rpc_conn_for(summary.channels.get(channel_key, ""))
+
+        codec = None
+        modes = list(getattr(summary, "serialization_modes", None) or [])
+        if modes and "xlang" not in modes and "json" in modes:
+            from aster.json_codec import JsonProxyCodec
+            codec = JsonProxyCodec()
+
+        from aster.session import create_proxy_session
+        session_client = await create_proxy_session(
+            service_name=service_name,
+            connection=conn,
+            codec=codec,
+            aster_client=self,
+        )
+        self._clients.append(session_client)
+        return session_client
+
+    def _find_service(self, service_name: str) -> "ServiceSummary":
+        """Look up a service by name in the admission response."""
+        for s in self._services:
+            if s.name == service_name:
+                return s
+        available = [s.name for s in self._services]
+        raise ValueError(
+            f"Service '{service_name}' not found. "
+            f"Available: {available}"
+        )
 
     @property
     def gossip_topic(self) -> str:

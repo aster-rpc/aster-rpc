@@ -17,6 +17,8 @@ from dataclasses import asdict, dataclass, field
 
 import blake3
 
+FIELD_SCHEMA_VERSION = 1
+
 
 @dataclass
 class ContractManifest:
@@ -26,13 +28,16 @@ class ContractManifest:
     ``ContractManifest(**json.loads(text))``.
     """
 
-    service: str
+    v: int = FIELD_SCHEMA_VERSION
+    """Field schema version. 1 = structured kind system."""
+
+    service: str = ""
     """Service name."""
 
-    version: int
+    version: int = 1
     """Service version integer."""
 
-    contract_id: str
+    contract_id: str = ""
     """64-char hex string (full BLAKE3 digest of canonical ServiceContract bytes)."""
 
     canonical_encoding: str = "fory-xlang/0.15"
@@ -132,6 +137,17 @@ class ContractManifest:
         if "type_count" in data:
             data["type_count"] = int(data["type_count"])
 
+        # Upgrade legacy (unversioned) manifests to v1 field schema
+        if data.get("v") is None:
+            data["v"] = FIELD_SCHEMA_VERSION
+            for m in data.get("methods", []):
+                for key in ("fields", "response_fields"):
+                    if key in m:
+                        m[key] = [
+                            upgrade_legacy_field(f) if "kind" not in f else f
+                            for f in m[key]
+                        ]
+
         return cls(**data)
 
     @classmethod
@@ -195,42 +211,9 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
                 hints = get_type_hints(req_type)
             except Exception:
                 hints = {}
-
             for f in dataclasses.fields(req_type):
                 ftype = hints.get(f.name, f.type)
-                type_name = _type_display_name(ftype)
-
-                has_default = (
-                    f.default is not dataclasses.MISSING
-                    or f.default_factory is not dataclasses.MISSING
-                )
-
-                default_val = None
-                if f.default is not dataclasses.MISSING:
-                    default_val = f.default
-                elif f.default_factory is not dataclasses.MISSING:
-                    # Don't call the factory -- just note it has one
-                    default_val = None
-
-                field_info_req: dict[str, Any] = {
-                    "name": f.name,
-                    "type": type_name,
-                    "required": not has_default,
-                    "default": default_val if _is_json_safe(default_val) else str(default_val),
-                }
-                elem_type = _extract_list_element_type(ftype)
-                if elem_type is not None and dataclasses.is_dataclass(elem_type):
-                    field_info_req["element_wire_tag"] = getattr(elem_type, "__wire_type__", "")
-                    field_info_req["element_type"] = _type_display_name(elem_type)
-                    try:
-                        elem_hints = get_type_hints(elem_type)
-                    except Exception:
-                        elem_hints = {}
-                    field_info_req["element_fields"] = [
-                        {"name": ef.name, "type": _type_display_name(elem_hints.get(ef.name, ef.type))}
-                        for ef in dataclasses.fields(elem_type)
-                    ]
-                fields.append(field_info_req)
+                fields.append(build_field_v1(f, ftype))
 
         resp_type = getattr(method_info, "response_type", None)
 
@@ -255,26 +238,7 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
                 resp_hints = {}
             for f in dataclasses.fields(resp_type):
                 ftype = resp_hints.get(f.name, f.type)
-                field_info: dict[str, Any] = {
-                    "name": f.name,
-                    "type": _type_display_name(ftype),
-                }
-                # For list[X] fields, store the element type's wire_tag
-                # so dynamic clients can synthesize the element type too.
-                elem_type = _extract_list_element_type(ftype)
-                if elem_type is not None and dataclasses.is_dataclass(elem_type):
-                    field_info["element_wire_tag"] = getattr(elem_type, "__wire_type__", "")
-                    field_info["element_type"] = _type_display_name(elem_type)
-                    # Store element fields recursively
-                    try:
-                        elem_hints = get_type_hints(elem_type)
-                    except Exception:
-                        elem_hints = {}
-                    field_info["element_fields"] = [
-                        {"name": ef.name, "type": _type_display_name(elem_hints.get(ef.name, ef.type))}
-                        for ef in dataclasses.fields(elem_type)
-                    ]
-                resp_fields.append(field_info)
+                resp_fields.append(build_field_v1(f, ftype))
 
         methods_out.append({
             "name": method_name,
@@ -352,6 +316,225 @@ def _type_display_name(t: object) -> str:
 def _is_json_safe(val: object) -> bool:
     """Check if a value is safely JSON-serializable."""
     return val is None or isinstance(val, (str, int, float, bool))
+
+
+# ── V1 field schema ──────────────────────────────────────────────────────────
+
+_PY_TO_KIND: dict[type, str] = {
+    str: "string",
+    int: "int",
+    float: "float",
+    bool: "bool",
+    bytes: "bytes",
+}
+
+
+def _classify_type(tp: object) -> dict[str, Any]:
+    """Classify a Python type into the v1 field schema kind system.
+
+    Returns a partial field dict with kind, nullable, and type-specific
+    keys (item_kind, ref_name, enum_values, etc.).
+    """
+    import enum
+    import typing
+
+    result: dict[str, Any] = {}
+
+    # Unwrap Optional / X | None
+    origin = getattr(tp, "__origin__", None)
+    args = getattr(tp, "__args__", ())
+
+    is_optional = False
+    if origin is typing.Union and type(None) in args:
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            is_optional = True
+            tp = non_none[0]
+            origin = getattr(tp, "__origin__", None)
+            args = getattr(tp, "__args__", ())
+
+    result["nullable"] = is_optional
+
+    # Primitives
+    if tp in _PY_TO_KIND:
+        result["kind"] = _PY_TO_KIND[tp]
+        return result
+
+    # Enum
+    if isinstance(tp, type) and issubclass(tp, enum.Enum):
+        result["kind"] = "enum"
+        result["ref_name"] = tp.__name__
+        result["enum_values"] = [e.value for e in tp]
+        return result
+
+    # list[X]
+    if origin is list:
+        result["kind"] = "list"
+        if args:
+            elem = _classify_type(args[0])
+            result["item_kind"] = elem.get("kind", "string")
+            result["item_nullable"] = elem.get("nullable", False)
+            if elem.get("ref_name"):
+                result["item_ref"] = elem["ref_name"]
+            if elem.get("wire_tag"):
+                result["item_wire_tag"] = elem["wire_tag"]
+        else:
+            result["item_kind"] = "string"
+            result["item_nullable"] = False
+        return result
+
+    # dict[K, V]
+    if origin is dict:
+        result["kind"] = "map"
+        if len(args) >= 2:
+            key_info = _classify_type(args[0])
+            val_info = _classify_type(args[1])
+            result["key_kind"] = key_info.get("kind", "string")
+            result["value_kind"] = val_info.get("kind", "string")
+            result["value_nullable"] = val_info.get("nullable", False)
+            if val_info.get("ref_name"):
+                result["value_ref"] = val_info["ref_name"]
+        else:
+            result["key_kind"] = "string"
+            result["value_kind"] = "string"
+            result["value_nullable"] = False
+        return result
+
+    # Dataclass reference
+    if dataclasses.is_dataclass(tp) and isinstance(tp, type):
+        result["kind"] = "ref"
+        result["ref_name"] = tp.__name__
+        result["wire_tag"] = getattr(tp, "__wire_type__", "")
+        return result
+
+    # Fallback: treat as string
+    result["kind"] = "string"
+    return result
+
+
+def build_field_v1(f: dataclasses.Field, resolved_type: object) -> dict[str, Any]:
+    """Build a v1 schema field dict from a dataclass field.
+
+    Args:
+        f: The dataclass Field object.
+        resolved_type: The resolved type hint for this field.
+
+    Returns:
+        A v1 field schema dict.
+    """
+    info = _classify_type(resolved_type)
+
+    has_default = (
+        f.default is not dataclasses.MISSING
+        or f.default_factory is not dataclasses.MISSING
+    )
+
+    default_value = None
+    default_kind = "none"
+
+    if f.default is not dataclasses.MISSING:
+        default_value = f.default if _is_json_safe(f.default) else str(f.default)
+        default_kind = "value"
+    elif f.default_factory is not dataclasses.MISSING:
+        factory = f.default_factory
+        if factory is list:
+            default_kind = "empty_list"
+        elif factory is dict:
+            default_kind = "empty_map"
+        else:
+            default_kind = "factory"
+
+    field_dict: dict[str, Any] = {
+        "name": f.name,
+        "kind": info.get("kind", "string"),
+        "nullable": info.get("nullable", False),
+        "required": not has_default,
+        "default_value": default_value,
+        "default_kind": default_kind,
+    }
+
+    # Type-specific keys (only include when set)
+    for key in ("ref_name", "wire_tag", "enum_values",
+                "item_kind", "item_ref", "item_wire_tag", "item_nullable",
+                "key_kind", "value_kind", "value_ref", "value_nullable"):
+        if key in info:
+            field_dict[key] = info[key]
+
+    field_dict["properties"] = {}
+    return field_dict
+
+
+def upgrade_legacy_field(old: dict[str, Any]) -> dict[str, Any]:
+    """Convert an unversioned legacy field dict to v1 schema.
+
+    Parses the Python type string and maps to the structured kind system.
+    """
+    name = old.get("name", "")
+    type_str = str(old.get("type", "string")).lower()
+    required = old.get("required", False)
+    default = old.get("default")
+
+    kind = "string"
+    extra: dict[str, Any] = {}
+
+    if type_str in ("str", "string"):
+        kind = "string"
+    elif type_str in ("int", "integer"):
+        kind = "int"
+    elif type_str in ("float", "double"):
+        kind = "float"
+    elif type_str in ("bool", "boolean"):
+        kind = "bool"
+    elif type_str == "bytes":
+        kind = "bytes"
+    elif type_str.startswith("list"):
+        kind = "list"
+        extra["item_kind"] = "string"
+        extra["item_nullable"] = False
+        elem_wire_tag = old.get("element_wire_tag", "")
+        elem_type = old.get("element_type", "")
+        if elem_wire_tag or elem_type:
+            extra["item_kind"] = "ref"
+            extra["item_ref"] = elem_type
+            extra["item_wire_tag"] = elem_wire_tag
+    elif type_str.startswith("dict") or type_str.startswith("map"):
+        kind = "map"
+        extra["key_kind"] = "string"
+        extra["value_kind"] = "string"
+        extra["value_nullable"] = False
+    elif type_str.startswith("optional"):
+        kind = "string"
+        extra["nullable"] = True
+    else:
+        kind = "ref"
+        extra["ref_name"] = old.get("type", "")
+        extra["wire_tag"] = old.get("wire_tag", "")
+
+    nullable = extra.pop("nullable", False)
+    default_kind = "none"
+    default_value = None
+    if default is not None:
+        default_kind = "value"
+        default_value = default
+    elif not required:
+        if kind == "list":
+            default_kind = "empty_list"
+        elif kind == "map":
+            default_kind = "empty_map"
+        elif nullable:
+            default_kind = "null"
+
+    result: dict[str, Any] = {
+        "name": name,
+        "kind": kind,
+        "nullable": nullable,
+        "required": required,
+        "default_value": default_value,
+        "default_kind": default_kind,
+        **extra,
+        "properties": {},
+    }
+    return result
 
 
 # ── FatalContractMismatch ─────────────────────────────────────────────────────

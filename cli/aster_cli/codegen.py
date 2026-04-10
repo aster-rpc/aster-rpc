@@ -152,6 +152,93 @@ def _py_default_str(type_name: str, default: Any) -> str | None:
     return None
 
 
+# ── V1 schema-aware helpers ──────────────────────────────────────────────────
+
+_KIND_TO_PY: dict[str, str] = {
+    "string": "str",
+    "int": "int",
+    "float": "float",
+    "bool": "bool",
+    "bytes": "bytes",
+}
+
+
+def _py_type_from_field(f: dict[str, Any], known_types: dict[str, str]) -> str:
+    """Derive Python type annotation from a v1 schema field dict.
+
+    Falls back to the legacy _py_type_str for unversioned fields.
+    """
+    kind = f.get("kind")
+    if kind is None:
+        return _field_py_type(f, known_types)
+
+    nullable = f.get("nullable", False)
+    base: str
+
+    if kind in _KIND_TO_PY:
+        base = _KIND_TO_PY[kind]
+    elif kind == "list":
+        item_kind = f.get("item_kind", "string")
+        if item_kind == "ref":
+            item_name = f.get("item_ref", "Any")
+            item_py = known_types.get(item_name, item_name)
+        elif item_kind in _KIND_TO_PY:
+            item_py = _KIND_TO_PY[item_kind]
+        else:
+            item_py = "Any"
+        base = f"list[{item_py}]"
+    elif kind == "map":
+        key_py = _KIND_TO_PY.get(f.get("key_kind", "string"), "str")
+        val_kind = f.get("value_kind", "string")
+        if val_kind == "ref":
+            val_py = known_types.get(f.get("value_ref", "Any"), f.get("value_ref", "Any"))
+        elif val_kind in _KIND_TO_PY:
+            val_py = _KIND_TO_PY[val_kind]
+        else:
+            val_py = "Any"
+        base = f"dict[{key_py}, {val_py}]"
+    elif kind == "ref":
+        ref_name = f.get("ref_name", "Any")
+        base = known_types.get(ref_name, ref_name)
+    elif kind == "enum":
+        base = "str"
+    else:
+        base = "Any"
+
+    if nullable:
+        return f"Optional[{base}]"
+    return base
+
+
+def _py_default_from_field(f: dict[str, Any]) -> str | None:
+    """Derive Python default expression from a v1 schema field dict.
+
+    Falls back to legacy _py_default_str for unversioned fields.
+    """
+    dk = f.get("default_kind")
+    if dk is None:
+        return _py_default_str(f.get("type", "str"), f.get("default"))
+
+    if dk == "value":
+        dv = f.get("default_value")
+        if isinstance(dv, str):
+            return repr(dv)
+        if isinstance(dv, bool):
+            return "True" if dv else "False"
+        if dv is not None:
+            return str(dv)
+        return "None"
+    if dk == "empty_list":
+        return "dataclasses.field(default_factory=list)"
+    if dk == "empty_map":
+        return "dataclasses.field(default_factory=dict)"
+    if dk == "null":
+        return "None"
+    if dk == "none":
+        return None
+    return None
+
+
 def _field_py_type(field: dict[str, Any], known_types: dict[str, str]) -> str:
     raw_type = field.get("type", "str")
     if str(raw_type).lower() == "optional":
@@ -203,11 +290,18 @@ def collect_types(
 
     def _collect_element_types(fields: list[dict], service: str) -> None:
         for f in fields:
-            elem_tag = f.get("element_wire_tag", "")
-            elem_name = f.get("element_type", "")
+            # V1 schema: item_wire_tag / item_ref
+            elem_tag = f.get("item_wire_tag", "") or f.get("element_wire_tag", "")
+            elem_name = f.get("item_ref", "") or f.get("element_type", "")
             elem_fields = f.get("element_fields", [])
             if elem_tag:
                 _ensure_type(elem_tag, elem_name, elem_fields, service)
+            # V1 schema: ref fields
+            if f.get("kind") == "ref":
+                ref_tag = f.get("wire_tag", "")
+                ref_name = f.get("ref_name", "")
+                if ref_tag:
+                    _ensure_type(ref_tag, ref_name, [], service)
             field_type = f.get("type", "")
             if isinstance(field_type, str) and field_type in _KNOWN_WIRE_TYPES:
                 wire_tag, nested_fields = _KNOWN_WIRE_TYPES[field_type]
@@ -288,15 +382,11 @@ def _gen_type_class(rec: _TypeRecord, known_types: dict[str, str]) -> str:
 
     for f in rec.fields:
         fname = f["name"]
-        raw_type = f.get("type", "str")
-        ftype_str = _field_py_type(f, known_types)
-        default = _py_default_str(raw_type, f.get("default"))
+        ftype_str = _py_type_from_field(f, known_types)
+        default = _py_default_from_field(f)
 
         if default is not None:
-            if default.startswith("dataclasses.field("):
-                lines.append(f"    {fname}: {ftype_str} = {default}")
-            else:
-                lines.append(f"    {fname}: {ftype_str} = {default}")
+            lines.append(f"    {fname}: {ftype_str} = {default}")
         else:
             lines.append(f"    {fname}: {ftype_str} = None")
 
