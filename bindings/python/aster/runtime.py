@@ -1,5 +1,5 @@
 """
-aster.high_level -- Declarative ``AsterServer`` / ``AsterClient`` wrappers.
+aster.runtime -- Declarative ``AsterServer`` / ``AsterClient`` wrappers.
 
 Thin composition over the existing low-level primitives
 (:class:`aster.Server`, :func:`aster.trust.consumer.handle_consumer_admission_rpc`,
@@ -1973,9 +1973,13 @@ class _ProxyMethod:
         if proxy._transport is None:
             await proxy._ensure_transport()
 
-        # Fast path: dict payload, no kwargs -> unary
-        if payload is not None and payload.__class__ is dict and not kwargs:
-            result = await proxy._transport.unary(
+        # Detect client streaming: payload is an async iterator
+        if (
+            payload is not None
+            and not isinstance(payload, (dict, str, bytes))
+            and hasattr(payload, "__aiter__")
+        ):
+            result = await proxy._transport.client_stream(
                 proxy._service_name,
                 self._method_name,
                 payload,
@@ -1984,29 +1988,38 @@ class _ProxyMethod:
                 return _dataclasses_asdict(result)
             return result
 
-        # Detect client streaming: payload is an async iterator
-        if payload is not None and not isinstance(payload, (dict, str, bytes)):
-            if hasattr(payload, "__aiter__"):
-                result = await proxy._transport.client_stream(
-                    proxy._service_name,
-                    self._method_name,
-                    payload,
-                )
-                if _is_dataclass_instance(result):
-                    return _dataclasses_asdict(result)
-                return result
-
         # Build payload from dict or kwargs
         if payload is None:
             payload = kwargs
         elif isinstance(payload, dict) and kwargs:
             payload = {**payload, **kwargs}
 
-        result = await proxy._transport.unary(
-            proxy._service_name,
-            self._method_name,
-            payload if isinstance(payload, dict) else (payload or {}),
-        )
+        try:
+            result = await proxy._transport.unary(
+                proxy._service_name,
+                self._method_name,
+                payload if isinstance(payload, dict) else (payload or {}),
+            )
+        except Exception as exc:
+            # When the user calls a server-streaming method via the unary
+            # ``await proxy.method(...)`` path, the transport sees a second
+            # response frame and raises a low-level "multiple response
+            # frames" error. Translate that into an actionable message
+            # pointing at the streaming helpers, which is the only way to
+            # consume server_stream / bidi_stream methods on the proxy.
+            msg = str(exc)
+            if "multiple response frames" in msg:
+                hint = (
+                    f"'{proxy._service_name}.{self._method_name}' is a streaming "
+                    f"RPC and cannot be called as a unary `await proxy.{self._method_name}(...)`.\n"
+                    f"  - For server-streaming methods, iterate the result of "
+                    f"`proxy.{self._method_name}.stream(...)`:\n"
+                    f"      async for item in proxy.{self._method_name}.stream({{...}}):\n"
+                    f"          ...\n"
+                    f"  - For bidi-streaming methods, use `proxy.{self._method_name}.bidi()`."
+                )
+                raise RuntimeError(hint) from exc
+            raise
 
         if _is_dataclass_instance(result):
             return _dataclasses_asdict(result)

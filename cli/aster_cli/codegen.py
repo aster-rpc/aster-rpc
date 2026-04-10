@@ -645,7 +645,7 @@ def generate_python_clients(
         content += "from aster.service import MethodInfo\n"
         content += "from aster.transport.base import BidiChannel\n\n"
         content += "if TYPE_CHECKING:\n"
-        content += "    from aster.high_level import AsterClient\n"
+        content += "    from aster.runtime import AsterClient\n"
 
         # Import all types used by this service's methods
         type_imports = _collect_service_type_imports(svc_name, manifest, all_types, shared_types)

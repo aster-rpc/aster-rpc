@@ -97,14 +97,25 @@ class Display:
         table.add_column("Service", style="cyan bold")
         table.add_column("Methods", justify="right")
         table.add_column("Version", justify="right", style="dim")
-        table.add_column("Pattern", style="dim")
+        table.add_column("Scope", style="dim")
 
         for svc in services:
+            scoped = svc.get("scoped", "shared")
+            name = svc.get("name", "?")
+            # Annotate session-scoped services in the Service column too --
+            # the Scope column is easy to miss and `session` changes how
+            # users have to interact with the service (via `session <name>`
+            # subshell rather than `./method` directly).
+            display_name = (
+                f"{name} [yellow](session)[/yellow]"
+                if scoped in ("session", "stream")
+                else name
+            )
             table.add_row(
-                svc.get("name", "?"),
+                display_name,
                 str(svc.get("method_count", "?")),
                 f"v{svc.get('version', '?')}",
-                svc.get("scoped", "shared"),
+                scoped,
             )
 
         self.console.print(table)

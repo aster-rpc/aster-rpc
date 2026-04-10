@@ -92,6 +92,11 @@ class CommandContext:
     interactive: bool = True  # False when called from CLI
     raw_output: bool = False  # True for pipe-friendly JSON output
     guide: Any = None  # GuideManager instance (optional)
+    # Active session (set inside `session <ServiceName>` subshells). When
+    # set, method invocations are routed through the persistent session
+    # bidi stream instead of opening a new stream per call -- the only
+    # way to call methods on session-scoped services from the shell.
+    session: Any = None
 
 
 # ── Plugin registry ───────────────────────────────────────────────────────────
