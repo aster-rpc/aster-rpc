@@ -86,6 +86,26 @@ def _parse_attributes(attrs_str: str | None) -> dict[str, str]:
     # the CredentialSigner protocol in signer.py.
 
 
+def _style_helpers(quiet: bool):
+    """Return (bold, dim, green, yellow, reset) functions that respect
+    NO_COLOR, --quiet, and TTY detection."""
+    use_color = (
+        not quiet
+        and sys.stdout.isatty()
+        and os.environ.get("NO_COLOR") is None
+        and os.environ.get("TERM") != "dumb"
+    )
+    if use_color:
+        return (
+            lambda s: f"\033[1m{s}\033[0m",      # bold
+            lambda s: f"\033[2m{s}\033[0m",      # dim
+            lambda s: f"\033[32m{s}\033[0m",     # green
+            lambda s: f"\033[33m{s}\033[0m",     # yellow
+            "",
+        )
+    return (lambda s: s, lambda s: s, lambda s: s, lambda s: s, "")
+
+
 def cmd_enroll_node(args) -> int:
     """Execute ``aster enroll node``."""
     from aster_cli.identity import load_identity, save_identity, add_peer
@@ -95,6 +115,7 @@ def cmd_enroll_node(args) -> int:
     role = args.role
     name = args.name
     identity_path = Path(args.identity or args.out or ".aster-identity")
+    quiet = bool(getattr(args, "quiet", False))
 
     # ── Resolve signer (pluggable -- local keyring/file by default) ───────
     signer = resolve_signer(
@@ -112,12 +133,13 @@ def cmd_enroll_node(args) -> int:
         if secret_key_b64:
             secret_key = base64.b64decode(secret_key_b64)
             endpoint_id = node.get("endpoint_id") or _derive_endpoint_id(secret_key)
-            print(f"Reusing node key from {identity_path} (endpoint_id={endpoint_id[:16]}...)")
+            if not quiet:
+                print(f"Reusing node key from {identity_path} (endpoint_id={endpoint_id[:16]}...)")
         else:
-            secret_key, endpoint_id = _generate_node_key()
+            secret_key, endpoint_id = _generate_node_key(quiet)
     else:
         identity_data = {"node": {}, "peers": []}
-        secret_key, endpoint_id = _generate_node_key()
+        secret_key, endpoint_id = _generate_node_key(quiet)
 
     # Store node key in identity
     identity_data["node"] = {
@@ -177,22 +199,70 @@ def cmd_enroll_node(args) -> int:
     # ── Print summary ────────────────────────────────────────────────────
     from datetime import datetime, timezone
     expiry_dt = datetime.fromtimestamp(expires_at, tz=timezone.utc)
-    print(f"\nEnrolled: {name}")
-    print(f"  role         : {role}")
-    print(f"  type         : {cred_type}")
-    print(f"  endpoint_id  : {endpoint_id[:16]}...")
-    print(f"  mesh (root)  : {root_pubkey.hex()[:16]}...")
-    print(f"  expires      : {expiry_dt.isoformat()}")
-    print(f"  identity file: {identity_path}")
+
+    if quiet:
+        # Single line, parseable: "<path> <endpoint_id> <expires_iso>"
+        print(f"{identity_path} {endpoint_id} {expiry_dt.isoformat()}")
+        return 0
+
+    bold, dim, green, yellow, _ = _style_helpers(quiet)
+    capabilities = attributes.get("aster.role", "(none)")
+    abs_path = identity_path.resolve()
+
+    if role == "producer":
+        intro = (
+            "This file lets you run a server signed by your root key.\n"
+            "  When this server starts, it presents this credential and the\n"
+            "  Aster mesh recognises it as part of your trust domain."
+        )
+        next_step = (
+            "Use it:\n"
+            f"  Set ASTER_IDENTITY_FILE={identity_path} when starting your server,\n"
+            "  or place .aster-identity in the working directory."
+        )
+    else:
+        intro = (
+            "This file lets a consumer connect to your trusted-mode servers.\n"
+            "  It contains a node identity (secret key) AND a signed enrollment\n"
+            "  credential. The server validates the credential and grants the\n"
+            "  capabilities listed below."
+        )
+        next_step = (
+            "Use it:\n"
+            f"  aster shell <peer-addr> --rcan {identity_path}\n"
+            f"  aster call <peer-addr> Service.method '<json>' --rcan {identity_path}"
+        )
+
+    print("")
+    print(f"{bold(green('✓ Enrollment credential created'))}")
+    print("")
+    print(f"  {bold('File:')}         {abs_path}")
+    print(f"  {bold('Format:')}       TOML (.aster-identity) with [node] + [[peers]] sections")
+    print("")
+    print(f"  {bold('Peer:')}         {name}")
+    print(f"  {bold('Role:')}         {role} ({cred_type})")
+    print(f"  {bold('Capabilities:')} {capabilities}")
+    print(f"  {bold('Endpoint ID:')}  {endpoint_id[:16]}...")
+    print(f"  {bold('Trust root:')}   {root_pubkey.hex()[:16]}...")
+    print(f"  {bold('Expires:')}      {expiry_dt.isoformat()}")
+    print("")
+    print(f"  {dim(intro)}")
+    print("")
+    print(f"  {next_step}")
+    print("")
+    print(f"  {yellow('⚠  Keep this file secret -- it is both an identity AND a credential.')}")
+    print(f"  {dim(f'Anyone with this file can act as ' + repr(name) + ' until ' + str(expiry_dt.date()) + '.')}")
+    print("")
     return 0
 
 
-def _generate_node_key() -> tuple[bytes, str]:
+def _generate_node_key(quiet: bool = False) -> tuple[bytes, str]:
     """Generate a fresh node keypair."""
     from aster.trust.signing import generate_root_keypair
     priv, _pub = generate_root_keypair()
     endpoint_id = _derive_endpoint_id(priv)
-    print(f"Generated new node key (endpoint_id={endpoint_id[:16]}...)")
+    if not quiet:
+        print(f"Generated new node key (endpoint_id={endpoint_id[:16]}...)")
     return priv, endpoint_id
 
 
@@ -234,6 +304,8 @@ def register_enroll_subparser(subparsers) -> None:
                         help="Comma-separated capabilities (e.g., ops.status,ops.logs)")
     node_p.add_argument("--out", "-o", default=".aster-identity",
                         help="Output path (default: .aster-identity)")
+    node_p.add_argument("--quiet", "-q", action="store_true",
+                        help="Suppress educational output. Prints one parseable line: PATH ENDPOINT_ID EXPIRES_ISO")
 
 
 def run_enroll_command(args) -> int:
