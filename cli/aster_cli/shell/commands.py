@@ -458,6 +458,14 @@ class DirectInvokeCommand(ShellCommand):
             ctx.display.error("direct invocation requires being in a service directory")
             return
 
+        # Check if the method's schema is CLI-compatible when using key=value
+        m_node = node.child(method_name)
+        if m_node and call_args:
+            fields = m_node.metadata.get("fields", [])
+            hint = _check_cli_compatible(fields)
+            if hint:
+                ctx.display.warning(hint)
+
         payload = _parse_call_args(call_args)
 
         from aster_cli.shell.invoker import invoke_method
@@ -1384,13 +1392,28 @@ def _complete_path(ctx: CommandContext, partial: str, dirs_only: bool = False) -
     return results
 
 
+def _set_nested(d: dict[str, Any], dotted_key: str, value: Any) -> None:
+    """Set a value in a nested dict using dot syntax.
+
+    ``_set_nested(d, "a.b.c", 1)`` produces ``d["a"]["b"]["c"] = 1``.
+    """
+    parts = dotted_key.split(".")
+    for part in parts[:-1]:
+        if part not in d or not isinstance(d[part], dict):
+            d[part] = {}
+        d = d[part]
+    d[parts[-1]] = value
+
+
 def _parse_call_args(args: list[str]) -> dict[str, Any]:
     """Parse call arguments from shell tokens.
 
     Supports:
-      - key=value pairs: name="World" count=5
-      - Raw JSON string: '{"name": "World"}'
-      - Positional value for single-arg methods: "World"
+      - key=value pairs: ``name="World" count=5``
+      - Dot syntax for nested objects: ``config.timeout=30`` produces
+        ``{"config": {"timeout": 30}}``
+      - Raw JSON string: ``'{"name": "World"}'``
+      - Positional value for single-arg methods: ``"World"``
     """
     if not args:
         return {}
@@ -1403,43 +1426,70 @@ def _parse_call_args(args: list[str]) -> dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-    # Try as key=value pairs
+    # Try as key=value pairs (with dot syntax for nesting)
     result: dict[str, Any] = {}
     positional: list[str] = []
 
     for arg in args:
         if "=" in arg:
             key, value = arg.split("=", 1)
-            # Strip quotes
             value = value.strip("'\"")
-            # Try to parse as JSON value
             try:
-                result[key] = json.loads(value)
+                parsed = json.loads(value)
             except (json.JSONDecodeError, ValueError):
-                result[key] = value
+                parsed = value
+            _set_nested(result, key, parsed)
         else:
             positional.append(arg.strip("'\""))
 
-    # If we have both key=value pairs and leftover positional args,
-    # the positional args are likely unquoted values that shlex split.
-    # Merge them into the last key's value.
+    # Leftover positional args after key=value pairs: merge into last key
     if positional and result:
         last_key = list(result.keys())[-1]
         current = str(result[last_key])
         result[last_key] = current + " " + " ".join(positional)
 
-    # If only positional args, store under numeric keys
+    # Only positional args
     if positional and not result:
         if len(positional) == 1:
             try:
                 return {"_positional": json.loads(positional[0])}
             except (json.JSONDecodeError, ValueError):
                 return {"_positional": positional[0]}
-        # Could be unquoted key=value that was split, or just loose args
         for i, v in enumerate(positional):
             result[f"_arg{i}"] = v
 
     return result
+
+
+def _check_cli_compatible(fields: list[dict[str, Any]]) -> str | None:
+    """Check if a method's request schema can be built via CLI key=value syntax.
+
+    Returns None if compatible, or a hint message for unsupported schemas.
+    """
+    for f in fields:
+        kind = f.get("kind", "")
+        name = f.get("name", "?")
+
+        if kind == "list":
+            item_kind = f.get("item_kind", "string")
+            if item_kind == "ref":
+                item_ref = f.get("item_ref", "object")
+                return (
+                    f"field '{name}' is list<{item_ref}> which can't be "
+                    f"built with key=value syntax.\n"
+                    f"  Use JSON: ./method '{{\"{ name}\": [...]}}'"
+                )
+        elif kind == "map":
+            value_kind = f.get("value_kind", "string")
+            if value_kind == "ref":
+                return (
+                    f"field '{name}' is map<{f.get('key_kind', 'string')}, "
+                    f"{f.get('value_ref', 'object')}> which can't be "
+                    f"built with key=value syntax.\n"
+                    f"  Use JSON: ./method '{{\"{ name}\": {{...}}}}'"
+                )
+
+    return None
 
 
 def _method_signature(metadata: dict[str, Any]) -> str:
