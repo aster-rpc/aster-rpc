@@ -1,6 +1,6 @@
 # Day 0 Testing Setup (TypeScript)
 
-**Date:** 2026-04-10
+**Date:** 2026-04-11
 
 ## Goal
 
@@ -23,7 +23,11 @@ This produces:
 - `bindings/python/target/wheels/aster_rpc-*.whl` (the framework)
 - `cli/` (the CLI package)
 
-### 1b. Build the TS native addon
+### 1b. Build the TS native addon (required, not optional)
+
+The `.node` binary is no longer tracked in git, so a fresh checkout has
+no native addon at all. This step must run before any TS code can
+import `@aster-rpc/transport`.
 
 ```bash
 
@@ -32,10 +36,12 @@ npx napi build --release --platform
 
 ```
 
-This produces a platform-specific `.node` file (e.g.,
-`aster-transport.darwin-arm64.node`).
+This produces `aster-transport.<platform>.node` next to the hand-written
+`index.js` loader and `index.d.ts` that together form the
+`@aster-rpc/transport` package. The loader picks the matching binary at
+`require()` time via a `process.platform`/`process.arch` lookup table.
 
-### 1c. Build the TS packages
+### 1c. Build the TS packages (required)
 
 ```bash
 
@@ -44,6 +50,10 @@ bun install --ignore-scripts
 npx tsc -p packages/aster/tsconfig.json
 
 ```
+
+> The `@aster-rpc/aster` package's `main` now points at `./dist/index.js`
+> (not `./src/index.ts`), so the `tsc` step is load-bearing — without it,
+> the import test in 1e fails to resolve `@aster-rpc/aster`.
 
 ### 1d. Create the isolated test environment
 
@@ -59,17 +69,29 @@ cp /Users/emrul/dev/emrul/iroh-python/examples/mission-control/GUIDE_TypeScript.
 cp /Users/emrul/dev/emrul/iroh-python/docs/_internal/day0/testing-instructions-typescript.md $DAY0_HOME/testing-instructions.md
 cd $DAY0_HOME
 
-# Set up TS project with symlinked packages (no bun install needed)
+# Symlink the published @aster-rpc/* packages straight from the monorepo.
+# These point at the real package roots (no longer hacks around an internal
+# layout): @aster-rpc/aster lives at packages/aster, and @aster-rpc/transport
+# IS the native/ directory (its package.json + index.js loader + .node binary
+# from step 1b). No `bun install` needed in $DAY0_HOME because step 1c
+# already populated the workspace tree under bindings/typescript.
 echo '{"name":"day0-ts-test","type":"module"}' > package.json
 mkdir -p node_modules/@aster-rpc
 ln -sf /Users/emrul/dev/emrul/iroh-python/bindings/typescript/packages/aster node_modules/@aster-rpc/aster
 ln -sf /Users/emrul/dev/emrul/iroh-python/bindings/typescript/native node_modules/@aster-rpc/transport
 
-# Set up Python venv for CLI tools (aster shell, aster call, etc.)
+# Set up Python venv for CLI tools (aster shell, aster call, etc.).
+#
+# IMPORTANT: install the wheel and the cli in a SINGLE uv command. The
+# cli depends on `aster-rpc` and uv will happily resolve a stale 0.0.0
+# from its cache if the wheel isn't visible in the same resolution pass,
+# silently clobbering the freshly-installed wheel. --reinstall makes
+# re-runs in the same temp env idempotent.
 uv venv $DAY0_HOME/pyvenv --python 3.13
 source $DAY0_HOME/pyvenv/bin/activate
-uv pip install /Users/emrul/dev/emrul/iroh-python/bindings/python/target/wheels/aster_rpc-*.whl
-uv pip install /Users/emrul/dev/emrul/iroh-python/cli/
+uv pip install --reinstall \
+  /Users/emrul/dev/emrul/iroh-python/bindings/python/target/wheels/aster_rpc-*.whl \
+  /Users/emrul/dev/emrul/iroh-python/cli/
 
 # Verify clean state
 echo "Home: $HOME"
