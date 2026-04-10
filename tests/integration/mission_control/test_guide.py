@@ -459,7 +459,10 @@ async def test_ch6_gen_client(address: str, work_dir: str) -> None:
         await client.connect()
         stub = await MissionControlClient.from_connection(client)
         r = await stub.getStatus(StatusRequest(agent_id="gen-test"))
-        if getattr(r, "agent_id", None) == "gen-test" and getattr(r, "status", None) == "running":
+        # Response may be a dataclass (Fory) or a dict (JSON proxy codec).
+        agent_id = getattr(r, "agent_id", None) or (r.get("agent_id") if isinstance(r, dict) else None)
+        status = getattr(r, "status", None) or (r.get("status") if isinstance(r, dict) else None)
+        if agent_id == "gen-test" and status == "running":
             ok("Ch6 generated client makes real call")
         else:
             fail("Ch6 generated call", f"unexpected response: {r}")

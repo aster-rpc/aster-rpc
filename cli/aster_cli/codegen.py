@@ -391,7 +391,12 @@ def _gen_service_client(
     lines.append(f"        if not rpc_addr:")
     lines.append(f'            raise RuntimeError("{svc_name} has no rpc channel")')
     lines.append(f"        conn = await aster_client._rpc_conn_for(rpc_addr)")
-    lines.append(f"        codec = ForyCodec(types=cls._wire_types)")
+    lines.append(f"        modes = list(getattr(summary, 'serialization_modes', None) or [])")
+    lines.append(f"        if modes and 'xlang' not in modes and 'json' in modes:")
+    lines.append(f"            from aster.json_codec import JsonProxyCodec")
+    lines.append(f"            codec = JsonProxyCodec()")
+    lines.append(f"        else:")
+    lines.append(f"            codec = ForyCodec(types=cls._wire_types)")
     lines.append(f"        transport = IrohTransport(conn, codec=codec)")
 
     # Build methods dict from the class-level MethodInfo objects
