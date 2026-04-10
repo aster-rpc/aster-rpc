@@ -29,11 +29,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import inspect
 import logging
 import os
 import time
 import warnings
+
+# Hot-path aliases for the proxy client
+_dataclasses_asdict = dataclasses.asdict
+_dataclasses_is_dataclass = dataclasses.is_dataclass
+
+
+def _is_dataclass_instance(obj: Any) -> bool:
+    """Fast check: True if obj is a dataclass instance (not the class itself)."""
+    return _dataclasses_is_dataclass(obj) and not isinstance(obj, type)
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -1898,8 +1908,9 @@ class ProxyClient:
     def __init__(self, service_name: str, aster_client: AsterClient) -> None:
         self._service_name = service_name
         self._client = aster_client
-        self._transport = None
-        self._codec = None
+        self._transport: Any = None
+        self._codec: Any = None
+        self._method_cache: dict[str, "_ProxyMethod"] = {}
 
     async def _ensure_transport(self) -> None:
         if self._transport is not None:
@@ -1932,7 +1943,16 @@ class ProxyClient:
     def __getattr__(self, method_name: str) -> "_ProxyMethod":
         if method_name.startswith("_"):
             raise AttributeError(method_name)
-        return _ProxyMethod(self, method_name)
+        # Cache _ProxyMethod instances per method name to avoid per-call
+        # allocation in tight loops. Using object.__getattribute__ to avoid
+        # recursing into __getattr__.
+        cache = object.__getattribute__(self, "_method_cache")
+        cached = cache.get(method_name)
+        if cached is not None:
+            return cached
+        m = _ProxyMethod(self, method_name)
+        cache[method_name] = m
+        return m
 
 
 class _ProxyMethod:
@@ -1949,22 +1969,32 @@ class _ProxyMethod:
         - Pass a dict or kwargs -> unary RPC
         - Pass an async iterator/generator -> client streaming
         """
-        await self._proxy._ensure_transport()
-        import dataclasses
-        import collections.abc
+        proxy = self._proxy
+        if proxy._transport is None:
+            await proxy._ensure_transport()
 
-        # Detect client streaming: payload is an async iterator
-        if isinstance(payload, collections.abc.AsyncIterator) or (
-            hasattr(payload, "__aiter__") and not isinstance(payload, (dict, str, bytes))
-        ):
-            result = await self._proxy._transport.client_stream(
-                self._proxy._service_name,
+        # Fast path: dict payload, no kwargs -> unary
+        if payload is not None and payload.__class__ is dict and not kwargs:
+            result = await proxy._transport.unary(
+                proxy._service_name,
                 self._method_name,
                 payload,
             )
-            if dataclasses.is_dataclass(result) and not isinstance(result, type):
-                return dataclasses.asdict(result)
+            if _is_dataclass_instance(result):
+                return _dataclasses_asdict(result)
             return result
+
+        # Detect client streaming: payload is an async iterator
+        if payload is not None and not isinstance(payload, (dict, str, bytes)):
+            if hasattr(payload, "__aiter__"):
+                result = await proxy._transport.client_stream(
+                    proxy._service_name,
+                    self._method_name,
+                    payload,
+                )
+                if _is_dataclass_instance(result):
+                    return _dataclasses_asdict(result)
+                return result
 
         # Build payload from dict or kwargs
         if payload is None:
@@ -1972,15 +2002,14 @@ class _ProxyMethod:
         elif isinstance(payload, dict) and kwargs:
             payload = {**payload, **kwargs}
 
-        result = await self._proxy._transport.unary(
-            self._proxy._service_name,
+        result = await proxy._transport.unary(
+            proxy._service_name,
             self._method_name,
             payload if isinstance(payload, dict) else (payload or {}),
         )
 
-        # Convert dataclass result to dict for proxy UX
-        if dataclasses.is_dataclass(result) and not isinstance(result, type):
-            return dataclasses.asdict(result)
+        if _is_dataclass_instance(result):
+            return _dataclasses_asdict(result)
         return result
 
     async def stream(self, payload: dict | None = None, **kwargs: Any) -> Any:

@@ -60,6 +60,7 @@ async def main():
     print(f"Connected to {address[:30]}...")
     print(f"Client memory at start: {mem_start:.1f} MB")
     print(f"{'─' * 72}")
+    print("  ── Dynamic proxy client ────────────────────────────────────")
 
     # ── Warmup ────────────────────────────────────────────────────────
     for _ in range(20):
@@ -119,6 +120,60 @@ async def main():
         t0 = time.perf_counter()
         tasks = [
             mc.getStatus({"agent_id": f"concurrent-{i}"})
+            for i in range(concurrency)
+        ]
+        await asyncio.gather(*tasks)
+        elapsed = time.perf_counter() - t0
+        rps = concurrency / elapsed
+        print(f"  Concurrent ({concurrency:>3})      {rps:>8,.0f} req/s   {elapsed*1000:.1f}ms total")
+
+    # ── Typed client ──────────────────────────────────────────────────
+    print("  ── Typed client (generated from contract) ──────────────────")
+    from examples.python.mission_control.services import MissionControl
+    from examples.python.mission_control.types import StatusRequest, LogEntry
+
+    typed = await client.client(MissionControl)
+
+    # Warmup
+    for _ in range(20):
+        await typed.getStatus(StatusRequest(agent_id="warmup"))
+
+    # Unary getStatus
+    n_unary = 1000
+    lats = []
+    t0 = time.perf_counter()
+    for i in range(n_unary):
+        t_call = time.perf_counter()
+        await typed.getStatus(StatusRequest(agent_id=f"bench-{i}"))
+        lats.append((time.perf_counter() - t_call) * 1000)
+    elapsed = time.perf_counter() - t0
+    rps = n_unary / elapsed
+    p50, p90, p99 = percentiles(lats)
+    print(f"  Unary (getStatus)    {rps:>8,.0f} req/s   {fmt_lat(p50, p90, p99)}")
+
+    # Unary submitLog
+    n_log = 1000
+    lats = []
+    t0 = time.perf_counter()
+    for i in range(n_log):
+        t_call = time.perf_counter()
+        await typed.submitLog(LogEntry(
+            timestamp=time.time(),
+            level="info",
+            message=f"bench log {i}",
+            agent_id="bench",
+        ))
+        lats.append((time.perf_counter() - t_call) * 1000)
+    elapsed = time.perf_counter() - t0
+    rps = n_log / elapsed
+    p50, p90, p99 = percentiles(lats)
+    print(f"  Unary (submitLog)    {rps:>8,.0f} req/s   {fmt_lat(p50, p90, p99)}")
+
+    # Concurrent
+    for concurrency in [10, 50, 100]:
+        t0 = time.perf_counter()
+        tasks = [
+            typed.getStatus(StatusRequest(agent_id=f"concurrent-{i}"))
             for i in range(concurrency)
         ]
         await asyncio.gather(*tasks)
