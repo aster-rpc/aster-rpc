@@ -104,8 +104,12 @@ export class AsterServer {
       host: this.config.healthHost,
     });
     this._peerStore = new PeerAttributeStore();
-    this._hook = new MeshEndpointHook(false, this._peerStore);
     this._allowAllConsumers = opts.allowAllConsumers ?? true;
+    // In dev mode the hook must allow unenrolled peers, otherwise post-admission
+    // RPC connections would be denied (they reach Gate 0 before the peer-store
+    // entry from admission is checked, and the peer wouldn't be there for
+    // ephemeral consumers).
+    this._hook = new MeshEndpointHook(this._allowAllConsumers, this._peerStore);
     this._userInterceptors = opts.interceptors ?? [];
 
     for (const svc of opts.services) {
