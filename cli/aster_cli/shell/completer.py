@@ -136,12 +136,14 @@ class ShellCompleter(Completer):
                 continue
             completion = f"{name}="
             if completion.lower().startswith(partial.lower()):
-                ftype = f.get("type", "")
+                ftype = f.get("kind", "") or f.get("type", "")
+                ref = f.get("ref_name", "") or f.get("item_ref", "")
+                display_type = f"{ftype}<{ref}>" if ref else ftype
                 yield Completion(
                     completion,
                     start_position=-len(partial),
                     display=completion,
-                    display_meta=ftype,
+                    display_meta=display_type,
                 )
 
 

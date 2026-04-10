@@ -99,25 +99,21 @@ def resolve_path(root: VfsNode, cwd: str, target: str) -> tuple[VfsNode | None, 
     Returns:
         (node, resolved_path) or (None, target) if not found.
     """
-    # Build absolute path
+    # Build absolute path, then normalize . and .. segments
     if target.startswith("/"):
-        parts = [p for p in target.split("/") if p]
-    elif target == "..":
-        parts = [p for p in cwd.split("/") if p]
-        if parts:
-            parts.pop()
-    elif target.startswith("../"):
-        base = [p for p in cwd.split("/") if p]
-        if base:
-            base.pop()
-        rest = [p for p in target[3:].split("/") if p]
-        parts = base + rest
-    elif target == ".":
-        parts = [p for p in cwd.split("/") if p]
+        raw = [p for p in target.split("/") if p]
     else:
-        base = [p for p in cwd.split("/") if p]
-        extra = [p for p in target.split("/") if p]
-        parts = base + extra
+        raw = [p for p in cwd.split("/") if p] + [p for p in target.split("/") if p]
+
+    parts: list[str] = []
+    for seg in raw:
+        if seg == ".":
+            continue
+        elif seg == "..":
+            if parts:
+                parts.pop()
+        else:
+            parts.append(seg)
 
     # Walk the tree
     node = root
