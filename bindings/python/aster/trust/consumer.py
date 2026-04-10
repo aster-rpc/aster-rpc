@@ -286,9 +286,9 @@ async def handle_consumer_admission_rpc(
     if hook is not None:
         hook.add_peer(peer_node_id)
     _adm.record_consumer_admit()
-    logger.info("consumer admission: admitted %s", peer_node_id)
+    logger.info("consumer admission: admitted %s (expires_at=%d)", peer_node_id, cred.expires_at)
 
-    return ConsumerAdmissionResponse(
+    resp = ConsumerAdmissionResponse(
         admitted=True,
         attributes=result.attributes or {},
         services=list(services or []),
@@ -296,6 +296,8 @@ async def handle_consumer_admission_rpc(
         root_pubkey=root_pubkey.hex(),
         gossip_topic=_topic_for_peer,
     )
+    resp._credential_expires_at = cred.expires_at
+    return resp
 
 
 # ── Connection handler ───────────────────────────────────────────────────────
@@ -344,6 +346,7 @@ async def handle_consumer_admission_connection(
                 endpoint_id=peer_node_id,
                 handle=response.attributes.get("aster.name", ""),
                 attributes=response.attributes,
+                expires_at=getattr(response, "_credential_expires_at", 0.0),
                 admission_path="consumer_admission",
             ))
 
