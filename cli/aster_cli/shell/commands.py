@@ -7,6 +7,7 @@ as ``aster <noun> <verb>`` from the command line.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -23,8 +24,18 @@ from aster_cli.shell.plugin import (
     Argument,
     CommandContext,
     ShellCommand,
+    get_commands_for_path,
     register,
 )
+import argparse
+import re
+import shlex
+import time
+
+from rich.progress import Progress
+
+from aster_cli.shell.hooks import get_hook_registry
+from aster_cli.shell.invoker import invoke_method
 from aster_cli.shell.vfs import (
     NodeKind,
     VfsNode,
@@ -367,8 +378,6 @@ class SaveCommand(ShellCommand):
             out_path = args[1]
 
         try:
-            from rich.progress import Progress
-
             with Progress(console=ctx.display.console) as progress:
                 task = progress.add_task(f"Downloading {blob_hash[:12]}…", total=None)
                 content = await ctx.connection.read_blob(blob_hash)
@@ -422,8 +431,6 @@ class InvokeCommand(ShellCommand):
         # Parse arguments
         payload = _parse_call_args(call_args)
 
-        # Delegate to invoker
-        from aster_cli.shell.invoker import invoke_method
         await invoke_method(ctx, service_name, method_name, payload)
 
     def get_completions(self, ctx: CommandContext, partial: str) -> list[str]:
@@ -467,8 +474,6 @@ class DirectInvokeCommand(ShellCommand):
                 ctx.display.warning(hint)
 
         payload = _parse_call_args(call_args)
-
-        from aster_cli.shell.invoker import invoke_method
         await invoke_method(ctx, node.name, method_name, payload)
 
 
@@ -492,7 +497,6 @@ class HelpCommand(ShellCommand):
     contexts = []
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        from aster_cli.shell.plugin import get_commands_for_path
 
         commands = get_commands_for_path(ctx.vfs_cwd)
         ctx.display.print("[bold]Available commands:[/bold]")
@@ -538,7 +542,7 @@ class JoinShellCommand(ShellCommand):
     contexts = []
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         parsed = argparse.Namespace(
             command="join",
@@ -560,7 +564,7 @@ class VerifyShellCommand(ShellCommand):
     contexts = []
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         parsed = argparse.Namespace(
             command="verify",
@@ -581,7 +585,7 @@ class WhoamiShellCommand(ShellCommand):
     contexts = []
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         cmd_status(argparse.Namespace(command="whoami", raw_json=False, local_only=False, aster=getattr(ctx.connection, "_peer_addr", None), root_key=None))
 
@@ -593,7 +597,7 @@ class StatusShellCommand(ShellCommand):
     contexts = []
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         cmd_status(argparse.Namespace(command="status", raw_json=False, local_only=False, aster=getattr(ctx.connection, "_peer_addr", None), root_key=None))
 
@@ -605,7 +609,7 @@ class PublishShellCommand(ShellCommand):
     contexts = ["/services", "/services/*", "/aster/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
         target = args[0] if args else (node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None)
@@ -646,7 +650,7 @@ class UnpublishShellCommand(ShellCommand):
     contexts = ["/services", "/services/*", "/aster/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
         service = args[0] if args else (node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None)
@@ -672,7 +676,7 @@ class DiscoverShellCommand(ShellCommand):
     contexts = []
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         cmd_discover(
             argparse.Namespace(
@@ -693,7 +697,7 @@ class AccessListShellCommand(ShellCommand):
     contexts = ["/services/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
         service = args[0] if args else (node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None)
@@ -718,7 +722,7 @@ class GrantShellCommand(ShellCommand):
     contexts = ["/services/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
         service = node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None
@@ -753,7 +757,7 @@ class RevokeShellCommand(ShellCommand):
     contexts = ["/services/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
         service = node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None
@@ -785,7 +789,7 @@ class VisibilityShellCommand(ShellCommand):
     contexts = ["/services/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
         service = node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None
@@ -817,7 +821,7 @@ class UpdateServiceShellCommand(ShellCommand):
     contexts = ["/services/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
         service = node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None
@@ -865,7 +869,7 @@ class DelegationShellCommand(ShellCommand):
     contexts = ["/services/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
         service = node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None
@@ -906,7 +910,7 @@ class PublicShellCommand(ShellCommand):
     contexts = ["/services/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
         service = args[0] if args else (node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None)
@@ -931,7 +935,7 @@ class PrivateShellCommand(ShellCommand):
     contexts = ["/services/*", "/aster/*/*"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import argparse
+
 
         node, _ = resolve_path(ctx.vfs_root, ctx.vfs_cwd, ".")
         service = args[0] if args else (node.metadata.get("name") if node and node.kind == NodeKind.SERVICE else None)
@@ -1011,7 +1015,6 @@ class GenerateClientCommand(ShellCommand):
         # Namespace: --package flag, peer name, or endpoint_id prefix
         namespace = package or ctx.peer_name or ctx.connection.get_peer_display()
         # Sanitize: only keep alphanumeric + underscores
-        import re
         namespace = re.sub(r"[^a-zA-Z0-9_]", "_", namespace).strip("_") or "aster_client"
         source = f"{namespace}/{next(iter(manifests))}" if len(manifests) == 1 else namespace
 
@@ -1059,7 +1062,6 @@ class SessionCommand(ShellCommand):
                 return
 
         # Fire session hooks
-        from aster_cli.shell.hooks import get_hook_registry
         hooks = get_hook_registry()
         for hook in hooks.session_hooks:
             await hook.on_session_start(service_name, ctx)
@@ -1096,7 +1098,6 @@ class SessionCommand(ShellCommand):
                     break
 
                 # Parse and execute within the service context
-                import shlex
                 try:
                     parts = shlex.split(text)
                 except ValueError:
@@ -1111,7 +1112,6 @@ class SessionCommand(ShellCommand):
                     svc = target_node.child(service_name)
                     if svc and svc.child(method_name):
                         payload = _parse_call_args(call_args)
-                        from aster_cli.shell.invoker import invoke_method
                         await invoke_method(ctx, service_name, method_name, payload)
                         continue
 
@@ -1173,8 +1173,8 @@ class TailCommand(ShellCommand):
     contexts = ["/gossip"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import asyncio
-        import time
+
+
 
         ctx.display.info("Subscribing to producer mesh gossip topic…")
 
@@ -1240,8 +1240,8 @@ class WatchCommand(ShellCommand):
     contexts = ["/docs"]
 
     async def execute(self, args: list[str], ctx: CommandContext) -> None:
-        import asyncio
-        import time
+
+
 
         if not hasattr(ctx.connection, '_registry_event_rx') or not ctx.connection._registry_event_rx:
             ctx.display.error("no registry doc subscription available")
