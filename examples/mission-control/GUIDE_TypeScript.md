@@ -10,9 +10,9 @@
 ```typescript
 @Service({ name: "MissionControl", version: 1 })
 class MissionControl {
-    @Rpc()
+    @Rpc({ request: StatusRequest, response: StatusResponse })
     async getStatus(req: StatusRequest): Promise<StatusResponse> {
-        return new StatusResponse({ agent_id: req.agent_id, status: "running" });
+        return new StatusResponse({ agentId: req.agentId, status: "running" });
     }
 }
 ```
@@ -83,26 +83,26 @@ import { AsterServer, Service, Rpc, WireType } from '@aster-rpc/aster';
 
 @WireType("mission/StatusRequest")
 class StatusRequest {
-    agent_id: string = "";
+    agentId: string = "";
     constructor(init?: Partial<StatusRequest>) { if (init) Object.assign(this, init); }
 }
 
 @WireType("mission/StatusResponse")
 class StatusResponse {
-    agent_id: string = "";
+    agentId: string = "";
     status: string = "idle";
-    uptime_secs: number = 0;
+    uptimeSecs: number = 0;
     constructor(init?: Partial<StatusResponse>) { if (init) Object.assign(this, init); }
 }
 
 @Service({ name: "MissionControl", version: 1 })
 class MissionControl {
-    @Rpc()
+    @Rpc({ request: StatusRequest, response: StatusResponse })
     async getStatus(req: StatusRequest): Promise<StatusResponse> {
         return new StatusResponse({
-            agent_id: req.agent_id,
+            agentId: req.agentId,
             status: "running",
-            uptime_secs: 3600,
+            uptimeSecs: 3600,
         });
     }
 }
@@ -125,13 +125,13 @@ bun run control.ts
 # Terminal 2: connect and inspect
 aster shell aster1Qm...
 > cd services/MissionControl
-> ./getStatus agent_id="edge-node-7"
+> ./getStatus agentId="edge-node-7"
 ```
 
 Or skip the shell entirely -- call it straight from the command line:
 
 ```bash
-aster call aster1Qm... MissionControl.getStatus '{"agent_id": "edge-node-7"}'
+aster call aster1Qm... MissionControl.getStatus '{"agentId": "edge-node-7"}'
 ```
 
 > **`aster shell` vs `aster call`:** Use `aster shell` for interactive
@@ -151,6 +151,15 @@ aster call aster1Qm... MissionControl.getStatus '{"agent_id": "edge-node-7"}'
 - `aster call` invoked it non-interactively — Aster isn't just a library,
   it's a platform with a first-class CLI
 
+> **Why the `{ request: ..., response: ... }` on `@Rpc`?** TypeScript erases
+> generic and parameter types at runtime — by the time your service starts,
+> there's no way for Aster to inspect `getStatus(req: StatusRequest)` and
+> discover that `StatusRequest` is the wire type. Passing the constructors
+> explicitly is what lets the contract publisher know which `@WireType`
+> classes to publish, and what lets `aster contract gen-client` produce
+> typed clients in any language. **Forget this and the published manifest
+> has empty fields, breaking codegen for cross-language consumers.**
+
 ---
 
 ## Chapter 2: Live Log Streaming (5 min)
@@ -166,7 +175,7 @@ class LogEntry {
     timestamp: number = 0.0;
     level: string = "info";
     message: string = "";
-    agent_id: string = "";
+    agentId: string = "";
     constructor(init?: Partial<LogEntry>) { if (init) Object.assign(this, init); }
 }
 
@@ -178,7 +187,7 @@ class SubmitLogResult {
 
 @WireType("mission/TailRequest")
 class TailRequest {
-    agent_id: string = "";
+    agentId: string = "";
     level: string = "info";    // minimum level filter
     constructor(init?: Partial<TailRequest>) { if (init) Object.assign(this, init); }
 }
@@ -190,7 +199,7 @@ class MissionControl {
 
     // ... getStatus from Chapter 1 ...
 
-    @Rpc()
+    @Rpc({ request: LogEntry, response: SubmitLogResult })
     async submitLog(entry: LogEntry): Promise<SubmitLogResult> {
         /** Agents call this to push log entries. */
         if (this._logResolve) {
@@ -202,14 +211,14 @@ class MissionControl {
         return new SubmitLogResult();
     }
 
-    @ServerStream()
+    @ServerStream({ request: TailRequest, response: LogEntry })
     async *tailLogs(req: TailRequest): AsyncGenerator<LogEntry> {
         /** Stream log entries as they arrive. */
         while (true) {
             const entry = this._logBuffer.length > 0
                 ? this._logBuffer.shift()!
                 : await new Promise<LogEntry>(resolve => { this._logResolve = resolve; });
-            if (req.agent_id && entry.agent_id !== req.agent_id) continue;
+            if (req.agentId && entry.agentId !== req.agentId) continue;
             if (levelRank(entry.level) < levelRank(req.level)) continue;
             yield entry;
         }
@@ -219,7 +228,7 @@ class MissionControl {
 
 ```bash
 # In the shell:
-> ./tailLogs agent_id="edge-node-7" level="warn"
+> ./tailLogs agentId="edge-node-7" level="warn"
 #0 {"timestamp": 1712567890.1, "level": "warn", "message": "disk 92% full", ...}
 #1 {"timestamp": 1712567891.3, "level": "error", "message": "health check failed", ...}
 # Ctrl+C to stop
@@ -268,7 +277,7 @@ class IngestResult {
 class MissionControl {
     // ... previous methods ...
 
-    @ClientStream()
+    @ClientStream({ request: MetricPoint, response: IngestResult })
     async ingestMetrics(stream: AsyncIterable<MetricPoint>): Promise<IngestResult> {
         /** Receive a stream of metric points from an agent. */
         let accepted = 0;
@@ -353,15 +362,15 @@ const execAsync = promisify(exec);
 
 @WireType("mission/Heartbeat")
 class Heartbeat {
-    agent_id: string = "";
+    agentId: string = "";
     capabilities: string[] = [];   // ["gpu", "arm64", ...]
-    load_avg: number = 0.0;
+    loadAvg: number = 0.0;
     constructor(init?: Partial<Heartbeat>) { if (init) Object.assign(this, init); }
 }
 
 @WireType("mission/Assignment")
 class Assignment {
-    task_id: string = "";
+    taskId: string = "";
     command: string = "";
     constructor(init?: Partial<Assignment>) { if (init) Object.assign(this, init); }
 }
@@ -376,7 +385,7 @@ class Command {
 class CommandResult {
     stdout: string = "";
     stderr: string = "";
-    exit_code: number = -1;    // -1 means still running
+    exitCode: number = -1;    // -1 means still running
     constructor(init?: Partial<CommandResult>) { if (init) Object.assign(this, init); }
 }
 
@@ -384,32 +393,33 @@ class CommandResult {
 class AgentSession {
     /** Session-scoped: one instance per connected agent. */
     private _peer: string | null;
-    private _agent_id: string = "";
+    private _agentId: string = "";
     private _capabilities: string[] = [];
+
 
     constructor(peer?: string) {
         this._peer = peer ?? null;
     }
 
-    @Rpc()
+    @Rpc({ request: Heartbeat, response: Assignment })
     async register(hb: Heartbeat): Promise<Assignment> {
         /** Agent announces itself and gets an assignment. */
-        this._agent_id = hb.agent_id;
+        this._agentId = hb.agentId;
         this._capabilities = hb.capabilities;
         if (hb.capabilities.includes("gpu")) {
-            return new Assignment({ task_id: "train-42", command: "python train.py" });
+            return new Assignment({ taskId: "train-42", command: "python train.py" });
         }
-        return new Assignment({ task_id: "idle", command: "sleep 60" });
+        return new Assignment({ taskId: "idle", command: "sleep 60" });
     }
 
-    @Rpc()
+    @Rpc({ request: Heartbeat, response: Assignment })
     async heartbeat(hb: Heartbeat): Promise<Assignment> {
         /** Periodic check-in — update load, maybe get new work. */
         this._capabilities = hb.capabilities;
-        return new Assignment({ task_id: "continue", command: "" });
+        return new Assignment({ taskId: "continue", command: "" });
     }
 
-    @BidiStream()
+    @BidiStream({ request: Command, response: CommandResult })
     async *runCommand(commands: AsyncIterable<Command>): AsyncGenerator<CommandResult> {
         /** Execute commands on this agent — stream in, results stream back. */
         for await (const cmd of commands) {
@@ -418,13 +428,13 @@ class AgentSession {
                 yield new CommandResult({
                     stdout,
                     stderr,
-                    exit_code: 0,
+                    exitCode: 0,
                 });
             } catch (err: any) {
                 yield new CommandResult({
                     stdout: err.stdout ?? "",
                     stderr: err.stderr ?? err.message,
-                    exit_code: err.code ?? 1,
+                    exitCode: err.code ?? 1,
                 });
             }
         }
@@ -439,12 +449,12 @@ aster shell aster1Qm...
 > session AgentSession
 # prompt becomes "AgentSession~" — you're now in a dedicated session.
 # State persists across calls; the same instance handles every method.
-AgentSession~ register agent_id="edge-7" capabilities='["gpu"]'
-← {"agent_id": "edge-7", "task": "train-42"}
+AgentSession~ register agentId="edge-7" capabilities='["gpu"]'
+← {"agentId": "edge-7", "task": "train-42"}
 AgentSession~ runCommand command="df -h"
-← {"stdout": "Filesystem  Size  Used ...", "exit_code": 0}
+← {"stdout": "Filesystem  Size  Used ...", "exitCode": 0}
 AgentSession~ runCommand command="uptime"
-← {"stdout": " 14:32  up 3 days ...", "exit_code": 0}
+← {"stdout": " 14:32  up 3 days ...", "exitCode": 0}
 AgentSession~ end
 ```
 
@@ -460,7 +470,7 @@ AgentSession~ end
   agent gets its own identity, capabilities, and command channel
 - `runCommand` uses bidi streaming: commands flow in, results flow back,
   all on a single multiplexed QUIC stream
-- State like `this._agent_id` is private to that agent's session — no
+- State like `this._agentId` is private to that agent's session — no
   hand-rolled connection maps
 - When the agent disconnects, the session is cleaned up automatically
 
@@ -645,7 +655,7 @@ async function main() {
     const mc = client.proxy("MissionControl");
     const agent = client.proxy("AgentSession");
 
-    await mc.getStatus({ agent_id: "test" });     // OK — has ops.status
+    await mc.getStatus({ agentId: "test" });     // OK — has ops.status
     await mc.ingestMetrics(...);                   // OK — has ops.ingest
     // await agent.runCommand(...);                // AccessDenied — missing ops.admin
 
@@ -685,17 +695,16 @@ you want typed clients with IDE autocomplete and compile-time checking.
 ### Option A: Generate from a running service
 
 ```bash
-# Generate a Python client from the live control plane
-# (TypeScript codegen coming soon — use the proxy client for now)
-aster contract gen-client aster1Qm... --out ./clients --package mission_control --lang python
+# Generate a TypeScript client from the live control plane
+aster contract gen-client aster1Qm... --out ./clients --package mission_control --lang typescript
 
 # Output:
 # Generated 5 files
-#   ./clients/mission_control/types/mission_control_v1.ts
-#   ./clients/mission_control/types/agent_session_v1.ts
-#   ./clients/mission_control/services/mission_control_v1.ts
-#   ./clients/mission_control/services/agent_session_v1.ts
-#   ...
+#   ./clients/mission_control/types/mission-control-v1.ts
+#   ./clients/mission_control/types/agent-session-v1.ts
+#   ./clients/mission_control/services/mission-control-v1.ts
+#   ./clients/mission_control/services/agent-session-v1.ts
+#   ./clients/mission_control/index.ts
 ```
 
 ### Option B: Generate from an exported manifest
@@ -703,51 +712,74 @@ aster contract gen-client aster1Qm... --out ./clients --package mission_control 
 If the producer shared a `.aster.json` file (from `aster contract export`):
 
 ```bash
-aster contract gen-client ./MissionControl.aster.json --out ./clients --package mission_control --lang python
+aster contract gen-client ./MissionControl.aster.json --out ./clients --package mission_control --lang typescript
 ```
 
-Either way, you get typed client code. Today this generates Python; TypeScript
-codegen is coming soon. In the meantime, the **proxy client** gives you the
-same functionality without codegen:
+`--lang python` works the same way; pick the language that matches the
+consumer you're writing.
+
+### Using the generated client
 
 ```typescript
-// consumer.ts — proxy client, no codegen needed
+// consumer.ts — typed client with IDE autocomplete
 import { AsterClientWrapper } from '@aster-rpc/aster';
+import { MissionControlClient } from './clients/mission_control/services/mission-control-v1.js';
+import { StatusRequest } from './clients/mission_control/types/mission-control-v1.js';
+import { AgentSessionClient } from './clients/mission_control/services/agent-session-v1.js';
+import { Heartbeat } from './clients/mission_control/types/agent-session-v1.js';
 
 async function main() {
     const client = new AsterClientWrapper({ address: "aster1Qm..." });
     await client.connect();
 
-    const mc = client.proxy("MissionControl");
-    const resp = await mc.getStatus({ agent_id: "edge-node-7" });
-    console.log(`Status: ${(resp as any).status}, uptime: ${(resp as any).uptime_secs}s`);
+    // Shared service: every call gets a fresh stream over the same QUIC connection
+    const mc = await MissionControlClient.fromConnection(client);
+    const status = await mc.getStatus(new StatusRequest({ agentId: "edge-node-7" }));
+    console.log(`Status: ${status.status}, uptime: ${status.uptimeSecs}s`);
+
+    // Session-scoped service: one persistent bidi stream per fromConnection,
+    // server-side state survives across calls
+    const agent = await AgentSessionClient.fromConnection(client);
+    const assignment = await agent.register(new Heartbeat({
+        agentId: "edge-node-7",
+        capabilities: ["gpu"],
+    }));
+    console.log(`Assigned: ${assignment.taskId} -> ${assignment.command}`);
+
+    await client.close();
 }
 
 main();
 ```
 
-Or explore interactively first, then generate when you're ready:
+> **Two client kinds, one API.** The generator emits a different shim for
+> shared vs session-scoped services, but `fromConnection(client)` looks
+> identical from the call site. Shared services delegate to the wrapper's
+> shared RPC transport; session services route through `client.proxy()` to
+> reuse the existing session-protocol machinery, so per-agent state survives
+> across calls just like in the shell's `session AgentSession` subshell.
 
-```bash
-# Explore in the shell — no codegen needed
-aster shell aster1Qm...
-> cd services/MissionControl
-> ./getStatus agent_id="edge-node-7"
-{"agent_id": "edge-node-7", "status": "running", "uptime_secs": 3600}
+If you'd rather skip codegen entirely, the **proxy client** is still
+available — same wire format, no typed signatures:
 
-# Happy with the API? Generate a client:
-> generate-client --out ./clients --package mission_control --lang python
-Generated 5 files
+```typescript
+const mc = client.proxy("MissionControl");
+const resp = await mc.getStatus({ agentId: "edge-node-7" }) as any;
+console.log(`Status: ${resp.status}, uptime: ${resp.uptimeSecs}s`);
 ```
+
+Use the proxy for prototyping and one-off scripts; use the generated typed
+client for production code where IDE autocomplete and compile-time checking
+matter.
 
 **What just happened:**
 - `aster contract gen-client` pulled the contract from the running service
-  and generated typed clients — no `.proto` files, no shared repo
-  (Python codegen works today; TypeScript codegen is coming soon)
-- The generated client has `fromConnection()` which wires up the
-  transport, codec, and type registration automatically
-- Every generated class carries a `_contract_id` so the consumer can
-  detect when the producer has been updated
+  and generated typed clients in either TypeScript or Python — no `.proto`
+  files, no shared repo
+- The generated client's `fromConnection()` resolves the service on the
+  wrapper's admission summary and reuses the existing RPC transport
+- Every generated class carries a `contractId` so the consumer can detect
+  when the producer has been updated
 - The same command works from a `.aster.json` export file — the producer
   doesn't even need to be running
 
@@ -758,15 +790,16 @@ Generated 5 files
 **Goal:** Your teammate wants to send metrics from their Python
 application. They don't have your TypeScript source — just the ticket.
 
-Generate a Python client the same way:
+Generate a Python client the same way you generated the TypeScript one:
 
 ```bash
 # Generate Python types + client from the running service
 aster contract gen-client aster1Qm... --out ./generated --package mission_control --lang python
 ```
 
-> **Note:** Python client generation is coming soon. For now, the
-> proxy client works out of the box — no codegen needed:
+You can now `from generated.mission_control.services.mission_control_v1
+import MissionControlClient` and use the typed Python client just like the
+TS one. If you'd rather skip codegen, the proxy client works too:
 
 ```python
 from aster import AsterClient
@@ -777,8 +810,8 @@ async def main():
 
     # Proxy client — discovers methods from the contract
     mc = client.proxy("MissionControl")
-    status = await mc.getStatus({"agent_id": "py-worker-1"})
-    print(f"Status: {status['agent_id']} is {status['status']}")
+    status = await mc.getStatus({"agentId": "py-worker-1"})
+    print(f"Status: {status['agentId']} is {status['status']}")
 
     # Stream metrics from Python to the TypeScript control plane
     async def metrics():

@@ -571,14 +571,19 @@ def _call_command(args: argparse.Namespace) -> int:
 def _gen_client_command(args: argparse.Namespace) -> int:
     """Execute ``aster contract gen-client``."""
     import asyncio
-    from aster_cli.codegen import generate_python_clients, format_usage_snippet
+    from aster_cli.codegen import generate_python_clients
+    from aster_cli.codegen import format_usage_snippet as format_python_snippet
+    from aster_cli.codegen_typescript import (
+        generate_typescript_clients,
+        format_usage_snippet as format_typescript_snippet,
+    )
 
     source = args.source
     lang = args.lang
     out = args.out
 
-    if lang != "python":
-        print(f"Error: only 'python' is supported (got '{lang}')", file=sys.stderr)
+    if lang not in ("python", "typescript"):
+        print(f"Error: unsupported --lang '{lang}' (expected: python, typescript)", file=sys.stderr)
         return 1
 
     # Determine source type and load manifests
@@ -608,12 +613,21 @@ def _gen_client_command(args: argparse.Namespace) -> int:
     import re
     namespace = re.sub(r"[^a-zA-Z0-9_]", "_", namespace).strip("_") or "aster_client"
 
-    generated = generate_python_clients(manifests, out, namespace, source)
+    if lang == "typescript":
+        generated = generate_typescript_clients(manifests, out, namespace, source)
+        snippet = format_typescript_snippet(
+            out, namespace, manifests, source if source.startswith("aster1") else ""
+        )
+    else:
+        generated = generate_python_clients(manifests, out, namespace, source)
+        snippet = format_python_snippet(
+            out, namespace, manifests, source if source.startswith("aster1") else ""
+        )
 
     print(f"Generated {len(generated)} files")
     for f in generated:
         print(f"  {f}")
-    print(format_usage_snippet(out, namespace, manifests, source if source.startswith("aster1") else ""))
+    print(snippet)
 
     return 0
 
@@ -820,8 +834,9 @@ def main() -> None:
     gen_client_parser.add_argument(
         "--lang",
         default="python",
+        choices=["python", "typescript"],
         metavar="LANG",
-        help="Target language (default: python)",
+        help="Target language: python (default) | typescript (not yet implemented)",
     )
     gen_client_parser.add_argument(
         "--aster",
