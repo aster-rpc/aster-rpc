@@ -46,6 +46,8 @@ pub struct EndpointConfig {
     pub proxy_from_env: Option<bool>,
     /// Enable mDNS local network discovery (default: false).
     pub enable_local_discovery: Option<bool>,
+    /// Node data directory for persistent state; empty = no persistent state.
+    pub data_dir: Option<String>,
 }
 
 impl From<EndpointConfig> for CoreEndpointConfig {
@@ -65,6 +67,7 @@ impl From<EndpointConfig> for CoreEndpointConfig {
             portmapper_config: c.portmapper_config,
             proxy_url: c.proxy_url,
             proxy_from_env: c.proxy_from_env.unwrap_or(false),
+            data_dir: c.data_dir,
         }
     }
 }

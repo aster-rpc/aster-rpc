@@ -393,10 +393,17 @@ export class AsterServer {
   /**
    * Run the Gate 0 hook loop.
    *
-   * Pulls before_connect events from the native receiver and dispatches
-   * each one through MeshEndpointHook.shouldAllow(). The native binding
-   * uses an event-id + respond-by-id API; this method adapts it to the
-   * callback-shape that runHookLoop expects.
+   * Polls after_handshake events from the native receiver and dispatches
+   * each one through MeshEndpointHook.shouldAllow(). After-handshake fires
+   * for **all** connections (inbound and outbound) right after TLS, which
+   * is exactly when we want to enforce the admitted-set check.
+   *
+   * NOTE: We do NOT use before_connect — that fires only for *outgoing*
+   * connections in iroh, so it would miss incoming RPC connections to
+   * the server (which is what we need to gate).
+   *
+   * The native binding uses an event-id + respond-by-id API; this loop
+   * polls events directly and responds via respondAfterHandshake().
    */
   private async _runGate0(): Promise<void> {
     if (!this._node) return;
@@ -405,26 +412,30 @@ export class AsterServer {
       this.logger.warn('Gate 0: hooks enabled but no receiver available');
       return;
     }
+    this.logger.debug('Gate 0: hook loop started');
 
-    // Adapt the native (event_id, respond_connect) API to the callback
-    // shape MeshEndpointHook.runHookLoop expects.
-    const adaptedReceiver = {
-      recvBeforeConnect: async () => {
-        const event = await receiver.recvBeforeConnect();
-        if (event == null) return null;
-        return {
-          info: {
-            remoteEndpointId: event.info.remoteEndpointId,
-            alpn: new Uint8Array(event.info.alpn),
-          },
-          respond: async (decision: { allow: boolean }) => {
-            receiver.respondConnect(event.eventId, decision.allow);
-          },
-        };
-      },
-    };
-
-    await this._hook.runHookLoop(adaptedReceiver);
+    try {
+      while (true) {
+        const event = await receiver.recvAfterHandshake();
+        if (event == null) {
+          this.logger.debug('Gate 0: receiver closed');
+          return;
+        }
+        const alpnBytes = new Uint8Array(event.info.alpn);
+        const peerId = event.info.remoteEndpointId;
+        const allow = this._hook.shouldAllow(peerId, alpnBytes);
+        if (allow) {
+          receiver.respondHandshake(event.eventId, true, undefined, undefined);
+        } else {
+          this.logger.info(
+            `Gate 0 denied ${peerId.slice(0, 12)} on alpn=${new TextDecoder().decode(alpnBytes)}`,
+          );
+          receiver.respondHandshake(event.eventId, false, 403, 'not admitted');
+        }
+      }
+    } catch (e) {
+      this.logger.error('Gate 0 hook loop error', { error: String(e) });
+    }
   }
 
   /**
