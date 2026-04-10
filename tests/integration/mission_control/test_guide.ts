@@ -235,10 +235,13 @@ async function testCh5NoCredential(address: string): Promise<void> {
 async function testCh5EdgeCredential(address: string, edgeCred: string): Promise<void> {
   let client: AsterClientWrapper;
   try {
+    // The .cred file is a TOML .aster-identity containing both the node
+    // secret key and the consumer peer entry. Pass it as identity= and the
+    // client extracts the inline credential automatically.
     client = new AsterClientWrapper({
       address,
-      enrollmentCredentialFile: edgeCred,
-    } as any);
+      identity: edgeCred,
+    });
     await client.connect();
   } catch (e) {
     fail('Ch5 edge connect', String(e));
@@ -307,8 +310,8 @@ async function testCh5OpsCredential(address: string, opsCred: string): Promise<v
   try {
     client = new AsterClientWrapper({
       address,
-      enrollmentCredentialFile: opsCred,
-    } as any);
+      identity: opsCred,
+    });
     await client.connect();
   } catch (e) {
     fail('Ch5 ops connect', String(e));

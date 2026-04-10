@@ -33,6 +33,7 @@ import {
 } from './interceptors/base.js';
 import { withRequestContext, type AsterLogger, createLogger } from './logging.js';
 import { validateMetadata } from './limits.js';
+import type { PeerAttributeStore } from './peer-store.js';
 
 /** QUIC connection interface (matches NAPI IrohConnection). */
 interface ServerConnection {
@@ -63,6 +64,8 @@ export interface ServerOptions {
   codec?: Codec;
   interceptors?: Interceptor[];
   logger?: AsterLogger;
+  /** Per-peer admission attributes used to populate CallContext.attributes. */
+  peerStore?: PeerAttributeStore;
 }
 
 /**
@@ -82,6 +85,7 @@ export class RpcServer {
   private codec: Codec;
   private interceptors: Interceptor[];
   private logger: AsterLogger;
+  private peerStore?: PeerAttributeStore;
   private _serving = false;
   private _connections = new Set<ServerConnection>();
 
@@ -93,6 +97,7 @@ export class RpcServer {
     this.codec = opts.codec ?? new JsonCodec();
     this.interceptors = opts.interceptors ?? [];
     this.logger = opts.logger ?? createLogger();
+    this.peerStore = opts.peerStore;
   }
 
   /** Start accepting connections. Runs until close() is called. */
@@ -194,6 +199,16 @@ export class RpcServer {
       let peerId: string | undefined;
       try { peerId = conn.remoteNodeId(); } catch { /* ignore */ }
 
+      // Pull admission attributes from the peer store so authorization
+      // interceptors (CapabilityInterceptor) see the caller's roles.
+      let attributes: Record<string, string> | undefined;
+      if (peerId && this.peerStore) {
+        const m = this.peerStore.getAttributes(peerId);
+        if (m.size > 0) {
+          attributes = Object.fromEntries(m);
+        }
+      }
+
       const callCtx = buildCallContext({
         service: header.service,
         method: header.method,
@@ -203,6 +218,7 @@ export class RpcServer {
         pattern: methodInfo.pattern as any,
         idempotent: methodInfo.idempotent,
         callId: header.callId || undefined,
+        attributes,
       });
 
       // Dispatch by pattern

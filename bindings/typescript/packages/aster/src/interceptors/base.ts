@@ -90,6 +90,7 @@ export function buildCallContext(opts: {
   idempotent?: boolean;
   callId?: string;
   sessionId?: string;
+  attributes?: Record<string, string>;
 }): CallContext {
   return new CallContext({
     ...opts,

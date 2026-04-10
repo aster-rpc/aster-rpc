@@ -368,6 +368,53 @@ export function parseSimpleToml(text: string): Record<string, unknown> {
   return result;
 }
 
+function splitTopLevel(s: string, sep: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let inStr: string | null = null;
+  let buf = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]!;
+    if (inStr) {
+      if (ch === inStr) inStr = null;
+      buf += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inStr = ch;
+      buf += ch;
+      continue;
+    }
+    if (ch === '{' || ch === '[') depth++;
+    else if (ch === '}' || ch === ']') depth--;
+    if (ch === sep && depth === 0) {
+      out.push(buf);
+      buf = '';
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf.length > 0) out.push(buf);
+  return out;
+}
+
+function findTopLevelEquals(s: string): number {
+  let inStr: string | null = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]!;
+    if (inStr) {
+      if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inStr = ch;
+      continue;
+    }
+    if (ch === '=') return i;
+  }
+  return -1;
+}
+
 function parseTomlValue(raw: string): unknown {
   // Quoted string
   if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
@@ -384,9 +431,8 @@ function parseTomlValue(raw: string): unknown {
     const inner = raw.slice(1, -1).trim();
     if (!inner) return {};
     const obj: Record<string, unknown> = {};
-    // Split on commas not inside quotes
-    for (const pair of inner.split(',')) {
-      const eqIdx = pair.indexOf('=');
+    for (const pair of splitTopLevel(inner, ',')) {
+      const eqIdx = findTopLevelEquals(pair);
       if (eqIdx === -1) continue;
       const k = pair.slice(0, eqIdx).trim().replace(/^["']|["']$/g, '');
       const v = pair.slice(eqIdx + 1).trim();

@@ -16,7 +16,9 @@ import { HealthServer } from './health.js';
 import { DEFAULT_BACKOFF, type ExponentialBackoff } from './types.js';
 import { JsonCodec } from './codec.js';
 import { RpcServer } from './server.js';
-import { handleConsumerAdmissionConnection, type ConsumerAdmissionOpts, type ServiceSummary } from './trust/consumer.js';
+import { handleConsumerAdmissionConnection, performAdmission, type ConsumerAdmissionOpts, type ServiceSummary } from './trust/consumer.js';
+import type { ConsumerEnrollmentCredential } from './trust/credentials.js';
+import { loadIdentity, parseSimpleToml } from './config.js';
 import { handleDelegatedAdmissionConnection, type DelegatedAdmissionPolicy } from './trust/delegated.js';
 import { MeshEndpointHook } from './trust/hooks.js';
 import { PeerAttributeStore } from './peer-store.js';
@@ -81,7 +83,6 @@ export class AsterServer {
   private _serviceSummaries: ServiceSummary[] = [];
   private _registryNamespace = '';
   private _servePromise: Promise<void> | null = null;
-  private _gate0Promise: Promise<void> | null = null;
   private _admissionAbort: AbortController | null = null;
 
   constructor(opts: AsterServerOptions) {
@@ -189,6 +190,7 @@ export class AsterServer {
       codec: new JsonCodec(),
       interceptors,
       logger: this.logger,
+      peerStore: this._peerStore,
     });
 
     // Publish contracts to registry doc (non-fatal on failure)
@@ -376,7 +378,7 @@ export class AsterServer {
     // allow/deny decisions. Without this, the admitted-set is never
     // consulted and every connection passes the QUIC handshake.
     if (this._node.hasHooks?.()) {
-      this._gate0Promise = this._runGate0().catch(e => {
+      void this._runGate0().catch(e => {
         this.logger.error('gate0 hook loop failed', { error: String(e) });
       });
     }
@@ -556,6 +558,7 @@ export class AsterServer {
       services: this._serviceSummaries,
       registryNamespace: this._registryNamespace || undefined,
       allowUnenrolled: this._allowAllConsumers,
+      peerStore: this._peerStore,
       logger: this.logger,
     };
     const rootKeyHex = this._resolveRootPubkeyHex();
@@ -700,8 +703,72 @@ export interface AsterClientOptions {
   identity?: string;
   /** Peer name for identity file lookup. */
   peer?: string;
+  /** Path to a pre-signed enrollment credential file (.cred JSON or .aster-identity TOML). */
+  enrollmentCredentialFile?: string;
   /** Retry configuration for reconnection. */
   retryBackoff?: ExponentialBackoff;
+}
+
+/**
+ * Read the first consumer (or named) peer entry from a .aster-identity TOML file
+ * without the synthesised attributes that loadIdentity adds.
+ */
+function loadRawConsumerPeer(
+  filePath: string | undefined,
+  peerName: string | undefined,
+): Record<string, unknown> | null {
+  const { existsSync, readFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const path = filePath ?? join(process.cwd(), '.aster-identity');
+  if (!existsSync(path)) return null;
+  try {
+    const data = parseSimpleToml(readFileSync(path, 'utf-8'));
+    const peers = (data.peers ?? []) as Record<string, unknown>[];
+    if (peerName) {
+      return peers.find(p => p.name === peerName) ?? null;
+    }
+    return peers.find(p => p.role === 'consumer') ?? peers[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build a ConsumerEnrollmentCredential from a [[peers]] entry in .aster-identity.
+ * Mirrors Python's `_credential_from_peer_entry`.
+ */
+function credentialFromPeerEntry(peer: Record<string, unknown>): ConsumerEnrollmentCredential {
+  return {
+    credentialType: ((peer.type as string) ?? 'policy') as 'policy' | 'ott',
+    rootPubkey: peer.root_pubkey as string,
+    expiresAt: Number(peer.expires_at),
+    attributes: (peer.attributes ?? {}) as Record<string, string>,
+    endpointId: (peer.endpoint_id as string) || undefined,
+    nonce: (peer.nonce as string) || undefined,
+    signature: (peer.signature as string) ?? '',
+  };
+}
+
+/**
+ * Load a pre-signed ConsumerEnrollmentCredential from a JSON credential file
+ * (the `.cred` file produced by `aster enroll`).
+ */
+function loadEnrollmentCredential(filePath: string): ConsumerEnrollmentCredential {
+  const { readFileSync } = require('node:fs');
+  const { homedir } = require('node:os');
+  const expanded = filePath.startsWith('~')
+    ? filePath.replace(/^~/, homedir())
+    : filePath;
+  const d = JSON.parse(readFileSync(expanded, 'utf-8'));
+  return {
+    credentialType: (d.credential_type ?? d.type ?? 'policy') as 'policy' | 'ott',
+    rootPubkey: d.root_pubkey,
+    expiresAt: Number(d.expires_at),
+    attributes: d.attributes ?? {},
+    endpointId: d.endpoint_id || undefined,
+    nonce: d.nonce || undefined,
+    signature: d.signature ?? '',
+  };
 }
 
 /**
@@ -720,6 +787,9 @@ export class AsterClientWrapper {
   private _node: any = null;
   private _services: ServiceSummary[] = [];
   private _registryNamespace = '';
+  private _inlineCredential: ConsumerEnrollmentCredential | null = null;
+  private _enrollmentCredentialFile: string | undefined;
+  private _identitySecretKey: Uint8Array | null = null;
 
   constructor(opts: AsterClientOptions) {
     this.config = { ...configFromEnv(), ...opts.config } as AsterConfig;
@@ -728,6 +798,28 @@ export class AsterClientWrapper {
     }
     this._address = opts.address ?? opts.endpointAddr as string | undefined;
     this.backoff = opts.retryBackoff ?? DEFAULT_BACKOFF;
+
+    // Load identity file (.aster-identity) if present. The first consumer-role
+    // peer entry IS the credential — mirrors Python AsterClient behaviour.
+    // The node secret_key is also pulled out so the client's QUIC endpoint id
+    // matches the endpoint_id baked into the credential.
+    //
+    // We use loadIdentity for the secret key but parse the TOML raw for the
+    // peer entry — loadIdentity synthesizes `aster.name` into attributes,
+    // which would corrupt the signed-attribute set on the credential.
+    const identity = loadIdentity(this.config.identityFile, opts.peer, 'consumer');
+    if (identity) {
+      this._identitySecretKey = identity.secretKey;
+      if (!opts.enrollmentCredentialFile) {
+        const rawPeer = loadRawConsumerPeer(this.config.identityFile, opts.peer);
+        if (rawPeer) {
+          this._inlineCredential = credentialFromPeerEntry(rawPeer);
+        }
+      }
+    }
+    this._enrollmentCredentialFile =
+      opts.enrollmentCredentialFile ?? this.config.enrollmentCredentialFile;
+
     if (opts.transport) {
       this.transport = opts.transport;
       this._connected = true;
@@ -768,8 +860,17 @@ export class AsterClientWrapper {
       throw new Error('Aster native addon not found.');
     }
 
-    // Create an in-memory client node
-    this._node = await native.IrohNode.memory();
+    // Create an in-memory client node. When an identity file provided a
+    // secret key, pass it through so the client's endpoint id matches the
+    // credential's enrolled endpoint_id.
+    if (this._identitySecretKey) {
+      this._node = await native.IrohNode.memoryWithAlpns(
+        [Buffer.from(ALPN_CONSUMER_ADMISSION), Buffer.from(RPC_ALPN)],
+        { secretKey: Buffer.from(this._identitySecretKey) },
+      );
+    } else {
+      this._node = await native.IrohNode.memory();
+    }
 
     // Parse the address to get the endpoint ID and optional address hints.
     //
@@ -805,11 +906,22 @@ export class AsterClientWrapper {
       return this._node.connect(endpointId, alpn);
     };
 
+    // Build credential: inline peer entry > credential file > null (open-gate).
+    let credential: ConsumerEnrollmentCredential | null = this._inlineCredential;
+    if (!credential && this._enrollmentCredentialFile) {
+      credential = loadEnrollmentCredential(this._enrollmentCredentialFile);
+    }
+
     // Consumer admission
     const admissionConn = await doConnect(Buffer.from(ALPN_CONSUMER_ADMISSION));
-    const { performAdmission: doAdmission } = await import('./trust/consumer.js');
-    // Pass null credential for open-gate mode (sends empty credential_json)
-    const admissionResponse = await doAdmission(admissionConn, null as any);
+    const admissionResponse = await performAdmission(admissionConn, credential as any);
+
+    if (!admissionResponse.admitted) {
+      throw new Error(
+        'consumer admission denied — set enrollmentCredentialFile or ' +
+        'ASTER_ENROLLMENT_CREDENTIAL to a valid enrollment credential',
+      );
+    }
 
     this._services = admissionResponse.services ?? [];
     this._registryNamespace = admissionResponse.registryNamespace ?? '';
