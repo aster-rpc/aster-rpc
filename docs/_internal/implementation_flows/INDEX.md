@@ -227,6 +227,7 @@ security vulnerability:
 | [producer_accept_loop.md](producer_accept_loop.md) | Server ALPN routing, connection lifecycle, Gate 0 |
 | [session_protocol.md](session_protocol.md) | Session opening, CALL framing, patterns, cancellation, deadlines |
 | [publish_contracts.md](publish_contracts.md) | Contract identity, canonical encoding, registry publication |
+| [manifest_field_schema.md](manifest_field_schema.md) | V1 field schema: kind system, nullability, defaults, cross-platform codegen |
 
 ## Reference implementations
 
