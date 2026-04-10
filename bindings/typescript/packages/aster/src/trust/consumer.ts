@@ -37,6 +37,11 @@ export interface ServiceSummary {
   pattern: string;
   methods: string[];
   channels?: Record<string, string>;
+  /** Serialization modes the server supports for this service.
+   *  Values: "xlang" (Fory), "json", "row", "native". A consumer must
+   *  pick one of these for any RPC call. The TypeScript binding only
+   *  publishes "json" because Fory JS is not yet XLANG-compliant. */
+  serializationModes?: string[];
 }
 
 /** Consumer admission request. */
@@ -362,6 +367,7 @@ export async function handleConsumerAdmissionConnection(
       pattern: s.pattern,
       methods: s.methods,
       channels: s.channels ?? {},
+      serialization_modes: s.serializationModes ?? s.serialization_modes ?? [],
     }));
     const wireResponse: Record<string, unknown> = {
       admitted: response.admitted,

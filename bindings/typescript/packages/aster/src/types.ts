@@ -10,6 +10,9 @@ export const SerializationMode = {
   NATIVE: 1,
   /** Row-oriented. For random-access reads. */
   ROW: 2,
+  /** JSON over UTF-8. Cross-language fallback. The TypeScript binding
+   *  uses this exclusively because Fory JS is not yet XLANG-compliant. */
+  JSON: 3,
 } as const;
 
 export type SerializationMode = (typeof SerializationMode)[keyof typeof SerializationMode];

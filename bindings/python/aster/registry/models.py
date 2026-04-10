@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import IntEnum
 
 
@@ -63,6 +63,11 @@ class ServiceSummary:
     version: int
     contract_id: str                    # BLAKE3 hex digest
     channels: dict[str, str]            # channel name → contract_id
+    # Serialization modes the server supports for this service (e.g.
+    # ["xlang"], ["json"], or both). Empty/missing means the consumer should
+    # assume the project default (XLANG). The TypeScript binding publishes
+    # ["json"] only because Fory JS is not yet XLANG-compliant.
+    serialization_modes: list[str] = field(default_factory=list)
 
     def to_json_dict(self) -> dict:
         return {
@@ -70,6 +75,7 @@ class ServiceSummary:
             "version": self.version,
             "contract_id": self.contract_id,
             "channels": self.channels,
+            "serialization_modes": list(self.serialization_modes),
         }
 
     @classmethod
@@ -79,6 +85,7 @@ class ServiceSummary:
             version=int(d["version"]),
             contract_id=d["contract_id"],
             channels=d.get("channels") or {},
+            serialization_modes=list(d.get("serialization_modes") or []),
         )
 
 
