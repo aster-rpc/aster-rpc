@@ -108,8 +108,18 @@ interface RpcOptions {
   timeout?: number;
   idempotent?: boolean;
   serialization?: SerializationMode;
-  requires?: CapabilityRequirement;
+  requires?: CapabilityRequirement | string;
   metadata?: Metadata;
+  /**
+   * Request message constructor. TypeScript erases type parameters at runtime,
+   * so the contract publisher and codegen pipeline cannot discover the request
+   * shape unless it is passed explicitly here. Without it the published manifest
+   * will lack the wire tag and field list, which breaks `aster gen-client`
+   * for cross-language consumers.
+   */
+  request?: new (...args: any[]) => any;
+  /** Response message constructor. See `request` for why this is needed. */
+  response?: new (...args: any[]) => any;
 }
 
 function methodDecorator(pattern: RpcPattern, options?: RpcOptions) {
@@ -120,12 +130,12 @@ function methodDecorator(pattern: RpcPattern, options?: RpcOptions) {
     const info: MethodInfo = {
       name: options?.name ?? '', // explicit name or filled in by @Service
       pattern,
-      requestType: undefined,
-      responseType: undefined,
+      requestType: options?.request,
+      responseType: options?.response,
       timeout: options?.timeout,
       idempotent: options?.idempotent ?? false,
       serialization: options?.serialization,
-      requires: options?.requires,
+      requires: options?.requires as CapabilityRequirement | undefined,
       handler: undefined, // filled in by @Service
       metadata: options?.metadata,
     };

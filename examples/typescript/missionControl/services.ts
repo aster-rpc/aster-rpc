@@ -45,7 +45,7 @@ export class MissionControl {
 
   // -- Chapter 1: status ------------------------------------------------------
 
-  @Rpc()
+  @Rpc({ request: StatusRequest, response: StatusResponse })
   async getStatus(req: StatusRequest): Promise<StatusResponse> {
     return new StatusResponse({
       agent_id: req.agent_id,
@@ -56,7 +56,7 @@ export class MissionControl {
 
   // -- Chapter 2: logging -----------------------------------------------------
 
-  @Rpc()
+  @Rpc({ request: LogEntry, response: SubmitLogResult })
   async submitLog(entry: LogEntry): Promise<SubmitLogResult> {
     // Wake any waiting tailLogs streams
     if (this.logWaiters.length > 0) {
@@ -68,7 +68,7 @@ export class MissionControl {
     return new SubmitLogResult({ accepted: true });
   }
 
-  @ServerStream()
+  @ServerStream({ request: TailRequest, response: LogEntry })
   async *tailLogs(req: TailRequest): AsyncGenerator<LogEntry> {
     const minRank = LOG_LEVEL_RANK[req.level?.toLowerCase() ?? "info"] ?? 0;
     while (true) {
@@ -89,7 +89,7 @@ export class MissionControl {
 
   // -- Chapter 3: metrics -----------------------------------------------------
 
-  @ClientStream()
+  @ClientStream({ request: MetricPoint, response: IngestResult })
   async ingestMetrics(stream: AsyncIterable<MetricPoint>): Promise<IngestResult> {
     let accepted = 0;
     for await (const point of stream) {
@@ -105,7 +105,7 @@ export class AgentSession {
   private _agentId = "";
   private _capabilities: string[] = [];
 
-  @Rpc()
+  @Rpc({ request: Heartbeat, response: Assignment })
   async register(hb: Heartbeat): Promise<Assignment> {
     this._agentId = hb.agent_id;
     this._capabilities = [...(hb.capabilities ?? [])];
@@ -115,13 +115,13 @@ export class AgentSession {
     return new Assignment({ task_id: "idle", command: "sleep 60" });
   }
 
-  @Rpc()
+  @Rpc({ request: Heartbeat, response: Assignment })
   async heartbeat(hb: Heartbeat): Promise<Assignment> {
     this._capabilities = [...(hb.capabilities ?? [])];
     return new Assignment({ task_id: "continue", command: "" });
   }
 
-  @BidiStream()
+  @BidiStream({ request: Command, response: CommandResult })
   async *runCommand(commands: AsyncIterable<Command>): AsyncGenerator<CommandResult> {
     for await (const cmd of commands) {
       const proc = Bun.spawn(["sh", "-c", cmd.command], {

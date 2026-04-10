@@ -303,44 +303,64 @@ export class AsterServer {
     const WIRE_TYPE_KEY = Symbol.for('aster.wire_type');
     const methods: ManifestMethod[] = [];
 
+    /** Extract a field list by instantiating a constructor and reading keys. */
+    const extractFields = (Ctor: unknown): ManifestField[] => {
+      if (!Ctor || typeof Ctor !== 'function') return [];
+      try {
+        const inst = new (Ctor as new () => any)();
+        const out: ManifestField[] = [];
+        for (const key of Object.keys(inst)) {
+          const val = inst[key];
+          let fieldType = 'str';
+          if (typeof val === 'number') fieldType = Number.isInteger(val) ? 'int' : 'float';
+          else if (typeof val === 'boolean') fieldType = 'bool';
+          else if (Array.isArray(val)) fieldType = 'list';
+          else if (val && typeof val === 'object') fieldType = 'dict';
+          out.push({
+            name: key,
+            type: fieldType,
+            required: val === '' || val === 0 || val === false,
+          });
+        }
+        return out;
+      } catch {
+        return [];
+      }
+    };
+
+    const wireTagOf = (Ctor: unknown): string | undefined => {
+      if (!Ctor || typeof Ctor !== 'function') return undefined;
+      return (Ctor as any)[WIRE_TYPE_KEY];
+    };
+
+    const displayNameOf = (Ctor: unknown): string => {
+      if (!Ctor || typeof Ctor !== 'function') return '';
+      return (Ctor as any).name ?? '';
+    };
+
     for (const [methodName, mi] of info.methods.entries()) {
       const patternStr =
         mi.pattern === 1 ? 'server_stream' :
         mi.pattern === 2 ? 'client_stream' :
         mi.pattern === 3 ? 'bidi_stream' : 'unary';
 
-      // Extract field descriptors from @WireType request type
-      const fields: ManifestField[] = [];
       const reqType = mi.requestType;
-      if (reqType && typeof reqType === 'function') {
-        try {
-          const inst = new reqType();
-          for (const key of Object.keys(inst)) {
-            const val = inst[key];
-            let fieldType = 'str';
-            if (typeof val === 'number') fieldType = Number.isInteger(val) ? 'int' : 'float';
-            else if (typeof val === 'boolean') fieldType = 'bool';
-            else if (Array.isArray(val)) fieldType = 'list';
-            else if (val && typeof val === 'object') fieldType = 'dict';
-            fields.push({
-              name: key,
-              type: fieldType,
-              required: val === '' || val === 0 || val === false,
-            });
-          }
-        } catch { /* can't instantiate — skip field extraction */ }
-      }
-
-      const wireTag = reqType ? (reqType as any)[WIRE_TYPE_KEY] : undefined;
+      const respType = mi.responseType;
 
       methods.push({
         name: methodName,
         pattern: patternStr,
-        requestType: wireTag ?? '',
-        responseType: '',
+        // requestType / responseType carry the human-readable display name
+        // for the codegen (matches Python manifest layout). The wire tag
+        // travels separately so codegen can register the type with Fory.
+        requestType: displayNameOf(reqType),
+        responseType: displayNameOf(respType),
+        requestWireTag: wireTagOf(reqType),
+        responseWireTag: wireTagOf(respType),
         timeout: mi.timeout ?? 0,
         idempotent: mi.idempotent ?? false,
-        fields,
+        fields: extractFields(reqType),
+        responseFields: extractFields(respType),
       });
     }
 
