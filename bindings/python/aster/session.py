@@ -180,11 +180,13 @@ class SessionServer:
         service_info: ServiceInfo,
         codec: ForyCodec,
         interceptors: list[Any] | None = None,
+        peer_store: Any | None = None,
     ) -> None:
         self._service_class = service_class
         self._service_info = service_info
         self._codec = codec
         self._interceptors = list(interceptors) if interceptors else []
+        self._peer_store = peer_store
 
     async def run(
         self,
@@ -285,6 +287,9 @@ class SessionServer:
                     await _write_trailer(send, self._codec, StatusCode.RESOURCE_EXHAUSTED, str(exc))
                     return
                 metadata = dict(zip(_keys, _vals))
+                attributes = {}
+                if self._peer_store is not None and peer:
+                    attributes = self._peer_store.get_attributes(peer)
                 call_ctx = build_call_context(
                     service=self._service_info.name,
                     method=method_name,
@@ -296,6 +301,7 @@ class SessionServer:
                     idempotent=method_info.idempotent,
                     call_id=call_header.callId or None,
                     session_id=session_id,
+                    attributes=attributes,
                 )
 
                 # Run authorization-style interceptors BEFORE dispatching the
