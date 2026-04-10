@@ -56,7 +56,10 @@ export interface ServiceContract {
 const PATTERN_NAMES: Record<number, string> = {
   0: 'unary', 1: 'server_stream', 2: 'client_stream', 3: 'bidi_stream',
 };
-const SCOPE_NAMES: Record<number, string> = { 0: 'shared', 1: 'session' };
+// The Rust canonical encoder accepts both "session" and "stream" via
+// #[serde(alias = "stream")]. We send "stream" here for compat with
+// pre-rename NAPI binaries that haven't been rebuilt yet.
+const SCOPE_NAMES: Record<number, string> = { 0: 'shared', 1: 'stream' };
 const CAP_NAMES: Record<number, string> = { 0: 'role', 1: 'any_of', 2: 'all_of' };
 
 function hex(data: Uint8Array): string {
