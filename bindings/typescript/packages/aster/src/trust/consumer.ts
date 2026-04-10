@@ -21,6 +21,7 @@ import { admit } from './admission.js';
 import type { MeshEndpointHook } from './hooks.js';
 import { MAX_ADMISSION_PAYLOAD_SIZE, MAX_SERVICES_IN_ADMISSION, validateHexField } from '../limits.js';
 import type { NonceStore } from './nonce.js';
+import { createPeerAdmission, type PeerAttributeStore } from '../peer-store.js';
 
 /**
  * Service summary returned in admission response.
@@ -64,6 +65,9 @@ export interface ConsumerAdmissionOpts {
   allowUnenrolled?: boolean;
   /** Gossip topic ID (32 bytes). Included in response only for root node. */
   gossipTopicId?: Uint8Array;
+  /** When supplied, successful admissions are recorded so the RPC dispatch
+   *  layer can read the peer's attributes from CallContext. */
+  peerStore?: PeerAttributeStore;
   logger?: { info(msg: string, ...args: unknown[]): void; warn(msg: string, ...args: unknown[]): void; error(msg: string, ...args: unknown[]): void };
 }
 
@@ -86,9 +90,12 @@ export async function performAdmission(
   const send = bi.takeSend();
   const recv = bi.takeRecv();
 
-  // Build and send request (snake_case keys for Python interop)
+  // Build and send request (snake_case keys for Python interop).
+  // The credential is serialised to its snake_case wire form via
+  // consumerCredToJson — JSON.stringify on the camelCase TS interface
+  // would produce the wrong keys and the server would reject it.
   const wireRequest = {
-    credential_json: credential ? JSON.stringify(credential) : '',
+    credential_json: credential ? consumerCredToJson(credential) : '',
     iid_token: iidToken ?? '',
   };
   const reqBytes = new TextEncoder().encode(JSON.stringify(wireRequest));
@@ -229,6 +236,13 @@ export async function handleConsumerAdmissionRpc(
   const isEmptyCredential = !req.credentialJson || req.credentialJson === '{}' || req.credentialJson === 'null';
   if (isEmptyCredential && opts.allowUnenrolled) {
     hook.addPeer(peerNodeId);
+    if (opts.peerStore) {
+      opts.peerStore.admit(createPeerAdmission({
+        endpointId: peerNodeId,
+        attributes: new Map(),
+        admissionPath: 'aster.consumer_admission',
+      }));
+    }
     const role = topicForPeer ? 'root' : 'open gate';
     log.info(`consumer admission: auto-admitted ${peerNodeId} (${role})`);
     return {
@@ -272,6 +286,17 @@ export async function handleConsumerAdmissionRpc(
   }
 
   hook.addPeer(peerNodeId);
+  if (opts.peerStore) {
+    const attrMap = new Map<string, string>();
+    for (const [k, v] of Object.entries(result.attributes ?? {})) {
+      attrMap.set(k, String(v));
+    }
+    opts.peerStore.admit(createPeerAdmission({
+      endpointId: peerNodeId,
+      attributes: attrMap,
+      admissionPath: 'aster.consumer_admission',
+    }));
+  }
   log.info(`consumer admission: admitted ${peerNodeId}`);
 
   return {
