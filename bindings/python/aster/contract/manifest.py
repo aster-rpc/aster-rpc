@@ -361,6 +361,21 @@ def _classify_type(tp: object) -> dict[str, Any]:
         result["kind"] = _PY_TO_KIND[tp]
         return result
 
+    # Bare dict (no type params): treat as map[string, string]
+    if tp is dict:
+        result["kind"] = "map"
+        result["key_kind"] = "string"
+        result["value_kind"] = "string"
+        result["value_nullable"] = False
+        return result
+
+    # Bare list (no type params): treat as list[string]
+    if tp is list:
+        result["kind"] = "list"
+        result["item_kind"] = "string"
+        result["item_nullable"] = False
+        return result
+
     # Enum
     if isinstance(tp, type) and issubclass(tp, enum.Enum):
         result["kind"] = "enum"

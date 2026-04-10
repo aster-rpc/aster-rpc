@@ -378,9 +378,15 @@ class PeerConnection:
         config.storage_path = None
 
         if self._rcan_path:
-            # Let AsterConfig find the .aster-identity in CWD for secret_key
-            # (don't override identity_file -- let the default search work)
-            pass
+            # Look for .aster-identity alongside the credential file.
+            # `aster enroll node` creates them as a pair, so the directory
+            # containing the .cred is the most reliable place to find the
+            # matching identity. Fall back to CWD if not present there.
+            cred_dir = os.path.dirname(os.path.abspath(self._rcan_path))
+            paired = os.path.join(cred_dir, ".aster-identity")
+            if not config.identity_file or not os.path.exists(config.identity_file):
+                if os.path.exists(paired):
+                    config.identity_file = paired
         else:
             # No credential -- use root key or ephemeral
             config.identity_file = "/dev/null/.aster-identity"
@@ -1997,7 +2003,13 @@ async def _run_shell(
 
             # Check if command is valid at current path
             if not cmd.is_valid_at(ctx.vfs_cwd):
-                display.error(f"'{cmd_name}' is not available at {ctx.vfs_cwd}")
+                hint = ""
+                if cmd.contexts:
+                    valid = cmd.contexts[0].rstrip("/*").rstrip("/") or "/"
+                    hint = f"\n  Try: cd {valid} && {cmd_name} {' '.join(cmd_args)}".rstrip()
+                display.error(
+                    f"'{cmd_name}' is not available at {ctx.vfs_cwd}{hint}"
+                )
                 continue
 
             # Execute

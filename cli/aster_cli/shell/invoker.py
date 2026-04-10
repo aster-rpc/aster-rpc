@@ -159,7 +159,7 @@ async def invoke_method(
         elif "FAILED_PRECONDITION" in msg or "scope mismatch" in msg.lower():
             display.error(
                 f"RPC failed: '{service_name}' is session-scoped.\n"
-                f"  Use the session command: session {service_name}"
+                f"  Try: cd /services && session {service_name}"
             )
         elif "PERMISSION_DENIED" in msg:
             display.error(
