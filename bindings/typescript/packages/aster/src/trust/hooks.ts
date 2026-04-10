@@ -70,9 +70,11 @@ const _ADMISSION_ALPN_STRINGS: ReadonlySet<string> = new Set([
 export class MeshEndpointHook {
   readonly admitted: Set<string> = new Set();
   readonly allowUnenrolled: boolean;
+  private _peerStore?: { get(endpointId: string): unknown | undefined };
 
-  constructor(allowUnenrolled = false) {
+  constructor(allowUnenrolled = false, peerStore?: { get(endpointId: string): unknown | undefined }) {
     this.allowUnenrolled = allowUnenrolled;
+    this._peerStore = peerStore;
   }
 
   // ── Decision logic ──────────────────────────────────────────────────────
@@ -84,13 +86,17 @@ export class MeshEndpointHook {
    * @param alpn - ALPN negotiated for this connection (Uint8Array).
    */
   shouldAllow(remoteEndpointId: string, alpn: Uint8Array): boolean {
-    // Admission ALPNs are always open — credential presentation
+    // Admission ALPNs are always open -- credential presentation
     const alpnStr = _decoder.decode(alpn);
     if (_ADMISSION_ALPN_STRINGS.has(alpnStr)) {
       return true;
     }
-    // Admitted peers are always allowed
-    if (this.admitted.has(remoteEndpointId)) {
+    // If we have a peer store, use it for expiry-aware checks
+    if (this._peerStore) {
+      if (this._peerStore.get(remoteEndpointId) != null) {
+        return true;
+      }
+    } else if (this.admitted.has(remoteEndpointId)) {
       return true;
     }
     // Open-mode bypass (local/dev only)
