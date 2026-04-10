@@ -29,6 +29,13 @@ from aster.interceptors.base import (
     build_call_context,
     normalize_error,
 )
+from aster.json_codec import json_decode, json_encode, safe_decompress
+from aster.limits import (
+    LimitExceeded,
+    MAX_METADATA_ENTRIES,
+    validate_metadata,
+)
+from aster.logging import request_context
 from aster.protocol import StreamHeader, RpcStatus
 from aster.status import StatusCode, RpcError
 from aster.rpc_types import SerializationMode
@@ -353,7 +360,6 @@ class Server:
             # 0x02. Accept both for cross-language interop.
             try:
                 if payload and payload[0:1] == b'{':
-                    from aster.json_codec import json_decode
                     header = json_decode(payload, StreamHeader)
                 else:
                     header = self._codec.decode(payload, StreamHeader)
@@ -445,7 +451,6 @@ class Server:
                 return
 
             # Dispatch based on RPC pattern -- with logging context
-            from aster.logging import request_context
             pattern = method_info.pattern
             peer_id = ""
             try:
@@ -578,9 +583,7 @@ class Server:
                 continue
             compressed = bool(flags & COMPRESSED)
             if serialization_mode == SerializationMode.JSON.value:
-                from aster.json_codec import json_decode
                 if compressed:
-                    from aster.json_codec import safe_decompress
                     payload = safe_decompress(payload)
                 request = json_decode(payload, expected_type)
             else:
@@ -592,7 +595,6 @@ class Server:
     ) -> tuple[bytes, bool]:
         """Encode a response payload, respecting the stream's serialization mode."""
         if serialization_mode == SerializationMode.JSON.value:
-            from aster.json_codec import json_encode
             return json_encode(response), False
         return self._codec.encode_compressed(response)
 
@@ -742,7 +744,6 @@ class Server:
 
                 compressed = bool(flags & COMPRESSED)
                 if header.serializationMode == SerializationMode.JSON.value:
-                    from aster.json_codec import json_decode
                     if compressed:
                         import zstandard
                         payload = zstandard.ZstdDecompressor().decompress(payload)
@@ -881,7 +882,6 @@ class Server:
 
                 compressed = bool(flags & COMPRESSED)
                 if serialization_mode == SerializationMode.JSON.value:
-                    from aster.json_codec import json_decode
                     if compressed:
                         import zstandard
                         payload = zstandard.ZstdDecompressor().decompress(payload)
@@ -903,7 +903,6 @@ class Server:
         """Write an OK status trailer."""
         status = RpcStatus(code=StatusCode.OK, message="")
         if serialization_mode == SerializationMode.JSON.value:
-            from aster.json_codec import json_encode
             payload = json_encode({"code": 0, "message": "", "detailKeys": [], "detailValues": []})
         else:
             payload = self._codec.encode(status)
@@ -916,7 +915,6 @@ class Server:
         """Write an error status trailer."""
         try:
             if serialization_mode == SerializationMode.JSON.value:
-                from aster.json_codec import json_encode
                 payload = json_encode({"code": code.value, "message": message, "detailKeys": [], "detailValues": []})
             else:
                 status = RpcStatus(code=code, message=message)
@@ -1019,7 +1017,6 @@ def _validated_metadata(
     if not keys:
         return None
 
-    from aster.limits import LimitExceeded, validate_metadata
 
     vals = values or []
     try:
@@ -1028,7 +1025,6 @@ def _validated_metadata(
         import logging
         logging.getLogger(__name__).warning("Metadata limit exceeded: %s", e)
         # Truncate to the limit rather than rejecting the entire call
-        from aster.limits import MAX_METADATA_ENTRIES
         keys = keys[:MAX_METADATA_ENTRIES]
         vals = vals[:MAX_METADATA_ENTRIES]
 

@@ -35,6 +35,42 @@ export const ATTR_IID_ACCOUNT = 'aster.iid_account';
 export const ATTR_IID_REGION = 'aster.iid_region';
 export const ATTR_IID_ROLE_ARN = 'aster.iid_role_arn';
 
+// ── Crypto backend (lazy-loaded once, then cached) ──────────────────────────
+//
+// We try @noble/ed25519 first (portable, works in browsers/bun/node) and fall
+// back to node:crypto. Both modules are loaded once at first use; subsequent
+// calls hit the cached references — critical for hot paths like per-RPC
+// signature verification.
+
+type EdModule = {
+  utils: { randomPrivateKey(): Uint8Array };
+  getPublicKeyAsync(privateKey: Uint8Array): Promise<Uint8Array>;
+  signAsync(message: Uint8Array, privateKey: Uint8Array): Promise<Uint8Array>;
+  verifyAsync(signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array): Promise<boolean>;
+};
+
+type NodeCryptoModule = typeof import('node:crypto');
+
+let _edModule: EdModule | null | undefined; // undefined = not tried, null = unavailable
+let _nodeCrypto: NodeCryptoModule | null | undefined;
+
+async function getEd(): Promise<EdModule | null> {
+  if (_edModule !== undefined) return _edModule;
+  try {
+    // @ts-ignore — optional dependency
+    _edModule = (await import('@noble/ed25519')) as EdModule;
+  } catch {
+    _edModule = null;
+  }
+  return _edModule;
+}
+
+async function getNodeCrypto(): Promise<NodeCryptoModule> {
+  if (_nodeCrypto) return _nodeCrypto;
+  _nodeCrypto = await import('node:crypto');
+  return _nodeCrypto;
+}
+
 /**
  * Generate an ed25519 keypair.
  * Returns [privateKey (32 bytes), publicKey (32 bytes)].
@@ -47,20 +83,17 @@ export const ATTR_IID_ROLE_ARN = 'aster.iid_role_arn';
  * ```
  */
 export async function generateKeypair(): Promise<[Uint8Array, Uint8Array]> {
-  try {
-    // @ts-ignore — optional dependency, falls back to Node crypto
-    const ed = await import('@noble/ed25519');
+  const ed = await getEd();
+  if (ed) {
     const privateKey = ed.utils.randomPrivateKey();
     const publicKey = await ed.getPublicKeyAsync(privateKey);
     return [privateKey, publicKey];
-  } catch {
-    // Fallback to Node crypto
-    const { generateKeyPairSync } = await import('node:crypto');
-    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
-    const privBuf = privateKey.export({ type: 'pkcs8', format: 'der' }).subarray(-32);
-    const pubBuf = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
-    return [new Uint8Array(privBuf), new Uint8Array(pubBuf)];
   }
+  const { generateKeyPairSync } = await getNodeCrypto();
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  const privBuf = privateKey.export({ type: 'pkcs8', format: 'der' }).subarray(-32);
+  const pubBuf = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+  return [new Uint8Array(privBuf), new Uint8Array(pubBuf)];
 }
 
 /**
@@ -68,22 +101,20 @@ export async function generateKeypair(): Promise<[Uint8Array, Uint8Array]> {
  * Returns 64-byte signature.
  */
 export async function sign(privateKey: Uint8Array, message: Uint8Array): Promise<Uint8Array> {
-  try {
-    // @ts-ignore — optional dependency, falls back to Node crypto
-    const ed = await import('@noble/ed25519');
+  const ed = await getEd();
+  if (ed) {
     return ed.signAsync(message, privateKey);
-  } catch {
-    const { sign: cryptoSign, createPrivateKey } = await import('node:crypto');
-    const key = createPrivateKey({
-      key: Buffer.concat([
-        Buffer.from('302e020100300506032b657004220420', 'hex'),
-        Buffer.from(privateKey),
-      ]),
-      format: 'der',
-      type: 'pkcs8',
-    });
-    return new Uint8Array(cryptoSign(null, Buffer.from(message), key));
   }
+  const { sign: cryptoSign, createPrivateKey } = await getNodeCrypto();
+  const key = createPrivateKey({
+    key: Buffer.concat([
+      Buffer.from('302e020100300506032b657004220420', 'hex'),
+      Buffer.from(privateKey),
+    ]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  return new Uint8Array(cryptoSign(null, Buffer.from(message), key));
 }
 
 /**
@@ -94,22 +125,20 @@ export async function verify(
   message: Uint8Array,
   signature: Uint8Array,
 ): Promise<boolean> {
-  try {
-    // @ts-ignore — optional dependency, falls back to Node crypto
-    const ed = await import('@noble/ed25519');
+  const ed = await getEd();
+  if (ed) {
     return ed.verifyAsync(signature, message, publicKey);
-  } catch {
-    const { verify: cryptoVerify, createPublicKey } = await import('node:crypto');
-    const key = createPublicKey({
-      key: Buffer.concat([
-        Buffer.from('302a300506032b6570032100', 'hex'),
-        Buffer.from(publicKey),
-      ]),
-      format: 'der',
-      type: 'spki',
-    });
-    return cryptoVerify(null, Buffer.from(message), key, Buffer.from(signature));
   }
+  const { verify: cryptoVerify, createPublicKey } = await getNodeCrypto();
+  const key = createPublicKey({
+    key: Buffer.concat([
+      Buffer.from('302a300506032b6570032100', 'hex'),
+      Buffer.from(publicKey),
+    ]),
+    format: 'der',
+    type: 'spki',
+  });
+  return cryptoVerify(null, Buffer.from(message), key, Buffer.from(signature));
 }
 
 // ── Hex helpers ──────────────────────────────────────────────────────────────

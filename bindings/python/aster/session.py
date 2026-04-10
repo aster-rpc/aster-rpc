@@ -46,8 +46,10 @@ from aster.framing import (
     write_frame,
 )
 from aster.interceptors.base import (
+    apply_request_interceptors,
     build_call_context,
 )
+from aster.limits import LimitExceeded, validate_metadata
 from aster.protocol import CallHeader, RpcStatus, StreamHeader
 from aster.service import ServiceInfo, MethodInfo
 from aster.status import RpcError, StatusCode
@@ -261,7 +263,6 @@ class SessionServer:
                     return
 
                 # Build call context
-                from aster.limits import validate_metadata, LimitExceeded
                 _keys = call_header.metadataKeys or []
                 _vals = call_header.metadataValues or []
                 try:
@@ -288,7 +289,6 @@ class SessionServer:
                 # check in server.py -- without it, session-scoped services
                 # bypass Gate 3 capability checks entirely.
                 if self._interceptors:
-                    from aster.interceptors.base import apply_request_interceptors
                     try:
                         await apply_request_interceptors(self._interceptors, call_ctx, None)
                     except RpcError as auth_err:

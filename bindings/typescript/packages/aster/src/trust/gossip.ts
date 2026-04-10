@@ -24,6 +24,30 @@ import { validateRcan } from './rcan.js';
 import type { MeshState } from './mesh.js';
 import type { ClockDriftTracker } from './clock.js';
 
+// ── Hash backend (lazy-cached) ──────────────────────────────────────────────
+
+let _blake3: ((data: Uint8Array, opts?: { dkLen?: number }) => Uint8Array) | null | undefined;
+let _nodeCreateHash: typeof import('node:crypto').createHash | undefined;
+
+async function getBlake3(): Promise<typeof _blake3> {
+  if (_blake3 !== undefined) return _blake3;
+  try {
+    // @ts-ignore — optional dependency
+    const mod = await import('@noble/hashes/blake3') as any;
+    _blake3 = mod.blake3;
+  } catch {
+    _blake3 = null;
+  }
+  return _blake3;
+}
+
+async function getCreateHash() {
+  if (_nodeCreateHash) return _nodeCreateHash;
+  const { createHash } = await import('node:crypto');
+  _nodeCreateHash = createHash;
+  return _nodeCreateHash;
+}
+
 // ── Types ───────────────────────────────────────────────────────────────────
 
 export interface ProducerMessage {
@@ -81,17 +105,14 @@ export async function deriveGossipTopic(rootPubkey: Uint8Array, salt: Uint8Array
   const label = new TextEncoder().encode('aster-producer-mesh');
   const data = concatBytes([rootPubkey, label, salt]);
 
-  try {
-    // Try @noble/hashes blake3 first
-    // @ts-ignore — optional dependency
-    const { blake3 } = await import('@noble/hashes/blake3') as any;
+  const blake3 = await getBlake3();
+  if (blake3) {
     return blake3(data, { dkLen: 32 });
-  } catch {
-    // Fallback: sha256 via node:crypto (note: Python uses blake3)
-    const { createHash } = await import('node:crypto');
-    const hash = createHash('sha256').update(data).digest();
-    return new Uint8Array(hash.buffer, hash.byteOffset, 32);
   }
+  // Fallback: sha256 via node:crypto (note: Python uses blake3)
+  const createHash = await getCreateHash();
+  const hash = createHash('sha256').update(data).digest();
+  return new Uint8Array(hash.buffer, hash.byteOffset, 32);
 }
 
 // ── Canonical signing bytes ─────────────────────────────────────────────────
