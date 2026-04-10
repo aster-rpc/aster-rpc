@@ -328,7 +328,10 @@ export class SessionServer {
     recv: { readExact(n: number): Promise<Uint8Array> },
   ): Promise<void> {
     const self = this;
-    let readerError: Error | null = null;
+    // Wrap the error in an object so TS doesn't narrow it to `never`
+    // after the for-await loop (closure mutations to a local var aren't
+    // visible to the flow analyzer; property access through one is).
+    const errBox: { value: Error | null } = { value: null };
     async function* requestIter() {
       try {
         while (true) {
@@ -344,7 +347,7 @@ export class SessionServer {
           yield req;
         }
       } catch (e) {
-        readerError = e instanceof Error ? e : new Error(String(e));
+        errBox.value = e instanceof Error ? e : new Error(String(e));
       }
     }
 
@@ -358,8 +361,8 @@ export class SessionServer {
       await writeFrame(send as any, respPayload, respCompressed ? COMPRESSED : 0);
     }
 
-    if (readerError) {
-      throw new RpcError(StatusCode.INTERNAL, `bidi stream reader error: ${readerError.message}`);
+    if (errBox.value !== null) {
+      throw new RpcError(StatusCode.INTERNAL, `bidi stream reader error: ${errBox.value.message}`);
     }
     await this.writeOkTrailer(send);
   }

@@ -469,9 +469,12 @@ export class RpcServer {
     // Auth interceptors already ran in dispatchRpc() before this method.
     // No need to run them again here.
 
-    // Create request iterable from incoming frames with error capture
+    // Create request iterable from incoming frames with error capture.
+    // Wrap the error in an object so TS doesn't narrow it to `never`
+    // after the for-await loop (TS can't track closure mutations to a
+    // local variable, but it can track property access through one).
     const self = this;
-    let readerError: Error | null = null;
+    const errBox: { value: Error | null } = { value: null };
     async function* requestIter() {
       try {
         while (true) {
@@ -487,7 +490,7 @@ export class RpcServer {
           yield request;
         }
       } catch (e) {
-        readerError = e instanceof Error ? e : new Error(String(e));
+        errBox.value = e instanceof Error ? e : new Error(String(e));
       }
     }
 
@@ -502,9 +505,9 @@ export class RpcServer {
       await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
     }
 
-    if (readerError) {
+    if (errBox.value !== null) {
       await this.writeErrorTrailer(send, StatusCode.INTERNAL,
-        `bidi stream reader error: ${readerError.message}`);
+        `bidi stream reader error: ${errBox.value.message}`);
       return;
     }
 
