@@ -2,7 +2,7 @@
   "private": true,
   "name": "aster-typescript-workspace",
   "workspaces": [
-    "packages/transport",
+    "native",
     "packages/aster",
     "../../examples/typescript/missionControl",
     "../../tests/integration/mission_control"

@@ -256,3 +256,11 @@ AGENTS.md
 aster-docs
 aster-website
 scripts/check-ascii.py
+
+# TypeScript NAPI build artifacts -- the .node binary and per-platform
+# npm/<platform>/ dirs are produced by `napi build` / `napi create-npm-dirs`
+# during the publish workflow and must not be committed (the macOS arm64
+# binary alone is ~30MB).
+bindings/typescript/native/aster-transport.*.node
+bindings/typescript/native/index.*.node
+bindings/typescript/native/npm/
