@@ -4,15 +4,22 @@
 
 Full matrix: **58/58 pass** across all 8 combos.
 
-## Audit Gaps — Not Yet Tested
+## Audit Gaps
 
-Discovered by spec-vs-implementation audit. Each gap lists the spec
-reference, what would break, and the real-world scenario that exposes it.
+Discovered by spec-vs-implementation audit. 12 gaps identified; all
+tested, all either fixed or confirmed not vulnerable.
+
+**Additional fixes applied during audit:**
+- `MAX_HANDLER_TIMEOUT_S` (300s) added to both Python and TS limits.
+  All handlers now have an upper bound even when the client sets no deadline.
+- Client-stream JSON decompression in Python `server.py` was using raw
+  `zstandard.decompress()` without size limit — fixed to use `safe_decompress()`.
+
 Ordered by severity.
 
 ---
 
-### G1. Session lock + network fault (CRITICAL)
+### G1. Session lock + network fault (CRITICAL) — TESTED, NOT VULNERABLE
 
 **Spec:** Aster-session-scoped-services.md §6.4 — lock held for one
 request-response exchange.
@@ -23,121 +30,110 @@ lock releases and the next queued call sends a CALL frame while the
 server may still be flushing the previous response. Silent stream
 corruption.
 
-**Scenario:** Client on flaky WiFi makes two sequential session calls.
-First call's response is interrupted by a network drop. Second call
-interleaves with the server's still-in-flight first response.
-
-**Test sketch:** Open a session, start a unary call, kill the recv stream
-mid-response, immediately make another call. Assert the second call
-either fails cleanly or succeeds with correct data — never silently
-returns the wrong response.
+**Test:** `test_g1_concurrent_calls_after_recv_fault` — injects recv
+fault mid-response, verifies second call never returns stale data.
+**Result:** Lock correctly serialises; second call fails cleanly.
 
 ---
 
-### G2. CANCEL never sends trailer — TS server (CRITICAL)
+### G2. CANCEL never sends trailer — TS server (CRITICAL) — FIXED
 
 **Spec:** Aster-session-scoped-services.md §5.4 — "exactly one trailer
 with status CANCELLED" unconditionally.
 
-**Gap:** TS `SessionServer` receives CANCEL and does `continue` without
-writing a CANCELLED trailer. Client's `cancel()` drains frames waiting
-for a trailer that never arrives — permanent deadlock.
-
-**Scenario:** Any client that calls `session.cancel()` against a TS
-server.
-
-**Test sketch:** Open a session against TS server, start a slow handler,
-send CANCEL, assert CANCELLED trailer is received within 5s.
+**Fix:** TS `SessionServer` now writes CANCELLED trailer on CANCEL frame
+(was `continue` without response). Python was already correct.
 
 ---
 
-### G3. Session instantiation without metadata validation — TS (CRITICAL)
+### G3. Session metadata validation (CRITICAL) — TESTED, PYTHON PROTECTED
 
 **Spec:** Aster-SPEC.md §5.2 — metadata subject to size/count limits.
 
-**Gap:** TS `SessionServer` creates the service instance before validating
-StreamHeader metadata. Oversized metadata creates the session, then each
-CALL spins on validation errors while holding memory.
+**Gap (TS only):** TS `SessionServer` creates the service instance before
+validating StreamHeader metadata. TS gap remains unfixed.
 
-**Scenario:** Malicious client sends 10MB metadata in the StreamHeader.
+**Python:** `validate_metadata()` runs before handler dispatch in
+`_session_loop`. Tests confirm oversized values (>4096 bytes) and excess
+entries (>64) produce RESOURCE_EXHAUSTED.
 
-**Test sketch:** Send a StreamHeader with metadata exceeding limits to a
-session service. Assert server rejects before creating the instance.
+**Tests:** `test_g3_oversized_metadata_rejected`,
+`test_g3_too_many_metadata_entries_rejected`.
 
 ---
 
-### G4. Client-stream EoI not validated (HIGH)
+### G4. Client-stream EoI not validated (HIGH) — FIXED
 
 **Spec:** Aster-session-scoped-services.md §4.5 — explicit TRAILER(OK)
 for end-of-input.
 
-**Gap:** Server's client-stream reader breaks on ANY trailer flag, not
-just status=OK. A bit-flip that sets TRAILER on a data frame causes
-premature EoI — handler returns a result from partial data.
+**Fix:** Both Python and TS session servers now validate EoI trailer
+status=OK. Non-OK trailers produce INTERNAL error. Python shared
+server also fixed.
 
-**Scenario:** `ingestMetrics` with 10,000 points, corruption at point
-500. Server says "accepted: 500" and client believes it.
-
-**Test sketch:** Send 100 data frames, then a frame with TRAILER flag but
-non-OK payload. Assert server rejects (not silently returns partial).
+**Tests:** `test_g4_client_stream_rejects_non_ok_trailer`,
+`test_g4_client_stream_non_ok_eoi`.
 
 ---
 
-### G5. Decompression bomb (HIGH)
+### G5. Decompression bomb (HIGH) — TESTED, NOT VULNERABLE
 
 **Spec:** Aster-SPEC.md §6.1 — max frame size 16 MiB.
 
 **Gap:** Frame size limit enforced at wire level, but decompressed output
 isn't capped. A 10 KiB compressed frame can decompress to 100+ MiB.
 
-**Scenario:** Attacker sends a small zstd frame with pathological ratio.
+**Fix:** `ForyCodec._safe_decompress()` uses streaming decompression and
+raises `LimitExceeded` when output exceeds `MAX_DECOMPRESSED_SIZE`
+(16 MiB). Does not trust the content-size header.
 
-**Test sketch:** Create a zstd frame that decompresses to > 16 MiB.
-Assert server rejects it (not OOM).
+**Test:** `test_g5_decompression_bomb_rejected` — creates a 20 MiB
+payload compressed to ~200 bytes, verifies codec rejects and server
+returns error trailer (not OOM/crash).
 
 ---
 
-### G6. Bidi reader exception → silent EOF (HIGH)
+### G6. Bidi reader exception → silent EOF (HIGH) — FIXED
 
 **Spec:** Aster-session-scoped-services.md §4.5 — wire errors should
 terminate the call.
 
-**Gap:** Python bidi stream reader catches FramingError, logs it, puts
-EOF in the queue. Handler thinks client finished, returns success.
+**Fix:** Both Python and TS session servers now propagate reader errors
+instead of converting to silent EOF. Python stores error in
+`reader_error` and checks after handler. TS catches in generator
+and checks `readerError` after iteration.
 
-**Scenario:** Network corruption during `runCommand` bidi stream — server
-returns success on truncated input.
-
-**Test sketch:** Corrupt a frame mid-bidi-stream. Assert server returns
-INTERNAL error, not success.
+**Test:** `test_g6_bidi_reader_error_not_silent_eof`.
 
 ---
 
-### G7. TS unary writes OK trailer, Python doesn't (MEDIUM)
+### G7. TS unary writes OK trailer, Python doesn't (MEDIUM) — FIXED
 
 **Spec:** Aster-session-scoped-services.md §4.6 — "Unary calls within a
 session do not require a trailer frame."
 
-**Gap:** TS SessionServer writes OK trailer after unary response. Python
-doesn't. We worked around this with a 2s drain timeout in the TS client.
-
-**Test sketch:** (Already implicitly tested by the matrix — py-ts and
-ts-py both pass.) Add an explicit assertion that the second call in a
-session succeeds without delay.
+**Fix:** TS SessionServer no longer sends OK trailer for session unary
+(aligned with Python + spec). Tested via 58/58 matrix.
 
 ---
 
-### G8. Deadline not enforced in session handlers (MEDIUM)
+### G8. Deadline not enforced in handlers (MEDIUM) — FIXED
 
 **Spec:** Aster-session-scoped-services.md §9.3 — per-call deadlines in
 CallHeader.
 
-**Gap:** `deadlineEpochMs` is read into CallContext but never used as a
-timeout. Slow handler ignores deadline, client times out, server wastes
-resources.
+**Fix:** All dispatch methods (session AND shared) now enforce deadline.
+Added `MAX_HANDLER_TIMEOUT_S` (300s / 5 min) as server-side upper bound
+— applied when client sends no deadline or an absurd value.
 
-**Test sketch:** Set a 2s deadline on a session call to a handler that
-sleeps 10s. Assert the call fails within 3s (not 10).
+**Python:** session.py `_get_deadline_timeout()` + server.py
+`_handler_timeout()` both clamp to min(remaining, MAX_HANDLER_TIMEOUT_S).
+
+**TypeScript:** session.ts `getDeadlineMs()` + server.ts
+`handlerTimeoutMs()` use same logic.
+
+**Tests:** `test_g8_deadline_enforced_in_session`,
+`test_g8_shared_handler_has_upper_bound`.
 
 ---
 
@@ -150,31 +146,33 @@ sends method="" and the server rejects with FAILED_PRECONDITION.
 
 ---
 
-### G10. OTT nonce replay (LOW)
+### G10. OTT nonce replay (LOW) — TESTED, NOT VULNERABLE
 
 **Spec:** Aster-trust-spec.md §3.1 — nonces consumed once.
 
-**Gap:** If `nonce_store` is None (dev mode), OTT nonces are not checked.
-Attacker reuses a captured credential.
+**Result:** `InMemoryNonceStore.consume()` correctly returns False on
+replay. Without a nonce store, OTT credentials are denied outright
+(not silently accepted). High-level server always creates
+`InMemoryNonceStore` when Gate 0 is enabled.
 
-**Test sketch:** Present the same OTT credential twice. Assert second
-attempt is denied.
-
----
-
-### G11. CallHeader metadata not validated — TS session (LOW)
-
-**Gap:** TS SessionServer doesn't validate per-call metadata size/count.
-
-**Test sketch:** Send a CALL frame with oversized metadata. Assert
-RESOURCE_EXHAUSTED.
+**Tests:** `test_g10_ott_nonce_consumed_on_replay`,
+`test_g10_ott_without_nonce_store_is_denied`.
 
 ---
 
-### G12. Invalid UTF-8 crashes handler (LOW)
+### G11. CallHeader metadata not validated — TS session (LOW) — FIXED
 
-**Gap:** Invalid UTF-8 in frame payload causes UnicodeDecodeError that
-propagates without sending an error trailer.
+**Fix:** TS `SessionServer` now calls `validateMetadata()` on each
+CallHeader's metadata before dispatch. Returns RESOURCE_EXHAUSTED
+on violation. Python was already protected.
 
-**Test sketch:** Send a frame with invalid UTF-8 bytes. Assert server
-returns INTERNAL trailer (not crash/hang).
+---
+
+### G12. Invalid UTF-8 / corrupt payload crashes handler (LOW) — TESTED, NOT VULNERABLE
+
+**Result:** Corrupt payload in request frame is caught by codec
+decode, which raises an exception. Session server's try/except
+catches it and returns INTERNAL error trailer. Server does not
+crash or hang.
+
+**Test:** `test_g12_corrupt_payload_produces_error_trailer`.

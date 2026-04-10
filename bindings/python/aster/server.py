@@ -130,7 +130,9 @@ class Server:
             codec: The ForyCodec for serialization. Defaults to XLANG mode.
             fory_config: Optional configuration for implicitly created codecs.
             interceptors: List of interceptor instances to apply to all calls.
-            max_concurrent_streams: Maximum concurrent streams per connection.
+            max_concurrent_streams: Maximum concurrent QUIC streams per
+                connection (i.e. per client peer). Streams beyond this
+                limit are rejected at the QUIC layer. ``None`` = unlimited.
             registry: Optional ServiceRegistry. If not provided, creates one from services.
             owns_endpoint: If True (default), ``close()`` also closes the endpoint.
                 Set False when the endpoint is managed externally (e.g. by
@@ -139,7 +141,11 @@ class Server:
         self._endpoint = endpoint
         self._owns_endpoint = owns_endpoint
         self._peer_store = peer_store
-        self._interceptors = list(interceptors) if interceptors else []
+        from aster.interceptors.deadline import DeadlineInterceptor
+        if interceptors is not None:
+            self._interceptors = list(interceptors)
+        else:
+            self._interceptors = [DeadlineInterceptor()]
         self._max_concurrent_streams = max_concurrent_streams
         self._service_instances: dict[tuple[str, int], Any] = {}
         # For session-scoped services we store the class (not an instance)
@@ -641,6 +647,15 @@ class Server:
             return json_encode(response), False
         return self._codec.encode_compressed(response)
 
+    @staticmethod
+    def _handler_timeout(call_ctx: Any) -> float:
+        """Return handler timeout: min(remaining deadline, server max)."""
+        from aster.limits import MAX_HANDLER_TIMEOUT_S
+        remaining = getattr(call_ctx, "remaining_seconds", None)
+        if remaining is None:
+            return MAX_HANDLER_TIMEOUT_S
+        return max(0.0, min(remaining, MAX_HANDLER_TIMEOUT_S))
+
     async def _handle_unary(
         self,
         conn_ctx: ConnectionContext,
@@ -665,10 +680,15 @@ class Server:
 
             request = await apply_request_interceptors(interceptors, call_ctx, request)
 
-            # Invoke handler
-            response = handler_method(request)
-            if asyncio.iscoroutine(response):
-                response = await response
+            # Invoke handler with deadline enforcement
+            timeout = self._handler_timeout(call_ctx)
+            try:
+                response = handler_method(request)
+                if asyncio.iscoroutine(response):
+                    response = await asyncio.wait_for(response, timeout=timeout)
+            except asyncio.TimeoutError:
+                await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                return
             response = await apply_response_interceptors(interceptors, call_ctx, response)
 
             # Encode and write response
@@ -731,8 +751,12 @@ class Server:
                 except (ValueError, NotImplementedError):
                     pass  # Not in ROW mode or schema not available
 
-            # Stream responses
+            # Stream responses with deadline enforcement
+            deadline_time = asyncio.get_event_loop().time() + self._handler_timeout(call_ctx)
             async for response in response_iter:
+                if asyncio.get_event_loop().time() > deadline_time:
+                    await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                    return
                 response = await apply_response_interceptors(interceptors, call_ctx, response)
                 response_payload, response_compressed = self._encode_response(response, header.serializationMode)
                 response_flags = COMPRESSED if response_compressed else 0
@@ -768,6 +792,7 @@ class Server:
         interceptors = self._resolve_interceptors(self._registry.lookup(header.service, header.version))
         try:
             # Collect all request frames until trailer or stream end
+            from aster.limits import MAX_CLIENT_STREAM_ITEMS
             requests: list[Any] = []
 
             while True:
@@ -777,6 +802,17 @@ class Server:
 
                 payload, flags = frame
                 if flags & TRAILER:
+                    try:
+                        eoi_status: RpcStatus = self._codec.decode(payload) if not header.serializationMode == SerializationMode.JSON.value else json_decode(payload, RpcStatus)
+                        if eoi_status.code != StatusCode.OK:
+                            await self._write_error_trailer(
+                                send, StatusCode.INTERNAL,
+                                f"client sent non-OK EoI trailer (code={eoi_status.code})",
+                                serialization_mode=header.serializationMode,
+                            )
+                            return
+                    except Exception:
+                        pass
                     break
                 # §5.6 / §SS5.6: CANCEL on a non-session stream is ignored
                 if flags & CANCEL:
@@ -785,11 +821,18 @@ class Server:
                     )
                     continue
 
+                if len(requests) >= MAX_CLIENT_STREAM_ITEMS:
+                    await self._write_error_trailer(
+                        send, StatusCode.RESOURCE_EXHAUSTED,
+                        f"client stream exceeded {MAX_CLIENT_STREAM_ITEMS} items",
+                        serialization_mode=header.serializationMode,
+                    )
+                    return
+
                 compressed = bool(flags & COMPRESSED)
                 if header.serializationMode == SerializationMode.JSON.value:
                     if compressed:
-                        import zstandard
-                        payload = zstandard.ZstdDecompressor().decompress(payload)
+                        payload = safe_decompress(payload)
                     request = json_decode(payload, method_info.request_type)
                 else:
                     request = self._codec.decode_compressed(payload, compressed, method_info.request_type)
@@ -800,9 +843,14 @@ class Server:
                 for item in requests:
                     yield item
 
-            response = handler_method(request_iter())
-            if asyncio.iscoroutine(response):
-                response = await response
+            timeout = self._handler_timeout(call_ctx)
+            try:
+                response = handler_method(request_iter())
+                if asyncio.iscoroutine(response):
+                    response = await asyncio.wait_for(response, timeout=timeout)
+            except asyncio.TimeoutError:
+                await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                return
             response = await apply_response_interceptors(interceptors, call_ctx, response)
 
             # Encode and write response
@@ -870,8 +918,17 @@ class Server:
                 except (ValueError, NotImplementedError):
                     pass  # Not in ROW mode or schema not available
 
-            # Stream responses from handler
+            # Stream responses from handler with deadline enforcement
+            deadline_time = asyncio.get_event_loop().time() + self._handler_timeout(call_ctx)
             async for response in response_iter:
+                if asyncio.get_event_loop().time() > deadline_time:
+                    reader_task.cancel()
+                    try:
+                        await reader_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                    return
                 response = await apply_response_interceptors(interceptors, call_ctx, response)
                 response_payload, response_compressed = self._encode_response(response, header.serializationMode)
                 response_flags = COMPRESSED if response_compressed else 0

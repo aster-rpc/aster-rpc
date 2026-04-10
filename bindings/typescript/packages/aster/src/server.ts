@@ -33,7 +33,8 @@ import {
   applyResponseInterceptors,
 } from './interceptors/base.js';
 import { withRequestContext, type AsterLogger, createLogger } from './logging.js';
-import { validateMetadata } from './limits.js';
+import { validateMetadata, MAX_HANDLER_TIMEOUT_S, MAX_CLIENT_STREAM_ITEMS } from './limits.js';
+import { DeadlineInterceptor } from './interceptors/deadline.js';
 import type { PeerAttributeStore } from './peer-store.js';
 
 /** QUIC connection interface (matches NAPI IrohConnection). */
@@ -96,7 +97,7 @@ export class RpcServer {
   constructor(opts: ServerOptions) {
     this.registry = opts.registry;
     this.codec = opts.codec ?? new JsonCodec();
-    this.interceptors = opts.interceptors ?? [];
+    this.interceptors = opts.interceptors ?? [new DeadlineInterceptor()];
     this.logger = opts.logger ?? createLogger();
     this.peerStore = opts.peerStore;
   }
@@ -352,8 +353,23 @@ export class RpcServer {
     // Interceptors
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
 
-    // Invoke handler
-    let response = await handler.call(svcInfo.instance, request);
+    // Invoke handler with deadline enforcement
+    let response: any;
+    const timeout = this.handlerTimeoutMs(callCtx);
+    try {
+      response = await Promise.race([
+        handler.call(svcInfo.instance, request),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded')), timeout),
+        ),
+      ]);
+    } catch (e) {
+      if (e instanceof RpcError && e.code === StatusCode.DEADLINE_EXCEEDED) {
+        await this.writeErrorTrailer(send, StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
+        return;
+      }
+      throw e;
+    }
     response = await applyResponseInterceptors(this.interceptors, callCtx, response);
 
     // Write response + trailer
@@ -381,7 +397,12 @@ export class RpcServer {
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
 
     const gen = handler.call(svcInfo.instance, request);
+    const deadlineMs = Date.now() + this.handlerTimeoutMs(callCtx);
     for await (let response of gen) {
+      if (Date.now() > deadlineMs) {
+        await this.writeErrorTrailer(send, StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
+        return;
+      }
       response = await applyResponseInterceptors(this.interceptors, callCtx, response);
       const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
       await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
@@ -401,8 +422,23 @@ export class RpcServer {
       const frame = await readFrame(recv, 0);
       if (!frame) break;
       const [payload, flags] = frame;
-      if (flags & TRAILER) break;
+      if (flags & TRAILER) {
+        try {
+          const eoi = this.codec.decode(payload) as RpcStatus;
+          if (eoi.code !== StatusCode.OK) {
+            await this.writeErrorTrailer(send, StatusCode.INTERNAL,
+              `client sent non-OK EoI trailer (code=${eoi.code})`);
+            return;
+          }
+        } catch { /* best-effort validation */ }
+        break;
+      }
       if (flags & CANCEL) continue;
+      if (requests.length >= MAX_CLIENT_STREAM_ITEMS) {
+        await this.writeErrorTrailer(send, StatusCode.RESOURCE_EXHAUSTED,
+          `client stream exceeded ${MAX_CLIENT_STREAM_ITEMS} items`);
+        return;
+      }
       const compressed = !!(flags & COMPRESSED);
       let request = compressed
         ? (this.codec as any).decodeCompressed(payload, true)
@@ -414,7 +450,22 @@ export class RpcServer {
     // Provide as async iterable
     async function* requestIter() { for (const r of requests) yield r; }
 
-    let response = await handler.call(svcInfo.instance, requestIter());
+    let response: any;
+    const timeout = this.handlerTimeoutMs(callCtx);
+    try {
+      response = await Promise.race([
+        handler.call(svcInfo.instance, requestIter()),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded')), timeout),
+        ),
+      ]);
+    } catch (e) {
+      if (e instanceof RpcError && e.code === StatusCode.DEADLINE_EXCEEDED) {
+        await this.writeErrorTrailer(send, StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
+        return;
+      }
+      throw e;
+    }
     response = await applyResponseInterceptors(this.interceptors, callCtx, response);
 
     const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
@@ -425,32 +476,48 @@ export class RpcServer {
 
   private async handleBidiStream(
     svcInfo: ServiceInfo, _methodInfo: MethodInfo, handler: Function,
-    _callCtx: CallContext, send: ServerSendStream, recv: ServerRecvStream,
+    callCtx: CallContext, send: ServerSendStream, recv: ServerRecvStream,
   ): Promise<void> {
     // Auth interceptors already ran in dispatchRpc() before this method.
     // No need to run them again here.
 
-    // Create request iterable from incoming frames
+    // Create request iterable from incoming frames with error capture
     const self = this;
+    let readerError: Error | null = null;
     async function* requestIter() {
-      while (true) {
-        const frame = await readFrame(recv, 0);
-        if (!frame) break;
-        const [payload, flags] = frame;
-        if (flags & TRAILER) break;
-        if (flags & CANCEL) continue;
-        const compressed = !!(flags & COMPRESSED);
-        const request = compressed
-          ? (self.codec as any).decodeCompressed(payload, true)
-          : self.codec.decode(payload);
-        yield request;
+      try {
+        while (true) {
+          const frame = await readFrame(recv, 0);
+          if (!frame) break;
+          const [payload, flags] = frame;
+          if (flags & TRAILER) break;
+          if (flags & CANCEL) continue;
+          const compressed = !!(flags & COMPRESSED);
+          const request = compressed
+            ? (self.codec as any).decodeCompressed(payload, true)
+            : self.codec.decode(payload);
+          yield request;
+        }
+      } catch (e) {
+        readerError = e instanceof Error ? e : new Error(String(e));
       }
     }
 
     const gen = handler.call(svcInfo.instance, requestIter());
+    const deadlineMs = Date.now() + this.handlerTimeoutMs(callCtx);
     for await (const response of gen) {
+      if (Date.now() > deadlineMs) {
+        await this.writeErrorTrailer(send, StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
+        return;
+      }
       const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
       await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
+    }
+
+    if (readerError) {
+      await this.writeErrorTrailer(send, StatusCode.INTERNAL,
+        `bidi stream reader error: ${readerError.message}`);
+      return;
     }
 
     await this.writeOkTrailer(send);
@@ -458,6 +525,14 @@ export class RpcServer {
   }
 
   // -- Helpers ----------------------------------------------------------------
+
+  private handlerTimeoutMs(callCtx: CallContext): number {
+    const maxMs = MAX_HANDLER_TIMEOUT_S * 1000;
+    const deadline = callCtx.deadline;
+    if (deadline == null || deadline <= 0) return maxMs;
+    const remaining = deadline * 1000 - Date.now();
+    return Math.max(0, Math.min(remaining, maxMs));
+  }
 
   private buildMetadata(header: StreamHeader): Record<string, string> {
     const metadata: Record<string, string> = {};

@@ -33,6 +33,7 @@ import {
   applyRequestInterceptors,
   applyResponseInterceptors,
 } from './interceptors/base.js';
+import { MAX_HANDLER_TIMEOUT_S, MAX_CLIENT_STREAM_ITEMS, validateMetadata, LimitExceeded } from './limits.js';
 
 /**
  * Server-side session handler.
@@ -80,6 +81,8 @@ export class SessionServer {
       const [payload, flags] = frame;
 
       if (flags & CANCEL) {
+        const status = new RpcStatus({ code: StatusCode.CANCELLED, message: 'cancelled' });
+        await writeFrame(send as any, this.codec.encode(status), TRAILER);
         continue;
       }
 
@@ -91,6 +94,19 @@ export class SessionServer {
 
       // Decode CallHeader
       const callHeader = this.codec.decode(payload) as CallHeader;
+
+      // Validate per-call metadata (G3/G11)
+      try {
+        validateMetadata(callHeader.metadataKeys ?? [], callHeader.metadataValues ?? []);
+      } catch (e) {
+        if (e instanceof LimitExceeded) {
+          const status = new RpcStatus({ code: StatusCode.RESOURCE_EXHAUSTED, message: e.message });
+          await writeFrame(send as any, this.codec.encode(status), TRAILER);
+          continue;
+        }
+        throw e;
+      }
+
       const methodInfo = serviceInfo.methods.get(callHeader.method);
 
       if (!methodInfo) {
@@ -111,6 +127,7 @@ export class SessionServer {
         pattern: methodInfo.pattern as any,
         idempotent: methodInfo.idempotent,
         attributes,
+        deadlineEpochMs: callHeader.deadlineEpochMs || 0,
       });
 
       // Run auth interceptors before reading the request
@@ -160,6 +177,32 @@ export class SessionServer {
     }
   }
 
+  // -- Helpers ----------------------------------------------------------------
+
+  private getDeadlineMs(callCtx: any): number {
+    const maxMs = MAX_HANDLER_TIMEOUT_S * 1000;
+    const deadline = callCtx?.deadline;
+    if (deadline == null || deadline <= 0) return Date.now() + maxMs;
+    const clientMs = deadline * 1000;
+    const serverMax = Date.now() + maxMs;
+    return Math.min(clientMs, serverMax);
+  }
+
+  private async withDeadline<T>(
+    callCtx: any,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const deadlineMs = this.getDeadlineMs(callCtx);
+    const remaining = deadlineMs - Date.now();
+    if (remaining <= 0) throw new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
+    return Promise.race([
+      fn(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded')), remaining),
+      ),
+    ]);
+  }
+
   // -- Pattern handlers -------------------------------------------------------
 
   private async handleUnary(
@@ -177,14 +220,13 @@ export class SessionServer {
 
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
 
-    let response = await methodInfo.handler!.call(instance, request);
+    let response = await this.withDeadline(callCtx, () =>
+      methodInfo.handler!.call(instance, request),
+    );
     response = await applyResponseInterceptors(this.interceptors, callCtx, response);
 
     const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
     await writeFrame(send as any, respPayload, respCompressed ? COMPRESSED : 0);
-    // Spec: session unary does NOT send a success trailer. The single
-    // response frame IS the complete response. Trailers are only for
-    // errors and streaming patterns.
   }
 
   private async handleServerStream(
@@ -203,7 +245,11 @@ export class SessionServer {
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
 
     const gen = methodInfo.handler!.call(instance, request);
+    const deadlineMs = this.getDeadlineMs(callCtx);
     for await (let response of gen) {
+      if (deadlineMs != null && Date.now() > deadlineMs) {
+        throw new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
+      }
       response = await applyResponseInterceptors(this.interceptors, callCtx, response);
       const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
       await writeFrame(send as any, respPayload, respCompressed ? COMPRESSED : 0);
@@ -222,8 +268,34 @@ export class SessionServer {
       const frame = await readFrame(recv as any, 0);
       if (!frame) break;
       const [p, f] = frame;
-      if (f & TRAILER) break;
+      if (f & TRAILER) {
+        // Validate EoI: must be status=OK (G4)
+        try {
+          const eoi = this.codec.decode(p) as RpcStatus;
+          if (eoi.code !== StatusCode.OK) {
+            const status = new RpcStatus({
+              code: StatusCode.INTERNAL,
+              message: `client sent non-OK EoI trailer (code=${eoi.code})`,
+            });
+            await writeFrame(send as any, this.codec.encode(status), TRAILER);
+            return;
+          }
+        } catch {
+          const status = new RpcStatus({ code: StatusCode.INTERNAL, message: 'malformed EoI trailer' });
+          await writeFrame(send as any, this.codec.encode(status), TRAILER);
+          return;
+        }
+        break;
+      }
       if (f & CANCEL) continue;
+      if (requests.length >= MAX_CLIENT_STREAM_ITEMS) {
+        const status = new RpcStatus({
+          code: StatusCode.RESOURCE_EXHAUSTED,
+          message: `client stream exceeded ${MAX_CLIENT_STREAM_ITEMS} items`,
+        });
+        await writeFrame(send as any, this.codec.encode(status), TRAILER);
+        return;
+      }
       const compressed = !!(f & COMPRESSED);
       const req = compressed
         ? (this.codec as any).decodeCompressed(p, true)
@@ -232,7 +304,9 @@ export class SessionServer {
     }
 
     async function* requestIter() { for (const r of requests) yield r; }
-    let response = await methodInfo.handler!.call(instance, requestIter());
+    let response = await this.withDeadline(callCtx, () =>
+      methodInfo.handler!.call(instance, requestIter()),
+    );
     response = await applyResponseInterceptors(this.interceptors, callCtx, response);
 
     const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
@@ -241,32 +315,44 @@ export class SessionServer {
   }
 
   private async handleBidiStream(
-    instance: any, methodInfo: MethodInfo, _callCtx: any,
+    instance: any, methodInfo: MethodInfo, callCtx: any,
     send: { writeAll(data: Uint8Array): Promise<void> },
     recv: { readExact(n: number): Promise<Uint8Array> },
   ): Promise<void> {
     const self = this;
+    let readerError: Error | null = null;
     async function* requestIter() {
-      while (true) {
-        const frame = await readFrame(recv as any, 0);
-        if (!frame) break;
-        const [p, f] = frame;
-        if (f & TRAILER) break;
-        if (f & CANCEL) continue;
-        const compressed = !!(f & COMPRESSED);
-        const req = compressed
-          ? (self.codec as any).decodeCompressed(p, true)
-          : self.codec.decode(p);
-        yield req;
+      try {
+        while (true) {
+          const frame = await readFrame(recv as any, 0);
+          if (!frame) break;
+          const [p, f] = frame;
+          if (f & TRAILER) break;
+          if (f & CANCEL) continue;
+          const compressed = !!(f & COMPRESSED);
+          const req = compressed
+            ? (self.codec as any).decodeCompressed(p, true)
+            : self.codec.decode(p);
+          yield req;
+        }
+      } catch (e) {
+        readerError = e instanceof Error ? e : new Error(String(e));
       }
     }
 
     const gen = methodInfo.handler!.call(instance, requestIter());
+    const deadlineMs = this.getDeadlineMs(callCtx);
     for await (const response of gen) {
+      if (Date.now() > deadlineMs) {
+        throw new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
+      }
       const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
       await writeFrame(send as any, respPayload, respCompressed ? COMPRESSED : 0);
     }
 
+    if (readerError) {
+      throw new RpcError(StatusCode.INTERNAL, `bidi stream reader error: ${readerError.message}`);
+    }
     await this.writeOkTrailer(send);
   }
 

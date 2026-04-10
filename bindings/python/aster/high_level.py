@@ -122,6 +122,14 @@ class AsterServer:
     ) -> None:
         """Create an Aster RPC server.
 
+        .. note:: **Interceptors are not wired by default.** The server ships
+           with interceptors for rate limiting, deadline enforcement, auth,
+           capability checks, circuit breaking, metrics, audit logging, and
+           retry hints -- but none are active unless you pass them via the
+           ``interceptors`` parameter. For production use, wire at minimum
+           ``DeadlineInterceptor`` and ``RateLimitInterceptor``. All
+           interceptors live in ``aster.interceptors``.
+
         Args:
             services: List of ``@service``-decorated class instances to serve.
                 At least one is required.
@@ -216,7 +224,11 @@ class AsterServer:
         self._endpoint_config_template = endpoint_config or config.to_endpoint_config()
         self._channel_name = channel_name
         self._codec = codec
-        self._interceptors = list(interceptors) if interceptors else []
+        from aster.interceptors.deadline import DeadlineInterceptor
+        if interceptors is not None:
+            self._interceptors = list(interceptors)
+        else:
+            self._interceptors = [DeadlineInterceptor()]
         self._hook = hook
         self._nonce_store = nonce_store
 

@@ -1,66 +1,272 @@
 # Session Protocol
 
-**Status:** Stub -- to be filled after chaos tests confirm invariants.
+Implementation flow for session-scoped services. Multiple RPC calls share
+a single bidirectional QUIC stream. The server instantiates one service
+instance per session, preserving state across calls.
 
-**Reference:** `bindings/python/aster/session.py` SessionServer + SessionStub
+**Spec:** Aster-session-scoped-services.md
 
-## What this flow covers
+## Wire protocol overview
 
-The wire protocol for session-scoped services where multiple RPC calls
-share a single bidirectional QUIC stream. Covers both server-side
-dispatch and client-side call multiplexing.
+```
+Client                                   Server
+   │                                        │
+   │── StreamHeader(method="", service=X) ─▶│  ← session opening
+   │                                        │── instantiate service(peer=...)
+   │── CALL frame (CallHeader) ────────────▶│  ← call 1 start
+   │── request data frame ─────────────────▶│
+   │◀─ response data frame ────────────────│  ← unary: no trailer
+   │                                        │
+   │── CALL frame (CallHeader) ────────────▶│  ← call 2 start
+   │── request data frame ─────────────────▶│
+   │◀─ response data frame(s) ─────────────│  ← server_stream
+   │◀─ TRAILER(OK) ────────────────────────│
+   │                                        │
+   │── send.finish() ──────────────────────▶│  ← session close
+   │                                        │── on_session_close()
+```
 
-## Sections to write
+The key discriminator: `StreamHeader.method == ""` signals session mode.
+A non-empty method on a session-scoped service triggers
+FAILED_PRECONDITION with an actionable error message.
 
-### 1. Session opening
-- Client sends StreamHeader with `method=""`, `service=<name>`, `callId=<session_id>`
-- Server checks scope discriminator: `method=="" + scoped='session'` match; mismatch -> FAILED_PRECONDITION with actionable error message
-- Server instantiates a fresh service class per session with `peer` parameter
-- Server enters CALL frame loop
+## Session opening
 
-### 2. Per-call framing
-- Client sends CALL frame (flag 0x10) with CallHeader (`method`, `callId`, `deadlineEpochMs`, metadata)
-- Client sends request data frame(s)
-- Server dispatches to handler based on pattern (unary, server_stream, client_stream, bidi_stream)
-- Server sends response data frame(s)
-- Server sends TRAILER frame with RpcStatus per call (streaming patterns)
-- **Unary special case:** spec says no success trailer required (Python omits it; TS currently sends it -- to be reconciled)
+### Server-side discriminator
 
-### 3. Client-stream and bidi end-of-input
-- Client signals end-of-input with explicit TRAILER(OK) frame -- NOT `send.finish()`
-- `finish()` is reserved for session close
-- Server must validate that EoI trailer has status=OK (not just any TRAILER flag)
+```python
+if header.method == "" and service_info.scoped == "session":
+    # Session mode — enter CALL frame loop
+elif header.method == "" and service_info.scoped == "shared":
+    # Scope mismatch — reject
+elif header.method != "" and service_info.scoped == "session":
+    # Client tried a one-shot call on a session service — reject
+```
 
-### 4. Cancellation
-- Client sends CANCEL frame (flag 0x20) to cancel the in-flight call
-- Server MUST respond with exactly one CANCELLED trailer -- unconditionally
-- Server cancels the handler task, drains any pending response frames
-- Client drains frames until it sees the CANCELLED trailer, then can issue next CALL
-- **Known gap (G2):** TS server currently does `continue` on CANCEL without sending trailer
+The error message must be clear:
+`"'AgentSession' is session-scoped: open a session stream (method='') instead of calling method 'register' directly"`
 
-### 5. Session close
-- Client calls `send.finish()` to close the send side
-- Server's frame reader returns null (EOF), exits the CALL loop
-- Server calls `on_session_close()` lifecycle hook if present on the service instance
-- Server calls `send.finish()` to close its send side
+**Python:** `server.py` dispatch logic around line 400.
+**TypeScript:** `server.ts` dispatch logic around line 190.
 
-### 6. Lock semantics (client-side)
-- Python SessionStub holds an async lock per session
-- Lock is acquired before sending CALL frame, released after reading the complete response
-- **Known gap (G1):** if network drops mid-response, lock releases and next call interleaves
+### Service instantiation
 
-### 7. Auth interceptors within sessions
-- CapabilityInterceptor runs per CALL, not just per session
-- Auth denial writes error trailer and continues the session loop (doesn't kill the session)
-- Peer attributes come from PeerAttributeStore, populated at admission time
+The server creates a **fresh instance per session** so each client gets
+its own state. The constructor receives `peer=<endpoint_id>`:
 
-## Invariants for new implementations
+```python
+instance = service_class(peer=peer)
+```
 
-_(To be confirmed by chaos tests, then documented here)_
+If the constructor fails, write an INTERNAL trailer and close the stream.
 
-## Bugs this flow exposed
+**TypeScript note:** TS tries `new ctor()` first; if that fails, falls
+back to reusing the registered instance (line 69-73 in session.ts).
 
-- TS server had no session handler at all -- returned UNIMPLEMENTED on method=""
-- TS server accepted one-shot calls to session-scoped methods (B1 bug)
-- Python session server passed default ForyCodec even when client requested JSON
-- Unary trailer mismatch caused second call to read stale trailer (TS server) or deadlock (Python server, if trailer expected)
+## Per-call framing
+
+### Frame flags
+
+| Flag | Value | Meaning |
+|------|-------|---------|
+| COMPRESSED | 0x01 | Payload is zstd-compressed |
+| TRAILER | 0x02 | Frame carries an RpcStatus |
+| HEADER | 0x04 | First frame on stream (StreamHeader) |
+| ROW_SCHEMA | 0x08 | ROW mode schema hoisting |
+| CALL | 0x10 | Session call boundary (CallHeader) |
+| CANCEL | 0x20 | Cancel in-flight call |
+
+### CallHeader
+
+Sent as the payload of a CALL frame:
+
+```
+method: string        — method name to dispatch
+callId: string        — unique ID for this call (UUID)
+deadlineEpochMs: int  — 0 = no deadline, else absolute epoch ms
+metadataKeys: string[]
+metadataValues: string[]
+```
+
+### Metadata validation
+
+Before dispatching, validate CallHeader metadata against limits:
+- `MAX_METADATA_ENTRIES` (64)
+- `MAX_METADATA_KEY_LEN` (256)
+- `MAX_METADATA_VALUE_LEN` (4096)
+- `MAX_METADATA_TOTAL_BYTES` (8192)
+
+Reject with RESOURCE_EXHAUSTED if exceeded.
+
+**Python:** `validate_metadata()` at `session.py:270`.
+**TypeScript:** `validateMetadata()` at `session.ts:99`.
+
+## Pattern dispatch
+
+After reading the CALL frame and request payload, dispatch based on the
+method's registered pattern:
+
+### Unary
+
+1. Read one request data frame
+2. Run handler
+3. Write one response data frame
+4. **No success trailer** — the single response IS the complete response
+
+This is a deliberate spec choice. Streaming patterns need trailers to
+signal end-of-stream; unary doesn't.
+
+### Server-stream
+
+1. Read one request data frame
+2. Run handler (async generator)
+3. Write response data frames as they yield
+4. Write TRAILER(OK) after the generator exhausts
+
+### Client-stream
+
+1. Read data frames until TRAILER(OK) end-of-input
+2. **Validate EoI:** trailer must have status=OK. Non-OK = INTERNAL error.
+3. Run handler with collected items
+4. Write one response data frame
+
+**Item cap:** `MAX_CLIENT_STREAM_ITEMS` (100,000). Reject with
+RESOURCE_EXHAUSTED if exceeded. Prevents memory exhaustion from a
+malicious client sending millions of tiny frames.
+
+### Bidi-stream
+
+1. Start reader task (reads frames into a queue)
+2. Start handler with async iterator over the queue
+3. Write response frames as handler yields
+4. After handler completes, check `reader_error`
+5. If reader error: write INTERNAL trailer (not OK)
+6. If clean: write TRAILER(OK)
+
+**Critical:** Reader errors must NOT be converted to silent EOF. If the
+frame reader hits a decode error, that error must be stored and checked
+after the handler finishes. This was the G6 silent corruption bug.
+
+## Cancellation
+
+Client sends a CANCEL frame (flag 0x20, empty payload). Server responds
+with **exactly one CANCELLED trailer**, unconditionally:
+
+```python
+if flags & CANCEL:
+    await _write_trailer(send, codec, StatusCode.CANCELLED, "cancelled")
+    continue  # session stays open
+```
+
+The session remains open after cancellation. Client drains frames until
+it sees the CANCELLED trailer, then can issue the next CALL.
+
+**Python:** The unary dispatcher runs handler and cancel-reader as
+concurrent tasks in `asyncio.wait`. If CANCEL wins, handler is cancelled.
+
+**TypeScript:** Fixed to send CANCELLED trailer (was `continue` without
+response — the G2 deadlock bug).
+
+## Deadline enforcement
+
+All dispatch methods enforce `deadlineEpochMs` from the CallHeader:
+
+- If no deadline is set (0), the server-side upper bound
+  `MAX_HANDLER_TIMEOUT_S` (300s / 5 min) applies.
+- If the client's deadline is further than MAX_HANDLER_TIMEOUT_S, it is
+  clamped to the server max.
+- Server returns DEADLINE_EXCEEDED trailer when the deadline fires.
+
+**Python helper:** `_get_deadline_timeout()` at `session.py:151`.
+**TypeScript helper:** `getDeadlineMs()` / `withDeadline()` in session.ts.
+
+## Session close
+
+Client calls `send.finish()` to close the send side. Server's frame pump
+returns None (EOF), exits the CALL loop. Server fires `on_session_close()`
+lifecycle hook if present on the instance.
+
+## Lock semantics (client-side)
+
+Python `SessionStub` holds an `asyncio.Lock` per session. Lock is acquired
+before sending the CALL frame and released after reading the complete
+response. This serializes calls — only one in-flight call per session.
+
+Confirmed by chaos tests: concurrent callers on one stub produce a
+correct linearizable history (`test_linearizable_increment`).
+
+## Auth interceptors within sessions
+
+CapabilityInterceptor runs **per CALL**, not per session. An auth denial
+writes an error trailer but **continues the session loop** (doesn't kill
+the session). The client can make other calls that pass auth.
+
+Peer attributes come from PeerAttributeStore, populated at admission time.
+
+## Invariants confirmed by chaos tests
+
+- No cross-talk between concurrent sessions (`test_no_crosstalk_between_sessions`)
+- Session state isolation (`test_session_state_isolation`)
+- Counter monotonicity under contention (`test_monotonicity_under_contention`)
+- Linearizable increment under lock contention (`test_linearizable_increment`)
+- Session churn does not leak resources (`test_soak_session_churn`)
+- EoI trailer status=OK validated (`test_g4_client_stream_non_ok_eoi`)
+- Bidi reader errors propagated (`test_g6_bidi_reader_error_not_silent_eof`)
+- CANCEL produces CANCELLED trailer (`test_g2_cancel_produces_cancelled_trailer`)
+- Deadline enforced (`test_g8_deadline_enforced_in_session`)
+- Corrupt payload produces error trailer (`test_g12_corrupt_payload_produces_error_trailer`)
+
+## Naming conventions (wire compatibility)
+
+These field names in CallHeader/StreamHeader are part of the wire protocol:
+
+| Wire name | Notes |
+|-----------|-------|
+| `method` | Empty string `""` for session opening |
+| `callId` | camelCase on wire (both Python and TS) |
+| `deadlineEpochMs` | camelCase on wire |
+| `metadataKeys` | camelCase on wire |
+| `metadataValues` | camelCase on wire |
+| `serializationMode` | camelCase on wire, integer value |
+
+RpcStatus fields:
+
+| Wire name | Type |
+|-----------|------|
+| `code` | Integer (StatusCode enum value) |
+| `message` | String |
+| `detailKeys` | String array |
+| `detailValues` | String array |
+
+Internal names (Python properties, method names) can use snake_case.
+The wire names are what the codec sees.
+
+## Implementation checklist for new bindings
+
+- [ ] Detect session mode: `StreamHeader.method == ""`
+- [ ] Scope discriminator with clear error messages
+- [ ] Fresh service instance per session with `peer` parameter
+- [ ] CALL frame loop with metadata validation
+- [ ] Four pattern dispatchers (unary, server_stream, client_stream, bidi)
+- [ ] Unary: no success trailer
+- [ ] Client-stream: validate EoI trailer status=OK
+- [ ] Client-stream: enforce MAX_CLIENT_STREAM_ITEMS
+- [ ] Bidi: propagate reader errors (not silent EOF)
+- [ ] CANCEL: send exactly one CANCELLED trailer
+- [ ] Deadline enforcement with MAX_HANDLER_TIMEOUT_S upper bound
+- [ ] Per-call auth interceptors (not per-session)
+- [ ] `on_session_close()` lifecycle hook
+- [ ] Client-side lock serializing calls on one session
+
+## Key files
+
+| Binding | File | Entry point |
+|---------|------|-------------|
+| Python | `session.py:168` | `SessionServer` class |
+| Python | `session.py:189` | `SessionServer.run()` |
+| Python | `session.py:221` | `SessionServer._session_loop()` |
+| Python | `session.py:357` | `SessionServer._pump_frames()` |
+| Python | `session.py:833` | `SessionStub` class |
+| Python | `session.py:1143` | `create_local_session()` |
+| TS | `session.ts:44` | `SessionServer` class |
+| TS | `session.ts:58` | `SessionServer.handleSession()` |
