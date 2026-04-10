@@ -213,13 +213,10 @@ export {
 } from './dynamic.js';
 
 // Session-scoped services (extended)
-export { SessionStub, createSession, createLocalSession } from './session.js';
+export { SessionServer, SessionStub, createSession } from './session.js';
 
 // Transport implementations
 export { IrohTransport } from './transport/iroh.js';
-
-// Session-scoped services
-export { SessionServer } from './session.js';
 
 // Configuration
 export {
