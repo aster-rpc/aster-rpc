@@ -572,7 +572,11 @@ def service(
         scoped: Service scope: "shared" or "session". Default "shared".
             The legacy alias "stream" is still accepted on input.
         interceptors: List of interceptor classes to apply to all methods.
-        max_concurrent_streams: Maximum concurrent streams for this service.
+        max_concurrent_streams: Maximum concurrent QUIC streams per
+            connection (i.e. per client peer). When a client exceeds
+            this limit, additional streams are rejected at the QUIC
+            layer. This applies to the server as a whole, not
+            per-service. ``None`` means unlimited.
 
     Returns:
         A decorator function (or the decorated class if used bare).

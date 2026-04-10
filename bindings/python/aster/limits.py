@@ -30,6 +30,17 @@ DEFAULT_FRAME_READ_TIMEOUT_S: float = 30.0
 Applied when no RPC deadline is set. Prevents hangs from peers that
 send a length header but never send the body."""
 
+MAX_HANDLER_TIMEOUT_S: float = 300.0
+"""Server-side upper bound on handler execution time (5 minutes).
+Applied regardless of client deadline. If the client sends no deadline
+(deadlineEpochMs=0), this is used as the default. If the client sends
+a deadline further in the future, it is clamped to this value."""
+
+MAX_CLIENT_STREAM_ITEMS: int = 100_000
+"""Maximum number of items a client can send in a client-stream or bidi-stream
+before the server stops accepting. Prevents memory exhaustion from a
+malicious client sending millions of tiny frames."""
+
 # ── Metadata limits ───────────────────────────────────────────────────────────
 
 MAX_METADATA_ENTRIES: int = 64

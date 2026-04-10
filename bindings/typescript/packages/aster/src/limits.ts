@@ -18,6 +18,17 @@ export const MAX_DECOMPRESSED_SIZE = 16 * 1024 * 1024;
 /** Default timeout for reading a frame from a QUIC stream (seconds). */
 export const DEFAULT_FRAME_READ_TIMEOUT_S = 30.0;
 
+/** Server-side upper bound on handler execution time (5 minutes).
+ *  Applied regardless of client deadline. If the client sends no deadline
+ *  (deadlineEpochMs=0), this is used as the default. If the client sends
+ *  a deadline further in the future, it is clamped to this value. */
+export const MAX_HANDLER_TIMEOUT_S = 300.0;
+
+/** Maximum number of items in a client-stream or bidi-stream before
+ *  the server stops accepting. Prevents memory exhaustion from a
+ *  malicious client sending millions of tiny frames. */
+export const MAX_CLIENT_STREAM_ITEMS = 100_000;
+
 // -- Metadata limits ---------------------------------------------------------
 
 /** Maximum number of key-value pairs in StreamHeader/CallHeader metadata. */

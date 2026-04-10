@@ -148,6 +148,20 @@ async def _write_response(send: Any, codec: ForyCodec, response: Any) -> None:
     await write_frame(send, payload, flags)
 
 
+def _get_deadline_timeout(call_ctx: Any) -> float:
+    """Return remaining seconds until deadline, clamped to server max.
+
+    If the client set no deadline, returns MAX_HANDLER_TIMEOUT_S.
+    If the client set a deadline further than MAX_HANDLER_TIMEOUT_S,
+    returns MAX_HANDLER_TIMEOUT_S.
+    """
+    from aster.limits import MAX_HANDLER_TIMEOUT_S
+    remaining = getattr(call_ctx, "remaining_seconds", None)
+    if remaining is None:
+        return MAX_HANDLER_TIMEOUT_S
+    return max(0.0, min(remaining, MAX_HANDLER_TIMEOUT_S))
+
+
 # ── Server side ──────────────────────────────────────────────────────────────
 
 
@@ -399,15 +413,36 @@ class SessionServer:
             return None
 
         cancel_event = asyncio.Event()
+        deadline_timeout = _get_deadline_timeout(call_ctx)
 
         # Run handler as task, concurrently wait for a CANCEL frame
         handler_task = asyncio.create_task(self._run_handler(handler_method, request))
         cancel_reader_task = asyncio.create_task(self._read_cancel_frame(frame_q, cancel_event))
 
+        deadline_task = asyncio.create_task(asyncio.sleep(deadline_timeout))
+        wait_set: set[asyncio.Task] = {handler_task, cancel_reader_task, deadline_task}
+
         done, pending = await asyncio.wait(
-            {handler_task, cancel_reader_task},
+            wait_set,
             return_when=asyncio.FIRST_COMPLETED,
         )
+
+        if deadline_task in done:
+            for t in (handler_task, cancel_reader_task):
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            await _write_trailer(send, self._codec, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+            return None
+
+        if not deadline_task.done():
+            deadline_task.cancel()
+            try:
+                await deadline_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         if cancel_reader_task in done:
             # CANCEL or unexpected frame arrived
@@ -491,6 +526,8 @@ class SessionServer:
             return None
 
         cancel_event = asyncio.Event()
+        deadline_timeout = _get_deadline_timeout(call_ctx)
+        deadline_time = asyncio.get_event_loop().time() + deadline_timeout
 
         try:
             response_iter = handler_method(request)
@@ -498,6 +535,9 @@ class SessionServer:
                 response_iter = await response_iter
 
             async for response in response_iter:
+                if asyncio.get_event_loop().time() > deadline_time:
+                    await _write_trailer(send, self._codec, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                    return None
                 if cancel_event.is_set():
                     await _write_trailer(send, self._codec, StatusCode.CANCELLED, "cancelled")
                     return None
@@ -588,6 +628,7 @@ class SessionServer:
         Returns ``_SESSION_CLOSED`` on EOF, else ``None``.
         """
         try:
+            from aster.limits import MAX_CLIENT_STREAM_ITEMS
             requests: list[Any] = []
             cancelled = False
 
@@ -603,9 +644,6 @@ class SessionServer:
                     break
 
                 if flags & TRAILER:
-                    # EoI must be TRAILER with status=OK. A non-OK trailer
-                    # (corruption, confused client) must not be silently
-                    # accepted as clean end-of-input.
                     try:
                         eoi_status = self._codec.decode(payload, RpcStatus)
                         if eoi_status.code != StatusCode.OK:
@@ -622,6 +660,13 @@ class SessionServer:
                         return None
                     break
 
+                if len(requests) >= MAX_CLIENT_STREAM_ITEMS:
+                    await _write_trailer(
+                        send, self._codec, StatusCode.RESOURCE_EXHAUSTED,
+                        f"client stream exceeded {MAX_CLIENT_STREAM_ITEMS} items",
+                    )
+                    return None
+
                 compressed = bool(flags & COMPRESSED)
                 item = self._codec.decode_compressed(payload, compressed, _resolve_type(method_info.request_type))
                 requests.append(item)
@@ -634,9 +679,16 @@ class SessionServer:
                 for item in requests:
                     yield item
 
-            response = handler_method(request_iter())
-            if asyncio.iscoroutine(response):
-                response = await response
+            deadline_timeout = _get_deadline_timeout(call_ctx)
+            try:
+                coro = handler_method(request_iter())
+                if asyncio.iscoroutine(coro):
+                    response = await asyncio.wait_for(coro, timeout=deadline_timeout)
+                else:
+                    response = coro
+            except asyncio.TimeoutError:
+                await _write_trailer(send, self._codec, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                return None
 
             # SUCCESS: write response payload only (no trailer, matches unary rule)
             await _write_response(send, self._codec, response)
@@ -713,9 +765,19 @@ class SessionServer:
                     await request_queue.put(_BIDI_EOF)
 
             reader_task = asyncio.create_task(reader())
+            deadline_timeout = _get_deadline_timeout(call_ctx)
+            deadline_time = asyncio.get_event_loop().time() + deadline_timeout
 
             try:
                 async for response in response_iter:
+                    if asyncio.get_event_loop().time() > deadline_time:
+                        reader_task.cancel()
+                        try:
+                            await reader_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        await _write_trailer(send, self._codec, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                        return None
                     if cancel_event.is_set():
                         await _write_trailer(send, self._codec, StatusCode.CANCELLED, "cancelled")
                         return None
