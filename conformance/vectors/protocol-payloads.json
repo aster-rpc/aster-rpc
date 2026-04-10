@@ -1,0 +1,172 @@
+{
+  "description": "Aster protocol payload vectors. These are the PAYLOADS inside frames (not the frame envelope). Generated from Python reference implementation. A new binding must produce identical JSON bytes and decode XLANG bytes correctly (XLANG encoding is only required if the binding supports Fory XLANG mode).",
+  "note": "JSON vectors are the primary compatibility target. Every binding must produce identical JSON for the same inputs. XLANG vectors are for bindings that implement Fory XLANG codec.",
+  "vectors": [
+    {
+      "name": "StreamHeader: basic unary",
+      "type": "StreamHeader",
+      "input": {
+        "service": "Echo",
+        "method": "echo",
+        "version": 1,
+        "callId": "test-call-1",
+        "deadlineEpochMs": 0,
+        "serializationMode": 0,
+        "metadataKeys": [],
+        "metadataValues": []
+      },
+      "xlang_hex": "02ff1d08016c129922120476538900ce9c801922a40518de0000022c746573742d63616c6c2d31106563686f104563686f0000",
+      "xlang_length": 51,
+      "json_utf8": "{\"service\":\"Echo\",\"method\":\"echo\",\"version\":1,\"callId\":\"test-call-1\",\"deadlineEpochMs\":0,\"serializationMode\":0,\"metadataKeys\":[],\"metadataValues\":[]}",
+      "json_length": 149
+    },
+    {
+      "name": "StreamHeader: session opening (method empty)",
+      "type": "StreamHeader",
+      "input": {
+        "service": "AgentSession",
+        "method": "",
+        "version": 1,
+        "callId": "session-001",
+        "deadlineEpochMs": 0,
+        "serializationMode": 0,
+        "metadataKeys": [],
+        "metadataValues": []
+      },
+      "xlang_hex": "02ff1d08016c129922120476538900ce9c801922a40518de0000022c73657373696f6e2d30303100304167656e7453657373696f6e0000",
+      "xlang_length": 55,
+      "json_utf8": "{\"service\":\"AgentSession\",\"method\":\"\",\"version\":1,\"callId\":\"session-001\",\"deadlineEpochMs\":0,\"serializationMode\":0,\"metadataKeys\":[],\"metadataValues\":[]}",
+      "json_length": 153
+    },
+    {
+      "name": "StreamHeader: JSON mode with metadata",
+      "type": "StreamHeader",
+      "input": {
+        "service": "MissionControl",
+        "method": "getStatus",
+        "version": 2,
+        "callId": "mc-42",
+        "deadlineEpochMs": 1712764800000,
+        "serializationMode": 3,
+        "metadataKeys": [
+          "aster.role"
+        ],
+        "metadataValues": [
+          "ops.status"
+        ]
+      },
+      "xlang_hex": "02ff1d08016c129922120476538900ce9c801922a40518de80b0e68bd9630604146d632d343224676574537461747573384d697373696f6e436f6e74726f6c010c2861737465722e726f6c65010c286f70732e737461747573",
+      "xlang_length": 89,
+      "json_utf8": "{\"service\":\"MissionControl\",\"method\":\"getStatus\",\"version\":2,\"callId\":\"mc-42\",\"deadlineEpochMs\":1712764800000,\"serializationMode\":3,\"metadataKeys\":[\"aster.role\"],\"metadataValues\":[\"ops.status\"]}",
+      "json_length": 194
+    },
+    {
+      "name": "CallHeader: basic session call",
+      "type": "CallHeader",
+      "input": {
+        "method": "echo",
+        "callId": "call-001",
+        "deadlineEpochMs": 0,
+        "metadataKeys": [],
+        "metadataValues": []
+      },
+      "xlang_hex": "02ff1d08016c1299221002380165c22001888871258679002063616c6c2d303031106563686f0000",
+      "xlang_length": 40,
+      "json_utf8": "{\"method\":\"echo\",\"callId\":\"call-001\",\"deadlineEpochMs\":0,\"metadataKeys\":[],\"metadataValues\":[]}",
+      "json_length": 95
+    },
+    {
+      "name": "CallHeader: with deadline and metadata",
+      "type": "CallHeader",
+      "input": {
+        "method": "increment",
+        "callId": "call-002",
+        "deadlineEpochMs": 1712764801000,
+        "metadataKeys": [
+          "trace-id"
+        ],
+        "metadataValues": [
+          "abc123"
+        ]
+      },
+      "xlang_hex": "02ff1d08016c1299221002380165c22001888871258679d0bfe68bd9632063616c6c2d30303224696e6372656d656e74010c2074726163652d6964010c18616263313233",
+      "xlang_length": 68,
+      "json_utf8": "{\"method\":\"increment\",\"callId\":\"call-002\",\"deadlineEpochMs\":1712764801000,\"metadataKeys\":[\"trace-id\"],\"metadataValues\":[\"abc123\"]}",
+      "json_length": 130
+    },
+    {
+      "name": "RpcStatus: OK (success trailer)",
+      "type": "RpcStatus",
+      "input": {
+        "code": 0,
+        "message": "",
+        "detailKeys": [],
+        "detailValues": []
+      },
+      "xlang_hex": "02ff1d08016c1299220e0256785626026a245353ca9f00000000",
+      "xlang_length": 26,
+      "json_utf8": "{\"code\":0,\"message\":\"\",\"detailKeys\":[],\"detailValues\":[]}",
+      "json_length": 57
+    },
+    {
+      "name": "RpcStatus: NOT_FOUND error",
+      "type": "RpcStatus",
+      "input": {
+        "code": 5,
+        "message": "service Echo not found",
+        "detailKeys": [],
+        "detailValues": []
+      },
+      "xlang_hex": "02ff1d08016c1299220e0256785626026a245353ca9f0a5873657276696365204563686f206e6f7420666f756e640000",
+      "xlang_length": 48,
+      "json_utf8": "{\"code\":5,\"message\":\"service Echo not found\",\"detailKeys\":[],\"detailValues\":[]}",
+      "json_length": 79
+    },
+    {
+      "name": "RpcStatus: CANCELLED",
+      "type": "RpcStatus",
+      "input": {
+        "code": 1,
+        "message": "cancelled",
+        "detailKeys": [],
+        "detailValues": []
+      },
+      "xlang_hex": "02ff1d08016c1299220e0256785626026a245353ca9f022463616e63656c6c65640000",
+      "xlang_length": 35,
+      "json_utf8": "{\"code\":1,\"message\":\"cancelled\",\"detailKeys\":[],\"detailValues\":[]}",
+      "json_length": 66
+    },
+    {
+      "name": "RpcStatus: DEADLINE_EXCEEDED",
+      "type": "RpcStatus",
+      "input": {
+        "code": 4,
+        "message": "deadline exceeded",
+        "detailKeys": [],
+        "detailValues": []
+      },
+      "xlang_hex": "02ff1d08016c1299220e0256785626026a245353ca9f0844646561646c696e652065786365656465640000",
+      "xlang_length": 43,
+      "json_utf8": "{\"code\":4,\"message\":\"deadline exceeded\",\"detailKeys\":[],\"detailValues\":[]}",
+      "json_length": 74
+    },
+    {
+      "name": "RpcStatus: PERMISSION_DENIED with details",
+      "type": "RpcStatus",
+      "input": {
+        "code": 7,
+        "message": "missing role: admin",
+        "detailKeys": [
+          "required_role"
+        ],
+        "detailValues": [
+          "admin"
+        ]
+      },
+      "xlang_hex": "02ff1d08016c1299220e0256785626026a245353ca9f0e4c6d697373696e6720726f6c653a2061646d696e010c3472657175697265645f726f6c65010c1461646d696e",
+      "xlang_length": 67,
+      "json_utf8": "{\"code\":7,\"message\":\"missing role: admin\",\"detailKeys\":[\"required_role\"],\"detailValues\":[\"admin\"]}",
+      "json_length": 98
+    }
+  ]
+}
