@@ -299,11 +299,20 @@ export class AsterServer {
       // Share registry doc (read-only) and store namespace ID
       await registryDoc.shareWithAddr('read');
       this._registryNamespace = registryDoc.docId();
-      this.logger.debug(`registry doc ready — namespace: ${this._registryNamespace.slice(0, 16)}`);
+      this.logger.info(
+        `registry doc ready — namespace=${this._registryNamespace.slice(0, 16)}… ` +
+        `services=${this.registry.getAllServices().length}`,
+      );
 
     } catch (err) {
-      // Non-fatal: server still works without registry
-      this.logger.warn(`contract publication failed (non-fatal): ${err}`);
+      // Non-fatal: server still works, but cross-language peers will see
+      // empty method tables. Log loudly so this isn't silently swallowed --
+      // every cross-language interop test depends on this code path.
+      const msg = err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : String(err);
+      this.logger.error(
+        `contract publication failed (non-fatal): cross-language clients ` +
+        `will see empty method tables. Cause: ${msg}`,
+      );
     }
   }
 
@@ -327,10 +336,27 @@ export class AsterServer {
           else if (typeof val === 'boolean') fieldType = 'bool';
           else if (Array.isArray(val)) fieldType = 'list';
           else if (val && typeof val === 'object') fieldType = 'dict';
+          // Capture the field default so cross-language codegen can emit
+          // it. JSON-safe primitives only -- nested objects round-trip via
+          // JSON.stringify which would lose Date/Map/Set semantics.
+          let defaultValue: unknown = undefined;
+          if (
+            val === null ||
+            typeof val === 'string' ||
+            typeof val === 'number' ||
+            typeof val === 'boolean'
+          ) {
+            defaultValue = val;
+          } else if (Array.isArray(val)) {
+            defaultValue = [];
+          } else if (val && typeof val === 'object') {
+            defaultValue = {};
+          }
           out.push({
             name: key,
             type: fieldType,
             required: val === '' || val === 0 || val === false,
+            default: defaultValue,
           });
         }
         return out;
@@ -1083,8 +1109,27 @@ function _proxyMethod(serviceName: string, methodName: string, transport: AsterT
         payload as AsyncIterable<unknown>,
       );
     }
-    // Default: unary
-    return transport.unary(serviceName, methodName, payload ?? {});
+    // Default: unary. If the user accidentally calls a server-streaming
+    // method via `await proxy.method(...)`, the underlying transport will
+    // see a second response frame and throw with "multiple response
+    // frames". Catch that and re-raise with an actionable hint pointing
+    // at `proxy.method.stream(...)` / `.bidi()`.
+    try {
+      return await transport.unary(serviceName, methodName, payload ?? {});
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('multiple response frames')) {
+        throw new Error(
+          `'${serviceName}.${methodName}' is a streaming RPC and cannot be ` +
+          `called as a unary 'await proxy.${methodName}(...)'.\n` +
+          `  - For server-streaming methods, iterate the result of ` +
+          `'proxy.${methodName}.stream(...)':\n` +
+          `      for await (const item of proxy.${methodName}.stream({...})) { ... }\n` +
+          `  - For bidi-streaming methods, use 'proxy.${methodName}.bidi()'.`,
+        );
+      }
+      throw err;
+    }
   };
 
   // .stream() — server streaming
@@ -1236,6 +1281,26 @@ class SessionProxyClient {
     // Spec: session unary has no success trailer. The response frame is
     // the complete response. Both Python and TS servers follow this rule.
     return this._codec.decode(respPayload);
+  }
+
+  /**
+   * Close this session, releasing the underlying bidi stream.
+   *
+   * Must be a real method (not synthesised by the JS Proxy) so that
+   * `proxy.close()` calls this implementation instead of routing
+   * "close" through the session protocol as a remote method name.
+   */
+  async close(): Promise<void> {
+    const send = this._send;
+    this._send = null;
+    this._recv = null;
+    if (send && typeof send.finish === 'function') {
+      try {
+        await send.finish();
+      } catch {
+        // Already closed / broken pipe -- best effort.
+      }
+    }
   }
 }
 
