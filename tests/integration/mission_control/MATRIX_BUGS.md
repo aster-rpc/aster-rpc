@@ -1,124 +1,180 @@
-# Mission Control Matrix — Known Bugs
+# Mission Control Matrix — Known Bugs & Audit Gaps
 
-Cross-language interop bugs surfaced by `run_matrix.sh`. Each entry lists
-the failing combo(s), the symptom in the matrix output, and what we know
-about the root cause.
+## Status snapshot (2026-04-10)
 
-The matrix dimensions are server-language × client-language × mode
-(dev/auth). py-py and ts-ts are the in-language baselines; the failures
-below are the cross-language gaps still to close.
+Full matrix: **58/58 pass** across all 8 combos.
 
----
+## Audit Gaps — Not Yet Tested
 
-## B1. TS server accepts session-scoped methods as one-shot bidi streams
-
-**Combos:** ts-ts (masks the bug), ts-py (surfaces it as a different error).
-
-**Symptom:** A client opens a regular bidirectional QUIC stream targeting
-`AgentSession.runCommand` (a `scoped: 'session'` service). The TS server
-dispatches it through the normal RPC path instead of rejecting the stream
-or requiring the session protocol envelope (StreamHeader with `method=""`,
-then per-call CALL frames).
-
-**Why it matters:** Session-scoped services exist precisely so multiple
-calls share one stream and per-session state can be tracked. Allowing them
-to be invoked as one-shot bidi calls bypasses that contract. It also hides
-the absence of a real TS session client (see B5) — ts-ts auth currently
-appears green only because the server is too permissive.
-
-**Fix sketch:** When the dispatched method belongs to a `scoped: 'session'`
-service, refuse the call with `FAILED_PRECONDITION` ("session protocol
-required") unless the StreamHeader was opened in session mode. The session
-protocol path should hand off to `SessionServer.handleSession`.
+Discovered by spec-vs-implementation audit. Each gap lists the spec
+reference, what would break, and the real-world scenario that exposes it.
+Ordered by severity.
 
 ---
 
-## B2. ts-client receives empty payload reading Python streaming responses
+### G1. Session lock + network fault (CRITICAL)
 
-**Combos:** py-ts dev (Ch4 register), py-ts auth (Ch5 edge tailLogs,
-Ch5 edge runCommand).
+**Spec:** Aster-session-scoped-services.md §6.4 — lock held for one
+request-response exchange.
 
-**Symptom:**
-```
-Ch4 register (gpu): RpcError: [UNKNOWN] JSON Parse error: Unrecognized token ''
-```
+**Gap:** Python `SessionStub._call_unary` holds an async lock while
+reading the response frame. If the QUIC stream drops mid-response, the
+lock releases and the next queued call sends a CALL frame while the
+server may still be flushing the previous response. Silent stream
+corruption.
 
-The TS client decodes a frame whose payload is empty / not JSON. The
-`Unrecognized token ''` strongly suggests the frame body is zero bytes,
-not malformed JSON.
+**Scenario:** Client on flaky WiFi makes two sequential session calls.
+First call's response is interrupted by a network drop. Second call
+interleaves with the server's still-in-flight first response.
 
-**Suspected cause:** Frame-length reader on the TS side may be consuming
-a trailer or sentinel frame as a data frame, or reading 0 bytes after a
-clean stream end without breaking the loop. Needs frame-by-frame trace
-against a Python server response.
-
----
-
-## B3. py-client gets `Expected RpcStatus, got NoneType` from TS server
-
-**Combos:** ts-py dev (Ch4 register), ts-py auth (Ch5 edge runCommand).
-
-**Symptom:**
-```
-Ch4 register (gpu): Expected RpcStatus, got NoneType
-```
-
-The Python client reads frames off a TS server stream and expects an
-explicit `RpcStatus` trailer at end of stream. It receives `None`,
-meaning the TS server closed the stream without writing the trailer.
-
-**Suspected cause:** TS server's bidi/session response writer omits the
-final OK trailer in some pattern (likely session-scoped services or after
-a streaming response that completes normally). Plan A's "Fix E (TS
-session server trailer format)" lives here.
+**Test sketch:** Open a session, start a unary call, kill the recv stream
+mid-response, immediately make another call. Assert the second call
+either fails cleanly or succeeds with correct data — never silently
+returns the wrong response.
 
 ---
 
-## B4. Python `gen-client` does not register types with the Fory codec
+### G2. CANCEL never sends trailer — TS server (CRITICAL)
 
-**Combos:** ts-py dev (Ch6 generated client).
+**Spec:** Aster-session-scoped-services.md §5.4 — "exactly one trailer
+with status CANCELLED" unconditionally.
 
-**Symptom:**
-```
-Ch6 generated call: [UNKNOWN] <class 'mc_gen.types.mission_control_v1.StatusRequest'> not registered
-```
+**Gap:** TS `SessionServer` receives CANCEL and does `continue` without
+writing a CANCELLED trailer. Client's `cancel()` drains frames waiting
+for a trailer that never arrives — permanent deadlock.
 
-`aster gen-client` produces Python type stubs but the generated client
-constructor never calls `ForyCodec(types=[...])` with the produced types,
-so first-call serialisation throws.
+**Scenario:** Any client that calls `session.cancel()` against a TS
+server.
 
-**Fix sketch:** Codegen template should collect every TypeDef in the
-manifest and pass them to the codec it instantiates, the same way
-`_collect_service_types` does for hand-written clients.
+**Test sketch:** Open a session against TS server, start a slow handler,
+send CANCEL, assert CANCELLED trailer is received within 5s.
 
 ---
 
-## B5. TS client has no real session-protocol implementation
+### G3. Session instantiation without metadata validation — TS (CRITICAL)
 
-**Combos:** Currently masked by B1 in ts-ts; would surface as the only
-remaining ts-py failure once B3 is fixed.
+**Spec:** Aster-SPEC.md §5.2 — metadata subject to size/count limits.
 
-**Symptom:** `ProxyClient.method.bidi()` opens a fresh bidi stream per
-call instead of multiplexing onto a single session stream. There is no
-TS analogue of Python's `SessionStub` / `create_session` flow.
+**Gap:** TS `SessionServer` creates the service instance before validating
+StreamHeader metadata. Oversized metadata creates the session, then each
+CALL spins on validation errors while holding memory.
 
-**Fix sketch:** Port `bindings/python/aster/session.py` (~150 lines for
-SessionStub + create_session, ignore SessionServer + cancel handling for
-the first cut). Wire `AsterClient.client(serviceClass)` to dispatch to
-the session path when `info.scoped === 'stream'`, mirroring Python's
-high-level client at `bindings/python/aster/high_level.py:1513`.
+**Scenario:** Malicious client sends 10MB metadata in the StreamHeader.
+
+**Test sketch:** Send a StreamHeader with metadata exceeding limits to a
+session service. Assert server rejects before creating the instance.
 
 ---
 
-## Status snapshot
+### G4. Client-stream EoI not validated (HIGH)
 
-| Combo       | Pass / Total | Failing chapters |
-|-------------|-------------:|-----------------|
-| py-py dev   |          9/9 | —               |
-| py-py auth  |          6/6 | —               |
-| py-ts dev   |          4/5 | Ch4 (B2)        |
-| py-ts auth  |          4/6 | Ch5 edge tailLogs, Ch5 edge runCommand (B2) |
-| ts-py dev   |          6/8 | Ch4 (B3), Ch6 (B4) |
-| ts-py auth  |          5/6 | Ch5 edge runCommand (B3) |
-| ts-ts dev   |          6/6 | —               |
-| ts-ts auth  |          6/6 | (B1 still latent) |
+**Spec:** Aster-session-scoped-services.md §4.5 — explicit TRAILER(OK)
+for end-of-input.
+
+**Gap:** Server's client-stream reader breaks on ANY trailer flag, not
+just status=OK. A bit-flip that sets TRAILER on a data frame causes
+premature EoI — handler returns a result from partial data.
+
+**Scenario:** `ingestMetrics` with 10,000 points, corruption at point
+500. Server says "accepted: 500" and client believes it.
+
+**Test sketch:** Send 100 data frames, then a frame with TRAILER flag but
+non-OK payload. Assert server rejects (not silently returns partial).
+
+---
+
+### G5. Decompression bomb (HIGH)
+
+**Spec:** Aster-SPEC.md §6.1 — max frame size 16 MiB.
+
+**Gap:** Frame size limit enforced at wire level, but decompressed output
+isn't capped. A 10 KiB compressed frame can decompress to 100+ MiB.
+
+**Scenario:** Attacker sends a small zstd frame with pathological ratio.
+
+**Test sketch:** Create a zstd frame that decompresses to > 16 MiB.
+Assert server rejects it (not OOM).
+
+---
+
+### G6. Bidi reader exception → silent EOF (HIGH)
+
+**Spec:** Aster-session-scoped-services.md §4.5 — wire errors should
+terminate the call.
+
+**Gap:** Python bidi stream reader catches FramingError, logs it, puts
+EOF in the queue. Handler thinks client finished, returns success.
+
+**Scenario:** Network corruption during `runCommand` bidi stream — server
+returns success on truncated input.
+
+**Test sketch:** Corrupt a frame mid-bidi-stream. Assert server returns
+INTERNAL error, not success.
+
+---
+
+### G7. TS unary writes OK trailer, Python doesn't (MEDIUM)
+
+**Spec:** Aster-session-scoped-services.md §4.6 — "Unary calls within a
+session do not require a trailer frame."
+
+**Gap:** TS SessionServer writes OK trailer after unary response. Python
+doesn't. We worked around this with a 2s drain timeout in the TS client.
+
+**Test sketch:** (Already implicitly tested by the matrix — py-ts and
+ts-py both pass.) Add an explicit assertion that the second call in a
+session succeeds without delay.
+
+---
+
+### G8. Deadline not enforced in session handlers (MEDIUM)
+
+**Spec:** Aster-session-scoped-services.md §9.3 — per-call deadlines in
+CallHeader.
+
+**Gap:** `deadlineEpochMs` is read into CallContext but never used as a
+timeout. Slow handler ignores deadline, client times out, server wastes
+resources.
+
+**Test sketch:** Set a 2s deadline on a session call to a handler that
+sleeps 10s. Assert the call fails within 3s (not 10).
+
+---
+
+### G9. No client-side scope validation (MEDIUM)
+
+**Gap:** If a developer calls `createSession(SharedService)`, the client
+sends method="" and the server rejects with FAILED_PRECONDITION.
+
+**Test sketch:** (Already tested by the scope mismatch guard test.)
+
+---
+
+### G10. OTT nonce replay (LOW)
+
+**Spec:** Aster-trust-spec.md §3.1 — nonces consumed once.
+
+**Gap:** If `nonce_store` is None (dev mode), OTT nonces are not checked.
+Attacker reuses a captured credential.
+
+**Test sketch:** Present the same OTT credential twice. Assert second
+attempt is denied.
+
+---
+
+### G11. CallHeader metadata not validated — TS session (LOW)
+
+**Gap:** TS SessionServer doesn't validate per-call metadata size/count.
+
+**Test sketch:** Send a CALL frame with oversized metadata. Assert
+RESOURCE_EXHAUSTED.
+
+---
+
+### G12. Invalid UTF-8 crashes handler (LOW)
+
+**Gap:** Invalid UTF-8 in frame payload causes UnicodeDecodeError that
+propagates without sending an error trailer.
+
+**Test sketch:** Send a frame with invalid UTF-8 bytes. Assert server
+returns INTERNAL trailer (not crash/hang).
