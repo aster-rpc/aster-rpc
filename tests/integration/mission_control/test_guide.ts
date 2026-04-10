@@ -381,6 +381,31 @@ async function testCh5OpsCredential(address: string, opsCred: string): Promise<v
 
 // ── Mode runners ─────────────────────────────────────────────────────────────
 
+async function testScopeMismatch(client: AsterClientWrapper): Promise<void> {
+  // Calling a session-scoped method via a one-shot stream (non-session
+  // protocol) must fail with FAILED_PRECONDITION on both Python and TS
+  // servers. This is a defensive guard against clients that don't know
+  // about session protocol.
+  try {
+    // Use the transport directly to send a one-shot unary call.
+    // This bypasses the session-aware proxy and opens a regular stream
+    // with method="register" on a scoped='session' service.
+    const r = await (client as any).transport.unary('AgentSession', 'register', {
+      agent_id: 'scope-test',
+      capabilities: [],
+      load_avg: 0,
+    });
+    fail('scope mismatch guard', `call succeeded (should have been rejected): ${JSON.stringify(r)}`);
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes('FAILED_PRECONDITION') || msg.includes('session-scoped')) {
+      ok('scope mismatch → FAILED_PRECONDITION');
+    } else {
+      fail('scope mismatch guard', `unexpected error: ${msg}`);
+    }
+  }
+}
+
 async function runDevMode(address: string): Promise<void> {
   section('Dev mode (no auth)');
 
@@ -397,6 +422,7 @@ async function runDevMode(address: string): Promise<void> {
   await testCh2Streaming(mc);
   await testCh3ClientStream(mc);
   await testCh4Session(client);
+  await testScopeMismatch(client);
 
   await client.close();
 }
