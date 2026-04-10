@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import copy
 import json
+import os
 import sys
 import time
 from types import SimpleNamespace
@@ -83,7 +84,6 @@ def _load_root_secret_key(config: Any) -> bytes | None:
     Returns 32-byte secret key or None if unavailable.
     """
     import json as _json
-    import os
 
     # 1) Try keyring -- scoped by active profile
     try:
@@ -121,8 +121,6 @@ def _load_root_secret_key(config: Any) -> bytes | None:
 
 def _get_active_profile() -> str | None:
     """Read the active profile name from ``~/.aster/config.toml``."""
-    import os
-
     config_path = os.path.expanduser("~/.aster/config.toml")
     if not os.path.exists(config_path):
         return None
@@ -148,8 +146,6 @@ def _resolve_peer_arg(peer_arg: str) -> tuple[str, str]:
     Raises ``SystemExit`` with a helpful message if it looks like a name
     but can't be resolved.
     """
-    import os
-
     # Handle compact aster1... ticket format
     if peer_arg.startswith("aster1"):
         try:
@@ -242,8 +238,6 @@ def _resolve_peer_arg(peer_arg: str) -> tuple[str, str]:
 
 def _lookup_peer_name(addr: str) -> str | None:
     """Try to find a friendly name for an address from .aster-identity."""
-    import os
-
     identity_path = os.path.join(os.getcwd(), ".aster-identity")
     if not os.path.exists(identity_path):
         return None
