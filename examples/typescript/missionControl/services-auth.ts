@@ -40,7 +40,7 @@ export class MissionControl {
   private logWaiters: ((entry: LogEntry) => void)[] = [];
   private metrics: MetricPoint[] = [];
 
-  @Rpc({ requires: Role.STATUS })
+  @Rpc({ requires: Role.STATUS, request: StatusRequest, response: StatusResponse })
   async getStatus(req: StatusRequest): Promise<StatusResponse> {
     return new StatusResponse({
       agent_id: req.agent_id,
@@ -49,7 +49,7 @@ export class MissionControl {
     });
   }
 
-  @Rpc()
+  @Rpc({ request: LogEntry, response: SubmitLogResult })
   async submitLog(entry: LogEntry): Promise<SubmitLogResult> {
     if (this.logWaiters.length > 0) {
       const waiter = this.logWaiters.shift()!;
@@ -60,7 +60,7 @@ export class MissionControl {
     return new SubmitLogResult({ accepted: true });
   }
 
-  @ServerStream({ requires: anyOf(Role.LOGS, Role.ADMIN) })
+  @ServerStream({ requires: anyOf(Role.LOGS, Role.ADMIN), request: TailRequest, response: LogEntry })
   async *tailLogs(req: TailRequest): AsyncGenerator<LogEntry> {
     const minRank = LOG_LEVEL_RANK[req.level?.toLowerCase() ?? "info"] ?? 0;
     while (true) {
@@ -79,7 +79,7 @@ export class MissionControl {
     });
   }
 
-  @ClientStream({ requires: Role.INGEST })
+  @ClientStream({ requires: Role.INGEST, request: MetricPoint, response: IngestResult })
   async ingestMetrics(stream: AsyncIterable<MetricPoint>): Promise<IngestResult> {
     let accepted = 0;
     for await (const point of stream) {
@@ -95,7 +95,7 @@ export class AgentSession {
   private _agentId = "";
   private _capabilities: string[] = [];
 
-  @Rpc({ requires: Role.INGEST })
+  @Rpc({ requires: Role.INGEST, request: Heartbeat, response: Assignment })
   async register(hb: Heartbeat): Promise<Assignment> {
     this._agentId = hb.agent_id;
     this._capabilities = [...(hb.capabilities ?? [])];
@@ -105,13 +105,13 @@ export class AgentSession {
     return new Assignment({ task_id: "idle", command: "sleep 60" });
   }
 
-  @Rpc()
+  @Rpc({ request: Heartbeat, response: Assignment })
   async heartbeat(hb: Heartbeat): Promise<Assignment> {
     this._capabilities = [...(hb.capabilities ?? [])];
     return new Assignment({ task_id: "continue", command: "" });
   }
 
-  @BidiStream({ requires: Role.ADMIN })
+  @BidiStream({ requires: Role.ADMIN, request: Command, response: CommandResult })
   async *runCommand(commands: AsyncIterable<Command>): AsyncGenerator<CommandResult> {
     for await (const cmd of commands) {
       const proc = Bun.spawn(["sh", "-c", cmd.command], {
