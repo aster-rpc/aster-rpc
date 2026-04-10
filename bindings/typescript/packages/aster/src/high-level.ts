@@ -20,10 +20,15 @@ import { handleConsumerAdmissionConnection, type ConsumerAdmissionOpts, type Ser
 import { handleDelegatedAdmissionConnection, type DelegatedAdmissionPolicy } from './trust/delegated.js';
 import { MeshEndpointHook } from './trust/hooks.js';
 import { PeerAttributeStore } from './peer-store.js';
+import { CapabilityInterceptor } from './interceptors/capability.js';
+import type { Interceptor } from './interceptors/base.js';
+import { canonicalXlangBytes, contractIdFromContract, fromServiceInfo } from './contract/identity.js';
+import type { ContractManifest, ManifestMethod, ManifestField } from './contract/manifest.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const ALPN_CONSUMER_ADMISSION = 'aster.consumer_admission';
+const ALPN_PRODUCER_ADMISSION = 'aster.producer_admission';
 const ALPN_DELEGATED_ADMISSION = 'aster.admission';
 const RPC_ALPN = 'aster/1';
 
@@ -71,8 +76,10 @@ export class AsterServer {
   private _running = false;
   private _closed = false;
   private _allowAllConsumers: boolean;
+  private _userInterceptors: unknown[] = [];
   private _signalHandlers: (() => void)[] = [];
   private _serviceSummaries: ServiceSummary[] = [];
+  private _registryNamespace = '';
   private _servePromise: Promise<void> | null = null;
   private _admissionAbort: AbortController | null = null;
 
@@ -94,6 +101,7 @@ export class AsterServer {
     this._hook = new MeshEndpointHook();
     this._peerStore = new PeerAttributeStore();
     this._allowAllConsumers = opts.allowAllConsumers ?? true;
+    this._userInterceptors = opts.interceptors ?? [];
 
     for (const svc of opts.services) {
       this.registry.register(svc);
@@ -114,15 +122,23 @@ export class AsterServer {
       );
     }
 
+    // Initialize contract identity binding (needed for _publishContracts)
+    const { setNativeContract } = await import('./contract/identity.js');
+    setNativeContract(native);
+
     // Create node with RPC + admission ALPNs
     const alpns = [
       Buffer.from(RPC_ALPN),
       Buffer.from(ALPN_CONSUMER_ADMISSION),
+      Buffer.from(ALPN_PRODUCER_ADMISSION),
       Buffer.from(ALPN_DELEGATED_ADMISSION),
     ];
     this._node = await native.IrohNode.memoryWithAlpns(alpns);
 
     // Build service summaries for admission response
+    // Encode the server's own node ID as the RPC channel address
+    const nodeId = this._node.nodeId();
+    const rpcAddr = Buffer.from(nodeId).toString('base64');
     this._serviceSummaries = [];
     for (const info of this.registry.getAllServices()) {
       this._serviceSummaries.push({
@@ -131,15 +147,42 @@ export class AsterServer {
         contractId: '',
         pattern: info.scoped ?? 'shared',
         methods: Object.keys(info.methods),
+        channels: { rpc: rpcAddr },
       });
+    }
+
+    // Auto-wire CapabilityInterceptor if any service declares requires=
+    const interceptors: Interceptor[] = [...(this._userInterceptors as Interceptor[])];
+    let anyHasRequires = false;
+    for (const info of this.registry.getAllServices()) {
+      if (info.requires) anyHasRequires = true;
+      for (const mi of info.methods.values()) {
+        if (mi.requires) anyHasRequires = true;
+      }
+    }
+    const hasCapInterceptor = interceptors.some(i => i instanceof CapabilityInterceptor);
+    if ((!this._allowAllConsumers || anyHasRequires) && !hasCapInterceptor) {
+      const cap = new CapabilityInterceptor();
+      // Register requirements from service/method declarations
+      for (const info of this.registry.getAllServices()) {
+        for (const [methodName, mi] of info.methods.entries()) {
+          const req = mi.requires ?? info.requires;
+          if (req) cap.setRequirement(info.name, methodName, req);
+        }
+      }
+      interceptors.unshift(cap);
     }
 
     // Create the RPC server (uses JsonCodec for cross-language compat)
     this._rpcServer = new RpcServer({
       registry: this.registry,
       codec: new JsonCodec(),
+      interceptors,
       logger: this.logger,
     });
+
+    // Publish contracts to registry doc (non-fatal on failure)
+    await this._publishContracts();
 
     await this.health.start();
     this._running = true;
@@ -153,6 +196,158 @@ export class AsterServer {
   }
 
   /**
+   * Create a registry doc and publish each service's contract.
+   *
+   * After publication, `_registryNamespace` is set to the 64-char hex
+   * namespace ID so the admission response can return it.
+   *
+   * Non-fatal: if publication fails, the server still works — consumers
+   * just won't get rich contract metadata.
+   */
+  private async _publishContracts(): Promise<void> {
+    try {
+      const dc = this._node.docsClient();
+      const bc = this._node.blobsClient();
+
+      // Step 1: Create registry doc and author
+      const registryDoc = await dc.create();
+      const authorId = await dc.createAuthor();
+
+      // Step 2-10: For each service, build contract and publish
+      for (const info of this.registry.getAllServices()) {
+        // Build ServiceContract from service info
+        const contract = fromServiceInfo(info);
+        const contractId = contractIdFromContract(contract);
+
+        // Build manifest with method field descriptors
+        const manifest = this._buildManifest(info, contractId);
+        const canonicalBytes = canonicalXlangBytes(contract);
+
+        // Build collection and upload to blob store
+        const { buildCollection: build } =
+          await import('./contract/publication.js');
+        const entries = build(manifest, canonicalBytes);
+        const collectionHash = await bc.addCollection(
+          entries.map(([name, data]) => [name, Buffer.from(data)] as [string, Buffer]),
+        );
+        const ticket = bc.createCollectionTicket(collectionHash);
+
+        // Write ArtifactRef to registry doc
+        const { contractKey, versionKey } = await import('./registry/keys.js');
+        const artifactRef = {
+          contract_id: contractId,
+          collection_hash: collectionHash,
+          ticket,
+          published_by: authorId,
+          published_at_epoch_ms: Date.now(),
+          collection_format: 'index',
+        };
+        const encoder = new TextEncoder();
+        await registryDoc.setBytes(
+          authorId,
+          contractKey(contractId),
+          Buffer.from(encoder.encode(JSON.stringify(artifactRef))),
+        );
+
+        // Write manifest shortcut (avoids blob download round-trip)
+        const { manifestToJson } = await import('./contract/manifest.js');
+        await registryDoc.setBytes(
+          authorId,
+          `manifests/${contractId}`,
+          Buffer.from(encoder.encode(manifestToJson(manifest))),
+        );
+
+        // Write version pointer
+        await registryDoc.setBytes(
+          authorId,
+          versionKey(info.name, info.version),
+          Buffer.from(encoder.encode(contractId)),
+        );
+
+        // Update service summary with contract ID
+        const summary = this._serviceSummaries.find(s => s.name === info.name);
+        if (summary) summary.contractId = contractId;
+
+        this.logger.debug(
+          `published contract ${contractId.slice(0, 12)} for ${info.name} v${info.version}`,
+        );
+      }
+
+      // Share registry doc (read-only) and store namespace ID
+      await registryDoc.shareWithAddr('read');
+      this._registryNamespace = registryDoc.docId();
+      this.logger.debug(`registry doc ready — namespace: ${this._registryNamespace.slice(0, 16)}`);
+
+    } catch (err) {
+      // Non-fatal: server still works without registry
+      this.logger.warn(`contract publication failed (non-fatal): ${err}`);
+    }
+  }
+
+  /**
+   * Build a ContractManifest from a ServiceInfo with field-level detail.
+   */
+  private _buildManifest(info: any, contractId: string): ContractManifest {
+    const WIRE_TYPE_KEY = Symbol.for('aster.wire_type');
+    const methods: ManifestMethod[] = [];
+
+    for (const [methodName, mi] of info.methods.entries()) {
+      const patternStr =
+        mi.pattern === 1 ? 'server_stream' :
+        mi.pattern === 2 ? 'client_stream' :
+        mi.pattern === 3 ? 'bidi_stream' : 'unary';
+
+      // Extract field descriptors from @WireType request type
+      const fields: ManifestField[] = [];
+      const reqType = mi.requestType;
+      if (reqType && typeof reqType === 'function') {
+        try {
+          const inst = new reqType();
+          for (const key of Object.keys(inst)) {
+            const val = inst[key];
+            let fieldType = 'str';
+            if (typeof val === 'number') fieldType = Number.isInteger(val) ? 'int' : 'float';
+            else if (typeof val === 'boolean') fieldType = 'bool';
+            else if (Array.isArray(val)) fieldType = 'list';
+            else if (val && typeof val === 'object') fieldType = 'dict';
+            fields.push({
+              name: key,
+              type: fieldType,
+              required: val === '' || val === 0 || val === false,
+            });
+          }
+        } catch { /* can't instantiate — skip field extraction */ }
+      }
+
+      const wireTag = reqType ? (reqType as any)[WIRE_TYPE_KEY] : undefined;
+
+      methods.push({
+        name: methodName,
+        pattern: patternStr,
+        requestType: wireTag ?? '',
+        responseType: '',
+        timeout: mi.timeout ?? 0,
+        idempotent: mi.idempotent ?? false,
+        fields,
+      });
+    }
+
+    return {
+      service: info.name,
+      version: info.version,
+      contractId,
+      canonicalEncoding: 'fory-xlang/0.15',
+      typeCount: 0,
+      typeHashes: [],
+      methodCount: methods.length,
+      methods,
+      serializationModes: ['xlang'],
+      scoped: info.scoped === 'stream' ? 'stream' : 'shared',
+      deprecated: false,
+    };
+  }
+
+  /**
    * Start accepting connections. Blocks until close() is called.
    */
   async serve(): Promise<void> {
@@ -163,19 +358,11 @@ export class AsterServer {
     // Install signal handlers for graceful shutdown
     this._installSignalHandlers();
 
-    // Start admission handler in background
-    this._admissionAbort = new AbortController();
-    const admissionPromise = this._admissionLoop();
+    // Enable RPC server connection handling
+    this._rpcServer.setServing(true);
 
-    // Start delegated admission loop if policies exist
-    const delegatedPromise = this._delegationPolicies.size > 0
-      ? this._delegatedAdmissionLoop()
-      : Promise.resolve();
-
-    // Start RPC server
-    const rpcPromise = this._rpcServer.serve(this._node);
-
-    this._servePromise = Promise.all([admissionPromise, delegatedPromise, rpcPromise]).then(() => {});
+    // Single accept loop with ALPN routing (matches Python's _accept_loop)
+    this._servePromise = this._acceptLoop();
     try {
       await this._servePromise;
     } catch (e) {
@@ -244,19 +431,49 @@ export class AsterServer {
 
   // ── Admission loop ──────────────────────────────────────────────────────
 
-  private async _admissionLoop(): Promise<void> {
+  /**
+   * Single accept loop with ALPN-based routing.
+   *
+   * All aster ALPNs (RPC, consumer admission, delegated admission) are
+   * multiplexed through one channel. This loop reads the ALPN tag and
+   * dispatches to the correct handler — matching Python's `_accept_loop`.
+   */
+  private async _acceptLoop(): Promise<void> {
     if (!this._node) return;
 
     while (this._running && !this._closed) {
       try {
-        // Accept connections on the consumer admission ALPN
+        // Accept next connection — ALPN tag is on the connection
         const conn = await this._node.acceptAster();
-        this._handleAdmission(conn).catch(e => {
-          this.logger.error('admission error', { error: String(e) });
-        });
+        const alpn: string = conn.alpn() ?? '';
+
+        if (alpn === RPC_ALPN) {
+          // RPC connection — dispatch to RpcServer
+          this._rpcServer!.handleConnection(conn).catch(e => {
+            this.logger.error('rpc connection error', { error: String(e) });
+          });
+        } else if (alpn === ALPN_CONSUMER_ADMISSION) {
+          // Consumer admission
+          this._handleAdmission(conn).catch(e => {
+            this.logger.error('admission error', { error: String(e) });
+          });
+        } else if (alpn === ALPN_PRODUCER_ADMISSION) {
+          // Producer-to-producer mesh admission
+          this._handleProducerAdmission(conn).catch(e => {
+            this.logger.error('producer admission error', { error: String(e) });
+          });
+        } else if (alpn === ALPN_DELEGATED_ADMISSION) {
+          // Delegated admission
+          this._handleDelegatedAdmission(conn).catch(e => {
+            this.logger.error('delegated admission error', { error: String(e) });
+          });
+        } else {
+          this.logger.warn(`unknown ALPN: ${alpn}`);
+          try { conn.close(400, 'unknown ALPN'); } catch { /* ignore */ }
+        }
       } catch (e) {
         if (this._closed) return;
-        this.logger.error('admission accept error', { error: String(e) });
+        this.logger.error('accept error', { error: String(e) });
       }
     }
   }
@@ -269,26 +486,11 @@ export class AsterServer {
     };
     const opts: ConsumerAdmissionOpts = {
       services: this._serviceSummaries,
+      registryNamespace: this._registryNamespace || undefined,
       allowUnenrolled: this._allowAllConsumers,
       logger: this.logger,
     };
-    // Resolve root pubkey from config (either raw bytes or from file)
-    const rootKeyHex = (() => {
-      if (this.config.rootPubkey) return Buffer.from(this.config.rootPubkey).toString('hex');
-      if (this.config.rootPubkeyFile) {
-        try {
-          const { readFileSync } = require('node:fs');
-          const expanded = this.config.rootPubkeyFile.replace(/^~/, process.env.HOME ?? '');
-          const raw = readFileSync(expanded, 'utf-8').trim();
-          // Support both raw hex and JSON {"public_key": "hex"} format
-          if (raw.startsWith('{')) {
-            try { return JSON.parse(raw).public_key; } catch { /* fall through */ }
-          }
-          return raw;
-        } catch (e: any) { this.logger.warn(`failed to read rootPubkeyFile: ${e.message}`); return ''; }
-      }
-      return '';
-    })();
+    const rootKeyHex = this._resolveRootPubkeyHex();
     await handleConsumerAdmissionConnection(
       adapted,
       rootKeyHex,
@@ -297,27 +499,47 @@ export class AsterServer {
     );
   }
 
-  // ── Delegated admission loop ─────────────────────────────────────────────
+  // ── Producer admission ───────────────────────────────────────────────────
 
-  private async _delegatedAdmissionLoop(): Promise<void> {
-    if (!this._node) return;
-
-    while (this._running && !this._closed) {
-      try {
-        const conn = await this._node.acceptAster();
-        const policy = this._delegationPolicies.values().next().value;
-        if (!policy) continue;
-        handleDelegatedAdmissionConnection(
-          conn,
-          { policy, hook: this._hook, peerStore: this._peerStore },
-        ).catch(e => {
-          this.logger.error('delegated admission error', { error: String(e) });
-        });
-      } catch (e) {
-        if (this._closed) return;
-        this.logger.error('delegated admission accept error', { error: String(e) });
-      }
+  private async _handleProducerAdmission(conn: any): Promise<void> {
+    // Producer admission requires root pubkey and mesh state.
+    // If not configured (open mode), reject gracefully.
+    if (!this.config.rootPubkey && !this.config.rootPubkeyFile) {
+      this.logger.warn('producer admission: no root pubkey configured, ignoring');
+      return;
     }
+    const { handleProducerAdmissionConnection } = await import('./trust/bootstrap.js');
+    const rootKeyHex = this._resolveRootPubkeyHex();
+    const { MeshState } = await import('./trust/mesh.js');
+    const meshState = new MeshState();
+    await handleProducerAdmissionConnection(conn, rootKeyHex, meshState);
+  }
+
+  private _resolveRootPubkeyHex(): string {
+    if (this.config.rootPubkey) return Buffer.from(this.config.rootPubkey).toString('hex');
+    if (this.config.rootPubkeyFile) {
+      try {
+        const { readFileSync } = require('node:fs');
+        const expanded = this.config.rootPubkeyFile.replace(/^~/, process.env.HOME ?? '');
+        const raw = readFileSync(expanded, 'utf-8').trim();
+        if (raw.startsWith('{')) {
+          try { return JSON.parse(raw).public_key; } catch { /* fall through */ }
+        }
+        return raw;
+      } catch { return ''; }
+    }
+    return '';
+  }
+
+  // ── Delegated admission ─────────────────────────────────────────────────
+
+  private async _handleDelegatedAdmission(conn: any): Promise<void> {
+    const policy = this._delegationPolicies.values().next().value;
+    if (!policy) return;
+    await handleDelegatedAdmissionConnection(
+      conn,
+      { policy, hook: this._hook, peerStore: this._peerStore },
+    );
   }
 
   // ── Signal handling ─────────────────────────────────────────────────────
@@ -514,7 +736,8 @@ export class AsterClientWrapper {
     // Consumer admission
     const admissionConn = await doConnect(Buffer.from(ALPN_CONSUMER_ADMISSION));
     const { performAdmission: doAdmission } = await import('./trust/consumer.js');
-    const admissionResponse = await doAdmission(admissionConn, {} as any);
+    // Pass null credential for open-gate mode (sends empty credential_json)
+    const admissionResponse = await doAdmission(admissionConn, null as any);
 
     this._services = admissionResponse.services ?? [];
     this._registryNamespace = admissionResponse.registryNamespace ?? '';
@@ -584,9 +807,27 @@ export class AsterClientWrapper {
 /**
  * Dynamic proxy client -- invokes RPC methods without local type definitions.
  *
- * Created via `AsterClientWrapper.proxy("ServiceName")`. Methods are
- * dispatched dynamically -- any method name called on the proxy becomes
- * a unary RPC call.
+ * Created via `AsterClientWrapper.proxy("ServiceName")`. Supports all four
+ * RPC patterns:
+ *
+ * ```ts
+ * const mc = client.proxy("MissionControl");
+ *
+ * // Unary
+ * const status = await mc.getStatus({ agent_id: "edge-7" });
+ *
+ * // Client streaming — pass an async iterable
+ * const result = await mc.ingestMetrics(asyncGenerator());
+ *
+ * // Server streaming — use .stream()
+ * for await (const entry of mc.tailLogs.stream({ level: "info" })) { ... }
+ *
+ * // Bidi streaming — use .bidi()
+ * const ch = mc.runCommand.bidi();
+ * await ch.open();
+ * await ch.send({ command: "ls" });
+ * for await (const r of ch) { ... }
+ * ```
  */
 export class ProxyClient {
   constructor(
@@ -598,17 +839,39 @@ export class ProxyClient {
         if (prop in target || typeof prop === 'symbol') {
           return (target as any)[prop];
         }
-        return async (payload?: unknown) => {
-          const result = await target.transport.unary(
-            target.serviceName,
-            prop,
-            payload ?? {},
-          );
-          return result;
-        };
+        return _proxyMethod(target.serviceName, prop, target.transport);
       },
     });
   }
+}
+
+/** A bound proxy method supporting all RPC patterns. */
+function _proxyMethod(serviceName: string, methodName: string, transport: AsterTransport) {
+  // The callable: detects async iterables for client streaming, else unary
+  const fn = async (payload?: unknown) => {
+    // Detect client streaming: payload is an async iterable (but not a plain object)
+    if (payload != null && typeof payload === 'object' && Symbol.asyncIterator in payload) {
+      return transport.clientStream(
+        serviceName,
+        methodName,
+        payload as AsyncIterable<unknown>,
+      );
+    }
+    // Default: unary
+    return transport.unary(serviceName, methodName, payload ?? {});
+  };
+
+  // .stream() — server streaming
+  fn.stream = (payload?: unknown): AsyncIterable<unknown> => {
+    return transport.serverStream(serviceName, methodName, payload ?? {});
+  };
+
+  // .bidi() — bidirectional streaming
+  fn.bidi = () => {
+    return transport.bidiStream(serviceName, methodName);
+  };
+
+  return fn;
 }
 
 // ── Native addon loader ──────────────────────────────────────────────────────

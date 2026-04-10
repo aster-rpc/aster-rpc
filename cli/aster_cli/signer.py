@@ -54,8 +54,9 @@ class LocalSigner:
     """Signs credentials using a locally-available root private key.
 
     Resolution order:
-    1. OS keyring (profile-scoped).
-    2. ``--root-key`` file path.
+    1. Explicit ``--root-key`` file path (highest priority -- wins over keyring
+       so test setups and CI can pin the exact key being used).
+    2. OS keyring (profile-scoped).
     3. Default ``~/.aster/root.key``.
     """
 
@@ -69,7 +70,16 @@ class LocalSigner:
     def _resolve(self) -> None:
         from aster_cli.credentials import get_root_privkey, has_keyring
 
-        # Try keyring first
+        # 1. Explicit --root-key file wins (so test setups, CI, and isolated
+        # environments can pin a specific key without keyring interference).
+        if self._root_key_file and os.path.exists(self._root_key_file):
+            with open(self._root_key_file) as f:
+                kd = json.load(f)
+            self._privkey = bytes.fromhex(kd["private_key"])
+            self._pubkey = bytes.fromhex(kd["public_key"]) if "public_key" in kd else self._derive_pubkey(self._privkey)
+            return
+
+        # 2. OS keyring (profile-scoped)
         if has_keyring():
             hex_key = get_root_privkey(self._profile_name)
             if hex_key is not None:
@@ -77,18 +87,14 @@ class LocalSigner:
                 self._pubkey = self._derive_pubkey(self._privkey)
                 return
 
-        # Fall back to file
-        key_paths = [
-            p for p in [self._root_key_file, os.path.expanduser("~/.aster/root.key")]
-            if p
-        ]
-        for path in key_paths:
-            if os.path.exists(path):
-                with open(path) as f:
-                    kd = json.load(f)
-                self._privkey = bytes.fromhex(kd["private_key"])
-                self._pubkey = bytes.fromhex(kd["public_key"])
-                return
+        # 3. Default ~/.aster/root.key
+        default_path = os.path.expanduser("~/.aster/root.key")
+        if os.path.exists(default_path):
+            with open(default_path) as f:
+                kd = json.load(f)
+            self._privkey = bytes.fromhex(kd["private_key"])
+            self._pubkey = bytes.fromhex(kd["public_key"]) if "public_key" in kd else self._derive_pubkey(self._privkey)
+            return
 
         print(
             f"Error: no root private key found for profile '{self._profile_name}'.\n"

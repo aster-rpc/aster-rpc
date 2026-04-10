@@ -1507,12 +1507,24 @@ class AsterClient:
             )
 
         conn = await self._rpc_conn_for(summary.channels[channel_key])
-        client = create_client(
-            service_cls,
-            connection=conn,
-            codec=codec,
-            interceptors=interceptors,
-        )
+
+        # Session-scoped services use the session protocol (one bidi stream
+        # with method multiplexing). Dispatch to create_session.
+        if info.scoped == "stream":
+            from aster.session import create_session
+            client = await create_session(
+                service_cls,
+                connection=conn,
+                codec=codec,
+                interceptors=interceptors,
+            )
+        else:
+            client = create_client(
+                service_cls,
+                connection=conn,
+                codec=codec,
+                interceptors=interceptors,
+            )
         self._clients.append(client)
         return client
 
@@ -1699,20 +1711,32 @@ def _credential_from_peer_entry(peer: dict) -> ConsumerEnrollmentCredential:
 
 
 def _load_enrollment_credential(path: str) -> ConsumerEnrollmentCredential:
-    """Load a pre-signed ConsumerEnrollmentCredential from a JSON file.
+    """Load a pre-signed ConsumerEnrollmentCredential from a credential file.
 
-    The JSON should have been created by ``aster authorize consumer`` (CLI)
-    and contains: credential_type, root_pubkey (hex), expires_at, attributes,
-    nonce (hex, OTT only), signature (hex).
+    Supports two formats:
+    - JSON: standalone ``{"credential_type":..., "root_pubkey":..., ...}``
+    - TOML (.aster-identity): reads the first consumer ``[[peers]]`` entry
     """
     import json as _json
 
     expanded = os.path.expanduser(path)
     with open(expanded) as f:
-        d = _json.load(f)
+        raw = f.read()
+
+    # Try JSON first
+    raw_stripped = raw.strip()
+    if raw_stripped.startswith("{"):
+        d = _json.loads(raw_stripped)
+    elif raw_stripped.startswith("[node]") or raw_stripped.startswith("[") or raw_stripped.startswith("#"):
+        # TOML identity file -- extract the first consumer peer entry
+        d = _extract_credential_from_identity(raw_stripped)
+    else:
+        # Try JSON anyway (may be array or other format)
+        d = _json.loads(raw_stripped)
+
     nonce_hex = d.get("nonce")
     cred = ConsumerEnrollmentCredential(
-        credential_type=d.get("credential_type", "policy"),
+        credential_type=d.get("credential_type") or d.get("type", "policy"),
         root_pubkey=bytes.fromhex(d["root_pubkey"]),
         expires_at=int(d["expires_at"]),
         attributes=d.get("attributes", {}),
@@ -1721,6 +1745,25 @@ def _load_enrollment_credential(path: str) -> ConsumerEnrollmentCredential:
         signature=bytes.fromhex(d.get("signature", "")),
     )
     return cred
+
+
+def _extract_credential_from_identity(toml_text: str) -> dict:
+    """Extract the first consumer peer entry from a TOML .aster-identity file."""
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    data = tomllib.loads(toml_text)
+    peers = data.get("peers", [])
+    # Find the first consumer-role peer
+    for peer in peers:
+        if peer.get("role") == "consumer":
+            return peer
+    # Fall back to first peer
+    if peers:
+        return peers[0]
+    raise ValueError(f"No peer entries found in identity file")
 
 
 def _coerce_node_addr(addr: NodeAddr | str | bytes) -> NodeAddr:

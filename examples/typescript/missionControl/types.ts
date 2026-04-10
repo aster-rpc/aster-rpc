@@ -4,6 +4,10 @@
  * Each type has a stable wire identity via @WireType so Python (or any
  * other Aster binding) can interoperate. Tags match the Python example
  * exactly — that's how cross-language RPC works.
+ *
+ * Field names use snake_case to match the cross-language wire format.
+ * Python's codec normalizes camelCase→snake_case, so snake_case here
+ * ensures both directions work without conversion.
  */
 
 import { WireType } from '@aster-rpc/aster';
@@ -12,15 +16,15 @@ import { WireType } from '@aster-rpc/aster';
 
 @WireType("mission/StatusRequest")
 export class StatusRequest {
-  agentId = "";
+  agent_id = "";
   constructor(init?: Partial<StatusRequest>) { if (init) Object.assign(this, init); }
 }
 
 @WireType("mission/StatusResponse")
 export class StatusResponse {
-  agentId = "";
+  agent_id = "";
   status = "idle";
-  uptimeSecs = 0;
+  uptime_secs = 0;
   constructor(init?: Partial<StatusResponse>) { if (init) Object.assign(this, init); }
 }
 
@@ -31,7 +35,7 @@ export class LogEntry {
   timestamp = 0;
   level = "info";
   message = "";
-  agentId = "";
+  agent_id = "";
   constructor(init?: Partial<LogEntry>) { if (init) Object.assign(this, init); }
 }
 
@@ -43,7 +47,7 @@ export class SubmitLogResult {
 
 @WireType("mission/TailRequest")
 export class TailRequest {
-  agentId = "";
+  agent_id = "";
   level = "info";
   constructor(init?: Partial<TailRequest>) { if (init) Object.assign(this, init); }
 }
@@ -70,15 +74,15 @@ export class IngestResult {
 
 @WireType("mission/Heartbeat")
 export class Heartbeat {
-  agentId = "";
+  agent_id = "";
   capabilities: string[] = [];
-  loadAvg = 0;
+  load_avg = 0;
   constructor(init?: Partial<Heartbeat>) { if (init) Object.assign(this, init); }
 }
 
 @WireType("mission/Assignment")
 export class Assignment {
-  taskId = "";
+  task_id = "";
   command = "";
   constructor(init?: Partial<Assignment>) { if (init) Object.assign(this, init); }
 }
@@ -93,6 +97,6 @@ export class Command {
 export class CommandResult {
   stdout = "";
   stderr = "";
-  exitCode = -1;
+  exit_code = -1;
   constructor(init?: Partial<CommandResult>) { if (init) Object.assign(this, init); }
 }

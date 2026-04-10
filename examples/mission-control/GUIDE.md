@@ -24,6 +24,15 @@ No YAML. No protobuf compilation. No port numbers. No cloud account.
 Encrypted, authenticated, works across NATs, and your TypeScript
 colleague can call it too.
 
+**What you're replacing:** Traditional RPC means writing `.proto` files,
+compiling them, setting up TLS certificates, configuring a reverse proxy
+or service mesh so clients can find your service, managing certificate
+rotation, and repeating all of that for every new service. With Aster you
+get mTLS-grade mutual authentication (no CA infrastructure), gRPC-style
+streaming RPCs (no `.proto` compilation), and peer-to-peer connectivity
+(no port forwarding or load balancers). Your TypeScript teammate calls
+your Python service without installing anything from your repo.
+
 This guide builds **Mission Control** — a control plane for managing
 remote agents. An agent could be a CI runner, an IoT sensor, an AI
 worker, or a service on your colleague's laptop across the world.

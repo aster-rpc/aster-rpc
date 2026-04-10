@@ -14,6 +14,7 @@ use crate::gossip::GossipClient;
 use crate::hooks::NodeHookReceiver;
 use crate::net::IrohConnection;
 
+
 /// IrohNode — a peer-to-peer Iroh node with all protocols enabled.
 ///
 /// Create via `IrohNode.memory()` or `IrohNode.persistent(path)`.
@@ -91,16 +92,18 @@ impl IrohNode {
     }
 
     /// Accept the next incoming aster-ALPN connection.
-    /// Returns [alpn, connection].
+    /// The ALPN tag is stored on the returned connection (call `conn.alpn()` to read it).
     #[napi]
     pub async fn accept_aster(&self) -> Result<IrohConnection> {
-        let (_alpn, conn) = self
+        let (alpn, conn) = self
             .inner
             .clone()
             .accept_aster()
             .await
             .map_err(to_napi_err)?;
-        Ok(IrohConnection::from(conn))
+        let mut iroh_conn = IrohConnection::from(conn);
+        iroh_conn.alpn_tag = Some(String::from_utf8_lossy(&alpn).to_string());
+        Ok(iroh_conn)
     }
 
     /// Get the blobs client for this node.

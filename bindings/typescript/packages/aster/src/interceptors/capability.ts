@@ -23,23 +23,23 @@ export class CapabilityInterceptor implements Interceptor {
     const req = this.requirements.get(key);
     if (!req) return request;
 
-    const callerRole = ctx.attributes['aster.role'] ?? '';
+    // aster.role is a comma-separated list: "ops.status,ops.logs,ops.admin"
+    const roleStr = ctx.attributes['aster.role'] ?? '';
+    const callerRoles = new Set(roleStr.split(',').map(r => r.trim()).filter(Boolean));
 
     switch (req.kind) {
       case 'role':
-        if (!req.roles.includes(callerRole)) {
+        if (!callerRoles.has(req.roles[0])) {
           throw new RpcError(StatusCode.PERMISSION_DENIED, `requires role: ${req.roles.join(', ')}`);
         }
         break;
       case 'any_of':
-        if (!req.roles.includes(callerRole)) {
+        if (!req.roles.some(r => callerRoles.has(r))) {
           throw new RpcError(StatusCode.PERMISSION_DENIED, `requires any of: ${req.roles.join(', ')}`);
         }
         break;
       case 'all_of':
-        // For all_of, caller needs all roles — single-role check can't satisfy this
-        // In practice, this would check against a set of caller roles
-        if (!req.roles.includes(callerRole)) {
+        if (!req.roles.every(r => callerRoles.has(r))) {
           throw new RpcError(StatusCode.PERMISSION_DENIED, `requires all of: ${req.roles.join(', ')}`);
         }
         break;

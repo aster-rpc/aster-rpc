@@ -24,7 +24,7 @@ await client.connect();
 const mc = client.proxy("MissionControl");
 
 // Chapter 1: check in
-const status = await mc.getStatus({ agentId: "ts-agent-1" });
+const status = await mc.getStatus({ agent_id: "ts-agent-1" });
 console.log("Status:", status);
 
 // Chapter 2: push a log entry
@@ -32,7 +32,7 @@ await mc.submitLog({
   timestamp: Date.now() / 1000,
   level: "info",
   message: "agent started",
-  agentId: "ts-agent-1",
+  agent_id: "ts-agent-1",
 });
 console.log("Log submitted");
 

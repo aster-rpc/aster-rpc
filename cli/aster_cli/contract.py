@@ -497,10 +497,15 @@ def _call_command(args: argparse.Namespace) -> int:
         print(f"Error: invalid JSON payload: {e}", file=sys.stderr)
         return 1
 
+    rcan_path = getattr(args, "rcan", None)
+
     async def _run() -> int:
         from aster.high_level import AsterClient
 
-        client = AsterClient(address=address)
+        client = AsterClient(
+            address=address,
+            enrollment_credential_file=rcan_path,
+        )
         try:
             await client.connect()
             proxy = client.proxy(service_name)
@@ -509,7 +514,28 @@ def _call_command(args: argparse.Namespace) -> int:
             print(_json.dumps(result, indent=2, default=str))
             return 0
         except Exception as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+            msg = str(exc)
+            # Friendly error for session-scoped services -- `aster call` can't drive them
+            if "Stream/service scope mismatch" in msg or "FAILED_PRECONDITION" in msg:
+                print(
+                    f"Error: {service_name!r} appears to be session-scoped and "
+                    f"cannot be called via 'aster call'.\n"
+                    f"\n"
+                    f"Session-scoped services hold per-connection state, so they need "
+                    f"a persistent client.\n"
+                    f"'aster call' is a one-shot tool -- the session would be torn "
+                    f"down before the next call could use it.\n"
+                    f"\n"
+                    f"Use a generated typed client instead:\n"
+                    f"  aster contract gen-client <address> --out ./clients --package my_app\n"
+                    f"  # then in Python:\n"
+                    f"  from my_app.services.{service_name.lower()}_v1 import {service_name}Client\n"
+                    f"  stub = await {service_name}Client.from_connection(client)\n"
+                    f"  result = await stub.{method_name}(...)",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"Error: {exc}", file=sys.stderr)
             return 1
         finally:
             await client.close()
@@ -869,6 +895,10 @@ def main() -> None:
     call_parser.add_argument(
         "--json", dest="json_output", action="store_true",
         help="Output raw JSON (default)",
+    )
+    call_parser.add_argument(
+        "--rcan", default=None, metavar="PATH",
+        help="Path to credential file (JSON or .aster-identity TOML)",
     )
 
     # ``aster init`` subcommand

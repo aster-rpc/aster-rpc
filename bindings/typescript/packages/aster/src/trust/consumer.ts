@@ -35,6 +35,7 @@ export interface ServiceSummary {
   contractId: string;
   pattern: string;
   methods: string[];
+  channels?: Record<string, string>;
 }
 
 /** Consumer admission request. */
@@ -87,7 +88,7 @@ export async function performAdmission(
 
   // Build and send request (snake_case keys for Python interop)
   const wireRequest = {
-    credential_json: JSON.stringify(credential),
+    credential_json: credential ? JSON.stringify(credential) : '',
     iid_token: iidToken ?? '',
   };
   const reqBytes = new TextEncoder().encode(JSON.stringify(wireRequest));
@@ -101,7 +102,11 @@ export async function performAdmission(
 
   // Read response (snake_case keys from Python wire format)
   const respBytes = await recv.readToEnd(MAX_ADMISSION_PAYLOAD_SIZE);
-  const d = JSON.parse(new TextDecoder().decode(respBytes));
+  const respText = new TextDecoder().decode(respBytes);
+  if (!respText || respText.length === 0) {
+    throw new Error('admission failed: server returned empty response (may be overloaded, retry)');
+  }
+  const d = JSON.parse(respText);
   const response: ConsumerAdmissionResponse = {
     admitted: d.admitted,
     reason: d.reason,
@@ -221,7 +226,8 @@ export async function handleConsumerAdmissionRpc(
   }
 
   // Dev mode / open gate: empty credential -> auto-admit
-  if (!req.credentialJson && opts.allowUnenrolled) {
+  const isEmptyCredential = !req.credentialJson || req.credentialJson === '{}' || req.credentialJson === 'null';
+  if (isEmptyCredential && opts.allowUnenrolled) {
     hook.addPeer(peerNodeId);
     const role = topicForPeer ? 'root' : 'open gate';
     log.info(`consumer admission: auto-admitted ${peerNodeId} (${role})`);
@@ -246,10 +252,10 @@ export async function handleConsumerAdmissionRpc(
   }
 
   // Trust anchor check: credential's rootPubkey must match server's
-  if (cred.rootPubkey !== rootPubkey) {
+  if (!cred.rootPubkey || cred.rootPubkey !== rootPubkey) {
     log.warn(
       `consumer admission: untrusted root key from ${peerNodeId} ` +
-      `(got ${cred.rootPubkey.slice(0, 12)}, expected ${rootPubkey.slice(0, 12)})`,
+      `(got ${(cred.rootPubkey ?? '(none)').slice(0, 12)}, expected ${rootPubkey.slice(0, 12)})`,
     );
     return denied;
   }
@@ -330,6 +336,7 @@ export async function handleConsumerAdmissionConnection(
       contract_id: s.contractId ?? s.contract_id ?? '',
       pattern: s.pattern,
       methods: s.methods,
+      channels: s.channels ?? {},
     }));
     const wireResponse: Record<string, unknown> = {
       admitted: response.admitted,
@@ -343,8 +350,15 @@ export async function handleConsumerAdmissionConnection(
       wireResponse.gossip_topic = response.gossipTopic;
     }
 
-    await send.writeAll(new TextEncoder().encode(JSON.stringify(wireResponse)));
-    await send.finish();
+    const responseBytes = new TextEncoder().encode(JSON.stringify(wireResponse));
+    try {
+      await send.writeAll(responseBytes);
+      await send.finish();
+    } catch (writeErr) {
+      log.warn(`consumer admission: failed to send response to ${peerNodeId}: ${writeErr}`);
+      // Stream write failed — client will see an empty/closed stream.
+      // Nothing more we can do; the connection may already be gone.
+    }
     // Don't conn.close() — let QUIC drain the streams naturally.
     // Calling close() sends CONNECTION_CLOSE which kills in-flight
     // data before the consumer can readToEnd().

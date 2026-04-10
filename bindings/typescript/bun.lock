@@ -15,6 +15,20 @@
         "vitest": "^3.2.0",
       },
     },
+    "../../examples/typescript/missionControl": {
+      "name": "@aster-examples/mission-control",
+      "version": "0.0.0",
+      "dependencies": {
+        "@aster-rpc/aster": "workspace:*",
+      },
+    },
+    "../../tests/integration/mission_control": {
+      "name": "@aster-tests/mission-control",
+      "version": "0.0.0",
+      "dependencies": {
+        "@aster-rpc/aster": "workspace:*",
+      },
+    },
     "packages/aster": {
       "name": "@aster-rpc/aster",
       "version": "0.1.0-alpha.0",
@@ -39,9 +53,13 @@
 
     "@apache-fory/core": ["@apache-fory/core@link:../../docs/_internal/fory/javascript/packages/core", {}],
 
+    "@aster-examples/mission-control": ["@aster-examples/mission-control@workspace:../../examples/typescript/missionControl"],
+
     "@aster-rpc/aster": ["@aster-rpc/aster@workspace:packages/aster"],
 
     "@aster-rpc/transport": ["@aster-rpc/transport@workspace:packages/transport"],
+
+    "@aster-tests/mission-control": ["@aster-tests/mission-control@workspace:../../tests/integration/mission_control"],
 
     "@babel/helper-string-parser": ["@babel/helper-string-parser@7.27.1", "", {}, "sha512-qMlSxKbpRlAridDExk92nSobyDdpPijUq2DW6oDnUqd0iOGxmQjyqhMIihI9+zv4LPyZdRje2cavWPbCbWm3eA=="],
 

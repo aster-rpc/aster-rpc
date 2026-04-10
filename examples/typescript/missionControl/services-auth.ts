@@ -43,9 +43,9 @@ export class MissionControl {
   @Rpc({ requires: Role.STATUS })
   async getStatus(req: StatusRequest): Promise<StatusResponse> {
     return new StatusResponse({
-      agentId: req.agentId,
+      agent_id: req.agent_id,
       status: "running",
-      uptimeSecs: 3600,
+      uptime_secs: 3600,
     });
   }
 
@@ -65,7 +65,7 @@ export class MissionControl {
     const minRank = LOG_LEVEL_RANK[req.level?.toLowerCase() ?? "info"] ?? 0;
     while (true) {
       const entry = await this.nextLog();
-      if (req.agentId && entry.agentId !== req.agentId) continue;
+      if (req.agent_id && entry.agent_id !== req.agent_id) continue;
       if ((LOG_LEVEL_RANK[entry.level?.toLowerCase() ?? "info"] ?? 0) < minRank) continue;
       yield entry;
     }
@@ -92,23 +92,23 @@ export class MissionControl {
 
 @Service({ name: "AgentSession", version: 1, scoped: "session" })
 export class AgentSession {
-  private agentId = "";
-  private capabilities: string[] = [];
+  private _agentId = "";
+  private _capabilities: string[] = [];
 
   @Rpc({ requires: Role.INGEST })
   async register(hb: Heartbeat): Promise<Assignment> {
-    this.agentId = hb.agentId;
-    this.capabilities = [...(hb.capabilities ?? [])];
-    if (this.capabilities.includes("gpu")) {
-      return new Assignment({ taskId: "train-42", command: "python train.py" });
+    this._agentId = hb.agent_id;
+    this._capabilities = [...(hb.capabilities ?? [])];
+    if (this._capabilities.includes("gpu")) {
+      return new Assignment({ task_id: "train-42", command: "python train.py" });
     }
-    return new Assignment({ taskId: "idle", command: "sleep 60" });
+    return new Assignment({ task_id: "idle", command: "sleep 60" });
   }
 
   @Rpc()
   async heartbeat(hb: Heartbeat): Promise<Assignment> {
-    this.capabilities = [...(hb.capabilities ?? [])];
-    return new Assignment({ taskId: "continue", command: "" });
+    this._capabilities = [...(hb.capabilities ?? [])];
+    return new Assignment({ task_id: "continue", command: "" });
   }
 
   @BidiStream({ requires: Role.ADMIN })
@@ -120,8 +120,8 @@ export class AgentSession {
       });
       const stdout = await new Response(proc.stdout).text();
       const stderr = await new Response(proc.stderr).text();
-      const exitCode = await proc.exited;
-      yield new CommandResult({ stdout, stderr, exitCode });
+      const exit_code = await proc.exited;
+      yield new CommandResult({ stdout, stderr, exit_code });
     }
   }
 }

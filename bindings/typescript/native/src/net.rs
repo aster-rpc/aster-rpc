@@ -14,16 +14,23 @@ use crate::error::to_napi_err;
 #[napi]
 pub struct IrohConnection {
     pub(crate) inner: CoreConnection,
+    pub(crate) alpn_tag: Option<String>,
 }
 
 impl From<CoreConnection> for IrohConnection {
     fn from(inner: CoreConnection) -> Self {
-        Self { inner }
+        Self { inner, alpn_tag: None }
     }
 }
 
 #[napi]
 impl IrohConnection {
+    /// The ALPN this connection was accepted on (set by acceptAster).
+    #[napi]
+    pub fn alpn(&self) -> Option<String> {
+        self.alpn_tag.clone()
+    }
+
     /// Open a bidirectional QUIC stream. Returns [sendStream, recvStream].
     #[napi]
     pub async fn open_bi(&self) -> Result<IrohBiStream> {
