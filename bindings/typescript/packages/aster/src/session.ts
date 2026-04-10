@@ -195,12 +195,20 @@ export class SessionServer {
     const deadlineMs = this.getDeadlineMs(callCtx);
     const remaining = deadlineMs - Date.now();
     if (remaining <= 0) throw new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
-    return Promise.race([
-      fn(),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded')), remaining),
-      ),
-    ]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        fn(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded')),
+            remaining,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   // -- Pattern handlers -------------------------------------------------------

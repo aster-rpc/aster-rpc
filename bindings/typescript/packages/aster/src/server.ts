@@ -355,14 +355,8 @@ export class RpcServer {
 
     // Invoke handler with deadline enforcement
     let response: any;
-    const timeout = this.handlerTimeoutMs(callCtx);
     try {
-      response = await Promise.race([
-        handler.call(svcInfo.instance, request),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded')), timeout),
-        ),
-      ]);
+      response = await this.runWithDeadline(callCtx, () => handler.call(svcInfo.instance, request));
     } catch (e) {
       if (e instanceof RpcError && e.code === StatusCode.DEADLINE_EXCEEDED) {
         await this.writeErrorTrailer(send, StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
@@ -451,14 +445,8 @@ export class RpcServer {
     async function* requestIter() { for (const r of requests) yield r; }
 
     let response: any;
-    const timeout = this.handlerTimeoutMs(callCtx);
     try {
-      response = await Promise.race([
-        handler.call(svcInfo.instance, requestIter()),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded')), timeout),
-        ),
-      ]);
+      response = await this.runWithDeadline(callCtx, () => handler.call(svcInfo.instance, requestIter()));
     } catch (e) {
       if (e instanceof RpcError && e.code === StatusCode.DEADLINE_EXCEEDED) {
         await this.writeErrorTrailer(send, StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
@@ -532,6 +520,28 @@ export class RpcServer {
     if (deadline == null || deadline <= 0) return maxMs;
     const remaining = deadline * 1000 - Date.now();
     return Math.max(0, Math.min(remaining, maxMs));
+  }
+
+  /** Run a handler with deadline enforcement, clearing the timer when done. */
+  private async runWithDeadline<T>(
+    callCtx: CallContext,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const timeout = this.handlerTimeoutMs(callCtx);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        fn(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new RpcError(StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded')),
+            timeout,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   private buildMetadata(header: StreamHeader): Record<string, string> {
