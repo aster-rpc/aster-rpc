@@ -20,6 +20,7 @@ import {
   COMPRESSED,
   CANCEL,
 } from './framing.js';
+import { SessionServer } from './session.js';
 import { StreamHeader, RpcStatus } from './protocol.js';
 import { StatusCode, RpcError } from './status.js';
 import { RpcPattern } from './types.js';
@@ -191,7 +192,35 @@ export class RpcServer {
         return;
       }
 
-      // Look up method
+      // ── Session discriminator check ─────────────────────────────────
+      const isSessionStream = (header.method === '');
+      const isSessionService = (svcInfo.scoped === 'session');
+
+      if (isSessionStream !== isSessionService) {
+        await this.writeErrorTrailer(
+          send, StatusCode.FAILED_PRECONDITION, 'Stream/service scope mismatch',
+        );
+        return;
+      }
+
+      if (isSessionStream) {
+        let peerId: string | undefined;
+        try { peerId = conn.remoteNodeId(); } catch { /* ignore */ }
+
+        let attributes: Record<string, string> | undefined;
+        if (peerId && this.peerStore) {
+          const m = this.peerStore.getAttributes(peerId);
+          if (m.size > 0) attributes = Object.fromEntries(m);
+        }
+
+        const sessionServer = new SessionServer(this.codec, this.interceptors);
+        await sessionServer.handleSession(recv, send, svcInfo, header, peerId, attributes);
+        try { await send.finish(); } catch { /* best effort */ }
+        return;
+      }
+      // ── End session discriminator ──────────────────────────────────
+
+      // Look up method (shared services only — session dispatch is above)
       const methodInfo = svcInfo.methods.get(header.method);
       if (!methodInfo) {
         await this.writeErrorTrailer(send, StatusCode.UNIMPLEMENTED, `method '${header.service}.${header.method}' not found`);

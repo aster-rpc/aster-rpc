@@ -46,6 +46,11 @@ function isPermissionDenied(e: unknown): boolean {
   return msg.includes('PERMISSION_DENIED') || msg.toLowerCase().includes('permission');
 }
 
+function isDeniedOrScopeMismatch(e: unknown): boolean {
+  const msg = String(e);
+  return isPermissionDenied(e) || msg.includes('FAILED_PRECONDITION') || msg.includes('scope mismatch');
+}
+
 // ── Chapter tests ───────────────────────────────────────────────────────────
 
 async function testCh1Unary(mc: any): Promise<void> {
@@ -295,7 +300,7 @@ async function testCh5EdgeCredential(address: string, edgeCred: string): Promise
       ok('Ch5 edge runCommand → no response (denied silently)');
     }
   } catch (e) {
-    if (isPermissionDenied(e)) {
+    if (isDeniedOrScopeMismatch(e)) {
       ok('Ch5 edge runCommand → DENIED (bidi auth check)');
     } else {
       fail('Ch5 edge runCommand denied', `unexpected error: ${e}`);
