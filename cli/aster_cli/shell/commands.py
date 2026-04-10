@@ -1035,6 +1035,9 @@ class GenerateClientCommand(ShellCommand):
 class SessionCommand(ShellCommand):
     name = "session"
     description = "Open a session subshell for a session-scoped service"
+    # Scoped to /services so future paths like /aster/<handle>/ get their
+    # own session command via namespace-specific dispatch (no ambiguity
+    # about which handle the session belongs to).
     contexts = ["/services", "/services/*"]
 
     def get_arguments(self) -> list[Argument]:

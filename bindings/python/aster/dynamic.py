@@ -96,75 +96,147 @@ class DynamicTypeFactory:
     """
 
     def __init__(self) -> None:
-        self._types: dict[str, type] = {}  # wire_tag → synthesized type
-        self._method_map: dict[str, dict[str, Any]] = {}  # "Service:method" → method meta
+        self._types: dict[str, type] = {}  # wire_tag -> synthesized type
+        self._type_defs: dict[str, tuple[str, list[dict[str, Any]]]] = {}  # wire_tag -> (name, fields)
+        self._method_map: dict[str, dict[str, Any]] = {}  # "Service:method" -> method meta
 
     def register_from_manifest(self, methods: list[dict[str, Any]]) -> None:
         """Register synthesized types from manifest method descriptors.
 
-        Args:
-            methods: List of method dicts from ContractManifest.methods.
-                     Each must have request_wire_tag, fields, and optionally
-                     response_wire_tag + response_fields.
+        Reads v1 field schema (kind/ref_name/item_ref/etc.) with fallback
+        to legacy keys for older manifests. Walks all methods to build a
+        wire_tag -> fields map, then synthesizes types with cross-method
+        ref resolution.
         """
+        # First pass: collect all type definitions across all methods
         for method in methods:
-            # Synthesize element types first (needed before the parent type)
-            for field_list in (method.get("fields", []), method.get("response_fields", [])):
-                self._synthesize_element_types(field_list)
-
-            # Synthesize request type
             req_tag = method.get("request_wire_tag", "")
             req_name = method.get("request_type", "")
-            fields = method.get("fields", [])
+            if req_tag and req_name and req_tag not in self._type_defs:
+                self._type_defs[req_tag] = (req_name, method.get("fields", []))
 
-            if req_tag and req_name and req_tag not in self._types:
-                req_cls = self._synthesize_type(req_tag, req_name, fields)
-                self._types[req_tag] = req_cls
-                logger.debug("Synthesized request type: %s (%s)", req_name, req_tag)
-
-            # Synthesize response type
             resp_tag = method.get("response_wire_tag", "")
             resp_name = method.get("response_type", "")
-            resp_fields = method.get("response_fields", [])
+            if resp_tag and resp_name and resp_tag not in self._type_defs:
+                self._type_defs[resp_tag] = (resp_name, method.get("response_fields", []))
 
-            if resp_tag and resp_name and resp_tag not in self._types:
-                resp_cls = self._synthesize_type(resp_tag, resp_name, resp_fields)
-                self._types[resp_tag] = resp_cls
-                logger.debug("Synthesized response type: %s (%s)", resp_name, resp_tag)
+        # Second pass: synthesize each type. _ensure_type recurses into
+        # nested ref types as needed.
+        for tag in list(self._type_defs.keys()):
+            if tag not in self._types:
+                self._ensure_type(tag)
 
-    def _synthesize_element_types(self, fields: list[dict[str, Any]]) -> None:
-        """Pre-synthesize element types for list[X] fields."""
-        for f in fields:
-            elem_tag = f.get("element_wire_tag", "")
-            elem_name = f.get("element_type", "")
-            elem_fields = f.get("element_fields", [])
-            if elem_tag and elem_name and elem_tag not in self._types:
-                elem_cls = self._synthesize_type(elem_tag, elem_name, elem_fields)
-                self._types[elem_tag] = elem_cls
-                logger.debug("Synthesized element type: %s (%s)", elem_name, elem_tag)
+    def _ensure_type(self, tag: str) -> type | None:
+        """Synthesize the type for a wire tag if not already done."""
+        if tag in self._types:
+            return self._types[tag]
+        defn = self._type_defs.get(tag)
+        if defn is None:
+            return None
+        name, fields = defn
+        cls = self._synthesize_type(tag, name, fields)
+        self._types[tag] = cls
+        logger.debug("Synthesized type: %s (%s)", name, tag)
+        return cls
+
+    def _resolve_field_type(self, f: dict[str, Any]) -> type:
+        """Resolve a v1 schema field to a Python type for the dataclass."""
+        kind = f.get("kind")
+        if kind is not None:
+            # V1 schema path
+            if kind == "string":
+                return str
+            if kind == "int":
+                return int
+            if kind == "float":
+                return float
+            if kind == "bool":
+                return bool
+            if kind == "bytes":
+                return bytes
+            if kind == "ref":
+                ref_tag = f.get("wire_tag", "")
+                if ref_tag:
+                    nested = self._ensure_type(ref_tag)
+                    if nested is not None:
+                        return nested
+                return object
+            if kind == "enum":
+                return str
+            if kind == "list":
+                item_kind = f.get("item_kind", "string")
+                if item_kind == "ref":
+                    item_tag = f.get("item_wire_tag", "")
+                    if item_tag:
+                        nested = self._ensure_type(item_tag)
+                        if nested is not None:
+                            return list[nested]
+                return list
+            if kind == "map":
+                return dict
+            return object
+
+        # Legacy path
+        elem_tag = f.get("element_wire_tag", "")
+        if elem_tag:
+            nested = self._ensure_type(elem_tag)
+            if nested is not None:
+                return list[nested]
+        return _resolve_type(f.get("type", "str"))
+
+    def _resolve_field_default(self, f: dict[str, Any]) -> Any:
+        """Resolve a v1 schema field's default value (or dataclass field)."""
+        dk = f.get("default_kind")
+        if dk is not None:
+            # V1 schema path
+            if dk == "value":
+                dv = f.get("default_value")
+                if dv is not None:
+                    return dv
+            elif dk == "empty_list":
+                return dataclasses.field(default_factory=list)
+            elif dk == "empty_map":
+                return dataclasses.field(default_factory=dict)
+            elif dk == "null":
+                return None
+
+            # Type-based default for v1 fields without explicit default_value
+            kind = f.get("kind", "string")
+            if kind == "string":
+                return ""
+            if kind == "int":
+                return 0
+            if kind == "float":
+                return 0.0
+            if kind == "bool":
+                return False
+            if kind == "bytes":
+                return b""
+            if kind == "list":
+                return dataclasses.field(default_factory=list)
+            if kind == "map":
+                return dataclasses.field(default_factory=dict)
+            return None
+
+        # Legacy path
+        return _resolve_default(f.get("type", "str"), f.get("default"))
 
     def _synthesize_type(
         self, tag: str, name: str, fields: list[dict[str, Any]]
     ) -> type:
         """Create a dataclass with the given wire_type tag and fields."""
-        # Build field specifications for make_dataclass
         dc_fields: list[tuple[str, type, Any]] = []
         for f in fields:
-            elem_tag = f.get("element_wire_tag", "")
-            if elem_tag and elem_tag in self._types:
-                # Parameterized list: list[ElementType]
-                py_type = list[self._types[elem_tag]]
+            py_type = self._resolve_field_type(f)
+            default = self._resolve_field_default(f)
+            if isinstance(default, dataclasses.Field):
+                dc_fields.append((f["name"], py_type, default))
             else:
-                py_type = _resolve_type(f.get("type", "str"))
-            default = _resolve_default(f.get("type", "str"), f.get("default"))
-            dc_fields.append((f["name"], py_type, dataclasses.field(default=default)))
+                dc_fields.append((f["name"], py_type, dataclasses.field(default=default)))
 
-        # Create the dataclass
         cls = dataclasses.make_dataclass(name, dc_fields)
 
-        # Apply wire_type tag
         cls.__wire_type__ = tag
-        # Split tag into namespace/typename for Fory registration
         if "/" in tag:
             ns, tn = tag.rsplit("/", 1)
         elif "." in tag:

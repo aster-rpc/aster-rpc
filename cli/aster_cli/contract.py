@@ -500,12 +500,26 @@ def _call_command(args: argparse.Namespace) -> int:
     rcan_path = getattr(args, "rcan", None)
 
     async def _run() -> int:
+        import os as _os
         from aster.high_level import AsterClient
         from aster.config import AsterConfig
 
         config = AsterConfig.from_env()
         config.storage_path = None
-        if not rcan_path:
+
+        if rcan_path:
+            # Look for the .aster-identity file alongside the credential
+            # file. `aster enroll node` creates them as a pair in the same
+            # directory. If the env didn't already point at one and the
+            # CWD doesn't have one, fall back to the credential's dir.
+            cred_dir = _os.path.dirname(_os.path.abspath(rcan_path))
+            paired = _os.path.join(cred_dir, ".aster-identity")
+            if not config.identity_file or not _os.path.exists(config.identity_file):
+                if _os.path.exists(paired):
+                    config.identity_file = paired
+        else:
+            # No credential -- skip identity file lookup so we don't
+            # accidentally use stale CWD .aster-identity in dev mode
             config.identity_file = "/dev/null/.aster-identity"
 
         client = AsterClient(
@@ -579,7 +593,7 @@ def _gen_client_command(args: argparse.Namespace) -> int:
         namespace = args.package or _namespace_from_directory_ref(source)
     elif source.startswith("aster1"):
         # Source is a live node ticket -- connect, fetch manifests, disconnect
-        manifests = asyncio.run(_fetch_manifests_from_node(source))
+        manifests = asyncio.run(_fetch_manifests_from_node(source, getattr(args, "rcan", None)))
         namespace = args.package or source[6:14]  # first 8 chars after "aster1"
     else:
         print(f"Error: unrecognised source '{source}'", file=sys.stderr)
@@ -639,14 +653,31 @@ def _namespace_from_directory_ref(source: str) -> str:
     return f"{handle.lstrip('@')}_{service}"
 
 
-async def _fetch_manifests_from_node(ticket: str) -> dict[str, dict]:
+async def _fetch_manifests_from_node(ticket: str, rcan_path: str | None = None) -> dict[str, dict]:
     """Connect to a live node, fetch all manifests, and return them."""
     from aster.high_level import AsterClient, _coerce_node_addr
+    from aster.config import AsterConfig
     from aster import docs_client, blobs_client
     from aster.registry.keys import contract_key
     import asyncio
+    import os as _os
 
-    client = AsterClient(address=ticket)
+    config = AsterConfig.from_env()
+    config.storage_path = None
+    if rcan_path:
+        cred_dir = _os.path.dirname(_os.path.abspath(rcan_path))
+        paired = _os.path.join(cred_dir, ".aster-identity")
+        if not config.identity_file or not _os.path.exists(config.identity_file):
+            if _os.path.exists(paired):
+                config.identity_file = paired
+    else:
+        config.identity_file = "/dev/null/.aster-identity"
+
+    client = AsterClient(
+        config=config,
+        address=ticket,
+        enrollment_credential_file=rcan_path,
+    )
     await client.connect()
 
     bc = blobs_client(client._node)
@@ -797,6 +828,12 @@ def main() -> None:
         default=None,
         metavar="ADDR",
         help="Override @aster service address for @handle/Service sources",
+    )
+    gen_client_parser.add_argument(
+        "--rcan",
+        default=None,
+        metavar="PATH",
+        help="Path to enrollment credential (.cred file) for trusted-mode connections",
     )
 
     # ``aster contract export``
