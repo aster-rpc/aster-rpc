@@ -39,6 +39,8 @@ import {
 export interface ServiceOptions {
   name: string;
   version?: number;
+  /** Dispatch scope. Canonical values are 'shared' and 'session'.
+   *  The legacy alias 'stream' is still accepted on input. */
   scoped?: 'shared' | 'session' | 'stream';
   serialization?: SerializationMode[];
   requires?: CapabilityRequirement;
@@ -81,8 +83,9 @@ export function Service(options: ServiceOptions) {
       }
     }
 
-    // Accept "session" as alias for "stream"
-    const scoped = options.scoped === 'session' ? 'stream' : (options.scoped ?? 'shared');
+    // Canonical scope value is 'session'; accept the legacy 'stream' alias
+    // on input.
+    const scoped = options.scoped === 'stream' ? 'session' : (options.scoped ?? 'shared');
 
     const serviceInfo: ServiceInfo = {
       name: options.name,

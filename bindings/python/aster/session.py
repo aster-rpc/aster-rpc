@@ -979,7 +979,7 @@ async def create_session(
     ``method=""`` to indicate session mode.
 
     Args:
-        service_class: A class decorated with ``@service(scoped='stream')``.
+        service_class: A class decorated with ``@service(scoped='session')``.
         connection: An ``IrohConnection`` instance.
         codec: Optional pre-built ``ForyCodec``.
         fory_config: Optional codec configuration.

@@ -2,7 +2,7 @@
 Phase 8 tests: Session-scoped services.
 
 Tests cover:
-- @service(scoped='stream') decorator validation
+- @service(scoped='session') decorator validation
 - Local session lifecycle (state persistence, close hook)
 - All RPC patterns within a session (unary, server_stream, client_stream, bidi)
 - CANCEL frame handling
@@ -92,9 +92,9 @@ def _make_fake_pipes():
 
 
 def test_scoped_service_requires_peer_param():
-    """@service(scoped='stream') raises TypeError if __init__ lacks 'peer'."""
+    """@service(scoped='session') raises TypeError if __init__ lacks 'peer'."""
     with pytest.raises(TypeError, match="peer"):
-        @service(name="NoPeerService", version=1, scoped="stream")
+        @service(name="NoPeerService", version=1, scoped="session")
         class NoPeerService:
             def __init__(self):  # missing peer
                 pass
@@ -107,7 +107,7 @@ def test_scoped_service_requires_peer_param():
 # ── Shared service definition used by multiple tests ────────────────────────
 
 
-@service(name="CounterService", version=1, scoped="stream")
+@service(name="CounterService", version=1, scoped="session")
 class CounterService:
     """Session service that tracks cumulative state."""
 
@@ -258,7 +258,7 @@ async def test_local_session_unary_error_trailer_only():
 async def test_local_session_cancel_mid_call():
     """After sending CANCEL the server returns CANCELLED trailer; session stays open."""
     # Use a slow service to ensure the handler is running when CANCEL arrives
-    @service(name="SlowService", version=1, scoped="stream")
+    @service(name="SlowService", version=1, scoped="session")
     class SlowService:
         def __init__(self, peer=None):
             pass
@@ -430,7 +430,7 @@ async def test_local_session_bidi():
 @pytest.mark.timeout(30)
 async def test_local_session_mid_call_call_rejection():
     """Sending a CALL frame while a handler is in-flight returns FAILED_PRECONDITION."""
-    @service(name="BlockingService", version=1, scoped="stream")
+    @service(name="BlockingService", version=1, scoped="session")
     class BlockingService:
         def __init__(self, peer=None):
             self._gate = asyncio.Event()
@@ -535,7 +535,7 @@ async def test_stream_discriminator_mismatch_shared():
 
     # Build a minimal server-like handler that checks the discriminator
     is_session_stream = (bad_header.method == "")
-    is_session_service = (service_info.scoped == "stream")
+    is_session_service = (service_info.scoped == "session")
     assert is_session_stream != is_session_service, "This is the mismatch case"
 
     # Write FAILED_PRECONDITION as the server would
@@ -580,7 +580,7 @@ async def test_local_session_parity():
         async def double(self, req: PReq) -> PResp:
             return PResp(y=req.x * 2)
 
-    @service(name="ParitySession", version=1, scoped="stream")
+    @service(name="ParitySession", version=1, scoped="session")
     class ParitySession:
         def __init__(self, peer=None):
             pass

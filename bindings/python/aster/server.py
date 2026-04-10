@@ -38,7 +38,7 @@ from aster.limits import (
 from aster.logging import request_context
 from aster.protocol import StreamHeader, RpcStatus
 from aster.status import StatusCode, RpcError
-from aster.rpc_types import SerializationMode
+from aster.rpc_types import RpcScope, SerializationMode
 from aster.service import ServiceRegistry, ServiceInfo, MethodInfo
 
 if TYPE_CHECKING:
@@ -192,7 +192,7 @@ class Server:
         for service_info in self._registry.get_all_services():
             key = (service_info.name, service_info.version)
             # Session-scoped services don't need a pre-existing instance
-            if service_info.scoped == "stream":
+            if service_info.scoped == RpcScope.SESSION:
                 continue
             if key not in self._service_instances:
                 raise ServerError(
@@ -389,7 +389,7 @@ class Server:
 
             # ── Session discriminator check ───────────────────────────────
             is_session_stream = (header.method == "")
-            is_session_service = (service_info.scoped == "stream")
+            is_session_service = (service_info.scoped == RpcScope.SESSION)
             if is_session_stream != is_session_service:
                 await self._write_error_trailer(
                     send, StatusCode.FAILED_PRECONDITION, "Stream/service scope mismatch"

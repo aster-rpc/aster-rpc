@@ -234,8 +234,8 @@
       "hash_hex": "fa0c0f060948339efa40781951af4bc8b79ef83ccec3ebf71225def83b52d572"
     },
     {
-      "id": "micro.scope.stream",
-      "description": "ServiceContract with STREAM scope",
+      "id": "micro.scope.session",
+      "description": "ServiceContract with SESSION scope",
       "bytes_hex": "2653636f70655465737402000c010c16786c616e6701fd",
       "hash_hex": "e0c2d24e5a5b10bef763917a4e10b07b7c280aeac2486ed8d2a253335bf333ea"
     },

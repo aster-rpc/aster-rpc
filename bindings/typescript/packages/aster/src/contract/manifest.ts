@@ -48,7 +48,7 @@ export interface ContractManifest {
   methodCount: number;
   methods: ManifestMethod[];
   serializationModes: string[];
-  scoped: string; // "shared" | "stream"
+  scoped: string; // "shared" | "session"
   deprecated: boolean;
   semver?: string;
   vcsRevision?: string;

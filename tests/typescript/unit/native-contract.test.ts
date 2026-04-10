@@ -114,7 +114,7 @@ describe('native contract identity (Rust core via NAPI)', () => {
       methods: [{ name: "send_message", pattern: "unary",
         request_type: "0".repeat(64), response_type: "0".repeat(64),
         idempotent: false, default_timeout: 5000.0, requires: null }],
-      serialization_modes: [], scoped: "stream", requires: null,
+      serialization_modes: [], scoped: "session", requires: null,
     });
     expect(native.computeContractIdFromJson(json)).toBe(
       'e49ce2b5992b58dc06d348511e05ebdb1fcf7ec504e12a931611913c5ea76ace'

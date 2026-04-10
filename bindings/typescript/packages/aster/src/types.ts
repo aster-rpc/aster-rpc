@@ -27,6 +27,22 @@ export const RpcPattern = {
 
 export type RpcPattern = (typeof RpcPattern)[keyof typeof RpcPattern];
 
+/** Service dispatch scope.
+ *
+ *  - SHARED:  one service instance shared by all callers, fresh QUIC stream
+ *             per RPC call. The default for stateless services.
+ *  - SESSION: one service instance per client connection, all calls for that
+ *             instance multiplexed onto a single bidirectional QUIC stream.
+ *             Use this when the service needs per-peer state. The decorator
+ *             still accepts the legacy alias `'stream'` on input.
+ */
+export const RpcScope = {
+  SHARED: 'shared',
+  SESSION: 'session',
+} as const;
+
+export type RpcScope = (typeof RpcScope)[keyof typeof RpcScope];
+
 /** Exponential backoff configuration. */
 export interface ExponentialBackoff {
   initialMs: number;

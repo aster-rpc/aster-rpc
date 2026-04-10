@@ -87,7 +87,7 @@ from .config import load_endpoint_config, AsterConfig
 # ── Aster RPC framework ───────────────────────────────────────────────────────
 
 from .status import StatusCode, RpcError
-from .rpc_types import SerializationMode, RetryPolicy, ExponentialBackoff
+from .rpc_types import RpcScope, SerializationMode, RetryPolicy, ExponentialBackoff
 from .framing import (
     COMPRESSED,
     TRAILER,
@@ -209,6 +209,7 @@ __all__ = [
     # ── Aster RPC framework ──
     "StatusCode",
     "RpcError",
+    "RpcScope",
     "SerializationMode",
     "RetryPolicy",
     "ExponentialBackoff",

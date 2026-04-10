@@ -154,7 +154,7 @@ def test_vector_A6_methoddef_without_requires(vectors):
 
 
 def test_scope_distinctness_hashes_differ():
-    """SHARED vs STREAM ServiceContracts must produce different contract_ids."""
+    """SHARED vs SESSION ServiceContracts must produce different contract_ids."""
     shared = ServiceContract(
         name="Svc",
         version=1,
@@ -162,13 +162,13 @@ def test_scope_distinctness_hashes_differ():
         serialization_modes=["xlang"],
         scoped=ScopeKind.SHARED,
     )
-    stream = ServiceContract(
+    session = ServiceContract(
         name="Svc",
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        scoped=ScopeKind.STREAM,
+        scoped=ScopeKind.SESSION,
     )
     id_shared = compute_contract_id(canonical_xlang_bytes(shared))
-    id_stream = compute_contract_id(canonical_xlang_bytes(stream))
-    assert id_shared != id_stream, "SHARED and STREAM contracts must have different contract_ids"
+    id_session = compute_contract_id(canonical_xlang_bytes(session))
+    assert id_shared != id_session, "SHARED and SESSION contracts must have different contract_ids"

@@ -59,7 +59,7 @@ class ServiceInfo:
     Attributes:
         name: The service name.
         version: The service version.
-        scoped: Service scope ("shared" or "stream").
+        scoped: Service scope ("shared" or "session").
         methods: Dict mapping method names to MethodInfo objects.
         serialization_modes: Supported serialization modes.
         interceptors: Interceptor classes for this service.

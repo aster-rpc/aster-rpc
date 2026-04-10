@@ -7,7 +7,7 @@ Spec reference: §5.1 (serialization modes)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import Enum, IntEnum
 
 
 class SerializationMode(IntEnum):
@@ -17,6 +17,21 @@ class SerializationMode(IntEnum):
     NATIVE = 1
     ROW = 2
     JSON = 3
+
+
+class RpcScope(str, Enum):
+    """Service dispatch scope.
+
+    SHARED:  one service instance shared by all callers, fresh QUIC stream
+             per RPC call. The default and most common choice.
+    SESSION: one service instance per client connection, all calls for that
+             instance multiplexed onto a single bidirectional QUIC stream.
+             Use this when the service needs per-peer state. The decorator
+             still accepts the legacy alias ``"stream"`` on input.
+    """
+
+    SHARED = "shared"
+    SESSION = "session"
 
 
 @dataclass

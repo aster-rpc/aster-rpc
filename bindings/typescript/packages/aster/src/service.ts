@@ -32,7 +32,7 @@ export interface MethodInfo {
 export interface ServiceInfo {
   name: string;
   version: number;
-  scoped: 'shared' | 'stream';
+  scoped: 'shared' | 'session';
   methods: Map<string, MethodInfo>;
   serializationModes: SerializationMode[];
   requires: CapabilityRequirement | undefined;

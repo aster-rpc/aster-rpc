@@ -52,6 +52,7 @@ from . import (
 from .client import ServiceClient, create_client
 from .contract.identity import contract_id_from_service
 from .registry.models import ServiceSummary
+from .rpc_types import RpcScope
 from .server import Server
 from .trust.bootstrap import (
     handle_producer_admission_connection,
@@ -1521,7 +1522,7 @@ class AsterClient:
 
         # Session-scoped services use the session protocol (one bidi stream
         # with method multiplexing). Dispatch to create_session.
-        if info.scoped == "stream":
+        if info.scoped == RpcScope.SESSION:
             from aster.session import create_session
             client = await create_session(
                 service_cls,

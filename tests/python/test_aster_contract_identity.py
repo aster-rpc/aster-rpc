@@ -87,7 +87,7 @@ def test_hash_stability():
 
 
 def test_scope_distinctness():
-    """SHARED and STREAM scoped contracts have different contract_ids."""
+    """SHARED and SESSION scoped contracts have different contract_ids."""
     base = dict(
         name="ScopeTest",
         version=1,
@@ -95,12 +95,12 @@ def test_scope_distinctness():
         serialization_modes=["xlang"],
     )
     sc_shared = ServiceContract(**base, scoped=ScopeKind.SHARED)
-    sc_stream = ServiceContract(**base, scoped=ScopeKind.STREAM)
+    sc_session = ServiceContract(**base, scoped=ScopeKind.SESSION)
 
     id_shared = compute_contract_id(canonical_xlang_bytes(sc_shared))
-    id_stream = compute_contract_id(canonical_xlang_bytes(sc_stream))
+    id_session = compute_contract_id(canonical_xlang_bytes(sc_session))
 
-    assert id_shared != id_stream, "SHARED and STREAM must produce different contract_ids"
+    assert id_shared != id_session, "SHARED and SESSION must produce different contract_ids"
 
 
 # ── 10. NFC normalization ─────────────────────────────────────────────────────
