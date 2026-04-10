@@ -515,32 +515,36 @@ def _call_command(args: argparse.Namespace) -> int:
         )
         try:
             await client.connect()
-            proxy = client.proxy(service_name)
-            method = getattr(proxy, method_name)
-            result = await method(payload)
+
+            # Detect session-scoped services and use session proxy
+            try:
+                proxy = client.proxy(service_name)
+                method = getattr(proxy, method_name)
+                result = await method(payload)
+            except TypeError as te:
+                if "session-scoped" in str(te):
+                    # Auto-open a session for the one-shot call
+                    session = await client.session(service_name)
+                    try:
+                        result = await session.call(method_name, payload)
+                    finally:
+                        await session.close()
+                else:
+                    raise
+
             print(_json.dumps(result, indent=2, default=str))
             return 0
         except Exception as exc:
             msg = str(exc)
-            # Friendly error for session-scoped services -- `aster call` can't drive them
-            if "Stream/service scope mismatch" in msg or "FAILED_PRECONDITION" in msg:
-                print(
-                    f"Error: {service_name!r} appears to be session-scoped and "
-                    f"cannot be called via 'aster call'.\n"
-                    f"\n"
-                    f"Session-scoped services hold per-connection state, so they need "
-                    f"a persistent client.\n"
-                    f"'aster call' is a one-shot tool -- the session would be torn "
-                    f"down before the next call could use it.\n"
-                    f"\n"
-                    f"Use a generated typed client instead:\n"
-                    f"  aster contract gen-client <address> --out ./clients --package my_app\n"
-                    f"  # then in Python:\n"
-                    f"  from my_app.services.{service_name.lower()}_v1 import {service_name}Client\n"
-                    f"  stub = await {service_name}Client.from_connection(client)\n"
-                    f"  result = await stub.{method_name}(...)",
-                    file=sys.stderr,
-                )
+            if "PERMISSION_DENIED" in msg:
+                print(f"Error: permission denied for {service_name}.{method_name}.\n"
+                      f"  Check your credential has the required role.",
+                      file=sys.stderr)
+            elif "UNAVAILABLE" in msg:
+                print(f"Error: service unavailable -- connection may have dropped.",
+                      file=sys.stderr)
+            elif "DEADLINE_EXCEEDED" in msg:
+                print(f"Error: request timed out.", file=sys.stderr)
             else:
                 print(f"Error: {exc}", file=sys.stderr)
             return 1

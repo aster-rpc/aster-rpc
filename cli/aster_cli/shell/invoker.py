@@ -148,7 +148,35 @@ async def invoke_method(
     except KeyboardInterrupt:
         display.info("(cancelled)")
     except Exception as e:
-        display.error(f"RPC failed: {e}")
+        msg = str(e)
+        # Provide actionable hints for common errors
+        if "Expected" in msg and "got dict" in msg:
+            display.error(
+                f"RPC failed: the server expected a typed object but received a dict.\n"
+                f"  This usually means the shell is sending JSON to a Fory-only service.\n"
+                f"  Try: aster call <addr> {service_name}.{method_name} '<json>'"
+            )
+        elif "FAILED_PRECONDITION" in msg or "scope mismatch" in msg.lower():
+            display.error(
+                f"RPC failed: '{service_name}' is session-scoped.\n"
+                f"  Use the session command: session {service_name}"
+            )
+        elif "PERMISSION_DENIED" in msg:
+            display.error(
+                f"RPC failed: permission denied for {service_name}.{method_name}.\n"
+                f"  Check your credential has the required role."
+            )
+        elif "DEADLINE_EXCEEDED" in msg:
+            display.error(
+                f"RPC failed: request timed out ({service_name}.{method_name})."
+            )
+        elif "UNAVAILABLE" in msg:
+            display.error(
+                f"RPC failed: service unavailable. The connection may have dropped.\n"
+                f"  Try: refresh"
+            )
+        else:
+            display.error(f"RPC failed: {e}")
 
 
 async def _display_stream(
