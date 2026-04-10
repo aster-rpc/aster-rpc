@@ -182,7 +182,9 @@ export class SessionServer {
 
     const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
     await writeFrame(send as any, respPayload, respCompressed ? COMPRESSED : 0);
-    await this.writeOkTrailer(send);
+    // Spec: session unary does NOT send a success trailer. The single
+    // response frame IS the complete response. Trailers are only for
+    // errors and streaming patterns.
   }
 
   private async handleServerStream(
