@@ -13,7 +13,7 @@ import type { AsterConfig } from './config.js';
 import { configFromEnv } from './config.js';
 import { createLogger, type AsterLogger } from './logging.js';
 import { HealthServer } from './health.js';
-import { DEFAULT_BACKOFF, RpcScope, type ExponentialBackoff } from './types.js';
+import { DEFAULT_BACKOFF, RpcPattern, RpcScope, type ExponentialBackoff } from './types.js';
 import { JsonCodec } from './codec.js';
 import { RpcServer } from './server.js';
 import { handleConsumerAdmissionConnection, performAdmission, type ConsumerAdmissionOpts, type ServiceSummary } from './trust/consumer.js';
@@ -376,10 +376,18 @@ export class AsterServer {
     };
 
     for (const [methodName, mi] of info.methods.entries()) {
+      // RpcPattern is a string enum -- 'unary' / 'server_stream' /
+      // 'client_stream' / 'bidi_stream'. The previous integer comparison
+      // (mi.pattern === 1, etc.) silently fell through to 'unary' for
+      // every method, so the published manifest mislabeled @ServerStream
+      // and @BidiStream as unary. The server still dispatched correctly
+      // from the in-memory MethodInfo, but any client that consumed the
+      // manifest -- including the shell and `aster contract gen-client` --
+      // would call them as unary and crash on the second response frame.
       const patternStr =
-        mi.pattern === 1 ? 'server_stream' :
-        mi.pattern === 2 ? 'client_stream' :
-        mi.pattern === 3 ? 'bidi_stream' : 'unary';
+        mi.pattern === RpcPattern.SERVER_STREAM ? 'server_stream' :
+        mi.pattern === RpcPattern.CLIENT_STREAM ? 'client_stream' :
+        mi.pattern === RpcPattern.BIDI_STREAM ? 'bidi_stream' : 'unary';
 
       const reqType = mi.requestType;
       const respType = mi.responseType;
