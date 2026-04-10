@@ -703,32 +703,36 @@ export class AsterClientWrapper {
     // Create an in-memory client node
     this._node = await native.IrohNode.memory();
 
-    // Parse the address to get the endpoint ID and optional address hints
+    // Parse the address to get the endpoint ID and optional address hints.
+    //
+    // The ticket's `relayAddr` is a SocketAddr (STUN-discovered public IP),
+    // NOT an iroh RelayUrl. Treat it as another direct addr — iroh will use
+    // any reachable transport address it can.
     let endpointId: string;
-    let directAddrs: string[] | undefined;
-    let relayUrl: string | undefined;
+    let allDirectAddrs: string[] = [];
 
     if (this._address.startsWith('aster1')) {
+      let parsed: any;
       try {
-        const parsed = native.asterTicketFromString(this._address);
-        endpointId = parsed.endpointId;
-        directAddrs = parsed.directAddrs?.length ? parsed.directAddrs : undefined;
-        relayUrl = parsed.relayAddr || undefined;
+        parsed = native.asterTicketFromString(this._address);
       } catch {
-        const decoded = native.asterTicketDecode(Buffer.from(this._address));
-        endpointId = decoded.endpointId;
-        directAddrs = decoded.directAddrs?.length ? decoded.directAddrs : undefined;
-        relayUrl = decoded.relayAddr || undefined;
+        parsed = native.asterTicketDecode(Buffer.from(this._address));
       }
+      endpointId = parsed.endpointId;
+      if (parsed.directAddrs?.length) allDirectAddrs.push(...parsed.directAddrs);
+      if (parsed.relayAddr) allDirectAddrs.push(parsed.relayAddr);
     } else {
       // Treat as raw hex endpoint ID
       endpointId = this._address;
     }
 
+    const directAddrs = allDirectAddrs.length ? allDirectAddrs : undefined;
+
     // Helper: connect using full address info when available, else bare endpoint ID
     const doConnect = (alpn: Buffer) => {
-      if (directAddrs || relayUrl) {
-        return this._node.connectNodeAddr(endpointId, alpn, directAddrs, relayUrl);
+      if (directAddrs) {
+        // No relay URL — iroh's connect_node_addr handles direct addresses
+        return this._node.connectNodeAddr(endpointId, alpn, directAddrs, undefined);
       }
       return this._node.connect(endpointId, alpn);
     };
