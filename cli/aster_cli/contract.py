@@ -836,7 +836,7 @@ def main() -> None:
         default="python",
         choices=["python", "typescript"],
         metavar="LANG",
-        help="Target language: python (default) | typescript (not yet implemented)",
+        help="Target language: python (default) | typescript",
     )
     gen_client_parser.add_argument(
         "--aster",
