@@ -1054,15 +1054,42 @@ class SessionCommand(ShellCommand):
             ctx.display.error("usage: session <service>")
             return
 
+        # Make sure /services and the target service node are populated
+        # before we touch metadata or render `ls` -- otherwise running
+        # `session AgentSession` from anywhere except /services would
+        # silently skip the scope check (target is None) and the in-shell
+        # `ls` would see no methods (children empty).
+        services_node = ctx.vfs_root.child("services")
+        if services_node:
+            await ensure_loaded(services_node, ctx.connection)
+        target = services_node.child(service_name) if services_node else None
+        if target:
+            await ensure_loaded(target, ctx.connection)
+
         # Check if session-scoped
-        svc_node = ctx.vfs_root.child("services")
-        if svc_node:
-            target = svc_node.child(service_name)
-            if target and target.metadata.get("scoped") != "session":
-                ctx.display.warning(f"{service_name} is not session-scoped (scoped={target.metadata.get('scoped', 'shared')})")
-                ctx.display.info("Session subshell is designed for session-scoped services.")
-                ctx.display.info("Shared services don't maintain per-connection state.")
+        if target and target.metadata.get("scoped") not in ("session", "stream"):
+            ctx.display.warning(f"{service_name} is not session-scoped (scoped={target.metadata.get('scoped', 'shared')})")
+            ctx.display.info("Session subshell is designed for session-scoped services.")
+            ctx.display.info("Shared services don't maintain per-connection state.")
+            return
+
+        # Open the persistent session BEFORE fiddling with shell state.
+        # If this fails (peer doesn't speak the service, network drop,
+        # auth denied, etc.) we surface the error and stay in the main
+        # shell rather than entering a half-open subshell.
+        session_handle = None
+        if hasattr(ctx.connection, "open_session"):
+            try:
+                session_handle = await ctx.connection.open_session(service_name)
+            except Exception as exc:
+                ctx.display.error(f"Failed to open session for {service_name}: {exc}")
                 return
+        else:
+            ctx.display.error(
+                f"This connection backend doesn't support sessions; "
+                f"cannot enter session subshell for {service_name}."
+            )
+            return
 
         # Fire session hooks
         hooks = get_hook_registry()
@@ -1077,7 +1104,10 @@ class SessionCommand(ShellCommand):
 
         # Save main shell state
         saved_cwd = ctx.vfs_cwd
+        saved_session = getattr(ctx, "session", None)
         ctx.vfs_cwd = f"/services/{service_name}"
+        # Bind the session so invoke_method routes calls through it
+        ctx.session = session_handle
 
         # Subshell loop
         from prompt_toolkit import PromptSession as PS
@@ -1154,7 +1184,12 @@ class SessionCommand(ShellCommand):
             except EOFError:
                 break
 
-        # Restore state
+        # Close the session and restore state
+        try:
+            await ctx.connection.close_session(session_handle)
+        except Exception:
+            pass
+        ctx.session = saved_session
         ctx.vfs_cwd = saved_cwd
 
         # Fire session end hooks

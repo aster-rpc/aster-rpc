@@ -501,7 +501,7 @@ def _call_command(args: argparse.Namespace) -> int:
 
     async def _run() -> int:
         import os as _os
-        from aster.high_level import AsterClient
+        from aster.runtime import AsterClient
         from aster.config import AsterConfig
 
         config = AsterConfig.from_env()
@@ -655,7 +655,7 @@ def _namespace_from_directory_ref(source: str) -> str:
 
 async def _fetch_manifests_from_node(ticket: str, rcan_path: str | None = None) -> dict[str, dict]:
     """Connect to a live node, fetch all manifests, and return them."""
-    from aster.high_level import AsterClient, _coerce_node_addr
+    from aster.runtime import AsterClient, _coerce_node_addr
     from aster.config import AsterConfig
     from aster import docs_client, blobs_client
     from aster.registry.keys import contract_key

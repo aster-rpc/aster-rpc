@@ -519,7 +519,37 @@ class PeerConnection:
 
             for svc in self._services:
                 try:
-                    # Read ArtifactRef from registry doc by key
+                    # Fast path: read the manifest directly from the doc
+                    # via the ``manifests/{contract_id}`` shortcut. Both the
+                    # Python and TypeScript producers write this entry alongside
+                    # the ArtifactRef -- it lets the shell get method schemas
+                    # without a blob-collection round-trip and works even when
+                    # the blob store sync is slow or broken (e.g. cross-language
+                    # peers where doc sync is the only reliable transport).
+                    manifest_key = f"manifests/{svc.contract_id}".encode()
+                    shortcut_entries = await doc.query_key_exact(manifest_key)
+                    if shortcut_entries:
+                        try:
+                            manifest_bytes = await doc.read_entry_content(
+                                shortcut_entries[0].content_hash
+                            )
+                            manifest = _json.loads(manifest_bytes)
+                            self._manifests[svc.name] = manifest
+                            logger.debug(
+                                "Fetched manifest shortcut for %s: %d methods",
+                                svc.name,
+                                len(manifest.get("methods", [])),
+                            )
+                            continue
+                        except Exception as exc:
+                            logger.debug(
+                                "Manifest shortcut failed for %s: %s -- "
+                                "falling back to blob collection",
+                                svc.name,
+                                exc,
+                            )
+
+                    # Slow path: read ArtifactRef and download the collection
                     key = contract_key(svc.contract_id)
                     entries = await doc.query_key_exact(key)
                     if not entries:
@@ -576,7 +606,7 @@ class PeerConnection:
     def _get_remote_node_id(self) -> str | None:
         """Get the remote peer's endpoint ID (node_id hex)."""
         try:
-            from aster.high_level import _coerce_node_addr
+            from aster.runtime import _coerce_node_addr
             addr = _coerce_node_addr(self._aster_client._endpoint_addr_in)
             return addr.endpoint_id or None
         except Exception:
@@ -630,7 +660,7 @@ class PeerConnection:
     def get_peer_display(self) -> str:
         """Get the peer's display name (handle or endpoint_id prefix)."""
         try:
-            from aster.high_level import _coerce_node_addr
+            from aster.runtime import _coerce_node_addr
             addr = _coerce_node_addr(self._aster_client._endpoint_addr_in)
             return addr.endpoint_id[:8] if addr.endpoint_id else "unknown"
         except Exception:
@@ -759,9 +789,18 @@ class PeerConnection:
 
         conn = self._rpc_conns[channel_addr]
 
-        # Build a codec with synthesized types if available
+        # If the peer advertises JSON-only (e.g. the TypeScript binding,
+        # whose Fory implementation is not yet XLANG-compliant), use the
+        # JSON proxy codec -- otherwise the Fory client would send bytes
+        # the server can't decode and the call would fail with the opaque
+        # "Expected RpcStatus, got NoneType". Mirrors the auto-selection
+        # in AsterClient._rpc_for_service.
         codec = None
-        if self._type_factory and self._type_factory.type_count > 0:
+        modes = list(getattr(summary, "serialization_modes", None) or [])
+        if modes and "xlang" not in modes and "json" in modes:
+            from aster.json_codec import JsonProxyCodec
+            codec = JsonProxyCodec()
+        elif self._type_factory and self._type_factory.type_count > 0:
             try:
                 codec = ForyCodec(
                     mode=SerializationMode.XLANG,
@@ -804,6 +843,30 @@ class PeerConnection:
                 f"  stub = await {service}Client.from_connection(client)"
             )
 
+    async def open_session(self, service: str) -> Any:
+        """Open a persistent session against a session-scoped service.
+
+        Returns a ``SessionProxyClient`` that multiplexes calls over a
+        single bidi stream. The caller is responsible for closing it via
+        :meth:`close_session` (or the session's own ``close()`` method).
+
+        Used by the shell's ``session <ServiceName>`` subshell to route
+        method invocations through the same persistent stream so per-agent
+        state survives across calls.
+        """
+        if not self._aster_client:
+            raise RuntimeError("not connected")
+        return await self._aster_client.session(service)
+
+    async def close_session(self, session: Any) -> None:
+        """Close a session opened via :meth:`open_session`."""
+        if session is None:
+            return
+        try:
+            await session.close()
+        except Exception:
+            pass
+
     async def invoke(
         self, service: str, method: str, payload: dict[str, Any]
     ) -> Any:
@@ -815,9 +878,12 @@ class PeerConnection:
         self._check_session_scope(service, method)
         transport = await self._get_transport(service)
 
-        # Try to build a typed request from the dynamic type factory
+        # Try to build a typed request from the dynamic type factory.
+        # Skip when the transport uses JsonProxyCodec (TS server, JSON-only) --
+        # the JSON codec sends the dict directly and doesn't need a Fory dataclass.
         request: Any = payload
-        if self._type_factory:
+        from aster.json_codec import JsonProxyCodec
+        if self._type_factory and not isinstance(getattr(transport, "_codec", None), JsonProxyCodec):
             meta = self._get_method_meta(service, method)
             if meta and meta.get("request_wire_tag"):
                 try:
@@ -919,7 +985,7 @@ class PeerConnection:
         # Need bootstrap peers -- the producer we connected to
         bootstrap = []
         if self._aster_client._endpoint_addr_in:
-            from aster.high_level import _coerce_node_addr
+            from aster.runtime import _coerce_node_addr
             addr = _coerce_node_addr(self._aster_client._endpoint_addr_in)
             if addr.endpoint_id:
                 bootstrap.append(addr.endpoint_id)

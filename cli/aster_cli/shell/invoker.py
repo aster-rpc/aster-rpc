@@ -105,6 +105,25 @@ async def invoke_method(
     try:
         t0 = time.monotonic()
 
+        # When the user is inside a `session <Service>` subshell, route
+        # every call through the persistent SessionProxyClient instead of
+        # opening a new bidi stream per invocation. This is the only way
+        # to call methods on session-scoped services from the shell --
+        # the per-call ``connection.invoke`` path explicitly rejects them.
+        active_session = getattr(ctx, "session", None)
+        if active_session is not None:
+            result = await active_session.call(method_name, payload)
+            elapsed = (time.monotonic() - t0) * 1000
+            renderer = hooks.output_renderer
+            rendered = False
+            if renderer:
+                rendered = await renderer.render_response(
+                    schema, _to_serializable(result), display
+                )
+            if not rendered:
+                display.rpc_result(_to_serializable(result), elapsed_ms=elapsed)
+            return
+
         if pattern == "unary":
             result = await ctx.connection.invoke(service_name, method_name, payload)
             elapsed = (time.monotonic() - t0) * 1000

@@ -64,7 +64,7 @@ Error Handling
 All RPC failures raise :class:`RpcError` with a :class:`StatusCode`.
 """
 
-from aster.high_level import AsterServer, AsterClient
+from aster.runtime import AsterServer, AsterClient
 from aster.decorators import service, rpc, server_stream, client_stream, bidi_stream
 from aster.codec import wire_type
 from aster.status import RpcError, StatusCode

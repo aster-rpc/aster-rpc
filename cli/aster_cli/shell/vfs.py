@@ -171,6 +171,20 @@ async def populate_service_methods(node: VfsNode, connection: Any) -> None:
     try:
         contract = await connection.get_contract(node.name)
         methods = contract.get("methods", []) if isinstance(contract, dict) else getattr(contract, "methods", [])
+
+        # If the background manifest fetch is still running and we got
+        # nothing, wait for it once before giving up. This avoids the
+        # race where a user (or scripted client) `cd`s into a service
+        # and runs `ls` faster than the cross-language doc sync can
+        # complete.
+        if not methods and hasattr(connection, "wait_for_manifests"):
+            try:
+                await connection.wait_for_manifests(timeout=10.0)
+                contract = await connection.get_contract(node.name)
+                methods = contract.get("methods", []) if isinstance(contract, dict) else getattr(contract, "methods", [])
+            except Exception:
+                pass
+
         if methods:
             for method in methods:
                 m_name = method.get("name", str(method)) if isinstance(method, dict) else str(method)
