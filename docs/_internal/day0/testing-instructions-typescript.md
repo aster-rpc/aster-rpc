@@ -108,30 +108,49 @@ Expected: prints `Accepted: 10000` (or similar count).
 
 Add `AgentSession` (session-scoped service) as shown. Restart server.
 
-**Test via shell session command:**
+Session-scoped services need a dedicated session subshell -- you can't
+just `./register` from `/services/AgentSession` like a shared service,
+because each call would tear down and re-create the session. Use the
+`session` command from `/services` (or any path under it) to open a
+persistent session subshell.
+
+**Test:**
 
 ```bash
 aster shell <address>
+cd services
 session AgentSession
-./register agentId="edge-1" capabilities='["gpu"]'
+# now in the session subshell, prompt becomes:
+#   AgentSession~
+register agentId="edge-1" capabilities='["gpu"]'
 ```
 
-Expected: returns an Assignment.
+Expected: returns an Assignment. The session persists -- subsequent
+calls share state with the same `AgentSession` instance.
 
 For bidi streaming:
 
 ```
-./runCommand
-> command="echo hello"
+AgentSession~ runCommand command="echo hello"
 ```
 
 Expected: returns CommandResult with stdout.
 
+To leave the session subshell:
+
+```
+AgentSession~ end
+```
+
 **Report:**
-- [ ] Session-scoped service shows in shell
+- [ ] Session-scoped service shows in shell as `(session)`
+- [ ] `session AgentSession` opens a subshell with `AgentSession~` prompt
 - [ ] `register` returns Assignment
 - [ ] `runCommand` bidi stream works
+- [ ] `end` returns to the main shell
 - [ ] Two separate shell connections get independent sessions
+- [ ] Calling `./register` directly from `/services/AgentSession` shows
+  a clear error pointing at the `session` command
 
 ## Chapter 5: Auth & Capabilities
 

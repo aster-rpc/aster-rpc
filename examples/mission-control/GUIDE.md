@@ -389,16 +389,27 @@ class AgentSession:
 ```
 
 ```bash
-# Operator connects and runs commands on a specific agent's session:
+# Operator connects and opens a session subshell:
 aster shell aster1Qm...
-> cd services/AgentSession
-> ./runCommand
-bidi> command="df -h"
+> cd services
+> session AgentSession
+# prompt becomes "AgentSession~" — you're now in a dedicated session.
+# State persists across calls; the same instance handles every method.
+AgentSession~ register agent_id="edge-7" capabilities='["gpu"]'
+← {"agent_id": "edge-7", "task": "train-42"}
+AgentSession~ runCommand command="df -h"
 ← {"stdout": "Filesystem  Size  Used ...", "exit_code": 0}
-bidi> command="uptime"
+AgentSession~ runCommand command="uptime"
 ← {"stdout": " 14:32  up 3 days ...", "exit_code": 0}
-> end
+AgentSession~ end
 ```
+
+> **Why a session subshell?** Session-scoped services hold per-connection
+> state. If you tried `./runCommand` directly from `/services/AgentSession`,
+> the shell would open a new stream per call and tear down the state
+> between them. The `session` command opens one persistent session and
+> routes every method through it. The `AgentSession~` prompt makes it
+> obvious you're inside a stateful session. Type `end` to close it.
 
 **What just happened:**
 - `scoped="session"` creates a fresh `AgentSession` per connection — each
@@ -553,8 +564,9 @@ asyncio.run(main())
 ```bash
 # Or from the CLI — the shell respects credentials too
 aster shell aster1Qm... --rcan ops-team.cred
-> cd services/AgentSession
-> ./runCommand               # ✓ ops-team has ops.admin
+> cd services
+> session AgentSession                 # opens session subshell
+AgentSession~ runCommand command="df"  # ✓ ops-team has ops.admin
 ```
 
 **What just happened:**
