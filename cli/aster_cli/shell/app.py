@@ -363,19 +363,29 @@ class PeerConnection:
         from aster import AsterClient
         from aster.config import AsterConfig
 
-        # The shell needs its own node identity -- not the service's.
-        # Use the root private key (if available) as the shell's secret_key.
-        # This gives the shell the root owner's identity, which services
-        # in the mesh will recognise as the trust anchor -- free auth.
-        # Falls back to ephemeral if no root key is configured.
+        # Identity resolution for the shell's QUIC node:
+        #
+        # 1. If --rcan is provided, the user has their own identity.
+        #    Load secret_key from the .aster-identity in CWD (which
+        #    was created by `aster enroll node`). The RCAN credential's
+        #    endpoint_id must match this key.
+        #
+        # 2. If no --rcan, use the root private key (if available).
+        #    This gives the shell the root owner's identity -- free auth.
+        #
+        # 3. Fall back to ephemeral identity (dev mode).
         config = AsterConfig.from_env()
         config.storage_path = None
-        # Set to a non-existent path to prevent CWD .aster-identity fallback
-        # (identity_file=None still searches CWD)
-        config.identity_file = "/dev/null/.aster-identity"
 
-        root_secret = _load_root_secret_key(config)
-        config.secret_key = root_secret  # None → ephemeral, which is fine
+        if self._rcan_path:
+            # Let AsterConfig find the .aster-identity in CWD for secret_key
+            # (don't override identity_file -- let the default search work)
+            pass
+        else:
+            # No credential -- use root key or ephemeral
+            config.identity_file = "/dev/null/.aster-identity"
+            root_secret = _load_root_secret_key(config)
+            config.secret_key = root_secret
 
         self._aster_client = AsterClient(
             config=config,
@@ -575,7 +585,7 @@ class PeerConnection:
                 "name": svc.name,
                 "version": svc.version,
                 "contract_id": svc.contract_id,
-                "scoped": manifest.get("scoped", "shared"),
+                "scoped": getattr(svc, "pattern", None) or manifest.get("scoped", "shared"),
                 "channels": svc.channels if hasattr(svc, "channels") else {},
             }
 

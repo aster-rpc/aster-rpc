@@ -501,8 +501,15 @@ def _call_command(args: argparse.Namespace) -> int:
 
     async def _run() -> int:
         from aster.high_level import AsterClient
+        from aster.config import AsterConfig
+
+        config = AsterConfig.from_env()
+        config.storage_path = None
+        if not rcan_path:
+            config.identity_file = "/dev/null/.aster-identity"
 
         client = AsterClient(
+            config=config,
             address=address,
             enrollment_credential_file=rcan_path,
         )
