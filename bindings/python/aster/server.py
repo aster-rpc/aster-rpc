@@ -370,11 +370,16 @@ class Server:
                 )
                 return
 
+            # All early-return error trailers must respect the client's
+            # requested serialization mode so the client can decode them.
+            ser_mode = header.serializationMode
+
             # Validate header -- service name is always required; method may be ""
             # for session streams
             if not header.service:
                 await self._write_error_trailer(
-                    send, StatusCode.INVALID_ARGUMENT, "Missing service name"
+                    send, StatusCode.INVALID_ARGUMENT, "Missing service name",
+                    serialization_mode=ser_mode,
                 )
                 return
 
@@ -383,7 +388,8 @@ class Server:
             if service_info is None:
                 await self._write_error_trailer(
                     send, StatusCode.NOT_FOUND,
-                    f"Service '{header.service}' v{header.version} not found"
+                    f"Service '{header.service}' v{header.version} not found",
+                    serialization_mode=ser_mode,
                 )
                 return
 
@@ -392,7 +398,8 @@ class Server:
             is_session_service = (service_info.scoped == RpcScope.SESSION)
             if is_session_stream != is_session_service:
                 await self._write_error_trailer(
-                    send, StatusCode.FAILED_PRECONDITION, "Stream/service scope mismatch"
+                    send, StatusCode.FAILED_PRECONDITION, "Stream/service scope mismatch",
+                    serialization_mode=ser_mode,
                 )
                 return
 
@@ -402,7 +409,8 @@ class Server:
                 svc_class = self._service_classes.get(key)
                 if svc_class is None:
                     await self._write_error_trailer(
-                        send, StatusCode.INTERNAL, "Session service class not found"
+                        send, StatusCode.INTERNAL, "Session service class not found",
+                        serialization_mode=ser_mode,
                     )
                     return
                 all_interceptors = self._resolve_interceptors(service_info)
@@ -411,10 +419,17 @@ class Server:
                     peer = ctx.connection.remote_id()
                 except Exception:
                     peer = None
+                # Respect the client's requested serialization mode.
+                # If the client asked for JSON (mode 3), use the JSON codec
+                # so the session frames are cross-language compatible.
+                session_codec = self._codec
+                if ser_mode == SerializationMode.JSON.value:
+                    from aster.json_codec import JsonProxyCodec
+                    session_codec = JsonProxyCodec()
                 session_server = SessionServer(
                     service_class=svc_class,
                     service_info=service_info,
-                    codec=self._codec,
+                    codec=session_codec,
                     interceptors=all_interceptors,
                 )
                 await session_server.run(header, send, recv, peer=peer)
@@ -426,7 +441,8 @@ class Server:
             if method_info is None:
                 await self._write_error_trailer(
                     send, StatusCode.UNIMPLEMENTED,
-                    f"Method '{header.service}.{header.method}' not implemented"
+                    f"Method '{header.service}.{header.method}' not implemented",
+                    serialization_mode=ser_mode,
                 )
                 return
 
@@ -437,7 +453,8 @@ class Server:
             if header.serializationMode not in accepted_modes:
                 await self._write_error_trailer(
                     send, StatusCode.INVALID_ARGUMENT,
-                    f"Unsupported serialization mode: {header.serializationMode}"
+                    f"Unsupported serialization mode: {header.serializationMode}",
+                    serialization_mode=ser_mode,
                 )
                 return
 
@@ -446,7 +463,8 @@ class Server:
             handler_method = getattr(handler, header.method, None)
             if handler_method is None:
                 await self._write_error_trailer(
-                    send, StatusCode.INTERNAL, "Handler method not found"
+                    send, StatusCode.INTERNAL, "Handler method not found",
+                    serialization_mode=ser_mode,
                 )
                 return
 
@@ -475,7 +493,10 @@ class Server:
                 try:
                     await apply_request_interceptors(pre_interceptors, pre_call_ctx, None)
                 except RpcError as auth_err:
-                    await self._write_error_trailer(send, auth_err.code, auth_err.message)
+                    await self._write_error_trailer(
+                        send, auth_err.code, auth_err.message,
+                        serialization_mode=ser_mode,
+                    )
                     return
 
                 t0 = time.monotonic()

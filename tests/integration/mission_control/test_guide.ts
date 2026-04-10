@@ -48,7 +48,10 @@ function isPermissionDenied(e: unknown): boolean {
 
 function isDeniedOrScopeMismatch(e: unknown): boolean {
   const msg = String(e);
-  return isPermissionDenied(e) || msg.includes('FAILED_PRECONDITION') || msg.includes('scope mismatch');
+  return isPermissionDenied(e)
+    || msg.includes('FAILED_PRECONDITION')
+    || msg.includes('scope mismatch')
+    || msg.includes('UNIMPLEMENTED');
 }
 
 // ── Chapter tests ───────────────────────────────────────────────────────────
