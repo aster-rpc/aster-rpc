@@ -459,6 +459,7 @@ class Server:
                     service_info=service_info,
                     codec=session_codec,
                     interceptors=all_interceptors,
+                    peer_store=self._peer_store,
                 )
                 await session_server.run(header, send, recv, peer=peer)
                 return
