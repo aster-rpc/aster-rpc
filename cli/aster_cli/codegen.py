@@ -132,6 +132,13 @@ def _py_type_str(type_name: str, known_types: dict[str, str]) -> str:
 def _py_default_str(type_name: str, default: Any) -> str | None:
     """Return a Python default value string, or None if no default."""
     if default is not None:
+        # Mutable containers MUST go through dataclasses.field(default_factory=...)
+        # -- Python 3.13 raises ValueError on `tags: dict = {}` (and equivalent
+        # `[]` for list) at class creation time. Emit a factory instead.
+        if isinstance(default, dict):
+            return "dataclasses.field(default_factory=dict)"
+        if isinstance(default, list):
+            return "dataclasses.field(default_factory=list)"
         if isinstance(default, str):
             return repr(default)
         if isinstance(default, bool):
@@ -221,6 +228,13 @@ def _py_default_from_field(f: dict[str, Any]) -> str | None:
 
     if dk == "value":
         dv = f.get("default_value")
+        # Mutable containers MUST go through default_factory -- Python 3.13
+        # rejects `tags: dict = {}` at class creation time. See the matching
+        # guard in _py_default_str above.
+        if isinstance(dv, dict):
+            return "dataclasses.field(default_factory=dict)"
+        if isinstance(dv, list):
+            return "dataclasses.field(default_factory=list)"
         if isinstance(dv, str):
             return repr(dv)
         if isinstance(dv, bool):
