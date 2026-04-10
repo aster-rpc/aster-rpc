@@ -169,18 +169,18 @@ class IrohTransport(Transport):
         4. Read response payload frame(s)
         5. Read trailer frame (TRAILER flag)
         """
-        call_id = str(uuid.uuid4())
         send, recv = await self._conn.open_bi()
 
         try:
-            # Build and write StreamHeader
+            # Build StreamHeader. callId is empty for shared streams -- the
+            # stream itself is the correlation. Server-side build_call_context
+            # generates its own UUID for tracing.
             keys, values = _build_metadata(metadata)
             header = StreamHeader(
                 service=service,
                 method=method,
                 version=1,
-
-                callId=call_id,
+                callId="",
                 deadlineEpochMs=deadline_epoch_ms,
                 serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
                 metadataKeys=keys,
@@ -188,12 +188,23 @@ class IrohTransport(Transport):
             )
 
             header_bytes = self._codec.encode(header)
-            await write_frame(send, header_bytes, flags=HEADER)
-
-            # Encode and write request
             payload, compressed = self._codec.encode_compressed(request)
-            flags = COMPRESSED if compressed else 0
-            await write_frame(send, payload, flags=flags)
+            req_flags = COMPRESSED if compressed else 0
+
+            # Pack header frame + request frame into one buffer and write
+            # in a single PyO3 call. This saves an event-loop yield per call,
+            # which is significant on Python (asyncio scheduling is the
+            # dominant cost on the unary hot path).
+            import struct as _struct
+            buf = (
+                _struct.pack("<I", len(header_bytes) + 1)
+                + bytes([HEADER])
+                + header_bytes
+                + _struct.pack("<I", len(payload) + 1)
+                + bytes([req_flags])
+                + payload
+            )
+            await send.write_all(buf)
             await send.finish()
 
             # Read response frames

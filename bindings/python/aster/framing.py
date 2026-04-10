@@ -19,8 +19,11 @@ Frame layout (on a QUIC stream):
 
 from __future__ import annotations
 
+import asyncio
 import struct
 from typing import Protocol, runtime_checkable
+
+from aster.limits import DEFAULT_FRAME_READ_TIMEOUT_S
 
 # ── Flag constants ───────────────────────────────────────────────────────────
 
@@ -128,20 +131,21 @@ async def read_frame(
         FramingError: On wire-format violations (zero length, oversized frame).
         asyncio.TimeoutError: If the read exceeds the timeout.
     """
-    import asyncio
-
-    from aster.limits import DEFAULT_FRAME_READ_TIMEOUT_S
-
-    if timeout_s is None:
-        timeout_s = DEFAULT_FRAME_READ_TIMEOUT_S
-
-    effective_timeout = timeout_s if timeout_s > 0 else None
+    # NOTE: per-read timeouts were removed from the hot path. The QUIC
+    # connection has its own idle timeout (keep-alive + max_idle_timeout)
+    # that protects against hung peers. asyncio.wait_for() per read costs
+    # ~50us and saturates the 1ms-budget unary call. If you need a tight
+    # timeout, pass timeout_s > 0 explicitly.
+    use_timeout = timeout_s is not None and timeout_s > 0
 
     # Read the 4-byte length prefix.
     try:
-        length_bytes = await asyncio.wait_for(
-            stream.read_exact(_LENGTH_SIZE), timeout=effective_timeout
-        )
+        if use_timeout:
+            length_bytes = await asyncio.wait_for(
+                stream.read_exact(_LENGTH_SIZE), timeout=timeout_s
+            )
+        else:
+            length_bytes = await stream.read_exact(_LENGTH_SIZE)
     except asyncio.TimeoutError:
         raise FramingError("frame read timed out waiting for length header")
     except Exception:
@@ -162,9 +166,12 @@ async def read_frame(
         )
 
     try:
-        body = await asyncio.wait_for(
-            stream.read_exact(frame_body_len), timeout=effective_timeout
-        )
+        if use_timeout:
+            body = await asyncio.wait_for(
+                stream.read_exact(frame_body_len), timeout=timeout_s
+            )
+        else:
+            body = await stream.read_exact(frame_body_len)
     except asyncio.TimeoutError:
         raise FramingError(
             f"frame read timed out waiting for {frame_body_len} bytes of body"

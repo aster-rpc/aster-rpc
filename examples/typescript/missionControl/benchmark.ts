@@ -16,6 +16,7 @@
  */
 
 import { AsterClientWrapper } from '@aster-rpc/aster';
+import { MissionControl } from './services.ts';
 
 function memMB(): number {
   try {
@@ -54,6 +55,7 @@ const mc = client.proxy("MissionControl");
 console.log(`Connected to ${address.slice(0, 30)}...`);
 console.log(`Client memory at start: ${memStart.toFixed(1)} MB`);
 console.log("─".repeat(72));
+console.log("  ── Dynamic proxy client ────────────────────────────────────");
 
 // ── Warmup ────────────────────────────────────────────────────────────────
 for (let i = 0; i < 20; i++) {
@@ -119,6 +121,55 @@ for (const concurrency of [10, 50, 100]) {
   t0 = performance.now();
   const tasks = Array.from({ length: concurrency }, (_, i) =>
     mc.getStatus({ agent_id: `concurrent-${i}` }),
+  );
+  await Promise.all(tasks);
+  elapsed = (performance.now() - t0) / 1000;
+  rps = concurrency / elapsed;
+  const label = concurrency.toString().padStart(3);
+  console.log(`  Concurrent (${label})      ${rps.toFixed(0).padStart(8)} req/s   ${(elapsed * 1000).toFixed(1)}ms total`);
+}
+
+// ── Typed client ──────────────────────────────────────────────────────────
+console.log("  ── Typed client (generated from contract) ──────────────────");
+const typed: any = await client.client(MissionControl as any);
+
+for (let i = 0; i < 20; i++) {
+  await typed.getStatus({ agent_id: "warmup" });
+}
+
+lats = [];
+t0 = performance.now();
+for (let i = 0; i < N_UNARY; i++) {
+  const tc = performance.now();
+  await typed.getStatus({ agent_id: `bench-${i}` });
+  lats.push(performance.now() - tc);
+}
+elapsed = (performance.now() - t0) / 1000;
+rps = N_UNARY / elapsed;
+p = percentiles(lats);
+console.log(`  Unary (getStatus)    ${rps.toFixed(0).padStart(8)} req/s   ${fmtLat(p)}`);
+
+lats = [];
+t0 = performance.now();
+for (let i = 0; i < N_LOG; i++) {
+  const tc = performance.now();
+  await typed.submitLog({
+    timestamp: Date.now() / 1000,
+    level: "info",
+    message: `bench log ${i}`,
+    agent_id: "bench",
+  });
+  lats.push(performance.now() - tc);
+}
+elapsed = (performance.now() - t0) / 1000;
+rps = N_LOG / elapsed;
+p = percentiles(lats);
+console.log(`  Unary (submitLog)    ${rps.toFixed(0).padStart(8)} req/s   ${fmtLat(p)}`);
+
+for (const concurrency of [10, 50, 100]) {
+  t0 = performance.now();
+  const tasks = Array.from({ length: concurrency }, (_, i) =>
+    typed.getStatus({ agent_id: `concurrent-${i}` }),
   );
   await Promise.all(tasks);
   elapsed = (performance.now() - t0) / 1000;
