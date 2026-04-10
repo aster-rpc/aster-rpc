@@ -577,13 +577,58 @@ aster enroll node --role consumer --name "edge-node-7" \
     --capabilities ops.status,ops.ingest \
     --root-key ~/.aster/root.key \
     --out edge-node-7.cred
+```
 
+`aster enroll node` will print a summary like this:
+
+```
+✓ Enrollment credential created
+
+  File:         /home/you/work/edge-node-7.cred
+  Format:       TOML (.aster-identity) with [node] + [[peers]] sections
+
+  Peer:         edge-node-7
+  Role:         consumer (policy)
+  Capabilities: ops.status,ops.ingest
+  Endpoint ID:  142179f10b7bc606...
+  Trust root:   cd948e4c1456cdbe...
+  Expires:      2026-05-10T20:20:12+00:00
+
+  This file lets a consumer connect to your trusted-mode servers.
+  It contains a node identity (secret key) AND a signed enrollment
+  credential. The server validates the credential and grants the
+  capabilities listed below.
+
+  Use it:
+  aster shell <peer-addr> --rcan edge-node-7.cred
+  aster call <peer-addr> Service.method '<json>' --rcan edge-node-7.cred
+
+  ⚠  Keep this file secret -- it is both an identity AND a credential.
+```
+
+> **What's in the file?** Despite the `.cred` extension, it's a regular
+> `.aster-identity` TOML file with two sections:
+>
+> - `[node]` — the consumer's secret key + endpoint ID. Used by the
+>   QUIC layer to prove the consumer's identity.
+> - `[[peers]]` — the signed enrollment credential. Presented to
+>   servers to claim capabilities.
+>
+> Both sections live in the same file because they're paired: the
+> server checks that the QUIC peer ID matches the credential's
+> `endpoint_id`. If they don't match, admission fails.
+
+```bash
 # Issue an operator credential -- full access including admin
 aster enroll node --role consumer --name "ops-team" \
     --capabilities ops.status,ops.logs,ops.admin,ops.ingest \
     --root-key ~/.aster/root.key \
     --out ops-team.cred
 ```
+
+> **Need quiet output for scripts?** Use `--quiet` (or `-q`). The
+> command prints exactly one line: `<path> <endpoint_id> <expires_iso>`
+> on success and exits non-zero on failure. Easy to parse from CI.
 
 ### Step 5: Connect with credentials
 
