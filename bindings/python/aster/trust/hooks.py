@@ -69,15 +69,19 @@ class MeshEndpointHook:
             event.send_decision(HookDecision.create_deny(403, b"not admitted"))
     """
 
-    def __init__(self, allow_unenrolled: bool = False) -> None:
+    def __init__(self, allow_unenrolled: bool = False, peer_store: "Any | None" = None) -> None:
         """
         Args:
             allow_unenrolled: When True, all connections are permitted
                 regardless of admission state.  Use only in local/dev
                 deployments.  Defaults to False (production-safe).
+            peer_store: Optional ``PeerAttributeStore`` for expiry-aware
+                admission checks.  When set, ``should_allow()`` checks the
+                store for credential expiry instead of the bare ``admitted`` set.
         """
         self.admitted: set[str] = set()
         self.allow_unenrolled = allow_unenrolled
+        self._peer_store = peer_store
 
     # ── Decision logic ────────────────────────────────────────────────────────
 
@@ -91,8 +95,13 @@ class MeshEndpointHook:
         # Admission ALPNs are always open -- credential presentation
         if alpn in _ADMISSION_ALPNS:
             return True
-        # Admitted peers are always allowed
-        if remote_endpoint_id in self.admitted:
+        # If we have a peer store, use it for expiry-aware checks
+        if self._peer_store is not None:
+            admission = self._peer_store.get(remote_endpoint_id)
+            if admission is not None:
+                return True
+            # Peer not in store (or expired) -- fall through to deny
+        elif remote_endpoint_id in self.admitted:
             return True
         # Open-mode bypass (local/dev only)
         if self.allow_unenrolled:

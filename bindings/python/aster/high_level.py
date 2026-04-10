@@ -286,14 +286,14 @@ class AsterServer:
         gate0_needed = False
         if not self._allow_all_consumers:
             if self._hook is None:
-                self._hook = MeshEndpointHook()
+                self._hook = MeshEndpointHook(peer_store=self._peer_store)
             if self._nonce_store is None:
                 self._nonce_store = InMemoryNonceStore()
             gate0_needed = True
         if not self._allow_all_producers:
             aster_alpns.append(ALPN_PRODUCER_ADMISSION)
             if self._hook is None:
-                self._hook = MeshEndpointHook()
+                self._hook = MeshEndpointHook(peer_store=self._peer_store)
             gate0_needed = True
 
         # Build EndpointConfig so hooks (Gate 0) are installed when needed.
@@ -698,6 +698,8 @@ class AsterServer:
                 self._run_gate0(), name="aster-gate0"
             )
             subtasks.append(self._hook_loop_task)
+
+        self._peer_store.start_reaper()
 
         subtasks.append(
             asyncio.create_task(self._accept_loop(), name="aster-accept")
