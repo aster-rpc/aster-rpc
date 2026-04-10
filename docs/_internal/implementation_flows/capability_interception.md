@@ -74,6 +74,18 @@ For session-scoped services, auth fires **per CALL**, not per session.
 An auth denial writes an error trailer but continues the session loop
 (doesn't kill the session). The client can make other calls that pass auth.
 
+The `SessionServer` must receive the `PeerAttributeStore` so it can look
+up attributes for each CALL. Without this, `ctx.attributes` is empty and
+all role checks fail (this was a bug found by the QA agent).
+
+### Attribute expiry
+
+Attributes have a TTL. The `PeerAttributeStore` lazily evicts entries
+whose credential `expires_at` has passed or whose server-side TTL
+(`ASTER_PEER_TTL_S`, default 24h) has elapsed. If a peer's attributes
+expire between calls, the next call will see empty attributes and all
+role checks will fail. The peer must re-admit to get fresh attributes.
+
 ```python
 # session.py _session_loop, after decoding CallHeader:
 try:

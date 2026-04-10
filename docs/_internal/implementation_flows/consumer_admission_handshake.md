@@ -149,6 +149,22 @@ These attributes are later threaded into `CallContext.attributes` on every
 RPC call from this peer, enabling Gate 3 capability checks without
 re-reading the credential.
 
+### Expiry and reconnection
+
+The credential's `expires_at` is stored alongside the attributes in
+`PeerAdmission`. On reconnection, the peer skips admission (Gate 0
+recognises them) but both Gate 0 and the attribute store check expiry:
+
+- If `expires_at` has passed, the peer is evicted and must re-admit.
+- If `ASTER_PEER_TTL_S` (default 24h) has elapsed since admission,
+  the peer is evicted regardless of credential expiry.
+- A background reaper sweeps expired entries every 5 minutes to
+  prevent unbounded memory growth.
+- Re-admission overwrites the old entry with fresh `expires_at`.
+
+**Python:** `PeerAdmission.is_expired()` at `peer_store.py`.
+**TypeScript:** `isExpired()` at `peer-store.ts`.
+
 ## Response format
 
 ```json
@@ -220,7 +236,10 @@ language's convention (camelCase in TS, snake_case in Python).
 - [ ] Serialize credential to JSON with **snake_case** keys
 - [ ] Open admission ALPN stream, send StreamHeader + JSON request
 - [ ] Parse response: `admitted`, `services[]`, `ticket`
-- [ ] Store peer attributes in PeerAttributeStore on admission
+- [ ] Store peer attributes AND `expires_at` in PeerAttributeStore on admission
+- [ ] Lazy expiry check on attribute lookup (credential expiry + server TTL)
+- [ ] Background reaper to sweep expired entries (prevent memory leak)
+- [ ] `ASTER_PEER_TTL_S` env var for server-side admission TTL
 - [ ] Handle both `policy` and `ott` credential types
 - [ ] Validate nonce length (32 bytes) before consumption
 - [ ] Reject OTT credentials when no nonce store is configured
