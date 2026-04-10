@@ -1,7 +1,7 @@
 """Tests for BlobsClient: add_bytes, read_to_bytes, and tag operations."""
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.iroh_primitives]
 
 
 async def test_blob_round_trip():

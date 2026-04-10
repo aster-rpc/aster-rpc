@@ -30,7 +30,7 @@ from dumbpipe import (
 )
 from aster import create_endpoint, NodeAddr
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.iroh_primitives]
 
 
 # ============================================================================

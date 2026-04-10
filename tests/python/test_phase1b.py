@@ -1,6 +1,8 @@
 """Phase 1b: Tests for datagram completion, remote-info, and monitoring surfaces."""
 import asyncio
 import pytest
+
+pytestmark = pytest.mark.iroh_primitives
 import pytest_asyncio
 
 from aster import (

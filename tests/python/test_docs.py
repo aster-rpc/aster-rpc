@@ -1,4 +1,6 @@
 import pytest
+
+pytestmark = pytest.mark.iroh_primitives
 from aster._aster import DocEntry, IrohNode, docs_client
 
 
