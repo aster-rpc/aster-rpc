@@ -19,7 +19,10 @@ pub struct IrohConnection {
 
 impl From<CoreConnection> for IrohConnection {
     fn from(inner: CoreConnection) -> Self {
-        Self { inner, alpn_tag: None }
+        Self {
+            inner,
+            alpn_tag: None,
+        }
     }
 }
 
