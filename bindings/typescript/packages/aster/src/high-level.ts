@@ -103,8 +103,8 @@ export class AsterServer {
       port: this.config.healthPort,
       host: this.config.healthHost,
     });
-    this._hook = new MeshEndpointHook();
     this._peerStore = new PeerAttributeStore();
+    this._hook = new MeshEndpointHook(false, this._peerStore);
     this._allowAllConsumers = opts.allowAllConsumers ?? true;
     this._userInterceptors = opts.interceptors ?? [];
 
@@ -402,6 +402,7 @@ export class AsterServer {
 
     // Enable RPC server connection handling
     this._rpcServer.setServing(true);
+    this._peerStore.startReaper();
 
     // Spawn the Gate 0 hook loop if hooks are enabled. This polls
     // before_connect events from iroh and applies the MeshEndpointHook's

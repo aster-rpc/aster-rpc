@@ -299,6 +299,7 @@ export async function handleConsumerAdmissionRpc(
     opts.peerStore.admit(createPeerAdmission({
       endpointId: peerNodeId,
       attributes: attrMap,
+      expiresAt: cred.expiresAt ?? 0,
       admissionPath: 'aster.consumer_admission',
     }));
   }
