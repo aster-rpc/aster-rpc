@@ -5,7 +5,7 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use aster_transport_core::CoreNode;
+use aster_transport_core::{CoreEndpointConfig, CoreNode};
 
 use crate::blobs::BlobsClient;
 use crate::docs::DocsClient;
@@ -14,6 +14,60 @@ use crate::gossip::GossipClient;
 use crate::hooks::NodeHookReceiver;
 use crate::net::IrohConnection;
 
+/// Endpoint configuration for `IrohNode.memoryWithAlpns` / `persistentWithAlpns`.
+///
+/// Mirrors `bindings/python/rust/src/net.rs::EndpointConfig` so the same
+/// surface is available across PyO3 and NAPI bindings. All fields are
+/// optional with sensible defaults; pass `undefined` to use core defaults.
+#[napi(object)]
+#[derive(Clone, Default)]
+pub struct EndpointConfig {
+    /// Relay mode: `"default"`, `"disabled"`, or `"staging"`.
+    pub relay_mode: Option<String>,
+    /// Optional 32-byte secret key for the endpoint identity.
+    pub secret_key: Option<Buffer>,
+    /// Enable connection monitoring / remote-info tracking (Phase 1b).
+    pub enable_monitoring: Option<bool>,
+    /// Enable endpoint hooks (before_connect / after_handshake callbacks).
+    pub enable_hooks: Option<bool>,
+    /// Timeout in ms for hook replies (default 5000).
+    pub hook_timeout_ms: Option<u32>,
+    /// Bind address e.g. `"0.0.0.0:9000"`, `"127.0.0.1:0"`, `"[::]:0"`.
+    pub bind_addr: Option<String>,
+    /// Relay-only mode: disable all direct IP (UDP/QUIC) transports.
+    pub clear_ip_transports: Option<bool>,
+    /// Direct IP-only mode: disable all relay transports.
+    pub clear_relay_transports: Option<bool>,
+    /// Portmapper (UPnP/NAT-PMP): `"enabled"` (default) or `"disabled"`.
+    pub portmapper_config: Option<String>,
+    /// HTTP/SOCKS proxy URL for relay/HTTPS traffic e.g. `"http://proxy:8080"`.
+    pub proxy_url: Option<String>,
+    /// Read proxy from `HTTP_PROXY` / `HTTPS_PROXY` environment variables.
+    pub proxy_from_env: Option<bool>,
+    /// Enable mDNS local network discovery (default: false).
+    pub enable_local_discovery: Option<bool>,
+}
+
+impl From<EndpointConfig> for CoreEndpointConfig {
+    fn from(c: EndpointConfig) -> Self {
+        CoreEndpointConfig {
+            relay_mode: c.relay_mode,
+            relay_urls: Vec::new(),
+            alpns: Vec::new(),
+            secret_key: c.secret_key.map(|b| b.to_vec()),
+            enable_discovery: c.enable_local_discovery.unwrap_or(false),
+            enable_monitoring: c.enable_monitoring.unwrap_or(false),
+            enable_hooks: c.enable_hooks.unwrap_or(false),
+            hook_timeout_ms: c.hook_timeout_ms.unwrap_or(5000) as u64,
+            bind_addr: c.bind_addr,
+            clear_ip_transports: c.clear_ip_transports.unwrap_or(false),
+            clear_relay_transports: c.clear_relay_transports.unwrap_or(false),
+            portmapper_config: c.portmapper_config,
+            proxy_url: c.proxy_url,
+            proxy_from_env: c.proxy_from_env.unwrap_or(false),
+        }
+    }
+}
 
 /// IrohNode — a peer-to-peer Iroh node with all protocols enabled.
 ///
@@ -58,20 +112,35 @@ impl IrohNode {
     }
 
     /// Create an in-memory node with custom ALPNs.
+    ///
+    /// `config` is optional; pass `undefined` for core defaults. To enable
+    /// Gate 0 hooks (required for `allow_all_consumers=false` admission),
+    /// set `enableHooks: true`.
     #[napi(factory)]
-    pub async fn memory_with_alpns(alpns: Vec<Buffer>) -> Result<IrohNode> {
+    pub async fn memory_with_alpns(
+        alpns: Vec<Buffer>,
+        config: Option<EndpointConfig>,
+    ) -> Result<IrohNode> {
         let alpn_vecs: Vec<Vec<u8>> = alpns.into_iter().map(|b| b.to_vec()).collect();
-        let inner = CoreNode::memory_with_alpns(alpn_vecs, None)
+        let core_cfg: Option<CoreEndpointConfig> = config.map(Into::into);
+        let inner = CoreNode::memory_with_alpns(alpn_vecs, core_cfg)
             .await
             .map_err(to_napi_err)?;
         Ok(IrohNode { inner })
     }
 
     /// Create a persistent node with custom ALPNs.
+    ///
+    /// `config` is optional; pass `undefined` for core defaults.
     #[napi(factory)]
-    pub async fn persistent_with_alpns(path: String, alpns: Vec<Buffer>) -> Result<IrohNode> {
+    pub async fn persistent_with_alpns(
+        path: String,
+        alpns: Vec<Buffer>,
+        config: Option<EndpointConfig>,
+    ) -> Result<IrohNode> {
         let alpn_vecs: Vec<Vec<u8>> = alpns.into_iter().map(|b| b.to_vec()).collect();
-        let inner = CoreNode::persistent_with_alpns(path, alpn_vecs, None)
+        let core_cfg: Option<CoreEndpointConfig> = config.map(Into::into);
+        let inner = CoreNode::persistent_with_alpns(path, alpn_vecs, core_cfg)
             .await
             .map_err(to_napi_err)?;
         Ok(IrohNode { inner })
