@@ -269,7 +269,7 @@ export {
   ProxyClient,
   type AsterServerOptions,
   type AsterClientOptions,
-} from './high-level.js';
+} from './runtime.js';
 
 // @aster endpoint registration
 export {

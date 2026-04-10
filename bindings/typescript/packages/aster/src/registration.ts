@@ -4,7 +4,7 @@
  * Background task that registers producer endpoints with the @aster
  * service so consumers can discover them. Mirrors the Python
  * `_aster_registration_loop` / `_register_endpoints_with_aster` /
- * `_resolve_aster_address` / `_load_producer_tokens` from high_level.py.
+ * `_resolve_aster_address` / `_load_producer_tokens` from runtime.py.
  *
  * Usage:
  *   const tokens = loadProducerTokens(identityData);
