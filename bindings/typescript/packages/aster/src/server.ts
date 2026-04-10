@@ -197,9 +197,16 @@ export class RpcServer {
       const isSessionService = (svcInfo.scoped === 'session');
 
       if (isSessionStream !== isSessionService) {
-        await this.writeErrorTrailer(
-          send, StatusCode.FAILED_PRECONDITION, 'Stream/service scope mismatch',
-        );
+        let peerId = '';
+        try { peerId = conn.remoteNodeId(); } catch { /* ignore */ }
+        let msg: string;
+        if (isSessionService) {
+          msg = `'${header.service}' is session-scoped: open a session stream (method='') instead of calling method '${header.method}' directly`;
+        } else {
+          msg = `'${header.service}' is shared: send a method name instead of opening a session stream (method='')`;
+        }
+        this.logger.warn(`scope mismatch: ${msg}; peer=${peerId}`);
+        await this.writeErrorTrailer(send, StatusCode.FAILED_PRECONDITION, msg);
         return;
       }
 

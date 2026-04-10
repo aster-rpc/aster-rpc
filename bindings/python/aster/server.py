@@ -397,8 +397,30 @@ class Server:
             is_session_stream = (header.method == "")
             is_session_service = (service_info.scoped == RpcScope.SESSION)
             if is_session_stream != is_session_service:
+                peer_id = ""
+                try:
+                    peer_id = ctx.connection.remote_id()
+                except Exception:
+                    pass
+                if is_session_service:
+                    msg = (
+                        f"'{header.service}' is session-scoped: open a session "
+                        f"stream (method='') instead of calling method "
+                        f"'{header.method}' directly"
+                    )
+                    logger.warning(
+                        "scope mismatch: %s; peer=%s", msg, peer_id,
+                    )
+                else:
+                    msg = (
+                        f"'{header.service}' is shared: send a method name "
+                        f"instead of opening a session stream (method='')"
+                    )
+                    logger.warning(
+                        "scope mismatch: %s; peer=%s", msg, peer_id,
+                    )
                 await self._write_error_trailer(
-                    send, StatusCode.FAILED_PRECONDITION, "Stream/service scope mismatch",
+                    send, StatusCode.FAILED_PRECONDITION, msg,
                     serialization_mode=ser_mode,
                 )
                 return

@@ -500,6 +500,27 @@ async def run_dev_mode(address: str, work_dir: str | None) -> None:
     except ImportError as e:
         fail("Ch4 import", f"could not import services: {e}")
 
+    # Scope mismatch guard: calling a session-scoped method via one-shot
+    # stream must fail with FAILED_PRECONDITION on both Python and TS servers.
+    try:
+        mc_transport = client._rpc_conns.get(
+            next(iter(client._rpc_conns), ""), None
+        )
+        if mc_transport is not None:
+            from aster.transport.iroh import IrohTransport
+            from aster.json_codec import JsonProxyCodec
+            raw = IrohTransport(mc_transport, codec=JsonProxyCodec())
+            await raw.unary("AgentSession", "register", {"agent_id": "scope-test"})
+            fail("scope mismatch guard", "call succeeded (should have been rejected)")
+        else:
+            ok("scope mismatch (skipped -- no rpc connection)")
+    except Exception as e:
+        msg = str(e)
+        if "FAILED_PRECONDITION" in msg or "session-scoped" in msg:
+            ok("scope mismatch -> FAILED_PRECONDITION")
+        else:
+            fail("scope mismatch guard", f"unexpected error: {msg}")
+
     await client.close()
 
     if work_dir:
