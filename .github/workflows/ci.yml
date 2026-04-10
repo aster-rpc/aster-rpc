@@ -50,7 +50,35 @@ jobs:
       - name: cargo clippy (ffi)
         run: cargo clippy -p aster_transport_ffi -- -D warnings
 
-  # ── Python bindings: unit tests (fast, no networking) ──────────────
+  # ── Detect what changed (used by gating tests) ────────────────────
+  changes:
+    needs: lint
+    runs-on: [self-hosted, Linux, X64]
+    outputs:
+      iroh: ${{ steps.filter.outputs.iroh }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            iroh:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'core/**'
+              - 'bindings/python/rust/**'
+              - 'tests/python/test_blobs.py'
+              - 'tests/python/test_docs.py'
+              - 'tests/python/test_gossip.py'
+              - 'tests/python/test_dumbpipe.py'
+              - 'tests/python/test_net.py'
+              - 'tests/python/test_node.py'
+              - 'tests/python/test_phase1b.py'
+              - '.github/workflows/ci.yml'
+
+  # ── Python bindings: framework tests (fast, no iroh primitives) ────
+  # Runs on every push. Excludes iroh-primitive tests (blobs/docs/gossip/
+  # dumbpipe/net/node/phase1b) which are gated on iroh dep changes.
   test-unit:
     needs: lint
     runs-on: [self-hosted, Linux, X64]
@@ -66,7 +94,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
-      - name: Build and run unit tests
+      - name: Build and run framework tests
         run: |
           uv venv .venv
           source .venv/bin/activate
@@ -74,10 +102,46 @@ jobs:
           uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
           uv run maturin develop -m bindings/python/rust/Cargo.toml
           uv pip install -e cli/
-          uv run pytest tests/python/ -v --timeout=30 -m "not network"
+          uv run pytest tests/python/ tests/chaos/ -v --timeout=30 \
+            -m "not network and not iroh_primitives"
         shell: bash
 
-  # ── Python bindings: full test matrix (includes networking) ────────
+  # ── Iroh primitive tests: only when iroh deps or Rust binding change ─
+  # These exercise blobs, docs, gossip, dumbpipe, raw QUIC -- the upstream
+  # iroh features we wrap but don't develop. Slow (~5 min) and rarely
+  # affected by RPC framework or CLI changes.
+  test-iroh-primitives:
+    needs: [lint, changes]
+    if: needs.changes.outputs.iroh == 'true'
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - name: Build and run iroh primitive tests
+        run: |
+          uv venv .venv
+          source .venv/bin/activate
+          uv pip install pytest pytest-asyncio pytest-timeout pytest-rerunfailures maturin
+          uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
+          uv run maturin develop -m bindings/python/rust/Cargo.toml
+          uv pip install -e cli/
+          uv run pytest tests/python/ -v --timeout=60 --reruns=2 --reruns-delay=2 \
+            -m "iroh_primitives"
+        shell: bash
+
+  # ── Python bindings: cross-platform full test matrix ───────────────
+  # Runs on PRs and main pushes. Excludes iroh primitives (covered by
+  # test-iroh-primitives when iroh deps change). Includes the framework
+  # tests + all the auth/admission/e2e/integration tests on every platform.
   test-full:
     needs: lint
     strategy:
@@ -121,7 +185,8 @@ jobs:
           uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
           uv run maturin develop -m bindings/python/rust/Cargo.toml
           uv pip install -e cli/
-          uv run pytest tests/python/ -v --timeout=60 --reruns=2 --reruns-delay=2
+          uv run pytest tests/python/ tests/chaos/ -v --timeout=60 --reruns=2 --reruns-delay=2 \
+            -m "not iroh_primitives"
         shell: bash
 
       - name: Build and test (Windows)
@@ -135,7 +200,7 @@ jobs:
           uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
           uv run maturin develop -m bindings/python/rust/Cargo.toml
           uv pip install -e cli/
-          uv run pytest tests/python/ -v --timeout=60 --reruns=2 --reruns-delay=2
+          uv run pytest tests/python/ tests/chaos/ -v --timeout=60 --reruns=2 --reruns-delay=2 -m "not iroh_primitives"
         shell: pwsh
 
   # ── Rust core tests (no Python dependency) ─────────────────────────
@@ -151,6 +216,43 @@ jobs:
         run: cargo test -p aster_transport_core
       - name: cargo test (ffi)
         run: cargo test -p aster_transport_ffi
+
+  # ── Rust sanitizers (ASan + LSan + TSan) ──────────────────────────
+  test-rust-sanitize:
+    needs: lint
+    runs-on: [self-hosted, Linux, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, leak, thread]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Run ${{ matrix.sanitizer }} sanitizer tests
+        env:
+          RUSTFLAGS: "-Z sanitizer=${{ matrix.sanitizer }}"
+        run: |
+          cargo test -p aster_transport_ffi --lib --tests
+
+  # ── Miri (interpreter for unsafe code validation) ─────────────────
+  test-rust-miri:
+    needs: lint
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: miri
+      - name: Install miri
+        run: cargo miri setup
+      - name: cargo miri test (ffi lib)
+        run: cargo miri test -p aster_transport_ffi --lib
+      - name: cargo miri test (ffi integration tests)
+        run: cargo miri test -p aster_transport_ffi --test cq_state_machine
+      # Loom tests are excluded from miri (loom uses its own runtime)
 
   # ── API docs generation ──────────────────────────────────────────
   docs:

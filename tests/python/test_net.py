@@ -3,6 +3,8 @@ import asyncio
 import struct
 
 import pytest
+
+pytestmark = pytest.mark.iroh_primitives
 import pytest_asyncio
 
 from aster import create_endpoint

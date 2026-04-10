@@ -14,6 +14,8 @@ import asyncio
 import json
 import os
 import pytest
+
+pytestmark = pytest.mark.iroh_primitives
 import pytest_asyncio
 
 from aster import IrohNode, gossip_client, GossipTopicHandle

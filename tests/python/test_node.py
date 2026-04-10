@@ -10,7 +10,7 @@ Tests:
 import tempfile
 import pytest
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.iroh_primitives]
 
 
 async def test_node_id():

@@ -41,6 +41,7 @@ reruns_delay = 2
 # not importable from pyfory.includes.libformat.  Benign third-party issue.
 markers = [
     "network: tests that require real network I/O (node pairs, gossip, etc.)",
+    "iroh_primitives: tests for iroh upstream primitives (blobs, docs, gossip, dumbpipe, raw QUIC). Run when iroh deps or our Rust binding changes.",
 ]
 filterwarnings = [
     "ignore:.*enum class CTypeId not importable from pyfory\\.includes\\.libformat.*:UserWarning",
