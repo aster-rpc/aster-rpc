@@ -190,4 +190,12 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if os.environ.get("ASTER_USE_UVLOOP") == "1":
+        try:
+            import uvloop
+            uvloop.run(main())
+        except ImportError:
+            print("(uvloop not installed; falling back to asyncio)")
+            asyncio.run(main())
+    else:
+        asyncio.run(main())

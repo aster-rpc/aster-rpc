@@ -21,6 +21,34 @@ Sub-modules are also available directly::
     from aster.trust.consumer import handle_consumer_admission_rpc
 """
 
+# ── uvloop auto-install ──────────────────────────────────────────────────────
+# uvloop is a libuv-backed asyncio replacement that's ~20-25% faster on
+# the Aster RPC hot path (per call: open_bi + write/read frames + finish,
+# many event-loop yields). Auto-install when available; opt out with
+# ASTER_NO_UVLOOP=1. Only takes effect if no event loop has been created
+# yet -- safe to no-op if the user already has a loop running.
+def _install_uvloop_if_available() -> None:
+    import os
+    if os.environ.get("ASTER_NO_UVLOOP") == "1":
+        return
+    try:
+        import asyncio
+        import uvloop
+    except ImportError:
+        return
+    try:
+        # Only install if no event loop policy has been explicitly set
+        # away from the default. asyncio.get_event_loop_policy() returns
+        # an instance of the default policy class until something changes it.
+        current = asyncio.get_event_loop_policy()
+        if isinstance(current, uvloop.EventLoopPolicy):
+            return
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except Exception:
+        pass
+
+_install_uvloop_if_available()
+
 # ── Native bindings (iroh transport layer) ───────────────────────────────────
 
 try:

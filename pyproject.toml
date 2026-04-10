@@ -13,6 +13,11 @@ dependencies = [
     "pyfory==0.16.0",
     "zstandard>=0.25.0",
     "tomli>=2.0; python_version < '3.11'",
+    # uvloop: libuv-backed asyncio replacement, ~20-25% faster on the
+    # RPC hot path. Required on Linux/macOS, skipped on Windows (no
+    # uvloop support there). Auto-installed at import time; opt out
+    # with ASTER_NO_UVLOOP=1.
+    "uvloop>=0.19; sys_platform != 'win32'",
 ]
 
 [project.optional-dependencies]
