@@ -1119,26 +1119,32 @@ class SessionCommand(ShellCommand):
                         continue
 
                 # Built-in subshell commands
+                services_root = ctx.vfs_root.child("services")
+                svc = services_root.child(service_name) if services_root else None
+
                 if method_name == "help":
                     ctx.display.print("[bold]Session commands:[/bold]")
-                    ctx.display.print("  [green]end[/green]         Close this session")
-                    ctx.display.print("  [green]help[/green]        Show this help")
+                    ctx.display.print("  [green]end[/green]              Close this session")
+                    ctx.display.print("  [green]help[/green]             Show this help")
+                    ctx.display.print("  [green]ls[/green]               List available methods")
+                    ctx.display.print("  [green]<method> args[/green]    Invoke a method (./method also works)")
                     ctx.display.print()
                     ctx.display.print("[bold]Available methods:[/bold]")
-                    if svc_node:
-                        svc = svc_node.child(service_name)
-                        if svc:
-                            for c in svc.sorted_children():
-                                sig = c.metadata.get("request_type", "")
-                                pattern = c.metadata.get("pattern", "unary")
-                                ctx.display.print(f"  [green]{c.name:20s}[/green] {pattern:15s} {sig}")
+                    if svc:
+                        for c in svc.sorted_children():
+                            sig = c.metadata.get("request_type", "")
+                            pattern = c.metadata.get("pattern", "unary")
+                            ctx.display.print(f"  [green]{c.name:20s}[/green] {pattern:15s} {sig}")
+                    else:
+                        ctx.display.print("  [dim](no methods discovered)[/dim]")
                 elif method_name == "ls":
-                    if svc_node:
-                        svc = svc_node.child(service_name)
-                        if svc:
-                            for c in svc.sorted_children():
-                                pattern = c.metadata.get("pattern", "unary")
-                                ctx.display.print(f"  [green]{c.name}[/green]  [dim]{pattern}[/dim]")
+                    if svc:
+                        for c in svc.sorted_children():
+                            pattern = c.metadata.get("pattern", "unary")
+                            sig = c.metadata.get("request_type", "")
+                            ctx.display.print(f"  [green]{c.name:20s}[/green] [dim]{pattern:15s} {sig}[/dim]")
+                    else:
+                        ctx.display.print("  [dim](no methods discovered)[/dim]")
                 else:
                     ctx.display.error(f"unknown method: {method_name} (try 'help')")
 
