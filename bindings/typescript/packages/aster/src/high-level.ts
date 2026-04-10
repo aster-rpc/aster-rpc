@@ -26,6 +26,9 @@ import { CapabilityInterceptor } from './interceptors/capability.js';
 import type { Interceptor } from './interceptors/base.js';
 import { canonicalXlangBytes, contractIdFromContract, fromServiceInfo } from './contract/identity.js';
 import type { ContractManifest, ManifestMethod, ManifestField } from './contract/manifest.js';
+import { writeFrame, readFrame, HEADER, TRAILER, CALL } from './framing.js';
+import { StreamHeader, CallHeader, RpcStatus } from './protocol.js';
+import { StatusCode, RpcError } from './status.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -982,6 +985,13 @@ export class AsterClientWrapper {
    * ```
    */
   proxy(serviceName: string): ProxyClient {
+    // Check if this is a session-scoped service from the admission summary.
+    // If so, return a SessionProxyClient that multiplexes calls over a
+    // single bidi stream using the session protocol.
+    const summary = this._services.find(s => s.name === serviceName);
+    if (summary && (summary.pattern === 'session' || summary.pattern === 'stream')) {
+      return new SessionProxyClient(serviceName, this._node, this.transport) as any;
+    }
     return new ProxyClient(serviceName, this.transport);
   }
 
@@ -1122,6 +1132,124 @@ export class ProxyBidiChannel {
       this._channel = this.transport.bidiStream(this.serviceName, this.methodName);
     }
     return this._channel[Symbol.asyncIterator]();
+  }
+}
+
+// ── SessionProxyClient ──────────────────────────────────────────────────────
+
+/**
+ * Dynamic proxy client for session-scoped services. Opens a single bidi QUIC
+ * stream with the session protocol (StreamHeader method="") and multiplexes
+ * calls via CALL frames. Created automatically by AsterClientWrapper.proxy()
+ * when the service summary indicates scoped='session'.
+ */
+class SessionProxyClient {
+  private _send: any = null;
+  private _recv: any = null;
+  private _codec = new JsonCodec();
+  private _opening: Promise<void> | null = null;
+
+  constructor(
+    private readonly serviceName: string,
+    _node: any,
+    private readonly _transport: AsterTransport,
+  ) {
+    return new Proxy(this, {
+      get(target, prop: string) {
+        if (prop in target || typeof prop === 'symbol') {
+          return (target as any)[prop];
+        }
+        return target._sessionMethod(prop);
+      },
+    });
+  }
+
+  private _sessionMethod(methodName: string) {
+    const self = this;
+    const fn = async (payload?: unknown): Promise<unknown> => {
+      await self._ensureOpen();
+      return self._callUnary(methodName, payload ?? {});
+    };
+    fn.stream = (_payload?: unknown): AsyncIterable<unknown> => {
+      throw new RpcError(StatusCode.UNIMPLEMENTED, 'session proxy server_stream not yet implemented');
+    };
+    fn.bidi = (): ProxyBidiChannel => {
+      throw new RpcError(StatusCode.UNIMPLEMENTED, 'session proxy bidi not yet implemented') as any;
+    };
+    return fn;
+  }
+
+  private async _ensureOpen(): Promise<void> {
+    if (this._send) return;
+    if (this._opening) return this._opening;
+    this._opening = this._open();
+    return this._opening;
+  }
+
+  private async _open(): Promise<void> {
+    // The IrohTransport wraps the connection. We need the raw connection
+    // to open a bidi stream. Reach through the transport to get it.
+    const conn = (this._transport as any).conn ?? (this._transport as any)._conn;
+    if (!conn) throw new RpcError(StatusCode.UNAVAILABLE, 'no QUIC connection for session');
+
+    const bi = await conn.openBi();
+    this._send = bi.takeSend();
+    this._recv = bi.takeRecv();
+
+    // Send the session StreamHeader (method="" signals session mode)
+    const header = new StreamHeader({
+      service: this.serviceName,
+      method: '',
+      version: 1,
+      callId: crypto.randomUUID(),
+      serializationMode: 3, // JSON
+    });
+    await writeFrame(this._send, this._codec.encode(header), HEADER);
+  }
+
+  private async _callUnary(method: string, request: unknown): Promise<unknown> {
+    // Send CALL frame with CallHeader
+    const callHeader = new CallHeader({
+      method,
+      callId: crypto.randomUUID(),
+    });
+    await writeFrame(this._send, this._codec.encode(callHeader), CALL);
+
+    // Send request payload
+    await writeFrame(this._send, this._codec.encode(request), 0);
+
+    // Read response
+    const respFrame = await readFrame(this._recv, 0);
+    if (!respFrame) throw new RpcError(StatusCode.UNAVAILABLE, 'session stream ended');
+    const [respPayload, respFlags] = respFrame;
+
+    if (respFlags & TRAILER) {
+      const status = this._codec.decode(respPayload) as RpcStatus;
+      throw RpcError.fromStatus(status.code as StatusCode, status.message);
+    }
+
+    const response = this._codec.decode(respPayload);
+
+    // The TS session server sends an OK trailer after each unary response.
+    // Python's session server does not. Drain one more frame if it's a
+    // TRAILER; if it's a CALL or EOF that means the next call is starting
+    // and we leave the stream alone.
+    try {
+      const next = await readFrame(this._recv, 2);
+      if (next) {
+        const [nPayload, nFlags] = next;
+        if ((nFlags & TRAILER) && nPayload.length > 0) {
+          const st = this._codec.decode(nPayload) as RpcStatus;
+          if (st.code !== StatusCode.OK) {
+            throw RpcError.fromStatus(st.code as StatusCode, st.message);
+          }
+        }
+      }
+    } catch {
+      // Timeout or stream ended -- fine, no trailer to drain
+    }
+
+    return response;
   }
 }
 

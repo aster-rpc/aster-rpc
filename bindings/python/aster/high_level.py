@@ -316,6 +316,7 @@ class AsterServer:
                     version=info.version,
                     contract_id=cid,
                     channels={self._channel_name: addr_b64},
+                    pattern=info.scoped or "shared",
                 )
             )
         self._service_summaries = summaries

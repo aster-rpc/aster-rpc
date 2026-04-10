@@ -63,6 +63,8 @@ class ServiceSummary:
     version: int
     contract_id: str                    # BLAKE3 hex digest
     channels: dict[str, str]            # channel name → contract_id
+    # Dispatch scope: "shared" (default) or "session".
+    pattern: str = "shared"
     # Serialization modes the server supports for this service (e.g.
     # ["xlang"], ["json"], or both). Empty/missing means the consumer should
     # assume the project default (XLANG). The TypeScript binding publishes
@@ -75,6 +77,7 @@ class ServiceSummary:
             "version": self.version,
             "contract_id": self.contract_id,
             "channels": self.channels,
+            "pattern": self.pattern,
             "serialization_modes": list(self.serialization_modes),
         }
 
@@ -85,6 +88,7 @@ class ServiceSummary:
             version=int(d["version"]),
             contract_id=d["contract_id"],
             channels=d.get("channels") or {},
+            pattern=d.get("pattern") or "shared",
             serialization_modes=list(d.get("serialization_modes") or []),
         )
 
