@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from typing import Any
 
 from aster_cli.access import (
@@ -1109,19 +1110,35 @@ class SessionCommand(ShellCommand):
         # Bind the session so invoke_method routes calls through it
         ctx.session = session_handle
 
-        # Subshell loop
-        from prompt_toolkit import PromptSession as PS
-        from prompt_toolkit.formatted_text import HTML
+        # Subshell loop. Mirrors the TTY/non-TTY split in the outer
+        # shell REPL: prompt_toolkit assumes a real terminal and emits
+        # garbled cursor-positioning escapes when stdin/stdout are a
+        # pipe, which means scripted callers (CI, expect-driven QA
+        # runs, anything piping commands to `aster shell`) can't drive
+        # the subshell. The plain-stdin reader works in both modes.
+        is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
 
-        sub_session = PS()
+        if is_interactive:
+            from prompt_toolkit import PromptSession as PS
+            from prompt_toolkit.formatted_text import HTML
+            sub_session = PS()
+            prompt_html = HTML(
+                f"<style fg='#E6C06B'>{service_name}</style>"
+                f"<style fg='#666666'>~</style> "
+            )
+
+            async def read_subshell_line() -> str:
+                return await sub_session.prompt_async(prompt_html)
+        else:
+            async def read_subshell_line() -> str:
+                line = await asyncio.to_thread(sys.stdin.readline)
+                if not line:
+                    raise EOFError()
+                return line.rstrip("\r\n")
 
         while True:
             try:
-                prompt = HTML(
-                    f"<style fg='#E6C06B'>{service_name}</style>"
-                    f"<style fg='#666666'>~</style> "
-                )
-                text = await sub_session.prompt_async(prompt)
+                text = await read_subshell_line()
                 text = text.strip()
 
                 if not text:

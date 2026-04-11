@@ -28,6 +28,8 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from rich.console import Console
 
+from aster.json_codec import JsonProxyCodec
+
 from aster_cli.shell.completer import ShellCompleter
 from aster_cli.shell.display import Display
 from aster_cli.shell.plugin import CommandContext, get_command
@@ -792,7 +794,6 @@ class PeerConnection:
         codec = None
         modes = list(getattr(summary, "serialization_modes", None) or [])
         if modes and "xlang" not in modes and "json" in modes:
-            from aster.json_codec import JsonProxyCodec
             codec = JsonProxyCodec()
         elif self._type_factory and self._type_factory.type_count > 0:
             try:
@@ -861,6 +862,43 @@ class PeerConnection:
         except Exception:
             pass
 
+    def _build_typed_request(
+        self,
+        transport: Any,
+        service: str,
+        method: str,
+        payload: dict[str, Any],
+    ) -> Any:
+        """Convert a dict payload into a typed Fory dataclass when needed.
+
+        The Fory codec expects @wire_type-decorated dataclass instances,
+        not raw dicts. When the transport uses Fory (Python servers), we
+        synthesize the right typed instance from the manifest's field
+        descriptors via ``DynamicTypeFactory``. When the transport uses
+        ``JsonProxyCodec`` (TS servers), we leave the dict alone -- the
+        JSON codec sends keys verbatim.
+
+        This was originally only called from ``invoke()`` for unary
+        calls; the streaming methods (server_stream, client_stream,
+        bidi_stream) used to pass raw dicts unconditionally, which
+        worked for TS servers but tripped Fory's "expected a typed
+        object but received a dict" against Python servers. Now all
+        four invocation paths share this helper.
+        """
+        if not isinstance(payload, dict):
+            return payload  # already typed (e.g. user passed a dataclass)
+        if not self._type_factory:
+            return payload
+        if isinstance(getattr(transport, "_codec", None), JsonProxyCodec):
+            return payload  # JSON path takes raw dicts
+        meta = self._get_method_meta(service, method)
+        if not meta or not meta.get("request_wire_tag"):
+            return payload
+        try:
+            return self._type_factory.build_request(meta, payload)
+        except Exception:
+            return payload  # fall back to dict; Fory will give the same error
+
     async def invoke(
         self, service: str, method: str, payload: dict[str, Any]
     ) -> Any:
@@ -871,20 +909,7 @@ class PeerConnection:
         """
         self._check_session_scope(service, method)
         transport = await self._get_transport(service)
-
-        # Try to build a typed request from the dynamic type factory.
-        # Skip when the transport uses JsonProxyCodec (TS server, JSON-only) --
-        # the JSON codec sends the dict directly and doesn't need a Fory dataclass.
-        request: Any = payload
-        from aster.json_codec import JsonProxyCodec
-        if self._type_factory and not isinstance(getattr(transport, "_codec", None), JsonProxyCodec):
-            meta = self._get_method_meta(service, method)
-            if meta and meta.get("request_wire_tag"):
-                try:
-                    request = self._type_factory.build_request(meta, payload)
-                except Exception:
-                    pass  # fall back to dict
-
+        request = self._build_typed_request(transport, service, method, payload)
         return await transport.unary(service, method, request)
 
     async def server_stream(
@@ -893,17 +918,27 @@ class PeerConnection:
         """Start a server-streaming RPC."""
         self._check_session_scope(service, method)
         transport = await self._get_transport(service)
-        return transport.server_stream(service, method, payload)
+        request = self._build_typed_request(transport, service, method, payload)
+        return transport.server_stream(service, method, request)
 
     async def client_stream(
         self, service: str, method: str, values: list[Any]
     ) -> Any:
-        """Send a client-streaming RPC."""
+        """Send a client-streaming RPC.
+
+        Each input dict is converted to a typed Fory dataclass when the
+        transport uses Fory; JSON-codec transports pass dicts through.
+        """
         self._check_session_scope(service, method)
         transport = await self._get_transport(service)
 
+        typed_values = [
+            self._build_typed_request(transport, service, method, v)
+            for v in values
+        ]
+
         async def _iter():
-            for v in values:
+            for v in typed_values:
                 yield v
 
         return await transport.client_stream(service, method, _iter())
@@ -914,14 +949,33 @@ class PeerConnection:
         """Start a bidi-streaming RPC.
 
         Note: bidi_stream returns a BidiChannel, not an async iterator.
-        The invoker handles the read/write loop.
+        The invoker handles the read/write loop and is responsible for
+        calling :meth:`build_typed_request_for_bidi` on each outgoing
+        value before sending it -- bidi can't pre-convert because the
+        values are produced lazily.
         """
         self._check_session_scope(service, method)
+
         # We need async transport setup, so return a coroutine wrapper
         async def _start():
             transport = await self._get_transport(service)
             return transport.bidi_stream(service, method)
         return _start()
+
+    def build_typed_request_for_bidi(
+        self, service: str, method: str, value: Any
+    ) -> Any:
+        """Public helper for the bidi invoker loop.
+
+        Bidi streams produce values lazily on a separate task, so we
+        can't pre-convert them like server/client streams. The invoker
+        calls this on each outgoing value just before pushing it onto
+        the bidi channel.
+        """
+        transport = self._transports.get(service)
+        if transport is None:
+            return value  # transport not yet built; the underlying call will fail anyway
+        return self._build_typed_request(transport, service, method, value)
 
     async def list_doc_entries(self) -> list[dict[str, Any]]:
         """List all entries in the registry doc."""
