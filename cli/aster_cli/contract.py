@@ -767,11 +767,38 @@ async def _fetch_manifests_from_directory_ref(
     return {manifest.get("service", service_name): manifest}
 
 
+def _resolve_aster_version() -> str:
+    """Find the installed aster-cli + aster-rpc versions for `--version`.
+
+    Reads from importlib.metadata so the version string reflects the
+    actually-installed package, not whatever's hard-coded in source.
+    """
+    parts: list[str] = []
+    try:
+        from importlib.metadata import version as _pkg_version, PackageNotFoundError
+    except ImportError:  # pragma: no cover -- Python <3.8 not supported anyway
+        return "unknown"
+    try:
+        parts.append(f"aster-cli {_pkg_version('aster-cli')}")
+    except PackageNotFoundError:
+        pass
+    try:
+        parts.append(f"aster-rpc {_pkg_version('aster-rpc')}")
+    except PackageNotFoundError:
+        pass
+    return " / ".join(parts) if parts else "unknown"
+
+
 def main() -> None:
     """Entry point for the ``aster`` CLI."""
     parser = argparse.ArgumentParser(
         prog="aster",
         description="Aster RPC framework command-line tools.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {_resolve_aster_version()}",
     )
     subparsers = parser.add_subparsers(dest="command", help="Subcommand")
 
@@ -833,10 +860,10 @@ def main() -> None:
     )
     gen_client_parser.add_argument(
         "--lang",
-        default="python",
+        required=True,
         choices=["python", "typescript"],
         metavar="LANG",
-        help="Target language: python (default) | typescript",
+        help="Target language: python | typescript (required)",
     )
     gen_client_parser.add_argument(
         "--aster",

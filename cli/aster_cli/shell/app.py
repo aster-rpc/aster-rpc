@@ -831,7 +831,7 @@ class PeerConnection:
                 f"invoked from the shell. Session-scoped services need a persistent "
                 f"session stream that holds per-connection state. Use a generated "
                 f"typed client instead:\n"
-                f"  aster contract gen-client <address> --out ./clients --package my_app\n"
+                f"  aster contract gen-client <address> --out ./clients --package my_app --lang python\n"
                 f"  # then in Python:\n"
                 f"  from my_app.services.{service.lower()}_v1 import {service}Client\n"
                 f"  stub = await {service}Client.from_connection(client)"
