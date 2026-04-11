@@ -222,10 +222,9 @@ public class IrohStream implements AutoCloseable {
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
 
-    // Register the operation to catch async errors (ERROR events)
-    runtime.registry().register(opId);
-
-    // Track by message_id so the SEND_COMPLETED handler can complete it
+    // Track by message_id so the SEND_COMPLETED handler can complete it.
+    // Note: We do NOT register with registry - SEND_COMPLETED goes to inbound handlers
+    // via pendingSends, not to registry.complete().
     CompletableFuture<Void> sendFuture = new CompletableFuture<>();
     pendingSends.put(messageId, sendFuture);
 
