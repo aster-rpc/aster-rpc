@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name    = "aster-rpc"
-version = "0.1.1"
+version = "0.1.2"
 description = "Aster RPC framework with Iroh P2P transport (Python bindings)"
 requires-python = ">=3.9,<3.14"
 dependencies = [
@@ -28,6 +28,12 @@ module-name    = "aster._aster"
 manifest-path  = "bindings/python/rust/Cargo.toml"
 features       = ["pyo3/extension-module"]
 python-source  = "bindings/python"
+# python-source restricts the sdist scope to bindings/python/, but maturin
+# auto-adds `License-File: LICENSE` to PKG-INFO when it sees a LICENSE file
+# at the project root. PyPI's PEP 639 check rejects sdists where the
+# declared license-file is not actually in the tarball, so we have to
+# explicitly include LICENSE in both wheel and sdist artifacts.
+include        = ["LICENSE"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
