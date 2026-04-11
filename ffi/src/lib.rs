@@ -193,6 +193,7 @@ pub struct iroh_endpoint_config_t {
     pub portmapper_config: u32,  // 0 = enabled (default), 1 = disabled
     pub proxy_url: iroh_bytes_t, // HTTP/SOCKS proxy URL string; empty = none
     pub proxy_from_env: u32,     // 1 = read HTTP_PROXY/HTTPS_PROXY from env
+    pub data_dir_utf8: iroh_bytes_t, // Node data directory; empty = no persistent state
 }
 
 #[repr(C)]
@@ -481,6 +482,9 @@ struct BridgeRuntime {
 
     // Buffer registry
     buffers: BufferRegistry,
+
+    // Endpoint secret keys: keyed by endpoint handle, stores the 32-byte secret key seed
+    endpoint_secret_keys: Mutex<HashMap<iroh_endpoint_t, Vec<u8>>>,
 }
 
 struct OperationState {
@@ -525,6 +529,7 @@ impl BridgeRuntime {
             hook_invocations: HandleRegistry::new(),
             doc_event_receivers: HandleRegistry::new(),
             buffers: BufferRegistry::new(),
+            endpoint_secret_keys: Mutex::new(HashMap::new()),
         })
     }
 
@@ -939,6 +944,26 @@ pub unsafe extern "C" fn iroh_buffer_release(runtime: iroh_runtime_t, buffer: u6
     } else {
         iroh_status_t::IROH_STATUS_NOT_FOUND as i32
     }
+}
+
+/// Release a string allocated by `alloc_string`.
+/// Java must call this to free strings returned via `iroh_bytes_t` fields
+/// in structs that were allocated with Rust-owned memory (not caller-buffers).
+///
+/// # Safety
+/// - `ptr` must be a pointer returned by a Rust `alloc_string` call
+/// - `len` must be the length passed back alongside `ptr`
+/// - Must be called exactly once for each allocation
+/// - `ptr` must not be null
+#[no_mangle]
+pub unsafe extern "C" fn iroh_string_release(ptr: *const u8, len: usize) -> i32 {
+    if ptr.is_null() || len == 0 {
+        return iroh_status_t::IROH_STATUS_OK as i32;
+    }
+    // SAFETY: caller guarantees this came from alloc_string (Box-based allocation)
+    // with length `len`. We reconstruct the Box and drop it.
+    let _boxed = unsafe { Vec::from_raw_parts(ptr as *mut u8, len, len) };
+    iroh_status_t::IROH_STATUS_OK as i32
 }
 
 // ============================================================================
@@ -1366,6 +1391,9 @@ pub unsafe extern "C" fn iroh_endpoint_create(
         5000
     };
 
+    // Extract secret_key before building core_config so we can store it later
+    let secret_key = unsafe { read_bytes_opt(&cfg.secret_key) };
+
     let core_config = CoreEndpointConfig {
         relay_mode: match cfg.relay_mode {
             0 => None,
@@ -1385,7 +1413,7 @@ pub unsafe extern "C" fn iroh_endpoint_create(
                     .collect()
             }
         },
-        secret_key: unsafe { read_bytes_opt(&cfg.secret_key) },
+        secret_key: secret_key.clone(),
         enable_discovery: cfg.enable_discovery != 0,
         enable_monitoring: true, // Always enable monitoring for FFI endpoints
         enable_hooks,
@@ -1401,6 +1429,7 @@ pub unsafe extern "C" fn iroh_endpoint_create(
         },
         proxy_url: unsafe { read_string_opt(&cfg.proxy_url) },
         proxy_from_env: cfg.proxy_from_env != 0,
+        data_dir: unsafe { read_string_opt(&cfg.data_dir_utf8) },
     };
 
     let (op_id, cancelled) = bridge.new_operation();
@@ -1424,6 +1453,13 @@ pub unsafe extern "C" fn iroh_endpoint_create(
                 };
 
                 let handle = bridge2.endpoints.insert(endpoint);
+
+                // Store the secret key seed for later export via iroh_endpoint_export_secret_key
+                if let Some(ref key) = secret_key {
+                    let mut keys = bridge2.endpoint_secret_keys.lock().unwrap();
+                    keys.insert(handle, key.clone());
+                }
+
                 bridge2.emit_simple(
                     iroh_event_kind_t::IROH_EVENT_ENDPOINT_CREATED,
                     iroh_status_t::IROH_STATUS_OK,
@@ -1535,6 +1571,14 @@ pub unsafe extern "C" fn iroh_endpoint_close(
 
         ep_arc.close().await;
         bridge2.endpoints.remove(endpoint);
+
+        // Remove the secret key from the registry
+        bridge2
+            .endpoint_secret_keys
+            .lock()
+            .unwrap()
+            .remove(&endpoint);
+
         bridge2.emit_simple(
             iroh_event_kind_t::IROH_EVENT_CLOSED,
             iroh_status_t::IROH_STATUS_OK,
@@ -1583,6 +1627,52 @@ pub unsafe extern "C" fn iroh_endpoint_id(
     if !out_buf.is_null() && len > 0 {
         unsafe {
             ptr::copy_nonoverlapping(id.as_ptr(), out_buf, len);
+        }
+    }
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn iroh_endpoint_export_secret_key(
+    runtime: iroh_runtime_t,
+    endpoint: iroh_endpoint_t,
+    out_buf: *mut u8,
+    capacity: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    // Check endpoint exists to return NOT_FOUND (keys are removed when endpoint is closed)
+    let _ep = match bridge.endpoints.get(endpoint) {
+        Some(e) => e,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let keys = bridge.endpoint_secret_keys.lock().unwrap();
+    let key = match keys.get(&endpoint) {
+        Some(k) => k,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let len = key.len();
+
+    *out_len = len;
+
+    if capacity < len {
+        return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+    }
+
+    if !out_buf.is_null() && len > 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(key.as_ptr(), out_buf, len);
         }
     }
 
@@ -1790,6 +1880,45 @@ pub unsafe extern "C" fn iroh_connect(
     };
     let alpn = unsafe { read_bytes(&cfg.alpn) };
 
+    // If addr is provided, copy it out before the async block to avoid lifetime issues
+    let connect_addr = if !cfg.addr.is_null() {
+        let addr_ref = unsafe { &*cfg.addr };
+        let addr_node_id = match unsafe { read_string(&addr_ref.endpoint_id) } {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let relay_url = if addr_ref.relay_url.ptr.is_null() || addr_ref.relay_url.len == 0 {
+            None
+        } else {
+            match unsafe { read_string(&addr_ref.relay_url) } {
+                Ok(s) => Some(s),
+                Err(e) => return e,
+            }
+        };
+        let mut direct_addresses = Vec::new();
+        if !addr_ref.direct_addresses.items.is_null() && addr_ref.direct_addresses.len > 0 {
+            let items = unsafe {
+                slice::from_raw_parts(
+                    addr_ref.direct_addresses.items,
+                    addr_ref.direct_addresses.len,
+                )
+            };
+            for item in items {
+                match unsafe { read_string(item) } {
+                    Ok(s) => direct_addresses.push(s),
+                    Err(e) => return e,
+                }
+            }
+        }
+        Some(CoreNodeAddr {
+            endpoint_id: addr_node_id,
+            relay_url,
+            direct_addresses,
+        })
+    } else {
+        None
+    };
+
     let (op_id, cancelled) = bridge.new_operation();
     unsafe {
         *out_operation = op_id;
@@ -1801,7 +1930,13 @@ pub unsafe extern "C" fn iroh_connect(
             return;
         }
 
-        match ep.connect(node_id, alpn).await {
+        let connect_result = if let Some(addr) = connect_addr {
+            ep.connect_node_addr(addr, alpn).await
+        } else {
+            ep.connect(node_id, alpn).await
+        };
+
+        match connect_result {
             Ok(conn) => {
                 let handle = bridge2.connections.insert(conn);
                 bridge2.emit_simple(
@@ -2198,7 +2333,7 @@ pub unsafe extern "C" fn iroh_connection_read_datagram(
         match conn_arc.read_datagram().await {
             Ok(data) => {
                 let event = EventInternal::new(
-                    iroh_event_kind_t::IROH_EVENT_BYTES_RESULT,
+                    iroh_event_kind_t::IROH_EVENT_DATAGRAM_RECEIVED,
                     iroh_status_t::IROH_STATUS_OK,
                     op_id,
                     connection,
@@ -2787,46 +2922,6 @@ pub unsafe extern "C" fn iroh_stream_stopped(
             }
         }
     });
-
-    iroh_status_t::IROH_STATUS_OK as i32
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn iroh_endpoint_export_secret_key(
-    runtime: iroh_runtime_t,
-    endpoint: iroh_endpoint_t,
-    out_buf: *mut u8,
-    capacity: usize,
-    out_len: *mut usize,
-) -> i32 {
-    if out_len.is_null() {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
-    }
-
-    let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return s as i32,
-    };
-
-    let ep_arc = match bridge.endpoints.get(endpoint) {
-        Some(e) => e,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
-    };
-
-    let key = ep_arc.export_secret_key();
-    let len = key.len();
-
-    *out_len = len;
-
-    if capacity < len {
-        return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
-    }
-
-    if !out_buf.is_null() && len > 0 {
-        unsafe {
-            ptr::copy_nonoverlapping(key.as_ptr(), out_buf, len);
-        }
-    }
 
     iroh_status_t::IROH_STATUS_OK as i32
 }
@@ -6118,4 +6213,263 @@ fn sort_json_value(value: &serde_json::Value) -> serde_json::Value {
         Value::Array(arr) => Value::Array(arr.iter().map(sort_json_value).collect()),
         other => other.clone(),
     }
+}
+
+// ─── Public Soak Test API ───────────────────────────────────────────────
+
+/// Run the soak test for the specified duration in seconds.
+///
+/// This is exposed publicly so the `soak_test_runner` binary can invoke it
+/// without duplicating the test logic.
+pub fn run_soak_test(duration_secs: u64) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    // ─── Metrics ────────────────────────────────────────────────────────────
+    struct SoakMetrics {
+        cycles_completed: AtomicUsize,
+        ops_submitted: AtomicUsize,
+        ops_completed: AtomicUsize,
+        ops_cancelled: AtomicUsize,
+        ops_errored: AtomicUsize,
+        max_pending_ops: AtomicUsize,
+        current_pending_ops: AtomicUsize,
+    }
+
+    impl SoakMetrics {
+        fn new() -> Self {
+            Self {
+                cycles_completed: AtomicUsize::new(0),
+                ops_submitted: AtomicUsize::new(0),
+                ops_completed: AtomicUsize::new(0),
+                ops_cancelled: AtomicUsize::new(0),
+                ops_errored: AtomicUsize::new(0),
+                max_pending_ops: AtomicUsize::new(0),
+                current_pending_ops: AtomicUsize::new(0),
+            }
+        }
+
+        fn record_submit(&self) {
+            self.ops_submitted.fetch_add(1, Ordering::Relaxed);
+            let pending = self.current_pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
+            loop {
+                let current_max = self.max_pending_ops.load(Ordering::Relaxed);
+                if pending <= current_max {
+                    break;
+                }
+                if self
+                    .max_pending_ops
+                    .compare_exchange(current_max, pending, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+
+        fn record_complete(&self) {
+            self.ops_completed.fetch_add(1, Ordering::Relaxed);
+            self.current_pending_ops.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        fn record_error(&self) {
+            self.ops_errored.fetch_add(1, Ordering::Relaxed);
+            self.current_pending_ops.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        fn record_cycle(&self) {
+            self.cycles_completed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    fn rand_u8() -> u8 {
+        let nanos = std::time::Instant::now().elapsed().as_nanos();
+        nanos as u8
+    }
+
+    fn drain_all_events(runtime: iroh_runtime_t) {
+        loop {
+            let mut events = unsafe { [std::mem::zeroed::<iroh_event_t>(); 16] };
+            let count = unsafe { iroh_poll_events(runtime, events.as_mut_ptr(), 16, 0) };
+            if count == 0 {
+                break;
+            }
+        }
+    }
+
+    fn poll_for_event(runtime: iroh_runtime_t, kind: iroh_event_kind_t, timeout_ms: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        loop {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let mut events = unsafe { [std::mem::zeroed::<iroh_event_t>(); 4] };
+            let count = unsafe { iroh_poll_events(runtime, events.as_mut_ptr(), 4, 50) };
+            for ev in events.iter().take(count) {
+                if ev.kind == kind as u32 {
+                    return true;
+                }
+            }
+        }
+    }
+
+    fn run_soak_cycle(runtime: iroh_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
+        drain_all_events(runtime);
+
+        let alpns = [b"aster".as_ptr()];
+        let alpn_lens = [5];
+
+        let mut node_op: iroh_operation_t = 0;
+        let status = unsafe {
+            iroh_node_memory_with_alpns(
+                runtime,
+                alpns.as_ptr(),
+                alpn_lens.as_ptr(),
+                1,
+                0,
+                &mut node_op,
+            )
+        };
+        if status != iroh_status_t::IROH_STATUS_OK as i32 {
+            return false;
+        }
+
+        let node_created =
+            poll_for_event(runtime, iroh_event_kind_t::IROH_EVENT_NODE_CREATED, 2000);
+        if !node_created {
+            return false;
+        }
+
+        let mut accept_op: iroh_operation_t = 0;
+        let status = unsafe { iroh_node_accept_aster(runtime, 1, 0, &mut accept_op) };
+        if status != iroh_status_t::IROH_STATUS_OK as i32 {
+            return false;
+        }
+        metrics.record_submit();
+
+        let should_cancel = rand_u8() < 25;
+        if should_cancel {
+            std::thread::sleep(Duration::from_millis(5));
+            let _ = unsafe { iroh_operation_cancel(runtime, accept_op) };
+        }
+
+        loop {
+            let mut events = unsafe { [std::mem::zeroed::<iroh_event_t>(); 8] };
+            let count = unsafe { iroh_poll_events(runtime, events.as_mut_ptr(), 8, 100) };
+            if count == 0 {
+                break;
+            }
+            for ev in events.iter().take(count).copied() {
+                if ev.operation == accept_op {
+                    if ev.status == iroh_status_t::IROH_STATUS_OK as u32 {
+                        metrics.record_complete();
+                    } else {
+                        metrics.record_error();
+                    }
+                }
+            }
+        }
+
+        let mut close_op: iroh_operation_t = 0;
+        let status = unsafe { iroh_node_close(runtime, 1, 0, &mut close_op) };
+        if status == iroh_status_t::IROH_STATUS_OK as i32 {
+            let _closed = poll_for_event(runtime, iroh_event_kind_t::IROH_EVENT_CLOSED, 2000);
+        }
+
+        metrics.record_cycle();
+        true
+    }
+
+    // ─── Main ────────────────────────────────────────────────────────────────
+
+    println!(
+        "Starting soak test for {} seconds ({} hours)",
+        duration_secs,
+        duration_secs / 3600
+    );
+    println!("Churn pattern: node_create → accept → cancel/close → node_close (10% cancel rate)");
+    println!();
+
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(duration_secs);
+
+    let mut runtime: iroh_runtime_t = 0;
+    let status = unsafe { iroh_runtime_new(std::ptr::null(), &mut runtime) };
+    assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+    let metrics = Arc::new(SoakMetrics::new());
+    let mut cycle_count = 0usize;
+    let print_interval = 100;
+
+    while Instant::now() < deadline {
+        let cycle_start = Instant::now();
+
+        let success = run_soak_cycle(runtime, &metrics);
+
+        let _cycle_duration = cycle_start.elapsed();
+        cycle_count += 1;
+
+        if cycle_count.is_multiple_of(print_interval) || !success {
+            let elapsed = start.elapsed();
+            let ops_sub = metrics.ops_submitted.load(Ordering::Relaxed);
+            let ops_comp = metrics.ops_completed.load(Ordering::Relaxed);
+            let ops_cancel = metrics.ops_cancelled.load(Ordering::Relaxed);
+            let ops_err = metrics.ops_errored.load(Ordering::Relaxed);
+            let max_pending = metrics.max_pending_ops.load(Ordering::Relaxed);
+            let current_pending = metrics.current_pending_ops.load(Ordering::Relaxed);
+
+            println!(
+                "[{:?}] cycle {} — submitted={}, completed={}, cancelled={}, errored={}, max_pending={}, current_pending={}",
+                elapsed,
+                cycle_count,
+                ops_sub,
+                ops_comp,
+                ops_cancel,
+                ops_err,
+                max_pending,
+                current_pending
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let elapsed = start.elapsed();
+
+    let ops_sub = metrics.ops_submitted.load(Ordering::Relaxed);
+    let ops_comp = metrics.ops_completed.load(Ordering::Relaxed);
+    let ops_cancel = metrics.ops_cancelled.load(Ordering::Relaxed);
+    let ops_err = metrics.ops_errored.load(Ordering::Relaxed);
+    let max_pending = metrics.max_pending_ops.load(Ordering::Relaxed);
+    let final_pending = metrics.current_pending_ops.load(Ordering::Relaxed);
+
+    println!();
+    println!("=== Soak Test Results ===");
+    println!("Duration: {:?}", elapsed);
+    println!("Cycles: {}", cycle_count);
+    println!("Ops submitted: {}", ops_sub);
+    println!("Ops completed: {}", ops_comp);
+    println!("Ops cancelled: {}", ops_cancel);
+    println!("Ops errored: {}", ops_err);
+    println!("Max pending ops: {}", max_pending);
+    println!("Final pending ops: {}", final_pending);
+    println!();
+
+    assert_eq!(
+        final_pending, 0,
+        "Final pending ops should be 0 (leaked ops detected)"
+    );
+    assert!(
+        max_pending < 100,
+        "Max pending ops should be bounded (was {})",
+        max_pending
+    );
+
+    let status = unsafe { iroh_runtime_close(runtime) };
+    assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+
+    println!("Soak test PASSED — no leaks detected");
 }
