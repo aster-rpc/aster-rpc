@@ -46,6 +46,8 @@ const RPC_ALPN = 'aster/1';
  * error enumerates the common causes as a hint to the user rather than a
  * precise diagnosis. Its `message` is a multi-line actionable hint suitable
  * for direct CLI output.
+ *
+ * @group Server and Client
  */
 export class AdmissionDeniedError extends Error {
   readonly hadCredential: boolean;
@@ -98,7 +100,10 @@ export class AdmissionDeniedError extends Error {
 
 // ── AsterServer ──────────────────────────────────────────────────────────────
 
-/** Options for AsterServer. */
+/**
+ * Options for AsterServer.
+ * @group Server and Client
+ */
 export interface AsterServerOptions {
   services: object[];
   config?: Partial<AsterConfig>;
@@ -126,6 +131,8 @@ export interface AsterServerOptions {
  * console.log(server.address);
  * await server.serve();
  * ```
+ *
+ * @group Server and Client
  */
 export class AsterServer {
   readonly registry: ServiceRegistry;
@@ -856,7 +863,10 @@ export class AsterServer {
 
 // ── AsterClient ──────────────────────────────────────────────────────────────
 
-/** Options for AsterClient. */
+/**
+ * Options for AsterClientWrapper.
+ * @group Server and Client
+ */
 export interface AsterClientOptions {
   /** Connection address (aster1... ticket, base64 NodeAddr, or hex EndpointId). */
   address?: string;
@@ -973,6 +983,8 @@ function loadEnrollmentCredential(filePath: string): ConsumerEnrollmentCredentia
  *
  * Wraps connection setup, admission, and client stub creation.
  * Supports reconnection with exponential backoff.
+ *
+ * @group Server and Client
  */
 export class AsterClientWrapper {
   private transport!: AsterTransport;
@@ -1251,6 +1263,8 @@ export class AsterClientWrapper {
  * await ch.send({ command: "ls" });
  * for await (const r of ch) { ... }
  * ```
+ *
+ * @group Server and Client
  */
 export class ProxyClient {
   constructor(

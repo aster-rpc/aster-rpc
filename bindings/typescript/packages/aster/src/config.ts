@@ -7,7 +7,10 @@
  * 3. Environment variables (ASTER_* prefix, always win)
  */
 
-/** Aster configuration. */
+/**
+ * Aster configuration.
+ * @group Server and Client
+ */
 export interface AsterConfig {
   // Trust
   rootPubkey?: Uint8Array;

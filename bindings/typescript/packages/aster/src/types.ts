@@ -2,7 +2,10 @@
  * Shared types and enums for the Aster RPC framework.
  */
 
-/** Serialization mode for Fory codec. */
+/**
+ * Serialization mode for Fory codec.
+ * @group Serialization
+ */
 export const SerializationMode = {
   /** Cross-language (Fory XLANG). Default and recommended. */
   XLANG: 0,
@@ -43,7 +46,10 @@ export const RpcScope = {
 
 export type RpcScope = (typeof RpcScope)[keyof typeof RpcScope];
 
-/** Exponential backoff configuration. */
+/**
+ * Exponential backoff configuration.
+ * @group Serialization
+ */
 export interface ExponentialBackoff {
   initialMs: number;
   maxMs: number;
@@ -59,7 +65,10 @@ export const DEFAULT_BACKOFF: ExponentialBackoff = {
   jitter: 0.1,
 };
 
-/** Retry policy configuration. */
+/**
+ * Retry policy configuration.
+ * @group Serialization
+ */
 export interface RetryPolicy {
   maxAttempts: number;
   backoff: ExponentialBackoff;

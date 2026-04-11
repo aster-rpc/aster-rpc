@@ -209,7 +209,10 @@ export const WIRE_TYPE_KEY = Symbol.for('aster.wire_type');
 /** Metadata key for wire type field metadata. */
 export const WIRE_TYPE_FIELDS_KEY = Symbol.for('aster.wire_type_fields');
 
-/** Options for @WireType decorator. */
+/**
+ * Options for the `WireType` decorator.
+ * @group Decorators
+ */
 export interface WireTypeOptions {
   /** Field-level metadata (field name -> Metadata). */
   metadata?: Record<string, Metadata>;
