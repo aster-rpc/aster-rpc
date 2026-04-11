@@ -444,6 +444,14 @@ iroh_status_t iroh_endpoint_id(
     uint64_t endpoint,
     uint8_t* out_buf, size_t capacity, size_t* out_len
 );
+// Returns the 32-byte secret key seed for an endpoint.
+// Stores the seed in BridgeRuntime.endpoint_secret_keys at iroh_endpoint_create time.
+iroh_status_t iroh_endpoint_export_secret_key(
+    iroh_runtime_t runtime,
+    uint64_t endpoint,
+    uint8_t* out_buf, size_t capacity, size_t* out_len
+);
+// Status codes: NOT_FOUND if endpoint doesn't exist or has no stored key.
 iroh_status_t iroh_endpoint_addr_info(
     iroh_runtime_t runtime,
     uint64_t endpoint,
@@ -748,7 +756,7 @@ typedef struct iroh_endpoint_config_s {
     uint32_t portmapper_config;       // 0=enabled (default), 1=disabled
     iroh_bytes_t proxy_url;           // HTTP/SOCKS proxy URL string; empty=none
     uint32_t proxy_from_env;          // 1=read HTTP_PROXY/HTTPS_PROXY from env
-    uint32_t reserved;
+    iroh_bytes_t data_dir_utf8;        // Node data directory; empty=no persistent state
 } iroh_endpoint_config_t;
 
 typedef struct iroh_connect_config_s {

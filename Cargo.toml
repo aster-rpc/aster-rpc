@@ -1,6 +1,6 @@
 [workspace]
 members = ["core", "ffi", "bindings/python/rust", "bindings/typescript/native"]
-exclude = ["core/fuzz"]
+exclude = ["core/fuzz", "ffi/fuzz"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -25,4 +25,3 @@ anyhow      = "1"
 futures-lite = "2"
 once_cell = "1"
 libc = "0.2"
-rand = "0.10.0"

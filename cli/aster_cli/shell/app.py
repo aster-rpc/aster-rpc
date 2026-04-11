@@ -1988,6 +1988,14 @@ async def _run_shell(
         cwd = "/"
     _last_ctrl_c = 0.0  # timestamp of last Ctrl+C for double-tap exit
 
+    # Detect non-interactive (piped) mode and switch to a plain-stdin
+    # reader. prompt_toolkit's PromptSession assumes a real terminal: when
+    # stdin/stdout are pipes it falls back to a degraded renderer that
+    # echoes prompts twice and emits cursor-positioning ANSI escapes that
+    # mangle the output. This is the duplicated/garbled "non-interactive
+    # mode" failure mode QA agents kept hitting.
+    is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
+
     # Command context (mutable -- cwd updates)
     ctx = CommandContext(
         vfs_cwd=cwd,
@@ -1995,32 +2003,47 @@ async def _run_shell(
         connection=connection,
         display=display,
         peer_name=peer_name,
-        interactive=True,
+        interactive=is_interactive,
         raw_output=raw,
         guide=guide,
     )
 
-    # History
+    # History (only used in interactive mode -- non-interactive runs are
+    # one-shot and don't benefit from a shared command history)
     history_dir = Path.home() / ".aster"
     history_dir.mkdir(exist_ok=True)
-    history = FileHistory(str(history_dir / "shell_history"))
 
-    # Completer
-    completer = ShellCompleter(get_context=lambda: ctx)
+    # Read-line abstraction: pick the implementation up-front so the REPL
+    # body stays the same shape in both modes.
+    read_line: "callable[[], asyncio.Future[str]]"
+    if is_interactive:
+        history = FileHistory(str(history_dir / "shell_history"))
+        completer = ShellCompleter(get_context=lambda: ctx)
+        session: PromptSession = PromptSession(
+            history=history,
+            completer=completer,
+            style=SHELL_STYLE,
+            complete_while_typing=True,
+        )
 
-    # Prompt session
-    session: PromptSession = PromptSession(
-        history=history,
-        completer=completer,
-        style=SHELL_STYLE,
-        complete_while_typing=True,
-    )
+        async def read_line() -> str:  # type: ignore[no-redef]
+            prompt = _make_prompt(peer_name, ctx.vfs_cwd)
+            return await session.prompt_async(prompt)
+    else:
+        # Plain stdin reader. No prompt rendering, no completer, no
+        # history. asyncio.to_thread keeps the event loop responsive
+        # while we're blocked on stdin so background tasks (manifest
+        # fetch, etc.) keep running.
+        async def read_line() -> str:  # type: ignore[no-redef]
+            line = await asyncio.to_thread(sys.stdin.readline)
+            if not line:
+                raise EOFError()
+            return line.rstrip("\r\n")
 
     # REPL loop
     while True:
         try:
-            prompt = _make_prompt(peer_name, ctx.vfs_cwd)
-            text = await session.prompt_async(prompt)
+            text = await read_line()
             text = text.strip()
             _last_ctrl_c = 0.0  # reset on successful input
 

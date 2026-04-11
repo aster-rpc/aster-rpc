@@ -79,6 +79,8 @@ pub struct CoreEndpointConfig {
     pub proxy_url: Option<String>,
     /// Read proxy URL from HTTP_PROXY / HTTPS_PROXY environment variables
     pub proxy_from_env: bool,
+    /// Node data directory for persistent state; empty = no persistent state
+    pub data_dir: Option<String>,
 }
 
 impl Default for CoreEndpointConfig {
@@ -98,6 +100,7 @@ impl Default for CoreEndpointConfig {
             portmapper_config: None,
             proxy_url: None,
             proxy_from_env: false,
+            data_dir: None,
         }
     }
 }
