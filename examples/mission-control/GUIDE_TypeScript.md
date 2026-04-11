@@ -532,16 +532,24 @@ complex cases compose with `anyOf` / `allOf`:
 @Service({ name: "MissionControl", version: 1 })
 class MissionControl {
 
-    @Rpc({ requires: Role.STATUS })
+    @Rpc({ request: StatusRequest, response: StatusResponse, requires: Role.STATUS })
     async getStatus(req: StatusRequest): Promise<StatusResponse> { ... }
 
-    @ServerStream({ requires: anyOf(Role.LOGS, Role.ADMIN) })
+    @ServerStream({
+        request: TailRequest,
+        response: LogEntry,
+        requires: anyOf(Role.LOGS, Role.ADMIN),
+    })
     async *tailLogs(req: TailRequest): AsyncGenerator<LogEntry> {
         /** Log access for log viewers OR admins — either role works. */
         ...
     }
 
-    @ClientStream({ requires: Role.INGEST })
+    @ClientStream({
+        request: MetricPoint,
+        response: IngestResult,
+        requires: Role.INGEST,
+    })
     async ingestMetrics(stream: AsyncIterable<MetricPoint>): Promise<IngestResult> {
         /** Agents push metrics — scoped to the ingest role. */
         ...
@@ -551,16 +559,26 @@ class MissionControl {
 @Service({ name: "AgentSession", version: 1, scoped: "session" })
 class AgentSession {
 
-    @Rpc({ requires: Role.INGEST })
+    @Rpc({ request: Heartbeat, response: Assignment, requires: Role.INGEST })
     async register(hb: Heartbeat): Promise<Assignment> { ... }
 
-    @BidiStream({ requires: Role.ADMIN })
+    @BidiStream({
+        request: Command,
+        response: CommandResult,
+        requires: Role.ADMIN,
+    })
     async *runCommand(commands: AsyncIterable<Command>): AsyncGenerator<CommandResult> {
         /** Command execution is admin-only. */
         ...
     }
 }
 ```
+
+> **Reminder:** every `@Rpc` / `@ServerStream` / `@ClientStream` /
+> `@BidiStream` needs the explicit `request:` and `response:` constructors
+> alongside `requires:`. Missing them will fire a warning at server start
+> and the published manifest will have empty fields, breaking gen-client
+> for cross-language consumers.
 
 ### Step 3: Start the control plane with auth
 
@@ -790,6 +808,27 @@ matter.
 **Goal:** Your teammate wants to send metrics from their Python
 application. They don't have your TypeScript source — just the ticket.
 
+> **Who owns the contract?** The producer — in this case, your
+> TypeScript service. Field names on the wire are whatever the
+> **producer** defines them as. This Mission Control was written in
+> TypeScript with camelCase fields, so the wire is `agentId`,
+> `uptimeSecs`, `taskId` regardless of what language the consumer is
+> written in.
+>
+> Aster's contract validation is **strict**: extra or misspelled
+> JSON fields are rejected at decode time with a `CONTRACT_VIOLATION`
+> status code, naming the offending field. There's no auto-rename or
+> camel/snake normalization to hide bugs. If your Python teammate
+> typos `agent_id` (Python's natural idiom) the server tells them so
+> immediately, on the same call.
+>
+> If they generate a typed client (`aster contract gen-client …
+> --lang python`), the codegen reads the producer's manifest and
+> emits Python dataclasses with the producer's field names. They use
+> them like any other dataclass — no thinking about wire format. If
+> they hand-roll JSON keys via the proxy client below, they have to
+> use the producer's field names directly.
+
 Generate a Python client the same way you generated the TypeScript one:
 
 ```bash
@@ -799,7 +838,9 @@ aster contract gen-client aster1Qm... --out ./generated --package mission_contro
 
 You can now `from generated.mission_control.services.mission_control_v1
 import MissionControlClient` and use the typed Python client just like the
-TS one. If you'd rather skip codegen, the proxy client works too:
+TS one. If you'd rather skip codegen, the proxy client works too — but
+your Python teammate will need to use the TS server's camelCase field
+names directly:
 
 ```python
 from aster import AsterClient
@@ -808,7 +849,10 @@ async def main():
     client = AsterClient(address="aster1Qm...")
     await client.connect()
 
-    # Proxy client — discovers methods from the contract
+    # Proxy client — discovers methods from the contract.
+    # NOTE: camelCase field names because the PRODUCER (this TS
+    # MissionControl) defines them that way. The wire format is the
+    # producer's contract; consumers use it as-is.
     mc = client.proxy("MissionControl")
     status = await mc.getStatus({"agentId": "py-worker-1"})
     print(f"Status: {status['agentId']} is {status['status']}")
