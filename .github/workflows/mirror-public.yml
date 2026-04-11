@@ -19,6 +19,24 @@ jobs:
           # would fall back to github-actions[bot] (403 on the target).
           persist-credentials: false
 
+      - name: Strip AI co-author trailers from history
+        env:
+          FILTER_BRANCH_SQUELCH_WARNING: "1"
+        run: |
+          # Rewrite every commit message on HEAD to drop
+          # `Co-Authored-By: *Claude*` trailers inserted by parallel
+          # agent sessions. Scoped to this ephemeral workspace only --
+          # the private repo (emrul/aster-rpc) history is not touched.
+          # Legitimate human Co-Authored-By lines are preserved.
+          #
+          # filter-branch is slow but ships with core git and has zero
+          # install cost. For a one-shot per-mirror rewrite it is fine.
+          git config user.name "Emrul Islam"
+          git config user.email "emrul@aster.dev"
+          git filter-branch --force --msg-filter \
+            'sed -e "/^[Cc]o-[Aa]uthored-[Bb]y:.*[Cc]laude/d"' \
+            HEAD
+
       - name: Filter internal files
         run: |
           # Remove files listed in .publicignore
