@@ -70,6 +70,32 @@ graph LR
 
 ---
 
+## Install
+
+Two packages -- the framework and the CLI:
+
+```bash
+uv pip install aster-rpc aster-cli
+# or:
+pip install aster-rpc aster-cli
+```
+
+The framework gives you `from aster import ...` for your service code.
+The CLI gives you `aster shell`, `aster trust keygen`, `aster enroll node`,
+and `aster contract gen-client` -- the operator tools you'll use throughout
+this guide.
+
+Verify:
+
+```bash
+aster --version
+```
+
+**Requirements:** Python 3.9 -- 3.13, macOS / Linux / Windows. The framework
+ships as pre-built wheels for the common platforms.
+
+---
+
 ## Chapter 1: Your First Agent Check-In (5 min)
 
 **Goal:** The full working version of what you just saw — define a service,

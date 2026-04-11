@@ -72,6 +72,34 @@ graph LR
 
 ---
 
+## Install
+
+Two pieces -- the TypeScript runtime and the CLI tools.
+
+```bash
+# In your TypeScript project:
+bun add @aster-rpc/aster
+# or: npm install @aster-rpc/aster
+
+# The CLI ships as a Python package and is shared across all language
+# bindings -- one shell, one trust manager, one contract generator,
+# usable against any Aster server regardless of language:
+uv tool install aster-cli
+# or: pip install aster-cli
+```
+
+Verify:
+
+```bash
+aster --version
+```
+
+**Requirements:** Node.js 20+ or Bun 1.0+ for the TypeScript runtime.
+Python 3.9 -- 3.13 for the CLI tools (it's a one-time install you can
+forget about; the day-to-day work is all in TypeScript).
+
+---
+
 ## Chapter 1: Your First Agent Check-In (5 min)
 
 **Goal:** The full working version of what you just saw — define a service,
