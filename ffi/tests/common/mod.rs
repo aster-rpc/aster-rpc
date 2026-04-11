@@ -48,6 +48,10 @@ pub fn empty_endpoint_config() -> aster_transport_ffi::iroh_endpoint_config_t {
             len: 0,
         },
         proxy_from_env: 0,
+        data_dir_utf8: aster_transport_ffi::iroh_bytes_t {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
     }
 }
 
