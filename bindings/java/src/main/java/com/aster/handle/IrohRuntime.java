@@ -79,11 +79,13 @@ public class IrohRuntime implements AutoCloseable {
                 ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
   }
 
-  long nativeHandle() {
+  /** Returns the native runtime handle for FFI calls. */
+  public long nativeHandle() {
     return handle;
   }
 
-  OperationRegistry registry() {
+  /** Returns the operation registry for registering async operation futures. */
+  public OperationRegistry registry() {
     return registry;
   }
 
@@ -108,6 +110,15 @@ public class IrohRuntime implements AutoCloseable {
     poller.addInboundHandler(handler);
   }
 
+  /**
+   * Remove an inbound handler.
+   *
+   * @param handler the handler to remove
+   */
+  public void removeInboundHandler(Consumer<IrohEvent> handler) {
+    poller.removeInboundHandler(handler);
+  }
+
   /** Returns the operation registry for direct use. */
   public OperationRegistry operations() {
     return registry;
@@ -121,7 +132,8 @@ public class IrohRuntime implements AutoCloseable {
    */
   public CompletableFuture<IrohEndpoint> endpointCreateAsync(EndpointConfig config) {
     var lib = IrohLibrary.getInstance();
-    var alloc = lib.allocator();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
 
     MemorySegment configSeg = config.toNative(alloc);
 

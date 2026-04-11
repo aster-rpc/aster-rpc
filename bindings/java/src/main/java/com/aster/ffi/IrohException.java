@@ -1,5 +1,8 @@
 package com.aster.ffi;
 
+import java.lang.foreign.Arena;
+import java.lang.foreign.ValueLayout;
+
 /** Top-level exception for all FFI-level errors. */
 public class IrohException extends RuntimeException {
   private final IrohStatus status;
@@ -29,5 +32,56 @@ public class IrohException extends RuntimeException {
 
   public int errorCode() {
     return errorCode;
+  }
+
+  /**
+   * Factory method that creates the most specific known {@link IrohException} subclass for the
+   * given status code. Falls back to {@link IrohException} if the status has no specific subclass.
+   *
+   * @param status the status code
+   * @param message the error message
+   * @return a typed exception
+   */
+  public static IrohException forStatus(IrohStatus status, String message) {
+    return switch (status) {
+      case NOT_FOUND -> new com.aster.exception.IrohNotFoundException(message);
+      case INVALID_ARGUMENT -> new com.aster.exception.IrohInvalidArgumentException(message);
+      case TIMEOUT -> new com.aster.exception.IrohTimeoutException(message);
+      case CANCELLED -> new com.aster.exception.IrohCancelledException(message);
+      case CONNECTION_REFUSED -> new com.aster.exception.IrohConnectionRefusedException(message);
+      case STREAM_RESET -> new com.aster.exception.IrohStreamResetException(message);
+      case BUFFER_TOO_SMALL -> new com.aster.exception.IrohBufferTooSmallException(message);
+      case ALREADY_CLOSED -> new com.aster.exception.IrohAlreadyClosedException(message);
+      default -> new IrohException(status, message);
+    };
+  }
+
+  /**
+   * Returns the full message including the native error detail from {@code
+   * iroh_last_error_message}. If no native error is available, returns just this exception's
+   * message.
+   */
+  public String getMessageWithNativeDetail() {
+    String nativeDetail = nativeErrorMessage();
+    if (nativeDetail == null || nativeDetail.isEmpty()) {
+      return getMessage();
+    }
+    return getMessage() + " — native: " + nativeDetail;
+  }
+
+  private static String nativeErrorMessage() {
+    try {
+      var lib = IrohLibrary.getInstance();
+      var arena = Arena.ofAuto();
+      var buf = arena.allocate(1024);
+      long len = lib.lastErrorMessage(buf, 1024);
+      if (len <= 0) {
+        return "";
+      }
+      byte[] bytes = buf.asSlice(0, len).toArray(ValueLayout.JAVA_BYTE);
+      return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+    } catch (Exception e) {
+      return "";
+    }
   }
 }

@@ -2,13 +2,14 @@ package com.aster.handle;
 
 import com.aster.ffi.*;
 import java.lang.foreign.*;
+import java.util.HexFormat;
 import java.util.concurrent.*;
 
 public class IrohConnection extends IrohHandle {
 
   private final IrohRuntime runtime;
 
-  IrohConnection(IrohRuntime runtime, long handle) {
+  public IrohConnection(IrohRuntime runtime, long handle) {
     super(handle);
     this.runtime = runtime;
   }
@@ -55,7 +56,8 @@ public class IrohConnection extends IrohHandle {
    */
   public CompletableFuture<IrohStream> openBiAsync() {
     var lib = IrohLibrary.getInstance();
-    var alloc = lib.allocator();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
     var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
     var openBi =
@@ -98,7 +100,8 @@ public class IrohConnection extends IrohHandle {
    */
   public CompletableFuture<IrohStream> acceptBiAsync() {
     var lib = IrohLibrary.getInstance();
-    var alloc = lib.allocator();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
     var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
     var acceptBi =
@@ -131,5 +134,204 @@ public class IrohConnection extends IrohHandle {
               }
               throw new IrohException("accept_bi failed: unexpected event " + event.kind());
             });
+  }
+
+  /**
+   * Get the remote peer's node ID as a hex string.
+   *
+   * @return the remote node ID as a hex string
+   */
+  public String remoteId() {
+    var lib = IrohLibrary.getInstance();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
+
+    // Node IDs are 32 bytes. Reserve extra capacity for hex encoding.
+    var bufSeg = alloc.allocate(64);
+    var lenSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+
+    try {
+      int status =
+          lib.connectionRemoteId(runtime.nativeHandle(), nativeHandle(), bufSeg, 64, lenSeg);
+      if (status != 0) {
+        throw new IrohException(
+            IrohStatus.fromCode(status), "iroh_connection_remote_id failed: " + status);
+      }
+    } catch (Throwable t) {
+      throw new IrohException("iroh_connection_remote_id threw: " + t.getMessage());
+    }
+
+    int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);
+    if (len == 0) {
+      return "";
+    }
+
+    byte[] bytes = bufSeg.asSlice(0, len).toArray(ValueLayout.JAVA_BYTE);
+    return HexFormat.of().formatHex(bytes);
+  }
+
+  /**
+   * Send a datagram on this connection.
+   *
+   * @param data the datagram payload
+   * @return a future that completes when the datagram has been sent
+   */
+  public CompletableFuture<Void> sendDatagramAsync(byte[] data) {
+    var lib = IrohLibrary.getInstance();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
+
+    // Build iroh_bytes_t for the data
+    MemorySegment dataSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    MemorySegment heapSeg = alloc.allocate(data.length);
+    heapSeg.copyFrom(MemorySegment.ofArray(data));
+    dataSeg.set(ValueLayout.ADDRESS, 0, heapSeg);
+    dataSeg.set(ValueLayout.JAVA_LONG, 8, (long) data.length);
+
+    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+
+    try {
+      int status = lib.connectionSendDatagram(runtime.nativeHandle(), nativeHandle(), dataSeg);
+      if (status != 0) {
+        throw new IrohException(
+            IrohStatus.fromCode(status), "iroh_connection_send_datagram failed: " + status);
+      }
+    } catch (IrohException e) {
+      return CompletableFuture.failedFuture(e);
+    } catch (Throwable t) {
+      return CompletableFuture.failedFuture(
+          new IrohException("iroh_connection_send_datagram threw: " + t.getMessage()));
+    }
+
+    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+    return runtime.registry().register(opId).thenApply(event -> null);
+  }
+
+  /**
+   * Read an incoming datagram on this connection.
+   *
+   * @return a future that completes with the received datagram
+   */
+  public CompletableFuture<Datagram> readDatagramAsync() {
+    var lib = IrohLibrary.getInstance();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
+    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+
+    try {
+      int status = lib.connectionReadDatagram(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
+      if (status != 0) {
+        throw new IrohException(
+            IrohStatus.fromCode(status), "iroh_connection_read_datagram failed: " + status);
+      }
+    } catch (IrohException e) {
+      return CompletableFuture.failedFuture(e);
+    } catch (Throwable t) {
+      return CompletableFuture.failedFuture(
+          new IrohException("iroh_connection_read_datagram threw: " + t.getMessage()));
+    }
+
+    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+    return runtime
+        .registry()
+        .register(opId)
+        .thenApply(
+            event -> {
+              if (event.kind() == IrohEventKind.DATAGRAM_RECEIVED) {
+                byte[] data = event.data().asByteBuffer().array();
+                return new Datagram(data);
+              }
+              throw new IrohException("readDatagram failed: unexpected event " + event.kind());
+            });
+  }
+
+  /**
+   * Get a future that completes when this connection is closed.
+   *
+   * @return a future that completes when the connection is closed
+   */
+  public CompletableFuture<Void> onClosedAsync() {
+    var lib = IrohLibrary.getInstance();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
+    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+
+    try {
+      int status = lib.connectionClosed(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
+      if (status != 0) {
+        throw new IrohException(
+            IrohStatus.fromCode(status), "iroh_connection_closed failed: " + status);
+      }
+    } catch (IrohException e) {
+      return CompletableFuture.failedFuture(e);
+    } catch (Throwable t) {
+      return CompletableFuture.failedFuture(
+          new IrohException("iroh_connection_closed threw: " + t.getMessage()));
+    }
+
+    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+    return runtime.registry().register(opId).thenApply(event -> null);
+  }
+
+  /**
+   * Get the maximum datagram size for this connection.
+   *
+   * @return the maximum datagram size in bytes, or empty if datagrams are not supported
+   */
+  public java.util.OptionalInt maxDatagramSize() {
+    var lib = IrohLibrary.getInstance();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
+
+    var sizeSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+    var isSomeSeg = alloc.allocate(ValueLayout.JAVA_INT);
+
+    try {
+      int status =
+          lib.connectionMaxDatagramSize(runtime.nativeHandle(), nativeHandle(), sizeSeg, isSomeSeg);
+      if (status != 0) {
+        throw new IrohException(
+            IrohStatus.fromCode(status), "iroh_connection_max_datagram_size failed: " + status);
+      }
+    } catch (Throwable t) {
+      throw new IrohException("iroh_connection_max_datagram_size threw: " + t.getMessage());
+    }
+
+    int isSome = isSomeSeg.get(ValueLayout.JAVA_INT, 0);
+    if (isSome == 0) {
+      return java.util.OptionalInt.empty();
+    }
+
+    long size = sizeSeg.get(ValueLayout.JAVA_LONG, 0);
+    return java.util.OptionalInt.of((int) size);
+  }
+
+  /**
+   * Get the available datagram send buffer space.
+   *
+   * @return the available buffer space in bytes
+   */
+  public int datagramBufferSpace() {
+    var lib = IrohLibrary.getInstance();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
+
+    var bytesSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+
+    try {
+      int status =
+          lib.connectionDatagramSendBufferSpace(runtime.nativeHandle(), nativeHandle(), bytesSeg);
+      if (status != 0) {
+        throw new IrohException(
+            IrohStatus.fromCode(status),
+            "iroh_connection_datagram_send_buffer_space failed: " + status);
+      }
+    } catch (Throwable t) {
+      throw new IrohException(
+          "iroh_connection_datagram_send_buffer_space threw: " + t.getMessage());
+    }
+
+    long bytes = bytesSeg.get(ValueLayout.JAVA_LONG, 0);
+    return (int) bytes;
   }
 }
