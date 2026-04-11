@@ -162,104 +162,61 @@ class IrohTransport(Transport):
     ) -> Any:
         """Perform a unary RPC call over Iroh QUIC.
 
-        Flow:
-        1. Open bidirectional stream
-        2. Write StreamHeader frame (HEADER flag)
-        3. Write request payload frame
-        4. Read response payload frame(s)
-        5. Read trailer frame (TRAILER flag)
+        Uses a single FFI crossing via core::unary_call -- the Rust side
+        handles open_bi, write, finish, and the read loop internally.
         """
-        send, recv = await self._conn.open_bi()
+        import struct as _struct
+
+        keys, values = _build_metadata(metadata)
+        header = StreamHeader(
+            service=service,
+            method=method,
+            version=1,
+            callId="",
+            deadlineEpochMs=deadline_epoch_ms,
+            serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
+            metadataKeys=keys,
+            metadataValues=values,
+        )
+
+        header_bytes = self._codec.encode(header)
+        payload, compressed = self._codec.encode_compressed(request)
+        req_flags = COMPRESSED if compressed else 0
+
+        header_frame = (
+            _struct.pack("<I", len(header_bytes) + 1)
+            + bytes([HEADER])
+            + header_bytes
+        )
+        request_frame = (
+            _struct.pack("<I", len(payload) + 1)
+            + bytes([req_flags])
+            + payload
+        )
 
         try:
-            # Build StreamHeader. callId is empty for shared streams -- the
-            # stream itself is the correlation. Server-side build_call_context
-            # generates its own UUID for tracing.
-            keys, values = _build_metadata(metadata)
-            header = StreamHeader(
-                service=service,
-                method=method,
-                version=1,
-                callId="",
-                deadlineEpochMs=deadline_epoch_ms,
-                serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
-                metadataKeys=keys,
-                metadataValues=values,
-            )
+            (
+                response_payload,
+                response_flags,
+                trailer_payload,
+                trailer_flags,
+            ) = await self._conn.unary_call(header_frame, request_frame)
+        except Exception as e:
+            raise _map_transport_exception(e) from e
 
-            header_bytes = self._codec.encode(header)
-            payload, compressed = self._codec.encode_compressed(request)
-            req_flags = COMPRESSED if compressed else 0
-
-            # Pack header frame + request frame into one buffer and write
-            # in a single PyO3 call. This saves an event-loop yield per call,
-            # which is significant on Python (asyncio scheduling is the
-            # dominant cost on the unary hot path).
-            import struct as _struct
-            buf = (
-                _struct.pack("<I", len(header_bytes) + 1)
-                + bytes([HEADER])
-                + header_bytes
-                + _struct.pack("<I", len(payload) + 1)
-                + bytes([req_flags])
-                + payload
-            )
-            await send.write_all(buf)
-            await send.finish()
-
-            # Read response frames
-            response_payload = None
-            while True:
-                frame = await read_frame(recv)
-                if frame is None:
-                    raise ConnectionLostError("stream ended before response")
-                payload, flags = frame
-                
-                if flags & TRAILER:
-                    # Trailer received - decode status
-                    status = self._codec.decode(payload, RpcStatus)
-                    if status.code != StatusCode.OK:
-                        # Use from_status so the raised exception is the
-                        # specific subclass for the code (e.g.
-                        # ContractViolationError) instead of a base
-                        # RpcError. Lets users catch by class.
-                        raise RpcError.from_status(
-                            StatusCode(status.code),
-                            status.message,
-                            dict(zip(status.detailKeys, status.detailValues)),
-                        )
-                    break
-                
-                # Data frame - should be the response
-                if response_payload is not None:
-                    raise TransportError("received multiple response frames for unary RPC")
-                
-                compressed = bool(flags & COMPRESSED)
-                response_payload = self._codec.decode_compressed(
-                    payload, compressed
+        if trailer_flags & TRAILER:
+            status = self._codec.decode(trailer_payload, RpcStatus)
+            if status.code != StatusCode.OK:
+                raise RpcError.from_status(
+                    StatusCode(status.code),
+                    status.message,
+                    dict(zip(status.detailKeys, status.detailValues)),
                 )
 
-            return response_payload
-
-        except RpcError:
-            try:
-                recv.stop(1)
-            except Exception:
-                pass
-            raise
-        except Exception as e:
-            # Ensure stream is stopped on error
-            try:
-                recv.stop(1)
-            except Exception:
-                pass
-            raise _map_transport_exception(e) from e
-        finally:
-            # Close send side (if not already closed by finish())
-            try:
-                await send.finish()
-            except Exception:
-                pass
+        resp_compressed = bool(response_flags & COMPRESSED)
+        return self._codec.decode_compressed(
+            response_payload, resp_compressed
+        )
 
     # ── Server Streaming ───────────────────────────────────────────────────
 
