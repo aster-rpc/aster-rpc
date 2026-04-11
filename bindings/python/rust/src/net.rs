@@ -3,6 +3,8 @@
 //! Phase 2: Now wraps aster_transport_core types instead of iroh types directly.
 //! Phase 1b surfaces: max_datagram_size, datagram_send_buffer_space, connection_info.
 
+use std::sync::Arc;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::tokio::future_into_py;
@@ -986,6 +988,111 @@ fn session_unary_call<'py>(
 }
 
 // ============================================================================
+// Server Reactor
+// ============================================================================
+
+use std::sync::Mutex as StdMutex;
+
+#[pyclass]
+pub struct ReactorResponseSender {
+    inner: StdMutex<
+        Option<tokio::sync::oneshot::Sender<aster_transport_core::reactor::OutgoingResponse>>,
+    >,
+}
+
+#[pymethods]
+impl ReactorResponseSender {
+    fn submit(&self, response_frame: Vec<u8>, trailer_frame: Vec<u8>) -> PyResult<()> {
+        let sender = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("lock poisoned"))?
+            .take()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("response already submitted")
+            })?;
+        let _ = sender.send(aster_transport_core::reactor::OutgoingResponse {
+            response_frame,
+            trailer_frame,
+        });
+        Ok(())
+    }
+}
+
+#[pyclass]
+pub struct ReactorHandle {
+    inner: Arc<tokio::sync::Mutex<aster_transport_core::reactor::ReactorHandle>>,
+}
+
+#[pymethods]
+impl ReactorHandle {
+    fn next_call<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = handle.lock().await;
+            match guard.next_call().await {
+                Some(call) => {
+                    let sender = ReactorResponseSender {
+                        inner: StdMutex::new(Some(call.response_sender)),
+                    };
+                    Ok(Some((
+                        call.call_id,
+                        PyBytesResult(call.header_payload),
+                        call.header_flags,
+                        PyBytesResult(call.request_payload),
+                        call.request_flags,
+                        call.peer_id,
+                        call.is_session_call,
+                        sender,
+                    )))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+}
+
+#[pyclass]
+pub struct ReactorFeeder {
+    inner: aster_transport_core::reactor::ReactorFeeder,
+}
+
+#[pymethods]
+impl ReactorFeeder {
+    fn feed(&self, conn: &IrohConnection) {
+        self.inner.feed(conn.inner.clone());
+    }
+}
+
+#[pyfunction]
+fn start_reactor(node: &crate::node::IrohNode, channel_capacity: usize) -> ReactorHandle {
+    crate::ensure_tokio_runtime();
+    let rt_handle = pyo3_async_runtimes::tokio::get_runtime().handle().clone();
+    let core_handle = aster_transport_core::reactor::start_reactor_on(
+        &rt_handle,
+        node.inner().clone(),
+        channel_capacity,
+    );
+    ReactorHandle {
+        inner: Arc::new(tokio::sync::Mutex::new(core_handle)),
+    }
+}
+
+#[pyfunction]
+fn create_reactor(channel_capacity: usize) -> (ReactorHandle, ReactorFeeder) {
+    crate::ensure_tokio_runtime();
+    let rt_handle = pyo3_async_runtimes::tokio::get_runtime().handle().clone();
+    let (core_handle, core_feeder) =
+        aster_transport_core::reactor::create_reactor(&rt_handle, channel_capacity);
+    (
+        ReactorHandle {
+            inner: Arc::new(tokio::sync::Mutex::new(core_handle)),
+        },
+        ReactorFeeder { inner: core_feeder },
+    )
+}
+
+// ============================================================================
 // Module registration
 // ============================================================================
 
@@ -999,9 +1106,14 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IrohConnection>()?;
     m.add_class::<IrohSendStream>()?;
     m.add_class::<IrohRecvStream>()?;
+    m.add_class::<ReactorHandle>()?;
+    m.add_class::<ReactorResponseSender>()?;
+    m.add_class::<ReactorFeeder>()?;
     m.add_function(wrap_pyfunction!(net_client, m)?)?;
     m.add_function(wrap_pyfunction!(create_endpoint, m)?)?;
     m.add_function(wrap_pyfunction!(create_endpoint_with_config, m)?)?;
     m.add_function(wrap_pyfunction!(session_unary_call, m)?)?;
+    m.add_function(wrap_pyfunction!(start_reactor, m)?)?;
+    m.add_function(wrap_pyfunction!(create_reactor, m)?)?;
     Ok(())
 }
