@@ -1163,16 +1163,51 @@ class SessionProxyClient:
 
     async def call(self, method: str, request: dict | None = None) -> dict | Any:
         """Call a unary method on this session."""
+        import struct as _struct
+
         async with self._lock:
             call_header = CallHeader(
                 method=method,
                 callId=str(uuid.uuid4()),
                 deadlineEpochMs=0,
             )
-            payload = self._codec.encode(call_header)
-            await write_frame(self._send, payload, flags=CALL)
-
+            ch_payload = self._codec.encode(call_header)
             req_payload = self._codec.encode(request or {})
+
+            call_header_frame = (
+                _struct.pack("<I", len(ch_payload) + 1)
+                + bytes([CALL])
+                + ch_payload
+            )
+            request_frame = (
+                _struct.pack("<I", len(req_payload) + 1)
+                + bytes([0])
+                + req_payload
+            )
+
+            # Use single-crossing session call if available (IrohStreams)
+            if hasattr(self._send, '__class__') and hasattr(self._recv, '__class__'):
+                try:
+                    from aster._aster import session_unary_call as _session_unary_call
+                    (
+                        resp_payload,
+                        resp_flags,
+                        trailer_payload,
+                        trailer_flags,
+                    ) = await _session_unary_call(
+                        self._send, self._recv,
+                        call_header_frame, request_frame,
+                    )
+                    if trailer_flags & TRAILER and trailer_payload:
+                        status = self._codec.decode(trailer_payload, RpcStatus)
+                        if status.code != StatusCode.OK:
+                            raise RpcError(StatusCode(status.code), status.message)
+                    return self._codec.decode(resp_payload)
+                except ImportError:
+                    pass
+
+            # Fallback: per-frame writes + reads
+            await write_frame(self._send, ch_payload, flags=CALL)
             await write_frame(self._send, req_payload, flags=0)
 
             frame = await read_frame(self._recv)

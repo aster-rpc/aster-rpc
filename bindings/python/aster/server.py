@@ -347,8 +347,13 @@ class Server:
         _stream_metrics = _gcm()
         _stream_metrics.stream_opened()
         try:
-            # Read the StreamHeader (first frame with HEADER flag)
-            frame = await read_frame(recv)
+            # Read the StreamHeader (first frame with HEADER flag).
+            # Use read_one_frame (single FFI crossing) if available,
+            # falling back to read_frame (2 crossings) for non-Iroh streams.
+            if hasattr(recv, 'read_one_frame'):
+                frame = await recv.read_one_frame()
+            else:
+                frame = await read_frame(recv)
             if frame is None:
                 logger.warning("Stream ended before header")
                 return
@@ -621,7 +626,10 @@ class Server:
         serialization_mode: int = 0,
     ) -> tuple[Any, int] | tuple[None, None]:
         while True:
-            frame = await read_frame(recv)
+            if hasattr(recv, 'read_one_frame'):
+                frame = await recv.read_one_frame()
+            else:
+                frame = await read_frame(recv)
             if frame is None:
                 return None, None
             payload, flags = frame
@@ -692,15 +700,28 @@ class Server:
                 return
             response = await apply_response_interceptors(interceptors, call_ctx, response)
 
-            # Encode and write response
+            # Encode response + trailer, write + finish in one FFI crossing
+            import struct as _struct
             response_payload, response_compressed = self._encode_response(response, header.serializationMode)
             response_flags = COMPRESSED if response_compressed else 0
-            await write_frame(send, response_payload, response_flags)
 
-            # Write trailer
-            await self._write_ok_trailer(send, header.serializationMode)
+            status = RpcStatus(code=StatusCode.OK, message="")
+            if header.serializationMode == SerializationMode.JSON.value:
+                trailer_payload = json_encode({"code": 0, "message": "", "detailKeys": [], "detailValues": []})
+            else:
+                trailer_payload = self._codec.encode(status)
 
-            await send.finish()
+            response_frame = (
+                _struct.pack("<I", len(response_payload) + 1)
+                + bytes([response_flags])
+                + response_payload
+            )
+            trailer_frame = (
+                _struct.pack("<I", len(trailer_payload) + 1)
+                + bytes([TRAILER])
+                + trailer_payload
+            )
+            await send.write_response(response_frame, trailer_frame)
 
         except asyncio.CancelledError:
             raise

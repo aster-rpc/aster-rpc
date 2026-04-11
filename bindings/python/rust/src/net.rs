@@ -438,6 +438,25 @@ impl IrohSendStream {
         })
     }
 
+    /// Write response frame + trailer frame and finish the stream in one
+    /// FFI crossing. For server-side unary dispatch.
+    fn write_response<'py>(
+        &self,
+        py: Python<'py>,
+        response_frame: Vec<u8>,
+        trailer_frame: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let stream = self.inner.clone();
+        future_into_py(py, async move {
+            let mut buf = Vec::with_capacity(response_frame.len() + trailer_frame.len());
+            buf.extend_from_slice(&response_frame);
+            buf.extend_from_slice(&trailer_frame);
+            stream.write_all(buf).await.map_err(err_to_py)?;
+            stream.finish().await.map_err(err_to_py)?;
+            Ok(())
+        })
+    }
+
     /// Signal that no more data will be written.
     fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let stream = self.inner.clone();
@@ -478,6 +497,83 @@ impl IrohRecvStream {
         future_into_py(py, async move {
             let chunk = stream.read(max_len).await.map_err(err_to_py)?;
             Ok(chunk.map(PyBytesResult))
+        })
+    }
+
+    /// Read header frame + request frame in one FFI crossing.
+    /// Returns (header_payload, header_flags, request_payload, request_flags).
+    /// For server-side unary dispatch.
+    fn read_request<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let stream = self.inner.clone();
+        future_into_py(py, async move {
+            use aster_transport_core::framing::FLAG_HEADER;
+
+            // Read header frame (read_exact for length, then body)
+            let header_bytes = stream.read_exact(4).await.map_err(err_to_py)?;
+            let frame_body_len = u32::from_le_bytes([
+                header_bytes[0],
+                header_bytes[1],
+                header_bytes[2],
+                header_bytes[3],
+            ]) as usize;
+            if frame_body_len == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err("zero-length frame"));
+            }
+            let body = stream.read_exact(frame_body_len).await.map_err(err_to_py)?;
+            let header_flags = body[0];
+            let header_payload = body[1..].to_vec();
+
+            if header_flags & FLAG_HEADER == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "first frame missing HEADER flag",
+                ));
+            }
+
+            // Read request frame
+            let len_bytes = stream.read_exact(4).await.map_err(err_to_py)?;
+            let frame_body_len =
+                u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]])
+                    as usize;
+            if frame_body_len == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err("zero-length frame"));
+            }
+            let body = stream.read_exact(frame_body_len).await.map_err(err_to_py)?;
+            let request_flags = body[0];
+            let request_payload = body[1..].to_vec();
+
+            Ok((
+                PyBytesResult(header_payload),
+                header_flags,
+                PyBytesResult(request_payload),
+                request_flags,
+            ))
+        })
+    }
+
+    /// Read one length-prefixed frame in a single FFI crossing.
+    /// Returns (payload, flags) or None if the stream ended.
+    fn read_one_frame<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let stream = self.inner.clone();
+        future_into_py(py, async move {
+            use aster_transport_core::framing::MAX_FRAME_SIZE;
+
+            let len_bytes = match stream.read_exact(4).await {
+                Ok(b) => b,
+                Err(_) => return Ok(None::<(PyBytesResult, u8)>),
+            };
+            let frame_body_len =
+                u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]])
+                    as usize;
+            if frame_body_len == 0 || frame_body_len > MAX_FRAME_SIZE as usize {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "invalid frame length: {}",
+                    frame_body_len
+                )));
+            }
+            let body = stream.read_exact(frame_body_len).await.map_err(err_to_py)?;
+            let flags = body[0];
+            let payload = body[1..].to_vec();
+            Ok(Some((PyBytesResult(payload), flags)))
         })
     }
 
@@ -551,6 +647,36 @@ impl IrohConnection {
         future_into_py(py, async move {
             let recv = conn.accept_uni().await.map_err(err_to_py)?;
             Ok(IrohRecvStream::from(recv))
+        })
+    }
+
+    // ========================================================================
+    // Transactional RPC (v0.3 — single FFI crossing per call)
+    // ========================================================================
+
+    /// Execute a complete unary RPC in one FFI crossing.
+    ///
+    /// Takes pre-encoded header and request frames (raw bytes from the
+    /// Python codec). Returns (response_payload, response_flags,
+    /// trailer_payload, trailer_flags) as raw bytes for Python to decode.
+    fn unary_call<'py>(
+        &self,
+        py: Python<'py>,
+        header_frame: Vec<u8>,
+        request_frame: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.inner.clone();
+        future_into_py(py, async move {
+            let result = conn
+                .unary_call(&header_frame, &request_frame)
+                .await
+                .map_err(err_to_py)?;
+            Ok((
+                PyBytesResult(result.response_payload),
+                result.response_flags,
+                PyBytesResult(result.trailer_payload),
+                result.trailer_flags,
+            ))
         })
     }
 
@@ -826,6 +952,40 @@ pub fn create_endpoint_with_config<'py>(
 }
 
 // ============================================================================
+// Session unary call (single FFI crossing for session-scoped calls)
+// ============================================================================
+
+/// Execute a unary call within a session on existing streams.
+/// One FFI crossing instead of 4.
+#[pyfunction]
+fn session_unary_call<'py>(
+    py: Python<'py>,
+    send: &IrohSendStream,
+    recv: &IrohRecvStream,
+    call_header_frame: Vec<u8>,
+    request_frame: Vec<u8>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let send_inner = send.inner.clone();
+    let recv_inner = recv.inner.clone();
+    future_into_py(py, async move {
+        let result = aster_transport_core::session_unary_call(
+            &send_inner,
+            &recv_inner,
+            &call_header_frame,
+            &request_frame,
+        )
+        .await
+        .map_err(err_to_py)?;
+        Ok((
+            PyBytesResult(result.response_payload),
+            result.response_flags,
+            PyBytesResult(result.trailer_payload),
+            result.trailer_flags,
+        ))
+    })
+}
+
+// ============================================================================
 // Module registration
 // ============================================================================
 
@@ -842,5 +1002,6 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(net_client, m)?)?;
     m.add_function(wrap_pyfunction!(create_endpoint, m)?)?;
     m.add_function(wrap_pyfunction!(create_endpoint_with_config, m)?)?;
+    m.add_function(wrap_pyfunction!(session_unary_call, m)?)?;
     Ok(())
 }

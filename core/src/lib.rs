@@ -1529,6 +1529,228 @@ impl CoreConnection {
             .map(|s| s.current_mtu)
             .unwrap_or(0)
     }
+
+    // ========================================================================
+    // Transactional RPC methods (v0.3 — collapse FFI crossings)
+    // ========================================================================
+
+    /// Execute a complete unary RPC in one async call. Collapses 8 FFI
+    /// crossings (open_bi, write_all, finish, read_exact×4, finish) into 1.
+    ///
+    /// The caller pre-encodes the header frame and request frame using
+    /// whatever codec the stream uses. Core treats them as opaque bytes,
+    /// handles the QUIC IO, and returns the raw response + trailer bytes
+    /// for the caller to decode.
+    pub async fn unary_call(
+        &self,
+        header_frame: &[u8],
+        request_frame: &[u8],
+    ) -> Result<UnaryCallResult> {
+        use crate::framing::{FLAG_TRAILER, MAX_FRAME_SIZE};
+
+        let (send, recv) = self.inner.open_bi().await?;
+        let mut send = send;
+        let mut recv = recv;
+
+        // Write header + request frames and finish send side
+        send.write_all(header_frame).await?;
+        send.write_all(request_frame).await?;
+        send.finish()?;
+
+        // Read frames until we get the trailer
+        let mut response_payload: Option<Vec<u8>> = None;
+        let mut response_flags: u8 = 0;
+
+        loop {
+            // Read 4-byte length prefix
+            let mut len_buf = [0u8; 4];
+            match recv.read_exact(&mut len_buf).await {
+                Ok(()) => {}
+                Err(e) => {
+                    if response_payload.is_some() {
+                        // Stream ended after response but before trailer —
+                        // some protocols omit trailer on success (session unary).
+                        // Return what we have with empty trailer.
+                        return Ok(UnaryCallResult {
+                            response_payload: response_payload.unwrap_or_default(),
+                            response_flags,
+                            trailer_payload: Vec::new(),
+                            trailer_flags: FLAG_TRAILER,
+                        });
+                    }
+                    return Err(anyhow!("stream ended before response: {}", e));
+                }
+            }
+
+            let frame_body_len = u32::from_le_bytes(len_buf) as usize;
+            if frame_body_len == 0 {
+                return Err(anyhow!("received zero-length frame"));
+            }
+            if frame_body_len > MAX_FRAME_SIZE as usize {
+                return Err(anyhow!(
+                    "frame size {} exceeds maximum {}",
+                    frame_body_len,
+                    MAX_FRAME_SIZE
+                ));
+            }
+
+            // Read flags + payload
+            let mut body = vec![0u8; frame_body_len];
+            recv.read_exact(&mut body).await?;
+
+            let flags = body[0];
+            let payload = body[1..].to_vec();
+
+            if flags & FLAG_TRAILER != 0 {
+                return Ok(UnaryCallResult {
+                    response_payload: response_payload.unwrap_or_default(),
+                    response_flags,
+                    trailer_payload: payload,
+                    trailer_flags: flags,
+                });
+            }
+
+            // Data frame — should be the response
+            if response_payload.is_some() {
+                return Err(anyhow!("received multiple data frames in unary call"));
+            }
+            response_payload = Some(payload);
+            response_flags = flags;
+        }
+    }
+
+    /// Read incoming request header + payload from an accepted stream.
+    /// Collapses 4 FFI crossings (read_exact×4) into 1.
+    ///
+    /// Returns the raw header bytes and request bytes for the caller to
+    /// decode with its codec.
+    pub async fn read_request(recv: &mut iroh::endpoint::RecvStream) -> Result<IncomingRequest> {
+        use crate::framing::FLAG_HEADER;
+
+        // Read header frame
+        let (header_payload, header_flags) = read_one_frame(recv).await?;
+        if header_flags & FLAG_HEADER == 0 {
+            return Err(anyhow!("first frame missing HEADER flag"));
+        }
+
+        // Read request frame
+        let (request_payload, request_flags) = read_one_frame(recv).await?;
+
+        Ok(IncomingRequest {
+            header_payload,
+            header_flags,
+            request_payload,
+            request_flags,
+        })
+    }
+
+    /// Write response + trailer and finish the send side.
+    /// Collapses 3 FFI crossings (write_all×2, finish) into 1.
+    pub async fn write_response(
+        send: &mut iroh::endpoint::SendStream,
+        response_frame: &[u8],
+        trailer_frame: &[u8],
+    ) -> Result<()> {
+        send.write_all(response_frame).await?;
+        send.write_all(trailer_frame).await?;
+        send.finish()?;
+        Ok(())
+    }
+}
+
+/// Execute a unary call within a session on existing streams. Writes
+/// call_header + request, reads response frame(s) + optional trailer.
+/// One FFI crossing instead of 4.
+pub async fn session_unary_call(
+    send: &CoreSendStream,
+    recv: &CoreRecvStream,
+    call_header_frame: &[u8],
+    request_frame: &[u8],
+) -> Result<UnaryCallResult> {
+    use crate::framing::{FLAG_TRAILER, MAX_FRAME_SIZE};
+
+    // Write call header + request in one write
+    let mut buf = Vec::with_capacity(call_header_frame.len() + request_frame.len());
+    buf.extend_from_slice(call_header_frame);
+    buf.extend_from_slice(request_frame);
+    send.write_all(buf).await?;
+
+    // Read one response frame. Per spec §4.6, session unary calls do NOT
+    // require a trailer on success — the response data frame alone is the
+    // complete reply. If the server sends a trailer instead (error case),
+    // we return it as the trailer.
+    let len_bytes = recv.read_exact(4).await?;
+    let frame_body_len =
+        u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+    if frame_body_len == 0 || frame_body_len > MAX_FRAME_SIZE as usize {
+        return Err(anyhow!("invalid frame length: {}", frame_body_len));
+    }
+
+    let body = recv.read_exact(frame_body_len).await?;
+    let flags = body[0];
+    let payload = body[1..].to_vec();
+
+    if flags & FLAG_TRAILER != 0 {
+        // Error case: server sent a trailer instead of a response
+        Ok(UnaryCallResult {
+            response_payload: Vec::new(),
+            response_flags: 0,
+            trailer_payload: payload,
+            trailer_flags: flags,
+        })
+    } else {
+        // Success: data frame is the response, no trailer expected
+        Ok(UnaryCallResult {
+            response_payload: payload,
+            response_flags: flags,
+            trailer_payload: Vec::new(),
+            trailer_flags: 0,
+        })
+    }
+}
+
+/// Result of a unary RPC call. All fields are raw bytes — the caller
+/// decodes them with its codec.
+pub struct UnaryCallResult {
+    pub response_payload: Vec<u8>,
+    pub response_flags: u8,
+    pub trailer_payload: Vec<u8>,
+    pub trailer_flags: u8,
+}
+
+/// An incoming request read from an accepted stream.
+pub struct IncomingRequest {
+    pub header_payload: Vec<u8>,
+    pub header_flags: u8,
+    pub request_payload: Vec<u8>,
+    pub request_flags: u8,
+}
+
+/// Read one length-prefixed frame from a recv stream.
+async fn read_one_frame(recv: &mut iroh::endpoint::RecvStream) -> Result<(Vec<u8>, u8)> {
+    use crate::framing::MAX_FRAME_SIZE;
+
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await?;
+
+    let frame_body_len = u32::from_le_bytes(len_buf) as usize;
+    if frame_body_len == 0 {
+        return Err(anyhow!("received zero-length frame"));
+    }
+    if frame_body_len > MAX_FRAME_SIZE as usize {
+        return Err(anyhow!(
+            "frame size {} exceeds maximum {}",
+            frame_body_len,
+            MAX_FRAME_SIZE
+        ));
+    }
+
+    let mut body = vec![0u8; frame_body_len];
+    recv.read_exact(&mut body).await?;
+
+    let flags = body[0];
+    let payload = body[1..].to_vec();
+    Ok((payload, flags))
 }
 
 // ============================================================================
