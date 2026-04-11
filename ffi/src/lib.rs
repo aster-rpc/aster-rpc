@@ -789,16 +789,27 @@ pub unsafe extern "C" fn iroh_runtime_new(
 
 #[no_mangle]
 pub unsafe extern "C" fn iroh_runtime_close(runtime: iroh_runtime_t) -> i32 {
-    match runtimes().lock() {
-        Ok(mut guard) => {
-            if guard.remove(&runtime).is_some() {
-                iroh_status_t::IROH_STATUS_OK as i32
-            } else {
-                iroh_status_t::IROH_STATUS_NOT_FOUND as i32
-            }
-        }
-        Err(_) => iroh_status_t::IROH_STATUS_INTERNAL as i32,
+    let arc = match runtimes().lock() {
+        Ok(mut guard) => match guard.remove(&runtime) {
+            Some(arc) => arc,
+            None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        },
+        Err(_) => return iroh_status_t::IROH_STATUS_INTERNAL as i32,
+    };
+
+    // Dropping BridgeRuntime drops the tokio Runtime, which panics if
+    // called from within an async context (e.g. .NET DisposeAsync,
+    // Java Cleaner thread). Detect this and move the drop to a plain
+    // OS thread where blocking is safe.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || drop(arc))
+            .join()
+            .expect("runtime shutdown thread panicked");
+    } else {
+        drop(arc);
     }
+
+    iroh_status_t::IROH_STATUS_OK as i32
 }
 
 // ============================================================================
