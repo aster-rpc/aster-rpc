@@ -123,7 +123,9 @@ public class IrohPollThread {
     // Non-terminal inbound events — dispatch to inbound handlers only.
     // These are identified by having a handle but no operation future (the operation
     // already completed; these are async notifications).
+    // SEND_COMPLETED is also inbound since it's tracked via pendingSends in IrohStream.
     if (event.kind() == IrohEventKind.FRAME_RECEIVED
+        || event.kind() == IrohEventKind.SEND_COMPLETED
         || event.kind() == IrohEventKind.HOOK_BEFORE_CONNECT
         || event.kind() == IrohEventKind.HOOK_AFTER_CONNECT) {
       for (Consumer<IrohEvent> handler : inboundHandlers) {

@@ -71,7 +71,8 @@ public class IrohConnection extends IrohHandle {
                 ValueLayout.ADDRESS));
 
     try {
-      int status = (int) openBi.invoke(nativeHandle(), 0L, opSeg);
+      // runtime, connection, user_data, out_operation
+      int status = (int) openBi.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
       if (status != 0) {
         throw new IrohException(IrohStatus.fromCode(status), "iroh_open_bi failed: " + status);
       }
@@ -115,7 +116,8 @@ public class IrohConnection extends IrohHandle {
                 ValueLayout.ADDRESS));
 
     try {
-      int status = (int) acceptBi.invoke(nativeHandle(), 0L, opSeg);
+      // runtime, connection, user_data, out_operation
+      int status = (int) acceptBi.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
       if (status != 0) {
         throw new IrohException(IrohStatus.fromCode(status), "iroh_accept_bi failed: " + status);
       }
