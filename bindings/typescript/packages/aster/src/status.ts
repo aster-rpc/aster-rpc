@@ -12,6 +12,8 @@
  * The 100+ space gives Aster room to mint more precise codes over
  * time, signalling clearly that they are intentionally separate
  * from the gRPC vocabulary.
+ *
+ * @group Errors
  */
 export const StatusCode = {
   // gRPC-mirrored codes (0-16)
@@ -65,7 +67,10 @@ export function statusName(code: StatusCode): string {
   return STATUS_NAMES[code] ?? `UNKNOWN(${code})`;
 }
 
-/** Base error class for Aster RPC errors. */
+/**
+ * Base error class for Aster RPC errors.
+ * @group Errors
+ */
 export class RpcError extends Error {
   readonly code: StatusCode;
   readonly details: Record<string, string>;
@@ -210,6 +215,8 @@ export class UnauthenticatedError extends RpcError {
  *
  * Carries the offending field names in `details.unexpected_fields`
  * (comma-separated, repr-sanitized).
+ *
+ * @group Errors
  */
 export class ContractViolationError extends RpcError {
   constructor(message = '', details?: Record<string, string>) {

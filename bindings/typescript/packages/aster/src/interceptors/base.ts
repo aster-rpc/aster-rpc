@@ -10,7 +10,10 @@
 import { RpcError, StatusCode } from '../status.js';
 import type { RpcPattern } from '../types.js';
 
-/** Context describing a single RPC invocation. */
+/**
+ * Context describing a single RPC invocation.
+ * @group Interceptors
+ */
 export class CallContext {
   service: string;
   method: string;
@@ -66,7 +69,10 @@ export class CallContext {
   }
 }
 
-/** Base interceptor interface. */
+/**
+ * Base interceptor interface.
+ * @group Interceptors
+ */
 export interface Interceptor {
   onRequest?(ctx: CallContext, request: unknown): Promise<unknown>;
   onResponse?(ctx: CallContext, response: unknown): Promise<unknown>;
