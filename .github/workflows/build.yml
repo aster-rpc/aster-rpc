@@ -177,14 +177,16 @@ jobs:
           path: dist
       - name: List artifacts
         run: ls -lh dist/
-      - name: Create release and upload wheels
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ github.ref_name }}" dist/* \
-            --repo "${{ github.repository }}" \
-            --title "${{ github.ref_name }}" \
-            --generate-notes
+      # softprops/action-gh-release is self-contained and does not depend
+      # on `gh` CLI being installed on the runner -- the self-hosted box
+      # does not have gh, so `gh release create` fails with exit 127.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
 
   # ── Publish to PyPI (tags only, trusted publishing) ────────────────
   pypi:
@@ -196,14 +198,13 @@ jobs:
     permissions:
       id-token: write
     steps:
+      # `pattern: wheels-*` already pulls the sdist (uploaded as
+      # `wheels-sdist` by the sdist job), so there is no separate
+      # `sdist` artifact to download. Only one download step needed.
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
           merge-multiple: true
-          path: dist
-      - uses: actions/download-artifact@v4
-        with:
-          name: sdist
           path: dist
       - name: List artifacts
         run: ls -lh dist/

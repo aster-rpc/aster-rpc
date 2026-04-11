@@ -85,14 +85,16 @@ jobs:
         with:
           name: aster-cli-dist
           path: dist
-      - name: Create release and upload artifacts
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ github.ref_name }}" dist/* \
-            --repo "${{ github.repository }}" \
-            --title "aster-cli ${{ needs.version.outputs.cli_version }}" \
-            --generate-notes
+      # softprops/action-gh-release is self-contained and does not depend
+      # on `gh` CLI being installed on the runner -- the self-hosted box
+      # does not have gh, so `gh release create` fails with exit 127.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: aster-cli ${{ needs.version.outputs.cli_version }}
+          generate_release_notes: true
+          files: dist/*
 
   # ── Publish to PyPI (cli-v* tags only, trusted publishing) ─────────
   pypi:
