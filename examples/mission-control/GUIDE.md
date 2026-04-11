@@ -707,15 +707,37 @@ Generated 5 files
 **Goal:** Your teammate wants to send metrics from their TypeScript
 application. They don't have your Python source — just the ticket.
 
-Generate a TypeScript client the same way:
+> **Who owns the contract?** The producer — in this case, your Python
+> service. Field names on the wire are whatever the **producer**
+> defines them as. This Mission Control was written in Python with
+> snake_case fields, so the wire is `agent_id`, `uptime_secs`,
+> `task_id` regardless of what language the consumer is written in.
+>
+> Aster's contract validation is **strict**: extra or misspelled
+> JSON fields are rejected at decode time with a `CONTRACT_VIOLATION`
+> status code, naming the offending field. There's no auto-rename or
+> camel/snake normalization to hide bugs. If you typo `agentid` the
+> server tells you so, on the same call.
+>
+> If you generate a typed client (`aster contract gen-client …
+> --lang typescript`), the codegen reads the producer's manifest and
+> emits TypeScript classes with the producer's field names. You just
+> use them like any other TS class — no thinking about wire format.
+> If you hand-roll JSON keys via the proxy client below, you have to
+> use the producer's field names directly.
+
+Generate a TypeScript client the same way you generated the Python one:
 
 ```bash
 # Generate TypeScript types + client from the running service
 aster contract gen-client aster1Qm... --out ./generated --package mission_control --lang typescript
 ```
 
-> **Note:** TypeScript client generation is coming soon. For now, the
-> proxy client works out of the box — no codegen needed:
+You can `import { MissionControlClient } from
+'./generated/mission_control/services/mission-control-v1.js'` and use
+the typed TS client just like the Python one. If you'd rather skip
+codegen, the proxy client works too — but you'll need to use the
+Python server's snake_case field names directly:
 
 ```typescript
 import { AsterClient } from '@aster-rpc/aster';
@@ -723,17 +745,20 @@ import { AsterClient } from '@aster-rpc/aster';
 const client = new AsterClient({ address: "aster1Qm..." });
 await client.connect();
 
-// Proxy client — discovers methods from the contract
+// Proxy client — discovers methods from the contract.
+// NOTE: snake_case field names because the PRODUCER (this Python
+// MissionControl) defines them that way. The wire format is the
+// producer's contract; consumers use it as-is.
 const mc = client.proxy("MissionControl");
-const status = await mc.getStatus({ agentId: "ts-worker-1" });
-console.log(`Status: ${status.agentId} is ${status.status}`);
+const status = await mc.getStatus({ agent_id: "ts-worker-1" }) as any;
+console.log(`Status: ${status.agent_id} is ${status.status}`);
 
 // Stream metrics from TypeScript to the Python control plane
 const result = await mc.ingestMetrics(async function*() {
   for (let i = 0; i < 1000; i++) {
     yield { name: "gpu.temp", value: 72 + Math.random() * 10 };
   }
-}());
+}()) as any;
 console.log(`Accepted: ${result.accepted}`);
 ```
 
@@ -743,8 +768,11 @@ console.log(`Accepted: ${result.accepted}`);
   stubs dynamically — full RPC, no codegen required
 - Same wire format, same contract hash — the Python producer and
   TypeScript consumer agree on the protocol without sharing a repo
-- When TypeScript codegen lands, `--lang typescript` will produce the
-  same typed client experience as Python
+- The producer defined `agent_id` (snake_case), so that's what the
+  consumer sends. If your TypeScript teammate prefers idiomatic
+  camelCase in their codebase, they can wrap the proxy client in a
+  thin adapter — or just use the generated typed client, which lets
+  them use the Python field names without it feeling un-TS-like
 
 > **"But there's no .proto file — how does TypeScript know what Python
 > sent?"** — The `@wire_type` decorator registers each type's schema in

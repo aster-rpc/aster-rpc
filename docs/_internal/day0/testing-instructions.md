@@ -198,7 +198,9 @@ cd services/AgentSession
 ## Chapter 6: Generating Typed Clients
 
 ```bash
-aster contract gen-client <address> --out ./clients --package mission_control
+# --lang is required (no default). Use python here -- the matching TS
+# command is in testing-instructions-typescript.md.
+aster contract gen-client <address> --out ./clients --package mission_control --lang python
 ```
 
 Then:

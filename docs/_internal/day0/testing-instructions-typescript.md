@@ -210,14 +210,17 @@ session AgentSession
 ## Chapter 6: Generating Typed Clients
 
 ```bash
-aster contract gen-client <address> --out ./clients --package mission_control
+# --lang is required (no default). Use typescript here.
+aster contract gen-client <address> --out ./clients --package mission_control --lang typescript
 ```
 
 Then:
 
 ```bash
+# NOTE: TS codegen emits kebab-case filenames -- mission-control-v1.js,
+# NOT mission_control_v1.js (snake_case is the Python codegen convention).
 bun -e "
-import { MissionControlClient } from './clients/mission_control/services/mission_control_v1.js';
+import { MissionControlClient } from './clients/mission_control/services/mission-control-v1.js';
 console.log('Import OK');
 "
 ```
