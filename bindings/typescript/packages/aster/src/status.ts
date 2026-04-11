@@ -2,11 +2,19 @@
  * Aster RPC status codes and error hierarchy.
  *
  * Spec reference: S6.5 (status codes).
- * Semantically identical to gRPC codes 0-16.
+ *
+ * Codes 0-16 mirror gRPC's google.rpc.Code semantically. Codes 100+
+ * are Aster-native and have no gRPC equivalent. The 17-99 range is
+ * reserved as a buffer in case gRPC ever extends its enum.
+ *
+ * A common gripe with gRPC's status codes is that there are too few
+ * to express the variety of failures real services actually hit.
+ * The 100+ space gives Aster room to mint more precise codes over
+ * time, signalling clearly that they are intentionally separate
+ * from the gRPC vocabulary.
  */
-
-/** Aster RPC status codes (gRPC-compatible, 0-16). */
 export const StatusCode = {
+  // gRPC-mirrored codes (0-16)
   OK: 0,
   CANCELLED: 1,
   UNKNOWN: 2,
@@ -24,6 +32,21 @@ export const StatusCode = {
   UNAVAILABLE: 14,
   DATA_LOSS: 15,
   UNAUTHENTICATED: 16,
+
+  // 17-99 reserved (gRPC extension buffer)
+
+  // Aster-native codes (100+)
+  /**
+   * The wire payload doesn't match the published contract: e.g. the
+   * JSON dict has fields the receiver's @WireType class doesn't
+   * declare, or vice versa. Distinct from INVALID_ARGUMENT because
+   * the violation is about data SHAPE, not value, and shape
+   * violations can occur at any nesting depth (a top-level
+   * INVALID_ARGUMENT label doesn't apply when the bad field is two
+   * objects deep). The producer owns the contract; consumers must
+   * use the field names defined by the producer's manifest.
+   */
+  CONTRACT_VIOLATION: 101,
 } as const;
 
 export type StatusCode = (typeof StatusCode)[keyof typeof StatusCode];
@@ -35,6 +58,7 @@ const STATUS_NAMES: Record<number, string> = {
   7: 'PERMISSION_DENIED', 8: 'RESOURCE_EXHAUSTED', 9: 'FAILED_PRECONDITION',
   10: 'ABORTED', 11: 'OUT_OF_RANGE', 12: 'UNIMPLEMENTED', 13: 'INTERNAL',
   14: 'UNAVAILABLE', 15: 'DATA_LOSS', 16: 'UNAUTHENTICATED',
+  101: 'CONTRACT_VIOLATION',
 };
 
 export function statusName(code: StatusCode): string {
@@ -181,6 +205,19 @@ export class UnauthenticatedError extends RpcError {
   }
 }
 
+/**
+ * Raised when the wire payload doesn't match the published contract.
+ *
+ * Carries the offending field names in `details.unexpected_fields`
+ * (comma-separated, repr-sanitized).
+ */
+export class ContractViolationError extends RpcError {
+  constructor(message = '', details?: Record<string, string>) {
+    super(StatusCode.CONTRACT_VIOLATION, message, details);
+    this.name = 'ContractViolationError';
+  }
+}
+
 const RPC_ERROR_TYPES = new Map<StatusCode, new (message?: string, details?: Record<string, string>) => RpcError>([
   [StatusCode.CANCELLED, CancelledError],
   [StatusCode.UNKNOWN, UnknownRpcError],
@@ -198,4 +235,5 @@ const RPC_ERROR_TYPES = new Map<StatusCode, new (message?: string, details?: Rec
   [StatusCode.UNAVAILABLE, UnavailableError],
   [StatusCode.DATA_LOSS, DataLossError],
   [StatusCode.UNAUTHENTICATED, UnauthenticatedError],
+  [StatusCode.CONTRACT_VIOLATION, ContractViolationError],
 ]);

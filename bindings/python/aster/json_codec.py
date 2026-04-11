@@ -79,18 +79,6 @@ def json_encode(obj: Any) -> bytes:
     return json.dumps(obj).encode("utf-8")
 
 
-def _camel_to_snake(name: str) -> str:
-    """Convert camelCase to snake_case."""
-    import re
-    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
-    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
-
-
-def _normalize_keys(d: dict) -> dict:
-    """Convert camelCase keys to snake_case for cross-language compat."""
-    return {_camel_to_snake(k): v for k, v in d.items()}
-
-
 def json_decode(data: bytes | str, expected_type: type | None = None) -> Any:
     """Deserialize JSON bytes into a dataclass instance or plain dict.
 
@@ -114,8 +102,19 @@ def json_decode(data: bytes | str, expected_type: type | None = None) -> Any:
     return _dict_to_dataclass(raw, expected_type)
 
 
-def _dict_to_dataclass(d: dict, cls: type) -> Any:
-    """Recursively construct a dataclass from a dict."""
+def _dict_to_dataclass(d: dict, cls: type, _path: str = "") -> Any:
+    """Recursively construct a dataclass from a dict.
+
+    Strict mode: any dict key that doesn't match a field on ``cls``
+    raises :class:`aster.status.ContractViolationError`. The producer
+    owns the contract -- consumers must use the field names defined
+    by the producer's manifest. The codec does not silently drop or
+    rename keys.
+
+    The ``_path`` argument tracks the dotted path through nested
+    objects so the error message can point at the exact field that
+    violated the contract (e.g. ``request.metadata.bogusField``).
+    """
     if not isinstance(d, dict):
         return d
 
@@ -124,12 +123,34 @@ def _dict_to_dataclass(d: dict, cls: type) -> Any:
     except Exception:
         hints = {}
 
+    field_names = {f.name for f in dataclasses.fields(cls)}
+    unexpected = [k for k in d.keys() if k not in field_names]
+    if unexpected:
+        from aster.status import ContractViolationError
+        sanitized = _sanitize_keys(unexpected)
+        location = _path or cls.__name__
+        message = (
+            f"contract violation at {location}: unexpected JSON field(s) "
+            f"{sanitized} (expected: {sorted(field_names)})"
+        )
+        raise ContractViolationError(
+            message=message,
+            details={
+                "unexpected_fields": ",".join(sanitized),
+                "location": location,
+                "expected_class": cls.__name__,
+            },
+        )
+
     kwargs = {}
     for f in dataclasses.fields(cls):
         if f.name not in d:
             continue
         value = d[f.name]
         field_type = hints.get(f.name, f.type)
+        # Track the dotted path for nested calls so the error message
+        # can name the deepest field that violated the contract.
+        nested_path = f"{_path}.{f.name}" if _path else f"{cls.__name__}.{f.name}"
 
         # Unwrap Optional
         origin = getattr(field_type, "__origin__", None)
@@ -146,7 +167,7 @@ def _dict_to_dataclass(d: dict, cls: type) -> Any:
             # Get the non-None type
             inner = next((a for a in args if a is not type(None)), None)
             if inner and dataclasses.is_dataclass(inner) and isinstance(value, dict):
-                kwargs[f.name] = _dict_to_dataclass(value, inner)
+                kwargs[f.name] = _dict_to_dataclass(value, inner, nested_path)
                 continue
 
         # Handle nested dataclass
@@ -156,15 +177,36 @@ def _dict_to_dataclass(d: dict, cls: type) -> Any:
             elem_type = args[0]
             if dataclasses.is_dataclass(elem_type) and isinstance(value, list):
                 kwargs[f.name] = [
-                    _dict_to_dataclass(item, elem_type) if isinstance(item, dict) else item
-                    for item in value
+                    _dict_to_dataclass(item, elem_type, f"{nested_path}[{i}]")
+                    if isinstance(item, dict) else item
+                    for i, item in enumerate(value)
                 ]
                 continue
 
         if dataclasses.is_dataclass(actual_type) and isinstance(value, dict):
-            kwargs[f.name] = _dict_to_dataclass(value, actual_type)
+            kwargs[f.name] = _dict_to_dataclass(value, actual_type, nested_path)
             continue
 
         kwargs[f.name] = value
 
     return cls(**kwargs)
+
+
+def _sanitize_keys(keys: list[str], max_count: int = 5, max_len: int = 80) -> list[str]:
+    """Repr-quote unexpected key names for safe logging.
+
+    Prevents log injection: keys can contain control chars, ANSI
+    escapes, newlines, or backslashes that would corrupt the error
+    message or terminal. ``repr()`` escapes all of those. Caps the
+    number of keys and the length of each so a malicious client
+    can't blow up log storage with megabyte-long key names.
+    """
+    out: list[str] = []
+    for k in keys[:max_count]:
+        s = k if isinstance(k, str) else str(k)
+        if len(s) > max_len:
+            s = s[:max_len] + "...(truncated)"
+        out.append(repr(s))
+    if len(keys) > max_count:
+        out.append(f"...(+{len(keys) - max_count} more)")
+    return out

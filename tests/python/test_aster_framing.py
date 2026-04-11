@@ -77,9 +77,8 @@ class EmptyRecvStream:
 
 
 class TestStatusCode:
-    def test_all_codes_exist(self):
-        """All 17 status codes (0--16) are defined."""
-        assert len(StatusCode) == 17
+    def test_grpc_mirrored_codes_exist(self):
+        """The 17 gRPC-mirrored codes (0-16) are present and unchanged."""
         assert StatusCode.OK == 0
         assert StatusCode.UNAUTHENTICATED == 16
 
@@ -88,14 +87,33 @@ class TestStatusCode:
             assert isinstance(code, int)
 
     def test_code_names(self):
-        expected = [
+        # gRPC-mirrored block (0-16) is locked -- order and names must
+        # not drift, since the wire format is the integer value.
+        grpc_block = [
             "OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT",
             "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS",
             "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION",
             "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL",
             "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED",
         ]
-        assert [c.name for c in StatusCode] == expected
+        all_names = [c.name for c in StatusCode]
+        assert all_names[:17] == grpc_block
+
+    def test_aster_native_codes_in_high_range(self):
+        """Aster-native codes live at 100+, leaving 17-99 as a gRPC buffer."""
+        for code in StatusCode:
+            if code.name in {
+                "OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT",
+                "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS",
+                "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION",
+                "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL",
+                "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED",
+            }:
+                assert 0 <= code.value <= 16
+            else:
+                assert code.value >= 100, (
+                    f"{code.name}={code.value} sits in the reserved 17-99 range"
+                )
 
 
 # ── RpcError tests ──────────────────────────────────────────────────────────
