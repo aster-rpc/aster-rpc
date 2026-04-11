@@ -1319,6 +1319,42 @@ class AsterClient:
         secret_key_from_identity, peer_entry = config.load_identity(
             peer_name=peer, role="consumer"
         )
+
+        # If the user only passed `enrollment_credential_file` (no separate
+        # `identity=`), and that file is a TOML `.aster-identity` (which is
+        # what `aster enroll node` produces), reach into the same file for
+        # the [node] secret_key. Otherwise the QUIC endpoint id we generate
+        # at startup won't match the one baked into the credential and the
+        # server rejects admission with no useful error.
+        #
+        # This makes `enrollment_credential_file=` and `identity=` do the
+        # same thing for the same TOML file -- mirrors how the TS binding's
+        # AsterClientWrapper now treats `enrollmentCredentialFile`.
+        cred_file_for_identity = enrollment_credential_file or config.enrollment_credential_file
+        if (
+            not secret_key_from_identity
+            and not peer_entry
+            and cred_file_for_identity
+            and os.path.exists(os.path.expanduser(cred_file_for_identity))
+        ):
+            try:
+                paired_secret, paired_peer = config.load_identity_from_path(
+                    os.path.expanduser(cred_file_for_identity),
+                    peer_name=peer,
+                    role="consumer",
+                )
+                if paired_secret:
+                    secret_key_from_identity = paired_secret
+                if paired_peer:
+                    peer_entry = paired_peer
+            except Exception:
+                # Best-effort: if the .cred isn't a TOML identity file
+                # (e.g. it's a flat JSON credential), fall through to the
+                # existing _load_enrollment_credential path which handles
+                # both formats. The user just won't get the secret key
+                # auto-loaded -- they'll need to pass `identity=` too.
+                pass
+
         if secret_key_from_identity and not config.secret_key:
             config.secret_key = secret_key_from_identity
         if peer_entry and not root_pubkey:
