@@ -183,6 +183,7 @@ class AsterServer:
         mesh_state: MeshState | None = None,
         clock_drift_config: ClockDriftConfig | None = None,
         persist_mesh_state: bool = False,
+        use_reactor: bool = False,
     ) -> None:
         """Create an Aster RPC server.
 
@@ -303,6 +304,7 @@ class AsterServer:
         self._mesh_state = mesh_state
         self._clock_drift_config = clock_drift_config
         self._persist_mesh_state = persist_mesh_state
+        self._use_reactor = use_reactor
 
         # Populated by start()
         self._started: bool = False
@@ -516,6 +518,7 @@ class AsterServer:
             interceptors=self._interceptors,
             owns_endpoint=False,
             peer_store=self._peer_store,
+            node=self._node,
         )
 
         self._print_banner()
@@ -770,6 +773,17 @@ class AsterServer:
 
         self._peer_store.start_reaper()
 
+        self._reactor_feeder = None
+        if self._use_reactor:
+            from aster._aster import create_reactor
+            reactor_handle, self._reactor_feeder = create_reactor(256)
+            subtasks.append(
+                asyncio.create_task(
+                    self._reactor_dispatch_loop(reactor_handle),
+                    name="aster-reactor-dispatch",
+                )
+            )
+
         subtasks.append(
             asyncio.create_task(self._accept_loop(), name="aster-accept")
         )
@@ -833,10 +847,13 @@ class AsterServer:
                     continue
 
                 if alpn == RPC_ALPN:
-                    asyncio.create_task(
-                        self._server.handle_connection(conn),
-                        name="aster-rpc-conn",
-                    )
+                    if self._reactor_feeder is not None:
+                        self._reactor_feeder.feed(conn)
+                    else:
+                        asyncio.create_task(
+                            self._server.handle_connection(conn),
+                            name="aster-rpc-conn",
+                        )
                 elif alpn == ALPN_CONSUMER_ADMISSION:
                     # Always handle consumer admission -- even when
                     # allow_all_consumers=True the consumer needs the
@@ -876,6 +893,26 @@ class AsterServer:
                         conn.close(0, b"unexpected alpn")
                     except Exception:  # noqa: BLE001
                         pass
+        except asyncio.CancelledError:
+            pass
+
+    async def _reactor_dispatch_loop(self, reactor_handle: Any) -> None:
+        """Pull fully-read requests from the Rust reactor and dispatch."""
+        assert self._server is not None
+        try:
+            while True:
+                call = await reactor_handle.next_call()
+                if call is None:
+                    break
+                (call_id, header_payload, header_flags, request_payload,
+                 request_flags, peer_id, is_session_call, response_sender) = call
+                asyncio.create_task(
+                    self._server._dispatch_reactor_call(
+                        call_id, header_payload, header_flags,
+                        request_payload, request_flags,
+                        peer_id, is_session_call, response_sender,
+                    )
+                )
         except asyncio.CancelledError:
             pass
 
