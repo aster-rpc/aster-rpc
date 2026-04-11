@@ -124,8 +124,6 @@ public class IrohPollThread {
     // These are identified by having a handle but no operation future (the operation
     // already completed; these are async notifications).
     if (event.kind() == IrohEventKind.FRAME_RECEIVED
-        || event.kind() == IrohEventKind.CONNECTION_ACCEPTED
-        || event.kind() == IrohEventKind.CONNECTED
         || event.kind() == IrohEventKind.HOOK_BEFORE_CONNECT
         || event.kind() == IrohEventKind.HOOK_AFTER_CONNECT) {
       for (Consumer<IrohEvent> handler : inboundHandlers) {
@@ -139,7 +137,8 @@ public class IrohPollThread {
     }
 
     // Terminal success events — complete the operation future.
-    // STREAM_OPENED, STREAM_ACCEPTED, ENDPOINT_CREATED, CONNECTED, etc.
+    // STREAM_OPENED, STREAM_ACCEPTED, ENDPOINT_CREATED, CONNECTED,
+    // CONNECTION_ACCEPTED, etc.
     registry.complete(event.operation(), event);
   }
 

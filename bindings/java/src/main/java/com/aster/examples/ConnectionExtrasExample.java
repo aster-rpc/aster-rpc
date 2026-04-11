@@ -4,6 +4,7 @@ import com.aster.config.EndpointConfig;
 import com.aster.handle.IrohConnection;
 import com.aster.handle.IrohEndpoint;
 import com.aster.handle.IrohRuntime;
+import com.aster.node.NodeAddr;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -62,9 +63,10 @@ public class ConnectionExtrasExample {
     // Give A time to start accepting
     Thread.sleep(100);
 
-    // B connects to A using A's node ID
+    // B connects to A using A's address info (includes relay URL)
     System.out.println("4. B connecting to A...");
-    CompletableFuture<IrohConnection> connectFuture = endpointB.connectAsync(epAID, ALPN);
+    NodeAddr addrA = endpointA.addrInfo();
+    CompletableFuture<IrohConnection> connectFuture = endpointB.connectNodeAddrAsync(addrA, ALPN);
     IrohConnection connB = connectFuture.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
     System.out.println("   Connected!\n");
 
