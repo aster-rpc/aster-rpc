@@ -163,7 +163,7 @@ func (c *Connection) ReadDatagram(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read datagram poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_DATAGRAM_RECEIVED {
+	if ev.Kind != IROH_EVENT_BYTES_RESULT {
 		return nil, fmt.Errorf("read datagram: unexpected event %d", ev.Kind)
 	}
 

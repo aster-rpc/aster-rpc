@@ -62,6 +62,9 @@ const (
 	IROH_EVENT_GOSSIP_NEIGHBOR_DOWN   EventKind = 54
 	IROH_EVENT_GOSSIP_LAGGED          EventKind = 55
 	// Datagrams
+	// TODO(iroh): IROH_EVENT_DATAGRAM_RECEIVED (60) is never emitted by any FFI function.
+	// iroh_connection_read_datagram emits IROH_EVENT_BYTES_RESULT (91) instead.
+	// Consider removing DATAGRAM_RECEIVED from this enum or clarifying its intended use.
 	IROH_EVENT_DATAGRAM_RECEIVED      EventKind = 60
 	// Aster custom-ALPN
 	IROH_EVENT_ASTER_ACCEPTED         EventKind = 65

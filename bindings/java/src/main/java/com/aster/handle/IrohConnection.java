@@ -190,8 +190,6 @@ public class IrohConnection extends IrohHandle {
     dataSeg.set(ValueLayout.ADDRESS, 0, heapSeg);
     dataSeg.set(ValueLayout.JAVA_LONG, 8, (long) data.length);
 
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
-
     try {
       int status = lib.connectionSendDatagram(runtime.nativeHandle(), nativeHandle(), dataSeg);
       if (status != 0) {
@@ -205,8 +203,7 @@ public class IrohConnection extends IrohHandle {
           new IrohException("iroh_connection_send_datagram threw: " + t.getMessage()));
     }
 
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime.registry().register(opId).thenApply(event -> null);
+    return CompletableFuture.completedFuture(null);
   }
 
   /**
@@ -239,8 +236,14 @@ public class IrohConnection extends IrohHandle {
         .register(opId)
         .thenApply(
             event -> {
-              if (event.kind() == IrohEventKind.DATAGRAM_RECEIVED) {
-                byte[] data = event.data().asByteBuffer().array();
+              if (event.kind() == IrohEventKind.BYTES_RESULT) {
+                byte[] data = null;
+                if (event.hasBuffer()
+                    && event.data() != MemorySegment.NULL
+                    && event.dataLen() > 0) {
+                  data = event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE);
+                  runtime.releaseBuffer(event.buffer());
+                }
                 return new Datagram(data);
               }
               throw new IrohException("readDatagram failed: unexpected event " + event.kind());
