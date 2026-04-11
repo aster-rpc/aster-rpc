@@ -63,47 +63,137 @@
  * @packageDocumentation
  */
 
-// Server / client
+/**
+ * Declarative RPC server.
+ * @group Server and Client
+ */
+export { AsterServer } from './runtime.js';
+
+/**
+ * Options for creating an {@link AsterServer}.
+ * @group Server and Client
+ */
+export type { AsterServerOptions } from './runtime.js';
+
+/**
+ * High-level RPC client wrapper with admission, proxy, and typed clients.
+ * @group Server and Client
+ */
+export { AsterClientWrapper } from './runtime.js';
+
+/**
+ * Options for creating an {@link AsterClientWrapper}.
+ * @group Server and Client
+ */
+export type { AsterClientOptions } from './runtime.js';
+
+/**
+ * Dynamic JSON proxy client -- call any service without local types.
+ * @group Server and Client
+ */
+export { ProxyClient } from './runtime.js';
+
+/**
+ * Thrown when a connection is rejected by the producer's admission gate.
+ * @group Server and Client
+ */
+export { AdmissionDeniedError } from './runtime.js';
+
+/**
+ * Unified server/client configuration.
+ * @group Server and Client
+ */
+export type { AsterConfig } from './config.js';
+
+/**
+ * Mark a class as an Aster RPC service.
+ * @group Decorators
+ */
+export { Service, type ServiceOptions } from './decorators.js';
+
+/**
+ * Mark a method as a unary RPC.
+ * @group Decorators
+ */
+export { Rpc } from './decorators.js';
+
+/**
+ * Mark a method as a server-streaming RPC (returns AsyncGenerator).
+ * @group Decorators
+ */
+export { ServerStream } from './decorators.js';
+
+/**
+ * Mark a method as a client-streaming RPC.
+ * @group Decorators
+ */
+export { ClientStream } from './decorators.js';
+
+/**
+ * Mark a method as a bidirectional-streaming RPC.
+ * @group Decorators
+ */
+export { BidiStream } from './decorators.js';
+
+/**
+ * Register a class for cross-language Fory serialization.
+ * @group Decorators
+ */
+export { WireType, type WireTypeOptions } from './decorators.js';
+
+/**
+ * Compose capability requirements with OR semantics.
+ * @group Authorization
+ */
+export { anyOf } from './capabilities.js';
+
+/**
+ * Compose capability requirements with AND semantics.
+ * @group Authorization
+ */
+export { allOf } from './capabilities.js';
+
+/**
+ * Select the wire format: XLANG (default), NATIVE, ROW, or JSON.
+ * @group Serialization
+ */
+export { SerializationMode } from './types.js';
+
+/**
+ * Exponential-backoff parameters for retry policies.
+ * @group Serialization
+ */
+export type { ExponentialBackoff } from './types.js';
+
+/**
+ * Retry policy declared on a service or method.
+ * @group Serialization
+ */
+export type { RetryPolicy } from './types.js';
+
+/**
+ * Base class for all RPC failures. Carries a gRPC-compatible StatusCode.
+ * @group Errors
+ */
+export { RpcError } from './status.js';
+
+/**
+ * gRPC-compatible status code enum (0--16).
+ * @group Errors
+ */
+export { StatusCode, statusName } from './status.js';
+
+/**
+ * Thrown when a call violates the service contract (unknown method, bad schema).
+ * @group Errors
+ */
+export { ContractViolationError } from './status.js';
+
+/**
+ * Typed exception subclasses, one per gRPC status code.
+ * @group Errors
+ */
 export {
-  AsterServer,
-  AsterClientWrapper,
-  ProxyClient,
-  AdmissionDeniedError,
-  type AsterServerOptions,
-  type AsterClientOptions,
-} from './runtime.js';
-
-export { type AsterConfig } from './config.js';
-
-// Decorators -- define services and types
-export {
-  Service,
-  Rpc,
-  ServerStream,
-  ClientStream,
-  BidiStream,
-  WireType,
-  type ServiceOptions,
-  type WireTypeOptions,
-} from './decorators.js';
-
-// Authorization -- compose capability requirements
-export { anyOf, allOf } from './capabilities.js';
-
-// Serialization -- pick wire format
-export {
-  SerializationMode,
-  type ExponentialBackoff,
-  type RetryPolicy,
-} from './types.js';
-
-// Errors -- typed exceptions for RPC failures
-export {
-  RpcError,
-  StatusCode,
-  statusName,
-  ContractViolationError,
-  // gRPC-mirror status code subclasses
   CancelledError,
   UnknownRpcError,
   InvalidArgumentError,
@@ -122,17 +212,68 @@ export {
   UnauthenticatedError,
 } from './status.js';
 
-// Interceptors -- middleware that wraps every RPC call
-export {
-  CallContext,
-  type Interceptor,
-} from './interceptors/base.js';
+/**
+ * Per-call context passed to every interceptor.
+ * @group Interceptors
+ */
+export { CallContext } from './interceptors/base.js';
+
+/**
+ * Interceptor interface -- middleware that wraps every RPC call.
+ * @group Interceptors
+ */
+export { type Interceptor } from './interceptors/base.js';
+
+/**
+ * Enforce and propagate call deadlines.
+ * @group Interceptors
+ */
 export { DeadlineInterceptor } from './interceptors/deadline.js';
+
+/**
+ * Token-based authentication.
+ * @group Interceptors
+ */
 export { AuthInterceptor } from './interceptors/auth.js';
+
+/**
+ * Automatic retry for idempotent methods.
+ * @group Interceptors
+ */
 export { RetryInterceptor } from './interceptors/retry.js';
+
+/**
+ * Circuit breaker for failing endpoints.
+ * @group Interceptors
+ */
 export { CircuitBreakerInterceptor, type CircuitBreakerOptions } from './interceptors/circuit-breaker.js';
+
+/**
+ * Structured audit logging for every RPC call.
+ * @group Interceptors
+ */
 export { AuditLogInterceptor, type AuditEntry, type AuditLogFn } from './interceptors/audit.js';
+
+/**
+ * Collect call latency and error metrics.
+ * @group Interceptors
+ */
 export { MetricsInterceptor } from './interceptors/metrics.js';
+
+/**
+ * Token-bucket rate limiting per service, method, or peer.
+ * @group Interceptors
+ */
 export { RateLimitInterceptor, type RateLimitOptions } from './interceptors/rate-limit.js';
+
+/**
+ * Automatic payload compression (gzip/zstd).
+ * @group Interceptors
+ */
 export { CompressionInterceptor } from './interceptors/compression.js';
+
+/**
+ * Enforce \`requires\` capability checks declared on services.
+ * @group Interceptors
+ */
 export { CapabilityInterceptor } from './interceptors/capability.js';

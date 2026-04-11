@@ -21,7 +21,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "docs": "typedoc src/public.ts --out docs-api --readme none --hideGenerator --excludePrivate --excludeInternal --name '@aster-rpc/aster API Reference'"
+    "docs": "typedoc --options typedoc.json"
   },
   "dependencies": {
     "@aster-rpc/transport": "0.1.0-alpha.0"
