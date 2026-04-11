@@ -219,7 +219,11 @@ class IrohTransport(Transport):
                     # Trailer received - decode status
                     status = self._codec.decode(payload, RpcStatus)
                     if status.code != StatusCode.OK:
-                        raise RpcError(
+                        # Use from_status so the raised exception is the
+                        # specific subclass for the code (e.g.
+                        # ContractViolationError) instead of a base
+                        # RpcError. Lets users catch by class.
+                        raise RpcError.from_status(
                             StatusCode(status.code),
                             status.message,
                             dict(zip(status.detailKeys, status.detailValues)),
@@ -328,7 +332,11 @@ class IrohTransport(Transport):
                 if flags & TRAILER:
                     status = self._codec.decode(payload, RpcStatus)
                     if status.code != StatusCode.OK:
-                        raise RpcError(
+                        # Use from_status so the raised exception is the
+                        # specific subclass for the code (e.g.
+                        # ContractViolationError) instead of a base
+                        # RpcError. Lets users catch by class.
+                        raise RpcError.from_status(
                             StatusCode(status.code),
                             status.message,
                             dict(zip(status.detailKeys, status.detailValues)),
@@ -417,7 +425,11 @@ class IrohTransport(Transport):
                 if flags & TRAILER:
                     status = self._codec.decode(payload, RpcStatus)
                     if status.code != StatusCode.OK:
-                        raise RpcError(
+                        # Use from_status so the raised exception is the
+                        # specific subclass for the code (e.g.
+                        # ContractViolationError) instead of a base
+                        # RpcError. Lets users catch by class.
+                        raise RpcError.from_status(
                             StatusCode(status.code),
                             status.message,
                             dict(zip(status.detailKeys, status.detailValues)),
@@ -568,7 +580,7 @@ class IrohBidiChannel(BidiChannel):
                 status = self._codec.decode(payload, RpcStatus)
                 self._last_trailer = (status.code, status.message)
                 if status.code != StatusCode.OK:
-                    raise RpcError(
+                    raise RpcError.from_status(
                         StatusCode(status.code),
                         status.message,
                         dict(zip(status.detailKeys, status.detailValues)),
