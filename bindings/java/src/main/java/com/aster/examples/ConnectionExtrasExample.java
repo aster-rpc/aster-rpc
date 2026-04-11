@@ -95,6 +95,35 @@ public class ConnectionExtrasExample {
     }
     System.out.println();
 
+    // Test bidirectional datagram send/receive.
+    // NOTE: readDatagramAsync() relies on the iroh FFI emitting BYTES_RESULT (91), not DATAGRAM_RECEIVED (60).
+    // DATAGRAM_RECEIVED is defined in the FFI spec but no FFI function emits it.
+    // See IrohEventKind.java TODO comment about this discrepancy.
+    System.out.println("   --- Testing Datagram Send/Receive ---");
+    byte[] testData = "Hello Datagram!".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+    // Start reading datagram on A (non-blocking)
+    CompletableFuture<com.aster.handle.Datagram> readFuture = connA.readDatagramAsync();
+
+    // Send datagram from B to A
+    connB.sendDatagramAsync(testData).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    System.out.printf(
+        "   B sent datagram: %s%n", new String(testData, java.nio.charset.StandardCharsets.UTF_8));
+
+    // A receives the datagram
+    var received = readFuture.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    System.out.printf(
+        "   A received datagram: %s%n",
+        new String(received.data(), java.nio.charset.StandardCharsets.UTF_8));
+
+    java.util.Arrays.equals(testData, received.data());
+    if (java.util.Arrays.equals(testData, received.data())) {
+      System.out.println("   ✓ Datagram data matches!");
+    } else {
+      System.out.println("   ✗ Datagram data mismatch!");
+    }
+    System.out.println();
+
     // Close connection
     System.out.println("6. Closing connection...");
     connB.close();

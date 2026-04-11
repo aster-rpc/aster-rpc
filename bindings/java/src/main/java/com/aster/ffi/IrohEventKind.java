@@ -60,6 +60,9 @@ public enum IrohEventKind {
   GOSSIP_LAGGED(55),
 
   // Datagrams
+  // TODO(iroh): DATAGRAM_RECEIVED (60) is never emitted by any FFI function.
+  // iroh_connection_read_datagram emits BYTES_RESULT (91) instead.
+  // Consider removing DATAGRAM_RECEIVED from this enum or clarifying its intended use.
   DATAGRAM_RECEIVED(60),
 
   // Aster custom-ALPN
