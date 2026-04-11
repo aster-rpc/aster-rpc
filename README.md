@@ -6,7 +6,7 @@ Aster is a peer-to-peer RPC framework with identity in the connection. You defin
 
 The 2026 vivid example is AI agents calling tools on remote machines: agent on machine A wants to invoke a function on machine B, you don't want a hosted proxy in between, you don't want to rotate API keys, and you want the call to be scoped to specific methods. That's exactly what Aster solves. The same engineering also covers IoT fleets, edge compute, multi-tenant microservices, and anything else where the machine is the principal and the user is the delegating authority.
 
-Built on [iroh](https://iroh.computer) (QUIC + NAT traversal), [Apache Fory](https://fory.apache.org) (cross-language wire format), and [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) (content-addressed contract identity). Capability-based credentials, four-gate authorization, and an offline ed25519 root key. The trust model is documented in [the spec](ffi_spec/Aster-trust-spec.md).
+Built on [iroh](https://iroh.computer) (QUIC + NAT traversal), [Apache Fory](https://fory.apache.org) (cross-language wire format), and [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) (content-addressed contract identity). Capability-based credentials, four-gate authorization, and an offline ed25519 root key.
 
 - **Website** — [aster.site](https://aster.site)
 - **Docs** — [docs.aster.site](https://docs.aster.site)
@@ -133,29 +133,25 @@ For the full guide — auth, sessions, streaming, cross-language interop — see
 ## What's in this repo
 
 ```
-aster-rpc/                          PyPI: aster-rpc           (framework + Python bindings)
-@aster-rpc/aster                    npm:  @aster-rpc/aster    (framework + TypeScript bindings)
+aster-rpc/                          PyPI: aster-rpc            (framework + Python bindings)
+@aster-rpc/aster                    npm:  @aster-rpc/aster     (framework + TypeScript bindings)
 @aster-rpc/transport                npm:  @aster-rpc/transport (NAPI-RS native addon)
-aster-cli                           PyPI: aster-cli           (the `aster` command)
+aster-cli                           PyPI: aster-cli            (the `aster` command)
 
 bindings/python/                    Python binding source (PyO3 + Python)
 bindings/typescript/                TypeScript binding source (NAPI-RS + TypeScript)
-bindings/dotnet/                    .NET binding scaffold (in progress)
-bindings/java/                      Java binding scaffold (in progress)
-bindings/go/                        Go binding scaffold (in progress)
 
 cli/                                CLI source (the `aster` command)
 core/                               Shared Rust core (iroh wrapper)
-ffi/                                C FFI for non-Python language bindings
-ffi_spec/                           Wire-protocol and trust specifications
 
-examples/python/                    Python example services
-examples/typescript/                TypeScript example services
-examples/mission-control/           The canonical Mission Control walkthrough
+examples/python/                    Python example services (incl. mission_control)
+examples/typescript/                TypeScript example services (incl. missionControl, hello-world)
 
 tests/                              Unit + integration tests for all bindings
 conformance/                        Cross-language conformance vectors
 ```
+
+Java, .NET, Kotlin, and Go bindings are in progress in the source repo and will land in the public tree once they're shipping. Rust is planned.
 
 ---
 
@@ -240,16 +236,6 @@ brew install sccache       # macOS
 export RUSTC_WRAPPER=sccache
 ```
 
-### Pre-push hook
-
-A pre-push hook runs `cargo fmt --check`, `cargo clippy`, and the aster-cli compatibility check before allowing pushes:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-Checked into the repo at `.githooks/pre-push` — one-time setup per clone.
-
 ---
 
 ## Architecture
@@ -277,7 +263,7 @@ Checked into the repo at `.githooks/pre-push` — one-time setup per clone.
 
 The Python binding is built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs); the TypeScript binding uses [NAPI-RS](https://napi.rs/). Both share the same Rust core (`core/` + iroh crates), so a Python client and a TypeScript server (or vice versa) speak the same wire protocol byte-for-byte.
 
-For implementation details, see [`docs/_internal/implementation_flows/INDEX.md`](docs/_internal/implementation_flows/INDEX.md).
+Full conceptual reference, API docs, and the four-gate trust model live on the [docs site](https://docs.aster.site).
 
 ---
 
