@@ -121,6 +121,7 @@ class Server:
         registry: ServiceRegistry | None = None,
         owns_endpoint: bool = True,
         peer_store: "PeerAttributeStore | None" = None,
+        node: Any = None,
     ) -> None:
         """Initialize the server.
 
@@ -141,6 +142,7 @@ class Server:
         self._endpoint = endpoint
         self._owns_endpoint = owns_endpoint
         self._peer_store = peer_store
+        self._node = node
         from aster.interceptors.deadline import DeadlineInterceptor
         if interceptors is not None:
             self._interceptors = list(interceptors)
@@ -260,6 +262,231 @@ class Server:
             self._serving = False
             self._serve_task = None
             self._shutdown_event.set()
+
+    async def serve_reactor(self, channel_capacity: int = 256) -> None:
+        """Start the server using the Rust-driven reactor.
+
+        The reactor runs the accept loop, stream reads, and response writes
+        entirely in Rust. Python only handles dispatch and handler invocation.
+        This reduces server-side FFI crossings to 1 per call (the next_call
+        delivery), compared to 3+ crossings per call in the normal serve path.
+
+        Requires that the Server was constructed with a ``node`` parameter.
+        """
+        if self._node is None:
+            raise ServerError(
+                "serve_reactor() requires a node; pass node= to Server()"
+            )
+        if self._serving:
+            raise ServerError("server is already serving")
+
+        from aster._aster import start_reactor
+
+        self._serving = True
+        self._serve_task = asyncio.current_task()
+        self._shutdown_event.clear()
+
+        logger.info("Server starting (reactor mode) on %s", self._endpoint.endpoint_id())
+
+        reactor = start_reactor(self._node, channel_capacity)
+
+        try:
+            while self._serving:
+                call = await reactor.next_call()
+                if call is None:
+                    break
+
+                (call_id, header_payload, header_flags, request_payload,
+                 request_flags, peer_id, is_session_call, response_sender) = call
+
+                asyncio.create_task(
+                    self._dispatch_reactor_call(
+                        call_id, header_payload, header_flags,
+                        request_payload, request_flags,
+                        peer_id, is_session_call, response_sender,
+                    )
+                )
+        finally:
+            self._serving = False
+            self._serve_task = None
+            self._shutdown_event.set()
+
+    async def _dispatch_reactor_call(
+        self,
+        call_id: int,
+        header_payload: bytes,
+        header_flags: int,
+        request_payload: bytes,
+        request_flags: int,
+        peer_id: str,
+        is_session_call: bool,
+        response_sender: Any,
+    ) -> None:
+        import struct as _struct
+
+        try:
+            if not (header_flags & HEADER):
+                self._reactor_error_response(
+                    response_sender, StatusCode.INTERNAL,
+                    "First frame must have HEADER flag",
+                )
+                return
+
+            if header_payload and header_payload[0:1] == b'{':
+                header = json_decode(header_payload, StreamHeader)
+            else:
+                header = self._codec.decode(header_payload, StreamHeader)
+
+            ser_mode = header.serializationMode
+
+            if not header.service:
+                self._reactor_error_response(
+                    response_sender, StatusCode.INVALID_ARGUMENT,
+                    "Missing service name", ser_mode,
+                )
+                return
+
+            service_info = self._registry.lookup(header.service, header.version)
+            if service_info is None:
+                self._reactor_error_response(
+                    response_sender, StatusCode.NOT_FOUND,
+                    f"Service '{header.service}' v{header.version} not found",
+                    ser_mode,
+                )
+                return
+
+            method_info = service_info.get_method(header.method)
+            if method_info is None:
+                self._reactor_error_response(
+                    response_sender, StatusCode.UNIMPLEMENTED,
+                    f"Method '{header.service}.{header.method}' not implemented",
+                    ser_mode,
+                )
+                return
+
+            if method_info.pattern != "unary":
+                self._reactor_error_response(
+                    response_sender, StatusCode.UNIMPLEMENTED,
+                    f"Reactor only supports unary calls, got '{method_info.pattern}'",
+                    ser_mode,
+                )
+                return
+
+            handler = self._get_handler_for_service(service_info)
+            handler_method = getattr(handler, header.method, None)
+            if handler_method is None:
+                self._reactor_error_response(
+                    response_sender, StatusCode.INTERNAL,
+                    "Handler method not found", ser_mode,
+                )
+                return
+
+            # Decode request
+            compressed = bool(request_flags & COMPRESSED)
+            if ser_mode == SerializationMode.JSON.value:
+                if compressed:
+                    request_payload = safe_decompress(request_payload)
+                request = json_decode(request_payload, method_info.request_type)
+            else:
+                request = self._codec.decode_compressed(
+                    request_payload, compressed, method_info.request_type,
+                )
+
+            # Interceptors
+            call_ctx = build_call_context(
+                service=header.service,
+                method=header.method,
+                metadata=_validated_metadata(header.metadataKeys, header.metadataValues),
+                deadline_epoch_ms=header.deadlineEpochMs,
+                peer=peer_id,
+                is_streaming=False,
+                pattern="unary",
+                idempotent=method_info.idempotent,
+                call_id=header.callId or None,
+                attributes=(
+                    self._peer_store.get_attributes(peer_id)
+                    if self._peer_store and peer_id else {}
+                ),
+            )
+            interceptors = self._resolve_interceptors(service_info)
+            request = await apply_request_interceptors(interceptors, call_ctx, request)
+
+            # Invoke handler
+            timeout = self._handler_timeout(call_ctx)
+            response = handler_method(request)
+            if asyncio.iscoroutine(response):
+                response = await asyncio.wait_for(response, timeout=timeout)
+            response = await apply_response_interceptors(interceptors, call_ctx, response)
+
+            # Encode response + trailer
+            response_payload, response_compressed = self._encode_response(
+                response, ser_mode,
+            )
+            resp_flags = COMPRESSED if response_compressed else 0
+
+            status = RpcStatus(code=StatusCode.OK, message="")
+            if ser_mode == SerializationMode.JSON.value:
+                trailer_payload = json_encode({
+                    "code": 0, "message": "", "detailKeys": [], "detailValues": [],
+                })
+            else:
+                trailer_payload = self._codec.encode(status)
+
+            response_frame = (
+                _struct.pack("<I", len(response_payload) + 1)
+                + bytes([resp_flags])
+                + response_payload
+            )
+            trailer_frame = (
+                _struct.pack("<I", len(trailer_payload) + 1)
+                + bytes([TRAILER])
+                + trailer_payload
+            )
+
+            response_sender.submit(bytes(response_frame), bytes(trailer_frame))
+
+        except RpcError as e:
+            self._reactor_error_response(
+                response_sender, e.code, e.message,
+                getattr(header, "serializationMode", 0) if "header" in dir() else 0,
+            )
+        except asyncio.TimeoutError:
+            self._reactor_error_response(
+                response_sender, StatusCode.DEADLINE_EXCEEDED,
+                "deadline exceeded",
+                getattr(header, "serializationMode", 0) if "header" in dir() else 0,
+            )
+        except Exception as e:
+            logger.error("Reactor dispatch error: %s", e)
+            self._reactor_error_response(
+                response_sender, StatusCode.INTERNAL, str(e),
+            )
+
+    def _reactor_error_response(
+        self,
+        response_sender: Any,
+        code: StatusCode,
+        message: str,
+        serialization_mode: int = 0,
+    ) -> None:
+        import struct as _struct
+        try:
+            if serialization_mode == SerializationMode.JSON.value:
+                trailer_payload = json_encode({
+                    "code": code.value, "message": message,
+                    "detailKeys": [], "detailValues": [],
+                })
+            else:
+                status = RpcStatus(code=code, message=message)
+                trailer_payload = self._codec.encode(status)
+            trailer_frame = (
+                _struct.pack("<I", len(trailer_payload) + 1)
+                + bytes([TRAILER])
+                + trailer_payload
+            )
+            response_sender.submit(b"", bytes(trailer_frame))
+        except Exception as e:
+            logger.error("Failed to send reactor error response: %s", e)
 
     async def handle_connection(self, incoming: Any) -> None:
         """Handle a connection accepted elsewhere (e.g. a shared multi-ALPN loop).
