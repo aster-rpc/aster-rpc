@@ -31,7 +31,10 @@ jobs:
       - name: Compute version
         id: ver
         run: |
-          BASE=$(node -e "console.log(require('./bindings/typescript/native/package.json').version)")
+          # Pure-shell JSON field read: cut on " and take the 4th field of
+          # the first `"version"` line. Avoids depending on node in this
+          # job (setup-node is scoped to the native build jobs only).
+          BASE=$(grep '"version"' bindings/typescript/native/package.json | head -1 | cut -d'"' -f4)
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
             echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
