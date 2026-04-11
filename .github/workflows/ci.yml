@@ -41,6 +41,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
+      - name: aster-cli ↔ aster-rpc version compat
+        run: python3 scripts/check-cli-compat.py
       - name: cargo fmt
         run: cargo fmt --manifest-path bindings/python/rust/Cargo.toml --check
       - name: cargo clippy (bindings)

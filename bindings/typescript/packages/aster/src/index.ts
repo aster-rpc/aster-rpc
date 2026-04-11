@@ -268,6 +268,7 @@ export {
   AsterServer,
   AsterClientWrapper,
   ProxyClient,
+  AdmissionDeniedError,
   type AsterServerOptions,
   type AsterClientOptions,
 } from './runtime.js';

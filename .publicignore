@@ -20,6 +20,7 @@ docs/_internal/fory/
 ffi/
 bindings/java/
 bindings/go/
+bindings/dotnet/
 
 # CI workflows (private repo runs CI; public repo is read-only mirror)
 .github/workflows/

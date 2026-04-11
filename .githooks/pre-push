@@ -8,6 +8,12 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 RESET='\033[0m'
 
+echo "pre-push: checking aster-cli ↔ aster-rpc version compat..."
+if ! python3 scripts/check-cli-compat.py; then
+    echo -e "${RED}pre-push: aster-cli lower bound is stale${RESET}"
+    exit 1
+fi
+
 echo "pre-push: checking Rust lint..."
 
 if ! cargo fmt --manifest-path bindings/python/rust/Cargo.toml --check >/dev/null 2>&1; then

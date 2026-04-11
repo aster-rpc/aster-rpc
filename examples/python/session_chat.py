@@ -1,11 +1,11 @@
 """
 Session-scoped Chat Service — Aster RPC Example.
 
-Demonstrates session-scoped services (``@service(scoped="stream")``), where
+Demonstrates session-scoped services (``@service(scoped="session")``), where
 each connection gets its own service instance with private state.
 
 Key concepts:
-  - ``@service(scoped="stream")`` creates one service instance per connection
+  - ``@service(scoped="session")`` creates one service instance per connection
   - ``__init__(self, peer)`` receives the peer identity on construction
   - Multiple sequential RPC calls share the same session state
   - ``on_session_close()`` fires when the session stream ends
@@ -83,7 +83,7 @@ class HistoryItem:
 # ── Session-scoped service ───────────────────────────────────────────────────
 
 
-@service("ChatRoom", scoped="stream")
+@service("ChatRoom", scoped="session")
 class ChatRoomService:
     """A chat room where each connection gets its own session.
 
