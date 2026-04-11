@@ -365,7 +365,8 @@ def _gen_shared_client(
         f"  static async fromConnection(client: AsterClientWrapper): Promise<{cls}> {{"
     )
     lines.append(
-        f'    const summary = client.services.find(s => s.name === "{svc_name}");'
+        f'    const summary = client.services.find('
+        f'(s: {{ name: string }}) => s.name === "{svc_name}");'
     )
     lines.append("    if (!summary) {")
     lines.append(
@@ -488,7 +489,8 @@ def _gen_session_client(
         f"  static async fromConnection(client: AsterClientWrapper): Promise<{cls}> {{"
     )
     lines.append(
-        f'    const summary = client.services.find(s => s.name === "{svc_name}");'
+        f'    const summary = client.services.find('
+        f'(s: {{ name: string }}) => s.name === "{svc_name}");'
     )
     lines.append("    if (!summary) {")
     lines.append(

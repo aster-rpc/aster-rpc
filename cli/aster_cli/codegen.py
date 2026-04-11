@@ -733,6 +733,13 @@ def _collect_service_type_imports(
     def _add_import(display_name: str) -> None:
         if not display_name or display_name in seen or display_name in ("None", "Any"):
             return
+        # Skip generic-wrapper forms like ``AsyncIterator[CommandResult]``
+        # that occasionally leak through from PEP 563 string annotations.
+        # Importing them produces ``from x import AsyncIterator[Y]`` which
+        # is invalid Python. The manifest publisher unwraps these too,
+        # but we guard here as a belt-and-braces defence.
+        if not display_name.isidentifier():
+            return
         seen.add(display_name)
         if display_name in shared_names:
             imports.append((display_name, _to_snake_case(display_name)))

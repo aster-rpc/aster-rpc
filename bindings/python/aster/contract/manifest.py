@@ -263,15 +263,29 @@ def _resolve_type_by_name(name: str, hint_type: type | None = None) -> type | st
 
     Searches the hint type's module first, then all loaded modules.
     Returns the original string if resolution fails.
+
+    Handles PEP 563 string annotations including generic wrappers --
+    ``AsyncIterator[CommandResult]`` is unwrapped to ``CommandResult``
+    before lookup, because the wrapper carries no information beyond
+    what the method's ``pattern`` field already encodes (the codegen
+    knows that a server_stream method yields the response type, that
+    a bidi_stream method takes an AsyncIterator of the request type
+    and yields the response type, etc.).
     """
     import sys
     import dataclasses
+
+    # Strip generic wrappers to get at the wire type. We unwrap from the
+    # outside in: AsyncIterator[CommandResult] -> CommandResult,
+    # Optional[Foo] -> Foo, list[Foo] -> Foo. A bare class name passes
+    # through unchanged.
+    bare = _strip_generic_wrapper(name)
 
     # Try the hint type's module first
     if hint_type is not None and hasattr(hint_type, "__module__"):
         mod = sys.modules.get(hint_type.__module__)
         if mod is not None:
-            candidate = getattr(mod, name, None)
+            candidate = getattr(mod, bare, None)
             if candidate is not None and (isinstance(candidate, type) or dataclasses.is_dataclass(candidate)):
                 return candidate
 
@@ -279,11 +293,34 @@ def _resolve_type_by_name(name: str, hint_type: type | None = None) -> type | st
     for mod in sys.modules.values():
         if mod is None:
             continue
-        candidate = getattr(mod, name, None)
+        candidate = getattr(mod, bare, None)
         if candidate is not None and dataclasses.is_dataclass(candidate):
             return candidate
 
-    return name
+    # Resolution failed -- return the bare (unwrapped) name so downstream
+    # consumers don't see the broken generic-syntax form.
+    return bare
+
+
+def _strip_generic_wrapper(name: str) -> str:
+    """Pull the inner type out of a generic wrapper string.
+
+    ``AsyncIterator[CommandResult]`` -> ``CommandResult``
+    ``Optional[Foo]`` -> ``Foo``
+    ``list[Bar]`` -> ``Bar``
+    ``Foo`` -> ``Foo``
+
+    Recurses for nested wrappers (``AsyncIterator[Optional[X]]`` -> ``X``).
+    For union/comma-separated forms, picks the first non-None component.
+    """
+    s = name.strip()
+    while "[" in s and s.endswith("]"):
+        bracket = s.index("[")
+        s = s[bracket + 1:-1].strip()
+        if "," in s:
+            parts = [p.strip() for p in s.split(",")]
+            s = next((p for p in parts if p and p != "None"), parts[0])
+    return s
 
 
 def _unwrap_generic(t: object) -> type:
