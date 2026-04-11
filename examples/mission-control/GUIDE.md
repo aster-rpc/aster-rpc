@@ -636,8 +636,11 @@ you want typed clients with IDE autocomplete and compile-time checking.
 ### Option A: Generate from a running service
 
 ```bash
-# Generate a Python client from the live control plane
-aster contract gen-client aster1Qm... --out ./clients --package mission_control
+# Generate a Python client from the live control plane.
+# --lang is required (python | typescript) -- there's no default,
+# so the same command is the right starting point regardless of
+# which language you're targeting.
+aster contract gen-client aster1Qm... --out ./clients --package mission_control --lang python
 
 # Output:
 # Generated 5 files
@@ -653,7 +656,7 @@ aster contract gen-client aster1Qm... --out ./clients --package mission_control
 If the producer shared a `.aster.json` file (from `aster contract export`):
 
 ```bash
-aster contract gen-client ./MissionControl.aster.json --out ./clients --package mission_control
+aster contract gen-client ./MissionControl.aster.json --out ./clients --package mission_control --lang python
 ```
 
 Either way, you get a typed client:
