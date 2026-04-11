@@ -75,7 +75,7 @@ jobs:
 
       - name: Validate conformance vectors
         working-directory: bindings/typescript/packages/aster
-        run: bun run vitest run ../../tests/unit/framing.test.ts
+        run: bun run vitest run ../../../../tests/typescript/unit/framing.test.ts
 
   # ── NAPI-RS: cargo check ───────────────────────────────────────────
   napi-check:
