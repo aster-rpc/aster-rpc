@@ -1,0 +1,33 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/public.ts"],
+  "out": "docs-api",
+  "name": "@aster-rpc/aster API Reference",
+  "readme": "none",
+  "hideGenerator": true,
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "disableSources": true,
+  "categorizeByGroup": false,
+  "navigation": {
+    "includeCategories": false,
+    "includeGroups": true,
+    "includeFolders": false
+  },
+  "groupOrder": [
+    "Server and Client",
+    "Decorators",
+    "Authorization",
+    "Serialization",
+    "Errors",
+    "Interceptors",
+    "*"
+  ],
+  "sort": ["source-order"],
+  "visibilityFilters": {
+    "protected": false,
+    "private": false,
+    "inherited": false,
+    "external": false
+  }
+}
