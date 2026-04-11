@@ -274,7 +274,7 @@ jobs:
         run: |
           for dir in artifacts/npm-linux-x64-gnu artifacts/npm-linux-arm64-gnu artifacts/npm-darwin-arm64 artifacts/npm-darwin-x64 artifacts/npm-win32-x64-msvc; do
             echo "─── Publishing $dir ───"
-            (cd "$dir" && npm publish --access public --tag ${{ steps.tag.outputs.dist_tag }})
+            (cd "$dir" && npm publish --access public --tag ${{ steps.tag.outputs.dist_tag }} --ignore-scripts)
           done
 
       - name: Publish @aster-rpc/transport (loader)
@@ -282,11 +282,11 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd artifacts/npm-transport
-          npm publish --access public --tag ${{ steps.tag.outputs.dist_tag }}
+          npm publish --access public --tag ${{ steps.tag.outputs.dist_tag }} --ignore-scripts
 
       - name: Publish @aster-rpc/aster
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd artifacts/npm-aster
-          npm publish --access public --tag ${{ steps.tag.outputs.dist_tag }}
+          npm publish --access public --tag ${{ steps.tag.outputs.dist_tag }} --ignore-scripts

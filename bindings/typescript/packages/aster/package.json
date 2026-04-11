@@ -20,8 +20,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "prepublishOnly": "tsc"
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@aster-rpc/transport": "0.1.0-alpha.0"
