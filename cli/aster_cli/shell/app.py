@@ -1991,15 +1991,21 @@ async def _run_shell(
             apply_remote_identity_state(state, remote)
 
     if not raw:
+        open_gate = bool(
+            getattr(connection, "_aster_client", None)
+            and getattr(connection._aster_client, "open_gate", False)
+        )
         banner_lines = _build_identity_banner_lines(
             state,
             remote_error=remote_error,
             air_gapped=air_gapped,
+            open_gate=open_gate,
         )
-        display.console.print()
-        display.console.print(
-            Panel("\n".join(banner_lines), border_style="blue", padding=(0, 2))
-        )
+        if banner_lines:
+            display.console.print()
+            display.console.print(
+                Panel("\n".join(banner_lines), border_style="blue", padding=(0, 2))
+            )
 
     if directory_mode:
         root = build_directory_root()
@@ -2012,8 +2018,16 @@ async def _run_shell(
         # Pre-populate from connection
         svc_count, blob_count = await _populate_from_connection(root, connection)
 
-        # Welcome banner
-        display.welcome(peer_name, svc_count, blob_count)
+        # Welcome banner -- include our own short node id so users can
+        # see exactly which endpoint their credential must match.
+        our_node_id: str | None = None
+        try:
+            ac = getattr(connection, "_aster_client", None)
+            if ac is not None and getattr(ac, "_node", None) is not None:
+                our_node_id = ac._node.node_addr_info().endpoint_id
+        except Exception:
+            our_node_id = None
+        display.welcome(peer_name, svc_count, blob_count, our_node_id=our_node_id)
 
     # ── Guided tour ───────────────────────────────────────────────────────
     from aster_cli.shell.guide import (
@@ -2195,15 +2209,25 @@ def _build_identity_banner_lines(
     *,
     remote_error: str | None,
     air_gapped: bool,
+    open_gate: bool = False,
 ) -> list[str]:
-    """Build shell startup identity banner lines."""
+    """Build shell startup identity banner lines.
+
+    On an open-gate server (``open_gate=True``) the "Identity not configured"
+    prompt is suppressed entirely: the server doesn't care about the user's
+    local @aster identity, so nagging the user to set one up is pure noise.
+    """
     lines: list[str] = []
     if air_gapped:
         lines.append("[bold]Air-gapped[/bold] [dim]@aster lookups disabled for this session[/dim]")
 
     if not state["root_pubkey"]:
-        lines.append("[bold]Identity not configured[/bold]")
-        lines.append("[dim]Run `aster keygen root` or `join <handle> <email>` to get started.[/dim]")
+        if open_gate:
+            # Server is open-gate, local identity is irrelevant; stay silent.
+            pass
+        else:
+            lines.append("[bold]Identity not configured[/bold]")
+            lines.append("[dim]Run `aster keygen root` or `join <handle> <email>` to get started.[/dim]")
     elif state["handle_status"] == "pending":
         lines.append(f"[bold cyan]{state['display_handle']}[/bold cyan] [yellow]pending verification[/yellow]")
         lines.append("[dim]Run `verify <code>` or `status` to check for auto-verification.[/dim]")
@@ -2356,5 +2380,11 @@ def run_shell_command(args: argparse.Namespace) -> int:
         pass
     except SystemExit:
         pass
+    except Exception as exc:
+        from aster.runtime import AdmissionDeniedError
+        if isinstance(exc, AdmissionDeniedError):
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        raise
 
     return 0

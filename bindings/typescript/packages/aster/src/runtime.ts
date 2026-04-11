@@ -37,6 +37,65 @@ const ALPN_PRODUCER_ADMISSION = 'aster.producer_admission';
 const ALPN_DELEGATED_ADMISSION = 'aster.admission';
 const RPC_ALPN = 'aster/1';
 
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+/**
+ * Raised when a consumer is refused by the server's admission check.
+ *
+ * The server never reveals *why* admission failed (no oracle leak), so this
+ * error enumerates the common causes as a hint to the user rather than a
+ * precise diagnosis. Its `message` is a multi-line actionable hint suitable
+ * for direct CLI output.
+ */
+export class AdmissionDeniedError extends Error {
+  readonly hadCredential: boolean;
+  readonly credentialFile: string | null;
+  readonly ourEndpointId: string;
+  readonly serverAddress: string;
+
+  constructor(opts: {
+    hadCredential: boolean;
+    credentialFile: string | null;
+    ourEndpointId: string;
+    serverAddress: string;
+  }) {
+    const shortId = opts.ourEndpointId
+      ? opts.ourEndpointId.slice(0, 16) + '...'
+      : '<unknown>';
+    let message: string;
+    if (!opts.hadCredential) {
+      message =
+        'consumer admission denied -- this server requires a credential.\n' +
+        '  - Get an enrollment credential file (.cred) from the server\'s operator.\n' +
+        '  - Then retry with: --rcan <path/to/file.cred>\n' +
+        '    (or set ASTER_ENROLLMENT_CREDENTIAL=<path> in the environment)';
+    } else {
+      const credLabel = opts.credentialFile ?? '<credential>';
+      message =
+        `consumer admission denied -- the server rejected your credential.\n` +
+        `  credential: ${credLabel}\n` +
+        `  your node:  ${shortId}\n` +
+        '  Common causes:\n' +
+        '    1. The credential expired (check the \'Expires\' field on the file).\n' +
+        '    2. The credential was issued to a DIFFERENT node. Credentials are\n' +
+        '       bound to a single endpoint id: if you copied this file from\n' +
+        '       another machine/process, the server sees a different node id\n' +
+        '       and refuses admission. Ask the operator to re-issue it for\n' +
+        `       endpointId=${shortId}.\n` +
+        '    3. The server trusts a different root key than the one that signed\n' +
+        '       this credential.\n' +
+        '    4. The credential\'s role/capabilities don\'t match this server\'s\n' +
+        '       policy (the server may reject unknown capabilities outright).';
+    }
+    super(message);
+    this.name = 'AdmissionDeniedError';
+    this.hadCredential = opts.hadCredential;
+    this.credentialFile = opts.credentialFile;
+    this.ourEndpointId = opts.ourEndpointId;
+    this.serverAddress = opts.serverAddress;
+  }
+}
+
 // ── AsterServer ──────────────────────────────────────────────────────────────
 
 /** Options for AsterServer. */
@@ -770,6 +829,11 @@ export class AsterServer {
 
     // Endpoint
     try {
+      const nodeId = this._node?.nodeId?.();
+      if (nodeId) {
+        const short = nodeId.slice(0, 16) + '\u2026';
+        w(`    ${D}node id:${R}   ${W}${short}${R}  ${D}(this node's keypair fingerprint)${R}\n`);
+      }
       w(`    ${D}endpoint:${R}  ${this.address}\n`);
     } catch { /* not started yet */ }
 
@@ -1066,8 +1130,12 @@ export class AsterClientWrapper {
 
     // Build credential: inline peer entry > credential file > null (open-gate).
     let credential: ConsumerEnrollmentCredential | null = this._inlineCredential;
-    if (!credential && this._enrollmentCredentialFile) {
+    let credentialFileLabel: string | null = null;
+    if (credential) {
+      credentialFileLabel = '<inline .aster-identity peer entry>';
+    } else if (this._enrollmentCredentialFile) {
       credential = loadEnrollmentCredential(this._enrollmentCredentialFile);
+      credentialFileLabel = this._enrollmentCredentialFile;
     }
 
     // Consumer admission
@@ -1075,10 +1143,16 @@ export class AsterClientWrapper {
     const admissionResponse = await performAdmission(admissionConn, credential as any);
 
     if (!admissionResponse.admitted) {
-      throw new Error(
-        'consumer admission denied — set enrollmentCredentialFile or ' +
-        'ASTER_ENROLLMENT_CREDENTIAL to a valid enrollment credential',
-      );
+      let ourEndpointId = '';
+      try {
+        ourEndpointId = this._node?.nodeId?.() ?? '';
+      } catch { /* ignore */ }
+      throw new AdmissionDeniedError({
+        hadCredential: credential != null,
+        credentialFile: credentialFileLabel,
+        ourEndpointId,
+        serverAddress: this._address ?? '',
+      });
     }
 
     this._services = admissionResponse.services ?? [];

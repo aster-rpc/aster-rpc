@@ -157,6 +157,12 @@ in real time using server streaming.
 from collections.abc import AsyncIterator
 from aster import server_stream
 
+# Ordered severity used by the level filter below.
+_LEVEL_ORDER = {"debug": 0, "info": 1, "warn": 2, "error": 3, "fatal": 4}
+
+def _level_rank(level: str) -> int:
+    return _LEVEL_ORDER.get(level.lower(), 0)
+
 @wire_type("mission/LogEntry")
 @dataclass
 class LogEntry:
@@ -208,10 +214,43 @@ class MissionControl:
 # Ctrl+C to stop
 ```
 
+Or from your own Python code using the proxy client:
+
+```python
+# tail_logs.py — consume a server stream programmatically
+import asyncio
+from aster import AsterClient
+
+async def main():
+    client = AsterClient(address="aster1Qm...")
+    await client.connect()
+    mc = client.proxy("MissionControl")
+
+    # Server-streaming methods are called via `.stream(...)` and iterated
+    # with `async for`. The plain `await mc.tailLogs({...})` form is for
+    # unary methods only — it will raise on a streaming RPC.
+    async for entry in mc.tailLogs.stream({"level": "warn"}):
+        print(entry)
+
+    await client.close()
+
+asyncio.run(main())
+```
+
 > **Tip:** `tailLogs` blocks until a log entry arrives. If the queue is
 > empty, the client waits. Submit a log entry from another terminal
 > (or via `aster call ... MissionControl.submitLog '{"message":"test"}'`)
 > to see it appear in the stream. Press Ctrl+C to stop.
+
+> **Proxy method shapes** — the proxy uses a different call form per RPC
+> pattern, mirroring what each one actually does:
+>
+> | Pattern | How to call it |
+> |---|---|
+> | Unary | `await mc.getStatus({...})` |
+> | Server stream | `async for x in mc.tailLogs.stream({...}):` |
+> | Client stream | `await mc.ingestMetrics(async_iter)` |
+> | Bidi stream | `ch = mc.runCommand.bidi(); await ch.open(); ...` |
 
 **What just happened:**
 - `@server_stream` turns an async generator into a streaming RPC
@@ -431,6 +470,8 @@ Two service types, two different lifetimes:
 **Goal:** Not every caller should be able to deploy or run commands on agents.
 Define roles, compose requirements, and issue scoped credentials.
 
+Up until now the system has run in `open-gate` mode. That's fine sometimes, but other times you need to put controls on who can access your service. In this step, we will enable authentication so our service will no longer be open to anyone who contacts our node — callers will have to prove they're _authorized_.
+
 The auth flow has three steps:
 1. **Define** -- declare which capabilities each method requires (in code)
 2. **Issue** -- create credentials with specific capabilities (CLI)
@@ -443,7 +484,7 @@ write, no token parsing -- it's declarative.
 
 ### Step 1: Generate a root key
 
-The root key is the trust anchor for your entire deployment. Keep it
+The root key is the trust anchor for your entire deployment. **It identifies you personally as the owner of your deployment**. Keep it
 offline — you'll use it to sign credentials, not to run services.
 
 ```bash
@@ -461,7 +502,8 @@ aster trust keygen --out-key ~/.aster/root.key
 
 ```python
 from enum import Enum
-from aster import any_of, all_of
+from aster import any_of
+# Also available: `all_of(A, B)` -- caller must have BOTH roles.
 
 class Role(str, Enum):
     """Capabilities that can be granted to consumers."""
@@ -507,12 +549,12 @@ class AgentSession:
 
 ```python
 config = AsterConfig(
-    root_pubkey_file="~/.aster/root.pub",
+    root_pubkey_file="~/.aster/root.pub", # <- this is the owner's public key (i.e. yours)
     allow_all_consumers=False,   # require credentials
 )
 async with AsterServer(
     services=[MissionControl(), AgentSession()],
-    identity=".aster-identity",
+    identity=".aster-identity", # <- this is the identity of the endpoint
     peer="mission-control",
     config=config,
 ) as srv:
@@ -520,7 +562,13 @@ async with AsterServer(
     await srv.serve()
 ```
 
+Each Aster endpoint will have its own identity (secret key pair) and it will have the public key of its owner (you) so it knows who administers it.
+
+> **No `.aster-identity` file?** Aster generates a fresh ephemeral keypair on startup. That's fine for experiments, but every restart gives you a new endpoint id — and any credentials you issued to the old one will stop working. Once you start enrolling peers, commit to a persistent identity file.
+
 ### Step 4: Enroll agents
+
+When you want to allow another endpoint connect to yours, you must give it permission. You do that by generating a _credential_ for it and putting in it the roles that endpoint should have.
 
 ```bash
 # Issue a credential for an edge agent -- status and ingest only
@@ -570,7 +618,7 @@ aster enroll node --role consumer --name "edge-node-7" \
 > `endpoint_id`. If they don't match, admission fails.
 
 ```bash
-# Issue an operator credential -- full access including admin
+# Issue a credential for the ops team -- full access including admin
 aster enroll node --role consumer --name "ops-team" \
     --capabilities ops.status,ops.logs,ops.admin,ops.ingest \
     --root-key ~/.aster/root.key \
@@ -633,6 +681,13 @@ directly from the running service.
 So far you've been using the shell to explore. But for production code,
 you want typed clients with IDE autocomplete and compile-time checking.
 
+> **Following on from Chapter 5?** `gen-client` against a live node opens a
+> regular consumer connection, so if your server is running in trusted mode
+> (`allow_all_consumers=False`) the same credential rules apply: append
+> `--rcan ops-team.cred` (or any credential with read access) to the
+> commands below. If your server is still in open-gate mode, no credential
+> is needed.
+
 ### Option A: Generate from a running service
 
 ```bash
@@ -640,6 +695,7 @@ you want typed clients with IDE autocomplete and compile-time checking.
 # --lang is required (python | typescript) -- there's no default,
 # so the same command is the right starting point regardless of
 # which language you're targeting.
+# Add `--rcan ops-team.cred` if the server is in trusted mode (Chapter 5).
 aster contract gen-client aster1Qm... --out ./clients --package mission_control --lang python
 
 # Output:

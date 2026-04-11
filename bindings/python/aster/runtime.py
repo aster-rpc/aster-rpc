@@ -84,9 +84,63 @@ from .trust.mesh import ClockDriftConfig, MeshState
 from .trust.nonces import InMemoryNonceStore
 from .trust.signing import sign_credential
 
-__all__ = ["AsterServer", "AsterClient", "RPC_ALPN"]
+__all__ = ["AsterServer", "AsterClient", "AdmissionDeniedError", "RPC_ALPN"]
 
 RPC_ALPN: bytes = b"aster/1"
+
+
+# ── Errors ───────────────────────────────────────────────────────────────────
+
+
+class AdmissionDeniedError(PermissionError):
+    """Raised when a consumer is refused by the server's admission check.
+
+    The server never reveals *why* admission failed (no oracle leak), so this
+    exception enumerates the common causes as a hint to the user rather than
+    a precise diagnosis.
+    """
+
+    def __init__(
+        self,
+        *,
+        had_credential: bool,
+        credential_file: str | None,
+        our_endpoint_id: str,
+        server_address: str,
+    ) -> None:
+        self.had_credential = had_credential
+        self.credential_file = credential_file
+        self.our_endpoint_id = our_endpoint_id
+        self.server_address = server_address
+        super().__init__(self.format_hint())
+
+    def format_hint(self) -> str:
+        """Return a multi-line actionable hint suitable for CLI output."""
+        short_id = (self.our_endpoint_id[:16] + "...") if self.our_endpoint_id else "<unknown>"
+        if not self.had_credential:
+            return (
+                "consumer admission denied -- this server requires a credential.\n"
+                "  - Get an enrollment credential file (.cred) from the server's operator.\n"
+                "  - Then retry with: --rcan <path/to/file.cred>\n"
+                "    (or set ASTER_ENROLLMENT_CREDENTIAL=<path> in the environment)"
+            )
+        cred_label = self.credential_file or "<credential>"
+        return (
+            f"consumer admission denied -- the server rejected your credential.\n"
+            f"  credential: {cred_label}\n"
+            f"  your node:  {short_id}\n"
+            "  Common causes:\n"
+            "    1. The credential expired (check the 'Expires' field on the file).\n"
+            "    2. The credential was issued to a DIFFERENT node. Credentials are\n"
+            "       bound to a single endpoint id: if you copied this file from\n"
+            "       another machine/process, the server sees a different node id\n"
+            "       and refuses admission. Ask the operator to re-issue it for\n"
+            f"       endpoint_id={short_id}.\n"
+            "    3. The server trusts a different root key than the one that signed\n"
+            "       this credential.\n"
+            "    4. The credential's role/capabilities don't match this server's\n"
+            "       policy (the server may reject unknown capabilities outright)."
+        )
 
 
 # ── AsterServer ──────────────────────────────────────────────────────────────
@@ -511,10 +565,12 @@ class AsterServer:
 
         # ── Endpoint ─────────────────────────────────────────────────────
         compact = None
+        endpoint_id_full = None
         if self._node:
             try:
                 from . import AsterTicket
                 addr_info = self._node.node_addr_info()
+                endpoint_id_full = addr_info.endpoint_id
                 t = AsterTicket(
                     endpoint_id=addr_info.endpoint_id,
                     direct_addrs=addr_info.direct_addresses or [],
@@ -523,6 +579,9 @@ class AsterServer:
             except Exception:
                 pass
 
+        if endpoint_id_full:
+            short = endpoint_id_full[:16] + "…"
+            w(f"    {D}node id:{R}   {W}{short}{R}  {D}(this node's keypair fingerprint){R}\n")
         if compact:
             w(f"    {D}endpoint:{R}  {compact}\n")
 
@@ -1392,6 +1451,7 @@ class AsterClient:
         self._services: list[ServiceSummary] = []
         self._registry_namespace: str = ""
         self._gossip_topic: str = ""
+        self._open_gate: bool = False
         self._rpc_conns: dict[str, Any] = {}
         self._clients: list[ServiceClient] = []
         self._connected: bool = False
@@ -1483,12 +1543,15 @@ class AsterClient:
         assert self._ep is not None
 
         # Build credential from: inline peer entry > credential file > empty.
+        credential_file: str | None = None
         if self._inline_credential:
             cred = _credential_from_peer_entry(self._inline_credential)
             cred_json = consumer_cred_to_json(cred)
+            credential_file = "<inline .aster-identity peer entry>"
         elif self._enrollment_credential_file:
             cred = _load_enrollment_credential(self._enrollment_credential_file)
             cred_json = consumer_cred_to_json(cred)
+            credential_file = self._enrollment_credential_file
         else:
             # No credential -- dev mode / open-gate flow.
             cred_json = ""
@@ -1507,10 +1570,24 @@ class AsterClient:
         raw = await recv.read_to_end(64 * 1024)
         resp = ConsumerAdmissionResponse.from_json(raw)
         if not resp.admitted:
-            raise PermissionError(
-                "consumer admission denied -- set ASTER_ENROLLMENT_CREDENTIAL "
-                "to a valid enrollment token"
+            our_endpoint_id = ""
+            try:
+                if self._node is not None:
+                    our_endpoint_id = self._node.node_addr_info().endpoint_id
+            except Exception:
+                pass
+            raise AdmissionDeniedError(
+                had_credential=bool(cred_json),
+                credential_file=credential_file,
+                our_endpoint_id=our_endpoint_id,
+                server_address=str(self._endpoint_addr_in),
             )
+
+        # If the admission succeeded without us presenting a credential,
+        # the server must be running in open-gate mode (allow_all_consumers).
+        # The shell uses this to suppress noisy "Identity not configured"
+        # banners that are irrelevant on open-gate servers.
+        self._open_gate = not cred_json
 
         self._services = list(resp.services)
         self._registry_namespace = resp.registry_namespace or ""
@@ -1643,6 +1720,17 @@ class AsterClient:
         Empty string if no registry doc was provided by the producer.
         """
         return self._registry_namespace
+
+    @property
+    def open_gate(self) -> bool:
+        """True if the server admitted this client without a credential.
+
+        When True, the server is running with ``allow_all_consumers=True``
+        and no credential was required. Useful for clients (e.g. the shell)
+        that want to suppress identity-related banners that are irrelevant
+        on open-gate servers.
+        """
+        return self._open_gate
 
     def proxy(self, service_name: str) -> "ProxyClient":
         """Create a dynamic proxy client for a shared (stream-per-call) service.

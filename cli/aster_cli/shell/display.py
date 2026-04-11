@@ -281,16 +281,29 @@ class Display:
             self.info(f"({elapsed_ms:.0f}ms)")
         self.json_value(result)
 
-    def welcome(self, peer_name: str, service_count: int, blob_count: int) -> None:
-        """Display the welcome banner on connection."""
+    def welcome(
+        self,
+        peer_name: str,
+        service_count: int,
+        blob_count: int,
+        our_node_id: str | None = None,
+    ) -> None:
+        """Display the welcome banner on connection.
+
+        If ``our_node_id`` is provided, the local node's short endpoint id
+        is shown on a dedicated line so credential-mismatch debugging can
+        start from a visible landmark ("credentials are bound to this id").
+        """
         self.console.print()
+        body = (
+            f"[bold]Connected to {escape(peer_name)}[/bold]\n"
+            f"[dim]{service_count} services, {blob_count} blobs[/dim]"
+        )
+        if our_node_id:
+            short = our_node_id[:16] + "…"
+            body += f"\n[dim]your node:[/dim] [white]{escape(short)}[/white]"
         self.console.print(
-            Panel(
-                f"[bold]Connected to {escape(peer_name)}[/bold]\n"
-                f"[dim]{service_count} services, {blob_count} blobs[/dim]",
-                border_style="cyan",
-                padding=(0, 2),
-            )
+            Panel(body, border_style="cyan", padding=(0, 2))
         )
         self.console.print()
 

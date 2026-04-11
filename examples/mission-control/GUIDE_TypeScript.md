@@ -170,6 +170,14 @@ in real time using server streaming.
 ```typescript
 import { ServerStream } from '@aster-rpc/aster';
 
+// Ordered severity used by the level filter below.
+const LEVEL_ORDER: Record<string, number> = {
+    debug: 0, info: 1, warn: 2, error: 3, fatal: 4,
+};
+function levelRank(level: string): number {
+    return LEVEL_ORDER[level.toLowerCase()] ?? 0;
+}
+
 @WireType("mission/LogEntry")
 class LogEntry {
     timestamp: number = 0.0;
@@ -234,10 +242,40 @@ class MissionControl {
 # Ctrl+C to stop
 ```
 
+Or from your own TypeScript code using the proxy client:
+
+```typescript
+// tail-logs.ts — consume a server stream programmatically
+import { AsterClientWrapper } from '@aster-rpc/aster';
+
+const client = new AsterClientWrapper({ address: "aster1Qm..." });
+await client.connect();
+const mc = client.proxy("MissionControl");
+
+// Server-streaming methods are called via `.stream(...)` and iterated
+// with `for await`. Calling `await mc.tailLogs({...})` directly is for
+// unary methods only — it will throw on a streaming RPC.
+for await (const entry of mc.tailLogs.stream({ level: "warn" })) {
+    console.log(entry);
+}
+
+await client.close();
+```
+
 > **Tip:** `tailLogs` blocks until a log entry arrives. If the buffer is
 > empty, the client waits. Submit a log entry from another terminal
 > (or via `aster call ... MissionControl.submitLog '{"message":"test"}'`)
 > to see it appear in the stream. Press Ctrl+C to stop.
+
+> **Proxy method shapes** — the proxy uses a different call form per RPC
+> pattern, mirroring what each one actually does:
+>
+> | Pattern | How to call it |
+> |---|---|
+> | Unary | `await mc.getStatus({...})` |
+> | Server stream | `for await (const x of mc.tailLogs.stream({...})) { ... }` |
+> | Client stream | `await mc.ingestMetrics(asyncIter)` |
+> | Bidi stream | `const ch = mc.runCommand.bidi(); await ch.open(); ...` |
 
 **What just happened:**
 - `@ServerStream` turns an async generator into a streaming RPC
@@ -485,6 +523,8 @@ Two service types, two different lifetimes:
 **Goal:** Not every caller should be able to deploy or run commands on agents.
 Define roles, compose requirements, and issue scoped credentials.
 
+Up until now the system has run in `open-gate` mode. That's fine sometimes, but other times you need to put controls on who can access your service. In this step, we will enable authentication so our service will no longer be open to anyone who contacts our node — callers will have to prove they're _authorized_.
+
 The auth flow has three steps:
 1. **Define** -- declare which capabilities each method requires (in code)
 2. **Issue** -- create credentials with specific capabilities (CLI)
@@ -497,7 +537,7 @@ write, no token parsing -- it's declarative.
 
 ### Step 1: Generate a root key
 
-The root key is the trust anchor for your entire deployment. Keep it
+The root key is the trust anchor for your entire deployment. **It identifies you personally as the owner of your deployment**. Keep it
 offline — you'll use it to sign credentials, not to run services.
 
 ```bash
@@ -514,7 +554,8 @@ aster trust keygen --out-key ~/.aster/root.key
 ### Step 2: Define roles in code
 
 ```typescript
-import { anyOf, allOf } from '@aster-rpc/aster';
+import { anyOf } from '@aster-rpc/aster';
+// Also available: `allOf(A, B)` — caller must have BOTH roles.
 
 /** Capabilities that can be granted to consumers. */
 const Role = {
@@ -585,10 +626,10 @@ class AgentSession {
 ```typescript
 const server = new AsterServer({
     services: [new MissionControl(), new AgentSession()],
-    identity: ".aster-identity",
+    identity: ".aster-identity", // <- this is the identity of the endpoint
     peer: "mission-control",
     config: {
-        rootPubkeyFile: "~/.aster/root.pub",
+        rootPubkeyFile: "~/.aster/root.pub", // <- this is the owner's public key (i.e. yours)
     },
     allowAllConsumers: false,   // require credentials
 });
@@ -597,7 +638,13 @@ console.log(server.address);
 await server.serve();
 ```
 
+Each Aster endpoint will have its own identity (secret key pair) and it will have the public key of its owner (you) so it knows who administers it.
+
+> **No `.aster-identity` file?** Aster generates a fresh ephemeral keypair on startup. That's fine for experiments, but every restart gives you a new endpoint id — and any credentials you issued to the old one will stop working. Once you start enrolling peers, commit to a persistent identity file.
+
 ### Step 4: Enroll agents
+
+When you want to allow another endpoint connect to yours, you must give it permission. You do that by generating a _credential_ for it and putting in it the roles that endpoint should have.
 
 ```bash
 # Issue a credential for an edge agent -- status and ingest only
@@ -647,7 +694,7 @@ aster enroll node --role consumer --name "edge-node-7" \
 > `endpoint_id`. If they don't match, admission fails.
 
 ```bash
-# Issue an operator credential -- full access including admin
+# Issue a credential for the ops team -- full access including admin
 aster enroll node --role consumer --name "ops-team" \
     --capabilities ops.status,ops.logs,ops.admin,ops.ingest \
     --root-key ~/.aster/root.key \
@@ -710,10 +757,18 @@ directly from the running service.
 So far you've been using the shell to explore. But for production code,
 you want typed clients with IDE autocomplete and compile-time checking.
 
+> **Following on from Chapter 5?** `gen-client` against a live node opens a
+> regular consumer connection, so if your server is running in trusted mode
+> (`allowAllConsumers: false`) the same credential rules apply: append
+> `--rcan ops-team.cred` (or any credential with read access) to the
+> commands below. If your server is still in open-gate mode, no credential
+> is needed.
+
 ### Option A: Generate from a running service
 
 ```bash
-# Generate a TypeScript client from the live control plane
+# Generate a TypeScript client from the live control plane.
+# Add `--rcan ops-team.cred` if the server is in trusted mode (Chapter 5).
 aster contract gen-client aster1Qm... --out ./clients --package mission_control --lang typescript
 
 # Output:

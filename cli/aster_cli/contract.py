@@ -549,6 +549,10 @@ def _call_command(args: argparse.Namespace) -> int:
             print(_json.dumps(result, indent=2, default=str))
             return 0
         except Exception as exc:
+            from aster.runtime import AdmissionDeniedError
+            if isinstance(exc, AdmissionDeniedError):
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
             msg = str(exc)
             if "PERMISSION_DENIED" in msg:
                 print(f"Error: permission denied for {service_name}.{method_name}.\n"
@@ -587,18 +591,27 @@ def _gen_client_command(args: argparse.Namespace) -> int:
         return 1
 
     # Determine source type and load manifests
+    from aster.runtime import AdmissionDeniedError
     if os.path.isfile(source):
         # Source is a local .aster.json export file
         manifests = _load_manifests_for_codegen(source)
         namespace = args.package or Path(source).stem.replace(".aster", "").replace(".", "_") or "local"
     elif source.startswith("@") and "/" in source:
-        manifests = asyncio.run(
-            _fetch_manifests_from_directory_ref(source, getattr(args, "aster", None))
-        )
+        try:
+            manifests = asyncio.run(
+                _fetch_manifests_from_directory_ref(source, getattr(args, "aster", None))
+            )
+        except AdmissionDeniedError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         namespace = args.package or _namespace_from_directory_ref(source)
     elif source.startswith("aster1"):
         # Source is a live node ticket -- connect, fetch manifests, disconnect
-        manifests = asyncio.run(_fetch_manifests_from_node(source, getattr(args, "rcan", None)))
+        try:
+            manifests = asyncio.run(_fetch_manifests_from_node(source, getattr(args, "rcan", None)))
+        except AdmissionDeniedError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         namespace = args.package or source[6:14]  # first 8 chars after "aster1"
     else:
         print(f"Error: unrecognised source '{source}'", file=sys.stderr)
@@ -956,9 +969,17 @@ def main() -> None:
     from aster_cli.shell import register_shell_subparser
     register_shell_subparser(subparsers)
 
-    # ``aster blob``, ``aster service`` -- CLI equivalents of shell commands
-    from aster_cli.shell.plugin import register_cli_subcommands
-    register_cli_subcommands(subparsers)
+    # ``aster blob`` / ``aster service`` -- intentionally NOT registered at
+    # the top-level CLI for now. The shell plugin system registers these as
+    # argparse subcommands, but they have no execution path in main() yet
+    # (there is no ``elif args.command == "service"`` branch), so calling
+    # them prints the root help and exits 1 -- a worse UX than the command
+    # simply not existing. They remain available inside `aster shell`
+    # as `blob ls`, `service describe`, etc. Re-enable when the dispatcher
+    # is wired up.
+    #
+    # from aster_cli.shell.plugin import register_cli_subcommands
+    # register_cli_subcommands(subparsers)
 
     # ``aster call`` -- one-shot RPC invocation
     call_parser = subparsers.add_parser(

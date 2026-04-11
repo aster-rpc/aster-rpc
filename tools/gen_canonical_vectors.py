@@ -535,7 +535,7 @@ def micro_optional_vectors() -> list[Vector]:
 
 
 def micro_scope_vectors() -> list[Vector]:
-    """Scope distinctness: SHARED vs STREAM must produce different contract_ids."""
+    """Scope distinctness: SHARED vs SESSION must produce different contract_ids."""
     sc_shared = ServiceContract(
         name="ScopeTest",
         version=1,
@@ -544,18 +544,18 @@ def micro_scope_vectors() -> list[Vector]:
         scoped=ScopeKind.SHARED,
         requires=None,
     )
-    sc_stream = ServiceContract(
+    sc_session = ServiceContract(
         name="ScopeTest",
         version=1,
         methods=[],
         serialization_modes=["xlang"],
-        scoped=ScopeKind.STREAM,
+        scoped=ScopeKind.SESSION,
         requires=None,
     )
     v_shared = make_vector("micro.scope.shared", "ServiceContract with SHARED scope", sc_shared)
-    v_stream = make_vector("micro.scope.stream", "ServiceContract with STREAM scope", sc_stream)
-    assert v_shared.hash_hex != v_stream.hash_hex, "SHARED and STREAM must have different hashes!"
-    return [v_shared, v_stream]
+    v_session = make_vector("micro.scope.session", "ServiceContract with SESSION scope", sc_session)
+    assert v_shared.hash_hex != v_session.hash_hex, "SHARED and SESSION must have different hashes!"
+    return [v_shared, v_session]
 
 
 def micro_nfc_vectors() -> list[Vector]:
