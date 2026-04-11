@@ -1,76 +1,61 @@
 # Aster
 
-**Peer-to-peer RPC framework + control-plane CLI, built on [Iroh](https://iroh.computer).**
+> **Machines need to authenticate to other machines, often on behalf of a user. Aster makes that safe — without a central authority and without shared secrets.**
 
-Write a service in Python or TypeScript, get a typed client in another language, talk to it from anywhere on the public internet without a CA, port-forwarding, or central server. Aster handles the trust, transport, and contract identity for you.
+Aster is a peer-to-peer RPC framework with identity in the connection. You define typed services in Python or TypeScript, and any machine that holds the right capability credential can call them — across NATs, across organisations, across languages — without DNS, without a load balancer, without a certificate authority, and without an OAuth proxy in the middle.
 
-- **Website**: [aster.site](https://aster.site)
-- **Docs**: [docs.aster.site](https://docs.aster.site)
-- **Quickstart**: [Mission Control in 30 minutes](https://docs.aster.site/quickstart/mission-control)
+The 2026 vivid example is AI agents calling tools on remote machines: agent on machine A wants to invoke a function on machine B, you don't want a hosted proxy in between, you don't want to rotate API keys, and you want the call to be scoped to specific methods. That's exactly what Aster solves. The same engineering also covers IoT fleets, edge compute, multi-tenant microservices, and anything else where the machine is the principal and the user is the delegating authority.
+
+Built on [iroh](https://iroh.computer) (QUIC + NAT traversal), [Apache Fory](https://fory.apache.org) (cross-language wire format), and [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) (content-addressed contract identity). Capability-based credentials, four-gate authorization, and an offline ed25519 root key. The trust model is documented in [the spec](ffi_spec/Aster-trust-spec.md).
+
+- **Website** — [aster.site](https://aster.site)
+- **Docs** — [docs.aster.site](https://docs.aster.site)
+- **Mission Control walkthrough** — [docs.aster.site/docs/quickstart/mission-control](https://docs.aster.site/docs/quickstart/mission-control) (the canonical 30-minute deep dive — seven chapters, four streaming patterns, auth, gen-client, cross-language)
 
 ---
 
-## Install the CLI
+## Install
 
-The Aster CLI (`aster`) gives you a control plane for your services: connect to a peer, browse its contracts, call methods, stream logs, manage credentials, generate typed clients, and more.
+Two packages: the framework and the CLI.
 
-### One-line install (recommended)
-
-```bash
-curl -LsSf https://aster.site/install.sh | sh
-```
-
-This installs [`uv`](https://docs.astral.sh/uv/) (if not already present) and then runs `uv tool install aster-cli`. The result is the `aster` command on your `PATH`, with everything isolated in its own environment so it never conflicts with your system Python.
-
-### Verify the installer first (security-conscious)
+### Python
 
 ```bash
-curl -LsSfO https://aster.site/install.sh
-shasum -a 256 install.sh
-# Expected: 27536761d65bd03df2a770ef124121f531406fb56861d7049c9e7c30668d8a5c
-sh install.sh
+uv pip install aster-rpc aster-cli
+# or:
+pip install aster-rpc aster-cli
 ```
 
-The expected hash is published on [aster.site](https://aster.site) and updated with every release. If the hash doesn't match, **don't run the script** — it may have been tampered with.
+`aster-rpc` gives you `from aster import ...` for your service code. `aster-cli` gives you the `aster` command — shell, contract gen-client, trust manager, enrollment, MCP integration. They're versioned independently.
 
-### Already have `uv`?
+### TypeScript
+
+```bash
+bun add @aster-rpc/aster
+# or: npm install @aster-rpc/aster
+```
+
+The CLI is shared across all language bindings — install it once via Python and it works against any Aster server regardless of what wrote the service:
 
 ```bash
 uv tool install aster-cli
+# or: pip install aster-cli
 ```
-
-### Already have `pip`?
-
-```bash
-pip install aster-cli
-```
-
-We strongly recommend `uv tool install` over `pip install --user` because it isolates the CLI from your system Python.
-
-### Platforms
-
-- **Linux** (x86_64, aarch64) — full support
-- **macOS** (Intel, Apple Silicon) — full support
-- **Windows** — install via `pip install aster-cli` (no `install.sh` yet; PRs welcome)
 
 ### Verify
 
 ```bash
 aster --version
-aster --help
-aster shell --demo      # interactive demo, no network needed
+aster shell --demo      # interactive shell against a sample peer, no network needed
 ```
+
+Pre-built wheels for Linux x86_64/aarch64, macOS arm64, and Windows x64. TypeScript native binaries for the same platforms via NAPI-RS.
 
 ---
 
-## Use Aster from Python
+## A working service in 60 seconds
 
-```bash
-pip install aster-rpc
-# or: uv add aster-rpc
-```
-
-Define a service:
+### Python
 
 ```python
 from dataclasses import dataclass
@@ -88,92 +73,99 @@ class Response:
 
 @service(name="HelloService", version=1)
 class HelloService:
-    @rpc()
+    @rpc
     async def greet(self, req: Request) -> Response:
         return Response(message=f"Hello, {req.name}!")
 
 async def main():
     async with AsterServer(services=[HelloService()]) as srv:
-        print(srv.address)  # Share this aster1... ticket
+        print(srv.address)   # share this aster1... with consumers
         await srv.serve()
 ```
 
-Call it from another machine:
+Call it from another machine — no DNS, no port forwarding, no shared schema file:
 
 ```python
 from aster import AsterClient
 
 async def main():
-    client = AsterClient(address="aster1...")
-    await client.connect()
-    hello = client.proxy("HelloService")
-    result = await hello.greet({"name": "World"})
-    print(result["message"])
+    async with AsterClient(address="aster1...") as c:
+        hello = c.proxy("HelloService")
+        reply = await hello.greet({"name": "World"})
+        print(reply["message"])
 ```
 
-That's a working RPC service running on Iroh's NAT-traversing QUIC transport, with content-addressed contract identity. No port forwarding, no TLS certificate, no shared schema file.
-
-For the full guide, see [docs.aster.site/quickstart/mission-control](https://docs.aster.site/quickstart/mission-control).
-
----
-
-## Use Aster from TypeScript / Bun
-
-```bash
-bun add @aster-rpc/aster
-```
+### TypeScript
 
 ```typescript
-import { Service, Rpc, WireType, AsterServer, AsterClientWrapper } from "@aster-rpc/aster";
+import { Service, Rpc, AsterServer, AsterClientWrapper } from "@aster-rpc/aster";
 
-@WireType("hello/Request")
-class Request { name: string = ""; }
+class Request {
+  name = "";
+  constructor(init?: Partial<Request>) { if (init) Object.assign(this, init); }
+}
 
-@WireType("hello/Response")
-class Response { message: string = ""; }
+class Response {
+  message = "";
+  constructor(init?: Partial<Response>) { if (init) Object.assign(this, init); }
+}
 
 @Service({ name: "HelloService", version: 1 })
-class HelloService {
-  @Rpc()
+export class HelloService {
+  @Rpc({ request: Request, response: Response })
   async greet(req: Request): Promise<Response> {
-    return { message: `Hello, ${req.name}!` };
+    return new Response({ message: `Hello, ${req.name}!` });
   }
 }
 
-const srv = new AsterServer({ services: [new HelloService()] });
-await srv.start();
-console.log(srv.address);
-await srv.serve();
+const server = new AsterServer({ services: [new HelloService()] });
+await server.start();
+console.log(server.address);
+await server.serve();
 ```
+
+The Python service and the TypeScript service speak the same wire format natively — no codegen step, no IDL file. A Python client can call a TypeScript service and vice versa using the dynamic proxy or a generated typed client.
+
+For the full guide — auth, sessions, streaming, cross-language interop — see the [Mission Control walkthrough](https://docs.aster.site/docs/quickstart/mission-control).
 
 ---
 
 ## What's in this repo
 
 ```
-aster-rpc/                          PyPI: aster-rpc          (Python bindings + RPC framework)
-@aster-rpc/aster                    npm:  @aster-rpc/aster   (TypeScript bindings + RPC framework)
-aster-cli                           PyPI: aster-cli          (the `aster` command)
+aster-rpc/                          PyPI: aster-rpc           (framework + Python bindings)
+@aster-rpc/aster                    npm:  @aster-rpc/aster    (framework + TypeScript bindings)
+@aster-rpc/transport                npm:  @aster-rpc/transport (NAPI-RS native addon)
+aster-cli                           PyPI: aster-cli           (the `aster` command)
 
 bindings/python/                    Python binding source (PyO3 + Python)
 bindings/typescript/                TypeScript binding source (NAPI-RS + TypeScript)
-bindings/java/                      Java binding (in progress)
-bindings/go/                        Go binding (in progress)
+bindings/dotnet/                    .NET binding scaffold (in progress)
+bindings/java/                      Java binding scaffold (in progress)
+bindings/go/                        Go binding scaffold (in progress)
 
 cli/                                CLI source (the `aster` command)
 core/                               Shared Rust core (iroh wrapper)
 ffi/                                C FFI for non-Python language bindings
+ffi_spec/                           Wire-protocol and trust specifications
 
-examples/python/                    Python examples (mission_control, etc.)
-examples/typescript/                TypeScript examples
-examples/mission-control/           Mission Control walkthrough (the quickstart)
+examples/python/                    Python example services
+examples/typescript/                TypeScript example services
+examples/mission-control/           The canonical Mission Control walkthrough
 
-docs/_internal/                     Implementation flows, design notes, perf
-                                    investigation. Not published.
-ffi_spec/                           Wire-protocol specification documents
-conformance/                        Cross-language conformance vectors
 tests/                              Unit + integration tests for all bindings
+conformance/                        Cross-language conformance vectors
 ```
+
+---
+
+## Where this is going
+
+Today: typed services, four streaming patterns, capability-based auth, Python and TypeScript bindings shipping at 0.1.2, MCP integration for AI agent tool calling.
+
+Next: identity-aware load balancing and self-healing built from the same primitives. The substrate keeps growing from one consistent identity model — load balancing across endpoints that share an identity, self-healing rooted in the same trust topology. The "no infrastructure" pitch starts as *no DNS, no LB, no certs* and grows into *no DNS, no LB, no certs, no service mesh, no sidecars, no control plane*.
+
+Java, .NET, Kotlin, and Go bindings are in progress. Rust is planned (direct access to the core crate, no FFI overhead).
 
 ---
 
@@ -191,8 +183,8 @@ You only need this if you're contributing to Aster itself. Most users should `pi
 ### Python binding
 
 ```bash
-git clone https://github.com/emrul/iroh-python.git
-cd iroh-python
+git clone https://github.com/aster-rpc/aster-rpc.git
+cd aster-rpc
 
 uv venv
 uv pip install maturin pytest pytest-asyncio pytest-timeout pytest-rerunfailures
@@ -205,18 +197,6 @@ Or use the build script which also regenerates type stubs:
 ```bash
 ./scripts/build.sh
 ```
-
-### Optional: speed up Rust builds with sccache
-
-```bash
-brew install sccache       # macOS
-# or: cargo install sccache
-
-export RUSTC_WRAPPER=sccache
-sccache --start-server || true
-```
-
-`./scripts/validate.sh` auto-enables `sccache` when installed and prints cache stats at the end.
 
 ### TypeScript binding
 
@@ -235,9 +215,6 @@ uv run pytest tests/python/ -v --timeout=30
 # Python: unit tests only (fast)
 uv run pytest tests/python/ -v --timeout=30 -m "not network"
 
-# Single file
-uv run pytest tests/python/test_blobs.py -v --timeout=30
-
 # TypeScript
 cd bindings/typescript && bun test
 
@@ -245,10 +222,9 @@ cd bindings/typescript && bun test
 bash tests/integration/mission_control/run_matrix.sh
 ```
 
-### Lint / format
+### Lint and full validation
 
 ```bash
-# Rust
 cargo fmt --manifest-path bindings/python/rust/Cargo.toml
 cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings
 
@@ -256,9 +232,17 @@ cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings
 ./scripts/validate.sh
 ```
 
+### Optional: speed up Rust builds with sccache
+
+```bash
+brew install sccache       # macOS
+# or: cargo install sccache
+export RUSTC_WRAPPER=sccache
+```
+
 ### Pre-push hook
 
-A pre-push hook runs `cargo fmt --check` and `cargo clippy` before allowing pushes:
+A pre-push hook runs `cargo fmt --check`, `cargo clippy`, and the aster-cli compatibility check before allowing pushes:
 
 ```bash
 git config core.hooksPath .githooks
@@ -272,16 +256,17 @@ Checked into the repo at `.githooks/pre-push` — one-time setup per clone.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  Application code (Python / TypeScript / Java / Go)                  │
+│  Application code (Python / TypeScript / Java / .NET / Go)           │
 ├──────────────────────────────────────────────────────────────────────┤
 │  Aster RPC framework                                                 │
 │    @service / @rpc decorators, codegen, interceptors,                │
 │    contract identity, session-scoped services, capabilities          │
 ├──────────────────────────────────────────────────────────────────────┤
 │  Wire protocol                                                       │
-│    Stream framing, codec (Fory XLANG / JSON), trailers, deadlines    │
+│    Stream framing, codec (Fory XLANG / NATIVE / ROW / JSON),         │
+│    trailers, deadlines                                               │
 ├──────────────────────────────────────────────────────────────────────┤
-│  Trust layer (Gate 0/1/3)                                            │
+│  Trust layer (Gates 0–3)                                             │
 │    ed25519 root key, OTT/policy credentials, peer admission,         │
 │    role-based capabilities, optional @aster delegated auth           │
 ├──────────────────────────────────────────────────────────────────────┤
