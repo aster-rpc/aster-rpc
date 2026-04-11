@@ -4,6 +4,7 @@
   "workspaces": [
     "native",
     "packages/aster",
+    "../../examples/typescript/hello-world",
     "../../examples/typescript/missionControl",
     "../../tests/integration/mission_control"
   ],

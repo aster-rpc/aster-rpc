@@ -1,7 +1,13 @@
 /**
- * Hello World example — the simplest Aster service in TypeScript.
+ * Hello World example -- the simplest Aster service in TypeScript.
  *
- * Run: bun run examples/hello-world/service.ts
+ * Demonstrates a unary RPC and a server-streaming RPC running entirely
+ * in-process via LocalTransport. No network setup, no credentials, no
+ * aster1... ticket -- just one file you can run with `bun service.ts`.
+ *
+ * For the real-network version (AsterServer + AsterClientWrapper across
+ * two processes, with credentials and streaming), see the Mission Control
+ * walkthrough at https://docs.aster.site/docs/quickstart/mission-control
  */
 
 import {
@@ -12,7 +18,7 @@ import {
   ServiceRegistry,
   LocalTransport,
   createClient,
-} from '../../packages/aster/src/index.js';
+} from '@aster-rpc/aster';
 
 // -- Wire types ---------------------------------------------------------------
 
