@@ -392,6 +392,31 @@ export class AsterServer {
       const reqType = mi.requestType;
       const respType = mi.responseType;
 
+      // TypeScript erases parameter types at runtime, so the only way to
+      // know what request/response classes a method takes is for the user
+      // to pass them explicitly via @Rpc({ request: T, response: U }).
+      // When a method is decorated as `@Rpc()` (or any options object that
+      // doesn't include `request:` / `response:`), the published manifest
+      // has empty fields and broken wire tags -- which silently breaks
+      // gen-client for cross-language consumers and breaks the shell's
+      // method discovery for native consumers. Warn loudly at server start
+      // so the failure mode is visible without making the decorator
+      // hard-fail (which would break unit tests of decorator metadata
+      // collection that don't actually go through the manifest publish
+      // path).
+      if (!reqType || !respType) {
+        const missing: string[] = [];
+        if (!reqType) missing.push('request');
+        if (!respType) missing.push('response');
+        this.logger.warn(
+          `${info.name}.${methodName}: @${patternStr === 'unary' ? 'Rpc' : patternStr === 'server_stream' ? 'ServerStream' : patternStr === 'client_stream' ? 'ClientStream' : 'BidiStream'} is missing ${missing.join(' and ')} type(s). ` +
+          `The published manifest will have empty fields, which breaks ` +
+          `cross-language gen-client and the shell's method discovery. ` +
+          `Pass the constructors explicitly: ` +
+          `@${patternStr === 'unary' ? 'Rpc' : patternStr === 'server_stream' ? 'ServerStream' : patternStr === 'client_stream' ? 'ClientStream' : 'BidiStream'}({ request: SomeRequest, response: SomeResponse })`,
+        );
+      }
+
       methods.push({
         name: methodName,
         pattern: patternStr,
@@ -819,8 +844,22 @@ function credentialFromPeerEntry(peer: Record<string, unknown>): ConsumerEnrollm
 }
 
 /**
- * Load a pre-signed ConsumerEnrollmentCredential from a JSON credential file
- * (the `.cred` file produced by `aster enroll`).
+ * Load a pre-signed ConsumerEnrollmentCredential from a credential file.
+ *
+ * Accepts both formats produced by `aster enroll node`:
+ *
+ *   1. **TOML** (the actual `.cred` / `.aster-identity` format produced by
+ *      the CLI today): a `[node]` section with the consumer's secret key,
+ *      plus one or more `[[peers]]` sections each holding a signed
+ *      enrollment credential. The first consumer-role peer is used.
+ *   2. **JSON** (legacy / hand-rolled credential dumps): a flat object
+ *      with credential_type / root_pubkey / expires_at / attributes /
+ *      endpoint_id / nonce / signature.
+ *
+ * Format detection peeks at the first non-whitespace character: `{`
+ * means JSON, anything else means TOML. The TOML path goes through the
+ * existing identity-loader helpers so that `enrollmentCredentialFile:`
+ * and `identity:` end up doing the same thing for the same file.
  */
 function loadEnrollmentCredential(filePath: string): ConsumerEnrollmentCredential {
   const { readFileSync } = require('node:fs');
@@ -828,16 +867,34 @@ function loadEnrollmentCredential(filePath: string): ConsumerEnrollmentCredentia
   const expanded = filePath.startsWith('~')
     ? filePath.replace(/^~/, homedir())
     : filePath;
-  const d = JSON.parse(readFileSync(expanded, 'utf-8'));
-  return {
-    credentialType: (d.credential_type ?? d.type ?? 'policy') as 'policy' | 'ott',
-    rootPubkey: d.root_pubkey,
-    expiresAt: Number(d.expires_at),
-    attributes: d.attributes ?? {},
-    endpointId: d.endpoint_id || undefined,
-    nonce: d.nonce || undefined,
-    signature: d.signature ?? '',
-  };
+  const text = readFileSync(expanded, 'utf-8') as string;
+  const firstChar = text.replace(/^\s+/, '').charAt(0);
+
+  if (firstChar === '{') {
+    // JSON path
+    const d = JSON.parse(text);
+    return {
+      credentialType: (d.credential_type ?? d.type ?? 'policy') as 'policy' | 'ott',
+      rootPubkey: d.root_pubkey,
+      expiresAt: Number(d.expires_at),
+      attributes: d.attributes ?? {},
+      endpointId: d.endpoint_id || undefined,
+      nonce: d.nonce || undefined,
+      signature: d.signature ?? '',
+    };
+  }
+
+  // TOML path -- reuse the identity helpers so behaviour matches `identity:`
+  const data = parseSimpleToml(text);
+  const peers = (data.peers ?? []) as Record<string, unknown>[];
+  const consumerPeer = peers.find(p => p.role === 'consumer') ?? peers[0];
+  if (!consumerPeer) {
+    throw new Error(
+      `loadEnrollmentCredential(${filePath}): no [[peers]] entry found in ` +
+      `the TOML credential file. Did you run \`aster enroll node --role consumer\`?`,
+    );
+  }
+  return credentialFromPeerEntry(consumerPeer);
 }
 
 /**
