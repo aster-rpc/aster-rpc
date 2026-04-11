@@ -1,5 +1,12 @@
 # Aster
 
+[![PyPI – aster-rpc](https://img.shields.io/pypi/v/aster-rpc?label=PyPI%3A%20aster-rpc&color=3776ab&logo=pypi&logoColor=white)](https://pypi.org/project/aster-rpc/)
+[![PyPI – aster-cli](https://img.shields.io/pypi/v/aster-cli?label=PyPI%3A%20aster-cli&color=3776ab&logo=pypi&logoColor=white)](https://pypi.org/project/aster-cli/)
+[![npm – @aster-rpc/aster](https://img.shields.io/npm/v/@aster-rpc/aster?label=npm%3A%20%40aster-rpc%2Faster&color=cb3837&logo=npm&logoColor=white)](https://www.npmjs.com/package/@aster-rpc/aster)
+[![Python](https://img.shields.io/pypi/pyversions/aster-rpc?label=Python&color=3776ab&logo=python&logoColor=white)](https://pypi.org/project/aster-rpc/)
+[![Node.js](https://img.shields.io/badge/Node.js-20%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 > **Machines need to authenticate to other machines, often on behalf of a user. Aster makes that safe — without a central authority and without shared secrets.**
 
 Aster is a peer-to-peer RPC framework with identity in the connection. You define typed services in Python or TypeScript, and any machine that holds the right capability credential can call them — across NATs, across organisations, across languages — without DNS, without a load balancer, without a certificate authority, and without an OAuth proxy in the middle.
