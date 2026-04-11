@@ -45,6 +45,23 @@ jobs:
           git add -A
           git commit -m "Mirror from private repo" --allow-empty || true
 
-          # Push to public repo
-          git remote add public https://x-access-token:${PUBLIC_REPO_TOKEN}@github.com/aster-rpc/aster-rpc.git || true
-          git push public main --force
+          # Push to public repo.
+          #
+          # Self-hosted runners retain the .git directory between runs, so
+          # the `public` remote from a prior run is still configured with
+          # whatever (possibly empty) token value was in scope then. Always
+          # reset the URL so the CURRENT PUBLIC_REPO_TOKEN is what's used.
+          if [ -z "${PUBLIC_REPO_TOKEN:-}" ]; then
+            echo "::error::PUBLIC_REPO_TOKEN secret is empty or missing."
+            exit 1
+          fi
+          PUBLIC_URL="https://x-access-token:${PUBLIC_REPO_TOKEN}@github.com/aster-rpc/aster-rpc.git"
+          if git remote get-url public >/dev/null 2>&1; then
+            git remote set-url public "${PUBLIC_URL}"
+          else
+            git remote add public "${PUBLIC_URL}"
+          fi
+          # Override any leftover credential helper from actions/checkout so
+          # it can't fall back to GITHUB_TOKEN (which is scoped to the source
+          # repo only and will 403 on the target org repo).
+          git -c credential.helper= push public main --force
