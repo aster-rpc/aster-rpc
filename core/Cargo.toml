@@ -23,6 +23,12 @@ unicode-normalization = "0.1"
 hex = "0.4"
 bs58 = "0.5"
 ed25519-dalek = { version = "3.0.0-pre.1", features = ["rand_core"] }
+crossbeam-utils = { workspace = true }
 
 [dev-dependencies]
 rand_core = { version = "0.9", features = ["os_rng"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ring_bench"
+harness = false
