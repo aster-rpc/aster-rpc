@@ -243,6 +243,9 @@ cython_debug/
 
 lib_aster_python.dylib.dSYM/
 node_modules/
+
+# TypeDoc output (build artifact, copied into the docs site separately)
+bindings/typescript/packages/aster/docs-api/
 **/_internal/*/
 !**/_internal/day0/
 

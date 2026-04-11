@@ -38,7 +38,7 @@ export const StatusCode = {
   // Aster-native codes (100+)
   /**
    * The wire payload doesn't match the published contract: e.g. the
-   * JSON dict has fields the receiver's @WireType class doesn't
+   * JSON dict has fields the receiver's `@WireType` class doesn't
    * declare, or vice versa. Distinct from INVALID_ARGUMENT because
    * the violation is about data SHAPE, not value, and shape
    * violations can occur at any nesting depth (a top-level
