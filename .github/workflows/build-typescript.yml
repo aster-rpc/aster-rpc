@@ -96,6 +96,10 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
 
       - name: Install npm deps
+        # npm workspaces must be installed from the workspace root, not
+        # a member directory, otherwise npm synthesizes `link:.` entries
+        # for cross-member links and fails with EUNSUPPORTEDPROTOCOL.
+        working-directory: bindings/typescript
         run: npm install --no-audit --no-fund --ignore-scripts
 
       - name: Stamp version
@@ -194,6 +198,9 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
       - name: Install npm deps
+        # Install from the workspace root, not the member dir (see
+        # build-native job for rationale).
+        working-directory: bindings/typescript
         run: npm install --no-audit --no-fund --ignore-scripts
       - name: Stamp version
         shell: bash
