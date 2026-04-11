@@ -242,13 +242,24 @@ async def _handle_bidi(
     if initial_payload:
         await send_queue.put(initial_payload)
 
+    # Convert each outgoing dict to a typed Fory dataclass when the
+    # transport uses Fory (Python servers). For TS servers + JSON
+    # codec, this is a no-op. The bidi case can't pre-convert like
+    # the other streaming patterns because values arrive lazily on a
+    # separate task; we convert them at the queue boundary instead.
+    def _maybe_typed(value: Any) -> Any:
+        builder = getattr(ctx.connection, "build_typed_request_for_bidi", None)
+        if builder is None:
+            return value
+        return builder(service_name, method_name, value)
+
     async def input_producer() -> AsyncIterator[Any]:
         """Yield values from the send queue until sentinel."""
         while True:
             value = await send_queue.get()
             if value is _SENTINEL:
                 return
-            yield value
+            yield _maybe_typed(value)
 
     async def read_user_input() -> None:
         """Read lines from stdin and push to send queue."""
