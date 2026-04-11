@@ -276,7 +276,8 @@ public class IrohEndpoint extends IrohHandle {
                 ValueLayout.ADDRESS));
 
     try {
-      int status = (int) accept.invoke(nativeHandle(), 0L, opSeg);
+      // runtime, endpoint, user_data, out_operation
+      int status = (int) accept.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
       if (status != 0) {
         throw new IrohException(IrohStatus.fromCode(status), "iroh_accept failed: " + status);
       }
