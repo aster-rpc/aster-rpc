@@ -1,12 +1,9 @@
 package com.aster.config;
 
-import com.aster.ffi.IrohLibrary;
 import com.aster.ffi.IrohRelayMode;
-import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SegmentAllocator;
 import java.lang.foreign.ValueLayout;
-import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 
@@ -15,54 +12,28 @@ import java.util.List;
  *
  * <p>Call {@link #toNative(SegmentAllocator)} to produce a native struct suitable for {@code
  * iroh_endpoint_create}.
+ *
+ * <p>All fields are set via direct memory access (segment.set) to avoid VarHandle issues with
+ * nested structs in Java 25 FFM.
  */
 public class EndpointConfig {
 
-  private static final MemoryLayout LAYOUT = IrohLibrary.IROH_ENDPOINT_CONFIG;
-  private static final VarHandle VH_STRUCT_SIZE =
-      LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("struct_size"));
-  private static final VarHandle VH_RELAY_MODE =
-      LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("relay_mode"));
-  private static final VarHandle VH_ENABLE_DISCOVERY =
-      LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("enable_discovery"));
-  private static final VarHandle VH_ENABLE_HOOKS =
-      LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("enable_hooks"));
-  private static final VarHandle VH_HOOK_TIMEOUT_MS =
-      LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("hook_timeout_ms"));
-  private static final VarHandle VH_CLEAR_IP_TRANSPORTS =
-      LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("clear_ip_transports"));
-  private static final VarHandle VH_CLEAR_RELAY_TRANSPORTS =
-      LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("clear_relay_transports"));
-  private static final VarHandle VH_PORTMAPPER_CONFIG =
-      LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("portmapper_config"));
-  private static final VarHandle VH_PROXY_FROM_ENV =
-      LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("proxy_from_env"));
-
-  private static final VarHandle VH_ALPNS_ITEMS =
-      LAYOUT.varHandle(
-          MemoryLayout.PathElement.groupElement("alpns"),
-          MemoryLayout.PathElement.groupElement("items"));
-  private static final VarHandle VH_ALPNS_LEN =
-      LAYOUT.varHandle(
-          MemoryLayout.PathElement.groupElement("alpns"),
-          MemoryLayout.PathElement.groupElement("len"));
-  private static final VarHandle VH_RELAY_URLS_ITEMS =
-      LAYOUT.varHandle(
-          MemoryLayout.PathElement.groupElement("relay_urls"),
-          MemoryLayout.PathElement.groupElement("items"));
-  private static final VarHandle VH_RELAY_URLS_LEN =
-      LAYOUT.varHandle(
-          MemoryLayout.PathElement.groupElement("relay_urls"),
-          MemoryLayout.PathElement.groupElement("len"));
-
-  private static final VarHandle VH_BYTES_PTR =
-      IrohLibrary.IROH_BYTES.varHandle(MemoryLayout.PathElement.groupElement("ptr"));
-  private static final VarHandle VH_BYTES_LEN =
-      IrohLibrary.IROH_BYTES.varHandle(MemoryLayout.PathElement.groupElement("len"));
-  private static final VarHandle VH_LIST_ITEMS =
-      IrohLibrary.IROH_BYTES_LIST.varHandle(MemoryLayout.PathElement.groupElement("items"));
-  private static final VarHandle VH_LIST_LEN =
-      IrohLibrary.IROH_BYTES_LIST.varHandle(MemoryLayout.PathElement.groupElement("len"));
+  // iroh_endpoint_config_t layout (verified against Rust iroh_endpoint_config_t):
+  // struct_size: 0 (INT)
+  // relay_mode: 4 (INT)
+  // secret_key: 8 (IROH_BYTES: ptr at +0, len at +8) → 16 bytes
+  // alpns: 24 (IROH_BYTES_LIST: items at +0, len at +8) → 16 bytes
+  // relay_urls: 40 (IROH_BYTES_LIST: items at +0, len at +8) → 16 bytes
+  // enable_discovery: 56 (INT)
+  // enable_hooks: 60 (INT)
+  // hook_timeout_ms: 64 (LONG)
+  // bind_addr: 72 (IROH_BYTES: ptr at +0, len at +8) → 16 bytes
+  // clear_ip_transports: 88 (INT)
+  // clear_relay_transports: 92 (INT)
+  // portmapper_config: 96 (INT)
+  // proxy_url: 104 (IROH_BYTES: ptr at +0, len at +8) → 16 bytes
+  // proxy_from_env: 120 (INT)
+  // data_dir_utf8: 128 (IROH_BYTES: ptr at +0, len at +8) → 16 bytes
 
   private int relayMode = 0; // 0=default
   private byte[] secretKey = new byte[0];
@@ -77,6 +48,7 @@ public class EndpointConfig {
   private int portmapperConfig = 0; // 0=enabled
   private byte[] proxyUrl = new byte[0];
   private boolean proxyFromEnv = false;
+  private byte[] dataDir = new byte[0];
 
   public EndpointConfig relayMode(int mode) {
     this.relayMode = mode;
@@ -149,34 +121,49 @@ public class EndpointConfig {
     return this;
   }
 
+  public EndpointConfig dataDir(String path) {
+    this.dataDir = path.getBytes(StandardCharsets.UTF_8);
+    return this;
+  }
+
   /**
    * Encode this config into a native {@code iroh_endpoint_config_t} struct allocated from {@code
    * allocator}.
+   *
+   * <p>Uses direct memory access (segment.set) instead of VarHandle to avoid Java 25 FFM issues
+   * with nested struct field access.
    */
   public MemorySegment toNative(SegmentAllocator alloc) {
-    MemorySegment seg = alloc.allocate(LAYOUT);
+    MemorySegment seg = alloc.allocate(144);
 
-    // Use MemorySegment.set(...) directly to avoid VarHandle varargs arity issues
-    seg.set(ValueLayout.JAVA_INT, 0, (int) LAYOUT.byteSize());
-    seg.set(ValueLayout.JAVA_INT, 4, (int) relayMode);
+    // struct_size at 0
+    seg.set(ValueLayout.JAVA_INT, 0, 144);
+    // relay_mode at 4
+    seg.set(ValueLayout.JAVA_INT, 4, relayMode);
+    // enable_discovery at 56
     seg.set(ValueLayout.JAVA_INT, 56, enableDiscovery ? 1 : 0);
+    // enable_hooks at 60
     seg.set(ValueLayout.JAVA_INT, 60, enableHooks ? 1 : 0);
+    // hook_timeout_ms at 64
     seg.set(ValueLayout.JAVA_LONG, 64, hookTimeoutMs);
+    // clear_ip_transports at 88
     seg.set(ValueLayout.JAVA_INT, 88, clearIpTransports ? 1 : 0);
+    // clear_relay_transports at 92
     seg.set(ValueLayout.JAVA_INT, 92, clearRelayTransports ? 1 : 0);
+    // portmapper_config at 96
     seg.set(ValueLayout.JAVA_INT, 96, portmapperConfig);
+    // proxy_from_env at 120
     seg.set(ValueLayout.JAVA_INT, 120, proxyFromEnv ? 1 : 0);
 
-    // secret_key: allocate bytes, store ptr+len into the nested IROH_BYTES sub-region
+    // secret_key at 8: ptr at +0, len at +8
     if (secretKey.length > 0) {
       MemorySegment dataSeg = alloc.allocate(secretKey.length);
       dataSeg.copyFrom(MemorySegment.ofArray(secretKey));
-      MemorySegment secretKeySeg = seg.asSlice(8, 16); // IROH_BYTES at offset 8
-      VH_BYTES_PTR.set(secretKeySeg, dataSeg);
-      VH_BYTES_LEN.set(secretKeySeg, (long) secretKey.length);
+      seg.set(ValueLayout.ADDRESS, 8, dataSeg);
+      seg.set(ValueLayout.JAVA_LONG, 16, (long) secretKey.length);
     }
 
-    // alpns: allocate array of iroh_bytes_t, fill, store ptr+len
+    // alpns at 24: items ptr at +0, len at +8
     if (!alpns.isEmpty()) {
       MemorySegment listSeg = alloc.allocate(16L * alpns.size());
       for (int i = 0; i < alpns.size(); i++) {
@@ -187,11 +174,11 @@ public class EndpointConfig {
         listSeg.set(ValueLayout.ADDRESS, itemOffset, itemSeg);
         listSeg.set(ValueLayout.JAVA_LONG, itemOffset + 8, (long) b.length);
       }
-      VH_ALPNS_ITEMS.set(seg, listSeg);
-      VH_ALPNS_LEN.set(seg, (long) alpns.size());
+      seg.set(ValueLayout.ADDRESS, 24, listSeg);
+      seg.set(ValueLayout.JAVA_LONG, 32, (long) alpns.size());
     }
 
-    // relay_urls: same pattern
+    // relay_urls at 40: items ptr at +0, len at +8
     if (!relayUrls.isEmpty()) {
       MemorySegment listSeg = alloc.allocate(16L * relayUrls.size());
       for (int i = 0; i < relayUrls.size(); i++) {
@@ -202,26 +189,32 @@ public class EndpointConfig {
         listSeg.set(ValueLayout.ADDRESS, itemOffset, itemSeg);
         listSeg.set(ValueLayout.JAVA_LONG, itemOffset + 8, (long) b.length);
       }
-      VH_RELAY_URLS_ITEMS.set(seg, listSeg);
-      VH_RELAY_URLS_LEN.set(seg, (long) relayUrls.size());
+      seg.set(ValueLayout.ADDRESS, 40, listSeg);
+      seg.set(ValueLayout.JAVA_LONG, 48, (long) relayUrls.size());
     }
 
-    // bind_addr: allocate string bytes, store ptr+len into the nested IROH_BYTES sub-region
+    // bind_addr at 72: ptr at +0, len at +8
     if (bindAddr.length > 0) {
       MemorySegment dataSeg = alloc.allocate(bindAddr.length);
       dataSeg.copyFrom(MemorySegment.ofArray(bindAddr));
-      MemorySegment bindAddrSeg = seg.asSlice(72, 16); // IROH_BYTES at offset 72
-      VH_BYTES_PTR.set(bindAddrSeg, dataSeg);
-      VH_BYTES_LEN.set(bindAddrSeg, (long) bindAddr.length);
+      seg.set(ValueLayout.ADDRESS, 72, dataSeg);
+      seg.set(ValueLayout.JAVA_LONG, 80, (long) bindAddr.length);
     }
 
-    // proxy_url: allocate string bytes, store ptr+len into the nested IROH_BYTES sub-region
+    // proxy_url at 104: ptr at +0, len at +8
     if (proxyUrl.length > 0) {
       MemorySegment dataSeg = alloc.allocate(proxyUrl.length);
       dataSeg.copyFrom(MemorySegment.ofArray(proxyUrl));
-      MemorySegment proxyUrlSeg = seg.asSlice(104, 16); // IROH_BYTES at offset 104
-      VH_BYTES_PTR.set(proxyUrlSeg, dataSeg);
-      VH_BYTES_LEN.set(proxyUrlSeg, (long) proxyUrl.length);
+      seg.set(ValueLayout.ADDRESS, 104, dataSeg);
+      seg.set(ValueLayout.JAVA_LONG, 112, (long) proxyUrl.length);
+    }
+
+    // data_dir_utf8 at 128: ptr at +0, len at +8
+    if (dataDir.length > 0) {
+      MemorySegment dataSeg = alloc.allocate(dataDir.length);
+      dataSeg.copyFrom(MemorySegment.ofArray(dataDir));
+      seg.set(ValueLayout.ADDRESS, 128, dataSeg);
+      seg.set(ValueLayout.JAVA_LONG, 136, (long) dataDir.length);
     }
 
     return seg;

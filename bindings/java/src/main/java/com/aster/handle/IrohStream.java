@@ -2,24 +2,39 @@ package com.aster.handle;
 
 import com.aster.ffi.*;
 import java.io.IOException;
-import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
+import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 import java.util.concurrent.*;
 import java.util.concurrent.Flow.*;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * A bidirectional iroh stream.
+ *
+ * <p>Two consumption models are available:
+ *
+ * <ul>
+ *   <li>{@link #receiveFrames()} — push-based {@link Publisher} of all received frames
+ *   <li>{@link #readAsync(long)} — single-frame read returning a {@link CompletableFuture}
+ * </ul>
+ *
+ * <p>Both models coexist because they suit different usage patterns: the publisher is ideal for
+ * streaming processing pipelines, while {@code readAsync} is useful for request-response patterns
+ * layered on top of a stream.
+ */
 public class IrohStream implements AutoCloseable {
 
   private final IrohRuntime runtime;
-  private final long handle;
+  private final long sendHandle;
+  private final long recvHandle;
   private volatile boolean closed = false;
 
   private final MethodHandle streamWrite;
   private final MethodHandle streamFinish;
   private final MethodHandle streamRead;
   private final MethodHandle streamStop;
+  private final MethodHandle sendStreamFree;
+  private final MethodHandle recvStreamFree;
 
   /**
    * Pending send operations, keyed by the application message ID echoed in {@code SEND_COMPLETED}.
@@ -34,13 +49,28 @@ public class IrohStream implements AutoCloseable {
   /** Frames received on this stream. */
   private final SubmissionPublisher<byte[]> frames = new SubmissionPublisher<>();
 
+  /**
+   * Stream termination events. Emitted exactly once when {@code STREAM_FINISHED} or {@code
+   * STREAM_RESET} is received.
+   */
+  private final SubmissionPublisher<StreamTerminated> terminated = new SubmissionPublisher<>();
+
+  /**
+   * Pending read operations, keyed by op_id returned from {@code iroh_stream_read}. The {@code
+   * FRAME_RECEIVED} event carries the same op_id, which completes the pending future with the frame
+   * bytes.
+   */
+  private final ConcurrentHashMap<Long, CompletableFuture<byte[]>> pendingReads =
+      new ConcurrentHashMap<>();
+
   IrohStream(IrohRuntime runtime, long handle) {
     this(runtime, handle, 0);
   }
 
-  IrohStream(IrohRuntime runtime, long handle, long ignoredRelated) {
+  IrohStream(IrohRuntime runtime, long sendHandle, long recvHandle) {
     this.runtime = runtime;
-    this.handle = handle;
+    this.sendHandle = sendHandle;
+    this.recvHandle = recvHandle;
 
     var lib = IrohLibrary.getInstance();
 
@@ -85,19 +115,43 @@ public class IrohStream implements AutoCloseable {
                 ValueLayout.JAVA_LONG,
                 ValueLayout.JAVA_INT));
 
+    this.sendStreamFree =
+        lib.getHandle(
+            "iroh_send_stream_free",
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
+
+    this.recvStreamFree =
+        lib.getHandle(
+            "iroh_recv_stream_free",
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
+
     registerEventHandler();
   }
 
   private void registerEventHandler() {
     runtime.addInboundHandler(
         event -> {
-          if (event.handle() != handle) return;
+          // FRAME_RECEIVED events arrive on the recv stream handle.
+          // SEND_COMPLETED, STREAM_FINISHED, STREAM_RESET arrive on the send stream handle.
+          if (event.handle() != sendHandle && event.handle() != recvHandle) return;
 
           switch (event.kind()) {
             case IrohEventKind.FRAME_RECEIVED -> {
+              byte[] payload = null;
               if (event.hasBuffer() && event.data() != MemorySegment.NULL && event.dataLen() > 0) {
-                byte[] payload = event.data().toArray(ValueLayout.JAVA_BYTE);
+                payload = event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE);
                 runtime.releaseBuffer(event.buffer());
+              }
+              // Complete any pending readAsync future keyed by this op_id
+              long opId = event.operation();
+              CompletableFuture<byte[]> readFuture = pendingReads.remove(opId);
+              if (readFuture != null && payload != null) {
+                readFuture.complete(payload);
+              }
+              // Also submit to the frames publisher for Publisher-based consumers
+              if (payload != null) {
                 frames.submit(payload);
               }
             }
@@ -110,7 +164,11 @@ public class IrohStream implements AutoCloseable {
               }
             }
             case IrohEventKind.STREAM_FINISHED, IrohEventKind.STREAM_RESET -> {
-              if (event.kind() == IrohEventKind.STREAM_RESET) {
+              boolean isReset = event.kind() == IrohEventKind.STREAM_RESET;
+              int errorCode = event.errorCode();
+              terminated.submit(
+                  new StreamTerminated(isReset ? Reason.RESET : Reason.FINISHED, errorCode));
+              if (isReset) {
                 frames.closeExceptionally(new IOException("stream reset"));
               } else {
                 frames.close();
@@ -122,7 +180,7 @@ public class IrohStream implements AutoCloseable {
   }
 
   public long nativeHandle() {
-    return handle;
+    return sendHandle;
   }
 
   /**
@@ -136,7 +194,8 @@ public class IrohStream implements AutoCloseable {
    */
   public CompletableFuture<Void> sendAsync(byte[] payload) {
     var lib = IrohLibrary.getInstance();
-    var alloc = lib.allocator();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
 
     long messageId = nextMessageId.incrementAndGet();
 
@@ -152,7 +211,8 @@ public class IrohStream implements AutoCloseable {
     try {
       // runtime, send_stream, data (iroh_bytes_t), user_data, out_operation
       int status =
-          (int) streamWrite.invoke(runtime.nativeHandle(), handle, payloadSeg, messageId, opSeg);
+          (int)
+              streamWrite.invoke(runtime.nativeHandle(), sendHandle, payloadSeg, messageId, opSeg);
       if (status != 0) {
         throw new IrohException(IrohStatus.fromCode(status), "iroh_stream_write failed: " + status);
       }
@@ -179,11 +239,12 @@ public class IrohStream implements AutoCloseable {
    */
   public CompletableFuture<Void> finishAsync() {
     var lib = IrohLibrary.getInstance();
-    var alloc = lib.allocator();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
     var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
     try {
-      int status = (int) streamFinish.invoke(runtime.nativeHandle(), handle, 0L, opSeg);
+      int status = (int) streamFinish.invoke(runtime.nativeHandle(), sendHandle, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
             IrohStatus.fromCode(status), "iroh_stream_finish failed: " + status);
@@ -203,7 +264,7 @@ public class IrohStream implements AutoCloseable {
    */
   public void reset(int errorCode) {
     try {
-      int status = (int) streamStop.invoke(runtime.nativeHandle(), handle, (long) errorCode);
+      int status = (int) streamStop.invoke(runtime.nativeHandle(), sendHandle, (long) errorCode);
       if (status != 0) {
         throw new IrohException(IrohStatus.fromCode(status), "iroh_stream_stop failed: " + status);
       }
@@ -220,11 +281,12 @@ public class IrohStream implements AutoCloseable {
    */
   public CompletableFuture<byte[]> readAsync(long maxLen) {
     var lib = IrohLibrary.getInstance();
-    var alloc = lib.allocator();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
     var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
     try {
-      int status = (int) streamRead.invoke(runtime.nativeHandle(), handle, maxLen, 0L, opSeg);
+      int status = (int) streamRead.invoke(runtime.nativeHandle(), sendHandle, maxLen, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(IrohStatus.fromCode(status), "iroh_stream_read failed: " + status);
       }
@@ -234,7 +296,9 @@ public class IrohStream implements AutoCloseable {
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
     CompletableFuture<byte[]> readFuture = new CompletableFuture<>();
-    runtime.registry().register(opId); // error completion only; data via FRAME_RECEIVED
+    runtime.registry().register(opId);
+    // Track so FRAME_RECEIVED handler can complete this future with the frame bytes
+    pendingReads.put(opId, readFuture);
     return readFuture;
   }
 
@@ -246,10 +310,52 @@ public class IrohStream implements AutoCloseable {
     return frames;
   }
 
+  /**
+   * Returns a {@link Publisher} that emits exactly one {@link StreamTerminated} event when this
+   * stream is closed, either cleanly ({@code STREAM_FINISHED}) or abruptly ({@code STREAM_RESET}).
+   *
+   * <p>This publisher closes after emitting the termination event.
+   */
+  public Publisher<StreamTerminated> closed() {
+    return terminated;
+  }
+
   public void close() {
     if (!closed) {
       closed = true;
       frames.close();
+      terminated.close();
+      // Free both native stream handles. These are synchronous calls — safe to call from
+      // any thread. It is safe to call free on a stream that has already been freed by
+      // the remote (Rust will return NOT_FOUND which we ignore).
+      try {
+        sendStreamFree.invoke(runtime.nativeHandle(), sendHandle);
+      } catch (Throwable t) {
+        System.err.println("iroh_send_stream_free failed: " + t.getMessage());
+      }
+      if (recvHandle != 0) {
+        try {
+          recvStreamFree.invoke(runtime.nativeHandle(), recvHandle);
+        } catch (Throwable t) {
+          System.err.println("iroh_recv_stream_free failed: " + t.getMessage());
+        }
+      }
     }
   }
+
+  /** Reason a stream was terminated. */
+  public enum Reason {
+    /** Stream ended cleanly — all data was read and the send side was finished. */
+    FINISHED,
+    /** Stream was reset abruptly by the remote or local peer. */
+    RESET
+  }
+
+  /**
+   * Emitted by {@link #closed()} when this stream terminates.
+   *
+   * @param reason why the stream ended
+   * @param errorCode QUIC error code (0 if finished cleanly)
+   */
+  public record StreamTerminated(Reason reason, int errorCode) {}
 }

@@ -95,6 +95,28 @@ public final class IrohLibrary implements SymbolLookup {
     }
   }
 
+  // --- Error ---
+
+  /**
+   * Get the last error message from the native layer.
+   *
+   * @param buffer the buffer to write the error message into
+   * @param capacity the capacity of the buffer
+   * @return the number of bytes written (excluding null terminator), or 0 if no error
+   */
+  public long lastErrorMessage(MemorySegment buffer, long capacity) {
+    try {
+      return (long)
+          getHandle(
+                  "iroh_last_error_message",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG))
+              .invoke(buffer, capacity);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
   // --- Node identity ---
 
   /**
@@ -144,6 +166,1585 @@ public final class IrohLibrary implements SymbolLookup {
     return runtimeHandleSegment;
   }
 
+  // --- Node async FFI (iroh_node_*) ---
+
+  /**
+   * Create a memory-backed node asynchronously.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int nodeMemoryAsync(long runtimeHandle, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_node_memory",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Create a persistent node asynchronously.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param pathBytes the path bytes (valid for duration of call)
+   * @param pathLen the length of the path in bytes (excluding null terminator)
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int nodePersistentAsync(
+      long runtimeHandle, MemorySegment pathBytes, long pathLen, MemorySegment outOpId) {
+    try {
+      // Build iroh_bytes_t { ptr, len } struct on the stack/inline in the arena
+      MemorySegment pathIrohBytes = allocator.allocate(IROH_BYTES); // 16 bytes
+      pathIrohBytes.set(ValueLayout.ADDRESS, 0, pathBytes);
+      pathIrohBytes.set(ValueLayout.JAVA_LONG, 8, pathLen);
+      return (int)
+          getHandle(
+                  "iroh_node_persistent",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      IROH_BYTES, // path: iroh_bytes_t { ptr, len }
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, pathIrohBytes, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Create a memory-backed node with custom ALPNs asynchronously.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param alpnItemsPtr pointer to array of alpn byte arrays
+   * @param alpnLensPtr pointer to array of alpn lengths
+   * @param alpnCount number of ALPNs
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int nodeMemoryWithAlpnsAsync(
+      long runtimeHandle,
+      MemorySegment alpnItemsPtr,
+      MemorySegment alpnLensPtr,
+      long alpnCount,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_node_memory_with_alpns",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, alpnItemsPtr, alpnLensPtr, alpnCount, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Accept an incoming aster connection on a node.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int nodeAcceptAsterAsync(long runtimeHandle, long nodeHandle, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_node_accept_aster",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Close a node asynchronously.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int nodeCloseAsync(long runtimeHandle, long nodeHandle, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_node_close",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Get the node ID (bytes) for a node.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param outBuf output buffer
+   * @param capacity buffer capacity
+   * @param outLen where to write the actual length
+   * @return status code (0 = OK)
+   */
+  public int nodeId(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment outBuf,
+      long capacity,
+      MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_node_id",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, outBuf, capacity, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Export the secret key for a node.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param outBuf output buffer
+   * @param capacity buffer capacity
+   * @param outLen where to write the actual length
+   * @return status code (0 = OK)
+   */
+  public int nodeExportSecretKey(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment outBuf,
+      long capacity,
+      MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_node_export_secret_key",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, outBuf, capacity, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Get structured address info for a node.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param outBuf output buffer for string data
+   * @param bufCapacity buffer capacity
+   * @param outAddrSegment output segment for the iroh_node_addr_t struct
+   * @return status code (0 = OK)
+   */
+  public int nodeAddrInfo(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment outBuf,
+      long bufCapacity,
+      MemorySegment outAddrSegment) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_node_addr_info",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, outBuf, bufCapacity, outAddrSegment);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Get the bound address info for an endpoint.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param endpointHandle the endpoint handle
+   * @param outBuf output buffer for string data (relay URL, direct addresses)
+   * @param bufCapacity buffer capacity
+   * @param outAddrSegment output segment for the iroh_node_addr_t struct
+   * @return status code (0 = OK)
+   */
+  public int endpointAddrInfo(
+      long runtimeHandle,
+      long endpointHandle,
+      MemorySegment outBuf,
+      long bufCapacity,
+      MemorySegment outAddrSegment) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_endpoint_addr_info",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, endpointHandle, outBuf, bufCapacity, outAddrSegment);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Free a node handle synchronously.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @return status code (0 = OK)
+   */
+  public int nodeFree(long runtimeHandle, long nodeHandle) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_node_free",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG))
+              .invoke(runtimeHandle, nodeHandle);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Add a node address to an endpoint.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param endpointHandle the endpoint handle
+   * @param addrSegment segment containing the iroh_node_addr_t struct
+   * @return status code (0 = OK)
+   */
+  public int addNodeAddr(long runtimeHandle, long endpointHandle, MemorySegment addrSegment) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_add_node_addr",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, endpointHandle, addrSegment);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  // --- Connection extras ---
+
+  /**
+   * Get the remote peer's node ID.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param connectionHandle the connection handle
+   * @param outBuf output buffer for the node ID bytes
+   * @param capacity buffer capacity
+   * @param outLen where to write the actual length
+   * @return status code (0 = OK)
+   */
+  public int connectionRemoteId(
+      long runtimeHandle,
+      long connectionHandle,
+      MemorySegment outBuf,
+      long capacity,
+      MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_connection_remote_id",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, connectionHandle, outBuf, capacity, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Send a datagram on a connection.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param connectionHandle the connection handle
+   * @param dataSegment segment containing the datagram data (iroh_bytes_t)
+   * @return status code (0 = OK)
+   */
+  public int connectionSendDatagram(
+      long runtimeHandle, long connectionHandle, MemorySegment dataSegment) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_connection_send_datagram",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, connectionHandle, dataSegment);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Read a datagram from a connection.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param connectionHandle the connection handle
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int connectionReadDatagram(
+      long runtimeHandle, long connectionHandle, long userData, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_connection_read_datagram",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, connectionHandle, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Wait for a connection to be closed.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param connectionHandle the connection handle
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int connectionClosed(
+      long runtimeHandle, long connectionHandle, long userData, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_connection_closed",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, connectionHandle, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Get the max datagram size for a connection.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param connectionHandle the connection handle
+   * @param outSize where to write the max size
+   * @param outIsSome where to write whether the size is known (1=true, 0=false)
+   * @return status code (0 = OK)
+   */
+  public int connectionMaxDatagramSize(
+      long runtimeHandle, long connectionHandle, MemorySegment outSize, MemorySegment outIsSome) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_connection_max_datagram_size",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, connectionHandle, outSize, outIsSome);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Get the available datagram send buffer space.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param connectionHandle the connection handle
+   * @param outBytes where to write the available bytes
+   * @return status code (0 = OK)
+   */
+  public int connectionDatagramSendBufferSpace(
+      long runtimeHandle, long connectionHandle, MemorySegment outBytes) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_connection_datagram_send_buffer_space",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, connectionHandle, outBytes);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  // --- Blobs ---
+
+  /**
+   * Add bytes to the blob store.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param dataSegment segment containing the data (iroh_bytes_t)
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int blobsAddBytes(
+      long runtimeHandle, long nodeHandle, MemorySegment dataSegment, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_add_bytes",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      IROH_BYTES,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, dataSegment, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Read blob data.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param hashHexSegment segment containing the hash hex string (iroh_bytes_t)
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int blobsRead(
+      long runtimeHandle, long nodeHandle, MemorySegment hashHexSegment, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_read",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, hashHexSegment, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Add bytes as a named collection entry.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param nameSegment segment containing the name (iroh_bytes_t)
+   * @param dataSegment segment containing the data (iroh_bytes_t)
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int blobsAddBytesAsCollection(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment nameSegment,
+      MemorySegment dataSegment,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_add_bytes_as_collection",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, nameSegment, dataSegment, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Add a multi-file collection.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param entriesJsonSegment segment containing the JSON string (iroh_bytes_t)
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int blobsAddCollection(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment entriesJsonSegment,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_add_collection",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, entriesJsonSegment, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * List collection entries.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param hashHexSegment segment containing the collection hash (iroh_bytes_t)
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int blobsListCollection(
+      long runtimeHandle, long nodeHandle, MemorySegment hashHexSegment, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_list_collection",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, hashHexSegment, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Create a ticket for a blob.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param hashHexSegment segment containing the blob hash (iroh_bytes_t)
+   * @param outBuf output buffer for the ticket string
+   * @param capacity buffer capacity
+   * @param outLen where to write the actual length
+   * @return status code (0 = OK)
+   */
+  public int blobsCreateTicket(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment hashHexSegment,
+      MemorySegment outBuf,
+      long capacity,
+      MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_create_ticket",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, hashHexSegment, outBuf, capacity, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Create a ticket for a collection.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param hashHexSegment segment containing the collection hash (iroh_bytes_t)
+   * @param outBuf output buffer for the ticket string
+   * @param capacity buffer capacity
+   * @param outLen where to write the actual length
+   * @return status code (0 = OK)
+   */
+  public int blobsCreateCollectionTicket(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment hashHexSegment,
+      MemorySegment outBuf,
+      long capacity,
+      MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_create_collection_ticket",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, hashHexSegment, outBuf, capacity, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Download a blob from a ticket.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param ticketSegment segment containing the ticket (iroh_bytes_t)
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int blobsDownload(
+      long runtimeHandle, long nodeHandle, MemorySegment ticketSegment, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_download",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, ticketSegment, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Get blob status synchronously.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param hashHexPtr pointer to the hash hex string
+   * @param hashHexLen length of the hash hex string
+   * @param outStatus where to write the status (0=not_found, 1=partial, 2=complete)
+   * @param outSize where to write the size in bytes
+   * @return status code (0 = OK)
+   */
+  public int blobsStatus(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment hashHexPtr,
+      long hashHexLen,
+      MemorySegment outStatus,
+      MemorySegment outSize) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_status",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, hashHexPtr, hashHexLen, outStatus, outSize);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Check if blob is stored locally.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param hashHexPtr pointer to the hash hex string
+   * @param hashHexLen length of the hash hex string
+   * @param outHas where to write whether blob is complete (1=yes, 0=no)
+   * @return status code (0 = OK)
+   */
+  public int blobsHas(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment hashHexPtr,
+      long hashHexLen,
+      MemorySegment outHas) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_has",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, hashHexPtr, hashHexLen, outHas);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Observe blob download snapshot.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param hashHexPtr pointer to the hash hex string
+   * @param hashHexLen length of the hash hex string
+   * @param outIsComplete where to write whether blob is complete
+   * @param outSize where to write the total size
+   * @return status code (0 = OK)
+   */
+  public int blobsObserveSnapshot(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment hashHexPtr,
+      long hashHexLen,
+      MemorySegment outIsComplete,
+      MemorySegment outSize) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_observe_snapshot",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, hashHexPtr, hashHexLen, outIsComplete, outSize);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Observe blob download completion.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param hashHexPtr pointer to the hash hex string
+   * @param hashHexLen length of the hash hex string
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int blobsObserveComplete(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment hashHexPtr,
+      long hashHexLen,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_observe_complete",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, hashHexPtr, hashHexLen, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Get local blob info.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param hashHexPtr pointer to the hash hex string
+   * @param hashHexLen length of the hash hex string
+   * @param outIsComplete where to write whether blob is complete locally
+   * @param outLocalBytes where to write the local byte count
+   * @return status code (0 = OK)
+   */
+  public int blobsLocalInfo(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment hashHexPtr,
+      long hashHexLen,
+      MemorySegment outIsComplete,
+      MemorySegment outLocalBytes) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_local_info",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(
+                  runtimeHandle, nodeHandle, hashHexPtr, hashHexLen, outIsComplete, outLocalBytes);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  // ============================================================================
+  // Tags
+  // ============================================================================
+
+  /**
+   * Set a named tag. format: 0 = raw, 1 = hash_seq. Emits IROH_EVENT_TAG_SET.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param namePtr pointer to the tag name string
+   * @param nameLen length of the tag name
+   * @param hashHexPtr pointer to the hash hex string
+   * @param hashHexLen length of the hash hex string
+   * @param format the blob format (0=raw, 1=hash_seq)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int tagsSet(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment namePtr,
+      long nameLen,
+      MemorySegment hashHexPtr,
+      long hashHexLen,
+      int format,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_tags_set",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(
+                  runtimeHandle,
+                  nodeHandle,
+                  namePtr,
+                  nameLen,
+                  hashHexPtr,
+                  hashHexLen,
+                  format,
+                  userData,
+                  outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Get a tag by name. Emits IROH_EVENT_TAG_GET with payload on found, NOT_FOUND status if absent.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param namePtr pointer to the tag name string
+   * @param nameLen length of the tag name
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int tagsGet(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment namePtr,
+      long nameLen,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_tags_get",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, namePtr, nameLen, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Delete a tag by name. Emits IROH_EVENT_TAG_DELETED with count in event.flags.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param namePtr pointer to the tag name string
+   * @param nameLen length of the tag name
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int tagsDelete(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment namePtr,
+      long nameLen,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_tags_delete",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, namePtr, nameLen, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * List tags matching a prefix (empty prefix = all tags). Emits IROH_EVENT_TAG_LIST with packed
+   * tag records in payload; event.flags = count.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param prefixPtr pointer to the prefix string
+   * @param prefixLen length of the prefix (0 for all tags)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int tagsListPrefix(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment prefixPtr,
+      long prefixLen,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_tags_list_prefix",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, prefixPtr, prefixLen, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  // ============================================================================
+  // Docs
+  // ============================================================================
+
+  /**
+   * Create a new document.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docsCreate(long runtimeHandle, long nodeHandle, long userData, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_docs_create",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Create a new author for content addressing.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docsCreateAuthor(
+      long runtimeHandle, long nodeHandle, long userData, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_docs_create_author",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Join a document from a ticket.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param ticketSegment segment containing the ticket (iroh_bytes_t)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docsJoin(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment ticketSegment,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_docs_join",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, ticketSegment, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Set bytes in a document.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param docHandle the document handle
+   * @param authorSegment segment containing the author hex (iroh_bytes_t)
+   * @param keySegment segment containing the key (iroh_bytes_t)
+   * @param valueSegment segment containing the value (iroh_bytes_t)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docSetBytes(
+      long runtimeHandle,
+      long docHandle,
+      MemorySegment authorSegment,
+      MemorySegment keySegment,
+      MemorySegment valueSegment,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_set_bytes",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(
+                  runtimeHandle,
+                  docHandle,
+                  authorSegment,
+                  keySegment,
+                  valueSegment,
+                  userData,
+                  outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Get exact entry from a document.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param docHandle the document handle
+   * @param authorSegment segment containing the author hex (iroh_bytes_t)
+   * @param keySegment segment containing the key (iroh_bytes_t)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docGetExact(
+      long runtimeHandle,
+      long docHandle,
+      MemorySegment authorSegment,
+      MemorySegment keySegment,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_get_exact",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, authorSegment, keySegment, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Share a document.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param docHandle the document handle
+   * @param mode the share mode (0=read, 1=write)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docShare(
+      long runtimeHandle, long docHandle, int mode, long userData, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_share",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, mode, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Query a document.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param docHandle the document handle
+   * @param mode the query mode (0=author, 1=all, 2=prefix)
+   * @param keySegment segment containing the key prefix (iroh_bytes_t)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docQuery(
+      long runtimeHandle,
+      long docHandle,
+      int mode,
+      MemorySegment keySegment,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_query",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, mode, keySegment, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Read entry content from a document.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param docHandle the document handle
+   * @param contentHashSegment segment containing the content hash hex (iroh_bytes_t)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docReadEntryContent(
+      long runtimeHandle,
+      long docHandle,
+      MemorySegment contentHashSegment,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_read_entry_content",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, contentHashSegment, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Start syncing a document.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param docHandle the document handle
+   * @param peersSegment segment containing the peers list (iroh_bytes_list_t)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docStartSync(
+      long runtimeHandle,
+      long docHandle,
+      MemorySegment peersSegment,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_start_sync",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, peersSegment, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Leave (stop syncing) a document.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param docHandle the document handle
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docLeave(long runtimeHandle, long docHandle, long userData, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_leave",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Subscribe to document events.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param docHandle the document handle
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docSubscribe(
+      long runtimeHandle, long docHandle, long userData, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_subscribe",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Receive document events.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param receiverHandle the receiver handle from subscribe
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docEventRecv(
+      long runtimeHandle, long receiverHandle, long userData, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_event_recv",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, receiverHandle, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Set download policy for a document.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param docHandle the document handle
+   * @param mode the download policy mode
+   * @param prefixesSegment segment containing the prefixes list (iroh_bytes_list_t)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docSetDownloadPolicy(
+      long runtimeHandle,
+      long docHandle,
+      int mode,
+      MemorySegment prefixesSegment,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_set_download_policy",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, mode, prefixesSegment, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Share a document with address info.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param docHandle the document handle
+   * @param mode the share mode (0=read, 1=write)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docShareWithAddr(
+      long runtimeHandle, long docHandle, int mode, long userData, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_share_with_addr",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, mode, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Join and subscribe to a document atomically.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param ticketSegment segment containing the ticket (iroh_bytes_t)
+   * @param userData user data passed to the operation
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int docsJoinAndSubscribe(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment ticketSegment,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_docs_join_and_subscribe",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, ticketSegment, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Free a document handle.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param docHandle the document handle to free
+   * @return status code (0 = OK)
+   */
+  public int docFree(long runtimeHandle, long docHandle) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_free",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG))
+              .invoke(runtimeHandle, docHandle);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
   // --- Struct layouts (verified against Rust #[repr(C)] structs in ffi/src/lib.rs) ---
 
   public static final MemoryLayout IROH_BYTES =
@@ -172,9 +1773,9 @@ public final class IrohLibrary implements SymbolLookup {
   /**
    * iroh_endpoint_config_t: struct_size, relay_mode, secret_key, alpns, relay_urls,
    * enable_discovery, enable_hooks, hook_timeout_ms, bind_addr, clear_ip_transports,
-   * clear_relay_transports, portmapper_config, proxy_url, proxy_from_env.
+   * clear_relay_transports, portmapper_config, proxy_url, proxy_from_env, data_dir_utf8.
    *
-   * <p>Total: 120 bytes. Matches Rust iroh_endpoint_config_t exactly.
+   * <p>Total: 144 bytes. Matches Rust iroh_endpoint_config_t exactly.
    */
   public static final MemoryLayout IROH_ENDPOINT_CONFIG =
       MemoryLayout.structLayout(
@@ -192,7 +1793,9 @@ public final class IrohLibrary implements SymbolLookup {
           ValueLayout.JAVA_INT.withName("portmapper_config"), // 96
           MemoryLayout.paddingLayout(4), // 4 bytes padding → proxy_url at 104 (8-byte aligned)
           IROH_BYTES.withName("proxy_url"), // 104 (ptr+len = 16 bytes)
-          ValueLayout.JAVA_INT.withName("proxy_from_env") // 120
+          ValueLayout.JAVA_INT.withName("proxy_from_env"), // 120
+          MemoryLayout.paddingLayout(4), // 4 bytes padding → data_dir_utf8 at 128 (8-byte aligned)
+          IROH_BYTES.withName("data_dir_utf8") // 128 (ptr+len = 16 bytes)
           );
 
   /**
@@ -206,6 +1809,14 @@ public final class IrohLibrary implements SymbolLookup {
           IROH_BYTES.withName("node_id"), // 8  (ptr+len = 16 bytes)
           IROH_BYTES.withName("alpn"), // 24 (ptr+len = 16 bytes)
           ValueLayout.ADDRESS.withName("addr") // 40
+          );
+
+  /** iroh_node_addr_t: endpoint_id, relay_url, direct_addresses. Total: 48 bytes. */
+  public static final MemoryLayout IROH_NODE_ADDR =
+      MemoryLayout.structLayout(
+          IROH_BYTES.withName("endpoint_id"), // 0  (ptr+len = 16 bytes)
+          IROH_BYTES.withName("relay_url"), // 16 (ptr+len = 16 bytes)
+          IROH_BYTES_LIST.withName("direct_addresses") // 32 (items+len = 16 bytes)
           );
 
   /**

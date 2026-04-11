@@ -9,7 +9,11 @@ public enum IrohStatus {
   QUEUE_FULL(4),
   BUFFER_TOO_SMALL(5),
   UNSUPPORTED(6),
-  INTERNAL(7);
+  INTERNAL(7),
+  TIMEOUT(8),
+  CANCELLED(9),
+  CONNECTION_REFUSED(10),
+  STREAM_RESET(11);
 
   public final int code;
 

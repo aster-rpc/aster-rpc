@@ -43,7 +43,7 @@ public class IrohPollThread {
 
     IrohLibrary lib = IrohLibrary.getInstance();
 
-    this.eventBuffer = lib.allocator().allocate(IrohLibrary.IROH_EVENT, (long) maxEvents);
+    this.eventBuffer = lib.allocator().allocate(IrohLibrary.IROH_EVENT.byteSize() * maxEvents, 1);
 
     this.pollEvents =
         lib.getHandle(
@@ -114,12 +114,9 @@ public class IrohPollThread {
   private void dispatchEvent(IrohEvent event) {
     // Error events — always complete exceptionally
     if (event.kind() == IrohEventKind.ERROR || event.kind() == IrohEventKind.OPERATION_CANCELLED) {
+      IrohStatus status = IrohStatus.fromCode(event.status());
       registry.completeExceptionally(
-          event.operation(),
-          new IrohException(
-              IrohStatus.INTERNAL,
-              event.errorCode(),
-              "operation failed with error code: " + event.errorCode()));
+          event.operation(), IrohException.forStatus(status, "operation failed: " + status.name()));
       return;
     }
 

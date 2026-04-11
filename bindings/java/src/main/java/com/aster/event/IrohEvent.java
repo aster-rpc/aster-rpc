@@ -25,6 +25,7 @@ public record IrohEvent(
     long userData,
     int status,
     int errorCode,
+    int flags,
     long buffer,
     long dataLen,
     MemorySegment data) {
@@ -46,6 +47,7 @@ public record IrohEvent(
         seg.get(ValueLayout.JAVA_LONG, 40),
         (int) seg.get(ValueLayout.JAVA_INT, 8),
         (int) seg.get(ValueLayout.JAVA_INT, 72),
+        (int) seg.get(ValueLayout.JAVA_INT, 76),
         seg.get(ValueLayout.JAVA_LONG, 64),
         dataLen,
         data);

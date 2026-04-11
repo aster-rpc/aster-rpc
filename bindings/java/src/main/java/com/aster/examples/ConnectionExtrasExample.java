@@ -1,0 +1,109 @@
+package com.aster.examples;
+
+import com.aster.config.EndpointConfig;
+import com.aster.handle.IrohConnection;
+import com.aster.handle.IrohEndpoint;
+import com.aster.handle.IrohRuntime;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Example: Connection Extras (8.1)
+ *
+ * <p>This example demonstrates how to: - Create runtimes and endpoints with matching ALPNs -
+ * Connect two endpoints using node IDs - Accept connections - Close connections cleanly
+ *
+ * <p>Run with: mvn exec:java -Dexec.mainClass="com.aster.examples.ConnectionExtrasExample"
+ */
+public class ConnectionExtrasExample {
+
+  private static final String ALPN = "aster";
+  private static final int TIMEOUT_SECONDS = 15;
+
+  public static void main(String[] args) {
+    System.out.println("=== Connection Extras Example (8.1) ===\n");
+
+    try {
+      runExample();
+    } catch (Exception e) {
+      System.err.println("Error: " + e.getMessage());
+      e.printStackTrace();
+      System.exit(1);
+    }
+  }
+
+  private static void runExample() throws Exception {
+    // Create runtime A and endpoint A (listener) with ALPN
+    System.out.println("1. Creating runtime A and endpoint A (listener)...");
+
+    IrohRuntime runtimeA = IrohRuntime.create();
+    EndpointConfig configA = new EndpointConfig().alpns(java.util.List.of(ALPN));
+    IrohEndpoint endpointA =
+        runtimeA.endpointCreateAsync(configA).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+    String epAID = endpointA.nodeId();
+    System.out.printf("   Endpoint A created! ID: %.8s...%n%n", epAID);
+
+    // Create runtime B and endpoint B (dialer) with same ALPN
+    System.out.println("2. Creating runtime B and endpoint B (dialer)...");
+
+    IrohRuntime runtimeB = IrohRuntime.create();
+    EndpointConfig configB = new EndpointConfig().alpns(java.util.List.of(ALPN));
+    IrohEndpoint endpointB =
+        runtimeB.endpointCreateAsync(configB).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+    String epBID = endpointB.nodeId();
+    System.out.printf("   Endpoint B created! ID: %.8s...%n%n", epBID);
+
+    // A accepts connections
+    System.out.println("3. A accepting connections...");
+    CompletableFuture<IrohConnection> acceptFuture = endpointA.acceptAsync();
+
+    // Give A time to start accepting
+    Thread.sleep(100);
+
+    // B connects to A using A's node ID
+    System.out.println("4. B connecting to A...");
+    CompletableFuture<IrohConnection> connectFuture = endpointB.connectAsync(epAID, ALPN);
+    IrohConnection connB = connectFuture.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    System.out.println("   Connected!\n");
+
+    // Wait for A to accept
+    IrohConnection connA = acceptFuture.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+    System.out.println("5. Testing Connection Extras...\n");
+
+    // RemoteID: A gets B's ID
+    String remoteIdB = connA.remoteId();
+    System.out.printf("   RemoteID: %.8s... (expected: %.8s...)%n", remoteIdB, epBID);
+    if (remoteIdB.equals(epBID)) {
+      System.out.println("   ✓ RemoteID matches!");
+    } else {
+      System.out.println("   ✗ RemoteID mismatch!");
+    }
+    System.out.println();
+
+    // MaxDatagramSize
+    var maxSize = connB.maxDatagramSize();
+    if (maxSize.isPresent()) {
+      System.out.printf("   MaxDatagramSize: %d bytes%n", maxSize.getAsInt());
+      System.out.println("   ✓ Datagrams supported!");
+    } else {
+      System.out.println("   MaxDatagramSize: not configured");
+    }
+    System.out.println();
+
+    // Close connection
+    System.out.println("6. Closing connection...");
+    connB.close();
+    connA.close();
+    endpointA.close();
+    endpointB.close();
+    runtimeA.close();
+    runtimeB.close();
+    System.out.println("   ✓ Connection closed!");
+    System.out.println();
+
+    System.out.println("=== SUCCESS ===");
+  }
+}
