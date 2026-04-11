@@ -3,7 +3,7 @@
 A control plane for managing remote agents, demonstrating all four
 RPC patterns, session-scoped services, and capability-based auth.
 
-See examples/mission-control/GUIDE.md for the full walkthrough.
+See https://docs.aster.site/docs/quickstart/mission-control for the full walkthrough.
 """
 
 from .roles import Role

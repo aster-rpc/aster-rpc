@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-tools/gen_canonical_vectors.py — Generate canonical test vectors for Phase 9.
+scripts/gen_canonical_vectors.py -- Generate canonical test vectors for Phase 9.
 
 Constructs the Appendix A and B fixtures from Aster-ContractIdentity.md,
 runs the canonical encoder, computes BLAKE3 hashes, and writes:
@@ -9,7 +9,7 @@ runs the canonical encoder, computes BLAKE3 hashes, and writes:
 
 Usage::
 
-    uv run python tools/gen_canonical_vectors.py
+    uv run python scripts/gen_canonical_vectors.py
 """
 
 from __future__ import annotations
@@ -179,7 +179,7 @@ def vector_A6() -> Vector:
 
 
 def vector_B1() -> Vector:
-    """B.1: Direct self-recursion — TreeNode with SELF_REF fields."""
+    """B.1: Direct self-recursion -- TreeNode with SELF_REF fields."""
     td = TypeDef(
         kind=TypeDefKind.MESSAGE,
         package="example",
@@ -235,7 +235,7 @@ def vector_B1() -> Vector:
 
 
 def vector_B2() -> Vector:
-    """B.2: Two-type mutual recursion — Book (hashed first, back-edge to Author)."""
+    """B.2: Two-type mutual recursion -- Book (hashed first, back-edge to Author)."""
     # Book is hashed first (written_by uses SELF_REF to example.Author)
     td_book = TypeDef(
         kind=TypeDefKind.MESSAGE,
@@ -325,7 +325,7 @@ def vector_B2_author(book_hash: bytes) -> Vector:
 
 
 def vector_B3() -> Vector:
-    """B.3: Three-type cycle — Gamma (hashed first, back-edge to Alpha)."""
+    """B.3: Three-type cycle -- Gamma (hashed first, back-edge to Alpha)."""
     td_gamma = TypeDef(
         kind=TypeDefKind.MESSAGE,
         package="example",
@@ -353,7 +353,7 @@ def vector_B3() -> Vector:
 
 
 def vector_B4() -> Vector:
-    """B.4: Diamond with back-edge — C (hashed first, a_field is SELF_REF to A)."""
+    """B.4: Diamond with back-edge -- C (hashed first, a_field is SELF_REF to A)."""
     td_c = TypeDef(
         kind=TypeDefKind.MESSAGE,
         package="example",
@@ -585,11 +585,11 @@ def micro_nfc_vectors() -> list[Vector]:
     v_nfc = make_vector("micro.nfc.nfc_name", "ServiceContract with NFC name (café)", sc_nfc)
     v_nfd = make_vector("micro.nfc.nfd_name", "ServiceContract with NFD name (café via NFD)", sc_nfd)
     # Note: These will differ because we NFC-normalize strings at write time
-    # via write_string which uses s.encode("utf-8") — Python's encode normalizes
+    # via write_string which uses s.encode("utf-8") -- Python's encode normalizes
     # NFD to NFC for UTF-8 output. Actually: Python str.encode('utf-8') does NOT
     # normalize; NFD and NFC produce different UTF-8 bytes.
     # The spec says NFC normalization must happen BEFORE encoding.
-    # Our write_string does not normalize — the caller must normalize the identifier.
+    # Our write_string does not normalize -- the caller must normalize the identifier.
     # For service names (not identifiers), we normalize in write_string? No.
     # The spec says: roles in CapabilityRequirement are NFC-normalized.
     # For service.name: the spec says use normalize_identifier for identifiers.
@@ -688,7 +688,7 @@ def main() -> None:
 
     output = {
         "meta": {
-            "generated_by": "tools/gen_canonical_vectors.py",
+            "generated_by": "scripts/gen_canonical_vectors.py",
             "spec": "Aster-ContractIdentity.md",
             "encoding": "fory-xlang/0.15",
         },

@@ -3,7 +3,7 @@
 A control plane for managing remote agents, demonstrating all four Aster
 RPC patterns, session-scoped services, and capability-based auth.
 
-See the full walkthrough: [GUIDE.md](../../mission-control/GUIDE.md)
+**Full walkthrough on the docs site:** [Mission Control quickstart](https://docs.aster.site/docs/quickstart/mission-control) — seven chapters covering all four RPC patterns, session-scoped services, capability-based auth, contract gen-client, and cross-language interop. The code in this directory is the runnable Python implementation that the walkthrough builds up to chapter by chapter.
 
 ## Quick start
 

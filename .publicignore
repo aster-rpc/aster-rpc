@@ -26,3 +26,7 @@ bindings/dotnet/
 .github/workflows/
 .githooks/
 scripts/check-ascii.py
+
+# Self-hosted GitHub Actions runner config (Docker + entrypoint scripts).
+# Deployment infrastructure for the runner machines, not for public consumption.
+.github/runner/
