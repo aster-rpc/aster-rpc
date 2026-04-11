@@ -499,6 +499,52 @@ class AsterConfig:
         default = os.path.join(os.getcwd(), ".aster-identity")
         return default if os.path.exists(default) else None
 
+    def load_identity_from_path(
+        self,
+        path: str,
+        peer_name: str | None = None,
+        role: str | None = None,
+    ) -> tuple[bytes | None, dict | None]:
+        """Load secret_key + peer entry from a specific TOML identity file.
+
+        Same return shape as :meth:`load_identity` but reads from an
+        explicit path instead of consulting ``self.identity_file``. Used
+        by ``AsterClient`` to fold the secret key out of an
+        ``enrollment_credential_file`` when no separate ``identity=`` was
+        provided -- both options should do the same thing for the same
+        TOML file produced by ``aster enroll node``.
+        """
+        import base64 as _b64
+
+        if sys.version_info >= (3, 11):
+            import tomllib as _tl
+        else:
+            import tomli as _tl  # type: ignore[no-redef]
+
+        with open(path, "rb") as f:
+            data = _tl.load(f)
+
+        node = data.get("node", {})
+        secret_key_b64 = node.get("secret_key")
+        secret_key = _b64.b64decode(secret_key_b64) if secret_key_b64 else None
+
+        peers = data.get("peers", [])
+        peer = None
+        if peer_name is not None:
+            for p in peers:
+                if p.get("name") == peer_name:
+                    peer = p
+                    break
+        elif role is not None:
+            for p in peers:
+                if p.get("role") == role:
+                    peer = p
+                    break
+        elif peers:
+            peer = peers[0]
+
+        return secret_key, peer
+
     def to_endpoint_config(self) -> EndpointConfig | None:
         """Build an :class:`EndpointConfig` from the network fields.
 

@@ -19,6 +19,7 @@ docs/_internal/fory/
 # FFI and future bindings (not shipped in Day 0)
 ffi/
 bindings/java/
+bindings/go/
 
 # CI workflows (private repo runs CI; public repo is read-only mirror)
 .github/workflows/
