@@ -131,7 +131,7 @@ class LocalBidiChannel(BidiChannel):
             self._last_trailer = (code, message)
             self._trailer_read = True
             if code != StatusCode.OK:
-                raise RpcError(StatusCode(code), message)
+                raise RpcError.from_status(StatusCode(code), message)
             raise ConnectionLostError("stream ended after trailer")
         
         return msg.data
