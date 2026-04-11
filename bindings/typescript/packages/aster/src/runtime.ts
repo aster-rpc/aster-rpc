@@ -405,15 +405,22 @@ export class AsterServer {
       // collection that don't actually go through the manifest publish
       // path).
       if (!reqType || !respType) {
+        const decoratorByPattern: Record<string, string> = {
+          unary: 'Rpc',
+          server_stream: 'ServerStream',
+          client_stream: 'ClientStream',
+          bidi_stream: 'BidiStream',
+        };
+        const decorator = decoratorByPattern[patternStr] ?? 'Rpc';
         const missing: string[] = [];
         if (!reqType) missing.push('request');
         if (!respType) missing.push('response');
         this.logger.warn(
-          `${info.name}.${methodName}: @${patternStr === 'unary' ? 'Rpc' : patternStr === 'server_stream' ? 'ServerStream' : patternStr === 'client_stream' ? 'ClientStream' : 'BidiStream'} is missing ${missing.join(' and ')} type(s). ` +
-          `The published manifest will have empty fields, which breaks ` +
-          `cross-language gen-client and the shell's method discovery. ` +
-          `Pass the constructors explicitly: ` +
-          `@${patternStr === 'unary' ? 'Rpc' : patternStr === 'server_stream' ? 'ServerStream' : patternStr === 'client_stream' ? 'ClientStream' : 'BidiStream'}({ request: SomeRequest, response: SomeResponse })`,
+          `${info.name}.${methodName}: @${decorator} is missing ` +
+          `${missing.join(' and ')} type(s). The published manifest will ` +
+          `have empty fields, which breaks cross-language gen-client and ` +
+          `the shell's method discovery. Pass the constructors explicitly: ` +
+          `@${decorator}({ request: SomeRequest, response: SomeResponse })`,
         );
       }
 
@@ -945,6 +952,31 @@ export class AsterClientWrapper {
     }
     this._enrollmentCredentialFile =
       opts.enrollmentCredentialFile ?? this.config.enrollmentCredentialFile;
+
+    // If the user only passed `enrollmentCredentialFile` (no separate
+    // `identity:`) and that file is a TOML `.aster-identity` produced by
+    // `aster enroll node`, reach into the same file for the [node]
+    // secret_key. Otherwise the QUIC endpoint id we generate at startup
+    // won't match the credential's `endpoint_id` and admission fails
+    // with no useful error.
+    //
+    // Both `enrollmentCredentialFile:` and `identity:` should do the
+    // same thing for the same TOML file -- mirrors the matching fix on
+    // the Python AsterClient.
+    if (
+      !this._identitySecretKey
+      && this._enrollmentCredentialFile
+      && !identity
+    ) {
+      const credIdentity = loadIdentity(
+        this._enrollmentCredentialFile,
+        opts.peer,
+        'consumer',
+      );
+      if (credIdentity) {
+        this._identitySecretKey = credIdentity.secretKey;
+      }
+    }
 
     if (opts.transport) {
       this.transport = opts.transport;
