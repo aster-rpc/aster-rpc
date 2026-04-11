@@ -38,7 +38,7 @@ from aster import (
     rpc,
     wire_type,
 )
-from aster.high_level import RPC_ALPN
+from aster.runtime import RPC_ALPN
 from aster.trust.hooks import ALPN_CONSUMER_ADMISSION, MeshEndpointHook
 from aster.trust.credentials import ConsumerEnrollmentCredential
 from aster.trust.consumer import (

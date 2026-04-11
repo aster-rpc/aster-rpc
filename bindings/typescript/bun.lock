@@ -29,21 +29,31 @@
         "@aster-rpc/aster": "workspace:*",
       },
     },
+    "native": {
+      "name": "@aster-rpc/transport",
+      "version": "0.1.0-alpha.0",
+      "devDependencies": {
+        "@napi-rs/cli": "^3.6.0",
+      },
+      "optionalDependencies": {
+        "@aster-rpc/transport-darwin-arm64": "0.1.0-alpha.0",
+        "@aster-rpc/transport-darwin-x64": "0.1.0-alpha.0",
+        "@aster-rpc/transport-linux-arm64-gnu": "0.1.0-alpha.0",
+        "@aster-rpc/transport-linux-x64-gnu": "0.1.0-alpha.0",
+        "@aster-rpc/transport-win32-x64-msvc": "0.1.0-alpha.0",
+      },
+    },
     "packages/aster": {
       "name": "@aster-rpc/aster",
       "version": "0.1.0-alpha.0",
       "dependencies": {
-        "@aster-rpc/transport": "workspace:*",
+        "@aster-rpc/transport": "0.1.0-alpha.0",
       },
       "devDependencies": {
         "@types/node": "^25.5.2",
         "typescript": "^5.7.0",
         "vitest": "^3.2.0",
       },
-    },
-    "packages/transport": {
-      "name": "@aster-rpc/transport",
-      "version": "0.1.0-alpha.0",
     },
   },
   "packages": {
@@ -57,7 +67,7 @@
 
     "@aster-rpc/aster": ["@aster-rpc/aster@workspace:packages/aster"],
 
-    "@aster-rpc/transport": ["@aster-rpc/transport@workspace:packages/transport"],
+    "@aster-rpc/transport": ["@aster-rpc/transport@workspace:native"],
 
     "@aster-tests/mission-control": ["@aster-tests/mission-control@workspace:../../tests/integration/mission_control"],
 

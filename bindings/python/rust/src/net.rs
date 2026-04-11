@@ -157,6 +157,9 @@ pub struct EndpointConfig {
     /// Enable mDNS local network discovery (default: false)
     #[pyo3(get, set)]
     pub enable_local_discovery: bool,
+    /// Node data directory for persistent state; empty = no persistent state
+    #[pyo3(get, set)]
+    pub data_dir: Option<String>,
 }
 
 #[pymethods]
@@ -176,6 +179,7 @@ impl EndpointConfig {
         proxy_url=None,
         proxy_from_env=false,
         enable_local_discovery=false,
+        data_dir=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -192,6 +196,7 @@ impl EndpointConfig {
         proxy_url: Option<String>,
         proxy_from_env: bool,
         enable_local_discovery: bool,
+        data_dir: Option<String>,
     ) -> Self {
         Self {
             relay_mode,
@@ -207,6 +212,7 @@ impl EndpointConfig {
             proxy_url,
             proxy_from_env,
             enable_local_discovery,
+            data_dir,
         }
     }
 }
@@ -228,6 +234,7 @@ impl From<&EndpointConfig> for CoreEndpointConfig {
             portmapper_config: config.portmapper_config.clone(),
             proxy_url: config.proxy_url.clone(),
             proxy_from_env: config.proxy_from_env,
+            data_dir: config.data_dir.clone(),
         }
     }
 }
