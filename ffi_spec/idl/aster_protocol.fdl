@@ -1,0 +1,52 @@
+// Aster RPC protocol types -- single source of truth for all language bindings.
+// Generate: .venv/bin/foryc ffi_spec/idl/aster_protocol.fdl --rust_out=... --python_out=... --java_out=...
+
+package _aster;
+
+option java_package = "com.aster.protocol";
+
+message StreamHeader {
+    string svc = 1;
+    string rpcMethod = 2;
+    int32 version = 3;
+    string callId = 4;
+    int64 deadlineEpochMs = 5;
+    int32 serializationMode = 6;
+    list<string> metadataKeys = 7;
+    list<string> metadataValues = 8;
+}
+
+message CallHeader {
+    string rpcMethod = 1;
+    string callId = 2;
+    int64 deadlineEpochMs = 3;
+    list<string> metadataKeys = 4;
+    list<string> metadataValues = 5;
+}
+
+message RpcStatus {
+    int32 code = 1;
+    string msg = 2;
+    list<string> detailKeys = 3;
+    list<string> detailValues = 4;
+}
+
+message ReactorCallData {
+    string svc = 1;
+    string rpcMethod = 2;
+    int32 version = 3;
+    string callId = 4;
+    int64 deadlineEpochMs = 5;
+    int32 serializationMode = 6;
+    string pattern = 7;
+    bool idempotent = 8;
+    string peerId = 9;
+    bool isSessionCall = 10;
+    list<string> metadataKeys = 11;
+    list<string> metadataValues = 12;
+    bytes headerPayload = 13;
+    bytes requestPayload = 14;
+    int32 requestFlags = 15;
+    bool isRouted = 16;
+    int32 headerFlags = 17;
+}
