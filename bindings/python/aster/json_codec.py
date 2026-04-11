@@ -14,6 +14,8 @@ import dataclasses
 import json
 from typing import Any, Optional, get_type_hints
 
+from aster.status import ContractViolationError
+
 
 def safe_decompress(data: bytes) -> bytes:
     """Decompress zstd bytes with a size limit to prevent decompression bombs."""
@@ -126,7 +128,6 @@ def _dict_to_dataclass(d: dict, cls: type, _path: str = "") -> Any:
     field_names = {f.name for f in dataclasses.fields(cls)}
     unexpected = [k for k in d.keys() if k not in field_names]
     if unexpected:
-        from aster.status import ContractViolationError
         sanitized = _sanitize_keys(unexpected)
         location = _path or cls.__name__
         message = (
