@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 
 namespace Aster;
 
@@ -93,7 +94,7 @@ public struct RuntimeConfig
 
     public static RuntimeConfig Default => new()
     {
-        struct_size = (uint)sizeof(RuntimeConfig),
+        struct_size = (uint)Marshal.SizeOf<RuntimeConfig>(),
         worker_threads = 1,
         event_queue_capacity = 256,
         reserved = 0,
@@ -129,7 +130,7 @@ public struct Bytes
     public IntPtr ptr;   // const uint8_t*
     public UIntPtr len;  // uintptr_t
 
-    public Span<byte> AsSpan() => new(ptr.ToPointer(), (int)len);
+    public unsafe Span<byte> AsSpan() => new(ptr.ToPointer(), (int)len);
 }
 
 /// <summary>
@@ -148,7 +149,7 @@ public struct EndpointConfig
 
     public static EndpointConfig Default => new()
     {
-        struct_size = (uint)sizeof(EndpointConfig),
+        struct_size = (uint)Marshal.SizeOf<EndpointConfig>(),
         relay_mode = 0, // default relay mode
         secret_key = default,
         alpns = default,
@@ -195,7 +196,7 @@ public struct ConnectConfig
 
     public static ConnectConfig Default => new()
     {
-        struct_size = (uint)sizeof(ConnectConfig),
+        struct_size = (uint)Marshal.SizeOf<ConnectConfig>(),
         flags = 0,
         node_id = default,
         alpn = default,
