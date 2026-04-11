@@ -3,21 +3,44 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - 'scripts/**'
-      - 'ffi_spec/**'
-      - '*.md'
-      - 'README.md'
-      - 'LICENSE*'
+    # Allow-list, not block-list. The previous `paths-ignore` form
+    # didn't exclude `.github/**`, which meant every workflow-file tweak
+    # (mirror filter, build-cli script, build-typescript script, etc.)
+    # spun up the entire Rust + Python test matrix on the self-hosted
+    # runners for ~20 minutes. Now CI only fires when a path it
+    # actually tests changes.
+    #
+    # Notably absent and intentional:
+    #   - bindings/typescript/**  (covered by ci-typescript.yml)
+    #   - bindings/{java,go,dotnet}/**  (no CI coverage yet)
+    #   - docs/**, *.md, scripts/**, ffi_spec/**  (no code)
+    #   - .github/workflows/{build*,mirror*,ci-typescript}.yml
+    #     (each has its own trigger or doesn't need CI)
+    paths:
+      - 'core/**'
+      - 'ffi/**'
+      - 'bindings/python/**'
+      - 'cli/**'
+      - 'tests/python/**'
+      - 'tests/integration/**'
+      - 'conformance/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'pyproject.toml'
+      - '.github/workflows/ci.yml'
   pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - 'scripts/**'
-      - 'ffi_spec/**'
-      - '*.md'
-      - 'README.md'
-      - 'LICENSE*'
+    paths:
+      - 'core/**'
+      - 'ffi/**'
+      - 'bindings/python/**'
+      - 'cli/**'
+      - 'tests/python/**'
+      - 'tests/integration/**'
+      - 'conformance/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'pyproject.toml'
+      - '.github/workflows/ci.yml'
   workflow_dispatch:
 
 concurrency:
