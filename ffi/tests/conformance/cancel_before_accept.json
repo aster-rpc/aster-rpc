@@ -1,0 +1,14 @@
+{
+  "name": "cancel_before_accept",
+  "description": "Cancel an accept before it completes",
+  "entries": [
+    { "seq": 0, "relative_time_ms": 0, "action": "SUBMIT", "op_id": 1, "user_tag": 10, "op": "node_create" },
+    { "seq": 1, "relative_time_ms": 5, "action": "POLL", "op_id": 0 },
+    { "seq": 2, "relative_time_ms": 10, "action": "COMPLETE", "op_id": 1, "handle": 1, "kind": "NODE_CREATED", "status": 0 },
+    { "seq": 3, "relative_time_ms": 15, "action": "SUBMIT", "op_id": 2, "user_tag": 11, "op": "accept" },
+    { "seq": 4, "relative_time_ms": 20, "action": "POLL", "op_id": 0 },
+    { "seq": 5, "relative_time_ms": 25, "action": "CANCEL", "op_id": 2, "user_tag": 11 },
+    { "seq": 6, "relative_time_ms": 30, "action": "POLL", "op_id": 0 },
+    { "seq": 7, "relative_time_ms": 35, "action": "COMPLETE", "op_id": 2, "kind": "NONE", "status": 9, "error_msg": "cancelled" }
+  ]
+}

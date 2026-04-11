@@ -371,6 +371,10 @@ fn test_endpoint_create_invalid_config() {
                 len: 0,
             },
             proxy_from_env: 0,
+            data_dir_utf8: iroh_bytes_t {
+                ptr: ptr::null(),
+                len: 0,
+            },
         };
         let status = iroh_endpoint_create(runtime, &config, 0, ptr::null_mut());
         assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);

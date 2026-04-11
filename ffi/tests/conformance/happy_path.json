@@ -1,0 +1,23 @@
+{
+  "name": "accept_connect_read_close",
+  "description": "Happy path: accept → connect → open_bi → read → close",
+  "entries": [
+    { "seq": 0, "relative_time_ms": 0, "action": "SUBMIT", "op_id": 1, "user_tag": 10, "op": "node_create" },
+    { "seq": 1, "relative_time_ms": 5, "action": "POLL", "op_id": 0 },
+    { "seq": 2, "relative_time_ms": 10, "action": "COMPLETE", "op_id": 1, "handle": 1, "kind": "NODE_CREATED", "status": 0 },
+    { "seq": 3, "relative_time_ms": 15, "action": "SUBMIT", "op_id": 2, "user_tag": 11, "op": "accept" },
+    { "seq": 4, "relative_time_ms": 20, "action": "SUBMIT", "op_id": 3, "user_tag": 12, "op": "connect" },
+    { "seq": 5, "relative_time_ms": 25, "action": "POLL", "op_id": 0 },
+    { "seq": 6, "relative_time_ms": 30, "action": "COMPLETE", "op_id": 2, "handle": 7, "kind": "CONNECTION_ACCEPTED", "status": 0 },
+    { "seq": 7, "relative_time_ms": 35, "action": "COMPLETE", "op_id": 3, "handle": 8, "kind": "CONNECTED", "status": 0 },
+    { "seq": 8, "relative_time_ms": 40, "action": "SUBMIT", "op_id": 4, "user_tag": 13, "op": "open_bi" },
+    { "seq": 9, "relative_time_ms": 45, "action": "POLL", "op_id": 0 },
+    { "seq": 10, "relative_time_ms": 50, "action": "COMPLETE", "op_id": 4, "handle": 9, "kind": "STREAM_OPENED", "status": 0 },
+    { "seq": 11, "relative_time_ms": 55, "action": "SUBMIT", "op_id": 5, "user_tag": 14, "op": "read" },
+    { "seq": 12, "relative_time_ms": 60, "action": "POLL", "op_id": 0 },
+    { "seq": 13, "relative_time_ms": 120, "action": "COMPLETE", "op_id": 5, "handle": 9, "kind": "FRAME_RECEIVED", "status": 0, "data_len": 128 },
+    { "seq": 14, "relative_time_ms": 121, "action": "RELEASE", "op_id": 0, "events": [5] },
+    { "seq": 15, "relative_time_ms": 200, "action": "CLOSE", "op_id": 0, "handle": 9 },
+    { "seq": 16, "relative_time_ms": 205, "action": "CLOSE", "op_id": 0, "handle": 8 }
+  ]
+}

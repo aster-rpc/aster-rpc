@@ -6,17 +6,25 @@ edition = "2021"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[[bin]]
+name = "soak_test_runner"
+path = "src/bin/soak_test_runner/main.rs"
+
 [dependencies]
 aster_transport_core = { path = "../core" }
 iroh = { workspace = true }
 tokio = { workspace = true }
-libc = { workspace = true }
-once_cell = { workspace = true }
 anyhow = { workspace = true }
-rand = { workspace = true }
-bytes = { workspace = true }
 getrandom = "0.2"
 serde_json = "1"
 hex = "0.4"
 base64 = "0.22"
-cbindgen = { version = "0.24", optional = true }
+# Note: iroh_ffi.h is regenerated externally with cbindgen; not a build dep.
+
+[dev-dependencies]
+loom = "0.7"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ffi_benchmarks"
+harness = false
