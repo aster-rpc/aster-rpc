@@ -23,18 +23,44 @@ jobs:
         env:
           FILTER_BRANCH_SQUELCH_WARNING: "1"
         run: |
-          # Rewrite every commit message on HEAD to drop
-          # `Co-Authored-By: *Claude*` trailers inserted by parallel
-          # agent sessions. Scoped to this ephemeral workspace only --
-          # the private repo (emrul/aster-rpc) history is not touched.
-          # Legitimate human Co-Authored-By lines are preserved.
+          # Rewrite every commit message on HEAD to scrub LLM
+          # co-author attribution before the public mirror push.
+          # Scoped to this ephemeral workspace only -- the private repo
+          # (emrul/aster-rpc) history is not touched. Legitimate human
+          # Co-Authored-By lines are preserved.
+          #
+          # The previous version only stripped lines that *started*
+          # with `Co-Authored-By:`. That missed two important cases:
+          #   1. Lines wrapped in backticks or quoted in commit bodies
+          #      (e.g. a meta-commit that explains the strip step itself
+          #      and quotes the trailer pattern). GitHub's commit parser
+          #      is forgiving enough that it still attributes those as
+          #      co-authors and surfaces them on the Contributors page.
+          #   2. Lines like "Co-authored-by: Claude" without a colon
+          #      that some clients emit.
+          #
+          # The new sed:
+          #   1. Deletes any line containing the literal trailer pattern
+          #      anywhere on the line (`Co-Authored-By:` followed by
+          #      "Claude" later in the same line), regardless of leading
+          #      characters (whitespace, backticks, quotes).
+          #   2. Replaces any remaining bare occurrences of the phrase
+          #      "Co-Authored-By: Claude" in commit prose (without an
+          #      email) with "[scrubbed]" so the trigger pattern is gone
+          #      even when describing it.
+          #   3. Replaces any remaining "Claude Opus" version strings
+          #      with "[LLM]" so version-specific identifiers don't leak.
           #
           # filter-branch is slow but ships with core git and has zero
           # install cost. For a one-shot per-mirror rewrite it is fine.
           git config user.name "Emrul Islam"
           git config user.email "emrul@aster.dev"
           git filter-branch --force --msg-filter \
-            'sed -e "/^[Cc]o-[Aa]uthored-[Bb]y:.*[Cc]laude/d"' \
+            'sed -E \
+              -e "/[Cc]o-[Aa]uthored-[Bb]y:.*[Cc]laude/d" \
+              -e "s/[Cc]laude Opus[^[:space:]]*/[LLM]/g" \
+              -e "s/[Cc]laude/[LLM]/g" \
+              -e "s/anthropic\\.com/[scrubbed]/g"' \
             HEAD
 
       - name: Filter internal files
