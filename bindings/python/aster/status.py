@@ -10,7 +10,18 @@ from enum import IntEnum
 
 
 class StatusCode(IntEnum):
-    """RPC status codes (semantically identical to gRPC codes 0-16).
+    """RPC status codes.
+
+    Codes 0-16 mirror gRPC's ``google.rpc.Code`` semantically. Codes
+    100+ are Aster-native and have no gRPC equivalent. The 17-99
+    range is reserved as a buffer in case gRPC ever extends its enum.
+
+    A common gripe with gRPC's status codes is that there are too
+    few of them to express the variety of failures real services
+    actually hit -- everything ends up shoehorned into a handful of
+    overloaded categories. The 100+ space gives Aster room to mint
+    more precise codes over time, signalling clearly that they are
+    intentionally separate from the gRPC vocabulary.
 
     Use these to inspect errors returned by the server::
 
@@ -19,10 +30,11 @@ class StatusCode(IntEnum):
         except RpcError as e:
             if e.code == StatusCode.NOT_FOUND:
                 print("Service not found")
-            elif e.code == StatusCode.PERMISSION_DENIED:
-                print("Missing required capability")
+            elif e.code == StatusCode.CONTRACT_VIOLATION:
+                print("Wire shape doesn't match the contract")
     """
 
+    # ── gRPC-mirrored codes (0-16) ───────────────────────────────────
     OK = 0                    #: Success.
     CANCELLED = 1             #: The call was cancelled by the client.
     UNKNOWN = 2               #: Unknown error (server bug or unhandled exception).
@@ -40,6 +52,23 @@ class StatusCode(IntEnum):
     UNAVAILABLE = 14          #: Server temporarily unavailable (retry later).
     DATA_LOSS = 15            #: Unrecoverable data loss.
     UNAUTHENTICATED = 16      #: No valid credentials provided.
+
+    # ── Reserved range (17-99) ───────────────────────────────────────
+    # Intentionally left empty -- reserved as a buffer in case gRPC
+    # ever extends its enum upward. New Aster-native codes start at
+    # 101 and grow from there.
+
+    # ── Aster-native codes (100+) ────────────────────────────────────
+    #: The wire payload doesn't match the published contract -- e.g.
+    #: the JSON dict has fields the server's @wire_type dataclass
+    #: doesn't declare, or vice versa. Distinct from INVALID_ARGUMENT
+    #: because the violation is about the SHAPE of the data, not its
+    #: value, and because shape violations can occur at any nesting
+    #: depth (a top-level INVALID_ARGUMENT label doesn't apply when
+    #: the bad field is two objects deep). The producer owns the
+    #: contract; consumers must use the field names defined by the
+    #: producer's manifest.
+    CONTRACT_VIOLATION = 101
 
 
 class RpcError(Exception):
@@ -171,6 +200,17 @@ class UnauthenticatedError(RpcError):
         super().__init__(StatusCode.UNAUTHENTICATED, message, details)
 
 
+class ContractViolationError(RpcError):
+    """Raised when the wire payload doesn't match the published contract.
+
+    Carries the offending field names in ``details`` under the key
+    ``unexpected_fields`` (comma-separated, sanitized via repr).
+    """
+
+    def __init__(self, message: str = "", details: dict[str, str] | None = None) -> None:
+        super().__init__(StatusCode.CONTRACT_VIOLATION, message, details)
+
+
 _RPC_ERROR_TYPES: dict[StatusCode, type[RpcError]] = {
     StatusCode.CANCELLED: CancelledError,
     StatusCode.UNKNOWN: UnknownRpcError,
@@ -188,4 +228,5 @@ _RPC_ERROR_TYPES: dict[StatusCode, type[RpcError]] = {
     StatusCode.UNAVAILABLE: UnavailableError,
     StatusCode.DATA_LOSS: DataLossError,
     StatusCode.UNAUTHENTICATED: UnauthenticatedError,
+    StatusCode.CONTRACT_VIOLATION: ContractViolationError,
 }

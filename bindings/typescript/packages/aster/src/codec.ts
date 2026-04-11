@@ -77,8 +77,20 @@ function zstdDecompress(data: Uint8Array): Uint8Array {
 // -- JsonCodec ----------------------------------------------------------------
 
 /**
- * Simple JSON codec for testing and development.
- * Does not support cross-language Fory XLANG wire format.
+ * Simple JSON codec for cross-language interop and development.
+ *
+ * Strict mode: when ``decode`` is called with a ``hintType`` argument
+ * (a @WireType-decorated class constructor), the codec validates that
+ * every key in the decoded object matches a field declared on the
+ * class. Unknown keys raise ``ContractViolationError`` -- the producer
+ * owns the contract, and consumers must use the field names defined
+ * by the producer's manifest. Validation walks nested objects and
+ * arrays recursively, so a bad field at any depth fails loudly.
+ *
+ * If ``hintType`` is omitted (or is ``null``/``undefined``), decoding
+ * is permissive and returns the raw parsed value -- the codec doesn't
+ * know what shape to enforce. Callers that need strict validation
+ * must always pass the expected type.
  */
 export class JsonCodec implements Codec {
   private encoder = new TextEncoder();
@@ -93,8 +105,12 @@ export class JsonCodec implements Codec {
     return this.encoder.encode(JSON.stringify(obj));
   }
 
-  decode(payload: Uint8Array): unknown {
-    return JSON.parse(this.decoder.decode(payload));
+  decode(payload: Uint8Array, hintType?: unknown): unknown {
+    const parsed = JSON.parse(this.decoder.decode(payload));
+    if (hintType && typeof hintType === 'function') {
+      validateContractShape(parsed, hintType as new (...args: any[]) => any);
+    }
+    return parsed;
   }
 
   encodeCompressed(obj: unknown): [Uint8Array, boolean] {
@@ -108,13 +124,199 @@ export class JsonCodec implements Codec {
     return [data, false];
   }
 
-  decodeCompressed(payload: Uint8Array, compressed: boolean): unknown {
+  decodeCompressed(payload: Uint8Array, compressed: boolean, hintType?: unknown): unknown {
     if (compressed) {
       const decompressed = zstdDecompress(payload);
-      return this.decode(decompressed);
+      return this.decode(decompressed, hintType);
     }
-    return this.decode(payload);
+    return this.decode(payload, hintType);
   }
+}
+
+/**
+ * Cached introspection result for a @WireType class.
+ *
+ * We cache the field name set + nested-class map per constructor so
+ * the validator doesn't `new cls()` on every decode -- that would
+ * re-run any side effects in the constructor (e.g. `id =
+ * crypto.randomUUID()` initializers, allocator calls). The cache is
+ * a WeakMap so it doesn't pin classes that are otherwise garbage.
+ *
+ * `null` for the cache value means "introspection failed once, don't
+ * try again" (e.g. the constructor required positional args). The
+ * validator will fall back to permissive decode for that class
+ * forever.
+ */
+interface ClassShape {
+  fieldNames: Set<string>;
+  /** field name -> nested @WireType class to recurse into, if any. */
+  nestedTypes: Map<string, new (...args: any[]) => any>;
+  /** field name -> array element @WireType class, if any. */
+  elementTypes: Map<string, new (...args: any[]) => any>;
+}
+const _shapeCache = new WeakMap<new (...args: any[]) => any, ClassShape | null>();
+
+function introspectClass(
+  cls: new (...args: any[]) => any,
+): ClassShape | null {
+  const cached = _shapeCache.get(cls);
+  if (cached !== undefined) return cached;
+
+  let template: any;
+  try {
+    template = new cls();
+  } catch {
+    // Class isn't default-constructible -- record a sentinel so we
+    // never retry, and fall back to permissive decode forever.
+    _shapeCache.set(cls, null);
+    return null;
+  }
+
+  const fieldNames = new Set(Object.keys(template));
+  const nestedTypes = new Map<string, new (...args: any[]) => any>();
+  const elementTypes = new Map<string, new (...args: any[]) => any>();
+
+  for (const [key, defaultValue] of Object.entries(template)) {
+    if (defaultValue === null || defaultValue === undefined) continue;
+    if (Array.isArray(defaultValue)) {
+      // For arrays, sample the first element if any. Empty arrays
+      // can't be introspected -- documented limitation.
+      const sample = defaultValue[0];
+      const elementCls = sample?.constructor as
+        | (new (...args: any[]) => any)
+        | undefined;
+      if (
+        elementCls &&
+        elementCls !== Object &&
+        typeof elementCls === 'function'
+      ) {
+        elementTypes.set(key, elementCls);
+      }
+      continue;
+    }
+    if (typeof defaultValue !== 'object') continue; // primitive (incl. enum members)
+    const nestedCls = (defaultValue as object).constructor as
+      | (new (...args: any[]) => any)
+      | undefined;
+    if (
+      nestedCls &&
+      nestedCls !== Object &&
+      nestedCls !== Array &&
+      nestedCls !== Date &&
+      nestedCls !== Map &&
+      nestedCls !== Set &&
+      typeof nestedCls === 'function'
+    ) {
+      nestedTypes.set(key, nestedCls);
+    }
+  }
+
+  const shape: ClassShape = { fieldNames, nestedTypes, elementTypes };
+  _shapeCache.set(cls, shape);
+  return shape;
+}
+
+/**
+ * Strict shape validation: walks ``value`` against ``cls`` and throws
+ * ``ContractViolationError`` if any object has keys not declared on
+ * the corresponding @WireType class. Recurses into nested objects and
+ * arrays so a bad field at any depth fails loudly with the dotted
+ * path to the violation.
+ *
+ * Limitations (documented; tests pin them):
+ *
+ * - Nested types behind a `null` / `undefined` default are not
+ *   recursed into. Top-level validation always runs.
+ * - Empty array defaults can't be element-introspected. Top-level
+ *   validation always runs.
+ * - Date / Map / Set / typed-array fields are treated as opaque
+ *   primitives -- their values may be objects on the wire but the
+ *   validator doesn't try to recurse.
+ * - Class generics are erased at runtime; the validator sees the
+ *   default value of the generic field, not its declared type.
+ */
+function validateContractShape(
+  value: unknown,
+  cls: new (...args: any[]) => any,
+  path = '',
+): void {
+  if (value === null || value === undefined) return;
+  if (typeof value !== 'object' || Array.isArray(value)) return;
+
+  const shape = introspectClass(cls);
+  if (shape === null) return; // class isn't default-constructible
+
+  const { fieldNames, nestedTypes, elementTypes } = shape;
+  const dict = value as Record<string, unknown>;
+
+  const unexpected: string[] = [];
+  for (const key of Object.keys(dict)) {
+    if (!fieldNames.has(key)) unexpected.push(key);
+  }
+  if (unexpected.length > 0) {
+    const sanitized = sanitizeKeys(unexpected);
+    const location = path || cls.name || 'unknown';
+    const message =
+      `contract violation at ${location}: unexpected JSON field(s) ` +
+      `${JSON.stringify(sanitized)} (expected: ${JSON.stringify([...fieldNames].sort())})`;
+    // Lazy import to avoid a circular dep with status.ts
+    const { ContractViolationError } = require('./status.js');
+    throw new ContractViolationError(message, {
+      unexpected_fields: sanitized.join(','),
+      location,
+      expected_class: cls.name || 'unknown',
+    });
+  }
+
+  // Recurse into nested @WireType objects + arrays using the cached
+  // shape map. This avoids re-instantiating the class on every
+  // decode (preserving constructor side effects) and is O(1) per
+  // field after the first decode.
+  for (const [key, child] of Object.entries(dict)) {
+    if (child === null || child === undefined) continue;
+    const nestedPath = path ? `${path}.${key}` : `${cls.name || 'value'}.${key}`;
+    const nestedCls = nestedTypes.get(key);
+    if (nestedCls && typeof child === 'object' && !Array.isArray(child)) {
+      validateContractShape(child, nestedCls, nestedPath);
+      continue;
+    }
+    const elementCls = elementTypes.get(key);
+    if (elementCls && Array.isArray(child)) {
+      for (let i = 0; i < child.length; i++) {
+        const item = child[i];
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+          validateContractShape(item, elementCls, `${nestedPath}[${i}]`);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Repr-quote unexpected key names for safe logging.
+ *
+ * Prevents log injection: keys can contain control chars, ANSI
+ * escapes, newlines, or backslashes that would corrupt the error
+ * message or terminal. We replace control chars with their escape
+ * forms, cap each key's length, and cap the number of keys in the
+ * list so a malicious client can't blow up log storage with
+ * megabyte-long key names.
+ */
+function sanitizeKeys(keys: string[], maxCount = 5, maxLen = 80): string[] {
+  const out: string[] = [];
+  for (const k of keys.slice(0, maxCount)) {
+    let s = String(k);
+    if (s.length > maxLen) s = s.slice(0, maxLen) + '...(truncated)';
+    // Escape control chars + non-printable bytes via JSON.stringify
+    // (which produces a quoted string with backslash-escapes), then
+    // strip the surrounding quotes to keep the inline form readable.
+    const quoted = JSON.stringify(s);
+    out.push(quoted.slice(1, -1));
+  }
+  if (keys.length > maxCount) {
+    out.push(`...(+${keys.length - maxCount} more)`);
+  }
+  return out;
 }
 
 // -- Type graph walking -------------------------------------------------------

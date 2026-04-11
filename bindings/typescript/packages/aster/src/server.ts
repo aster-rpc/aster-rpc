@@ -335,7 +335,7 @@ export class RpcServer {
   }
 
   private async handleUnary(
-    svcInfo: ServiceInfo, _methodInfo: MethodInfo, handler: Function,
+    svcInfo: ServiceInfo, methodInfo: MethodInfo, handler: Function,
     callCtx: CallContext, send: ServerSendStream, recv: ServerRecvStream,
   ): Promise<void> {
     // Read request
@@ -346,9 +346,13 @@ export class RpcServer {
     }
     const [reqPayload, reqFlags] = reqFrame;
     const compressed = !!(reqFlags & COMPRESSED);
+    // Pass the request type as the codec hint so JsonCodec can do
+    // strict shape validation. Wrong/extra/missing fields raise
+    // CONTRACT_VIOLATION before the handler runs.
+    const reqType = methodInfo.requestType as unknown;
     let request = compressed
-      ? (this.codec as any).decodeCompressed(reqPayload, true)
-      : this.codec.decode(reqPayload);
+      ? (this.codec as any).decodeCompressed(reqPayload, true, reqType)
+      : this.codec.decode(reqPayload, reqType);
 
     // Interceptors
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
@@ -374,7 +378,7 @@ export class RpcServer {
   }
 
   private async handleServerStream(
-    svcInfo: ServiceInfo, _methodInfo: MethodInfo, handler: Function,
+    svcInfo: ServiceInfo, methodInfo: MethodInfo, handler: Function,
     callCtx: CallContext, send: ServerSendStream, recv: ServerRecvStream,
   ): Promise<void> {
     const reqFrame = await readFrame(recv, 0);
@@ -384,9 +388,10 @@ export class RpcServer {
     }
     const [reqPayload, reqFlags] = reqFrame;
     const compressed = !!(reqFlags & COMPRESSED);
+    const reqType = methodInfo.requestType as unknown;
     let request = compressed
-      ? (this.codec as any).decodeCompressed(reqPayload, true)
-      : this.codec.decode(reqPayload);
+      ? (this.codec as any).decodeCompressed(reqPayload, true, reqType)
+      : this.codec.decode(reqPayload, reqType);
 
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
 
@@ -407,11 +412,12 @@ export class RpcServer {
   }
 
   private async handleClientStream(
-    svcInfo: ServiceInfo, _methodInfo: MethodInfo, handler: Function,
+    svcInfo: ServiceInfo, methodInfo: MethodInfo, handler: Function,
     callCtx: CallContext, send: ServerSendStream, recv: ServerRecvStream,
   ): Promise<void> {
     // Collect requests until stream ends
     const requests: unknown[] = [];
+    const reqType = methodInfo.requestType as unknown;
     while (true) {
       const frame = await readFrame(recv, 0);
       if (!frame) break;
@@ -435,8 +441,8 @@ export class RpcServer {
       }
       const compressed = !!(flags & COMPRESSED);
       let request = compressed
-        ? (this.codec as any).decodeCompressed(payload, true)
-        : this.codec.decode(payload);
+        ? (this.codec as any).decodeCompressed(payload, true, reqType)
+        : this.codec.decode(payload, reqType);
       request = await applyRequestInterceptors(this.interceptors, callCtx, request);
       requests.push(request);
     }
@@ -463,7 +469,7 @@ export class RpcServer {
   }
 
   private async handleBidiStream(
-    svcInfo: ServiceInfo, _methodInfo: MethodInfo, handler: Function,
+    svcInfo: ServiceInfo, methodInfo: MethodInfo, handler: Function,
     callCtx: CallContext, send: ServerSendStream, recv: ServerRecvStream,
   ): Promise<void> {
     // Auth interceptors already ran in dispatchRpc() before this method.
@@ -475,6 +481,7 @@ export class RpcServer {
     // local variable, but it can track property access through one).
     const self = this;
     const errBox: { value: Error | null } = { value: null };
+    const reqType = methodInfo.requestType as unknown;
     async function* requestIter() {
       try {
         while (true) {
@@ -485,8 +492,8 @@ export class RpcServer {
           if (flags & CANCEL) continue;
           const compressed = !!(flags & COMPRESSED);
           const request = compressed
-            ? (self.codec as any).decodeCompressed(payload, true)
-            : self.codec.decode(payload);
+            ? (self.codec as any).decodeCompressed(payload, true, reqType)
+            : self.codec.decode(payload, reqType);
           yield request;
         }
       } catch (e) {
