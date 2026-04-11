@@ -31,6 +31,7 @@ export {
   UnavailableError,
   DataLossError,
   UnauthenticatedError,
+  ContractViolationError,
 } from './status.js';
 
 // Types and enums

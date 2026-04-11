@@ -11,6 +11,7 @@
 
 import { MAX_DECOMPRESSED_SIZE } from './limits.js';
 import { WIRE_TYPE_KEY } from './decorators.js';
+import { ContractViolationError } from './status.js';
 
 /** Default compression threshold in bytes (4 KiB). */
 export const DEFAULT_COMPRESSION_THRESHOLD = 4096;
@@ -259,8 +260,6 @@ function validateContractShape(
     const message =
       `contract violation at ${location}: unexpected JSON field(s) ` +
       `${JSON.stringify(sanitized)} (expected: ${JSON.stringify([...fieldNames].sort())})`;
-    // Lazy import to avoid a circular dep with status.ts
-    const { ContractViolationError } = require('./status.js');
     throw new ContractViolationError(message, {
       unexpected_fields: sanitized.join(','),
       location,
