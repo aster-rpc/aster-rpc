@@ -12,6 +12,12 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          # Do NOT install the scoped GITHUB_TOKEN as an http.extraheader
+          # on github.com requests. That header overrides URL-embedded
+          # credentials on every git push, so the PUBLIC_REPO_TOKEN we
+          # embed into the `public` remote URL would be ignored and git
+          # would fall back to github-actions[bot] (403 on the target).
+          persist-credentials: false
 
       - name: Filter internal files
         run: |
