@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Aster</RootNamespace>
+    <AssemblyName>Aster</AssemblyName>
+    <!-- Library, not executable -->
+    <OutputType>Library</OutputType>
+  </PropertyGroup>
+
+  <!-- Native library configuration -->
+  <PropertyGroup>
+    <!-- Path to the built Rust FFI library -->
+    <NativeLibraryPath Condition="'$(NativeLibraryPath)' == ''">/Users/emrul/dev/emrul/iroh-python/target/release</NativeLibraryPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Embed the C header for reference; not compiled -->
+    <None Include="$(NativeLibraryPath)/libaster_transport_ffi.dylib" Link="libaster_transport_ffi.dylib">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="$(MSBuildThisFileDirectory)../../../../ffi_spec/iroh_bridge.h" Link="iroh_bridge.h" />
+  </ItemGroup>
+
+</Project>

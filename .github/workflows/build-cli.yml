@@ -1,0 +1,113 @@
+name: Build & Publish aster-cli
+
+on:
+  push:
+    branches: [main]
+    tags: ["cli-v*"]
+    paths:
+      - 'cli/**'
+      - '.github/workflows/build-cli.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-cli-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Compute version ───────────────────────────────────────────────
+  # aster-cli versioning is independent of aster-rpc. The source of
+  # truth is cli/pyproject.toml. Dev builds append .devN for the run.
+  version:
+    runs-on: [self-hosted, Linux, X64]
+    outputs:
+      cli_version: ${{ steps.ver.outputs.cli_version }}
+      is_release: ${{ steps.ver.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compute version
+        id: ver
+        run: |
+          BASE_VERSION=$(grep '^version' cli/pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          if [[ "$GITHUB_REF" == refs/tags/cli-v* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/cli-v}"
+            if [[ "$TAG_VERSION" != "$BASE_VERSION" ]]; then
+              echo "::error::Tag cli-v${TAG_VERSION} does not match cli/pyproject.toml version ${BASE_VERSION}"
+              exit 1
+            fi
+            echo "cli_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cli_version=${BASE_VERSION}.dev${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Show version
+        run: |
+          echo "aster-cli version: ${{ steps.ver.outputs.cli_version }}"
+          echo "Release:           ${{ steps.ver.outputs.is_release }}"
+
+  # ── Build sdist + wheel (pure-Python, single job) ─────────────────
+  build:
+    needs: [version]
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install build
+        run: python -m pip install --upgrade build
+      - name: Stamp version
+        run: |
+          sed -i 's/^version\s*=.*/version = "${{ needs.version.outputs.cli_version }}"/' cli/pyproject.toml
+          grep '^version' cli/pyproject.toml
+      - name: Build sdist + wheel
+        run: python -m build --sdist --wheel --outdir dist cli/
+      - name: List artifacts
+        run: ls -lh dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aster-cli-dist
+          path: dist
+
+  # ── Create GitHub Release (cli-v* tags only) ───────────────────────
+  release:
+    name: Create GitHub Release
+    runs-on: [self-hosted, Linux, X64]
+    if: startsWith(github.ref, 'refs/tags/cli-v')
+    needs: [build, version]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aster-cli-dist
+          path: dist
+      - name: Create release and upload artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "aster-cli ${{ needs.version.outputs.cli_version }}" \
+            --generate-notes
+
+  # ── Publish to PyPI (cli-v* tags only, trusted publishing) ─────────
+  pypi:
+    name: Publish aster-cli to PyPI
+    runs-on: [self-hosted, Linux, X64]
+    if: startsWith(github.ref, 'refs/tags/cli-v')
+    needs: [build, version]
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aster-cli-dist
+          path: dist
+      - name: List artifacts
+        run: ls -lh dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
