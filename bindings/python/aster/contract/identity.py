@@ -125,10 +125,14 @@ def normalize_identifier(s: str) -> str:
 class FieldDef:
     """Describes a single field in a MESSAGE TypeDef.
 
-    Field IDs are normative and match the canonical serialization order.
+    ``id`` is accepted for source compatibility but is IGNORED by the Rust
+    canonicalizer -- field IDs are re-derived as 1-based NFC-name-sorted
+    positions during canonicalization per §11.3.2.3. Setting ``id`` in
+    Python has no effect on ``contract_id``; the value exists only so
+    legacy call sites that construct FieldDef positionally keep working.
     """
 
-    id: int                         # field 1: ZigZag varint
+    id: int                         # field 1: derived from NFC-name-sort at canonicalization time
     name: str                       # field 2: UTF-8 string
     type_kind: TypeKind             # field 3: unsigned varint
     type_primitive: str             # field 4: UTF-8 string (empty when unused)
@@ -140,6 +144,10 @@ class FieldDef:
     container_key_kind: TypeKind    # field 10: unsigned varint
     container_key_primitive: str    # field 11: UTF-8 string
     container_key_ref: bytes        # field 12: bytes
+    required: bool = True           # field 13: True if no declared default (§11.3.2.3)
+    default_value: bytes = b""      # field 14: canonical XLANG bytes of scalar default,
+                                    # empty bytes otherwise. Empty containers use the
+                                    # single-byte sentinel b"\x00".
 
 
 @dataclass
@@ -205,6 +213,12 @@ class ServiceContract:
     serialization_modes: list[str] = field(default_factory=list)       # field 4
     scoped: ScopeKind = ScopeKind.SHARED         # field 5: unsigned varint
     requires: CapabilityRequirement | None = None  # field 6: optional
+    producer_language: str = ""                  # field 7: REQUIRED when "native" in serialization_modes,
+                                                  # empty string otherwise. One of
+                                                  # "python"|"typescript"|"java"|"csharp"|"go". See
+                                                  # §11.3.2.3 Serialization Modes. Validated by Rust
+                                                  # at canonicalization time -- invalid combinations
+                                                  # raise via the FFI.
 
     @classmethod
     def from_service_info(
