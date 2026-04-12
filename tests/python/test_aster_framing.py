@@ -400,8 +400,8 @@ class TestProtocolTypes:
             service="MyService",
             method="do_thing",
             version=1,
-            callId="call-1",
-            deadlineEpochMs=1000,
+            callId=1,
+            deadline=1000,
             serializationMode=0,
             metadataKeys=["key"],
             metadataValues=["val"],
@@ -413,7 +413,7 @@ class TestProtocolTypes:
     def test_call_header_defaults(self):
         h = CallHeader()
         assert h.method == ""
-        assert h.callId == ""
+        assert h.callId == 0
 
     def test_rpc_status_defaults(self):
         s = RpcStatus()
@@ -499,8 +499,8 @@ class TestForySerializationRoundTrip:
             service="TestService",
             method="test_method",
             version=1,
-            callId="call-001",
-            deadlineEpochMs=1712000000000,
+            callId=2,
+            deadline=30,
             serializationMode=0,
             metadataKeys=["trace_id", "auth"],
             metadataValues=["t1", "token"],
@@ -515,7 +515,7 @@ class TestForySerializationRoundTrip:
         assert restored.method == original.method
         assert restored.version == original.version
         assert restored.callId == original.callId
-        assert restored.deadlineEpochMs == original.deadlineEpochMs
+        assert restored.deadline == original.deadline
         assert restored.serializationMode == original.serializationMode
         assert restored.metadataKeys == original.metadataKeys
         assert restored.metadataValues == original.metadataValues
@@ -524,8 +524,8 @@ class TestForySerializationRoundTrip:
         f = self._create_fory(CallHeader)
         original = CallHeader(
             method="assign_task",
-            callId="call-002",
-            deadlineEpochMs=1712000001000,
+            callId=3,
+            deadline=60,
             metadataKeys=["k1"],
             metadataValues=["v1"],
         )
@@ -534,7 +534,7 @@ class TestForySerializationRoundTrip:
         assert isinstance(restored, CallHeader)
         assert restored.method == original.method
         assert restored.callId == original.callId
-        assert restored.deadlineEpochMs == original.deadlineEpochMs
+        assert restored.deadline == original.deadline
         assert restored.metadataKeys == original.metadataKeys
         assert restored.metadataValues == original.metadataValues
 
@@ -559,7 +559,7 @@ class TestForySerializationRoundTrip:
         f = self._create_fory(StreamHeader)
         h = StreamHeader(
             service="Svc", method="m", version=1,
-            callId="c1",
+            callId=4,
         )
         b1 = f.serialize(h)
         b2 = f.serialize(h)

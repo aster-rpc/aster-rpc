@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import pyfory
+
 # Import wire_type from codec.py to avoid duplication
 from aster.codec import wire_type
 
@@ -29,10 +31,10 @@ class StreamHeader:
 
     service: str = ""
     method: str = ""
-    version: int = 0
-    callId: str = ""
-    deadlineEpochMs: int = 0
-    serializationMode: int = 0
+    version: pyfory.int32 = 0
+    callId: pyfory.int32 = 0
+    deadline: pyfory.int16 = 0          # relative seconds, 0 = no deadline
+    serializationMode: pyfory.int8 = 0  # XLANG=0, NATIVE=1, ROW=2, JSON=3
     metadataKeys: list[str] = field(default_factory=list)
     metadataValues: list[str] = field(default_factory=list)
 
@@ -47,8 +49,8 @@ class CallHeader:
     """
 
     method: str = ""
-    callId: str = ""
-    deadlineEpochMs: int = 0
+    callId: pyfory.int32 = 0
+    deadline: pyfory.int16 = 0          # relative seconds, 0 = no deadline
     metadataKeys: list[str] = field(default_factory=list)
     metadataValues: list[str] = field(default_factory=list)
 

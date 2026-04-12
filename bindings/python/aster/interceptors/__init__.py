@@ -10,7 +10,7 @@ from aster.interceptors.base import (
     apply_request_interceptors,
     apply_response_interceptors,
     build_call_context,
-    deadline_from_epoch_ms,
+    deadline_from_relative_secs,
     normalize_error,
 )
 from aster.interceptors.circuit_breaker import CircuitBreakerInterceptor
@@ -27,7 +27,7 @@ __all__ = [
     "apply_request_interceptors",
     "apply_response_interceptors",
     "build_call_context",
-    "deadline_from_epoch_ms",
+    "deadline_from_relative_secs",
     "normalize_error",
     "DeadlineInterceptor",
     "AuthInterceptor",

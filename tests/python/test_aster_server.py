@@ -408,7 +408,7 @@ class TestClientCallOverrides:
                 request,
                 *,
                 metadata=None,
-                deadline_epoch_ms=0,
+                deadline_secs=0,
                 serialization_mode=0,
                 contract_id="",
             ):
@@ -417,7 +417,7 @@ class TestClientCallOverrides:
                     method=method,
                     request=request,
                     metadata=metadata,
-                    deadline_epoch_ms=deadline_epoch_ms,
+                    deadline_secs=deadline_secs,
                     serialization_mode=serialization_mode,
                     contract_id=contract_id,
                 )
@@ -448,7 +448,7 @@ class TestClientCallOverrides:
         assert captured["method"] == "echo"
         assert captured["request"] is request
         assert captured["metadata"] == {"trace_id": "abc123"}
-        assert captured["deadline_epoch_ms"] > 0
+        assert captured["deadline_secs"] > 0
         assert captured["serialization_mode"] == SerializationMode.XLANG.value
         assert captured["contract_id"] == ""
 
@@ -568,7 +568,7 @@ class TestServiceClientBase:
         assert client.service_version == 1
 
     def test_client_timeout_conversion(self):
-        """Timeout is converted to deadline_epoch_ms."""
+        """Timeout is converted to deadline_secs."""
         from aster.service import ServiceRegistry
         
         registry = ServiceRegistry()
