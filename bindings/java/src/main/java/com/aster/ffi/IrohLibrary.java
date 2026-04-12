@@ -1957,9 +1957,8 @@ public final class IrohLibrary implements SymbolLookup {
   /**
    * Compute the contract_id (64-char hex BLAKE3) from a ServiceContract JSON.
    *
-   * <p>C signature:
-   * {@code int32_t aster_contract_id(const uint8_t *json_ptr, uintptr_t json_len,
-   *                                   uint8_t *out_buf, uintptr_t *out_len);}
+   * <p>C signature: {@code int32_t aster_contract_id(const uint8_t *json_ptr, uintptr_t json_len,
+   * uint8_t *out_buf, uintptr_t *out_len);}
    *
    * @param jsonPtr pointer to UTF-8 JSON bytes
    * @param jsonLen length of JSON
@@ -1988,10 +1987,9 @@ public final class IrohLibrary implements SymbolLookup {
   /**
    * Compute canonical bytes for a named type from JSON.
    *
-   * <p>C signature:
-   * {@code int32_t aster_canonical_bytes(const uint8_t *type_name_ptr, uintptr_t type_name_len,
-   *                                       const uint8_t *json_ptr, uintptr_t json_len,
-   *                                       uint8_t *out_buf, uintptr_t *out_len);}
+   * <p>C signature: {@code int32_t aster_canonical_bytes(const uint8_t *type_name_ptr, uintptr_t
+   * type_name_len, const uint8_t *json_ptr, uintptr_t json_len, uint8_t *out_buf, uintptr_t
+   * *out_len);}
    *
    * @param typeNamePtr pointer to type name ("ServiceContract", "TypeDef", "MethodDef")
    * @param typeNameLen length of type name

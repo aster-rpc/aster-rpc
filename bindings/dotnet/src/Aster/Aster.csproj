@@ -25,4 +25,8 @@
     <None Include="$(MSBuildThisFileDirectory)../../../../ffi_spec/iroh_bridge.h" Link="iroh_bridge.h" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Tomlyn" Version="2.3.0" />
+  </ItemGroup>
+
 </Project>
