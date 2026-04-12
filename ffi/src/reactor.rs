@@ -1,3 +1,5 @@
+#![allow(unused_variables)]
+
 //! Reactor FFI — batch-drain call delivery for non-Python bindings.
 //!
 //! Architecture:
@@ -221,7 +223,7 @@ pub unsafe extern "C" fn aster_reactor_create(
 /// Destroy a reactor. Stops the pump task and releases resources.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_destroy(
-    _runtime: iroh_runtime_t,
+    runtime: iroh_runtime_t,
     reactor: aster_reactor_t,
 ) -> i32 {
     match REACTORS.remove(reactor) {
@@ -244,7 +246,7 @@ pub unsafe extern "C" fn aster_reactor_destroy(
 /// processing (using the reactor's buffer registry, not the runtime's).
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_poll(
-    _runtime: iroh_runtime_t,
+    runtime: iroh_runtime_t,
     reactor: aster_reactor_t,
     out_calls: *mut aster_reactor_call_t,
     max_calls: u32,
@@ -356,7 +358,7 @@ pub unsafe extern "C" fn aster_reactor_poll(
 /// After this call, the call_id is no longer valid.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_submit(
-    _runtime: iroh_runtime_t,
+    runtime: iroh_runtime_t,
     reactor: aster_reactor_t,
     call_id: u64,
     response_ptr: *const u8,
@@ -398,7 +400,7 @@ pub unsafe extern "C" fn aster_reactor_submit(
 /// Each buffer ID from aster_reactor_call_t must be released exactly once.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_buffer_release(
-    _runtime: iroh_runtime_t,
+    runtime: iroh_runtime_t,
     reactor: aster_reactor_t,
     buffer: u64,
 ) -> i32 {
