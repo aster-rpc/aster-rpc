@@ -1078,6 +1078,117 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   // ============================================================================
+  // Gossip
+  // ============================================================================
+
+  /**
+   * Subscribe to a gossip topic.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param nodeHandle the node handle
+   * @param topicSegment iroh_bytes_t topic (struct by value)
+   * @param peersSegment iroh_bytes_list_t peers (struct by value)
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int gossipSubscribe(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment topicSegment,
+      MemorySegment peersSegment,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_gossip_subscribe",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      IROH_BYTES,
+                      IROH_BYTES_LIST,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, nodeHandle, topicSegment, peersSegment, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Broadcast data to a gossip topic.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param topicHandle the gossip topic handle
+   * @param dataSegment iroh_bytes_t data (struct by value)
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int gossipBroadcast(
+      long runtimeHandle, long topicHandle, MemorySegment dataSegment, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_gossip_broadcast",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      IROH_BYTES,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, topicHandle, dataSegment, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Receive the next message from a gossip topic.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param topicHandle the gossip topic handle
+   * @param outOpId where to write the operation id
+   * @return status code (0 = OK)
+   */
+  public int gossipRecv(long runtimeHandle, long topicHandle, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_gossip_recv",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, topicHandle, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Free a gossip topic handle.
+   *
+   * @param runtimeHandle the runtime handle
+   * @param topicHandle the gossip topic handle
+   * @return status code (0 = OK)
+   */
+  public int gossipTopicFree(long runtimeHandle, long topicHandle) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_gossip_topic_free",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG))
+              .invoke(runtimeHandle, topicHandle);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  // ============================================================================
   // Tags
   // ============================================================================
 
@@ -1840,4 +1951,78 @@ public final class IrohLibrary implements SymbolLookup {
           ValueLayout.JAVA_INT.withName("error_code"), // 72
           ValueLayout.JAVA_INT.withName("flags") // 76
           );
+
+  // --- Aster contract identity (aster_contract_id, aster_canonical_bytes) ---
+
+  /**
+   * Compute the contract_id (64-char hex BLAKE3) from a ServiceContract JSON.
+   *
+   * <p>C signature:
+   * {@code int32_t aster_contract_id(const uint8_t *json_ptr, uintptr_t json_len,
+   *                                   uint8_t *out_buf, uintptr_t *out_len);}
+   *
+   * @param jsonPtr pointer to UTF-8 JSON bytes
+   * @param jsonLen length of JSON
+   * @param outBuf caller-owned output buffer (at least 65 bytes for 64-char hex + null)
+   * @param outLen pointer to uintptr_t: in = buffer capacity, out = bytes written
+   * @return status code (0 = OK)
+   */
+  public int asterContractId(
+      MemorySegment jsonPtr, long jsonLen, MemorySegment outBuf, MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_contract_id",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(jsonPtr, jsonLen, outBuf, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Compute canonical bytes for a named type from JSON.
+   *
+   * <p>C signature:
+   * {@code int32_t aster_canonical_bytes(const uint8_t *type_name_ptr, uintptr_t type_name_len,
+   *                                       const uint8_t *json_ptr, uintptr_t json_len,
+   *                                       uint8_t *out_buf, uintptr_t *out_len);}
+   *
+   * @param typeNamePtr pointer to type name ("ServiceContract", "TypeDef", "MethodDef")
+   * @param typeNameLen length of type name
+   * @param jsonPtr pointer to UTF-8 JSON bytes
+   * @param jsonLen length of JSON
+   * @param outBuf caller-owned output buffer
+   * @param outLen pointer to uintptr_t: in = capacity, out = bytes written
+   * @return status code (0 = OK)
+   */
+  public int asterCanonicalBytes(
+      MemorySegment typeNamePtr,
+      long typeNameLen,
+      MemorySegment jsonPtr,
+      long jsonLen,
+      MemorySegment outBuf,
+      MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_canonical_bytes",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(typeNamePtr, typeNameLen, jsonPtr, jsonLen, outBuf, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
 }
