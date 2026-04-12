@@ -20,6 +20,8 @@ use anyhow::Result;
 
 use aster_transport_core::*;
 
+pub mod reactor;
+
 // ============================================================================
 // ABI Version
 // ============================================================================
@@ -279,36 +281,36 @@ fn get_last_error() -> *const c_char {
 // Handle Registry - Arc-backed safe handle storage
 // ============================================================================
 
-struct HandleRegistry<T> {
+pub(crate) struct HandleRegistry<T> {
     next_id: AtomicU64,
     items: RwLock<HashMap<u64, Arc<T>>>,
 }
 
 impl<T> HandleRegistry<T> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             next_id: AtomicU64::new(1),
             items: RwLock::new(HashMap::new()),
         }
     }
 
-    fn insert(&self, value: T) -> u64 {
+    pub(crate) fn insert(&self, value: T) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let arc = Arc::new(value);
         self.items.write().unwrap().insert(id, arc);
         id
     }
 
-    fn get(&self, id: u64) -> Option<Arc<T>> {
+    pub(crate) fn get(&self, id: u64) -> Option<Arc<T>> {
         self.items.read().unwrap().get(&id).cloned()
     }
 
-    fn remove(&self, id: u64) -> Option<Arc<T>> {
+    pub(crate) fn remove(&self, id: u64) -> Option<Arc<T>> {
         self.items.write().unwrap().remove(&id)
     }
 
     #[allow(dead_code)]
-    fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.items.read().unwrap().len()
     }
 }
@@ -403,32 +405,33 @@ struct EventOwned {
 // Buffer Registry - Track allocated buffers
 // ============================================================================
 
-struct BufferRegistry {
+pub(crate) struct BufferRegistry {
     next_id: AtomicU64,
     buffers: RwLock<HashMap<u64, Arc<[u8]>>>,
 }
 
 impl BufferRegistry {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             next_id: AtomicU64::new(1),
             buffers: RwLock::new(HashMap::new()),
         }
     }
 
-    fn insert(&self, data: Vec<u8>) -> (u64, Arc<[u8]>) {
+    pub(crate) fn insert(&self, data: Vec<u8>) -> (u64, Arc<[u8]>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let arc: Arc<[u8]> = data.into();
         self.buffers.write().unwrap().insert(id, arc.clone());
         (id, arc)
     }
 
-    fn get(&self, id: u64) -> Option<Arc<[u8]>> {
+    #[allow(dead_code)]
+    pub(crate) fn get(&self, id: u64) -> Option<Arc<[u8]>> {
         self.buffers.read().unwrap().get(&id).cloned()
     }
 
-    fn remove(&self, id: u64) -> Option<Arc<[u8]>> {
-        self.buffers.write().unwrap().remove(&id)
+    pub(crate) fn release(&self, id: u64) -> bool {
+        self.buffers.write().unwrap().remove(&id).is_some()
     }
 }
 
@@ -451,13 +454,13 @@ struct HookInvocationState {
 // Bridge Runtime - Main FFI runtime
 // ============================================================================
 
-struct BridgeRuntime {
-    runtime: tokio::runtime::Runtime,
+pub(crate) struct BridgeRuntime {
+    pub(crate) runtime: tokio::runtime::Runtime,
     events_tx: tokio::sync::mpsc::UnboundedSender<EventOwned>,
     events_rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<EventOwned>>,
 
     // Handle registries
-    nodes: HandleRegistry<CoreNode>,
+    pub(crate) nodes: HandleRegistry<CoreNode>,
     endpoints: HandleRegistry<CoreNetClient>,
     connections: HandleRegistry<CoreConnection>,
     send_streams: HandleRegistry<CoreSendStream>,
@@ -615,7 +618,7 @@ fn runtimes() -> &'static Mutex<HashMap<iroh_runtime_t, Arc<BridgeRuntime>>> {
     RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn load_runtime(handle: iroh_runtime_t) -> Result<Arc<BridgeRuntime>, iroh_status_t> {
+pub(crate) fn load_runtime(handle: iroh_runtime_t) -> Result<Arc<BridgeRuntime>, iroh_status_t> {
     let guard = runtimes()
         .lock()
         .map_err(|_| iroh_status_t::IROH_STATUS_INTERNAL)?;
@@ -950,7 +953,7 @@ pub unsafe extern "C" fn iroh_buffer_release(runtime: iroh_runtime_t, buffer: u6
         Err(_) => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
     };
 
-    if bridge.buffers.remove(buffer).is_some() {
+    if bridge.buffers.release(buffer) {
         iroh_status_t::IROH_STATUS_OK as i32
     } else {
         iroh_status_t::IROH_STATUS_NOT_FOUND as i32

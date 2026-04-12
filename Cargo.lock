@@ -211,6 +211,7 @@ dependencies = [
  "hex",
  "iroh",
  "loom",
+ "once_cell",
  "serde_json",
  "tokio",
 ]
