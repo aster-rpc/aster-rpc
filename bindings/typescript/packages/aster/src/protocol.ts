@@ -15,9 +15,9 @@ export class StreamHeader {
   service = '';
   method = '';
   version = 0;
-  callId = '';
-  deadlineEpochMs = 0;
-  serializationMode = 0;
+  callId = 0;               // int32 sequence number
+  deadline = 0;             // int16 relative seconds, 0 = none
+  serializationMode = 0;    // int8: XLANG=0, NATIVE=1, ROW=2, JSON=3
   metadataKeys: string[] = [];
   metadataValues: string[] = [];
 
@@ -31,8 +31,8 @@ export class CallHeader {
   static readonly wireType = '_aster/CallHeader';
 
   method = '';
-  callId = '';
-  deadlineEpochMs = 0;
+  callId = 0;               // int32 sequence number
+  deadline = 0;             // int16 relative seconds, 0 = none
   metadataKeys: string[] = [];
   metadataValues: string[] = [];
 

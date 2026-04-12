@@ -73,10 +73,10 @@ class Interceptor(ABC):
         return error
 
 
-def deadline_from_epoch_ms(deadline_epoch_ms: int) -> float | None:
-    if deadline_epoch_ms <= 0:
+def deadline_from_relative_secs(deadline_secs: int) -> float | None:
+    if deadline_secs <= 0:
         return None
-    return deadline_epoch_ms / 1000.0
+    return time.time() + deadline_secs
 
 
 def build_call_context(
@@ -84,24 +84,24 @@ def build_call_context(
     service: str,
     method: str,
     metadata: dict[str, str] | None = None,
-    deadline_epoch_ms: int = 0,
+    deadline_secs: int = 0,
     peer: str | None = None,
     is_streaming: bool = False,
     pattern: str | None = None,
     idempotent: bool = False,
-    call_id: str | None = None,
+    call_id: int = 0,
     session_id: str | None = None,
     attributes: dict[str, str] | None = None,
 ) -> CallContext:
     return CallContext(
         service=service,
         method=method,
-        call_id=call_id or str(uuid.uuid4()),
+        call_id=str(call_id) if call_id else str(uuid.uuid4()),
         session_id=session_id,
         peer=peer,
         metadata=dict(metadata or {}),
         attributes=dict(attributes or {}),
-        deadline=deadline_from_epoch_ms(deadline_epoch_ms),
+        deadline=deadline_from_relative_secs(deadline_secs),
         is_streaming=is_streaming,
         pattern=pattern,
         idempotent=idempotent,

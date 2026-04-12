@@ -62,7 +62,7 @@ def _create_session_pair():
     session_id = str(uuid.uuid4())
     header = StreamHeader(
         service=info.name, method="", version=info.version,
-        callId=session_id,
+        callId=1,
         serializationMode=SerializationMode.XLANG.value,
     )
 

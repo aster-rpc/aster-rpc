@@ -90,10 +90,10 @@ class ServiceClient:
     }
 
     def _get_deadline(self, timeout: float | None) -> int:
-        """Convert a timeout to deadline_epoch_ms."""
+        """Convert a timeout (seconds) to relative deadline (seconds)."""
         if timeout is None:
             return 0
-        return int((time.time() + timeout) * 1000)
+        return max(1, int(timeout))
 
     def _resolve_serialization_mode(
         self,
@@ -122,14 +122,14 @@ class ServiceClient:
         method_info: MethodInfo,
         *,
         metadata: dict[str, str] | None,
-        deadline_epoch_ms: int,
+        deadline_secs: int,
     ) -> CallContext:
         is_streaming = method_info.pattern != RpcPattern.UNARY
         return build_call_context(
             service=self._service_info.name,
             method=method_info.name,
             metadata=metadata,
-            deadline_epoch_ms=deadline_epoch_ms,
+            deadline_secs=deadline_secs,
             is_streaming=is_streaming,
             pattern=method_info.pattern,
             idempotent=method_info.idempotent,
@@ -224,7 +224,7 @@ class ServiceClient:
         deadline = self._get_deadline(timeout)
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
 
-        ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
+        ctx = self._build_context(method_info, metadata=metadata, deadline_secs=deadline)
 
         async def invoke(current_request: Any) -> Any:
             return await self._transport.unary(
@@ -232,7 +232,7 @@ class ServiceClient:
                 method=method_info.name,
                 request=current_request,
                 metadata=ctx.metadata,
-                deadline_epoch_ms=deadline,
+                deadline_secs=deadline,
                 serialization_mode=serialization_mode,
 
             )
@@ -252,7 +252,7 @@ class ServiceClient:
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
 
 
-        ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
+        ctx = self._build_context(method_info, metadata=metadata, deadline_secs=deadline)
 
         async def iterator() -> AsyncIterator[Any]:
             current_request = await apply_request_interceptors(self._interceptors, ctx, request)
@@ -261,7 +261,7 @@ class ServiceClient:
                 method=method_info.name,
                 request=current_request,
                 metadata=ctx.metadata,
-                deadline_epoch_ms=deadline,
+                deadline_secs=deadline,
                 serialization_mode=serialization_mode,
 
             )
@@ -289,7 +289,7 @@ class ServiceClient:
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
 
 
-        ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
+        ctx = self._build_context(method_info, metadata=metadata, deadline_secs=deadline)
 
         async def wrapped_requests() -> AsyncIterator[Any]:
             async for item in requests:
@@ -301,7 +301,7 @@ class ServiceClient:
                 method=method_info.name,
                 requests=wrapped_requests(),
                 metadata=ctx.metadata,
-                deadline_epoch_ms=deadline,
+                deadline_secs=deadline,
                 serialization_mode=serialization_mode,
 
             )
@@ -320,12 +320,12 @@ class ServiceClient:
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
 
 
-        ctx = self._build_context(method_info, metadata=metadata, deadline_epoch_ms=deadline)
+        ctx = self._build_context(method_info, metadata=metadata, deadline_secs=deadline)
         channel = self._transport.bidi_stream(
             service=self._service_info.name,
             method=method_info.name,
             metadata=ctx.metadata,
-            deadline_epoch_ms=deadline,
+            deadline_secs=deadline,
             serialization_mode=serialization_mode,
         )
         if not self._interceptors:

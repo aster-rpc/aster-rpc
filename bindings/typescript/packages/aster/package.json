@@ -24,6 +24,7 @@
     "docs": "typedoc --options typedoc.json"
   },
   "dependencies": {
+    "@apache-fory/core": "file:../../../../docs/_internal/fory/javascript/packages/core",
     "@aster-rpc/transport": "0.1.0-alpha.0"
   },
   "devDependencies": {

@@ -122,12 +122,12 @@ export class SessionServer {
       const callCtx = buildCallContext({
         service: serviceInfo.name,
         method: callHeader.method,
-        callId: callHeader.callId || undefined,
+        callId: callHeader.callId ? String(callHeader.callId) : undefined,
         peer,
         pattern: methodInfo.pattern as any,
         idempotent: methodInfo.idempotent,
         attributes,
-        deadlineEpochMs: callHeader.deadlineEpochMs || 0,
+        deadlineSecs: callHeader.deadline || 0,
       });
 
       // Run auth interceptors before reading the request
