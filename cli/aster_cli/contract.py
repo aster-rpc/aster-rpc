@@ -214,11 +214,15 @@ def _gen_single_service(spec: str, args: argparse.Namespace) -> "ContractManifes
     # Build type_hashes list (hex, sorted)
     type_hashes_hex = sorted(h.hex() for h in type_hashes.values())
 
-    # Serialization modes
+    # Serialization modes -- convert enum values to lowercase name strings
     ser_modes: list[str] = []
     for mode in service_info.serialization_modes:
-        if hasattr(mode, "value"):
+        if hasattr(mode, "name"):
+            ser_modes.append(mode.name.lower())
+        elif hasattr(mode, "value") and isinstance(mode.value, str):
             ser_modes.append(mode.value)
+        elif isinstance(mode, str):
+            ser_modes.append(mode)
         else:
             ser_modes.append(str(mode))
     if not ser_modes:
@@ -881,17 +885,53 @@ def _preview_from_manifest(path: str) -> int:
         print(f"Error reading {path}: {e}", file=sys.stderr)
         return 1
 
+    _MODE_INT_TO_STR = {0: "xlang", 1: "json", 2: "native"}
+
     manifests = data if isinstance(data, list) else [data]
     for m in manifests:
+        # Normalize serialization_modes: old manifests may store integer enum values
+        raw_modes = m.get("serialization_modes", ["xlang"])
+        modes = [_MODE_INT_TO_STR.get(x, str(x)) if isinstance(x, int) else str(x) for x in raw_modes]
         _print_preview(
             service_name=m.get("service", "?"),
             version=m.get("version", 0),
             contract_id=m.get("contract_id", "?"),
             producer=m.get("producer_language", ""),
-            modes=m.get("serialization_modes", ["xlang"]),
+            modes=modes,
             methods=m.get("methods", []),
         )
     return 0
+
+
+def _format_field_type(f: dict) -> str:
+    """Build a human-readable type string from a v1 field dict.
+
+    Handles both v1 schema (``kind``, ``ref_name``, ``item_kind``, etc.)
+    and legacy v0 (``type`` as a flat string).
+    """
+    # v1 schema path
+    kind = f.get("kind")
+    if kind:
+        if kind == "ref":
+            return f.get("ref_name") or f.get("wire_tag") or "ref"
+        if kind == "enum":
+            return f.get("ref_name") or "enum"
+        if kind == "list":
+            item = f.get("item_kind", "?")
+            if item == "ref":
+                item = f.get("item_ref") or f.get("item_wire_tag") or "ref"
+            return f"list<{item}>"
+        if kind == "map":
+            key = f.get("key_kind", "string")
+            val = f.get("value_kind", "?")
+            if val == "ref":
+                val = f.get("value_ref") or "ref"
+            return f"map<{key}, {val}>"
+        # Primitives: string, int, float, bool, bytes
+        return kind
+
+    # Legacy v0 path
+    return f.get("type", "?")
 
 
 def _print_preview(
@@ -927,10 +967,13 @@ def _print_preview(
             for i, f in enumerate(sorted_fields):
                 fid = i + 1
                 fname = f.get("name", "?")
-                ftype = f.get("type", "?")
+                ftype = _format_field_type(f)
+                nullable = f.get("nullable", False)
                 req = f.get("required", True)
-                default = f.get("default")
+                default = f.get("default_value") if f.get("default_value") is not None else f.get("default")
                 line = f"  #{fid:<3} {fname:<20}: {ftype}"
+                if nullable:
+                    line += "?"
                 if not req and default is not None:
                     line += f"  = {default!r}"
                 elif not req:
