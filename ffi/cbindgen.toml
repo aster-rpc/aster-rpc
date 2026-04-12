@@ -9,4 +9,4 @@ include_version = true
 namespace = "iroh_ffi"
 
 [export]
-include = ["iroh_*", "IROH_*"]
+include = ["iroh_*", "IROH_*", "aster_*", "ASTER_*"]

@@ -171,6 +171,66 @@ typedef struct iroh_transport_metrics_t {
   uint64_t net_reports_full;
 } iroh_transport_metrics_t;
 
+typedef uint64_t aster_reactor_t;
+
+/**
+ * C-visible call descriptor returned by aster_reactor_poll.
+ */
+typedef struct aster_reactor_call_t {
+  /**
+   * Reactor-assigned call ID (for submit correlation).
+   */
+  uint64_t call_id;
+  /**
+   * Pointer to header payload bytes (owned by buffer registry).
+   */
+  const uint8_t *header_ptr;
+  /**
+   * Length of header payload.
+   */
+  uint32_t header_len;
+  /**
+   * Header frame flags.
+   */
+  uint8_t header_flags;
+  /**
+   * Pointer to request payload bytes (owned by buffer registry).
+   */
+  const uint8_t *request_ptr;
+  /**
+   * Length of request payload.
+   */
+  uint32_t request_len;
+  /**
+   * Request frame flags.
+   */
+  uint8_t request_flags;
+  /**
+   * Pointer to peer ID string (UTF-8, not null-terminated, owned by buffer registry).
+   */
+  const uint8_t *peer_ptr;
+  /**
+   * Length of peer ID string.
+   */
+  uint32_t peer_len;
+  /**
+   * 1 if this is a session call, 0 otherwise.
+   */
+  uint8_t is_session_call;
+  /**
+   * Buffer ID for the header payload (release after processing).
+   */
+  uint64_t header_buffer;
+  /**
+   * Buffer ID for the request payload.
+   */
+  uint64_t request_buffer;
+  /**
+   * Buffer ID for the peer ID string.
+   */
+  uint64_t peer_buffer;
+} aster_reactor_call_t;
+
 uint32_t iroh_abi_version_major(void);
 
 uint32_t iroh_abi_version_minor(void);
@@ -887,3 +947,62 @@ int32_t aster_ticket_decode(const uint8_t *ticket_ptr,
                             uintptr_t ticket_len,
                             uint8_t *out_buf,
                             uintptr_t *out_len);
+
+/**
+ * Create a reactor attached to a node. The reactor starts accepting
+ * connections and delivering calls via the SPSC ring.
+ *
+ * `ring_capacity` is rounded up to the next power of two.
+ * `out_reactor` receives the reactor handle on success.
+ */
+int32_t aster_reactor_create(iroh_runtime_t runtime,
+                             iroh_node_t node,
+                             uint32_t ring_capacity,
+                             aster_reactor_t *out_reactor);
+
+/**
+ * Destroy a reactor. Stops the pump task and releases resources.
+ */
+int32_t aster_reactor_destroy(iroh_runtime_t runtime, aster_reactor_t reactor);
+
+/**
+ * Poll for incoming calls. Drains up to `max_calls` from the ring buffer
+ * into the caller-provided `out_calls` array. Returns the number of calls
+ * written.
+ *
+ * If `timeout_ms` is 0, returns immediately (non-blocking).
+ * If `timeout_ms` > 0, blocks up to that duration waiting for at least one call.
+ *
+ * The caller must release each call's buffers via `iroh_buffer_release` after
+ * processing (using the reactor's buffer registry, not the runtime's).
+ */
+uint32_t aster_reactor_poll(iroh_runtime_t runtime,
+                            aster_reactor_t reactor,
+                            struct aster_reactor_call_t *out_calls,
+                            uint32_t max_calls,
+                            uint32_t timeout_ms);
+
+/**
+ * Submit a response for a call received via aster_reactor_poll.
+ *
+ * `response_ptr`/`response_len` is the response frame bytes.
+ * `trailer_ptr`/`trailer_len` is the trailer frame bytes.
+ *
+ * The reactor writes both frames to the QUIC stream and finishes it.
+ * After this call, the call_id is no longer valid.
+ */
+int32_t aster_reactor_submit(iroh_runtime_t runtime,
+                             aster_reactor_t reactor,
+                             uint64_t call_id,
+                             const uint8_t *response_ptr,
+                             uint32_t response_len,
+                             const uint8_t *trailer_ptr,
+                             uint32_t trailer_len);
+
+/**
+ * Release a buffer obtained from a reactor call descriptor.
+ * Each buffer ID from aster_reactor_call_t must be released exactly once.
+ */
+int32_t aster_reactor_buffer_release(iroh_runtime_t runtime,
+                                     aster_reactor_t reactor,
+                                     uint64_t buffer);
