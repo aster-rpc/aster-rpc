@@ -900,14 +900,35 @@ section.
 
 Once a binding has walked its native types and produced a
 language-agnostic schema struct (service name, version,
-`serialization_modes`, list of `TypeDef` / `MethodDef` records with
-resolved wire types and defaults), it MUST hand that struct — serialized
-as UTF-8 JSON matching the shape defined in §11.3.3 — to the Rust
-canonicalizer via the C FFI function `aster_contract_id(json_ptr, len)
--> [u8; 32]`. Bindings MUST NOT implement canonicalization or BLAKE3
-hashing in their own language. The Rust FFI is the single source of
-truth for canonicalization (the "how") just as this section is the
-single source of truth for native-type mapping (the "what").
+`serialization_modes`, `producer_language` if applicable, list of
+`TypeDef` / `MethodDef` records with resolved wire types and defaults),
+it MUST hand that struct — serialized as UTF-8 JSON matching the shape
+defined in §11.3.3 — to the Rust canonicalizer via the C FFI function
+
+```c
+int32_t aster_contract_id(
+    const uint8_t *json_ptr,
+    size_t         json_len,
+    uint8_t       *out_buf,     // caller-owned output buffer
+    size_t        *out_len       // in: buffer capacity; out: bytes written
+);
+```
+
+which writes the 64-byte ASCII hex encoding of the BLAKE3 contract hash
+into `out_buf` and returns a status code (`0` on success,
+`BUFFER_TOO_SMALL` with `*out_len` set to the required size on a too-small
+input buffer, or a negative error code on invalid JSON). This is the
+standard caller-owned-buffer FFI pattern used throughout the rest of the
+Aster FFI surface (`iroh_buffer_release` is NOT called on this output —
+the caller manages the buffer).
+
+Bindings MUST NOT implement canonicalization or BLAKE3 hashing in their
+own language. The Rust FFI is the single source of truth for
+canonicalization (the "how") just as this section is the single source of
+truth for native-type mapping (the "what"). The function also performs
+the `producer_language` invariant check (§11.3.2.3 Serialization Modes) —
+bindings pass the JSON through verbatim and rely on Rust to reject
+invalid combinations with a descriptive error.
 
 ##### New-Binding Checklist
 
@@ -1083,13 +1104,12 @@ message ServiceContract {
     list<MethodDef> methods = 3;    // Sorted by method name (Unicode codepoint, NFC-normalized)
     list<string> serialization_modes = 4; // Ordered by producer preference. Validated per §11.3.2.3
                                           // service-level mode validation at decoration time.
-    string alpn = 5;                // Always "aster/{wire_version}"
-    ScopeKind scoped = 6;           // SHARED (default) or STREAM (session-scoped)
-    optional CapabilityRequirement requires = 7;  // Optional service-level baseline. Effective
+    ScopeKind scoped = 5;           // SHARED (default) or SESSION (session-scoped)
+    optional CapabilityRequirement requires = 6;  // Optional service-level baseline. Effective
                                          // requirement for a method is the conjunction of
                                          // this field and the method's own requires field.
                                          // Absent on both = no rcan check for that method.
-    string producer_language = 8;   // REQUIRED when "native" appears in serialization_modes;
+    string producer_language = 7;   // REQUIRED when "native" appears in serialization_modes;
                                     // MUST be the empty string "" otherwise. One of
                                     // "python" | "typescript" | "java" | "csharp" | "go"
                                     // when set. Part of contract_id so that two different
@@ -1097,6 +1117,11 @@ message ServiceContract {
                                     // even when their schemas appear structurally similar —
                                     // a native-mode contract is language-bound by construction.
                                     // See §11.3.2.3 Serialization Modes for details.
+
+    // Note: `alpn` (e.g. "aster/1") is a transport-layer concern, not a
+    // contract-identity concern. The wire version is pinned in
+    // ContractManifest.canonical_encoding and consumers verify it at call
+    // time; it does NOT participate in canonical bytes or contract_id.
 }
 ```
 
@@ -1772,9 +1797,9 @@ Input:
     version: 1
     methods: []                    // empty list
     serialization_modes: ["xlang"]
-    alpn: "aster/1"
     scoped: SHARED                 // enum value 0
     requires: absent               // optional field, not present
+    producer_language: ""          // empty unless "native" in serialization_modes
   }
 
 Field-by-field encoding (ascending field ID order):
@@ -1795,21 +1820,24 @@ Field-by-field encoding (ascending field ID order):
     0x0C               // elements header
     UTF-8 string "xlang" (5 bytes): varuint36_small((5 << 2) | 2) followed by "xlang"
 
-  Field 5 (alpn: string "aster/1"):
-    UTF-8 header: varuint36_small((7 << 2) | 2) = varuint36_small(30)
-    Followed by 7 UTF-8 bytes: "aster/1"
-
-  Field 6 (scoped: ScopeKind.SHARED = 0):
+  Field 5 (scoped: ScopeKind.SHARED = 0):
     varuint(0) = 0x00
 
-  Field 7 (requires: optional, absent):
+  Field 6 (requires: optional, absent):
     NULL_FLAG = 0xFD
 
-Expected bytes: 32456d7074795365727669636502000c010c16786c616e671e61737465722f3100fd
-Expected hash:  66d4a269145ccf609d7f98130ab66f5d72175fd8ad456416455d9525d253df1f
+  Field 7 (producer_language: string ""):
+    UTF-8 header: varuint36_small((0 << 2) | 2) = varuint36_small(2) = 0x02
+    No payload bytes (empty string)
+
+Expected bytes: 32456d7074795365727669636502000c010c16786c616e6700fd02
+Expected hash:  d016f1c19d536b69c4fb2af96acce700da5c45bd6c4860b6c9ae408b4ca35438
 ```
 
-*Python-reference v1, pending cross-verification (Java binding)*
+*Regenerated 2026-04-12 to match Rust reference (`core/src/contract.rs`
+`test_a2_empty_service_contract`) after FieldDef/ServiceContract layout
+changes per §11.3.2.3. Previous vectors assumed `alpn` was part of
+canonical bytes; it is not.*
 
 ### A.3 Minimal TypeDef (enum, no references)
 
@@ -1858,9 +1886,13 @@ Input:
     union_variants: []
   }
 
-Expected bytes: 0012746573741e57726170706572010c0216696e6e6572010220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02000000000200000c000c
-Expected hash:  f72fd18c27bc41c07a1a582758142a7cb14b5c9ec8e6f286871ad280b66fbafa
+Expected bytes: 0012746573741e57726170706572010c0216696e6e6572010220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa020000000002000100000c000c
+Expected hash:  67396f0456ee178135a0adb73adbf884c57ce0358e2698d3b21a7eb5820d7c4f
 ```
+
+*Regenerated 2026-04-12 to match Rust reference (`test_a4_typedef_with_ref`)
+after FieldDef gained `required` (field 13) and `default_value` (field 14)
+per §11.3.2.3. Previous vectors pre-date those fields.*
 
 *Python-reference v1, pending cross-verification (Java binding)*
 
