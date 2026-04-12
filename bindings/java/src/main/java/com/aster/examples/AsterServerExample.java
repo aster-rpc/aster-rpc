@@ -30,7 +30,8 @@ public class AsterServerExample {
 
     // 0. Compute contract_id via the Rust canonicalizer
     System.out.println("0. Computing contract_id via Rust FFI...");
-    String contractJson = """
+    String contractJson =
+        """
         {"name": "EchoService", "version": 1,
          "methods": [], "serialization_modes": ["xlang"],
          "scoped": "shared", "requires": null, "producer_language": ""}

@@ -2,4 +2,4 @@ module aster-ffi
 
 go 1.23.0
 
-require golang.org/x/tools v0.32.0
+require github.com/BurntSushi/toml v1.6.0

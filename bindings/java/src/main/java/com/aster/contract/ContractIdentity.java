@@ -1,7 +1,6 @@
 package com.aster.contract;
 
 import com.aster.ffi.IrohLibrary;
-
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -10,12 +9,12 @@ import java.nio.charset.StandardCharsets;
 /**
  * Computes Aster contract identities via the Rust FFI canonicalizer.
  *
- * <p>All canonicalization and BLAKE3 hashing is done in Rust -- Java never computes
- * canonical bytes or hashes locally. This follows the universal decodability axiom
- * rule in spec section 11.3.2.3: "Bindings MUST NOT implement canonicalization or
- * BLAKE3 hashing in their own language."
+ * <p>All canonicalization and BLAKE3 hashing is done in Rust -- Java never computes canonical bytes
+ * or hashes locally. This follows the universal decodability axiom rule in spec section 11.3.2.3:
+ * "Bindings MUST NOT implement canonicalization or BLAKE3 hashing in their own language."
  *
  * <p>Usage:
+ *
  * <pre>{@code
  * String contractJson = """
  *     {"name": "HelloService", "version": 1, "methods": [],
@@ -36,10 +35,10 @@ public final class ContractIdentity {
   /**
    * Compute the contract_id from a ServiceContract JSON string.
    *
-   * <p>The JSON must match the serde shape of {@code core::contract::ServiceContract}
-   * (fields: name, version, methods, serialization_modes, scoped, requires,
-   * producer_language). The Rust FFI validates the producer_language invariant
-   * (must be empty unless "native" in serialization_modes).
+   * <p>The JSON must match the serde shape of {@code core::contract::ServiceContract} (fields:
+   * name, version, methods, serialization_modes, scoped, requires, producer_language). The Rust FFI
+   * validates the producer_language invariant (must be empty unless "native" in
+   * serialization_modes).
    *
    * @param serviceContractJson UTF-8 JSON string describing the ServiceContract
    * @return 64-character hex-encoded BLAKE3 contract hash
@@ -62,7 +61,8 @@ public final class ContractIdentity {
       int status = lib.asterContractId(jsonSeg, jsonBytes.length, outBuf, outLen);
       if (status != 0) {
         throw new IllegalArgumentException(
-            "aster_contract_id failed with status " + status
+            "aster_contract_id failed with status "
+                + status
                 + ". Check the ServiceContract JSON for validity.");
       }
 
@@ -99,12 +99,12 @@ public final class ContractIdentity {
       MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
       outLen.set(ValueLayout.JAVA_LONG, 0, bufSize);
 
-      int status = lib.asterCanonicalBytes(
-          typeNameSeg, typeNameBytes.length, jsonSeg, jsonBytes.length, outBuf, outLen);
+      int status =
+          lib.asterCanonicalBytes(
+              typeNameSeg, typeNameBytes.length, jsonSeg, jsonBytes.length, outBuf, outLen);
 
       if (status != 0) {
-        throw new IllegalArgumentException(
-            "aster_canonical_bytes failed with status " + status);
+        throw new IllegalArgumentException("aster_canonical_bytes failed with status " + status);
       }
 
       long written = outLen.get(ValueLayout.JAVA_LONG, 0);

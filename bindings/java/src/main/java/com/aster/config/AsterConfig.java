@@ -4,18 +4,23 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Base64;
 import java.util.List;
+import org.tomlj.Toml;
+import org.tomlj.TomlParseResult;
+import org.tomlj.TomlTable;
 
 /**
  * Unified configuration for AsterServer.
  *
  * <p>Three-layer resolution (later wins):
+ *
  * <ol>
- *   <li>Built-in defaults (ephemeral key, in-memory store, all gates open).</li>
- *   <li>TOML config file ({@code aster.toml}) -- requires a TOML library (future).</li>
- *   <li>{@code ASTER_*} environment variables.</li>
+ *   <li>Built-in defaults (ephemeral key, in-memory store, all gates open).
+ *   <li>TOML config file ({@code aster.toml}) -- requires a TOML library (future).
+ *   <li>{@code ASTER_*} environment variables.
  * </ol>
  *
  * <p>Usage:
+ *
  * <pre>{@code
  * // From env only (the common case for containers):
  * AsterConfig config = AsterConfig.fromEnv();
@@ -69,31 +74,97 @@ public final class AsterConfig {
 
   // ── Getters ────────────────────────────────────────────────────────────
 
-  public byte[] rootPubkey() { return rootPubkey; }
-  public String rootPubkeyFile() { return rootPubkeyFile; }
-  public String enrollmentCredentialFile() { return enrollmentCredentialFile; }
-  public String enrollmentCredentialIid() { return enrollmentCredentialIid; }
-  public boolean allowAllConsumers() { return allowAllConsumers; }
-  public boolean allowAllProducers() { return allowAllProducers; }
-  public String endpointAddr() { return endpointAddr; }
-  public String storagePath() { return storagePath; }
-  public byte[] secretKey() { return secretKey; }
-  public String relayMode() { return relayMode; }
-  public String bindAddr() { return bindAddr; }
-  public boolean enableMonitoring() { return enableMonitoring; }
-  public boolean enableHooks() { return enableHooks; }
-  public int hookTimeoutMs() { return hookTimeoutMs; }
-  public boolean localDiscovery() { return localDiscovery; }
-  public String logFormat() { return logFormat; }
-  public String logLevel() { return logLevel; }
-  public boolean logMask() { return logMask; }
-  public String identityFile() { return identityFile; }
+  public byte[] rootPubkey() {
+    return rootPubkey;
+  }
+
+  public String rootPubkeyFile() {
+    return rootPubkeyFile;
+  }
+
+  public String enrollmentCredentialFile() {
+    return enrollmentCredentialFile;
+  }
+
+  public String enrollmentCredentialIid() {
+    return enrollmentCredentialIid;
+  }
+
+  public boolean allowAllConsumers() {
+    return allowAllConsumers;
+  }
+
+  public boolean allowAllProducers() {
+    return allowAllProducers;
+  }
+
+  public String endpointAddr() {
+    return endpointAddr;
+  }
+
+  public String storagePath() {
+    return storagePath;
+  }
+
+  public byte[] secretKey() {
+    return secretKey;
+  }
+
+  public String relayMode() {
+    return relayMode;
+  }
+
+  public String bindAddr() {
+    return bindAddr;
+  }
+
+  public boolean enableMonitoring() {
+    return enableMonitoring;
+  }
+
+  public boolean enableHooks() {
+    return enableHooks;
+  }
+
+  public int hookTimeoutMs() {
+    return hookTimeoutMs;
+  }
+
+  public boolean localDiscovery() {
+    return localDiscovery;
+  }
+
+  public String logFormat() {
+    return logFormat;
+  }
+
+  public String logLevel() {
+    return logLevel;
+  }
+
+  public boolean logMask() {
+    return logMask;
+  }
+
+  public String identityFile() {
+    return identityFile;
+  }
 
   // ── Factory ────────────────────────────────────────────────────────────
 
   /** Build config from {@code ASTER_*} environment variables only. */
   public static AsterConfig fromEnv() {
     return builder().applyEnv().build();
+  }
+
+  /** Build config from a TOML file, with env-var overrides (env wins). */
+  public static AsterConfig fromFile(Path path) {
+    return builder().applyToml(path).applyEnv().build();
+  }
+
+  /** Build config from a TOML file, with env-var overrides (env wins). */
+  public static AsterConfig fromFile(String path) {
+    return fromFile(Path.of(path));
   }
 
   public static Builder builder() {
@@ -137,35 +208,172 @@ public final class AsterConfig {
     private final AsterConfig c = new AsterConfig();
 
     // Trust
-    public Builder rootPubkey(byte[] key) { c.rootPubkey = key; return this; }
-    public Builder rootPubkeyFile(String path) { c.rootPubkeyFile = path; return this; }
-    public Builder enrollmentCredentialFile(String path) { c.enrollmentCredentialFile = path; return this; }
-    public Builder enrollmentCredentialIid(String iid) { c.enrollmentCredentialIid = iid; return this; }
-    public Builder allowAllConsumers(boolean v) { c.allowAllConsumers = v; return this; }
-    public Builder allowAllProducers(boolean v) { c.allowAllProducers = v; return this; }
+    public Builder rootPubkey(byte[] key) {
+      c.rootPubkey = key;
+      return this;
+    }
+
+    public Builder rootPubkeyFile(String path) {
+      c.rootPubkeyFile = path;
+      return this;
+    }
+
+    public Builder enrollmentCredentialFile(String path) {
+      c.enrollmentCredentialFile = path;
+      return this;
+    }
+
+    public Builder enrollmentCredentialIid(String iid) {
+      c.enrollmentCredentialIid = iid;
+      return this;
+    }
+
+    public Builder allowAllConsumers(boolean v) {
+      c.allowAllConsumers = v;
+      return this;
+    }
+
+    public Builder allowAllProducers(boolean v) {
+      c.allowAllProducers = v;
+      return this;
+    }
 
     // Connect
-    public Builder endpointAddr(String addr) { c.endpointAddr = addr; return this; }
+    public Builder endpointAddr(String addr) {
+      c.endpointAddr = addr;
+      return this;
+    }
 
     // Storage
-    public Builder storagePath(String path) { c.storagePath = path; return this; }
+    public Builder storagePath(String path) {
+      c.storagePath = path;
+      return this;
+    }
 
     // Network
-    public Builder secretKey(byte[] key) { c.secretKey = key; return this; }
-    public Builder relayMode(String mode) { c.relayMode = mode; return this; }
-    public Builder bindAddr(String addr) { c.bindAddr = addr; return this; }
-    public Builder enableMonitoring(boolean v) { c.enableMonitoring = v; return this; }
-    public Builder enableHooks(boolean v) { c.enableHooks = v; return this; }
-    public Builder hookTimeoutMs(int ms) { c.hookTimeoutMs = ms; return this; }
-    public Builder localDiscovery(boolean v) { c.localDiscovery = v; return this; }
+    public Builder secretKey(byte[] key) {
+      c.secretKey = key;
+      return this;
+    }
+
+    public Builder relayMode(String mode) {
+      c.relayMode = mode;
+      return this;
+    }
+
+    public Builder bindAddr(String addr) {
+      c.bindAddr = addr;
+      return this;
+    }
+
+    public Builder enableMonitoring(boolean v) {
+      c.enableMonitoring = v;
+      return this;
+    }
+
+    public Builder enableHooks(boolean v) {
+      c.enableHooks = v;
+      return this;
+    }
+
+    public Builder hookTimeoutMs(int ms) {
+      c.hookTimeoutMs = ms;
+      return this;
+    }
+
+    public Builder localDiscovery(boolean v) {
+      c.localDiscovery = v;
+      return this;
+    }
 
     // Logging
-    public Builder logFormat(String fmt) { c.logFormat = fmt; return this; }
-    public Builder logLevel(String lvl) { c.logLevel = lvl; return this; }
-    public Builder logMask(boolean v) { c.logMask = v; return this; }
+    public Builder logFormat(String fmt) {
+      c.logFormat = fmt;
+      return this;
+    }
+
+    public Builder logLevel(String lvl) {
+      c.logLevel = lvl;
+      return this;
+    }
+
+    public Builder logMask(boolean v) {
+      c.logMask = v;
+      return this;
+    }
 
     // Identity
-    public Builder identityFile(String path) { c.identityFile = path; return this; }
+    public Builder identityFile(String path) {
+      c.identityFile = path;
+      return this;
+    }
+
+    /**
+     * Apply values from an {@code aster.toml} file. Call before {@link #applyEnv()} so env wins.
+     */
+    public Builder applyToml(Path path) {
+      try {
+        TomlParseResult toml = Toml.parse(path);
+
+        // [trust]
+        TomlTable trust = toml.getTable("trust");
+        if (trust != null) {
+          tomlString(trust, "root_pubkey_file", v -> c.rootPubkeyFile = v);
+          tomlString(trust, "enrollment_credential", v -> c.enrollmentCredentialFile = v);
+          tomlString(trust, "enrollment_credential_iid", v -> c.enrollmentCredentialIid = v);
+          tomlBool(trust, "allow_all_consumers", v -> c.allowAllConsumers = v);
+          tomlBool(trust, "allow_all_producers", v -> c.allowAllProducers = v);
+          if (trust.contains("root_pubkey")) {
+            c.rootPubkey = hexToBytes(trust.getString("root_pubkey"));
+          }
+        }
+
+        // [connect]
+        TomlTable connect = toml.getTable("connect");
+        if (connect != null) {
+          tomlString(connect, "endpoint_addr", v -> c.endpointAddr = v);
+        }
+
+        // [storage]
+        TomlTable storage = toml.getTable("storage");
+        if (storage != null) {
+          tomlString(storage, "path", v -> c.storagePath = v);
+        }
+
+        // [network]
+        TomlTable network = toml.getTable("network");
+        if (network != null) {
+          tomlString(network, "relay_mode", v -> c.relayMode = v);
+          tomlString(network, "bind_addr", v -> c.bindAddr = v);
+          tomlString(network, "portmapper_config", v -> c.portmapperConfig = v);
+          tomlString(network, "proxy_url", v -> c.proxyUrl = v);
+          tomlBool(network, "enable_monitoring", v -> c.enableMonitoring = v);
+          tomlBool(network, "enable_hooks", v -> c.enableHooks = v);
+          tomlBool(network, "clear_ip_transports", v -> c.clearIpTransports = v);
+          tomlBool(network, "clear_relay_transports", v -> c.clearRelayTransports = v);
+          tomlBool(network, "proxy_from_env", v -> c.proxyFromEnv = v);
+          tomlBool(network, "local_discovery", v -> c.localDiscovery = v);
+          if (network.contains("hook_timeout_ms")) {
+            c.hookTimeoutMs = network.getLong("hook_timeout_ms").intValue();
+          }
+          if (network.contains("secret_key")) {
+            c.secretKey = Base64.getDecoder().decode(network.getString("secret_key"));
+          }
+        }
+
+        // [logging]
+        TomlTable logging = toml.getTable("logging");
+        if (logging != null) {
+          tomlString(logging, "format", v -> c.logFormat = v.toLowerCase());
+          tomlString(logging, "level", v -> c.logLevel = v.toLowerCase());
+          tomlBool(logging, "mask", v -> c.logMask = v);
+        }
+      } catch (Exception e) {
+        throw new RuntimeException(
+            "Failed to parse TOML config: " + path + ": " + e.getMessage(), e);
+      }
+      return this;
+    }
 
     /** Apply {@code ASTER_*} environment variables (overrides any prior builder calls). */
     public Builder applyEnv() {
@@ -222,7 +430,10 @@ public final class AsterConfig {
     private static void envInt(String key, java.util.function.Consumer<Integer> setter) {
       String v = System.getenv(key);
       if (v != null) {
-        try { setter.accept(Integer.parseInt(v.trim())); } catch (NumberFormatException ignored) {}
+        try {
+          setter.accept(Integer.parseInt(v.trim()));
+        } catch (NumberFormatException ignored) {
+        }
       }
     }
 
@@ -239,6 +450,17 @@ public final class AsterConfig {
         setter.accept(Base64.getDecoder().decode(v.trim()));
       }
     }
+
+    // TOML helpers
+    private static void tomlString(
+        TomlTable t, String key, java.util.function.Consumer<String> setter) {
+      if (t.contains(key)) setter.accept(t.getString(key));
+    }
+
+    private static void tomlBool(
+        TomlTable t, String key, java.util.function.Consumer<Boolean> setter) {
+      if (t.contains(key)) setter.accept(t.getBoolean(key));
+    }
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────
@@ -247,8 +469,9 @@ public final class AsterConfig {
     int len = hex.length();
     byte[] data = new byte[len / 2];
     for (int i = 0; i < len; i += 2) {
-      data[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
-          + Character.digit(hex.charAt(i + 1), 16));
+      data[i / 2] =
+          (byte)
+              ((Character.digit(hex.charAt(i), 16) << 4) + Character.digit(hex.charAt(i + 1), 16));
     }
     return data;
   }
@@ -272,7 +495,8 @@ public final class AsterConfig {
       if (content.length() == 64) {
         return hexToBytes(content);
       }
-    } catch (Exception ignored) {}
+    } catch (Exception ignored) {
+    }
     return null;
   }
 }

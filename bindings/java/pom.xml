@@ -74,6 +74,13 @@
             <version>${kotlin.version}</version>
         </dependency>
 
+        <!-- TOML config file parsing (aster.toml) -->
+        <dependency>
+            <groupId>org.tomlj</groupId>
+            <artifactId>tomlj</artifactId>
+            <version>1.1.1</version>
+        </dependency>
+
         <!-- ArchUnit for architectural tests -->
         <dependency>
             <groupId>com.tngtech.archunit</groupId>

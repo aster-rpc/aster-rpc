@@ -1,6 +1,9 @@
 using System;
 using System.IO;
 using System.Text;
+using System.Text.Json;
+using Tomlyn;  // TomlSerializer
+using Tomlyn.Model;  // TomlTable
 
 namespace Aster;
 
@@ -63,6 +66,144 @@ public class AsterConfig
         var c = new AsterConfig();
         c.ApplyEnv();
         return c;
+    }
+
+    /// <summary>Build config from a config file (aster.toml or aster.json), with env-var
+    /// overrides (env wins). Detects format by file extension.</summary>
+    public static AsterConfig FromFile(string path)
+    {
+        var c = new AsterConfig();
+        if (path.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            c.ApplyJsonFile(path);
+        else
+            c.ApplyTomlFile(path);
+        c.ApplyEnv();
+        return c;
+    }
+
+    /// <summary>Apply values from an aster.toml file.</summary>
+    public void ApplyTomlFile(string path)
+    {
+        var text = File.ReadAllText(path);
+        var model = TomlSerializer.Deserialize<TomlTable>(text)
+            ?? throw new InvalidOperationException($"Failed to parse TOML from {path}");
+
+        void Sec(string name, Action<TomlTable> action)
+        {
+            if (model.TryGetValue(name, out var obj) && obj is TomlTable t) action(t);
+        }
+
+        Sec("trust", t =>
+        {
+            TStr(t, "root_pubkey_file", v => RootPubkeyFile = v);
+            TStr(t, "enrollment_credential", v => EnrollmentCredentialFile = v);
+            TStr(t, "enrollment_credential_iid", v => EnrollmentCredentialIid = v);
+            TBool(t, "allow_all_consumers", v => AllowAllConsumers = v);
+            TBool(t, "allow_all_producers", v => AllowAllProducers = v);
+            TStr(t, "root_pubkey", v => RootPubkey = Convert.FromHexString(v));
+        });
+
+        Sec("connect", t => TStr(t, "endpoint_addr", v => EndpointAddr = v));
+        Sec("storage", t => TStr(t, "path", v => StoragePath = v));
+
+        Sec("network", t =>
+        {
+            TStr(t, "relay_mode", v => RelayMode = v);
+            TStr(t, "bind_addr", v => BindAddr = v);
+            TStr(t, "portmapper_config", v => PortmapperConfig = v);
+            TStr(t, "proxy_url", v => ProxyUrl = v);
+            TBool(t, "enable_monitoring", v => EnableMonitoring = v);
+            TBool(t, "enable_hooks", v => EnableHooks = v);
+            TBool(t, "clear_ip_transports", v => ClearIpTransports = v);
+            TBool(t, "clear_relay_transports", v => ClearRelayTransports = v);
+            TBool(t, "proxy_from_env", v => ProxyFromEnv = v);
+            TBool(t, "local_discovery", v => LocalDiscovery = v);
+            if (t.TryGetValue("hook_timeout_ms", out var htm) && htm is long htmVal)
+                HookTimeoutMs = (int)htmVal;
+            TStr(t, "secret_key", v => SecretKey = Convert.FromBase64String(v));
+        });
+
+        Sec("logging", t =>
+        {
+            TStr(t, "format", v => LogFormat = v.ToLowerInvariant());
+            TStr(t, "level", v => LogLevel = v.ToLowerInvariant());
+            TBool(t, "mask", v => LogMask = v);
+        });
+    }
+
+    private static void TStr(TomlTable t, string k, Action<string> s) { if (t.TryGetValue(k, out var v) && v is string sv) s(sv); }
+    private static void TBool(TomlTable t, string k, Action<bool> s) { if (t.TryGetValue(k, out var v) && v is bool bv) s(bv); }
+
+    /// <summary>Apply values from a JSON config file (aster.json).
+    /// The file uses the same section structure as aster.toml but in JSON form:
+    /// {"trust": {...}, "connect": {...}, "storage": {...}, "network": {...}, "logging": {...}}</summary>
+    public void ApplyJsonFile(string path)
+    {
+        var text = File.ReadAllText(path);
+        using var doc = JsonDocument.Parse(text);
+        var root = doc.RootElement;
+
+        // trust section
+        if (root.TryGetProperty("trust", out var trust))
+        {
+            JsonStr(trust, "root_pubkey_file", v => RootPubkeyFile = v);
+            JsonStr(trust, "enrollment_credential", v => EnrollmentCredentialFile = v);
+            JsonStr(trust, "enrollment_credential_iid", v => EnrollmentCredentialIid = v);
+            JsonBool(trust, "allow_all_consumers", v => AllowAllConsumers = v);
+            JsonBool(trust, "allow_all_producers", v => AllowAllProducers = v);
+            JsonStr(trust, "root_pubkey", v => RootPubkey = Convert.FromHexString(v));
+        }
+
+        // connect section
+        if (root.TryGetProperty("connect", out var conn))
+            JsonStr(conn, "endpoint_addr", v => EndpointAddr = v);
+
+        // storage section
+        if (root.TryGetProperty("storage", out var stor))
+            JsonStr(stor, "path", v => StoragePath = v);
+
+        // network section
+        if (root.TryGetProperty("network", out var net))
+        {
+            JsonStr(net, "relay_mode", v => RelayMode = v);
+            JsonStr(net, "bind_addr", v => BindAddr = v);
+            JsonStr(net, "portmapper_config", v => PortmapperConfig = v);
+            JsonStr(net, "proxy_url", v => ProxyUrl = v);
+            JsonBool(net, "enable_monitoring", v => EnableMonitoring = v);
+            JsonBool(net, "enable_hooks", v => EnableHooks = v);
+            JsonBool(net, "clear_ip_transports", v => ClearIpTransports = v);
+            JsonBool(net, "clear_relay_transports", v => ClearRelayTransports = v);
+            JsonBool(net, "proxy_from_env", v => ProxyFromEnv = v);
+            JsonBool(net, "local_discovery", v => LocalDiscovery = v);
+            JsonInt(net, "hook_timeout_ms", v => HookTimeoutMs = v);
+            JsonStr(net, "secret_key", v => SecretKey = Convert.FromBase64String(v));
+        }
+
+        // logging section
+        if (root.TryGetProperty("logging", out var log))
+        {
+            JsonStr(log, "format", v => LogFormat = v.ToLowerInvariant());
+            JsonStr(log, "level", v => LogLevel = v.ToLowerInvariant());
+            JsonBool(log, "mask", v => LogMask = v);
+        }
+    }
+
+    private static void JsonStr(JsonElement e, string key, Action<string> setter)
+    {
+        if (e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String)
+            setter(v.GetString()!);
+    }
+
+    private static void JsonBool(JsonElement e, string key, Action<bool> setter)
+    {
+        if (e.TryGetProperty(key, out var v) && (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.False))
+            setter(v.GetBoolean());
+    }
+
+    private static void JsonInt(JsonElement e, string key, Action<int> setter)
+    {
+        if (e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number)
+            setter(v.GetInt32());
     }
 
     /// <summary>Override fields from ASTER_* environment variables.</summary>

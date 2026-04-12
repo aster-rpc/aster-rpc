@@ -5,9 +5,12 @@ package aster
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/BurntSushi/toml"
 )
 
 // AsterConfig is the unified configuration for AsterServer.
@@ -70,6 +73,153 @@ func LoadFromEnv() AsterConfig {
 	c := DefaultAsterConfig()
 	c.ApplyEnv()
 	return c
+}
+
+// LoadFromFile returns a config loaded from an aster.toml file, with
+// ASTER_* env var overrides (env wins).
+func LoadFromFile(path string) (AsterConfig, error) {
+	c := DefaultAsterConfig()
+	if err := c.ApplyToml(path); err != nil {
+		return c, err
+	}
+	c.ApplyEnv()
+	return c, nil
+}
+
+// tomlConfig mirrors the aster.toml structure for BurntSushi/toml decoding.
+type tomlConfig struct {
+	Trust   tomlTrust   `toml:"trust"`
+	Connect tomlConnect `toml:"connect"`
+	Storage tomlStorage `toml:"storage"`
+	Network tomlNetwork `toml:"network"`
+	Logging tomlLogging `toml:"logging"`
+}
+type tomlTrust struct {
+	RootPubkey              string `toml:"root_pubkey"`
+	RootPubkeyFile          string `toml:"root_pubkey_file"`
+	EnrollmentCredential    string `toml:"enrollment_credential"`
+	EnrollmentCredentialIID string `toml:"enrollment_credential_iid"`
+	AllowAllConsumers       *bool  `toml:"allow_all_consumers"`
+	AllowAllProducers       *bool  `toml:"allow_all_producers"`
+}
+type tomlConnect struct {
+	EndpointAddr string `toml:"endpoint_addr"`
+}
+type tomlStorage struct {
+	Path string `toml:"path"`
+}
+type tomlNetwork struct {
+	SecretKey            string `toml:"secret_key"`
+	RelayMode            string `toml:"relay_mode"`
+	BindAddr             string `toml:"bind_addr"`
+	EnableMonitoring     *bool  `toml:"enable_monitoring"`
+	EnableHooks          *bool  `toml:"enable_hooks"`
+	HookTimeoutMs        *int   `toml:"hook_timeout_ms"`
+	ClearIpTransports    *bool  `toml:"clear_ip_transports"`
+	ClearRelayTransports *bool  `toml:"clear_relay_transports"`
+	PortmapperConfig     string `toml:"portmapper_config"`
+	ProxyUrl             string `toml:"proxy_url"`
+	ProxyFromEnv         *bool  `toml:"proxy_from_env"`
+	LocalDiscovery       *bool  `toml:"local_discovery"`
+}
+type tomlLogging struct {
+	Format string `toml:"format"`
+	Level  string `toml:"level"`
+	Mask   *bool  `toml:"mask"`
+}
+
+// ApplyToml loads values from an aster.toml file. Call before ApplyEnv
+// so that env vars take precedence.
+func (c *AsterConfig) ApplyToml(path string) error {
+	var tc tomlConfig
+	if _, err := toml.DecodeFile(path, &tc); err != nil {
+		return fmt.Errorf("parsing %s: %w", path, err)
+	}
+
+	// Trust
+	if tc.Trust.RootPubkey != "" {
+		if b, err := hex.DecodeString(tc.Trust.RootPubkey); err == nil {
+			c.RootPubkey = b
+		}
+	}
+	if tc.Trust.RootPubkeyFile != "" {
+		c.RootPubkeyFile = tc.Trust.RootPubkeyFile
+	}
+	if tc.Trust.EnrollmentCredential != "" {
+		c.EnrollmentCredentialFile = tc.Trust.EnrollmentCredential
+	}
+	if tc.Trust.EnrollmentCredentialIID != "" {
+		c.EnrollmentCredentialIID = tc.Trust.EnrollmentCredentialIID
+	}
+	if tc.Trust.AllowAllConsumers != nil {
+		c.AllowAllConsumers = *tc.Trust.AllowAllConsumers
+	}
+	if tc.Trust.AllowAllProducers != nil {
+		c.AllowAllProducers = *tc.Trust.AllowAllProducers
+	}
+
+	// Connect
+	if tc.Connect.EndpointAddr != "" {
+		c.EndpointAddr = tc.Connect.EndpointAddr
+	}
+
+	// Storage
+	if tc.Storage.Path != "" {
+		c.StoragePath = tc.Storage.Path
+	}
+
+	// Network
+	if tc.Network.SecretKey != "" {
+		if b, err := base64.StdEncoding.DecodeString(tc.Network.SecretKey); err == nil {
+			c.SecretKey = b
+		}
+	}
+	if tc.Network.RelayMode != "" {
+		c.RelayMode = tc.Network.RelayMode
+	}
+	if tc.Network.BindAddr != "" {
+		c.BindAddr = tc.Network.BindAddr
+	}
+	if tc.Network.PortmapperConfig != "" {
+		c.PortmapperConfig = tc.Network.PortmapperConfig
+	}
+	if tc.Network.ProxyUrl != "" {
+		c.ProxyUrl = tc.Network.ProxyUrl
+	}
+	if tc.Network.EnableMonitoring != nil {
+		c.EnableMonitoring = *tc.Network.EnableMonitoring
+	}
+	if tc.Network.EnableHooks != nil {
+		c.EnableHooks = *tc.Network.EnableHooks
+	}
+	if tc.Network.HookTimeoutMs != nil {
+		c.HookTimeoutMs = *tc.Network.HookTimeoutMs
+	}
+	if tc.Network.ClearIpTransports != nil {
+		c.ClearIpTransports = *tc.Network.ClearIpTransports
+	}
+	if tc.Network.ClearRelayTransports != nil {
+		c.ClearRelayTransports = *tc.Network.ClearRelayTransports
+	}
+	if tc.Network.ProxyFromEnv != nil {
+		c.ProxyFromEnv = *tc.Network.ProxyFromEnv
+	}
+	if tc.Network.LocalDiscovery != nil {
+		c.LocalDiscovery = *tc.Network.LocalDiscovery
+	}
+
+	// Logging
+	if tc.Logging.Format != "" {
+		c.LogFormat = strings.ToLower(tc.Logging.Format)
+	}
+	if tc.Logging.Level != "" {
+		c.LogLevel = strings.ToLower(tc.Logging.Level)
+	}
+	if tc.Logging.Mask != nil {
+		c.LogMask = *tc.Logging.Mask
+	}
+
+	return nil
 }
 
 // ApplyEnv overrides fields from ASTER_* environment variables.
