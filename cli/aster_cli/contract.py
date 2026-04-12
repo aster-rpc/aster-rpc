@@ -232,6 +232,10 @@ def _gen_single_service(spec: str, args: argparse.Namespace) -> "ContractManifes
     # Extract method descriptors with field definitions
     methods = extract_method_descriptors(service_info)
 
+    # Determine producer_language per spec 11.3.2.3:
+    # required when "native" in serialization_modes, empty string otherwise.
+    producer_lang = "python" if "native" in ser_modes else ""
+
     # Build manifest
     manifest = ContractManifest(
         service=service_info.name,
@@ -243,6 +247,7 @@ def _gen_single_service(spec: str, args: argparse.Namespace) -> "ContractManifes
         method_count=len(contract.methods),
         methods=methods,
         serialization_modes=ser_modes,
+        producer_language=producer_lang,
         scoped=scoped_str,
         deprecated=False,
         semver=getattr(args, "semver", None),
@@ -780,6 +785,175 @@ async def _fetch_manifests_from_directory_ref(
     return {manifest.get("service", service_name): manifest}
 
 
+def _preview_command(args: argparse.Namespace) -> int:
+    """Execute ``aster contract preview`` per spec 11.4.5.
+
+    Renders a human-friendly dump of the service contract's wire-type mapping
+    so devs can see what consumers will see -- field IDs (NFC-name-sorted),
+    wire types, source types, defaults, and mode info.
+    """
+    import json
+
+    if getattr(args, "service", None):
+        return _preview_from_source(args)
+    elif getattr(args, "manifest", None):
+        return _preview_from_manifest(args.manifest)
+    else:
+        # Default: try .aster/manifest.json
+        manifest_path = ".aster/manifest.json"
+        if os.path.exists(manifest_path):
+            return _preview_from_manifest(manifest_path)
+        print(
+            "Error: No --service or --manifest specified and no .aster/manifest.json found.",
+            file=sys.stderr,
+        )
+        print("  Run `aster contract preview --service module:Class` or `--manifest path`.", file=sys.stderr)
+        return 1
+
+
+def _preview_from_source(args: argparse.Namespace) -> int:
+    """Preview by walking Python source classes."""
+    from aster.contract.identity import (
+        ServiceContract,
+        build_type_graph,
+        canonical_xlang_bytes,
+        compute_contract_id,
+        compute_type_hash,
+        resolve_with_cycles,
+    )
+    from aster.contract.manifest import extract_method_descriptors
+    from aster.decorators import _SERVICE_INFO_ATTR
+
+    for spec in args.service:
+        cls = _import_service_class(spec)
+        service_info = getattr(cls, _SERVICE_INFO_ATTR, None)
+        if service_info is None:
+            print(f"Error: {cls.__name__} is not @service decorated.", file=sys.stderr)
+            return 1
+
+        root_types: list[type] = []
+        for mi in service_info.methods.values():
+            if mi.request_type is not None:
+                root_types.append(mi.request_type)
+            if mi.response_type is not None:
+                root_types.append(mi.response_type)
+
+        type_graph = build_type_graph(root_types)
+        type_defs = resolve_with_cycles(type_graph)
+        type_hashes: dict[str, bytes] = {}
+        for fqn, td in type_defs.items():
+            td_bytes = canonical_xlang_bytes(td)
+            type_hashes[fqn] = compute_type_hash(td_bytes)
+
+        contract = ServiceContract.from_service_info(service_info, type_hashes)
+        contract_bytes = canonical_xlang_bytes(contract)
+        contract_id = compute_contract_id(contract_bytes)
+
+        ser_modes = []
+        for m in service_info.serialization_modes:
+            if hasattr(m, "name"):
+                ser_modes.append(m.name.lower())
+            elif hasattr(m, "value") and isinstance(m.value, str):
+                ser_modes.append(m.value)
+            else:
+                ser_modes.append(str(m))
+        if not ser_modes:
+            ser_modes = ["xlang"]
+
+        _print_preview(
+            service_name=service_info.name,
+            version=service_info.version,
+            contract_id=contract_id,
+            producer="python",
+            modes=ser_modes,
+            methods=extract_method_descriptors(service_info),
+        )
+    return 0
+
+
+def _preview_from_manifest(path: str) -> int:
+    """Preview from a manifest.json file."""
+    import json
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Error reading {path}: {e}", file=sys.stderr)
+        return 1
+
+    manifests = data if isinstance(data, list) else [data]
+    for m in manifests:
+        _print_preview(
+            service_name=m.get("service", "?"),
+            version=m.get("version", 0),
+            contract_id=m.get("contract_id", "?"),
+            producer=m.get("producer_language", ""),
+            modes=m.get("serialization_modes", ["xlang"]),
+            methods=m.get("methods", []),
+        )
+    return 0
+
+
+def _print_preview(
+    service_name: str,
+    version: int,
+    contract_id: str,
+    producer: str,
+    modes: list[str],
+    methods: list[dict],
+) -> None:
+    """Print the human-friendly preview per spec 11.4.5."""
+    print(f"service {service_name}@{version}")
+    print(f"contract_id     : {contract_id}")
+    if producer:
+        print(f"producer        : {producer}")
+    print(f"modes           : {', '.join(modes)}")
+    print()
+
+    # Collect all unique message types from methods
+    seen_types: set[str] = set()
+    for m in methods:
+        for field_list_key in ("fields", "response_fields"):
+            fields = m.get(field_list_key, [])
+            if not fields:
+                continue
+            type_name = m.get("request_type" if field_list_key == "fields" else "response_type", "?")
+            if type_name in seen_types:
+                continue
+            seen_types.add(type_name)
+            # Sort fields by name for NFC-name-sorted display (matches canonical field_id order)
+            sorted_fields = sorted(fields, key=lambda f: f.get("name", ""))
+            print(f"message {type_name} {{")
+            for i, f in enumerate(sorted_fields):
+                fid = i + 1
+                fname = f.get("name", "?")
+                ftype = f.get("type", "?")
+                req = f.get("required", True)
+                default = f.get("default")
+                line = f"  #{fid:<3} {fname:<20}: {ftype}"
+                if not req and default is not None:
+                    line += f"  = {default!r}"
+                elif not req:
+                    line += "  (optional)"
+                print(line)
+            print("}")
+            print()
+
+    for m in methods:
+        pattern = m.get("pattern", "unary")
+        req_type = m.get("request_type", "?")
+        resp_type = m.get("response_type", "?")
+        timeout = m.get("timeout")
+        print(f"rpc {m.get('name', '?')} ({pattern})")
+        print(f"  request   : {req_type}")
+        print(f"  response  : {resp_type}")
+        if timeout:
+            print(f"  timeout   : {timeout}s")
+        if m.get("idempotent"):
+            print(f"  idempotent: true")
+        print()
+
+
 def _resolve_aster_version() -> str:
     """Find the installed aster-cli + aster-rpc versions for `--version`.
 
@@ -937,6 +1111,25 @@ def main() -> None:
         help="Local manifest to compare against (default: .aster/manifest.json)",
     )
 
+    # ``aster contract preview``
+    preview_parser = contract_subparsers.add_parser(
+        "preview",
+        help="Human-readable dump of a contract's wire-type mapping.",
+    )
+    preview_group = preview_parser.add_mutually_exclusive_group()
+    preview_group.add_argument(
+        "--service",
+        action="append",
+        metavar="MODULE:CLASS",
+        help="Service class to preview (reads from source tree; requires Python toolchain)",
+    )
+    preview_group.add_argument(
+        "--manifest",
+        default=None,
+        metavar="PATH",
+        help="Path to manifest.json to preview (toolchain-agnostic)",
+    )
+
     # ``aster trust`` subcommand group (Phase 11)
     from aster_cli.trust import register_trust_subparser, run_trust_command
     trust_parser = register_trust_subparser(subparsers)
@@ -1064,6 +1257,8 @@ def main() -> None:
             sys.exit(_verify_command(args))
         elif args.contract_command == "gen-client":
             sys.exit(_gen_client_command(args))
+        elif args.contract_command == "preview":
+            sys.exit(_preview_command(args))
         else:
             contract_parser.print_help()
             sys.exit(1)
