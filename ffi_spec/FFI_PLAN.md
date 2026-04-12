@@ -1,8 +1,10 @@
 # Iroh FFI — Complete Refactoring & Multi-Language Binding Plan
 
-**Status:** Final Plan  
-**Date:** 2026-04-04 (Phase 1c added; Phase 1b merged from FFI_PLAN_PATCH.md)  
+**Status:** Implemented (Phase 1 complete)
+**Date:** 2026-04-04 (Phase 1c added; Phase 1b merged from FFI_PLAN_PATCH.md)
 **Scope:** Refactor `aster_transport_core` and `aster_transport_ffi` to provide a polished, language-neutral C ABI; update Python bindings; implement Java FFM bindings.
+
+> **For RPC dispatch in new language bindings, read [`docs/_internal/reactor-ffi-guide.md`](../docs/_internal/reactor-ffi-guide.md).** That guide is the authoritative contract for the `aster_reactor_*` C functions and the SPSC ring buffer call delivery path. This document covers the broader C ABI (runtime, nodes, blobs, docs, gossip, hooks, completion queue) on which the reactor sits.
 
 ---
 
