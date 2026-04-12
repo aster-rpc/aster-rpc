@@ -333,8 +333,9 @@ mod tests {
     fn test_ed25519_verify_valid() {
         use ed25519_dalek::Signer;
 
-        use rand_core::TryRngCore;
-        let signing_key = SigningKey::generate(&mut rand_core::OsRng.unwrap_err());
+        // Deterministic test key — avoids the rand_core/rand version dance and
+        // the test does not require entropy.
+        let signing_key = SigningKey::from_bytes(&[1u8; 32]);
         let verifying_key = signing_key.verifying_key();
 
         let message = b"hello world";
@@ -349,8 +350,7 @@ mod tests {
     fn test_ed25519_verify_tampered() {
         use ed25519_dalek::Signer;
 
-        use rand_core::TryRngCore;
-        let signing_key = SigningKey::generate(&mut rand_core::OsRng.unwrap_err());
+        let signing_key = SigningKey::from_bytes(&[2u8; 32]);
         let verifying_key = signing_key.verifying_key();
 
         let message = b"hello world";
@@ -366,10 +366,8 @@ mod tests {
     fn test_ed25519_verify_wrong_key() {
         use ed25519_dalek::Signer;
 
-        use rand_core::TryRngCore;
-        let mut csprng = rand_core::OsRng.unwrap_err();
-        let signing_key = SigningKey::generate(&mut csprng);
-        let other_key = SigningKey::generate(&mut csprng);
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let other_key = SigningKey::from_bytes(&[4u8; 32]);
 
         let message = b"hello world";
         let signature = signing_key.sign(message);
