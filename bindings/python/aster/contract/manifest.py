@@ -65,6 +65,11 @@ class ContractManifest:
     serialization_modes: list[str] = field(default_factory=list)
     """Supported serialization mode strings (e.g. ["xlang"])."""
 
+    producer_language: str = ""
+    """Producer language identifier. REQUIRED when "native" in serialization_modes,
+    empty string otherwise. One of "python", "typescript", "java", "csharp", "go".
+    See spec 11.3.2.3 Serialization Modes. Validated by the Rust canonicalizer."""
+
     scoped: str = "shared"
     """Service scope: "shared" or "session"."""
 
