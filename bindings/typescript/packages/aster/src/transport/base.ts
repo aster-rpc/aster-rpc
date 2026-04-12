@@ -12,9 +12,9 @@ import type { StatusCode } from '../status.js';
 /** Options for a single RPC call. */
 export interface CallOptions {
   metadata?: Record<string, string>;
-  deadlineEpochMs?: number;
+  deadlineSecs?: number;
   serializationMode?: number;
-  callId?: string;
+  callId?: number;
 }
 
 /**

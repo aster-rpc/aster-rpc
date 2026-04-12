@@ -1382,6 +1382,7 @@ class SessionProxyClient {
   private _send: any = null;
   private _recv: any = null;
   private _codec = new JsonCodec();
+  private _callIdCounter = 0;
   private _opening: Promise<void> | null = null;
 
   constructor(
@@ -1436,7 +1437,7 @@ class SessionProxyClient {
       service: this.serviceName,
       method: '',
       version: 1,
-      callId: crypto.randomUUID(),
+      callId: ++this._callIdCounter,
       serializationMode: 3, // JSON
     });
     await writeFrame(this._send, this._codec.encode(header), HEADER);
@@ -1446,7 +1447,7 @@ class SessionProxyClient {
     // Send CALL frame with CallHeader
     const callHeader = new CallHeader({
       method,
-      callId: crypto.randomUUID(),
+      callId: ++this._callIdCounter,
     });
     await writeFrame(this._send, this._codec.encode(callHeader), CALL);
 

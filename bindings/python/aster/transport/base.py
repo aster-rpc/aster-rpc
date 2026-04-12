@@ -41,7 +41,7 @@ class Transport(Protocol):
         request: Any,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int = 0,
     ) -> Any:
         """Perform a unary RPC call.
@@ -51,7 +51,7 @@ class Transport(Protocol):
             method: The method name within the service.
             request: The serialized request message.
             metadata: Optional key/value pairs sent in StreamHeader.
-            deadline_epoch_ms: Deadline for the call (Unix epoch ms).
+            deadline_secs: Deadline in relative seconds (0 = no deadline).
             serialization_mode: Serialization mode (XLANG=0, NATIVE=1, ROW=2).
 
 
@@ -71,7 +71,7 @@ class Transport(Protocol):
         request: Any,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int = 0,
     ) -> AsyncIterator[Any]:
         """Initiate a server-streaming RPC.
@@ -81,7 +81,7 @@ class Transport(Protocol):
             method: The method name within the service.
             request: The serialized request message.
             metadata: Optional key/value pairs sent in StreamHeader.
-            deadline_epoch_ms: Deadline for the call (Unix epoch ms).
+            deadline_secs: Deadline in relative seconds (0 = no deadline).
             serialization_mode: Serialization mode.
 
 
@@ -101,7 +101,7 @@ class Transport(Protocol):
         requests: AsyncIterator[Any],
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int = 0,
     ) -> Any:
         """Perform a client-streaming RPC.
@@ -111,7 +111,7 @@ class Transport(Protocol):
             method: The method name within the service.
             requests: Async iterator of serialized request messages.
             metadata: Optional key/value pairs sent in StreamHeader.
-            deadline_epoch_ms: Deadline for the call (Unix epoch ms).
+            deadline_secs: Deadline in relative seconds (0 = no deadline).
             serialization_mode: Serialization mode.
 
 
@@ -130,7 +130,7 @@ class Transport(Protocol):
         method: str,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int = 0,
     ) -> BidiChannel:
         """Initiate a bidirectional-streaming RPC.
@@ -139,7 +139,7 @@ class Transport(Protocol):
             service: The target service name.
             method: The method name within the service.
             metadata: Optional key/value pairs sent in StreamHeader.
-            deadline_epoch_ms: Deadline for the call (Unix epoch ms).
+            deadline_secs: Deadline in relative seconds (0 = no deadline).
             serialization_mode: Serialization mode.
 
 

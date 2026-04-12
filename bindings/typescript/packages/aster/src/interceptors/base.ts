@@ -79,9 +79,9 @@ export interface Interceptor {
   onError?(ctx: CallContext, error: RpcError): Promise<RpcError | null>;
 }
 
-/** Convert deadline epoch ms to Unix seconds, or undefined. */
-export function deadlineFromEpochMs(ms: number): number | undefined {
-  return ms > 0 ? ms / 1000 : undefined;
+/** Convert relative deadline (seconds) to absolute Unix seconds, or undefined. */
+export function deadlineFromRelativeSecs(secs: number): number | undefined {
+  return secs > 0 ? Date.now() / 1000 + secs : undefined;
 }
 
 /** Build a CallContext from common parameters. */
@@ -89,7 +89,7 @@ export function buildCallContext(opts: {
   service: string;
   method: string;
   metadata?: Record<string, string>;
-  deadlineEpochMs?: number;
+  deadlineSecs?: number;
   peer?: string;
   isStreaming?: boolean;
   pattern?: RpcPattern;
@@ -100,7 +100,7 @@ export function buildCallContext(opts: {
 }): CallContext {
   return new CallContext({
     ...opts,
-    deadline: deadlineFromEpochMs(opts.deadlineEpochMs ?? 0),
+    deadline: deadlineFromRelativeSecs(opts.deadlineSecs ?? 0),
   });
 }
 

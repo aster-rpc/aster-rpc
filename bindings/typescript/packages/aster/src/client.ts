@@ -94,7 +94,7 @@ export async function timeSleep(seconds: number): Promise<void> {
  */
 export function timeouts(timeoutS: number, metadata?: Record<string, string>): CallOptions {
   return {
-    deadlineEpochMs: Date.now() + timeoutS * 1000,
+    deadlineSecs: Math.max(1, Math.round(timeoutS)),
     metadata,
   };
 }
@@ -135,8 +135,8 @@ export function createClient<T extends new (...args: any[]) => any>(
           metadata: { ...options?.metadata, ...callOpts?.metadata },
         };
 
-        if (options?.timeout && !opts.deadlineEpochMs) {
-          opts.deadlineEpochMs = Date.now() + options.timeout * 1000;
+        if (options?.timeout && !opts.deadlineSecs) {
+          opts.deadlineSecs = Math.max(1, Math.round(options.timeout));
         }
 
         switch (methodInfo.pattern) {

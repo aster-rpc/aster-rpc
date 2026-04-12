@@ -156,7 +156,7 @@ class IrohTransport(Transport):
         request: Any,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int | None = None,
 
     ) -> Any:
@@ -172,8 +172,8 @@ class IrohTransport(Transport):
             service=service,
             method=method,
             version=1,
-            callId="",
-            deadlineEpochMs=deadline_epoch_ms,
+            callId=0,
+            deadline=deadline_secs,
             serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
             metadataKeys=keys,
             metadataValues=values,
@@ -227,7 +227,7 @@ class IrohTransport(Transport):
         request: Any,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int | None = None,
 
     ) -> AsyncIterator[Any]:
@@ -241,7 +241,7 @@ class IrohTransport(Transport):
         """
         return self._server_stream_impl(
             service, method, request, metadata,
-            deadline_epoch_ms, serialization_mode,
+            deadline_secs, serialization_mode,
         )
 
     async def _server_stream_impl(
@@ -250,10 +250,10 @@ class IrohTransport(Transport):
         method: str,
         request: Any,
         metadata: dict[str, str] | None,
-        deadline_epoch_ms: int,
+        deadline_secs: int,
         serialization_mode: int,
     ) -> AsyncIterator[Any]:
-        call_id = str(uuid.uuid4())
+        call_id = 0
         send, recv = await self._conn.open_bi()
 
         try:
@@ -265,7 +265,7 @@ class IrohTransport(Transport):
                 version=1,
 
                 callId=call_id,
-                deadlineEpochMs=deadline_epoch_ms,
+                deadline=deadline_secs,
                 serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
                 metadataKeys=keys,
                 metadataValues=values,
@@ -329,7 +329,7 @@ class IrohTransport(Transport):
         requests: AsyncIterator[Any],
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int | None = None,
 
     ) -> Any:
@@ -342,7 +342,7 @@ class IrohTransport(Transport):
         4. Finish stream
         5. Read response frame + trailer
         """
-        call_id = str(uuid.uuid4())
+        call_id = 0
         send, recv = await self._conn.open_bi()
 
         try:
@@ -354,7 +354,7 @@ class IrohTransport(Transport):
                 version=1,
 
                 callId=call_id,
-                deadlineEpochMs=deadline_epoch_ms,
+                deadline=deadline_secs,
                 serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
                 metadataKeys=keys,
                 metadataValues=values,
@@ -421,7 +421,7 @@ class IrohTransport(Transport):
         method: str,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int | None = None,
 
     ) -> BidiChannel:
@@ -432,7 +432,7 @@ class IrohTransport(Transport):
             service=service,
             method=method,
             metadata=metadata,
-            deadline_epoch_ms=deadline_epoch_ms,
+            deadline_secs=deadline_secs,
             serialization_mode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
         )
 
@@ -454,7 +454,7 @@ class IrohBidiChannel(BidiChannel):
         service: str,
         method: str,
         metadata: dict[str, str] | None,
-        deadline_epoch_ms: int,
+        deadline_secs: int,
         serialization_mode: int,
     ) -> None:
         self._conn = connection
@@ -462,7 +462,7 @@ class IrohBidiChannel(BidiChannel):
         self._service = service
         self._method = method
         self._metadata = metadata
-        self._deadline_epoch_ms = deadline_epoch_ms
+        self._deadline_secs = deadline_secs
         self._serialization_mode = serialization_mode
         self._send: "aster.IrohSendStream | None" = None
         self._recv: "aster.IrohRecvStream | None" = None
@@ -490,7 +490,6 @@ class IrohBidiChannel(BidiChannel):
         if self._send is not None and self._recv is not None:
             return self._send, self._recv
 
-        call_id = str(uuid.uuid4())
         self._send, self._recv = await self._conn.open_bi()
 
         # Write StreamHeader
@@ -499,8 +498,8 @@ class IrohBidiChannel(BidiChannel):
             service=self._service,
             method=self._method,
             version=1,
-            callId=call_id,
-            deadlineEpochMs=self._deadline_epoch_ms,
+            callId=0,
+            deadline=self._deadline_secs,
             serializationMode=self._serialization_mode,
             metadataKeys=keys,
             metadataValues=values,

@@ -196,7 +196,7 @@ class SessionServer:
         peer: str | None = None,
     ) -> None:
         """Drive the session lifecycle for one stream."""
-        session_id = stream_header.callId or str(uuid.uuid4())
+        session_id = str(stream_header.callId) if stream_header.callId else str(uuid.uuid4())
         serialization_mode = stream_header.serializationMode
 
         # Instantiate the service class with peer= kwarg
@@ -294,12 +294,12 @@ class SessionServer:
                     service=self._service_info.name,
                     method=method_name,
                     metadata=metadata,
-                    deadline_epoch_ms=call_header.deadlineEpochMs,
+                    deadline_secs=call_header.deadline,
                     peer=peer,
                     is_streaming=method_info.pattern != "unary",
                     pattern=method_info.pattern,
                     idempotent=method_info.idempotent,
-                    call_id=call_header.callId or None,
+                    call_id=call_header.callId,
                     session_id=session_id,
                     attributes=attributes,
                 )
@@ -830,6 +830,14 @@ class SessionServer:
 _BIDI_EOF = object()
 # Sentinels returned by dispatch methods to signal session_loop control flow
 _SESSION_CLOSED = object()
+
+_next_session_id = 0
+
+
+def _alloc_session_id() -> int:
+    global _next_session_id
+    _next_session_id += 1
+    return _next_session_id
 _SESSION_NEXT_CALL = object()
 
 
@@ -859,6 +867,11 @@ class SessionStub:
         self._interceptors = list(interceptors) if interceptors else []
         self._session_id = session_id
         self._lock = asyncio.Lock()
+        self._call_id_counter = 0
+
+    def _next_call_id(self) -> int:
+        self._call_id_counter += 1
+        return self._call_id_counter
 
     async def close(self) -> None:
         """Close the session (client-side)."""
@@ -991,8 +1004,8 @@ class SessionStub:
         meta_vals = list((metadata or {}).values())
         call_header = CallHeader(
             method=method_info.name,
-            callId=str(uuid.uuid4()),
-            deadlineEpochMs=0,
+            callId=self._next_call_id(),
+            deadline=0,
             metadataKeys=meta_keys,
             metadataValues=meta_vals,
         )
@@ -1111,7 +1124,8 @@ async def create_session(
         raise ValueError("create_session requires a connection")
 
     send, recv = await connection.open_bi()
-    session_id = str(uuid.uuid4())
+    wire_session_id = _alloc_session_id()
+    session_id = str(wire_session_id)
 
     # Pick the wire serialization mode from the codec being used. If the
     # caller passed a JsonProxyCodec (e.g. because the server only speaks
@@ -1129,7 +1143,7 @@ async def create_session(
         service=service_info.name,
         method="",
         version=service_info.version,
-        callId=session_id,
+        callId=wire_session_id,
         serializationMode=ser_mode,
     )
     header_payload = codec.encode(header)
@@ -1160,16 +1174,18 @@ class SessionProxyClient:
         self._codec = codec
         self._session_id = session_id
         self._lock = asyncio.Lock()
+        self._call_id_counter = 0
 
     async def call(self, method: str, request: dict | None = None) -> dict | Any:
         """Call a unary method on this session."""
         import struct as _struct
 
         async with self._lock:
+            self._call_id_counter += 1
             call_header = CallHeader(
                 method=method,
-                callId=str(uuid.uuid4()),
-                deadlineEpochMs=0,
+                callId=self._call_id_counter,
+                deadline=0,
             )
             ch_payload = self._codec.encode(call_header)
             req_payload = self._codec.encode(request or {})
@@ -1255,7 +1271,8 @@ async def create_proxy_session(
         codec = JsonProxyCodec()
 
     send, recv = await connection.open_bi()
-    session_id = str(uuid.uuid4())
+    wire_session_id = _alloc_session_id()
+    session_id = str(wire_session_id)
 
     from aster.json_codec import JsonProxyCodec
     ser_mode = SerializationMode.JSON.value if isinstance(codec, JsonProxyCodec) else 0
@@ -1264,7 +1281,7 @@ async def create_proxy_session(
         service=service_name,
         method="",
         version=1,
-        callId=session_id,
+        callId=wire_session_id,
         serializationMode=ser_mode,
     )
     header_payload = codec.encode(header)
@@ -1324,14 +1341,15 @@ def create_local_session(
     s2c_send = _FakeSendStream(s2c)
     s2c_recv = _FakeRecvStream(s2c)
 
-    session_id = str(uuid.uuid4())
+    wire_session_id = _alloc_session_id()
+    session_id = str(wire_session_id)
 
     # Build a StreamHeader that the SessionServer will receive
     stream_header = StreamHeader(
         service=service_info.name,
         method="",
         version=service_info.version,
-        callId=session_id,
+        callId=wire_session_id,
         serializationMode=(
             service_info.serialization_modes[0].value
             if service_info.serialization_modes

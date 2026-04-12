@@ -1,5 +1,5 @@
-// Aster RPC protocol types -- single source of truth for all language bindings.
-// Generate: .venv/bin/foryc ffi_spec/idl/aster_protocol.fdl --rust_out=... --python_out=... --java_out=...
+// Aster RPC protocol types -- reference document for correct field types.
+// Hand-written types in each language must match these types exactly.
 
 package _aster;
 
@@ -9,17 +9,17 @@ message StreamHeader {
     string svc = 1;
     string rpcMethod = 2;
     int32 version = 3;
-    string callId = 4;
-    int64 deadlineEpochMs = 5;
-    int32 serializationMode = 6;
+    int32 callId = 4;             // sequence number (was string UUID)
+    int16 deadline = 5;           // relative seconds, 0 = none (was int64 epoch ms)
+    int8 serializationMode = 6;   // 4 modes: XLANG=0, NATIVE=1, ROW=2, JSON=3
     list<string> metadataKeys = 7;
     list<string> metadataValues = 8;
 }
 
 message CallHeader {
     string rpcMethod = 1;
-    string callId = 2;
-    int64 deadlineEpochMs = 3;
+    int32 callId = 2;             // sequence number (was string UUID)
+    int16 deadline = 3;           // relative seconds, 0 = none (was int64 epoch ms)
     list<string> metadataKeys = 4;
     list<string> metadataValues = 5;
 }
@@ -35,9 +35,9 @@ message ReactorCallData {
     string svc = 1;
     string rpcMethod = 2;
     int32 version = 3;
-    string callId = 4;
-    int64 deadlineEpochMs = 5;
-    int32 serializationMode = 6;
+    int32 callId = 4;
+    int16 deadline = 5;
+    int8 serializationMode = 6;
     string pattern = 7;
     bool idempotent = 8;
     string peerId = 9;

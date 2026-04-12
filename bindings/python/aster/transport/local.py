@@ -50,7 +50,7 @@ class CallRequest:
     method: str
     request: Any
     metadata: dict[str, str] | None
-    deadline_epoch_ms: int
+    deadline_secs: int
     serialization_mode: int
     response_queue: asyncio.Queue[Any]
     error_queue: asyncio.Queue[Exception]
@@ -80,7 +80,7 @@ class LocalBidiChannel(BidiChannel):
         service: str,
         method: str,
         metadata: dict[str, str] | None,
-        deadline_epoch_ms: int,
+        deadline_secs: int,
         serialization_mode: int,
 
         send_queue: asyncio.Queue[LocalBidiMessage],
@@ -91,7 +91,7 @@ class LocalBidiChannel(BidiChannel):
         self._service = service
         self._method = method
         self._metadata = metadata
-        self._deadline_epoch_ms = deadline_epoch_ms
+        self._deadline_secs = deadline_secs
         self._serialization_mode = serialization_mode
 
         self._send_queue = send_queue
@@ -224,7 +224,7 @@ class LocalTransport(Transport):
         service: str,
         method: str,
         metadata: dict[str, str] | None,
-        deadline_epoch_ms: int,
+        deadline_secs: int,
         *,
         is_streaming: bool = False,
     ) -> CallContext:
@@ -233,7 +233,7 @@ class LocalTransport(Transport):
             service=service,
             method=method,
             metadata=metadata,
-            deadline_epoch_ms=deadline_epoch_ms,
+            deadline_secs=deadline_secs,
             is_streaming=is_streaming,
         )
 
@@ -262,7 +262,7 @@ class LocalTransport(Transport):
         request: Any,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int = 0,
 
     ) -> Any:
@@ -283,7 +283,7 @@ class LocalTransport(Transport):
 
         # Build context for interceptors
         ctx = await self._build_context(
-            service, method, metadata, deadline_epoch_ms
+            service, method, metadata, deadline_secs
         )
         
         # Serialize request if wire_compatible
@@ -335,14 +335,14 @@ class LocalTransport(Transport):
         request: Any,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int = 0,
 
     ) -> AsyncIterator[Any]:
         """Initiate a server-streaming RPC (in-process)."""
         return self._server_stream_impl(
             service, method, request, metadata,
-            deadline_epoch_ms, serialization_mode,
+            deadline_secs, serialization_mode,
         )
 
     async def _server_stream_impl(
@@ -351,14 +351,14 @@ class LocalTransport(Transport):
         method: str,
         request: Any,
         metadata: dict[str, str] | None,
-        deadline_epoch_ms: int,
+        deadline_secs: int,
         serialization_mode: int,
 
     ) -> AsyncIterator[Any]:
         handler, types, pattern = self._registry(service, method)
         
         ctx = await self._build_context(
-            service, method, metadata, deadline_epoch_ms, is_streaming=True
+            service, method, metadata, deadline_secs, is_streaming=True
         )
         
         # Run request through interceptor chain
@@ -401,7 +401,7 @@ class LocalTransport(Transport):
         requests: AsyncIterator[Any],
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int = 0,
 
     ) -> Any:
@@ -409,7 +409,7 @@ class LocalTransport(Transport):
         handler, types, pattern = self._registry(service, method)
         
         ctx = await self._build_context(
-            service, method, metadata, deadline_epoch_ms, is_streaming=True
+            service, method, metadata, deadline_secs, is_streaming=True
         )
         
         # Collect requests (could be streaming in a real network scenario,
@@ -454,7 +454,7 @@ class LocalTransport(Transport):
         method: str,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_epoch_ms: int = 0,
+        deadline_secs: int = 0,
         serialization_mode: int = 0,
 
     ) -> BidiChannel:
@@ -468,7 +468,7 @@ class LocalTransport(Transport):
             service=service,
             method=method,
             metadata=metadata,
-            deadline_epoch_ms=deadline_epoch_ms,
+            deadline_secs=deadline_secs,
             serialization_mode=serialization_mode,
             send_queue=send_queue,
             recv_queue=recv_queue,
@@ -479,7 +479,7 @@ class LocalTransport(Transport):
         # Start the handler task
         asyncio.create_task(
             self._bidi_handler_task(
-                service, method, metadata, deadline_epoch_ms,
+                service, method, metadata, deadline_secs,
                 send_queue, recv_queue, trailer_queue,
             )
         )
@@ -491,7 +491,7 @@ class LocalTransport(Transport):
         service: str,
         method: str,
         metadata: dict[str, str] | None,
-        deadline_epoch_ms: int,
+        deadline_secs: int,
         send_queue: asyncio.Queue[LocalBidiMessage],
         recv_queue: asyncio.Queue[LocalBidiMessage],
         trailer_queue: asyncio.Queue[tuple[int, str]],
@@ -500,7 +500,7 @@ class LocalTransport(Transport):
         handler, types, pattern = self._registry(service, method)
         
         ctx = await self._build_context(
-            service, method, metadata, deadline_epoch_ms, is_streaming=True
+            service, method, metadata, deadline_secs, is_streaming=True
         )
 
         try:
