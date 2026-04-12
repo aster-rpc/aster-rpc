@@ -316,6 +316,631 @@ wire-level union construct.
 These rules mean canonical hashing is coupled not just to "Fory XLANG in
 general" but to a precisely pinned subset of it.
 
+#### 11.3.2.3 Language Type Mapping and the Universal Decodability Axiom
+
+§11.3.2.2 pins how wire types are encoded. This section pins how each binding
+language's **native types** are translated into those wire types when a
+developer authors a service using language-native decorators (`@wire_type` in
+Python, `@WireType` in TypeScript, annotations in Java/C#, struct tags in Go)
+rather than writing an FDL file directly.
+
+The underlying problem is that different languages make different default
+choices for ambiguous native types. Fory's Python binding maps Python `int`
+to VARINT64; Fory's TypeScript binding maps `number` to VARINT32; Python
+`int` is arbitrary-precision while TS `number` is IEEE 754 double. Without a
+normative rule, two developers writing "the same" service in different
+languages would produce different `contract_id`s — or worse, the same
+`contract_id` with silently incompatible wire behaviour.
+
+##### Universal Decodability Axiom
+
+Aster maintains a canonical wire-type table as a global invariant per
+serialization mode. The axiom is normative:
+
+> **Axiom.** For every serialization mode declared in a `ServiceContract`'s
+> `serialization_modes`, every binding that advertises support for that mode
+> MUST losslessly decode every wire type used in any method's request or
+> response type in the contract. A producer MAY only declare types whose wire
+> representation falls within the **intersection** of the wire-type tables for
+> all declared modes. "Lossless" means: the decoded local value, when
+> re-encoded to canonical wire bytes, produces the identical byte sequence as
+> the source — bit-exact round-trip, not semantic equivalence.
+
+Three corollaries follow immediately and are normative:
+
+1. **Producer fail-fast.** Any native type (or combination of type and
+   default value) that cannot be resolved to an entry in every declared
+   mode's wire-type table MUST cause decoration-time failure in the
+   producer's binding, naming the service, method, field, type, default
+   value (if applicable), mode that failed, and the fix choices defined
+   below.
+2. **Adding a wire type is a spec amendment.** New wire types require
+   explicit verification of lossless decode in every existing supported
+   binding, checked in as conformance vectors (per
+   `conformance/` directory). Silent extension is forbidden.
+3. **Adding a new binding is gated on the full table.** A new language
+   binding is "supported" only once it passes the full conformance suite for
+   every wire type in the current table under every supported mode. Partial
+   bindings MAY exist but MUST NOT be listed as supported targets in public
+   documentation until they pass.
+
+This axiom is the invariant that makes the README's promise *"the Python
+service and the TypeScript service speak the same wire format natively"*
+literally true instead of aspirational.
+
+##### Producer-Owned Contract Principle
+
+A contract is defined by the producer (the service author), and the
+producer's language choice IS the contract. Consumers in other languages
+MUST match the producer's declared wire types. The contract identity system
+does not attempt to reconcile native-type defaults across languages; it
+records the producer's choice, computes `contract_id` from that record, and
+consumers generate bindings (dynamic or typed) that match.
+
+Consequences:
+
+1. **Each language has a fixed, deterministic default mapping.** The default
+   is not a best-effort guess — it is normative for that binding and does not
+   vary by version, runtime flag, or heuristic.
+2. **Field rename is a new contract.** Field names are part of canonical
+   bytes (§11.3.3 `FieldDef.name`). Renaming any field changes `contract_id`.
+   There is no protobuf-style tag-based rename stability, by design.
+3. **A new language binding adds itself to the mapping table below.**
+   Bindings MUST NOT invent defaults silently; the table is the single
+   source of truth.
+
+##### Serialization Modes
+
+Aster supports three serialization modes, declared at the service level in
+`ServiceContract.serialization_modes`. Modes are part of `contract_id`.
+
+- **`xlang`** — Fory XLANG canonical profile per §11.3.2.2. Cross-language,
+  strict wire-type set. The default when no mode is declared. Contracts
+  advertising only `xlang` can be consumed by any supported binding.
+
+- **`json`** — JSON encoding per the table below. Strictly narrower
+  wire-type set than `xlang` (JSON cannot losslessly represent every XLANG
+  type). Intended for browser consumers and for bindings whose native Fory
+  support is immature; SHOULD NOT be preferred for performance-sensitive
+  or high-fidelity RPC. A method's declared types MUST all have a JSON
+  encoding in the table below for the service to advertise `json`.
+
+- **`native`** — The producer language's Fory native mode. Unconstrained
+  by the cross-language mapping table: any type the producer-language's
+  Fory native binding supports is legal. Contracts advertising `native`
+  MUST set `ContractManifest.producer_language` to the producer's language
+  identifier (`"python"`, `"typescript"`, `"java"`, `"csharp"`, `"go"`, …),
+  and cross-language consumers MUST refuse to generate typed clients
+  against a `native`-only contract whose `producer_language` differs from
+  the consumer's language. NATIVE wire format MAY change between Fory
+  versions; contracts advertising `native` MUST pin the Fory version in
+  `ContractManifest.canonical_encoding` (e.g.
+  `fory-python-native/0.15`), and consumers MUST check version
+  compatibility at call time. Upgrading Fory is a re-publish operation
+  for NATIVE contracts. The `contract_id` itself is stable across Fory
+  versions because it is over the schema, not the wire bytes.
+
+**Default mode set.** A service declared with no explicit
+`serialization_modes` argument defaults to `["xlang"]`. Opting into `json`
+or `native` is explicit and triggers the validation walker described under
+*Service-Level Mode Validation* below.
+
+**Intersection rule (mixed-mode contracts).** When multiple modes are
+declared, the producer's legal type universe is the intersection of the
+declared modes' wire-type tables. Since `json` is strictly narrower than
+`xlang`, a contract declaring `["xlang", "json"]` is JSON-bound. Since
+`native` is strictly wider than `xlang`, a contract declaring
+`["xlang", "native"]` is XLANG-bound.
+
+##### Language-Native Default Mapping
+
+The following table is the authoritative language-native → wire-type mapping
+for XLANG and JSON modes. NATIVE mode is unconstrained by this table.
+Every Aster binding MUST implement exactly these defaults and MUST NOT add
+others without a spec amendment.
+
+|Language |Native type       |Wire type |Notes                                                                 |
+|---------|------------------|----------|----------------------------------------------------------------------|
+|Python   |`int`             |`int64`   |Python int is arbitrary-precision; int64 is the widest safe default   |
+|Python   |`float`           |`float64` |                                                                      |
+|Python   |`bool`            |`bool`    |                                                                      |
+|Python   |`str`             |`string`  |UTF-8, NFC for identifiers (§11.3.2.2)                                |
+|Python   |`bytes`           |`binary`  |                                                                      |
+|Python   |`list[T]`         |`list<T>` |                                                                      |
+|Python   |`dict[K,V]`       |`map<K,V>`|                                                                      |
+|Python   |`set[T]`          |`set<T>`  |                                                                      |
+|Python   |`frozenset[T]`    |`set<T>`  |                                                                      |
+|Python   |`datetime`        |`timestamp`|Aware datetimes only; naive raises. Microsecond UTC precision         |
+|Python   |`uuid.UUID`       |`uuid`    |                                                                      |
+|TS       |`number`          |`float64` |`number` is IEEE 754 double — honest mapping, not an integer          |
+|TS       |`bigint`          |`int64`   |Use for integers on the wire                                          |
+|TS       |`boolean`         |`bool`    |                                                                      |
+|TS       |`string`          |`string`  |                                                                      |
+|TS       |`Uint8Array`      |`binary`  |                                                                      |
+|TS       |`Array<T>`        |`list<T>` |                                                                      |
+|TS       |`Map<K,V>`        |`map<K,V>`|                                                                      |
+|TS       |`Set<T>`          |`set<T>`  |                                                                      |
+|TS       |`Date`            |`timestamp`|Millisecond source precision, widened to microseconds on wire        |
+|Java     |`int`             |`int32`   |Native — no ambiguity                                                 |
+|Java     |`long`            |`int64`   |                                                                      |
+|Java     |`float`           |`float32` |                                                                      |
+|Java     |`double`          |`float64` |                                                                      |
+|Java     |`boolean`         |`bool`    |                                                                      |
+|Java     |`String`          |`string`  |                                                                      |
+|Java     |`byte[]`          |`binary`  |                                                                      |
+|Java     |`List<T>`         |`list<T>` |                                                                      |
+|Java     |`Map<K,V>`        |`map<K,V>`|                                                                      |
+|Java     |`Set<T>`          |`set<T>`  |                                                                      |
+|Java     |`Instant`         |`timestamp`|Nanosecond source precision, truncated to microseconds on wire       |
+|Java     |`UUID`            |`uuid`    |                                                                      |
+|C#       |`int`             |`int32`   |Native — no ambiguity                                                 |
+|C#       |`long`            |`int64`   |                                                                      |
+|C#       |`float`           |`float32` |                                                                      |
+|C#       |`double`          |`float64` |                                                                      |
+|C#       |`bool`            |`bool`    |                                                                      |
+|C#       |`string`          |`string`  |                                                                      |
+|C#       |`byte[]`          |`binary`  |                                                                      |
+|C#       |`List<T>`         |`list<T>` |                                                                      |
+|C#       |`Dictionary<K,V>` |`map<K,V>`|                                                                      |
+|C#       |`HashSet<T>`      |`set<T>`  |                                                                      |
+|C#       |`DateTimeOffset`  |`timestamp`|100-ns tick source precision, truncated to microseconds on wire      |
+|C#       |`Guid`            |`uuid`    |                                                                      |
+|Go       |`int32`           |`int32`   |Go devs use explicit widths in wire code                              |
+|Go       |`int64`           |`int64`   |                                                                      |
+|Go       |`float32`         |`float32` |                                                                      |
+|Go       |`float64`         |`float64` |                                                                      |
+|Go       |`bool`            |`bool`    |                                                                      |
+|Go       |`string`          |`string`  |                                                                      |
+|Go       |`[]byte`          |`binary`  |                                                                      |
+|Go       |`[]T`             |`list<T>` |                                                                      |
+|Go       |`map[K]V`         |`map<K,V>`|                                                                      |
+|Go       |`time.Time`       |`timestamp`|Nanosecond source precision, truncated to microseconds on wire       |
+|Go       |`uuid.UUID`       |`uuid`    |`github.com/google/uuid`                                              |
+
+**Unconditionally disallowed native types.** The following MUST raise at
+decoration time in the relevant binding, regardless of declared mode:
+
+- Python platform-dependent numpy widths (`numpy.int_`, `numpy.uint_`, …)
+  without explicit `aster.iXX` / `uXX` override.
+- Python `Any`, `object` / TS `unknown`, `any` / Java `Object`, raw types /
+  C# `object`, `dynamic` / Go `interface{}` — untyped fields have no wire
+  representation.
+- Go `int` / `uint` (platform-dependent width) — developers MUST choose
+  `int32` / `int64` / `uint32` / `uint64` explicitly.
+- Python naive `datetime` (timezone-unaware) — use `aster.local_datetime`
+  if truly intended, otherwise construct with an explicit `tzinfo`.
+- Heterogeneous tuples (Python `tuple[int, str, float]`, TS `[number,
+  string, boolean]`) — require a named message type instead. Homogeneous
+  tuples (Python `tuple[int, ...]`) map to `list<int>`.
+- Python `OrderedDict` with order semantically required — wire map ordering
+  is not guaranteed across bindings. Use `list<KeyValuePair>` or a custom
+  message type when ordering matters.
+- Floats in schema defaults that are NaN, ±Infinity, or subnormal — NaN has
+  multiple bit patterns, breaking canonicalization. Non-default float
+  values on the wire MAY be any IEEE 754 value including NaN; the
+  restriction is only on schema defaults.
+- Map keys outside the allowed key-type set below.
+
+**Suspicious field warning (non-fatal).** TS `number` used in a field whose
+name matches the regex
+`(?i)(count|id|size|length|index|offset|timestamp|epoch|nanos|micros|millis|seconds|bytes|total|version)`
+SHOULD emit a decoration-time **warning** — not an error — suggesting
+`bigint` or `aster.i64`. The honest-default-but-loud-when-suspicious rule
+gives TS devs a hint without blocking; `aster contract preview` also
+surfaces these warnings in its output. Suppressing the warning requires
+either fixing the type or explicitly annotating the field with `aster.f64`
+to state intent.
+
+##### JSON Mode Encoding Table
+
+Every wire type in this table has a pinned JSON encoding. A wire type
+missing from this table is **forbidden** in any service that declares
+`json` in its `serialization_modes`.
+
+|Wire type        |JSON encoding                                                             |
+|-----------------|--------------------------------------------------------------------------|
+|`bool`           |JSON `true` / `false`                                                     |
+|`int8` / `int16` |JSON number                                                               |
+|`int32`          |JSON number                                                               |
+|`uint8`/`16`/`32`|JSON number                                                               |
+|`int64`, `uint64`|JSON **string** (decimal representation, always — not conditional)        |
+|`float32`        |JSON number; NaN / ±Inf forbidden as schema defaults, encoded literally on wire|
+|`float64`        |JSON number; NaN / ±Inf forbidden as schema defaults, encoded literally on wire|
+|`string`         |JSON string, UTF-8                                                        |
+|`binary`         |JSON string, base64url without padding                                    |
+|`timestamp`      |JSON string, ISO-8601 UTC with exactly 6 fractional digits (`YYYY-MM-DDTHH:MM:SS.ffffffZ`)|
+|`uuid`           |JSON string, canonical hyphenated lowercase (8-4-4-4-12)                  |
+|`decimal(p,s)`   |JSON string, decimal representation matching declared precision and scale|
+|`list<T>`        |JSON array                                                                |
+|`set<T>`         |JSON array, sorted deterministically (elements sorted by canonical wire bytes)|
+|`map<K,V>`       |JSON object when `K = string`; JSON array of `[K, V]` pairs otherwise     |
+|`enum`           |JSON string (variant name, NFC-normalized — **not** the ordinal)          |
+|`union`          |JSON object `{"_type": "fully.qualified.Name", ...variant fields}`        |
+|`message`        |JSON object with NFC field names                                          |
+|`null`           |JSON `null` (for nullable wire types only)                                |
+
+Two rules are deliberately pinned and not conditional:
+
+- **`int64` and `uint64` are ALWAYS encoded as JSON strings**, even when the
+  value fits in JavaScript's safe integer range (2⁵³ − 1). Conditional
+  stringification requires consumers to branch at runtime and is fragile;
+  always-string matches the protobuf-json convention and is unambiguous.
+- **Enums are encoded by variant name, not by ordinal, in JSON.** XLANG
+  encodes enums as ordinals (compact, binary); JSON encodes by name
+  (human-readable, debuggable). This is a mode-specific encoding
+  difference and does not affect `contract_id` — both modes describe the
+  same schema.
+
+##### Nullable and Optional Fields
+
+Every language has a native concept of "absent value," but the syntaxes and
+defaults differ. Normative mapping:
+
+|Language |Native nullability                                   |Wire type    |
+|---------|-----------------------------------------------------|-------------|
+|Python   |`Optional[T]`, `T \| None`                           |`nullable<T>`|
+|TS       |`T \| null`, `T \| undefined`, `field?: T`           |`nullable<T>`|
+|Java     |`@Nullable T`, `Optional<T>`                         |`nullable<T>`|
+|C#       |`T?` (nullable value types and nullable reference types)|`nullable<T>`|
+|Go       |`*T` (pointer to T)                                  |`nullable<T>`|
+
+All three TypeScript syntaxes (`T | null`, `T | undefined`, `field?: T`)
+MUST map to the same `nullable<T>` wire type so that two TS developers
+expressing the same intent produce the same `contract_id`.
+
+**Decode widening/narrowing rule (normative).** The axiom's "every
+binding MUST losslessly decode" requirement interacts with nullability as
+follows:
+
+- A consumer's local representation of a non-nullable producer field MAY
+  be widened to nullable. A Python consumer generating a stub for a
+  producer field `agent_id: string` MAY emit `str | None` locally — a
+  `null` will never arrive on the wire, so widening is safe.
+- A consumer's local representation of a nullable producer field MUST
+  remain nullable. Narrowing a nullable field to non-nullable is
+  forbidden because `null` may arrive on the wire and a non-nullable
+  decoder would fail. Gen-client tools MUST honor this.
+
+##### Enums
+
+Native enum types map to the Fory XLANG enum wire type. Normative mapping:
+
+|Language |Native                                                         |Wire type|
+|---------|---------------------------------------------------------------|---------|
+|Python   |`IntEnum`                                                      |`enum`   |
+|Python   |`StrEnum`                                                      |`string` (not enum — preserve the semantic distinction) |
+|TS       |`enum` or discriminated union of string literals               |`enum`   |
+|Java     |`enum`                                                         |`enum`   |
+|C#       |`enum`                                                         |`enum`   |
+|Go       |typed integer constants registered with the framework         |`enum`   |
+
+Normative enum rules:
+
+1. **Variant ordering is part of the contract.** XLANG encodes enum values
+   as their ordinal. Reordering variants changes canonical bytes and
+   therefore `contract_id`. Adding a variant at the end changes
+   `contract_id`. Removing a variant changes `contract_id`. All three
+   operations are breaking changes requiring a new contract version.
+2. **Variant names are part of canonical bytes.** Renaming a variant
+   changes `contract_id`, consistent with the field-rename rule.
+3. **JSON encoding uses the variant name, not the ordinal.** XLANG encoding
+   uses the ordinal. The same contract advertises both in mixed-mode
+   services without `contract_id` ambiguity — the schema is the same.
+4. **Enum variant ordering in canonical bytes follows declaration order**,
+   which is stable in all supported languages. The ordinal assigned to
+   each variant is its declaration-order index, 0-based. Bindings MUST
+   NOT reorder variants during canonicalization.
+5. **Python `StrEnum` maps to `string`, not `enum`.** A string enum in
+   Python is semantically a string, and XLANG encodes it as a string
+   without ordinal constraints. Devs who want ordinal-compact encoding
+   MUST use `IntEnum`.
+
+##### Time, UUID, and Decimal
+
+Three types appear in almost every real RPC schema and have non-obvious
+cross-language encodings:
+
+- **`timestamp`** is pinned to **microsecond UTC** precision. Sources with
+  higher precision (Java `Instant` nanoseconds, Go `time.Time` nanoseconds,
+  C# `DateTimeOffset` 100ns ticks) are **truncated** on encode. Sources with
+  lower precision (TS `Date` milliseconds) upscale by multiplication (exact).
+  Timezone-aware only — naive datetimes raise at decoration time. A
+  nanosecond-precision alternative MAY be added to the table in a future
+  spec revision as `timestamp_nanos`; until then, producers needing
+  nanoseconds MUST use `aster.i64` and document the epoch manually, or
+  declare `native` mode.
+- **`uuid`** is pinned to **16 raw bytes** (binary-16) on the XLANG wire
+  and to canonical hyphenated lowercase `8-4-4-4-12` string form in JSON.
+  The UUID variant and version are preserved bit-for-bit.
+- **`decimal(p, s)`** is a parameterized type requiring explicit
+  precision (`p`, total digits) and scale (`s`, digits after the decimal
+  point). There is no unparameterized `decimal` — a producer MUST use
+  `aster.decimal(30, 10)`-style declaration. The XLANG wire encoding is a
+  string of digits matching the declared precision/scale; the JSON
+  encoding is identical (a decimal string). This avoids pinning on any
+  specific language's native decimal representation (Python `Decimal`,
+  Java `BigDecimal`, and C# `decimal` have different maximum precisions;
+  the string representation is the common denominator). A future spec
+  revision MAY upgrade this to a native Fory decimal wire type; string
+  is the safe v1 choice.
+
+##### Collections: Sets and Tuples
+
+Beyond `list` and `map`:
+
+- **Sets** map to `set<T>` wire type in all languages that have a native
+  set. Go has no native set type (idiomatic Go uses `map[K]struct{}`
+  manually); Go producers MUST use `list<T>` or raise at decoration time.
+- **Homogeneous tuples** (Python `tuple[int, ...]`, all elements the same
+  type) map to `list<int>`.
+- **Heterogeneous tuples** (Python `tuple[int, str, float]`, TS
+  `[number, string, boolean]`) MUST raise at decoration time. Producers
+  requiring heterogeneous grouping MUST declare a named message. This
+  follows directly from the axiom: no wire type exists for heterogeneous
+  fixed-arity sequences across all supported bindings, so the producer
+  fails fast.
+
+##### Nested Message References
+
+Inside a message definition, a field whose type is another
+`@wire_type`-decorated message is a nested reference. At the source layer
+this is expressed naturally (Python `owner: User`, TS `owner: User`, Java
+`User owner`, etc.). During canonicalization, the binding's schema walker
+MUST resolve the reference and emit `TypeKind.REF` with a 32-byte
+`type_ref` hash per §11.3.3 — nested references are by **type hash**, not
+by name, in canonical bytes. This creates a Merkle DAG: changes to the
+referenced type transitively change the referring contract's
+`contract_id`.
+
+Name-level resolution during schema walking MUST use fully-qualified names
+(`package.MessageName`) to disambiguate same-short-name types across
+namespaces. The NFC normalization rule for identifiers (§11.3.2.2) applies
+to package and type names.
+
+##### Unions (v1 Scope)
+
+Discriminated union / sum types map to `TypeKind.UNION` with a
+variant list. v1 normative scope:
+
+1. **All-message variants only.** A union variant's type MUST be a
+   `@wire_type`-decorated message. `Union[int, str]`-style primitive
+   variants MUST raise in v1 — they may be supported in a future spec
+   revision.
+2. **`T | None` is not a union, it is nullable `T`.** Bindings MUST
+   detect this pattern (Python `Optional[T]` / TS `T | null`) and emit
+   `nullable<T>` rather than a union.
+3. **Variant discriminator.** Each variant is identified by the variant's
+   fully-qualified message name (`package.Name`). The canonical union
+   encoding follows §11.3.3 `UnionVariantDef`: each variant contributes a
+   name (NFC) and its own 32-byte `type_ref` hash.
+4. **Language mapping:** Python `A | B`, TS `A | B` with all-class
+   variants, Java sealed interfaces, C# record hierarchies with a
+   discriminator, Go registered interface implementations. Other shapes
+   MUST raise.
+5. **JSON encoding** per the JSON table: `{"_type": "package.Name",
+   ...variant fields}`.
+
+##### Default Values in `contract_id`
+
+Schema default values participate in `contract_id`. Changing a default
+value is a breaking change that produces a new `contract_id`. This is
+deliberate: gen-client tools bake declared defaults into generated typed
+clients, and a silent default change would drift client behavior without
+any visible contract change. Making defaults part of identity forces a
+re-publish and re-generation when defaults change.
+
+Normative restrictions on default values participating in canonicalization:
+
+1. **Scalar-only.** Only `bool`, all integer widths, `float32`, `float64`,
+   `string`, `binary`, `enum`, `timestamp`, `uuid`, and `decimal(p,s)`
+   defaults are permitted as participating defaults. Float defaults MUST
+   be finite (no NaN, no ±Infinity, no subnormals); `-0.0` is normalized
+   to `+0.0`.
+2. **Empty containers allowed.** `list<T>` defaults MUST be the empty
+   list, `set<T>` defaults MUST be the empty set, `map<K,V>` defaults
+   MUST be the empty map. Non-empty container defaults MUST raise at
+   decoration time.
+3. **No nested-message defaults.** A field of message type MAY have a
+   default only if that default is `null` (implying the field is also
+   nullable). A non-null nested-message default MUST raise.
+4. **"No default" is distinct from "default = zero-value."** A field
+   declared without a default is `required` and the `FieldDef` records
+   this distinctly from a field declared with a zero-value default.
+   `name: str` (no default) and `name: str = ""` (default empty string)
+   produce different `contract_id`s. This matches developer intent:
+   "required" is a contract statement, not a construction convenience.
+5. **Canonical encoding of defaults** is defined in §11.3.3 via a new
+   `FieldDef.default_value` field (bytes; empty bytes when no default is
+   declared; non-empty bytes containing the canonical XLANG encoding of
+   the default value for scalar types, or a pinned sentinel for empty
+   containers). See §11.3.3 for the full layout.
+6. **Per-mode default validation.** A default value that is legal for
+   its wire type under XLANG MAY still be illegal under JSON — for
+   example, an `int64` default value of `9007199254740993` (2⁵³ + 1) is
+   legal under XLANG (varint) but exceeds JavaScript safe integer range
+   and would round-trip lossy through JSON number parsing. Since JSON
+   encodes `int64` as a string, this specific case is actually safe;
+   but a float default that is exactly representable in IEEE 754 binary
+   may not round-trip through JSON's decimal literal form. Validation
+   walkers MUST check defaults against the declared modes' encoding
+   rules, not just against the wire type.
+
+##### Field ID Assignment
+
+**Field IDs are assigned normatively as the 1-based position of the field
+in the NFC-normalized-name-sorted order of all fields within a message.**
+This is a change from the previous declaration-order rule, and is
+required for cross-language determinism:
+
+1. **Java's `Class.getDeclaredFields()` has no guaranteed order** per the
+   JLS. A declaration-order rule would produce nondeterministic
+   `contract_id`s across JVMs and even across runs on the same JVM.
+2. **NFC-name-sort is language-independent and derivable from the field
+   set alone.** Every binding computes the same IDs from the same field
+   names without needing to preserve declaration order.
+3. **Renaming a field changes its NFC-sorted position**, therefore
+   changes its ID, therefore changes `contract_id` — consistent with the
+   "rename is a new contract" rule.
+4. **The field ID remains part of canonical encoding** (§11.3.3 `FieldDef`
+   field 1) and `FieldDef` serialization within a `TypeDef` remains sorted
+   by ID — which is equivalent to sorted by NFC-name under this rule.
+
+This is an intentional breaking change: existing Python contracts whose
+declaration order does not match NFC-sort order will produce new
+`contract_id`s after binding implementations update. Acceptable per the
+pre-production status of all current contracts.
+
+##### Map Key Type Set
+
+Map keys are constrained to types that are hashable and comparable in
+every supported language. Legal map key types:
+
+- All integer widths (`int8`..`int64`, `uint8`..`uint64`)
+- `bool`
+- `string`
+- `uuid`
+
+**Forbidden** map key types: `float32`, `float64`, `binary`, `decimal`,
+`timestamp`, nested messages, enums, unions, and nullable types. Float
+keys are forbidden because NaN-as-key is semantically broken in every
+language. Nested message keys are forbidden because not all target
+languages support arbitrary value equality for map keys. `decimal` and
+`timestamp` keys are forbidden because string-based representations have
+canonicalization ambiguity. Enum keys MUST be represented as their
+integer-type ordinal explicitly if needed. Producers needing richer keys
+MUST use `list<KeyValuePair>` or a custom structure.
+
+##### Explicit Wire-Type Overrides (Branded Aliases)
+
+Every binding MUST expose a fixed set of branded type aliases for when a
+developer wants to override the default. The names are normative across
+languages so that cross-language code reviews and documentation can
+reference them unambiguously:
+
+|Alias              |Wire type         |
+|-------------------|------------------|
+|`aster.i8`         |`int8`            |
+|`aster.i16`        |`int16`           |
+|`aster.i32`        |`int32`           |
+|`aster.i64`        |`int64`           |
+|`aster.u8`         |`uint8`           |
+|`aster.u16`        |`uint16`          |
+|`aster.u32`        |`uint32`          |
+|`aster.u64`        |`uint64`          |
+|`aster.f32`        |`float32`         |
+|`aster.f64`        |`float64`         |
+|`aster.uuid`       |`uuid`            |
+|`aster.timestamp`  |`timestamp`       |
+|`aster.local_datetime`|`local_datetime`|
+|`aster.decimal(p, s)`|`decimal(p, s)` |
+
+These aliases map to the Fory IDL wire-type markers. In languages with a
+type system rich enough to express them (TS branded types, Python
+`typing.Annotated`, Java annotations, C# attributes, Go struct tags), the
+alias is carried in the type signature and read by the binding's schema
+walker. In languages where the alias cannot be expressed as a type, the
+binding MUST provide an equivalent field-level annotation mechanism (e.g.
+a decorator parameter).
+
+##### Service-Level Mode Validation
+
+When a service is registered (decoration / static-init / `init()` depending
+on binding), the binding MUST:
+
+1. For each declared mode M in `ServiceContract.serialization_modes`:
+2. For each method in the service:
+3. For each field (transitively, through nested message references) in
+   the method's request and response types:
+4. Verify that the field's wire type has an entry in mode M's table, and
+   that the field's default value (if any) has a valid encoding under
+   M's encoding rules.
+5. On the FIRST failure, raise a decoration-time error naming:
+   - the service name and version,
+   - the failed mode,
+   - the method name,
+   - the field path (e.g. `StatusResponse.uptime_secs`),
+   - the offending type and default value,
+   - the reason ("type not representable in JSON mode", "default value
+     exceeds range", etc.),
+   - and the three remediation choices below.
+
+**The three remediation choices for mode failures** are reported
+verbatim in the error message to guide the developer:
+
+1. **Remove the mode** from `serialization_modes` if that mode is not
+   strictly required by consumers.
+2. **Change the offending field's type or default** so it becomes
+   representable in the declared mode (e.g., replace a `decimal` field
+   with a `string` field, or narrow an `int64` default to fit JSON
+   safe range).
+3. **Split the method into a separate service** whose mode set excludes
+   the failing mode, preserving the richer types for same-language
+   consumers while still advertising a simpler mode set on the
+   remaining service.
+
+This three-fix structure is the reason mode declaration is per-service
+rather than per-method: it pushes developers toward clean service
+boundaries rather than ragged per-method capability matrices.
+
+##### Import-Time Validation (Normative)
+
+Bindings MUST validate all fields of a `@wire_type`-decorated message at
+**decoration time** — for Python, when the decorator runs at module
+import; for TypeScript, when the class is declared; for Java/C#, at
+static-init or reflective-registration time; for Go, at `init()` when a
+type is registered with the framework. Validation MUST NOT be deferred
+to first-call time. Failures MUST raise a clear error naming the field
+and the reason (ambiguous type, disallowed native type, unknown
+annotation, missing default for a mode-constrained type, etc.), and
+MUST reference the documentation URL
+`https://docs.aster.site/docs/concepts/types-across-languages` for this
+section.
+
+##### Contract Canonicalization Is Shared
+
+Once a binding has walked its native types and produced a
+language-agnostic schema struct (service name, version,
+`serialization_modes`, list of `TypeDef` / `MethodDef` records with
+resolved wire types and defaults), it MUST hand that struct — serialized
+as UTF-8 JSON matching the shape defined in §11.3.3 — to the Rust
+canonicalizer via the C FFI function `aster_contract_id(json_ptr, len)
+-> [u8; 32]`. Bindings MUST NOT implement canonicalization or BLAKE3
+hashing in their own language. The Rust FFI is the single source of
+truth for canonicalization (the "how") just as this section is the
+single source of truth for native-type mapping (the "what").
+
+##### New-Binding Checklist
+
+To add a new Aster language binding (Rust, Kotlin, Swift, etc.), the
+implementer MUST:
+
+1. Add a row per supported native primitive, collection, nullable
+   construct, enum kind, timestamp, UUID, and set to the mapping table
+   above, following the producer-owned principle.
+2. Implement the `aster.iXX` / `uXX` / `fXX` / `uuid` / `timestamp` /
+   `local_datetime` / `decimal(p,s)` alias set.
+3. Implement the field-ID assignment rule (NFC-name-sorted position).
+4. Implement decoration-time validation of every `@wire_type`-decorated
+   message, raising on disallowed types, unknown annotations, bad
+   defaults, and heterogeneous tuples.
+5. Implement per-mode validation at service registration, applying the
+   three-fix error message structure.
+6. Produce a schema JSON blob matching §11.3.3 shape from walked native
+   types, including `serialization_modes`, `producer_language` (if
+   `native` mode is declared), and field `default_value`.
+7. Call `aster_contract_id` via the C FFI and compare against any
+   embedded manifest. Bindings MUST NOT implement canonicalization or
+   BLAKE3 hashing locally.
+8. Register the branded aliases in the binding's public API surface and
+   docstring each one with a link to this section.
+9. Add a conformance vector row to `conformance/` demonstrating byte-exact
+   round-trip for every wire type under every mode the binding supports.
+   The binding is not "supported" (listable as a target in public
+   documentation) until all conformance vectors pass.
+10. Add the binding to the `aster contract preview` command's supported
+    languages list so the human-friendly dump (§11.4.5) can render
+    contracts authored in the new language.
+
 ### 11.3.3 Framework-Internal Type Definitions
 
 These types live in the `_aster` reserved namespace and are used exclusively
@@ -374,18 +999,27 @@ enum ScopeKind [id=6] {
 // ── Type atoms ──────────────────────────────────────────────
 
 message FieldDef {
-    int32 id = 1;                   // Field number from IDL or code
-    string name = 2;                // Canonical field name (snake_case)
+    int32 id = 1;                   // 1-based position in NFC-name-sorted order per §11.3.2.3.
+                                    // NOT a developer-managed protobuf-style tag; derivable from
+                                    // the field name set alone. Present solely for canonical sort
+                                    // stability.
+    string name = 2;                // Canonical field name (NFC-normalized)
     TypeKind type_kind = 3;         // PRIMITIVE, REF, SELF_REF, ANY
     string type_primitive = 4;      // e.g. "string", "int32", "bool" — set when type_kind = PRIMITIVE
     bytes type_ref = 5;             // BLAKE3 hash (32 bytes) of referenced TypeDef — set when type_kind = REF
     string self_ref_name = 6;       // Fully-qualified type name — set when type_kind = SELF_REF
-    bool optional = 7;
+    bool optional = 7;              // Nullable wire type — see §11.3.2.3 nullable rules
     bool ref_tracked = 8;           // Fory `ref` modifier
     ContainerKind container = 9;    // NONE, LIST, SET, MAP
     TypeKind container_key_kind = 10; // For maps: PRIMITIVE or REF
     string container_key_primitive = 11;
     bytes container_key_ref = 12;
+    bool required = 13;             // True if the field has no declared default. Distinct from
+                                    // "default = zero-value". See §11.3.2.3 defaults rules.
+    bytes default_value = 14;       // Canonical XLANG encoding of the declared default value when
+                                    // required = false and type is scalar; empty bytes otherwise.
+                                    // Empty containers (list/set/map) use a pinned single-byte
+                                    // sentinel 0x00. Participates in contract_id per §11.3.2.3.
 }
 
 // Canonical zero-value convention for discriminated fields:
@@ -397,6 +1031,9 @@ message FieldDef {
 //   enum discriminator value ANY
 // - when container != MAP: container_key_kind = PRIMITIVE (zero value),
 //   container_key_primitive = "", container_key_ref = empty bytes
+// - when required = true: default_value = empty bytes (must be explicit "no default")
+// - when required = false and default_value = empty bytes: invalid — MUST raise during
+//   canonicalization (indicates a binding bug)
 
 message EnumValueDef {
     string name = 1;
@@ -444,13 +1081,22 @@ message ServiceContract {
     string name = 1;                // Wire service name
     int32 version = 2;              // Human-facing version label
     list<MethodDef> methods = 3;    // Sorted by method name (Unicode codepoint, NFC-normalized)
-    list<string> serialization_modes = 4; // Ordered by producer preference
+    list<string> serialization_modes = 4; // Ordered by producer preference. Validated per §11.3.2.3
+                                          // service-level mode validation at decoration time.
     string alpn = 5;                // Always "aster/{wire_version}"
     ScopeKind scoped = 6;           // SHARED (default) or STREAM (session-scoped)
     optional CapabilityRequirement requires = 7;  // Optional service-level baseline. Effective
                                          // requirement for a method is the conjunction of
                                          // this field and the method's own requires field.
                                          // Absent on both = no rcan check for that method.
+    string producer_language = 8;   // REQUIRED when "native" appears in serialization_modes;
+                                    // MUST be the empty string "" otherwise. One of
+                                    // "python" | "typescript" | "java" | "csharp" | "go"
+                                    // when set. Part of contract_id so that two different
+                                    // native-mode producers produce distinct contract IDs
+                                    // even when their schemas appear structurally similar —
+                                    // a native-mode contract is language-bound by construction.
+                                    // See §11.3.2.3 Serialization Modes for details.
 }
 ```
 
@@ -809,6 +1455,10 @@ ContractManifest {
     method_count: int32
     methods: list<MethodDescriptor>  // full method schemas for dynamic invocation
     serialization_modes: list<string>
+    producer_language: string?       // REQUIRED when "native" in serialization_modes;
+                                      // one of "python" | "typescript" | "java" | "csharp" | "go".
+                                      // Cross-language gen-client refuses for native-only contracts
+                                      // whose producer_language differs from the target.
     scoped: string                   // "shared" or "session"
     deprecated: bool
 
@@ -835,10 +1485,12 @@ MethodDescriptor {
 }
 
 FieldDescriptor {
-    name: string                     // field name
-    type: string                     // type name (e.g. "str", "int", "list[str]", "MyType")
-    required: bool                   // true if no default value
+    name: string                     // field name (NFC-normalized)
+    type: string                     // wire type name per §11.3.2.3 (e.g. "int64", "string", "list<string>", "MyType")
+    source_type: string              // producer-language native type (e.g. "int", "number", "Date") — for preview tooling
+    required: bool                   // true if no default value (distinct from default = zero-value)
     default: any?                    // JSON-safe default value, null if required or non-serializable
+    field_id: int32                  // 1-based position in NFC-name-sorted order; derivable but pre-computed for readers
 }
 ```
 
@@ -906,6 +1558,113 @@ reads the manifest blob at collection index 0 to resolve logical names to blob
 hashes, fetches `contract.xlang` and all type blobs by their hashes, and
 verifies `blake3(contract.xlang bytes) == contract_id` before trusting the
 bundle.
+
+### 11.4.5 `aster contract preview` — Human-Readable Contract Dump
+
+The language-mapping rules in §11.3.2.3 are designed to be honest for each
+language's native types, but the producer-owned-contract principle means the
+wire representation of a service is determined by the language it was
+authored in. A TypeScript developer who writes `count: number = 0` expecting
+"an integer counter" gets a `float64` field on the wire, and a downstream
+Java consumer generating a stub from that contract sees `double count`. This
+is correct per §11.3.2.3, but it is also surprising, and the earlier the
+developer notices, the cheaper the fix.
+
+`aster contract preview` is the tool for noticing early. It is a **purely
+offline** command, like `aster contract gen`, but its output is a
+human-friendly rendering of the contract as it would appear to consumers —
+not an IDL file, not a codegen artifact, just a dump designed to be read.
+
+```bash
+aster contract preview                    # read from current source tree
+aster contract preview --manifest path    # read from a generated manifest.json
+aster contract preview --contract-id ID   # fetch from a running registry
+```
+
+**Output format.** The command MUST emit a structured, human-readable
+rendering that shows, for every message type and method:
+
+1. The service name, version, computed `contract_id`, and the producing
+   language (from `ContractManifest.producer_language` when set, or
+   detected from the source tree when run with no arguments).
+2. The **service-level `serialization_modes`** line. If the dev explicitly
+   narrowed modes, or if service-level validation (§11.3.2.3) rejected a
+   mode, this line surfaces the rejection reason.
+3. Each message type, with fields listed **in NFC-name-sorted order**
+   (matching the canonical `field_id` assignment rule) as
+   `#id  field_name  :  wire_type  (source: native_type)  [nullable] [=default]`
+   so the developer can see the wire truth, what they wrote, the ID the
+   canonicalizer assigned, nullability, and the default value if any.
+4. Each method's pattern, request type, response type, timeout, and
+   capability requirements.
+5. A **warnings** block flagging any field that matched the "suspicious
+   native type" heuristics from §11.3.2.3 (e.g. a TS field named
+   `total_bytes` typed as `number`, producing `float64`), plus any mode
+   rejections encountered during service-level validation.
+
+**Example output** for a TS-authored contract containing the subtlety:
+
+```text
+service mission.Control@1
+contract_id     : 7a3b9c...4f2e
+producer        : typescript/0.2.0
+modes           : xlang                  (json declined: StatusResponse.uptime_secs has default
+                                                         9007199254740993 which is not representable
+                                                         in JSON number; remove "json" from modes,
+                                                         narrow the default, or split this method)
+
+message mission.StatusRequest {
+  #1  agent_id     : string    (source: string)
+}
+
+message mission.StatusResponse {
+  #1  agent_id     : string    (source: string)
+  #2  status       : string    (source: string)  = "idle"
+  #3  total_bytes  : float64   (source: number)          ⚠ suspicious
+  #4  uptime_secs  : int64     (source: bigint)  = 9007199254740993
+}
+
+rpc GetStatus (unary)
+  request   : mission.StatusRequest
+  response  : mission.StatusResponse
+  timeout   : 5.0s
+  requires  : mission.read
+
+⚠ Warnings (2)
+  mission.StatusResponse.total_bytes — field name suggests an integer counter, but
+    TS `number` maps to float64. If an integer is intended, use `bigint` or
+    `aster.i64`. See https://docs.aster.site/docs/concepts/types-across-languages
+  serialization_modes — "json" was requested but declined during service-level
+    validation. Reason shown on the modes line above.
+```
+
+**Non-normative output styling.** The format above is a suggested layout.
+Implementations MAY use colour, box-drawing, or alternate column widths, but
+MUST preserve the "#field_id, field name, wire type, source type, nullable
+flag, default value" column structure, MUST list fields in NFC-name-sorted
+order (matching `field_id`), and MUST render warnings in a dedicated section
+that a grep-style tool can detect (`⚠` or the literal token `WARNING` at
+start of line).
+
+**Exit code.** The command MUST exit non-zero if the contract cannot be read
+or canonicalized. It MUST exit zero in the presence of warnings — warnings
+are informational, not errors. A future `--strict` flag MAY be added to
+exit non-zero on warnings for CI use.
+
+**Intended use.** `aster contract preview` is the first tool a developer
+runs after adding or changing a message type. It is also the tool a
+cross-language team runs during code review when a service author in
+language A is publishing a contract that will be consumed in language B.
+The warning class defined in §11.3.2.3 is expected to catch the most common
+cross-language surprises; the preview output is what surfaces them.
+
+**Cross-language source reading caveat.** `aster contract preview`
+(no arguments) reads from the current source tree, which requires the
+producer language's toolchain to be installed (Python interpreter for
+Python sources, Node/Bun for TypeScript, JDK for Java, etc.).
+`--manifest <path>` and `--contract-id <id>` modes are toolchain-agnostic
+and always work because they read from the canonical manifest JSON
+rather than walking native decorators.
 
 -----
 
