@@ -33,7 +33,7 @@ send a length header but never send the body."""
 MAX_HANDLER_TIMEOUT_S: float = 300.0
 """Server-side upper bound on handler execution time (5 minutes).
 Applied regardless of client deadline. If the client sends no deadline
-(deadlineEpochMs=0), this is used as the default. If the client sends
+(deadline=0), this is used as the default. If the client sends
 a deadline further in the future, it is clamped to this value."""
 
 MAX_CLIENT_STREAM_ITEMS: int = 100_000

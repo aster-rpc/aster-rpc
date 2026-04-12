@@ -2,8 +2,8 @@
  * xlang.ts -- XLANG codec factory for cross-language interop.
  *
  * Creates a ForyCodec pre-configured with the Aster protocol types
- * (StreamHeader, RpcStatus) for cross-language communication with
- * Python and other language bindings.
+ * (StreamHeader, CallHeader, RpcStatus) with explicit field types
+ * that match the Python pyfory type annotations exactly.
  *
  * @example
  * ```ts
@@ -20,17 +20,18 @@ import { StreamHeader, CallHeader, RpcStatus } from './protocol.js';
  * Create a ForyCodec pre-configured for cross-language (XLANG) interop.
  *
  * Registers the Aster protocol types (StreamHeader, CallHeader, RpcStatus)
- * so the transport can encode/decode the wire protocol. User-defined types
- * are serialized dynamically by Fory's compatible mode.
+ * with explicit int8/int16/int32 field types matching the IDL spec.
  *
  * Requires `@apache-fory/core` to be installed.
  */
 export function createXlangCodec(): ForyCodec {
-  // Dynamic import to keep @apache-fory/core optional
   let Fory: any;
+  let Type: any;
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    Fory = require('@apache-fory/core').default;
+    const foryModule = require('@apache-fory/core');
+    Fory = foryModule.default;
+    Type = foryModule.Type;
   } catch {
     throw new Error(
       'Cross-language (XLANG) codec requires @apache-fory/core. ' +
@@ -41,22 +42,52 @@ export function createXlangCodec(): ForyCodec {
   const fory = new Fory({ refTracking: false });
   const codec = new ForyCodec(fory);
 
-  // Register protocol types with their wire tags
-  const protocolTypes = [StreamHeader, CallHeader, RpcStatus];
-  for (const cls of protocolTypes) {
-    const tag = (cls as any).wireType as string;
-    if (tag) {
-      const [ns, name] = tag.includes('/') ? tag.split('/') : ['', tag];
-      // Build Fory type description from the class
-      codec.registerType(
-        fory.classResolver.createTypeDescription({
-          type: cls,
-          namespace: ns,
-          typeName: name,
-        }),
-      );
-    }
-  }
+  // StreamHeader: explicit field types matching Python pyfory annotations
+  const streamHeaderType = Type.struct(
+    { namespace: '_aster', typeName: 'StreamHeader' },
+    {
+      service: Type.string(),
+      method: Type.string(),
+      version: Type.int32(),
+      callId: Type.int32(),
+      deadline: Type.int16(),
+      serializationMode: Type.int8(),
+      metadataKeys: Type.array(Type.string()),
+      metadataValues: Type.array(Type.string()),
+    },
+    { withConstructor: true },
+  );
+  streamHeaderType.initMeta(StreamHeader);
+  codec.registerType(streamHeaderType);
+
+  // CallHeader: explicit field types
+  const callHeaderType = Type.struct(
+    { namespace: '_aster', typeName: 'CallHeader' },
+    {
+      method: Type.string(),
+      callId: Type.int32(),
+      deadline: Type.int16(),
+      metadataKeys: Type.array(Type.string()),
+      metadataValues: Type.array(Type.string()),
+    },
+    { withConstructor: true },
+  );
+  callHeaderType.initMeta(CallHeader);
+  codec.registerType(callHeaderType);
+
+  // RpcStatus: all fields are already naturally typed (int32, string, list<string>)
+  const rpcStatusType = Type.struct(
+    { namespace: '_aster', typeName: 'RpcStatus' },
+    {
+      code: Type.int32(),
+      message: Type.string(),
+      detailKeys: Type.array(Type.string()),
+      detailValues: Type.array(Type.string()),
+    },
+    { withConstructor: true },
+  );
+  rpcStatusType.initMeta(RpcStatus);
+  codec.registerType(rpcStatusType);
 
   return codec;
 }

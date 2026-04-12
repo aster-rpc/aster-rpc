@@ -50,7 +50,7 @@ def _make_session_pipes():
     c_recv = _FakeRecvStream(s2c)
     header = StreamHeader(
         service=info.name, method="", version=info.version,
-        callId=str(uuid.uuid4()),
+        callId=2,
         serializationMode=SerializationMode.XLANG.value,
     )
     server = SessionServer(
@@ -64,7 +64,7 @@ def _make_session_pipes():
 
 async def _call_unary(c_send, c_recv, codec, method, request):
     """Send a CALL + request, read response. Returns response or raises."""
-    call_hdr = CallHeader(method=method, callId=str(uuid.uuid4()))
+    call_hdr = CallHeader(method=method, callId=3)
     await write_frame(c_send, codec.encode(call_hdr), flags=CALL)
     await write_frame(c_send, codec.encode(request), flags=0)
 
@@ -127,7 +127,7 @@ async def test_g2_cancel_produces_cancelled_trailer():
 
     try:
         # Start a slow call (increment with 10s delay)
-        call_hdr = CallHeader(method="increment", callId=str(uuid.uuid4()))
+        call_hdr = CallHeader(method="increment", callId=4)
         await write_frame(c_send, codec.encode(call_hdr), flags=CALL)
         await write_frame(c_send, codec.encode(CounterReq(delay=10.0)), flags=0)
 
@@ -184,7 +184,7 @@ async def test_g4_client_stream_rejects_non_ok_trailer():
 
     try:
         # Start a client_stream call (sum_stream)
-        call_hdr = CallHeader(method="sum_stream", callId=str(uuid.uuid4()))
+        call_hdr = CallHeader(method="sum_stream", callId=5)
         await write_frame(c_send, codec.encode(call_hdr), flags=CALL)
 
         # Send some items
@@ -218,7 +218,7 @@ async def test_g4_client_stream_non_ok_eoi():
 
     try:
         # Start a client_stream call
-        call_hdr = CallHeader(method="sum_stream", callId=str(uuid.uuid4()))
+        call_hdr = CallHeader(method="sum_stream", callId=6)
         await write_frame(c_send, codec.encode(call_hdr), flags=CALL)
 
         # Send some items
@@ -308,7 +308,7 @@ async def test_g6_bidi_reader_error_not_silent_eof():
 
     header = StreamHeader(
         service=info.name, method="", version=info.version,
-        callId=str(uuid.uuid4()),
+        callId=7,
         serializationMode=SerializationMode.XLANG.value,
     )
     server = SessionServer(
@@ -320,7 +320,7 @@ async def test_g6_bidi_reader_error_not_silent_eof():
 
     try:
         # Start bidi call
-        call_hdr = CallHeader(method="echo_bidi", callId=str(uuid.uuid4()))
+        call_hdr = CallHeader(method="echo_bidi", callId=8)
         await write_frame(c_send, codec.encode(call_hdr), flags=CALL)
 
         # Send a few valid items
@@ -427,7 +427,7 @@ async def test_g1_concurrent_calls_after_recv_fault():
 
     header = StreamHeader(
         service=info.name, method="", version=info.version,
-        callId=str(uuid.uuid4()),
+        callId=9,
         serializationMode=SerializationMode.XLANG.value,
     )
     from aster.session import SessionServer
@@ -523,7 +523,7 @@ async def test_g5_decompression_bomb_rejected():
 
     try:
         # Start a session call
-        call_hdr = CallHeader(method="echo", callId=str(uuid.uuid4()))
+        call_hdr = CallHeader(method="echo", callId=10)
         await write_frame(c_send, test_codec.encode(call_hdr), flags=CALL)
 
         # Send the bomb as a compressed request frame
@@ -553,27 +553,24 @@ async def test_g5_decompression_bomb_rejected():
 # =============================================================================
 # G8: Deadline enforcement in session handlers
 #
-# If deadlineEpochMs is set in the CallHeader, the server should enforce
+# If deadline is set in the CallHeader, the server should enforce
 # it as a timeout on handler execution. Currently the deadline is read
 # into CallContext but never used as a timeout.
 # =============================================================================
 
 @pytest.mark.timeout(15)
 async def test_g8_deadline_enforced_in_session():
-    """G8: Session handler must respect deadlineEpochMs as execution timeout."""
+    """G8: Session handler must respect deadline as execution timeout."""
     import time
 
     c_send, c_recv, server_task, codec = _make_session_pipes()
 
     try:
-        # Set a 1-second deadline from now
-        deadline_ms = int(time.time() * 1000) + 1000
-
         # Start a call to slow_echo with 10s delay but 1s deadline
         call_hdr = CallHeader(
             method="slow_echo",
-            callId=str(uuid.uuid4()),
-            deadlineEpochMs=deadline_ms,
+            callId=1,
+            deadline=1,  # 1 second relative
         )
         await write_frame(c_send, codec.encode(call_hdr), flags=CALL)
         await write_frame(c_send, codec.encode(EchoReq(value=42, delay=10.0)), flags=0)
@@ -640,7 +637,7 @@ async def test_g3_oversized_metadata_rejected():
         big_value = "x" * 10000
         call_hdr = CallHeader(
             method="echo",
-            callId=str(uuid.uuid4()),
+            callId=11,
             metadataKeys=["big_key"],
             metadataValues=[big_value],
         )
@@ -686,7 +683,7 @@ async def test_g3_too_many_metadata_entries_rejected():
         values = [f"val_{i}" for i in range(100)]
         call_hdr = CallHeader(
             method="echo",
-            callId=str(uuid.uuid4()),
+            callId=12,
             metadataKeys=keys,
             metadataValues=values,
         )
@@ -780,7 +777,7 @@ async def test_g12_corrupt_payload_produces_error_trailer():
 
     try:
         # Send a valid CALL frame
-        call_hdr = CallHeader(method="echo", callId=str(uuid.uuid4()))
+        call_hdr = CallHeader(method="echo", callId=13)
         await write_frame(c_send, codec.encode(call_hdr), flags=CALL)
 
         # Send garbage bytes as the request payload
@@ -815,7 +812,7 @@ async def test_g12_corrupt_payload_produces_error_trailer():
 # G8-shared: Deadline enforcement in shared (non-session) dispatch
 #
 # The server-side upper bound MAX_HANDLER_TIMEOUT_S must be enforced
-# even when no client deadline is set (deadlineEpochMs=0).
+# even when no client deadline is set (deadline=0).
 # =============================================================================
 
 @pytest.mark.timeout(15)

@@ -263,11 +263,11 @@ export class RpcServer {
         service: header.service,
         method: header.method,
         metadata: this.buildMetadata(header),
-        deadlineEpochMs: header.deadlineEpochMs,
+        deadlineSecs: header.deadline,
         peer: peerId,
         pattern: methodInfo.pattern as any,
         idempotent: methodInfo.idempotent,
-        callId: header.callId || undefined,
+        callId: header.callId ? String(header.callId) : undefined,
         attributes,
       });
 

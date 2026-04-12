@@ -134,7 +134,7 @@ def create_chaos_session(
         service=service_info.name,
         method="",
         version=service_info.version,
-        callId=session_id,
+        callId=1,
         serializationMode=SerializationMode.XLANG.value,
     )
 
@@ -189,7 +189,7 @@ def create_chaos_raw_session(
         service=service_info.name,
         method="",
         version=service_info.version,
-        callId=session_id,
+        callId=1,
         serializationMode=SerializationMode.XLANG.value,
     )
 
@@ -327,7 +327,7 @@ async def cancel_workload(nemesis: NemesisBase, history: History) -> None:
         # Send CALL frame for slow_increment (5s delay)
         call_header = CallHeader(
             method="increment",
-            callId=str(uuid.uuid4()),
+            callId=1,
         )
         await write_frame(c_send, codec.encode(call_header), flags=CALL)
 

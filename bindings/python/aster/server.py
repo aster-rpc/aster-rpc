@@ -397,12 +397,12 @@ class Server:
                 service=header.service,
                 method=header.method,
                 metadata=_validated_metadata(header.metadataKeys, header.metadataValues),
-                deadline_epoch_ms=header.deadlineEpochMs,
+                deadline_secs=header.deadline,
                 peer=peer_id,
                 is_streaming=False,
                 pattern="unary",
                 idempotent=method_info.idempotent,
-                call_id=header.callId or None,
+                call_id=header.callId,
                 attributes=(
                     self._peer_store.get_attributes(peer_id)
                     if self._peer_store and peer_id else {}
@@ -738,7 +738,7 @@ class Server:
                 pass
 
             with request_context(
-                request_id=header.callId or "",
+                request_id=str(header.callId) if header.callId else "",
                 service=header.service,
                 method=header.method,
                 peer=peer_id,
@@ -837,12 +837,12 @@ class Server:
             service=header.service,
             method=header.method,
             metadata=_validated_metadata(header.metadataKeys, header.metadataValues),
-            deadline_epoch_ms=header.deadlineEpochMs,
+            deadline_secs=header.deadline,
             peer=peer,
             is_streaming=method_info.pattern != "unary",
             pattern=method_info.pattern,
             idempotent=method_info.idempotent,
-            call_id=header.callId or None,
+            call_id=header.callId,
             attributes=attributes,
         )
 
