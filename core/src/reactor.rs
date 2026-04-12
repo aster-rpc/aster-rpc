@@ -274,9 +274,10 @@ async fn handle_session(
 }
 
 async fn read_one_frame(recv: &CoreRecvStream) -> Result<(Vec<u8>, u8)> {
-    let len_bytes = recv.read_exact(4).await?;
-    let frame_body_len =
-        u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+    // Stack-allocated length header (no heap alloc)
+    let mut len_bytes = [0u8; 4];
+    recv.read_exact_into(&mut len_bytes).await?;
+    let frame_body_len = u32::from_le_bytes(len_bytes) as usize;
 
     if frame_body_len == 0 {
         return Err(anyhow!("zero-length frame"));
@@ -285,8 +286,16 @@ async fn read_one_frame(recv: &CoreRecvStream) -> Result<(Vec<u8>, u8)> {
         return Err(anyhow!("frame too large: {}", frame_body_len));
     }
 
-    let body = recv.read_exact(frame_body_len).await?;
-    let flags = body[0];
-    let payload = body[1..].to_vec();
+    // Read flags + payload directly into a pre-allocated Vec using read_into.
+    // This eliminates the `body[1..].to_vec()` copy by reading the flags byte
+    // separately and the payload into its own buffer.
+    let mut flags_buf = [0u8; 1];
+    recv.read_exact_into(&mut flags_buf).await?;
+    let flags = flags_buf[0];
+
+    let payload_len = frame_body_len - 1;
+    let mut payload = vec![0u8; payload_len];
+    recv.read_exact_into(&mut payload).await?;
+
     Ok((payload, flags))
 }

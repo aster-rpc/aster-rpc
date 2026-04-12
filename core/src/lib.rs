@@ -1817,6 +1817,29 @@ impl CoreRecvStream {
         Ok(buf)
     }
 
+    /// Zero-copy read of exactly `buf.len()` bytes into the caller-provided buffer.
+    ///
+    /// Uses noq's `read_into` (from aster-rpc/noq) which bypasses the `Bytes`
+    /// intermediate allocation inside the assembler. This is the fast path for
+    /// the reactor frame reader and any FFI consumer that already has a buffer
+    /// ready to receive data.
+    pub async fn read_exact_into(&self, buf: &mut [u8]) -> Result<()> {
+        let mut s = self.inner.lock().await;
+        let mut filled = 0;
+        while filled < buf.len() {
+            match s.read_into(&mut buf[filled..]).await? {
+                Some(0) | None => {
+                    return Err(anyhow!(
+                        "stream ended with {} bytes remaining",
+                        buf.len() - filled
+                    ))
+                }
+                Some(n) => filled += n,
+            }
+        }
+        Ok(())
+    }
+
     pub async fn read_to_end(&self, max_size: usize) -> Result<Vec<u8>> {
         let mut s = self.inner.lock().await;
         Ok(s.read_to_end(max_size).await?.to_vec())
