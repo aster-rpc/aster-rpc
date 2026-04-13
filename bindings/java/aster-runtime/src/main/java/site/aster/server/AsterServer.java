@@ -76,6 +76,7 @@ public final class AsterServer implements AutoCloseable {
   private final AtomicBoolean running = new AtomicBoolean(true);
   private final Thread pollThread;
   private final ExecutorService callExecutor;
+  private final ExecutorService streamingExecutor;
 
   private AsterServer(Builder b, IrohNode node, Reactor reactor) {
     this.node = node;
@@ -88,6 +89,18 @@ public final class AsterServer implements AutoCloseable {
     this.config = b.config;
     this.manifest = buildManifest(this.services.values());
     this.callExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    // Streaming dispatchers (client-stream / bidi) call ReactorRequestStream.receive ->
+    // Reactor.recvFrame -> runtime.block_on(rx.recv()). block_on parks the calling thread,
+    // and on a virtual thread that pins the carrier for up to ~POLL_TIMEOUT_MS per recv.
+    // Hop streaming dispatchers to a platform-thread executor instead so the carriers stay
+    // free for unary / server-stream work running on the VT executor.
+    this.streamingExecutor =
+        Executors.newCachedThreadPool(
+            r -> {
+              Thread t = new Thread(r, "aster-server-streaming");
+              t.setDaemon(true);
+              return t;
+            });
     this.pollThread =
         Thread.ofPlatform().daemon(true).name("aster-server-poll").start(this::pollLoop);
   }
@@ -121,8 +134,10 @@ public final class AsterServer implements AutoCloseable {
       Thread.currentThread().interrupt();
     }
     callExecutor.shutdown();
+    streamingExecutor.shutdown();
     try {
       callExecutor.awaitTermination(2, TimeUnit.SECONDS);
+      streamingExecutor.awaitTermination(2, TimeUnit.SECONDS);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
@@ -207,6 +222,32 @@ public final class AsterServer implements AutoCloseable {
       Object instance = resolveInstance(svc, call);
       CallContext ctx = buildCallContext(header, method, call);
 
+      // Trampoline streaming dispatchers (client-stream / bidi) onto a platform-thread
+      // executor so their blocking Reactor.recvFrame calls don't pin a virtual-thread
+      // carrier. Unary + server-stream stay on the VT executor (they don't block on
+      // recvFrame and benefit from cheap VT fanout).
+      if (Thread.currentThread().isVirtual()
+          && (method instanceof ClientStreamDispatcher || method instanceof BidiStreamDispatcher)) {
+        final MethodDispatcher pinnedMethod = method;
+        final Object pinnedInstance = instance;
+        final CallContext pinnedCtx = ctx;
+        streamingExecutor.execute(() -> runDispatch(call, pinnedMethod, pinnedInstance, pinnedCtx));
+        return;
+      }
+
+      runDispatch(call, method, instance, ctx);
+    } catch (RpcError e) {
+      submitErrorTrailer(callId, e.code(), e.rpcMessage());
+    } catch (Exception e) {
+      submitErrorTrailer(
+          callId, StatusCode.INTERNAL, e.getMessage() == null ? "error" : e.getMessage());
+    }
+  }
+
+  private void runDispatch(
+      AsterCall call, MethodDispatcher method, Object instance, CallContext ctx) {
+    long callId = call.callId();
+    try {
       switch (method) {
         case UnaryDispatcher u -> {
           byte[] responseBytes = u.invoke(instance, call.request(), codec, ctx);
