@@ -108,12 +108,27 @@ public final class AsterClient implements AutoCloseable {
             });
   }
 
-  /** Make a unary RPC call. */
+  /** Make a unary RPC call against a SHARED-scoped service (sessionId=0). */
   public <Req, Resp> CompletableFuture<Resp> call(
       NodeAddr target, String service, String method, Req request, Class<Resp> responseType) {
     return connect(target)
         .thenComposeAsync(
-            conn -> runUnary(conn, service, method, request, responseType), callExecutor);
+            conn -> runUnary(conn, 0, service, method, request, responseType), callExecutor);
+  }
+
+  /**
+   * Open a session for the given peer (multiplexed-streams spec §6 / §7.5). Allocates a fresh
+   * monotonic {@code sessionId} on the underlying connection; subsequent calls through the returned
+   * {@link ClientSession} carry that {@code sessionId} on every {@code StreamHeader} so the server
+   * can route them to the same per-peer SESSION-scoped service instance.
+   *
+   * <p>There is no "open session" RPC — sessions are created implicitly server-side on first
+   * arrival of a stream with a fresh {@code sessionId}. This call only allocates the id locally.
+   * Returned sessions need not be explicitly closed: server-side reap happens when the connection
+   * drops.
+   */
+  public CompletableFuture<ClientSession> openSession(NodeAddr target) {
+    return connect(target).thenApply(conn -> new ClientSession(this, conn, conn.nextSessionId()));
   }
 
   /**
@@ -125,7 +140,7 @@ public final class AsterClient implements AutoCloseable {
       NodeAddr target, String service, String method, Req request, Class<Resp> responseType) {
     return connect(target)
         .thenComposeAsync(
-            conn -> runServerStream(conn, service, method, request, responseType), callExecutor);
+            conn -> runServerStream(conn, 0, service, method, request, responseType), callExecutor);
   }
 
   /**
@@ -147,7 +162,7 @@ public final class AsterClient implements AutoCloseable {
     }
     return connect(target)
         .thenComposeAsync(
-            conn -> runClientStream(conn, service, method, materialized, responseType),
+            conn -> runClientStream(conn, 0, service, method, materialized, responseType),
             callExecutor);
   }
 
@@ -170,7 +185,7 @@ public final class AsterClient implements AutoCloseable {
     }
     return connect(target)
         .thenComposeAsync(
-            conn -> runBidiBuffered(conn, service, method, materialized, responseType),
+            conn -> runBidiBuffered(conn, 0, service, method, materialized, responseType),
             callExecutor);
   }
 
@@ -182,28 +197,35 @@ public final class AsterClient implements AutoCloseable {
       NodeAddr target, String service, String method, Class<Resp> responseType) {
     return connect(target)
         .thenApplyAsync(
-            conn -> {
-              AsterCall call = acquireShared(conn);
-              try {
-                sendStreamHeader(call, service, method);
-              } catch (Throwable t) {
-                call.discard();
-                throw reThrow(t);
-              }
-              return new BidiCall<Req, Resp>(call, codec, headerCodec, responseType);
-            },
-            callExecutor);
+            conn -> openBidiStreamOn(conn, 0, service, method, responseType), callExecutor);
   }
 
-  private <Req, Resp> CompletableFuture<Resp> runUnary(
-      IrohConnection conn, String service, String method, Req request, Class<Resp> responseType) {
+  <Req, Resp> BidiCall<Req, Resp> openBidiStreamOn(
+      IrohConnection conn, int sessionId, String service, String method, Class<Resp> responseType) {
+    AsterCall call = acquireOn(conn, sessionId);
+    try {
+      sendStreamHeader(call, sessionId, service, method);
+    } catch (Throwable t) {
+      call.discard();
+      throw reThrow(t);
+    }
+    return new BidiCall<Req, Resp>(call, codec, headerCodec, responseType);
+  }
+
+  <Req, Resp> CompletableFuture<Resp> runUnary(
+      IrohConnection conn,
+      int sessionId,
+      String service,
+      String method,
+      Req request,
+      Class<Resp> responseType) {
     CompletableFuture<Resp> out = new CompletableFuture<>();
     callExecutor.execute(
         () -> {
           AsterCall call = null;
           try {
-            call = acquireShared(conn);
-            sendStreamHeader(call, service, method);
+            call = acquireOn(conn, sessionId);
+            sendStreamHeader(call, sessionId, service, method);
             byte[] requestBytes = codec.encode(request);
             call.sendFrame(AsterFraming.encodeFrame(requestBytes, AsterFraming.FLAG_END_STREAM));
             UnaryResult<Resp> result = drainUnary(call, responseType);
@@ -218,15 +240,20 @@ public final class AsterClient implements AutoCloseable {
     return out;
   }
 
-  private <Req, Resp> CompletableFuture<List<Resp>> runServerStream(
-      IrohConnection conn, String service, String method, Req request, Class<Resp> responseType) {
+  <Req, Resp> CompletableFuture<List<Resp>> runServerStream(
+      IrohConnection conn,
+      int sessionId,
+      String service,
+      String method,
+      Req request,
+      Class<Resp> responseType) {
     CompletableFuture<List<Resp>> out = new CompletableFuture<>();
     callExecutor.execute(
         () -> {
           AsterCall call = null;
           try {
-            call = acquireShared(conn);
-            sendStreamHeader(call, service, method);
+            call = acquireOn(conn, sessionId);
+            sendStreamHeader(call, sessionId, service, method);
             byte[] requestBytes = codec.encode(request);
             call.sendFrame(AsterFraming.encodeFrame(requestBytes, AsterFraming.FLAG_END_STREAM));
             List<Resp> collected = drainStreaming(call, responseType);
@@ -241,8 +268,9 @@ public final class AsterClient implements AutoCloseable {
     return out;
   }
 
-  private <Req, Resp> CompletableFuture<Resp> runClientStream(
+  <Req, Resp> CompletableFuture<Resp> runClientStream(
       IrohConnection conn,
+      int sessionId,
       String service,
       String method,
       List<Req> requests,
@@ -252,8 +280,8 @@ public final class AsterClient implements AutoCloseable {
         () -> {
           AsterCall call = null;
           try {
-            call = acquireShared(conn);
-            sendStreamHeader(call, service, method);
+            call = acquireOn(conn, sessionId);
+            sendStreamHeader(call, sessionId, service, method);
             for (int i = 0; i < requests.size(); i++) {
               byte[] reqBytes = codec.encode(requests.get(i));
               byte flags = (i == requests.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
@@ -271,8 +299,9 @@ public final class AsterClient implements AutoCloseable {
     return out;
   }
 
-  private <Req, Resp> CompletableFuture<List<Resp>> runBidiBuffered(
+  <Req, Resp> CompletableFuture<List<Resp>> runBidiBuffered(
       IrohConnection conn,
+      int sessionId,
       String service,
       String method,
       List<Req> requests,
@@ -282,8 +311,8 @@ public final class AsterClient implements AutoCloseable {
         () -> {
           AsterCall call = null;
           try {
-            call = acquireShared(conn);
-            sendStreamHeader(call, service, method);
+            call = acquireOn(conn, sessionId);
+            sendStreamHeader(call, sessionId, service, method);
             for (int i = 0; i < requests.size(); i++) {
               byte[] reqBytes = codec.encode(requests.get(i));
               byte flags = (i == requests.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
@@ -305,12 +334,13 @@ public final class AsterClient implements AutoCloseable {
   // Shared helpers
   // -------------------------------------------------------------------------
 
-  private AsterCall acquireShared(IrohConnection conn) {
-    // Spec §6: sessionId == 0 selects the SHARED pool for stateless calls.
-    return AsterCall.acquire(conn.runtime().nativeHandle(), conn.nativeHandle(), 0);
+  private AsterCall acquireOn(IrohConnection conn, int sessionId) {
+    // Spec §6: sessionId == 0 selects the SHARED pool for stateless calls; non-zero acquires
+    // from (or lazily creates) the per-session pool keyed on this id.
+    return AsterCall.acquire(conn.runtime().nativeHandle(), conn.nativeHandle(), sessionId);
   }
 
-  private void sendStreamHeader(AsterCall call, String service, String method) {
+  private void sendStreamHeader(AsterCall call, int sessionId, String service, String method) {
     StreamHeader header =
         new StreamHeader(
             service,
@@ -321,7 +351,7 @@ public final class AsterClient implements AutoCloseable {
             StreamHeader.SERIALIZATION_XLANG,
             List.of(),
             List.of(),
-            0 /* sessionId: SHARED */);
+            sessionId);
     byte[] headerBytes = headerCodec.encode(header);
     call.sendFrame(AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER));
   }
