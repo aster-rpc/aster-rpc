@@ -20,6 +20,11 @@ export class StreamHeader {
   serializationMode = 0;    // int8: XLANG=0, NATIVE=1, ROW=2, JSON=3
   metadataKeys: string[] = [];
   metadataValues: string[] = [];
+  // Session identifier (multiplexed-streams, spec §6). 0 = stateless
+  // SHARED pool stream; non-zero = stream belongs to the session with
+  // this id on this (peer, connection). Client allocates monotonically
+  // per connection. On the wire this is an int32, matching pyfory.
+  sessionId = 0;
 
   constructor(init?: Partial<StreamHeader>) {
     if (init) Object.assign(this, init);
