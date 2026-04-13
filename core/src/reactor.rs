@@ -104,6 +104,11 @@ pub struct RequestFrame {
 pub enum OutgoingFrame {
     Frame(Vec<u8>),
     Trailer(Vec<u8>),
+    /// Unary fast-path: response frame concatenated with trailer frame, to
+    /// be written in a single `send.write_all` call. Mirrors the client-side
+    /// `aster_call_unary` pattern that writes header+request as one buffer.
+    /// Terminal: the reactor returns `CallOutcome::Complete` after writing.
+    CompleteUnary(Vec<u8>),
 }
 
 /// An event dispatched from the reactor to its consumer. In addition to
@@ -509,6 +514,12 @@ async fn dispatch_one_call(
                                     }
                                     break;
                                 }
+                                OutgoingFrame::CompleteUnary(bytes) => {
+                                    if !bytes.is_empty() {
+                                        let _ = send.write_all(bytes).await;
+                                    }
+                                    break;
+                                }
                             }
                         }
                         return Ok(CallOutcome::StreamEof);
@@ -534,6 +545,12 @@ async fn dispatch_one_call(
                         // The send half is dropped naturally when the
                         // peer EOFs and we return cleanly from
                         // dispatch_stream.
+                        return Ok(CallOutcome::Complete);
+                    }
+                    Some(OutgoingFrame::CompleteUnary(bytes)) => {
+                        if !bytes.is_empty() {
+                            send.write_all(bytes).await?;
+                        }
                         return Ok(CallOutcome::Complete);
                     }
                     None => {
