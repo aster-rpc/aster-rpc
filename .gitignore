@@ -274,3 +274,7 @@ bindings/typescript/native/aster-transport.*.node
 bindings/typescript/native/index.*.node
 bindings/typescript/native/npm/
 bindings/typescript/package-lock.json
+
+# .NET build artifacts
+bindings/dotnet/**/bin/
+bindings/dotnet/**/obj/
