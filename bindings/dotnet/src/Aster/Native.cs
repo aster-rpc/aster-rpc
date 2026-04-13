@@ -335,4 +335,19 @@ internal static partial class Native
     public static partial int aster_registry_acl_list_writers(
         ulong runtime, ulong doc,
         ulong user_data, out ulong out_operation);
+
+    // ─── Hook responders (Phase 1b) ──────────────────────────────────────────
+    // The hook FFI is event-driven: BEFORE_CONNECT (70) / AFTER_CONNECT (71)
+    // events arrive on the runtime event pump carrying an iroh_hook_invocation_t
+    // handle in event.related. The host then calls one of these respond
+    // functions to allow/deny and release the invocation. Calling respond
+    // twice for the same invocation returns NOT_FOUND.
+
+    [LibraryImport(NativeLib, EntryPoint = "iroh_hook_before_connect_respond")]
+    public static partial int iroh_hook_before_connect_respond(
+        ulong runtime, ulong invocation, int decision);
+
+    [LibraryImport(NativeLib, EntryPoint = "iroh_hook_after_connect_respond")]
+    public static partial int iroh_hook_after_connect_respond(
+        ulong runtime, ulong invocation);
 }
