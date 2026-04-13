@@ -2,6 +2,7 @@ pub mod canonical;
 pub mod contract;
 pub mod framing;
 pub mod reactor;
+pub mod registry;
 pub mod ring;
 pub mod signing;
 pub mod ticket;
