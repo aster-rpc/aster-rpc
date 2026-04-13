@@ -260,4 +260,29 @@ internal static partial class Native
 
     [LibraryImport(NativeLib, EntryPoint = "aster_canonical_bytes")]
     public static unsafe partial int aster_canonical_bytes(byte* type_name_ptr, UIntPtr type_name_len, byte* json_ptr, UIntPtr json_len, byte* out_buf, UIntPtr* out_len);
+
+    // ─── Aster Registry (§11) ────────────────────────────────────────────────
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_registry_now_epoch_ms")]
+    public static partial long aster_registry_now_epoch_ms();
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_registry_is_fresh")]
+    public static unsafe partial int aster_registry_is_fresh(byte* lease_json_ptr, UIntPtr lease_json_len, int lease_duration_s);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_registry_is_routable")]
+    public static unsafe partial int aster_registry_is_routable(byte* status_ptr, UIntPtr status_len);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_registry_filter_and_rank")]
+    public static unsafe partial int aster_registry_filter_and_rank(
+        byte* leases_json_ptr, UIntPtr leases_json_len,
+        byte* opts_json_ptr, UIntPtr opts_json_len,
+        byte* out_buf, UIntPtr* out_len);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_registry_key")]
+    public static unsafe partial int aster_registry_key(
+        int kind,
+        byte* arg1_ptr, UIntPtr arg1_len,
+        byte* arg2_ptr, UIntPtr arg2_len,
+        byte* arg3_ptr, UIntPtr arg3_len,
+        byte* out_buf, UIntPtr* out_len);
 }
