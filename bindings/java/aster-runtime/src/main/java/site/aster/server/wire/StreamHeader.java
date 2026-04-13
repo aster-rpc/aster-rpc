@@ -33,6 +33,15 @@ public final class StreamHeader {
   public List<String> metadataKeys = List.of();
   public List<String> metadataValues = List.of();
 
+  /**
+   * Session identifier (multiplexed-streams spec §6). {@code 0} means this stream is a stateless
+   * SHARED-pool stream; a non-zero value means the stream belongs to the session with this id on
+   * the sender's {@code (peer, connection)}. Monotonically allocated client-side per connection.
+   * Treated as 4-byte little-endian on the wire; a signed {@code int} suffices because the counter
+   * never reaches 2^31 in practice.
+   */
+  public int sessionId;
+
   public StreamHeader() {}
 
   public StreamHeader(
@@ -44,6 +53,28 @@ public final class StreamHeader {
       byte serializationMode,
       List<String> metadataKeys,
       List<String> metadataValues) {
+    this(
+        service,
+        method,
+        version,
+        callId,
+        deadline,
+        serializationMode,
+        metadataKeys,
+        metadataValues,
+        0);
+  }
+
+  public StreamHeader(
+      String service,
+      String method,
+      int version,
+      int callId,
+      short deadline,
+      byte serializationMode,
+      List<String> metadataKeys,
+      List<String> metadataValues,
+      int sessionId) {
     this.service = service == null ? "" : service;
     this.method = method == null ? "" : method;
     this.version = version;
@@ -52,6 +83,7 @@ public final class StreamHeader {
     this.serializationMode = serializationMode;
     this.metadataKeys = metadataKeys == null ? List.of() : List.copyOf(metadataKeys);
     this.metadataValues = metadataValues == null ? List.of() : List.copyOf(metadataValues);
+    this.sessionId = sessionId;
   }
 
   public String service() {
@@ -86,6 +118,10 @@ public final class StreamHeader {
     return metadataValues;
   }
 
+  public int sessionId() {
+    return sessionId;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -94,6 +130,7 @@ public final class StreamHeader {
         && callId == that.callId
         && deadline == that.deadline
         && serializationMode == that.serializationMode
+        && sessionId == that.sessionId
         && Objects.equals(service, that.service)
         && Objects.equals(method, that.method)
         && Objects.equals(metadataKeys, that.metadataKeys)
@@ -110,6 +147,7 @@ public final class StreamHeader {
         deadline,
         serializationMode,
         metadataKeys,
-        metadataValues);
+        metadataValues,
+        sessionId);
   }
 }
