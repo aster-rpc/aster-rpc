@@ -212,6 +212,41 @@ public final class AsterClient implements AutoCloseable {
                             doBidiStreamCall(stream, service, method, requests, responseType)));
   }
 
+  /**
+   * Open a true interleaved bidi-streaming call. Returns a {@link BidiCall} object the caller
+   * drives directly: call {@link BidiCall#send(Object)} to push request frames, {@link
+   * BidiCall#recv()} to pull response frames as they arrive (blocking until the next one or
+   * end-of-stream), and {@link BidiCall#complete()} to signal end-of-request.
+   *
+   * <p>Use this instead of {@link #callBidiStream} when the server emits responses while the client
+   * is still sending requests (ping-pong patterns, request-response loops, server-driven
+   * backpressure). For simple "send N, get N" batched bidi the buffered {@link #callBidiStream} is
+   * still the lighter API.
+   */
+  public <Req, Resp> CompletableFuture<BidiCall<Req, Resp>> openBidiStream(
+      NodeAddr target, String service, String method, Class<Resp> responseType) {
+    StreamHeader header =
+        new StreamHeader(
+            service,
+            method,
+            1,
+            0,
+            (short) 0,
+            StreamHeader.SERIALIZATION_XLANG,
+            List.of(),
+            List.of());
+    byte[] headerBytes = headerCodec.encode(header);
+    byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
+    return connect(target)
+        .thenCompose(conn -> conn.openBiAsync())
+        .thenCompose(
+            stream ->
+                stream
+                    .sendAsync(headerFrame)
+                    .thenApply(
+                        v -> new BidiCall<Req, Resp>(stream, codec, headerCodec, responseType)));
+  }
+
   private <Req, Resp> CompletableFuture<Resp> doCall(
       IrohStream stream, String service, String method, Req request, Class<Resp> responseType) {
     CompletableFuture<Resp> result = new CompletableFuture<>();

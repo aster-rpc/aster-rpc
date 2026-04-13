@@ -2,13 +2,16 @@ package site.aster.examples.missioncontrol;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import site.aster.client.AsterClient;
+import site.aster.client.BidiCall;
 import site.aster.codec.ForyCodec;
 import site.aster.examples.missioncontrol.types.Assignment;
 import site.aster.examples.missioncontrol.types.Command;
@@ -39,6 +42,7 @@ import site.aster.server.AsterServer;
  *   <li>Plain-class wire types with collection fields ({@code Heartbeat.capabilities})
  * </ul>
  */
+@Timeout(value = 30)
 final class MissionControlE2ETest {
 
   @Test
@@ -228,6 +232,46 @@ final class MissionControlE2ETest {
       for (CommandResult r : results) {
         assertEquals(0, r.exitCode());
         assertEquals("", r.stderr());
+      }
+    }
+  }
+
+  @Test
+  void interleavedBidiRunCommandPingPong() throws Exception {
+    try (Fixture f = Fixture.start()) {
+      try (BidiCall<Command, CommandResult> call =
+          f.client
+              .<Command, CommandResult>openBidiStream(
+                  f.serverAddr,
+                  AgentSessionDispatcher.SERVICE_NAME,
+                  "runCommand",
+                  CommandResult.class)
+              .orTimeout(15, TimeUnit.SECONDS)
+              .get()) {
+
+        // True ping-pong: send one command, immediately receive its result, then send the next.
+        // The buffered callBidiStream can't model this — it materializes all requests first.
+        call.send(new Command("ls"));
+        CommandResult r1 = call.recv();
+        assertNotNull(r1);
+        assertEquals("ran: ls", r1.stdout());
+
+        call.send(new Command("date"));
+        CommandResult r2 = call.recv();
+        assertNotNull(r2);
+        assertEquals("ran: date", r2.stdout());
+
+        call.send(new Command("uptime"));
+        CommandResult r3 = call.recv();
+        assertNotNull(r3);
+        assertEquals("ran: uptime", r3.stdout());
+
+        call.complete();
+
+        // Server's runCommand drains in.receive() until null, so after complete() the dispatcher
+        // returns and the runtime sends the OK trailer. recv() should return null cleanly.
+        CommandResult tail = call.recv();
+        assertNull(tail, "expected end-of-stream after complete()");
       }
     }
   }
