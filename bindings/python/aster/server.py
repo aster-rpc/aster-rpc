@@ -87,6 +87,34 @@ class ConnectionContext:
     __hash__ = object.__hash__
 
 
+# ── Per-connection session state (spec §6 / §7.5) ────────────────────────────
+
+
+@dataclass
+class _ConnectionState:
+    """Per-connection session tracking for the reactor dispatch path.
+
+    Mirrors Java `AsterServer.ConnectionState`. Holds the active session key
+    set, the monotonic graveyard counter, and the per-connection cap. Mutated
+    from the single-threaded reactor dispatch loop -- no locks required.
+    """
+    max_sessions: int
+    active_sessions: set[tuple[int, type]] = field(default_factory=set)
+    last_opened_session_id: int = 0
+
+
+class _SessionNotFound(Exception):
+    """sessionId <= last_opened_session_id and not in the active map."""
+
+
+class _SessionLimitExceeded(Exception):
+    """Opening this session would exceed max_sessions_per_connection."""
+
+
+class _SessionScopeMismatch(Exception):
+    """SHARED call carried a sessionId, or SESSION call arrived without one."""
+
+
 # ── Server ──────────────────────────────────────────────────────────────────
 
 
@@ -118,6 +146,7 @@ class Server:
         fory_config: ForyConfig | None = None,
         interceptors: list[Any] | None = None,
         max_concurrent_streams: int | None = None,
+        max_sessions_per_connection: int = 1024,
         registry: ServiceRegistry | None = None,
         owns_endpoint: bool = True,
         peer_store: "PeerAttributeStore | None" = None,
@@ -149,9 +178,16 @@ class Server:
         else:
             self._interceptors = [DeadlineInterceptor()]
         self._max_concurrent_streams = max_concurrent_streams
+        self._max_sessions_per_connection = max_sessions_per_connection
         self._service_instances: dict[tuple[str, int], Any] = {}
         # For session-scoped services we store the class (not an instance)
         self._service_classes: dict[tuple[str, int], type] = {}
+        # Reactor-path per-connection session state (spec §6 / §7.5).
+        # Keyed by connection_id → active sessions + graveyard counter.
+        self._connection_sessions: dict[int, _ConnectionState] = {}
+        # Session-scoped handler instance cache for the reactor path.
+        # Keyed by (connection_id, session_id, impl_class).
+        self._reactor_session_instances: dict[tuple[int, int, type], Any] = {}
 
         # Set up service registry first so we can collect types for the codec.
         if registry is not None:
@@ -268,8 +304,8 @@ class Server:
 
         The reactor runs the accept loop, stream reads, and response writes
         entirely in Rust. Python only handles dispatch and handler invocation.
-        This reduces server-side FFI crossings to 1 per call (the next_call
-        delivery), compared to 3+ crossings per call in the normal serve path.
+        The pump consumes `next_event()` so per-connection session lifecycle
+        (spec §6 / §7.5) can observe ConnectionClosed events and reap state.
 
         Requires that the Server was constructed with a ``node`` parameter.
         """
@@ -292,25 +328,75 @@ class Server:
 
         try:
             while self._serving:
-                call = await reactor.next_call()
-                if call is None:
+                event = await reactor.next_event()
+                if event is None:
                     break
 
-                (call_id, header_payload, header_flags, request_payload,
-                 request_flags, peer_id, response_sender) = call
-                # is_session_call removed (multiplexed-streams migration);
-                # Python session routing rebuilds in Objective 2.
-                asyncio.create_task(
-                    self._dispatch_reactor_call(
-                        call_id, header_payload, header_flags,
-                        request_payload, request_flags,
-                        peer_id, False, response_sender,
+                if event.kind == "call":
+                    response_sender = event.take_sender()
+                    if response_sender is None:
+                        # Shouldn't happen -- guard against double-take.
+                        logger.warning("Call event missing response sender")
+                        continue
+                    asyncio.create_task(
+                        self._dispatch_reactor_call(
+                            event.call_id,
+                            event.header_payload or b"",
+                            event.header_flags,
+                            event.request_payload or b"",
+                            event.request_flags,
+                            event.peer_id,
+                            event.connection_id,
+                            response_sender,
+                        )
                     )
-                )
+                elif event.kind == "connection_closed":
+                    self._on_reactor_connection_closed(
+                        event.connection_id, event.peer_id,
+                    )
         finally:
             self._serving = False
             self._serve_task = None
             self._shutdown_event.set()
+
+    def _on_reactor_connection_closed(
+        self, connection_id: int, peer_id: str,
+    ) -> None:
+        """Reap per-connection session state on ConnectionClosed (spec §7.5).
+
+        Drops the ``_ConnectionState`` and all cached session handler
+        instances for this connection. Instances with an async ``close()``
+        hook have it scheduled on the current loop; sync ``close()`` is
+        invoked immediately.
+        """
+        state = self._connection_sessions.pop(connection_id, None)
+        if state is None:
+            return
+
+        for session_id, impl_class in list(state.active_sessions):
+            instance = self._reactor_session_instances.pop(
+                (connection_id, session_id, impl_class), None,
+            )
+            if instance is None:
+                continue
+            close_hook = getattr(instance, "close", None)
+            if close_hook is None:
+                continue
+            try:
+                result = close_hook()
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Session close() raised for %s sessionId=%d: %s",
+                    impl_class.__name__, session_id, e,
+                )
+
+        logger.debug(
+            "Reactor connection closed: connection_id=%d peer=%s "
+            "(reaped %d sessions)",
+            connection_id, peer_id, len(state.active_sessions),
+        )
 
     async def _dispatch_reactor_call(
         self,
@@ -320,7 +406,7 @@ class Server:
         request_payload: bytes,
         request_flags: int,
         peer_id: str,
-        is_session_call: bool,
+        connection_id: int,
         response_sender: Any,
     ) -> None:
         import struct as _struct
@@ -373,7 +459,28 @@ class Server:
                 )
                 return
 
-            handler = self._get_handler_for_service(service_info)
+            try:
+                handler = self._resolve_instance(
+                    service_info, connection_id,
+                    getattr(header, "sessionId", 0), peer_id,
+                )
+            except _SessionScopeMismatch as e:
+                self._reactor_error_response(
+                    response_sender, StatusCode.FAILED_PRECONDITION,
+                    str(e), ser_mode,
+                )
+                return
+            except _SessionNotFound as e:
+                self._reactor_error_response(
+                    response_sender, StatusCode.NOT_FOUND, str(e), ser_mode,
+                )
+                return
+            except _SessionLimitExceeded as e:
+                self._reactor_error_response(
+                    response_sender, StatusCode.RESOURCE_EXHAUSTED,
+                    str(e), ser_mode,
+                )
+                return
             handler_method = getattr(handler, header.method, None)
             if handler_method is None:
                 self._reactor_error_response(
@@ -816,6 +923,88 @@ class Server:
                 f"No implementation registered for service {service_info.name} v{service_info.version}"
             )
         return handler
+
+    def _resolve_instance(
+        self,
+        service_info: ServiceInfo,
+        connection_id: int,
+        session_id: int,
+        peer_id: str,
+    ) -> Any:
+        """Spec §6 lookup-or-create for the reactor dispatch path.
+
+        Mirrors Java ``AsterServer.resolveInstance`` post-Step-6.5:
+
+        - SHARED service + ``sessionId == 0`` → cached shared instance.
+        - SHARED service + ``sessionId != 0`` → FAILED_PRECONDITION.
+        - SESSION service + ``sessionId == 0`` → FAILED_PRECONDITION.
+        - SESSION service + ``sessionId > last_opened_session_id`` → create,
+          subject to ``max_sessions_per_connection`` cap.
+        - SESSION service + ``sessionId`` already active → reuse instance.
+        - SESSION service + ``sessionId <= last_opened_session_id`` and not
+          active → NOT_FOUND (graveyard).
+        """
+        is_session_scope = service_info.scoped == RpcScope.SESSION
+
+        if not is_session_scope:
+            if session_id != 0:
+                raise _SessionScopeMismatch(
+                    f"service '{service_info.name}' is SHARED but call "
+                    f"carried sessionId={session_id}"
+                )
+            return self._get_handler_for_service(service_info)
+
+        if session_id == 0:
+            raise _SessionScopeMismatch(
+                f"service '{service_info.name}' is SESSION-scoped; call "
+                "must carry a non-zero sessionId"
+            )
+
+        impl_class = self._service_classes.get(
+            (service_info.name, service_info.version)
+        )
+        if impl_class is None:
+            raise ServiceNotFoundError(
+                f"No implementation class registered for service "
+                f"{service_info.name} v{service_info.version}"
+            )
+
+        state = self._connection_sessions.get(connection_id)
+        if state is None:
+            state = _ConnectionState(max_sessions=self._max_sessions_per_connection)
+            self._connection_sessions[connection_id] = state
+
+        key = (session_id, impl_class)
+        if key in state.active_sessions:
+            instance_key = (connection_id, session_id, impl_class)
+            instance = self._reactor_session_instances.get(instance_key)
+            if instance is None:
+                # Shouldn't happen: active set and instance map are in lockstep.
+                instance = impl_class(peer=peer_id)
+                self._reactor_session_instances[instance_key] = instance
+            return instance
+
+        if session_id <= state.last_opened_session_id:
+            raise _SessionNotFound(
+                f"session {session_id} was previously opened on this "
+                "connection and is now closed"
+            )
+
+        # Spec §7.5: cap counts active sessions only. A fresh sessionId
+        # beyond the cap is rejected *without* bumping the graveyard
+        # counter, so a retry with the same id surfaces RESOURCE_EXHAUSTED
+        # again rather than flipping to NOT_FOUND.
+        if len(state.active_sessions) >= state.max_sessions:
+            raise _SessionLimitExceeded(
+                f"connection has reached "
+                f"max_sessions_per_connection={state.max_sessions}"
+            )
+
+        state.last_opened_session_id = session_id
+        state.active_sessions.add(key)
+        instance = impl_class(peer=peer_id)
+        self._reactor_session_instances[(connection_id, session_id, impl_class)] = instance
+        return instance
 
     def _resolve_interceptors(self, service_info: ServiceInfo) -> list[Any]:
         resolved = list(self._interceptors)

@@ -33,6 +33,7 @@ HEADER: int = 0x04       # Bit 2 -- stream header (first frame)
 ROW_SCHEMA: int = 0x08   # Bit 3 -- Fory row schema frame
 CALL: int = 0x10         # Bit 4 -- per-call header in a session stream
 CANCEL: int = 0x20       # Bit 5 -- cancel current call in a session stream
+END_STREAM: int = 0x40   # Bit 6 -- last request frame for this call on a multiplexed stream
 
 # ── Limits ───────────────────────────────────────────────────────────────────
 
@@ -70,6 +71,23 @@ _LENGTH_SIZE = 4
 _FLAGS_SIZE = 1
 
 
+def encode_frame(payload: bytes, flags: int = 0) -> bytes:
+    """Return the framed byte string for a single frame.
+
+    Mirrors `write_frame` but produces the bytes without writing to a
+    stream -- used by the multiplexed-streams client (`AsterCall`) which
+    takes pre-framed bytes in `send_frame(frame_bytes)`.
+    """
+    frame_body_len = _FLAGS_SIZE + len(payload)
+    if frame_body_len == _FLAGS_SIZE and not (flags & (TRAILER | CANCEL | END_STREAM)):
+        raise FramingError("zero-length payload is not permitted")
+    if frame_body_len > MAX_FRAME_SIZE:
+        raise FramingError(
+            f"frame size {frame_body_len} exceeds maximum {MAX_FRAME_SIZE}"
+        )
+    return struct.pack(_LENGTH_FMT, frame_body_len) + bytes([flags]) + payload
+
+
 # ── write_frame ──────────────────────────────────────────────────────────────
 
 
@@ -96,7 +114,7 @@ async def write_frame(
     #     present, but an empty trailer is still a valid end-of-stream marker)
     #   - CANCEL: flags-only cancel frame in a session stream (spec §5.2)
     # Any other empty-payload frame is a wire-format error.
-    if frame_body_len == _FLAGS_SIZE and not (flags & (TRAILER | CANCEL)):
+    if frame_body_len == _FLAGS_SIZE and not (flags & (TRAILER | CANCEL | END_STREAM)):
         raise FramingError("zero-length payload is not permitted")
 
     if frame_body_len > MAX_FRAME_SIZE:

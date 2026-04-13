@@ -169,7 +169,7 @@ from .client import (
     ClientError,
     ClientTimeoutError,
 )
-from .runtime import AsterServer, AsterClient, AdmissionDeniedError, RPC_ALPN
+from .runtime import AsterServer, AsterClient, ClientSession, AdmissionDeniedError, RPC_ALPN
 from .capabilities import any_of, all_of
 from .health import HealthServer, check_health, check_ready, metrics_snapshot
 from .interceptors import (
@@ -298,6 +298,7 @@ __all__ = [
     "AsterConfig",
     "AsterServer",
     "AsterClient",
+    "ClientSession",
     "AdmissionDeniedError",
     "RPC_ALPN",
 ]
