@@ -240,6 +240,37 @@ async fn handle_stream_inner(
     result
 }
 
+/// Outcome of dispatching one call through `dispatch_one_call`.
+enum CallOutcome {
+    /// The call completed (trailer sent to the peer). For session
+    /// streams the caller should loop to read the next `CallHeader`
+    /// on the same stream; for stateless streams the caller should
+    /// finish the send side and return.
+    Complete,
+    /// The peer closed the stream before the call finished. The caller
+    /// should return `Ok(())` from the dispatch function.
+    StreamEof,
+}
+
+/// Unified multiplexed-call reader. Every inbound stream — stateless
+/// or session — goes through this function. It:
+///
+/// 1. Reads the `StreamHeader` (first frame, must carry `FLAG_HEADER`).
+/// 2. Reads the second frame and uses its flag shape to decide whether
+///    this is a session stream (next frame is a `CallHeader`) or a
+///    stateless stream (next frame is already the first request frame).
+///    This is the "presence of CallHeader frames after StreamHeader"
+///    discriminator from spec §6.
+/// 3. Loops on `dispatch_one_call`:
+///    - Stateless streams run exactly one iteration and return.
+///    - Session streams run until the peer EOFs or a protocol error
+///      occurs; between iterations the reader reads the next
+///      `CallHeader` + first request frame for the next call.
+///
+/// Today the `is_session_call` bool passed to the binding is derived
+/// directly from the frame-shape discriminator. When the migration
+/// lands `StreamHeader.sessionId` and `aster_call_*`, routing moves
+/// to the session id but the loop structure in this function stays.
 async fn dispatch_stream(
     frame_rx: &mut mpsc::UnboundedReceiver<WireFrame>,
     send: CoreSendStream,
@@ -260,55 +291,123 @@ async fn dispatch_stream(
         .await
         .ok_or_else(|| anyhow!("eof after stream header"))?;
 
-    if second.flags & FLAG_CALL != 0 {
-        handle_session(
-            send,
-            frame_rx,
-            peer_id,
-            stream_id,
-            call_tx,
-            header.payload,
-            second.payload,
-            second.flags,
-        )
-        .await
+    // Frame-shape discriminator: a `CALL` frame after the stream
+    // header means "session stream with multi-call framing"; anything
+    // else means "stateless one-shot stream, this frame is the first
+    // request data frame".
+    let is_session = second.flags & FLAG_CALL != 0;
+
+    // Seed the first iteration: stateless uses the `StreamHeader`
+    // payload as the per-call header and the second frame as the first
+    // request; session needs to also read the first request frame, and
+    // uses the `CallHeader` as the per-call header.
+    let (mut call_header_payload, mut call_header_flags, mut first_req) = if is_session {
+        let first_req = match frame_rx.recv().await {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        if first_req.flags & FLAG_CALL != 0 {
+            return Err(anyhow!(
+                "expected request frame, got CallHeader (flags={:#x})",
+                first_req.flags
+            ));
+        }
+        (second.payload, second.flags, first_req)
     } else {
-        handle_stateless(
-            send,
+        (header.payload, header.flags, second)
+    };
+
+    loop {
+        let outcome = dispatch_one_call(
+            &send,
             frame_rx,
-            peer_id,
+            &peer_id,
             stream_id,
-            call_tx,
-            header.payload,
-            header.flags,
-            second.payload,
-            second.flags,
+            &call_tx,
+            call_header_payload,
+            call_header_flags,
+            first_req.payload,
+            first_req.flags,
+            is_session,
         )
-        .await
+        .await?;
+
+        match outcome {
+            CallOutcome::StreamEof => return Ok(()),
+            CallOutcome::Complete => {
+                if !is_session {
+                    // Stateless: one call per stream. Finish and go.
+                    send.finish().await?;
+                    return Ok(());
+                }
+                // Session: read the next CallHeader and first request
+                // frame, then loop.
+                let next_call = match frame_rx.recv().await {
+                    Some(f) => f,
+                    None => return Ok(()),
+                };
+                if next_call.flags & FLAG_CALL == 0 {
+                    return Err(anyhow!(
+                        "expected CallHeader, got flags={:#x}",
+                        next_call.flags
+                    ));
+                }
+                let next_req = match frame_rx.recv().await {
+                    Some(f) => f,
+                    None => return Ok(()),
+                };
+                if next_req.flags & FLAG_CALL != 0 {
+                    return Err(anyhow!(
+                        "expected request frame, got CallHeader (flags={:#x})",
+                        next_req.flags
+                    ));
+                }
+                call_header_payload = next_call.payload;
+                call_header_flags = next_call.flags;
+                first_req = next_req;
+            }
+        }
     }
 }
 
+/// Dispatch one call on an open multiplexed stream: send the
+/// `IncomingCall` to the binding, forward additional request frames
+/// until `FLAG_END_STREAM`/QUIC EOF, drain response frames from the
+/// binding, and return when the terminal trailer is written.
+///
+/// The `is_session` flag affects three behaviours, consolidated from
+/// the old `handle_stateless` / `handle_session` split:
+///
+/// - **Request-channel EOF.** Stateless streams can rely on QUIC EOF
+///   to close the request channel (one call per stream, no more frames
+///   possible). Session streams must see `FLAG_END_STREAM` explicitly
+///   because the stream stays open for the next call, and treat QUIC
+///   EOF as "stream is over, stop dispatching entirely" (`StreamEof`).
+/// - **Unexpected `CallHeader` mid-call.** In session mode this is a
+///   protocol violation (peer tried to start a new call before ending
+///   the previous request stream). In stateless mode it cannot happen
+///   because the discriminator placed us on the non-session branch.
+/// - **Trailer handling.** Stateless streams `finish()` the send side
+///   after the trailer (caller does this, not us). Session streams
+///   leave the send side open so the next call on the stream can write
+///   its own frames.
 #[allow(clippy::too_many_arguments)]
-async fn handle_stateless(
-    send: CoreSendStream,
+async fn dispatch_one_call(
+    send: &CoreSendStream,
     frame_rx: &mut mpsc::UnboundedReceiver<WireFrame>,
-    peer_id: String,
+    peer_id: &str,
     stream_id: u64,
-    call_tx: mpsc::Sender<IncomingCall>,
+    call_tx: &mpsc::Sender<IncomingCall>,
     header_payload: Vec<u8>,
     header_flags: u8,
     first_request_payload: Vec<u8>,
     first_request_flags: u8,
-) -> Result<()> {
+    is_session: bool,
+) -> Result<CallOutcome> {
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
     let (req_tx, req_rx) = mpsc::unbounded_channel();
     let cancelled = Arc::new(AtomicBool::new(false));
 
-    // Stateless mode: if the first request frame already carries
-    // FLAG_END_STREAM (or the call shape is unary/server-stream where the
-    // peer will simply EOF), the binding doesn't need any more frames.
-    // Either way we ALSO forward subsequent wire frames (until EOF or
-    // END_STREAM) so client-streaming peers can push their full input.
     let mut request_done = first_request_flags & FLAG_END_STREAM != 0;
     let mut req_tx_opt = if request_done { None } else { Some(req_tx) };
 
@@ -320,8 +419,8 @@ async fn handle_stateless(
             header_flags,
             request_payload: first_request_payload,
             request_flags: first_request_flags,
-            peer_id,
-            is_session_call: false,
+            peer_id: peer_id.to_string(),
+            is_session_call: is_session,
             response_sender: resp_tx,
             request_receiver: req_rx,
             cancelled: cancelled.clone(),
@@ -333,19 +432,24 @@ async fn handle_stateless(
         tokio::select! {
             biased;
 
-            // Forward any additional request frames the peer sends.
+            // Forward additional request frames from the peer.
             wire = frame_rx.recv(), if !request_done => {
                 match wire {
                     Some(frame) => {
                         if frame.flags & FLAG_CANCEL != 0 {
-                            // Peer signalled cancellation: surface to the binding,
-                            // close the request channel, and stop forwarding. The
-                            // dispatcher's eventual trailer (whatever shape it ends
-                            // up sending) will close the response side.
+                            // Peer signalled cancellation: surface to
+                            // the binding, close the request channel,
+                            // and stop forwarding. The binding's
+                            // eventual trailer closes the response side.
                             cancelled.store(true, Ordering::Release);
                             request_done = true;
                             req_tx_opt = None;
                             continue;
+                        }
+                        if is_session && frame.flags & FLAG_CALL != 0 {
+                            return Err(anyhow!(
+                                "got CallHeader before previous call's END_STREAM"
+                            ));
                         }
                         let end = frame.flags & FLAG_END_STREAM != 0;
                         if let Some(tx) = req_tx_opt.as_ref() {
@@ -360,14 +464,20 @@ async fn handle_stateless(
                         }
                     }
                     None => {
-                        // Peer EOF — close the request channel.
+                        if is_session {
+                            // QUIC EOF on a session stream: the whole
+                            // stream is over, not just this call.
+                            return Ok(CallOutcome::StreamEof);
+                        }
+                        // Stateless: peer EOF just means "no more
+                        // request frames"; keep draining responses.
                         request_done = true;
                         req_tx_opt = None;
                     }
                 }
             }
 
-            // Drain response frames as they arrive from the binding.
+            // Drain response frames from the binding.
             resp = resp_rx.recv() => {
                 match resp {
                     Some(OutgoingFrame::Frame(bytes)) => {
@@ -379,11 +489,13 @@ async fn handle_stateless(
                         if !bytes.is_empty() {
                             send.write_all(bytes).await?;
                         }
-                        send.finish().await?;
-                        return Ok(());
+                        // Stateless `finish()` happens in the caller
+                        // after we return so the two call paths share
+                        // one exit shape. Session streams keep the
+                        // send side open for the next call.
+                        return Ok(CallOutcome::Complete);
                     }
                     None => {
-                        send.finish().await?;
                         return Err(anyhow!(
                             "binding dropped response channel without trailer"
                         ));
@@ -391,141 +503,6 @@ async fn handle_stateless(
                 }
             }
         }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_session(
-    send: CoreSendStream,
-    frame_rx: &mut mpsc::UnboundedReceiver<WireFrame>,
-    peer_id: String,
-    stream_id: u64,
-    call_tx: mpsc::Sender<IncomingCall>,
-    _stream_header_payload: Vec<u8>,
-    first_call_header: Vec<u8>,
-    first_call_flags: u8,
-) -> Result<()> {
-    let mut call_header_payload = first_call_header;
-    let mut call_header_flags = first_call_flags;
-
-    loop {
-        // Read the first request frame for this call.
-        let first = match frame_rx.recv().await {
-            Some(f) => f,
-            None => return Ok(()),
-        };
-        if first.flags & FLAG_CALL != 0 {
-            return Err(anyhow!(
-                "expected request frame, got CallHeader (flags={:#x})",
-                first.flags
-            ));
-        }
-
-        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
-        let (req_tx, req_rx) = mpsc::unbounded_channel();
-        let cancelled = Arc::new(AtomicBool::new(false));
-
-        // Session mode CANNOT rely on QUIC EOF to end a call's request
-        // stream — the bi-stream stays open between calls. Client-streaming
-        // calls in session mode MUST mark the last request frame with
-        // FLAG_END_STREAM so the reactor knows where one call's request
-        // stream ends and the next CallHeader begins.
-        let mut request_done = first.flags & FLAG_END_STREAM != 0;
-        let mut req_tx_opt = if request_done { None } else { Some(req_tx) };
-
-        call_tx
-            .send(IncomingCall {
-                call_id: next_call_id(),
-                stream_id,
-                header_payload: call_header_payload,
-                header_flags: call_header_flags,
-                request_payload: first.payload,
-                request_flags: first.flags,
-                peer_id: peer_id.clone(),
-                is_session_call: true,
-                response_sender: resp_tx,
-                request_receiver: req_rx,
-                cancelled: cancelled.clone(),
-            })
-            .await
-            .map_err(|_| anyhow!("reactor channel closed"))?;
-
-        // Drain request + response frames for this call. Exit the inner
-        // loop on Trailer so the next iteration can read the next
-        // CallHeader. A peer that sets FLAG_CALL before the previous
-        // call's request stream finished is a protocol violation — we
-        // detect it by seeing a CALL frame while `request_done == false`.
-        loop {
-            tokio::select! {
-                biased;
-
-                wire = frame_rx.recv(), if !request_done => {
-                    match wire {
-                        Some(frame) => {
-                            if frame.flags & FLAG_CANCEL != 0 {
-                                cancelled.store(true, Ordering::Release);
-                                request_done = true;
-                                req_tx_opt = None;
-                                continue;
-                            }
-                            if frame.flags & FLAG_CALL != 0 {
-                                return Err(anyhow!(
-                                    "got CallHeader before previous call's END_STREAM"
-                                ));
-                            }
-                            let end = frame.flags & FLAG_END_STREAM != 0;
-                            if let Some(tx) = req_tx_opt.as_ref() {
-                                let _ = tx.send(RequestFrame {
-                                    payload: frame.payload,
-                                    flags: frame.flags,
-                                });
-                            }
-                            if end {
-                                request_done = true;
-                                req_tx_opt = None;
-                            }
-                        }
-                        None => return Ok(()),
-                    }
-                }
-
-                resp = resp_rx.recv() => {
-                    match resp {
-                        Some(OutgoingFrame::Frame(bytes)) => {
-                            if !bytes.is_empty() {
-                                send.write_all(bytes).await?;
-                            }
-                        }
-                        Some(OutgoingFrame::Trailer(bytes)) => {
-                            if !bytes.is_empty() {
-                                send.write_all(bytes).await?;
-                            }
-                            // The next loop iteration creates a fresh
-                            // (req_tx, req_rx) pair, dropping the old one
-                            // and closing any unread request channel.
-                            break;
-                        }
-                        None => {
-                            return Err(anyhow!("binding dropped session call channel"));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Wait for the next CallHeader.
-        let next = match frame_rx.recv().await {
-            Some(f) => f,
-            None => return Ok(()),
-        };
-        if next.flags & FLAG_CALL == 0 {
-            return Err(anyhow!(
-                "expected CallHeader, got flags={:#x}",
-                next.flags
-            ));
-        }
-        call_header_payload = next.payload;
-        call_header_flags = next.flags;
     }
 }
 

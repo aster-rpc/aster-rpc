@@ -15,6 +15,7 @@
 5. [Backpressure and Timeout Policy](#5-backpressure-and-timeout-policy)
 6. [Wire Format Changes](#6-wire-format-changes)
 7. [Server Dispatch Changes](#7-server-dispatch-changes)
+7.5. [Connection Lifecycle and Memory Bounds](#75-connection-lifecycle-and-memory-bounds)
 8. [FFI Surface (Sketch)](#8-ffi-surface-sketch)
 9. [Configuration](#9-configuration)
 10. [Metrics](#10-metrics)
@@ -118,9 +119,32 @@ Pool acquisition uses a fair queue (FIFO) so that a burst of 1000 calls drains i
 
 **One addition:**
 
-- `StreamHeader.sessionId: bytes` (optional, default empty). When present, the server routes the stream into the session context identified by `sessionId`. When absent, the stream is stateless (used for the SHARED pool). For session streaming substreams, the client sends the parent session's id here.
+- `StreamHeader.sessionId: u32` (default `0`). Encoded as a 4-byte little-endian field in the StreamHeader. `0` means "stateless stream, route through the SHARED pool." Any non-zero value means "this stream belongs to the session identified by this id on this `(peer, connection)`." For session streaming substreams, the client sends the parent session's id here.
 
-**Unknown `sessionId` handling.** If the server receives a stream with a `sessionId` that doesn't match any active session context (either it never existed, or it has expired/closed since the call started), the server writes an `RpcStatus` trailer with code `NOT_FOUND` and message `"session not found"`, then closes the stream. Both failure modes look identical on the wire so we don't leak which one occurred. The client maps `NOT_FOUND` on a session-bound call to a typed `SessionNotFoundError` so callers can decide whether to reopen the session and retry, or fail the operation.
+**Client-side `sessionId` allocation.** The client maintains a per-connection `AtomicU32` counter starting at `0`. Each `open_session()` call does `counter.fetch_add(1) + 1` (so the first session is `1`, the second `2`, and so on). The counter is per-connection, so reopening a connection resets it. This guarantees:
+
+- Monotonicity within a connection (server can rely on it for the graveyard check below).
+- No collisions across sessions on the same connection (the counter is the source of truth, no client-side coordination needed).
+- Trivial allocation cost (one atomic increment).
+
+`u32` gives ~4.2B sessions per connection before wraparound, which is comfortably out of reach for any realistic workload (and a wraparound would just look like a NOT_FOUND to the server, not a security issue).
+
+**Session creation semantics — Model A (implicit on first arrival).**
+
+Sessions are created **implicitly** the first time a stream arrives at the server with a `sessionId` not currently in the per-connection session map. Specifically, on every inbound stream the server:
+
+1. Looks up `(connection, sessionId)` in the per-connection session map.
+2. If found: bind this stream to the existing session context.
+3. If not found and `sessionId > last_opened_session_id` for this connection: create the session context (subject to `max_sessions_per_connection`, see §9), bump `last_opened_session_id` to `sessionId`, bind this stream.
+4. If not found and `sessionId <= last_opened_session_id`: the session was previously created and has been closed/expired. Emit NOT_FOUND (see below).
+
+There is no separate "open session" RPC. The session's lifecycle starts when the server first sees its `sessionId`. This matches what the current binding does today (implicit create on first call), with `(connection, sessionId)` as the key instead of `(peer, service)`.
+
+**Why monotonic-counter graveyard.** The `last_opened_session_id` per-connection integer is a bounded, exact graveyard for "this session was previously known and has been closed." No HashSet, no TTL eviction, no memory growth — just one `u32` per connection. It works because the client's monotonic counter guarantees fresh sessionIds are always greater than any previously-issued one.
+
+**Unknown / closed `sessionId` handling.** If the server cannot bind a stream's `sessionId` to a session context per the rules above, it writes an `RpcStatus` trailer with code `NOT_FOUND` and message `"session not found"`, then closes the stream. The client maps `NOT_FOUND` on a session-bound call to a typed `SessionNotFoundError` so callers can decide whether to reopen the session and retry, or fail the operation.
+
+This case is for sessions that were *previously created and have been closed/expired by the server* (idle timeout, auth revoked, server tear-down). A `sessionId > last_opened_session_id` always succeeds (subject to limits), so a fresh client never spuriously NOT_FOUNDs.
 
 **Discriminator change.** Today the server uses `header.method == ""` as the signal for "this is a session stream, expect CallHeaders." Going forward, the server uses **the presence of CallHeader frames after the StreamHeader** as the signal for "this is multiplexed." The `method` field on `StreamHeader` becomes optional and is ignored on multiplexed streams; the per-call `method` lives in the `CallHeader`.
 
@@ -135,13 +159,62 @@ For the migration window, the server can accept both signals (empty `method` OR 
 **Proposed:** drop the discriminator. Every inbound stream goes through a `MultiplexedCallReader` that:
 
 1. Reads the `StreamHeader`.
-2. If `sessionId` is present, looks up or creates the session context, binds the reader to it, and dispatches each call into the session instance.
-3. If `sessionId` is absent, dispatches each call statelessly through the service registry.
+2. If `sessionId == 0`, dispatches each call statelessly through the service registry (SHARED pool stream).
+3. If `sessionId != 0`, performs the lookup-or-create per the Model A rules in §6 (look up `(connection, sessionId)` in the per-connection session map; create if `> last_opened_session_id`; emit NOT_FOUND if `<= last_opened_session_id`), binds the reader to the resolved session context, and dispatches each call into the session instance.
 4. Loops on `CallHeader` until the stream closes or a transport error occurs.
 
 `SessionServer` becomes "a `MultiplexedCallReader` bound to a session instance." The stateless SHARED-pool path is "a `MultiplexedCallReader` bound to the registry." One implementation, two bindings.
 
 This refactor is the server-side equivalent of moving the client framing state machine into `core`: one copy of the loop, parameterised over what to do with each decoded call.
+
+**Where session identity lives.** Core does **not** parse the `StreamHeader` payload (it stays Fory-opaque) and does **not** maintain the session map. Both responsibilities live in the binding. Core's only job is the multiplexed call loop and the per-call channel plumbing; the binding parses headers, owns the per-connection session map, runs the lookup-or-create logic, and emits NOT_FOUND trailers when a sessionId fails the graveyard check. This keeps core thin and lets each binding integrate session lifetime with its own object-lifetime model (Java GC, Python refcounts, etc.).
+
+---
+
+## 7.5. Connection Lifecycle and Memory Bounds
+
+Sessions persist across calls; without explicit cleanup their server-side state would grow without bound. This section makes the cleanup contract explicit and bounds the memory cost.
+
+**Sessions are scoped per-connection, not per-peer-identity.** When a peer's QUIC connection drops, every session created on that connection is torn down. If the peer reconnects, they get a fresh connection with `last_opened_session_id` reset to `0` and an empty session map — they call `open_session()` again and start over. There is no resume-across-disconnects in this layer; if a use case needs that, it builds explicit state-serialization on top of the routing layer.
+
+This rule is what bounds memory: the server's per-`(peer, connection)` session map is reaped whole when the connection closes. There is no orphan path.
+
+**Core emits `ConnectionClosed` events.** Today the reactor's `connection_loop` exits silently when `accept_bi` errors. Going forward it MUST emit a `ConnectionClosed` event before exiting so the binding has a hook to reap state. The reactor's dispatch channel becomes:
+
+```rust
+pub enum ReactorEvent {
+    Call(IncomingCall),
+    ConnectionClosed { peer_id: String, info: CoreClosedInfo },
+}
+```
+
+The FFI poll surface gains a discriminator on the returned slot so bindings can demultiplex `Call` vs `ConnectionClosed`. On `ConnectionClosed`, the binding looks up its per-connection session map, drops every session instance and substream, and frees the map.
+
+**Per-connection session limit.** A single misbehaving (or malicious) peer must not be able to OOM the server by calling `open_session()` in a loop. A configurable cap bounds this:
+
+- `aster.transport.max_sessions_per_connection` (see §9). Default `1024`.
+- When the client sends a `StreamHeader` with `sessionId > last_opened_session_id` AND the active-session count for this connection is already at the cap, the server emits an `RpcStatus` trailer with code `RESOURCE_EXHAUSTED` and message `"session limit reached"`, then closes the stream. `last_opened_session_id` is **not** bumped in this case (the session was rejected, so future references to it are NOT_FOUND, not "previously created").
+- The cap counts active sessions only; closed sessions don't count even though they're tracked by the graveyard counter.
+
+**Memory bound.** Worst-case per-server memory for session state is:
+
+```
+max_connections × max_sessions_per_connection × per_session_state_size
+```
+
+All three terms are operator-controlled. With defaults (assume 10k connections, 1024 sessions/conn, 1KB/session), that's ~10GB worst-case — high but bounded, and the per-session-state-size term is what most deployments will tune downward. With a more typical mix (1k conns, 16 sessions/conn, 1KB), it's ~16MB.
+
+**Streaming substreams are not part of this accounting.** They're per-call, lifetime-bounded by the user's iterator/future, and reclaimed when the call ends. They count against the QUIC `max_concurrent_streams` ceiling (§9), not against the session cap.
+
+**Binding responsibilities — summary.** Every binding MUST:
+
+1. Maintain a per-`(peer, connection)` session map keyed by `sessionId`.
+2. Maintain a per-connection `last_opened_session_id` integer for the graveyard check.
+3. Maintain a per-connection active-session count for the cap check.
+4. On every inbound stream's StreamHeader: run the lookup-or-create logic from §6, emitting NOT_FOUND or RESOURCE_EXHAUSTED on the appropriate failure paths.
+5. On every `ConnectionClosed` event from core: drop the session map, the counter, and the active-session count for that connection.
+
+These are mechanical, not invented — they're the binding's existing per-stream / per-peer state management generalised to a longer-lived "session" unit.
 
 ---
 
@@ -208,10 +281,11 @@ All new keys live under `aster.transport.*` in `AsterConfig` and are configurabl
 | `aster.transport.shared_pool_size` | `int` | `8` | Maximum number of multiplexed streams per `(connection, SHARED-pool)`. Calls beyond this queue. Validated against the QUIC ceiling at connect time — see below. |
 | `aster.transport.session_pool_size` | `int` | `1` | Maximum number of multiplexed streams per session. Default `1` means unary calls on a session run serially. Raise for parallelism within a session. |
 | `aster.transport.stream_acquire_timeout_ms` | `int` | `5000` | How long a call waits for a free stream before erroring with `StreamAcquireTimeoutError`. Applies both to pool-full waits and to QUIC-ceiling-reached waits. |
+| `aster.transport.max_sessions_per_connection` | `int` | `1024` | Server-side cap on the number of active sessions per inbound connection (see §7.5). When the cap is reached, further `open_session()` attempts from that peer fail with `RESOURCE_EXHAUSTED`. Sized to be generous for normal use but small enough that a single connection can't OOM the server. |
 
-**Grep target.** Engineers should be able to grep `shared_pool_size` or `session_pool_size` and land on this section of this document. Bindings document these keys in their own README under the same names.
+**Grep target.** Engineers should be able to grep `shared_pool_size`, `session_pool_size`, or `max_sessions_per_connection` and land on this section of this document. Bindings document these keys in their own README under the same names.
 
-**Validation.** All three values must be ≥ 1. `shared_pool_size` and `session_pool_size` should be small (typical: 1–32); a warning is logged if either exceeds 64 since it likely indicates a misconfiguration.
+**Validation.** All four values must be ≥ 1. `shared_pool_size` and `session_pool_size` should be small (typical: 1–32); a warning is logged if either exceeds 64 since it likely indicates a misconfiguration. `max_sessions_per_connection` typical range is 64–16384; warn outside that range.
 
 **Connect-time QUIC ceiling validation.** The QUIC `max_concurrent_streams` ceiling is negotiated at connection establishment and is set by the *peer*, so it cannot be validated at client startup. Instead, the client validates at connect time:
 
@@ -234,8 +308,10 @@ All metrics carry the `peer` label (the producer node id, hex). Pool metrics als
 | `aster_transport_quic_stream_limit_blocks_total` | counter | `peer` | Number of times a stream open blocked because the QUIC `max_concurrent_streams` ceiling was reached. Tracks how often the peer is saturated. |
 | `aster_transport_streaming_substreams_active` | gauge | `peer` | Number of active streaming substreams (server/client/bidi calls in progress). Useful for capacity planning against the QUIC ceiling. |
 | `aster_transport_pool_size_effective` | gauge | `peer`, `pool` | The *effective* pool size after connect-time QUIC ceiling clamping (see §9). When this is below the configured `shared_pool_size`, the peer is constraining us. |
+| `aster_transport_active_sessions_per_connection` | gauge | `peer` | Number of currently-active sessions on this inbound connection (server-side, see §7.5). Sustained values near `max_sessions_per_connection` mean the cap is constraining the peer; sustained low values mean the cap is sized fine. |
+| `aster_transport_session_limit_rejections_total` | counter | `peer` | Server-side `open_session()` attempts rejected with `RESOURCE_EXHAUSTED` because the connection had already hit `max_sessions_per_connection`. A nonzero value means at least one peer is hitting the cap; investigate. |
 
-The `acquire_wait_seconds` histogram is the diagnostic metric — it tells operators *whether* the pool is the bottleneck before they have to guess. The `acquire_timeouts_total` counter is the alerting metric. The `pool_size_effective` gauge is the "is the peer the limit?" metric.
+The `acquire_wait_seconds` histogram is the diagnostic metric — it tells operators *whether* the pool is the bottleneck before they have to guess. The `acquire_timeouts_total` counter is the alerting metric. The `pool_size_effective` gauge is the "is the peer the limit?" metric. The `session_limit_rejections_total` counter is the "is a peer trying to OOM us?" metric.
 
 These metrics live in `core` and are exposed through the existing transport metrics surface (`transport_metrics()` in Python, parity in TS/Java).
 
