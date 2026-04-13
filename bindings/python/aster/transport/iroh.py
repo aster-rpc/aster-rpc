@@ -91,8 +91,33 @@ class _CallDriver:
         session_id: int,
         codec: ForyCodec,
     ) -> "_CallDriver":
+        """Acquire a **unary** call handle via the per-connection pool.
+        For streaming RPC patterns use `acquire_streaming` -- per spec
+        §3 line 65, streaming substreams must bypass the pool so they
+        don't starve unary slots on the same session (scenario §4.4).
+        """
         try:
             call = await AsterCall.acquire(conn, session_id)
+        except StreamAcquireError as exc:
+            raise _acquire_error_to_rpc_error(exc) from exc
+        return cls(call, codec)
+
+    @classmethod
+    async def acquire_streaming(
+        cls,
+        conn: "aster.IrohConnection",
+        codec: ForyCodec,
+    ) -> "_CallDriver":
+        """Acquire a **streaming** call handle. Opens a dedicated
+        multiplexed substream via `open_bi` that bypasses the
+        per-connection pool entirely (spec §3 line 65). Used for
+        server-stream, client-stream, and bidi patterns. The session
+        id still ships in the `StreamHeader` the binding writes, so
+        the server still routes the call to the right session
+        instance -- only pool accounting is bypassed.
+        """
+        try:
+            call = await AsterCall.acquire_streaming(conn)
         except StreamAcquireError as exc:
             raise _acquire_error_to_rpc_error(exc) from exc
         return cls(call, codec)
@@ -303,7 +328,7 @@ class IrohTransport(Transport):
         deadline_secs: int,
         serialization_mode: int,
     ) -> AsyncIterator[Any]:
-        driver = await _CallDriver.acquire(self._conn, self._session_id, self._codec)
+        driver = await _CallDriver.acquire_streaming(self._conn, self._codec)
         released = False
         try:
             await driver.send_header(
@@ -345,7 +370,7 @@ class IrohTransport(Transport):
         deadline_secs: int = 0,
         serialization_mode: int | None = None,
     ) -> Any:
-        driver = await _CallDriver.acquire(self._conn, self._session_id, self._codec)
+        driver = await _CallDriver.acquire_streaming(self._conn, self._codec)
         try:
             await driver.send_header(
                 service=service,
@@ -465,9 +490,7 @@ class IrohBidiChannel(BidiChannel):
     async def _ensure_driver(self) -> _CallDriver:
         if self._driver is not None:
             return self._driver
-        self._driver = await _CallDriver.acquire(
-            self._conn, self._session_id, self._codec
-        )
+        self._driver = await _CallDriver.acquire_streaming(self._conn, self._codec)
         try:
             await self._driver.send_header(
                 service=self._service,

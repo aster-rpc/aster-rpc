@@ -47,6 +47,17 @@ public final class AsterCall implements AutoCloseable {
                   ValueLayout.ADDRESS // out_call (aster_call_t*)
                   ));
 
+  private static final MethodHandle ACQUIRE_STREAMING =
+      IrohLibrary.getInstance()
+          .getHandle(
+              "aster_call_acquire_streaming",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT, // return: status or negative subcode
+                  ValueLayout.JAVA_LONG, // runtime
+                  ValueLayout.JAVA_LONG, // connection
+                  ValueLayout.ADDRESS // out_call (aster_call_t*)
+                  ));
+
   private static final MethodHandle SEND_FRAME =
       IrohLibrary.getInstance()
           .getHandle(
@@ -144,6 +155,38 @@ public final class AsterCall implements AutoCloseable {
       throw e;
     } catch (Throwable t) {
       throw new IrohException("aster_call_acquire threw: " + t.getMessage());
+    }
+  }
+
+  /**
+   * Acquire a <strong>streaming</strong> call handle. Unlike {@link #acquire}, this bypasses the
+   * per-connection pool entirely and opens a dedicated multiplexed substream via {@code
+   * CoreConnection::open_bi} — per {@code ffi_spec/Aster-multiplexed-streams.md} §3 line 65,
+   * "streaming substreams don't count against any pool." Use this for server-stream / client-stream
+   * / bidi calls; use {@link #acquire} for unary.
+   *
+   * <p>The session id is not used by this entry point — the binding carries the session id in the
+   * {@code StreamHeader} it sends itself. Omitted from the signature to make the "no pool
+   * involvement" intent unambiguous.
+   *
+   * @param runtimeHandle the {@code iroh_runtime_t} handle
+   * @param connectionHandle the {@code iroh_connection_t} handle
+   * @throws StreamAcquireException mapped from {@code ASTER_CALL_ERR_*} subcodes (rare — streaming
+   *     substreams only fail on QUIC-ceiling or transport errors)
+   * @throws IrohException mapped from generic {@code iroh_status_t} codes
+   */
+  public static AsterCall acquireStreaming(long runtimeHandle, long connectionHandle) {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment outCall = arena.allocate(ValueLayout.JAVA_LONG);
+      int status = (int) ACQUIRE_STREAMING.invoke(runtimeHandle, connectionHandle, outCall);
+      if (status == IrohStatus.OK.code) {
+        return new AsterCall(runtimeHandle, outCall.get(ValueLayout.JAVA_LONG, 0));
+      }
+      throw mapAcquireError(status);
+    } catch (RuntimeException | Error e) {
+      throw e;
+    } catch (Throwable t) {
+      throw new IrohException("aster_call_acquire_streaming threw: " + t.getMessage());
     }
   }
 

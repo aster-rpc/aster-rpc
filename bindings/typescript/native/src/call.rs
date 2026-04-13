@@ -11,7 +11,9 @@ use napi_derive::napi;
 
 use aster_transport_core::framing::MAX_FRAME_SIZE;
 use aster_transport_core::pool::{AcquireError, PoolKey};
-use aster_transport_core::{CoreRecvStream, CoreSendStream, MultiplexedStreamHandle};
+use aster_transport_core::{
+    CoreRecvStream, CoreSendStream, MultiplexedStream, MultiplexedStreamHandle,
+};
 
 use crate::net::IrohConnection;
 
@@ -86,10 +88,38 @@ pub struct RecvFrameResult {
     pub kind: i32,
 }
 
-/// Client-side per-call handle over a pooled multiplexed bi-stream.
+/// The underlying stream for a call. Two shapes per spec §3:
+/// - `Pooled` — handle into the per-connection `MultiplexedStreamPool`;
+///   used for unary calls.
+/// - `Streaming` — dedicated substream that bypasses the pool entirely;
+///   used for server-stream / client-stream / bidi per spec §3 line 65
+///   ("streaming substreams don't count against any pool").
+enum CallStream {
+    Pooled(MultiplexedStreamHandle),
+    Streaming(MultiplexedStream),
+}
+
+impl CallStream {
+    fn get(&self) -> &MultiplexedStream {
+        match self {
+            Self::Pooled(h) => h.get(),
+            Self::Streaming(s) => s,
+        }
+    }
+
+    fn discard(self) {
+        match self {
+            Self::Pooled(h) => h.discard(),
+            Self::Streaming(_) => { /* drops */ }
+        }
+    }
+}
+
+/// Client-side per-call handle. Wraps either a pool-backed stream
+/// (unary) or a dedicated streaming substream (server/client/bidi).
 #[napi]
 pub struct AsterCall {
-    handle: Arc<StdMutex<Option<MultiplexedStreamHandle>>>,
+    handle: Arc<StdMutex<Option<CallStream>>>,
 }
 
 #[napi]
@@ -105,7 +135,29 @@ impl AsterCall {
         let key = pool_key_for(session_id);
         let handle = core.acquire_stream(key).await.map_err(acquire_err_to_napi)?;
         Ok(AsterCall {
-            handle: Arc::new(StdMutex::new(Some(handle))),
+            handle: Arc::new(StdMutex::new(Some(CallStream::Pooled(handle)))),
+        })
+    }
+
+    /// Acquire a **streaming** call handle. Unlike `acquire`, this
+    /// bypasses the per-connection pool and opens a dedicated
+    /// multiplexed substream via `open_bi` — per
+    /// `ffi_spec/Aster-multiplexed-streams.md` §3 line 65, "streaming
+    /// substreams don't count against any pool." Use this for
+    /// server-stream / client-stream / bidi calls; use `acquire` for
+    /// unary.
+    ///
+    /// `sessionId` is not used by this entry point — the binding
+    /// carries the session id in the `StreamHeader` it sends itself.
+    #[napi(factory)]
+    pub async fn acquire_streaming(conn: &IrohConnection) -> Result<AsterCall> {
+        let core = conn.core_clone();
+        let stream = core
+            .open_streaming_substream()
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(AsterCall {
+            handle: Arc::new(StdMutex::new(Some(CallStream::Streaming(stream)))),
         })
     }
 
@@ -196,8 +248,8 @@ impl AsterCall {
             .handle
             .lock()
             .map_err(|_| Error::from_reason("call handle poisoned".to_string()))?;
-        if let Some(h) = guard.take() {
-            h.discard();
+        if let Some(s) = guard.take() {
+            s.discard();
         }
         Ok(())
     }
@@ -206,12 +258,12 @@ impl AsterCall {
 impl AsterCall {
     fn clone_send(&self) -> Option<CoreSendStream> {
         let guard = self.handle.lock().ok()?;
-        guard.as_ref().map(|h| h.get().0.clone())
+        guard.as_ref().map(|s| s.get().0.clone())
     }
 
     fn clone_recv(&self) -> Option<CoreRecvStream> {
         let guard = self.handle.lock().ok()?;
-        guard.as_ref().map(|h| h.get().1.clone())
+        guard.as_ref().map(|s| s.get().1.clone())
     }
 }
 
