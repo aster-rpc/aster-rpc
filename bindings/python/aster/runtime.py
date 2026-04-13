@@ -60,6 +60,7 @@ from . import (
     gossip_client, AsterConfig,
 )
 from .client import ServiceClient, create_client
+from .transport.iroh import IrohTransport
 from .contract.identity import contract_id_from_service
 from .registry.models import ServiceSummary
 from .rpc_types import RpcScope
@@ -897,24 +898,33 @@ class AsterServer:
             pass
 
     async def _reactor_dispatch_loop(self, reactor_handle: Any) -> None:
-        """Pull fully-read requests from the Rust reactor and dispatch."""
+        """Pull reactor events and dispatch calls / reap closed connections."""
         assert self._server is not None
         try:
             while True:
-                call = await reactor_handle.next_call()
-                if call is None:
+                event = await reactor_handle.next_event()
+                if event is None:
                     break
-                (call_id, header_payload, header_flags, request_payload,
-                 request_flags, peer_id, response_sender) = call
-                # is_session_call removed (multiplexed-streams migration);
-                # Python session routing rebuilds in Objective 2.
-                asyncio.create_task(
-                    self._server._dispatch_reactor_call(
-                        call_id, header_payload, header_flags,
-                        request_payload, request_flags,
-                        peer_id, False, response_sender,
+                if event.kind == "call":
+                    response_sender = event.take_sender()
+                    if response_sender is None:
+                        continue
+                    asyncio.create_task(
+                        self._server._dispatch_reactor_call(
+                            event.call_id,
+                            event.header_payload or b"",
+                            event.header_flags,
+                            event.request_payload or b"",
+                            event.request_flags,
+                            event.peer_id,
+                            event.connection_id,
+                            response_sender,
+                        )
                     )
-                )
+                elif event.kind == "connection_closed":
+                    self._server._on_reactor_connection_closed(
+                        event.connection_id, event.peer_id,
+                    )
         except asyncio.CancelledError:
             pass
 
@@ -1493,6 +1503,12 @@ class AsterClient:
         self._open_gate: bool = False
         self._rpc_conns: dict[str, Any] = {}
         self._clients: list[ServiceClient] = []
+        # Per-connection monotonic sessionId counter. Keyed by rpc_addr
+        # (same key as `_rpc_conns`) so each cached IrohConnection gets
+        # its own namespace. Counter starts at 0; `_next_session_id`
+        # returns `++counter`, so the first allocated id is 1 (spec §6:
+        # 0 is reserved for the SHARED pool).
+        self._session_id_counters: dict[str, int] = {}
         self._connected: bool = False
         self._closed: bool = False
         self._reconnect_attempts: int = 0
@@ -1546,6 +1562,7 @@ class AsterClient:
         services list. Uses exponential backoff on repeated failures.
         """
         self._rpc_conns.clear()
+        self._session_id_counters.clear()
         self._clients.clear()
         self._connected = False
 
@@ -1646,6 +1663,102 @@ class AsterClient:
         conn = await self._ep.connect_node_addr(rpc_addr, RPC_ALPN)
         self._rpc_conns[rpc_addr_b64] = conn
         return conn
+
+    def _next_session_id(self, rpc_addr_b64: str) -> int:
+        """Allocate a fresh monotonic sessionId for the connection
+        cached under `rpc_addr_b64`. Counter starts at 0; returned ids
+        start at 1 (spec §6: sessionId==0 is reserved for the SHARED
+        pool). Reset whenever the underlying connection is replaced
+        (e.g. after `reconnect`).
+        """
+        current = self._session_id_counters.get(rpc_addr_b64, 0) + 1
+        self._session_id_counters[rpc_addr_b64] = current
+        return current
+
+    async def _resolve_service(
+        self,
+        service_cls: type,
+        channel: str | None,
+    ) -> tuple[Any, str, Any]:
+        """Resolve `(connection, rpc_addr_key, service_info)` for a
+        service class. Shared between `client()` and `open_session()`.
+        Raises the same errors as `client()` on missing service /
+        channel.
+        """
+        if not self._connected:
+            raise RuntimeError("AsterClient not connected; call connect() first")
+        info = getattr(service_cls, "__aster_service_info__", None)
+        if info is None:
+            raise TypeError(
+                f"{service_cls!r} is not @service-decorated "
+                f"(missing __aster_service_info__)"
+            )
+        summary: ServiceSummary | None = None
+        for s in self._services:
+            if s.name == info.name and s.version == info.version:
+                summary = s
+                break
+        if summary is None:
+            raise LookupError(
+                f"service {info.name!r} v{info.version} not offered by producer "
+                f"(got: {[(s.name, s.version) for s in self._services]})"
+            )
+        channel_key = channel or self._channel_name
+        if channel_key not in summary.channels:
+            raise LookupError(
+                f"service {info.name!r} has no channel {channel_key!r} "
+                f"(available: {list(summary.channels)})"
+            )
+        rpc_addr_key = summary.channels[channel_key]
+        conn = await self._rpc_conn_for(rpc_addr_key)
+        return conn, rpc_addr_key, info
+
+    async def open_session(
+        self,
+        *,
+        service_cls: type | None = None,
+        channel: str | None = None,
+    ) -> "ClientSession":
+        """Open a new client-bound session against the peer's RPC
+        connection. Allocates a fresh monotonic `sessionId` (per spec
+        §6) on the underlying `(peer, connection)`; every RPC made via
+        `ClientSession.client(...)` threads that id into its
+        `StreamHeader` so the server routes them into the same
+        session-scoped service instance.
+
+        `service_cls` picks which of the producer's announced RPC
+        addresses to bind to. If omitted, the first advertised RPC
+        channel on any service is used -- fine when the producer only
+        serves one channel but explicit is clearer.
+        """
+        if not self._connected:
+            raise RuntimeError("AsterClient not connected; call connect() first")
+
+        if service_cls is not None:
+            conn, rpc_addr_key, _ = await self._resolve_service(service_cls, channel)
+        else:
+            # Fall back to any advertised RPC channel. Every service
+            # summary from admission carries the same `rpc_addr` when
+            # the producer serves a single channel, so this is
+            # deterministic in the common case.
+            summary = next(iter(self._services), None)
+            if summary is None:
+                raise LookupError("no services advertised by the producer")
+            channel_key = channel or self._channel_name
+            if channel_key not in summary.channels:
+                raise LookupError(
+                    f"producer has no channel {channel_key!r}"
+                )
+            rpc_addr_key = summary.channels[channel_key]
+            conn = await self._rpc_conn_for(rpc_addr_key)
+
+        session_id = self._next_session_id(rpc_addr_key)
+        return ClientSession(
+            parent=self,
+            connection=conn,
+            rpc_addr_key=rpc_addr_key,
+            session_id=session_id,
+        )
 
     async def client(
         self,
@@ -1873,6 +1986,118 @@ class AsterClient:
         (endpoint_id == root_pubkey). Empty string otherwise.
         """
         return self._gossip_topic
+
+
+class ClientSession:
+    """A client-bound session over a per-connection multiplexed stream pool.
+
+    Allocated via `AsterClient.open_session(...)`. Pins a
+    `(connection, sessionId)` pair; every client stub produced through
+    `ClientSession.client(...)` threads the same `sessionId` into its
+    outbound `StreamHeader`, so the server side routes all calls to the
+    same session-scoped service instance (spec §6, §7.5).
+
+    The session is not a live server resource -- it's a client-side
+    identifier that the server lazily materializes on the first call.
+    Closing the session is a client-side operation that simply stops
+    using the id; the server eventually reaps session state when the
+    underlying QUIC connection closes.
+    """
+
+    def __init__(
+        self,
+        *,
+        parent: AsterClient,
+        connection: Any,
+        rpc_addr_key: str,
+        session_id: int,
+    ) -> None:
+        self._parent = parent
+        self._connection = connection
+        self._rpc_addr_key = rpc_addr_key
+        self._session_id = session_id
+        self._closed = False
+        self._stubs: list[ServiceClient] = []
+
+    @property
+    def session_id(self) -> int:
+        return self._session_id
+
+    @property
+    def connection(self) -> Any:
+        return self._connection
+
+    async def client(
+        self,
+        service_cls: type,
+        *,
+        codec: Any | None = None,
+        interceptors: list[Any] | None = None,
+    ) -> ServiceClient:
+        """Return a typed client stub bound to this session. Each stub
+        uses an `IrohTransport` whose `session_id` is set to this
+        session's id, so every outbound call carries the same routing
+        key into the server's per-connection session map.
+
+        Session-scoped (`RpcScope.SESSION`) service classes are routed
+        here naturally; stateless services can also be used via a
+        session, which just means the server treats them as
+        session-instance-bound for the duration of the connection.
+        """
+        if self._closed:
+            raise RuntimeError("ClientSession is closed")
+
+        info = getattr(service_cls, "__aster_service_info__", None)
+        if info is None:
+            raise TypeError(
+                f"{service_cls!r} is not @service-decorated "
+                f"(missing __aster_service_info__)"
+            )
+
+        # Auto-pick JSON codec when producer advertises JSON-only, same
+        # logic as `AsterClient.client`.
+        if codec is None:
+            summary: ServiceSummary | None = None
+            for s in self._parent.services:
+                if s.name == info.name and s.version == info.version:
+                    summary = s
+                    break
+            if summary is not None:
+                modes = list(getattr(summary, "serialization_modes", None) or [])
+                if modes and "xlang" not in modes and "json" in modes:
+                    from aster.json_codec import JsonProxyCodec
+                    codec = JsonProxyCodec()
+
+        transport = IrohTransport(
+            connection=self._connection,
+            codec=codec,
+            session_id=self._session_id,
+        )
+        stub = create_client(
+            service_cls,
+            transport=transport,
+            codec=codec,
+            interceptors=interceptors,
+        )
+        self._stubs.append(stub)
+        return stub
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for stub in self._stubs:
+            try:
+                await stub.close()
+            except Exception:
+                pass
+        self._stubs.clear()
+
+    async def __aenter__(self) -> "ClientSession":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
 
 
 def _resolve_relay_addr(relay_url: str) -> str | None:

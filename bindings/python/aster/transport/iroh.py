@@ -1,37 +1,44 @@
 """
 aster.transport.iroh -- Iroh-based remote transport.
 
-Spec reference: §8.3.1 (Transport protocol)
+Spec reference: §8.3.1 (Transport protocol), Aster-multiplexed-streams.md §5/§6
 
-This module implements the Transport interface using Iroh QUIC streams.
-Each RPC call opens a bidirectional stream, sends the StreamHeader frame,
-then performs the appropriate read/write sequence for the RPC pattern.
+Every RPC call goes through the per-connection multiplexed-stream pool
+via `aster._aster.AsterCall`. The call handle owns a pooled bi-stream
+for its lifetime and releases it back to the pool on success (or
+discards it on error). Streams are never finished per-call; the server
+reads frames in a loop (spec §6), so every request's last frame
+carries `FLAG_END_STREAM` to tell the dispatcher the request phase is
+done.
+
+`session_id` selects the pool routing key: 0 = SHARED pool (stateless),
+non-zero = per-session pool. `ClientSession.open` on the client allocates
+a monotonic u32 per connection.
 """
 
 from __future__ import annotations
 
-import asyncio
-import uuid
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 import aster
+from aster._aster import AsterCall, StreamAcquireError
 from aster.codec import ForyCodec, ForyConfig
 from aster.framing import (
-    HEADER,
-    TRAILER,
     COMPRESSED,
+    END_STREAM,
+    HEADER,
     ROW_SCHEMA,
-    write_frame,
-    read_frame,
+    TRAILER,
+    encode_frame,
 )
-from aster.protocol import StreamHeader, RpcStatus
-from aster.status import StatusCode, RpcError
+from aster.protocol import RpcStatus, StreamHeader
 from aster.rpc_types import SerializationMode
+from aster.status import RpcError, StatusCode
 from aster.transport.base import (
-    Transport,
     BidiChannel,
-    TransportError,
     ConnectionLostError,
+    Transport,
+    TransportError,
 )
 
 if TYPE_CHECKING:
@@ -41,38 +48,16 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Keywords in exception messages that indicate a QUIC stream/connection reset.
-_RESET_KEYWORDS = (
-    "reset",
-    "stream reset",
-    "connection reset",
-    "RESET_STREAM",
-    "connection lost",
-    "connection closed",
-)
-
-
-def _map_transport_exception(exc: Exception) -> Exception:
-    """Map QUIC/Iroh transport exceptions to appropriate RpcError per spec S6.7.
-
-    QUIC RESET_STREAM and connection-level resets are mapped to
-    ``StatusCode.UNAVAILABLE`` so callers see a retriable error.
-    """
-    if isinstance(exc, RpcError):
-        return exc
-    msg = str(exc).lower()
-    if any(kw in msg for kw in _RESET_KEYWORDS) or isinstance(exc, (ConnectionError, ConnectionLostError)):
-        return RpcError(StatusCode.UNAVAILABLE, f"stream reset by peer: {exc}")
-    return exc
-
-
-# ── Helper functions ─────────────────────────────────────────────────────────
+# `recv_frame` kind discriminator values. Keep in sync with
+# `bindings/python/rust/src/call.rs`.
+_RECV_OK = 0
+_RECV_END_OF_STREAM = 1
+_RECV_TIMEOUT = 2
 
 
 def _build_metadata(
     metadata: dict[str, str] | None,
 ) -> tuple[list[str], list[str]]:
-    """Convert metadata dict to parallel key/value lists."""
     if not metadata:
         return [], []
     keys = list(metadata.keys())
@@ -80,48 +65,136 @@ def _build_metadata(
     return keys, values
 
 
-def _extract_metadata(
-    keys: list[str], values: list[str]
-) -> dict[str, str]:
-    """Convert parallel key/value lists to dict."""
-    if not keys:
-        return {}
-    return dict(zip(keys, values))
+def _acquire_error_to_rpc_error(exc: StreamAcquireError) -> RpcError:
+    reason = getattr(exc, "reason", "UNKNOWN")
+    # Pool exhaustion / transport failures all map to UNAVAILABLE so
+    # callers see a retriable error (spec §6.7).
+    return RpcError(StatusCode.UNAVAILABLE, f"stream acquire failed: {reason}: {exc}")
 
 
-async def _read_trailer(
-    recv: "aster.IrohRecvStream",
-) -> tuple[int, str]:
-    """Read a TRAILER frame and extract status."""
-    frame = await read_frame(recv)
-    if frame is None:
-        raise ConnectionLostError("stream ended before trailer")
-    payload, flags = frame
-    if not (flags & TRAILER):
-        raise TransportError(f"expected TRAILER frame, got flags={flags:#x}")
-    
-    # Decode the RpcStatus
-    codec = ForyCodec(mode=SerializationMode.XLANG)
-    status = codec.decode(payload, RpcStatus)
+class _CallDriver:
+    """Per-call helper that owns an `AsterCall` handle and drives the
+    multiplexed request/response loop. Always pair with `release()` on
+    success or `discard()` on error -- the handle is valid only between
+    `acquire()` and one of those terminators.
+    """
 
-    from aster.limits import validate_status_message
-    return status.code, validate_status_message(status.message)
+    def __init__(self, call: AsterCall, codec: ForyCodec) -> None:
+        self._call = call
+        self._codec = codec
+        self._terminated = False
 
+    @classmethod
+    async def acquire(
+        cls,
+        conn: "aster.IrohConnection",
+        session_id: int,
+        codec: ForyCodec,
+    ) -> "_CallDriver":
+        try:
+            call = await AsterCall.acquire(conn, session_id)
+        except StreamAcquireError as exc:
+            raise _acquire_error_to_rpc_error(exc) from exc
+        return cls(call, codec)
 
-# ── IrohTransport ───────────────────────────────────────────────────────────
+    async def send_header(
+        self,
+        *,
+        service: str,
+        method: str,
+        deadline_secs: int,
+        serialization_mode: int,
+        metadata: dict[str, str] | None,
+        session_id: int,
+    ) -> None:
+        keys, values = _build_metadata(metadata)
+        header = StreamHeader(
+            service=service,
+            method=method,
+            version=1,
+            callId=0,
+            deadline=deadline_secs,
+            serializationMode=serialization_mode,
+            metadataKeys=keys,
+            metadataValues=values,
+            sessionId=session_id,
+        )
+        header_bytes = self._codec.encode(header)
+        await self._call.send_frame(encode_frame(header_bytes, HEADER))
+
+    async def send_request(self, request: Any, *, last: bool = True) -> None:
+        payload, compressed = self._codec.encode_compressed(request)
+        flags = 0
+        if compressed:
+            flags |= COMPRESSED
+        if last:
+            flags |= END_STREAM
+        await self._call.send_frame(encode_frame(payload, flags))
+
+    async def send_end_stream(self) -> None:
+        """Send an empty END_STREAM frame to signal no more requests on a
+        bidi-streaming call whose final request was already emitted
+        without the `last=True` flag."""
+        await self._call.send_frame(encode_frame(b"", END_STREAM))
+
+    async def recv_frame(self) -> tuple[bytes, int] | None:
+        """Pull one frame from the recv side. Returns `(payload, flags)`
+        or `None` on end-of-stream. Raises on transport errors."""
+        payload, flags, kind = await self._call.recv_frame(0)
+        if kind == _RECV_OK:
+            return payload, flags
+        if kind == _RECV_END_OF_STREAM:
+            return None
+        # timeout_ms=0 means block indefinitely, so this branch is
+        # unreachable in practice; treat as a transport error.
+        raise TransportError("unexpected recv timeout on multiplexed stream")
+
+    def decode_response(self, payload: bytes, flags: int, response_type: Any = None) -> Any:
+        compressed = bool(flags & COMPRESSED)
+        return self._codec.decode_compressed(payload, compressed)
+
+    def check_trailer(self, payload: bytes) -> None:
+        """Parse a trailer payload and raise RpcError if non-OK.
+
+        Empty payload is a clean OK trailer (core strips empty END_STREAM
+        forwards on the server side; see commit `cdabc02`).
+        """
+        if not payload:
+            return
+        status = self._codec.decode(payload, RpcStatus)
+        if status.code != StatusCode.OK:
+            raise RpcError.from_status(
+                StatusCode(status.code),
+                status.message,
+                dict(zip(status.detailKeys, status.detailValues)),
+            )
+
+    def release(self) -> None:
+        if not self._terminated:
+            self._terminated = True
+            self._call.release()
+
+    def discard(self) -> None:
+        if not self._terminated:
+            self._terminated = True
+            self._call.discard()
 
 
 class IrohTransport(Transport):
-    """Transport implementation using Iroh QUIC streams.
+    """Transport implementation over the per-connection multiplexed-stream pool.
 
-    This transport opens a bidirectional QUIC stream for each RPC call,
-    writes the StreamHeader as the first frame, then performs the
-    appropriate read/write sequence for each RPC pattern.
+    Every RPC call acquires a pooled bi-stream via `AsterCall`, writes a
+    `StreamHeader` as the first frame, then drives the pattern-specific
+    request/response loop. Streams are returned to the pool on success
+    (`release`) or discarded on error (`discard`).
 
     Args:
-        connection: The Iroh connection to use for RPC calls.
-        codec: The ForyCodec instance for serialization. If None, a
-            default codec with XLANG mode is used.
+        connection: The Iroh connection to issue calls on.
+        codec: Fory codec for request/response serialization. Defaults
+            to an XLANG codec.
+        session_id: Pool routing key. 0 = SHARED (stateless); non-zero
+            selects a per-session pool keyed by this id. Normally set
+            via `AsterClient.open_session` rather than directly.
     """
 
     def __init__(
@@ -129,13 +202,14 @@ class IrohTransport(Transport):
         connection: "aster.IrohConnection",
         codec: ForyCodec | None = None,
         fory_config: ForyConfig | None = None,
+        session_id: int = 0,
     ) -> None:
         self._conn = connection
         self._codec = codec or ForyCodec(
             mode=SerializationMode.XLANG,
             fory_config=fory_config,
         )
-        # Auto-detect JSON mode from codec type
+        self._session_id = session_id
         from aster.json_codec import JsonProxyCodec
         self._default_serialization_mode = (
             SerializationMode.JSON.value
@@ -143,9 +217,15 @@ class IrohTransport(Transport):
             else SerializationMode.XLANG.value
         )
 
+    @property
+    def session_id(self) -> int:
+        return self._session_id
+
     async def close(self) -> None:
-        """Close the underlying Iroh connection."""
         self._conn.close(0, b"normal close")
+
+    def _resolve_mode(self, override: int | None) -> int:
+        return override if override is not None else self._default_serialization_mode
 
     # ── Unary ───────────────────────────────────────────────────────────────
 
@@ -158,65 +238,44 @@ class IrohTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_secs: int = 0,
         serialization_mode: int | None = None,
-
     ) -> Any:
-        """Perform a unary RPC call over Iroh QUIC.
-
-        Uses a single FFI crossing via core::unary_call -- the Rust side
-        handles open_bi, write, finish, and the read loop internally.
-        """
-        import struct as _struct
-
-        keys, values = _build_metadata(metadata)
-        header = StreamHeader(
-            service=service,
-            method=method,
-            version=1,
-            callId=0,
-            deadline=deadline_secs,
-            serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
-            metadataKeys=keys,
-            metadataValues=values,
-        )
-
-        header_bytes = self._codec.encode(header)
-        payload, compressed = self._codec.encode_compressed(request)
-        req_flags = COMPRESSED if compressed else 0
-
-        header_frame = (
-            _struct.pack("<I", len(header_bytes) + 1)
-            + bytes([HEADER])
-            + header_bytes
-        )
-        request_frame = (
-            _struct.pack("<I", len(payload) + 1)
-            + bytes([req_flags])
-            + payload
-        )
-
+        driver = await _CallDriver.acquire(self._conn, self._session_id, self._codec)
         try:
-            (
-                response_payload,
-                response_flags,
-                trailer_payload,
-                trailer_flags,
-            ) = await self._conn.unary_call(header_frame, request_frame)
-        except Exception as e:
-            raise _map_transport_exception(e) from e
+            await driver.send_header(
+                service=service,
+                method=method,
+                deadline_secs=deadline_secs,
+                serialization_mode=self._resolve_mode(serialization_mode),
+                metadata=metadata,
+                session_id=self._session_id,
+            )
+            await driver.send_request(request, last=True)
 
-        if trailer_flags & TRAILER:
-            status = self._codec.decode(trailer_payload, RpcStatus)
-            if status.code != StatusCode.OK:
-                raise RpcError.from_status(
-                    StatusCode(status.code),
-                    status.message,
-                    dict(zip(status.detailKeys, status.detailValues)),
-                )
-
-        resp_compressed = bool(response_flags & COMPRESSED)
-        return self._codec.decode_compressed(
-            response_payload, resp_compressed
-        )
+            response_payload: bytes | None = None
+            response_flags = 0
+            while True:
+                frame = await driver.recv_frame()
+                if frame is None:
+                    raise ConnectionLostError("stream ended before trailer")
+                payload, flags = frame
+                if flags & TRAILER:
+                    driver.check_trailer(payload)
+                    if response_payload is None:
+                        raise RpcError(
+                            StatusCode.INTERNAL,
+                            "unary call received OK trailer with no response frame",
+                        )
+                    driver.release()
+                    return driver.decode_response(response_payload, response_flags)
+                if flags & ROW_SCHEMA:
+                    continue
+                if response_payload is not None:
+                    raise TransportError("unary call received multiple response frames")
+                response_payload = payload
+                response_flags = flags
+        except BaseException:
+            driver.discard()
+            raise
 
     # ── Server Streaming ───────────────────────────────────────────────────
 
@@ -229,19 +288,10 @@ class IrohTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_secs: int = 0,
         serialization_mode: int | None = None,
-
     ) -> AsyncIterator[Any]:
-        """Initiate a server-streaming RPC.
-
-        Flow:
-        1. Open bidirectional stream
-        2. Write StreamHeader frame (HEADER flag)
-        3. Write request payload frame
-        4. Read N response payload frames until trailer
-        """
         return self._server_stream_impl(
             service, method, request, metadata,
-            deadline_secs, serialization_mode,
+            deadline_secs, self._resolve_mode(serialization_mode),
         )
 
     async def _server_stream_impl(
@@ -253,72 +303,35 @@ class IrohTransport(Transport):
         deadline_secs: int,
         serialization_mode: int,
     ) -> AsyncIterator[Any]:
-        call_id = 0
-        send, recv = await self._conn.open_bi()
-
+        driver = await _CallDriver.acquire(self._conn, self._session_id, self._codec)
+        released = False
         try:
-            # Write StreamHeader
-            keys, values = _build_metadata(metadata)
-            header = StreamHeader(
+            await driver.send_header(
                 service=service,
                 method=method,
-                version=1,
-
-                callId=call_id,
-                deadline=deadline_secs,
-                serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
-                metadataKeys=keys,
-                metadataValues=values,
+                deadline_secs=deadline_secs,
+                serialization_mode=serialization_mode,
+                metadata=metadata,
+                session_id=self._session_id,
             )
-            header_bytes = self._codec.encode(header)
-            await write_frame(send, header_bytes, flags=HEADER)
+            await driver.send_request(request, last=True)
 
-            # Write request
-            payload, compressed = self._codec.encode_compressed(request)
-            flags = COMPRESSED if compressed else 0
-            await write_frame(send, payload, flags=flags)
-            await send.finish()
-
-            # Read response frames until trailer
             while True:
-                frame = await read_frame(recv)
+                frame = await driver.recv_frame()
                 if frame is None:
                     raise ConnectionLostError("stream ended before trailer")
                 payload, flags = frame
-
                 if flags & TRAILER:
-                    status = self._codec.decode(payload, RpcStatus)
-                    if status.code != StatusCode.OK:
-                        # Use from_status so the raised exception is the
-                        # specific subclass for the code (e.g.
-                        # ContractViolationError) instead of a base
-                        # RpcError. Lets users catch by class.
-                        raise RpcError.from_status(
-                            StatusCode(status.code),
-                            status.message,
-                            dict(zip(status.detailKeys, status.detailValues)),
-                        )
-                    break
-
-                # §5.5.2: Consume ROW_SCHEMA frame (first frame in ROW mode)
+                    driver.check_trailer(payload)
+                    driver.release()
+                    released = True
+                    return
                 if flags & ROW_SCHEMA:
                     continue
-
-                compressed = bool(flags & COMPRESSED)
-                yield self._codec.decode_compressed(payload, compressed)
-
-        except RpcError:
-            try:
-                recv.stop(1)
-            except Exception:
-                pass
-            raise
-        except Exception as e:
-            try:
-                recv.stop(1)
-            except Exception:
-                pass
-            raise _map_transport_exception(e) from e
+                yield driver.decode_response(payload, flags)
+        finally:
+            if not released:
+                driver.discard()
 
     # ── Client Streaming ───────────────────────────────────────────────────
 
@@ -331,87 +344,56 @@ class IrohTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_secs: int = 0,
         serialization_mode: int | None = None,
-
     ) -> Any:
-        """Perform a client-streaming RPC.
-
-        Flow:
-        1. Open bidirectional stream
-        2. Write StreamHeader frame (HEADER flag)
-        3. Write N request payload frames
-        4. Finish stream
-        5. Read response frame + trailer
-        """
-        call_id = 0
-        send, recv = await self._conn.open_bi()
-
+        driver = await _CallDriver.acquire(self._conn, self._session_id, self._codec)
         try:
-            # Write StreamHeader
-            keys, values = _build_metadata(metadata)
-            header = StreamHeader(
+            await driver.send_header(
                 service=service,
                 method=method,
-                version=1,
-
-                callId=call_id,
-                deadline=deadline_secs,
-                serializationMode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
-                metadataKeys=keys,
-                metadataValues=values,
+                deadline_secs=deadline_secs,
+                serialization_mode=self._resolve_mode(serialization_mode),
+                metadata=metadata,
+                session_id=self._session_id,
             )
-            header_bytes = self._codec.encode(header)
-            await write_frame(send, header_bytes, flags=HEADER)
+            # Buffer all requests so we can mark the last one with
+            # END_STREAM. This matches Java's `runClientStream`.
+            buffered: list[Any] = [item async for item in requests]
+            if not buffered:
+                # Protocol requires at least one request frame to arrive
+                # inline with the call (core dispatcher bootstrap).
+                raise TransportError(
+                    "client_stream requires at least one request frame"
+                )
+            for i, item in enumerate(buffered):
+                await driver.send_request(item, last=(i == len(buffered) - 1))
 
-            # Stream request messages
-            async for request in requests:
-                payload, compressed = self._codec.encode_compressed(request)
-                flags = COMPRESSED if compressed else 0
-                await write_frame(send, payload, flags=flags)
-
-            # Signal end of input
-            await send.finish()
-
-            # Read response
-            response_payload = None
+            response_payload: bytes | None = None
+            response_flags = 0
             while True:
-                frame = await read_frame(recv)
+                frame = await driver.recv_frame()
                 if frame is None:
-                    raise ConnectionLostError("stream ended before response")
+                    raise ConnectionLostError("stream ended before trailer")
                 payload, flags = frame
-
                 if flags & TRAILER:
-                    status = self._codec.decode(payload, RpcStatus)
-                    if status.code != StatusCode.OK:
-                        # Use from_status so the raised exception is the
-                        # specific subclass for the code (e.g.
-                        # ContractViolationError) instead of a base
-                        # RpcError. Lets users catch by class.
-                        raise RpcError.from_status(
-                            StatusCode(status.code),
-                            status.message,
-                            dict(zip(status.detailKeys, status.detailValues)),
+                    driver.check_trailer(payload)
+                    if response_payload is None:
+                        raise RpcError(
+                            StatusCode.INTERNAL,
+                            "client_stream got OK trailer with no response frame",
                         )
-                    break
-
+                    driver.release()
+                    return driver.decode_response(response_payload, response_flags)
+                if flags & ROW_SCHEMA:
+                    continue
                 if response_payload is not None:
-                    raise TransportError("received multiple response frames")
-                compressed = bool(flags & COMPRESSED)
-                response_payload = self._codec.decode_compressed(payload, compressed)
-
-            return response_payload
-
-        except RpcError:
-            try:
-                recv.stop(1)
-            except Exception:
-                pass
+                    raise TransportError(
+                        "client_stream received multiple response frames"
+                    )
+                response_payload = payload
+                response_flags = flags
+        except BaseException:
+            driver.discard()
             raise
-        except Exception as e:
-            try:
-                recv.stop(1)
-            except Exception:
-                pass
-            raise _map_transport_exception(e) from e
 
     # ── Bidirectional Streaming ───────────────────────────────────────────
 
@@ -423,9 +405,7 @@ class IrohTransport(Transport):
         metadata: dict[str, str] | None = None,
         deadline_secs: int = 0,
         serialization_mode: int | None = None,
-
     ) -> BidiChannel:
-        """Initiate a bidirectional-streaming RPC."""
         return IrohBidiChannel(
             connection=self._conn,
             codec=self._codec,
@@ -433,18 +413,17 @@ class IrohTransport(Transport):
             method=method,
             metadata=metadata,
             deadline_secs=deadline_secs,
-            serialization_mode=serialization_mode if serialization_mode is not None else self._default_serialization_mode,
+            serialization_mode=self._resolve_mode(serialization_mode),
+            session_id=self._session_id,
         )
 
 
-# ── IrohBidiChannel ─────────────────────────────────────────────────────────
-
-
 class IrohBidiChannel(BidiChannel):
-    """BidiChannel implementation for Iroh QUIC streams.
+    """Interleaved bidi channel over a pooled multiplexed stream.
 
-    Manages a bidirectional stream for bidirectional or client-streaming RPCs.
-    Supports the async context manager protocol for convenient resource management.
+    Request frames carry `END_STREAM` on the final frame (emitted by
+    `close()`), after which the pool handle is released once the server
+    writes its trailer.
     """
 
     def __init__(
@@ -456,6 +435,7 @@ class IrohBidiChannel(BidiChannel):
         metadata: dict[str, str] | None,
         deadline_secs: int,
         serialization_mode: int,
+        session_id: int,
     ) -> None:
         self._conn = connection
         self._codec = codec
@@ -464,122 +444,124 @@ class IrohBidiChannel(BidiChannel):
         self._metadata = metadata
         self._deadline_secs = deadline_secs
         self._serialization_mode = serialization_mode
-        self._send: "aster.IrohSendStream | None" = None
-        self._recv: "aster.IrohRecvStream | None" = None
-        self._header_written = False
-        self._closed = False
+        self._session_id = session_id
+        self._driver: _CallDriver | None = None
+        self._sent_end_stream = False
         self._trailer_read = False
         self._last_trailer: tuple[int, str] | None = None
 
     async def __aenter__(self) -> "IrohBidiChannel":
-        """Enter the async context manager, opening the stream."""
-        await self._ensure_stream()
+        await self._ensure_driver()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Exit the async context manager, closing the stream."""
         await self.close()
         if self._last_trailer is None:
             try:
                 await self.wait_for_trailer()
             except Exception:
-                pass  # Stream may already be closed
+                pass
 
-    async def _ensure_stream(self) -> tuple["aster.IrohSendStream", "aster.IrohRecvStream"]:
-        """Lazily open the bidirectional stream and write header."""
-        if self._send is not None and self._recv is not None:
-            return self._send, self._recv
-
-        self._send, self._recv = await self._conn.open_bi()
-
-        # Write StreamHeader
-        keys, values = _build_metadata(self._metadata)
-        header = StreamHeader(
-            service=self._service,
-            method=self._method,
-            version=1,
-            callId=0,
-            deadline=self._deadline_secs,
-            serializationMode=self._serialization_mode,
-            metadataKeys=keys,
-            metadataValues=values,
+    async def _ensure_driver(self) -> _CallDriver:
+        if self._driver is not None:
+            return self._driver
+        self._driver = await _CallDriver.acquire(
+            self._conn, self._session_id, self._codec
         )
-        header_bytes = self._codec.encode(header)
-        await write_frame(self._send, header_bytes, flags=HEADER)
-        self._header_written = True
-
-        return self._send, self._recv
+        try:
+            await self._driver.send_header(
+                service=self._service,
+                method=self._method,
+                deadline_secs=self._deadline_secs,
+                serialization_mode=self._serialization_mode,
+                metadata=self._metadata,
+                session_id=self._session_id,
+            )
+        except BaseException:
+            self._driver.discard()
+            self._driver = None
+            raise
+        return self._driver
 
     async def send(self, msg: Any) -> None:
-        """Send a message on the stream."""
-        if self._closed:
-            raise TransportError("channel is closed")
-        
-        send, _ = await self._ensure_stream()
-        payload, compressed = self._codec.encode_compressed(msg)
-        flags = COMPRESSED if compressed else 0
-        await write_frame(send, payload, flags=flags)
+        if self._sent_end_stream:
+            raise TransportError("channel is closed for sending")
+        driver = await self._ensure_driver()
+        try:
+            await driver.send_request(msg, last=False)
+        except BaseException:
+            driver.discard()
+            self._driver = None
+            raise
 
     async def recv(self) -> Any:
-        """Receive the next message from the stream."""
-        _, recv = await self._ensure_stream()
-
+        driver = await self._ensure_driver()
         while True:
-            frame = await read_frame(recv)
+            try:
+                frame = await driver.recv_frame()
+            except BaseException:
+                driver.discard()
+                self._driver = None
+                raise
             if frame is None:
                 raise ConnectionLostError("stream ended")
-            
             payload, flags = frame
-
             if flags & TRAILER:
                 self._trailer_read = True
+                if not payload:
+                    self._last_trailer = (StatusCode.OK, "")
+                    driver.release()
+                    self._driver = None
+                    return None
                 status = self._codec.decode(payload, RpcStatus)
                 self._last_trailer = (status.code, status.message)
                 if status.code != StatusCode.OK:
+                    driver.discard()
+                    self._driver = None
                     raise RpcError.from_status(
                         StatusCode(status.code),
                         status.message,
                         dict(zip(status.detailKeys, status.detailValues)),
                     )
-                # Clean end-of-stream: return None so callers can use
-                # `while (msg := await ch.recv()) is not None:`
+                driver.release()
+                self._driver = None
                 return None
-
-            # §5.5.2: Consume ROW_SCHEMA frame (first frame in ROW mode)
             if flags & ROW_SCHEMA:
                 continue
-
-            compressed = bool(flags & COMPRESSED)
-            return self._codec.decode_compressed(payload, compressed)
+            return driver.decode_response(payload, flags)
 
     async def close(self) -> None:
-        """Close the sending side of the stream."""
-        if self._closed:
+        """Signal end-of-requests. Sends an empty `END_STREAM` frame so
+        the server-side dispatcher stops reading. Idempotent."""
+        if self._sent_end_stream or self._driver is None:
+            self._sent_end_stream = True
             return
-        
-        self._closed = True
-        
-        if self._send is not None:
-            try:
-                await self._send.finish()
-            except Exception:
-                pass
+        self._sent_end_stream = True
+        try:
+            await self._driver.send_end_stream()
+        except Exception:
+            pass
 
     async def wait_for_trailer(self) -> tuple[int, str]:
-        """Wait for the trailing status frame."""
         if self._last_trailer is not None:
             return self._last_trailer
-        
-        _, recv = await self._ensure_stream()
-
+        driver = await self._ensure_driver()
         while True:
-            frame = await read_frame(recv)
+            try:
+                frame = await driver.recv_frame()
+            except BaseException:
+                driver.discard()
+                self._driver = None
+                raise
             if frame is None:
                 raise ConnectionLostError("stream ended before trailer")
-            
             payload, flags = frame
-
             if flags & TRAILER:
-                status = self._codec.decode(payload, RpcStatus)
-                self._last_trailer = (status.code, status.message)
+                if not payload:
+                    self._last_trailer = (StatusCode.OK, "")
+                else:
+                    status = self._codec.decode(payload, RpcStatus)
+                    self._last_trailer = (status.code, status.message)
+                driver.release()
+                self._driver = None
                 return self._last_trailer

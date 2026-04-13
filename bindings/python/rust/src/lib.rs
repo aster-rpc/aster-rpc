@@ -16,6 +16,7 @@
 use pyo3::prelude::*;
 
 mod blobs;
+mod call;
 mod contract;
 mod docs;
 mod error;
@@ -63,6 +64,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register all module types
     node::register(py, m)?;
     net::register(py, m)?;
+    call::register(py, m)?;
     blobs::register(py, m)?;
     docs::register(py, m)?;
     gossip::register(py, m)?;
