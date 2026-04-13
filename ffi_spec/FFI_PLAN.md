@@ -24,6 +24,7 @@
 9. [Memory Ownership Rules](#7-memory-ownership-rules)
 10. [Testing & Validation Strategy](#8-testing--validation-strategy)
 11. [Migration Guide](#9-migration-guide)
+12. [Phase 1i: Low-Level Transport Optimizations (noq/iroh Fork)](#3i-phase-1i-low-level-transport-optimizations-noqiroh-fork)
 
 ---
 
@@ -3501,3 +3502,139 @@ int32_t aster_ticket_decode(
 ```
 
 Both are synchronous. `aster_ticket_encode` writes the `aster1...` string to `out_buf`. `aster_ticket_decode` writes a JSON object with `endpoint_id`, `relay_addr`, `direct_addrs`, `credential_type`, `credential_data_hex`.
+
+## 3i. Phase 1i: Low-Level Transport Optimizations (noq/iroh Fork)
+
+**Status:** Available (aster-rpc/noq + aster-rpc/iroh forks)
+**Date:** 2026-04-12
+
+### Overview
+
+The `aster-rpc/noq` and `aster-rpc/iroh` forks add two capabilities designed to reduce overhead on the FFI data path. These are available through a single `iroh` dependency from `aster-rpc/iroh`.
+
+### What's Available
+
+#### 1. `RecvStream::read_into(&mut [u8])` — Zero-Copy Recv
+
+`iroh::endpoint::RecvStream` (re-exported from noq) now has a `read_into` method that copies stream data directly into a caller-provided `&mut [u8]` without creating intermediate `Bytes` handles. This eliminates one reference-count increment/decrement per read on the receive path.
+
+```rust
+// Before (current iroh_stream_read implementation):
+//   RecvStream::read() → Bytes allocation → copy into event payload → Arc<[u8]>
+//   Two allocations, one memcpy, one atomic refcount per read.
+
+// After (with read_into):
+//   RecvStream::read_into(&mut ring_buffer_slot) → direct copy
+//   One memcpy, no allocations, no refcount.
+```
+
+**How to integrate with the C ABI:**
+
+The `iroh_stream_read` FFI function currently submits an async task that calls `RecvStream::read()`, allocates a `Vec<u8>`, and posts the result to the completion queue as an `Arc<[u8]>`. To use `read_into`:
+
+```rust
+// In aster_transport_ffi stream read handler:
+async fn handle_stream_read(recv: &mut RecvStream, max_len: usize) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; max_len];
+    match recv.read_into(&mut buf).await {
+        Ok(Some(n)) => {
+            buf.truncate(n);
+            Some(buf)
+        }
+        Ok(None) => None, // stream finished
+        Err(e) => { /* handle error */ None }
+    }
+}
+```
+
+For the **reactor SPSC ring buffer** path (`aster_reactor_*` functions), `read_into` is the ideal fit: the reactor can provide a slice of the ring buffer directly, achieving zero-copy from QUIC decrypt to foreign language reader:
+
+```rust
+// In reactor pump task:
+let slot = ring_buffer.claim_write_slot();
+let n = recv_stream.read_into(slot).await?;
+ring_buffer.commit(n);
+// Go/Java/.NET reader sees the data with zero additional copies.
+```
+
+**Also available:**
+- `RecvStream::poll_read_into(cx, buf)` — poll-based variant for custom futures
+- Both are cancel-safe and ordered-only
+
+#### 2. `iroh::poll_driver::PollDriver` — Sync QUIC Driver
+
+Re-exported from noq, `PollDriver` is a synchronous driver that wraps noq-proto's sans-IO endpoint and connections without requiring Tokio. Designed for FFI bridges with their own event loop.
+
+```rust
+use iroh::poll_driver::{PollDriver, PollEvent, PollDriverError};
+
+let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+socket.set_nonblocking(true)?;
+let mut driver = PollDriver::new(socket, proto_endpoint);
+
+// In the foreign language's event loop (Go netpoller, Java NIO, etc.):
+loop {
+    let events = driver.drive(Instant::now());
+    for event in events {
+        match event {
+            PollEvent::StreamReadable { connection, stream } => {
+                let mut buf = [0u8; 4096];
+                let n = driver.stream_recv(connection, stream, &mut buf)?;
+                // buf[..n] contains data, read directly via read_into
+            }
+            PollEvent::Connected { connection } => { /* ... */ }
+            // ...
+        }
+    }
+    driver.flush_transmits(Instant::now())?;
+    let next_timeout = driver.poll_timeout();
+    // sleep/epoll until socket readable or timeout
+}
+```
+
+**API surface:**
+- `drive(now)` — recv datagrams, handle timers, route events → `Vec<PollEvent>`
+- `flush_transmits(now)` — send outgoing packets
+- `stream_recv(conn, stream, buf)` — uses `read_into` internally
+- `stream_send(conn, stream, data)` — write to stream
+- `poll_timeout()` — next timer deadline
+- `accept()`, `connect()`, `close()`, `open_bi()`, `open_uni()`
+
+**When to use PollDriver vs Iroh Endpoint:**
+
+| | Iroh Endpoint (async) | PollDriver (sync) |
+|-|----------------------|-------------------|
+| Relay/holepunching | Yes | No |
+| Node discovery | Yes | No |
+| Requires Tokio | Yes | No |
+| FFI overhead | Completion queue + task spawn per op | Direct call, caller drives |
+| Best for | Connections that need NAT traversal | Direct LAN peers, latency-critical paths |
+
+For most Aster deployments, the **Iroh Endpoint** path with `read_into` is the right choice — it gives you relay, holepunching, and discovery while eliminating unnecessary allocations on the data path.
+
+`PollDriver` is for specialized cases where Aster embeds in a runtime that can't tolerate a Tokio thread pool (e.g. a Go process with its own goroutine scheduler, or a real-time .NET application).
+
+### Security Fixes Included
+
+The aster-rpc/iroh fork also includes security hardening from a code audit:
+
+| Fix | Impact |
+|-----|--------|
+| Relay accept rate limiting (token bucket) | Prevents connection flooding DoS |
+| max_incoming capped to 256 | Limits half-open QUIC connection memory |
+| RemoteStateActor panics logged, not propagated | Single actor failure doesn't crash endpoint |
+| Accepting::into_0rtt returns Result | No panic on unauthenticated 0-RTT path |
+| Saturating arithmetic in relay frames + rate limiter | Prevents integer overflow on crafted input |
+
+### Dependency Configuration
+
+`aster_transport_core` Cargo.toml should use:
+
+```toml
+[dependencies]
+iroh = { git = "https://github.com/aster-rpc/iroh", branch = "main" }
+```
+
+This transitively pulls `aster-rpc/noq` (which has `read_into` and `PollDriver`).
+`read_into` is available on `iroh::endpoint::RecvStream` with no additional configuration.
+`PollDriver` is available at `iroh::poll_driver`.
