@@ -35,6 +35,14 @@ else
     echo "  Install with: brew install sccache"
 fi
 
+# ── 0. Pin fork transitive deps (hickory-proto / hickory-net) ─────
+step "pin-fork-deps.sh"
+if ./scripts/pin-fork-deps.sh; then
+    pass "Fork deps pinned"
+else
+    fail "Failed to pin fork deps"
+fi
+
 # ── 1. Rust formatting ─────────────────────────────────────────────
 step "cargo fmt --check"
 if cargo fmt --manifest-path bindings/python/rust/Cargo.toml --check; then

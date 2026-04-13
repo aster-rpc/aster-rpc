@@ -13,6 +13,10 @@ STUB="bindings/python/aster/_aster.pyi"
 
 WHEEL_DIR="bindings/python/target/wheels"
 
+# Pin aster-rpc fork transitive deps (hickory-proto / hickory-net → beta.1)
+# before invoking cargo. No-op if already pinned.
+./scripts/pin-fork-deps.sh
+
 # Build wheel, then install it — single cargo compilation
 uv run maturin build -m "$MANIFEST" --out "$WHEEL_DIR" "$@"
 uv pip install "$WHEEL_DIR"/aster_rpc-*.whl --force-reinstall --no-deps

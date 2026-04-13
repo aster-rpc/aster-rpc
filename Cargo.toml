@@ -5,14 +5,13 @@ resolver = "2"
 
 [workspace.dependencies]
 # Core Iroh
+# Declared as crates.io versions; [patch.crates-io] below rewrites them
+# to the aster-rpc forks (security fixes, read_into, BytesMut pooling).
 iroh        = "0.97.0"
-
-# Protocol Crates (Option B - Router Pattern)
-iroh-blobs  = "0.99.0"  # ⚠️ Not production-ready per README, but usable
+iroh-blobs  = "0.99.0"
 iroh-docs   = "0.97.0"
 iroh-gossip = "0.97.0"
 iroh-tickets = "0.4.0"
-# iroh-automerge = { git = "https://github.com/n0-computer/iroh-automerge", branch = "main" }  # Experimental/optional
 
 # Python FFI
 pyo3        = { version = "0.28.2", features = ["extension-module", "abi3-py39"] }
@@ -26,3 +25,24 @@ futures-lite = "2"
 once_cell = "1"
 libc = "0.2"
 crossbeam-utils = "0.8"
+
+# ──────────────────────────────────────────────────────────────────────────
+# aster-rpc forks
+# ──────────────────────────────────────────────────────────────────────────
+# All iroh/noq crates are rewired to the aster-rpc forks via [patch.crates-io].
+# Pinned to commit SHAs for reproducible builds. Bump these when pulling in
+# new fork changes.
+#
+# Why [patch.crates-io]: transitive consumers (e.g. iroh-blobs depends on
+# iroh from crates.io) must also resolve to the fork. A regular dep override
+# only affects the top-level use; [patch] rewires every resolution.
+[patch.crates-io]
+iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "1d8cb0121eb4d25e1b819efc343eecd524f48c3d" }
+iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "1d8cb0121eb4d25e1b819efc343eecd524f48c3d" }
+iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "1d8cb0121eb4d25e1b819efc343eecd524f48c3d" }
+iroh-blobs  = { git = "https://github.com/aster-rpc/iroh-blobs",  rev = "867fe38dc5846117ad7fcf89656cf0dc122353b2" }
+iroh-docs   = { git = "https://github.com/aster-rpc/iroh-docs",   rev = "be1fb71eec1cc1b3cb80a45d801381105b3053fc" }
+iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "20cdb7311c7efea3d12e302a514506fc31c80951" }
+noq         = { git = "https://github.com/aster-rpc/noq",         rev = "e7a90869738ba551c4ade4eddc1c89993503b42a" }
+noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "e7a90869738ba551c4ade4eddc1c89993503b42a" }
+noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "e7a90869738ba551c4ade4eddc1c89993503b42a" }
