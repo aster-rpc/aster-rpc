@@ -8,21 +8,25 @@ package site.aster.server;
  * {@link #requestFlags()}.
  *
  * @param callId reactor-assigned call ID (used internally for response correlation)
- * @param streamId reactor-assigned unique ID for the QUIC bi-stream — together with {@code peerId}
- *     this is the correct key for session-scoped service instances
- * @param header de-framed header payload (contains StreamHeader: contract ID, method, etc.)
+ * @param connectionId reactor-assigned id for the QUIC connection this call arrived on. Sessions
+ *     are scoped per-{@code (peer, connection)} (spec §7.5); use this together with the {@code
+ *     sessionId} decoded from the {@code StreamHeader} payload to key per-session state.
+ * @param streamId reactor-assigned unique ID for the QUIC bi-stream. With multiplexed streams a
+ *     single bi-stream may carry many calls, so DO NOT key per-session state on this — use {@code
+ *     (connectionId, sessionId)} instead.
+ * @param header de-framed header payload (contains StreamHeader: contract ID, method, sessionId,
+ *     etc.)
  * @param headerFlags the flags byte from the header frame
  * @param request de-framed request payload (contains the serialized RPC request)
  * @param requestFlags the flags byte from the request frame
  * @param peerId hex-encoded node ID of the remote peer
- * @param isSessionCall true if this call is part of a session (multi-frame) stream
  */
 public record AsterCall(
     long callId,
+    long connectionId,
     long streamId,
     byte[] header,
     byte headerFlags,
     byte[] request,
     byte requestFlags,
-    String peerId,
-    boolean isSessionCall) {}
+    String peerId) {}
