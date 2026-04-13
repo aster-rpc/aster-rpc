@@ -9,8 +9,15 @@ Usage:
     uv run pytest tests/chaos/ -v --timeout=30
 """
 
-import asyncio
 import pytest
+
+pytest.skip(
+    "aster.session retired -- Phase-8 CALL-frame mechanism removed; "
+    "replaced by ClientSession + reactor-based session lifecycle",
+    allow_module_level=True,
+)
+
+import asyncio
 
 from .harness import (
     History,

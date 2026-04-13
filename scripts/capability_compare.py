@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-capability_compare.py — Compare Python capability surface against TypeScript.
+capability_compare.py -- Compare Python capability surface against TypeScript.
 
 Reads the extracted Python capabilities, searches the TypeScript codebase for
 matching classes/methods, and reports coverage gaps.
@@ -34,10 +34,10 @@ def to_pascal(name: str) -> str:
     return "".join(p.capitalize() for p in name.split("_"))
 
 
-# Capabilities handled by Rust core — all bindings get these for free via FFI.
+# Capabilities handled by Rust core -- all bindings get these for free via FFI.
 # Exclude from cross-binding comparison.
 RUST_CORE_DUPLICATES = {
-    # canonical.py — 100% duplicate of core/src/canonical.rs
+    # canonical.py -- 100% duplicate of core/src/canonical.rs
     "write_varint", "write_zigzag_i32", "write_zigzag_i64", "write_string",
     "write_bytes_field", "write_bool", "write_float64", "write_list_header",
     "write_optional_absent", "write_optional_present_prefix",
@@ -47,9 +47,9 @@ RUST_CORE_DUPLICATES = {
     "CanonicalWriter.float64", "CanonicalWriter.list_header",
     "CanonicalWriter.optional_absent", "CanonicalWriter.optional_present_prefix",
     "CanonicalWriter.raw", "CanonicalWriter.getvalue",
-    # signing.py — signing bytes construction duplicated in core/src/signing.rs
+    # signing.py -- signing bytes construction duplicated in core/src/signing.rs
     "canonical_json", "canonical_signing_bytes",
-    # identity.py — hash computation delegated to Rust core
+    # identity.py -- hash computation delegated to Rust core
     "compute_type_hash", "normalize_identifier",
     "resolve_with_cycles",  # orchestration around Rust tarjan_scc
 }
@@ -146,18 +146,19 @@ METHOD_MAP = {
     "rpc_addr_b64": ["rpcAddrB64"],
     "mesh_state": ["meshState"],
     "root_pubkey": ["rootPubkey"],
-    # IID — Python snake_case vs TS SCREAMING_CASE for acronyms
+    # IID -- Python snake_case vs TS SCREAMING_CASE for acronyms
     "get_iid_backend": ["getIIDBackend"],
     "verify_iid": ["verifyIID"],
-    # Signing — Python name vs TS name
+    # Signing -- Python name vs TS name
     "generate_root_keypair": ["generateRootKeypair", "generateKeypair"],
     "load_private_key": ["loadPrivateKey"],
     "load_public_key": ["loadPublicKey"],
     "verify_signature": ["verifySignature", "verify"],
     "sign_credential": ["signCredential"],
-    # Session
-    "create_session": ["createSession"],
-    "create_local_session": ["createLocalSession"],
+    # Session: the old Phase-8 create_session/create_local_session surface
+    # was retired with the multiplexed-streams migration. Session lifecycle
+    # is now driven by AsterClient.open_session() + ClientSession.client().
+    "open_session": ["openSession"],
     # Config
     "load_endpoint_config": ["loadEndpointConfig", "configFromFile"],
     "resolve_root_pubkey": ["resolveRootPubkey"],
@@ -275,7 +276,7 @@ def check_capability(
     if method.startswith("__") and method.endswith("__"):
         return "python_only", f"dunder method {method}"
 
-    # Skip Rust core duplicates — all bindings get these via FFI
+    # Skip Rust core duplicates -- all bindings get these via FFI
     cap_id = cap.get("id", "")
     if cap_id in RUST_CORE_DUPLICATES:
         return "python_only", f"Rust core duplicate ({cap_id})"

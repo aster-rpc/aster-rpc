@@ -13,12 +13,18 @@ run as part of the normal suite with a 60s timeout.
 
 from __future__ import annotations
 
+import pytest
+
+pytest.skip(
+    "aster.session retired -- Phase-8 CALL-frame mechanism removed; "
+    "replaced by ClientSession + reactor-based session lifecycle",
+    allow_module_level=True,
+)
+
 import asyncio
 import time
 import uuid
 from typing import AsyncIterator
-
-import pytest
 
 from aster.codec import ForyCodec
 from aster.decorators import _SERVICE_INFO_ATTR
