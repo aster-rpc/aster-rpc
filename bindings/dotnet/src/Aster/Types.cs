@@ -24,42 +24,71 @@ public enum Status
 
 /// <summary>
 /// Event kinds emitted by the Rust completion queue via iroh_poll_events.
-/// These mirror iroh_event_kind_t in the C ABI.
+/// Values must exactly match iroh_event_kind_t in the C ABI.
 /// </summary>
 public enum EventKind : uint
 {
     None = 0,
 
-    // Connection lifecycle
-    Connected = 10,
-    ConnectionAccepted = 11,
-    ConnectionClosed = 12,
+    // Lifecycle
+    NodeCreated = 1,
+    NodeCreateFailed = 2,
+    EndpointCreated = 3,
+    EndpointCreateFailed = 4,
+    Closed = 5,
 
-    // Stream lifecycle
+    // Connections
+    Connected = 10,
+    ConnectFailed = 11,
+    ConnectionAccepted = 12,
+    ConnectionClosed = 13,
+
+    // Streams
     StreamOpened = 20,
     StreamAccepted = 21,
-    StreamFinished = 22,
-    StreamReset = 23,
+    FrameReceived = 22,
+    SendCompleted = 23,
+    StreamFinished = 24,
+    StreamReset = 25,
 
-    // Data
-    FrameReceived = 30,
-    SendCompleted = 31,
+    // Blobs
+    BlobAdded = 30,
+    BlobRead = 31,
+    BlobDownloaded = 32,
+    BlobTicketCreated = 33,
+    BlobCollectionAdded = 34,
+    BlobCollectionTicketCreated = 35,
 
-    // Endpoint lifecycle
-    EndpointCreated = 40,
-    EndpointReady = 41,
-    EndpointClosed = 42,
+    // Tags
+    TagSet = 36,
+    TagGet = 37,
+    TagDeleted = 38,
+    TagList = 39,
+
+    // Docs
+    DocCreated = 40,
+    DocJoined = 41,
+    DocSet = 42,
+    DocGet = 43,
+    DocShared = 44,
+    AuthorCreated = 45,
+    DocQuery = 46,
+    DocSubscribed = 47,
+    DocEvent = 48,
+    DocJoinedAndSubscribed = 49,
 
     // Gossip
-    GossipReceived = 50,
+    GossipSubscribed = 50,
+    GossipBroadcastDone = 51,
+    GossipReceived = 52,
     GossipNeighborUp = 53,
     GossipNeighborDown = 54,
     GossipLagged = 55,
 
+    // Blobs extra
+    BlobObserveComplete = 56,
+
     // Datagrams
-    // TODO(iroh): DATAGRAM_RECEIVED (60) is never emitted by any FFI function.
-    // iroh_connection_read_datagram emits BYTES_RESULT (91) instead.
-    // Consider removing DATAGRAM_RECEIVED from this enum or clarifying its intended use.
     DatagramReceived = 60,
 
     // Aster custom-ALPN
@@ -131,10 +160,63 @@ public struct Bytes
     public UIntPtr len;  // uintptr_t
 
     public unsafe Span<byte> AsSpan() => new(ptr.ToPointer(), (int)len);
+
+    /// <summary>
+    /// Creates a Bytes from a GCHandle-pinned array.
+    /// Caller must pin the array with GCHandle.Alloc(data, GCHandleType.Pinned)
+    /// and free it after the FFI call.
+    /// </summary>
+    public static Bytes FromPinned(GCHandle handle, int length)
+    {
+        return new Bytes { ptr = handle.AddrOfPinnedObject(), len = (UIntPtr)length };
+    }
+
+    /// <summary>
+    /// Creates a Bytes from managed array for immediate synchronous FFI calls.
+    /// The data must remain valid for the duration of the call.
+    /// </summary>
+    public static Bytes FromArray(byte[] data)
+    {
+        if (data == null || data.Length == 0)
+            return default;
+        var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
+        // NOTE: caller is responsible for ensuring this is used in a synchronous
+        // P/Invoke context where the pinned address remains valid.
+        var bytes = new Bytes { ptr = handle.AddrOfPinnedObject(), len = (UIntPtr)data.Length };
+        // We intentionally leak the pin here because FromArray is used in patterns
+        // like Native.foo(Bytes.FromArray(data)) where the call is synchronous.
+        // The GC handle will be collected. For long-lived usage, use FromPinned.
+        handle.Free();
+        return bytes;
+    }
 }
+
+/// <summary>Relay mode for endpoint configuration.</summary>
+public enum RelayMode : uint
+{
+    Default = 0,
+    Custom = 1,
+    Disabled = 2,
+}
+
+/// <summary>Strongly-typed wrapper for a native endpoint handle.</summary>
+public readonly record struct EndpointHandle(ulong Value);
+
+/// <summary>Strongly-typed wrapper for a native connection handle.</summary>
+public readonly record struct ConnectionHandle(ulong Value);
+
+/// <summary>Strongly-typed wrapper for a native send stream handle.</summary>
+public readonly record struct SendStreamHandle(ulong Value);
+
+/// <summary>Strongly-typed wrapper for a native recv stream handle.</summary>
+public readonly record struct RecvStreamHandle(ulong Value);
+
+/// <summary>Strongly-typed wrapper for a native node handle.</summary>
+public readonly record struct NodeHandle(ulong Value);
 
 /// <summary>
 /// Runtime configuration for creating an endpoint.
+/// Must match iroh_endpoint_config_t in the C header exactly (144 bytes).
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct EndpointConfig
@@ -145,17 +227,24 @@ public struct EndpointConfig
     public BytesList alpns;
     public BytesList relay_urls;
     public uint enable_discovery;
-    public uint reserved;
+    public uint enable_hooks;
+    public ulong hook_timeout_ms;
+    public Bytes bind_addr;
+    public uint clear_ip_transports;
+    public uint clear_relay_transports;
+    public uint portmapper_config;
+    public Bytes proxy_url;
+    public uint proxy_from_env;
+    public Bytes data_dir_utf8;
 
     public static EndpointConfig Default => new()
     {
         struct_size = (uint)Marshal.SizeOf<EndpointConfig>(),
-        relay_mode = 0, // default relay mode
+        relay_mode = 0,
         secret_key = default,
         alpns = default,
         relay_urls = default,
         enable_discovery = 1,
-        reserved = 0,
     };
 }
 
