@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package mission_control;
+
+service MissionControl {
+  rpc GetStatus (StatusRequest) returns (StatusResponse);
+  rpc SubmitLog (LogEntry) returns (SubmitLogResult);
+}
+
+message StatusRequest {
+  string agent_id = 1;
+}
+
+message StatusResponse {
+  string agent_id = 1;
+  string status = 2;
+  int64 uptime_secs = 3;
+}
+
+message LogEntry {
+  double timestamp = 1;
+  string level = 2;
+  string message = 3;
+  string agent_id = 4;
+}
+
+message SubmitLogResult {
+  bool accepted = 1;
+}
