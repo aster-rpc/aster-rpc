@@ -519,28 +519,74 @@ def _gen_service_client(
         pattern = method.get("pattern", "unary")
         req_cls = known_types.get(method.get("request_type", ""), "Any")
         resp_cls = known_types.get(method.get("response_type", ""), "Any")
+        is_inline = method.get("request_style") == "inline"
+        inline_params = method.get("inline_params", []) or []
 
         lines.append("")
 
+        # Helper: render inline params into a signature + body construction.
+        def _inline_signature() -> tuple[str, str]:
+            sig_parts: list[str] = ["self"]
+            for ip in inline_params:
+                pname = ip.get("name", "arg")
+                ptype = _py_type_from_field(ip, known_types)
+                default = _py_default_from_field(ip)
+                if default is not None and not default.startswith("dataclasses.field"):
+                    sig_parts.append(f"{pname}: {ptype} = {default}")
+                elif default is not None:
+                    # Mutable container default → use None sentinel + convert in body
+                    sig_parts.append(f"{pname}: {ptype} | None = None")
+                else:
+                    sig_parts.append(f"{pname}: {ptype}")
+            sig_parts.append("*")
+            sig_parts.append("timeout: float | None = None")
+            sig = ", ".join(sig_parts)
+            # Body: construct the synthesized request object
+            kwargs = ", ".join(f"{ip.get('name', 'arg')}={ip.get('name', 'arg')}" for ip in inline_params)
+            ctor = f"{req_cls}({kwargs})" if inline_params else f"{req_cls}()"
+            return sig, ctor
+
         if pattern == "unary":
-            lines.append(f"    async def {mname}(")
-            lines.append(f"        self, request: {req_cls}, *, timeout: float | None = None")
-            lines.append(f"    ) -> {resp_cls}:")
-            lines.append(f"        return await self._call_unary(")
-            lines.append(f"            method_info=self._mi_{mname},")
-            lines.append(f"            request=request,")
-            lines.append(f"            timeout=timeout,")
-            lines.append(f"        )")
+            if is_inline:
+                sig, ctor = _inline_signature()
+                lines.append(f"    async def {mname}(")
+                lines.append(f"        {sig}")
+                lines.append(f"    ) -> {resp_cls}:")
+                lines.append(f"        return await self._call_unary(")
+                lines.append(f"            method_info=self._mi_{mname},")
+                lines.append(f"            request={ctor},")
+                lines.append(f"            timeout=timeout,")
+                lines.append(f"        )")
+            else:
+                lines.append(f"    async def {mname}(")
+                lines.append(f"        self, request: {req_cls}, *, timeout: float | None = None")
+                lines.append(f"    ) -> {resp_cls}:")
+                lines.append(f"        return await self._call_unary(")
+                lines.append(f"            method_info=self._mi_{mname},")
+                lines.append(f"            request=request,")
+                lines.append(f"            timeout=timeout,")
+                lines.append(f"        )")
 
         elif pattern == "server_stream":
-            lines.append(f"    def {mname}(")
-            lines.append(f"        self, request: {req_cls}, *, timeout: float | None = None")
-            lines.append(f"    ) -> AsyncIterator[{resp_cls}]:")
-            lines.append(f"        return self._call_server_stream(")
-            lines.append(f"            method_info=self._mi_{mname},")
-            lines.append(f"            request=request,")
-            lines.append(f"            timeout=timeout,")
-            lines.append(f"        )")
+            if is_inline:
+                sig, ctor = _inline_signature()
+                lines.append(f"    def {mname}(")
+                lines.append(f"        {sig}")
+                lines.append(f"    ) -> AsyncIterator[{resp_cls}]:")
+                lines.append(f"        return self._call_server_stream(")
+                lines.append(f"            method_info=self._mi_{mname},")
+                lines.append(f"            request={ctor},")
+                lines.append(f"            timeout=timeout,")
+                lines.append(f"        )")
+            else:
+                lines.append(f"    def {mname}(")
+                lines.append(f"        self, request: {req_cls}, *, timeout: float | None = None")
+                lines.append(f"    ) -> AsyncIterator[{resp_cls}]:")
+                lines.append(f"        return self._call_server_stream(")
+                lines.append(f"            method_info=self._mi_{mname},")
+                lines.append(f"            request=request,")
+                lines.append(f"            timeout=timeout,")
+                lines.append(f"        )")
 
         elif pattern == "client_stream":
             lines.append(f"    async def {mname}(")

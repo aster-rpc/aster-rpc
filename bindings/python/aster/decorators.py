@@ -731,15 +731,80 @@ def _scan_service_methods(
         method_info: MethodInfo | None = getattr(method, _METHOD_INFO_ATTR, None)
 
         if method_info is not None:
-            # Extract types from signature
-            request_type, response_type = _extract_types_from_signature(
-                method, name, serialization_modes
+            from aster.interceptors.base import handler_accepts_ctx
+            from aster.inline_params import (
+                classify_method,
+                make_inline_adapter,
+                synthesize_request_type,
+                RequestStyle,
             )
 
-            # Update the MethodInfo with extracted types
+            # Resolve type hints for Mode detection + downstream extraction
+            hints = _get_type_hints_safe(method)
+            accepts_ctx = handler_accepts_ctx(method)
+            # Client/bidi streams take an AsyncIterator[T] -- T is the wire
+            # request and there is no Mode 2 analogue (can't synthesize a
+            # class from a streaming iterator). Force them to Mode 1.
+            if method_info.pattern in (RpcPattern.CLIENT_STREAM, RpcPattern.BIDI_STREAM):
+                request_style = RequestStyle.EXPLICIT
+                inline_params_list = []
+                ctx_param_name = None
+            else:
+                request_style, inline_params_list, ctx_param_name = classify_method(method, hints)
+
+            if request_style == RequestStyle.EXPLICIT:
+                # Mode 1: existing behavior -- single @wire_type request arg.
+                request_type, response_type = _extract_types_from_signature(
+                    method, name, serialization_modes
+                )
+                dispatch_method = method
+                inline_param_tuples: list[tuple[str, Any]] = []
+            else:
+                # Mode 2: synthesize a {Method}Request wire type from the
+                # inline parameter list, install an adapter on the class so
+                # dispatch still sees a single-request signature.
+                synthesized = synthesize_request_type(cls, name, inline_params_list)
+                request_type = synthesized
+
+                # Extract response type directly from the return annotation.
+                # _extract_types_from_signature expects a first wire param
+                # which Mode 2 handlers don't have, so we read the return
+                # annotation here and apply the same streaming-unwrap logic.
+                sig_for_ret = inspect.signature(method)
+                return_ann = hints.get("return", sig_for_ret.return_annotation)
+                if return_ann is inspect.Signature.empty:
+                    raise TypeError(
+                        f"Method {name} has no return type annotation"
+                    )
+                if return_ann is None or return_ann is type(None):
+                    raise TypeError(
+                        f"Method {name} returns None -- Aster RPC methods must "
+                        f"return a @wire_type dataclass, not None."
+                    )
+                response_type = _unwrap_async_iterator(return_ann)
+
+                # Build the adapter and install it on the class so
+                # getattr(instance, method_name) sees the wrapped version.
+                adapter = make_inline_adapter(
+                    method, inline_params_list, accepts_ctx, ctx_param_name,
+                )
+                setattr(cls, name, adapter)
+                dispatch_method = adapter
+                inline_param_tuples = [(p.name, p.annotation) for p in inline_params_list]
+
+            # Update the MethodInfo with extracted types and mode metadata
             method_info.name = name
             method_info.request_type = request_type
             method_info.response_type = response_type
+            method_info.accepts_ctx = accepts_ctx
+            method_info.request_style = request_style
+            method_info.inline_params = inline_param_tuples
+
+            # For Mode 2 we replaced the method on the class; re-attach the
+            # MethodInfo pointer to the adapter so subsequent class scans
+            # still find it.
+            if dispatch_method is not method:
+                setattr(dispatch_method, _METHOD_INFO_ATTR, method_info)
 
             methods[name] = method_info
 
@@ -766,6 +831,8 @@ def _extract_types_from_signature(
     Raises:
         TypeError: If type annotations are missing or invalid.
     """
+    from aster.interceptors.base import CallContext
+
     sig = inspect.signature(method)
     hints = _get_type_hints_safe(method)
 
@@ -773,6 +840,18 @@ def _extract_types_from_signature(
 
     # Skip 'self' parameter
     params = [p for p in params if p.name != "self"]
+
+    # Exclude any CallContext parameter from the request-type extraction.
+    # It is a framework-injected parameter, not part of the wire contract.
+    def _is_ctx_param(p: inspect.Parameter) -> bool:
+        ann = hints.get(p.name, p.annotation)
+        if ann is CallContext:
+            return True
+        if isinstance(ann, str) and ann.split(".")[-1] == "CallContext":
+            return True
+        return False
+
+    params = [p for p in params if not _is_ctx_param(p)]
 
     # Determine if this is a streaming method based on the MethodInfo
     method_info: MethodInfo | None = getattr(method, _METHOD_INFO_ATTR, None)
@@ -806,10 +885,11 @@ def _extract_types_from_signature(
         # Unwrap AsyncIterator to get the inner type
         request_type = _unwrap_async_iterator(request_type)
 
-    # Extract response type
+    # Extract response type. Prefer ``hints["return"]`` (which resolves
+    # forward-reference strings under ``from __future__ import annotations``)
+    # and fall back to the raw return annotation for legacy paths.
+    response_annotation = hints.get("return", sig.return_annotation)
     if pattern in (RpcPattern.UNARY, RpcPattern.CLIENT_STREAM):
-        # Unary/client-stream: single response (return type)
-        response_annotation = sig.return_annotation
         if response_annotation is inspect.Signature.empty:
             raise TypeError(
                 f"Method {method_name} has no return type annotation"
@@ -823,7 +903,6 @@ def _extract_types_from_signature(
         response_type = _unwrap_async_iterator(response_annotation)
     else:
         # Server-stream/bidi-stream: response is async iterator
-        response_annotation = sig.return_annotation
         if response_annotation is inspect.Signature.empty:
             raise TypeError(
                 f"Method {method_name} has no return type annotation"
@@ -985,17 +1064,31 @@ def _validate_xlang_tags_for_service(cls: type, service_info: Any, _caller_local
         # This ensures forward references are resolved correctly
         hints = _get_type_hints_safe(method)
 
-        # Check request type from parameter annotations
-        params = list(inspect.signature(method).parameters.values())
-        params = [p for p in params if p.name != "self"]
-        if params:
-            request_param = params[0]
-            request_type = hints.get(request_param.name, request_param.annotation)
-            if request_type is not inspect.Parameter.empty:
-                pattern = getattr(method_info, "pattern", RpcPattern.UNARY)
-                if pattern in (RpcPattern.CLIENT_STREAM, RpcPattern.BIDI_STREAM):
-                    request_type = _unwrap_async_iterator(request_type)
-                check_type(request_type, f"{name}(request)")
+        # Prefer the already-resolved request type on MethodInfo (handles
+        # Mode 2 synthesized classes) and fall back to the parameter
+        # annotation for legacy callers.
+        if method_info.request_type is not None:
+            check_type(method_info.request_type, f"{name}(request)")
+        else:
+            from aster.interceptors.base import CallContext as _CCtx
+            params = list(inspect.signature(method).parameters.values())
+            params = [p for p in params if p.name != "self"]
+            def _not_ctx(p: inspect.Parameter) -> bool:
+                ann = hints.get(p.name, p.annotation)
+                if ann is _CCtx:
+                    return False
+                if isinstance(ann, str) and ann.split(".")[-1] == "CallContext":
+                    return False
+                return True
+            params = [p for p in params if _not_ctx(p)]
+            if params:
+                request_param = params[0]
+                request_type = hints.get(request_param.name, request_param.annotation)
+                if request_type is not inspect.Parameter.empty:
+                    pattern = getattr(method_info, "pattern", RpcPattern.UNARY)
+                    if pattern in (RpcPattern.CLIENT_STREAM, RpcPattern.BIDI_STREAM):
+                        request_type = _unwrap_async_iterator(request_type)
+                    check_type(request_type, f"{name}(request)")
 
         # Check response type from return annotation (use resolved hints, not raw annotation)
         if "return" in hints:

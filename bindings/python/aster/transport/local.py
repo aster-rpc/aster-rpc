@@ -24,7 +24,10 @@ from aster.interceptors.base import (
     apply_request_interceptors,
     apply_response_interceptors,
     build_call_context,
+    handler_accepts_ctx,
+    invoke_handler_with_ctx,
     normalize_error,
+    reset_call_context,
 )
 from aster.interceptors.deadline import DeadlineInterceptor
 from aster.status import StatusCode, RpcError
@@ -293,36 +296,45 @@ class LocalTransport(Transport):
         # Run request through interceptor chain
         request = await apply_request_interceptors(self._interceptors, ctx, request)
         
-        # Invoke handler
+        # Invoke handler with CallContext injection
+        accepts_ctx = handler_accepts_ctx(handler)
+        _cv_token = None
         try:
-            response = handler(request)
-            
+            response, _cv_token = invoke_handler_with_ctx(handler, request, ctx, accepts_ctx)
+
             # Handle coroutines
             if asyncio.iscoroutine(response):
                 response = await self._await_with_deadline(ctx, response)
-                
+
         except RpcError as exc:
+            reset_call_context(_cv_token)
+            _cv_token = None
             maybe_error = await apply_error_interceptors(self._interceptors, ctx, exc)
             if maybe_error is not None:
                 raise maybe_error
             raise
         except Exception as e:
+            reset_call_context(_cv_token)
+            _cv_token = None
             err = normalize_error(e)
             maybe_error = await apply_error_interceptors(self._interceptors, ctx, err)
             if maybe_error is not None:
                 raise maybe_error
             raise
 
-        # Run response through interceptor chain
-        response = await apply_response_interceptors(self._interceptors, ctx, response)
+        try:
+            # Run response through interceptor chain
+            response = await apply_response_interceptors(self._interceptors, ctx, response)
 
-        # Serialize response if wire_compatible
-        if self._wire_compatible and response is not None:
-            response = self._deserialize(
-                self._get_serialized_bytes(response, True),
-                type(response),
-                True
-            )
+            # Serialize response if wire_compatible
+            if self._wire_compatible and response is not None:
+                response = self._deserialize(
+                    self._get_serialized_bytes(response, True),
+                    type(response),
+                    True
+                )
+        finally:
+            reset_call_context(_cv_token)
 
         return response
 
@@ -364,12 +376,14 @@ class LocalTransport(Transport):
         # Run request through interceptor chain
         request = await apply_request_interceptors(self._interceptors, ctx, request)
 
+        accepts_ctx = handler_accepts_ctx(handler)
+        _cv_token = None
         try:
-            response_iter = handler(request)
-            
+            response_iter, _cv_token = invoke_handler_with_ctx(handler, request, ctx, accepts_ctx)
+
             if asyncio.iscoroutine(response_iter):
                 response_iter = await self._await_with_deadline(ctx, response_iter)
-            
+
             async for item in response_iter:
                 # Run each item through interceptor chain
                 for interceptor in self._interceptors:
@@ -384,13 +398,15 @@ class LocalTransport(Transport):
                     )
                 
                 yield item
-                
+
         except Exception as e:
             err = normalize_error(e)
             maybe_error = await apply_error_interceptors(self._interceptors, ctx, err)
             if maybe_error is not None:
                 raise maybe_error
             raise
+        finally:
+            reset_call_context(_cv_token)
 
     # ── Client Streaming ───────────────────────────────────────────────────
 
@@ -420,21 +436,28 @@ class LocalTransport(Transport):
             request = await apply_request_interceptors(self._interceptors, ctx, request)
             collected.append(request)
 
+        accepts_ctx = handler_accepts_ctx(handler)
+        _cv_token = None
         try:
-            response = handler(collected)
-            
+            response, _cv_token = invoke_handler_with_ctx(handler, collected, ctx, accepts_ctx)
+
             if asyncio.iscoroutine(response):
                 response = await self._await_with_deadline(ctx, response)
-                
+
         except Exception as e:
+            reset_call_context(_cv_token)
+            _cv_token = None
             err = normalize_error(e)
             maybe_error = await apply_error_interceptors(self._interceptors, ctx, err)
             if maybe_error is not None:
                 raise maybe_error
             raise
 
-        # Run response through interceptor chain
-        response = await apply_response_interceptors(self._interceptors, ctx, response)
+        try:
+            # Run response through interceptor chain
+            response = await apply_response_interceptors(self._interceptors, ctx, response)
+        finally:
+            reset_call_context(_cv_token)
 
         # Serialize if wire_compatible
         if self._wire_compatible and response is not None:

@@ -401,27 +401,66 @@ def _gen_shared_client(
         pattern = method.get("pattern", "unary")
         req_ts = _ts_request_type(method, known_types)
         resp_ts = _ts_response_type(method, known_types)
+        is_inline = method.get("request_style") == "inline"
+        inline_params = method.get("inline_params", []) or []
         lines.append("")
 
-        if pattern == "unary":
-            lines.append(f"  async {mname}(request: {req_ts}): Promise<{resp_ts}> {{")
-            lines.append(
-                f"    return (await this.transport.unary("
-                f'"{svc_name}", "{mname}", request)) as {resp_ts};'
+        # Render inline parameter signature + constructor for Mode 2 methods.
+        def _inline_sig_and_ctor() -> tuple[str, str]:
+            parts: list[str] = []
+            kwargs: list[str] = []
+            for ip in inline_params:
+                pname = ip.get("name", "arg")
+                pts, _default = _ts_type_from_field(ip, known_types)
+                parts.append(f"{pname}: {pts}")
+                kwargs.append(f"{pname}")
+            sig = ", ".join(parts)
+            ctor = (
+                f"new {req_ts}({{{', '.join(kwargs)}}})" if inline_params else f"new {req_ts}()"
             )
-            lines.append("  }")
+            return sig, ctor
+
+        if pattern == "unary":
+            if is_inline:
+                sig, ctor = _inline_sig_and_ctor()
+                lines.append(f"  async {mname}({sig}): Promise<{resp_ts}> {{")
+                lines.append(
+                    f"    return (await this.transport.unary("
+                    f'"{svc_name}", "{mname}", {ctor})) as {resp_ts};'
+                )
+                lines.append("  }")
+            else:
+                lines.append(f"  async {mname}(request: {req_ts}): Promise<{resp_ts}> {{")
+                lines.append(
+                    f"    return (await this.transport.unary("
+                    f'"{svc_name}", "{mname}", request)) as {resp_ts};'
+                )
+                lines.append("  }")
 
         elif pattern == "server_stream":
-            lines.append(
-                f"  async *{mname}(request: {req_ts}): AsyncGenerator<{resp_ts}> {{"
-            )
-            lines.append(
-                f"    for await (const item of this.transport.serverStream("
-                f'"{svc_name}", "{mname}", request)) {{'
-            )
-            lines.append(f"      yield item as {resp_ts};")
-            lines.append("    }")
-            lines.append("  }")
+            if is_inline:
+                sig, ctor = _inline_sig_and_ctor()
+                lines.append(
+                    f"  async *{mname}({sig}): AsyncGenerator<{resp_ts}> {{"
+                )
+                lines.append(
+                    f"    for await (const item of this.transport.serverStream("
+                    f'"{svc_name}", "{mname}", {ctor})) {{'
+                )
+                lines.append(f"      yield item as {resp_ts};")
+                lines.append("    }")
+                lines.append("  }")
+            else:
+                lines.append(
+                    f"  async *{mname}(request: {req_ts}): AsyncGenerator<{resp_ts}> {{"
+                )
+                lines.append(
+                    f"    for await (const item of this.transport.serverStream("
+                    f'"{svc_name}", "{mname}", request)) {{'
+                )
+                lines.append(f"      yield item as {resp_ts};")
+                lines.append("    }")
+                lines.append("  }")
 
         elif pattern == "client_stream":
             lines.append(

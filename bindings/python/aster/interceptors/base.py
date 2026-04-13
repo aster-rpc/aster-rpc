@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import time
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from aster.status import RpcError, StatusCode
 
@@ -47,6 +48,18 @@ class CallContext:
     pattern: str | None = None
     idempotent: bool = False
     attempt: int = 1
+
+    _current: ClassVar[contextvars.ContextVar["CallContext | None"]] = (
+        contextvars.ContextVar("aster_call_context", default=None)
+    )
+
+    @classmethod
+    def current(cls) -> "CallContext | None":
+        """Return the CallContext for the RPC currently being dispatched.
+
+        Returns ``None`` when called outside an RPC handler invocation.
+        """
+        return cls._current.get()
 
     @property
     def remaining_seconds(self) -> float | None:
@@ -141,6 +154,62 @@ async def apply_error_interceptors(
             return None
         current = await interceptor.on_error(ctx, current)
     return current
+
+
+def handler_accepts_ctx(method: Any) -> bool:
+    """Return True if ``method`` declares a ``CallContext`` parameter.
+
+    Inspects the method signature (excluding ``self``) and returns True if
+    any parameter is annotated with ``CallContext``. Used by dispatch to
+    decide whether to inject the context.
+    """
+    import inspect
+    try:
+        sig = inspect.signature(method)
+    except (TypeError, ValueError):
+        return False
+    for name, param in sig.parameters.items():
+        if name == "self":
+            continue
+        ann = param.annotation
+        if ann is CallContext:
+            return True
+        if isinstance(ann, str) and ann.split(".")[-1] == "CallContext":
+            return True
+    return False
+
+
+def invoke_handler_with_ctx(handler_method: Any, request: Any, ctx: CallContext, accepts_ctx: bool) -> Any:
+    """Invoke a unary/streaming handler with the call context.
+
+    Always sets the ``CallContext._current`` contextvar so handlers can
+    access the context via ``CallContext.current()`` regardless of whether
+    they declared an explicit parameter. If ``accepts_ctx`` is True the
+    context is also passed positionally as the second argument.
+
+    Returns whatever the handler returns (coroutine, async iterator, etc.)
+    -- callers are responsible for awaiting/iterating and for resetting the
+    contextvar afterwards via ``reset_call_context(token)``.
+    """
+    token = CallContext._current.set(ctx)
+    try:
+        if accepts_ctx:
+            result = handler_method(request, ctx)
+        else:
+            result = handler_method(request)
+    except BaseException:
+        CallContext._current.reset(token)
+        raise
+    return result, token
+
+
+def reset_call_context(token: Any) -> None:
+    """Reset the call-context contextvar using a token from ``invoke_handler_with_ctx``."""
+    if token is not None:
+        try:
+            CallContext._current.reset(token)
+        except (ValueError, LookupError):
+            pass
 
 
 def normalize_error(error: Exception) -> RpcError:

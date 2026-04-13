@@ -8,7 +8,28 @@
 import { StatusCode, RpcError } from '../status.js';
 import { RpcPattern } from '../types.js';
 import type { ServiceRegistry, ServiceInfo, MethodInfo } from '../service.js';
+import { CallContext, buildCallContext } from '../interceptors/base.js';
 import type { AsterTransport, CallOptions, BidiChannel } from './base.js';
+
+function invokeHandler(
+  svcInfo: ServiceInfo,
+  methodInfo: MethodInfo,
+  request: unknown,
+): unknown {
+  const handler = methodInfo.handler!;
+  const ctx = buildCallContext({
+    service: svcInfo.name,
+    method: methodInfo.name,
+    pattern: methodInfo.pattern,
+    idempotent: methodInfo.idempotent,
+  });
+  const acceptsCtx = methodInfo.acceptsCtx === true;
+  return CallContext.runWith(ctx, () =>
+    acceptsCtx
+      ? handler.call(svcInfo.instance, request, ctx)
+      : handler.call(svcInfo.instance, request),
+  );
+}
 
 /**
  * In-memory receive stream for testing.
@@ -67,8 +88,7 @@ export class LocalTransport implements AsterTransport {
   ): Promise<unknown> {
     const [svcInfo, methodInfo] = this.resolve(service, method);
     this.assertPattern(methodInfo, RpcPattern.UNARY);
-    const handler = methodInfo.handler!;
-    return handler.call(svcInfo.instance, request);
+    return invokeHandler(svcInfo, methodInfo, request);
   }
 
   async *serverStream(
@@ -79,8 +99,7 @@ export class LocalTransport implements AsterTransport {
   ): AsyncIterable<unknown> {
     const [svcInfo, methodInfo] = this.resolve(service, method);
     this.assertPattern(methodInfo, RpcPattern.SERVER_STREAM);
-    const handler = methodInfo.handler!;
-    const gen = handler.call(svcInfo.instance, request);
+    const gen = invokeHandler(svcInfo, methodInfo, request) as AsyncIterable<unknown>;
     yield* gen;
   }
 
@@ -92,8 +111,7 @@ export class LocalTransport implements AsterTransport {
   ): Promise<unknown> {
     const [svcInfo, methodInfo] = this.resolve(service, method);
     this.assertPattern(methodInfo, RpcPattern.CLIENT_STREAM);
-    const handler = methodInfo.handler!;
-    return handler.call(svcInfo.instance, requests);
+    return invokeHandler(svcInfo, methodInfo, requests);
   }
 
   bidiStream(
@@ -108,8 +126,6 @@ export class LocalTransport implements AsterTransport {
     const requestQueue: unknown[] = [];
     let requestResolve: (() => void) | null = null;
     let sendClosed = false;
-
-    const handler = methodInfo.handler!;
 
     // Request iterable that the handler reads from
     const requestIterable: AsyncIterable<unknown> = {
@@ -128,8 +144,8 @@ export class LocalTransport implements AsterTransport {
       },
     };
 
-    // Start the handler
-    const responseGen = handler.call(svcInfo.instance, requestIterable);
+    // Start the handler (with CallContext injection)
+    const responseGen = invokeHandler(svcInfo, methodInfo, requestIterable) as AsyncIterable<unknown>;
 
     const channel: BidiChannel = {
       async send(msg: unknown) {

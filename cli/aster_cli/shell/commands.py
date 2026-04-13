@@ -1179,7 +1179,7 @@ class SessionCommand(ShellCommand):
                     ctx.display.print("[bold]Available methods:[/bold]")
                     if svc:
                         for c in svc.sorted_children():
-                            sig = c.metadata.get("request_type", "")
+                            sig = _method_signature(c.metadata)
                             pattern = c.metadata.get("pattern", "unary")
                             ctx.display.print(f"  [green]{c.name:20s}[/green] {pattern:15s} {sig}")
                     else:
@@ -1188,7 +1188,7 @@ class SessionCommand(ShellCommand):
                     if svc:
                         for c in svc.sorted_children():
                             pattern = c.metadata.get("pattern", "unary")
-                            sig = c.metadata.get("request_type", "")
+                            sig = _method_signature(c.metadata)
                             ctx.display.print(f"  [green]{c.name:20s}[/green] [dim]{pattern:15s} {sig}[/dim]")
                     else:
                         ctx.display.print("  [dim](no methods discovered)[/dim]")
@@ -1554,9 +1554,29 @@ def _check_cli_compatible(fields: list[dict[str, Any]]) -> str | None:
 
 
 def _method_signature(metadata: dict[str, Any]) -> str:
-    """Build a human-readable method signature from metadata."""
-    req = metadata.get("request_type", "")
+    """Build a human-readable method signature from metadata.
+
+    Mode 2 (``request_style == "inline"``) methods are rendered as
+    ``(param: type, ...) -> Resp`` to match what the producer actually
+    wrote, rather than the opaque synthesized request class name.
+    """
     resp = metadata.get("response_type", "")
+    if metadata.get("request_style") == "inline":
+        inline = metadata.get("inline_params", []) or []
+        if inline:
+            parts = []
+            for p in inline:
+                pname = p.get("name", "arg")
+                kind = p.get("kind") or p.get("type") or "?"
+                parts.append(f"{pname}: {kind}")
+            sig_args = ", ".join(parts)
+        else:
+            sig_args = ""
+        if resp:
+            return f"({sig_args}) ->{resp}"
+        return f"({sig_args}) ->…"
+
+    req = metadata.get("request_type", "")
     if req and resp:
         return f"({req}) ->{resp}"
     elif req:

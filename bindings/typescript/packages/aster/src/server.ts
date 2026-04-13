@@ -357,10 +357,17 @@ export class RpcServer {
     // Interceptors
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
 
-    // Invoke handler with deadline enforcement
+    // Invoke handler with deadline enforcement + CallContext injection
+    const acceptsCtx = methodInfo.acceptsCtx === true;
     let response: any;
     try {
-      response = await this.runWithDeadline(callCtx, () => handler.call(svcInfo.instance, request));
+      response = await CallContext.runWith(callCtx, () =>
+        this.runWithDeadline(callCtx, () =>
+          acceptsCtx
+            ? handler.call(svcInfo.instance, request, callCtx)
+            : handler.call(svcInfo.instance, request),
+        ),
+      );
     } catch (e) {
       if (e instanceof RpcError && e.code === StatusCode.DEADLINE_EXCEEDED) {
         await this.writeErrorTrailer(send, StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
@@ -395,7 +402,12 @@ export class RpcServer {
 
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
 
-    const gen = handler.call(svcInfo.instance, request);
+    const acceptsCtx = methodInfo.acceptsCtx === true;
+    const gen = CallContext.runWith(callCtx, () =>
+      acceptsCtx
+        ? handler.call(svcInfo.instance, request, callCtx)
+        : handler.call(svcInfo.instance, request),
+    );
     const deadlineMs = Date.now() + this.handlerTimeoutMs(callCtx);
     for await (let response of gen) {
       if (Date.now() > deadlineMs) {
@@ -450,9 +462,16 @@ export class RpcServer {
     // Provide as async iterable
     async function* requestIter() { for (const r of requests) yield r; }
 
+    const acceptsCtxCS = methodInfo.acceptsCtx === true;
     let response: any;
     try {
-      response = await this.runWithDeadline(callCtx, () => handler.call(svcInfo.instance, requestIter()));
+      response = await CallContext.runWith(callCtx, () =>
+        this.runWithDeadline(callCtx, () =>
+          acceptsCtxCS
+            ? handler.call(svcInfo.instance, requestIter(), callCtx)
+            : handler.call(svcInfo.instance, requestIter()),
+        ),
+      );
     } catch (e) {
       if (e instanceof RpcError && e.code === StatusCode.DEADLINE_EXCEEDED) {
         await this.writeErrorTrailer(send, StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
@@ -501,7 +520,12 @@ export class RpcServer {
       }
     }
 
-    const gen = handler.call(svcInfo.instance, requestIter());
+    const acceptsCtxBD = methodInfo.acceptsCtx === true;
+    const gen = CallContext.runWith(callCtx, () =>
+      acceptsCtxBD
+        ? handler.call(svcInfo.instance, requestIter(), callCtx)
+        : handler.call(svcInfo.instance, requestIter()),
+    );
     const deadlineMs = Date.now() + this.handlerTimeoutMs(callCtx);
     for await (const response of gen) {
       if (Date.now() > deadlineMs) {

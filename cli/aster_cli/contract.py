@@ -274,9 +274,9 @@ _CONTRACTS_DIR = Path(os.path.expanduser("~/.aster/contracts"))
 # Fixed key order for deterministic output -- methods and types sorted
 # alphabetically, all dict keys in a stable order so `diff` is meaningful.
 _METHOD_KEY_ORDER = [
-    "name", "pattern", "request_type", "response_type",
+    "name", "pattern", "request_style", "request_type", "response_type",
     "request_wire_tag", "response_wire_tag",
-    "timeout", "idempotent", "fields", "response_fields",
+    "timeout", "idempotent", "inline_params", "fields", "response_fields",
 ]
 
 _FIELD_KEY_ORDER = ["name", "type", "required", "default"]
@@ -290,6 +290,10 @@ def _ordered_method(m: dict) -> dict:
             v = m[k]
             if k in ("fields", "response_fields") and isinstance(v, list):
                 v = [_ordered_field(f) for f in sorted(v, key=lambda f: f.get("name", ""))]
+            elif k == "inline_params" and isinstance(v, list):
+                # Preserve parameter declaration order -- positional matters
+                # for both codegen and the wire contract.
+                v = [_ordered_field(f) for f in v]
             out[k] = v
     # Any extra keys not in the fixed list, sorted
     for k in sorted(m.keys()):
@@ -988,7 +992,20 @@ def _print_preview(
         resp_type = m.get("response_type", "?")
         timeout = m.get("timeout")
         print(f"rpc {m.get('name', '?')} ({pattern})")
-        print(f"  request   : {req_type}")
+        # Mode 2 methods have a synthesized request type; render the
+        # handler's inline parameter list instead of the opaque class name
+        # so readers see the signature the producer actually wrote.
+        if m.get("request_style") == "inline":
+            inline = m.get("inline_params", []) or []
+            if inline:
+                parts = [
+                    f"{p.get('name', '?')}: {_format_field_type(p)}" for p in inline
+                ]
+                print(f"  request   : ({', '.join(parts)})")
+            else:
+                print(f"  request   : ()")
+        else:
+            print(f"  request   : {req_type}")
         print(f"  response  : {resp_type}")
         if timeout:
             print(f"  timeout   : {timeout}s")

@@ -50,6 +50,17 @@ class MethodInfo:
     serialization: SerializationMode | None = None
     requires: CapabilityRequirement | None = None
     metadata: Metadata | None = None
+    # True if the handler method's signature declares a CallContext
+    # parameter. Detected at decoration time by scanning the signature.
+    accepts_ctx: bool = False
+    # "explicit" (Mode 1, single @wire_type request arg) or
+    # "inline" (Mode 2, synthesized request from handler param list).
+    # Default "explicit" for backward compat; set by @service scanning.
+    request_style: str = "explicit"
+    # For Mode 2 / inline: the handler's parameter list in declaration order.
+    # Each entry is a tuple ``(name, type)`` describing one wire field.
+    # Empty for Mode 1 and for Mode 2 methods with zero request fields.
+    inline_params: list[tuple[str, Any]] = field(default_factory=list)
 
 
 @dataclass

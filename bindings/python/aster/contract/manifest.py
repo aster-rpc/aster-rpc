@@ -246,6 +246,23 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
                 ftype = resp_hints.get(f.name, f.type)
                 resp_fields.append(build_field_v1(f, ftype))
 
+        # Capture Mode 2 inline params so codegen and the shell can render
+        # inline signatures. For Mode 1 we leave this empty and the consumer
+        # of the manifest treats the method as taking an explicit request
+        # class.
+        request_style = getattr(method_info, "request_style", "explicit")
+        inline_param_dicts: list[dict] = []
+        if request_style == "inline":
+            raw_params = getattr(method_info, "inline_params", []) or []
+            # Build a lookup from field name → field dict already extracted
+            # from the synthesized request class, so codegen gets the same
+            # type/required/default representation as for explicit types.
+            by_name = {f.get("name"): f for f in fields}
+            for pname, _ptype in raw_params:
+                fdict = by_name.get(pname)
+                if fdict is not None:
+                    inline_param_dicts.append(fdict)
+
         methods_out.append({
             "name": method_name,
             "pattern": getattr(method_info, "pattern", "unary"),
@@ -257,6 +274,8 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
             "idempotent": getattr(method_info, "idempotent", False),
             "fields": fields,
             "response_fields": resp_fields,
+            "request_style": request_style,
+            "inline_params": inline_param_dicts,
         })
 
     methods_out.sort(key=lambda m: m["name"])

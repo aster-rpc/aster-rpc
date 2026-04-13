@@ -422,7 +422,9 @@ class SessionServer:
         deadline_timeout = _get_deadline_timeout(call_ctx)
 
         # Run handler as task, concurrently wait for a CANCEL frame
-        handler_task = asyncio.create_task(self._run_handler(handler_method, request))
+        handler_task = asyncio.create_task(
+            self._run_handler(handler_method, request, call_ctx, method_info.accepts_ctx)
+        )
         cancel_reader_task = asyncio.create_task(self._read_cancel_frame(frame_q, cancel_event))
 
         deadline_task = asyncio.create_task(asyncio.sleep(deadline_timeout))
@@ -535,8 +537,12 @@ class SessionServer:
         deadline_timeout = _get_deadline_timeout(call_ctx)
         deadline_time = asyncio.get_event_loop().time() + deadline_timeout
 
+        from aster.interceptors.base import invoke_handler_with_ctx, reset_call_context
+        _cv_token = None
         try:
-            response_iter = handler_method(request)
+            response_iter, _cv_token = invoke_handler_with_ctx(
+                handler_method, request, call_ctx, method_info.accepts_ctx,
+            )
             if asyncio.iscoroutine(response_iter):
                 response_iter = await response_iter
 
@@ -582,13 +588,25 @@ class SessionServer:
             logger.error("Session server_stream handler error: %s", e)
             await _write_trailer(send, self._codec, StatusCode.INTERNAL, str(e))
             return None
+        finally:
+            reset_call_context(_cv_token)
 
-    async def _run_handler(self, handler_method: Any, request: Any) -> Any:
-        """Run a unary handler and return its result."""
-        response = handler_method(request)
-        if asyncio.iscoroutine(response):
-            response = await response
-        return response
+    async def _run_handler(self, handler_method: Any, request: Any, call_ctx: Any = None, accepts_ctx: bool = False) -> Any:
+        """Run a unary handler and return its result.
+
+        If ``accepts_ctx`` is True, the ``call_ctx`` is injected as the
+        second positional argument. The ``CallContext._current`` contextvar
+        is set for the duration of the call so handlers can also access the
+        context via ``CallContext.current()``.
+        """
+        from aster.interceptors.base import invoke_handler_with_ctx, reset_call_context
+        response, _token = invoke_handler_with_ctx(handler_method, request, call_ctx, accepts_ctx)
+        try:
+            if asyncio.iscoroutine(response):
+                response = await response
+            return response
+        finally:
+            reset_call_context(_token)
 
     async def _read_cancel_frame(
         self,
@@ -686,19 +704,26 @@ class SessionServer:
                     yield item
 
             deadline_timeout = _get_deadline_timeout(call_ctx)
+            from aster.interceptors.base import invoke_handler_with_ctx, reset_call_context
+            _cv_token = None
             try:
-                coro = handler_method(request_iter())
-                if asyncio.iscoroutine(coro):
-                    response = await asyncio.wait_for(coro, timeout=deadline_timeout)
-                else:
-                    response = coro
-            except asyncio.TimeoutError:
-                await _write_trailer(send, self._codec, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
-                return None
+                try:
+                    coro, _cv_token = invoke_handler_with_ctx(
+                        handler_method, request_iter(), call_ctx, method_info.accepts_ctx,
+                    )
+                    if asyncio.iscoroutine(coro):
+                        response = await asyncio.wait_for(coro, timeout=deadline_timeout)
+                    else:
+                        response = coro
+                except asyncio.TimeoutError:
+                    await _write_trailer(send, self._codec, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                    return None
 
-            # SUCCESS: write response payload only (no trailer, matches unary rule)
-            await _write_response(send, self._codec, response)
-            return None
+                # SUCCESS: write response payload only (no trailer, matches unary rule)
+                await _write_response(send, self._codec, response)
+                return None
+            finally:
+                reset_call_context(_cv_token)
 
         except asyncio.CancelledError:
             try:
@@ -738,7 +763,10 @@ class SessionServer:
                         break
                     yield item
 
-            response_iter = handler_method(request_iter())
+            from aster.interceptors.base import invoke_handler_with_ctx, reset_call_context
+            response_iter, _cv_token = invoke_handler_with_ctx(
+                handler_method, request_iter(), call_ctx, method_info.accepts_ctx,
+            )
             if asyncio.iscoroutine(response_iter):
                 response_iter = await response_iter
 
@@ -825,6 +853,11 @@ class SessionServer:
             logger.error("Session bidi_stream handler error: %s", e)
             await _write_trailer(send, self._codec, StatusCode.INTERNAL, str(e))
             return None
+        finally:
+            try:
+                reset_call_context(_cv_token)
+            except NameError:
+                pass
 
 
 _BIDI_EOF = object()
