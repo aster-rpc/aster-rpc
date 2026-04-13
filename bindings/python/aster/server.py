@@ -348,50 +348,14 @@ class Server:
         """The Iroh endpoint this server is bound to."""
         return self._endpoint
 
-    async def serve(self) -> None:
-        """Start the server and accept connections.
+    async def serve(self, channel_capacity: int = 256) -> None:
+        """Start the server. Alias for :meth:`serve_reactor`.
 
-        This method runs until shutdown is requested via drain() or close().
+        The reactor is the only dispatch path post-multiplexed-streams
+        (spec Sec. 6). This method exists so existing ``await server.serve()``
+        call sites keep working; it requires ``node=`` on the ``Server``.
         """
-        if self._serving:
-            raise ServerError("server is already serving")
-
-        self._serving = True
-        self._serve_task = asyncio.current_task()
-        self._shutdown_event.clear()
-
-        logger.info("Server starting on %s", self._endpoint.endpoint_id())
-
-        try:
-            while self._serving:
-                try:
-                    # Accept a new connection
-                    incoming = await self._endpoint.accept()
-                    
-                    # Create connection context
-                    conn_ctx = ConnectionContext(
-                        connection=incoming,
-                        server=self,
-                    )
-                    
-                    async with self._connections_lock:
-                        self._connections.add(conn_ctx)
-                    
-                    # Start connection handler task
-                    task = asyncio.create_task(self._handle_connection(conn_ctx))
-                    conn_ctx.connection_task = task
-                    
-                except Exception as e:
-                    if not self._serving:
-                        break
-                    if self._serving:
-                        logger.error("Error accepting connection: %s", e)
-                    continue
-
-        finally:
-            self._serving = False
-            self._serve_task = None
-            self._shutdown_event.set()
+        await self.serve_reactor(channel_capacity=channel_capacity)
 
     async def serve_reactor(self, channel_capacity: int = 256) -> None:
         """Start the server using the Rust-driven reactor.
@@ -583,17 +547,65 @@ class Server:
                 )
                 return
 
+            # Validate the client's requested serialization mode. JSON is
+            # always accepted for cross-language interop.
+            accepted_modes = [m.value for m in service_info.serialization_modes]
+            accepted_modes.append(SerializationMode.JSON.value)
+            if header.serializationMode not in accepted_modes:
+                self._reactor_error_response(
+                    response_sender, StatusCode.INVALID_ARGUMENT,
+                    f"Unsupported serialization mode: {header.serializationMode}",
+                    ser_mode,
+                )
+                return
+
+            # Pre-dispatch authz: run CallContext-only interceptors
+            # (CapabilityInterceptor, deadline, rate-limit, metrics, audit)
+            # with request=None so they can reject the call before any
+            # request frames are decoded. This guarantees auth fires on
+            # every pattern -- including bidi/client streams that might
+            # never produce a request frame.
+            pre_call_ctx = build_call_context(
+                service=header.service,
+                method=header.method,
+                metadata=_validated_metadata(header.metadataKeys, header.metadataValues),
+                deadline_secs=header.deadline,
+                peer=peer_id,
+                is_streaming=(method_info.pattern != "unary"),
+                pattern=method_info.pattern,
+                idempotent=method_info.idempotent,
+                call_id=header.callId,
+                attributes=(
+                    self._peer_store.get_attributes(peer_id)
+                    if self._peer_store and peer_id else {}
+                ),
+            )
+            pre_interceptors = self._resolve_interceptors(service_info)
+            try:
+                await apply_request_interceptors(pre_interceptors, pre_call_ctx, None)
+            except RpcError as auth_err:
+                self._reactor_error_response(
+                    response_sender, auth_err.code, auth_err.message, ser_mode,
+                )
+                return
+
             # Branch on RPC pattern. Unary runs inline on the reactor fast
             # path (sender.submit bundles response + trailer). Streaming
             # patterns build adapter objects that look like QUIC streams so
-            # we can reuse the non-reactor `_handle_*_stream` methods.
+            # we can reuse the `_handle_*_stream` methods.
             pattern = method_info.pattern
             if pattern != "unary":
-                await self._dispatch_reactor_streaming(
-                    pattern, header, service_info, method_info,
-                    handler_method, peer_id, request_payload, request_flags,
-                    response_sender, request_receiver,
-                )
+                with request_context(
+                    request_id=str(header.callId) if header.callId else "",
+                    service=header.service,
+                    method=header.method,
+                    peer=peer_id,
+                ):
+                    await self._dispatch_reactor_streaming(
+                        pattern, header, service_info, method_info,
+                        handler_method, peer_id, request_payload, request_flags,
+                        response_sender, request_receiver,
+                    )
                 return
 
             # Decode request
@@ -768,314 +780,6 @@ class Server:
             response_sender.submit(b"", bytes(trailer_frame))
         except Exception as e:
             logger.error("Failed to send reactor error response: %s", e)
-
-    async def handle_connection(self, incoming: Any) -> None:
-        """Handle a connection accepted elsewhere (e.g. a shared multi-ALPN loop).
-
-        Sets up the :class:`ConnectionContext` and tracks it for ``drain()`` /
-        ``close()``, then delegates to the same per-stream handling used by
-        :meth:`serve`. Call this when :class:`AsterServer` (or any higher
-        dispatcher) owns the accept loop on a shared endpoint and routes
-        connections by ALPN.
-        """
-        ctx = ConnectionContext(connection=incoming, server=self)
-        async with self._connections_lock:
-            self._connections.add(ctx)
-        await self._handle_connection(ctx)
-
-    async def _handle_connection(self, ctx: ConnectionContext) -> None:
-        """Handle a single client connection.
-
-        Accepts bidirectional streams and dispatches them to handlers.
-        """
-        from aster.health import get_connection_metrics
-        conn_metrics = get_connection_metrics()
-        conn_metrics.connection_opened()
-        logger.debug("Connection opened from %s", ctx.connection.remote_id())
-
-        try:
-            while not ctx.draining:
-                try:
-                    # Accept a bidirectional stream
-                    send, recv = await ctx.connection.accept_bi()
-                    
-                    # Check max concurrent streams limit
-                    if self._max_concurrent_streams is not None:
-                        async with self._connections_lock:
-                            active_streams = len([t for t in ctx.stream_tasks if not t.done()])
-                        if active_streams >= self._max_concurrent_streams:
-                            logger.warning("Max concurrent streams reached, rejecting")
-                            recv.stop(8)  # QUIC error code for capacity error
-                            continue
-
-                    # Start stream handler task
-                    task = asyncio.create_task(
-                        self._handle_stream(ctx, send, recv)
-                    )
-                    ctx.stream_tasks.add(task)
-                    task.add_done_callback(ctx.stream_tasks.discard)
-
-                except Exception as e:
-                    msg = str(e)
-                    if ctx.draining or "normal close" in msg or "code 0" in msg:
-                        logger.debug("Connection closed: %s", msg)
-                    else:
-                        logger.error("Error accepting stream: %s", e)
-                    break
-
-        except asyncio.CancelledError:
-            logger.debug("Connection handler cancelled")
-        except Exception as e:
-            logger.error("Connection error: %s", e)
-        finally:
-            # Clean up connection context
-            async with self._connections_lock:
-                self._connections.discard(ctx)
-
-            # Cancel all stream tasks (copy to avoid set-changed-during-iteration)
-            for task in list(ctx.stream_tasks):
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-
-            conn_metrics.connection_closed()
-            logger.debug("Connection closed")
-
-    async def _handle_stream(self, ctx: ConnectionContext, send: Any, recv: Any) -> None:
-        """Handle a single RPC stream.
-
-
-        Reads the StreamHeader, dispatches to the appropriate handler,
-        and manages the stream lifecycle.
-        """
-        from aster.health import get_connection_metrics as _gcm
-        _stream_metrics = _gcm()
-        _stream_metrics.stream_opened()
-        try:
-            # Read the StreamHeader (first frame with HEADER flag).
-            # Use read_one_frame (single FFI crossing) if available,
-            # falling back to read_frame (2 crossings) for non-Iroh streams.
-            if hasattr(recv, 'read_one_frame'):
-                frame = await recv.read_one_frame()
-            else:
-                frame = await read_frame(recv)
-            if frame is None:
-                logger.warning("Stream ended before header")
-                return
-
-            payload, flags = frame
-            if not (flags & HEADER):
-                logger.warning("First frame missing HEADER flag")
-                await self._write_error_trailer(
-                    send, StatusCode.INTERNAL, "First frame must have HEADER flag"
-                )
-                return
-
-            # Decode the StreamHeader.
-            # Sniff: JSON starts with '{' (0x7B), Fory XLANG starts with
-            # 0x02. Accept both for cross-language interop.
-            try:
-                if payload and payload[0:1] == b'{':
-                    header = json_decode(payload, StreamHeader)
-                else:
-                    header = self._codec.decode(payload, StreamHeader)
-            except Exception as e:
-                logger.error("Failed to decode StreamHeader: %s", e)
-                await self._write_error_trailer(
-                    send, StatusCode.INTERNAL, "Invalid StreamHeader"
-                )
-                return
-
-            # All early-return error trailers must respect the client's
-            # requested serialization mode so the client can decode them.
-            ser_mode = header.serializationMode
-
-            # Validate header -- service name is always required; method may be ""
-            # for session streams
-            if not header.service:
-                await self._write_error_trailer(
-                    send, StatusCode.INVALID_ARGUMENT, "Missing service name",
-                    serialization_mode=ser_mode,
-                )
-                return
-
-            # Look up the service
-            service_info = self._registry.lookup(header.service, header.version)
-            if service_info is None:
-                await self._write_error_trailer(
-                    send, StatusCode.NOT_FOUND,
-                    f"Service '{header.service}' v{header.version} not found",
-                    serialization_mode=ser_mode,
-                )
-                return
-
-            # ── Session discriminator check ───────────────────────────────
-            is_session_stream = (header.method == "")
-            is_session_service = (service_info.scoped == RpcScope.SESSION)
-            if is_session_stream != is_session_service:
-                peer_id = ""
-                try:
-                    peer_id = ctx.connection.remote_id()
-                except Exception:
-                    pass
-                if is_session_service:
-                    msg = (
-                        f"'{header.service}' is session-scoped: open a session "
-                        f"stream (method='') instead of calling method "
-                        f"'{header.method}' directly"
-                    )
-                    logger.warning(
-                        "scope mismatch: %s; peer=%s", msg, peer_id,
-                    )
-                else:
-                    msg = (
-                        f"'{header.service}' is shared: send a method name "
-                        f"instead of opening a session stream (method='')"
-                    )
-                    logger.warning(
-                        "scope mismatch: %s; peer=%s", msg, peer_id,
-                    )
-                await self._write_error_trailer(
-                    send, StatusCode.FAILED_PRECONDITION, msg,
-                    serialization_mode=ser_mode,
-                )
-                return
-
-            if is_session_stream:
-                from aster.session import SessionServer
-                key = (service_info.name, service_info.version)
-                svc_class = self._service_classes.get(key)
-                if svc_class is None:
-                    await self._write_error_trailer(
-                        send, StatusCode.INTERNAL, "Session service class not found",
-                        serialization_mode=ser_mode,
-                    )
-                    return
-                all_interceptors = self._resolve_interceptors(service_info)
-                peer: str | None = None
-                try:
-                    peer = ctx.connection.remote_id()
-                except Exception:
-                    peer = None
-                # Respect the client's requested serialization mode.
-                # If the client asked for JSON (mode 3), use the JSON codec
-                # so the session frames are cross-language compatible.
-                session_codec = self._codec
-                if ser_mode == SerializationMode.JSON.value:
-                    from aster.json_codec import JsonProxyCodec
-                    session_codec = JsonProxyCodec()
-                session_server = SessionServer(
-                    service_class=svc_class,
-                    service_info=service_info,
-                    codec=session_codec,
-                    interceptors=all_interceptors,
-                    peer_store=self._peer_store,
-                )
-                await session_server.run(header, send, recv, peer=peer)
-                return
-            # ── End session discriminator check ───────────────────────────
-
-            # Look up the method (only for non-session streams)
-            method_info = service_info.get_method(header.method)
-            if method_info is None:
-                await self._write_error_trailer(
-                    send, StatusCode.UNIMPLEMENTED,
-                    f"Method '{header.service}.{header.method}' not implemented",
-                    serialization_mode=ser_mode,
-                )
-                return
-
-            # Validate serialization mode.
-            # JSON (mode 3) is always accepted for cross-language interop.
-            accepted_modes = [m.value for m in service_info.serialization_modes]
-            accepted_modes.append(SerializationMode.JSON.value)
-            if header.serializationMode not in accepted_modes:
-                await self._write_error_trailer(
-                    send, StatusCode.INVALID_ARGUMENT,
-                    f"Unsupported serialization mode: {header.serializationMode}",
-                    serialization_mode=ser_mode,
-                )
-                return
-
-            # Get the handler instance and method
-            handler = self._get_handler_for_service(service_info)
-            handler_method = getattr(handler, header.method, None)
-            if handler_method is None:
-                await self._write_error_trailer(
-                    send, StatusCode.INTERNAL, "Handler method not found",
-                    serialization_mode=ser_mode,
-                )
-                return
-
-            # Dispatch based on RPC pattern -- with logging context
-            pattern = method_info.pattern
-            peer_id = ""
-            try:
-                peer_id = ctx.connection.remote_id()
-            except Exception:
-                pass
-
-            with request_context(
-                request_id=str(header.callId) if header.callId else "",
-                service=header.service,
-                method=header.method,
-                peer=peer_id,
-            ):
-                # Run authorization-style interceptors BEFORE pattern dispatch.
-                # CallContext-only interceptors (CapabilityInterceptor, deadline,
-                # metrics, rate-limit) execute here and can reject the stream
-                # before any frames are read. This guarantees auth checks fire
-                # on every pattern, including bidi/client streams that might
-                # never produce a request frame.
-                pre_call_ctx = self._build_call_context(header, method_info, ctx)
-                pre_interceptors = self._resolve_interceptors(service_info)
-                try:
-                    await apply_request_interceptors(pre_interceptors, pre_call_ctx, None)
-                except RpcError as auth_err:
-                    await self._write_error_trailer(
-                        send, auth_err.code, auth_err.message,
-                        serialization_mode=ser_mode,
-                    )
-                    return
-
-                t0 = time.monotonic()
-                if pattern == "unary":
-                    await self._handle_unary(ctx, send, recv, header, handler_method, method_info)
-                elif pattern == "server_stream":
-                    await self._handle_server_stream(ctx, send, recv, header, handler_method, method_info)
-                elif pattern == "client_stream":
-                    await self._handle_client_stream(ctx, send, recv, header, handler_method, method_info)
-                elif pattern == "bidi_stream":
-                    await self._handle_bidi_stream(ctx, send, recv, header, handler_method, method_info)
-                else:
-                    await self._write_error_trailer(
-                        send, StatusCode.INTERNAL, f"Unknown RPC pattern: {pattern}"
-                    )
-                    return
-                duration_ms = (time.monotonic() - t0) * 1000
-                logger.debug(
-                    "rpc completed",
-                    extra={"duration_ms": round(duration_ms, 1), "status_code": "OK"},
-                )
-
-        except asyncio.CancelledError:
-            # Stream was cancelled (e.g., deadline exceeded)
-            try:
-                recv.stop(1)
-            except Exception:
-                pass
-            raise
-        except RpcError as e:
-            # Handler raised RpcError - write it as trailer
-            await self._write_error_trailer(send, e.code, e.message)
-        except Exception as e:
-            logger.error("Stream handler error: %s", e)
-            await self._write_error_trailer(send, StatusCode.INTERNAL, str(e))
-        finally:
-            _stream_metrics.stream_closed()
 
     def _get_handler_for_service(self, service_info: ServiceInfo) -> Any:
         """Get a handler instance for a service.
@@ -1254,83 +958,6 @@ class Server:
         if remaining is None:
             return MAX_HANDLER_TIMEOUT_S
         return max(0.0, min(remaining, MAX_HANDLER_TIMEOUT_S))
-
-    async def _handle_unary(
-        self,
-        conn_ctx: ConnectionContext,
-        send: Any,
-        recv: Any,
-        header: StreamHeader,
-        handler_method: Any,
-        method_info: MethodInfo,
-    ) -> None:
-        """Handle a unary RPC call."""
-        call_ctx = self._build_call_context(header, method_info, conn_ctx)
-        interceptors = self._resolve_interceptors(self._registry.lookup(header.service, header.version))
-        try:
-            # Read the request frame
-            request, flags = await self._decode_request_frame(recv, method_info.request_type, header.serializationMode)
-            if request is None:
-                await self._write_error_trailer(send, StatusCode.UNAVAILABLE, "Stream ended")
-                return
-            if flags & TRAILER:
-                await self._write_error_trailer(send, StatusCode.UNAVAILABLE, "Unexpected trailer")
-                return
-
-            request = await apply_request_interceptors(interceptors, call_ctx, request)
-
-            # Invoke handler with deadline enforcement
-            timeout = self._handler_timeout(call_ctx)
-            from aster.interceptors.base import invoke_handler_with_ctx, reset_call_context
-            _cv_token = None
-            try:
-                try:
-                    response, _cv_token = invoke_handler_with_ctx(
-                        handler_method, request, call_ctx, method_info.accepts_ctx,
-                    )
-                    if asyncio.iscoroutine(response):
-                        response = await asyncio.wait_for(response, timeout=timeout)
-                except asyncio.TimeoutError:
-                    await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
-                    return
-                response = await apply_response_interceptors(interceptors, call_ctx, response)
-            finally:
-                reset_call_context(_cv_token)
-
-            # Encode response + trailer, write + finish in one FFI crossing
-            import struct as _struct
-            response_payload, response_compressed = self._encode_response(response, header.serializationMode)
-            response_flags = COMPRESSED if response_compressed else 0
-
-            status = RpcStatus(code=StatusCode.OK, message="")
-            if header.serializationMode == SerializationMode.JSON.value:
-                trailer_payload = json_encode({"code": 0, "message": "", "detailKeys": [], "detailValues": []})
-            else:
-                trailer_payload = self._codec.encode(status)
-
-            response_frame = (
-                _struct.pack("<I", len(response_payload) + 1)
-                + bytes([response_flags])
-                + response_payload
-            )
-            trailer_frame = (
-                _struct.pack("<I", len(trailer_payload) + 1)
-                + bytes([TRAILER])
-                + trailer_payload
-            )
-            await send.write_response(response_frame, trailer_frame)
-
-        except asyncio.CancelledError:
-            raise
-        except RpcError as e:
-            maybe_error = await apply_error_interceptors(interceptors, call_ctx, e)
-            if maybe_error is not None:
-                raise maybe_error
-        except Exception as e:
-            logger.error("Unary handler error: %s", e)
-            maybe_error = await apply_error_interceptors(interceptors, call_ctx, normalize_error(e))
-            if maybe_error is not None:
-                await self._write_error_trailer(send, maybe_error.code, maybe_error.message)
 
     async def _handle_server_stream(
         self,

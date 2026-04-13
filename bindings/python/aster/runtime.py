@@ -184,7 +184,6 @@ class AsterServer:
         mesh_state: MeshState | None = None,
         clock_drift_config: ClockDriftConfig | None = None,
         persist_mesh_state: bool = False,
-        use_reactor: bool = False,
     ) -> None:
         """Create an Aster RPC server.
 
@@ -305,7 +304,6 @@ class AsterServer:
         self._mesh_state = mesh_state
         self._clock_drift_config = clock_drift_config
         self._persist_mesh_state = persist_mesh_state
-        self._use_reactor = use_reactor
 
         # Populated by start()
         self._started: bool = False
@@ -774,16 +772,16 @@ class AsterServer:
 
         self._peer_store.start_reaper()
 
-        self._reactor_feeder = None
-        if self._use_reactor:
-            from aster._aster import create_reactor
-            reactor_handle, self._reactor_feeder = create_reactor(256)
-            subtasks.append(
-                asyncio.create_task(
-                    self._reactor_dispatch_loop(reactor_handle),
-                    name="aster-reactor-dispatch",
-                )
+        # Reactor is the only dispatch path (spec Sec. 6). Create it
+        # unconditionally and feed every RPC connection through it.
+        from aster._aster import create_reactor
+        reactor_handle, self._reactor_feeder = create_reactor(256)
+        subtasks.append(
+            asyncio.create_task(
+                self._reactor_dispatch_loop(reactor_handle),
+                name="aster-reactor-dispatch",
             )
+        )
 
         subtasks.append(
             asyncio.create_task(self._accept_loop(), name="aster-accept")
@@ -848,13 +846,7 @@ class AsterServer:
                     continue
 
                 if alpn == RPC_ALPN:
-                    if self._reactor_feeder is not None:
-                        self._reactor_feeder.feed(conn)
-                    else:
-                        asyncio.create_task(
-                            self._server.handle_connection(conn),
-                            name="aster-rpc-conn",
-                        )
+                    self._reactor_feeder.feed(conn)
                 elif alpn == ALPN_CONSUMER_ADMISSION:
                     # Always handle consumer admission -- even when
                     # allow_all_consumers=True the consumer needs the
