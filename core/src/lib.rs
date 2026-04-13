@@ -43,6 +43,8 @@ use iroh_gossip::ALPN as GOSSIP_ALPN;
 use iroh_tickets::Ticket;
 use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot, Mutex};
+
+use crate::pool::{AcquireError, PoolConfig, PoolKey, StreamFactory, StreamHandle, StreamPool};
 use tokio_stream::StreamExt;
 use tracing::debug;
 use url::Url;
@@ -1355,16 +1357,64 @@ impl CoreNetClient {
 // CoreConnection - QUIC connection
 // ============================================================================
 
+/// Pair of (send, recv) halves of a single QUIC bi-stream — the unit
+/// of multiplexing in the per-connection stream pool.
+pub type MultiplexedStream = (CoreSendStream, CoreRecvStream);
+
+/// Per-connection stream pool over multiplexed bi-streams. See
+/// `core::pool` for the underlying primitive and `Aster-multiplexed-streams.md`
+/// §3 for design.
+pub type MultiplexedStreamPool = StreamPool<MultiplexedStream>;
+
+/// Handle returned by `CoreConnection::acquire_stream`. RAII; on drop
+/// the underlying multiplexed stream is returned to the pool unless
+/// `discard()` was called.
+pub type MultiplexedStreamHandle = StreamHandle<MultiplexedStream>;
+
 #[derive(Clone)]
 pub struct CoreConnection {
     inner: Arc<Connection>,
+    /// Per-connection multiplexed-stream pool. The pool's factory
+    /// wraps `Connection::open_bi`. SHARED-pool (None) and
+    /// per-session (Some(sessionId)) streams both live here.
+    pool: MultiplexedStreamPool,
 }
 
 impl CoreConnection {
     fn new(conn: Connection) -> Self {
-        Self {
-            inner: Arc::new(conn),
-        }
+        Self::with_pool_config(conn, PoolConfig::default())
+    }
+
+    fn with_pool_config(conn: Connection, config: PoolConfig) -> Self {
+        let inner = Arc::new(conn);
+        let conn_for_factory = inner.clone();
+        let factory: StreamFactory<MultiplexedStream> = Arc::new(move || {
+            let conn = conn_for_factory.clone();
+            Box::pin(async move {
+                let (send, recv) = conn.open_bi().await?;
+                Ok((CoreSendStream::new(send), CoreRecvStream::new(recv)))
+            })
+        });
+        let pool = StreamPool::new(config, factory);
+        Self { inner, pool }
+    }
+
+    /// Borrow the per-connection multiplexed-stream pool. Callers can
+    /// query stats, apply the connect-time QUIC ceiling clamp, or
+    /// acquire streams directly.
+    pub fn pool(&self) -> &MultiplexedStreamPool {
+        &self.pool
+    }
+
+    /// Acquire a multiplexed stream from the pool. `key` is `None`
+    /// for SHARED unary calls or `Some(sessionId)` for session-bound
+    /// calls. The returned handle returns the stream to the pool on
+    /// drop unless `discard()` is called.
+    pub async fn acquire_stream(
+        &self,
+        key: PoolKey,
+    ) -> Result<MultiplexedStreamHandle, AcquireError> {
+        self.pool.acquire(key).await
     }
 
     pub async fn open_bi(&self) -> Result<(CoreSendStream, CoreRecvStream)> {
