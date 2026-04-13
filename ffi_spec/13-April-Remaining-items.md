@@ -11,21 +11,21 @@ FFI-backed languages: Java, Go, .NET.
 
 ## Capability matrix
 
-| # | Capability                                          | Python | TS  | Java        | Go       | .NET     |
-|---|-----------------------------------------------------|--------|-----|-------------|----------|----------|
-| 1 | AsterConfig (TOML loading + env resolution)         | ✅     | ✅  | ✅          | ✅       | ✅       |
-| 2 | Interceptors (9 interceptor types)                  | ✅     | ✅  | ✅          | ✅       | ✅       |
-| 3 | Registry — pure-function FFI wrappers               | ✅     | —   | ✅          | ✅       | ✅       |
-| 4 | Registry — async doc-backed FFI wrappers            | ✅\*   | —   | ✅          | ✅       | ✅       |
-| 5 | Decorators `@rpc` / `@service` / `@stream`          | ✅     | ✅  | ✅\*\*\*    | ❌       | ❌       |
-| 6 | Contract manifest submission to registry doc        | ✅     | ✅  | ❌          | ❌       | ❌       |
-| 7 | Hooks (before_connect / after_connect wrappers)     | ✅     | ✅  | ✅\*\*      | ✅\*\*   | ✅\*\*   |
-| 8 | Reactor wrapper (create / submit / poll / destroy)  | ✅     | ✅  | ✅          | ✅       | ✅       |
-| 9 | AsterServer (endpoint + reactor + interceptors)     | ✅     | ✅  | ✅\*\*\*\*  | partial  | partial  |
-|10 | AsterClient (endpoint + resolve + interceptors)     | ✅     | ✅  | ✅\*\*\*\*  | ❌       | ❌       |
-|11 | Session-scoped services                             | ✅     | ✅  | ✅          | ❌       | ❌       |
-|12 | Fory codec wired in                                 | ✅ v0.16 | ✅ | ✅ v0.16    | ✅ v0.16 | ✅ v0.16 |
-|13 | JSON / raw-bytes codec fallback                     | ✅     | ✅  | ✅ raw      | ✅ raw   | ✅ raw   |
+| # | Capability                                          | Python | TS  | Java          | Go       | .NET     |
+|---|-----------------------------------------------------|--------|-----|---------------|----------|----------|
+| 1 | AsterConfig (TOML loading + env resolution)         | ✅     | ✅  | ✅            | ✅       | ✅       |
+| 2 | Interceptors (9 interceptor types)                  | ✅     | ✅  | ✅            | ✅       | ✅       |
+| 3 | Registry — pure-function FFI wrappers               | ✅     | —   | ✅            | ✅       | ✅       |
+| 4 | Registry — async doc-backed FFI wrappers            | ✅\*   | —   | ✅            | ✅       | ✅       |
+| 5 | Decorators `@rpc` / `@service` / `@stream`          | ✅     | ✅  | ✅\*\*\*      | ❌       | ❌       |
+| 6 | Contract manifest submission to registry doc        | ✅     | ✅  | ❌            | ❌       | ❌       |
+| 7 | Hooks (before_connect / after_connect wrappers)     | ✅     | ✅  | ✅\*\*        | ✅\*\*   | ✅\*\*   |
+| 8 | Reactor wrapper (create / submit / poll / destroy)  | ✅     | ✅  | ✅            | ✅       | ✅       |
+| 9 | AsterServer (endpoint + reactor + interceptors)     | ✅     | ✅  | ✅\*\*\*\*\*  | partial  | partial  |
+|10 | AsterClient (endpoint + resolve + interceptors)     | ✅     | ✅  | ✅\*\*\*\*\*  | ❌       | ❌       |
+|11 | Session-scoped services                             | ✅     | ✅  | ✅            | ❌       | ❌       |
+|12 | Fory codec wired in                                 | ✅ v0.16 | ✅ | ✅ v0.16      | ✅ v0.16 | ✅ v0.16 |
+|13 | JSON / raw-bytes codec fallback                     | ✅     | ✅  | ✅ raw        | ✅ raw   | ✅ raw   |
 
 \* Python registry layer currently uses its own async doc I/O; it has
   not yet been switched over to the new `aster_registry_resolve` /
@@ -58,14 +58,28 @@ pieces are missing.
   work, blocked on the same read-side reactor mpsc that gates
   client-stream / bidi runtime support.
 
-\*\*\*\* Java AsterServer / AsterClient cover unary + server-streaming
-  end to end (round-trip QUIC, framed wire, OK and error trailers,
-  session-scope keyed on `(peerId, streamId, implClass)`,
-  thread-safe Fory codec). Client-streaming and bidi-streaming
-  invocation are still UNIMPLEMENTED — the runtime returns an error
-  trailer pending the read-side reactor mpsc widening described in
-  the Java open-items section below. Manifest publish + hook event
-  dispatch are also still pending.
+\*\*\*\* (Superseded by \*\*\*\*\* below — left in place so older commit
+  messages still parse.)
+
+\*\*\*\*\* Java AsterServer / AsterClient now cover ALL FOUR RPC
+  shapes end-to-end: unary, server-streaming, client-streaming,
+  and bidi-streaming. Read-side support landed in `a148efb` (Rust +
+  FFI: per-stream frame reader task, `aster_reactor_recv_frame`
+  entry point, `FLAG_END_STREAM = 0x40` wire flag) and `07a2b4c`
+  (Java side: `Reactor.recvFrame` FFM wrapper,
+  `ReactorRequestStream` SPI helper, `AsterServer` ClientStream /
+  BidiStream wiring, `AsterClient.callClientStream` /
+  `callBidiStream`). The Mission Control example exercises every
+  shape (8/8 E2E tests green: 3 unary + 1 server-stream + 1
+  server-stream-with-filter + 1 client-stream + 1 bidi + the two
+  session-scope variants). Caveats: bidi is BUFFERED — all requests
+  are sent before any response is read (sufficient for ping-pong
+  services like `runCommand` because the server's send-side mpsc
+  queues responses until the client drains, but not true
+  interleaved bidi). True interleaved bidi needs a `BidiCall<Req,
+  Resp>` API with explicit `send` / `complete` plus a
+  `Flow.Publisher<Resp>` for incremental response delivery.
+  Manifest publish + hook event dispatch are still pending.
 
 ## Cross-cutting prerequisites (do these once, all bindings benefit)
 
@@ -206,20 +220,43 @@ remaining items all depend on decorators landing first.
 These came up during the G.1 / G.2-core / Mission Control push and
 are tracked here so the next session can pick one up cold:
 
-- **Reactor read-side mpsc + client-stream / bidi-stream support.**
-  The reactor today reads exactly two frames (header + first request)
-  per call before handing off to the binding; for client-streaming
-  (`MissionControl.ingestMetrics`) and bidi-streaming
-  (`AgentSession.runCommand`) it needs to keep reading subsequent
-  request frames and deliver them as an async stream to the binding.
-  Concretely: change `IncomingCall` to carry a
-  `mpsc::Receiver<RequestFrame>`, add a new `aster_reactor_recv_frame`
-  FFI entry point (read-side counterpart to the
-  `submit_frame`/`submit_trailer` pair landed in G.2-core), and wire
-  `ClientStreamDispatcher` / `BidiStreamDispatcher` into
-  `AsterServer.dispatchCall`. Cancellation propagation
-  (`ResponseStream.isCancelled()` always returns false today; needs a
-  CANCEL-frame read path) rides naturally on top.
+- ~~**Reactor read-side mpsc + client-stream / bidi-stream support.**~~
+  Landed 2026-04-13 across two commits: `a148efb` (Rust + FFI)
+  and `07a2b4c` (Java side + MC parity). New `FLAG_END_STREAM = 0x40`
+  wire flag, per-stream frame reader task in `core/src/reactor.rs`,
+  new `aster_reactor_recv_frame` FFI entry point, sealed
+  `Reactor.RecvFrame` result type, `ReactorRequestStream` SPI helper,
+  `AsterServer.dispatchCall` ClientStream / BidiStream cases wired,
+  `AsterClient.callClientStream` and `callBidiStream` shipped (both
+  buffered shape — see open-item below for true interleaved bidi),
+  `MissionControl.ingestMetrics` + `AgentSession.runCommand`
+  implemented in the example. 8/8 E2E tests green.
+
+- **True interleaved bidi API.** `AsterClient.callBidiStream` is
+  currently buffered: all requests are materialized and sent before
+  any response is read. Sufficient for ping-pong services like
+  `runCommand` because the server's send-side mpsc queues responses
+  until the client drains, but not true streaming bidi. Needs a
+  `BidiCall<Req, Resp>` object with explicit `send(Req)` /
+  `complete()` methods plus a `Flow.Publisher<Resp>` (or `BlockingQueue`
+  / `Iterator`) for incremental response delivery. Pure binding
+  work, no Rust changes.
+
+- **Cancellation propagation.** `ResponseStream.isCancelled()`
+  always returns false. Needs a CANCEL-frame read path on the
+  reactor side and an `aster_reactor_check_cancelled(call_id)` FFI
+  counterpart. Wire-format flag `FLAG_CANCEL = 0x20` already exists
+  in `core/src/framing.rs` — just needs the read-side handling +
+  the FFI lookup.
+
+- **block_on inside virtual-thread dispatchers.** `recvFrame`
+  parks the carrier thread for up to 1s per recv (the
+  `POLL_TIMEOUT_MS` constant in `ReactorRequestStream`). Fine for
+  the demo-level concurrency in MC tests; high-concurrency
+  client-stream services would benefit from either a
+  platform-thread executor for streaming dispatchers or a
+  callback-based recv API. Document for now, address if profiling
+  shows it as a bottleneck.
 - **`DispatcherEmitter` server-stream / client-stream / bidi emit.**
   Currently every streaming kind emits an
   `UnsupportedOperationException` stub. The real bodies are
@@ -251,19 +288,28 @@ are tracked here so the next session can pick one up cold:
   but the gating dependency for an `examples/kotlin/mission-control`
   Gradle subproject.
 
-#### Java milestone reached (2026-04-13)
+#### Java milestone reached (2026-04-13, expanded)
 
 The Java binding has a working end-to-end Mission Control server in
-`bindings/java/aster-examples-mission-control` (commit `012bcc9`).
-Two services (shared `MissionControl` + session-scoped
-`AgentSession`), 3 unary methods + 1 server-streaming method, all
-exercised by 6 green Java↔Java E2E tests. The
-client-streaming / bidi-streaming methods from the Python sample
-(`ingestMetrics`, `runCommand`) are deliberately omitted until the
-read-side reactor mpsc work above lands. Run the server locally
-with: `cd bindings/java && mvn -P fast -pl
-aster-examples-mission-control exec:java
--Dexec.mainClass=site.aster.examples.missioncontrol.Server`.
+`bindings/java/aster-examples-mission-control`. Initial milestone
+landed in commit `012bcc9` with unary + server-streaming only;
+expanded to FULL RPC-pattern parity with the Python sample in
+commits `a148efb` (reactor read-side mpsc) + `07a2b4c` (Java side
++ MC client-stream / bidi). Two services (shared `MissionControl`
++ session-scoped `AgentSession`), all four method shapes covered:
+
+  - `getStatus` / `submitLog` / `register` / `heartbeat` (unary)
+  - `tailLogs` (server-streaming, with level filter)
+  - `ingestMetrics` (client-streaming)
+  - `runCommand` (bidi-streaming, fake-exec for deterministic tests)
+
+Exercised by 8 green Java↔Java E2E tests in `MissionControlE2ETest`.
+Run the server locally with:
+
+```
+cd bindings/java && mvn -P fast -pl aster-examples-mission-control \
+  exec:java -Dexec.mainClass=site.aster.examples.missioncontrol.Server
+```
 
 ### Go (`bindings/go/`)
 1. ~~Add Fory v0.16 to `go.mod`; create `aster/codec` package.~~ ✅
@@ -325,14 +371,23 @@ aster-examples-mission-control exec:java
 7. **Session-scoped services** in all three. ✅ **Java done**
    (`f8de78d` G.2-core).
 8. **Java end-to-end milestone**: working Mission Control server in
-   `bindings/java/aster-examples-mission-control` (commit `012bcc9`,
-   2026-04-13). Two services, 6/6 E2E tests green. Stretch goal:
-   point a Python operator at it for cross-language smoke.
-9. **Reactor read-side mpsc + client/bidi streaming** — the next big
-   Rust + Java + FFI item. Unblocks the omitted MC methods
-   (`ingestMetrics`, `runCommand`) and lets `DispatcherEmitter` grow
-   real streaming bodies for codegen-apt.
-10. (Separately) Python switchover to the async registry FFI ops, then
+   `bindings/java/aster-examples-mission-control` with all four RPC
+   shapes (commits `012bcc9` + `a148efb` + `07a2b4c`, 2026-04-13).
+   Two services, 8/8 E2E tests green. Stretch goal: point a Python
+   operator at it for cross-language smoke.
+9. ~~**Reactor read-side mpsc + client/bidi streaming**~~ — landed in
+   `a148efb` (Rust + FFI) + `07a2b4c` (Java side + MC parity).
+   Wire format gained `FLAG_END_STREAM = 0x40`, reactor gained a
+   per-stream frame reader task feeding a shared mpsc, FFI gained
+   `aster_reactor_recv_frame`, Java gained `Reactor.recvFrame` +
+   `ReactorRequestStream` + AsterServer client/bidi wiring +
+   `AsterClient.callClientStream` / `callBidiStream`.
+10. **DispatcherEmitter streaming emit + true interleaved bidi API**
+    — both pure binding work, no Rust changes. The codegen item lets
+    us delete the hand-written MC dispatchers; the bidi API item
+    replaces the buffered `callBidiStream` for use cases that need
+    true streaming responses.
+11. (Separately) Python switchover to the async registry FFI ops, then
     delete the per-language Python registry modules — item C in
     `session-instructions-registry-rust.md`.
 
