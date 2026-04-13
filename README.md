@@ -191,15 +191,35 @@ cd aster-rpc
 
 uv venv
 uv pip install maturin pytest pytest-asyncio pytest-timeout pytest-rerunfailures
+./scripts/pin-fork-deps.sh   # see "aster-rpc fork deps" below
 uv run maturin develop -m bindings/python/rust/Cargo.toml
 uv pip install -e cli/
 ```
 
-Or use the build script which also regenerates type stubs:
+Or use the build script which also regenerates type stubs and pins fork deps:
 
 ```bash
 ./scripts/build.sh
 ```
+
+### aster-rpc fork deps
+
+This repo depends on the `aster-rpc/*` GitHub forks of `iroh`, `noq`,
+`iroh-blobs`, `iroh-docs`, and `iroh-gossip` (pinned to commit SHAs via
+`[patch.crates-io]` in the root `Cargo.toml`). The forks contain security
+fixes, zero-copy `read_into` on `RecvStream`, and dependency alignment
+that hasn't landed upstream yet.
+
+One wart: cargo's resolver picks the latest `hickory-proto` / `hickory-net`
+beta by default, but the iroh fork pins `hickory-resolver = "=0.26.0-beta.1"`
+and beta.3 has breaking API changes. Run the pinning script once after a
+fresh clone (or any time you `rm Cargo.lock`):
+
+```bash
+./scripts/pin-fork-deps.sh
+```
+
+`build.sh` and `validate.sh` both call this automatically.
 
 ### TypeScript binding
 
