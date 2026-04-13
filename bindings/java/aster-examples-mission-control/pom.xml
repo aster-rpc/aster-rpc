@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>site.aster</groupId>
+        <artifactId>aster-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>aster-examples-mission-control</artifactId>
+    <packaging>jar</packaging>
+
+    <name>Aster Example — Mission Control</name>
+    <description>
+        Java port of the Python Mission Control sample (examples/python/mission_control).
+        Demonstrates a fleet-wide MissionControl service (shared scope) plus a per-agent
+        AgentSession service (session scope), exposed over Aster RPC. Currently implements
+        unary and server-streaming methods only — client-streaming (ingestMetrics) and
+        bidi-streaming (runCommand) await reactor read-side multi-frame support.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>site.aster</groupId>
+            <artifactId>aster-annotations</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>site.aster</groupId>
+            <artifactId>aster-runtime</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.fory</groupId>
+            <artifactId>fory-core</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
