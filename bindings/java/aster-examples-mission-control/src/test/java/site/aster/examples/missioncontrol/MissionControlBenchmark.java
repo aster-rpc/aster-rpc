@@ -1,5 +1,7 @@
 package site.aster.examples.missioncontrol;
 
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -16,6 +18,7 @@ import site.aster.examples.missioncontrol.types.StatusRequest;
 import site.aster.examples.missioncontrol.types.StatusResponse;
 import site.aster.examples.missioncontrol.types.SubmitLogResult;
 import site.aster.node.NodeAddr;
+import site.aster.probe.AsterProbes;
 import site.aster.server.AsterServer;
 
 /**
@@ -72,9 +75,16 @@ final class MissionControlBenchmark {
       System.out.println("────────────────────────────────────────────────────────────────────");
 
       warmup(client, addr);
+      AsterProbes.reset();
 
       benchmarkUnaryGetStatus(client, addr);
+      maybeDumpProbes("getStatus");
+      AsterProbes.reset();
+
       benchmarkUnarySubmitLog(client, addr);
+      maybeDumpProbes("submitLog");
+      AsterProbes.reset();
+
       benchmarkClientStreamIngestMetrics(client, addr);
       benchmarkConcurrentGetStatus(client, addr);
 
@@ -238,6 +248,17 @@ final class MissionControlBenchmark {
     System.out.printf(
         "  %-22s  %,12.0f req/s   p50=%6.2fms  p90=%6.2fms  p99=%6.2fms%n",
         label, rps, p50, p90, p99);
+  }
+
+  private static void maybeDumpProbes(String stage) {
+    if (!AsterProbes.ENABLED) return;
+    try {
+      Path dir = Paths.get("target", "probes");
+      AsterProbes.dump(dir, stage);
+      System.out.println("  [probes] dumped " + stage + " → " + dir.toAbsolutePath());
+    } catch (Exception e) {
+      System.out.println("  [probes] dump failed: " + e.getMessage());
+    }
   }
 
   private static long heapUsedMb() {

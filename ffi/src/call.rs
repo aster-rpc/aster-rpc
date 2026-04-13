@@ -484,8 +484,10 @@ pub unsafe extern "C" fn aster_call_unary(
 
     let key = pool_key_for(session_id);
 
+    let probe_enabled = *crate::probe::ENABLED;
     let result: Result<(Option<(Vec<u8>, u8)>, Vec<u8>), UnaryErr> =
         bridge.runtime.handle().block_on(async move {
+            let t_a = if probe_enabled { crate::probe::now_ns() } else { 0 };
             let handle = match conn.acquire_stream(key).await {
                 Ok(h) => h,
                 Err(e) => return Err(UnaryErr::Acquire(e)),
@@ -503,12 +505,14 @@ pub unsafe extern "C" fn aster_call_unary(
                 handle.discard();
                 return Err(UnaryErr::Transport);
             }
+            let t_b = if probe_enabled { crate::probe::now_ns() } else { 0 };
 
             // 2. Drain frames until trailer. Capture the first non-row-schema
             //    data frame as the response; ignore extras (server contract
             //    for unary is "exactly one"; binding can validate from
             //    out_trailer status if it cares).
             let mut response: Option<(Vec<u8>, u8)> = None;
+            let mut t_c: u64 = 0;
             let trailer_payload = loop {
                 match read_one_frame(&recv).await {
                     Ok((payload, flags)) => {
@@ -521,6 +525,9 @@ pub unsafe extern "C" fn aster_call_unary(
                         }
                         if response.is_none() {
                             response = Some((payload, flags));
+                            if probe_enabled && t_c == 0 {
+                                t_c = crate::probe::now_ns();
+                            }
                         }
                         // Extra response frames (>1) are ignored — the trailer
                         // is what closes the call.
@@ -531,6 +538,15 @@ pub unsafe extern "C" fn aster_call_unary(
                     }
                 }
             };
+            let t_d = if probe_enabled { crate::probe::now_ns() } else { 0 };
+            if probe_enabled {
+                crate::probe::record_unary(crate::probe::UnaryProbe {
+                    t_a,
+                    t_b,
+                    t_c,
+                    t_d,
+                });
+            }
 
             // 3. Stream returns to the pool on drop (release path).
             drop(handle);

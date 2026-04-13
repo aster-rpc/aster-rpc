@@ -241,8 +241,10 @@ public final class AsterServer implements AutoCloseable {
 
   private void dispatchCall(AsterCall call) {
     long callId = call.callId();
+    long probeT2 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
     try {
       StreamHeader header = decodeStreamHeader(call.header());
+      long probeT3 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
       RegisteredService svc = services.get(header.service());
       if (svc == null) {
         submitErrorTrailer(
@@ -281,11 +283,12 @@ public final class AsterServer implements AutoCloseable {
         final MethodDispatcher pinnedMethod = method;
         final Object pinnedInstance = instance;
         final CallContext pinnedCtx = ctx;
-        streamingExecutor.execute(() -> runDispatch(call, pinnedMethod, pinnedInstance, pinnedCtx));
+        streamingExecutor.execute(
+            () -> runDispatch(call, pinnedMethod, pinnedInstance, pinnedCtx, probeT2, probeT3));
         return;
       }
 
-      runDispatch(call, method, instance, ctx);
+      runDispatch(call, method, instance, ctx, probeT2, probeT3);
     } catch (RpcError e) {
       submitErrorTrailer(callId, e.code(), e.rpcMessage());
     } catch (Exception e) {
@@ -295,16 +298,27 @@ public final class AsterServer implements AutoCloseable {
   }
 
   private void runDispatch(
-      AsterCall call, MethodDispatcher method, Object instance, CallContext ctx) {
+      AsterCall call,
+      MethodDispatcher method,
+      Object instance,
+      CallContext ctx,
+      long probeT2,
+      long probeT3) {
     long callId = call.callId();
     try {
       switch (method) {
         case UnaryDispatcher u -> {
+          long probeT4 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
           byte[] responseBytes = u.invoke(instance, call.request(), codec, ctx);
+          long probeT5 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
           byte[] responseFrame = AsterFraming.encodeFrame(responseBytes, (byte) 0);
           byte[] trailerFrame =
               AsterFraming.encodeFrame(okTrailerBytes(), AsterFraming.FLAG_TRAILER);
           submitResponse(callId, new CallResponse(responseFrame, trailerFrame));
+          if (site.aster.probe.AsterProbes.ENABLED) {
+            long probeT6 = System.nanoTime();
+            site.aster.probe.AsterProbes.recordServer(probeT2, probeT3, probeT4, probeT5, probeT6);
+          }
         }
         case ServerStreamDispatcher s -> {
           ReactorResponseStream out = new ReactorResponseStream(reactor, callId, foryHeaderCodec);

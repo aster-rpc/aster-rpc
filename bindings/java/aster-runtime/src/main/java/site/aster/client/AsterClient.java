@@ -232,9 +232,13 @@ public final class AsterClient implements AutoCloseable {
             System.arraycopy(headerFrame, 0, requestPair, 0, headerFrame.length);
             System.arraycopy(requestFrame, 0, requestPair, headerFrame.length, requestFrame.length);
 
+            long probeT0 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
             AsterCall.UnaryResult result =
                 AsterCall.unary(
                     conn.runtime().nativeHandle(), conn.nativeHandle(), sessionId, requestPair);
+            if (site.aster.probe.AsterProbes.ENABLED) {
+              site.aster.probe.AsterProbes.recordClient(probeT0, System.nanoTime());
+            }
 
             // Decode trailer first; non-OK status surfaces as RpcError.
             RpcStatus status =

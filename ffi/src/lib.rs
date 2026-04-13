@@ -21,6 +21,7 @@ use anyhow::Result;
 use aster_transport_core::*;
 
 pub mod call;
+pub mod probe;
 pub mod reactor;
 
 // ============================================================================
