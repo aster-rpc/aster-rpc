@@ -13,7 +13,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aster_transport_core::reactor::{self, OutgoingFrame, ReactorHandle};
+use aster_transport_core::reactor::{self, OutgoingFrame, ReactorHandle, RequestFrame};
 use aster_transport_core::ring;
 use tokio::sync::mpsc;
 
@@ -81,6 +81,13 @@ struct RingCall {
     peer_len: u32,
     is_session_call: bool,
     response_sender: Option<mpsc::UnboundedSender<OutgoingFrame>>,
+    /// Per-call receiver for ADDITIONAL request frames (after the first).
+    /// Stashed into `ReactorState::request_receivers` on `aster_reactor_poll`
+    /// and consumed by `aster_reactor_recv_frame`. For unary / server-stream
+    /// calls the binding never reaches in here and the receiver is dropped
+    /// when the call is cleaned up, which closes the per-call request
+    /// channel.
+    request_receiver: Option<mpsc::UnboundedReceiver<RequestFrame>>,
 }
 
 // Safety: RingCall is only moved between the pump task and the poll thread.
@@ -96,10 +103,22 @@ pub(crate) struct ReactorState {
     /// `recv().await` loop and finishes the stream.
     response_senders:
         Mutex<std::collections::HashMap<u64, mpsc::UnboundedSender<OutgoingFrame>>>,
+    /// Pending per-call request receivers keyed by call_id. The binding
+    /// pulls additional request frames via `aster_reactor_recv_frame`,
+    /// which locks the per-call receiver and `block_on`s a single
+    /// `rx.recv()` with a timeout. Inner mutex is std (not tokio) because
+    /// the lock is held only across a synchronous `block_on` call from
+    /// the binding's poll thread.
+    request_receivers:
+        Mutex<std::collections::HashMap<u64, Mutex<mpsc::UnboundedReceiver<RequestFrame>>>>,
     /// Signal to stop the pump task.
     stopped: Arc<AtomicBool>,
     /// Buffer registry for payload lifetime management.
     buffers: Arc<BufferRegistry>,
+    /// Tokio runtime handle, captured at reactor creation time. Used by
+    /// `aster_reactor_recv_frame` to `block_on` the per-call receiver from
+    /// the binding's (non-runtime) poll thread.
+    rt_handle: tokio::runtime::Handle,
 }
 
 // ============================================================================
@@ -147,6 +166,7 @@ async fn pump_task(
             peer_len: peer_arc.len() as u32,
             is_session_call: call.is_session_call,
             response_sender: Some(call.response_sender),
+            request_receiver: Some(call.request_receiver),
         };
 
         // Spin-try push with backpressure.
@@ -225,8 +245,10 @@ pub unsafe extern "C" fn aster_reactor_create(
     let state = ReactorState {
         consumer: Mutex::new(consumer),
         response_senders: Mutex::new(std::collections::HashMap::new()),
+        request_receivers: Mutex::new(std::collections::HashMap::new()),
         stopped,
         buffers,
+        rt_handle: rt_handle.clone(),
     };
 
     let handle_id = REACTORS.insert(state);
@@ -305,13 +327,22 @@ pub unsafe extern "C" fn aster_reactor_poll(
             ptr::write(out_calls.add(written as usize), desc);
         }
 
-        // Stash the response sender for later submit.
+        // Stash the response sender + request receiver for later submit /
+        // recv_frame calls. Both are owned by the FFI state until the
+        // call's terminal trailer (or destroy).
         if let Some(sender) = ring_call.response_sender {
             state
                 .response_senders
                 .lock()
                 .unwrap()
                 .insert(ring_call.call_id, sender);
+        }
+        if let Some(receiver) = ring_call.request_receiver {
+            state
+                .request_receivers
+                .lock()
+                .unwrap()
+                .insert(ring_call.call_id, Mutex::new(receiver));
         }
 
         written += 1;
@@ -352,6 +383,13 @@ pub unsafe extern "C" fn aster_reactor_poll(
                         .lock()
                         .unwrap()
                         .insert(ring_call.call_id, sender);
+                }
+                if let Some(receiver) = ring_call.request_receiver {
+                    state
+                        .request_receivers
+                        .lock()
+                        .unwrap()
+                        .insert(ring_call.call_id, Mutex::new(receiver));
                 }
                 written += 1;
             });
@@ -412,6 +450,9 @@ pub unsafe extern "C" fn aster_reactor_submit(
     let _ = sender.send(OutgoingFrame::Trailer(trailer_frame));
     // `sender` goes out of scope here — the map already dropped its copy,
     // so this closes the mpsc channel and lets the reactor finish the stream.
+
+    // Drop the per-call request receiver too (terminal cleanup).
+    state.request_receivers.lock().unwrap().remove(&call_id);
 
     iroh_status_t::IROH_STATUS_OK as i32
 }
@@ -486,7 +527,141 @@ pub unsafe extern "C" fn aster_reactor_submit_trailer(
 
     let _ = sender.send(OutgoingFrame::Trailer(trailer));
     // `sender` dropped here — channel closes once the reactor drains it.
+
+    // Drop the per-call request receiver too (terminal cleanup).
+    state.request_receivers.lock().unwrap().remove(&call_id);
+
     iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Result codes returned by `aster_reactor_recv_frame` in addition to the
+/// usual `iroh_status_t` codes for error cases.
+pub const ASTER_RECV_FRAME_OK: i32 = 0;
+/// Per-call request channel was closed cleanly (peer signalled END_STREAM
+/// or its recv stream EOF'd). No frame was written; the binding should
+/// stop calling recv_frame for this call_id.
+pub const ASTER_RECV_FRAME_END_OF_STREAM: i32 = 1;
+/// Timeout expired with no frame available. The binding may retry.
+pub const ASTER_RECV_FRAME_TIMEOUT: i32 = 2;
+
+/// Pull the next ADDITIONAL request frame for a client-streaming or
+/// bidi-streaming call. Blocks up to `timeout_ms` waiting for a frame.
+///
+/// On `ASTER_RECV_FRAME_OK` (return value 0), the function writes:
+/// - `*out_payload_ptr`: pointer to payload bytes (owned by the reactor's
+///   buffer registry — must be released via `aster_reactor_buffer_release`)
+/// - `*out_payload_len`: payload length in bytes
+/// - `*out_flags`: frame flags byte (peer may set `FLAG_END_STREAM` here on
+///   the last frame; the binding may use that as a hint but is not required
+///   to — the reactor will also surface end-of-stream as
+///   `ASTER_RECV_FRAME_END_OF_STREAM` on the next call)
+/// - `*out_buffer_id`: registry id for releasing the payload buffer
+///
+/// On `ASTER_RECV_FRAME_END_OF_STREAM` (return value 1) or
+/// `ASTER_RECV_FRAME_TIMEOUT` (return value 2), no out parameters are
+/// touched and the call_id remains valid for further recv attempts (in the
+/// timeout case) or is now drained (end-of-stream case — further calls
+/// will continue to return end-of-stream).
+///
+/// Negative return values are `iroh_status_t` error codes (e.g.
+/// `IROH_STATUS_NOT_FOUND` if the call_id is unknown).
+///
+/// The first request frame is delivered inline via `aster_reactor_poll`'s
+/// `request_ptr` / `request_len` / `request_flags` fields. This function
+/// is for SUBSEQUENT frames only.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn aster_reactor_recv_frame(
+    runtime: iroh_runtime_t,
+    reactor: aster_reactor_t,
+    call_id: u64,
+    timeout_ms: u32,
+    out_payload_ptr: *mut *const u8,
+    out_payload_len: *mut u32,
+    out_flags: *mut u8,
+    out_buffer_id: *mut u64,
+) -> i32 {
+    if out_payload_ptr.is_null()
+        || out_payload_len.is_null()
+        || out_flags.is_null()
+        || out_buffer_id.is_null()
+    {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let state = match REACTORS.get(reactor) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    // Take the receiver out of the map for the duration of the recv. This
+    // means concurrent `recv_frame` calls on the same call_id will see
+    // NOT_FOUND temporarily — that's fine, the contract is single-consumer
+    // per call_id.
+    let receiver_mutex = match state.request_receivers.lock().unwrap().remove(&call_id) {
+        Some(r) => r,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let mut receiver = match receiver_mutex.into_inner() {
+        Ok(r) => r,
+        Err(_) => return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32,
+    };
+
+    let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+    let recv_result = state.rt_handle.block_on(async {
+        if timeout_ms == 0 {
+            // Non-blocking poll
+            match receiver.try_recv() {
+                Ok(frame) => Ok(Some(frame)),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => Err(()),
+            }
+        } else {
+            tokio::select! {
+                frame = receiver.recv() => match frame {
+                    Some(f) => Ok(Some(f)),
+                    None => Err(()),
+                },
+                _ = tokio::time::sleep(timeout) => Ok(None),
+            }
+        }
+    });
+
+    match recv_result {
+        Ok(Some(frame)) => {
+            // Stash the receiver back so subsequent recv_frame calls work.
+            state
+                .request_receivers
+                .lock()
+                .unwrap()
+                .insert(call_id, Mutex::new(receiver));
+
+            let (buf_id, arc) = state.buffers.insert(frame.payload);
+            unsafe {
+                ptr::write(out_payload_ptr, arc.as_ptr());
+                ptr::write(out_payload_len, arc.len() as u32);
+                ptr::write(out_flags, frame.flags);
+                ptr::write(out_buffer_id, buf_id);
+            }
+            ASTER_RECV_FRAME_OK
+        }
+        Ok(None) => {
+            // Timeout — put the receiver back so the binding can retry.
+            state
+                .request_receivers
+                .lock()
+                .unwrap()
+                .insert(call_id, Mutex::new(receiver));
+            ASTER_RECV_FRAME_TIMEOUT
+        }
+        Err(()) => {
+            // Channel closed — drop the receiver permanently. Subsequent
+            // recv_frame calls for this call_id will get NOT_FOUND, which
+            // the binding can interpret as "already drained".
+            ASTER_RECV_FRAME_END_OF_STREAM
+        }
+    }
 }
 
 /// Release a buffer obtained from a reactor call descriptor.

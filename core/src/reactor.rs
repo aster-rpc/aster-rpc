@@ -7,7 +7,21 @@
 //! time, terminated by a Trailer. The reactor writes each frame to the QUIC
 //! stream as it arrives, enabling server-streaming and bidi-streaming RPCs.
 //!
-//! Two modes:
+//! Read-side mpsc (added for client-stream / bidi support):
+//! - Every QUIC bi-stream gets a single frame-reader task that owns the
+//!   recv side and pushes every frame it reads (header, calls, requests)
+//!   into a per-stream tokio mpsc channel.
+//! - The dispatch loop (stateless or session) consumes from that channel
+//!   and routes frames: header frames bootstrap the call, request frames
+//!   are forwarded to a per-call `request_sender` that feeds the binding.
+//! - For client-streaming or bidi calls the binding pulls additional
+//!   request frames via the FFI `recv_frame` path. The reactor closes
+//!   the per-call request channel when it sees `FLAG_END_STREAM` on a
+//!   request frame, or when the QUIC recv stream EOFs (stateless mode
+//!   only — session mode requires explicit `FLAG_END_STREAM` because
+//!   the stream stays open between calls).
+//!
+//! Two reactor entry shapes:
 //! - `start_reactor` / `start_reactor_on`: owns the accept loop (pulls from
 //!   `node.accept_aster()`). Good for standalone Server use.
 //! - `create_reactor`: returns a handle + feeder. The caller owns the accept
@@ -19,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
-use crate::framing::{FLAG_CALL, FLAG_HEADER, MAX_FRAME_SIZE};
+use crate::framing::{FLAG_CALL, FLAG_END_STREAM, FLAG_HEADER, MAX_FRAME_SIZE};
 use crate::{CoreConnection, CoreNode, CoreRecvStream, CoreSendStream};
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -49,6 +63,21 @@ pub struct IncomingCall {
     pub peer_id: String,
     pub is_session_call: bool,
     pub response_sender: mpsc::UnboundedSender<OutgoingFrame>,
+    /// Receiver for ADDITIONAL request frames after the first one (which
+    /// is delivered inline via `request_payload` / `request_flags`). Unary
+    /// and server-streaming calls will see this channel close almost
+    /// immediately; client-streaming and bidi-streaming calls pull frames
+    /// until `FLAG_END_STREAM` or QUIC EOF closes the channel.
+    pub request_receiver: mpsc::UnboundedReceiver<RequestFrame>,
+}
+
+/// One additional request frame delivered to the binding's per-call
+/// `request_receiver` channel. The first request frame is delivered inline
+/// in the [`IncomingCall`] descriptor; this type is for everything after
+/// that, used only by client-streaming and bidi-streaming calls.
+pub struct RequestFrame {
+    pub payload: Vec<u8>,
+    pub flags: u8,
 }
 
 /// Outgoing frame emitted by the binding. The reactor writes each `Frame` to
@@ -159,6 +188,30 @@ async fn handle_stream(
     }
 }
 
+/// One frame as read off the wire by the per-stream reader task.
+struct WireFrame {
+    payload: Vec<u8>,
+    flags: u8,
+}
+
+/// Per-stream frame reader task. Owns `recv` for the lifetime of the QUIC
+/// bi-stream and pushes every frame it reads into a shared mpsc that the
+/// dispatch loop consumes from. Exits on the first read error (typically
+/// EOF when the peer closes its send side), which closes the channel and
+/// signals the dispatch loop that no more frames are coming.
+async fn read_all_frames(recv: CoreRecvStream, frame_tx: mpsc::UnboundedSender<WireFrame>) {
+    loop {
+        match read_one_frame(&recv).await {
+            Ok((payload, flags)) => {
+                if frame_tx.send(WireFrame { payload, flags }).is_err() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 async fn handle_stream_inner(
     send: CoreSendStream,
     recv: CoreRecvStream,
@@ -166,95 +219,166 @@ async fn handle_stream_inner(
     call_tx: mpsc::Sender<IncomingCall>,
 ) -> Result<()> {
     let stream_id = next_stream_id();
-    let (header_payload, header_flags) = read_one_frame(&recv).await?;
-    if header_flags & FLAG_HEADER == 0 {
+
+    // Spawn the per-stream reader task. Everything below pulls from
+    // `frame_rx`; nothing else touches `recv`.
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+    let reader_handle = tokio::spawn(read_all_frames(recv, frame_tx));
+
+    let result = dispatch_stream(&mut frame_rx, send, peer_id, stream_id, call_tx).await;
+
+    // Stop the reader task. For well-behaved peers it has already exited
+    // on EOF; for misbehaving peers we cut it off here.
+    reader_handle.abort();
+    result
+}
+
+async fn dispatch_stream(
+    frame_rx: &mut mpsc::UnboundedReceiver<WireFrame>,
+    send: CoreSendStream,
+    peer_id: String,
+    stream_id: u64,
+    call_tx: mpsc::Sender<IncomingCall>,
+) -> Result<()> {
+    let header = frame_rx
+        .recv()
+        .await
+        .ok_or_else(|| anyhow!("eof before stream header"))?;
+    if header.flags & FLAG_HEADER == 0 {
         return Err(anyhow!("first frame missing HEADER flag"));
     }
 
-    let (second_payload, second_flags) = read_one_frame(&recv).await?;
+    let second = frame_rx
+        .recv()
+        .await
+        .ok_or_else(|| anyhow!("eof after stream header"))?;
 
-    if second_flags & FLAG_CALL != 0 {
+    if second.flags & FLAG_CALL != 0 {
         handle_session(
             send,
-            recv,
+            frame_rx,
             peer_id,
             stream_id,
             call_tx,
-            header_payload,
-            second_payload,
-            second_flags,
+            header.payload,
+            second.payload,
+            second.flags,
         )
         .await
     } else {
         handle_stateless(
             send,
+            frame_rx,
             peer_id,
             stream_id,
             call_tx,
-            header_payload,
-            header_flags,
-            second_payload,
-            second_flags,
+            header.payload,
+            header.flags,
+            second.payload,
+            second.flags,
         )
         .await
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_stateless(
     send: CoreSendStream,
+    frame_rx: &mut mpsc::UnboundedReceiver<WireFrame>,
     peer_id: String,
     stream_id: u64,
     call_tx: mpsc::Sender<IncomingCall>,
     header_payload: Vec<u8>,
     header_flags: u8,
-    request_payload: Vec<u8>,
-    request_flags: u8,
+    first_request_payload: Vec<u8>,
+    first_request_flags: u8,
 ) -> Result<()> {
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
+    let (req_tx, req_rx) = mpsc::unbounded_channel();
+
+    // Stateless mode: if the first request frame already carries
+    // FLAG_END_STREAM (or the call shape is unary/server-stream where the
+    // peer will simply EOF), the binding doesn't need any more frames.
+    // Either way we ALSO forward subsequent wire frames (until EOF or
+    // END_STREAM) so client-streaming peers can push their full input.
+    let mut request_done = first_request_flags & FLAG_END_STREAM != 0;
+    let mut req_tx_opt = if request_done { None } else { Some(req_tx) };
+
     call_tx
         .send(IncomingCall {
             call_id: next_call_id(),
             stream_id,
             header_payload,
             header_flags,
-            request_payload,
-            request_flags,
+            request_payload: first_request_payload,
+            request_flags: first_request_flags,
             peer_id,
             is_session_call: false,
             response_sender: resp_tx,
+            request_receiver: req_rx,
         })
         .await
         .map_err(|_| anyhow!("reactor channel closed"))?;
 
-    // Drain every frame the binding emits, write it to the stream, and stop
-    // once the Trailer lands. Supports unary (1 Frame + 1 Trailer), server
-    // streaming (N Frames + 1 Trailer), and the error-only case (1 Trailer).
-    while let Some(frame) = resp_rx.recv().await {
-        match frame {
-            OutgoingFrame::Frame(bytes) => {
-                if !bytes.is_empty() {
-                    send.write_all(bytes).await?;
+    loop {
+        tokio::select! {
+            biased;
+
+            // Forward any additional request frames the peer sends.
+            wire = frame_rx.recv(), if !request_done => {
+                match wire {
+                    Some(frame) => {
+                        let end = frame.flags & FLAG_END_STREAM != 0;
+                        if let Some(tx) = req_tx_opt.as_ref() {
+                            let _ = tx.send(RequestFrame {
+                                payload: frame.payload,
+                                flags: frame.flags,
+                            });
+                        }
+                        if end {
+                            request_done = true;
+                            req_tx_opt = None;
+                        }
+                    }
+                    None => {
+                        // Peer EOF — close the request channel.
+                        request_done = true;
+                        req_tx_opt = None;
+                    }
                 }
             }
-            OutgoingFrame::Trailer(bytes) => {
-                if !bytes.is_empty() {
-                    send.write_all(bytes).await?;
+
+            // Drain response frames as they arrive from the binding.
+            resp = resp_rx.recv() => {
+                match resp {
+                    Some(OutgoingFrame::Frame(bytes)) => {
+                        if !bytes.is_empty() {
+                            send.write_all(bytes).await?;
+                        }
+                    }
+                    Some(OutgoingFrame::Trailer(bytes)) => {
+                        if !bytes.is_empty() {
+                            send.write_all(bytes).await?;
+                        }
+                        send.finish().await?;
+                        return Ok(());
+                    }
+                    None => {
+                        send.finish().await?;
+                        return Err(anyhow!(
+                            "binding dropped response channel without trailer"
+                        ));
+                    }
                 }
-                send.finish().await?;
-                return Ok(());
             }
         }
     }
-
-    // Binding dropped the channel without sending a trailer — close the
-    // stream cleanly so the client isn't left hanging on a dangling read.
-    send.finish().await?;
-    Err(anyhow!("binding dropped response channel without trailer"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_session(
     send: CoreSendStream,
-    recv: CoreRecvStream,
+    frame_rx: &mut mpsc::UnboundedReceiver<WireFrame>,
     peer_id: String,
     stream_id: u64,
     call_tx: mpsc::Sender<IncomingCall>,
@@ -266,63 +390,116 @@ async fn handle_session(
     let mut call_header_flags = first_call_flags;
 
     loop {
-        let (request_payload, request_flags) = read_one_frame(&recv).await?;
+        // Read the first request frame for this call.
+        let first = match frame_rx.recv().await {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        if first.flags & FLAG_CALL != 0 {
+            return Err(anyhow!(
+                "expected request frame, got CallHeader (flags={:#x})",
+                first.flags
+            ));
+        }
 
         let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+
+        // Session mode CANNOT rely on QUIC EOF to end a call's request
+        // stream — the bi-stream stays open between calls. Client-streaming
+        // calls in session mode MUST mark the last request frame with
+        // FLAG_END_STREAM so the reactor knows where one call's request
+        // stream ends and the next CallHeader begins.
+        let mut request_done = first.flags & FLAG_END_STREAM != 0;
+        let mut req_tx_opt = if request_done { None } else { Some(req_tx) };
+
         call_tx
             .send(IncomingCall {
                 call_id: next_call_id(),
                 stream_id,
                 header_payload: call_header_payload,
                 header_flags: call_header_flags,
-                request_payload,
-                request_flags,
+                request_payload: first.payload,
+                request_flags: first.flags,
                 peer_id: peer_id.clone(),
                 is_session_call: true,
                 response_sender: resp_tx,
+                request_receiver: req_rx,
             })
             .await
             .map_err(|_| anyhow!("reactor channel closed"))?;
 
-        // Drain frames for this call but DO NOT finish the stream on Trailer —
-        // session mode keeps the stream open for subsequent calls. The outer
-        // loop reads the next CallHeader once the trailer has been written.
+        // Drain request + response frames for this call. Exit the inner
+        // loop on Trailer so the next iteration can read the next
+        // CallHeader. A peer that sets FLAG_CALL before the previous
+        // call's request stream finished is a protocol violation — we
+        // detect it by seeing a CALL frame while `request_done == false`.
         loop {
-            match resp_rx.recv().await {
-                Some(OutgoingFrame::Frame(bytes)) => {
-                    if !bytes.is_empty() {
-                        send.write_all(bytes).await?;
+            tokio::select! {
+                biased;
+
+                wire = frame_rx.recv(), if !request_done => {
+                    match wire {
+                        Some(frame) => {
+                            if frame.flags & FLAG_CALL != 0 {
+                                return Err(anyhow!(
+                                    "got CallHeader before previous call's END_STREAM"
+                                ));
+                            }
+                            let end = frame.flags & FLAG_END_STREAM != 0;
+                            if let Some(tx) = req_tx_opt.as_ref() {
+                                let _ = tx.send(RequestFrame {
+                                    payload: frame.payload,
+                                    flags: frame.flags,
+                                });
+                            }
+                            if end {
+                                request_done = true;
+                                req_tx_opt = None;
+                            }
+                        }
+                        None => return Ok(()),
                     }
                 }
-                Some(OutgoingFrame::Trailer(bytes)) => {
-                    if !bytes.is_empty() {
-                        send.write_all(bytes).await?;
+
+                resp = resp_rx.recv() => {
+                    match resp {
+                        Some(OutgoingFrame::Frame(bytes)) => {
+                            if !bytes.is_empty() {
+                                send.write_all(bytes).await?;
+                            }
+                        }
+                        Some(OutgoingFrame::Trailer(bytes)) => {
+                            if !bytes.is_empty() {
+                                send.write_all(bytes).await?;
+                            }
+                            // The next loop iteration creates a fresh
+                            // (req_tx, req_rx) pair, dropping the old one
+                            // and closing any unread request channel.
+                            break;
+                        }
+                        None => {
+                            return Err(anyhow!("binding dropped session call channel"));
+                        }
                     }
-                    break;
                 }
-                None => return Err(anyhow!("binding dropped session call channel")),
             }
         }
 
-        match read_one_frame(&recv).await {
-            Ok((payload, flags)) => {
-                if flags & FLAG_CALL != 0 {
-                    call_header_payload = payload;
-                    call_header_flags = flags;
-                    continue;
-                }
-                return Err(anyhow!(
-                    "unexpected frame flags {:#x} in session loop",
-                    flags
-                ));
-            }
-            Err(_) => {
-                break;
-            }
+        // Wait for the next CallHeader.
+        let next = match frame_rx.recv().await {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        if next.flags & FLAG_CALL == 0 {
+            return Err(anyhow!(
+                "expected CallHeader, got flags={:#x}",
+                next.flags
+            ));
         }
+        call_header_payload = next.payload;
+        call_header_flags = next.flags;
     }
-
-    Ok(())
 }
 
 async fn read_one_frame(recv: &CoreRecvStream) -> Result<(Vec<u8>, u8)> {
