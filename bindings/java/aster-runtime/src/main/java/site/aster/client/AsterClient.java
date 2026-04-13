@@ -222,18 +222,37 @@ public final class AsterClient implements AutoCloseable {
     CompletableFuture<Resp> out = new CompletableFuture<>();
     callExecutor.execute(
         () -> {
-          AsterCall call = null;
           try {
-            call = acquireOn(conn, sessionId);
-            sendStreamHeader(call, sessionId, service, method);
+            byte[] headerBytes = headerCodec.encode(buildStreamHeader(sessionId, service, method));
+            byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
             byte[] requestBytes = codec.encode(request);
-            call.sendFrame(AsterFraming.encodeFrame(requestBytes, AsterFraming.FLAG_END_STREAM));
-            UnaryResult<Resp> result = drainUnary(call, responseType);
-            call.release();
-            call = null;
-            out.complete(result.value());
+            byte[] requestFrame =
+                AsterFraming.encodeFrame(requestBytes, AsterFraming.FLAG_END_STREAM);
+            byte[] requestPair = new byte[headerFrame.length + requestFrame.length];
+            System.arraycopy(headerFrame, 0, requestPair, 0, headerFrame.length);
+            System.arraycopy(requestFrame, 0, requestPair, headerFrame.length, requestFrame.length);
+
+            AsterCall.UnaryResult result =
+                AsterCall.unary(
+                    conn.runtime().nativeHandle(), conn.nativeHandle(), sessionId, requestPair);
+
+            // Decode trailer first; non-OK status surfaces as RpcError.
+            RpcStatus status =
+                result.trailerPayload().length == 0
+                    ? RpcStatus.ok()
+                    : (RpcStatus) headerCodec.decode(result.trailerPayload(), RpcStatus.class);
+            if (status.code() != RpcStatus.OK) {
+              throw new RpcError(
+                  StatusCode.fromValue(status.code()),
+                  status.message() == null ? "" : status.message());
+            }
+            if (result.responsePayload() == null) {
+              throw new RpcError(StatusCode.INTERNAL, "OK trailer with no response frame");
+            }
+            @SuppressWarnings("unchecked")
+            Resp decoded = (Resp) codec.decode(result.responsePayload(), responseType);
+            out.complete(decoded);
           } catch (Throwable t) {
-            if (call != null) call.discard();
             out.completeExceptionally(unwrap(t));
           }
         });
@@ -341,19 +360,21 @@ public final class AsterClient implements AutoCloseable {
   }
 
   private void sendStreamHeader(AsterCall call, int sessionId, String service, String method) {
-    StreamHeader header =
-        new StreamHeader(
-            service,
-            method,
-            1,
-            0,
-            (short) 0,
-            StreamHeader.SERIALIZATION_XLANG,
-            List.of(),
-            List.of(),
-            sessionId);
-    byte[] headerBytes = headerCodec.encode(header);
+    byte[] headerBytes = headerCodec.encode(buildStreamHeader(sessionId, service, method));
     call.sendFrame(AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER));
+  }
+
+  private static StreamHeader buildStreamHeader(int sessionId, String service, String method) {
+    return new StreamHeader(
+        service,
+        method,
+        1,
+        0,
+        (short) 0,
+        StreamHeader.SERIALIZATION_XLANG,
+        List.of(),
+        List.of(),
+        sessionId);
   }
 
   /** Record-style holder for drainUnary — lets us distinguish "empty OK" from "no frame". */
