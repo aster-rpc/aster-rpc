@@ -3,6 +3,7 @@ package site.aster.interceptors;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 
 /**
  * Context for a single RPC call, available to interceptors and handlers.
@@ -12,6 +13,43 @@ import java.util.UUID;
  * {@link #remainingSeconds()} for deadline awareness.
  */
 public final class CallContext {
+
+  // Async-local current-context holder. Published by the dispatcher via runWith(...) for the
+  // duration of a handler invocation so deeply-nested handler code can access the context
+  // without threading it through every call. Falls back to a ThreadLocal until Java's
+  // ScopedValue graduates out of preview.
+  private static final ThreadLocal<CallContext> CURRENT = new ThreadLocal<>();
+
+  /**
+   * Return the {@link CallContext} for the currently-executing dispatch.
+   *
+   * @throws IllegalStateException if called outside of a dispatcher-managed scope
+   */
+  public static CallContext current() {
+    CallContext ctx = CURRENT.get();
+    if (ctx == null) {
+      throw new IllegalStateException("CallContext.current() called outside of a dispatch scope");
+    }
+    return ctx;
+  }
+
+  /**
+   * Publish {@code ctx} as the current call context for the duration of {@code action}. Used by
+   * generated dispatchers to make {@link #current()} accessible from user handlers.
+   */
+  public static <T> T runWith(CallContext ctx, Callable<T> action) throws Exception {
+    CallContext prior = CURRENT.get();
+    CURRENT.set(ctx);
+    try {
+      return action.call();
+    } finally {
+      if (prior == null) {
+        CURRENT.remove();
+      } else {
+        CURRENT.set(prior);
+      }
+    }
+  }
 
   private final String service;
   private final String method;
