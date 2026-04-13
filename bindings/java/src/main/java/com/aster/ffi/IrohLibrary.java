@@ -2023,4 +2023,121 @@ public final class IrohLibrary implements SymbolLookup {
       throw new AssertionError(t);
     }
   }
+
+  // --- Registry FFI (§11) ------------------------------------------------
+
+  /** C signature: {@code int64_t aster_registry_now_epoch_ms(void);} */
+  public long asterRegistryNowEpochMs() {
+    try {
+      return (long)
+          getHandle("aster_registry_now_epoch_ms", FunctionDescriptor.of(ValueLayout.JAVA_LONG))
+              .invoke();
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * C signature: {@code int32_t aster_registry_is_fresh(const uint8_t *lease_json_ptr, uintptr_t
+   * lease_json_len, int32_t lease_duration_s);}
+   */
+  public int asterRegistryIsFresh(
+      MemorySegment leaseJsonPtr, long leaseJsonLen, int leaseDurationS) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_registry_is_fresh",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_INT))
+              .invoke(leaseJsonPtr, leaseJsonLen, leaseDurationS);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * C signature: {@code int32_t aster_registry_is_routable(const uint8_t *status_ptr, uintptr_t
+   * status_len);}
+   */
+  public int asterRegistryIsRoutable(MemorySegment statusPtr, long statusLen) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_registry_is_routable",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG))
+              .invoke(statusPtr, statusLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * C signature: {@code int32_t aster_registry_filter_and_rank(const uint8_t *leases_json_ptr,
+   * uintptr_t leases_json_len, const uint8_t *opts_json_ptr, uintptr_t opts_json_len, uint8_t
+   * *out_buf, uintptr_t *out_len);}
+   */
+  public int asterRegistryFilterAndRank(
+      MemorySegment leasesJsonPtr,
+      long leasesJsonLen,
+      MemorySegment optsJsonPtr,
+      long optsJsonLen,
+      MemorySegment outBuf,
+      MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_registry_filter_and_rank",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(leasesJsonPtr, leasesJsonLen, optsJsonPtr, optsJsonLen, outBuf, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * C signature: {@code int32_t aster_registry_key(int32_t kind, const uint8_t *arg1_ptr, uintptr_t
+   * arg1_len, const uint8_t *arg2_ptr, uintptr_t arg2_len, const uint8_t *arg3_ptr, uintptr_t
+   * arg3_len, uint8_t *out_buf, uintptr_t *out_len);}
+   */
+  public int asterRegistryKey(
+      int kind,
+      MemorySegment arg1Ptr,
+      long arg1Len,
+      MemorySegment arg2Ptr,
+      long arg2Len,
+      MemorySegment arg3Ptr,
+      long arg3Len,
+      MemorySegment outBuf,
+      MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_registry_key",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(kind, arg1Ptr, arg1Len, arg2Ptr, arg2Len, arg3Ptr, arg3Len, outBuf, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
 }
