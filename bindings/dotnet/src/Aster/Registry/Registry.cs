@@ -12,7 +12,7 @@ namespace Aster.Registry;
 /// over the synchronous FFI functions. Doc reads and writes still go through the existing
 /// node/docs FFI.
 /// </remarks>
-public static class Registry
+public static partial class Registry
 {
     private const int InitialOutBuf = 16 * 1024;
 

@@ -18,6 +18,8 @@ public sealed class GossipTopic : IDisposable
         _handle = handle;
     }
 
+    public ulong Handle => _handle;
+
     public async Task BroadcastAsync(byte[] data, CancellationToken ct = default)
     {
         GCHandle pin = GCHandle.Alloc(data, GCHandleType.Pinned);

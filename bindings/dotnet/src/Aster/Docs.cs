@@ -20,6 +20,8 @@ public sealed class Doc : IDisposable
 
     public ulong Handle => _handle;
 
+    internal Runtime Runtime => _runtime;
+
     public async Task SetBytesAsync(string authorId, string key, byte[] value, CancellationToken ct = default)
     {
         byte[] authorBytes = Encoding.UTF8.GetBytes(authorId);
