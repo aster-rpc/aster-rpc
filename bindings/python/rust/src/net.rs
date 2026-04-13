@@ -1043,6 +1043,12 @@ impl ReactorHandle {
                     let sender = ReactorResponseSender {
                         inner: StdMutex::new(Some(call.response_sender)),
                     };
+                    // Python framework hasn't been ported to pull additional
+                    // request frames via the reactor; drop the receiver so
+                    // the per-call request channel closes immediately. Python
+                    // client-streaming uses a different code path (the
+                    // higher-level Aster framework, not core::reactor).
+                    drop(call.request_receiver);
                     Ok(Some((
                         call.call_id,
                         PyBytesResult(call.header_payload),

@@ -11,6 +11,10 @@ pub const FLAG_HEADER: u8 = 0x04;
 pub const FLAG_ROW_SCHEMA: u8 = 0x08;
 pub const FLAG_CALL: u8 = 0x10;
 pub const FLAG_CANCEL: u8 = 0x20;
+/// Set on the LAST request frame of a client-streaming or bidi-streaming
+/// call. Tells the reactor to close the per-call request channel and stop
+/// reading more request frames for this call.
+pub const FLAG_END_STREAM: u8 = 0x40;
 
 /// Maximum frame body size: 16 MiB.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
