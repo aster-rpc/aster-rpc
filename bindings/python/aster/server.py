@@ -115,6 +115,100 @@ class _SessionScopeMismatch(Exception):
     """SHARED call carried a sessionId, or SESSION call arrived without one."""
 
 
+# ── Reactor I/O adapters (spec Sec. 8 streaming dispatch) ────────────────────
+# These let the reactor dispatch path reuse `_handle_server_stream`,
+# `_handle_client_stream`, `_handle_bidi_stream` without duplicating their
+# ~300 lines of interceptor / deadline / error-trailer logic. The adapters
+# look enough like a real QUIC bi-stream for `framing.write_frame` /
+# `framing.read_frame` to drive them.
+
+
+class _ReactorSendAdapter:
+    """SendStream-shaped wrapper over `ReactorResponseSender`.
+
+    ``framing.write_frame`` serializes its payload as
+    ``[4B LE len][1B flags][payload]`` and then calls ``write_all(data)``.
+    This adapter inspects the flags byte and routes to the streaming or
+    terminal reactor-sender API. After a trailer is written, further
+    ``write_all`` calls are silently dropped (matches QUIC semantics once
+    the stream's send side is finished).
+    """
+
+    def __init__(self, sender: Any) -> None:
+        self._sender = sender
+        self._closed = False
+
+    async def write_all(self, data: bytes) -> None:
+        if self._closed or len(data) < 5:
+            return
+        flags = data[4]
+        if flags & TRAILER:
+            self._sender.send_trailer(bytes(data))
+            self._closed = True
+        else:
+            self._sender.send_frame(bytes(data))
+
+    async def finish(self) -> None:
+        # Reactor auto-finishes the QUIC stream after the trailer frame
+        # is written. Nothing to do here.
+        return None
+
+
+class _ReactorRecvAdapter:
+    """RecvStream-shaped wrapper over `ReactorRequestReceiver`.
+
+    The reactor delivers frames as ``(payload, flags)`` tuples. This
+    adapter re-frames them into the on-wire byte layout and serves them
+    through ``read_exact(n)`` so ``framing.read_frame`` can drive dispatch.
+    The first request frame arrives inline on the ``ReactorEvent``; callers
+    pass it as ``first_frame_bytes`` so it shows up as the first frame on
+    the adapter.
+    """
+
+    def __init__(
+        self,
+        receiver: Any,
+        first_frame_bytes: bytes | None = None,
+    ) -> None:
+        self._receiver = receiver
+        self._buffer = bytearray(first_frame_bytes or b"")
+        self._eof = False
+
+    async def read_exact(self, n: int) -> bytes:
+        import struct as _struct
+        while len(self._buffer) < n:
+            if self._eof or self._receiver is None:
+                raise EOFError("reactor request stream ended")
+            frame = await self._receiver.recv()
+            if frame is None:
+                self._eof = True
+                if len(self._buffer) < n:
+                    raise EOFError("reactor request stream ended")
+                break
+            payload, flags = frame
+            self._buffer.extend(_struct.pack("<I", len(payload) + 1))
+            self._buffer.append(flags)
+            self._buffer.extend(payload)
+        out = bytes(self._buffer[:n])
+        del self._buffer[:n]
+        return out
+
+
+class _ReactorConnStub:
+    """Minimal IrohConnection-shaped stub for `ConnectionContext`.
+
+    Reactor dispatch runs without a live Python ConnectionContext (the
+    real connection is owned by the Rust reactor). Streaming handlers only
+    need ``remote_id()`` for peer lookup in ``_build_call_context``.
+    """
+
+    def __init__(self, peer_id: str) -> None:
+        self._peer = peer_id
+
+    def remote_id(self) -> str:
+        return self._peer
+
+
 # ── Server ──────────────────────────────────────────────────────────────────
 
 
@@ -338,6 +432,8 @@ class Server:
                         # Shouldn't happen -- guard against double-take.
                         logger.warning("Call event missing response sender")
                         continue
+                    request_receiver = event.take_request_receiver()
+                    cancel_flag = event.cancel_flag
                     asyncio.create_task(
                         self._dispatch_reactor_call(
                             event.call_id,
@@ -348,6 +444,8 @@ class Server:
                             event.peer_id,
                             event.connection_id,
                             response_sender,
+                            request_receiver,
+                            cancel_flag,
                         )
                     )
                 elif event.kind == "connection_closed":
@@ -408,9 +506,13 @@ class Server:
         peer_id: str,
         connection_id: int,
         response_sender: Any,
+        request_receiver: Any = None,
+        cancel_flag: Any = None,
     ) -> None:
         import struct as _struct
 
+        header: StreamHeader | None = None
+        ser_mode = 0
         try:
             if not (header_flags & HEADER):
                 self._reactor_error_response(
@@ -451,14 +553,6 @@ class Server:
                 )
                 return
 
-            if method_info.pattern != "unary":
-                self._reactor_error_response(
-                    response_sender, StatusCode.UNIMPLEMENTED,
-                    f"Reactor only supports unary calls, got '{method_info.pattern}'",
-                    ser_mode,
-                )
-                return
-
             try:
                 handler = self._resolve_instance(
                     service_info, connection_id,
@@ -486,6 +580,19 @@ class Server:
                 self._reactor_error_response(
                     response_sender, StatusCode.INTERNAL,
                     "Handler method not found", ser_mode,
+                )
+                return
+
+            # Branch on RPC pattern. Unary runs inline on the reactor fast
+            # path (sender.submit bundles response + trailer). Streaming
+            # patterns build adapter objects that look like QUIC streams so
+            # we can reuse the non-reactor `_handle_*_stream` methods.
+            pattern = method_info.pattern
+            if pattern != "unary":
+                await self._dispatch_reactor_streaming(
+                    pattern, header, service_info, method_info,
+                    handler_method, peer_id, request_payload, request_flags,
+                    response_sender, request_receiver,
                 )
                 return
 
@@ -561,19 +668,79 @@ class Server:
 
         except RpcError as e:
             self._reactor_error_response(
-                response_sender, e.code, e.message,
-                getattr(header, "serializationMode", 0) if "header" in dir() else 0,
+                response_sender, e.code, e.message, ser_mode,
             )
         except asyncio.TimeoutError:
             self._reactor_error_response(
                 response_sender, StatusCode.DEADLINE_EXCEEDED,
-                "deadline exceeded",
-                getattr(header, "serializationMode", 0) if "header" in dir() else 0,
+                "deadline exceeded", ser_mode,
             )
         except Exception as e:
             logger.error("Reactor dispatch error: %s", e)
             self._reactor_error_response(
-                response_sender, StatusCode.INTERNAL, str(e),
+                response_sender, StatusCode.INTERNAL, str(e), ser_mode,
+            )
+
+    async def _dispatch_reactor_streaming(
+        self,
+        pattern: str,
+        header: StreamHeader,
+        service_info: ServiceInfo,
+        method_info: MethodInfo,
+        handler_method: Any,
+        peer_id: str,
+        first_request_payload: bytes,
+        first_request_flags: int,
+        response_sender: Any,
+        request_receiver: Any,
+    ) -> None:
+        """Drive a streaming RPC through the reactor channels.
+
+        Builds adapter objects that look like a QUIC bi-stream so the
+        existing `_handle_server_stream` / `_handle_client_stream` /
+        `_handle_bidi_stream` methods work unchanged. The first request
+        frame is already inline on the reactor event; we reframe it into
+        the recv adapter's buffer so ``framing.read_frame`` sees it as
+        the first frame on the stream.
+        """
+        import struct as _struct
+
+        first_frame_bytes = (
+            _struct.pack("<I", len(first_request_payload) + 1)
+            + bytes([first_request_flags])
+            + first_request_payload
+        )
+
+        send_adapter = _ReactorSendAdapter(response_sender)
+        recv_adapter = _ReactorRecvAdapter(request_receiver, first_frame_bytes)
+
+        conn_ctx = ConnectionContext(
+            connection=_ReactorConnStub(peer_id),  # type: ignore[arg-type]
+            server=self,
+        )
+
+        if pattern == "server_stream":
+            await self._handle_server_stream(
+                conn_ctx, send_adapter, recv_adapter, header,
+                handler_method, method_info,
+            )
+        elif pattern == "client_stream":
+            await self._handle_client_stream(
+                conn_ctx, send_adapter, recv_adapter, header,
+                handler_method, method_info,
+            )
+        elif pattern == "bidi_stream":
+            await self._handle_bidi_stream(
+                conn_ctx, send_adapter, recv_adapter, header,
+                handler_method, method_info,
+            )
+        else:
+            # Shouldn't happen -- unary is handled inline above and these
+            # are the only remaining patterns.
+            self._reactor_error_response(
+                response_sender, StatusCode.INTERNAL,
+                f"unknown RPC pattern '{pattern}'",
+                header.serializationMode,
             )
 
     def _reactor_error_response(

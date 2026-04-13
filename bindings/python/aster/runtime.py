@@ -909,6 +909,8 @@ class AsterServer:
                     response_sender = event.take_sender()
                     if response_sender is None:
                         continue
+                    request_receiver = event.take_request_receiver()
+                    cancel_flag = event.cancel_flag
                     asyncio.create_task(
                         self._server._dispatch_reactor_call(
                             event.call_id,
@@ -919,6 +921,8 @@ class AsterServer:
                             event.peer_id,
                             event.connection_id,
                             response_sender,
+                            request_receiver,
+                            cancel_flag,
                         )
                     )
                 elif event.kind == "connection_closed":
