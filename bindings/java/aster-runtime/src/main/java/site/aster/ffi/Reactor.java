@@ -172,6 +172,17 @@ public final class Reactor implements AutoCloseable {
                   ValueLayout.JAVA_LONG,
                   ValueLayout.JAVA_LONG));
 
+  private static final MethodHandle CHECK_CANCELLED =
+      IrohLibrary.getInstance()
+          .getHandle(
+              "aster_reactor_check_cancelled",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT, // 0=alive, 1=cancelled, <0=error
+                  ValueLayout.JAVA_LONG, // runtime
+                  ValueLayout.JAVA_LONG, // reactor
+                  ValueLayout.JAVA_LONG // call_id
+                  ));
+
   private static final MethodHandle RECV_FRAME =
       IrohLibrary.getInstance()
           .getHandle(
@@ -414,6 +425,21 @@ public final class Reactor implements AutoCloseable {
       }
       checkStatus(status, "aster_reactor_recv_frame");
       return RecvFrame.EndOfStream.INSTANCE; // unreachable
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /**
+   * Check whether the given call has been cancelled by the peer (or by a transport-level error).
+   * Streaming dispatchers should poll this from any long-running emit loop and stop early when it
+   * returns {@code true}. Returns {@code false} for unknown call ids (a call already cleaned up by
+   * submit/submit_trailer is reported as not-cancelled).
+   */
+  public boolean checkCancelled(long callId) {
+    try {
+      int status = (int) CHECK_CANCELLED.invoke(runtimeHandle, handle, callId);
+      return status == 1;
     } catch (Throwable t) {
       throw rethrow(t);
     }

@@ -276,6 +276,43 @@ final class MissionControlE2ETest {
     }
   }
 
+  @Test
+  void bidiRunCommandCancellationPropagates() throws Exception {
+    AgentSession.lastRunCommandExitReason = "";
+    try (Fixture f = Fixture.start()) {
+      try (BidiCall<Command, CommandResult> call =
+          f.client
+              .<Command, CommandResult>openBidiStream(
+                  f.serverAddr,
+                  AgentSessionDispatcher.SERVICE_NAME,
+                  "runCommand",
+                  CommandResult.class)
+              .orTimeout(15, TimeUnit.SECONDS)
+              .get()) {
+
+        call.send(new Command("ls"));
+        CommandResult r1 = call.recv();
+        assertNotNull(r1);
+        assertEquals("ran: ls", r1.stdout());
+
+        // Send a CANCEL frame instead of more commands. The reactor should observe it,
+        // set the per-call cancelled flag, and close the request channel. The server's
+        // runCommand loop sees in.receive() return null and the second isCancelled()
+        // check inside the dispatcher records "CANCELLED" as the exit reason.
+        call.cancel();
+
+        // Drain any trailing responses + the trailer. Should hit end-of-stream quickly.
+        CommandResult tail = call.recv();
+        assertNull(tail, "expected end-of-stream after cancel()");
+      }
+    }
+
+    assertEquals(
+        "CANCELLED",
+        AgentSession.lastRunCommandExitReason,
+        "server-side runCommand should record CANCELLED exit reason after the client cancels");
+  }
+
   // ─── Fixture ──────────────────────────────────────────────────────────────
 
   private static final class Fixture implements AutoCloseable {

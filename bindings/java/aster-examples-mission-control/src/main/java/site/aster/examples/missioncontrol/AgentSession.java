@@ -20,6 +20,15 @@ import site.aster.server.spi.ResponseStream;
  */
 public final class AgentSession {
 
+  /**
+   * Test-only observation point: records the reason {@link #runCommand} last exited ({@code "EOF"}
+   * = request stream closed cleanly, {@code "CANCELLED"} = {@code out.isCancelled()} flipped to
+   * true, {@code "EXCEPTION"} = unexpected error). Mutated only by the dispatcher thread; volatile
+   * so a test thread observes the latest value. Static because the SESSION-scoped instance is owned
+   * by the runtime and not directly accessible to the test fixture.
+   */
+  public static volatile String lastRunCommandExitReason = "";
+
   private final String peerId;
   private volatile String agentId = "";
   private volatile List<String> capabilities = List.of();
@@ -48,14 +57,31 @@ public final class AgentSession {
    * {@code out}. Returns when {@code in.receive()} reports end-of-stream.
    */
   public void runCommand(RequestStream in, ResponseStream out, Codec codec) throws Exception {
-    while (true) {
-      byte[] payload = in.receive();
-      if (payload == null) {
-        return;
+    try {
+      while (true) {
+        if (out.isCancelled()) {
+          lastRunCommandExitReason = "CANCELLED";
+          return;
+        }
+        byte[] payload = in.receive();
+        if (payload == null) {
+          // Distinguish EOF from "EOF caused by cancellation" — the cancellation flag
+          // is set BEFORE the per-call request channel closes, so checking again here
+          // catches the "client cancelled while we were blocked in receive()" case.
+          if (out.isCancelled()) {
+            lastRunCommandExitReason = "CANCELLED";
+          } else {
+            lastRunCommandExitReason = "EOF";
+          }
+          return;
+        }
+        Command cmd = (Command) codec.decode(payload, Command.class);
+        CommandResult result = new CommandResult("ran: " + cmd.command(), "", 0);
+        out.send(codec.encode(result));
       }
-      Command cmd = (Command) codec.decode(payload, Command.class);
-      CommandResult result = new CommandResult("ran: " + cmd.command(), "", 0);
-      out.send(codec.encode(result));
+    } catch (Throwable t) {
+      lastRunCommandExitReason = "EXCEPTION";
+      throw t;
     }
   }
 

@@ -28,12 +28,13 @@
 //!   loop and feeds RPC connections via `ReactorFeeder::feed`. Good for
 //!   AsterServer integration where the accept loop dispatches by ALPN.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
-use crate::framing::{FLAG_CALL, FLAG_END_STREAM, FLAG_HEADER, MAX_FRAME_SIZE};
+use crate::framing::{FLAG_CALL, FLAG_CANCEL, FLAG_END_STREAM, FLAG_HEADER, MAX_FRAME_SIZE};
 use crate::{CoreConnection, CoreNode, CoreRecvStream, CoreSendStream};
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -69,6 +70,12 @@ pub struct IncomingCall {
     /// immediately; client-streaming and bidi-streaming calls pull frames
     /// until `FLAG_END_STREAM` or QUIC EOF closes the channel.
     pub request_receiver: mpsc::UnboundedReceiver<RequestFrame>,
+    /// Set to `true` by the reactor when a `FLAG_CANCEL` frame arrives on
+    /// the wire OR when the QUIC stream errors mid-call. The binding can
+    /// poll this from a long-running streaming dispatcher (typically via
+    /// `aster_reactor_check_cancelled`) to stop early instead of running
+    /// to natural completion. Cleared/destroyed when the call ends.
+    pub cancelled: Arc<AtomicBool>,
 }
 
 /// One additional request frame delivered to the binding's per-call
@@ -295,6 +302,7 @@ async fn handle_stateless(
 ) -> Result<()> {
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
     let (req_tx, req_rx) = mpsc::unbounded_channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
 
     // Stateless mode: if the first request frame already carries
     // FLAG_END_STREAM (or the call shape is unary/server-stream where the
@@ -316,6 +324,7 @@ async fn handle_stateless(
             is_session_call: false,
             response_sender: resp_tx,
             request_receiver: req_rx,
+            cancelled: cancelled.clone(),
         })
         .await
         .map_err(|_| anyhow!("reactor channel closed"))?;
@@ -328,6 +337,16 @@ async fn handle_stateless(
             wire = frame_rx.recv(), if !request_done => {
                 match wire {
                     Some(frame) => {
+                        if frame.flags & FLAG_CANCEL != 0 {
+                            // Peer signalled cancellation: surface to the binding,
+                            // close the request channel, and stop forwarding. The
+                            // dispatcher's eventual trailer (whatever shape it ends
+                            // up sending) will close the response side.
+                            cancelled.store(true, Ordering::Release);
+                            request_done = true;
+                            req_tx_opt = None;
+                            continue;
+                        }
                         let end = frame.flags & FLAG_END_STREAM != 0;
                         if let Some(tx) = req_tx_opt.as_ref() {
                             let _ = tx.send(RequestFrame {
@@ -404,6 +423,7 @@ async fn handle_session(
 
         let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
 
         // Session mode CANNOT rely on QUIC EOF to end a call's request
         // stream — the bi-stream stays open between calls. Client-streaming
@@ -425,6 +445,7 @@ async fn handle_session(
                 is_session_call: true,
                 response_sender: resp_tx,
                 request_receiver: req_rx,
+                cancelled: cancelled.clone(),
             })
             .await
             .map_err(|_| anyhow!("reactor channel closed"))?;
@@ -441,6 +462,12 @@ async fn handle_session(
                 wire = frame_rx.recv(), if !request_done => {
                     match wire {
                         Some(frame) => {
+                            if frame.flags & FLAG_CANCEL != 0 {
+                                cancelled.store(true, Ordering::Release);
+                                request_done = true;
+                                req_tx_opt = None;
+                                continue;
+                            }
                             if frame.flags & FLAG_CALL != 0 {
                                 return Err(anyhow!(
                                     "got CallHeader before previous call's END_STREAM"

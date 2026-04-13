@@ -1049,6 +1049,10 @@ impl ReactorHandle {
                     // client-streaming uses a different code path (the
                     // higher-level Aster framework, not core::reactor).
                     drop(call.request_receiver);
+                    // Cancellation propagation also flows via FFI (not the
+                    // Python net.rs reactor wrapper); drop the flag here so
+                    // it doesn't leak.
+                    drop(call.cancelled);
                     Ok(Some((
                         call.call_id,
                         PyBytesResult(call.header_payload),

@@ -99,6 +99,30 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
   }
 
   /**
+   * Send a cancellation frame to the server. The reactor reads the {@code FLAG_CANCEL} marker, sets
+   * the per-call cancelled flag (which the dispatcher can observe via {@code
+   * ResponseStream.isCancelled()}), and closes the per-call request channel — which the
+   * dispatcher's {@code RequestStream.receive()} surfaces as a clean end-of-stream. After cancel,
+   * the caller should still drain {@link #recv()} until it returns null to receive any trailing
+   * responses + the trailer.
+   *
+   * <p>Idiomatic shape:
+   *
+   * <pre>{@code
+   * call.send(req);
+   * Resp r = call.recv();
+   * if (...some condition...) {
+   *   call.cancel();
+   *   while (call.recv() != null) { } // drain
+   * }
+   * }</pre>
+   */
+  public void cancel() throws Exception {
+    byte[] cancelFrame = AsterFraming.encodeFrame(new byte[0], AsterFraming.FLAG_CANCEL);
+    stream.sendAsync(cancelFrame).get();
+  }
+
+  /**
    * Block until the next response frame arrives or the stream ends. Returns {@code null} on a clean
    * OK trailer. Throws {@link RpcError} on a non-OK trailer or transport error.
    */

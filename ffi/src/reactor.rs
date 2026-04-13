@@ -88,6 +88,11 @@ struct RingCall {
     /// when the call is cleaned up, which closes the per-call request
     /// channel.
     request_receiver: Option<mpsc::UnboundedReceiver<RequestFrame>>,
+    /// Per-call cancellation flag. Set by the reactor when a `FLAG_CANCEL`
+    /// frame arrives on the wire (or the stream errors mid-call). Stashed
+    /// into `ReactorState::cancelled_flags` on poll so the binding can
+    /// query it via `aster_reactor_check_cancelled`.
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 // Safety: RingCall is only moved between the pump task and the poll thread.
@@ -111,6 +116,12 @@ pub(crate) struct ReactorState {
     /// the binding's poll thread.
     request_receivers:
         Mutex<std::collections::HashMap<u64, Mutex<mpsc::UnboundedReceiver<RequestFrame>>>>,
+    /// Per-call cancellation flags. Populated on poll, removed on
+    /// terminal submit. Streaming dispatchers query this via
+    /// `aster_reactor_check_cancelled` to break out of long-running
+    /// loops when the peer signals cancellation.
+    cancelled_flags:
+        Mutex<std::collections::HashMap<u64, Arc<std::sync::atomic::AtomicBool>>>,
     /// Signal to stop the pump task.
     stopped: Arc<AtomicBool>,
     /// Buffer registry for payload lifetime management.
@@ -167,6 +178,7 @@ async fn pump_task(
             is_session_call: call.is_session_call,
             response_sender: Some(call.response_sender),
             request_receiver: Some(call.request_receiver),
+            cancelled: Some(call.cancelled),
         };
 
         // Spin-try push with backpressure.
@@ -246,6 +258,7 @@ pub unsafe extern "C" fn aster_reactor_create(
         consumer: Mutex::new(consumer),
         response_senders: Mutex::new(std::collections::HashMap::new()),
         request_receivers: Mutex::new(std::collections::HashMap::new()),
+        cancelled_flags: Mutex::new(std::collections::HashMap::new()),
         stopped,
         buffers,
         rt_handle: rt_handle.clone(),
@@ -344,6 +357,13 @@ pub unsafe extern "C" fn aster_reactor_poll(
                 .unwrap()
                 .insert(ring_call.call_id, Mutex::new(receiver));
         }
+        if let Some(flag) = ring_call.cancelled {
+            state
+                .cancelled_flags
+                .lock()
+                .unwrap()
+                .insert(ring_call.call_id, flag);
+        }
 
         written += 1;
     });
@@ -390,6 +410,13 @@ pub unsafe extern "C" fn aster_reactor_poll(
                         .lock()
                         .unwrap()
                         .insert(ring_call.call_id, Mutex::new(receiver));
+                }
+                if let Some(flag) = ring_call.cancelled {
+                    state
+                        .cancelled_flags
+                        .lock()
+                        .unwrap()
+                        .insert(ring_call.call_id, flag);
                 }
                 written += 1;
             });
@@ -453,6 +480,7 @@ pub unsafe extern "C" fn aster_reactor_submit(
 
     // Drop the per-call request receiver too (terminal cleanup).
     state.request_receivers.lock().unwrap().remove(&call_id);
+    state.cancelled_flags.lock().unwrap().remove(&call_id);
 
     iroh_status_t::IROH_STATUS_OK as i32
 }
@@ -530,6 +558,7 @@ pub unsafe extern "C" fn aster_reactor_submit_trailer(
 
     // Drop the per-call request receiver too (terminal cleanup).
     state.request_receivers.lock().unwrap().remove(&call_id);
+    state.cancelled_flags.lock().unwrap().remove(&call_id);
 
     iroh_status_t::IROH_STATUS_OK as i32
 }
@@ -661,6 +690,39 @@ pub unsafe extern "C" fn aster_reactor_recv_frame(
             // the binding can interpret as "already drained".
             ASTER_RECV_FRAME_END_OF_STREAM
         }
+    }
+}
+
+/// Check whether the given call has been cancelled by the peer (or by a
+/// stream-level error). Streaming dispatchers should poll this from any
+/// long-running emit loop and stop early when it returns 1.
+///
+/// Returns:
+///   0 — call is alive (no cancellation observed yet)
+///   1 — call has been cancelled (peer sent FLAG_CANCEL or stream errored)
+///  <0 — `iroh_status_t` error code (e.g. NOT_FOUND if the call_id is unknown,
+///       which the binding may treat as "no longer cancellable" — typically
+///       maps to "already completed")
+#[no_mangle]
+pub unsafe extern "C" fn aster_reactor_check_cancelled(
+    runtime: iroh_runtime_t,
+    reactor: aster_reactor_t,
+    call_id: u64,
+) -> i32 {
+    let state = match REACTORS.get(reactor) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    let map = state.cancelled_flags.lock().unwrap();
+    match map.get(&call_id) {
+        Some(flag) => {
+            if flag.load(std::sync::atomic::Ordering::Acquire) {
+                1
+            } else {
+                0
+            }
+        }
+        None => 0,
     }
 }
 
