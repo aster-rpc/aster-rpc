@@ -7,11 +7,16 @@ import org.apache.fory.Fory;
 import site.aster.annotations.Scope;
 import site.aster.codec.Codec;
 import site.aster.examples.missioncontrol.types.Assignment;
+import site.aster.examples.missioncontrol.types.Command;
+import site.aster.examples.missioncontrol.types.CommandResult;
 import site.aster.examples.missioncontrol.types.Heartbeat;
 import site.aster.interceptors.CallContext;
+import site.aster.server.spi.BidiStreamDispatcher;
 import site.aster.server.spi.MethodDescriptor;
 import site.aster.server.spi.MethodDispatcher;
+import site.aster.server.spi.RequestStream;
 import site.aster.server.spi.RequestStyle;
+import site.aster.server.spi.ResponseStream;
 import site.aster.server.spi.ServiceDescriptor;
 import site.aster.server.spi.ServiceDispatcher;
 import site.aster.server.spi.StreamingKind;
@@ -38,6 +43,7 @@ public final class AgentSessionDispatcher implements ServiceDispatcher {
     LinkedHashMap<String, MethodDispatcher> m = new LinkedHashMap<>();
     m.put("register", new Register());
     m.put("heartbeat", new HeartbeatRpc());
+    m.put("runCommand", new RunCommand());
     this.methods = Map.copyOf(m);
   }
 
@@ -55,6 +61,8 @@ public final class AgentSessionDispatcher implements ServiceDispatcher {
   public void registerTypes(Fory fory) {
     safeRegister(fory, Heartbeat.class, Heartbeat.FORY_TAG);
     safeRegister(fory, Assignment.class, Assignment.FORY_TAG);
+    safeRegister(fory, Command.class, Command.FORY_TAG);
+    safeRegister(fory, CommandResult.class, CommandResult.FORY_TAG);
   }
 
   private static void safeRegister(Fory fory, Class<?> cls, String tag) {
@@ -89,6 +97,31 @@ public final class AgentSessionDispatcher implements ServiceDispatcher {
       Heartbeat hb = (Heartbeat) codec.decode(requestBytes, Heartbeat.class);
       Assignment assignment = ((AgentSession) impl).register(hb);
       return codec.encode(assignment);
+    }
+  }
+
+  private static final class RunCommand implements BidiStreamDispatcher {
+    private static final MethodDescriptor DESCRIPTOR =
+        new MethodDescriptor(
+            "runCommand",
+            StreamingKind.BIDI_STREAM,
+            RequestStyle.EXPLICIT,
+            Command.FORY_TAG,
+            List.of(),
+            CommandResult.FORY_TAG,
+            false,
+            false);
+
+    @Override
+    public MethodDescriptor descriptor() {
+      return DESCRIPTOR;
+    }
+
+    @Override
+    public void invoke(
+        Object impl, RequestStream in, Codec codec, CallContext ctx, ResponseStream out)
+        throws Exception {
+      ((AgentSession) impl).runCommand(in, out, codec);
     }
   }
 

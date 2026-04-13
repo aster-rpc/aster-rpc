@@ -1,13 +1,18 @@
 package site.aster.examples.missioncontrol;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import site.aster.codec.Codec;
+import site.aster.examples.missioncontrol.types.IngestResult;
 import site.aster.examples.missioncontrol.types.LogEntry;
+import site.aster.examples.missioncontrol.types.MetricPoint;
 import site.aster.examples.missioncontrol.types.StatusRequest;
 import site.aster.examples.missioncontrol.types.StatusResponse;
 import site.aster.examples.missioncontrol.types.SubmitLogResult;
 import site.aster.examples.missioncontrol.types.TailRequest;
+import site.aster.server.spi.RequestStream;
 import site.aster.server.spi.ResponseStream;
 
 /**
@@ -31,6 +36,7 @@ public final class MissionControl {
       java.util.Map.of("debug", 0, "info", 1, "warn", 2, "error", 3);
 
   private final LinkedBlockingQueue<LogEntry> logQueue = new LinkedBlockingQueue<>();
+  private final List<MetricPoint> metrics = new ArrayList<>();
   private final long startNanos = System.nanoTime();
 
   public StatusResponse getStatus(StatusRequest req) {
@@ -70,7 +76,33 @@ public final class MissionControl {
     }
   }
 
+  /**
+   * Drain a stream of {@link MetricPoint}s from the agent and accumulate them. Mirrors the Python
+   * {@code ingestMetrics} client-streaming method. Returns once {@code in.receive()} reports
+   * end-of-stream.
+   */
+  public IngestResult ingestMetrics(RequestStream in, Codec codec) throws Exception {
+    int accepted = 0;
+    while (true) {
+      byte[] payload = in.receive();
+      if (payload == null) {
+        return new IngestResult(accepted, 0);
+      }
+      MetricPoint point = (MetricPoint) codec.decode(payload, MetricPoint.class);
+      synchronized (metrics) {
+        metrics.add(point);
+      }
+      accepted++;
+    }
+  }
+
   public LinkedBlockingQueue<LogEntry> logQueue() {
     return logQueue;
+  }
+
+  public List<MetricPoint> metricsSnapshot() {
+    synchronized (metrics) {
+      return List.copyOf(metrics);
+    }
   }
 }

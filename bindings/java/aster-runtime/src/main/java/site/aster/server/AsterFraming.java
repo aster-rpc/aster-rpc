@@ -19,6 +19,12 @@ public final class AsterFraming {
   public static final byte FLAG_CALL = 0x10;
   public static final byte FLAG_CANCEL = 0x20;
 
+  /**
+   * Set on the LAST request frame of a client-streaming or bidi-streaming call. Tells the reactor
+   * to close the per-call request channel and stop reading more request frames for this call.
+   */
+  public static final byte FLAG_END_STREAM = 0x40;
+
   private AsterFraming() {}
 
   /**

@@ -6,14 +6,18 @@ import java.util.Map;
 import org.apache.fory.Fory;
 import site.aster.annotations.Scope;
 import site.aster.codec.Codec;
+import site.aster.examples.missioncontrol.types.IngestResult;
 import site.aster.examples.missioncontrol.types.LogEntry;
+import site.aster.examples.missioncontrol.types.MetricPoint;
 import site.aster.examples.missioncontrol.types.StatusRequest;
 import site.aster.examples.missioncontrol.types.StatusResponse;
 import site.aster.examples.missioncontrol.types.SubmitLogResult;
 import site.aster.examples.missioncontrol.types.TailRequest;
 import site.aster.interceptors.CallContext;
+import site.aster.server.spi.ClientStreamDispatcher;
 import site.aster.server.spi.MethodDescriptor;
 import site.aster.server.spi.MethodDispatcher;
+import site.aster.server.spi.RequestStream;
 import site.aster.server.spi.RequestStyle;
 import site.aster.server.spi.ResponseStream;
 import site.aster.server.spi.ServerStreamDispatcher;
@@ -48,6 +52,7 @@ public final class MissionControlDispatcher implements ServiceDispatcher {
     m.put("getStatus", new GetStatus());
     m.put("submitLog", new SubmitLog());
     m.put("tailLogs", new TailLogs());
+    m.put("ingestMetrics", new IngestMetrics());
     this.methods = Map.copyOf(m);
   }
 
@@ -68,6 +73,8 @@ public final class MissionControlDispatcher implements ServiceDispatcher {
     safeRegister(fory, LogEntry.class, LogEntry.FORY_TAG);
     safeRegister(fory, SubmitLogResult.class, SubmitLogResult.FORY_TAG);
     safeRegister(fory, TailRequest.class, TailRequest.FORY_TAG);
+    safeRegister(fory, MetricPoint.class, MetricPoint.FORY_TAG);
+    safeRegister(fory, IngestResult.class, IngestResult.FORY_TAG);
   }
 
   private static void safeRegister(Fory fory, Class<?> cls, String tag) {
@@ -126,6 +133,31 @@ public final class MissionControlDispatcher implements ServiceDispatcher {
     public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) {
       LogEntry entry = (LogEntry) codec.decode(requestBytes, LogEntry.class);
       SubmitLogResult result = ((MissionControl) impl).submitLog(entry);
+      return codec.encode(result);
+    }
+  }
+
+  private static final class IngestMetrics implements ClientStreamDispatcher {
+    private static final MethodDescriptor DESCRIPTOR =
+        new MethodDescriptor(
+            "ingestMetrics",
+            StreamingKind.CLIENT_STREAM,
+            RequestStyle.EXPLICIT,
+            MetricPoint.FORY_TAG,
+            List.of(),
+            IngestResult.FORY_TAG,
+            false,
+            false);
+
+    @Override
+    public MethodDescriptor descriptor() {
+      return DESCRIPTOR;
+    }
+
+    @Override
+    public byte[] invoke(Object impl, RequestStream in, Codec codec, CallContext ctx)
+        throws Exception {
+      IngestResult result = ((MissionControl) impl).ingestMetrics(in, codec);
       return codec.encode(result);
     }
   }
