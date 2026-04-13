@@ -19,6 +19,7 @@
         <module>aster-codegen-apt</module>
         <module>aster-codegen-ksp</module>
         <module>aster-runtime</module>
+        <module>aster-examples-mission-control</module>
     </modules>
 
     <properties>
