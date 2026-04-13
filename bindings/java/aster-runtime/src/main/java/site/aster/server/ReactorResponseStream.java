@@ -81,9 +81,7 @@ final class ReactorResponseStream implements ResponseStream {
 
   @Override
   public boolean isCancelled() {
-    // Cancellation propagation from the peer requires reading CANCEL frames off the request side
-    // of a session stream — not wired yet, deferred alongside ClientStream / BidiStream support.
-    return false;
+    return reactor.checkCancelled(callId);
   }
 
   private void submitTrailerFrame(byte[] trailerFrame) {
