@@ -35,6 +35,16 @@ public final class ClientSession implements AutoCloseable {
     this.sessionId = sessionId;
   }
 
+  /**
+   * Test/advanced-only: build a {@code ClientSession} with a caller-chosen {@code sessionId}.
+   * Bypasses the monotonic allocator on {@link IrohConnection#nextSessionId()} so isolation /
+   * graveyard / cap tests can exercise the server-side spec §6 / §7.5 paths under unexpected client
+   * behaviour. Production code should use {@link AsterClient#openSession} instead.
+   */
+  public static ClientSession forTest(AsterClient client, IrohConnection conn, int sessionId) {
+    return new ClientSession(client, conn, sessionId);
+  }
+
   /** Server-allocated id this session routes through. Useful for logs and tests. */
   public int sessionId() {
     return sessionId;
