@@ -20,6 +20,7 @@ use anyhow::Result;
 
 use aster_transport_core::*;
 
+pub mod call;
 pub mod reactor;
 
 // ============================================================================
@@ -469,7 +470,7 @@ pub(crate) struct BridgeRuntime {
     // Handle registries
     pub(crate) nodes: HandleRegistry<CoreNode>,
     endpoints: HandleRegistry<CoreNetClient>,
-    connections: HandleRegistry<CoreConnection>,
+    pub(crate) connections: HandleRegistry<CoreConnection>,
     send_streams: HandleRegistry<CoreSendStream>,
     recv_streams: HandleRegistry<CoreRecvStream>,
     #[allow(dead_code)]
