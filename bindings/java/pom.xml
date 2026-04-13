@@ -88,6 +88,13 @@
             <version>2.18.2</version>
         </dependency>
 
+        <!-- Apache Fory cross-language serialization (matches pyfory==0.16) -->
+        <dependency>
+            <groupId>org.apache.fory</groupId>
+            <artifactId>fory-core</artifactId>
+            <version>0.16.0</version>
+        </dependency>
+
         <!-- ArchUnit for architectural tests -->
         <dependency>
             <groupId>com.tngtech.archunit</groupId>
