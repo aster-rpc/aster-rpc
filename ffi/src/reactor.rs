@@ -193,8 +193,7 @@ pub unsafe extern "C" fn aster_reactor_create(
 
     // Create the core reactor (owns the accept loop).
     let rt_handle = bridge.runtime.handle().clone();
-    let reactor_handle =
-        reactor::start_reactor_on(&rt_handle, (*core_node).clone(), capacity);
+    let reactor_handle = reactor::start_reactor_on(&rt_handle, (*core_node).clone(), capacity);
 
     // Create the SPSC ring.
     let (producer, consumer) = ring::spsc::<RingCall>(capacity);
@@ -205,7 +204,12 @@ pub unsafe extern "C" fn aster_reactor_create(
     // Spawn the pump task.
     let pump_stopped = stopped.clone();
     let pump_buffers = buffers.clone();
-    rt_handle.spawn(pump_task(reactor_handle, producer, pump_buffers, pump_stopped));
+    rt_handle.spawn(pump_task(
+        reactor_handle,
+        producer,
+        pump_buffers,
+        pump_stopped,
+    ));
 
     let state = ReactorState {
         consumer: Mutex::new(consumer),
@@ -306,8 +310,7 @@ pub unsafe extern "C" fn aster_reactor_poll(
     }
 
     // No calls available and timeout > 0: spin-poll with yields.
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(timeout_ms as u64);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
 
     loop {
         if consumer.available() > 0 {
