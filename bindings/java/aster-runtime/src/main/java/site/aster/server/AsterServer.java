@@ -138,6 +138,29 @@ public final class AsterServer implements AutoCloseable {
   }
 
   /** Immutable snapshot of the discovered service descriptors — one per registered service. */
+  /**
+   * <strong>TEST-ONLY</strong>. Snapshot of per-connection state for assertions in tier-2 chaos
+   * tests. Maps {@code connectionId} to {@code (activeSessionCount, lastOpenedSessionId)}.
+   * Production code MUST NOT read this — it exists so tests can verify reap semantics (connection
+   * entries dropped on close, sessions counted correctly) without reflecting into private fields.
+   * Mirrors the TypeScript {@code AsterServer2.debugConnectionSnapshot}.
+   */
+  public Map<Long, ConnectionSnapshot> debugConnectionSnapshot() {
+    Map<Long, ConnectionSnapshot> out = new java.util.HashMap<>();
+    for (Map.Entry<Long, ConnectionState> e : connections.entrySet()) {
+      ConnectionState state = e.getValue();
+      synchronized (state) {
+        out.put(
+            e.getKey(),
+            new ConnectionSnapshot(state.activeSessions.size(), state.lastOpenedSessionId));
+      }
+    }
+    return out;
+  }
+
+  /** Test-only snapshot record; see {@link #debugConnectionSnapshot()}. */
+  public record ConnectionSnapshot(int activeSessionCount, int lastOpenedSessionId) {}
+
   public List<ServiceDescriptor> manifest() {
     return manifest;
   }

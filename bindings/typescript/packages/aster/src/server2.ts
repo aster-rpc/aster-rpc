@@ -226,6 +226,31 @@ export class AsterServer2 {
     await this.stopPromise;
   }
 
+  /**
+   * **TEST-ONLY**. Snapshot of per-connection state for assertions in
+   * chaos tests. Returns a map from opaque connection key → tuple of
+   * (activeSessionCount, lastOpenedSessionId). Production code must
+   * NOT read this — it is only exposed so tier-2 tests can verify
+   * reap semantics (connection entries drop on close) without
+   * peeking at private fields.
+   */
+  debugConnectionSnapshot(): ReadonlyMap<
+    string,
+    { activeSessionCount: number; lastOpenedSessionId: number }
+  > {
+    const out = new Map<
+      string,
+      { activeSessionCount: number; lastOpenedSessionId: number }
+    >();
+    for (const [key, state] of this.connections) {
+      out.set(key, {
+        activeSessionCount: state.activeSessions.size,
+        lastOpenedSessionId: state.lastOpenedSessionId,
+      });
+    }
+    return out;
+  }
+
   /** Stop accepting new calls. The poll loop exits after the current
    *  `nextEvent()` resolves (there's no cancel hook in the napi surface
    *  yet, so the exit is cooperative). */

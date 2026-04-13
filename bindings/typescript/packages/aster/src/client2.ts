@@ -114,6 +114,14 @@ export class AsterClient2 {
     return this.codec;
   }
 
+  /** **TEST-ONLY**. The `AsterCall` factory this client was built
+   *  with. Exposed for tier-2 chaos tests that build
+   *  `ClientSession.forTest` handles against adversarial session ids;
+   *  production code uses {@link openSession}. */
+  get asterCallFactory(): AsterCallFactory {
+    return this.asterCall;
+  }
+
   /** Open a new session on this connection. Allocates a monotonic
    *  sessionId scoped to the connection's `rpcAddrKey`. */
   async openSession<T extends object = object>(
@@ -204,6 +212,39 @@ export class ClientSession {
     this.transportRef = init.transport;
     this.codec = init.codec;
     this.services = init.services;
+  }
+
+  /**
+   * **TEST-ONLY** factory. Construct a {@link ClientSession} against
+   * an explicit `sessionId`, bypassing {@link AsterClient2.openSession}'s
+   * monotonic allocator. Mirrors Java's `ClientSession.forTest`.
+   *
+   * Production code MUST use {@link AsterClient2.openSession} so the
+   * spec §6 "first stream arrival creates the session" invariant holds
+   * under the client's allocation order. This factory exists so tier-2
+   * chaos tests can drive the server's lookup-or-create / graveyard
+   * logic with adversarial sessionId sequences (out-of-order, replayed,
+   * past-the-cap) that the allocator would never produce.
+   */
+  static forTest(
+    parent: AsterClient2,
+    connection: NativeConnection,
+    sessionId: number,
+  ): ClientSession {
+    const transport = new IrohTransport2({
+      connection,
+      asterCall: parent.asterCallFactory,
+      codec: parent.effectiveCodec,
+      sessionId,
+    });
+    return new ClientSession({
+      parent,
+      connection,
+      sessionId,
+      transport,
+      codec: parent.effectiveCodec,
+      services: undefined,
+    });
   }
 
   /** The server-allocated id this session routes through. Useful for

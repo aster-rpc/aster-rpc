@@ -184,6 +184,7 @@ class AsterServer:
         mesh_state: MeshState | None = None,
         clock_drift_config: ClockDriftConfig | None = None,
         persist_mesh_state: bool = False,
+        max_sessions_per_connection: int | None = None,
     ) -> None:
         """Create an Aster RPC server.
 
@@ -304,6 +305,7 @@ class AsterServer:
         self._mesh_state = mesh_state
         self._clock_drift_config = clock_drift_config
         self._persist_mesh_state = persist_mesh_state
+        self._max_sessions_per_connection = max_sessions_per_connection
 
         # Populated by start()
         self._started: bool = False
@@ -510,8 +512,7 @@ class AsterServer:
 
         # Server borrows a NetClient view of the node. AsterServer owns the
         # node lifecycle, so Server must NOT close the endpoint on its own.
-        self._server = Server(
-            net_client(self._node),
+        server_kwargs: dict[str, Any] = dict(
             services=self._services_in,
             codec=self._codec,
             interceptors=self._interceptors,
@@ -519,6 +520,9 @@ class AsterServer:
             peer_store=self._peer_store,
             node=self._node,
         )
+        if self._max_sessions_per_connection is not None:
+            server_kwargs["max_sessions_per_connection"] = self._max_sessions_per_connection
+        self._server = Server(net_client(self._node), **server_kwargs)
 
         self._print_banner()
         self._started = True
@@ -1256,6 +1260,27 @@ class AsterServer:
         """Alias for :attr:`address` (internal back-compat)."""
         return self.address
 
+    def debug_connection_snapshot(self) -> dict[int, dict[str, int]]:
+        """**TEST-ONLY**. Snapshot of per-connection session state for
+        tier-2 chaos test assertions. Maps ``connection_id`` to a dict
+        with keys ``active_session_count`` and ``last_opened_session_id``.
+        Production code MUST NOT read this -- it exists so tests can
+        verify reap semantics (connection entries drop on close) and
+        session accounting without reaching into private fields.
+
+        Mirrors TypeScript ``AsterServer2.debugConnectionSnapshot``
+        and Java ``AsterServer.debugConnectionSnapshot``.
+        """
+        if self._server is None:
+            return {}
+        out: dict[int, dict[str, int]] = {}
+        for conn_id, state in self._server._connection_sessions.items():
+            out[conn_id] = {
+                "active_session_count": len(state.active_sessions),
+                "last_opened_session_id": state.last_opened_session_id,
+            }
+        return out
+
     # Back-compat alias -- used in tests
     @property
     def endpoint_addr_b64(self) -> str:
@@ -1498,6 +1523,14 @@ class AsterClient:
         self._gossip_topic: str = ""
         self._open_gate: bool = False
         self._rpc_conns: dict[str, Any] = {}
+        # Serialises concurrent `_rpc_conn_for` lookups so bursts of
+        # `open_session()` calls can't each race past the cache miss
+        # and open their own connection (each connection has its own
+        # server-side session graveyard + cap, so the race lets a
+        # burst silently blow past `max_sessions_per_connection`).
+        # Created on demand in `_rpc_conn_for` because `__init__`
+        # may run outside an event loop.
+        self._rpc_conn_lock: asyncio.Lock | None = None
         self._clients: list[ServiceClient] = []
         # Per-connection monotonic sessionId counter. Keyed by rpc_addr
         # (same key as `_rpc_conns`) so each cached IrohConnection gets
@@ -1652,13 +1685,28 @@ class AsterClient:
         )
 
     async def _rpc_conn_for(self, rpc_addr_b64: str) -> Any:
+        # Fast path: cached connection, no lock needed.
         if rpc_addr_b64 in self._rpc_conns:
             return self._rpc_conns[rpc_addr_b64]
-        assert self._ep is not None
-        rpc_addr = _coerce_node_addr(rpc_addr_b64)
-        conn = await self._ep.connect_node_addr(rpc_addr, RPC_ALPN)
-        self._rpc_conns[rpc_addr_b64] = conn
-        return conn
+        # Slow path: serialise concurrent cache misses so a burst of
+        # callers opens at most ONE underlying QUIC connection per
+        # rpc_addr. Without the lock, N concurrent `open_session`s
+        # would each race through `connect_node_addr` and each get a
+        # distinct connection, which silently defeats the server-side
+        # `max_sessions_per_connection` cap (each connection has its
+        # own per-connection session state).
+        if self._rpc_conn_lock is None:
+            self._rpc_conn_lock = asyncio.Lock()
+        async with self._rpc_conn_lock:
+            # Re-check under the lock -- a concurrent caller may have
+            # populated the cache while we were waiting.
+            if rpc_addr_b64 in self._rpc_conns:
+                return self._rpc_conns[rpc_addr_b64]
+            assert self._ep is not None
+            rpc_addr = _coerce_node_addr(rpc_addr_b64)
+            conn = await self._ep.connect_node_addr(rpc_addr, RPC_ALPN)
+            self._rpc_conns[rpc_addr_b64] = conn
+            return conn
 
     def _next_session_id(self, rpc_addr_b64: str) -> int:
         """Allocate a fresh monotonic sessionId for the connection
@@ -2026,6 +2074,33 @@ class ClientSession:
         self._session_id = session_id
         self._closed = False
         self._stubs: list[ServiceClient] = []
+
+    @classmethod
+    def for_test(
+        cls,
+        parent: "AsterClient",
+        connection: Any,
+        session_id: int,
+    ) -> "ClientSession":
+        """**TEST-ONLY** factory. Construct a `ClientSession` against an
+        explicit `session_id`, bypassing `AsterClient.open_session`'s
+        monotonic allocator. Mirrors Java `ClientSession.forTest` and
+        TypeScript `ClientSession.forTest`.
+
+        Production code MUST use `AsterClient.open_session` so the
+        spec Sec. 6 "first stream arrival creates the session"
+        invariant holds under the client's allocation order. This
+        factory exists so tier-2 chaos tests can drive the server's
+        lookup-or-create / graveyard logic with adversarial session_id
+        sequences (out-of-order, replayed, past-the-cap) that the
+        allocator would never produce.
+        """
+        return cls(
+            parent=parent,
+            connection=connection,
+            rpc_addr_key="",
+            session_id=session_id,
+        )
 
     @property
     def session_id(self) -> int:

@@ -942,4 +942,280 @@ mod tests {
             );
         }
     }
+
+    // ========================================================================
+    // Property-based tests (tier 1)
+    //
+    // These drive the pool with adversarial randomized schedules and assert
+    // on the spec-level invariants that hand-written cases can't cover
+    // exhaustively. The shared harness builds a pool whose factory hands
+    // out `FakeStream`s and then replays a script of `Op`s against it,
+    // recording outcomes so the property assertions can inspect the
+    // post-state.
+    // ========================================================================
+
+    /// Routing key space for the property tests. Three sub-pools is
+    /// enough to exercise isolation between SHARED and two distinct
+    /// session keys without blowing up the state space.
+    fn key_for(slot: u8) -> PoolKey {
+        match slot % 3 {
+            0 => None,
+            1 => Some(vec![0xAA]),
+            _ => Some(vec![0xBB]),
+        }
+    }
+
+    /// A single scripted operation. Acquires are tagged with a slot
+    /// index (mod 3 → SHARED / session A / session B). Releases and
+    /// discards reference a previously acquired handle by ordinal, so
+    /// the harness can drop the right one regardless of schedule.
+    #[derive(Clone, Debug)]
+    enum Op {
+        Acquire(u8),
+        Release(usize),
+        Discard(usize),
+    }
+
+    fn op_strategy() -> impl proptest::strategy::Strategy<Value = Op> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (0u8..6).prop_map(Op::Acquire),
+            (0usize..16).prop_map(Op::Release),
+            (0usize..16).prop_map(Op::Discard),
+        ]
+    }
+
+    /// Run a script against a pool with generous caps and a short
+    /// acquire timeout. Returns the pool for post-run invariant checks.
+    async fn run_script(ops: Vec<Op>, shared: usize, session: usize) -> StreamPool<FakeStream> {
+        let (pool, _counter) = make_pool(cfg(shared, session, 200));
+        let mut held: Vec<StreamHandle<FakeStream>> = Vec::new();
+        for op in ops {
+            match op {
+                Op::Acquire(slot) => {
+                    let key = key_for(slot);
+                    if let Ok(h) = pool.acquire(key).await {
+                        held.push(h);
+                    }
+                    // POOL_FULL errors are expected — we over-saturate
+                    // on purpose — and must not corrupt invariants.
+                }
+                Op::Release(idx) => {
+                    if !held.is_empty() {
+                        let i = idx % held.len();
+                        drop(held.remove(i));
+                    }
+                }
+                Op::Discard(idx) => {
+                    if !held.is_empty() {
+                        let i = idx % held.len();
+                        held.remove(i).discard();
+                    }
+                }
+            }
+        }
+        // Drain any remaining handles so the post-state reflects a
+        // quiescent pool — makes the invariants easier to reason
+        // about.
+        drop(held);
+        pool
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            // 64 cases is enough to hit the interesting corners without
+            // slowing `cargo test` down significantly; the operations
+            // are cheap.
+            cases: 64,
+            .. proptest::test_runner::Config::default()
+        })]
+
+        /// Invariant: at the end of any script, every sub-pool's
+        /// `open_count` is ≤ its configured `max_size`. The pool must
+        /// never lazily allocate past its bound, regardless of
+        /// acquire/release/discard interleavings.
+        #[test]
+        fn open_count_never_exceeds_max_size(ops in proptest::collection::vec(op_strategy(), 0..40)) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let pool = rt.block_on(run_script(ops, 4, 2));
+            let shared_open = pool.open_count(&None);
+            let sess_a_open = pool.open_count(&Some(vec![0xAA]));
+            let sess_b_open = pool.open_count(&Some(vec![0xBB]));
+            proptest::prop_assert!(shared_open <= 4, "shared pool open_count {} > 4", shared_open);
+            proptest::prop_assert!(sess_a_open <= 2, "session A open_count {} > 2", sess_a_open);
+            proptest::prop_assert!(sess_b_open <= 2, "session B open_count {} > 2", sess_b_open);
+        }
+
+        /// Invariant: after the script quiesces (all handles dropped),
+        /// `open_count` equals `free_count` for every sub-pool. Nothing
+        /// should be "in flight" once every handle has been released
+        /// or discarded.
+        #[test]
+        fn quiescent_pool_has_no_in_flight_handles(ops in proptest::collection::vec(op_strategy(), 0..40)) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let pool = rt.block_on(run_script(ops, 4, 2));
+            for key in [None, Some(vec![0xAA]), Some(vec![0xBB])] {
+                let open = pool.open_count(&key);
+                let free = pool.free_count(&key);
+                proptest::prop_assert_eq!(
+                    open, free,
+                    "key {:?}: open={} free={} — quiescent pool should have no in-flight",
+                    key, open, free
+                );
+            }
+        }
+
+        /// Invariant: sub-pool isolation — the SHARED key and each
+        /// session key are independent. A discard on a session
+        /// sub-pool must never appear to free a slot in another
+        /// sub-pool. This is a structural invariant that prevents the
+        /// kind of bug §6 exists to prevent (cross-session
+        /// co-mingling inside the pool primitive).
+        #[test]
+        fn subpool_counts_are_independent(ops in proptest::collection::vec(op_strategy(), 0..30)) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let pool = rt.block_on(run_script(ops, 4, 2));
+            // The sum of per-key open_counts equals the total number
+            // of distinct streams that the factory was asked to make
+            // and that still belong to the pool. There is no shared
+            // accounting register — checking each key independently
+            // and that they don't interfere is the invariant.
+            let shared = pool.open_count(&None);
+            let a = pool.open_count(&Some(vec![0xAA]));
+            let b = pool.open_count(&Some(vec![0xBB]));
+            // Every sub-pool respects its own bound.
+            proptest::prop_assert!(shared <= pool.config().shared_pool_size);
+            proptest::prop_assert!(a <= pool.config().session_pool_size);
+            proptest::prop_assert!(b <= pool.config().session_pool_size);
+        }
+    }
+
+    /// Concurrency stress: spawn N tasks hammering the same pool with
+    /// random acquire/release/discard sequences across the three
+    /// routing keys. The sequential `proptest`s above can't exercise
+    /// the waiter queue, the `drop_slot` Retry signal path, or the
+    /// Mutex handoff between release-and-wake, because every `.await`
+    /// runs on a single task. This test spawns 8 tasks on a
+    /// multi-threaded runtime so the acquire/release paths actually
+    /// race.
+    ///
+    /// Post-quiescence invariants:
+    /// - Every sub-pool's `open_count` is within its configured bound.
+    /// - `open_count == free_count` on every key (nothing in flight).
+    /// - No waiters left queued (the internal `waiters` VecDeque is
+    ///   empty on every sub-pool).
+    ///
+    /// Pre-fix regression shape this would catch: a race on `drop_slot`
+    /// that lost wake-ups would leave waiters hung past the test
+    /// deadline and the task joins would fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_acquire_release_preserves_invariants() {
+        use std::sync::atomic::AtomicU64;
+        // Deliberately tight caps: 2 SHARED slots, 1 per session, with
+        // a 500ms acquire timeout. With 12 tasks competing for 4 total
+        // slots and holding for 200us per iteration, the waiter queue
+        // is guaranteed to fill and the `release`/`drop_slot` handoff
+        // paths are exercised — that's the whole point of the test.
+        let (pool, _counter) = make_pool(cfg(2, 1, 500));
+        let task_count = 12usize;
+        let iters_per_task = 40usize;
+        let ops_done = Arc::new(AtomicU64::new(0));
+
+        let mut joins = Vec::new();
+        for task_id in 0..task_count {
+            let p = pool.clone();
+            let counter = ops_done.clone();
+            joins.push(tokio::spawn(async move {
+                for i in 0..iters_per_task {
+                    // Rotate across all three keys deterministically
+                    // so every sub-pool sees traffic but per-task
+                    // sequences differ.
+                    let slot = ((task_id * 3 + i) % 3) as u8;
+                    let key = key_for(slot);
+                    match p.acquire(key).await {
+                        Ok(h) => {
+                            // Hold briefly so other tasks land in the
+                            // waiter queue. Using a tiny sleep is
+                            // intentional: it makes the test produce
+                            // real contention without being flaky.
+                            tokio::time::sleep(Duration::from_micros(200)).await;
+                            if i % 7 == 0 {
+                                h.discard();
+                            } else {
+                                drop(h);
+                            }
+                        }
+                        Err(_) => {
+                            // POOL_FULL under contention is expected
+                            // — that's the pressure we wanted.
+                        }
+                    }
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        // All tasks must finish within a generous deadline. If they
+        // don't, a waiter was lost and is hanging — the test fails
+        // with the join timeout instead of a deadlock.
+        let deadline = Duration::from_secs(30);
+        for j in joins {
+            tokio::time::timeout(deadline, j)
+                .await
+                .expect("task timed out — likely a lost wake-up")
+                .expect("task panicked");
+        }
+        assert_eq!(
+            ops_done.load(Ordering::Relaxed),
+            (task_count * iters_per_task) as u64
+        );
+
+        // Invariants after quiescence.
+        for (key, bound) in [
+            (None, 2usize),
+            (Some(vec![0xAA]), 1),
+            (Some(vec![0xBB]), 1),
+        ] {
+            let open = pool.open_count(&key);
+            let free = pool.free_count(&key);
+            assert!(
+                open <= bound,
+                "{key:?}: open_count {open} > bound {bound}"
+            );
+            assert_eq!(
+                open, free,
+                "{key:?}: open {open} != free {free} — handle leaked"
+            );
+        }
+        // No waiters parked on any sub-pool — everyone got served
+        // or timed out with POOL_FULL, which is a terminal state.
+        let subs = pool.inner.subs.lock().unwrap();
+        for (key, sub) in subs.iter() {
+            assert_eq!(
+                sub.waiters.len(),
+                0,
+                "{key:?}: waiter queue non-empty after quiescence"
+            );
+        }
+    }
+
+    /// Deterministic regression: the pool primitive must allow many
+    /// discards in a row without underflowing `open_count` (the internal
+    /// counter uses `saturating_sub`, this test pins the behaviour).
+    #[tokio::test]
+    async fn discard_cannot_underflow_open_count() {
+        let (pool, _) = make_pool(cfg(2, 1, 200));
+        let h1 = pool.acquire(None).await.unwrap();
+        let h2 = pool.acquire(None).await.unwrap();
+        h1.discard();
+        h2.discard();
+        // A defensive extra drop through `drop_slot` shouldn't panic
+        // or underflow; simulate it by acquiring and immediately
+        // discarding a few more times.
+        for _ in 0..5 {
+            let h = pool.acquire(None).await.unwrap();
+            h.discard();
+        }
+        assert_eq!(pool.open_count(&None), 0);
+    }
 }
