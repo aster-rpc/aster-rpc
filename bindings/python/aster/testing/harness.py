@@ -6,17 +6,13 @@ Spec reference: Aster-SPEC.md §13.2; Plan: §15.3
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from aster.server import Server
+from typing import Any
 
 
 class AsterTestHarness:
     """Test harness for Aster RPC services.
 
-    Provides factory methods for creating client/server pairs in different
-    configurations: local (in-process), remote (real Iroh), and session.
+    Provides factory methods for creating client/server pairs.
 
     Spec reference: Aster-SPEC.md §13.2; Plan: §15.3
     """
@@ -45,33 +41,3 @@ class AsterTestHarness:
             wire_compatible=wire_compatible,
         )
         return client, implementation
-
-    async def create_session_pair(
-        self,
-        service_class: type,
-        implementation: object,
-        wire_compatible: bool = True,
-    ) -> tuple[Any, Any]:
-        """Create an in-process session pair for scoped='session' services.
-
-        Args:
-            service_class: A class decorated with @service(scoped='session').
-            implementation: The implementation class or an instance (class is used).
-            wire_compatible: If True, exercises full serialization pipeline.
-
-        Returns:
-            (session_stub, implementation)
-        """
-        from aster.session import create_local_session
-
-        impl_class = (
-            implementation
-            if isinstance(implementation, type)
-            else type(implementation)
-        )
-        stub = create_local_session(
-            service_class,
-            impl_class,
-            wire_compatible=wire_compatible,
-        )
-        return stub, implementation

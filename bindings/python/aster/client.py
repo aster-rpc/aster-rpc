@@ -448,15 +448,17 @@ def create_client(
             fory_config=fory_config,
         )
 
-    # Session-scoped services need a SessionStub via create_session (async).
-    # create_client is sync -- callers using AsterClient.client() get the
-    # async dispatch automatically; direct callers should use create_session
-    # explicitly when working with session-scoped services.
+    # Session-scoped services need a ClientSession allocated from an
+    # AsterClient so each call threads the same sessionId (spec Sec. 6).
+    # create_client is sync; callers using AsterClient.client() get that
+    # wiring automatically. Direct callers should use
+    # `AsterClient.open_session(service_cls=...)` and then
+    # `ClientSession.client(service_cls)` for session-scoped services.
     if service_info.scoped == RpcScope.SESSION:
         raise ClientError(
             f"{service_class.__name__} is session-scoped and cannot be created "
-            f"via create_client(). Use aster.session.create_session() (async) "
-            f"or AsterClient.client() which handles both cases."
+            f"via create_client(). Use AsterClient.open_session() or "
+            f"AsterClient.client() which handles both cases."
         )
 
     if transport is None:

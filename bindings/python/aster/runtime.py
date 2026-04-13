@@ -1806,13 +1806,21 @@ class AsterClient:
                 from aster.json_codec import JsonProxyCodec
                 codec = JsonProxyCodec()
 
-        # Session-scoped services use the session protocol (one bidi stream
-        # with method multiplexing). Dispatch to create_session.
+        # Session-scoped services route via a ClientSession allocated on
+        # the fly. Every call threads the same monotonic sessionId into
+        # its StreamHeader, so the server lands all calls in the same
+        # session-instance (spec Sec. 6 / 7.5). Callers who want explicit
+        # session lifecycle should use AsterClient.open_session() instead.
         if info.scoped == RpcScope.SESSION:
-            from aster.session import create_session
-            client = await create_session(
-                service_cls,
+            session_id = self._next_session_id(summary.channels[channel_key])
+            session = ClientSession(
+                parent=self,
                 connection=conn,
+                rpc_addr_key=summary.channels[channel_key],
+                session_id=session_id,
+            )
+            client = await session.client(
+                service_cls,
                 codec=codec,
                 interceptors=interceptors,
             )
@@ -1953,12 +1961,16 @@ class AsterClient:
             from aster.json_codec import JsonProxyCodec
             codec = JsonProxyCodec()
 
-        from aster.session import create_proxy_session
-        session_client = await create_proxy_session(
-            service_name=service_name,
-            connection=conn,
-            codec=codec,
+        if codec is None:
+            from aster.json_codec import JsonProxyCodec
+            codec = JsonProxyCodec()
+        session_id = self._next_session_id(summary.channels.get(channel_key, ""))
+        session_client = SessionProxyClient(
             aster_client=self,
+            connection=conn,
+            service_name=service_name,
+            session_id=session_id,
+            codec=codec,
         )
         self._clients.append(session_client)
         return session_client
@@ -2094,6 +2106,72 @@ class ClientSession:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
+
+
+class SessionProxyClient:
+    """Dict-in / dict-out dynamic proxy for a session-scoped service.
+
+    Created via :meth:`AsterClient.session`. Works without local type
+    definitions -- every call is JSON-encoded, so the consumer can talk
+    to a producer without importing the service contract. All calls on
+    one proxy share the same monotonic `sessionId` so the server routes
+    them to the same session instance (spec Sec. 6 / 7.5).
+    """
+
+    def __init__(
+        self,
+        *,
+        aster_client: "AsterClient",
+        connection: Any,
+        service_name: str,
+        session_id: int,
+        codec: Any,
+    ) -> None:
+        from aster.transport.iroh import IrohTransport
+        self._aster_client = aster_client
+        self._service_name = service_name
+        self._session_id = session_id
+        self._codec = codec
+        self._closed = False
+        self._transport = IrohTransport(
+            connection, codec=codec, session_id=session_id,
+        )
+
+    @property
+    def session_id(self) -> int:
+        return self._session_id
+
+    async def call(self, method: str, request: dict | None = None) -> Any:
+        """Call a unary method on this session. Returns decoded response."""
+        if self._closed:
+            raise RuntimeError("SessionProxyClient is closed")
+        return await self._transport.unary(
+            self._service_name,
+            method,
+            request or {},
+            serialization_mode=SerializationMode.JSON.value,
+        )
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._transport.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        async def method_stub(request: dict | None = None, **kwargs: Any) -> Any:
+            if kwargs and request is None:
+                request = kwargs
+            return await self.call(name, request)
+
+        method_stub.__name__ = name
+        return method_stub
 
 
 def _resolve_relay_addr(relay_url: str) -> str | None:

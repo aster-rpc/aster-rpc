@@ -6,11 +6,18 @@ fault scenarios designed to expose known vulnerabilities. A passing
 test means the gap is NOT present; a failing test CONFIRMS the gap.
 """
 
+import pytest
+
+pytest.skip(
+    "aster.session retired -- Phase-8 CALL-frame mechanism removed; "
+    "replaced by ClientSession + reactor-based session lifecycle",
+    allow_module_level=True,
+)
+
 import asyncio
 import dataclasses
 import uuid
 from typing import AsyncIterator
-import pytest
 
 from aster.codec import ForyCodec, wire_type
 from aster.decorators import service, rpc, client_stream, bidi_stream
