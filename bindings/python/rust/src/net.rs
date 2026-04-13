@@ -996,9 +996,7 @@ use std::sync::Mutex as StdMutex;
 #[pyclass]
 pub struct ReactorResponseSender {
     inner: StdMutex<
-        Option<
-            tokio::sync::mpsc::UnboundedSender<aster_transport_core::reactor::OutgoingFrame>,
-        >,
+        Option<tokio::sync::mpsc::UnboundedSender<aster_transport_core::reactor::OutgoingFrame>>,
     >,
 }
 
@@ -1053,6 +1051,11 @@ impl ReactorHandle {
                     // Python net.rs reactor wrapper); drop the flag here so
                     // it doesn't leak.
                     drop(call.cancelled);
+                    // Multiplexed-streams migration (spec §6/§7):
+                    // `is_session_call` removed from the tuple — Python
+                    // sessions need to migrate to sessionId-based routing
+                    // (Objective 2). Until then the Python framework
+                    // treats every call as stateless.
                     Ok(Some((
                         call.call_id,
                         PyBytesResult(call.header_payload),
@@ -1060,7 +1063,6 @@ impl ReactorHandle {
                         PyBytesResult(call.request_payload),
                         call.request_flags,
                         call.peer_id,
-                        call.is_session_call,
                         sender,
                     )))
                 }

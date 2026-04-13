@@ -25,15 +25,19 @@ public class ReactorContractTest {
 
   @Test
   public void testCallLayoutSize() {
-    // 88 bytes total: see ffi/src/reactor.rs aster_reactor_call_t.
-    // Grew from 80 → 88 in G.2 when stream_id was added so SessionKey can be
-    // (peer, stream, service) instead of collapsing concurrent sessions per peer.
-    assertEquals(88, Reactor.CALL_LAYOUT.byteSize());
+    // 104 bytes total: see ffi/src/reactor.rs aster_reactor_call_t.
+    // Grew from 88 → 104 in the multiplexed-streams migration: added
+    // event_kind (with 7 bytes alignment padding) and connection_id;
+    // dropped is_session_call (the binding decodes sessionId from the
+    // StreamHeader instead).
+    assertEquals(104, Reactor.CALL_LAYOUT.byteSize());
   }
 
   @Test
   public void testCallLayoutFieldOffsets() {
+    assertEquals(Reactor.OFFSET_EVENT_KIND, offsetOf(Reactor.CALL_LAYOUT, "event_kind"));
     assertEquals(Reactor.OFFSET_CALL_ID, offsetOf(Reactor.CALL_LAYOUT, "call_id"));
+    assertEquals(Reactor.OFFSET_CONNECTION_ID, offsetOf(Reactor.CALL_LAYOUT, "connection_id"));
     assertEquals(Reactor.OFFSET_STREAM_ID, offsetOf(Reactor.CALL_LAYOUT, "stream_id"));
     assertEquals(Reactor.OFFSET_HEADER_PTR, offsetOf(Reactor.CALL_LAYOUT, "header_ptr"));
     assertEquals(Reactor.OFFSET_HEADER_LEN, offsetOf(Reactor.CALL_LAYOUT, "header_len"));
@@ -43,7 +47,6 @@ public class ReactorContractTest {
     assertEquals(Reactor.OFFSET_REQUEST_FLAGS, offsetOf(Reactor.CALL_LAYOUT, "request_flags"));
     assertEquals(Reactor.OFFSET_PEER_PTR, offsetOf(Reactor.CALL_LAYOUT, "peer_ptr"));
     assertEquals(Reactor.OFFSET_PEER_LEN, offsetOf(Reactor.CALL_LAYOUT, "peer_len"));
-    assertEquals(Reactor.OFFSET_IS_SESSION_CALL, offsetOf(Reactor.CALL_LAYOUT, "is_session_call"));
     assertEquals(Reactor.OFFSET_HEADER_BUFFER, offsetOf(Reactor.CALL_LAYOUT, "header_buffer"));
     assertEquals(Reactor.OFFSET_REQUEST_BUFFER, offsetOf(Reactor.CALL_LAYOUT, "request_buffer"));
     assertEquals(Reactor.OFFSET_PEER_BUFFER, offsetOf(Reactor.CALL_LAYOUT, "peer_buffer"));

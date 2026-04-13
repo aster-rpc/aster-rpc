@@ -297,13 +297,14 @@ class Server:
                     break
 
                 (call_id, header_payload, header_flags, request_payload,
-                 request_flags, peer_id, is_session_call, response_sender) = call
-
+                 request_flags, peer_id, response_sender) = call
+                # is_session_call removed (multiplexed-streams migration);
+                # Python session routing rebuilds in Objective 2.
                 asyncio.create_task(
                     self._dispatch_reactor_call(
                         call_id, header_payload, header_flags,
                         request_payload, request_flags,
-                        peer_id, is_session_call, response_sender,
+                        peer_id, False, response_sender,
                     )
                 )
         finally:

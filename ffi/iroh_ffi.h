@@ -40,6 +40,17 @@
 #define ASTER_CALL_ERR_POOL_CLOSED -14
 
 /**
+ * Event-kind discriminator for `aster_reactor_call_t` (spec §7.5).
+ * Bindings MUST check `event_kind` before reading any other field — a
+ * `ConnectionClosed` event populates only `event_kind`, `connection_id`,
+ * `peer_*` (peer_id of the closed connection); all other fields are zero
+ * or NULL.
+ */
+#define ASTER_EVENT_KIND_CALL 0
+
+#define ASTER_EVENT_KIND_CONNECTION_CLOSED 1
+
+/**
  * Result codes returned by `aster_reactor_recv_frame` in addition to the
  * usual `iroh_status_t` codes for error cases.
  */
@@ -220,67 +231,88 @@ typedef uint64_t iroh_buffer_t;
 typedef uint64_t aster_reactor_t;
 
 /**
- * C-visible call descriptor returned by aster_reactor_poll.
+ * C-visible event descriptor returned by aster_reactor_poll.
+ *
+ * Despite the historical `aster_reactor_call_t` name, this struct now
+ * carries either an inbound call (`event_kind == ASTER_EVENT_KIND_CALL`)
+ * or a connection-closed event
+ * (`event_kind == ASTER_EVENT_KIND_CONNECTION_CLOSED`). Bindings that
+ * support session lifecycle reaping (spec §7.5) MUST handle both kinds.
  */
 typedef struct aster_reactor_call_t {
   /**
-   * Reactor-assigned call ID (for submit correlation).
+   * Event-kind discriminator. See `ASTER_EVENT_KIND_*` constants.
+   */
+  uint8_t event_kind;
+  /**
+   * Reactor-assigned call ID (for submit correlation). Zero on
+   * ConnectionClosed events.
    */
   uint64_t call_id;
   /**
+   * Reactor-assigned unique ID for the QUIC connection this event
+   * belongs to (spec §7.5). Same id is reused across every call from
+   * this connection and emitted with the terminal ConnectionClosed
+   * event so the binding can drop per-connection state. A peer that
+   * disconnects and reconnects gets a fresh `connection_id`.
+   */
+  uint64_t connection_id;
+  /**
    * Reactor-assigned unique ID for the QUIC bi-stream this call arrived
-   * on. Stateless calls each get a fresh stream_id (one call per stream);
-   * session-mode calls share one stream_id across multiple calls. Bindings
-   * should key session-scoped service instances on `(peer_id, stream_id,
-   * service)` so concurrent sessions from the same peer stay isolated.
+   * on. Multiplexed streams (spec §6) carry many calls per bi-stream,
+   * so DO NOT key per-session state on `stream_id` — use
+   * `(connection_id, StreamHeader.sessionId)` from the binding-decoded
+   * header instead. Zero on ConnectionClosed events.
    */
   uint64_t stream_id;
   /**
    * Pointer to header payload bytes (owned by buffer registry).
+   * NULL on ConnectionClosed events.
    */
   const uint8_t *header_ptr;
   /**
-   * Length of header payload.
+   * Length of header payload. Zero on ConnectionClosed events.
    */
   uint32_t header_len;
   /**
-   * Header frame flags.
+   * Header frame flags. Zero on ConnectionClosed events.
    */
   uint8_t header_flags;
   /**
    * Pointer to request payload bytes (owned by buffer registry).
+   * NULL on ConnectionClosed events.
    */
   const uint8_t *request_ptr;
   /**
-   * Length of request payload.
+   * Length of request payload. Zero on ConnectionClosed events.
    */
   uint32_t request_len;
   /**
-   * Request frame flags.
+   * Request frame flags. Zero on ConnectionClosed events.
    */
   uint8_t request_flags;
   /**
-   * Pointer to peer ID string (UTF-8, not null-terminated, owned by buffer registry).
+   * Pointer to peer ID string (UTF-8, not null-terminated, owned by
+   * buffer registry). Populated on both Call and ConnectionClosed.
    */
   const uint8_t *peer_ptr;
   /**
-   * Length of peer ID string.
+   * Length of peer ID string. Populated on both Call and
+   * ConnectionClosed.
    */
   uint32_t peer_len;
   /**
-   * 1 if this is a session call, 0 otherwise.
-   */
-  uint8_t is_session_call;
-  /**
-   * Buffer ID for the header payload (release after processing).
+   * Buffer ID for the header payload (release after processing). Zero
+   * on ConnectionClosed events.
    */
   uint64_t header_buffer;
   /**
-   * Buffer ID for the request payload.
+   * Buffer ID for the request payload. Zero on ConnectionClosed events.
    */
   uint64_t request_buffer;
   /**
-   * Buffer ID for the peer ID string.
+   * Buffer ID for the peer ID string. Populated on both Call and
+   * ConnectionClosed.
    */
   uint64_t peer_buffer;
 } aster_reactor_call_t;

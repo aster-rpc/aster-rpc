@@ -1,17 +1,16 @@
 package site.aster.server.session;
 
 /**
- * Identifies a single session-scoped service instance.
+ * Identifies a single session-scoped service instance (multiplexed-streams spec §6 / §7.5).
  *
- * <p>Keying is {@code (peerId, streamId, implClass)} — one session instance per {@code (peer, QUIC
- * bi-stream, service class)}. The {@code streamId} component is what makes concurrent sessions from
- * the same peer independent: two browser tabs on one machine, or two agents in one process, each
- * open their own Aster stream and get their own session state, instead of fighting over a shared
- * instance as they did in Day-0.
+ * <p>Keying is {@code (connectionId, sessionId, implClass)}: one session instance per {@code (QUIC
+ * connection, client-allocated sessionId, service class)}. The {@code connectionId} makes
+ * concurrent connections from the same peer-identity independent (two browser tabs on one machine
+ * each open their own connection and get their own session graveyard); the {@code sessionId}
+ * discriminates concurrent sessions on the same connection.
  *
- * <p>The reactor assigns {@code streamId} per accepted bi-stream (see {@code aster_reactor_call_t
- * .stream_id} on the FFI side). Stateless (unary / server-stream) calls always get a fresh streamId
- * because they open a fresh stream per call; session-mode calls share one streamId across the calls
- * multiplexed on the same stream.
+ * <p>{@code peerId} is no longer part of the key — it is implied by {@code connectionId} (one peer
+ * per connection) and any caller wanting to surface it to user code carries it separately via the
+ * {@code CallContext}.
  */
-public record SessionKey(String peerId, long streamId, Class<?> implClass) {}
+public record SessionKey(long connectionId, int sessionId, Class<?> implClass) {}
