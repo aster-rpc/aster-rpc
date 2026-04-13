@@ -3,8 +3,9 @@
 //! The reactor runs entirely on the tokio runtime. It accepts connections,
 //! reads StreamHeader + request frames, and delivers fully-read requests
 //! to the language binding via an async channel. The binding runs the
-//! handler and submits the response via a sync oneshot channel. The
-//! reactor writes the response to the QUIC stream.
+//! handler and submits response frames via an mpsc channel, one frame at a
+//! time, terminated by a Trailer. The reactor writes each frame to the QUIC
+//! stream as it arrives, enabling server-streaming and bidi-streaming RPCs.
 //!
 //! Two modes:
 //! - `start_reactor` / `start_reactor_on`: owns the accept loop (pulls from
@@ -16,31 +17,50 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Result};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::framing::{FLAG_CALL, FLAG_HEADER, MAX_FRAME_SIZE};
 use crate::{CoreConnection, CoreNode, CoreRecvStream, CoreSendStream};
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_call_id() -> u64 {
     NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+fn next_stream_id() -> u64 {
+    NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct IncomingCall {
     pub call_id: u64,
+    /// Reactor-assigned unique id for the QUIC bi-stream this call arrived
+    /// on. Stateless (unary / server-stream) calls each get a fresh stream
+    /// id because they always open a new bi-stream; session-mode calls on
+    /// the same bi-stream share one stream id across multiple calls. Bindings
+    /// use `(peer_id, stream_id, service)` as the session key so concurrent
+    /// sessions from the same peer don't collapse onto one service instance.
+    pub stream_id: u64,
     pub header_payload: Vec<u8>,
     pub header_flags: u8,
     pub request_payload: Vec<u8>,
     pub request_flags: u8,
     pub peer_id: String,
     pub is_session_call: bool,
-    pub response_sender: oneshot::Sender<OutgoingResponse>,
+    pub response_sender: mpsc::UnboundedSender<OutgoingFrame>,
 }
 
-pub struct OutgoingResponse {
-    pub response_frame: Vec<u8>,
-    pub trailer_frame: Vec<u8>,
+/// Outgoing frame emitted by the binding. The reactor writes each `Frame` to
+/// the stream as it arrives; `Trailer` is the terminal frame — after writing
+/// it the reactor finishes the stream's send side and drops the channel.
+///
+/// Both variants carry already-framed bytes — `[4B LE len][1B flags][payload]`.
+/// The binding is responsible for the framing so the reactor can write bytes
+/// opaquely without reaching into the wire format.
+pub enum OutgoingFrame {
+    Frame(Vec<u8>),
+    Trailer(Vec<u8>),
 }
 
 pub struct ReactorHandle {
@@ -145,6 +165,7 @@ async fn handle_stream_inner(
     peer_id: String,
     call_tx: mpsc::Sender<IncomingCall>,
 ) -> Result<()> {
+    let stream_id = next_stream_id();
     let (header_payload, header_flags) = read_one_frame(&recv).await?;
     if header_flags & FLAG_HEADER == 0 {
         return Err(anyhow!("first frame missing HEADER flag"));
@@ -157,6 +178,7 @@ async fn handle_stream_inner(
             send,
             recv,
             peer_id,
+            stream_id,
             call_tx,
             header_payload,
             second_payload,
@@ -167,6 +189,7 @@ async fn handle_stream_inner(
         handle_stateless(
             send,
             peer_id,
+            stream_id,
             call_tx,
             header_payload,
             header_flags,
@@ -180,16 +203,18 @@ async fn handle_stream_inner(
 async fn handle_stateless(
     send: CoreSendStream,
     peer_id: String,
+    stream_id: u64,
     call_tx: mpsc::Sender<IncomingCall>,
     header_payload: Vec<u8>,
     header_flags: u8,
     request_payload: Vec<u8>,
     request_flags: u8,
 ) -> Result<()> {
-    let (resp_tx, resp_rx) = oneshot::channel();
+    let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
     call_tx
         .send(IncomingCall {
             call_id: next_call_id(),
+            stream_id,
             header_payload,
             header_flags,
             request_payload,
@@ -201,22 +226,37 @@ async fn handle_stateless(
         .await
         .map_err(|_| anyhow!("reactor channel closed"))?;
 
-    let response = resp_rx
-        .await
-        .map_err(|_| anyhow!("binding dropped response channel"))?;
+    // Drain every frame the binding emits, write it to the stream, and stop
+    // once the Trailer lands. Supports unary (1 Frame + 1 Trailer), server
+    // streaming (N Frames + 1 Trailer), and the error-only case (1 Trailer).
+    while let Some(frame) = resp_rx.recv().await {
+        match frame {
+            OutgoingFrame::Frame(bytes) => {
+                if !bytes.is_empty() {
+                    send.write_all(bytes).await?;
+                }
+            }
+            OutgoingFrame::Trailer(bytes) => {
+                if !bytes.is_empty() {
+                    send.write_all(bytes).await?;
+                }
+                send.finish().await?;
+                return Ok(());
+            }
+        }
+    }
 
-    let mut buf = Vec::with_capacity(response.response_frame.len() + response.trailer_frame.len());
-    buf.extend_from_slice(&response.response_frame);
-    buf.extend_from_slice(&response.trailer_frame);
-    send.write_all(buf).await?;
+    // Binding dropped the channel without sending a trailer — close the
+    // stream cleanly so the client isn't left hanging on a dangling read.
     send.finish().await?;
-    Ok(())
+    Err(anyhow!("binding dropped response channel without trailer"))
 }
 
 async fn handle_session(
     send: CoreSendStream,
     recv: CoreRecvStream,
     peer_id: String,
+    stream_id: u64,
     call_tx: mpsc::Sender<IncomingCall>,
     _stream_header_payload: Vec<u8>,
     first_call_header: Vec<u8>,
@@ -228,10 +268,11 @@ async fn handle_session(
     loop {
         let (request_payload, request_flags) = read_one_frame(&recv).await?;
 
-        let (resp_tx, resp_rx) = oneshot::channel();
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         call_tx
             .send(IncomingCall {
                 call_id: next_call_id(),
+                stream_id,
                 header_payload: call_header_payload,
                 header_flags: call_header_flags,
                 request_payload,
@@ -243,13 +284,24 @@ async fn handle_session(
             .await
             .map_err(|_| anyhow!("reactor channel closed"))?;
 
-        let response = resp_rx
-            .await
-            .map_err(|_| anyhow!("binding dropped response channel"))?;
-
-        send.write_all(response.response_frame).await?;
-        if !response.trailer_frame.is_empty() {
-            send.write_all(response.trailer_frame).await?;
+        // Drain frames for this call but DO NOT finish the stream on Trailer —
+        // session mode keeps the stream open for subsequent calls. The outer
+        // loop reads the next CallHeader once the trailer has been written.
+        loop {
+            match resp_rx.recv().await {
+                Some(OutgoingFrame::Frame(bytes)) => {
+                    if !bytes.is_empty() {
+                        send.write_all(bytes).await?;
+                    }
+                }
+                Some(OutgoingFrame::Trailer(bytes)) => {
+                    if !bytes.is_empty() {
+                        send.write_all(bytes).await?;
+                    }
+                    break;
+                }
+                None => return Err(anyhow!("binding dropped session call channel")),
+            }
         }
 
         match read_one_frame(&recv).await {

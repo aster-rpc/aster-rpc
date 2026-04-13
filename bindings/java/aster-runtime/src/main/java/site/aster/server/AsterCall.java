@@ -8,6 +8,8 @@ package site.aster.server;
  * {@link #requestFlags()}.
  *
  * @param callId reactor-assigned call ID (used internally for response correlation)
+ * @param streamId reactor-assigned unique ID for the QUIC bi-stream — together with {@code peerId}
+ *     this is the correct key for session-scoped service instances
  * @param header de-framed header payload (contains StreamHeader: contract ID, method, etc.)
  * @param headerFlags the flags byte from the header frame
  * @param request de-framed request payload (contains the serialized RPC request)
@@ -17,6 +19,7 @@ package site.aster.server;
  */
 public record AsterCall(
     long callId,
+    long streamId,
     byte[] header,
     byte headerFlags,
     byte[] request,

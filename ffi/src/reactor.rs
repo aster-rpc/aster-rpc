@@ -13,9 +13,9 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aster_transport_core::reactor::{self, OutgoingResponse, ReactorHandle};
+use aster_transport_core::reactor::{self, OutgoingFrame, ReactorHandle};
 use aster_transport_core::ring;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 
 use crate::{
     iroh_node_t, iroh_runtime_t, iroh_status_t, load_runtime, BufferRegistry, HandleRegistry,
@@ -32,6 +32,12 @@ pub type aster_reactor_t = u64;
 pub struct aster_reactor_call_t {
     /// Reactor-assigned call ID (for submit correlation).
     pub call_id: u64,
+    /// Reactor-assigned unique ID for the QUIC bi-stream this call arrived
+    /// on. Stateless calls each get a fresh stream_id (one call per stream);
+    /// session-mode calls share one stream_id across multiple calls. Bindings
+    /// should key session-scoped service instances on `(peer_id, stream_id,
+    /// service)` so concurrent sessions from the same peer stay isolated.
+    pub stream_id: u64,
     /// Pointer to header payload bytes (owned by buffer registry).
     pub header_ptr: *const u8,
     /// Length of header payload.
@@ -61,6 +67,7 @@ pub struct aster_reactor_call_t {
 /// Internal ring slot: holds an IncomingCall with buffer IDs already assigned.
 struct RingCall {
     call_id: u64,
+    stream_id: u64,
     header_buffer: u64,
     header_ptr: *const u8,
     header_len: u32,
@@ -73,7 +80,7 @@ struct RingCall {
     peer_ptr: *const u8,
     peer_len: u32,
     is_session_call: bool,
-    response_sender: Option<oneshot::Sender<OutgoingResponse>>,
+    response_sender: Option<mpsc::UnboundedSender<OutgoingFrame>>,
 }
 
 // Safety: RingCall is only moved between the pump task and the poll thread.
@@ -84,8 +91,11 @@ unsafe impl Send for RingCall {}
 pub(crate) struct ReactorState {
     /// Consumer side of the SPSC ring (read by aster_reactor_poll).
     consumer: Mutex<ring::Consumer<RingCall>>,
-    /// Pending response senders keyed by call_id.
-    response_senders: Mutex<std::collections::HashMap<u64, oneshot::Sender<OutgoingResponse>>>,
+    /// Pending response senders keyed by call_id. Removing a sender drops
+    /// the last reference to its mpsc channel, which unblocks the reactor's
+    /// `recv().await` loop and finishes the stream.
+    response_senders:
+        Mutex<std::collections::HashMap<u64, mpsc::UnboundedSender<OutgoingFrame>>>,
     /// Signal to stop the pump task.
     stopped: Arc<AtomicBool>,
     /// Buffer registry for payload lifetime management.
@@ -123,6 +133,7 @@ async fn pump_task(
 
         let ring_call = RingCall {
             call_id: call.call_id,
+            stream_id: call.stream_id,
             header_buffer: header_buf_id,
             header_ptr: header_arc.as_ptr(),
             header_len: header_arc.len() as u32,
@@ -276,6 +287,7 @@ pub unsafe extern "C" fn aster_reactor_poll(
     consumer.drain(max_calls as usize, |ring_call| {
         let desc = aster_reactor_call_t {
             call_id: ring_call.call_id,
+            stream_id: ring_call.stream_id,
             header_ptr: ring_call.header_ptr,
             header_len: ring_call.header_len,
             header_flags: ring_call.header_flags,
@@ -317,6 +329,7 @@ pub unsafe extern "C" fn aster_reactor_poll(
             consumer.drain(max_calls as usize, |ring_call| {
                 let desc = aster_reactor_call_t {
                     call_id: ring_call.call_id,
+                    stream_id: ring_call.stream_id,
                     header_ptr: ring_call.header_ptr,
                     header_len: ring_call.header_len,
                     header_flags: ring_call.header_flags,
@@ -352,12 +365,12 @@ pub unsafe extern "C" fn aster_reactor_poll(
     }
 }
 
-/// Submit a response for a call received via aster_reactor_poll.
+/// Submit a unary response (single response frame + trailer) in one FFI call.
 ///
-/// `response_ptr`/`response_len` is the response frame bytes.
-/// `trailer_ptr`/`trailer_len` is the trailer frame bytes.
+/// Convenience wrapper over `aster_reactor_submit_frame` + `aster_reactor_submit_trailer`
+/// for the unary path. For server-streaming or bidi, call `submit_frame` N times
+/// then `submit_trailer` once.
 ///
-/// The reactor writes both frames to the QUIC stream and finishes it.
 /// After this call, the call_id is no longer valid.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_submit(
@@ -374,6 +387,8 @@ pub unsafe extern "C" fn aster_reactor_submit(
         None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
     };
 
+    // Remove the sender from the map — this is the terminal submit, callers
+    // that still hold the call_id afterwards would get NOT_FOUND.
     let sender = match state.response_senders.lock().unwrap().remove(&call_id) {
         Some(s) => s,
         None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
@@ -391,11 +406,86 @@ pub unsafe extern "C" fn aster_reactor_submit(
         unsafe { std::slice::from_raw_parts(trailer_ptr, trailer_len as usize).to_vec() }
     };
 
-    let _ = sender.send(OutgoingResponse {
-        response_frame,
-        trailer_frame,
-    });
+    if !response_frame.is_empty() {
+        let _ = sender.send(OutgoingFrame::Frame(response_frame));
+    }
+    let _ = sender.send(OutgoingFrame::Trailer(trailer_frame));
+    // `sender` goes out of scope here — the map already dropped its copy,
+    // so this closes the mpsc channel and lets the reactor finish the stream.
 
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Submit one streaming response frame for a call. May be called multiple
+/// times per call; each call enqueues one Frame on the reactor's mpsc channel.
+/// The call_id remains valid until `aster_reactor_submit_trailer` is called.
+///
+/// `frame_ptr`/`frame_len` point to already-framed bytes (including the 4-byte
+/// length prefix and 1-byte flags). The binding is responsible for framing.
+#[no_mangle]
+pub unsafe extern "C" fn aster_reactor_submit_frame(
+    runtime: iroh_runtime_t,
+    reactor: aster_reactor_t,
+    call_id: u64,
+    frame_ptr: *const u8,
+    frame_len: u32,
+) -> i32 {
+    let state = match REACTORS.get(reactor) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    // Clone the sender without removing it — the call remains open for more
+    // frames and the eventual trailer.
+    let sender = {
+        let map = state.response_senders.lock().unwrap();
+        match map.get(&call_id) {
+            Some(s) => s.clone(),
+            None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        }
+    };
+
+    let frame = if frame_ptr.is_null() || frame_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(frame_ptr, frame_len as usize).to_vec() }
+    };
+
+    if sender.send(OutgoingFrame::Frame(frame)).is_err() {
+        return iroh_status_t::IROH_STATUS_NOT_FOUND as i32;
+    }
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Submit the trailer for a call and close the stream. After this call, the
+/// `call_id` is no longer valid. The trailer payload may be empty — the
+/// reactor still finishes the send side cleanly.
+#[no_mangle]
+pub unsafe extern "C" fn aster_reactor_submit_trailer(
+    runtime: iroh_runtime_t,
+    reactor: aster_reactor_t,
+    call_id: u64,
+    trailer_ptr: *const u8,
+    trailer_len: u32,
+) -> i32 {
+    let state = match REACTORS.get(reactor) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let sender = match state.response_senders.lock().unwrap().remove(&call_id) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let trailer = if trailer_ptr.is_null() || trailer_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(trailer_ptr, trailer_len as usize).to_vec() }
+    };
+
+    let _ = sender.send(OutgoingFrame::Trailer(trailer));
+    // `sender` dropped here — channel closes once the reactor drains it.
     iroh_status_t::IROH_STATUS_OK as i32
 }
 

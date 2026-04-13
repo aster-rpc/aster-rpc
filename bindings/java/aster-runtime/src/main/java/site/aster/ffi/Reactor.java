@@ -44,41 +44,46 @@ public final class Reactor implements AutoCloseable {
   // ============================================================================
 
   /**
-   * Memory layout of {@code aster_reactor_call_t}. 80 bytes total with 4-byte alignment padding.
+   * Memory layout of {@code aster_reactor_call_t}. 88 bytes total with 4-byte alignment padding.
+   *
+   * <p>{@code stream_id} was added in G.2 so session-scoped services can key on {@code (peer,
+   * stream, service)} and stop collapsing concurrent sessions from the same peer.
    */
   public static final MemoryLayout CALL_LAYOUT =
       MemoryLayout.structLayout(
           ValueLayout.JAVA_LONG.withName("call_id"), //                0
-          ValueLayout.ADDRESS.withName("header_ptr"), //               8
-          ValueLayout.JAVA_INT.withName("header_len"), //             16
-          ValueLayout.JAVA_BYTE.withName("header_flags"), //          20
-          MemoryLayout.paddingLayout(3), //                           21
-          ValueLayout.ADDRESS.withName("request_ptr"), //             24
-          ValueLayout.JAVA_INT.withName("request_len"), //            32
-          ValueLayout.JAVA_BYTE.withName("request_flags"), //         36
-          MemoryLayout.paddingLayout(3), //                           37
-          ValueLayout.ADDRESS.withName("peer_ptr"), //                40
-          ValueLayout.JAVA_INT.withName("peer_len"), //               48
-          ValueLayout.JAVA_BYTE.withName("is_session_call"), //       52
-          MemoryLayout.paddingLayout(3), //                           53
-          ValueLayout.JAVA_LONG.withName("header_buffer"), //         56
-          ValueLayout.JAVA_LONG.withName("request_buffer"), //        64
-          ValueLayout.JAVA_LONG.withName("peer_buffer") //            72
+          ValueLayout.JAVA_LONG.withName("stream_id"), //              8
+          ValueLayout.ADDRESS.withName("header_ptr"), //              16
+          ValueLayout.JAVA_INT.withName("header_len"), //             24
+          ValueLayout.JAVA_BYTE.withName("header_flags"), //          28
+          MemoryLayout.paddingLayout(3), //                           29
+          ValueLayout.ADDRESS.withName("request_ptr"), //             32
+          ValueLayout.JAVA_INT.withName("request_len"), //            40
+          ValueLayout.JAVA_BYTE.withName("request_flags"), //         44
+          MemoryLayout.paddingLayout(3), //                           45
+          ValueLayout.ADDRESS.withName("peer_ptr"), //                48
+          ValueLayout.JAVA_INT.withName("peer_len"), //               56
+          ValueLayout.JAVA_BYTE.withName("is_session_call"), //       60
+          MemoryLayout.paddingLayout(3), //                           61
+          ValueLayout.JAVA_LONG.withName("header_buffer"), //         64
+          ValueLayout.JAVA_LONG.withName("request_buffer"), //        72
+          ValueLayout.JAVA_LONG.withName("peer_buffer") //            80
           );
 
   public static final long OFFSET_CALL_ID = 0;
-  public static final long OFFSET_HEADER_PTR = 8;
-  public static final long OFFSET_HEADER_LEN = 16;
-  public static final long OFFSET_HEADER_FLAGS = 20;
-  public static final long OFFSET_REQUEST_PTR = 24;
-  public static final long OFFSET_REQUEST_LEN = 32;
-  public static final long OFFSET_REQUEST_FLAGS = 36;
-  public static final long OFFSET_PEER_PTR = 40;
-  public static final long OFFSET_PEER_LEN = 48;
-  public static final long OFFSET_IS_SESSION_CALL = 52;
-  public static final long OFFSET_HEADER_BUFFER = 56;
-  public static final long OFFSET_REQUEST_BUFFER = 64;
-  public static final long OFFSET_PEER_BUFFER = 72;
+  public static final long OFFSET_STREAM_ID = 8;
+  public static final long OFFSET_HEADER_PTR = 16;
+  public static final long OFFSET_HEADER_LEN = 24;
+  public static final long OFFSET_HEADER_FLAGS = 28;
+  public static final long OFFSET_REQUEST_PTR = 32;
+  public static final long OFFSET_REQUEST_LEN = 40;
+  public static final long OFFSET_REQUEST_FLAGS = 44;
+  public static final long OFFSET_PEER_PTR = 48;
+  public static final long OFFSET_PEER_LEN = 56;
+  public static final long OFFSET_IS_SESSION_CALL = 60;
+  public static final long OFFSET_HEADER_BUFFER = 64;
+  public static final long OFFSET_REQUEST_BUFFER = 72;
+  public static final long OFFSET_PEER_BUFFER = 80;
 
   // ============================================================================
   // Method handles
@@ -127,6 +132,32 @@ public final class Reactor implements AutoCloseable {
                   ValueLayout.JAVA_LONG, // call_id
                   ValueLayout.ADDRESS, // response_ptr
                   ValueLayout.JAVA_INT, // response_len
+                  ValueLayout.ADDRESS, // trailer_ptr
+                  ValueLayout.JAVA_INT // trailer_len
+                  ));
+
+  private static final MethodHandle SUBMIT_FRAME =
+      IrohLibrary.getInstance()
+          .getHandle(
+              "aster_reactor_submit_frame",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT, // status
+                  ValueLayout.JAVA_LONG, // runtime
+                  ValueLayout.JAVA_LONG, // reactor
+                  ValueLayout.JAVA_LONG, // call_id
+                  ValueLayout.ADDRESS, // frame_ptr
+                  ValueLayout.JAVA_INT // frame_len
+                  ));
+
+  private static final MethodHandle SUBMIT_TRAILER =
+      IrohLibrary.getInstance()
+          .getHandle(
+              "aster_reactor_submit_trailer",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT, // status
+                  ValueLayout.JAVA_LONG, // runtime
+                  ValueLayout.JAVA_LONG, // reactor
+                  ValueLayout.JAVA_LONG, // call_id
                   ValueLayout.ADDRESS, // trailer_ptr
                   ValueLayout.JAVA_INT // trailer_len
                   ));
@@ -218,6 +249,42 @@ public final class Reactor implements AutoCloseable {
               SUBMIT.invoke(
                   runtimeHandle, handle, callId, respPtr, respLen, trailerPtr, trailerLen);
       checkStatus(status, "aster_reactor_submit");
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /**
+   * Submit one response frame for a streaming call. May be called multiple times per call — the
+   * call stays open until {@link #submitTrailer} closes it.
+   *
+   * @param callId the call ID from the {@code aster_reactor_call_t}
+   * @param frame already-framed bytes ({@code [4B LE len][1B flags][payload]})
+   */
+  public void submitFrame(long callId, MemorySegment frame) {
+    try {
+      MemorySegment ptr = frame == null ? MemorySegment.NULL : frame;
+      int len = frame == null ? 0 : (int) frame.byteSize();
+      int status = (int) SUBMIT_FRAME.invoke(runtimeHandle, handle, callId, ptr, len);
+      checkStatus(status, "aster_reactor_submit_frame");
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /**
+   * Submit the trailer for a call and close the stream. After this call the {@code callId} is no
+   * longer valid.
+   *
+   * @param callId the call ID from the {@code aster_reactor_call_t}
+   * @param trailer already-framed trailer bytes (may be empty)
+   */
+  public void submitTrailer(long callId, MemorySegment trailer) {
+    try {
+      MemorySegment ptr = trailer == null ? MemorySegment.NULL : trailer;
+      int len = trailer == null ? 0 : (int) trailer.byteSize();
+      int status = (int) SUBMIT_TRAILER.invoke(runtimeHandle, handle, callId, ptr, len);
+      checkStatus(status, "aster_reactor_submit_trailer");
     } catch (Throwable t) {
       throw rethrow(t);
     }
