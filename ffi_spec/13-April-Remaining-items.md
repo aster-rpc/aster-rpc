@@ -232,31 +232,83 @@ are tracked here so the next session can pick one up cold:
   `MissionControl.ingestMetrics` + `AgentSession.runCommand`
   implemented in the example. 8/8 E2E tests green.
 
-- **True interleaved bidi API.** `AsterClient.callBidiStream` is
-  currently buffered: all requests are materialized and sent before
-  any response is read. Sufficient for ping-pong services like
-  `runCommand` because the server's send-side mpsc queues responses
-  until the client drains, but not true streaming bidi. Needs a
-  `BidiCall<Req, Resp>` object with explicit `send(Req)` /
-  `complete()` methods plus a `Flow.Publisher<Resp>` (or `BlockingQueue`
-  / `Iterator`) for incremental response delivery. Pure binding
-  work, no Rust changes.
+- ~~**True interleaved bidi API.**~~ Landed 2026-04-13 in `1b164d7`.
+  New `BidiCall<Req, Resp>` AutoCloseable in
+  `bindings/java/aster-runtime/.../client/BidiCall.java` exposing
+  `send(Req)` / `recv()` / `complete()` / `cancel()` / `close()`.
+  `AsterClient.openBidiStream(...)` returns
+  `CompletableFuture<BidiCall<Req, Resp>>`. Internal model: a
+  dedicated `aster-bidi-reader` virtual thread reads response
+  frames off the QUIC stream and pushes them onto a
+  `LinkedBlockingQueue<Object>`; `recv()` blocks on `take()`;
+  end-of-stream is signalled via a static `END_SENTINEL`. The
+  buffered `callBidiStream` stays as a convenience for batched
+  ping-pong shapes. Mid-implementation gotcha worth recording: the
+  first attempt put `stream.sendAsync(headerFrame).get()` inside
+  the BidiCall constructor invoked from `.thenApply(stream → new
+  BidiCall(...))`, which deadlocked because the executor thread
+  delivering the send completion was the same one blocked on the
+  `.get()`. Fix: BidiCall constructor is now I/O-free, the header
+  send happens in `openBidiStream` as a pure CompletableFuture
+  chain. The constructor's javadoc documents this so it doesn't
+  regress. New test
+  `MissionControlE2ETest#interleavedBidiRunCommandPingPong`.
 
-- **Cancellation propagation.** `ResponseStream.isCancelled()`
-  always returns false. Needs a CANCEL-frame read path on the
-  reactor side and an `aster_reactor_check_cancelled(call_id)` FFI
-  counterpart. Wire-format flag `FLAG_CANCEL = 0x20` already exists
-  in `core/src/framing.rs` — just needs the read-side handling +
-  the FFI lookup.
+- ~~**Cancellation propagation.**~~ Landed 2026-04-13 in `6539065`.
+  - `IncomingCall` gains `cancelled: Arc<AtomicBool>` (Acquire/Release
+    ordering). `handle_stateless` and `handle_session` inspect each
+    forwarded frame in their tokio::select loops: if `FLAG_CANCEL`
+    is set, store true on the flag, drop the request channel (which
+    surfaces as EOS to the dispatcher's `RequestStream.receive()`),
+    and `continue` instead of forwarding. The dispatcher's eventual
+    trailer arrives naturally.
+  - New FFI entry point
+    `aster_reactor_check_cancelled(runtime, reactor, call_id) -> i32`
+    (0 = alive, 1 = cancelled, <0 = error). `RingCall` carries the
+    `Option<Arc<AtomicBool>>`; `ReactorState.cancelled_flags` is the
+    per-call map; both poll drain sites populate it; submit and
+    submit_trailer evict it as terminal cleanup.
+  - Java side: `Reactor.checkCancelled(callId)` wraps the FFI;
+    `ReactorResponseStream.isCancelled()` now returns the real flag
+    instead of `false`; `BidiCall.cancel()` sends an empty
+    `FLAG_CANCEL` frame on the underlying QUIC stream — distinct
+    from `complete()` (graceful FIN) and `close()` (resource
+    teardown).
+  - `AgentSession.runCommand` updated to check `out.isCancelled()`
+    at the top of each loop iteration AND after `in.receive()`
+    returns null (catches "cancellation closed the request channel
+    while we were blocked"). Records exit reason in a static
+    volatile field for the test to verify.
+  - New test
+    `MissionControlE2ETest#bidiRunCommandCancellationPropagates`
+    proves the full path: client cancel → wire FLAG_CANCEL →
+    reactor sets flag → dispatcher's isCancelled() returns true →
+    static field records "CANCELLED".
+  - Still open: dispatcher's eventual trailer is still OK rather
+    than CANCELLED (graceful early exit); reactor doesn't yet set
+    `cancelled = true` on transport errors (e.g. peer crash, stream
+    reset). Both refinements left for follow-up.
 
-- **block_on inside virtual-thread dispatchers.** `recvFrame`
-  parks the carrier thread for up to 1s per recv (the
-  `POLL_TIMEOUT_MS` constant in `ReactorRequestStream`). Fine for
-  the demo-level concurrency in MC tests; high-concurrency
-  client-stream services would benefit from either a
-  platform-thread executor for streaming dispatchers or a
-  callback-based recv API. Document for now, address if profiling
-  shows it as a bottleneck.
+- ~~**block_on inside virtual-thread dispatchers.**~~ Landed
+  2026-04-13 in `c315112`. `AsterServer` now owns two executors:
+  `callExecutor` (newVirtualThreadPerTaskExecutor, current — hosts
+  unary + server-stream) and a new `streamingExecutor`
+  (newCachedThreadPool of platform threads named
+  `aster-server-streaming`, daemon — hosts client-stream + bidi).
+  `dispatchCall` checks `Thread.currentThread().isVirtual()` and
+  trampolines streaming dispatch onto the platform-thread executor
+  before invoking. The dispatch switch was extracted into a new
+  private `runDispatch()` helper so the inline path and the
+  trampolined path share one body. Each method has its own try/catch
+  so the trampoline doesn't lose RpcError → trailer handling.
+  `streamingExecutor.shutdown()` + `awaitTermination` wired into
+  `close()` parallel to `callExecutor`. What this does NOT fix:
+  block_on still parks ONE platform thread per in-flight streaming
+  call — that's what block_on does on a non-runtime thread.
+  CachedThreadPool grows on demand and idle threads expire after
+  60s. For workloads that need to multiplex thousands of streams
+  onto a handful of OS threads, the right fix is a callback-based
+  recv API (no block_on at all), which is a bigger FFI change.
 - **`DispatcherEmitter` server-stream / client-stream / bidi emit.**
   Currently every streaming kind emits an
   `UnsupportedOperationException` stub. The real bodies are
@@ -288,28 +340,90 @@ are tracked here so the next session can pick one up cold:
   but the gating dependency for an `examples/kotlin/mission-control`
   Gradle subproject.
 
-#### Java milestone reached (2026-04-13, expanded)
+#### Java milestone reached (2026-04-13, fully expanded)
 
 The Java binding has a working end-to-end Mission Control server in
 `bindings/java/aster-examples-mission-control`. Initial milestone
 landed in commit `012bcc9` with unary + server-streaming only;
 expanded to FULL RPC-pattern parity with the Python sample in
 commits `a148efb` (reactor read-side mpsc) + `07a2b4c` (Java side
-+ MC client-stream / bidi). Two services (shared `MissionControl`
-+ session-scoped `AgentSession`), all four method shapes covered:
++ MC client-stream / bidi); benchmarked against TLS gRPC Java in
+`3387fe8` + `2a8f5f5`; and the three open caveats from `07a2b4c`
+all closed on the same day in three follow-up commits: `1b164d7`
+(true interleaved BidiCall), `c315112` (streaming-executor
+carrier-pin fix), `6539065` (cancellation propagation). Two
+services (shared `MissionControl` + session-scoped `AgentSession`),
+all four method shapes covered, plus interleaved bidi and
+cancellation:
 
   - `getStatus` / `submitLog` / `register` / `heartbeat` (unary)
   - `tailLogs` (server-streaming, with level filter)
   - `ingestMetrics` (client-streaming)
   - `runCommand` (bidi-streaming, fake-exec for deterministic tests)
+  - `runCommand` via `BidiCall<Req, Resp>` (true interleaved,
+    `1b164d7`)
+  - `runCommand` cancellation propagation (`6539065`)
 
-Exercised by 8 green Java↔Java E2E tests in `MissionControlE2ETest`.
+Exercised by **10 green Java↔Java E2E tests** in
+`MissionControlE2ETest`. Total Java test count: aster-runtime 50 +
+MC 10 = **60 across 6 modules**, full `mvn -P fast test` in ~65s.
+
 Run the server locally with:
 
 ```
 cd bindings/java && mvn -P fast -pl aster-examples-mission-control \
   exec:java -Dexec.mainClass=site.aster.examples.missioncontrol.Server
 ```
+
+#### Java vs gRPC side-by-side (commits `3387fe8` + `2a8f5f5`, 2026-04-13)
+
+In-process Java↔Java Aster MC benchmark
+(`bindings/java/aster-examples-mission-control/.../MissionControlBenchmark.java`)
+plus a standalone TLS gRPC Java baseline
+(`benchmarks/grpc-java-mission-control/`) using the same
+`mission_control.proto` the Python gRPC baseline already had. Both
+ports use mvn-driven harnesses so the comparison is on identical
+hardware with identical encryption posture (TLS on both sides, in
+the gRPC case via a Netty self-signed cert).
+
+Run with:
+
+```
+cd bindings/java && mvn -P fast -pl aster-examples-mission-control \
+  -am test -Dtest=MissionControlBenchmark -Dsurefire.failIfNoSpecifiedTests=false
+
+cd benchmarks/grpc-java-mission-control && mvn -q exec:java
+```
+
+First numbers, M-series Mac, dev profile, 1000-iteration unary
+stages, in-process:
+
+| Stage                        | Aster Java       | gRPC Java        | Ratio       |
+|------------------------------|------------------|------------------|-------------|
+| Unary getStatus (1k seq)     | 1,178 r/s, p50 0.78ms | 2,336 r/s, p50 0.38ms | gRPC 2.0×  |
+| Unary submitLog (1k seq)     | 1,533 r/s, p50 0.62ms | 4,490 r/s, p50 0.21ms | gRPC 2.9×  |
+| Concurrent 10                | 3,802 r/s        | 2,985 r/s        | Aster 1.3× |
+| Concurrent 50                | 8,298 r/s        | 12,765 r/s       | gRPC 1.5×  |
+| Concurrent 100               | TIMED OUT        | 17,107 r/s       | gRPC works |
+| JVM heap delta               | +224 MB          | +50 MB           | gRPC 4.5×  |
+
+Read of result: we're "in the right ballpark" — within 2-3× of gRPC
+on sequential unary, slightly ahead at low concurrency, behind at
+higher concurrency, ~4× the heap. Two clear gaps drive most of it:
+
+1. **Stream-open-per-call architecture.** Every Aster unary call
+   opens a fresh QUIC bi-stream; gRPC pipelines unaries onto a
+   small pool of HTTP/2 streams. The wire format already supports
+   session-mode unary (`FLAG_CALL`) — exposing it on `AsterClient`
+   is the obvious next perf win and should close most of the
+   sequential gap.
+2. **Quinn's default `initial_max_streams_bidi=100`.** One-line
+   config change in `core/src/lib.rs`'s endpoint builder to lift
+   the concurrency ceiling. Surfaces as the TIMED OUT row above.
+
+The buffered client-stream API hits ~27K msg/s on a 10K-batch
+ingestion (not in the table because the proto doesn't define a
+client-stream method); that path is not bottlenecked.
 
 ### Go (`bindings/go/`)
 1. ~~Add Fory v0.16 to `go.mod`; create `aster/codec` package.~~ ✅
