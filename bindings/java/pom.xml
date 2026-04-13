@@ -5,13 +5,21 @@
 
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.aster</groupId>
-    <artifactId>aster-java</artifactId>
+    <groupId>site.aster</groupId>
+    <artifactId>aster-parent</artifactId>
     <version>0.1.0-SNAPSHOT</version>
-    <packaging>jar</packaging>
+    <packaging>pom</packaging>
 
-    <name>Aster Java FFI Bindings</name>
-    <description>Java FFM bindings for the Aster transport FFI layer</description>
+    <name>Aster Parent</name>
+    <description>Aster Java multi-module parent</description>
+
+    <modules>
+        <module>aster-annotations</module>
+        <module>aster-codegen-core</module>
+        <module>aster-codegen-apt</module>
+        <module>aster-codegen-ksp</module>
+        <module>aster-runtime</module>
+    </modules>
 
     <properties>
         <maven.compiler.source>25</maven.compiler.source>
@@ -25,11 +33,34 @@
         <error-prone.version>2.36.0</error-prone.version>
         <archunit.version>1.4.0</archunit.version>
         <kotlin.version>2.4.0-Beta1</kotlin.version>
+        <javapoet.version>0.6.0</javapoet.version>
+        <ksp.version>2.1.0-1.0.29</ksp.version>
     </properties>
 
-    <!-- Dependency BOMs for version management -->
     <dependencyManagement>
         <dependencies>
+            <dependency>
+                <groupId>site.aster</groupId>
+                <artifactId>aster-annotations</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>site.aster</groupId>
+                <artifactId>aster-codegen-core</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>com.palantir.javapoet</groupId>
+                <artifactId>javapoet</artifactId>
+                <version>${javapoet.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.google.devtools.ksp</groupId>
+                <artifactId>symbol-processing-api</artifactId>
+                <version>${ksp.version}</version>
+            </dependency>
+
             <dependency>
                 <groupId>com.google.errorprone</groupId>
                 <artifactId>error_prone_annotations</artifactId>
@@ -45,84 +76,53 @@
                 <artifactId>archunit-junit5</artifactId>
                 <version>${archunit.version}</version>
             </dependency>
+
+            <dependency>
+                <groupId>org.apache.fory</groupId>
+                <artifactId>fory-core</artifactId>
+                <version>0.16.0</version>
+            </dependency>
+
+            <dependency>
+                <groupId>org.jetbrains.kotlinx</groupId>
+                <artifactId>kotlinx-coroutines-core</artifactId>
+                <version>1.10.2</version>
+            </dependency>
+            <dependency>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-stdlib</artifactId>
+                <version>${kotlin.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>org.tomlj</groupId>
+                <artifactId>tomlj</artifactId>
+                <version>1.1.1</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+                <version>2.18.2</version>
+            </dependency>
+
+            <dependency>
+                <groupId>org.junit.jupiter</groupId>
+                <artifactId>junit-jupiter</artifactId>
+                <version>5.12.2</version>
+            </dependency>
+
+            <dependency>
+                <groupId>org.openjdk.jmh</groupId>
+                <artifactId>jmh-core</artifactId>
+                <version>1.37</version>
+            </dependency>
+            <dependency>
+                <groupId>org.openjdk.jmh</groupId>
+                <artifactId>jmh-generator-annprocess</artifactId>
+                <version>1.37</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
-
-    <dependencies>
-        <!-- Error Prone annotations (provided scope — used by compiler plugin only) -->
-        <dependency>
-            <groupId>com.google.errorprone</groupId>
-            <artifactId>error_prone_annotations</artifactId>
-            <scope>provided</scope>
-        </dependency>
-        <dependency>
-            <groupId>com.github.spotbugs</groupId>
-            <artifactId>spotbugs-annotations</artifactId>
-        </dependency>
-
-        <!-- Kotlin Coroutines for structured concurrency (IrohNode, Flow) -->
-        <dependency>
-            <groupId>org.jetbrains.kotlinx</groupId>
-            <artifactId>kotlinx-coroutines-core</artifactId>
-            <version>1.10.2</version>
-        </dependency>
-
-        <!-- Kotlin stdlib (required by coroutines) -->
-        <dependency>
-            <groupId>org.jetbrains.kotlin</groupId>
-            <artifactId>kotlin-stdlib</artifactId>
-            <version>${kotlin.version}</version>
-        </dependency>
-
-        <!-- TOML config file parsing (aster.toml) -->
-        <dependency>
-            <groupId>org.tomlj</groupId>
-            <artifactId>tomlj</artifactId>
-            <version>1.1.1</version>
-        </dependency>
-
-        <!-- Jackson for registry wire types + resolve options -->
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-            <version>2.18.2</version>
-        </dependency>
-
-        <!-- Apache Fory cross-language serialization (matches pyfory==0.16) -->
-        <dependency>
-            <groupId>org.apache.fory</groupId>
-            <artifactId>fory-core</artifactId>
-            <version>0.16.0</version>
-        </dependency>
-
-        <!-- ArchUnit for architectural tests -->
-        <dependency>
-            <groupId>com.tngtech.archunit</groupId>
-            <artifactId>archunit-junit5</artifactId>
-            <scope>test</scope>
-        </dependency>
-
-        <!-- JUnit 5 -->
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <version>5.12.2</version>
-            <scope>test</scope>
-        </dependency>
-
-        <!-- JMH (Java Microbenchmark Harness) for FFI overhead benchmarks -->
-        <dependency>
-            <groupId>org.openjdk.jmh</groupId>
-            <artifactId>jmh-core</artifactId>
-            <version>1.37</version>
-        </dependency>
-        <dependency>
-            <groupId>org.openjdk.jmh</groupId>
-            <artifactId>jmh-generator-annprocess</artifactId>
-            <version>1.37</version>
-            <scope>provided</scope>
-        </dependency>
-    </dependencies>
 
     <build>
         <pluginManagement>
@@ -157,7 +157,6 @@
                     </configuration>
                 </plugin>
 
-                <!-- Fmt Maven Plugin (Google Java Format compatible) -->
                 <plugin>
                     <groupId>com.spotify.fmt</groupId>
                     <artifactId>fmt-maven-plugin</artifactId>
@@ -180,13 +179,12 @@
                     </executions>
                 </plugin>
 
-                <!-- Checkstyle -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-checkstyle-plugin</artifactId>
                     <version>3.6.0</version>
                     <configuration>
-                        <configLocation>checkstyle.xml</configLocation>
+                        <configLocation>${maven.multiModuleProjectDirectory}/checkstyle.xml</configLocation>
                         <consoleOutput>true</consoleOutput>
                         <failsOnError>true</failsOnError>
                     </configuration>
@@ -201,7 +199,6 @@
                     </executions>
                 </plugin>
 
-                <!-- SpotBugs static analysis -->
                 <plugin>
                     <groupId>com.github.spotbugs</groupId>
                     <artifactId>spotbugs-maven-plugin</artifactId>
@@ -210,7 +207,7 @@
                         <effort>Max</effort>
                         <threshold>Low</threshold>
                         <failOnError>true</failOnError>
-                        <excludeFilterFile>spotbugs-exclude.xml</excludeFilterFile>
+                        <excludeFilterFile>${maven.multiModuleProjectDirectory}/spotbugs-exclude.xml</excludeFilterFile>
                     </configuration>
                     <executions>
                         <execution>
@@ -228,68 +225,34 @@
                     <artifactId>maven-jar-plugin</artifactId>
                     <version>3.4.0</version>
                 </plugin>
+
+                <plugin>
+                    <groupId>org.jetbrains.kotlin</groupId>
+                    <artifactId>kotlin-maven-plugin</artifactId>
+                    <version>${kotlin.version}</version>
+                    <dependencies>
+                        <dependency>
+                            <groupId>org.jetbrains.kotlin</groupId>
+                            <artifactId>kotlin-compiler</artifactId>
+                            <version>${kotlin.version}</version>
+                        </dependency>
+                        <dependency>
+                            <groupId>org.jetbrains.kotlinx</groupId>
+                            <artifactId>kotlinx-coroutines-core-jvm</artifactId>
+                            <version>1.10.2</version>
+                        </dependency>
+                    </dependencies>
+                </plugin>
+
+                <plugin>
+                    <groupId>org.openjdk.jmh</groupId>
+                    <artifactId>jmh-maven-plugin</artifactId>
+                    <version>1.37</version>
+                </plugin>
             </plugins>
         </pluginManagement>
 
         <plugins>
-            <!-- Java compiler: runs first so Kotlin can reference Java classes -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <executions>
-                    <!-- Compile Java first -->
-                    <execution>
-                        <id>default-compile</id>
-                        <phase>compile</phase>
-                        <goals>
-                            <goal>compile</goal>
-                        </goals>
-                        <configuration>
-                            <release>25</release>
-                            <encoding>${project.build.sourceEncoding}</encoding>
-                            <includes>
-                                <include>com/aster/**/*.java</include>
-                            </includes>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
-            <!-- Kotlin compiler: runs after Java, can reference compiled Java classes -->
-            <plugin>
-                <groupId>org.jetbrains.kotlin</groupId>
-                <artifactId>kotlin-maven-plugin</artifactId>
-                <version>${kotlin.version}</version>
-                <executions>
-                    <execution>
-                        <id>compile</id>
-                        <phase>compile</phase>
-                        <goals>
-                            <goal>compile</goal>
-                        </goals>
-                        <configuration>
-                            <javaParameters>true</javaParameters>
-                            <args>
-                                <arg>-Xjvm-default=all</arg>
-                            </args>
-                            <sourceDirs>
-                                <sourceDir>${project.basedir}/src/main/kotlin</sourceDir>
-                            </sourceDirs>
-                        </configuration>
-                    </execution>
-                </executions>
-                <dependencies>
-                    <dependency>
-                        <groupId>org.jetbrains.kotlin</groupId>
-                        <artifactId>kotlin-compiler</artifactId>
-                        <version>${kotlin.version}</version>
-                    </dependency>
-                    <dependency>
-                        <groupId>org.jetbrains.kotlinx</groupId>
-                        <artifactId>kotlinx-coroutines-core-jvm</artifactId>
-                        <version>1.10.2</version>
-                    </dependency>
-                </dependencies>
-            </plugin>
             <plugin>
                 <groupId>com.spotify.fmt</groupId>
                 <artifactId>fmt-maven-plugin</artifactId>
@@ -302,40 +265,10 @@
                 <groupId>com.github.spotbugs</groupId>
                 <artifactId>spotbugs-maven-plugin</artifactId>
             </plugin>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-surefire-plugin</artifactId>
-            </plugin>
-            <!-- JMH benchmark plugin -->
-            <plugin>
-                <groupId>org.openjdk.jmh</groupId>
-                <artifactId>jmh-maven-plugin</artifactId>
-                <version>1.37</version>
-                <executions>
-                    <execution>
-                        <id>run-benchmarks</id>
-                        <phase>none</phase>
-                        <goals>
-                            <goal>run</goal>
-                        </goals>
-                        <configuration>
-                            <includeBenchmarks>com.aster.benchmarks.*</includeBenchmarks>
-                            <operations>5</operations>
-                            <timeUnit>ns</timeUnit>
-                            <forks>1</forks>
-                            <warmupIterations>3</warmupIterations>
-                            <warmupTime>1s</warmupTime>
-                            <measurementIterations>5</measurementIterations>
-                            <measurementTime>1s</measurementTime>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
         </plugins>
     </build>
 
     <profiles>
-        <!-- Skip heavy checks for fast local iteration -->
         <profile>
             <id>fast</id>
             <build>
