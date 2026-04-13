@@ -49,11 +49,6 @@ pub unsafe extern "C" fn aster_probe_reset() {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn aster_probe_unary_count() -> u64 {
-    UNARY_RECORDS.lock().unwrap().len() as u64
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn aster_probe_dump_unary_csv(path_ptr: *const u8, path_len: u32) -> i32 {
     if path_ptr.is_null() || path_len == 0 {
         return -1;
