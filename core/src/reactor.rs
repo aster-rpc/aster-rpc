@@ -35,7 +35,7 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
 use crate::framing::{FLAG_CALL, FLAG_CANCEL, FLAG_END_STREAM, FLAG_HEADER, MAX_FRAME_SIZE};
-use crate::{CoreConnection, CoreNode, CoreRecvStream, CoreSendStream};
+use crate::{CoreClosedInfo, CoreConnection, CoreNode, CoreRecvStream, CoreSendStream};
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
@@ -99,41 +99,79 @@ pub enum OutgoingFrame {
     Trailer(Vec<u8>),
 }
 
+/// An event dispatched from the reactor to its consumer. In addition to
+/// incoming calls the reactor now surfaces connection-closed events so
+/// bindings can reap per-connection state (e.g. the session map and
+/// graveyard described in spec §7.5). Emitted exactly once per
+/// connection, after every stream on it has been accepted or the
+/// connection itself has errored/been closed.
+pub enum ReactorEvent {
+    Call(IncomingCall),
+    ConnectionClosed {
+        peer_id: String,
+        info: CoreClosedInfo,
+    },
+}
+
 pub struct ReactorHandle {
-    call_rx: mpsc::Receiver<IncomingCall>,
+    event_rx: mpsc::Receiver<ReactorEvent>,
 }
 
 impl ReactorHandle {
+    /// Pull the next event (call or connection-closed). Bindings that
+    /// need to reap per-connection state on disconnect should consume
+    /// from this API.
+    pub async fn next_event(&mut self) -> Option<ReactorEvent> {
+        self.event_rx.recv().await
+    }
+
+    /// Back-compat convenience: pull the next **Call** event,
+    /// silently draining (and logging at debug) any
+    /// `ConnectionClosed` events that arrive. Existing FFI consumers
+    /// that don't yet track connection lifecycle can continue to use
+    /// this shape unchanged.
     pub async fn next_call(&mut self) -> Option<IncomingCall> {
-        self.call_rx.recv().await
+        loop {
+            match self.event_rx.recv().await {
+                Some(ReactorEvent::Call(c)) => return Some(c),
+                Some(ReactorEvent::ConnectionClosed { peer_id, .. }) => {
+                    tracing::debug!(
+                        peer = %peer_id,
+                        "ConnectionClosed event dropped by next_call (binding has not migrated to next_event)"
+                    );
+                    continue;
+                }
+                None => return None,
+            }
+        }
     }
 }
 
 /// Feed connections into a reactor created with `create_reactor`.
 #[derive(Clone)]
 pub struct ReactorFeeder {
-    call_tx: mpsc::Sender<IncomingCall>,
+    event_tx: mpsc::Sender<ReactorEvent>,
     rt_handle: tokio::runtime::Handle,
 }
 
 impl ReactorFeeder {
     pub fn feed(&self, conn: CoreConnection) {
-        let tx = self.call_tx.clone();
+        let tx = self.event_tx.clone();
         self.rt_handle.spawn(connection_loop(conn, tx));
     }
 }
 
 /// Create a reactor without an accept loop. Returns a handle for receiving
-/// calls and a feeder for pushing connections from an external accept loop.
+/// events and a feeder for pushing connections from an external accept loop.
 pub fn create_reactor(
     handle: &tokio::runtime::Handle,
     channel_capacity: usize,
 ) -> (ReactorHandle, ReactorFeeder) {
-    let (call_tx, call_rx) = mpsc::channel(channel_capacity);
+    let (event_tx, event_rx) = mpsc::channel(channel_capacity);
     (
-        ReactorHandle { call_rx },
+        ReactorHandle { event_rx },
         ReactorFeeder {
-            call_tx,
+            event_tx,
             rt_handle: handle.clone(),
         },
     )
@@ -141,9 +179,9 @@ pub fn create_reactor(
 
 /// Start a reactor that owns the accept loop.
 pub fn start_reactor(node: CoreNode, channel_capacity: usize) -> ReactorHandle {
-    let (call_tx, call_rx) = mpsc::channel(channel_capacity);
-    tokio::spawn(accept_loop(node, call_tx));
-    ReactorHandle { call_rx }
+    let (event_tx, event_rx) = mpsc::channel(channel_capacity);
+    tokio::spawn(accept_loop(node, event_tx));
+    ReactorHandle { event_rx }
 }
 
 /// Same as `start_reactor` but takes an explicit runtime handle.
@@ -152,20 +190,20 @@ pub fn start_reactor_on(
     node: CoreNode,
     channel_capacity: usize,
 ) -> ReactorHandle {
-    let (call_tx, call_rx) = mpsc::channel(channel_capacity);
-    handle.spawn(accept_loop(node, call_tx));
-    ReactorHandle { call_rx }
+    let (event_tx, event_rx) = mpsc::channel(channel_capacity);
+    handle.spawn(accept_loop(node, event_tx));
+    ReactorHandle { event_rx }
 }
 
-async fn accept_loop(node: CoreNode, call_tx: mpsc::Sender<IncomingCall>) {
+async fn accept_loop(node: CoreNode, event_tx: mpsc::Sender<ReactorEvent>) {
     loop {
         match node.accept_aster().await {
             Ok((_alpn, conn)) => {
-                let tx = call_tx.clone();
+                let tx = event_tx.clone();
                 tokio::spawn(connection_loop(conn, tx));
             }
             Err(e) => {
-                if call_tx.is_closed() {
+                if event_tx.is_closed() {
                     break;
                 }
                 tracing::warn!("reactor accept error: {}", e);
@@ -174,21 +212,33 @@ async fn accept_loop(node: CoreNode, call_tx: mpsc::Sender<IncomingCall>) {
     }
 }
 
-async fn connection_loop(conn: CoreConnection, call_tx: mpsc::Sender<IncomingCall>) {
+async fn connection_loop(conn: CoreConnection, event_tx: mpsc::Sender<ReactorEvent>) {
     let peer_id = conn.remote_id();
 
     while let Ok((send, recv)) = conn.accept_bi().await {
-        let tx = call_tx.clone();
+        let tx = event_tx.clone();
         let peer = peer_id.clone();
         tokio::spawn(handle_stream(send, recv, peer, tx));
     }
+
+    // Connection closed or accept_bi returned an error — emit a
+    // ConnectionClosed event so the binding can reap per-connection
+    // state (spec §7.5). We await the remote side's close-info so
+    // the event carries the termination reason. `await` here is a
+    // bounded wait: if the connection is already fully closed the
+    // future resolves immediately; otherwise it resolves on the next
+    // close frame.
+    let info = conn.closed().await;
+    let _ = event_tx
+        .send(ReactorEvent::ConnectionClosed { peer_id, info })
+        .await;
 }
 
 async fn handle_stream(
     send: CoreSendStream,
     recv: CoreRecvStream,
     peer_id: String,
-    call_tx: mpsc::Sender<IncomingCall>,
+    call_tx: mpsc::Sender<ReactorEvent>,
 ) {
     if let Err(e) = handle_stream_inner(send, recv, peer_id, call_tx).await {
         tracing::debug!("reactor stream error: {}", e);
@@ -223,7 +273,7 @@ async fn handle_stream_inner(
     send: CoreSendStream,
     recv: CoreRecvStream,
     peer_id: String,
-    call_tx: mpsc::Sender<IncomingCall>,
+    call_tx: mpsc::Sender<ReactorEvent>,
 ) -> Result<()> {
     let stream_id = next_stream_id();
 
@@ -276,7 +326,7 @@ async fn dispatch_stream(
     send: CoreSendStream,
     peer_id: String,
     stream_id: u64,
-    call_tx: mpsc::Sender<IncomingCall>,
+    call_tx: mpsc::Sender<ReactorEvent>,
 ) -> Result<()> {
     let header = frame_rx
         .recv()
@@ -397,7 +447,7 @@ async fn dispatch_one_call(
     frame_rx: &mut mpsc::UnboundedReceiver<WireFrame>,
     peer_id: &str,
     stream_id: u64,
-    call_tx: &mpsc::Sender<IncomingCall>,
+    call_tx: &mpsc::Sender<ReactorEvent>,
     header_payload: Vec<u8>,
     header_flags: u8,
     first_request_payload: Vec<u8>,
@@ -412,7 +462,7 @@ async fn dispatch_one_call(
     let mut req_tx_opt = if request_done { None } else { Some(req_tx) };
 
     call_tx
-        .send(IncomingCall {
+        .send(ReactorEvent::Call(IncomingCall {
             call_id: next_call_id(),
             stream_id,
             header_payload,
@@ -424,7 +474,7 @@ async fn dispatch_one_call(
             response_sender: resp_tx,
             request_receiver: req_rx,
             cancelled: cancelled.clone(),
-        })
+        }))
         .await
         .map_err(|_| anyhow!("reactor channel closed"))?;
 
