@@ -1,217 +1,190 @@
-# Session Instructions: Mode 2 Inline Request Parameters + gen-client
+# Session Instructions: TypeScript Producer Introspection via TS Compiler API
 
-Paste this as the opening message of a new Claude Code session to resume the
-work deferred from `session-instructions-handler-context.md`.
+**Status of the Mode 2 work this doc started as.** Python Mode 2 inline
+request parameters shipped in commit `7fdbabb` (CallContext injection +
+Mode 2 across Python decorators, dispatch, contract identity, CLI,
+codegen, shell, MCP schema, and tests). This doc has been retargeted
+because the TypeScript story is different from Python's and warrants a
+different approach.
 
 ---
 
-The handler-context session (see previous commit) shipped Path 1 + Path 2
-of `ffi_spec/handler-context-design.md` (explicit `CallContext` parameter
-injection and `CallContext.current()` async-local) for **Python** and
-**TypeScript**. Java / Go / .NET were marked out of scope because those
-bindings don't yet have a method-level `@Rpc` dispatch framework.
+## Why TypeScript doesn't need Mode 2
 
-**This session picks up the second half of that design doc: inline request
-parameters (Mode 2) and the matching `gen-client` / manifest updates.** Read
-`ffi_spec/handler-context-design.md` §"Inline Request Parameters" fully
-before starting — it contains the mode-detection rules, the wire-type
-synthesis rules, examples per language, and the contract-identity
-equivalence proof.
+In Python, Mode 2 lets producers skip the `@dataclass` + `@wire_type` +
+annotated-fields-with-defaults boilerplate by writing handler methods
+with inline positional parameters. The framework synthesizes the
+request class under the hood.
 
-## What to implement
+In TypeScript, that boilerplate doesn't exist. Writing
+`class GetStatusParams { agentId = ""; nonce = 0 }` is already
+zero-ceremony idiomatic TS — exactly as terse as the Mode 2 aspirational
+syntax in the design doc. There is no ergonomic gap to close. A TS
+producer writing
 
-### 1. Python @rpc Mode 2 detection and wire-type synthesis
+```ts
+class GetStatusParams { agentId = ""; nonce = 0 }
 
-At `@service` decoration time, for each `@rpc` method:
-
-- Inspect the signature (minus `self` and minus any `CallContext` params —
-  the latter is already filtered by `_extract_types_from_signature` in
-  `bindings/python/aster/decorators.py`).
-- Classify the method into one of three modes:
-  - **EXPLICIT (Mode 1)** — exactly one param that is a `@wire_type` class.
-    Pass-through, existing behavior.
-  - **NO_REQUEST** — zero params. Synthesize an empty `{MethodName}Request`.
-  - **INLINE (Mode 2)** — any other combination. Synthesize a
-    `{MethodName}Request` wire type from the params.
-- For INLINE/NO_REQUEST, synthesize a dataclass at decoration time:
-  - Name: `{MethodName in PascalCase}Request`
-  - Package: same as the service's package (`aster.contract.identity`
-    package helpers already handle this)
-  - Fields: one per parameter, names match, types resolved via the language
-    mapping table (§11.3.2.3 in `ffi_spec/Aster-ContractIdentity.md`)
-  - Field IDs: NFC-name-sorted (same rule as explicit `@wire_type`)
-  - Register it with the contract identity system so `contract_id` matches
-    an equivalent explicit class.
-- Wrap the handler so dispatch still receives a single `request` argument:
-  the wrapper unpacks `request.field_name` into inline positional args
-  before invoking the user's handler. Keep `CallContext` injection working
-  orthogonally (Path 1 from the previous session).
-- Add a `request_style: "inline" | "explicit"` field on
-  `MethodInfo` (`bindings/python/aster/service.py`) so downstream code can
-  distinguish.
-
-**Contract-identity equivalence test** — a producer with
-
-```python
-@rpc
-async def get_status(self, agent_id: str) -> StatusResponse: ...
+@Rpc()
+async getStatus(p: GetStatusParams): Promise<StatusResponse> { ... }
 ```
 
-must produce the same `contract_id` for `GetStatusRequest` as
+already enjoys everything Mode 2 would give them. Porting Mode 2 to TS
+would add runtime magic (either `Function.toString()` parsing or
+`reflect-metadata` + experimental decorators) to solve a problem TS
+producers don't actually have. Don't do it.
 
-```python
-@wire_type("mission/GetStatusRequest")
-@dataclass
-class GetStatusRequest:
-    agent_id: str = ""
+## The real TS gap: the `request:` option on `@Rpc` is scaffolding
+
+Today `@Rpc({ request: GetStatusParams })` is required any time a
+producer wants codegen/manifest publication to work, because TS erases
+parameter types at runtime. The decorator has no way to see that the
+handler's first parameter is `GetStatusParams` without being told
+explicitly. That's the one piece of real friction left in the TS
+producer experience — not Mode 2.
+
+```ts
+// Today (TS):
+@Rpc({ request: GetStatusParams, response: StatusResponse })
+async getStatus(p: GetStatusParams): Promise<StatusResponse> { ... }
+
+// What we want (TS):
+@Rpc()
+async getStatus(p: GetStatusParams): Promise<StatusResponse> { ... }
 ```
 
-### 2. Python dispatch layer unpacking
+The runtime can't close this gap — the types are gone. But the codegen
+pipeline doesn't run at runtime; it runs at *build time*, where the
+TypeScript source is still available and the compiler has full type
+information. That's where we should solve it.
 
-`server.py`, `session.py`, and `transport/local.py` currently call
-`invoke_handler_with_ctx(handler_method, request, ctx, accepts_ctx)`. For
-Mode 2 methods, the wire request (the synthesized class) needs to be
-unpacked into positional arguments before calling the user's handler. The
-cleanest place to do this is inside `invoke_handler_with_ctx` by consulting
-`method_info.request_style` — but that requires passing `method_info`
-through, not just `accepts_ctx`. Alternative: install a small adapter
-wrapper around the user's handler at decoration time so the dispatch layer
-doesn't need to know about modes.
+## The fix: TS Compiler API AST extraction in `aster contract gen`
 
-Prefer the adapter-at-decoration-time approach — it keeps dispatch simple
-and means session/local/reactor all benefit without further changes.
+Switch `aster contract gen` (and `gen-client`) to use the TypeScript
+compiler API (`typescript` package, `ts.createProgram` → `TypeChecker`)
+to read producer service classes directly from their `.ts` source
+instead of importing and running them at runtime. This is how
+`nestjs-swagger`, `class-validator-jsonschema`, `ts-json-schema-generator`,
+and `tsoa` build typed metadata without runtime reflection.
 
-### 3. TypeScript mirror
+### How it plumbs together
 
-Same work in `bindings/typescript/packages/aster/src/decorators.ts` +
-`server.ts` + `session.ts` + `transport/local.ts`. Note the TS runtime
-constraints:
+1. **Input** — `aster contract gen --service ./src/services/mission_control.ts:MissionControlService`
+   (or a `tsconfig.json` + class name). The CLI no longer needs to
+   `require()` or `ts-node` the file.
+2. **Compiler setup** — load `tsconfig.json`, build a `ts.Program`,
+   grab the `TypeChecker`.
+3. **Class lookup** — walk the `SourceFile` AST looking for the class
+   decorated with `@Service({...})` whose name matches the requested
+   service.
+4. **Method extraction** — for each `@Rpc`/`@ServerStream`/etc.
+   decorated method on the class:
+   - Read the method's parameters via `TypeChecker.getSignatureFromDeclaration`
+   - For each parameter, resolve its type to a `ts.Type`, walk it, and
+     emit a FieldDef list (primitives → wire type names, refs →
+     `@WireType`-decorated classes already discovered in the program)
+   - Read the return type, unwrap `Promise<T>`/`AsyncGenerator<T>`, and
+     resolve to the response `@WireType` class
+5. **Contract identity** — build the same `ServiceContract` / `TypeDef`
+   graph the Python path already builds in
+   `aster.contract.identity`, compute `contract_id` via the same
+   BLAKE3 hashing pipeline. The hashes **must** match across
+   languages, so the canonical-bytes layer stays shared — only the
+   *introspection front end* is language-specific.
+6. **Manifest output** — write the same JSON manifest shape
+   `cli/aster_cli/contract.py` emits for Python producers. Consumers,
+   codegen, shell, and MCP schema see no difference; they read a
+   manifest and don't care which producer introspection path built it.
 
-- TS erases parameter types at runtime, so Mode 2 detection must rely on
-  something else. Options:
-  - Require an explicit `request?: new (...) => any` in `@Rpc({...})` — if
-    absent, treat as Mode 2 and synthesize from parameter *names* via
-    `Function.toString()` parsing (fragile) or force an explicit
-    `params: { name: "agent_id", type: "string" }[]` option.
-  - Accept that Mode 2 is not viable in TS without a schema hint and
-    document that producers need to use `@Rpc({ request: InlineSchema })`
-    where `InlineSchema` is a class with field declarations.
-- Whichever path: reach alignment with the user before implementing — this
-  is a design decision, not a mechanical port.
+### What this lets us drop
 
-### 4. `aster contract gen` — add `request_style` to the manifest
+- **`request?: new (...) => any` on `@Rpc`** — no longer needed.
+  Producers write `@Rpc()` with typed parameters and the CLI reads
+  the types from source. Keep the option around for one release as
+  a deprecation alias, then delete.
+- **`response?: new (...) => any` on `@Rpc`** — same.
+- **Any runtime fallback that scans `module.__dict__` for
+  `@WireType` classes** — all type discovery moves to build time.
 
-In `cli/aster_cli/contract.py` (the `_build_manifest` / `_method_dict`
-helpers), add a `request_style` field to each method descriptor with value
-`"inline"` or `"explicit"`. For inline mode, also include the parameter
-list (name + wire type) so generated clients can emit matching signatures.
+### What this does NOT change
 
-### 5. `aster contract gen-client` — emit inline or explicit clients
+- The runtime dispatch path. `server.ts` / `session.ts` still read
+  `methodInfo.handler` and invoke it. `acceptsCtx` detection stays on
+  `Function.length`. CallContext injection stays exactly as shipped.
+- The wire format. `contract_id`, type hashes, canonical bytes are
+  unchanged.
+- The Python producer path. Python producers still use the in-process
+  `@service` scan — that's fast and works fine for a dynamically
+  typed language. Only the TS entry point moves to build-time AST.
 
-`cli/aster_cli/codegen.py` (Python client codegen) and
-`cli/aster_cli/codegen_typescript.py` (TS client codegen) must branch on
-`request_style`:
+### Files to touch
 
-- **`"explicit"`** — existing behavior: emit a client method taking the
-  request class.
-- **`"inline"`** — emit a client method with matching inline params that
-  internally constructs the synthesized request object:
+- **New**: `cli/aster_cli/ts_introspect/` — a Python module that
+  shells out to a tiny Node.js/Bun script shipped alongside the CLI.
+  The script imports `typescript`, does the AST walk, and prints a
+  JSON blob describing the service (name, version, methods, types).
+  The Python side parses that JSON and hands it to the existing
+  manifest builder.
+  - Alternative: rewrite `aster contract gen` in TS for the TS code
+    path. More work; probably not worth it right now.
+- **Update**: `cli/aster_cli/contract.py` — add a `--lang ts` / file
+  extension switch that routes to the AST introspector instead of the
+  Python `import-the-service` path.
+- **Update**: `cli/aster_cli/codegen_typescript.py` — no changes
+  needed for this refactor itself; it already reads the manifest
+  JSON, not runtime objects.
+- **Update**: `bindings/typescript/packages/aster/src/decorators.ts`
+  — mark `request` / `response` options as `@deprecated` with a
+  JSDoc note pointing at the new path. Leave them functional for
+  one release so producers can migrate.
+- **Tests**: new integration test under `tests/typescript/` that
+  runs `aster contract gen` against a fixture TS service and
+  asserts the emitted manifest has the right `contract_id`,
+  methods, and fields. Add a cross-language test: the same logical
+  service written in Python vs TS should produce byte-identical
+  `contract_id`.
 
-  ```python
-  async def get_status(self, agent_id: str) -> StatusResponse:
-      return await self._invoke("getStatus", GetStatusRequest(agent_id=agent_id), StatusResponse)
-  ```
+### Why a separate Node script instead of calling TS compiler from Python
 
-### 6. `aster contract preview` — show inline params naturally
+Two reasons:
 
-`_preview_command` in `cli/aster_cli/contract.py` should render inline
-methods as `get_status(agent_id: str) -> StatusResponse` rather than
-`get_status(req: GetStatusRequest) -> StatusResponse`.
+1. **Version alignment.** The TS compiler API matches the version of
+   `typescript` the producer is already using. A Node script can use
+   whatever the producer's `tsconfig.json` + `package.json` pin, so
+   introspection sees the same types the producer's own `tsc` sees.
+   Python vendoring `typescript` would drift.
+2. **Trivial to ship.** The CLI already spawns `bunx tsc` for TS
+   client type-checking in tests. A `bunx tsx ./introspect.ts` call
+   is the same pattern. No new dependency surface for the Python
+   side beyond "there's a `node` or `bun` on PATH for TS producers."
 
-### 7. Shell inspection + call paths — render inline signatures everywhere
+### Order of work
 
-Anywhere the shell or CLI shows a user the shape of a method, the display
-must match what the producer actually wrote. A Mode 2 producer should
-appear as `get_status(agent_id: str)` in every surface, not as an opaque
-`GetStatusRequest` blob. Audit and update:
+1. Write the `introspect.ts` script standalone, against a hand-crafted
+   fixture TS service, and verify the emitted JSON matches what the
+   Python introspection path emits for an equivalent Python service.
+2. Wire it into `aster contract gen` behind a `--lang ts` flag.
+3. Add cross-language `contract_id` equivalence test.
+4. Deprecate `request` / `response` on `@Rpc`.
+5. Update `bindings/typescript/packages/aster/examples/` (if any) and
+   the README to show the new `@Rpc()`-only form.
 
-- **`cli/aster_cli/shell/commands.py`** — the `describe` / `inspect` /
-  `services` commands currently read `metadata.get("request_type", "")`
-  as a string and display it verbatim (see lines ~1182, 1191, 1558).
-  For `request_style == "inline"`, render the param list instead of the
-  synthesized request class name.
-- **`cli/aster_cli/shell/completer.py`** — tab-completion at line ~152
-  uses `request_type` to hint at the next argument; for inline methods it
-  should hint the first unset inline param name and its type.
-- **`cli/aster_cli/shell/app.py`** — the service browser pane (~645,
-  ~1083, ~1094) builds `{"name": request_type, "hash": ...}` entries for
-  the UI. For inline methods this should reflect the synthesized
-  `{Method}Request` for contract-identity purposes **but** the rendered
-  signature must show inline params — these are two separate concerns;
-  don't conflate them.
-- **`cli/aster_cli/shell/invoker.py`** — the call path at line ~28/43
-  builds a `request_fields` list from the manifest. For inline methods
-  it must read the new inline param list (from §4 above) and accept
-  inline positional/keyword arguments at the shell prompt, then construct
-  the synthesized request object before sending the call. A shell user
-  typing `call mission.get_status agent_id=foo` on a Mode 2 method must
-  work identically to calling a Mode 1 method with a single
-  `GetStatusRequest(agent_id="foo")` arg.
-- **`cli/aster_cli/shell/hooks.py`** — `MethodSchema.request_fields` at
-  line ~134/197/202 iterates expected fields to prompt/validate user
-  input. For inline methods the "fields" are the inline params directly;
-  the hook contract doesn't need to change, only the data that feeds it.
-- **`cli/aster_cli/mcp/schema.py`** — the MCP tool schema exposed to
-  external agents must describe inline-style methods with top-level
-  parameters on the tool, not a nested `req` object, so agents generate
-  sensible tool calls.
+### Out of scope
 
-The test for this is simple: take the `MissionControl` service from
-`tests/python/test_codegen_e2e.py`, convert one of its methods to Mode 2,
-and verify that `aster services describe MissionControl` + `aster call
-mission.get_status agent_id=foo` still work end-to-end and show the
-inline signature in all display surfaces.
+- Porting Mode 2 inline request params to TS. Not needed. TS
+  producers write classes.
+- Switching TS decorators from Stage 3 back to experimental so
+  `reflect-metadata` could work. Stage 3 is the right long-term
+  choice; we're solving this at build time instead.
+- Any changes to the Python introspection path — it stays as-is.
 
-## Key files to read first
+## Spec / doc cross-references
 
-- `ffi_spec/handler-context-design.md` — full design (both halves)
-- `ffi_spec/Aster-ContractIdentity.md` §11.3.2.3 — language mapping table
-- `bindings/python/aster/decorators.py` — @rpc decorator; the previous
-  session wired `CallContext` detection here and added `accepts_ctx`
-- `bindings/python/aster/contract/identity.py` — wire-type registration +
-  `contract_id` computation
-- `cli/aster_cli/contract.py` — manifest generation + preview
-- `cli/aster_cli/codegen.py` / `codegen_typescript.py` — current client
-  generators
-
-## Testing
-
-- **Mode 2 dispatch** — Python handler with `(self, agent_id: str)`,
-  Python client calling it, both via `LocalTransport` and `AsterServer`
-- **Mixed params** — `(self, agent_name: str, config: AgentConfig)` where
-  `AgentConfig` is a `@wire_type` class (tests the REF-type path)
-- **No-request** — `(self)` and `(self, ctx: CallContext)` both synthesize
-  an empty `{Method}Request`
-- **Contract-identity equivalence** — compute `contract_id` of an
-  explicit `GetStatusRequest` and of the synthesized one from a
-  Mode 2 handler; assert equal
-- **Wire interop** — a Mode 2 Python producer + an explicit-style Python
-  consumer (using the generated client) must round-trip
-- **Cross-language interop** — Python Mode 2 producer + generated TS
-  client; verify via `tests/python/test_codegen_e2e.py` style
-- Regression: existing tests must not break (1014 passing + 4
-  handler-context tests as of the previous session)
-
-## Commands
-
-```bash
-./scripts/build.sh
-uv run pytest tests/python/ -v --timeout=30
-cd bindings/typescript/packages/aster && bun run test
-```
-
-## What is NOT in scope
-
-- Java / Go / .NET inline params — same reason as before, no method-level
-  dispatch framework to hook into
-- Any changes to `CallContext` itself — that layer is done
+- `ffi_spec/handler-context-design.md` — design for Mode 2 (Python)
+  and CallContext injection (both langs). Mark the TS Mode 2 section
+  as "not pursued — see session-instructions-mode2-inline-params.md"
+  when you get to it.
+- `ffi_spec/Aster-ContractIdentity.md` §11.3.2.3 — language mapping
+  table. The TS AST introspector uses this same table to resolve TS
+  `ts.Type` nodes to wire type names.
+- Commit `7fdbabb` — reference for what Python already has.
