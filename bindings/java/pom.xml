@@ -34,6 +34,7 @@
         <archunit.version>1.4.0</archunit.version>
         <kotlin.version>2.4.0-Beta1</kotlin.version>
         <javapoet.version>0.6.0</javapoet.version>
+        <kotlinpoet.version>1.18.1</kotlinpoet.version>
         <ksp.version>2.1.0-1.0.29</ksp.version>
     </properties>
 
@@ -59,6 +60,16 @@
                 <groupId>com.palantir.javapoet</groupId>
                 <artifactId>javapoet</artifactId>
                 <version>${javapoet.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.squareup</groupId>
+                <artifactId>kotlinpoet</artifactId>
+                <version>${kotlinpoet.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.squareup</groupId>
+                <artifactId>kotlinpoet-ksp</artifactId>
+                <version>${kotlinpoet.version}</version>
             </dependency>
             <dependency>
                 <groupId>com.google.devtools.ksp</groupId>
