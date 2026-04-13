@@ -5,13 +5,18 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import site.aster.client.AsterClient;
 import site.aster.codec.ForyCodec;
 import site.aster.examples.missioncontrol.types.Assignment;
+import site.aster.examples.missioncontrol.types.Command;
+import site.aster.examples.missioncontrol.types.CommandResult;
 import site.aster.examples.missioncontrol.types.Heartbeat;
+import site.aster.examples.missioncontrol.types.IngestResult;
 import site.aster.examples.missioncontrol.types.LogEntry;
+import site.aster.examples.missioncontrol.types.MetricPoint;
 import site.aster.examples.missioncontrol.types.StatusRequest;
 import site.aster.examples.missioncontrol.types.StatusResponse;
 import site.aster.examples.missioncontrol.types.SubmitLogResult;
@@ -165,6 +170,65 @@ final class MissionControlE2ETest {
       assertEquals(1, entries.size());
       assertEquals("boom", entries.get(0).message());
       assertEquals("error", entries.get(0).level());
+    }
+  }
+
+  @Test
+  void clientStreamIngestMetricsRoundTrip() throws Exception {
+    try (Fixture f = Fixture.start()) {
+      List<MetricPoint> points =
+          List.of(
+              new MetricPoint("cpu.user", 0.42d, 1.0d, Map.of("host", "agent-1")),
+              new MetricPoint("cpu.user", 0.48d, 2.0d, Map.of("host", "agent-1")),
+              new MetricPoint("mem.rss", 1024.0d, 3.0d, Map.of("host", "agent-1")));
+
+      IngestResult result =
+          f.client
+              .<MetricPoint, IngestResult>callClientStream(
+                  f.serverAddr,
+                  MissionControlDispatcher.SERVICE_NAME,
+                  "ingestMetrics",
+                  points,
+                  IngestResult.class)
+              .orTimeout(15, TimeUnit.SECONDS)
+              .get();
+
+      assertEquals(3, result.accepted());
+      assertEquals(0, result.dropped());
+
+      List<MetricPoint> stored = f.missionControl.metricsSnapshot();
+      assertEquals(3, stored.size());
+      assertEquals("cpu.user", stored.get(0).name());
+      assertEquals("mem.rss", stored.get(2).name());
+      assertEquals(1024.0d, stored.get(2).value());
+    }
+  }
+
+  @Test
+  void bidiStreamRunCommandPingPong() throws Exception {
+    try (Fixture f = Fixture.start()) {
+      List<Command> cmds =
+          List.of(new Command("ls -l"), new Command("echo hello"), new Command("uptime"));
+
+      List<CommandResult> results =
+          f.client
+              .<Command, CommandResult>callBidiStream(
+                  f.serverAddr,
+                  AgentSessionDispatcher.SERVICE_NAME,
+                  "runCommand",
+                  cmds,
+                  CommandResult.class)
+              .orTimeout(15, TimeUnit.SECONDS)
+              .get();
+
+      assertEquals(3, results.size());
+      assertEquals("ran: ls -l", results.get(0).stdout());
+      assertEquals("ran: echo hello", results.get(1).stdout());
+      assertEquals("ran: uptime", results.get(2).stdout());
+      for (CommandResult r : results) {
+        assertEquals(0, r.exitCode());
+        assertEquals("", r.stderr());
+      }
     }
   }
 

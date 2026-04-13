@@ -160,6 +160,58 @@ public final class AsterClient implements AutoCloseable {
                             doServerStreamCall(stream, service, method, request, responseType)));
   }
 
+  /**
+   * Make a client-streaming RPC call: N request frames out (last marked with {@link
+   * AsterFraming#FLAG_END_STREAM}), one response frame in, then a {@code TRAILER}. The returned
+   * future completes with the single decoded response.
+   *
+   * <p>Buffered shape — all request objects are materialized up front. A streaming variant that
+   * pushes frames as the caller produces them is a later addition.
+   *
+   * @throws IllegalArgumentException if {@code requests} is empty (the wire format requires at
+   *     least one request frame to bootstrap the call delivery)
+   */
+  public <Req, Resp> CompletableFuture<Resp> callClientStream(
+      NodeAddr target,
+      String service,
+      String method,
+      Iterable<Req> requests,
+      Class<Resp> responseType) {
+    return connect(target)
+        .thenCompose(
+            conn ->
+                conn.openBiAsync()
+                    .thenCompose(
+                        stream ->
+                            doClientStreamCall(stream, service, method, requests, responseType)));
+  }
+
+  /**
+   * Make a bidirectional-streaming RPC call: N request frames out (last marked with {@link
+   * AsterFraming#FLAG_END_STREAM}), M response frames in, then a {@code TRAILER}.
+   *
+   * <p>Buffered shape — all requests are sent before any response is read. This is sufficient for
+   * ping-pong style bidi where the server processes the full request stream then emits its response
+   * stream, but it does NOT support true interleaved bidi (where the server starts emitting
+   * responses while the client is still sending requests). True interleaving requires a different
+   * API surface (e.g. a {@code BidiCall} object with explicit {@code send} / {@code complete}
+   * methods plus a {@link java.util.concurrent.Flow.Publisher} for responses) and is open work.
+   */
+  public <Req, Resp> CompletableFuture<List<Resp>> callBidiStream(
+      NodeAddr target,
+      String service,
+      String method,
+      Iterable<Req> requests,
+      Class<Resp> responseType) {
+    return connect(target)
+        .thenCompose(
+            conn ->
+                conn.openBiAsync()
+                    .thenCompose(
+                        stream ->
+                            doBidiStreamCall(stream, service, method, requests, responseType)));
+  }
+
   private <Req, Resp> CompletableFuture<Resp> doCall(
       IrohStream stream, String service, String method, Req request, Class<Resp> responseType) {
     CompletableFuture<Resp> result = new CompletableFuture<>();
@@ -306,6 +358,133 @@ public final class AsterClient implements AutoCloseable {
                   stream.close();
                 } catch (Exception ignored) {
                   // Best-effort — stream may already be closed.
+                }
+                if (err != null) {
+                  result.completeExceptionally(unwrap(err));
+                } else {
+                  result.complete(payloads);
+                }
+              });
+    } catch (Throwable t) {
+      try {
+        stream.close();
+      } catch (Exception ignored) {
+      }
+      result.completeExceptionally(t);
+    }
+    return result;
+  }
+
+  private <Req, Resp> CompletableFuture<Resp> doClientStreamCall(
+      IrohStream stream,
+      String service,
+      String method,
+      Iterable<Req> requests,
+      Class<Resp> responseType) {
+    CompletableFuture<Resp> result = new CompletableFuture<>();
+    try {
+      List<Req> requestList = new ArrayList<>();
+      requests.forEach(requestList::add);
+      if (requestList.isEmpty()) {
+        throw new IllegalArgumentException(
+            "callClientStream requires at least one request frame; the wire format delivers"
+                + " the first frame inline with the call to bootstrap the dispatcher");
+      }
+
+      StreamHeader header =
+          new StreamHeader(
+              service,
+              method,
+              1,
+              0,
+              (short) 0,
+              StreamHeader.SERIALIZATION_XLANG,
+              List.of(),
+              List.of());
+      byte[] headerBytes = headerCodec.encode(header);
+      byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
+
+      ClientFrameReader reader = new ClientFrameReader(stream);
+      CompletableFuture<Void> sendChain = stream.sendAsync(headerFrame);
+      for (int i = 0; i < requestList.size(); i++) {
+        byte[] reqBytes = codec.encode(requestList.get(i));
+        byte flags = (i == requestList.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
+        final byte[] frame = AsterFraming.encodeFrame(reqBytes, flags);
+        sendChain = sendChain.thenCompose(v -> stream.sendAsync(frame));
+      }
+
+      sendChain
+          .thenCompose(v -> stream.finishAsync())
+          .thenCompose(v -> readUntilTrailer(reader, responseType))
+          .whenComplete(
+              (resp, err) -> {
+                try {
+                  stream.close();
+                } catch (Exception ignored) {
+                  // Best-effort.
+                }
+                if (err != null) {
+                  result.completeExceptionally(unwrap(err));
+                } else {
+                  result.complete(resp);
+                }
+              });
+    } catch (Throwable t) {
+      try {
+        stream.close();
+      } catch (Exception ignored) {
+      }
+      result.completeExceptionally(t);
+    }
+    return result;
+  }
+
+  private <Req, Resp> CompletableFuture<List<Resp>> doBidiStreamCall(
+      IrohStream stream,
+      String service,
+      String method,
+      Iterable<Req> requests,
+      Class<Resp> responseType) {
+    CompletableFuture<List<Resp>> result = new CompletableFuture<>();
+    try {
+      List<Req> requestList = new ArrayList<>();
+      requests.forEach(requestList::add);
+      if (requestList.isEmpty()) {
+        throw new IllegalArgumentException(
+            "callBidiStream requires at least one request frame; the wire format delivers"
+                + " the first frame inline with the call to bootstrap the dispatcher");
+      }
+
+      StreamHeader header =
+          new StreamHeader(
+              service,
+              method,
+              1,
+              0,
+              (short) 0,
+              StreamHeader.SERIALIZATION_XLANG,
+              List.of(),
+              List.of());
+      byte[] headerBytes = headerCodec.encode(header);
+      byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
+
+      ClientFrameReader reader = new ClientFrameReader(stream);
+      CompletableFuture<Void> sendChain = stream.sendAsync(headerFrame);
+      for (int i = 0; i < requestList.size(); i++) {
+        byte[] reqBytes = codec.encode(requestList.get(i));
+        byte flags = (i == requestList.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
+        final byte[] frame = AsterFraming.encodeFrame(reqBytes, flags);
+        sendChain = sendChain.thenCompose(v -> stream.sendAsync(frame));
+      }
+
+      sendChain
+          .thenCompose(v -> stream.finishAsync())
+          .thenCompose(v -> collectUntilTrailer(reader, responseType))
+          .whenComplete(
+              (payloads, err) -> {
+                try {
+                  stream.close();
+                } catch (Exception ignored) {
                 }
                 if (err != null) {
                   result.completeExceptionally(unwrap(err));

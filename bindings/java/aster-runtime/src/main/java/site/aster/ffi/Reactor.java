@@ -172,6 +172,28 @@ public final class Reactor implements AutoCloseable {
                   ValueLayout.JAVA_LONG,
                   ValueLayout.JAVA_LONG));
 
+  private static final MethodHandle RECV_FRAME =
+      IrohLibrary.getInstance()
+          .getHandle(
+              "aster_reactor_recv_frame",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT, // return: status code (0/1/2 = ok/eos/timeout, <0 = err)
+                  ValueLayout.JAVA_LONG, // runtime
+                  ValueLayout.JAVA_LONG, // reactor
+                  ValueLayout.JAVA_LONG, // call_id
+                  ValueLayout.JAVA_INT, // timeout_ms
+                  ValueLayout.ADDRESS, // out_payload_ptr (**u8)
+                  ValueLayout.ADDRESS, // out_payload_len (*u32)
+                  ValueLayout.ADDRESS, // out_flags (*u8)
+                  ValueLayout.ADDRESS // out_buffer_id (*u64)
+                  ));
+
+  /** Status codes returned by {@code aster_reactor_recv_frame}. */
+  public static final int RECV_FRAME_OK = 0;
+
+  public static final int RECV_FRAME_END_OF_STREAM = 1;
+  public static final int RECV_FRAME_TIMEOUT = 2;
+
   // ============================================================================
   // Instance state
   // ============================================================================
@@ -302,6 +324,96 @@ public final class Reactor implements AutoCloseable {
       if (status != IrohStatus.OK.code && status != IrohStatus.NOT_FOUND.code) {
         checkStatus(status, "aster_reactor_buffer_release");
       }
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /**
+   * Result of a {@link #recvFrame(long, int)} call. Three terminal cases:
+   *
+   * <ul>
+   *   <li>{@link Ok} — a request frame is available; {@code payload} holds the bytes (already
+   *       copied out of the native buffer; the buffer has been released)
+   *   <li>{@link EndOfStream} — the per-call request channel has been closed by the peer ({@code
+   *       FLAG_END_STREAM} or QUIC EOF) or already drained; the binding should stop calling {@code
+   *       recvFrame} for this call_id
+   *   <li>{@link Timeout} — no frame arrived within {@code timeoutMs}; safe to retry
+   * </ul>
+   */
+  public sealed interface RecvFrame permits RecvFrame.Ok, RecvFrame.EndOfStream, RecvFrame.Timeout {
+    record Ok(byte[] payload, byte flags) implements RecvFrame {}
+
+    record EndOfStream() implements RecvFrame {
+      public static final EndOfStream INSTANCE = new EndOfStream();
+    }
+
+    record Timeout() implements RecvFrame {
+      public static final Timeout INSTANCE = new Timeout();
+    }
+  }
+
+  /**
+   * Pull the next ADDITIONAL request frame for a client-streaming or bidi-streaming call. The first
+   * request frame is delivered inline via {@link #poll}; this method is for SUBSEQUENT frames only.
+   *
+   * <p>Blocks up to {@code timeoutMs} waiting for a frame. {@code timeoutMs == 0} is a non-blocking
+   * try-recv. The returned payload bytes are copied out of the native buffer registry and the
+   * buffer is released before this method returns, so the caller does NOT need to call {@link
+   * #bufferRelease} for the result.
+   *
+   * @return one of {@link RecvFrame.Ok}, {@link RecvFrame.EndOfStream}, {@link RecvFrame.Timeout}
+   * @throws IrohException for transport errors (NOT for end-of-stream or timeout, which are normal
+   *     terminal states surfaced via the result)
+   */
+  public RecvFrame recvFrame(long callId, int timeoutMs) {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment outPayloadPtr = arena.allocate(ValueLayout.ADDRESS);
+      MemorySegment outPayloadLen = arena.allocate(ValueLayout.JAVA_INT);
+      MemorySegment outFlags = arena.allocate(ValueLayout.JAVA_BYTE);
+      MemorySegment outBufferId = arena.allocate(ValueLayout.JAVA_LONG);
+
+      int status =
+          (int)
+              RECV_FRAME.invoke(
+                  runtimeHandle,
+                  handle,
+                  callId,
+                  timeoutMs,
+                  outPayloadPtr,
+                  outPayloadLen,
+                  outFlags,
+                  outBufferId);
+
+      if (status == RECV_FRAME_OK) {
+        MemorySegment payloadAddr = outPayloadPtr.get(ValueLayout.ADDRESS, 0);
+        int payloadLen = outPayloadLen.get(ValueLayout.JAVA_INT, 0);
+        byte flags = outFlags.get(ValueLayout.JAVA_BYTE, 0);
+        long bufferId = outBufferId.get(ValueLayout.JAVA_LONG, 0);
+
+        // Copy the payload out of the native buffer. The buffer registry
+        // owns the storage; we release it here so the caller doesn't have
+        // to track a bufferId.
+        byte[] payload =
+            payloadLen == 0
+                ? new byte[0]
+                : payloadAddr.reinterpret(payloadLen).toArray(ValueLayout.JAVA_BYTE);
+        bufferRelease(bufferId);
+        return new RecvFrame.Ok(payload, flags);
+      }
+      if (status == RECV_FRAME_END_OF_STREAM) {
+        return RecvFrame.EndOfStream.INSTANCE;
+      }
+      if (status == RECV_FRAME_TIMEOUT) {
+        return RecvFrame.Timeout.INSTANCE;
+      }
+      // NOT_FOUND from the FFI layer (call_id unknown or already drained)
+      // is also a terminal end-of-stream from the binding's perspective.
+      if (status == IrohStatus.NOT_FOUND.code) {
+        return RecvFrame.EndOfStream.INSTANCE;
+      }
+      checkStatus(status, "aster_reactor_recv_frame");
+      return RecvFrame.EndOfStream.INSTANCE; // unreachable
     } catch (Throwable t) {
       throw rethrow(t);
     }

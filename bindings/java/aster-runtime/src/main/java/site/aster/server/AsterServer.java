@@ -224,16 +224,31 @@ public final class AsterServer implements AutoCloseable {
             out.fail(t);
           }
         }
-        case ClientStreamDispatcher ignored ->
+        case ClientStreamDispatcher c -> {
+          ReactorRequestStream in = new ReactorRequestStream(reactor, callId, call.request());
+          try {
+            byte[] responseBytes = c.invoke(instance, in, codec, ctx);
+            byte[] responseFrame = AsterFraming.encodeFrame(responseBytes, (byte) 0);
+            byte[] trailerFrame =
+                AsterFraming.encodeFrame(okTrailerBytes(), AsterFraming.FLAG_TRAILER);
+            submitResponse(callId, new CallResponse(responseFrame, trailerFrame));
+          } catch (RpcError e) {
+            submitErrorTrailer(callId, e.code(), e.rpcMessage());
+          } catch (Exception e) {
             submitErrorTrailer(
-                callId,
-                StatusCode.UNIMPLEMENTED,
-                "client-stream dispatch pending — reactor needs multi-frame request delivery");
-        case BidiStreamDispatcher ignored ->
-            submitErrorTrailer(
-                callId,
-                StatusCode.UNIMPLEMENTED,
-                "bidi-stream dispatch pending — reactor needs multi-frame request delivery");
+                callId, StatusCode.INTERNAL, e.getMessage() == null ? "error" : e.getMessage());
+          }
+        }
+        case BidiStreamDispatcher b -> {
+          ReactorRequestStream in = new ReactorRequestStream(reactor, callId, call.request());
+          ReactorResponseStream out = new ReactorResponseStream(reactor, callId, foryHeaderCodec);
+          try {
+            b.invoke(instance, in, codec, ctx, out);
+            out.complete();
+          } catch (Throwable t) {
+            out.fail(t);
+          }
+        }
       }
     } catch (RpcError e) {
       submitErrorTrailer(callId, e.code(), e.rpcMessage());

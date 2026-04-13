@@ -3,8 +3,12 @@ package site.aster.examples.missioncontrol;
 import java.util.concurrent.TimeUnit;
 import site.aster.codec.ForyCodec;
 import site.aster.examples.missioncontrol.types.Assignment;
+import site.aster.examples.missioncontrol.types.Command;
+import site.aster.examples.missioncontrol.types.CommandResult;
 import site.aster.examples.missioncontrol.types.Heartbeat;
+import site.aster.examples.missioncontrol.types.IngestResult;
 import site.aster.examples.missioncontrol.types.LogEntry;
+import site.aster.examples.missioncontrol.types.MetricPoint;
 import site.aster.examples.missioncontrol.types.StatusRequest;
 import site.aster.examples.missioncontrol.types.StatusResponse;
 import site.aster.examples.missioncontrol.types.SubmitLogResult;
@@ -70,6 +74,10 @@ public final class Server {
     codec.fory().register(TailRequest.class, TailRequest.FORY_TAG);
     codec.fory().register(Heartbeat.class, Heartbeat.FORY_TAG);
     codec.fory().register(Assignment.class, Assignment.FORY_TAG);
+    codec.fory().register(MetricPoint.class, MetricPoint.FORY_TAG);
+    codec.fory().register(IngestResult.class, IngestResult.FORY_TAG);
+    codec.fory().register(Command.class, Command.FORY_TAG);
+    codec.fory().register(CommandResult.class, CommandResult.FORY_TAG);
   }
 
   private Server() {}
