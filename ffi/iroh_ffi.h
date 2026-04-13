@@ -947,28 +947,6 @@ int32_t aster_canonical_bytes(const uint8_t *type_name_ptr,
                               uintptr_t *out_len);
 
 /**
- * Encode a frame: `[4-byte LE length][flags][payload]`.
- */
-int32_t aster_frame_encode(const uint8_t *payload_ptr,
-                           uintptr_t payload_len,
-                           uint8_t flags,
-                           uint8_t *out_buf,
-                           uintptr_t *out_len);
-
-/**
- * Decode a frame. Writes payload to `out_payload`, flags byte to `*out_flags`.
- *
- * `*out_payload_len` must be set to the capacity of `out_payload` on entry.
- * On success it is set to the actual payload length.
- * On BUFFER_TOO_SMALL it is set to the required payload size.
- */
-int32_t aster_frame_decode(const uint8_t *data_ptr,
-                           uintptr_t data_len,
-                           uint8_t *out_payload,
-                           uintptr_t *out_payload_len,
-                           uint8_t *out_flags);
-
-/**
  * Compute canonical signing bytes from credential JSON.
  *
  * The JSON must contain a `"kind"` field (`"producer"` or `"consumer"`)
@@ -1216,6 +1194,25 @@ int32_t aster_call_acquire(iroh_runtime_t runtime,
                            aster_call_t *out_call);
 
 /**
+ * Acquire a **streaming** call handle. Unlike `aster_call_acquire`,
+ * this bypasses the per-connection pool entirely and opens a
+ * dedicated multiplexed substream via `CoreConnection::open_bi` —
+ * per `ffi_spec/Aster-multiplexed-streams.md` §3 line 65, "streaming
+ * substreams don't count against any pool." Use this for
+ * server-stream / client-stream / bidi calls.
+ *
+ * The substream is bounded only by the QUIC `max_concurrent_streams`
+ * ceiling. It is closed on `aster_call_release` or `aster_call_discard`.
+ *
+ * `session_id` is not used by this entry point — the binding carries
+ * the session id in the `StreamHeader` it sends itself. Kept out of
+ * the signature to make the "no pool involvement" intent unambiguous.
+ */
+int32_t aster_call_acquire_streaming(iroh_runtime_t runtime,
+                                     iroh_connection_t connection,
+                                     aster_call_t *out_call);
+
+/**
  * Push a frame on a call's request side.
  *
  * `frame_ptr` / `frame_len` point to already-framed bytes (including
@@ -1340,6 +1337,10 @@ int32_t aster_call_unary(iroh_runtime_t runtime,
                          const uint8_t **out_trailer_ptr,
                          uint32_t *out_trailer_len,
                          iroh_buffer_t *out_trailer_buffer);
+
+void aster_probe_reset(void);
+
+int32_t aster_probe_dump_unary_csv(const uint8_t *path_ptr, uint32_t path_len);
 
 /**
  * Create a reactor attached to a node. The reactor starts accepting

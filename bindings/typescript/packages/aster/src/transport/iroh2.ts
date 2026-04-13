@@ -63,6 +63,11 @@ export interface NativeAsterCall {
  *  imported from `@aster-rpc/transport`. */
 export interface AsterCallFactory {
   acquire(conn: NativeConnection, sessionId: number): Promise<NativeAsterCall>;
+  /** Open a dedicated multiplexed substream that bypasses the
+   *  per-connection pool, for streaming RPC patterns. Per
+   *  `ffi_spec/Aster-multiplexed-streams.md` §3 line 65: "streaming
+   *  substreams don't count against any pool." */
+  acquireStreaming(conn: NativeConnection): Promise<NativeAsterCall>;
 }
 
 const RECV_OK = 0;
@@ -147,6 +152,7 @@ class CallDriver {
     private readonly codec: Codec,
   ) {}
 
+  /** Acquire a **unary** call handle through the per-connection pool. */
   static async acquire(
     factory: AsterCallFactory,
     conn: NativeConnection,
@@ -156,6 +162,27 @@ class CallDriver {
     let call: NativeAsterCall;
     try {
       call = await factory.acquire(conn, sessionId);
+    } catch (e) {
+      const acquireErr = StreamAcquireError.tryFrom(e);
+      if (acquireErr) throw acquireErrorToRpcError(acquireErr);
+      throw e;
+    }
+    return new CallDriver(call, codec);
+  }
+
+  /** Acquire a **streaming** call handle on a dedicated substream that
+   *  bypasses the per-connection pool. Use for server-stream /
+   *  client-stream / bidi patterns per spec §3 line 65. The session id
+   *  still ships in the `StreamHeader`; only pool accounting is
+   *  bypassed. */
+  static async acquireStreaming(
+    factory: AsterCallFactory,
+    conn: NativeConnection,
+    codec: Codec,
+  ): Promise<CallDriver> {
+    let call: NativeAsterCall;
+    try {
+      call = await factory.acquireStreaming(conn);
     } catch (e) {
       const acquireErr = StreamAcquireError.tryFrom(e);
       if (acquireErr) throw acquireErrorToRpcError(acquireErr);
@@ -364,10 +391,9 @@ export class IrohTransport2 implements AsterTransport {
     request: unknown,
     opts?: CallOptions,
   ): AsyncIterable<unknown> {
-    const driver = await CallDriver.acquire(
+    const driver = await CallDriver.acquireStreaming(
       this.factory,
       this.conn,
-      this.sessionIdValue,
       this.codec,
     );
     let released = false;
@@ -413,10 +439,9 @@ export class IrohTransport2 implements AsterTransport {
     requests: AsyncIterable<unknown>,
     opts?: CallOptions,
   ): Promise<unknown> {
-    const driver = await CallDriver.acquire(
+    const driver = await CallDriver.acquireStreaming(
       this.factory,
       this.conn,
-      this.sessionIdValue,
       this.codec,
     );
     try {
@@ -524,10 +549,9 @@ class IrohBidiChannel2 implements BidiChannel {
     if (this.acquirePromise !== null) return this.acquirePromise;
 
     this.acquirePromise = (async () => {
-      const driver = await CallDriver.acquire(
+      const driver = await CallDriver.acquireStreaming(
         this.opts.factory,
         this.opts.conn,
-        this.opts.sessionId,
         this.opts.codec,
       );
       try {

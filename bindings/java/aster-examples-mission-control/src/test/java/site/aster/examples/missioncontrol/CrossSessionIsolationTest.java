@@ -7,15 +7,20 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import site.aster.client.AsterClient;
+import site.aster.client.BidiCall;
 import site.aster.client.ClientSession;
 import site.aster.codec.ForyCodec;
 import site.aster.examples.missioncontrol.types.Assignment;
+import site.aster.examples.missioncontrol.types.Command;
+import site.aster.examples.missioncontrol.types.CommandResult;
 import site.aster.examples.missioncontrol.types.Heartbeat;
 import site.aster.examples.missioncontrol.types.StatusRequest;
 import site.aster.examples.missioncontrol.types.StatusResponse;
@@ -247,6 +252,58 @@ final class CrossSessionIsolationTest {
       assertNotSame(a, b, "ClientSession is not value-typed; two handles for the same id are OK");
       assertEquals(a.sessionId(), b.sessionId());
       assertSame(a.connection(), b.connection());
+    }
+  }
+
+  /**
+   * Spec §4.4 regression: a long-running streaming call on a session must not starve concurrent
+   * unary calls on the same session. With default {@code session_pool_size=1}, a naive
+   * implementation would route the streaming call through the single-slot session pool, and
+   * subsequent unary calls would queue on {@code POOL_FULL} until the streaming call drains. Spec
+   * §3 line 65 ("streaming substreams don't count against any pool") requires the client to open
+   * streaming calls on a dedicated substream that bypasses the pool entirely. This test is the
+   * regression gate for that invariant on the Java binding.
+   */
+  @Test
+  void streamingCallDoesNotStarveConcurrentUnaryOnSameSession() throws Exception {
+    try (Fixture f = Fixture.start();
+        ClientSession session =
+            f.client.openSession(f.serverAddr).orTimeout(15, TimeUnit.SECONDS).get()) {
+
+      // Open a bidi streaming call on the same session. Hold it open
+      // (no complete()) so its substream stays alive for the whole
+      // unary fan-out below.
+      try (BidiCall<Command, CommandResult> held =
+          session.<Command, CommandResult>openBidiStream(
+              AgentSessionDispatcher.SERVICE_NAME, "runCommand", CommandResult.class)) {
+        held.send(new Command("ls"));
+        CommandResult first = held.recv();
+        assertNotNull(first);
+
+        // Fire 5 concurrent unary `register` calls on the same session.
+        // Pre-fix these would queue on POOL_FULL because the bidi holds
+        // the single pool slot; the test wait budget would expire and
+        // the assertion below would fail.
+        List<CompletableFuture<Assignment>> futures = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+          futures.add(
+              session.<Heartbeat, Assignment>call(
+                  AgentSessionDispatcher.SERVICE_NAME,
+                  "register",
+                  new Heartbeat("agent-" + i, List.of("cpu"), 0.1d),
+                  Assignment.class));
+        }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0]))
+            .get(5, TimeUnit.SECONDS);
+        for (CompletableFuture<Assignment> fut : futures) {
+          assertNotNull(fut.get());
+        }
+
+        // Drain the held bidi cleanly so the fixture can shut down.
+        held.complete();
+        CommandResult tail = held.recv();
+        assertTrue(tail == null || tail.stdout() != null);
+      }
     }
   }
 

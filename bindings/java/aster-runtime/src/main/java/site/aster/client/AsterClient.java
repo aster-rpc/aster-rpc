@@ -202,7 +202,7 @@ public final class AsterClient implements AutoCloseable {
 
   <Req, Resp> BidiCall<Req, Resp> openBidiStreamOn(
       IrohConnection conn, int sessionId, String service, String method, Class<Resp> responseType) {
-    AsterCall call = acquireOn(conn, sessionId);
+    AsterCall call = acquireStreamingOn(conn);
     try {
       sendStreamHeader(call, sessionId, service, method);
     } catch (Throwable t) {
@@ -275,7 +275,7 @@ public final class AsterClient implements AutoCloseable {
         () -> {
           AsterCall call = null;
           try {
-            call = acquireOn(conn, sessionId);
+            call = acquireStreamingOn(conn);
             sendStreamHeader(call, sessionId, service, method);
             byte[] requestBytes = codec.encode(request);
             call.sendFrame(AsterFraming.encodeFrame(requestBytes, AsterFraming.FLAG_END_STREAM));
@@ -303,7 +303,7 @@ public final class AsterClient implements AutoCloseable {
         () -> {
           AsterCall call = null;
           try {
-            call = acquireOn(conn, sessionId);
+            call = acquireStreamingOn(conn);
             sendStreamHeader(call, sessionId, service, method);
             for (int i = 0; i < requests.size(); i++) {
               byte[] reqBytes = codec.encode(requests.get(i));
@@ -334,7 +334,7 @@ public final class AsterClient implements AutoCloseable {
         () -> {
           AsterCall call = null;
           try {
-            call = acquireOn(conn, sessionId);
+            call = acquireStreamingOn(conn);
             sendStreamHeader(call, sessionId, service, method);
             for (int i = 0; i < requests.size(); i++) {
               byte[] reqBytes = codec.encode(requests.get(i));
@@ -361,6 +361,18 @@ public final class AsterClient implements AutoCloseable {
     // Spec §6: sessionId == 0 selects the SHARED pool for stateless calls; non-zero acquires
     // from (or lazily creates) the per-session pool keyed on this id.
     return AsterCall.acquire(conn.runtime().nativeHandle(), conn.nativeHandle(), sessionId);
+  }
+
+  /**
+   * Acquire a call handle for a <strong>streaming</strong> RPC pattern (server-stream,
+   * client-stream, bidi). Bypasses the per-connection multiplexed-stream pool entirely and opens a
+   * dedicated substream — per {@code ffi_spec/Aster-multiplexed-streams.md} §3 line 65, "streaming
+   * substreams don't count against any pool." Without this bypass, a streaming call would hold a
+   * pool slot and block concurrent unary calls on the same session (spec §4.4). The session id
+   * still ships in the {@code StreamHeader}; only pool accounting is bypassed.
+   */
+  private AsterCall acquireStreamingOn(IrohConnection conn) {
+    return AsterCall.acquireStreaming(conn.runtime().nativeHandle(), conn.nativeHandle());
   }
 
   private void sendStreamHeader(AsterCall call, int sessionId, String service, String method) {

@@ -1417,6 +1417,23 @@ impl CoreConnection {
         self.pool.acquire(key).await
     }
 
+    /// Open a dedicated multiplexed substream that **bypasses the
+    /// per-connection pool**. Intended for streaming calls
+    /// (server-stream, client-stream, bidi) per
+    /// `ffi_spec/Aster-multiplexed-streams.md` §3: "streaming
+    /// substreams don't count against any pool." They're per-call,
+    /// lifetime-bounded by the call's iterator/future, and closed on
+    /// drop — no return-to-pool path. The only ceiling is the QUIC
+    /// `max_concurrent_streams` negotiated with the peer (spec §9).
+    ///
+    /// Callers MUST NOT use this for unary calls — those go through
+    /// `acquire_stream` so they share pooled streams and observe the
+    /// configured pool bounds.
+    pub async fn open_streaming_substream(&self) -> Result<MultiplexedStream> {
+        let (send, recv) = self.inner.open_bi().await?;
+        Ok((CoreSendStream::new(send), CoreRecvStream::new(recv)))
+    }
+
     pub async fn open_bi(&self) -> Result<(CoreSendStream, CoreRecvStream)> {
         let (send, recv) = self.inner.open_bi().await?;
         Ok((CoreSendStream::new(send), CoreRecvStream::new(recv)))

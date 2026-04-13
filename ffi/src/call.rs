@@ -38,7 +38,9 @@ use std::sync::Mutex;
 
 use aster_transport_core::framing::{FLAG_ROW_SCHEMA, FLAG_TRAILER, MAX_FRAME_SIZE};
 use aster_transport_core::pool::{AcquireError, PoolKey};
-use aster_transport_core::{CoreRecvStream, CoreSendStream, MultiplexedStreamHandle};
+use aster_transport_core::{
+    CoreRecvStream, CoreSendStream, MultiplexedStream, MultiplexedStreamHandle,
+};
 
 use crate::{
     iroh_buffer_t, iroh_connection_t, iroh_runtime_t, iroh_status_t, load_runtime, BufferRegistry,
@@ -65,11 +67,44 @@ pub const ASTER_CALL_ERR_PEER_STREAM_LIMIT_TOO_LOW: i32 = -12;
 pub const ASTER_CALL_ERR_STREAM_OPEN_FAILED: i32 = -13;
 pub const ASTER_CALL_ERR_POOL_CLOSED: i32 = -14;
 
+/// The underlying stream for a call. Two shapes per spec §3:
+/// - `Pooled` — a handle into the per-connection `MultiplexedStreamPool`.
+///   Used for unary calls. On drop it returns to the pool (LIFO) unless
+///   poisoned via `discard()`.
+/// - `Streaming` — a dedicated substream that bypasses the pool
+///   entirely. Used for server-stream / client-stream / bidi calls per
+///   spec §3 line 65 ("streaming substreams don't count against any
+///   pool"). On drop it just closes — no return-to-pool path.
+pub(crate) enum CallStream {
+    Pooled(MultiplexedStreamHandle),
+    Streaming(MultiplexedStream),
+}
+
+impl CallStream {
+    fn get(&self) -> &MultiplexedStream {
+        match self {
+            Self::Pooled(h) => h.get(),
+            Self::Streaming(s) => s,
+        }
+    }
+
+    /// Poison-discard semantics. For `Pooled`, frees the pool slot
+    /// without returning the stream (and wakes a waiter with `Retry`).
+    /// For `Streaming`, there's no pool to account against, so the
+    /// stream just drops.
+    fn discard(self) {
+        match self {
+            Self::Pooled(h) => h.discard(),
+            Self::Streaming(_) => { /* drops */ }
+        }
+    }
+}
+
 pub(crate) struct CallState {
-    /// Pool handle for the multiplexed stream this call is using.
-    /// Wrapped in `Mutex<Option<...>>` so that release/discard can
-    /// take ownership and drive the RAII drop semantics.
-    pool_handle: Mutex<Option<MultiplexedStreamHandle>>,
+    /// The multiplexed stream this call is using. Wrapped in
+    /// `Mutex<Option<...>>` so that release/discard can take
+    /// ownership and drive the RAII drop semantics.
+    stream: Mutex<Option<CallStream>>,
 }
 
 // ============================================================================
@@ -89,18 +124,18 @@ pub(crate) static CALL_BUFFERS: once_cell::sync::Lazy<BufferRegistry> =
 // Helpers
 // ============================================================================
 
-/// Borrow the `CoreSendStream` clone for the current pool handle.
+/// Borrow the `CoreSendStream` clone for the current call stream.
 /// Returns `None` if the call has been released/discarded.
 fn clone_send(state: &CallState) -> Option<CoreSendStream> {
-    let guard = state.pool_handle.lock().unwrap();
-    guard.as_ref().map(|h| h.get().0.clone())
+    let guard = state.stream.lock().unwrap();
+    guard.as_ref().map(|s| s.get().0.clone())
 }
 
-/// Borrow the `CoreRecvStream` clone for the current pool handle.
+/// Borrow the `CoreRecvStream` clone for the current call stream.
 /// Returns `None` if the call has been released/discarded.
 fn clone_recv(state: &CallState) -> Option<CoreRecvStream> {
-    let guard = state.pool_handle.lock().unwrap();
-    guard.as_ref().map(|h| h.get().1.clone())
+    let guard = state.stream.lock().unwrap();
+    guard.as_ref().map(|s| s.get().1.clone())
 }
 
 /// Read one wire frame: 4-byte LE length prefix + flags byte + payload.
@@ -199,13 +234,64 @@ pub unsafe extern "C" fn aster_call_acquire(
     match acquired {
         Ok(handle) => {
             let state = CallState {
-                pool_handle: Mutex::new(Some(handle)),
+                stream: Mutex::new(Some(CallStream::Pooled(handle))),
             };
             let id = CALLS.insert(state);
             unsafe { ptr::write(out_call, id) };
             iroh_status_t::IROH_STATUS_OK as i32
         }
         Err(e) => map_acquire_error(e),
+    }
+}
+
+/// Acquire a **streaming** call handle. Unlike `aster_call_acquire`,
+/// this bypasses the per-connection pool entirely and opens a
+/// dedicated multiplexed substream via `CoreConnection::open_bi` —
+/// per `ffi_spec/Aster-multiplexed-streams.md` §3 line 65, "streaming
+/// substreams don't count against any pool." Use this for
+/// server-stream / client-stream / bidi calls.
+///
+/// The substream is bounded only by the QUIC `max_concurrent_streams`
+/// ceiling. It is closed on `aster_call_release` or `aster_call_discard`.
+///
+/// `session_id` is not used by this entry point — the binding carries
+/// the session id in the `StreamHeader` it sends itself. Kept out of
+/// the signature to make the "no pool involvement" intent unambiguous.
+#[no_mangle]
+pub unsafe extern "C" fn aster_call_acquire_streaming(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    out_call: *mut aster_call_t,
+) -> i32 {
+    if out_call.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let conn = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let opened = bridge
+        .runtime
+        .handle()
+        .block_on(async move { conn.open_streaming_substream().await });
+
+    match opened {
+        Ok(stream) => {
+            let state = CallState {
+                stream: Mutex::new(Some(CallStream::Streaming(stream))),
+            };
+            let id = CALLS.insert(state);
+            unsafe { ptr::write(out_call, id) };
+            iroh_status_t::IROH_STATUS_OK as i32
+        }
+        Err(_) => ASTER_CALL_ERR_STREAM_OPEN_FAILED,
     }
 }
 
@@ -356,9 +442,10 @@ pub unsafe extern "C" fn aster_call_release(runtime: iroh_runtime_t, call: aster
     let _ = runtime;
     match CALLS.remove(call) {
         Some(state) => {
-            // Drop the handle. RAII returns the stream to the pool
-            // unless poisoned.
-            let _ = state.pool_handle.lock().unwrap().take();
+            // Drop the stream. For Pooled, RAII returns the stream to
+            // the pool (unless poisoned). For Streaming, the substream
+            // just closes — there's no pool to return to.
+            let _ = state.stream.lock().unwrap().take();
             iroh_status_t::IROH_STATUS_OK as i32
         }
         None => iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
@@ -380,8 +467,8 @@ pub unsafe extern "C" fn aster_call_discard(runtime: iroh_runtime_t, call: aster
     let _ = runtime;
     match CALLS.remove(call) {
         Some(state) => {
-            if let Some(handle) = state.pool_handle.lock().unwrap().take() {
-                handle.discard();
+            if let Some(stream) = state.stream.lock().unwrap().take() {
+                stream.discard();
             }
             iroh_status_t::IROH_STATUS_OK as i32
         }

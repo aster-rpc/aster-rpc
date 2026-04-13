@@ -22,7 +22,9 @@ use pyo3_async_runtimes::tokio::future_into_py;
 
 use aster_transport_core::framing::MAX_FRAME_SIZE;
 use aster_transport_core::pool::{AcquireError, PoolKey};
-use aster_transport_core::{CoreRecvStream, CoreSendStream, MultiplexedStreamHandle};
+use aster_transport_core::{
+    CoreRecvStream, CoreSendStream, MultiplexedStream, MultiplexedStreamHandle,
+};
 
 use crate::error::err_to_py;
 use crate::net::IrohConnection;
@@ -94,10 +96,39 @@ async fn read_one_frame(recv: &CoreRecvStream) -> Result<(Vec<u8>, u8), RecvErr>
     Ok((payload, flags))
 }
 
-/// Client-side per-call handle over a pooled multiplexed bi-stream.
+/// The underlying stream for a call. Two shapes per spec §3:
+/// - `Pooled` — handle into the per-connection `MultiplexedStreamPool`;
+///   used for unary calls; RAII-returns to the pool on drop.
+/// - `Streaming` — dedicated substream opened via `open_bi` that
+///   bypasses the pool entirely; used for server-stream / client-stream
+///   / bidi calls per spec §3 line 65 ("streaming substreams don't
+///   count against any pool"). Closes on drop — no return-to-pool.
+enum CallStream {
+    Pooled(MultiplexedStreamHandle),
+    Streaming(MultiplexedStream),
+}
+
+impl CallStream {
+    fn get(&self) -> &MultiplexedStream {
+        match self {
+            Self::Pooled(h) => h.get(),
+            Self::Streaming(s) => s,
+        }
+    }
+
+    fn discard(self) {
+        match self {
+            Self::Pooled(h) => h.discard(),
+            Self::Streaming(_) => { /* drops */ }
+        }
+    }
+}
+
+/// Client-side per-call handle. Wraps either a pool-backed stream
+/// (unary) or a dedicated streaming substream (server/client/bidi).
 #[pyclass]
 pub struct AsterCall {
-    handle: Arc<StdMutex<Option<MultiplexedStreamHandle>>>,
+    handle: Arc<StdMutex<Option<CallStream>>>,
 }
 
 #[pymethods]
@@ -117,7 +148,35 @@ impl AsterCall {
             let key = pool_key_for(session_id);
             let handle = core.acquire_stream(key).await.map_err(acquire_err_to_py)?;
             Ok(AsterCall {
-                handle: Arc::new(StdMutex::new(Some(handle))),
+                handle: Arc::new(StdMutex::new(Some(CallStream::Pooled(handle)))),
+            })
+        })
+    }
+
+    /// Acquire a **streaming** call handle. Unlike `acquire`, this
+    /// bypasses the per-connection pool entirely and opens a dedicated
+    /// multiplexed substream via `open_bi` — per
+    /// `ffi_spec/Aster-multiplexed-streams.md` §3 line 65, "streaming
+    /// substreams don't count against any pool." Use this for
+    /// server-stream / client-stream / bidi calls; use `acquire` for
+    /// unary.
+    ///
+    /// `session_id` is not used here — the binding carries the session
+    /// id in the `StreamHeader` it sends itself. Kept out of the
+    /// signature to make the "no pool involvement" intent unambiguous.
+    #[staticmethod]
+    fn acquire_streaming<'py>(
+        py: Python<'py>,
+        conn: &IrohConnection,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let core = conn.core_clone();
+        future_into_py(py, async move {
+            let stream = core
+                .open_streaming_substream()
+                .await
+                .map_err(|e| err_to_py(e.to_string()))?;
+            Ok(AsterCall {
+                handle: Arc::new(StdMutex::new(Some(CallStream::Streaming(stream)))),
             })
         })
     }
@@ -201,8 +260,8 @@ impl AsterCall {
             .handle
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("call handle poisoned"))?;
-        if let Some(h) = guard.take() {
-            h.discard();
+        if let Some(s) = guard.take() {
+            s.discard();
         }
         Ok(())
     }
@@ -211,12 +270,12 @@ impl AsterCall {
 impl AsterCall {
     fn clone_send(&self) -> Option<CoreSendStream> {
         let guard = self.handle.lock().ok()?;
-        guard.as_ref().map(|h| h.get().0.clone())
+        guard.as_ref().map(|s| s.get().0.clone())
     }
 
     fn clone_recv(&self) -> Option<CoreRecvStream> {
         let guard = self.handle.lock().ok()?;
-        guard.as_ref().map(|h| h.get().1.clone())
+        guard.as_ref().map(|s| s.get().1.clone())
     }
 }
 

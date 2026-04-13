@@ -374,24 +374,20 @@ describe('multiplexed-streams smoke (Session 1)', () => {
     await s2.close();
   });
 
-  // ── 4. Inter-session parallelism — concurrent server-streams on two
-  //     sessions share the same connection without deadlocking ──────────
+  // ── 4. Intra-session streaming + unary parallelism (spec §4.4) ──────────
   //
-  // Note on scope: spec §4 scenario 4 calls for a streaming call running
-  // in parallel with a unary call on the *same* session. That exposes a
-  // gap in core: with `session_pool_size=1` (the spec default), a
-  // long-running streaming call holds the single session-pool slot, so
-  // concurrent unary calls on the same session queue until it drains.
-  // Spec §3 says "streaming substreams don't count against any pool",
-  // but `CoreConnection::acquire_stream` does not yet distinguish
-  // streaming-vs-unary intent, so the optimisation is unimplemented.
+  // With the default `session_pool_size=1`, a naive implementation would
+  // route streaming calls through the same single-slot pool as unary
+  // calls, so a long-running streaming call on a session would block
+  // concurrent unary calls on the same session. Spec §3 line 65
+  // specifies that streaming substreams bypass the pool entirely —
+  // this test is the regression gate for that guarantee.
   //
-  // This is a core change (not a binding change) and lands in a
-  // follow-up session. For Session 1 we prove the next-best thing:
-  // *inter*-session parallelism — two server-streams running in
-  // parallel on two sessions on the same connection — which exercises
-  // the multiplexed pool's per-session keying without hitting the
-  // intra-session cap.
+  // Shape: hold a bidi channel open, then issue 5 unary calls on the
+  // same session. If streaming counted against the session pool, the
+  // unary calls would queue on POOL_FULL for the full
+  // stream_acquire_timeout and then error. With the bypass they
+  // complete immediately.
 
   it.skipIf(!available)(
     'SESSION: two server-streams run in parallel on two sessions, same connection',
@@ -399,10 +395,23 @@ describe('multiplexed-streams smoke (Session 1)', () => {
       const s1 = await client2!.openSession();
       const s2 = await client2!.openSession();
 
+      // Warm up each session with a sequenced unary so the server
+      // registers them in monotonic-allocation order. Without this,
+      // the two `bidiStream` first-send races in `Promise.all` can
+      // arrive at the server in reverse order, and the later-numbered
+      // session would advance `lastOpenedSessionId` past the
+      // earlier-numbered one, tripping the §7.5 graveyard check. The
+      // spec says "sessions are created on first stream arrival", so
+      // this is correct server behaviour — the test must sequence
+      // first-arrival if it wants inter-session parallelism later.
+      await s1.transport.unary('SessionSmoke', 'bump', { message: 'warmup' });
+      await s2.transport.unary('SessionSmoke', 'bump', { message: 'warmup' });
+
       // Each session has its own SessionSmokeService instance, so its
-      // counter starts at 0. We exercise the bidi pattern in parallel
-      // to prove both sessions' streaming substreams make progress
-      // concurrently without blocking each other.
+      // counter started at 0 and is now 1 after the warmup. We
+      // exercise the bidi pattern in parallel to prove both sessions'
+      // streaming substreams make progress concurrently without
+      // blocking each other.
       const c1 = s1.transport.bidiStream('SessionSmoke', 'bidiEcho');
       const c2 = s2.transport.bidiStream('SessionSmoke', 'bidiEcho');
 
@@ -425,12 +434,56 @@ describe('multiplexed-streams smoke (Session 1)', () => {
       await Promise.all([c1.close(), c2.close()]);
       await Promise.all([r1, r2]);
 
-      // Each session has its own counter, so both start at 1.
-      expect(out1).toEqual(['one:1', 'two:2']);
-      expect(out2).toEqual(['alpha:1', 'beta:2']);
+      // After the warmup bump (counter=1), the bidi messages increment
+      // from 2. Each session has its own counter, so both are at 2.
+      expect(out1).toEqual(['one:2', 'two:3']);
+      expect(out2).toEqual(['alpha:2', 'beta:3']);
 
       await s1.close();
       await s2.close();
+    },
+  );
+
+  // ── 5. Spec §4.4 regression: streaming + unary on the same session ────
+
+  it.skipIf(!available)(
+    'SESSION: streaming call does not block concurrent unary calls on same session (§4.4)',
+    async () => {
+      const session = await client2!.openSession();
+      const transport = session.transport;
+
+      // Open a bidi channel and hold it open without closing so the
+      // streaming substream stays live for the duration of the unary
+      // calls below. If the substream counted against the session
+      // pool (default size 1), every unary acquire would queue on
+      // POOL_FULL and eventually time out.
+      const channel = transport.bidiStream('SessionSmoke', 'bidiEcho');
+      const replies: string[] = [];
+      const reader = (async () => {
+        for await (const item of channel) replies.push((item as { reply: string }).reply);
+      })();
+      await channel.send({ message: 'streaming' });
+
+      // Fire 5 unary calls on the same session concurrently. These
+      // must all complete without being starved by the live bidi
+      // substream.
+      const unaries = await Promise.all(
+        Array.from({ length: 5 }, (_, i) =>
+          transport.unary('SessionSmoke', 'bump', { message: `u${i}` }),
+        ),
+      );
+      // bidiEcho's send consumed counter=1; unary bumps see counters
+      // 2..6, regardless of their dispatch order.
+      const seen = new Set(
+        (unaries as { reply: string }[]).map((r) => Number(r.reply.split(':')[1])),
+      );
+      expect(seen).toEqual(new Set([2, 3, 4, 5, 6]));
+
+      await channel.close();
+      await reader;
+      expect(replies).toEqual(['streaming:1']);
+
+      await session.close();
     },
   );
 });
