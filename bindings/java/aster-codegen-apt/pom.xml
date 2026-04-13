@@ -25,6 +25,18 @@
             <groupId>site.aster</groupId>
             <artifactId>aster-annotations</artifactId>
         </dependency>
+
+        <dependency>
+            <groupId>site.aster</groupId>
+            <artifactId>aster-runtime</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

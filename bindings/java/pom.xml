@@ -49,6 +49,11 @@
                 <artifactId>aster-codegen-core</artifactId>
                 <version>${project.version}</version>
             </dependency>
+            <dependency>
+                <groupId>site.aster</groupId>
+                <artifactId>aster-runtime</artifactId>
+                <version>${project.version}</version>
+            </dependency>
 
             <dependency>
                 <groupId>com.palantir.javapoet</groupId>
