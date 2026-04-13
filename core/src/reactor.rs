@@ -465,11 +465,21 @@ async fn dispatch_one_call(
                             ));
                         }
                         let end = frame.flags & FLAG_END_STREAM != 0;
-                        if let Some(tx) = req_tx_opt.as_ref() {
-                            let _ = tx.send(RequestFrame {
-                                payload: frame.payload,
-                                flags: frame.flags,
-                            });
+                        // An empty FLAG_END_STREAM frame is the
+                        // "no more requests" sentinel — bindings that
+                        // emit it (e.g. Java's BidiCall.complete())
+                        // would otherwise hand the dispatcher a zero
+                        // length payload that decodes to a null
+                        // request. Drop the empty frame and rely on
+                        // the channel close to signal EOS.
+                        let forward = !(end && frame.payload.is_empty());
+                        if forward {
+                            if let Some(tx) = req_tx_opt.as_ref() {
+                                let _ = tx.send(RequestFrame {
+                                    payload: frame.payload,
+                                    flags: frame.flags,
+                                });
+                            }
                         }
                         if end {
                             request_done = true;
