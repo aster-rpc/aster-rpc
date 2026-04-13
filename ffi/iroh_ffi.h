@@ -1293,6 +1293,55 @@ int32_t aster_call_discard(iroh_runtime_t runtime, aster_call_t call);
 int32_t aster_call_buffer_release(iroh_runtime_t runtime, iroh_buffer_t buffer);
 
 /**
+ * Unary fast-path (spec §8). Collapses
+ * `acquire` + `send_frame(header)` + `send_frame(request)` +
+ * `recv_frame(response)` + `recv_frame(trailer)` + `release` into a
+ * single FFI entry point and a single `block_on`. Bindings whose
+ * hot-path is dominated by FFI roundtrips (e.g. Java FFM, where every
+ * `block_on` parks a platform thread) see ~5-6× fewer FFI hops per
+ * unary call.
+ *
+ * `request_pair_ptr` / `request_pair_len` is a single buffer holding
+ * the already-framed StreamHeader frame *concatenated with* the
+ * already-framed request frame:
+ *
+ * ```text
+ *   [4B LE len][1B FLAG_HEADER][header_payload]
+ *   [4B LE len][1B request_flags][request_payload]
+ * ```
+ *
+ * The Rust side writes the whole buffer in one `write_all` so Quinn's
+ * flow control sees one logical write.
+ *
+ * On success, populates four sets of out parameters:
+ * - `out_response_*` — the FIRST non-row-schema response frame on the
+ *   stream, or zero-length if the dispatcher only sent a trailer.
+ * - `out_trailer_*` — the trailer frame's payload (an encoded
+ *   `RpcStatus`). Always populated on success; zero-length if the
+ *   dispatcher sent an empty OK trailer.
+ *
+ * Each populated payload comes with its own buffer id; bindings MUST
+ * call `aster_call_buffer_release` for every non-zero buffer id
+ * returned. Skipped row-schema frames are released internally.
+ *
+ * On error returns the appropriate `ASTER_CALL_ERR_*` (acquire failure)
+ * or `IROH_STATUS_INTERNAL` (transport / framing failure); no out
+ * parameters are populated. The pool slot is freed on every error path.
+ */
+int32_t aster_call_unary(iroh_runtime_t runtime,
+                         iroh_connection_t connection,
+                         uint32_t session_id,
+                         const uint8_t *request_pair_ptr,
+                         uint32_t request_pair_len,
+                         const uint8_t **out_response_ptr,
+                         uint32_t *out_response_len,
+                         uint8_t *out_response_flags,
+                         iroh_buffer_t *out_response_buffer,
+                         const uint8_t **out_trailer_ptr,
+                         uint32_t *out_trailer_len,
+                         iroh_buffer_t *out_trailer_buffer);
+
+/**
  * Create a reactor attached to a node. The reactor starts accepting
  * connections and delivering calls via the SPSC ring.
  *

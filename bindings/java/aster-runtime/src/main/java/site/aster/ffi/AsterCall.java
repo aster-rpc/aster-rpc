@@ -94,6 +94,26 @@ public final class AsterCall implements AutoCloseable {
               FunctionDescriptor.of(
                   ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
 
+  private static final MethodHandle UNARY =
+      IrohLibrary.getInstance()
+          .getHandle(
+              "aster_call_unary",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT, // status
+                  ValueLayout.JAVA_LONG, // runtime
+                  ValueLayout.JAVA_LONG, // connection
+                  ValueLayout.JAVA_INT, // session_id
+                  ValueLayout.ADDRESS, // request_pair_ptr
+                  ValueLayout.JAVA_INT, // request_pair_len
+                  ValueLayout.ADDRESS, // out_response_ptr  (**u8)
+                  ValueLayout.ADDRESS, // out_response_len  (*u32)
+                  ValueLayout.ADDRESS, // out_response_flags(*u8)
+                  ValueLayout.ADDRESS, // out_response_buffer (*u64)
+                  ValueLayout.ADDRESS, // out_trailer_ptr   (**u8)
+                  ValueLayout.ADDRESS, // out_trailer_len   (*u32)
+                  ValueLayout.ADDRESS // out_trailer_buffer (*u64)
+                  ));
+
   private final long runtimeHandle;
   private final long callHandle;
   private volatile boolean finished = false;
@@ -281,6 +301,123 @@ public final class AsterCall implements AutoCloseable {
   @Override
   public void close() {
     discard();
+  }
+
+  /**
+   * Result of {@link #unary}: the (optional) response payload and the trailer payload.
+   *
+   * @param responsePayload the first non-row-schema response data frame's payload bytes, or {@code
+   *     null} if the dispatcher only sent a trailer (typical for error trailers).
+   * @param responseFlags the flags byte from that response frame, or {@code 0} when {@code
+   *     responsePayload} is null.
+   * @param trailerPayload the trailer frame's payload — an encoded {@code RpcStatus}. Empty for a
+   *     clean OK trailer; non-empty for any error trailer or for OK trailers that carry metadata.
+   */
+  public record UnaryResult(byte[] responsePayload, byte responseFlags, byte[] trailerPayload) {}
+
+  /**
+   * Unary fast-path (spec §8). One FFI hop, one tokio {@code block_on}, one QUIC {@code write_all}
+   * on the request side, then a Rust-side loop that drains response frames until the trailer
+   * arrives. Replaces the acquire→send_frame→send_frame→recv_frame→recv_frame→release sequence (6
+   * hops) with a single FFI call.
+   *
+   * @param runtimeHandle the {@code iroh_runtime_t} handle
+   * @param connectionHandle the {@code iroh_connection_t} handle
+   * @param sessionId session id (0 = SHARED pool; non-zero = session-bound pool)
+   * @param requestPair pre-framed bytes — the StreamHeader frame concatenated with the request
+   *     frame (each is {@code [4B LE len][1B flags][payload]})
+   * @return a {@link UnaryResult} populated with the response data frame (if any) and the trailer
+   *     payload
+   * @throws StreamAcquireException if the acquire phase failed (mapped from {@code
+   *     ASTER_CALL_ERR_*})
+   * @throws IrohException for any transport-level failure (write, read, framing)
+   */
+  public static UnaryResult unary(
+      long runtimeHandle, long connectionHandle, int sessionId, byte[] requestPair) {
+    if (requestPair == null || requestPair.length == 0) {
+      throw new IllegalArgumentException("unary requires non-empty pre-framed request bytes");
+    }
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment reqSeg = arena.allocate(requestPair.length);
+      MemorySegment.copy(requestPair, 0, reqSeg, ValueLayout.JAVA_BYTE, 0, requestPair.length);
+
+      MemorySegment outRespPtr = arena.allocate(ValueLayout.ADDRESS);
+      MemorySegment outRespLen = arena.allocate(ValueLayout.JAVA_INT);
+      MemorySegment outRespFlags = arena.allocate(ValueLayout.JAVA_BYTE);
+      MemorySegment outRespBuf = arena.allocate(ValueLayout.JAVA_LONG);
+      MemorySegment outTrailerPtr = arena.allocate(ValueLayout.ADDRESS);
+      MemorySegment outTrailerLen = arena.allocate(ValueLayout.JAVA_INT);
+      MemorySegment outTrailerBuf = arena.allocate(ValueLayout.JAVA_LONG);
+
+      int status =
+          (int)
+              UNARY.invoke(
+                  runtimeHandle,
+                  connectionHandle,
+                  sessionId,
+                  reqSeg,
+                  requestPair.length,
+                  outRespPtr,
+                  outRespLen,
+                  outRespFlags,
+                  outRespBuf,
+                  outTrailerPtr,
+                  outTrailerLen,
+                  outTrailerBuf);
+
+      if (status != IrohStatus.OK.code) {
+        if (status <= ERR_POOL_FULL && status >= ERR_POOL_CLOSED) {
+          throw mapAcquireError(status);
+        }
+        IrohStatus s = IrohStatus.fromCode(status);
+        throw new IrohException(s, "aster_call_unary failed: " + s.name());
+      }
+
+      // Response payload — may be empty.
+      byte[] responsePayload = null;
+      byte responseFlags = outRespFlags.get(ValueLayout.JAVA_BYTE, 0);
+      int respLen = outRespLen.get(ValueLayout.JAVA_INT, 0);
+      long respBuf = outRespBuf.get(ValueLayout.JAVA_LONG, 0);
+      if (respLen > 0) {
+        MemorySegment respAddr = outRespPtr.get(ValueLayout.ADDRESS, 0);
+        responsePayload = respAddr.reinterpret(respLen).toArray(ValueLayout.JAVA_BYTE);
+      }
+      if (respBuf != 0) {
+        releaseBufferStatic(runtimeHandle, respBuf);
+      }
+
+      // Trailer payload — may be empty for a clean OK.
+      byte[] trailerPayload = new byte[0];
+      int trailerLen = outTrailerLen.get(ValueLayout.JAVA_INT, 0);
+      long trailerBuf = outTrailerBuf.get(ValueLayout.JAVA_LONG, 0);
+      if (trailerLen > 0) {
+        MemorySegment trailerAddr = outTrailerPtr.get(ValueLayout.ADDRESS, 0);
+        trailerPayload = trailerAddr.reinterpret(trailerLen).toArray(ValueLayout.JAVA_BYTE);
+      }
+      if (trailerBuf != 0) {
+        releaseBufferStatic(runtimeHandle, trailerBuf);
+      }
+
+      return new UnaryResult(responsePayload, responseFlags, trailerPayload);
+    } catch (RuntimeException | Error e) {
+      throw e;
+    } catch (Throwable t) {
+      throw new IrohException("aster_call_unary threw: " + t.getMessage());
+    }
+  }
+
+  private static void releaseBufferStatic(long runtimeHandle, long bufferId) {
+    try {
+      int status = (int) BUFFER_RELEASE.invoke(runtimeHandle, bufferId);
+      if (status != IrohStatus.OK.code && status != IrohStatus.NOT_FOUND.code) {
+        IrohStatus s = IrohStatus.fromCode(status);
+        throw new IrohException(s, "aster_call_buffer_release failed: " + s.name());
+      }
+    } catch (RuntimeException | Error e) {
+      throw e;
+    } catch (Throwable t) {
+      throw new IrohException("aster_call_buffer_release threw: " + t.getMessage());
+    }
   }
 
   /** Result of a {@link #recvFrame(int)} call. */
