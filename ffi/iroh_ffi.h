@@ -1006,3 +1006,149 @@ int32_t aster_reactor_submit(iroh_runtime_t runtime,
 int32_t aster_reactor_buffer_release(iroh_runtime_t runtime,
                                      aster_reactor_t reactor,
                                      uint64_t buffer);
+
+/* ==========================================================================
+ * Registry FFI (Aster-SPEC.md §11)
+ *
+ * Synchronous pure-function entry points that centralize the resolution
+ * logic (mandatory filters + ranking) and key-schema helpers in Rust so
+ * all language bindings get identical behavior.
+ * ========================================================================== */
+
+/**
+ * Return the current epoch-millis as seen by the Rust runtime. Bindings should
+ * use this instead of language-local clocks so lease freshness checks agree.
+ */
+int64_t aster_registry_now_epoch_ms(void);
+
+/**
+ * Return 1 if the given EndpointLease JSON is fresh within the provided window,
+ * 0 if expired. Negative values indicate an error (see iroh_last_error).
+ */
+int32_t aster_registry_is_fresh(const uint8_t *lease_json_ptr,
+                                uintptr_t lease_json_len,
+                                int32_t lease_duration_s);
+
+/** Return 1 if the health status bytes are READY or DEGRADED, else 0. */
+int32_t aster_registry_is_routable(const uint8_t *status_ptr, uintptr_t status_len);
+
+/**
+ * Apply the 5 mandatory filters and ranking strategy (§11.9) to a JSON array
+ * of EndpointLease objects. Returns a JSON array of ranked survivors (the
+ * top element is the resolved winner) in `out_buf`. On BUFFER_TOO_SMALL,
+ * `*out_len` is set to the required size.
+ *
+ * `opts_json` is a ResolveOptions JSON object; unknown fields are ignored
+ * and sensible defaults are applied for missing fields.
+ */
+int32_t aster_registry_filter_and_rank(const uint8_t *leases_json_ptr,
+                                       uintptr_t leases_json_len,
+                                       const uint8_t *opts_json_ptr,
+                                       uintptr_t opts_json_len,
+                                       uint8_t *out_buf,
+                                       uintptr_t *out_len);
+
+/**
+ * Produce a UTF-8 registry doc key for the given kind. `kind` maps:
+ *   0 = contract_key(arg1)
+ *   1 = version_key(arg1, arg2 parsed as int)
+ *   2 = channel_key(arg1, arg2)
+ *   3 = lease_key(arg1, arg2, arg3)
+ *   4 = lease_prefix(arg1, arg2)
+ *   5 = acl_key(arg1)
+ */
+int32_t aster_registry_key(int32_t kind,
+                           const uint8_t *arg1_ptr, uintptr_t arg1_len,
+                           const uint8_t *arg2_ptr, uintptr_t arg2_len,
+                           const uint8_t *arg3_ptr, uintptr_t arg3_len,
+                           uint8_t *out_buf, uintptr_t *out_len);
+
+/* ==========================================================================
+ * Registry FFI — async doc-backed operations
+ *
+ * These follow the standard event-based op model: each call returns an
+ * operation handle and emits a registry event on completion (kinds 80–84).
+ * Round-robin rotation and stale-seq filtering are persisted on the bridge,
+ * so they survive across calls. ACLs are stored per-doc on the bridge and
+ * are lazily created in open mode on first touch.
+ * ========================================================================== */
+
+/**
+ * Async resolve: pointer lookup → list_leases → seq filter → mandatory filters
+ * → rank. Emits IROH_EVENT_REGISTRY_RESOLVED (80) on completion. Payload is
+ * EndpointLease JSON. If no candidate survives, status is NOT_FOUND.
+ */
+int32_t aster_registry_resolve(iroh_runtime_t runtime,
+                               uint64_t doc,
+                               struct iroh_bytes_t opts_json,
+                               uint64_t user_data,
+                               iroh_operation_t *out_operation);
+
+/**
+ * Publish a lease and/or an artifact in a single op. Pass an empty
+ * iroh_bytes_t for either to skip. `gossip_topic` is a topic handle to
+ * broadcast the corresponding GossipEvent on, or 0 to skip. Emits
+ * IROH_EVENT_REGISTRY_PUBLISHED (81) on completion.
+ */
+int32_t aster_registry_publish(iroh_runtime_t runtime,
+                               uint64_t doc,
+                               struct iroh_bytes_t author_id,
+                               struct iroh_bytes_t lease_json,
+                               struct iroh_bytes_t artifact_json,
+                               struct iroh_bytes_t service,
+                               int32_t version,
+                               struct iroh_bytes_t channel,
+                               uint64_t gossip_topic,
+                               uint64_t user_data,
+                               iroh_operation_t *out_operation);
+
+/**
+ * Renew an existing lease in place: bumps lease_seq + timestamps, updates
+ * health/load, rewrites the row. `load` uses NaN as the sentinel for "no
+ * load reported". Emits IROH_EVENT_REGISTRY_RENEWED (82).
+ */
+int32_t aster_registry_renew_lease(iroh_runtime_t runtime,
+                                   uint64_t doc,
+                                   struct iroh_bytes_t author_id,
+                                   struct iroh_bytes_t service,
+                                   struct iroh_bytes_t contract_id,
+                                   struct iroh_bytes_t endpoint_id,
+                                   struct iroh_bytes_t health,
+                                   float load,
+                                   int32_t lease_duration_s,
+                                   uint64_t gossip_topic,
+                                   uint64_t user_data,
+                                   iroh_operation_t *out_operation);
+
+/**
+ * Add an author to the per-doc registry ACL writer set, persisting the
+ * updated list to the doc under _aster/acl/writers. Emits
+ * IROH_EVENT_REGISTRY_ACL_UPDATED (83).
+ */
+int32_t aster_registry_acl_add_writer(iroh_runtime_t runtime,
+                                      uint64_t doc,
+                                      struct iroh_bytes_t author_id,
+                                      struct iroh_bytes_t writer_id,
+                                      uint64_t user_data,
+                                      iroh_operation_t *out_operation);
+
+/**
+ * Remove an author from the per-doc registry ACL writer set and persist the
+ * updated list. Emits IROH_EVENT_REGISTRY_ACL_UPDATED (83).
+ */
+int32_t aster_registry_acl_remove_writer(iroh_runtime_t runtime,
+                                         uint64_t doc,
+                                         struct iroh_bytes_t author_id,
+                                         struct iroh_bytes_t writer_id,
+                                         uint64_t user_data,
+                                         iroh_operation_t *out_operation);
+
+/**
+ * List the current writer set for the per-doc registry ACL. Emits
+ * IROH_EVENT_REGISTRY_ACL_LISTED (84). Payload is a JSON array of AuthorId
+ * strings; empty if the ACL is still in open mode.
+ */
+int32_t aster_registry_acl_list_writers(iroh_runtime_t runtime,
+                                        uint64_t doc,
+                                        uint64_t user_data,
+                                        iroh_operation_t *out_operation);

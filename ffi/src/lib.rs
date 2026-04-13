@@ -148,6 +148,13 @@ pub enum iroh_event_kind_t {
     // Aster custom-ALPN (Phase 1e)
     IROH_EVENT_ASTER_ACCEPTED = 65,
 
+    // Registry (§11.9 — async doc-backed ops)
+    IROH_EVENT_REGISTRY_RESOLVED = 80,
+    IROH_EVENT_REGISTRY_PUBLISHED = 81,
+    IROH_EVENT_REGISTRY_RENEWED = 82,
+    IROH_EVENT_REGISTRY_ACL_UPDATED = 83,
+    IROH_EVENT_REGISTRY_ACL_LISTED = 84,
+
     // Generic
     IROH_EVENT_STRING_RESULT = 90,
     IROH_EVENT_BYTES_RESULT = 91,
@@ -488,6 +495,15 @@ pub(crate) struct BridgeRuntime {
 
     // Endpoint secret keys: keyed by endpoint handle, stores the 32-byte secret key seed
     endpoint_secret_keys: Mutex<HashMap<iroh_endpoint_t, Vec<u8>>>,
+
+    // Registry resolution state (§11.9): persistent round-robin counters + monotonic
+    // lease_seq cache, shared across every aster_registry_resolve call so rotation
+    // and stale rejection survive call boundaries.
+    registry_state: aster_transport_core::registry::ResolveState,
+
+    // Per-doc RegistryAcl, keyed by doc handle. Lazily created in open mode on first
+    // touch via `registry_acl_for_doc`.
+    registry_acls: Mutex<HashMap<u64, Arc<aster_transport_core::registry::RegistryAcl>>>,
 }
 
 struct OperationState {
@@ -533,6 +549,8 @@ impl BridgeRuntime {
             doc_event_receivers: HandleRegistry::new(),
             buffers: BufferRegistry::new(),
             endpoint_secret_keys: Mutex::new(HashMap::new()),
+            registry_state: aster_transport_core::registry::ResolveState::new(),
+            registry_acls: Mutex::new(HashMap::new()),
         })
     }
 
@@ -595,6 +613,25 @@ impl BridgeRuntime {
         };
         let id = self.operations.insert(op);
         (id, cancelled)
+    }
+
+    /// Return the per-doc RegistryAcl, lazily creating one in open mode on first
+    /// touch. Returns the same Arc on subsequent calls so add/remove writer state
+    /// persists for the life of the bridge.
+    fn registry_acl_for_doc(&self, doc: u64) -> Arc<aster_transport_core::registry::RegistryAcl> {
+        let mut guard = self.registry_acls.lock().unwrap();
+        guard
+            .entry(doc)
+            .or_insert_with(|| Arc::new(aster_transport_core::registry::RegistryAcl::new()))
+            .clone()
+    }
+
+    /// Return the per-doc RegistryAcl if one has been created, without creating one.
+    fn registry_acl_lookup(
+        &self,
+        doc: u64,
+    ) -> Option<Arc<aster_transport_core::registry::RegistryAcl>> {
+        self.registry_acls.lock().unwrap().get(&doc).cloned()
     }
 
     fn cancel_operation(&self, op_id: u64) -> bool {
@@ -6486,4 +6523,811 @@ pub fn run_soak_test(duration_secs: u64) {
     assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
     println!("Soak test PASSED — no leaks detected");
+}
+
+// ============================================================================
+// Registry FFI — centralized filter + rank logic (§11.9)
+//
+// These are synchronous pure-function FFI entry points that take JSON input
+// and return JSON output. All language bindings use their existing doc-read
+// FFI to fetch lease entries, then call into this layer to apply the
+// mandatory filters and ranking strategy, so there is exactly one copy of the
+// resolution logic across all five bindings.
+//
+// Async doc-read + publish integrations are available on the Rust core
+// (`core::registry::resolve`, `publish_lease`, `publish_artifact`,
+// `renew_lease`) and will be exposed through the event-based FFI model in a
+// follow-up pass.
+// ============================================================================
+
+/// Return the current wall-clock epoch-millis as seen by the Rust runtime.
+/// Single shared clock across all bindings prevents time-skew in lease freshness checks.
+#[no_mangle]
+pub unsafe extern "C" fn aster_registry_now_epoch_ms() -> i64 {
+    aster_transport_core::registry::now_epoch_ms()
+}
+
+/// Report whether a lease is still fresh given the lease duration window.
+/// `lease_json` is a single EndpointLease JSON object.
+/// Returns 1 = fresh, 0 = expired, negative = error (see set_last_error).
+#[no_mangle]
+pub unsafe extern "C" fn aster_registry_is_fresh(
+    lease_json_ptr: *const u8,
+    lease_json_len: usize,
+    lease_duration_s: i32,
+) -> i32 {
+    if lease_json_ptr.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let bytes = slice::from_raw_parts(lease_json_ptr, lease_json_len);
+    let lease: aster_transport_core::registry::EndpointLease = match serde_json::from_slice(bytes) {
+        Ok(l) => l,
+        Err(e) => return set_last_error(format!("invalid EndpointLease JSON: {e}")),
+    };
+    if lease.is_fresh(lease_duration_s) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Report whether a health status string is routable (READY or DEGRADED).
+/// `status_json` is a UTF-8 string (not JSON-quoted).
+#[no_mangle]
+pub unsafe extern "C" fn aster_registry_is_routable(
+    status_ptr: *const u8,
+    status_len: usize,
+) -> i32 {
+    if status_ptr.is_null() {
+        return 0;
+    }
+    let bytes = slice::from_raw_parts(status_ptr, status_len);
+    match std::str::from_utf8(bytes) {
+        Ok(s) => {
+            if aster_transport_core::registry::is_routable(s) {
+                1
+            } else {
+                0
+            }
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Apply mandatory filters + ranking to a list of EndpointLease JSON objects.
+///
+/// Input:
+/// - `leases_json`: a JSON array of EndpointLease objects.
+/// - `opts_json`: a ResolveOptions JSON object with fields:
+///   service (string), version (int|null), channel (string|null),
+///   contract_id (string|null), strategy (string), caller_alpn (string),
+///   caller_serialization_modes (array), caller_policy_realm (string|null),
+///   lease_duration_s (int).
+///
+/// Output (written to `out_buf`): a JSON array of EndpointLease objects in
+/// ranked order. The top element is the resolved winner. If the output buffer
+/// is too small, returns `BUFFER_TOO_SMALL` and sets `*out_len` to the
+/// required size.
+///
+/// Note: the round-robin rotation state is reset on every call (stateless).
+/// Stateful multi-call round-robin will be added when the async resolve FFI
+/// lands; for now, bindings should maintain their own rotation counter or
+/// accept per-call randomization.
+#[no_mangle]
+pub unsafe extern "C" fn aster_registry_filter_and_rank(
+    leases_json_ptr: *const u8,
+    leases_json_len: usize,
+    opts_json_ptr: *const u8,
+    opts_json_len: usize,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if leases_json_ptr.is_null() || opts_json_ptr.is_null() || out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let leases_bytes = slice::from_raw_parts(leases_json_ptr, leases_json_len);
+    let opts_bytes = slice::from_raw_parts(opts_json_ptr, opts_json_len);
+
+    let leases: Vec<aster_transport_core::registry::EndpointLease> =
+        match serde_json::from_slice(leases_bytes) {
+            Ok(v) => v,
+            Err(e) => return set_last_error(format!("invalid leases JSON: {e}")),
+        };
+
+    let opts_val: serde_json::Value = match serde_json::from_slice(opts_bytes) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(format!("invalid ResolveOptions JSON: {e}")),
+    };
+    let obj = match opts_val.as_object() {
+        Some(o) => o,
+        None => return set_last_error("ResolveOptions must be a JSON object"),
+    };
+    let get_str = |k: &str| obj.get(k).and_then(|v| v.as_str()).map(String::from);
+    let get_i32 = |k: &str| obj.get(k).and_then(|v| v.as_i64()).map(|v| v as i32);
+    let get_str_list = |k: &str| {
+        obj.get(k)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_str().map(String::from))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default()
+    };
+    let opts = aster_transport_core::registry::ResolveOptions {
+        service: get_str("service").unwrap_or_default(),
+        version: get_i32("version"),
+        channel: get_str("channel"),
+        contract_id: get_str("contract_id"),
+        strategy: get_str("strategy").unwrap_or_else(|| "round_robin".to_string()),
+        caller_alpn: get_str("caller_alpn").unwrap_or_else(|| "aster/1".to_string()),
+        caller_serialization_modes: {
+            let v = get_str_list("caller_serialization_modes");
+            if v.is_empty() {
+                vec!["fory-xlang".to_string()]
+            } else {
+                v
+            }
+        },
+        caller_policy_realm: get_str("caller_policy_realm"),
+        lease_duration_s: get_i32("lease_duration_s").unwrap_or(45),
+    };
+
+    let filtered = aster_transport_core::registry::apply_mandatory_filters(leases, &opts);
+    let state = aster_transport_core::registry::ResolveState::new();
+    let cid = opts.contract_id.clone().unwrap_or_else(|| "_".to_string());
+    let ranked = state.rank(filtered, &opts.strategy, &cid);
+
+    match serde_json::to_vec(&ranked) {
+        Ok(bytes) => write_to_caller_buf(&bytes, out_buf, out_len) as i32,
+        Err(e) => set_last_error(format!("failed to encode ranked leases: {e}")),
+    }
+}
+
+/// Return one of the registry key-schema strings by kind, for all bindings to share.
+///
+/// `kind` values:
+///   0 = contract_key(arg1)
+///   1 = version_key(arg1, arg2 as int)
+///   2 = channel_key(arg1, arg2)
+///   3 = lease_key(arg1, arg2, arg3)
+///   4 = lease_prefix(arg1, arg2)
+///   5 = acl_key(arg1)
+///
+/// `arg1/arg2/arg3` are UTF-8 strings. For version_key, arg2 must parse as i32.
+#[no_mangle]
+pub unsafe extern "C" fn aster_registry_key(
+    kind: i32,
+    arg1_ptr: *const u8,
+    arg1_len: usize,
+    arg2_ptr: *const u8,
+    arg2_len: usize,
+    arg3_ptr: *const u8,
+    arg3_len: usize,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let read = |ptr: *const u8, len: usize| -> Result<&str, i32> {
+        if ptr.is_null() && len != 0 {
+            return Err(iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+        }
+        let s = if len == 0 {
+            ""
+        } else {
+            match std::str::from_utf8(slice::from_raw_parts(ptr, len)) {
+                Ok(s) => s,
+                Err(e) => return Err(set_last_error(format!("invalid UTF-8: {e}"))),
+            }
+        };
+        Ok(s)
+    };
+    let a1 = match read(arg1_ptr, arg1_len) {
+        Ok(s) => s,
+        Err(s) => return s,
+    };
+    let a2 = match read(arg2_ptr, arg2_len) {
+        Ok(s) => s,
+        Err(s) => return s,
+    };
+    let a3 = match read(arg3_ptr, arg3_len) {
+        Ok(s) => s,
+        Err(s) => return s,
+    };
+
+    let key_bytes: Vec<u8> = match kind {
+        0 => aster_transport_core::registry::contract_key(a1),
+        1 => {
+            let v: i32 = match a2.parse() {
+                Ok(n) => n,
+                Err(e) => return set_last_error(format!("version must be int: {e}")),
+            };
+            aster_transport_core::registry::version_key(a1, v)
+        }
+        2 => aster_transport_core::registry::channel_key(a1, a2),
+        3 => aster_transport_core::registry::lease_key(a1, a2, a3),
+        4 => aster_transport_core::registry::lease_prefix(a1, a2),
+        5 => aster_transport_core::registry::acl_key(a1),
+        _ => return set_last_error(format!("unknown key kind: {kind}")),
+    };
+
+    write_to_caller_buf(&key_bytes, out_buf, out_len) as i32
+}
+
+// ============================================================================
+// Registry FFI — async doc-backed operations (§11.8 / §11.9)
+//
+// These operations follow the standard event-based FFI model:
+//   1. Caller invokes the function, gets back an operation handle.
+//   2. The op runs on the bridge tokio runtime.
+//   3. On completion the bridge emits an event which the caller drains via
+//      `iroh_event_recv`. The event payload (when present) is JSON.
+//
+// Round-robin rotation and stale-seq rejection are persistent across calls
+// because all ops share `bridge.registry_state`. Per-doc ACLs are stored on
+// the bridge keyed by doc handle and survive until the doc is freed.
+// ============================================================================
+
+fn parse_resolve_options_json(
+    bytes: &[u8],
+) -> Result<aster_transport_core::registry::ResolveOptions, String> {
+    let val: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("invalid ResolveOptions JSON: {e}"))?;
+    let obj = val
+        .as_object()
+        .ok_or_else(|| "ResolveOptions must be a JSON object".to_string())?;
+    let get_str = |k: &str| obj.get(k).and_then(|v| v.as_str()).map(String::from);
+    let get_i32 = |k: &str| obj.get(k).and_then(|v| v.as_i64()).map(|v| v as i32);
+    let get_str_list = |k: &str| {
+        obj.get(k)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_str().map(String::from))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default()
+    };
+    Ok(aster_transport_core::registry::ResolveOptions {
+        service: get_str("service").unwrap_or_default(),
+        version: get_i32("version"),
+        channel: get_str("channel"),
+        contract_id: get_str("contract_id"),
+        strategy: get_str("strategy").unwrap_or_else(|| "round_robin".to_string()),
+        caller_alpn: get_str("caller_alpn").unwrap_or_else(|| "aster/1".to_string()),
+        caller_serialization_modes: {
+            let v = get_str_list("caller_serialization_modes");
+            if v.is_empty() {
+                vec!["fory-xlang".to_string()]
+            } else {
+                v
+            }
+        },
+        caller_policy_realm: get_str("caller_policy_realm"),
+        lease_duration_s: get_i32("lease_duration_s").unwrap_or(45),
+    })
+}
+
+/// Async resolve: pointer lookup → list_leases → seq filter → mandatory filters → rank.
+///
+/// Inputs:
+/// - `doc`: a doc handle previously returned by `iroh_doc_create` / `iroh_doc_join`.
+/// - `opts_json`: ResolveOptions JSON (same shape as `aster_registry_filter_and_rank`).
+///
+/// On success emits `IROH_EVENT_REGISTRY_RESOLVED`. The event payload is the JSON
+/// of the winning EndpointLease, or empty with `IROH_STATUS_NOT_FOUND` if no
+/// candidate survived the filters.
+#[no_mangle]
+pub unsafe extern "C" fn aster_registry_resolve(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    opts_json: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let opts_bytes = unsafe { read_bytes(&opts_json) };
+    let opts = match parse_resolve_options_json(&opts_bytes) {
+        Ok(o) => o,
+        Err(e) => return set_last_error(e),
+    };
+    let acl = bridge.registry_acl_lookup(doc);
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        let result = aster_transport_core::registry::resolve(
+            &doc_arc,
+            &bridge2.registry_state,
+            &opts,
+            acl.as_deref(),
+        )
+        .await;
+
+        match result {
+            Ok(Some(lease)) => match serde_json::to_vec(&lease) {
+                Ok(bytes) => {
+                    let event = EventInternal::new(
+                        iroh_event_kind_t::IROH_EVENT_REGISTRY_RESOLVED,
+                        iroh_status_t::IROH_STATUS_OK,
+                        op_id,
+                        doc,
+                        0,
+                        user_data,
+                        0,
+                    );
+                    bridge2.emit_with_data(event, bytes);
+                }
+                Err(e) => {
+                    bridge2.emit_error(op_id, user_data, &format!("encode lease: {e}"));
+                }
+            },
+            Ok(None) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_REGISTRY_RESOLVED,
+                    iroh_status_t::IROH_STATUS_NOT_FOUND,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Publish a lease and/or an artifact in a single op.
+///
+/// Either or both of `lease_json` / `artifact_json` may be provided (pass an
+/// empty `iroh_bytes_t` to skip). For artifact publication, `service` and
+/// `version` must be set; `channel` is optional. `gossip_topic` is a topic
+/// handle to broadcast the corresponding GossipEvent on, or 0 to skip.
+///
+/// Emits `IROH_EVENT_REGISTRY_PUBLISHED` on success.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn aster_registry_publish(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    author_id: iroh_bytes_t,
+    lease_json: iroh_bytes_t,
+    artifact_json: iroh_bytes_t,
+    service: iroh_bytes_t,
+    version: i32,
+    channel: iroh_bytes_t,
+    gossip_topic: u64,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let author = match unsafe { read_string(&author_id) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let lease_bytes = unsafe { read_bytes(&lease_json) };
+    let artifact_bytes = unsafe { read_bytes(&artifact_json) };
+
+    let lease: Option<aster_transport_core::registry::EndpointLease> = if lease_bytes.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice(&lease_bytes) {
+            Ok(l) => Some(l),
+            Err(e) => return set_last_error(format!("invalid EndpointLease JSON: {e}")),
+        }
+    };
+
+    let artifact: Option<aster_transport_core::registry::ArtifactRef> = if artifact_bytes.is_empty()
+    {
+        None
+    } else {
+        match serde_json::from_slice(&artifact_bytes) {
+            Ok(a) => Some(a),
+            Err(e) => return set_last_error(format!("invalid ArtifactRef JSON: {e}")),
+        }
+    };
+
+    if lease.is_none() && artifact.is_none() {
+        return set_last_error("aster_registry_publish: both lease and artifact are empty");
+    }
+
+    let service_str = match unsafe { read_string(&service) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let channel_str = match unsafe { read_bytes_opt(&channel) } {
+        Some(b) => match String::from_utf8(b) {
+            Ok(s) => Some(s),
+            Err(e) => return set_last_error(format!("invalid channel UTF-8: {e}")),
+        },
+        None => None,
+    };
+
+    let topic = if gossip_topic == 0 {
+        None
+    } else {
+        bridge.gossip_topics.get(gossip_topic)
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        if let Some(ref lease) = lease {
+            if let Err(e) = aster_transport_core::registry::publish_lease(
+                &doc_arc,
+                &author,
+                lease,
+                topic.as_deref(),
+            )
+            .await
+            {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+                return;
+            }
+        }
+
+        if let Some(ref artifact) = artifact {
+            if let Err(e) = aster_transport_core::registry::publish_artifact(
+                &doc_arc,
+                &author,
+                artifact,
+                &service_str,
+                version,
+                channel_str.as_deref(),
+                topic.as_deref(),
+            )
+            .await
+            {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+                return;
+            }
+        }
+
+        bridge2.emit_simple(
+            iroh_event_kind_t::IROH_EVENT_REGISTRY_PUBLISHED,
+            iroh_status_t::IROH_STATUS_OK,
+            op_id,
+            doc,
+            gossip_topic,
+            user_data,
+            0,
+        );
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Renew an existing lease in place. Reads the current row, bumps lease_seq +
+/// timestamps, updates health/load, rewrites it.
+///
+/// `load` uses NaN as a sentinel for "no load reported".
+/// Emits `IROH_EVENT_REGISTRY_RENEWED` on success.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn aster_registry_renew_lease(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    author_id: iroh_bytes_t,
+    service: iroh_bytes_t,
+    contract_id: iroh_bytes_t,
+    endpoint_id: iroh_bytes_t,
+    health: iroh_bytes_t,
+    load: f32,
+    lease_duration_s: i32,
+    gossip_topic: u64,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let author = match unsafe { read_string(&author_id) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let service_str = match unsafe { read_string(&service) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let cid = match unsafe { read_string(&contract_id) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let eid = match unsafe { read_string(&endpoint_id) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let health_str = match unsafe { read_string(&health) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let load_opt = if load.is_nan() { None } else { Some(load) };
+
+    let topic = if gossip_topic == 0 {
+        None
+    } else {
+        bridge.gossip_topics.get(gossip_topic)
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match aster_transport_core::registry::renew_lease(
+            &doc_arc,
+            &author,
+            &service_str,
+            &cid,
+            &eid,
+            &health_str,
+            load_opt,
+            lease_duration_s,
+            topic.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_REGISTRY_RENEWED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    gossip_topic,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Add an author to the per-doc registry ACL writer set, persisting it to the
+/// doc under `_aster/acl/writers`. Switches the ACL out of open mode if it was
+/// in open mode. Emits `IROH_EVENT_REGISTRY_ACL_UPDATED` on success.
+#[no_mangle]
+pub unsafe extern "C" fn aster_registry_acl_add_writer(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    author_id: iroh_bytes_t,
+    writer_id: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    aster_registry_acl_mutate_writer(
+        runtime,
+        doc,
+        author_id,
+        writer_id,
+        user_data,
+        out_operation,
+        true,
+    )
+}
+
+/// Remove an author from the per-doc registry ACL writer set and persist the
+/// updated list. Emits `IROH_EVENT_REGISTRY_ACL_UPDATED` on success.
+#[no_mangle]
+pub unsafe extern "C" fn aster_registry_acl_remove_writer(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    author_id: iroh_bytes_t,
+    writer_id: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    aster_registry_acl_mutate_writer(
+        runtime,
+        doc,
+        author_id,
+        writer_id,
+        user_data,
+        out_operation,
+        false,
+    )
+}
+
+unsafe fn aster_registry_acl_mutate_writer(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    author_id: iroh_bytes_t,
+    writer_id: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+    add: bool,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let author = match unsafe { read_string(&author_id) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let writer = match unsafe { read_string(&writer_id) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let acl = bridge.registry_acl_for_doc(doc);
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        let result = if add {
+            acl.add_writer(&doc_arc, &author, &writer).await
+        } else {
+            acl.remove_writer(&doc_arc, &author, &writer).await
+        };
+
+        match result {
+            Ok(()) => {
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_REGISTRY_ACL_UPDATED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// List the current writer set for the per-doc registry ACL.
+///
+/// Emits `IROH_EVENT_REGISTRY_ACL_LISTED`. The event payload is a JSON array
+/// of AuthorId strings. If the ACL is in open mode (no writers added yet),
+/// the array is empty.
+#[no_mangle]
+pub unsafe extern "C" fn aster_registry_acl_list_writers(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    if bridge.docs.get(doc).is_none() {
+        return iroh_status_t::IROH_STATUS_NOT_FOUND as i32;
+    }
+
+    let acl = bridge.registry_acl_for_doc(doc);
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        let writers = acl.writers();
+        match serde_json::to_vec(&writers) {
+            Ok(bytes) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_REGISTRY_ACL_LISTED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, bytes);
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &format!("encode writers: {e}"));
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
 }
