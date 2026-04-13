@@ -7,6 +7,7 @@ import com.aster.ffi.IrohEventKind;
 import com.aster.ffi.IrohException;
 import com.aster.ffi.IrohLibrary;
 import com.aster.ffi.IrohStatus;
+import com.aster.gossip.IrohGossip;
 import com.aster.handle.IrohConnection;
 import com.aster.handle.IrohRuntime;
 import com.aster.tags.IrohTags;
@@ -221,13 +222,22 @@ public class IrohNode implements AutoCloseable {
     return new Docs(runtime, nodeHandle);
   }
 
-  /** Package-private accessor for the runtime. */
-  IrohRuntime runtime() {
+  /**
+   * Get the gossip pub-sub operations for this node.
+   *
+   * @return the IrohGossip instance
+   */
+  public IrohGossip gossip() {
+    return new IrohGossip(runtime, nodeHandle);
+  }
+
+  /** Accessor for the runtime. */
+  public IrohRuntime runtime() {
     return runtime;
   }
 
-  /** Package-private accessor for the node handle. */
-  long nodeHandle() {
+  /** Accessor for the native node handle. */
+  public long nodeHandle() {
     return nodeHandle;
   }
 
