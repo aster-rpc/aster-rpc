@@ -1,6 +1,7 @@
 pub mod canonical;
 pub mod contract;
 pub mod framing;
+pub mod pool;
 pub mod reactor;
 pub mod registry;
 pub mod ring;
