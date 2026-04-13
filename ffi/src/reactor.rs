@@ -535,10 +535,14 @@ pub unsafe extern "C" fn aster_reactor_submit(
         unsafe { std::slice::from_raw_parts(trailer_ptr, trailer_len as usize).to_vec() }
     };
 
-    if !response_frame.is_empty() {
-        let _ = sender.send(OutgoingFrame::Frame(response_frame));
-    }
-    let _ = sender.send(OutgoingFrame::Trailer(trailer_frame));
+    // Unary fast-path (mirrors the client-side `aster_call_unary` write):
+    // concatenate `[response frame][trailer frame]` and ship as one
+    // `CompleteUnary` message so the reactor task writes them with a
+    // single `send.write_all` + one select iteration instead of two.
+    let mut bundled = Vec::with_capacity(response_frame.len() + trailer_frame.len());
+    bundled.extend_from_slice(&response_frame);
+    bundled.extend_from_slice(&trailer_frame);
+    let _ = sender.send(OutgoingFrame::CompleteUnary(bundled));
     // `sender` goes out of scope here — the map already dropped its copy,
     // so this closes the mpsc channel and lets the reactor finish the stream.
 
