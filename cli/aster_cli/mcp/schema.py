@@ -158,9 +158,21 @@ def method_to_tool_definition(
     if required:
         input_schema["required"] = required
 
-    # Build description
+    # Build description. For Mode 2 (inline) methods show the signature
+    # the producer wrote rather than the opaque synthesized request class
+    # name, so LLM agents generate sensible tool calls.
     sig_parts = []
-    if req_type:
+    if method.get("request_style") == "inline":
+        inline = method.get("inline_params", []) or []
+        if inline:
+            pretty = ", ".join(
+                f"{p.get('name', 'arg')}: {p.get('kind') or p.get('type') or '?'}"
+                for p in inline
+            )
+            sig_parts.append(f"Request: ({pretty})")
+        else:
+            sig_parts.append("Request: ()")
+    elif req_type:
         sig_parts.append(f"Request: {req_type}")
     if resp_type:
         sig_parts.append(f"Response: {resp_type}")

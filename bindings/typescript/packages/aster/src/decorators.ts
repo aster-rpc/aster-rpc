@@ -79,6 +79,11 @@ export function Service(options: ServiceOptions) {
           info.name = name;
         }
         info.handler = descriptor.value;
+        // TypeScript erases types at runtime; we use Function.length as
+        // the signal for "handler wants a CallContext". A handler that
+        // declares more than one positional parameter gets the ctx
+        // injected as the second argument by the server dispatch.
+        info.acceptsCtx = (descriptor.value as Function).length > 1;
         methods.set(info.name, info);
       }
     }

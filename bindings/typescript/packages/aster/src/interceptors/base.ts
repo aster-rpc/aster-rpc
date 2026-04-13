@@ -7,8 +7,18 @@
  * - Error path: reverse order (LIFO)
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 import { RpcError, StatusCode } from '../status.js';
 import type { RpcPattern } from '../types.js';
+
+/**
+ * Async-local storage holding the CallContext for the currently-dispatching
+ * RPC. Set by the server dispatcher before invoking a handler; used by
+ * {@link CallContext.current} to provide implicit access from within
+ * handlers and downstream async code.
+ */
+const _callContextStorage = new AsyncLocalStorage<CallContext>();
 
 /**
  * Context describing a single RPC invocation.
@@ -67,6 +77,34 @@ export class CallContext {
     const remaining = this.remainingSeconds;
     return remaining !== undefined && remaining <= 0;
   }
+
+  /**
+   * Return the CallContext for the RPC currently being dispatched, or
+   * ``undefined`` when called outside a handler invocation.
+   */
+  static current(): CallContext | undefined {
+    return _callContextStorage.getStore();
+  }
+
+  /**
+   * Run ``fn`` with this CallContext installed as the current async-local
+   * context. Used by the server dispatcher; application code normally uses
+   * {@link CallContext.current} to read the context.
+   */
+  static runWith<R>(ctx: CallContext, fn: () => R): R {
+    return _callContextStorage.run(ctx, fn);
+  }
+}
+
+/**
+ * Return true if ``handler`` declares more than one positional parameter,
+ * which we take as a signal that it expects a ``CallContext`` as the
+ * second argument. TypeScript erases types at runtime, so we cannot
+ * inspect the exact parameter type; ``Function.length`` is the only
+ * signal available.
+ */
+export function handlerAcceptsCtx(handler: Function): boolean {
+  return (handler as Function).length > 1;
 }
 
 /**

@@ -26,6 +26,12 @@ export interface MethodInfo {
   requires: CapabilityRequirement | undefined;
   handler: ((...args: any[]) => any) | undefined;
   metadata: Metadata | undefined;
+  /**
+   * True if the handler declares a second parameter (interpreted as a
+   * CallContext injection). Detected at @Service decoration time via
+   * ``handler.length``.
+   */
+  acceptsCtx?: boolean;
 }
 
 /** Service metadata describing an RPC service. */

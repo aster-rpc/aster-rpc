@@ -137,6 +137,11 @@ class MethodSchema:
     response_fields: list[FieldSchema] | None = None
     timeout: float | None = None
     description: str = ""
+    # "explicit" (Mode 1, single request class) or "inline" (Mode 2, method
+    # takes inline params that the framework packs into a synthesized
+    # request class). For "inline" methods the shell renders
+    # ``method(name: type, ...)`` instead of ``method(RequestType)``.
+    request_style: str = "explicit"
 
 
 # Type alias for the ask function

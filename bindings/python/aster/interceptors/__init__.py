@@ -11,7 +11,10 @@ from aster.interceptors.base import (
     apply_response_interceptors,
     build_call_context,
     deadline_from_relative_secs,
+    handler_accepts_ctx,
+    invoke_handler_with_ctx,
     normalize_error,
+    reset_call_context,
 )
 from aster.interceptors.circuit_breaker import CircuitBreakerInterceptor
 from aster.interceptors.compression import CompressionInterceptor
@@ -28,7 +31,10 @@ __all__ = [
     "apply_response_interceptors",
     "build_call_context",
     "deadline_from_relative_secs",
+    "handler_accepts_ctx",
+    "invoke_handler_with_ctx",
     "normalize_error",
+    "reset_call_context",
     "DeadlineInterceptor",
     "AuthInterceptor",
     "RetryInterceptor",

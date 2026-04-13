@@ -44,6 +44,7 @@ def _build_method_schema(
         response_type=method_meta.get("response_type", ""),
         request_fields=request_fields,
         timeout=method_meta.get("timeout"),
+        request_style=method_meta.get("request_style", "explicit"),
     )
 
 

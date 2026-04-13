@@ -29,6 +29,7 @@ import type { ServiceInfo, MethodInfo } from './service.js';
 import { RpcPattern } from './types.js';
 import {
   type Interceptor,
+  CallContext,
   buildCallContext,
   applyRequestInterceptors,
   applyResponseInterceptors,
@@ -228,8 +229,13 @@ export class SessionServer {
 
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
 
-    let response = await this.withDeadline(callCtx, () =>
-      methodInfo.handler!.call(instance, request),
+    const acceptsCtxU = methodInfo.acceptsCtx === true;
+    let response = await CallContext.runWith(callCtx, () =>
+      this.withDeadline(callCtx, () =>
+        acceptsCtxU
+          ? methodInfo.handler!.call(instance, request, callCtx)
+          : methodInfo.handler!.call(instance, request),
+      ),
     );
     response = await applyResponseInterceptors(this.interceptors, callCtx, response);
 
@@ -252,7 +258,12 @@ export class SessionServer {
 
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
 
-    const gen = methodInfo.handler!.call(instance, request);
+    const acceptsCtxSS = methodInfo.acceptsCtx === true;
+    const gen = CallContext.runWith(callCtx, () =>
+      acceptsCtxSS
+        ? methodInfo.handler!.call(instance, request, callCtx)
+        : methodInfo.handler!.call(instance, request),
+    );
     const deadlineMs = this.getDeadlineMs(callCtx);
     for await (let response of gen) {
       if (deadlineMs != null && Date.now() > deadlineMs) {
@@ -312,8 +323,13 @@ export class SessionServer {
     }
 
     async function* requestIter() { for (const r of requests) yield r; }
-    let response = await this.withDeadline(callCtx, () =>
-      methodInfo.handler!.call(instance, requestIter()),
+    const acceptsCtxCS = methodInfo.acceptsCtx === true;
+    let response = await CallContext.runWith(callCtx, () =>
+      this.withDeadline(callCtx, () =>
+        acceptsCtxCS
+          ? methodInfo.handler!.call(instance, requestIter(), callCtx)
+          : methodInfo.handler!.call(instance, requestIter()),
+      ),
     );
     response = await applyResponseInterceptors(this.interceptors, callCtx, response);
 
@@ -351,7 +367,12 @@ export class SessionServer {
       }
     }
 
-    const gen = methodInfo.handler!.call(instance, requestIter());
+    const acceptsCtxBD = methodInfo.acceptsCtx === true;
+    const gen = CallContext.runWith(callCtx, () =>
+      acceptsCtxBD
+        ? methodInfo.handler!.call(instance, requestIter(), callCtx)
+        : methodInfo.handler!.call(instance, requestIter()),
+    );
     const deadlineMs = this.getDeadlineMs(callCtx);
     for await (const response of gen) {
       if (Date.now() > deadlineMs) {

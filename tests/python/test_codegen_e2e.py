@@ -142,6 +142,12 @@ class MissionControl:
     async def submit_log(self, entry: LogEntry) -> SubmitLogResult:
         return SubmitLogResult(accepted=True)
 
+    # Mode 2 inline method -- exercises the request_style="inline" codepath
+    # through the full manifest → codegen → generated-client pipeline.
+    @rpc()
+    async def ping_agent(self, agent_id: str, nonce: int) -> StatusResponse:
+        return StatusResponse(agent_id=agent_id, status=f"pong:{nonce}", uptime_secs=0)
+
     @server_stream()
     async def tail_logs(self, req: TailRequest) -> AsyncIterator[LogEntry]:
         for i in range(2):
@@ -321,6 +327,24 @@ async def test_python_codegen_against_live_server(tmp_path):
         # `await ...` calls but break iteration.
         assert hasattr(client_cls, "tail_logs"), \
             f"MissionControlClient missing tail_logs; methods: {dir(client_cls)}"
+
+        # Mode 2 assertion: `ping_agent` is an inline-param method -- the
+        # generated client must accept inline args, not an explicit
+        # request object. Inspect the generated signature to confirm the
+        # codegen emitted the right shape.
+        import inspect as _inspect
+        ping_sig = _inspect.signature(client_cls.ping_agent)
+        param_names = list(ping_sig.parameters.keys())
+        assert "agent_id" in param_names, (
+            f"ping_agent client missing inline 'agent_id' param; got {param_names}"
+        )
+        assert "nonce" in param_names, (
+            f"ping_agent client missing inline 'nonce' param; got {param_names}"
+        )
+        assert "request" not in param_names, (
+            f"ping_agent client should not take a 'request' arg in Mode 2; "
+            f"got {param_names}"
+        )
     finally:
         sys.path.remove(pkg_root)
         # Clean up imported modules so a re-run gets fresh state.

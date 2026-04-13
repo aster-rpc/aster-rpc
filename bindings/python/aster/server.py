@@ -413,10 +413,16 @@ class Server:
 
             # Invoke handler
             timeout = self._handler_timeout(call_ctx)
-            response = handler_method(request)
-            if asyncio.iscoroutine(response):
-                response = await asyncio.wait_for(response, timeout=timeout)
-            response = await apply_response_interceptors(interceptors, call_ctx, response)
+            from aster.interceptors.base import invoke_handler_with_ctx, reset_call_context
+            response, _cv_token = invoke_handler_with_ctx(
+                handler_method, request, call_ctx, method_info.accepts_ctx,
+            )
+            try:
+                if asyncio.iscoroutine(response):
+                    response = await asyncio.wait_for(response, timeout=timeout)
+                response = await apply_response_interceptors(interceptors, call_ctx, response)
+            finally:
+                reset_call_context(_cv_token)
 
             # Encode response + trailer
             response_payload, response_compressed = self._encode_response(
@@ -918,14 +924,21 @@ class Server:
 
             # Invoke handler with deadline enforcement
             timeout = self._handler_timeout(call_ctx)
+            from aster.interceptors.base import invoke_handler_with_ctx, reset_call_context
+            _cv_token = None
             try:
-                response = handler_method(request)
-                if asyncio.iscoroutine(response):
-                    response = await asyncio.wait_for(response, timeout=timeout)
-            except asyncio.TimeoutError:
-                await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
-                return
-            response = await apply_response_interceptors(interceptors, call_ctx, response)
+                try:
+                    response, _cv_token = invoke_handler_with_ctx(
+                        handler_method, request, call_ctx, method_info.accepts_ctx,
+                    )
+                    if asyncio.iscoroutine(response):
+                        response = await asyncio.wait_for(response, timeout=timeout)
+                except asyncio.TimeoutError:
+                    await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                    return
+                response = await apply_response_interceptors(interceptors, call_ctx, response)
+            finally:
+                reset_call_context(_cv_token)
 
             # Encode response + trailer, write + finish in one FFI crossing
             import struct as _struct
@@ -985,35 +998,41 @@ class Server:
                 return
             request = await apply_request_interceptors(interceptors, call_ctx, request)
 
-            # Invoke handler (async generator)
-            response_iter = handler_method(request)
-            if asyncio.iscoroutine(response_iter):
-                response_iter = await response_iter
+            # Invoke handler (async generator) with CallContext injection
+            from aster.interceptors.base import invoke_handler_with_ctx, reset_call_context
+            response_iter, _cv_token = invoke_handler_with_ctx(
+                handler_method, request, call_ctx, method_info.accepts_ctx,
+            )
+            try:
+                if asyncio.iscoroutine(response_iter):
+                    response_iter = await response_iter
 
-            # §5.5.2: ROW_SCHEMA hoisting -- send schema frame before first data frame
-            row_schema_sent = False
-            if header.serializationMode == SerializationMode.ROW.value:
-                try:
-                    schema_bytes = self._codec.encode_row_schema()
-                    await write_frame(send, schema_bytes, flags=ROW_SCHEMA)
-                    row_schema_sent = True
-                except (ValueError, NotImplementedError):
-                    pass  # Not in ROW mode or schema not available
+                # §5.5.2: ROW_SCHEMA hoisting -- send schema frame before first data frame
+                row_schema_sent = False
+                if header.serializationMode == SerializationMode.ROW.value:
+                    try:
+                        schema_bytes = self._codec.encode_row_schema()
+                        await write_frame(send, schema_bytes, flags=ROW_SCHEMA)
+                        row_schema_sent = True
+                    except (ValueError, NotImplementedError):
+                        pass  # Not in ROW mode or schema not available
 
-            # Stream responses with deadline enforcement
-            deadline_time = asyncio.get_event_loop().time() + self._handler_timeout(call_ctx)
-            async for response in response_iter:
-                if asyncio.get_event_loop().time() > deadline_time:
-                    await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
-                    return
-                response = await apply_response_interceptors(interceptors, call_ctx, response)
-                response_payload, response_compressed = self._encode_response(response, header.serializationMode)
-                response_flags = COMPRESSED if response_compressed else 0
-                await write_frame(send, response_payload, response_flags)
+                # Stream responses with deadline enforcement
+                deadline_time = asyncio.get_event_loop().time() + self._handler_timeout(call_ctx)
+                async for response in response_iter:
+                    if asyncio.get_event_loop().time() > deadline_time:
+                        await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                        return
+                    response = await apply_response_interceptors(interceptors, call_ctx, response)
+                    response_payload, response_compressed = self._encode_response(response, header.serializationMode)
+                    response_flags = COMPRESSED if response_compressed else 0
+                    await write_frame(send, response_payload, response_flags)
 
-            # Write trailer
-            await self._write_ok_trailer(send, header.serializationMode)
-            await send.finish()
+                # Write trailer
+                await self._write_ok_trailer(send, header.serializationMode)
+                await send.finish()
+            finally:
+                reset_call_context(_cv_token)
 
         except asyncio.CancelledError:
             raise
@@ -1093,14 +1112,21 @@ class Server:
                     yield item
 
             timeout = self._handler_timeout(call_ctx)
+            from aster.interceptors.base import invoke_handler_with_ctx, reset_call_context
+            _cv_token = None
             try:
-                response = handler_method(request_iter())
-                if asyncio.iscoroutine(response):
-                    response = await asyncio.wait_for(response, timeout=timeout)
-            except asyncio.TimeoutError:
-                await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
-                return
-            response = await apply_response_interceptors(interceptors, call_ctx, response)
+                try:
+                    response, _cv_token = invoke_handler_with_ctx(
+                        handler_method, request_iter(), call_ctx, method_info.accepts_ctx,
+                    )
+                    if asyncio.iscoroutine(response):
+                        response = await asyncio.wait_for(response, timeout=timeout)
+                except asyncio.TimeoutError:
+                    await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                    return
+                response = await apply_response_interceptors(interceptors, call_ctx, response)
+            finally:
+                reset_call_context(_cv_token)
 
             # Encode and write response
             response_payload, response_compressed = self._encode_response(response, header.serializationMode)
@@ -1149,46 +1175,52 @@ class Server:
                         break
                     yield item
 
-            # Invoke handler (async generator)
-            response_iter = handler_method(request_iter())
-            if asyncio.iscoroutine(response_iter):
-                response_iter = await response_iter
-
-            # Start reader task
-            reader_task = asyncio.create_task(
-                self._bidi_reader(recv, method_info.request_type, request_queue, request_done, interceptors, call_ctx, header.serializationMode)
+            # Invoke handler (async generator) with CallContext injection
+            from aster.interceptors.base import invoke_handler_with_ctx, reset_call_context
+            response_iter, _cv_token = invoke_handler_with_ctx(
+                handler_method, request_iter(), call_ctx, method_info.accepts_ctx,
             )
+            try:
+                if asyncio.iscoroutine(response_iter):
+                    response_iter = await response_iter
 
-            # §5.5.2: ROW_SCHEMA hoisting -- send schema frame before first data frame
-            if header.serializationMode == SerializationMode.ROW.value:
-                try:
-                    schema_bytes = self._codec.encode_row_schema()
-                    await write_frame(send, schema_bytes, flags=ROW_SCHEMA)
-                except (ValueError, NotImplementedError):
-                    pass  # Not in ROW mode or schema not available
+                # Start reader task
+                reader_task = asyncio.create_task(
+                    self._bidi_reader(recv, method_info.request_type, request_queue, request_done, interceptors, call_ctx, header.serializationMode)
+                )
 
-            # Stream responses from handler with deadline enforcement
-            deadline_time = asyncio.get_event_loop().time() + self._handler_timeout(call_ctx)
-            async for response in response_iter:
-                if asyncio.get_event_loop().time() > deadline_time:
-                    reader_task.cancel()
+                # §5.5.2: ROW_SCHEMA hoisting -- send schema frame before first data frame
+                if header.serializationMode == SerializationMode.ROW.value:
                     try:
-                        await reader_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
-                    return
-                response = await apply_response_interceptors(interceptors, call_ctx, response)
-                response_payload, response_compressed = self._encode_response(response, header.serializationMode)
-                response_flags = COMPRESSED if response_compressed else 0
-                await write_frame(send, response_payload, response_flags)
+                        schema_bytes = self._codec.encode_row_schema()
+                        await write_frame(send, schema_bytes, flags=ROW_SCHEMA)
+                    except (ValueError, NotImplementedError):
+                        pass  # Not in ROW mode or schema not available
 
-            # Write trailer
-            await self._write_ok_trailer(send, header.serializationMode)
-            await send.finish()
+                # Stream responses from handler with deadline enforcement
+                deadline_time = asyncio.get_event_loop().time() + self._handler_timeout(call_ctx)
+                async for response in response_iter:
+                    if asyncio.get_event_loop().time() > deadline_time:
+                        reader_task.cancel()
+                        try:
+                            await reader_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                        return
+                    response = await apply_response_interceptors(interceptors, call_ctx, response)
+                    response_payload, response_compressed = self._encode_response(response, header.serializationMode)
+                    response_flags = COMPRESSED if response_compressed else 0
+                    await write_frame(send, response_payload, response_flags)
 
-            # Wait for reader to finish
-            await reader_task
+                # Write trailer
+                await self._write_ok_trailer(send, header.serializationMode)
+                await send.finish()
+
+                # Wait for reader to finish
+                await reader_task
+            finally:
+                reset_call_context(_cv_token)
 
         except asyncio.CancelledError:
             raise
