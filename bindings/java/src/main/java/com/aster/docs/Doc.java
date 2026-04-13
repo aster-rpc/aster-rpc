@@ -31,11 +31,11 @@ public class Doc {
     this.docHandle = docHandle;
   }
 
-  private IrohRuntime runtime() {
+  public IrohRuntime runtime() {
     return runtime;
   }
 
-  private long docHandle() {
+  public long docHandle() {
     return docHandle;
   }
 

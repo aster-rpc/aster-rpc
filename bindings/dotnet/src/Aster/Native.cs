@@ -285,4 +285,54 @@ internal static partial class Native
         byte* arg2_ptr, UIntPtr arg2_len,
         byte* arg3_ptr, UIntPtr arg3_len,
         byte* out_buf, UIntPtr* out_len);
+
+    // Registry async doc-backed ops (event kinds 80-84).
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_registry_resolve")]
+    public static unsafe partial int aster_registry_resolve(
+        ulong runtime, ulong doc,
+        byte* opts_json_ptr, UIntPtr opts_json_len,
+        ulong user_data, out ulong out_operation);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_registry_publish")]
+    public static unsafe partial int aster_registry_publish(
+        ulong runtime, ulong doc,
+        byte* author_id_ptr, UIntPtr author_id_len,
+        byte* lease_json_ptr, UIntPtr lease_json_len,
+        byte* artifact_json_ptr, UIntPtr artifact_json_len,
+        byte* service_ptr, UIntPtr service_len,
+        int version,
+        byte* channel_ptr, UIntPtr channel_len,
+        ulong gossip_topic, ulong user_data, out ulong out_operation);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_registry_renew_lease")]
+    public static unsafe partial int aster_registry_renew_lease(
+        ulong runtime, ulong doc,
+        byte* author_id_ptr, UIntPtr author_id_len,
+        byte* service_ptr, UIntPtr service_len,
+        byte* contract_id_ptr, UIntPtr contract_id_len,
+        byte* endpoint_id_ptr, UIntPtr endpoint_id_len,
+        byte* health_ptr, UIntPtr health_len,
+        float load,
+        int lease_duration_s,
+        ulong gossip_topic, ulong user_data, out ulong out_operation);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_registry_acl_add_writer")]
+    public static unsafe partial int aster_registry_acl_add_writer(
+        ulong runtime, ulong doc,
+        byte* author_id_ptr, UIntPtr author_id_len,
+        byte* writer_id_ptr, UIntPtr writer_id_len,
+        ulong user_data, out ulong out_operation);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_registry_acl_remove_writer")]
+    public static unsafe partial int aster_registry_acl_remove_writer(
+        ulong runtime, ulong doc,
+        byte* author_id_ptr, UIntPtr author_id_len,
+        byte* writer_id_ptr, UIntPtr writer_id_len,
+        ulong user_data, out ulong out_operation);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_registry_acl_list_writers")]
+    public static partial int aster_registry_acl_list_writers(
+        ulong runtime, ulong doc,
+        ulong user_data, out ulong out_operation);
 }

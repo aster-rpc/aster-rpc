@@ -12,6 +12,7 @@ package aster
 import "C"
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"unsafe"
@@ -131,6 +132,261 @@ func FilterAndRankRust(
 		return nil, fmt.Errorf("aster_registry_filter_and_rank failed: %d", int(status))
 	}
 	return nil, fmt.Errorf("aster_registry_filter_and_rank: buffer grow failed")
+}
+
+// ─── Async doc-backed ops (event kinds 80-84) ──────────────────────────
+
+// bytesC builds a C.struct_iroh_bytes_t from a Go []byte. The empty case
+// (len=0) returns a zero struct with a nil ptr; the FFI side checks the
+// length first and ignores the pointer when len is 0.
+func bytesC(b []byte) C.struct_iroh_bytes_t {
+	if len(b) == 0 {
+		return C.struct_iroh_bytes_t{}
+	}
+	return C.struct_iroh_bytes_t{
+		ptr: (*C.uint8_t)(unsafe.Pointer(&b[0])),
+		len: C.uintptr_t(len(b)),
+	}
+}
+
+// ResolveAsync runs the full Rust resolve pipeline (pointer lookup,
+// list_leases, monotonic seq filter, mandatory filters, rank) for the
+// given options against the given registry doc. Returns the winning
+// lease, or nil if no candidate survived.
+func (d *Doc) ResolveAsync(ctx context.Context, opts ResolveOptionsJSON) (*EndpointLease, error) {
+	optsJSON, err := json.Marshal(opts)
+	if err != nil {
+		return nil, fmt.Errorf("marshal opts: %w", err)
+	}
+	var opID C.iroh_operation_t
+	r := C.aster_registry_resolve(
+		C.uint64_t(d.runtime.handle),
+		C.uint64_t(d.handle),
+		bytesC(optsJSON),
+		0,
+		&opID,
+	)
+	if r != 0 {
+		return nil, fmt.Errorf("aster_registry_resolve: %w", Error(r))
+	}
+	ev, err := d.runtime.Poll(ctx, uint64(opID))
+	if err != nil {
+		return nil, fmt.Errorf("resolve poll: %w", err)
+	}
+	if ev.Kind != IROH_EVENT_REGISTRY_RESOLVED {
+		return nil, fmt.Errorf("resolve: unexpected event %d", ev.Kind)
+	}
+	if ev.Status == IROH_STATUS_NOT_FOUND {
+		return nil, nil
+	}
+	if ev.DataPtr == nil || ev.DataLen == 0 {
+		return nil, nil
+	}
+	payload := C.GoBytes(ev.DataPtr, C.int(ev.DataLen))
+	var lease EndpointLease
+	if err := json.Unmarshal(payload, &lease); err != nil {
+		return nil, fmt.Errorf("decode lease: %w", err)
+	}
+	return &lease, nil
+}
+
+// PublishAsync publishes a lease and/or an artifact in a single op.
+// Either may be nil to skip; at least one must be supplied. When
+// publishing an artifact, service and version are required. topic is
+// optional gossip topic to broadcast on (nil to skip).
+func (d *Doc) PublishAsync(
+	ctx context.Context,
+	authorID string,
+	lease *EndpointLease,
+	artifact *ArtifactRef,
+	service string,
+	version int32,
+	channel string,
+	topic *GossipTopic,
+) error {
+	if lease == nil && artifact == nil {
+		return fmt.Errorf("PublishAsync requires at least one of lease or artifact")
+	}
+	var leaseBytes, artifactBytes []byte
+	if lease != nil {
+		b, err := json.Marshal(lease)
+		if err != nil {
+			return fmt.Errorf("marshal lease: %w", err)
+		}
+		leaseBytes = b
+	}
+	if artifact != nil {
+		b, err := json.Marshal(artifact)
+		if err != nil {
+			return fmt.Errorf("marshal artifact: %w", err)
+		}
+		artifactBytes = b
+	}
+	authorBytes := []byte(authorID)
+	serviceBytes := []byte(service)
+	channelBytes := []byte(channel)
+	var topicHandle uint64
+	if topic != nil {
+		topicHandle = topic.handle
+	}
+
+	var opID C.iroh_operation_t
+	r := C.aster_registry_publish(
+		C.uint64_t(d.runtime.handle),
+		C.uint64_t(d.handle),
+		bytesC(authorBytes),
+		bytesC(leaseBytes),
+		bytesC(artifactBytes),
+		bytesC(serviceBytes),
+		C.int32_t(version),
+		bytesC(channelBytes),
+		C.uint64_t(topicHandle),
+		0,
+		&opID,
+	)
+	if r != 0 {
+		return fmt.Errorf("aster_registry_publish: %w", Error(r))
+	}
+	ev, err := d.runtime.Poll(ctx, uint64(opID))
+	if err != nil {
+		return fmt.Errorf("publish poll: %w", err)
+	}
+	if ev.Kind != IROH_EVENT_REGISTRY_PUBLISHED {
+		return fmt.Errorf("publish: unexpected event %d", ev.Kind)
+	}
+	return nil
+}
+
+// RenewLeaseAsync renews an existing lease in place: bumps lease_seq +
+// timestamps, updates health/load, rewrites the row. Pass math.NaN() for
+// load to leave it unset.
+func (d *Doc) RenewLeaseAsync(
+	ctx context.Context,
+	authorID, service, contractID, endpointID, health string,
+	load float32,
+	leaseDurationS int32,
+	topic *GossipTopic,
+) error {
+	authorBytes := []byte(authorID)
+	serviceBytes := []byte(service)
+	contractBytes := []byte(contractID)
+	endpointBytes := []byte(endpointID)
+	healthBytes := []byte(health)
+	var topicHandle uint64
+	if topic != nil {
+		topicHandle = topic.handle
+	}
+
+	var opID C.iroh_operation_t
+	r := C.aster_registry_renew_lease(
+		C.uint64_t(d.runtime.handle),
+		C.uint64_t(d.handle),
+		bytesC(authorBytes),
+		bytesC(serviceBytes),
+		bytesC(contractBytes),
+		bytesC(endpointBytes),
+		bytesC(healthBytes),
+		C.float(load),
+		C.int32_t(leaseDurationS),
+		C.uint64_t(topicHandle),
+		0,
+		&opID,
+	)
+	if r != 0 {
+		return fmt.Errorf("aster_registry_renew_lease: %w", Error(r))
+	}
+	ev, err := d.runtime.Poll(ctx, uint64(opID))
+	if err != nil {
+		return fmt.Errorf("renew poll: %w", err)
+	}
+	if ev.Kind != IROH_EVENT_REGISTRY_RENEWED {
+		return fmt.Errorf("renew_lease: unexpected event %d", ev.Kind)
+	}
+	return nil
+}
+
+// AclAddWriterAsync adds an author to the per-doc registry ACL writer
+// set, persisting the updated list under _aster/acl/writers.
+func (d *Doc) AclAddWriterAsync(ctx context.Context, authorID, writerID string) error {
+	return d.aclMutateWriter(ctx, authorID, writerID, true)
+}
+
+// AclRemoveWriterAsync removes an author from the per-doc registry ACL
+// writer set and persists the updated list.
+func (d *Doc) AclRemoveWriterAsync(ctx context.Context, authorID, writerID string) error {
+	return d.aclMutateWriter(ctx, authorID, writerID, false)
+}
+
+func (d *Doc) aclMutateWriter(ctx context.Context, authorID, writerID string, add bool) error {
+	authorBytes := []byte(authorID)
+	writerBytes := []byte(writerID)
+	var opID C.iroh_operation_t
+	var r C.int32_t
+	if add {
+		r = C.aster_registry_acl_add_writer(
+			C.uint64_t(d.runtime.handle),
+			C.uint64_t(d.handle),
+			bytesC(authorBytes),
+			bytesC(writerBytes),
+			0,
+			&opID,
+		)
+	} else {
+		r = C.aster_registry_acl_remove_writer(
+			C.uint64_t(d.runtime.handle),
+			C.uint64_t(d.handle),
+			bytesC(authorBytes),
+			bytesC(writerBytes),
+			0,
+			&opID,
+		)
+	}
+	if r != 0 {
+		op := "aster_registry_acl_add_writer"
+		if !add {
+			op = "aster_registry_acl_remove_writer"
+		}
+		return fmt.Errorf("%s: %w", op, Error(r))
+	}
+	ev, err := d.runtime.Poll(ctx, uint64(opID))
+	if err != nil {
+		return fmt.Errorf("acl mutate poll: %w", err)
+	}
+	if ev.Kind != IROH_EVENT_REGISTRY_ACL_UPDATED {
+		return fmt.Errorf("acl mutate: unexpected event %d", ev.Kind)
+	}
+	return nil
+}
+
+// AclListWritersAsync lists the current writer set for the per-doc
+// registry ACL. Returns an empty slice when the ACL is in open mode.
+func (d *Doc) AclListWritersAsync(ctx context.Context) ([]string, error) {
+	var opID C.iroh_operation_t
+	r := C.aster_registry_acl_list_writers(
+		C.uint64_t(d.runtime.handle),
+		C.uint64_t(d.handle),
+		0,
+		&opID,
+	)
+	if r != 0 {
+		return nil, fmt.Errorf("aster_registry_acl_list_writers: %w", Error(r))
+	}
+	ev, err := d.runtime.Poll(ctx, uint64(opID))
+	if err != nil {
+		return nil, fmt.Errorf("acl list poll: %w", err)
+	}
+	if ev.Kind != IROH_EVENT_REGISTRY_ACL_LISTED {
+		return nil, fmt.Errorf("acl list: unexpected event %d", ev.Kind)
+	}
+	if ev.DataPtr == nil || ev.DataLen == 0 {
+		return []string{}, nil
+	}
+	payload := C.GoBytes(ev.DataPtr, C.int(ev.DataLen))
+	var writers []string
+	if err := json.Unmarshal(payload, &writers); err != nil {
+		return nil, fmt.Errorf("decode writers: %w", err)
+	}
+	return writers, nil
 }
 
 // RegistryKeyRust returns a registry doc key produced by the shared Rust key-schema helpers.

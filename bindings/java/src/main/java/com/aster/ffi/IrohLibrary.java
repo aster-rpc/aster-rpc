@@ -2140,4 +2140,273 @@ public final class IrohLibrary implements SymbolLookup {
       throw new AssertionError(t);
     }
   }
+
+  // --- Registry async doc-backed ops (event kinds 80-84) ----------------
+
+  /**
+   * C signature: {@code int32_t aster_registry_resolve(iroh_runtime_t runtime, uint64_t doc, struct
+   * iroh_bytes_t opts_json, uint64_t user_data, iroh_operation_t *out_operation);}
+   */
+  public int asterRegistryResolve(
+      long runtimeHandle,
+      long docHandle,
+      MemorySegment optsJsonPtr,
+      long optsJsonLen,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_registry_resolve",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, optsJsonPtr, optsJsonLen, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * C signature: {@code int32_t aster_registry_publish(iroh_runtime_t runtime, uint64_t doc, struct
+   * iroh_bytes_t author_id, struct iroh_bytes_t lease_json, struct iroh_bytes_t artifact_json,
+   * struct iroh_bytes_t service, int32_t version, struct iroh_bytes_t channel, uint64_t
+   * gossip_topic, uint64_t user_data, iroh_operation_t *out_operation);}
+   */
+  public int asterRegistryPublish(
+      long runtimeHandle,
+      long docHandle,
+      MemorySegment authorIdPtr,
+      long authorIdLen,
+      MemorySegment leaseJsonPtr,
+      long leaseJsonLen,
+      MemorySegment artifactJsonPtr,
+      long artifactJsonLen,
+      MemorySegment servicePtr,
+      long serviceLen,
+      int version,
+      MemorySegment channelPtr,
+      long channelLen,
+      long gossipTopic,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_registry_publish",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG, // runtime
+                      ValueLayout.JAVA_LONG, // doc
+                      ValueLayout.ADDRESS, // author ptr
+                      ValueLayout.JAVA_LONG, // author len
+                      ValueLayout.ADDRESS, // lease ptr
+                      ValueLayout.JAVA_LONG, // lease len
+                      ValueLayout.ADDRESS, // artifact ptr
+                      ValueLayout.JAVA_LONG, // artifact len
+                      ValueLayout.ADDRESS, // service ptr
+                      ValueLayout.JAVA_LONG, // service len
+                      ValueLayout.JAVA_INT, // version
+                      ValueLayout.ADDRESS, // channel ptr
+                      ValueLayout.JAVA_LONG, // channel len
+                      ValueLayout.JAVA_LONG, // gossip topic
+                      ValueLayout.JAVA_LONG, // user data
+                      ValueLayout.ADDRESS)) // out op
+              .invoke(
+                  runtimeHandle,
+                  docHandle,
+                  authorIdPtr,
+                  authorIdLen,
+                  leaseJsonPtr,
+                  leaseJsonLen,
+                  artifactJsonPtr,
+                  artifactJsonLen,
+                  servicePtr,
+                  serviceLen,
+                  version,
+                  channelPtr,
+                  channelLen,
+                  gossipTopic,
+                  userData,
+                  outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * C signature: {@code int32_t aster_registry_renew_lease(iroh_runtime_t runtime, uint64_t doc,
+   * struct iroh_bytes_t author_id, struct iroh_bytes_t service, struct iroh_bytes_t contract_id,
+   * struct iroh_bytes_t endpoint_id, struct iroh_bytes_t health, float load, int32_t
+   * lease_duration_s, uint64_t gossip_topic, uint64_t user_data, iroh_operation_t *out_operation);}
+   */
+  public int asterRegistryRenewLease(
+      long runtimeHandle,
+      long docHandle,
+      MemorySegment authorIdPtr,
+      long authorIdLen,
+      MemorySegment servicePtr,
+      long serviceLen,
+      MemorySegment contractIdPtr,
+      long contractIdLen,
+      MemorySegment endpointIdPtr,
+      long endpointIdLen,
+      MemorySegment healthPtr,
+      long healthLen,
+      float load,
+      int leaseDurationS,
+      long gossipTopic,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_registry_renew_lease",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG, // runtime
+                      ValueLayout.JAVA_LONG, // doc
+                      ValueLayout.ADDRESS, // author ptr
+                      ValueLayout.JAVA_LONG, // author len
+                      ValueLayout.ADDRESS, // service ptr
+                      ValueLayout.JAVA_LONG, // service len
+                      ValueLayout.ADDRESS, // contract id ptr
+                      ValueLayout.JAVA_LONG, // contract id len
+                      ValueLayout.ADDRESS, // endpoint id ptr
+                      ValueLayout.JAVA_LONG, // endpoint id len
+                      ValueLayout.ADDRESS, // health ptr
+                      ValueLayout.JAVA_LONG, // health len
+                      ValueLayout.JAVA_FLOAT, // load
+                      ValueLayout.JAVA_INT, // lease duration
+                      ValueLayout.JAVA_LONG, // gossip topic
+                      ValueLayout.JAVA_LONG, // user data
+                      ValueLayout.ADDRESS)) // out op
+              .invoke(
+                  runtimeHandle,
+                  docHandle,
+                  authorIdPtr,
+                  authorIdLen,
+                  servicePtr,
+                  serviceLen,
+                  contractIdPtr,
+                  contractIdLen,
+                  endpointIdPtr,
+                  endpointIdLen,
+                  healthPtr,
+                  healthLen,
+                  load,
+                  leaseDurationS,
+                  gossipTopic,
+                  userData,
+                  outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /** C signature: {@code int32_t aster_registry_acl_add_writer(...);} */
+  public int asterRegistryAclAddWriter(
+      long runtimeHandle,
+      long docHandle,
+      MemorySegment authorIdPtr,
+      long authorIdLen,
+      MemorySegment writerIdPtr,
+      long writerIdLen,
+      long userData,
+      MemorySegment outOpId) {
+    return aclMutateWriter(
+        "aster_registry_acl_add_writer",
+        runtimeHandle,
+        docHandle,
+        authorIdPtr,
+        authorIdLen,
+        writerIdPtr,
+        writerIdLen,
+        userData,
+        outOpId);
+  }
+
+  /** C signature: {@code int32_t aster_registry_acl_remove_writer(...);} */
+  public int asterRegistryAclRemoveWriter(
+      long runtimeHandle,
+      long docHandle,
+      MemorySegment authorIdPtr,
+      long authorIdLen,
+      MemorySegment writerIdPtr,
+      long writerIdLen,
+      long userData,
+      MemorySegment outOpId) {
+    return aclMutateWriter(
+        "aster_registry_acl_remove_writer",
+        runtimeHandle,
+        docHandle,
+        authorIdPtr,
+        authorIdLen,
+        writerIdPtr,
+        writerIdLen,
+        userData,
+        outOpId);
+  }
+
+  private int aclMutateWriter(
+      String symbol,
+      long runtimeHandle,
+      long docHandle,
+      MemorySegment authorIdPtr,
+      long authorIdLen,
+      MemorySegment writerIdPtr,
+      long writerIdLen,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  symbol,
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(
+                  runtimeHandle,
+                  docHandle,
+                  authorIdPtr,
+                  authorIdLen,
+                  writerIdPtr,
+                  writerIdLen,
+                  userData,
+                  outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /** C signature: {@code int32_t aster_registry_acl_list_writers(...);} */
+  public int asterRegistryAclListWriters(
+      long runtimeHandle, long docHandle, long userData, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_registry_acl_list_writers",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
 }

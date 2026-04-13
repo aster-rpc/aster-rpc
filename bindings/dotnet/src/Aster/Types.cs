@@ -99,6 +99,13 @@ public enum EventKind : uint
     HookAfterConnect = 71,
     HookInvocationReleased = 72,
 
+    // Registry async ops (§11.9)
+    RegistryResolved = 80,
+    RegistryPublished = 81,
+    RegistryRenewed = 82,
+    RegistryAclUpdated = 83,
+    RegistryAclListed = 84,
+
     // Generic results
     StringResult = 90,
     BytesResult = 91,
