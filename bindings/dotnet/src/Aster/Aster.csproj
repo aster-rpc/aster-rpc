@@ -27,6 +27,8 @@
 
   <ItemGroup>
     <PackageReference Include="Tomlyn" Version="2.3.0" />
+    <!-- Apache Fory cross-language serialization (matches pyfory==0.16) -->
+    <PackageReference Include="Apache.Fory" Version="0.16.0" />
   </ItemGroup>
 
 </Project>
