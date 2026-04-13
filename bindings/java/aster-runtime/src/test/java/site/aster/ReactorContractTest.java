@@ -25,13 +25,16 @@ public class ReactorContractTest {
 
   @Test
   public void testCallLayoutSize() {
-    // 80 bytes total: see ffi/src/reactor.rs aster_reactor_call_t.
-    assertEquals(80, Reactor.CALL_LAYOUT.byteSize());
+    // 88 bytes total: see ffi/src/reactor.rs aster_reactor_call_t.
+    // Grew from 80 → 88 in G.2 when stream_id was added so SessionKey can be
+    // (peer, stream, service) instead of collapsing concurrent sessions per peer.
+    assertEquals(88, Reactor.CALL_LAYOUT.byteSize());
   }
 
   @Test
   public void testCallLayoutFieldOffsets() {
     assertEquals(Reactor.OFFSET_CALL_ID, offsetOf(Reactor.CALL_LAYOUT, "call_id"));
+    assertEquals(Reactor.OFFSET_STREAM_ID, offsetOf(Reactor.CALL_LAYOUT, "stream_id"));
     assertEquals(Reactor.OFFSET_HEADER_PTR, offsetOf(Reactor.CALL_LAYOUT, "header_ptr"));
     assertEquals(Reactor.OFFSET_HEADER_LEN, offsetOf(Reactor.CALL_LAYOUT, "header_len"));
     assertEquals(Reactor.OFFSET_HEADER_FLAGS, offsetOf(Reactor.CALL_LAYOUT, "header_flags"));

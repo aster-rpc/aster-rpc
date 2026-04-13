@@ -67,6 +67,7 @@ public final class AsterServer implements AutoCloseable {
   private final Reactor reactor;
   private final Codec codec;
   private final ForyCodec foryHeaderCodec;
+  private volatile byte[] okTrailerBytesCache;
   private final Map<String, RegisteredService> services;
   private final SessionRegistry sessionRegistry;
   private final List<Interceptor> interceptors;
@@ -155,6 +156,7 @@ public final class AsterServer implements AutoCloseable {
 
   private AsterCall extractCall(MemorySegment slot) {
     long callId = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_CALL_ID);
+    long streamId = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_STREAM_ID);
     MemorySegment headerPtr = slot.get(ValueLayout.ADDRESS, Reactor.OFFSET_HEADER_PTR);
     int headerLen = slot.get(ValueLayout.JAVA_INT, Reactor.OFFSET_HEADER_LEN);
     byte headerFlags = slot.get(ValueLayout.JAVA_BYTE, Reactor.OFFSET_HEADER_FLAGS);
@@ -179,7 +181,7 @@ public final class AsterServer implements AutoCloseable {
                 peerPtr.reinterpret(peerLen).toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8)
             : "";
     return new AsterCall(
-        callId, header, headerFlags, request, requestFlags, peerId, isSession != 0);
+        callId, streamId, header, headerFlags, request, requestFlags, peerId, isSession != 0);
   }
 
   // ───── Dispatch ──────────────────────────────────────────────────────────
@@ -202,35 +204,37 @@ public final class AsterServer implements AutoCloseable {
             "unknown method: " + header.service() + "/" + header.method());
         return;
       }
-      Object instance = resolveInstance(svc, call.peerId());
+      Object instance = resolveInstance(svc, call);
       CallContext ctx = buildCallContext(header, method, call);
 
-      byte[] responseBytes;
       switch (method) {
-        case UnaryDispatcher u -> responseBytes = u.invoke(instance, call.request(), codec, ctx);
-        case ServerStreamDispatcher ignored -> {
-          submitErrorTrailer(
-              callId,
-              StatusCode.UNIMPLEMENTED,
-              "server-stream dispatch pending commit G (Flow bridging)");
-          return;
+        case UnaryDispatcher u -> {
+          byte[] responseBytes = u.invoke(instance, call.request(), codec, ctx);
+          byte[] responseFrame = AsterFraming.encodeFrame(responseBytes, (byte) 0);
+          byte[] trailerFrame =
+              AsterFraming.encodeFrame(okTrailerBytes(), AsterFraming.FLAG_TRAILER);
+          submitResponse(callId, new CallResponse(responseFrame, trailerFrame));
         }
-        case ClientStreamDispatcher ignored -> {
-          submitErrorTrailer(
-              callId,
-              StatusCode.UNIMPLEMENTED,
-              "client-stream dispatch pending commit G (Flow bridging)");
-          return;
+        case ServerStreamDispatcher s -> {
+          ReactorResponseStream out = new ReactorResponseStream(reactor, callId, foryHeaderCodec);
+          try {
+            s.invoke(instance, call.request(), codec, ctx, out);
+            out.complete();
+          } catch (Throwable t) {
+            out.fail(t);
+          }
         }
-        case BidiStreamDispatcher ignored -> {
-          submitErrorTrailer(
-              callId,
-              StatusCode.UNIMPLEMENTED,
-              "bidi-stream dispatch pending commit G (Flow bridging)");
-          return;
-        }
+        case ClientStreamDispatcher ignored ->
+            submitErrorTrailer(
+                callId,
+                StatusCode.UNIMPLEMENTED,
+                "client-stream dispatch pending — reactor needs multi-frame request delivery");
+        case BidiStreamDispatcher ignored ->
+            submitErrorTrailer(
+                callId,
+                StatusCode.UNIMPLEMENTED,
+                "bidi-stream dispatch pending — reactor needs multi-frame request delivery");
       }
-      submitResponse(callId, new CallResponse(responseBytes, new byte[0]));
     } catch (RpcError e) {
       submitErrorTrailer(callId, e.code(), e.rpcMessage());
     } catch (Exception e) {
@@ -239,11 +243,11 @@ public final class AsterServer implements AutoCloseable {
     }
   }
 
-  private Object resolveInstance(RegisteredService svc, String peerId) {
+  private Object resolveInstance(RegisteredService svc, AsterCall call) {
     if (svc.descriptor.scope() == Scope.SHARED) {
       return svc.sharedInstance;
     }
-    SessionKey key = new SessionKey(peerId, svc.descriptor.implClass());
+    SessionKey key = new SessionKey(call.peerId(), call.streamId(), svc.descriptor.implClass());
     return sessionRegistry.getOrCreate(key, svc.factory);
   }
 
@@ -293,11 +297,21 @@ public final class AsterServer implements AutoCloseable {
     }
   }
 
+  private byte[] okTrailerBytes() {
+    byte[] cached = okTrailerBytesCache;
+    if (cached == null) {
+      cached = foryHeaderCodec.encode(RpcStatus.ok());
+      okTrailerBytesCache = cached;
+    }
+    return cached;
+  }
+
   private void submitErrorTrailer(long callId, StatusCode code, String message) {
     RpcStatus status =
         new RpcStatus(code.value(), message == null ? "" : message, List.of(), List.of());
-    byte[] trailer = foryHeaderCodec.encode(status);
-    submitResponse(callId, new CallResponse(new byte[0], trailer));
+    byte[] trailerPayload = foryHeaderCodec.encode(status);
+    byte[] trailerFrame = AsterFraming.encodeFrame(trailerPayload, AsterFraming.FLAG_TRAILER);
+    submitResponse(callId, new CallResponse(new byte[0], trailerFrame));
   }
 
   // ───── Codec / wire type bootstrap ───────────────────────────────────────

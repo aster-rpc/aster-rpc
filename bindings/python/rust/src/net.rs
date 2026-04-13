@@ -996,12 +996,16 @@ use std::sync::Mutex as StdMutex;
 #[pyclass]
 pub struct ReactorResponseSender {
     inner: StdMutex<
-        Option<tokio::sync::oneshot::Sender<aster_transport_core::reactor::OutgoingResponse>>,
+        Option<
+            tokio::sync::mpsc::UnboundedSender<aster_transport_core::reactor::OutgoingFrame>,
+        >,
     >,
 }
 
 #[pymethods]
 impl ReactorResponseSender {
+    /// Submit a unary response: one Frame + one Trailer, atomically. After
+    /// this call the sender is consumed and further submits fail.
     fn submit(&self, response_frame: Vec<u8>, trailer_frame: Vec<u8>) -> PyResult<()> {
         let sender = self
             .inner
@@ -1011,10 +1015,14 @@ impl ReactorResponseSender {
             .ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("response already submitted")
             })?;
-        let _ = sender.send(aster_transport_core::reactor::OutgoingResponse {
-            response_frame,
+        if !response_frame.is_empty() {
+            let _ = sender.send(aster_transport_core::reactor::OutgoingFrame::Frame(
+                response_frame,
+            ));
+        }
+        let _ = sender.send(aster_transport_core::reactor::OutgoingFrame::Trailer(
             trailer_frame,
-        });
+        ));
         Ok(())
     }
 }
