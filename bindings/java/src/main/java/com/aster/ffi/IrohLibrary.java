@@ -2409,4 +2409,43 @@ public final class IrohLibrary implements SymbolLookup {
       throw new AssertionError(t);
     }
   }
+
+  // --- Hook responders (Phase 1b) ---------------------------------------
+
+  /**
+   * C signature: {@code int32_t iroh_hook_before_connect_respond(iroh_runtime_t runtime,
+   * iroh_hook_invocation_t invocation, enum iroh_hook_decision_t decision);}
+   */
+  public int irohHookBeforeConnectRespond(long runtimeHandle, long invocation, int decision) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_hook_before_connect_respond",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_INT))
+              .invoke(runtimeHandle, invocation, decision);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * C signature: {@code int32_t iroh_hook_after_connect_respond(iroh_runtime_t runtime,
+   * iroh_hook_invocation_t invocation);}
+   */
+  public int irohHookAfterConnectRespond(long runtimeHandle, long invocation) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_hook_after_connect_respond",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG))
+              .invoke(runtimeHandle, invocation);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
 }
