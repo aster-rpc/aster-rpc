@@ -41,7 +41,7 @@ class InterceptorService:
 
     @rpc(timeout=5.0, idempotent=True)
     async def slow(self, req: EchoRequest) -> EchoResponse:
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(2.0)
         return EchoResponse(message=req.message)
 
 
@@ -73,7 +73,7 @@ class TestPhase7Interceptors:
         )
 
         with pytest.raises(RpcError) as exc_info:
-            await client.slow(EchoRequest("late"), timeout=0.001)
+            await client.slow(EchoRequest("late"), timeout=1)
         assert exc_info.value.code == StatusCode.DEADLINE_EXCEEDED
 
     @pytest.mark.asyncio
