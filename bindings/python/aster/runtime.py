@@ -63,7 +63,7 @@ from .client import ServiceClient, create_client
 from .transport.iroh import IrohTransport
 from .contract.identity import contract_id_from_service
 from .registry.models import ServiceSummary
-from .rpc_types import RpcScope
+from .rpc_types import RpcScope, SerializationMode
 from .server import Server
 from .trust.bootstrap import (
     handle_producer_admission_connection,
@@ -2150,6 +2150,25 @@ class ClientSession:
                 if modes and "xlang" not in modes and "json" in modes:
                     from aster.json_codec import JsonProxyCodec
                     codec = JsonProxyCodec()
+
+        # If no explicit codec was supplied AND JSON auto-pick didn't
+        # trigger, build a service-aware Fory XLANG codec NOW so the
+        # IrohTransport we hand to `create_client` knows about the
+        # service's request/response types. Without this, the
+        # transport's codec defaults to a bare ForyCodec with zero
+        # registered types and the first `transport.unary(...)`
+        # raises `TypeUnregisteredError` at encode time. The stub's
+        # own codec is built inside `create_client` with the service
+        # types -- but the stub delegates wire encoding to the
+        # transport's codec, so the two must agree on types.
+        if codec is None:
+            from aster.client import _collect_service_types
+            from aster.codec import ForyCodec
+            request_response_types = _collect_service_types(service_cls, info)
+            codec = ForyCodec(
+                mode=SerializationMode.XLANG,
+                types=list(request_response_types) if request_response_types else None,
+            )
 
         transport = IrohTransport(
             connection=self._connection,

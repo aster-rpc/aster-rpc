@@ -50,10 +50,16 @@ function buildMetadata(metadata?: Record<string, string>): [string[], string[]] 
 export class IrohTransport implements AsterTransport {
   private conn: QuicConnection;
   private codec: Codec;
+  private readonly sessionId: number;
 
-  constructor(connection: QuicConnection, codec?: Codec) {
+  constructor(
+    connection: QuicConnection,
+    codec?: Codec,
+    options?: { sessionId?: number },
+  ) {
     this.conn = connection;
     this.codec = codec ?? new JsonCodec();
+    this.sessionId = options?.sessionId ?? 0;
   }
 
   async unary(
@@ -267,6 +273,7 @@ export class IrohTransport implements AsterTransport {
       serializationMode: opts?.serializationMode ?? (this.codec instanceof JsonCodec ? 3 : 0),
       metadataKeys: keys,
       metadataValues: values,
+      sessionId: this.sessionId,
     });
     const headerBytes = this.codec.encode(header);
     await writeFrame(send, headerBytes, HEADER);

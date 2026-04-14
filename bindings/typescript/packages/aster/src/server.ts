@@ -19,6 +19,7 @@ import {
   TRAILER,
   COMPRESSED,
   CANCEL,
+  END_STREAM,
 } from './framing.js';
 import { SessionServer } from './session.js';
 import { StreamHeader, RpcStatus } from './protocol.js';
@@ -149,21 +150,47 @@ export class RpcServer {
     }
   }
 
-  /** Handle a single RPC stream. */
+  /** Handle a single RPC stream.
+   *
+   * Multiplexed-streams note (spec §6): a single bi-stream may carry
+   * multiple sequential calls. We loop reading StreamHeaders until the
+   * peer EOFs its send side. Each call's handler writes its
+   * response+trailer but does NOT `finish()` the server's send side,
+   * so the stream stays reusable. v1 TS clients that still
+   * `send.finish()` after one call cause the loop to exit cleanly on
+   * the next read; new-protocol clients (Python, Java, TS v2) reuse
+   * the stream from their per-connection pool and the loop handles
+   * multiple calls per stream.
+   */
   private async handleStream(
     conn: ServerConnection,
     send: ServerSendStream,
     recv: ServerRecvStream,
   ): Promise<void> {
+    while (true) {
+      const shouldContinue = await this.handleOneCallOnStream(conn, send, recv);
+      if (!shouldContinue) return;
+    }
+  }
+
+  /** Handle one call on a stream. Returns `true` if the stream is
+   *  still alive and the caller should loop for the next call;
+   *  `false` on EOF, error, or terminal condition that should exit
+   *  the stream. */
+  private async handleOneCallOnStream(
+    conn: ServerConnection,
+    send: ServerSendStream,
+    recv: ServerRecvStream,
+  ): Promise<boolean> {
     try {
       // Read StreamHeader (first frame, HEADER flag)
       const frame = await readFrame(recv, 0);
-      if (!frame) return;
+      if (!frame) return false; // clean EOF between calls
       const [payload, flags] = frame;
 
       if (!(flags & HEADER)) {
         await this.writeErrorTrailer(send, StatusCode.INTERNAL, 'first frame must have HEADER flag');
-        return;
+        return false;
       }
 
       // Sniff the first byte: '{' (0x7B) means JSON, anything else is binary
@@ -176,42 +203,56 @@ export class RpcServer {
           StatusCode.INVALID_ARGUMENT,
           'this server only supports JSON serialization (mode 3); resend the StreamHeader as JSON',
         );
-        return;
+        return false;
       }
 
       const header = this.codec.decode(payload) as StreamHeader;
 
       if (!header.service) {
         await this.writeErrorTrailer(send, StatusCode.INVALID_ARGUMENT, 'missing service name');
-        return;
+        return false;
       }
 
       // Look up service
       const svcInfo = this.registry.lookup(header.service, header.version);
       if (!svcInfo) {
         await this.writeErrorTrailer(send, StatusCode.NOT_FOUND, `service '${header.service}' v${header.version} not found`);
-        return;
+        return false;
       }
 
       // ── Session discriminator check ─────────────────────────────────
-      const isSessionStream = (header.method === '');
+      // Spec §6 (multiplexed streams): the method name always lives in
+      // the StreamHeader. Session-scoped services are indicated by
+      // `StreamHeader.sessionId != 0`, NOT by an empty method.
+      // Legacy v1 clients that still send `method=''` + CALL frames
+      // are routed through the pre-migration `SessionServer` path as
+      // long as the service is session-scoped AND the client used
+      // the legacy discriminator. Everyone else sends `method=<name>`
+      // and is dispatched through the normal per-pattern path
+      // regardless of scope.
+      const isLegacySessionStream = (header.method === '');
       const isSessionService = (svcInfo.scoped === 'session');
+      const sessionId = (header as { sessionId?: number }).sessionId ?? 0;
 
-      if (isSessionStream !== isSessionService) {
-        let peerId = '';
-        try { peerId = conn.remoteNodeId(); } catch { /* ignore */ }
-        let msg: string;
-        if (isSessionService) {
-          msg = `'${header.service}' is session-scoped: open a session stream (method='') instead of calling method '${header.method}' directly`;
-        } else {
-          msg = `'${header.service}' is shared: send a method name instead of opening a session stream (method='')`;
-        }
-        this.logger.warn(`scope mismatch: ${msg}; peer=${peerId}`);
+      if (isLegacySessionStream && !isSessionService) {
+        // Legacy session shape on a shared service — error out.
+        const msg = `'${header.service}' is shared: send a method name instead of opening a session stream (method='')`;
+        this.logger.warn(`scope mismatch: ${msg}`);
         await this.writeErrorTrailer(send, StatusCode.FAILED_PRECONDITION, msg);
-        return;
+        return false;
       }
 
-      if (isSessionStream) {
+      if (!isLegacySessionStream && isSessionService && sessionId === 0) {
+        // Session-scoped service called with method name but no
+        // sessionId. Pre-migration behaviour: reject (the client
+        // should open a session stream).
+        const msg = `'${header.service}' is session-scoped: open a session stream (method='') instead of calling method '${header.method}' directly`;
+        this.logger.warn(`scope mismatch: ${msg}`);
+        await this.writeErrorTrailer(send, StatusCode.FAILED_PRECONDITION, msg);
+        return false;
+      }
+
+      if (isLegacySessionStream) {
         let peerId: string | undefined;
         try { peerId = conn.remoteNodeId(); } catch { /* ignore */ }
 
@@ -223,8 +264,10 @@ export class RpcServer {
 
         const sessionServer = new SessionServer(this.codec, this.interceptors);
         await sessionServer.handleSession(recv, send, svcInfo, header, peerId, attributes);
+        // Legacy session protocol owns the whole stream; after it
+        // returns the stream is done.
         try { await send.finish(); } catch { /* best effort */ }
-        return;
+        return false;
       }
       // ── End session discriminator ──────────────────────────────────
 
@@ -232,7 +275,7 @@ export class RpcServer {
       const methodInfo = svcInfo.methods.get(header.method);
       if (!methodInfo) {
         await this.writeErrorTrailer(send, StatusCode.UNIMPLEMENTED, `method '${header.service}.${header.method}' not found`);
-        return;
+        return false;
       }
 
       // Validate metadata
@@ -241,7 +284,7 @@ export class RpcServer {
           validateMetadata(header.metadataKeys, header.metadataValues);
         } catch {
           await this.writeErrorTrailer(send, StatusCode.RESOURCE_EXHAUSTED, 'metadata exceeds limits');
-          return;
+          return false;
         }
       }
 
@@ -277,6 +320,12 @@ export class RpcServer {
         () => this.dispatchRpc(svcInfo, methodInfo, callCtx, send, recv),
       );
 
+      // Spec §6: every stream is multiplexed. Don't finish the send
+      // side; loop for the next call on the same bi-stream. Legacy
+      // v1 clients that `send.finish()` after one call will cause
+      // the next read to return null and we'll exit cleanly.
+      return true;
+
     } catch (e) {
       if (e instanceof RpcError) {
         await this.writeErrorTrailer(send, e.code, e.message);
@@ -284,6 +333,7 @@ export class RpcServer {
         this.logger.error('stream handler error', { error: String(e) });
         await this.writeErrorTrailer(send, StatusCode.INTERNAL, String(e));
       }
+      return false;
     }
   }
 
@@ -377,11 +427,12 @@ export class RpcServer {
     }
     response = await applyResponseInterceptors(this.interceptors, callCtx, response);
 
-    // Write response + trailer
+    // Write response + trailer. Spec §6: don't finish the send side —
+    // the outer loop in `handleStream` will read the next StreamHeader
+    // on this multiplexed bi-stream.
     const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
     await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
     await this.writeOkTrailer(send);
-    await send.finish();
   }
 
   private async handleServerStream(
@@ -420,14 +471,23 @@ export class RpcServer {
     }
 
     await this.writeOkTrailer(send);
-    await send.finish();
+    // Spec §6: don't finish — let `handleStream` loop for the next call.
   }
 
   private async handleClientStream(
     svcInfo: ServiceInfo, methodInfo: MethodInfo, handler: Function,
     callCtx: CallContext, send: ServerSendStream, recv: ServerRecvStream,
   ): Promise<void> {
-    // Collect requests until stream ends
+    // Collect requests until the client marks end-of-input.
+    //
+    // Two protocols recognised (spec §6 multiplexed streams replaced
+    // the old shape but legacy v1 clients still send it):
+    //   - NEW: the last request frame carries `FLAG_END_STREAM` and
+    //     there is NO trailing empty frame. The client then waits
+    //     for the server's response on the same stream.
+    //   - OLD: the client sends request frames and then an empty
+    //     `FLAG_TRAILER` frame as explicit end-of-input.
+    // Either shape terminates collection.
     const requests: unknown[] = [];
     const reqType = methodInfo.requestType as unknown;
     while (true) {
@@ -457,6 +517,10 @@ export class RpcServer {
         : this.codec.decode(payload, reqType);
       request = await applyRequestInterceptors(this.interceptors, callCtx, request);
       requests.push(request);
+      // Spec §6: last request is marked with FLAG_END_STREAM.
+      // Consume the frame into `requests` first (payload may carry a
+      // real request, not just an empty marker), then exit the loop.
+      if (flags & END_STREAM) break;
     }
 
     // Provide as async iterable
@@ -484,7 +548,7 @@ export class RpcServer {
     const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
     await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
     await this.writeOkTrailer(send);
-    await send.finish();
+    // Spec §6: don't finish — let `handleStream` loop for the next call.
   }
 
   private async handleBidiStream(
@@ -507,13 +571,19 @@ export class RpcServer {
           const frame = await readFrame(recv, 0);
           if (!frame) break;
           const [payload, flags] = frame;
-          if (flags & TRAILER) break;
+          if (flags & TRAILER) break; // legacy explicit end-of-input
           if (flags & CANCEL) continue;
           const compressed = !!(flags & COMPRESSED);
           const request = compressed
             ? (self.codec as any).decodeCompressed(payload, true, reqType)
             : self.codec.decode(payload, reqType);
           yield request;
+          // Spec §6: the client marks the last request with
+          // FLAG_END_STREAM on the same frame as the payload. After
+          // yielding it, stop reading so the server handler can
+          // start writing responses and the outer stream loop can
+          // proceed to the next call.
+          if (flags & END_STREAM) break;
         }
       } catch (e) {
         errBox.value = e instanceof Error ? e : new Error(String(e));
@@ -543,7 +613,7 @@ export class RpcServer {
     }
 
     await this.writeOkTrailer(send);
-    await send.finish();
+    // Spec §6: don't finish — let `handleStream` loop for the next call.
   }
 
   // -- Helpers ----------------------------------------------------------------
