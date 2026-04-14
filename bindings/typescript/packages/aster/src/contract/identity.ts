@@ -209,12 +209,26 @@ export function buildTypeGraph(rootTypes: (new (...args: any[]) => any)[]): (new
 /**
  * Build a ServiceContract from a ServiceInfo object.
  * Used for contract identity verification.
+ *
+ * When `requestTypeHash` / `responseTypeHash` are present on a method
+ * (populated by `registerGenerated` from the aster-gen build-time
+ * scanner), they're threaded through to the ServiceContract so that
+ * the resulting `contract_id` matches what Python/Java compute for the
+ * same logical service. When absent (runtime-only path without
+ * codegen), the method falls back to 32 zero bytes — contract_id is
+ * then stable-per-service but not cross-language equivalent.
  */
 export function fromServiceInfo(info: {
   name: string;
   version: number;
   scoped?: string;
-  methods: Map<string, { name: string; pattern: string; idempotent?: boolean }>;
+  methods: Map<string, {
+    name: string;
+    pattern: string;
+    idempotent?: boolean;
+    requestTypeHash?: Uint8Array;
+    responseTypeHash?: Uint8Array;
+  }>;
   requires?: { kind: string; roles: string[] };
 }): ServiceContract {
   const contract: ServiceContract = {
@@ -230,8 +244,8 @@ export function fromServiceInfo(info: {
     contract.methods.push({
       name: m.name,
       pattern: m.pattern === 'server_stream' ? 1 : m.pattern === 'client_stream' ? 2 : m.pattern === 'bidi_stream' ? 3 : 0,
-      requestType: new Uint8Array(32),
-      responseType: new Uint8Array(32),
+      requestType: m.requestTypeHash ?? new Uint8Array(32),
+      responseType: m.responseTypeHash ?? new Uint8Array(32),
       idempotent: m.idempotent ?? false,
       defaultTimeout: 0,
       requires: undefined,

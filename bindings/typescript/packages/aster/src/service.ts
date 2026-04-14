@@ -32,6 +32,17 @@ export interface MethodInfo {
    * ``handler.length``.
    */
   acceptsCtx?: boolean;
+  /**
+   * 32-byte BLAKE3 hash of the canonical request TypeDef, computed at
+   * build time by aster-gen. Present when the service was registered
+   * via {@link registerGenerated}; absent on the pure-decorator path.
+   * When absent, contract identity falls back to a zero hash — the
+   * resulting contract_id is stable per-service but not equivalent to
+   * what Python/Java compute for the same logical service.
+   */
+  requestTypeHash?: Uint8Array;
+  /** Counterpart to {@link requestTypeHash}. */
+  responseTypeHash?: Uint8Array;
 }
 
 /** Service metadata describing an RPC service. */
