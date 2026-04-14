@@ -12,14 +12,33 @@ import { JsonCodec } from '../codec.js';
 import {
   writeFrame,
   readFrame,
+  encodeFrame,
   HEADER,
   TRAILER,
   COMPRESSED,
+  END_STREAM,
 } from '../framing.js';
 import { StreamHeader, RpcStatus } from '../protocol.js';
 import { StatusCode, RpcError } from '../status.js';
 import type { AsterTransport, CallOptions } from './base.js';
 import type { BidiChannel } from './base.js';
+
+// Lazy handle to the napi AsterCall class. Cached on first access so
+// the unary hot path doesn't re-resolve the native addon every call.
+// Falls back to `null` if the addon isn't loadable — the caller keeps
+// the old openBi path as a safety net.
+let _nativeAsterCall: any | null | undefined = undefined;
+function getNativeAsterCall(): any | null {
+  if (_nativeAsterCall !== undefined) return _nativeAsterCall;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const native = require('@aster-rpc/transport');
+    _nativeAsterCall = native?.AsterCall ?? null;
+  } catch {
+    _nativeAsterCall = null;
+  }
+  return _nativeAsterCall;
+}
 
 /** QUIC connection interface (matches NAPI IrohConnection). */
 interface QuicConnection {
@@ -68,6 +87,71 @@ export class IrohTransport implements AsterTransport {
     request: unknown,
     opts?: CallOptions,
   ): Promise<unknown> {
+    // Fast path: one napi round-trip through `AsterCall.unaryFastPath`
+    // (mirrors `ffi::aster_call_unary`). Replaces the ~10-hop
+    // openBi → 2x writeFrame → finish → 2x readFrame sequence with a
+    // single native call that does acquire + write_all + recv-loop +
+    // release on the Rust side. Falls back to the legacy path if the
+    // native addon isn't loadable.
+    const fast = getNativeAsterCall();
+    if (fast && typeof fast.unaryFastPath === 'function') {
+      try {
+        // Build the header and request frames separately, then
+        // concatenate into a single buffer so Quinn sees one logical
+        // write on the server side. The request carries
+        // `FLAG_END_STREAM` so the core dispatch loop knows the
+        // request phase is done and can start responding.
+        const headerBytes = this.codec.encode(
+          new StreamHeader({
+            service,
+            method,
+            version: 1,
+            callId: opts?.callId ?? 0,
+            deadline: opts?.deadlineSecs ?? 0,
+            serializationMode:
+              opts?.serializationMode ?? (this.codec instanceof JsonCodec ? 3 : 0),
+            metadataKeys: buildMetadata(opts?.metadata)[0],
+            metadataValues: buildMetadata(opts?.metadata)[1],
+            sessionId: this.sessionId,
+          }),
+        );
+        const headerFrame = encodeFrame(headerBytes, HEADER);
+        const [reqPayload, compressed] = this.codec.encodeCompressed(request);
+        const requestFrame = encodeFrame(
+          reqPayload,
+          (compressed ? COMPRESSED : 0) | END_STREAM,
+        );
+        const requestPair = new Uint8Array(
+          headerFrame.byteLength + requestFrame.byteLength,
+        );
+        requestPair.set(headerFrame, 0);
+        requestPair.set(requestFrame, headerFrame.byteLength);
+
+        const result = await fast.unaryFastPath(
+          this.conn,
+          this.sessionId,
+          requestPair,
+        );
+
+        // Trailer: empty means clean OK; non-empty carries an RpcStatus.
+        if (result.trailer && result.trailer.byteLength > 0) {
+          this.checkTrailer(result.trailer);
+        }
+        // Response body: empty means the dispatcher only sent a
+        // trailer (error case). For OK-with-empty-response, checkTrailer
+        // already passed and we return undefined.
+        if (!result.response || result.response.byteLength === 0) {
+          return undefined;
+        }
+        return this.codec.decode(result.response);
+      } catch (e) {
+        throw mapTransportError(e);
+      }
+    }
+
+    // Legacy fallback path — kept only for environments where the
+    // native addon isn't resolvable. Functionally identical to the
+    // pre-fast-path implementation.
     const bi = await this.conn.openBi();
     const send = bi.takeSend();
     const recv = bi.takeRecv();

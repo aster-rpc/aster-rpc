@@ -9,7 +9,7 @@ use std::time::Duration;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use aster_transport_core::framing::MAX_FRAME_SIZE;
+use aster_transport_core::framing::{FLAG_ROW_SCHEMA, FLAG_TRAILER, MAX_FRAME_SIZE};
 use aster_transport_core::pool::{AcquireError, PoolKey};
 use aster_transport_core::{
     CoreRecvStream, CoreSendStream, MultiplexedStream, MultiplexedStreamHandle,
@@ -88,6 +88,23 @@ pub struct RecvFrameResult {
     pub kind: i32,
 }
 
+/// Result of `AsterCall.unaryFastPath`. Mirrors `aster_call_unary`'s
+/// C-ABI out params in a JS-friendly shape.
+///
+/// - `response` is the first non-row-schema data frame's payload, or
+///   an empty buffer when the dispatcher skipped straight to the
+///   trailer (typical for error trailers).
+/// - `responseFlags` is the flags byte on that data frame, or `0`
+///   when `response` is empty.
+/// - `trailer` is the trailer frame's payload (an encoded
+///   `RpcStatus`). Empty means "clean OK trailer".
+#[napi(object)]
+pub struct UnaryFastPathResult {
+    pub response: Buffer,
+    pub response_flags: u8,
+    pub trailer: Buffer,
+}
+
 /// The underlying stream for a call. Two shapes per spec §3:
 /// - `Pooled` — handle into the per-connection `MultiplexedStreamPool`;
 ///   used for unary calls.
@@ -158,6 +175,105 @@ impl AsterCall {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(AsterCall {
             handle: Arc::new(StdMutex::new(Some(CallStream::Streaming(stream)))),
+        })
+    }
+
+    /// **Unary fast-path** (spec §8). Collapses the full
+    /// acquire → send header → send request → recv response →
+    /// recv trailer → release sequence into ONE napi round-trip.
+    ///
+    /// `requestPair` is a single buffer holding the already-framed
+    /// StreamHeader frame concatenated with the already-framed
+    /// request frame (`[4B LE len][1B flags][payload]` twice). The
+    /// Rust side writes the whole buffer in one `write_all` so Quinn
+    /// sees one logical write, then reads frames from the same
+    /// pooled stream until a `FLAG_TRAILER` frame appears. The first
+    /// non-row-schema data frame is returned as the response; any
+    /// extra data frames are ignored (unary contract).
+    ///
+    /// Why: v1 `IrohTransport.unary` does ~10 napi round-trips per
+    /// unary call (openBi + 2 writeFrames + finish + 2x readFrame
+    /// with 3 internal read_exact each). On macOS arm64 each hop is
+    /// ~30-50 µs, so ~0.4 ms of the per-call budget is pure
+    /// napi-boundary overhead. This method reduces it to ONE hop.
+    /// Java already uses the equivalent FFI fast path via
+    /// `ffi::aster_call_unary` and sees ~3k req/s vs TS's ~1k.
+    ///
+    /// On acquire failure the error carries the same
+    /// `StreamAcquireError:<REASON>:` prefix as `AsterCall.acquire`.
+    /// On transport failure the pool slot is discarded (poisoned)
+    /// so parked waiters wake with a retry signal.
+    #[napi]
+    pub async fn unary_fast_path(
+        conn: &IrohConnection,
+        session_id: u32,
+        request_pair: Buffer,
+    ) -> Result<UnaryFastPathResult> {
+        let core = conn.core_clone();
+        let key = pool_key_for(session_id);
+        let handle = core.acquire_stream(key).await.map_err(acquire_err_to_napi)?;
+
+        // Pull send/recv refs before any awaits so `handle` stays
+        // owned by this scope (RAII drop returns the stream to the
+        // pool on success, discards on failure).
+        let (send, recv) = {
+            let pair = handle.get();
+            (pair.0.clone(), pair.1.clone())
+        };
+
+        let bytes = request_pair.to_vec();
+        if bytes.is_empty() {
+            handle.discard();
+            return Err(Error::from_reason(
+                "unaryFastPath: requestPair is empty".to_string(),
+            ));
+        }
+
+        // 1. Single write_all for header+request.
+        if let Err(e) = send.write_all(bytes).await {
+            handle.discard();
+            return Err(Error::from_reason(format!(
+                "unaryFastPath: write_all failed: {e}"
+            )));
+        }
+
+        // 2. Drain frames until trailer. First non-row-schema data
+        //    frame is captured as the response; extras are ignored.
+        let mut response: Option<(Vec<u8>, u8)> = None;
+        let trailer_payload = loop {
+            match read_one_frame(&recv).await {
+                Ok((payload, flags)) => {
+                    if flags & FLAG_TRAILER != 0 {
+                        break payload;
+                    }
+                    if flags & FLAG_ROW_SCHEMA != 0 {
+                        continue;
+                    }
+                    if response.is_none() {
+                        response = Some((payload, flags));
+                    }
+                    // Extra data frames beyond the first are ignored.
+                }
+                Err(_) => {
+                    handle.discard();
+                    return Err(Error::from_reason(
+                        "unaryFastPath: read failed before trailer".to_string(),
+                    ));
+                }
+            }
+        };
+
+        // 3. Stream returns to the pool on drop (success path).
+        drop(handle);
+
+        let (resp_buf, resp_flags) = match response {
+            Some((p, f)) => (Buffer::from(p), f),
+            None => (Buffer::from(Vec::<u8>::new()), 0u8),
+        };
+        Ok(UnaryFastPathResult {
+            response: resp_buf,
+            response_flags: resp_flags,
+            trailer: Buffer::from(trailer_payload),
         })
     }
 
