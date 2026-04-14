@@ -149,6 +149,29 @@ export {
   type WireTypeOptions,
 } from './decorators.js';
 
+// Branded numeric types for explicit wire selection (spec §11.3.2.3)
+export {
+  i8, i16, i32, i64,
+  u8, u16, u32, u64,
+  f32, f64,
+  BRAND_TO_WIRE,
+  type AsterBrandTag,
+} from './brand.js';
+
+// Generated-file glue (for files emitted by `aster-gen`)
+export {
+  registerGenerated,
+  getWireShape,
+  getGeneratedMethodFields,
+  type WirePrimitive,
+  type WireFieldShape,
+  type WireTypeShape,
+  type GeneratedMethodDef,
+  type GeneratedServiceDef,
+  type RegisterGeneratedOptions,
+  type GeneratedCodec,
+} from './generated.js';
+
 // Codec
 export {
   JsonCodec,

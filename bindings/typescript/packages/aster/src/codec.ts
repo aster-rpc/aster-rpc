@@ -12,6 +12,7 @@
 import { MAX_DECOMPRESSED_SIZE } from './limits.js';
 import { WIRE_TYPE_KEY } from './decorators.js';
 import { ContractViolationError } from './status.js';
+import { getWireShape } from './generated.js';
 
 /** Default compression threshold in bytes (4 KiB). */
 export const DEFAULT_COMPRESSION_THRESHOLD = 4096;
@@ -157,11 +158,46 @@ interface ClassShape {
 }
 const _shapeCache = new WeakMap<new (...args: any[]) => any, ClassShape | null>();
 
+/**
+ * Classes we've already warned about for the runtime-introspection
+ * fallback. Keyed by constructor so we warn at most once per class
+ * per process. This is the signal that aster-gen hasn't been run —
+ * if it shows up in server logs, run `bunx aster-gen`.
+ */
+const _introspectFallbackWarned = new WeakSet<new (...args: any[]) => any>();
+
 function introspectClass(
   cls: new (...args: any[]) => any,
 ): ClassShape | null {
   const cached = _shapeCache.get(cls);
   if (cached !== undefined) return cached;
+
+  // Prefer the generated shape registry when available — it handles
+  // empty arrays, nullable nested types, and non-default-constructible
+  // classes (all of which break the runtime `new cls()` path below).
+  // TODO(aster-gen): once every user runs `bunx aster-gen` and Fory JS
+  // exposes a declarative typeInfo form, the runtime fallback can be
+  // deleted entirely. Tracked in ffi_spec/ts-buildtime-audit.md.
+  const generated = getWireShape(cls);
+  if (generated) {
+    const shape: ClassShape = {
+      fieldNames: new Set(generated.fieldNameSet),
+      nestedTypes: new Map(generated.nestedTypes),
+      elementTypes: new Map(generated.elementTypes),
+    };
+    _shapeCache.set(cls, shape);
+    return shape;
+  }
+
+  if (!_introspectFallbackWarned.has(cls)) {
+    _introspectFallbackWarned.add(cls);
+    const name = cls.name || '<anonymous>';
+    console.warn(
+      `[aster] ${name}: falling back to runtime introspection (new cls() + Object.keys). ` +
+      `Run 'bunx aster-gen' and import the generated file once at startup to get ` +
+      `empty-array / nullable-nested / non-default-constructible support and faster decode validation.`,
+    );
+  }
 
   let template: any;
   try {
@@ -320,6 +356,9 @@ function sanitizeKeys(keys: string[], maxCount = 5, maxLen = 80): string[] {
 
 // -- Type graph walking -------------------------------------------------------
 
+/** Root types that have already triggered the walkTypeGraph fallback warning. */
+const _walkGraphFallbackWarned = new WeakSet<new (...args: any[]) => any>();
+
 /**
  * Walk the type graph starting from root types, discovering nested @WireType
  * classes by inspecting default values of instances.
@@ -327,6 +366,15 @@ function sanitizeKeys(keys: string[], maxCount = 5, maxLen = 80): string[] {
  * Returns all discovered types in dependency order (leaves first), suitable
  * for registration with Fory. This is the TS equivalent of Python's
  * `_walk_type_graph()`.
+ *
+ * **Deprecation path.** Prefer the generated file from `bunx aster-gen`:
+ * it walks the type graph at build time via the TS compiler API and emits
+ * a topologically-ordered `WIRE_TYPES` list with full type information,
+ * correctly handling empty arrays, optional fields, and non-default-
+ * constructible classes. This runtime path warns once per root type when
+ * invoked and will be removed after the Fory JS binding exposes a
+ * declarative typeInfo schema. Tracked in
+ * `ffi_spec/ts-buildtime-audit.md`.
  *
  * Limitations (compared to Python's dataclass introspection):
  * - Only discovers nested types whose default values are instances of @WireType classes
@@ -336,6 +384,18 @@ function sanitizeKeys(keys: string[], maxCount = 5, maxLen = 80): string[] {
  * @returns All types in dependency order (leaves first)
  */
 export function walkTypeGraph(rootTypes: (new (...args: any[]) => any)[]): (new (...args: any[]) => any)[] {
+  for (const cls of rootTypes) {
+    if (!_walkGraphFallbackWarned.has(cls)) {
+      _walkGraphFallbackWarned.add(cls);
+      const name = cls.name || '<anonymous>';
+      console.warn(
+        `[aster] walkTypeGraph(${name}): runtime type-graph reflection is in use. ` +
+        `Run 'bunx aster-gen' and call registerGenerated() at startup — the generated ` +
+        `WIRE_TYPES list is built from AST types and handles cases this runtime path can't ` +
+        `(empty arrays, nullable nested refs, non-default-constructible classes).`,
+      );
+    }
+  }
   const visited = new Set<Function>();
   const ordered: (new (...args: any[]) => any)[] = [];
 

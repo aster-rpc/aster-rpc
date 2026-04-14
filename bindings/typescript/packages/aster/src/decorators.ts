@@ -1,10 +1,18 @@
 /**
  * Service and method decorators for defining Aster RPC services.
  *
- * Spec reference: S7.1-7.4 (decorators), S7.6 (language ownership)
+ * Spec reference: S7.1-7.4 (decorators), S7.6 (language ownership).
  *
  * Uses TC39 Stage 3 decorators (TS 5.0+). These compile away during
- * TypeScript compilation -- no runtime decorator support needed.
+ * TypeScript compilation — no runtime decorator support needed.
+ *
+ * **Build-time codegen.** The scanner CLI `aster-gen` (ships in this
+ * package as a `bin`) walks your `tsconfig.json` at build time and
+ * emits a `rpc.generated.ts` file carrying full service metadata
+ * derived from AST types — no runtime reflection, no manual
+ * `{ request, response }` options. Wire the generated file in once
+ * at startup with `registerGenerated(...)`. See the README for the
+ * full workflow.
  *
  * @example
  * ```ts
@@ -119,14 +127,23 @@ interface RpcOptions {
   requires?: CapabilityRequirement | string;
   metadata?: Metadata;
   /**
-   * Request message constructor. TypeScript erases type parameters at runtime,
-   * so the contract publisher and codegen pipeline cannot discover the request
-   * shape unless it is passed explicitly here. Without it the published manifest
-   * will lack the wire tag and field list, which breaks `aster gen-client`
-   * for cross-language consumers.
+   * **Legacy.** Request message constructor. Before `aster-gen`,
+   * this was required so the manifest publisher and `gen-client`
+   * could reach the type despite erasure. With `aster-gen` the
+   * scanner reads the first parameter type from the AST — omit
+   * this option. Still honored as a fallback when the scanner
+   * hasn't been run; see `ffi_spec/ts-buildtime-audit.md`.
+   *
+   * @deprecated Run `bunx aster-gen` and call `registerGenerated()`
+   *   instead.
    */
   request?: new (...args: any[]) => any;
-  /** Response message constructor. See `request` for why this is needed. */
+  /**
+   * **Legacy.** Response message constructor. See {@link request}.
+   *
+   * @deprecated Run `bunx aster-gen` and call `registerGenerated()`
+   *   instead.
+   */
   response?: new (...args: any[]) => any;
 }
 
