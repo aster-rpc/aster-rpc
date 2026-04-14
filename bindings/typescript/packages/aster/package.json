@@ -5,10 +5,25 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "aster-gen": "./dist/cli/gen.js"
+  },
   "exports": {
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./vite-plugin": {
+      "import": "./dist/plugins/vite.js",
+      "types": "./dist/plugins/vite.d.ts"
+    },
+    "./webpack-plugin": {
+      "import": "./dist/plugins/webpack.js",
+      "types": "./dist/plugins/webpack.d.ts"
+    },
+    "./gen": {
+      "import": "./dist/cli/gen.js",
+      "types": "./dist/cli/gen.d.ts"
     }
   },
   "files": [
@@ -26,6 +41,14 @@
   "dependencies": {
     "@apache-fory/core": "file:../../../../docs/_internal/fory/javascript/packages/core",
     "@aster-rpc/transport": "0.1.0-alpha.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "typescript": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^25.5.2",

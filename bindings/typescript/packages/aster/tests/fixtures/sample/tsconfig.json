@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "strict": true,
+    "experimentalDecorators": false,
+    "emitDecoratorMetadata": false,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@aster-rpc/aster": ["../../../src/index.ts"],
+      "@aster-rpc/aster/*": ["../../../src/*"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

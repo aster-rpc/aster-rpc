@@ -1,5 +1,53 @@
 # Session Instructions: TypeScript Producer Introspection via TS Compiler API
 
+**Status: shipped.** The design in this doc landed as `aster-gen`, a
+standalone TypeScript CLI bundled with `@aster-rpc/aster`. See
+`ffi_spec/ts-buildtime-audit.md` for the current state of the
+build-time vs runtime split, what shipped, what's deferred, and the
+concrete follow-up triggers.
+
+**Delta from the original plan below.** The original plan proposed a
+Python-CLI shell-out (`aster contract gen --lang ts` calls a bundled
+`introspect.ts`). The shipped design is a **standalone TS CLI** in
+`bindings/typescript/packages/aster/src/cli/gen.ts` exposed as a `bin`
+entry on `@aster-rpc/aster`, so TS users never touch the Python
+toolchain. Reasons: (1) TS devs shouldn't install Python to run
+codegen; (2) the scanner's only job is AST-walking + emitting — a
+tiny isolated task that belongs where its consumers are.
+
+**Also different from the original plan:** the scanner does **not**
+compute `contract_id`. The existing TS runtime path
+(`contractIdFromContract(fromServiceInfo(info))`) produces a stable
+per-service id using zero type hashes — not cross-language
+equivalent to Python/Rust, but unchanged by the scanner work. A
+proper cross-language contract_id requires a new NAPI entry point
+that runs the Tarjan-SCC type resolution in Rust; tracked as a
+follow-up in `ts-buildtime-audit.md` under "cross-language
+contract_id".
+
+**What shipped (short list):**
+
+- `src/cli/gen.ts` — scanner + `generate()` programmatic API
+- `src/brand.ts` — `i8…u64`, `f32`, `f64` branded primitives (spec §11.3.2.3)
+- `src/generated.ts` — `registerGenerated()` glue, shape registry,
+  method-fields registry
+- `src/plugins/vite.ts` + `src/plugins/webpack.ts` — build-tool
+  adapters around `generate()`
+- `tests/typescript/unit/aster-gen.test.ts` — 14 tests covering
+  primitives, brands, Date, nested refs, optional fields, homogeneous
+  arrays, `acceptsCtx` detection, pattern discovery, topo sort, and
+  the `registerGenerated` roundtrip
+- `@Rpc({ request, response })` options **removed** — the scanner
+  resolves them from AST. Users just write `@Rpc()`.
+- Runtime reflection (`introspectClass`, `walkTypeGraph`,
+  `_buildManifest:extractFields`) **preserved as fallback** with
+  warn-once logs pointing at `bunx aster-gen`. Removal triggers
+  documented in `ts-buildtime-audit.md`.
+
+---
+
+## Original plan (preserved below for historical reference)
+
 **Status of the Mode 2 work this doc started as.** Python Mode 2 inline
 request parameters shipped in commit `7fdbabb` (CallContext injection +
 Mode 2 across Python decorators, dispatch, contract identity, CLI,

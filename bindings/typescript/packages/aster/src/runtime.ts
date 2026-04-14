@@ -26,6 +26,7 @@ import { CapabilityInterceptor } from './interceptors/capability.js';
 import type { Interceptor } from './interceptors/base.js';
 import { canonicalXlangBytes, contractIdFromContract, fromServiceInfo } from './contract/identity.js';
 import type { ContractManifest, ManifestMethod, ManifestField } from './contract/manifest.js';
+import { getGeneratedMethodFields } from './generated.js';
 import { IrohTransport } from './transport/iroh.js';
 import { StatusCode, RpcError } from './status.js';
 
@@ -387,8 +388,20 @@ export class AsterServer {
   private _buildManifest(info: any, contractId: string): ContractManifest {
     const WIRE_TYPE_KEY = Symbol.for('aster.wire_type');
     const methods: ManifestMethod[] = [];
+    // Once-per-service-per-method-per-kind dedupe for the fallback
+    // warning so server startup doesn't spam logs. Reset each build
+    // since _buildManifest runs once per registered service per
+    // process.
+    const warnedFallback = new Set<string>();
 
-    /** Extract a field list by instantiating a constructor and reading keys. */
+    /**
+     * Extract a field list by instantiating a constructor and reading keys.
+     * TODO(aster-gen): this is the runtime fallback. The preferred path is
+     * `getGeneratedMethodFields(service, version, method)` which reads the
+     * list built at scan time by `bunx aster-gen`. Remove this helper once
+     * every consumer runs the scanner. Tracked in
+     * `ffi_spec/ts-buildtime-audit.md`.
+     */
     const extractFields = (Ctor: unknown): ManifestField[] => {
       if (!Ctor || typeof Ctor !== 'function') return [];
       try {
@@ -489,6 +502,30 @@ export class AsterServer {
         );
       }
 
+      // Prefer pre-derived manifest fields from the generated file
+      // (`bunx aster-gen` output, stashed by `registerGenerated`).
+      // Falls back to runtime `extractFields` with a warn-once log so
+      // server operators notice when the scanner hasn't been wired in.
+      const generatedFields = getGeneratedMethodFields(info.name, info.version, methodName);
+      let reqFields: ManifestField[];
+      let resFields: ManifestField[];
+      if (generatedFields) {
+        reqFields = [...generatedFields.requestFields];
+        resFields = [...generatedFields.responseFields];
+      } else {
+        const key = `${info.name}/${info.version}/${methodName}`;
+        if (!warnedFallback.has(key)) {
+          warnedFallback.add(key);
+          this.logger.warn(
+            `[aster] ${info.name}.${methodName}: manifest fields built via runtime reflection. ` +
+            `Run 'bunx aster-gen' and call registerGenerated() at startup to use AST-derived fields — ` +
+            `handles empty arrays, nullable nested types, and non-default-constructible classes.`,
+          );
+        }
+        reqFields = extractFields(reqType);
+        resFields = extractFields(respType);
+      }
+
       methods.push({
         name: methodName,
         pattern: patternStr,
@@ -501,8 +538,8 @@ export class AsterServer {
         responseWireTag: wireTagOf(respType),
         timeout: mi.timeout ?? 0,
         idempotent: mi.idempotent ?? false,
-        fields: extractFields(reqType),
-        responseFields: extractFields(respType),
+        fields: reqFields,
+        responseFields: resFields,
       });
     }
 
