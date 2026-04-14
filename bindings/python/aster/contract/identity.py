@@ -585,8 +585,16 @@ def _is_optional(tp: Any) -> tuple[bool, Any]:
 
 
 def _get_fqn(cls: type) -> str:
-    """Return fully-qualified name for a type."""
-    return f"{cls.__module__}.{cls.__qualname__}"
+    """Return the wire-tag FQN used as canonical type identity.
+
+    Why: self_ref_name and the type-graph node key must be language-neutral
+    (Aster-ContractIdentity.md §11.3.2.2). Using Python's module.qualname
+    would produce `__main__.Entry`-style names that don't match what Java/TS
+    emit for the same type.
+    """
+    package = _get_package_name(cls)
+    name = _get_type_name(cls)
+    return f"{package}.{name}" if package else name
 
 
 def _get_package_name(cls: type) -> str:

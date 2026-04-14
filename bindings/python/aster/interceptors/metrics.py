@@ -35,7 +35,17 @@ import time
 from typing import Any
 
 from aster.interceptors.base import CallContext, Interceptor
+from aster.logging import set_request_id
 from aster.status import RpcError
+
+try:
+    from opentelemetry import trace as _otel_trace  # type: ignore
+    from opentelemetry import metrics as _otel_metrics  # type: ignore
+    from opentelemetry.trace import StatusCode as _OtelStatusCode  # type: ignore
+except ImportError:
+    _otel_trace = None  # type: ignore
+    _otel_metrics = None  # type: ignore
+    _OtelStatusCode = None  # type: ignore
 
 
 class MetricsInterceptor(Interceptor):
@@ -66,29 +76,28 @@ class MetricsInterceptor(Interceptor):
         self._completed_counter: Any = None
         self._duration_histogram: Any = None
 
-        try:
-            from opentelemetry import trace, metrics  # type: ignore
+        if _otel_trace is not None and _otel_metrics is not None:
+            try:
+                self._tracer = _otel_trace.get_tracer("aster.rpc", "0.2.0")
+                self._meter = _otel_metrics.get_meter("aster.rpc", "0.2.0")
 
-            self._tracer = trace.get_tracer("aster.rpc", "0.2.0")
-            self._meter = metrics.get_meter("aster.rpc", "0.2.0")
-
-            self._started_counter = self._meter.create_counter(
-                "aster.rpc.started",
-                description="Total RPC calls started",
-                unit="1",
-            )
-            self._completed_counter = self._meter.create_counter(
-                "aster.rpc.completed",
-                description="Total RPC calls completed",
-                unit="1",
-            )
-            self._duration_histogram = self._meter.create_histogram(
-                "aster.rpc.duration",
-                description="RPC call duration",
-                unit="s",
-            )
-        except Exception:
-            pass  # OTel not installed -- use fallback counters
+                self._started_counter = self._meter.create_counter(
+                    "aster.rpc.started",
+                    description="Total RPC calls started",
+                    unit="1",
+                )
+                self._completed_counter = self._meter.create_counter(
+                    "aster.rpc.completed",
+                    description="Total RPC calls completed",
+                    unit="1",
+                )
+                self._duration_histogram = self._meter.create_histogram(
+                    "aster.rpc.duration",
+                    description="RPC call duration",
+                    unit="s",
+                )
+            except Exception:
+                pass  # OTel provider not configured -- use fallback counters
 
         # Track start times per call_id for duration calculation
         self._call_starts: dict[str, float] = {}
@@ -117,11 +126,9 @@ class MetricsInterceptor(Interceptor):
 
         # Start OTel span
         if self._tracer:
-            from opentelemetry import trace  # type: ignore
-
             span = self._tracer.start_span(
                 f"{ctx.service}/{ctx.method}",
-                kind=trace.SpanKind.SERVER,
+                kind=_otel_trace.SpanKind.SERVER,
                 attributes={
                     "rpc.system": "aster",
                     "rpc.service": ctx.service,
@@ -135,7 +142,6 @@ class MetricsInterceptor(Interceptor):
             ctx._otel_call_key = call_key  # type: ignore[attr-defined]
 
         # Set correlation ID for structured logging
-        from aster.logging import set_request_id
         set_request_id(ctx.call_id or f"{ctx.service}.{ctx.method}")
 
         return request
@@ -160,8 +166,7 @@ class MetricsInterceptor(Interceptor):
         # End OTel span
         span = getattr(ctx, "_otel_span", None)
         if span:
-            from opentelemetry.trace import StatusCode as OtelStatus  # type: ignore
-            span.set_status(OtelStatus.OK)
+            span.set_status(_OtelStatusCode.OK)
             span.end()
 
         return response
@@ -190,8 +195,7 @@ class MetricsInterceptor(Interceptor):
         # End OTel span with error
         span = getattr(ctx, "_otel_span", None)
         if span:
-            from opentelemetry.trace import StatusCode as OtelStatus  # type: ignore
-            span.set_status(OtelStatus.ERROR, str(error.message))
+            span.set_status(_OtelStatusCode.ERROR, str(error.message))
             span.set_attribute("rpc.aster.error_code", str(error.code))
             span.record_exception(error)
             span.end()

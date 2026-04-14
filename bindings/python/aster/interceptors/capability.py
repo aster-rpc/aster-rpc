@@ -10,10 +10,11 @@ call passes through unconditionally.
 
 from __future__ import annotations
 
+import enum
 import logging
 from typing import Any
 
-from aster.contract.identity import CapabilityRequirement
+from aster.contract.identity import CapabilityKind, CapabilityRequirement
 from aster.interceptors.base import CallContext, Interceptor
 from aster.service import ServiceInfo
 from aster.status import RpcError, StatusCode
@@ -35,8 +36,6 @@ def _normalize_requirement(req: Any) -> CapabilityRequirement | None:
     if isinstance(req, CapabilityRequirement):
         return req
     if isinstance(req, str):
-        from aster.contract.identity import CapabilityKind
-        import enum
         value = req.value if isinstance(req, enum.Enum) else str(req)
         return CapabilityRequirement(kind=CapabilityKind.ROLE, roles=[value])
     return req
