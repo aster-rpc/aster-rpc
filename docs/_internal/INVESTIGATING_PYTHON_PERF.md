@@ -108,7 +108,27 @@ This is the right production answer for throughput-bound workloads. Today's conc
 
 Prerequisite: verify the discovery layer's multi-endpoint advertisement story is production-ready. Then document it.
 
-### D. Don't build — declare ~2× acceptable
+### D. Free-threaded Python 3.13t — blocked on ecosystem
+
+A plausible concurrent-scaling path is "multi-threaded dispatch under free-threaded CPython 3.13t+": N worker threads each running their own asyncio loop, actually-in-parallel on different cores, single NodeId. A 2026-04-14 spike against `explore/gamma-spike` specifically tested whether this path is viable today.
+
+**Spike results (~20 minutes to definitive answer):**
+
+1. **Free-threaded Python 3.13.12 works natively.** `python3.13t` installs via `uv python install 3.13t`, `sys._is_gil_enabled()` returns `False` out of the box, the interpreter itself is fine.
+2. **Our current `_aster.abi3.so` does not load under cp313t.** Error: `SystemError: init function of _aster returned uninitialized object`. Our binding is built with PyO3's `abi3-py39` feature, and the abi3 stable ABI is incompatible with free-threaded Python. Fixable in principle by dropping `abi3-py39`, adding `#[pymodule(gil_used = false)]` on the Rust side, and `maturin develop`ing for cp313t. Roughly a day of work including a PyO3 Sync audit. **Fixable.**
+3. **`pyfory` 0.16.0 has no cp313t wheel.** Apache Fory publishes 20 wheels for the current release — cp39 / cp310 / cp311 / cp312 / cp313 — and all 20 are GIL-enabled (none have the `cp313t-cp313t` ABI tag). No sdist on PyPI. A source-build would require Apache Fory's full monorepo build toolchain locally, which includes Java + Cython + a codegen step; not a one-afternoon task. **Blocked upstream.**
+
+**Conclusion.** The blocker for β is *pyfory cp313t wheels*, not our code. Aster's entire typed-Fory path depends on pyfory, so until Apache Fory ships free-threaded wheels, β cannot run regardless of how much engineering we put in on the PyO3 side. The right posture is: watch Apache Fory's release cadence, and revisit β when cp313t wheels exist. No Aster-side work needed in the interim.
+
+**What to watch for.** When pyfory ships a `cp313t` wheel, the remaining work to validate β shape is:
+- Drop `abi3-py39` and rebuild `_aster` for cp313t with `#[pymodule(gil_used = false)]`.
+- PyO3 `Sync` audit on every `#[pyclass]` type we expose (AsterCall, AsterReactor, reactor event types, pool handles). Each needs either interior synchronisation or a `Py<T>`-safe design.
+- Minimal smoke test: two Python threads each calling `unary_fast_path` concurrently against the same server, verify no segfault and that `sys._is_gil_enabled()` stays `False` after module import.
+- If smoke test passes, then the larger architectural change (multi-worker reactor dispatch, shared service state semantics, per-worker asyncio loops) becomes worth building.
+
+**Why Pattern A is strictly better until then.** Pattern A (N independent processes, multi-endpoint discovery) delivers the same concurrent-throughput outcome without any of these prerequisites. It works on today's stock CPython, today's current abi3 build, today's pyfory 0.16.0. Unless a specific workload requires single-NodeId-with-shared-state (the one thing A cannot do), there is no reason to wait for β.
+
+### E. Don't build — declare ~2× acceptable
 
 Day-zero use cases (operator CLI, agent control plane, mesh admin) are not bound by sub-millisecond loopback latency. 620 µs p50 is fine for every production workload that isn't in a tight benchmark loop. The 2× gap to Java is:
 
@@ -124,6 +144,7 @@ This is the honest answer for most situations. The perf doc should stop framing 
 2. **Document Pattern A as the horizontal scaling story** (~1 day). Confirm multi-endpoint discovery works, write the docs page, point users at "run more processes" when they need throughput.
 3. **Stop iterating on the sequential axis unless a specific user need surfaces.** Options A and B both exist if demand materializes; revisit when there is concrete evidence a workload needs them. In the absence of that evidence, the time is better spent on features users actually ask for.
 4. **Retire the α/β/γ framing from earlier doc revisions.** The old options tree ("sync worker pool → free-threaded Python → multi-core parallelism") was built on a misread cProfile and a hypothesis that Python dispatch cost was ~0.4-0.5 ms per call. Samply measurements show the real server-side Python dispatch cost is ~136 µs per call spread across interpreter work that no γ-style fix removes, and the true lever for closing the *concurrent* gap is Pattern A, not β.
+5. **Watch `pyfory` for cp313t wheel availability.** The free-threaded-Python path (option D above) is blocked upstream at the pyfory codec layer, not in our code. A 2026-04-14 spike confirmed both that Apache Fory has not published cp313t wheels and that our current abi3 binding cannot load on cp313t anyway. When Apache Fory ships free-threaded wheels, the remaining Aster-side work is bounded and worth revisiting — until then, β is off the table regardless of demand.
 
 ## Reproducing
 
