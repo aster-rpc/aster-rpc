@@ -2169,4 +2169,12 @@ Phase 9 effort increased (5–8 days) reflecting the custom canonical encoder + 
 
 ---
 
+## Follow-up Specs
+
+Architectural improvements that build on top of the phased plan above. These are not blockers for any phase but represent the next major work after the core surface stabilises.
+
+- **[Aster-multiplexed-streams.md](Aster-multiplexed-streams.md)** — Unify the client/server stream lifecycle around a single multiplexed-stream primitive owned by `core`. Eliminates the SHARED stream-per-call perf cliff, fixes the "session streaming method blocks unary calls" footgun, and consolidates three copies of the framing state machine (Python, TS, Java) into one. Includes pool primitives, the unified `aster_call_*` FFI family, configuration keys, metrics, and the four-objective Java-first migration plan.
+
+---
+
 *End of plan.*

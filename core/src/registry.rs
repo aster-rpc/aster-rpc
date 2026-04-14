@@ -377,12 +377,7 @@ impl ResolveState {
         result
     }
 
-    fn apply_strategy(
-        &self,
-        group: &mut [EndpointLease],
-        strategy: &str,
-        contract_id: &str,
-    ) {
+    fn apply_strategy(&self, group: &mut [EndpointLease], strategy: &str, contract_id: &str) {
         if group.is_empty() {
             return;
         }
@@ -407,7 +402,9 @@ impl ResolveState {
                 // Cheap shuffle via timestamp-based LCG — good enough for load spreading.
                 let mut seed = now_epoch_ms() as u64;
                 for i in (1..group.len()).rev() {
-                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     let j = (seed as usize) % (i + 1);
                     group.swap(i, j);
                 }
@@ -423,7 +420,11 @@ impl ResolveState {
 
 /// Read a single contract pointer (version_key or channel_key) and return the
 /// contract_id it points to. Picks the entry with the highest timestamp.
-async fn read_pointer(doc: &CoreDoc, key: Vec<u8>, acl: Option<&RegistryAcl>) -> Result<Option<String>> {
+async fn read_pointer(
+    doc: &CoreDoc,
+    key: Vec<u8>,
+    acl: Option<&RegistryAcl>,
+) -> Result<Option<String>> {
     let mut entries = doc.query_key_exact(key).await?;
     if let Some(acl) = acl {
         entries = acl.filter_trusted(entries);
@@ -616,7 +617,14 @@ pub async fn renew_lease(
     let entry = entries
         .into_iter()
         .max_by_key(|e| e.timestamp)
-        .ok_or_else(|| anyhow!("no lease found for {}/{}/{}", service, contract_id, endpoint_id))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "no lease found for {}/{}/{}",
+                service,
+                contract_id,
+                endpoint_id
+            )
+        })?;
     let bytes = doc.read_entry_content(entry.content_hash).await?;
     let mut lease: EndpointLease = serde_json::from_slice(&bytes)?;
 
@@ -701,12 +709,7 @@ impl RegistryAcl {
         self.persist(doc, author_id, "writers").await
     }
 
-    pub async fn remove_writer(
-        &self,
-        doc: &CoreDoc,
-        author_id: &str,
-        writer: &str,
-    ) -> Result<()> {
+    pub async fn remove_writer(&self, doc: &CoreDoc, author_id: &str, writer: &str) -> Result<()> {
         self.writers.write().unwrap().remove(writer);
         self.persist(doc, author_id, "writers").await
     }
@@ -811,7 +814,14 @@ mod tests {
 
     #[test]
     fn filter_drops_draining() {
-        let leases = vec![make_lease("a", HEALTH_DRAINING, "aster/1", None, None, true)];
+        let leases = vec![make_lease(
+            "a",
+            HEALTH_DRAINING,
+            "aster/1",
+            None,
+            None,
+            true,
+        )];
         assert!(apply_mandatory_filters(leases, &base_opts()).is_empty());
     }
 
@@ -901,7 +911,10 @@ mod tests {
     fn key_helpers_match_python() {
         assert_eq!(contract_key("abc"), b"contracts/abc");
         assert_eq!(version_key("svc", 7), b"services/svc/versions/v7");
-        assert_eq!(channel_key("svc", "stable"), b"services/svc/channels/stable");
+        assert_eq!(
+            channel_key("svc", "stable"),
+            b"services/svc/channels/stable"
+        );
         assert_eq!(
             lease_key("svc", "cid", "eid"),
             b"services/svc/contracts/cid/endpoints/eid"
