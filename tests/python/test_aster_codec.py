@@ -28,6 +28,31 @@ from aster.codec import (
 )
 from aster.rpc_types import SerializationMode
 from aster.protocol import StreamHeader, CallHeader, RpcStatus
+
+
+def test_pyfory_cython_acceleration_is_enabled():
+    """Guard against silently running the pure-Python pyfory fallback.
+
+    `pyfory.ENABLE_FORY_CYTHON_SERIALIZATION` should be True on every
+    supported platform. If it flips to False (broken wheel, source install
+    without the compiled extension, etc.) codec throughput drops several-fold
+    and the failure is otherwise silent. This test is the canary.
+    """
+    import pyfory
+    assert pyfory.ENABLE_FORY_CYTHON_SERIALIZATION, (
+        "pyfory Cython acceleration is OFF -- the pure-Python fallback is "
+        "significantly slower. Reinstall pyfory so the compiled extension "
+        "is available: `uv pip install --force-reinstall --no-cache-dir pyfory`."
+    )
+    # Verify ForyCodec constructed the Cython Fory, not the Python fallback.
+    # The Cython class lives in the compiled `pyfory.serialization` extension;
+    # the pure-Python fallback lives in `pyfory._fory`.
+    codec = ForyCodec()
+    fory_cls = type(codec._fory)
+    assert fory_cls.__module__ == "pyfory.serialization", (
+        f"ForyCodec instantiated {fory_cls.__module__}.{fory_cls.__name__}, "
+        f"expected pyfory.serialization.Fory (the Cython fast path)."
+    )
 from aster.status import StatusCode
 
 
