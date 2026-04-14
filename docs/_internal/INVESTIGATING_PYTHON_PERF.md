@@ -19,6 +19,11 @@ The sequential gap to Java is **CPU-bound work distributed across the Python int
 
 The most recent optimization landed the same day: `ForyCodec._coerce_enum_fields` was calling `typing.get_type_hints` uncached on every decoded dataclass, re-parsing forward refs via compile+eval. Adding a per-class cache plus an early-return for types with no enum fields recovered **+38% typed Fory sequential throughput and +42% concurrent-100**. This was the single largest Python-side cost on the hot path before the fix, and it's now gone. There is no equivalent single lever left.
 
+**Concurrent scaling options are now well-understood.** Three forward paths were investigated on 2026-04-14:
+- **Pattern A (N independent processes, distinct NodeIds, multi-endpoint discovery)** — works on stock CPython today, zero framework changes, recommended default.
+- **Pattern B (1 Rust supervisor + N Python worker processes, single NodeId)** — viable, spike confirmed ~11 µs IPC tax over unix sockets (~1.8% of today's p50), ~1.5-2 weeks to build. The architectural stepping stone for β.
+- **β (free-threaded Python 3.13t worker threads)** — **blocked upstream**: pyfory 0.16.0 ships no `cp313t` wheel across any of its 20 published wheels, and our current abi3 binding cannot load on cp313t either. When Apache Fory ships free-threaded wheels, Pattern B's worker side can upgrade from multi-process to multi-thread without changing the supervisor.
+
 ## Where the 330 µs gap lives
 
 Samply native profile of both processes during the benchmark (commit `31a80b4`). Per-call CPU time derived from active samples over the benchmark window:
@@ -93,7 +98,7 @@ The remaining gap is distributed. Options ranked by effort vs payoff:
 
 Cumulative best case: 50-100 µs per call. Would bring typed Fory sequential from ~1,600 r/s to ~1,900 r/s. Incremental, not transformative.
 
-### B. Structural — move more of the dispatch path into Rust (3-5 days each)
+### B. Move the codec decode into Rust (in-process structural work, 3-5 days each)
 
 - **Server-side codec pre-decode in Rust** — the reactor delivers raw bytes to Python which then decodes them. If the request frame were decoded in Rust before crossing into Python (via pyfory-rs if it exists, or a small custom decoder for the common shapes), Python would receive structured data and skip the decode call. Est. 20-40 µs per call.
 - **Client-side trailer handling in Rust** — `unary_fast_path` returns raw bytes; Python decodes both the response and the trailer. If `unary_fast_path` inspected the trailer in Rust and returned `(response_bytes, status_code, error_message)`, Python would skip one decode. Est. 10-20 µs per call.
@@ -108,7 +113,69 @@ This is the right production answer for throughput-bound workloads. Today's conc
 
 Prerequisite: verify the discovery layer's multi-endpoint advertisement story is production-ready. Then document it.
 
-### D. Free-threaded Python 3.13t — blocked on ecosystem
+### D. Pattern B — Rust supervisor + N Python worker processes (spike confirmed, ~1.5-2 weeks to build)
+
+One Rust binary owns the iroh endpoint, the reactor, and a pool of Python worker processes spawned as children. Incoming calls are dispatched over unix-socket IPC to workers; each worker is an independent CPython interpreter with its own GIL, so there is no concurrent-threading footgun. Presents as one NodeId to the network (no multi-endpoint discovery needed), works on stock CPython today.
+
+**Architecture:**
+
+```
+[Client] ──QUIC──► [Rust supervisor: 1 iroh endpoint, 1 NodeId, the reactor]
+                         │
+                         ├──unix socket──► [Python worker 1]
+                         ├──unix socket──► [Python worker 2]
+                         └──unix socket──► [Python worker N]
+```
+
+The supervisor consumes reactor events from the existing C ABI (the same interface the PyO3 binding uses today, but called from a Rust dispatcher instead of delivering into Python). Each call is routed to one worker based on a sticky-per-stream strategy — all frames of a QUIC stream go to the same worker for the stream's lifetime. Session-scoped services use sticky-per-session routing on top.
+
+**Spike results (2026-04-14).** Raw unix-socket frame-exchange cost measured between a minimal Rust binary and a Python script ping-ponging length-prefixed frames in a tight loop. 50,000 RTTs per measurement, 4 rounds median for the default payload:
+
+| Payload | Per RTT | Throughput |
+|---:|---:|---:|
+| 64 B | 10.8 µs | 92,800 RTT/s |
+| 128 B | ~11.0 µs | ~92,000 RTT/s (median of 4 rounds) |
+| 256 B | 10.7 µs | 93,100 RTT/s |
+| 512 B | 11.5 µs | 86,800 RTT/s |
+| 1 KB | 11.6 µs | 86,200 RTT/s |
+| 4 KB | 12.4 µs | 81,000 RTT/s |
+
+Stock CPython 3.13 and free-threaded cp313t give identical IPC cost (~11 µs) — the cost is kernel-syscall-dominated, not interpreter-dominated.
+
+**Interpretation.** Inserting Pattern B's supervisor→worker IPC into today's unary path adds one round-trip per call ≈ **~11 µs on top of today's ~620 µs p50 = ~1.8% latency tax**. Per-worker-socket throughput ceiling is ~90,000 RTT/sec; today's full Aster pipeline runs at ~1,600 r/s per process, so the IPC layer has ~56× headroom before becoming a bottleneck. An earlier revision of this doc guessed "10-50 µs IPC tax"; the measured number is at the cheap end of that range and leaves plenty of budget for doing real work inside the supervisor before the IPC itself becomes a problem.
+
+**What still has to be built** (the spike only proved raw IPC is cheap; the system around it is real engineering):
+
+- **`aster-runtime` Rust binary** that owns the iroh endpoint, consumes reactor events Rust-side, spawns N worker processes as children, and dispatches over unix sockets. ~300-500 lines building on the existing reactor. (2-3 days)
+- **IPC protocol** — length-prefixed frames with a correlation ID, worker-hello handshake, shutdown sentinel. The frame shape can reuse the existing QUIC wire format; what needs defining is the supervisor↔worker envelope. (1-2 days)
+- **Python worker module** (`aster.worker` or similar) that connects to the supervisor's socket, registers services, runs a minimal asyncio loop, reads calls, invokes handlers, writes responses. (2 days)
+- **Dispatch strategy** — sticky-per-stream at stream-open time, session-scoped service affinity, round-robin across workers for new streams. Aligns with the earlier "stream is the right dispatch unit in a QUIC+P2P world" finding. (2 days)
+- **Worker lifecycle** — child supervision, graceful shutdown, crash recovery (failed worker's in-flight calls get error-responded, supervisor optionally restarts). (1-2 days)
+- **Streaming support** — bidi and server-stream with backpressure across IPC. The hardest piece, but maps cleanly to "correlation ID + multi-frame exchange on one socket." (2-3 days)
+- **Integration tests + benchmarks** — concurrent-100 actually scales with N, session routing works, crash recovery works. (2-3 days)
+
+**Total: ~1.5-2 weeks of focused work.** Earlier doc revisions called this "speculative, hardest" — the spike upgrades it to "tested, viable, well-scoped."
+
+**Stepping stone to β.** Pattern B is the architecture you want *anyway*, even if you eventually ship free-threaded Python. When pyfory ships cp313t wheels, the worker side can change from "N OS processes, each with its own GIL" to "1 OS process with N threads on cp313t, each with its own asyncio loop" — the supervisor, IPC protocol, and dispatch logic stay the same. Building Pattern B now is not wasted work toward β; it's the prerequisite shape for it. The only part that would become removable under β is the unix-socket round-trip (saving the ~11 µs IPC tax), and everything else — supervisor ownership of iroh, dispatcher loop, worker-registry, crash handling — is load-bearing in both worlds.
+
+**Comparison to Pattern A and β:**
+
+| | Pattern A (N procs, distinct NodeIds) | **Pattern B (1 NodeId, N worker procs)** | β (free-threaded threads) |
+|---|---|---|---|
+| Engineering cost | ~1 day (docs + discovery verify) | **~1.5-2 weeks** | Blocked upstream |
+| Works on stock CPython | Yes | **Yes** | No (cp313t only) |
+| pyfory dependency | Today's 0.16.0 | **Today's 0.16.0** | Needs cp313t wheel (unavailable) |
+| NodeId topology | N distinct (client discovers N) | **1 (client sees 1 endpoint)** | 1 |
+| Shared state across workers | No (process-isolated) | **No (process-isolated)** | Yes (thread-shared) |
+| Per-call IPC tax | 0 | **~11 µs (1.8%)** | 0 |
+| Handler thread-safety required | No | **No** | Yes |
+| Concurrent throughput ceiling | N × single-process | **N × single-process, one NodeId** | N cores within one process |
+
+Pattern A is strictly cheaper and is the right answer if multi-endpoint discovery fits the user's topology. Pattern B is the right answer if the "single NodeId" property matters — long-lived stream identity pinning, operational simplicity of one address to monitor/restart, or contexts where multi-endpoint discovery is awkward for the client.
+
+**When to build it.** Trigger: a concrete need for single-NodeId multi-core throughput that Pattern A cannot satisfy. In the absence of that trigger, Pattern A is cheaper and sufficient. The spike confirms the path exists and measures its cost — it doesn't mandate building it now.
+
+### E. Free-threaded Python 3.13t (β) — blocked on ecosystem
 
 A plausible concurrent-scaling path is "multi-threaded dispatch under free-threaded CPython 3.13t+": N worker threads each running their own asyncio loop, actually-in-parallel on different cores, single NodeId. A 2026-04-14 spike against `explore/gamma-spike` specifically tested whether this path is viable today.
 
@@ -126,9 +193,9 @@ A plausible concurrent-scaling path is "multi-threaded dispatch under free-threa
 - Minimal smoke test: two Python threads each calling `unary_fast_path` concurrently against the same server, verify no segfault and that `sys._is_gil_enabled()` stays `False` after module import.
 - If smoke test passes, then the larger architectural change (multi-worker reactor dispatch, shared service state semantics, per-worker asyncio loops) becomes worth building.
 
-**Why Pattern A is strictly better until then.** Pattern A (N independent processes, multi-endpoint discovery) delivers the same concurrent-throughput outcome without any of these prerequisites. It works on today's stock CPython, today's current abi3 build, today's pyfory 0.16.0. Unless a specific workload requires single-NodeId-with-shared-state (the one thing A cannot do), there is no reason to wait for β.
+**Why other options are better until then.** Pattern A (N independent processes, multi-endpoint discovery) delivers concurrent scaling today on stock CPython with zero framework changes. Pattern B (Rust supervisor + N Python worker processes) delivers the same single-NodeId property β offers, works today on stock CPython, and — per the spike — would serve as the prerequisite architecture for β anyway. Pattern B's worker processes can be upgraded to worker threads on cp313t when upstream catches up; the supervisor/dispatcher shape stays the same. There is no scenario where waiting for β is better than building Pattern B first if single-NodeId throughput is the goal.
 
-### E. Don't build — declare ~2× acceptable
+### F. Don't build — declare ~2× acceptable
 
 Day-zero use cases (operator CLI, agent control plane, mesh admin) are not bound by sub-millisecond loopback latency. 620 µs p50 is fine for every production workload that isn't in a tight benchmark loop. The 2× gap to Java is:
 
@@ -141,10 +208,11 @@ This is the honest answer for most situations. The perf doc should stop framing 
 ## Recommendation
 
 1. **`_coerce_enum_fields` fix is shipped** (commit `31a80b4`). No more action needed.
-2. **Document Pattern A as the horizontal scaling story** (~1 day). Confirm multi-endpoint discovery works, write the docs page, point users at "run more processes" when they need throughput.
-3. **Stop iterating on the sequential axis unless a specific user need surfaces.** Options A and B both exist if demand materializes; revisit when there is concrete evidence a workload needs them. In the absence of that evidence, the time is better spent on features users actually ask for.
-4. **Retire the α/β/γ framing from earlier doc revisions.** The old options tree ("sync worker pool → free-threaded Python → multi-core parallelism") was built on a misread cProfile and a hypothesis that Python dispatch cost was ~0.4-0.5 ms per call. Samply measurements show the real server-side Python dispatch cost is ~136 µs per call spread across interpreter work that no γ-style fix removes, and the true lever for closing the *concurrent* gap is Pattern A, not β.
-5. **Watch `pyfory` for cp313t wheel availability.** The free-threaded-Python path (option D above) is blocked upstream at the pyfory codec layer, not in our code. A 2026-04-14 spike confirmed both that Apache Fory has not published cp313t wheels and that our current abi3 binding cannot load on cp313t anyway. When Apache Fory ships free-threaded wheels, the remaining Aster-side work is bounded and worth revisiting — until then, β is off the table regardless of demand.
+2. **Document Pattern A as the horizontal scaling story** (~1 day). Confirm multi-endpoint discovery works, write the docs page, point users at "run more processes" when they need throughput. Pattern A is the right default recommendation for any user who can deploy more than one process.
+3. **Pattern B stays on the shelf until there is demand.** The spike confirmed it is viable (~11 µs IPC tax, no ecosystem blockers) and well-scoped (~1.5-2 weeks to build), but it is not worth the engineering investment in the absence of a concrete use case that Pattern A cannot satisfy. If a user need for single-NodeId multi-core throughput surfaces, **Pattern B is the path, not β**, until pyfory cp313t wheels exist — and even after they exist, Pattern B is the architectural prerequisite for β.
+4. **Stop iterating on the sequential axis unless a specific need surfaces.** Small in-process wins (options A and B in the options list) exist if a specific workload demands them; revisit when there is concrete evidence. In the absence of that evidence, the engineering time is better spent on features users actually ask for.
+5. **Retire the α/β/γ framing from earlier doc revisions.** The old options tree was built on a misread cProfile and a hypothesis that Python dispatch cost was ~0.4-0.5 ms per call. Samply measurements show the real server-side Python dispatch cost is ~136 µs per call spread across interpreter work that no γ-style fix removes, and the true levers for closing the *concurrent* gap are Pattern A (now) and Pattern B (when single-NodeId matters), not β.
+6. **Watch `pyfory` for cp313t wheel availability.** The free-threaded-Python path (option E above) is blocked upstream at the pyfory codec layer, not in our code. A 2026-04-14 spike confirmed both that Apache Fory has not published cp313t wheels and that our current abi3 binding cannot load on cp313t anyway. When Apache Fory ships free-threaded wheels, the β migration from Pattern B is small — the supervisor/dispatcher shape stays identical, only the worker side upgrades from multi-process to multi-thread. Watch, don't wait.
 
 ## Reproducing
 
