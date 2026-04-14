@@ -10,5 +10,8 @@
   },
   "dependencies": {
     "@aster-rpc/aster": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22"
   }
 }
