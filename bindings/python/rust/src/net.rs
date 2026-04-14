@@ -1082,7 +1082,9 @@ impl ReactorResponseSender {
 pub struct ReactorRequestReceiver {
     inner: Arc<
         tokio::sync::Mutex<
-            Option<tokio::sync::mpsc::UnboundedReceiver<aster_transport_core::reactor::RequestFrame>>,
+            Option<
+                tokio::sync::mpsc::UnboundedReceiver<aster_transport_core::reactor::RequestFrame>,
+            >,
         >,
     >,
 }
@@ -1179,9 +1181,7 @@ impl ReactorEvent {
 
     #[getter]
     fn header_payload<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
-        self.header_payload
-            .as_ref()
-            .map(|b| PyBytes::new(py, b))
+        self.header_payload.as_ref().map(|b| PyBytes::new(py, b))
     }
 
     #[getter]
@@ -1191,9 +1191,7 @@ impl ReactorEvent {
 
     #[getter]
     fn request_payload<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
-        self.request_payload
-            .as_ref()
-            .map(|b| PyBytes::new(py, b))
+        self.request_payload.as_ref().map(|b| PyBytes::new(py, b))
     }
 
     #[getter]

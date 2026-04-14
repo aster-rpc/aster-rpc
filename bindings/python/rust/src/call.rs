@@ -62,9 +62,10 @@ fn acquire_err_to_py(err: AcquireError) -> PyErr {
     let msg = format!("{reason}: {err}");
     Python::attach(|py| {
         let exc = StreamAcquireError::new_err(msg);
-        if let Ok(bound) = exc.value(py).setattr("reason", reason) {
-            let _ = bound;
-        }
+        // Best-effort attach of the typed `reason` attribute; if
+        // setattr fails the exception still carries the formatted
+        // message so the caller can still map it.
+        let _ = exc.value(py).setattr("reason", reason);
         exc
     })
 }
@@ -234,9 +235,7 @@ impl AsterCall {
             // 1. Single write_all for header+request.
             if let Err(e) = send.write_all(request_pair).await {
                 handle.discard();
-                return Err(err_to_py(format!(
-                    "unary_fast_path: write_all failed: {e}"
-                )));
+                return Err(err_to_py(format!("unary_fast_path: write_all failed: {e}")));
             }
 
             // 2. Drain frames until trailer. First non-row-schema
@@ -258,9 +257,7 @@ impl AsterCall {
                     }
                     Err(_) => {
                         handle.discard();
-                        return Err(err_to_py(
-                            "unary_fast_path: read failed before trailer",
-                        ));
+                        return Err(err_to_py("unary_fast_path: read failed before trailer"));
                     }
                 }
             };
@@ -305,11 +302,7 @@ impl AsterCall {
     /// `RECV_OK` / `RECV_END_OF_STREAM` / `RECV_TIMEOUT`. On EOS or
     /// timeout the payload is empty and flags is 0.
     #[pyo3(signature = (timeout_ms=0))]
-    fn recv_frame<'py>(
-        &self,
-        py: Python<'py>,
-        timeout_ms: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn recv_frame<'py>(&self, py: Python<'py>, timeout_ms: u32) -> PyResult<Bound<'py, PyAny>> {
         let recv = self
             .clone_recv()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("call already terminated"))?;
