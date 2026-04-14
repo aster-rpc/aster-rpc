@@ -51,11 +51,12 @@ from aster.transport.iroh import IrohTransport
 
 
 def _make_codec() -> ForyCodec:
-    """Build a codec that knows about every chaos wire type. All
-    chaos tests share this codec via an IrohTransport built directly
-    on the session's native connection -- bypasses ClientSession.client()
-    because its create_client path unconditionally rejects session-scoped
-    classes (a latent Python binding bug that's out of scope for tier 2).
+    """Build a codec that knows about every chaos wire type. Chaos
+    tests use this with an IrohTransport built directly on the
+    session's native connection; ``ClientSession.client()`` also
+    works for session-scoped classes now (see the regression test
+    below) but the direct-transport path gives finer control over
+    which error maps to which assertion.
     """
     return ForyCodec(
         mode=SerializationMode.XLANG,
@@ -482,3 +483,40 @@ async def test_same_session_id_on_two_distinct_connections_resolves_to_distinct_
 
             await pa.close()
             await pb.close()
+
+
+# ── 6. ClientSession.client() works for session-scoped classes ────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_client_session_client_accepts_session_scoped_classes():
+    """Regression guard for the Python ``create_client`` bug: a
+    ``ClientSession.client(SessionScopedCls)`` call must return a
+    typed stub and every invocation through it must route through
+    the session's bound transport.
+
+    Pre-fix, ``ClientSession.client`` called ``create_client`` which
+    unconditionally raised ``ClientError`` for any session-scoped
+    class, silently breaking the ``examples/python/session_chat.py``
+    path. The fix (client.py) skips the scope check when a
+    pre-built transport is supplied because
+    ``ClientSession.client`` builds an ``IrohTransport(session_id=...)``
+    before handing it off.
+    """
+    _reset_chaos_state()
+    async with AsterServer(
+        services=[ChaosSessionService],
+        allow_all_consumers=True,
+    ) as server:
+        addr_b64 = server.endpoint_addr_b64
+        async with AsterClient(endpoint_addr=addr_b64) as client:
+            session = await client.open_session()
+            # This call used to raise
+            # `ClientError: ChaosSessionService is session-scoped ...`.
+            stub = await session.client(ChaosSessionService, codec=_make_codec())
+            r1 = await stub.bump(BumpRequest(message="stubbed"))
+            r2 = await stub.bump(BumpRequest(message="stubbed"))
+            assert r1.reply == "stubbed:1"
+            assert r2.reply == "stubbed:2"
+            await session.close()

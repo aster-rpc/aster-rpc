@@ -26,8 +26,7 @@ import { CapabilityInterceptor } from './interceptors/capability.js';
 import type { Interceptor } from './interceptors/base.js';
 import { canonicalXlangBytes, contractIdFromContract, fromServiceInfo } from './contract/identity.js';
 import type { ContractManifest, ManifestMethod, ManifestField } from './contract/manifest.js';
-import { writeFrame, readFrame, HEADER, TRAILER, CALL } from './framing.js';
-import { StreamHeader, CallHeader, RpcStatus } from './protocol.js';
+import { IrohTransport } from './transport/iroh.js';
 import { StatusCode, RpcError } from './status.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -1373,23 +1372,50 @@ export class ProxyBidiChannel {
 // ── SessionProxyClient ──────────────────────────────────────────────────────
 
 /**
- * Dynamic proxy client for session-scoped services. Opens a single bidi QUIC
- * stream with the session protocol (StreamHeader method="") and multiplexes
- * calls via CALL frames. Created automatically by AsterClientWrapper.proxy()
- * when the service summary indicates scoped='session'.
+ * Dynamic proxy client for session-scoped services (new multiplexed-streams
+ * protocol, spec §6 / §7.5).
+ *
+ * Allocates a stable `sessionId` on construction and routes every proxy
+ * method call through an `IrohTransport` wired with that id. The transport
+ * writes each call's `StreamHeader` with `sessionId=N` and `method=<name>`
+ * so the server lands every call on the same per-connection session
+ * instance. The pre-migration implementation sent `StreamHeader(method="")`
+ * plus `FLAG_CALL`-wrapped CallHeaders on a single bidi stream — that
+ * protocol is dead and cross-binding matrices against any new-protocol
+ * server fail with `UNIMPLEMENTED: Method '<service>.'`.
+ *
+ * Each proxy instance uses a fresh sessionId (not shared across proxies)
+ * so that creating two proxies in the same process yields two independent
+ * server-side instances — matching the old behaviour.
  */
 class SessionProxyClient {
-  private _send: any = null;
-  private _recv: any = null;
-  private _codec = new JsonCodec();
-  private _callIdCounter = 0;
-  private _opening: Promise<void> | null = null;
+  private readonly _sessionTransport: AsterTransport;
+  private _closed = false;
+  private static _sessionIdCounter = 0;
 
   constructor(
     private readonly serviceName: string,
     _node: any,
-    private readonly _transport: AsterTransport,
+    transport: AsterTransport,
   ) {
+    // Reach through the v1 transport to get its underlying QUIC
+    // connection. We build a fresh transport on the same connection
+    // but pinned to a freshly-allocated sessionId, so each outbound
+    // call carries `StreamHeader.sessionId=N` without disturbing
+    // other callers of the original transport.
+    const conn = (transport as any).conn ?? (transport as any)._conn;
+    if (!conn) {
+      throw new RpcError(
+        StatusCode.UNAVAILABLE,
+        'SessionProxyClient: v1 transport did not expose its connection',
+      );
+    }
+    const sessionId = ++SessionProxyClient._sessionIdCounter;
+    // `new IrohTransport(conn, codec, { sessionId })` threads the id
+    // into every StreamHeader this transport writes. JSON codec is
+    // the only one the legacy proxy supported.
+    this._sessionTransport = new IrohTransport(conn, new JsonCodec(), { sessionId });
+
     return new Proxy(this, {
       get(target, prop: string) {
         if (prop in target || typeof prop === 'symbol') {
@@ -1403,90 +1429,46 @@ class SessionProxyClient {
   private _sessionMethod(methodName: string) {
     const self = this;
     const fn = async (payload?: unknown): Promise<unknown> => {
-      await self._ensureOpen();
       return self._callUnary(methodName, payload ?? {});
     };
-    fn.stream = (_payload?: unknown): AsyncIterable<unknown> => {
-      throw new RpcError(StatusCode.UNIMPLEMENTED, 'session proxy server_stream not yet implemented');
+    fn.stream = (payload?: unknown): AsyncIterable<unknown> => {
+      return self._sessionTransport.serverStream(
+        self.serviceName,
+        methodName,
+        payload ?? {},
+      );
     };
     fn.bidi = (): ProxyBidiChannel => {
-      throw new RpcError(StatusCode.UNIMPLEMENTED, 'session proxy bidi not yet implemented') as any;
+      throw new RpcError(
+        StatusCode.UNIMPLEMENTED,
+        'session proxy bidi not yet implemented',
+      ) as any;
     };
     return fn;
   }
 
-  private async _ensureOpen(): Promise<void> {
-    if (this._send) return;
-    if (this._opening) return this._opening;
-    this._opening = this._open();
-    return this._opening;
-  }
-
-  private async _open(): Promise<void> {
-    // The IrohTransport wraps the connection. We need the raw connection
-    // to open a bidi stream. Reach through the transport to get it.
-    const conn = (this._transport as any).conn ?? (this._transport as any)._conn;
-    if (!conn) throw new RpcError(StatusCode.UNAVAILABLE, 'no QUIC connection for session');
-
-    const bi = await conn.openBi();
-    this._send = bi.takeSend();
-    this._recv = bi.takeRecv();
-
-    // Send the session StreamHeader (method="" signals session mode)
-    const header = new StreamHeader({
-      service: this.serviceName,
-      method: '',
-      version: 1,
-      callId: ++this._callIdCounter,
-      serializationMode: 3, // JSON
-    });
-    await writeFrame(this._send, this._codec.encode(header), HEADER);
-  }
-
   private async _callUnary(method: string, request: unknown): Promise<unknown> {
-    // Send CALL frame with CallHeader
-    const callHeader = new CallHeader({
-      method,
-      callId: ++this._callIdCounter,
-    });
-    await writeFrame(this._send, this._codec.encode(callHeader), CALL);
-
-    // Send request payload
-    await writeFrame(this._send, this._codec.encode(request), 0);
-
-    // Read response
-    const respFrame = await readFrame(this._recv, 0);
-    if (!respFrame) throw new RpcError(StatusCode.UNAVAILABLE, 'session stream ended');
-    const [respPayload, respFlags] = respFrame;
-
-    if (respFlags & TRAILER) {
-      const status = this._codec.decode(respPayload) as RpcStatus;
-      throw RpcError.fromStatus(status.code as StatusCode, status.message);
+    if (this._closed) {
+      throw new RpcError(StatusCode.FAILED_PRECONDITION, 'SessionProxyClient is closed');
     }
-
-    // Spec: session unary has no success trailer. The response frame is
-    // the complete response. Both Python and TS servers follow this rule.
-    return this._codec.decode(respPayload);
+    return await this._sessionTransport.unary(this.serviceName, method, request);
   }
 
   /**
-   * Close this session, releasing the underlying bidi stream.
+   * Close the proxy. Marks the proxy closed so subsequent method
+   * calls fail fast. Does NOT close the underlying QUIC connection
+   * even though the session transport has a `.close()` method --
+   * `IrohTransport.close()` tears down the whole connection (shared
+   * with other proxies / sessions), so calling it from here would
+   * break siblings. The connection is owned by the parent
+   * `AsterClientWrapper` and closed when it does.
    *
    * Must be a real method (not synthesised by the JS Proxy) so that
    * `proxy.close()` calls this implementation instead of routing
    * "close" through the session protocol as a remote method name.
    */
   async close(): Promise<void> {
-    const send = this._send;
-    this._send = null;
-    this._recv = null;
-    if (send && typeof send.finish === 'function') {
-      try {
-        await send.finish();
-      } catch {
-        // Already closed / broken pipe -- best effort.
-      }
-    }
+    this._closed = true;
   }
 }
 
