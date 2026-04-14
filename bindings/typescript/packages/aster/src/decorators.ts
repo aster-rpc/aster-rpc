@@ -8,11 +8,10 @@
  *
  * **Build-time codegen.** The scanner CLI `aster-gen` (ships in this
  * package as a `bin`) walks your `tsconfig.json` at build time and
- * emits a `rpc.generated.ts` file carrying full service metadata
+ * emits `aster-rpc.generated.ts` carrying full service metadata
  * derived from AST types — no runtime reflection, no manual
- * `{ request, response }` options. Wire the generated file in once
- * at startup with `registerGenerated(...)`. See the README for the
- * full workflow.
+ * `{ request, response }` options. `AsterServer.start()` auto-imports
+ * the generated file. See the README for the full workflow.
  *
  * @example
  * ```ts

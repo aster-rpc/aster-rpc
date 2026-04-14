@@ -2,9 +2,11 @@
  * Mission Control services with role-based access control (Chapter 5).
  *
  * Same services as services.ts but with requires= on each method.
- * Used by: bun run server.ts --auth
+ * Used by: node server.ts --auth
  */
 
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import {
   Service,
   Rpc,
@@ -13,6 +15,8 @@ import {
   BidiStream,
   anyOf,
 } from '@aster-rpc/aster';
+
+const exec = promisify(execFile);
 
 import {
   StatusRequest,
@@ -40,7 +44,7 @@ export class MissionControl {
   private logWaiters: ((entry: LogEntry) => void)[] = [];
   private metrics: MetricPoint[] = [];
 
-  @Rpc({ requires: Role.STATUS, request: StatusRequest, response: StatusResponse })
+  @Rpc({ requires: Role.STATUS })
   async getStatus(req: StatusRequest): Promise<StatusResponse> {
     return new StatusResponse({
       agent_id: req.agent_id,
@@ -49,7 +53,7 @@ export class MissionControl {
     });
   }
 
-  @Rpc({ request: LogEntry, response: SubmitLogResult })
+  @Rpc()
   async submitLog(entry: LogEntry): Promise<SubmitLogResult> {
     if (this.logWaiters.length > 0) {
       const waiter = this.logWaiters.shift()!;
@@ -60,7 +64,7 @@ export class MissionControl {
     return new SubmitLogResult({ accepted: true });
   }
 
-  @ServerStream({ requires: anyOf(Role.LOGS, Role.ADMIN), request: TailRequest, response: LogEntry })
+  @ServerStream({ requires: anyOf(Role.LOGS, Role.ADMIN) })
   async *tailLogs(req: TailRequest): AsyncGenerator<LogEntry> {
     const minRank = LOG_LEVEL_RANK[req.level?.toLowerCase() ?? "info"] ?? 0;
     while (true) {
@@ -79,7 +83,7 @@ export class MissionControl {
     });
   }
 
-  @ClientStream({ requires: Role.INGEST, request: MetricPoint, response: IngestResult })
+  @ClientStream({ requires: Role.INGEST })
   async ingestMetrics(stream: AsyncIterable<MetricPoint>): Promise<IngestResult> {
     let accepted = 0;
     for await (const point of stream) {
@@ -95,7 +99,7 @@ export class AgentSession {
   private _agentId = "";
   private _capabilities: string[] = [];
 
-  @Rpc({ requires: Role.INGEST, request: Heartbeat, response: Assignment })
+  @Rpc({ requires: Role.INGEST })
   async register(hb: Heartbeat): Promise<Assignment> {
     this._agentId = hb.agent_id;
     this._capabilities = [...(hb.capabilities ?? [])];
@@ -105,23 +109,25 @@ export class AgentSession {
     return new Assignment({ task_id: "idle", command: "sleep 60" });
   }
 
-  @Rpc({ request: Heartbeat, response: Assignment })
+  @Rpc()
   async heartbeat(hb: Heartbeat): Promise<Assignment> {
     this._capabilities = [...(hb.capabilities ?? [])];
     return new Assignment({ task_id: "continue", command: "" });
   }
 
-  @BidiStream({ requires: Role.ADMIN, request: Command, response: CommandResult })
+  @BidiStream({ requires: Role.ADMIN })
   async *runCommand(commands: AsyncIterable<Command>): AsyncGenerator<CommandResult> {
     for await (const cmd of commands) {
-      const proc = Bun.spawn(["sh", "-c", cmd.command], {
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const stdout = await new Response(proc.stdout).text();
-      const stderr = await new Response(proc.stderr).text();
-      const exit_code = await proc.exited;
-      yield new CommandResult({ stdout, stderr, exit_code });
+      try {
+        const { stdout, stderr } = await exec("sh", ["-c", cmd.command]);
+        yield new CommandResult({ stdout, stderr, exit_code: 0 });
+      } catch (e: any) {
+        yield new CommandResult({
+          stdout: e.stdout ?? "",
+          stderr: e.stderr ?? e.message,
+          exit_code: e.code ?? 1,
+        });
+      }
     }
   }
 }

@@ -2,25 +2,26 @@
  * Types and registration glue for files emitted by `aster-gen`.
  *
  * `aster-gen` scans a TypeScript project at build time and emits a
- * single `rpc.generated.ts` file exporting `SERVICES` and `WIRE_TYPES`
+ * single `aster-rpc.generated.ts` file exporting `SERVICES` and `WIRE_TYPES`
  * literals that describe every `@Service` and `@WireType` class found.
  * The runtime decorators are pure markers — all the metadata lives in
  * the generated file.
  *
- * The generated file is consumed via {@link registerGenerated}:
+ * The generated file is auto-imported by `AsterServer.start()`:
  *
  * ```ts
- * import { AsterServer, registerGenerated } from '@aster-rpc/aster';
- * import { SERVICES, WIRE_TYPES } from './rpc.generated.js';
- *
- * registerGenerated({ SERVICES, WIRE_TYPES });
- * const server = new AsterServer({ services: [new MissionControlService()] });
+ * // Run `npx aster-gen` first — emits aster-rpc.generated.ts
+ * const server = new AsterServer({
+ *   services: [new MissionControlService()],
+ * });
+ * await server.start();  // auto-imports aster-rpc.generated.js
  * ```
  *
- * `registerGenerated` stamps the generated metadata onto each class
- * constructor under the existing `SERVICE_INFO_KEY` / `WIRE_TYPE_KEY`
- * symbols, so the runtime path (`ServiceRegistry.register`, the JSON
- * shape validator, Fory type registration) keeps working unchanged.
+ * Under the hood, `start()` calls {@link registerGenerated} which
+ * stamps the generated metadata onto each class constructor under the
+ * existing `SERVICE_INFO_KEY` / `WIRE_TYPE_KEY` symbols, so the runtime
+ * path (`ServiceRegistry.register`, the JSON shape validator, Fory type
+ * registration) keeps working unchanged.
  */
 
 import type { SerializationMode } from './types.js';
@@ -207,9 +208,9 @@ export interface GeneratedCodec {
 
 /** Options for {@link registerGenerated}. */
 export interface RegisterGeneratedOptions {
-  /** SERVICES export from `rpc.generated.ts`. */
+  /** SERVICES export from `aster-rpc.generated.ts`. */
   SERVICES: readonly GeneratedServiceDef[];
-  /** WIRE_TYPES export from `rpc.generated.ts`. */
+  /** WIRE_TYPES export from `aster-rpc.generated.ts`. */
   WIRE_TYPES: readonly WireTypeShape[];
   /**
    * Optional Fory codec. When provided, every wire type is
@@ -222,7 +223,10 @@ export interface RegisterGeneratedOptions {
 /**
  * Wire the generated file into the runtime.
  *
- * Call this once, before constructing `AsterServer`. It:
+ * Normally you don't call this directly — `AsterServer.start()`
+ * auto-imports `aster-rpc.generated.js` and calls this for you.
+ *
+ * If called directly, call once before constructing `AsterServer`. It:
  *
  * 1. Stamps `WIRE_TYPE_KEY` onto every wire type class constructor
  *    and records its pre-built shape in the shape registry so the

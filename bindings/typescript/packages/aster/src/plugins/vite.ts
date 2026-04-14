@@ -13,7 +13,7 @@
  *   plugins: [
  *     asterGen({
  *       project: 'tsconfig.json',
- *       out: 'src/rpc.generated.ts',
+ *       out: 'aster-rpc.generated.ts',
  *     }),
  *   ],
  * });

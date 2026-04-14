@@ -111,7 +111,7 @@ by fixing the type or explicitly annotating with `f64`.
 Wire types are erased at runtime, so `@aster-rpc/aster` ships a
 build-time scanner — `aster-gen` — that walks your `tsconfig.json`,
 reads field and parameter types from the TypeScript compiler API,
-and emits a `rpc.generated.ts` file with ready-made service +
+and emits a `aster-rpc.generated.ts` file with ready-made service +
 wire-type metadata.
 
 ```sh
@@ -120,11 +120,11 @@ bunx aster-gen
 npx aster-gen
 ```
 
-Defaults: reads `./tsconfig.json`, writes `./src/rpc.generated.ts`.
+Defaults: reads `./tsconfig.json`, writes `./aster-rpc.generated.ts`.
 Override with `-p` / `--project` and `-o` / `--out`:
 
 ```sh
-bunx aster-gen -p tsconfig.app.json -o build/rpc.generated.ts
+bunx aster-gen -p tsconfig.app.json -o build/aster-rpc.generated.ts
 ```
 
 Add it to `package.json` so builds and CI always regenerate:
@@ -149,7 +149,7 @@ export default defineConfig({
   plugins: [
     asterGen({
       project: 'tsconfig.json',
-      out: 'src/rpc.generated.ts',
+      out: 'aster-rpc.generated.ts',
     }),
   ],
 });
@@ -168,7 +168,7 @@ module.exports = {
   plugins: [
     new AsterGenWebpackPlugin({
       project: 'tsconfig.json',
-      out: 'src/rpc.generated.ts',
+      out: 'aster-rpc.generated.ts',
     }),
   ],
 };
@@ -176,26 +176,23 @@ module.exports = {
 
 ### Wiring the generated file
 
-Once per process, before constructing `AsterServer`, call
-`registerGenerated` with the exports from your `rpc.generated.ts`:
+`AsterServer.start()` auto-imports `aster-rpc.generated.js` from the
+working directory — no manual import needed:
 
 ```ts
-import { AsterServer, registerGenerated } from '@aster-rpc/aster';
-import { SERVICES, WIRE_TYPES } from './rpc.generated.js';
+import { AsterServer } from '@aster-rpc/aster';
 import { MissionControlService } from './services/mission_control.js';
-
-registerGenerated({ SERVICES, WIRE_TYPES });
 
 const server = new AsterServer({
   services: [new MissionControlService()],
 });
-await server.start();
+await server.start();  // auto-imports aster-rpc.generated.js
 ```
 
-`registerGenerated` stamps the pre-built metadata onto each class
-constructor, so the existing runtime paths (`ServiceRegistry`,
-manifest publication, JSON shape validation) consume the generated
-data instead of reflecting at runtime.
+The auto-import stamps the pre-built metadata onto each class
+constructor before services are registered, so the existing runtime
+paths (`ServiceRegistry`, manifest publication, JSON shape validation)
+consume the generated data instead of reflecting at runtime.
 
 ## What happens if you don't run `aster-gen`?
 

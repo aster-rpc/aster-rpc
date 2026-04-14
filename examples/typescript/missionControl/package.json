@@ -3,6 +3,11 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "build": "aster-gen",
+    "start": "npm run build && node server.ts",
+    "start:auth": "npm run build && node server.ts --auth"
+  },
   "dependencies": {
     "@aster-rpc/aster": "workspace:*"
   }
