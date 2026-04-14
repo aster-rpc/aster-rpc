@@ -21,6 +21,7 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { createRequire } from 'node:module';
 import ts from 'typescript';
 
 // ─── CLI argv ────────────────────────────────────────────────────────────────
@@ -547,62 +548,382 @@ function unwrapAsyncReturn(checker: ts.TypeChecker, t: ts.Type): ts.Type | undef
   return t;
 }
 
-// ─── Dependency ordering ─────────────────────────────────────────────────────
+// ─── Dependency ordering (Tarjan SCC) ────────────────────────────────────────
 
 /**
- * Topological sort of wire types so leaves come first. Naive DFS —
- * does not handle cycles. Cycles in the wire type graph are flagged
- * as a scan error (the NAPI contract_id path needs proper SCC
- * handling, tracked as a follow-up).
+ * Collect all wire-type tags referenced (transitively through containers)
+ * by a single scanned field. Used for building the reference graph and
+ * for back-edge detection within SCCs.
  */
-function orderWireTypes(
-  wireTypes: ScannedWireType[],
-): ScannedWireType[] {
-  const bySym = new Map<ts.Symbol, ScannedWireType>();
-  for (const w of wireTypes) bySym.set(w.sym, w);
+function collectFieldRefs(f: ScanField, acc: Set<string>): void {
+  if (f.kind === 'ref') {
+    acc.add(f.refTag);
+  } else if (f.kind === 'list' || f.kind === 'set') {
+    collectFieldRefs(f.element, acc);
+  } else if (f.kind === 'map') {
+    collectFieldRefs(f.key, acc);
+    collectFieldRefs(f.value, acc);
+  }
+}
 
-  const visited = new Set<ts.Symbol>();
-  const inProgress = new Set<ts.Symbol>();
-  const ordered: ScannedWireType[] = [];
+function wireTypeDeps(w: ScannedWireType): Set<string> {
+  const acc = new Set<string>();
+  for (const f of w.fields) collectFieldRefs(f, acc);
+  return acc;
+}
 
-  function deps(f: ScanField, acc: Set<ts.Symbol>): void {
-    if (f.kind === 'ref') {
-      for (const [sym, w] of bySym) {
-        if (w.tag === f.refTag) acc.add(sym);
+/**
+ * Tarjan's SCC on the @WireType reference graph, keyed by wire tag.
+ * Returns SCCs in reverse topological order (leaves first) — ready for
+ * bottom-up hashing. Self-referential types (`Entry.children: Entry[]`)
+ * land in a single-node SCC with a self-edge; mutually recursive types
+ * (`A ↔ B`) land in a multi-node SCC. The caller handles back-edge
+ * detection and SELF_REF emission.
+ *
+ * Spec: `Aster-ContractIdentity.md` §11.3. Mirror of the Rust
+ * implementation in `core/src/contract.rs::tarjan_scc`.
+ */
+function tarjanSccs(wireTypes: ScannedWireType[]): ScannedWireType[][] {
+  const byTag = new Map<string, ScannedWireType>();
+  for (const w of wireTypes) byTag.set(w.tag, w);
+
+  let idx = 0;
+  const index = new Map<string, number>();
+  const lowlink = new Map<string, number>();
+  const onStack = new Set<string>();
+  const stack: string[] = [];
+  const sccs: ScannedWireType[][] = [];
+
+  function strongconnect(vTag: string): void {
+    index.set(vTag, idx);
+    lowlink.set(vTag, idx);
+    idx++;
+    stack.push(vTag);
+    onStack.add(vTag);
+
+    const v = byTag.get(vTag);
+    if (v) {
+      // Sort deps for deterministic output across runs.
+      const deps = [...wireTypeDeps(v)].filter(t => byTag.has(t)).sort();
+      for (const wTag of deps) {
+        if (!index.has(wTag)) {
+          strongconnect(wTag);
+          lowlink.set(vTag, Math.min(lowlink.get(vTag)!, lowlink.get(wTag)!));
+        } else if (onStack.has(wTag)) {
+          lowlink.set(vTag, Math.min(lowlink.get(vTag)!, index.get(wTag)!));
+        }
       }
-    } else if (f.kind === 'list' || f.kind === 'set') {
-      deps(f.element, acc);
-    } else if (f.kind === 'map') {
-      deps(f.key, acc);
-      deps(f.value, acc);
+    }
+
+    if (lowlink.get(vTag) === index.get(vTag)) {
+      const scc: ScannedWireType[] = [];
+      while (true) {
+        const u = stack.pop()!;
+        onStack.delete(u);
+        const uw = byTag.get(u);
+        if (uw) scc.push(uw);
+        if (u === vTag) break;
+      }
+      sccs.push(scc);
     }
   }
 
-  function visit(sym: ts.Symbol): void {
-    if (visited.has(sym)) return;
-    if (inProgress.has(sym)) {
-      const w = bySym.get(sym);
+  // Visit in deterministic tag order so SCC output is stable.
+  const roots = [...wireTypes].map(w => w.tag).sort();
+  for (const t of roots) {
+    if (!index.has(t)) strongconnect(t);
+  }
+  return sccs;
+}
+
+/**
+ * DFS within a multi-node SCC from a fixed start node, recording which
+ * edges are back-edges (target already visited on the DFS path). Edges
+ * in the spanning tree resolve to REF via the already-computed hashes;
+ * back-edges resolve to SELF_REF so the cycle can be broken without a
+ * fixed-point hash iteration. Mirrors Python's `_spanning_tree_dfs` in
+ * `identity.py`.
+ */
+function sccBackEdges(scc: ScannedWireType[]): Map<string, Set<string>> {
+  const result = new Map<string, Set<string>>();
+  if (scc.length === 1) {
+    const w = scc[0]!;
+    const deps = wireTypeDeps(w);
+    if (deps.has(w.tag)) {
+      result.set(w.tag, new Set([w.tag]));
+    }
+    return result;
+  }
+
+  // Multi-node SCC: DFS from the lexicographically smallest tag (matches
+  // Python's NFC-sorted choice of start node — deterministic and
+  // language-independent).
+  const memberTags = new Set(scc.map(w => w.tag));
+  const byTag = new Map<string, ScannedWireType>();
+  for (const w of scc) byTag.set(w.tag, w);
+  const start = [...memberTags].sort()[0]!;
+
+  const visited = new Set<string>();
+  function dfs(tag: string): void {
+    visited.add(tag);
+    const w = byTag.get(tag);
+    if (!w) return;
+    const deps = [...wireTypeDeps(w)].filter(t => memberTags.has(t)).sort();
+    for (const r of deps) {
+      if (!visited.has(r)) {
+        dfs(r);
+      } else {
+        if (!result.has(tag)) result.set(tag, new Set());
+        result.get(tag)!.add(r);
+      }
+    }
+  }
+  dfs(start);
+  return result;
+}
+
+// ─── Type hash computation ───────────────────────────────────────────────────
+
+/**
+ * Rust `FieldDef` JSON shape — must match `core/src/contract.rs::FieldDef`
+ * serde layout exactly. Field names are the serde-default snake_case of
+ * the struct, all fields present (serde defaults still parse, but we
+ * emit the full shape for clarity).
+ */
+interface FieldDefJson {
+  id: number;
+  name: string;
+  type_kind: 'primitive' | 'ref' | 'self_ref' | 'any';
+  type_primitive: string;
+  type_ref: string; // hex-encoded bytes (64 chars for a 32-byte hash)
+  self_ref_name: string;
+  optional: boolean;
+  ref_tracked: boolean;
+  container: 'none' | 'list' | 'set' | 'map';
+  container_key_kind: 'primitive' | 'ref' | 'self_ref' | 'any';
+  container_key_primitive: string;
+  container_key_ref: string;
+  required: boolean;
+  default_value: string;
+}
+
+interface TypeDefJson {
+  kind: 'message' | 'enum' | 'union';
+  package: string;
+  name: string;
+  fields: FieldDefJson[];
+  enum_values: never[];
+  union_variants: never[];
+}
+
+/** Lazy-loaded NAPI binding — same module the runtime uses. */
+interface NativeContractBinding {
+  canonicalBytesFromJson(typeName: string, json: string): Uint8Array;
+  computeTypeHash(data: Uint8Array): Uint8Array;
+}
+
+let _nativeBinding: NativeContractBinding | undefined;
+function loadNativeBinding(): NativeContractBinding {
+  if (_nativeBinding) return _nativeBinding;
+  // `@aster-rpc/aster` is ESM, but the NAPI addon is CJS. `createRequire`
+  // gives us a sync-loading CJS require resolved from this module — the
+  // native addon is loaded once and cached.
+  const req = createRequire(import.meta.url);
+  const mod = req('@aster-rpc/transport');
+  if (typeof mod.canonicalBytesFromJson !== 'function' ||
+      typeof mod.computeTypeHash !== 'function') {
+    throw new ScanError(
+      'aster-gen: @aster-rpc/transport is missing canonicalBytesFromJson / ' +
+      'computeTypeHash. Rebuild the native addon: cd bindings/typescript/native && yarn build',
+    );
+  }
+  _nativeBinding = mod as NativeContractBinding;
+  return _nativeBinding;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  let s = '';
+  for (const b of bytes) s += b.toString(16).padStart(2, '0');
+  return s;
+}
+
+interface LeafShape {
+  type_kind: FieldDefJson['type_kind'];
+  type_primitive: string;
+  type_ref: string;
+  self_ref_name: string;
+}
+
+/**
+ * Map a ScanField primitive leaf to a Rust FieldDef leaf shape.
+ * `backEdgeTargets` is the set of wire tags (within the current SCC)
+ * that should emit `type_kind: self_ref` instead of `ref` — this is
+ * how cyclic types break the hash chicken-and-egg. For acyclic types
+ * the set is empty and everything resolves to `ref` via `typeHashes`.
+ */
+function resolveLeaf(
+  f: ScanField,
+  typeHashes: Map<string, string>,
+  backEdgeTargets: Set<string>,
+): LeafShape {
+  if (f.kind === 'primitive') {
+    return { type_kind: 'primitive', type_primitive: f.wire, type_ref: '', self_ref_name: '' };
+  }
+  if (f.kind === 'ref') {
+    if (backEdgeTargets.has(f.refTag)) {
+      // SELF_REF: encode the target by wire tag rather than by hash.
+      // The tag is language-neutral (unlike Python's current use of
+      // __module__.__qualname__, which is a latent cross-language
+      // parity gap on the Python side).
+      return { type_kind: 'self_ref', type_primitive: '', type_ref: '', self_ref_name: f.refTag };
+    }
+    const hash = typeHashes.get(f.refTag);
+    if (!hash) {
       throw new ScanError(
-        `cyclic wire type graph detected (includes ${w?.importName ?? '?'}). ` +
-        `Cyclic types are not yet supported by the TS scanner — open an issue.`,
+        `aster-gen: unresolved @WireType reference '${f.refTag}' — ` +
+        `Tarjan SCC should have hashed it first. This is a bug in ` +
+        `tarjanSccs or computeTypeHashes.`,
       );
     }
-    inProgress.add(sym);
-    const w = bySym.get(sym);
-    if (!w) {
-      inProgress.delete(sym);
-      return;
-    }
-    const ds = new Set<ts.Symbol>();
-    for (const f of w.fields) deps(f, ds);
-    for (const d of ds) visit(d);
-    inProgress.delete(sym);
-    visited.add(sym);
-    ordered.push(w);
+    return { type_kind: 'ref', type_primitive: '', type_ref: hash, self_ref_name: '' };
+  }
+  // Containers can't be leaves — scanFieldToFieldDef peels them first.
+  throw new ScanError(
+    `aster-gen: nested container in field '${f.name}' is not representable ` +
+    `in a single Rust FieldDef. Spec §11.3.2.3 allows at most one container ` +
+    `level per field.`,
+  );
+}
+
+/**
+ * Convert a ScanField to the Rust FieldDef JSON shape. Handles primitives,
+ * refs, and one level of list / set / map container (matching Python's
+ * `_build_field_def_for`).
+ */
+function scanFieldToFieldDef(
+  f: ScanField,
+  index: number,
+  typeHashes: Map<string, string>,
+  backEdgeTargets: Set<string>,
+): FieldDefJson {
+  const base: FieldDefJson = {
+    id: index,
+    name: f.name,
+    type_kind: 'primitive',
+    type_primitive: '',
+    type_ref: '',
+    self_ref_name: '',
+    optional: f.nullable,
+    ref_tracked: false,
+    container: 'none',
+    container_key_kind: 'primitive',
+    container_key_primitive: '',
+    container_key_ref: '',
+    required: true,
+    default_value: '',
+  };
+
+  if (f.kind === 'primitive' || f.kind === 'ref') {
+    const leaf = resolveLeaf(f, typeHashes, backEdgeTargets);
+    return { ...base, ...leaf };
   }
 
-  for (const w of wireTypes) visit(w.sym);
-  return ordered;
+  if (f.kind === 'list' || f.kind === 'set') {
+    const leaf = resolveLeaf(f.element, typeHashes, backEdgeTargets);
+    return { ...base, container: f.kind, ...leaf };
+  }
+
+  // map
+  const valueLeaf = resolveLeaf(f.value, typeHashes, backEdgeTargets);
+  const keyLeaf = resolveLeaf(f.key, typeHashes, backEdgeTargets);
+  return {
+    ...base,
+    container: 'map',
+    ...valueLeaf,
+    container_key_kind: keyLeaf.type_kind,
+    container_key_primitive: keyLeaf.type_primitive,
+    container_key_ref: keyLeaf.type_ref,
+  };
+}
+
+/**
+ * Split a @WireType tag into (package, name) using the conventional
+ * `"namespace/TypeName"` form. A tag without a `/` is treated as an
+ * unnamespaced type. This must match how Python's `@wire_type` populates
+ * `__fory_namespace__` / `__fory_typename__` so TS and Python compute
+ * identical TypeDef bytes for the same logical type.
+ */
+function splitTag(tag: string): { package: string; name: string } {
+  const idx = tag.lastIndexOf('/');
+  if (idx < 0) return { package: '', name: tag };
+  return { package: tag.slice(0, idx), name: tag.slice(idx + 1) };
+}
+
+function wireTypeToTypeDef(
+  w: ScannedWireType,
+  typeHashes: Map<string, string>,
+  backEdgeTargets: Set<string>,
+): TypeDefJson {
+  const { package: pkg, name } = splitTag(w.tag);
+  const fields = w.fields.map((f, i) => scanFieldToFieldDef(f, i + 1, typeHashes, backEdgeTargets));
+  return {
+    kind: 'message',
+    package: pkg,
+    name,
+    fields,
+    enum_values: [],
+    union_variants: [],
+  };
+}
+
+/**
+ * Walk wire types SCC-by-SCC in reverse topological order, compute each
+ * type's canonical BLAKE3 hash via the native binding, and return both
+ * the tag→hash map (input to method hash emission) and the flattened
+ * ordered list (input to emission so the generated file keeps leaves-
+ * first layout).
+ *
+ * Cyclic types are broken via `SELF_REF`: within an SCC, back-edges in
+ * a spanning-tree DFS emit `type_kind: self_ref` with the target wire
+ * tag in `self_ref_name`, instead of the (not-yet-computed) target
+ * hash. This is the standard trick for content-hashing a Merkle DAG
+ * over cyclic references; see `Aster-ContractIdentity.md` §11.3.2.2.
+ */
+function computeTypeHashes(wireTypes: ScannedWireType[]): {
+  hashes: Map<string, string>;
+  ordered: ScannedWireType[];
+} {
+  const native = loadNativeBinding();
+  const sccs = tarjanSccs(wireTypes);
+  const hashes = new Map<string, string>();
+  const ordered: ScannedWireType[] = [];
+
+  for (const scc of sccs) {
+    const backEdgesBySource = sccBackEdges(scc);
+    for (const w of scc) {
+      const backEdgeTargets = backEdgesBySource.get(w.tag) ?? new Set<string>();
+      const td = wireTypeToTypeDef(w, hashes, backEdgeTargets);
+      const canonical = native.canonicalBytesFromJson('TypeDef', JSON.stringify(td));
+      const hash = native.computeTypeHash(canonical);
+      hashes.set(w.tag, bytesToHex(hash));
+      ordered.push(w);
+    }
+  }
+  return { hashes, ordered };
+}
+
+/**
+ * Emit a Uint8Array literal expression from a hex-encoded 32-byte hash.
+ * The generated form is `new Uint8Array([0xab, 0xcd, ...])` — terse
+ * enough that the output stays readable, and zero-runtime-cost (no
+ * `hex.decode` call at module load).
+ */
+function emitHashLiteral(hex: string): string {
+  const parts: string[] = [];
+  for (let i = 0; i < hex.length; i += 2) {
+    parts.push('0x' + hex.substr(i, 2));
+  }
+  return `new Uint8Array([${parts.join(', ')}])`;
 }
 
 // ─── Output emission ─────────────────────────────────────────────────────────
@@ -719,7 +1040,22 @@ function emitServices(
   wireTypes: ScannedWireType[],
   services: ScannedService[],
   aliasFor: Map<ts.Symbol, string>,
+  typeHashes: Map<string, string>,
 ): string {
+  // Map a method's request/response type symbol to the @WireType tag,
+  // so we can look up the precomputed hash.
+  const tagBySym = new Map<ts.Symbol, string>();
+  for (const w of wireTypes) tagBySym.set(w.sym, w.tag);
+
+  const hashLitFor = (sym: ts.Symbol | undefined): string => {
+    if (!sym) return 'undefined';
+    const tag = tagBySym.get(sym);
+    if (!tag) return 'undefined';
+    const hex = typeHashes.get(tag);
+    if (!hex) return 'undefined';
+    return emitHashLiteral(hex);
+  };
+
   const entries: string[] = [];
   for (const s of services) {
     const alias = aliasFor.get(s.sym)!;
@@ -741,6 +1077,8 @@ function emitServices(
       metadata: undefined,
       requestFields: ${JSON.stringify(reqFields)},
       responseFields: ${JSON.stringify(resFields)},
+      requestTypeHash: ${hashLitFor(m.requestTypeSym)},
+      responseTypeHash: ${hashLitFor(m.responseTypeSym)},
     },`;
     }).join('\n');
     entries.push(
@@ -902,22 +1240,40 @@ function scan(cli: Cli): {
     return projectFiles.has(path.resolve(sf.fileName));
   };
 
-  // Pass 1: discover all @WireType classes so services can resolve
-  // request/response type refs in pass 2.
+  // Pass 1a: register every @WireType class's symbol -> tag BEFORE
+  // scanning any fields. This lets a class reference itself (e.g.
+  // `Entry.children: Entry[]`) — without the pre-pass, `typeToField`
+  // would see `Entry` as an unknown symbol because its own tag hadn't
+  // been added to `wireTypeTags` yet when its fields were walked.
+  const pendingClasses: Array<{ sf: ts.SourceFile; node: ts.ClassDeclaration; decorator: ts.Decorator; tag: string }> = [];
   for (const sf of program.getSourceFiles()) {
     if (!isProjectFile(sf)) continue;
     ts.forEachChild(sf, node => {
       if (!ts.isClassDeclaration(node) || !node.name) return;
       const wt = findDecorator(node, ['WireType']);
-      if (wt) {
-        const scanned = scanWireType(ctx, node, wt);
-        wireTypes.push(scanned);
-        ctx.wireTypeTags.set(scanned.sym, scanned.tag);
-        if (cli.verbose) {
-          console.error(`  @WireType ${scanned.importName} (${scanned.tag})`);
-        }
+      if (!wt) return;
+      if (!ts.isCallExpression(wt.expression)) {
+        throw new ScanError('@WireType must be called with a tag', locationOf(wt));
       }
+      const tagArg = wt.expression.arguments[0];
+      if (!tagArg || !ts.isStringLiteralLike(tagArg)) {
+        throw new ScanError('@WireType tag must be a string literal', locationOf(wt));
+      }
+      const sym = ctx.checker.getSymbolAtLocation(node.name!)!;
+      ctx.wireTypeTags.set(sym, tagArg.text);
+      pendingClasses.push({ sf, node, decorator: wt, tag: tagArg.text });
     });
+  }
+
+  // Pass 1b: now that every tag is registered, walk fields and produce
+  // the ScannedWireType entries. Self- and mutually-recursive refs now
+  // resolve correctly in `typeToField`.
+  for (const pc of pendingClasses) {
+    const scanned = scanWireType(ctx, pc.node, pc.decorator);
+    wireTypes.push(scanned);
+    if (cli.verbose) {
+      console.error(`  @WireType ${scanned.importName} (${scanned.tag})`);
+    }
   }
 
   // Pass 2: scan @Service classes.
@@ -945,7 +1301,7 @@ function emit(
   services: ScannedService[],
 ): string {
   const outPath = path.resolve(cli.out);
-  const ordered = orderWireTypes(wireTypes);
+  const { hashes: typeHashes, ordered } = computeTypeHashes(wireTypes);
   const { header, aliasFor } = buildImports(outPath, ordered, services);
 
   return [
@@ -958,7 +1314,7 @@ function emit(
     '',
     emitWireTypes(ordered, aliasFor),
     '',
-    emitServices(ordered, services, aliasFor),
+    emitServices(ordered, services, aliasFor, typeHashes),
     '',
   ].join('\n');
 }

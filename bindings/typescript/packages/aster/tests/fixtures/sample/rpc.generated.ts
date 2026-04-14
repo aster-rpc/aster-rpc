@@ -3,31 +3,12 @@
 // Regenerate with: bunx aster-gen
 
 import { RpcPattern } from '@aster-rpc/aster';
-import { StatusRequest as T0_StatusRequest, StatusResponse as T1_StatusResponse, WatchRequest as T2_WatchRequest, StatusEvent as T3_StatusEvent } from './src/types.js';
+import { StatusResponse as T0_StatusResponse, StatusEvent as T1_StatusEvent, StatusRequest as T2_StatusRequest, WatchRequest as T3_WatchRequest } from './src/types.js';
 import { MissionControlService as T4_MissionControlService } from './src/service.js';
 
 export const WIRE_TYPES = [
   {
-    ctor: T0_StatusRequest,
-    tag: "sample/StatusRequest",
-    fields: [
-    { name: "agentId", kind: 'primitive', wire: "string", nullable: false },
-    { name: "nonce", kind: 'primitive', wire: "int64", nullable: false },
-    ],
-    fieldNameSet: new Set(["agentId", "nonce"]),
-    nestedTypes: new Map([]),
-    elementTypes: new Map([]),
-    // foryTypeInfo is intentionally null: the current Fory JS API
-    // requires user code to build a typeInfo with a `buildTypeInfo`
-    // callback (see `ForyCodec.registerTypeGraph`). The scanner
-    // doesn't know Fory's internal shape. Follow-up: once the Fory
-    // JS binding exposes a declarative schema form, the scanner can
-    // emit it here and `registerGenerated` will feed it to Fory
-    // directly — no user callback needed.
-    foryTypeInfo: null,
-  },
-  {
-    ctor: T1_StatusResponse,
+    ctor: T0_StatusResponse,
     tag: "sample/StatusResponse",
     fields: [
     { name: "status", kind: 'primitive', wire: "string", nullable: false },
@@ -47,13 +28,33 @@ export const WIRE_TYPES = [
     foryTypeInfo: null,
   },
   {
-    ctor: T2_WatchRequest,
-    tag: "sample/WatchRequest",
+    ctor: T1_StatusEvent,
+    tag: "sample/StatusEvent",
+    fields: [
+    { name: "at", kind: 'primitive', wire: "timestamp", nullable: false },
+    { name: "status", kind: 'ref', refTag: "sample/StatusResponse", nullable: false },
+    { name: "optionalNote", kind: 'primitive', wire: "string", nullable: true },
+    ],
+    fieldNameSet: new Set(["at", "status", "optionalNote"]),
+    nestedTypes: new Map([["status", T0_StatusResponse]]),
+    elementTypes: new Map([]),
+    // foryTypeInfo is intentionally null: the current Fory JS API
+    // requires user code to build a typeInfo with a `buildTypeInfo`
+    // callback (see `ForyCodec.registerTypeGraph`). The scanner
+    // doesn't know Fory's internal shape. Follow-up: once the Fory
+    // JS binding exposes a declarative schema form, the scanner can
+    // emit it here and `registerGenerated` will feed it to Fory
+    // directly — no user callback needed.
+    foryTypeInfo: null,
+  },
+  {
+    ctor: T2_StatusRequest,
+    tag: "sample/StatusRequest",
     fields: [
     { name: "agentId", kind: 'primitive', wire: "string", nullable: false },
-    { name: "includeWarnings", kind: 'primitive', wire: "bool", nullable: false },
+    { name: "nonce", kind: 'primitive', wire: "int64", nullable: false },
     ],
-    fieldNameSet: new Set(["agentId", "includeWarnings"]),
+    fieldNameSet: new Set(["agentId", "nonce"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
     // foryTypeInfo is intentionally null: the current Fory JS API
@@ -66,15 +67,14 @@ export const WIRE_TYPES = [
     foryTypeInfo: null,
   },
   {
-    ctor: T3_StatusEvent,
-    tag: "sample/StatusEvent",
+    ctor: T3_WatchRequest,
+    tag: "sample/WatchRequest",
     fields: [
-    { name: "at", kind: 'primitive', wire: "timestamp", nullable: false },
-    { name: "status", kind: 'ref', refTag: "sample/StatusResponse", nullable: false },
-    { name: "optionalNote", kind: 'primitive', wire: "string", nullable: true },
+    { name: "agentId", kind: 'primitive', wire: "string", nullable: false },
+    { name: "includeWarnings", kind: 'primitive', wire: "bool", nullable: false },
     ],
-    fieldNameSet: new Set(["at", "status", "optionalNote"]),
-    nestedTypes: new Map([["status", T1_StatusResponse]]),
+    fieldNameSet: new Set(["agentId", "includeWarnings"]),
+    nestedTypes: new Map([]),
     elementTypes: new Map([]),
     // foryTypeInfo is intentionally null: the current Fory JS API
     // requires user code to build a typeInfo with a `buildTypeInfo`
@@ -100,8 +100,8 @@ export const SERVICES = [
     {
       name: "getStatus",
       pattern: RpcPattern.UNARY,
-      requestType: T0_StatusRequest,
-      responseType: T1_StatusResponse,
+      requestType: T2_StatusRequest,
+      responseType: T0_StatusResponse,
       acceptsCtx: false,
       idempotent: true,
       timeout: 30,
@@ -110,12 +110,14 @@ export const SERVICES = [
       metadata: undefined,
       requestFields: [{"name":"agentId","type":"str","required":true,"default":""},{"name":"nonce","type":"int","required":true,"default":0}],
       responseFields: [{"name":"status","type":"str","required":true,"default":""},{"name":"uptime","type":"int","required":true,"default":0},{"name":"warnings","type":"list","required":true,"default":[]}],
+      requestTypeHash: new Uint8Array([0xa3, 0xc1, 0x6e, 0x64, 0x3a, 0x31, 0x3a, 0xbb, 0x34, 0x29, 0xa9, 0x4e, 0x94, 0x1e, 0x70, 0xf8, 0xc9, 0xd3, 0xb0, 0xd4, 0x10, 0x93, 0x6f, 0xc3, 0x0c, 0x8e, 0x49, 0x69, 0xa7, 0x3a, 0xfc, 0x57]),
+      responseTypeHash: new Uint8Array([0x29, 0x1c, 0x26, 0x37, 0xf6, 0x46, 0x7d, 0x3f, 0x28, 0x40, 0x15, 0x33, 0xc5, 0x7d, 0xcd, 0x6e, 0x3c, 0xae, 0x82, 0x33, 0x61, 0x17, 0x46, 0x43, 0x2b, 0xe5, 0xb4, 0x7a, 0x95, 0x54, 0x7e, 0xa0]),
     },
     {
       name: "getStatusWithCtx",
       pattern: RpcPattern.UNARY,
-      requestType: T0_StatusRequest,
-      responseType: T1_StatusResponse,
+      requestType: T2_StatusRequest,
+      responseType: T0_StatusResponse,
       acceptsCtx: true,
       idempotent: false,
       timeout: undefined,
@@ -124,12 +126,14 @@ export const SERVICES = [
       metadata: undefined,
       requestFields: [{"name":"agentId","type":"str","required":true,"default":""},{"name":"nonce","type":"int","required":true,"default":0}],
       responseFields: [{"name":"status","type":"str","required":true,"default":""},{"name":"uptime","type":"int","required":true,"default":0},{"name":"warnings","type":"list","required":true,"default":[]}],
+      requestTypeHash: new Uint8Array([0xa3, 0xc1, 0x6e, 0x64, 0x3a, 0x31, 0x3a, 0xbb, 0x34, 0x29, 0xa9, 0x4e, 0x94, 0x1e, 0x70, 0xf8, 0xc9, 0xd3, 0xb0, 0xd4, 0x10, 0x93, 0x6f, 0xc3, 0x0c, 0x8e, 0x49, 0x69, 0xa7, 0x3a, 0xfc, 0x57]),
+      responseTypeHash: new Uint8Array([0x29, 0x1c, 0x26, 0x37, 0xf6, 0x46, 0x7d, 0x3f, 0x28, 0x40, 0x15, 0x33, 0xc5, 0x7d, 0xcd, 0x6e, 0x3c, 0xae, 0x82, 0x33, 0x61, 0x17, 0x46, 0x43, 0x2b, 0xe5, 0xb4, 0x7a, 0x95, 0x54, 0x7e, 0xa0]),
     },
     {
       name: "watchStatus",
       pattern: RpcPattern.SERVER_STREAM,
-      requestType: T2_WatchRequest,
-      responseType: T3_StatusEvent,
+      requestType: T3_WatchRequest,
+      responseType: T1_StatusEvent,
       acceptsCtx: false,
       idempotent: false,
       timeout: undefined,
@@ -138,6 +142,8 @@ export const SERVICES = [
       metadata: undefined,
       requestFields: [{"name":"agentId","type":"str","required":true,"default":""},{"name":"includeWarnings","type":"bool","required":true,"default":false}],
       responseFields: [{"name":"at","type":"str","required":true,"default":""},{"name":"status","type":"dict","required":true,"default":{}},{"name":"optionalNote","type":"str","required":false,"default":null}],
+      requestTypeHash: new Uint8Array([0x70, 0x13, 0x0c, 0xe0, 0x7c, 0xb7, 0xd9, 0xaf, 0x18, 0xa5, 0x2b, 0x89, 0x6d, 0x96, 0xc8, 0x19, 0x98, 0xe8, 0xe4, 0xac, 0x84, 0x05, 0x28, 0xae, 0x7a, 0x49, 0x07, 0x33, 0x96, 0xe3, 0xce, 0xb4]),
+      responseTypeHash: new Uint8Array([0x76, 0x89, 0xad, 0x6f, 0x51, 0xb2, 0x00, 0x00, 0x0d, 0x19, 0x86, 0xe9, 0x35, 0x99, 0x6d, 0x33, 0x47, 0xf0, 0xc3, 0x53, 0x96, 0x9a, 0xd5, 0x83, 0x1e, 0x29, 0x0e, 0x77, 0x2e, 0x76, 0x96, 0x6b]),
     },
     ],
   },

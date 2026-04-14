@@ -123,6 +123,21 @@ export interface GeneratedMethodDef {
   requestFields: readonly ManifestField[];
   /** Same as `requestFields`, for the response type. */
   responseFields: readonly ManifestField[];
+  /**
+   * 32-byte BLAKE3 hash of the canonical request TypeDef, computed by
+   * aster-gen by round-tripping each `@WireType` class through the
+   * Rust core via NAPI. `undefined` only when the method has no
+   * declared request type or the scanner could not resolve it.
+   *
+   * Spec: `ffi_spec/Aster-ContractIdentity.md` §11.3. This is what
+   * makes the TS binding's `contract_id` equivalent to Python/Java —
+   * without it, the runtime falls back to a zero hash and the
+   * resulting contract_id is stable-per-service but not cross-language
+   * equivalent.
+   */
+  requestTypeHash?: Uint8Array;
+  /** Counterpart to {@link requestTypeHash}. */
+  responseTypeHash?: Uint8Array;
 }
 
 /**
@@ -272,6 +287,8 @@ export function registerGenerated(opts: RegisterGeneratedOptions): void {
         handler,
         metadata: m.metadata,
         acceptsCtx: m.acceptsCtx,
+        requestTypeHash: m.requestTypeHash,
+        responseTypeHash: m.responseTypeHash,
       });
       _methodFieldsRegistry.set(
         methodFieldsKey(svc.name, svc.version, m.name),
