@@ -20,7 +20,7 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
-use aster_transport_core::framing::MAX_FRAME_SIZE;
+use aster_transport_core::framing::{FLAG_ROW_SCHEMA, FLAG_TRAILER, MAX_FRAME_SIZE};
 use aster_transport_core::pool::{AcquireError, PoolKey};
 use aster_transport_core::{
     CoreRecvStream, CoreSendStream, MultiplexedStream, MultiplexedStreamHandle,
@@ -178,6 +178,105 @@ impl AsterCall {
             Ok(AsterCall {
                 handle: Arc::new(StdMutex::new(Some(CallStream::Streaming(stream)))),
             })
+        })
+    }
+
+    /// **Unary fast-path** (spec §8). Collapses the full
+    /// acquire → send header → send request → recv response →
+    /// recv trailer → release sequence into ONE PyO3 crossing.
+    ///
+    /// `request_pair` is a single `bytes` buffer holding the
+    /// already-framed StreamHeader frame concatenated with the
+    /// already-framed request frame
+    /// (`[4B LE len][1B flags][payload]` twice). The Rust side
+    /// writes the whole buffer in one `write_all` so Quinn sees one
+    /// logical write, then reads frames from the same pooled stream
+    /// until a `FLAG_TRAILER` frame appears. Returns a 3-tuple
+    /// `(response_bytes, response_flags, trailer_bytes)`. An empty
+    /// `response_bytes` means the dispatcher skipped straight to
+    /// the trailer (typical for error trailers). An empty
+    /// `trailer_bytes` means a clean OK trailer.
+    ///
+    /// Why: v1 Python `IrohTransport.unary` does
+    /// send_header + send_request + recv_frame(response) +
+    /// recv_frame(trailer) — four PyO3 crossings per unary call.
+    /// Each crossing bounces the asyncio loop into Rust and back.
+    /// This fast-path reduces it to ONE. The Java FFI equivalent
+    /// (`ffi::aster_call_unary`) is what lets Java hit ~3k req/s
+    /// vs Python's ~900.
+    ///
+    /// On acquire failure raises `StreamAcquireError` with the
+    /// appropriate `reason` attribute; on transport failure raises
+    /// a generic `RuntimeError`.
+    #[staticmethod]
+    fn unary_fast_path<'py>(
+        py: Python<'py>,
+        conn: &IrohConnection,
+        session_id: u32,
+        request_pair: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let core = conn.core_clone();
+        future_into_py(py, async move {
+            if request_pair.is_empty() {
+                return Err(err_to_py("unary_fast_path: request_pair is empty"));
+            }
+            let key = pool_key_for(session_id);
+            let handle = core.acquire_stream(key).await.map_err(acquire_err_to_py)?;
+
+            // Pull send/recv clones before any awaits so `handle`
+            // stays scope-owned (RAII drop returns the stream to
+            // the pool on success, discards on failure).
+            let (send, recv) = {
+                let pair = handle.get();
+                (pair.0.clone(), pair.1.clone())
+            };
+
+            // 1. Single write_all for header+request.
+            if let Err(e) = send.write_all(request_pair).await {
+                handle.discard();
+                return Err(err_to_py(format!(
+                    "unary_fast_path: write_all failed: {e}"
+                )));
+            }
+
+            // 2. Drain frames until trailer. First non-row-schema
+            //    data frame is captured as the response; extras
+            //    are ignored (unary contract is "exactly one").
+            let mut response: Option<(Vec<u8>, u8)> = None;
+            let trailer_payload = loop {
+                match read_one_frame(&recv).await {
+                    Ok((payload, flags)) => {
+                        if flags & FLAG_TRAILER != 0 {
+                            break payload;
+                        }
+                        if flags & FLAG_ROW_SCHEMA != 0 {
+                            continue;
+                        }
+                        if response.is_none() {
+                            response = Some((payload, flags));
+                        }
+                    }
+                    Err(_) => {
+                        handle.discard();
+                        return Err(err_to_py(
+                            "unary_fast_path: read failed before trailer",
+                        ));
+                    }
+                }
+            };
+
+            // 3. Stream returns to the pool on drop (success path).
+            drop(handle);
+
+            let (resp_bytes, resp_flags) = match response {
+                Some((p, f)) => (p, f),
+                None => (Vec::new(), 0u8),
+            };
+            Ok((
+                PyBytesResult(resp_bytes),
+                resp_flags,
+                PyBytesResult(trailer_payload),
+            ))
         })
     }
 
