@@ -1,181 +1,179 @@
 # Python Performance — Current State
 
 **Last updated:** 2026-04-14
-**Status:** Current. Supersedes the 2026-04-13 pre-fast-path numbers.
+**Status:** Current. Supersedes all earlier revisions.
 
 ## TL;DR
 
-Two waves of fixes have landed:
+Python unary RPC on the Mission Control benchmark, Apple M2, in-process loopback, post-fix (commit `31a80b4`):
 
-1. **Server reactor** (2026-04-12) — `core/src/reactor.rs` + `bindings/python/aster/server.py`. Moved the server accept-loop and frame reader off the Python thread and onto the multi-threaded tokio runtime. Each inbound call now arrives at Python as a fully-formed call descriptor in **one** PyO3 crossing instead of ~9.
-2. **Client unary fast path** (2026-04-14, commit `c147a0c`) — `AsterCall.unary_fast_path` in `bindings/python/rust/src/call.rs`. Collapses the client unary path from four PyO3 crossings (send_header + send_request + recv_frame(response) + recv_frame(trailer)) to **one**. Mirrors the Java FFI `aster_call_unary` fast path.
-
-**After both waves**, Python unary is **~1,500 req/s** on the MC benchmark, **p50 ~0.66 ms**. The remaining gap to Java (~3.2k req/s) is no longer in the call pipeline. It is in the **dispatch fan-out**: every inbound call goes through `asyncio.create_task(...)` onto a single asyncio event loop running in one Python thread. The Rust side is already multi-threaded (`tokio::runtime::Builder::new_multi_thread()` in `bindings/python/rust/src/lib.rs:50`, defaulting to `num_cpus` workers) and has cores to spare — Python is feeding it through a one-lane funnel.
-
-Closing the remaining gap requires service-to-thread dispatch, ideally under free-threaded Python (3.13t+). See *Options* below.
-
-## Current numbers
-
-Mission Control example, in-process loopback, JSON codec, 1000-call unary loop after a 20-call warmup. Apple M2. Measured 2026-04-14 on commit `c147a0c`.
-
-### Sequential unary (getStatus)
-
-| Stack | req/s | p50 | vs 2026-04-13 |
-|---|---:|---:|---|
-| Python → Python | **1,507** | 0.66 ms | +72% (was 877) |
-| Python → TS      | **1,447** | 0.67 ms | +32% (was 1,100) |
-| TS → Python      | **1,750** | 0.56 ms | +77% (was 990) |
-| TS → TS          | **1,717** | 0.57 ms | +58% (was 1,085) |
-| **Java → Java (reference)** | **3,233** | 0.29 ms | unchanged |
-
-### Concurrent unary (Promise.all / asyncio.gather)
-
-| Stack | conc-10 | conc-50 | conc-100 |
+| Stack | Seq dyn JSON | Seq typed Fory | Conc-100 typed |
 |---|---:|---:|---:|
-| Python → Python | 4,013 r/s | 5,299 r/s | 5,942 r/s |
-| TS → TS (dynamic proxy) | 3,666 | 5,706 | 6,164 |
-| TS → TS (typed) | 5,652 | 5,567 | 6,222 |
-| **Java → Java** | 1,969 | **11,728** | **14,291** |
+| Python → Python | ~1,500 r/s | **~1,600 r/s** | **~6,050 r/s** |
+| Java → Java (reference) | — | ~3,230 r/s | ~14,290 r/s |
+| Gap | — | **~2.0×** | **~2.4×** |
 
-Gap to Java, sequential: **~2.1×**. Gap to Java, concurrent-100: **~2.3×** (dynamic) / **~2.3×** (typed).
+Typed Fory p50: Python 0.60 ms vs Java 0.29 ms — **~330 µs delta per call**.
 
-### How we got here (2026-04-14)
+The sequential gap to Java is **CPU-bound work distributed across the Python interpreter, PyO3 bindings, pyfory codec, and tokio-for-Python glue**. It is NOT wait time, NOT a single hot function, and NOT something a targeted optimization can close cheaply. Samply profiling (2026-04-14) accounted for ~95% of the per-call round-trip latency as CPU time in one of the two processes (server ~340 µs, client ~249 µs, combined ~589 µs out of ~620 µs p50) and showed no single component above ~30% of active samples.
 
-- **`AsterCall.unary_fast_path` (commit `c147a0c`, fix #2 in the 04-14 perf pass).** One PyO3 crossing for a full unary. Previously four: `send_header`, `send_request`, `recv_frame(response)`, `recv_frame(trailer)`. Each crossing bounced the asyncio loop into Rust and back. Eliminating three of them was measured as the main win.
-- **`typing.get_type_hints` caching in `_dict_to_dataclass` (fix #4).** Profile showed `get_type_hints` at ~90 µs per call on a small dataclass, re-evaluated on every JSON response decode because forward-ref resolution isn't memoized by the stdlib. Cached per-class. Minor on its own but it compounds with the fast path.
-- **v1 Python `IrohTransport.unary` rewritten** to build the header+request frame pair in Python and hand it to the native fast path in a single `await`. The `_CallDriver` path is kept for server-stream / client-stream / bidi where per-frame awaits are still the right primitive.
+The most recent optimization landed the same day: `ForyCodec._coerce_enum_fields` was calling `typing.get_type_hints` uncached on every decoded dataclass, re-parsing forward refs via compile+eval. Adding a per-class cache plus an early-return for types with no enum fields recovered **+38% typed Fory sequential throughput and +42% concurrent-100**. This was the single largest Python-side cost on the hot path before the fix, and it's now gone. There is no equivalent single lever left.
 
-The same four fixes were landed for TypeScript on the same commit. TS sees bigger absolute gains because v1 TS had a catastrophic concurrent collapse (303 r/s at conc-50) that the fast path fully resolved.
+## Where the 330 µs gap lives
 
-## Where the time actually goes
+Samply native profile of both processes during the benchmark (commit `31a80b4`). Per-call CPU time derived from active samples over the benchmark window:
 
-cProfile of 500 unary calls, captured on 2026-04-14 against the Python MC server **after** the fast-path landed. Self time, top 10 entries (trimmed):
+| Process | Active CPU / call | Python thread | Rust tokio workers |
+|---|---:|---:|---:|
+| Server (30s window, ~9,400 calls) | ~340 µs | ~136 µs | ~205 µs |
+| Client (20s tight loop, ~29,500 calls) | ~249 µs | ~83 µs | ~166 µs |
+| **Total both processes** | **~589 µs** | **~220 µs** | **~370 µs** |
 
-```
-  tottime  percall  function
-    5.909    0.001  {method 'control' of 'select.kqueue' objects}
-    0.021    0.000  asyncio/base_events.py:1962(_run_once)
-    0.017    0.000  {method 'run' of '_contextvars.Context' objects}
-    0.011    0.000  {method 'send_frame' of 'builtins.AsterCall'}  (streaming path only)
-    0.011    0.000  {method 'recv_frame' of 'builtins.AsterCall'}  (streaming path only)
-    0.009    0.000  asyncio/selectors.py:540(select)
-    0.009    0.000  {method 'recv' of '_socket.socket'}
-```
+Benchmark median p50 ≈ 620 µs. **~95% of the per-call round-trip latency is CPU time somewhere** — when one process is blocked in a kqueue wait, the other is doing work. Net wire/kernel overhead is ~30 µs per call. There is very little idle slack to reclaim.
 
-**95% of wall time is in `kqueue.control`** — the asyncio event loop parking between suspensions. Only ~5% is in our code. FFI crossings (the fast path's single `unary_fast_path` hop and the streaming path's `send_frame`/`recv_frame` methods) are **sub-1%** each. The reactor extracted the server-side crossings; the fast path extracted the client-side ones; what's left is structural asyncio scheduling cost.
+### Crate-level distribution (active samples combined across all threads)
 
-Per-call math: ~0.66 ms measured p50 / ~1,500 req/s. Of that:
-- **~0.4-0.5 ms** is asyncio scheduling: `_run_once` + `kqueue.control` + context-var work between the `await` on `unary_fast_path` and the response landing. Each `await` costs ~100-150 µs in stock asyncio, ~60-80 µs under uvloop. The fast path brings us down to ONE `await` per unary call, so this is already the minimum we can hit without changing the event-loop model.
-- **~0.05-0.1 ms** is Fory/JSON codec work: `encode_compressed` (request), `decode_compressed` (response), `_dict_to_dataclass` walk. Caching type hints (fix #4 on 2026-04-14) shaved ~50 µs off this budget.
-- **~0.05-0.1 ms** is the actual Rust work: pool acquire (LIFO, cheap), `write_all`, read loop until trailer, pool release.
+| Category | % of active samples | ~µs per call (both procs) |
+|---|---:|---:|
+| CPython bytecode (`python-interp`) | ~23% | ~135 |
+| Rust generic stdlib (`core`, `alloc`, `std`, impl methods) | ~43% | ~250 |
+| `tokio` runtime + scheduler | ~12% | ~70 |
+| `noq_proto` (iroh's QUIC) | ~4-5% | ~27 |
+| `pyo3` + `pyo3_async_runtimes` binding glue | ~3% | ~18 |
+| `pyfory` Cython codec | ~2-3% | ~18 |
+| `hashbrown`, `parking_lot`, `ring` (crypto) | ~2-3% | ~18 |
+| Python C extensions (uvloop, `_asyncio`, `serialization.so`) | ~3% | ~18 |
+| `aster_transport_core` (our reactor) | ~0.6% | ~4 |
+| `aster` (our PyO3 binding code) | ~0.2% | ~1 |
 
-The remaining lever is **not the call path** — it's **how many concurrent calls can run in parallel on distinct Python threads**. With GIL-bound CPython that number is 1; with free-threaded CPython it scales to N cores. See *Options* below.
+**No single category is above ~30% of active CPU.** Our own reactor and binding code combined are <1%. The cost is distributed across dozens of small contributors — the "death of a thousand cuts" shape.
 
-## What was previously believed and why it was wrong
+### What Python pays that Java wouldn't
 
-Two earlier framings need to be retired:
+Comparing to a hypothetical Java binding on the same iroh library (same `noq_proto`, same `tokio`, same `ring` crypto, same kernel network stack):
 
-1. **"FFI crossings are the bottleneck."** Correct for the pre-reactor architecture (April 10-11), and the analysis that produced this conclusion is exactly what motivated building the reactor. The mistake was carrying the conclusion forward after 2026-04-12 when the reactor shipped — at that point the FFI cost was no longer the dominant term, but assumed-knowledge memory and stale doc text continued to cite it. The reactor took the win the older docs predicted; the bottleneck moved.
-2. **"Scale Python by forking N workers behind a virtual address" (the ASGI/uvicorn analogy).** This does not apply to iroh. Each iroh endpoint has its own NodeId, and the cryptographic identity *is* the socket — there is no SO_REUSEPORT equivalent. Forking creates N distinct producers from the network's point of view, not N instances of the same one. The scaling axis is not "more endpoints," it is "more threads servicing one endpoint." Anything that assumes the web-framework worker model applies to Aster is wrong by construction.
+- **`python-interp`** (~135 µs/call): CPython bytecode interpreter executing Python dispatch, codec wrappers, handlers. Java's JIT compiles equivalent work down to native code at several-times higher throughput.
+- **`pyo3` + `pyo3_async_runtimes`** (~18 µs/call): GIL acquire/release on every crossing, `future_into_py` wrapping, `TaskLocals` propagation. Java's JNI has its own overhead but a structurally different cost model.
+- **`pyfory`** (~18 µs/call): client dominance is 2× decode (response + trailer), server is 1× decode. Already Cython-accelerated. Already smart-skipped on enum-free types (the 2026-04-14 fix). Further reductions would require detailed per-op auditing.
+- **Tokio-for-Python fraction**: not cleanly separable, but a meaningful chunk of the ~70 µs tokio budget is spent waking Python callbacks and propagating task locals for code that Java wouldn't need.
 
-The "ring buffer / Python bottleneck is QUIC" entry in the old design notes is also wrong for the same reason — it predates both the reactor and the cProfile pass that pinned the cost on asyncio scheduling, not transport.
+**Ballpark Python-attributable overhead: ~220 µs direct (`python-interp` + `pyo3` + `pyfory` + Python C extensions) + ~50-80 µs indirect (tokio/alloc/core driven by Python-aware machinery) ≈ 270-300 µs per call.** Matches the observed ~330 µs gap to Java closely.
 
-## What's already shipped
+**Conclusion:** the sequential gap to Java is a fundamental CPython-vs-JIT trade-off, not a fixable bug. No single Python-layer change closes more than a few tens of microseconds. Closing the whole gap would require either a different Python runtime (JIT or no-GIL with a different cost model) or moving substantially more of the dispatch path into Rust so Python only touches user-owned handlers.
 
-- **Multi-threaded tokio runtime.** `bindings/python/rust/src/lib.rs:50`. One shared multi-thread runtime per Python process, sized to `num_cpus`. I/O, accepts, frame reads/writes already use every core.
-- **uvloop auto-install** on Linux/macOS at `import aster` time. ~20% gain. Opt-out with `ASTER_NO_UVLOOP=1`.
-- **Write batching.** `bindings/python/aster/transport/iroh.py` — `write_all + finish` instead of `write + write + finish`. ~6%.
-- **`_ProxyMethod` cache + empty `callId`** on shared streams. ~2% combined.
-- **Server reactor.** `core/src/reactor.rs` + `bindings/python/aster/server.py:266-312`. Server-side accept loop, per-connection tasks, frame reading, and call delivery all happen in Rust on the tokio pool. Python only sees fully-formed call descriptors arriving via `aster_reactor_poll`. Sibling bindings (Java, TS) consume the same C ABI.
-- **Single-call PyO3 dispatch (server).** Each call from the reactor is delivered to Python in one FFI crossing rather than the ~9 of the pre-reactor stream-orchestration path.
-- **Unary fast path (client).** `AsterCall.unary_fast_path` in `bindings/python/rust/src/call.rs` — collapses acquire + send_header + send_request + recv_frame×2 + release into one PyO3 crossing. The Rust side does pool acquire → single `write_all` → read loop until FLAG_TRAILER → pool release, all inside one `future_into_py`. Landed 2026-04-14 in commit `c147a0c`. Measured +72% on `py→py` unary getStatus (877 → 1,507 req/s).
-- **`get_type_hints` caching.** `bindings/python/aster/json_codec.py` — memoizes `typing.get_type_hints(cls)` and `dataclasses.fields(cls)` per class. `get_type_hints` re-evaluates string forward refs every call without this cache, costing ~90 µs on a small dataclass. Landed in `c147a0c`.
+## What we just shipped (commit `31a80b4`, 2026-04-14)
 
-## What's not yet shipped — the actual remaining bottleneck
+- **`ForyCodec._coerce_enum_fields` cache + smart skip** (`bindings/python/aster/codec.py`). Cached `get_type_hints` plus a precomputed `_needs_coerce_cache[cls]` bool that early-returns for types with no enum fields anywhere in their graph. Measured impact on the MC getStatus benchmark (plain Fory, async dispatch, median of 3 rounds):
+  - Typed Fory sequential: 1,193 → 1,641 r/s (**+38%**, p50 −230 µs)
+  - Typed Fory conc-100: 4,258 → 6,046 r/s (**+42%**)
+  - Dynamic JSON: unchanged (different decode path)
+- **`test_pyfory_cython_acceleration_is_enabled`** (`tests/python/test_aster_codec.py`). Regression canary that asserts (a) `pyfory.ENABLE_FORY_CYTHON_SERIALIZATION` is True and (b) `ForyCodec` instantiated the Cython fast-path class, not the pure-Python fallback. If a broken wheel ever slips through CI, codec throughput would silently drop several-fold; this test catches it.
 
-`serve_reactor()` does this on every inbound call:
+## Earlier perf wins (pre-`31a80b4`)
 
-```python
-asyncio.create_task(self._dispatch_reactor_call(...))
-```
+Commit `c147a0c` (2026-04-14 morning) landed four related Python-side optimizations that produced the prior baseline:
 
-One asyncio loop. One Python thread. Under standard CPython the GIL serializes bytecode across that thread regardless of how many tokio workers are feeding it. 100 concurrent calls = 100 tasks on one loop = serialized through one scheduler.
+- **`AsterCall.unary_fast_path`** (`bindings/python/rust/src/call.rs`) — collapses the client unary path from 4 PyO3 crossings to 1 (acquire + send_header + send_request + recv_frame ×2 → one `future_into_py`). Mirrors the Java FFI equivalent.
+- **`typing.get_type_hints` cache in `_dict_to_dataclass`** (`bindings/python/aster/json_codec.py`) — same root-cause shape as the later Fory-side fix, for the JSON decode path.
+- **`IrohTransport.unary`** rewritten to build frames in one step.
+- Matching TypeScript-side fixes on the same commit.
 
-`docs/_internal/aster-java-fory-threading.md` documents the same problem solved cleanly on the Java side: `Executors.newVirtualThreadPerTaskExecutor()` with a `ThreadPoolFory` codec sized at `4 × Runtime.availableProcessors()` to avoid contention on the shared serializer. Java has this option because it has no GIL. Python doesn't, *yet*.
+Earlier still, the server reactor (`core/src/reactor.rs` + `bindings/python/aster/server.py:serve_reactor`) moved the server accept-loop, per-connection tasks, and frame reading entirely into Rust/tokio. Python only sees fully-formed call descriptors arriving through the reactor's C ABI, shared by all bindings (Python, TypeScript, Java).
 
-## Options for closing the gap
+## What's next — what's actually worth building
 
-### Option α — Service-to-thread under standard CPython
+The remaining gap is distributed. Options ranked by effort vs payoff:
 
-Each `AsterService` registered on the server runs on its own OS thread with its own asyncio event loop. The reactor's pump task dispatches each inbound call to the right service's loop based on the routing it already does (`contract_id` + service version → service handle).
+### A. Small Python-side wins (1-2 days each, 10-30 µs per call each)
 
-**What you gain:** scheduler isolation. A slow handler in service A no longer starves service B's loop. Cleaner mental model — each service is a self-contained worker.
-**What you don't gain:** real multi-core parallelism. The GIL still serializes Python bytecode across those threads. CPU-bound handlers don't get faster. I/O-bound handlers see modest wins from reduced contention on the single loop.
-**Realistic improvement:** 1.5-2× on mixed workloads, less on pure unary throughput.
-**Cost:** real architectural change to `server.py` and the reactor pump's dispatch — 3-5 days of focused work plus tests.
+- **Audit `IrohTransport.unary` and `_run_call_with_interceptors`** — every extra Python attribute lookup, method call, or context-var push on the hot path is ~1-2 µs. The cProfile shows ~60 µs/call of total client Python code outside PyO3 and codec; some is necessary, some may not be.
+- **Empty-interceptor fast path** — if a call has no interceptors registered (common in dev), the `await apply_*_interceptors(...)` chain should skip the async hop entirely instead of entering an empty coroutine.
+- **Lazy call context** — contextvar propagation costs ~4 µs per call on the client. For calls that don't observe deadline / metadata / peer attributes, materialize the `CallContext` lazily.
+- **pyfory-wrapper audit** — pyfory serialize/deserialize Cython is already fast. The ForyCodec wrapper around it (type checks, buffer resets, lookup paths) may have a few µs to shave.
 
-### Option β — Service-to-thread under free-threaded Python (3.13t+)
+Cumulative best case: 50-100 µs per call. Would bring typed Fory sequential from ~1,600 r/s to ~1,900 r/s. Incremental, not transformative.
 
-Same code as α, built and tested on the no-GIL interpreter. Per-service threads now run actually-in-parallel on different cores.
+### B. Structural — move more of the dispatch path into Rust (3-5 days each)
 
-**What you gain:** N services ≈ N× throughput on the same endpoint, bounded by how many cores Python can saturate. This is the Java story in Python, with no fork required.
-**Cost:** build wheels for free-threaded Python (separate ABI tag `cp313t`), confirm PyO3 + `pyo3-async-runtimes` work cleanly under no-GIL (mostly they do as of late 2025, but module-init has sharp edges), and accept that users who want full perf need a specific interpreter build.
-**Strategic angle:** in 2026, free-threaded Python is no longer experimental but uptake is still early. Being the first serious RPC framework built around it is a real positioning story for a launch — *"Aster is the first RPC framework designed for free-threaded Python."*
+- **Server-side codec pre-decode in Rust** — the reactor delivers raw bytes to Python which then decodes them. If the request frame were decoded in Rust before crossing into Python (via pyfory-rs if it exists, or a small custom decoder for the common shapes), Python would receive structured data and skip the decode call. Est. 20-40 µs per call.
+- **Client-side trailer handling in Rust** — `unary_fast_path` returns raw bytes; Python decodes both the response and the trailer. If `unary_fast_path` inspected the trailer in Rust and returned `(response_bytes, status_code, error_message)`, Python would skip one decode. Est. 10-20 µs per call.
 
-### Option γ — Bypass asyncio in the dispatch path entirely
+These are real engineering tasks with downstream cost (more Rust complexity, Fory dependency on the Rust side, schema distribution). Only worth doing if the sequential headline matters.
 
-Run handlers from a synchronous worker pool reading directly off the reactor queue, in the same shape Java does. This collapses the per-call asyncio scheduling overhead — there is no event loop in the dispatch path anymore, just threads pulling work from a queue and calling handlers.
+### C. Concurrent throughput — Pattern A (documentation + verification, ~1 day)
 
-**What you gain:** removes the 75% kqueue dominance for the dispatch path. Mixes well with α and β.
-**What you lose:** handlers can no longer freely `await` arbitrary asyncio things — they're running on a worker thread, not an event loop. Either we provide a way to hand a coroutine back to an event loop, or we split the API into "fast unary handlers" (sync, run on worker pool) and "general async handlers" (async, run on the legacy serve path).
-**Cost:** ergonomic regression on handler authoring. Probably a non-starter unless the API split is acceptable.
+**N independent Aster nodes with distinct NodeIds advertising the same logical service.** Clients discover multiple endpoints through the discovery layer (pkarr / mesh routing) and pick one per call or per connection. Standard Kubernetes/systemd scale-out. Works on stock CPython. Zero framework changes.
+
+This is the right production answer for throughput-bound workloads. Today's concurrent-100 typed at ~6,050 r/s per process × N processes scales linearly until something else becomes the bottleneck. For any real deployment, aggregate throughput is what matters, and Pattern A dominates any single-process optimization.
+
+Prerequisite: verify the discovery layer's multi-endpoint advertisement story is production-ready. Then document it.
+
+### D. Don't build — declare ~2× acceptable
+
+Day-zero use cases (operator CLI, agent control plane, mesh admin) are not bound by sub-millisecond loopback latency. 620 µs p50 is fine for every production workload that isn't in a tight benchmark loop. The 2× gap to Java is:
+
+- A rounding-error difference in any deployment where network RTT dominates
+- A fundamental Python-vs-JIT trade-off, not a bug
+- Amortized cleanly by concurrent workloads (conc-100 typed is already >6,000 r/s — higher than single-thread Java sequential)
+
+This is the honest answer for most situations. The perf doc should stop framing "sequential 1-thread parity with Java" as the headline goal — it's the wrong metric for a P2P RPC framework used in mesh deployments where throughput and horizontal scaling are the real levers.
 
 ## Recommendation
 
-α and β are the same code shipped under two interpreters. Build service-to-thread dispatch once. Validate correctness under standard CPython and measure the (modest) gain. Then test under free-threaded 3.13t and measure the (larger) gain. If the free-threaded number is what we hope, that becomes the documented production interpreter for Aster Python.
-
-This is **not near-free.** Realistic estimate: 5-8 days of focused work including tests under both interpreters, plus changes to how services are registered with the reactor. The "near-free" framing applies to *forking N processes behind a load balancer*, which doesn't work here. There is no near-free path to multi-core Python under one iroh endpoint.
-
-Before greenlighting this, weigh it against the positioning work — at the time of writing, Aster's bigger problem is "people don't know what it's for," not "Python is 4× slower than TS on loopback." Day-zero use cases (operator CLI, agent control plane, mesh admin) are not bound by the current Python throughput. The perf gap matters for *workloads we don't yet have demand for*.
-
-## What's explicitly not on the table
-
-- **Multi-process producer fan-out** — wrong scaling axis. NodeId is per-endpoint. Forking creates distinct producers, not load-balanced workers.
-- **Replacing asyncio with a different event loop** — uvloop is already on. The remaining cost is structural to the single-loop dispatch model, not to the loop implementation.
-- **More PyO3-level optimization** — the reactor extracted that win.
+1. **`_coerce_enum_fields` fix is shipped** (commit `31a80b4`). No more action needed.
+2. **Document Pattern A as the horizontal scaling story** (~1 day). Confirm multi-endpoint discovery works, write the docs page, point users at "run more processes" when they need throughput.
+3. **Stop iterating on the sequential axis unless a specific user need surfaces.** Options A and B both exist if demand materializes; revisit when there is concrete evidence a workload needs them. In the absence of that evidence, the time is better spent on features users actually ask for.
+4. **Retire the α/β/γ framing from earlier doc revisions.** The old options tree ("sync worker pool → free-threaded Python → multi-core parallelism") was built on a misread cProfile and a hypothesis that Python dispatch cost was ~0.4-0.5 ms per call. Samply measurements show the real server-side Python dispatch cost is ~136 µs per call spread across interpreter work that no γ-style fix removes, and the true lever for closing the *concurrent* gap is Pattern A, not β.
 
 ## Reproducing
 
+Python server + benchmark:
+
 ```bash
-# Start servers (one per terminal)
-PYTHONUNBUFFERED=1 uv run python -m examples.python.mission_control.server &
-cd examples/typescript/missionControl && bun run server.ts &
+# Server (one terminal)
+PYTHONUNBUFFERED=1 uv run python -m examples.python.mission_control.server
 
-# Benchmark
-uv run python -m examples.python.mission_control.benchmark <python-addr>
-bun run examples/typescript/missionControl/benchmark.ts <ts-addr>
+# Benchmark (another terminal)
+PYTHONPATH=. uv run python examples/python/mission_control/benchmark.py <server-addr>
+```
 
-# Profile (Python)
-uv run python -c "
-import cProfile, pstats, asyncio
+Native CPU profile with samply:
+
+```bash
+# Launch server under samply with a fixed sample duration
+PYTHONUNBUFFERED=1 samply record --save-only -o /tmp/server_prof.json.gz -d 30 -- \
+  uv run python -m examples.python.mission_control.server
+
+# Run the benchmark multiple times during the 30s window to generate load
+# Kill the server's python child when done — samply saves the profile on child exit
+```
+
+samply writes Firefox Profiler format (`.json.gz`). Open in <https://profiler.firefox.com/>. For offline analysis / symbolication, `nm -n bindings/python/aster/_aster.abi3.so` dumps the symbol table sorted by address; a small bisect-based lookup on top resolves the hex offsets samply records when it cannot find a `.dSYM` bundle at capture time.
+
+cProfile the typed client (for Python-side per-call breakdown):
+
+```python
+import asyncio, cProfile, pstats
 from aster import AsterClient
+from examples.python.mission_control.services import MissionControl
+from examples.python.mission_control.types import StatusRequest
+
 async def main():
-    c = AsterClient(address='aster1...')
+    c = AsterClient(address='<addr>')
     await c.connect()
-    mc = c.proxy('MissionControl')
-    for _ in range(20): await mc.getStatus({'agent_id': 'warmup'})
-    pr = cProfile.Profile(); pr.enable()
-    for i in range(500): await mc.getStatus({'agent_id': f'b{i}'})
-    pr.disable()
-    pstats.Stats(pr).sort_stats('cumulative').print_stats(20)
+    t = await c.client(MissionControl)
+    for _ in range(50): await t.getStatus(StatusRequest(agent_id='w'))
+    p = cProfile.Profile(); p.enable()
+    for i in range(500): await t.getStatus(StatusRequest(agent_id=f'p{i}'))
+    p.disable()
+    pstats.Stats(p).sort_stats('tottime').print_stats(20)
     await c.close()
+
 asyncio.run(main())
-"
 ```
 
 ## See also
 
-- [`reactor-ffi-guide.md`](reactor-ffi-guide.md) — the C ABI contract for the reactor. Authoritative for any new binding.
-- [`aster-java-fory-threading.md`](aster-java-fory-threading.md) — how Java solves the same dispatch-fan-out problem with virtual threads + a thread-pool codec. Reference design for the Python service-to-thread story.
-- [`benchmarking.md`](benchmarking.md) — how to run the benchmarks. (Some analysis sections are pre-reactor and need a similar refresh — flag for follow-up.)
-- [`v0.3-perf/PERF_FFI_CROSSINGS.md`](v0.3-perf/PERF_FFI_CROSSINGS.md) — the historical workspace that produced the reactor architecture. Useful as background, not as current state.
+- [`aster-java-fory-threading.md`](aster-java-fory-threading.md) — how Java scales concurrent Fory workloads with `ThreadPoolFory`. Reference for any future Python concurrent codec work.
+- [`benchmarking.md`](benchmarking.md) — how to run the benchmarks.
+- [`reactor-ffi-guide.md`](reactor-ffi-guide.md) — the C ABI contract for the reactor. Authoritative for new bindings.
