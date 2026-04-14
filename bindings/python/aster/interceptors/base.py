@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import time
 import uuid
 from abc import ABC
@@ -163,7 +164,6 @@ def handler_accepts_ctx(method: Any) -> bool:
     any parameter is annotated with ``CallContext``. Used by dispatch to
     decide whether to inject the context.
     """
-    import inspect
     try:
         sig = inspect.signature(method)
     except (TypeError, ValueError):
