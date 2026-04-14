@@ -26,7 +26,7 @@ import { CapabilityInterceptor } from './interceptors/capability.js';
 import type { Interceptor } from './interceptors/base.js';
 import { canonicalXlangBytes, contractIdFromContract, fromServiceInfo } from './contract/identity.js';
 import type { ContractManifest, ManifestMethod, ManifestField } from './contract/manifest.js';
-import { getGeneratedMethodFields } from './generated.js';
+import { getGeneratedMethodFields, registerGenerated, type RegisterGeneratedOptions } from './generated.js';
 import { IrohTransport } from './transport/iroh.js';
 import { StatusCode, RpcError } from './status.js';
 
@@ -104,8 +104,18 @@ export class AdmissionDeniedError extends Error {
  * Options for AsterServer.
  * @group Server and Client
  */
+/** Well-known filename emitted by `npx aster-gen`. */
+const GENERATED_FILENAME = 'aster-rpc.generated.js';
+
 export interface AsterServerOptions {
   services: object[];
+  /**
+   * Explicit generated metadata (output of `aster-gen`). When omitted,
+   * `start()` auto-imports `./aster-rpc.generated.js` from the working
+   * directory. Pass this only when the auto-import can't work (e.g.
+   * bundled apps where dynamic import paths aren't resolvable).
+   */
+  generated?: Pick<RegisterGeneratedOptions, 'SERVICES' | 'WIRE_TYPES'>;
   config?: Partial<AsterConfig>;
   /** Path to .aster-identity file. Overrides config.identityFile. */
   identity?: string;
@@ -124,6 +134,7 @@ export interface AsterServerOptions {
  *
  * @example
  * ```ts
+ * // Run `npx aster-gen` first — start() auto-imports aster-rpc.generated.js
  * const server = new AsterServer({
  *   services: [new MissionControl()],
  * });
@@ -148,6 +159,8 @@ export class AsterServer {
   private _closed = false;
   private _allowAllConsumers: boolean;
   private _userInterceptors: unknown[] = [];
+  private _pendingServices: object[] = [];
+  private _explicitGenerated: Pick<RegisterGeneratedOptions, 'SERVICES' | 'WIRE_TYPES'> | undefined;
   private _signalHandlers: (() => void)[] = [];
   private _serviceSummaries: ServiceSummary[] = [];
   private _registryNamespace = '';
@@ -177,17 +190,47 @@ export class AsterServer {
     // ephemeral consumers).
     this._hook = new MeshEndpointHook(this._allowAllConsumers, this._peerStore);
     this._userInterceptors = opts.interceptors ?? [];
-
-    for (const svc of opts.services) {
-      this.registry.register(svc);
-    }
+    this._pendingServices = opts.services;
+    this._explicitGenerated = opts.generated;
   }
 
   /**
    * Create the IrohNode and prepare for serving. Idempotent.
+   *
+   * On first call, auto-imports `aster-rpc.generated.js` from the
+   * working directory (unless `generated` was passed explicitly),
+   * registers the generated metadata, then registers all services.
    */
   async start(): Promise<void> {
     if (this._node) return;
+
+    // ── Register generated metadata + services ──────────────────────
+    if (this._pendingServices.length > 0) {
+      if (this._explicitGenerated) {
+        registerGenerated(this._explicitGenerated);
+      } else {
+        try {
+          const resolved = await import(
+            /* webpackIgnore: true */
+            require('node:path').resolve(process.cwd(), GENERATED_FILENAME)
+          );
+          if (resolved.SERVICES && resolved.WIRE_TYPES) {
+            registerGenerated({ SERVICES: resolved.SERVICES, WIRE_TYPES: resolved.WIRE_TYPES });
+          }
+        } catch {
+          this.logger.warn(
+            `[aster] ${GENERATED_FILENAME} not found in working directory. ` +
+            `The runtime will fall back to reflection for type metadata, which ` +
+            `cannot handle empty arrays, nullable nested types, or non-default-constructible ` +
+            `classes. Run 'npx aster-gen' to generate it.`,
+          );
+        }
+      }
+      for (const svc of this._pendingServices) {
+        this.registry.register(svc);
+      }
+      this._pendingServices = [];
+    }
 
     // Load native addon
     const native = await loadNative();
@@ -518,7 +561,7 @@ export class AsterServer {
           warnedFallback.add(key);
           this.logger.warn(
             `[aster] ${info.name}.${methodName}: manifest fields built via runtime reflection. ` +
-            `Run 'bunx aster-gen' and call registerGenerated() at startup to use AST-derived fields — ` +
+            `Run 'npx aster-gen' to use AST-derived fields — ` +
             `handles empty arrays, nullable nested types, and non-default-constructible classes.`,
           );
         }

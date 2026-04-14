@@ -194,7 +194,7 @@ function introspectClass(
     const name = cls.name || '<anonymous>';
     console.warn(
       `[aster] ${name}: falling back to runtime introspection (new cls() + Object.keys). ` +
-      `Run 'bunx aster-gen' and import the generated file once at startup to get ` +
+      `Run 'npx aster-gen' to get ` +
       `empty-array / nullable-nested / non-default-constructible support and faster decode validation.`,
     );
   }
@@ -390,7 +390,7 @@ export function walkTypeGraph(rootTypes: (new (...args: any[]) => any)[]): (new 
       const name = cls.name || '<anonymous>';
       console.warn(
         `[aster] walkTypeGraph(${name}): runtime type-graph reflection is in use. ` +
-        `Run 'bunx aster-gen' and call registerGenerated() at startup — the generated ` +
+        `Run 'npx aster-gen' — the generated ` +
         `WIRE_TYPES list is built from AST types and handles cases this runtime path can't ` +
         `(empty arrays, nullable nested refs, non-default-constructible classes).`,
       );

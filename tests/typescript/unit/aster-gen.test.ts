@@ -26,7 +26,7 @@ const _require = createRequire(import.meta.url);
 const PKG_ROOT = path.resolve(__dirname, '../../../bindings/typescript/packages/aster');
 const FIXTURE_DIR = path.join(PKG_ROOT, 'tests/fixtures/sample');
 const GEN_CLI = path.join(PKG_ROOT, 'dist/cli/gen.js');
-const GEN_OUT = path.join(FIXTURE_DIR, 'rpc.generated.ts');
+const GEN_OUT = path.join(FIXTURE_DIR, 'aster-rpc.generated.ts');
 
 function runScanner(): { stdout: string; stderr: string; status: number } {
   const result = spawnSync('node', [
@@ -189,7 +189,7 @@ describe('aster-gen scanner', () => {
 
 describe('aster-gen cyclic wire type graph', () => {
   const CYCLIC_FIXTURE = path.join(PKG_ROOT, 'tests/fixtures/cyclic');
-  const CYCLIC_OUT = path.join(CYCLIC_FIXTURE, 'rpc.generated.ts');
+  const CYCLIC_OUT = path.join(CYCLIC_FIXTURE, 'aster-rpc.generated.ts');
 
   let src: string;
 
@@ -272,7 +272,7 @@ describe('aster-gen cyclic wire type graph', () => {
 describe('aster-gen + registerGenerated roundtrip', () => {
   it('loads the generated file and stamps SERVICE_INFO_KEY onto class constructors', async () => {
     // Dynamic import so the compiled scanner output is loaded fresh.
-    const gen = await import(path.join(FIXTURE_DIR, 'rpc.generated.ts')) as {
+    const gen = await import(path.join(FIXTURE_DIR, 'aster-rpc.generated.ts')) as {
       SERVICES: any[];
       WIRE_TYPES: any[];
     };
