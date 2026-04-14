@@ -13,7 +13,9 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aster_transport_core::reactor::{self, OutgoingFrame, ReactorHandle, RequestFrame};
+use aster_transport_core::reactor::{
+    self, OutgoingFrame, ReactorEvent, ReactorHandle, RequestFrame,
+};
 use aster_transport_core::ring;
 use tokio::sync::mpsc;
 
@@ -27,46 +29,78 @@ use crate::{
 
 pub type aster_reactor_t = u64;
 
-/// C-visible call descriptor returned by aster_reactor_poll.
+/// Event-kind discriminator for `aster_reactor_call_t` (spec §7.5).
+/// Bindings MUST check `event_kind` before reading any other field — a
+/// `ConnectionClosed` event populates only `event_kind`, `connection_id`,
+/// `peer_*` (peer_id of the closed connection); all other fields are zero
+/// or NULL.
+pub const ASTER_EVENT_KIND_CALL: u8 = 0;
+pub const ASTER_EVENT_KIND_CONNECTION_CLOSED: u8 = 1;
+
+/// C-visible event descriptor returned by aster_reactor_poll.
+///
+/// Despite the historical `aster_reactor_call_t` name, this struct now
+/// carries either an inbound call (`event_kind == ASTER_EVENT_KIND_CALL`)
+/// or a connection-closed event
+/// (`event_kind == ASTER_EVENT_KIND_CONNECTION_CLOSED`). Bindings that
+/// support session lifecycle reaping (spec §7.5) MUST handle both kinds.
 #[repr(C)]
 pub struct aster_reactor_call_t {
-    /// Reactor-assigned call ID (for submit correlation).
+    /// Event-kind discriminator. See `ASTER_EVENT_KIND_*` constants.
+    pub event_kind: u8,
+    /// Reactor-assigned call ID (for submit correlation). Zero on
+    /// ConnectionClosed events.
     pub call_id: u64,
+    /// Reactor-assigned unique ID for the QUIC connection this event
+    /// belongs to (spec §7.5). Same id is reused across every call from
+    /// this connection and emitted with the terminal ConnectionClosed
+    /// event so the binding can drop per-connection state. A peer that
+    /// disconnects and reconnects gets a fresh `connection_id`.
+    pub connection_id: u64,
     /// Reactor-assigned unique ID for the QUIC bi-stream this call arrived
-    /// on. Stateless calls each get a fresh stream_id (one call per stream);
-    /// session-mode calls share one stream_id across multiple calls. Bindings
-    /// should key session-scoped service instances on `(peer_id, stream_id,
-    /// service)` so concurrent sessions from the same peer stay isolated.
+    /// on. Multiplexed streams (spec §6) carry many calls per bi-stream,
+    /// so DO NOT key per-session state on `stream_id` — use
+    /// `(connection_id, StreamHeader.sessionId)` from the binding-decoded
+    /// header instead. Zero on ConnectionClosed events.
     pub stream_id: u64,
     /// Pointer to header payload bytes (owned by buffer registry).
+    /// NULL on ConnectionClosed events.
     pub header_ptr: *const u8,
-    /// Length of header payload.
+    /// Length of header payload. Zero on ConnectionClosed events.
     pub header_len: u32,
-    /// Header frame flags.
+    /// Header frame flags. Zero on ConnectionClosed events.
     pub header_flags: u8,
     /// Pointer to request payload bytes (owned by buffer registry).
+    /// NULL on ConnectionClosed events.
     pub request_ptr: *const u8,
-    /// Length of request payload.
+    /// Length of request payload. Zero on ConnectionClosed events.
     pub request_len: u32,
-    /// Request frame flags.
+    /// Request frame flags. Zero on ConnectionClosed events.
     pub request_flags: u8,
-    /// Pointer to peer ID string (UTF-8, not null-terminated, owned by buffer registry).
+    /// Pointer to peer ID string (UTF-8, not null-terminated, owned by
+    /// buffer registry). Populated on both Call and ConnectionClosed.
     pub peer_ptr: *const u8,
-    /// Length of peer ID string.
+    /// Length of peer ID string. Populated on both Call and
+    /// ConnectionClosed.
     pub peer_len: u32,
-    /// 1 if this is a session call, 0 otherwise.
-    pub is_session_call: u8,
-    /// Buffer ID for the header payload (release after processing).
+    /// Buffer ID for the header payload (release after processing). Zero
+    /// on ConnectionClosed events.
     pub header_buffer: u64,
-    /// Buffer ID for the request payload.
+    /// Buffer ID for the request payload. Zero on ConnectionClosed events.
     pub request_buffer: u64,
-    /// Buffer ID for the peer ID string.
+    /// Buffer ID for the peer ID string. Populated on both Call and
+    /// ConnectionClosed.
     pub peer_buffer: u64,
 }
 
-/// Internal ring slot: holds an IncomingCall with buffer IDs already assigned.
+/// Internal ring slot: holds either an IncomingCall (event_kind=0) or a
+/// ConnectionClosed event (event_kind=1). For ConnectionClosed slots only
+/// `event_kind`, `connection_id`, and the `peer_*` fields are populated;
+/// the rest are zero/NULL.
 struct RingCall {
+    event_kind: u8,
     call_id: u64,
+    connection_id: u64,
     stream_id: u64,
     header_buffer: u64,
     header_ptr: *const u8,
@@ -79,7 +113,6 @@ struct RingCall {
     peer_buffer: u64,
     peer_ptr: *const u8,
     peer_len: u32,
-    is_session_call: bool,
     response_sender: Option<mpsc::UnboundedSender<OutgoingFrame>>,
     /// Per-call receiver for ADDITIONAL request frames (after the first).
     /// Stashed into `ReactorState::request_receivers` on `aster_reactor_poll`
@@ -106,8 +139,7 @@ pub(crate) struct ReactorState {
     /// Pending response senders keyed by call_id. Removing a sender drops
     /// the last reference to its mpsc channel, which unblocks the reactor's
     /// `recv().await` loop and finishes the stream.
-    response_senders:
-        Mutex<std::collections::HashMap<u64, mpsc::UnboundedSender<OutgoingFrame>>>,
+    response_senders: Mutex<std::collections::HashMap<u64, mpsc::UnboundedSender<OutgoingFrame>>>,
     /// Pending per-call request receivers keyed by call_id. The binding
     /// pulls additional request frames via `aster_reactor_recv_frame`,
     /// which locks the per-call receiver and `block_on`s a single
@@ -120,8 +152,7 @@ pub(crate) struct ReactorState {
     /// terminal submit. Streaming dispatchers query this via
     /// `aster_reactor_check_cancelled` to break out of long-running
     /// loops when the peer signals cancellation.
-    cancelled_flags:
-        Mutex<std::collections::HashMap<u64, Arc<std::sync::atomic::AtomicBool>>>,
+    cancelled_flags: Mutex<std::collections::HashMap<u64, Arc<std::sync::atomic::AtomicBool>>>,
     /// Signal to stop the pump task.
     stopped: Arc<AtomicBool>,
     /// Buffer registry for payload lifetime management.
@@ -150,35 +181,66 @@ async fn pump_task(
     stopped: Arc<AtomicBool>,
 ) {
     while !stopped.load(Ordering::Relaxed) {
-        let call = match handle.next_call().await {
-            Some(c) => c,
+        let event = match handle.next_event().await {
+            Some(e) => e,
             None => break, // reactor shut down
         };
 
-        // Register payloads in BufferRegistry so they stay alive while the
-        // FFI consumer holds pointers to them.
-        let (header_buf_id, header_arc) = buffers.insert(call.header_payload);
-        let (request_buf_id, request_arc) = buffers.insert(call.request_payload);
-        let (peer_buf_id, peer_arc) = buffers.insert(call.peer_id.into_bytes());
+        let ring_call = match event {
+            ReactorEvent::Call(call) => {
+                let (header_buf_id, header_arc) = buffers.insert(call.header_payload);
+                let (request_buf_id, request_arc) = buffers.insert(call.request_payload);
+                let (peer_buf_id, peer_arc) = buffers.insert(call.peer_id.into_bytes());
 
-        let ring_call = RingCall {
-            call_id: call.call_id,
-            stream_id: call.stream_id,
-            header_buffer: header_buf_id,
-            header_ptr: header_arc.as_ptr(),
-            header_len: header_arc.len() as u32,
-            header_flags: call.header_flags,
-            request_buffer: request_buf_id,
-            request_ptr: request_arc.as_ptr(),
-            request_len: request_arc.len() as u32,
-            request_flags: call.request_flags,
-            peer_buffer: peer_buf_id,
-            peer_ptr: peer_arc.as_ptr(),
-            peer_len: peer_arc.len() as u32,
-            is_session_call: call.is_session_call,
-            response_sender: Some(call.response_sender),
-            request_receiver: Some(call.request_receiver),
-            cancelled: Some(call.cancelled),
+                RingCall {
+                    event_kind: ASTER_EVENT_KIND_CALL,
+                    call_id: call.call_id,
+                    connection_id: call.connection_id,
+                    stream_id: call.stream_id,
+                    header_buffer: header_buf_id,
+                    header_ptr: header_arc.as_ptr(),
+                    header_len: header_arc.len() as u32,
+                    header_flags: call.header_flags,
+                    request_buffer: request_buf_id,
+                    request_ptr: request_arc.as_ptr(),
+                    request_len: request_arc.len() as u32,
+                    request_flags: call.request_flags,
+                    peer_buffer: peer_buf_id,
+                    peer_ptr: peer_arc.as_ptr(),
+                    peer_len: peer_arc.len() as u32,
+                    response_sender: Some(call.response_sender),
+                    request_receiver: Some(call.request_receiver),
+                    cancelled: Some(call.cancelled),
+                }
+            }
+            ReactorEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                ..
+            } => {
+                let (peer_buf_id, peer_arc) = buffers.insert(peer_id.into_bytes());
+
+                RingCall {
+                    event_kind: ASTER_EVENT_KIND_CONNECTION_CLOSED,
+                    call_id: 0,
+                    connection_id,
+                    stream_id: 0,
+                    header_buffer: 0,
+                    header_ptr: ptr::null(),
+                    header_len: 0,
+                    header_flags: 0,
+                    request_buffer: 0,
+                    request_ptr: ptr::null(),
+                    request_len: 0,
+                    request_flags: 0,
+                    peer_buffer: peer_buf_id,
+                    peer_ptr: peer_arc.as_ptr(),
+                    peer_len: peer_arc.len() as u32,
+                    response_sender: None,
+                    request_receiver: None,
+                    cancelled: None,
+                }
+            }
         };
 
         // Spin-try push with backpressure.
@@ -321,7 +383,9 @@ pub unsafe extern "C" fn aster_reactor_poll(
     // Try draining without waiting first.
     consumer.drain(max_calls as usize, |ring_call| {
         let desc = aster_reactor_call_t {
+            event_kind: ring_call.event_kind,
             call_id: ring_call.call_id,
+            connection_id: ring_call.connection_id,
             stream_id: ring_call.stream_id,
             header_ptr: ring_call.header_ptr,
             header_len: ring_call.header_len,
@@ -331,7 +395,6 @@ pub unsafe extern "C" fn aster_reactor_poll(
             request_flags: ring_call.request_flags,
             peer_ptr: ring_call.peer_ptr,
             peer_len: ring_call.peer_len,
-            is_session_call: if ring_call.is_session_call { 1 } else { 0 },
             header_buffer: ring_call.header_buffer,
             request_buffer: ring_call.request_buffer,
             peer_buffer: ring_call.peer_buffer,
@@ -379,7 +442,9 @@ pub unsafe extern "C" fn aster_reactor_poll(
         if consumer.available() > 0 {
             consumer.drain(max_calls as usize, |ring_call| {
                 let desc = aster_reactor_call_t {
+                    event_kind: ring_call.event_kind,
                     call_id: ring_call.call_id,
+                    connection_id: ring_call.connection_id,
                     stream_id: ring_call.stream_id,
                     header_ptr: ring_call.header_ptr,
                     header_len: ring_call.header_len,
@@ -389,7 +454,6 @@ pub unsafe extern "C" fn aster_reactor_poll(
                     request_flags: ring_call.request_flags,
                     peer_ptr: ring_call.peer_ptr,
                     peer_len: ring_call.peer_len,
-                    is_session_call: if ring_call.is_session_call { 1 } else { 0 },
                     header_buffer: ring_call.header_buffer,
                     request_buffer: ring_call.request_buffer,
                     peer_buffer: ring_call.peer_buffer,
@@ -471,10 +535,14 @@ pub unsafe extern "C" fn aster_reactor_submit(
         unsafe { std::slice::from_raw_parts(trailer_ptr, trailer_len as usize).to_vec() }
     };
 
-    if !response_frame.is_empty() {
-        let _ = sender.send(OutgoingFrame::Frame(response_frame));
-    }
-    let _ = sender.send(OutgoingFrame::Trailer(trailer_frame));
+    // Unary fast-path (mirrors the client-side `aster_call_unary` write):
+    // concatenate `[response frame][trailer frame]` and ship as one
+    // `CompleteUnary` message so the reactor task writes them with a
+    // single `send.write_all` + one select iteration instead of two.
+    let mut bundled = Vec::with_capacity(response_frame.len() + trailer_frame.len());
+    bundled.extend_from_slice(&response_frame);
+    bundled.extend_from_slice(&trailer_frame);
+    let _ = sender.send(OutgoingFrame::CompleteUnary(bundled));
     // `sender` goes out of scope here — the map already dropped its copy,
     // so this closes the mpsc channel and lets the reactor finish the stream.
 

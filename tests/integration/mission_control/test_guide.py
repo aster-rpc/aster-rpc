@@ -190,6 +190,14 @@ async def test_ch4_session(client, services_module) -> None:
         fail("Ch4 setup", f"AgentSession not in {services_module.__name__}")
         return
 
+    # Responses may be typed dataclasses (Fory codec) or dicts
+    # (JsonProxyCodec, used when the peer advertises JSON-only
+    # serialization). Accept either shape.
+    def _task_id(resp: Any) -> str:
+        if isinstance(resp, dict):
+            return resp.get("task_id", "") or resp.get("taskId", "")
+        return getattr(resp, "task_id", "") or getattr(resp, "taskId", "")
+
     # 4a: register with GPU → train-42
     try:
         agent = await client.client(AgentSession)
@@ -198,8 +206,9 @@ async def test_ch4_session(client, services_module) -> None:
             capabilities=["gpu"],
             load_avg=0.5,
         ))
-        if r.task_id != "train-42":
-            fail("Ch4 register (gpu)", f"expected task_id='train-42', got {r.task_id!r}")
+        tid = _task_id(r)
+        if tid != "train-42":
+            fail("Ch4 register (gpu)", f"expected task_id='train-42', got {tid!r}")
             return
         ok("Ch4 register (gpu) returns train-42")
     except Exception as e:
@@ -214,8 +223,9 @@ async def test_ch4_session(client, services_module) -> None:
             capabilities=["arm64"],
             load_avg=0.2,
         ))
-        if r.task_id != "idle":
-            fail("Ch4 register (no gpu)", f"expected task_id='idle', got {r.task_id!r}")
+        tid = _task_id(r)
+        if tid != "idle":
+            fail("Ch4 register (no gpu)", f"expected task_id='idle', got {tid!r}")
             return
         ok("Ch4 register (no gpu) returns idle")
     except Exception as e:
@@ -279,16 +289,28 @@ async def test_ch5_edge_credential(address: str, edge_cred: str) -> None:
             fail("Ch5 edge tailLogs denied", f"unexpected error: {e}")
 
     # runCommand bidi must be denied (lacks ops.admin)
-    # This tests the bidi auth bypass fix.
+    # This tests the bidi auth bypass fix. `runCommand` is a
+    # bidi-streaming method -- the typed stub returns a `BidiChannel`
+    # that you drive with `.send()` / `.recv()` / `.close()`, NOT an
+    # async iterable. Previously this test passed an iterator
+    # positionally, which raised a TypeError from the stub's
+    # signature instead of exercising the auth path.
     try:
         from examples.python.mission_control.services_auth import AgentSession
         from examples.python.mission_control.types import Command
         agent = await client.client(AgentSession)
-
-        async def commands():
-            yield Command(command="echo hello")
-
-        await agent.runCommand(commands())
+        channel = agent.runCommand()
+        try:
+            await channel.send(Command(command="echo hello"))
+            await channel.close()
+            # The auth denial surfaces as a trailer on recv().
+            await channel.recv()
+        finally:
+            # Best-effort close; already closed if the recv raised.
+            try:
+                await channel.close()
+            except Exception:
+                pass
         fail("Ch5 edge runCommand denied", "bidi succeeded (should have been denied)")
     except Exception as e:
         if "PERMISSION_DENIED" in str(e) or "permission" in str(e).lower():

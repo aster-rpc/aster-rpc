@@ -16,15 +16,15 @@ public final class InMemorySessionRegistry implements SessionRegistry {
   private final Map<SessionKey, Object> instances = new ConcurrentHashMap<>();
 
   @Override
-  public Object getOrCreate(SessionKey key, Function<String, Object> factory) {
-    return instances.computeIfAbsent(key, k -> factory.apply(k.peerId()));
+  public Object getOrCreate(SessionKey key, String peerId, Function<String, Object> factory) {
+    return instances.computeIfAbsent(key, k -> factory.apply(peerId));
   }
 
   @Override
-  public void onPeerDisconnected(String peerId) {
+  public void onConnectionClosed(long connectionId) {
     List<SessionKey> toRemove = new ArrayList<>();
     for (SessionKey k : instances.keySet()) {
-      if (k.peerId().equals(peerId)) {
+      if (k.connectionId() == connectionId) {
         toRemove.add(k);
       }
     }

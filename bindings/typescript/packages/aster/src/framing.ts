@@ -49,6 +49,8 @@ export const ROW_SCHEMA = 0x08;
 export const CALL = 0x10;
 /** Bit 5 -- cancel current call in a session stream. */
 export const CANCEL = 0x20;
+/** Bit 6 -- last request frame for this call on a multiplexed stream. */
+export const END_STREAM = 0x40;
 
 // -- Errors -------------------------------------------------------------------
 
@@ -82,8 +84,9 @@ export async function writeFrame(
 ): Promise<void> {
   const frameBodyLen = FLAGS_SIZE + payload.byteLength;
 
-  // Zero-length payloads are permitted only for TRAILER and CANCEL control frames
-  if (frameBodyLen === FLAGS_SIZE && !(flags & (TRAILER | CANCEL))) {
+  // Zero-length payloads are permitted only for TRAILER, CANCEL, and
+  // END_STREAM control frames (multiplexed-streams spec §6).
+  if (frameBodyLen === FLAGS_SIZE && !(flags & (TRAILER | CANCEL | END_STREAM))) {
     throw new FramingError('zero-length payload is not permitted');
   }
 

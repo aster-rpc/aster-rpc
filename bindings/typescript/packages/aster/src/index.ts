@@ -69,6 +69,7 @@ export {
   ROW_SCHEMA,
   CALL,
   CANCEL,
+  END_STREAM,
   FramingError,
   writeFrame,
   readFrame,
@@ -76,6 +77,42 @@ export {
   decodeFrame,
   type FrameResult,
 } from './framing.js';
+
+// -- Multiplexed-streams v2 (spec §6) ---------------------------------------
+// These exports ship alongside the v1 AsterClient / RpcServer during the
+// Session 1 migration window. Session 3 renames them to drop the `2`
+// suffix and deletes v1 (see ffi_spec/Aster-multiplexed-streams.md §11).
+export {
+  IrohTransport2,
+  StreamAcquireError,
+  type IrohTransport2Options,
+  type NativeConnection,
+  type AsterCallFactory,
+  type NativeAsterCall,
+  type AsterCallRecvResult,
+} from './transport/iroh2.js';
+
+export {
+  AsterClient2,
+  ClientSession,
+  type AsterClient2Options,
+  type OpenSessionOptions,
+} from './client2.js';
+
+export {
+  AsterServer2,
+  DEFAULT_MAX_SESSIONS_PER_CONNECTION,
+  type AsterServer2Options,
+  type SharedRegistration,
+  type SessionRegistration,
+  type NativeNode,
+  type NativeReactorHandle,
+  type NativeReactorEvent,
+  type NativeResponseSender,
+  type NativeRequestReceiver,
+  type NativeCancelFlag,
+  type StartReactorFn,
+} from './server2.js';
 
 // Protocol types
 export { StreamHeader, CallHeader, RpcStatus } from './protocol.js';

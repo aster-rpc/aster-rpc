@@ -20,6 +20,8 @@ use anyhow::Result;
 
 use aster_transport_core::*;
 
+pub mod call;
+pub mod probe;
 pub mod reactor;
 
 // ============================================================================
@@ -469,7 +471,7 @@ pub(crate) struct BridgeRuntime {
     // Handle registries
     pub(crate) nodes: HandleRegistry<CoreNode>,
     endpoints: HandleRegistry<CoreNetClient>,
-    connections: HandleRegistry<CoreConnection>,
+    pub(crate) connections: HandleRegistry<CoreConnection>,
     send_streams: HandleRegistry<CoreSendStream>,
     recv_streams: HandleRegistry<CoreRecvStream>,
     #[allow(dead_code)]
@@ -5946,59 +5948,6 @@ pub unsafe extern "C" fn aster_canonical_bytes(
     };
     match aster_transport_core::contract::canonical_bytes_from_json(type_name, json_str) {
         Ok(bytes) => write_to_caller_buf(&bytes, out_buf, out_len) as i32,
-        Err(e) => set_last_error(e),
-    }
-}
-
-/// Encode a frame: `[4-byte LE length][flags][payload]`.
-#[no_mangle]
-pub unsafe extern "C" fn aster_frame_encode(
-    payload_ptr: *const u8,
-    payload_len: usize,
-    flags: u8,
-    out_buf: *mut u8,
-    out_len: *mut usize,
-) -> i32 {
-    if out_len.is_null() {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
-    }
-    // payload_ptr may be null when payload_len == 0 (empty control frames)
-    let payload = if payload_len == 0 {
-        &[]
-    } else {
-        if payload_ptr.is_null() {
-            return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
-        }
-        slice::from_raw_parts(payload_ptr, payload_len)
-    };
-    match aster_transport_core::framing::encode_frame(payload, flags) {
-        Ok(frame) => write_to_caller_buf(&frame, out_buf, out_len) as i32,
-        Err(e) => set_last_error(e),
-    }
-}
-
-/// Decode a frame. Writes payload to `out_payload`, flags byte to `*out_flags`.
-///
-/// `*out_payload_len` must be set to the capacity of `out_payload` on entry.
-/// On success it is set to the actual payload length.
-/// On BUFFER_TOO_SMALL it is set to the required payload size.
-#[no_mangle]
-pub unsafe extern "C" fn aster_frame_decode(
-    data_ptr: *const u8,
-    data_len: usize,
-    out_payload: *mut u8,
-    out_payload_len: *mut usize,
-    out_flags: *mut u8,
-) -> i32 {
-    if data_ptr.is_null() || out_payload_len.is_null() || out_flags.is_null() {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
-    }
-    let data = slice::from_raw_parts(data_ptr, data_len);
-    match aster_transport_core::framing::decode_frame(data) {
-        Ok((payload, flags, _consumed)) => {
-            *out_flags = flags;
-            write_to_caller_buf(&payload, out_payload, out_payload_len) as i32
-        }
         Err(e) => set_last_error(e),
     }
 }

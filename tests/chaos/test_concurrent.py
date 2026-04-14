@@ -14,11 +14,17 @@ stubs against a shared server simultaneously. They check:
 
 from __future__ import annotations
 
+import pytest
+
+pytest.skip(
+    "aster.session retired -- Phase-8 CALL-frame mechanism removed; "
+    "replaced by ClientSession + reactor-based session lifecycle",
+    allow_module_level=True,
+)
+
 import asyncio
 import uuid
 from typing import AsyncIterator
-
-import pytest
 
 from aster.codec import ForyCodec, wire_type
 from aster.decorators import service, rpc, client_stream, server_stream, bidi_stream, _SERVICE_INFO_ATTR

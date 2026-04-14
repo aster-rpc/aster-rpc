@@ -2,7 +2,9 @@
 
 **Scope:** `bindings/java/aster-runtime` — how `ForyCodec` wraps Apache Fory v0.16 so one codec instance can be shared across every in-flight RPC on an `AsterServer`.
 
-**Summary:** `ForyCodec` holds a single `ThreadSafeFory` built via `Fory.builder().buildThreadSafeFory()`. Under the hood Fory gives us `ThreadPoolFory` — a fixed-size pool of `Fory` instances (default `4 × Runtime.availableProcessors()`) that borrows-and-returns per call, with a `SharedRegistry` so type registrations propagate across every pooled instance. This is the same implementation Fory's own `VirtualThreadSafeForyTest` uses.
+**Summary:** `ForyCodec` holds a single `ThreadSafeFory` built via `Fory.builder().buildThreadSafeForyPool(minPoolSize, maxPoolSize)`. This gives us `ClassLoaderForyPooled` — a real shared pool of `Fory` instances that borrows-and-returns per call, with a `SharedRegistry` so type registrations propagate across every pooled instance. Pool sized at `(2, max(CPU/2, 2))`.
+
+> **⚠ Do not use `buildThreadSafeFory()`.** In Fory 0.16 that method's bytecode literally returns `buildThreadLocalFory()` — i.e. `ThreadLocalFory`, not `ThreadPoolFory`. On a virtual-thread-per-task server this is the trap described in Option 3 below: every call = fresh VT = fresh `Fory` + codec recompile, ~200 µs per RPC of pure cold-start. We shipped this bug in the first version of `ForyCodec` and a Stage-1 timing probe (`t3 − t2` = 214 µs p50 for a 30-byte StreamHeader decode) is what caught it. Fix: call `buildThreadSafeForyPool(...)` explicitly.
 
 ## The problem
 
@@ -55,11 +57,11 @@ Confirming signal: Fory's own `VirtualThreadSafeForyTest` has **zero** tests for
 
 **Rejected:** fresh `Fory` per virtual thread = fresh codec compile per call = killed our latency budget.
 
-### Option 4 — Fory's `ThreadPoolFory` *(chosen)*
+### Option 4 — Fory's `ThreadPoolFory` via `buildThreadSafeForyPool(...)` *(chosen)*
 
-`Fory.builder().buildThreadSafeFory()` is the default thread-safe implementation and returns `ThreadPoolFory`:
+`Fory.builder().buildThreadSafeForyPool(minPoolSize, maxPoolSize)` returns a `ClassLoaderForyPooled`-backed `ThreadSafeFory`:
 
-- Fixed-size shared pool of `Fory` instances (default `4 × Runtime.availableProcessors()`; configurable via `buildThreadSafeForyPool(int)`).
+- Shared pool of `Fory` instances (we size `(2, max(CPU/2, 2))`; Fory's default overload takes explicit `int, int`).
 - Borrow/return per-call with a thread-agnostic slot scan. No thread ownership, no thread-local state, virtual-thread safe by construction.
 - Only blocks on a semaphore when every pooled instance is in use — at which point your machine is already saturated and Fory isn't the bottleneck.
 - `SharedRegistry` means `codec.fory().register(Foo.class, "tag")` is seen by every pool entry immediately, and by any entry created later if the pool ever grows.

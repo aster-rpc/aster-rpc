@@ -37,6 +37,13 @@ class StreamHeader:
     serializationMode: pyfory.int8 = 0  # XLANG=0, NATIVE=1, ROW=2, JSON=3
     metadataKeys: list[str] = field(default_factory=list)
     metadataValues: list[str] = field(default_factory=list)
+    # Session identifier (multiplexed-streams, spec §6). 0 = stateless
+    # SHARED pool stream; non-zero = stream belongs to the session with
+    # this id on this (peer, connection). Monotonically allocated
+    # client-side per connection. Treated as 4-byte little-endian on
+    # the wire; signed int32 here is equivalent for any value fitting
+    # the monotonic counter in practice.
+    sessionId: pyfory.int32 = 0
 
 
 @dataclass

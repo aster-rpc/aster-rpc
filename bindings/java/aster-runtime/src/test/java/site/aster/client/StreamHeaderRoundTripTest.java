@@ -40,7 +40,8 @@ final class StreamHeaderRoundTripTest {
             (short) 0,
             StreamHeader.SERIALIZATION_XLANG,
             List.of(),
-            List.of());
+            List.of(),
+            42 /* sessionId — round-trip a non-default value */);
 
     byte[] encoded = writer.encode(header);
     StreamHeader decoded = (StreamHeader) reader.decode(encoded, StreamHeader.class);
@@ -51,6 +52,7 @@ final class StreamHeaderRoundTripTest {
     assertEquals(header.callId(), decoded.callId());
     assertEquals(header.deadline(), decoded.deadline());
     assertEquals(header.serializationMode(), decoded.serializationMode());
+    assertEquals(header.sessionId(), decoded.sessionId());
   }
 
   @Test

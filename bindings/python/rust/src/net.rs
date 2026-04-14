@@ -616,6 +616,14 @@ impl From<CoreConnection> for IrohConnection {
     }
 }
 
+impl IrohConnection {
+    /// Borrow a clone of the underlying `CoreConnection` for sibling
+    /// modules (e.g. `call.rs`) that need to call core APIs directly.
+    pub(crate) fn core_clone(&self) -> CoreConnection {
+        self.inner.clone()
+    }
+}
+
 #[pymethods]
 impl IrohConnection {
     /// Open a bidirectional QUIC stream, returning (send, recv).
@@ -996,9 +1004,7 @@ use std::sync::Mutex as StdMutex;
 #[pyclass]
 pub struct ReactorResponseSender {
     inner: StdMutex<
-        Option<
-            tokio::sync::mpsc::UnboundedSender<aster_transport_core::reactor::OutgoingFrame>,
-        >,
+        Option<tokio::sync::mpsc::UnboundedSender<aster_transport_core::reactor::OutgoingFrame>>,
     >,
 }
 
@@ -1025,6 +1031,213 @@ impl ReactorResponseSender {
         ));
         Ok(())
     }
+
+    /// Streaming: send one response data frame. The sender stays open for
+    /// further `send_frame` / `send_trailer` calls. Use this instead of
+    /// `submit` for server-streaming, client-streaming, and bidi patterns.
+    fn send_frame(&self, frame: Vec<u8>) -> PyResult<()> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("lock poisoned"))?;
+        let sender = guard.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("response stream already closed")
+        })?;
+        sender
+            .send(aster_transport_core::reactor::OutgoingFrame::Frame(frame))
+            .map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("reactor dropped response channel")
+            })?;
+        Ok(())
+    }
+
+    /// Streaming terminator: send the trailer frame and consume the sender.
+    /// After this call the stream is closed and further sends fail.
+    fn send_trailer(&self, trailer_frame: Vec<u8>) -> PyResult<()> {
+        let sender = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("lock poisoned"))?
+            .take()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("response stream already closed")
+            })?;
+        sender
+            .send(aster_transport_core::reactor::OutgoingFrame::Trailer(
+                trailer_frame,
+            ))
+            .map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("reactor dropped response channel")
+            })?;
+        Ok(())
+    }
+}
+
+/// Per-call incoming request frame stream, surfaced to Python for
+/// client-streaming and bidi dispatch. The first request frame arrives
+/// inline on the [`ReactorEvent`]; this wrapper yields every frame after
+/// that until the stream ends or a `FLAG_END_STREAM` frame arrives.
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+pub struct ReactorRequestReceiver {
+    inner: Arc<
+        tokio::sync::Mutex<
+            Option<
+                tokio::sync::mpsc::UnboundedReceiver<aster_transport_core::reactor::RequestFrame>,
+            >,
+        >,
+    >,
+}
+
+#[pymethods]
+impl ReactorRequestReceiver {
+    /// Await the next request frame. Returns `(payload_bytes, flags)` or
+    /// `None` when the peer has finished sending.
+    fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let Some(rx) = guard.as_mut() else {
+                return Ok(None::<(PyBytesResult, u8)>);
+            };
+            match rx.recv().await {
+                Some(frame) => Ok(Some((PyBytesResult(frame.payload), frame.flags))),
+                None => {
+                    *guard = None;
+                    Ok(None)
+                }
+            }
+        })
+    }
+}
+
+/// Sync cancel flag wrapping the reactor's per-call `Arc<AtomicBool>`.
+/// Streaming dispatchers poll this between iterations to stop early when
+/// the peer sends `FLAG_CANCEL` or the QUIC stream errors mid-call.
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+pub struct ReactorCancelFlag {
+    inner: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[pymethods]
+impl ReactorCancelFlag {
+    #[getter]
+    fn is_cancelled(&self) -> bool {
+        self.inner.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Event variants surfaced by [`ReactorHandle::next_event`]. Mirrors
+/// `core::reactor::ReactorEvent` but as a Python-visible pyclass so the
+/// high-level server can demultiplex calls vs. connection-closed signals
+/// (spec §7.5).
+#[pyclass]
+pub struct ReactorEvent {
+    // `kind` = 0 → Call, 1 → ConnectionClosed.
+    kind: u8,
+    connection_id: u64,
+    peer_id: String,
+    // Call-only fields. Populated iff kind == 0.
+    call_id: u64,
+    header_payload: Option<Vec<u8>>,
+    header_flags: u8,
+    request_payload: Option<Vec<u8>>,
+    request_flags: u8,
+    sender: StdMutex<Option<ReactorResponseSender>>,
+    request_receiver: StdMutex<Option<ReactorRequestReceiver>>,
+    cancel_flag: Option<ReactorCancelFlag>,
+    // ConnectionClosed-only fields.
+    close_kind: Option<String>,
+    close_code: Option<u64>,
+    close_reason: Option<Vec<u8>>,
+}
+
+#[pymethods]
+impl ReactorEvent {
+    /// "call" | "connection_closed"
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match self.kind {
+            0 => "call",
+            _ => "connection_closed",
+        }
+    }
+
+    #[getter]
+    fn connection_id(&self) -> u64 {
+        self.connection_id
+    }
+
+    #[getter]
+    fn peer_id(&self) -> String {
+        self.peer_id.clone()
+    }
+
+    #[getter]
+    fn call_id(&self) -> u64 {
+        self.call_id
+    }
+
+    #[getter]
+    fn header_payload<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.header_payload.as_ref().map(|b| PyBytes::new(py, b))
+    }
+
+    #[getter]
+    fn header_flags(&self) -> u8 {
+        self.header_flags
+    }
+
+    #[getter]
+    fn request_payload<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.request_payload.as_ref().map(|b| PyBytes::new(py, b))
+    }
+
+    #[getter]
+    fn request_flags(&self) -> u8 {
+        self.request_flags
+    }
+
+    /// Take the response sender out of this Call event. May be called
+    /// once; returns `None` on subsequent calls or for non-Call events.
+    fn take_sender(&self) -> Option<ReactorResponseSender> {
+        let mut guard = self.sender.lock().ok()?;
+        guard.take()
+    }
+
+    /// Take the request receiver out of this Call event. May be called
+    /// once; returns `None` on subsequent calls or for non-Call events.
+    /// Only client-streaming and bidi dispatchers need this — unary and
+    /// server-streaming callers can ignore it (the first request frame is
+    /// already on `request_payload`).
+    fn take_request_receiver(&self) -> Option<ReactorRequestReceiver> {
+        let mut guard = self.request_receiver.lock().ok()?;
+        guard.take()
+    }
+
+    /// Return a clone of the cancel flag for this call (or `None` for
+    /// non-Call events). The flag is shared with the reactor — streaming
+    /// dispatchers poll it to stop early on `FLAG_CANCEL` or stream reset.
+    #[getter]
+    fn cancel_flag(&self) -> Option<ReactorCancelFlag> {
+        self.cancel_flag.clone()
+    }
+
+    #[getter]
+    fn close_kind(&self) -> Option<String> {
+        self.close_kind.clone()
+    }
+
+    #[getter]
+    fn close_code(&self) -> Option<u64> {
+        self.close_code
+    }
+
+    #[getter]
+    fn close_reason<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.close_reason.as_ref().map(|b| PyBytes::new(py, b))
+    }
 }
 
 #[pyclass]
@@ -1034,36 +1247,61 @@ pub struct ReactorHandle {
 
 #[pymethods]
 impl ReactorHandle {
-    fn next_call<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Pull the next reactor event (a call or a connection-closed
+    /// signal). Python framework drains the event stream here; see
+    /// spec §6 / §7.5 for per-connection session lifecycle.
+    fn next_event<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let handle = self.inner.clone();
         future_into_py(py, async move {
             let mut guard = handle.lock().await;
-            match guard.next_call().await {
-                Some(call) => {
+            match guard.next_event().await {
+                Some(aster_transport_core::reactor::ReactorEvent::Call(call)) => {
                     let sender = ReactorResponseSender {
                         inner: StdMutex::new(Some(call.response_sender)),
                     };
-                    // Python framework hasn't been ported to pull additional
-                    // request frames via the reactor; drop the receiver so
-                    // the per-call request channel closes immediately. Python
-                    // client-streaming uses a different code path (the
-                    // higher-level Aster framework, not core::reactor).
-                    drop(call.request_receiver);
-                    // Cancellation propagation also flows via FFI (not the
-                    // Python net.rs reactor wrapper); drop the flag here so
-                    // it doesn't leak.
-                    drop(call.cancelled);
-                    Ok(Some((
-                        call.call_id,
-                        PyBytesResult(call.header_payload),
-                        call.header_flags,
-                        PyBytesResult(call.request_payload),
-                        call.request_flags,
-                        call.peer_id,
-                        call.is_session_call,
-                        sender,
-                    )))
+                    let request_receiver = ReactorRequestReceiver {
+                        inner: Arc::new(tokio::sync::Mutex::new(Some(call.request_receiver))),
+                    };
+                    let cancel_flag = ReactorCancelFlag {
+                        inner: call.cancelled,
+                    };
+                    Ok(Some(ReactorEvent {
+                        kind: 0,
+                        connection_id: call.connection_id,
+                        peer_id: call.peer_id,
+                        call_id: call.call_id,
+                        header_payload: Some(call.header_payload),
+                        header_flags: call.header_flags,
+                        request_payload: Some(call.request_payload),
+                        request_flags: call.request_flags,
+                        sender: StdMutex::new(Some(sender)),
+                        request_receiver: StdMutex::new(Some(request_receiver)),
+                        cancel_flag: Some(cancel_flag),
+                        close_kind: None,
+                        close_code: None,
+                        close_reason: None,
+                    }))
                 }
+                Some(aster_transport_core::reactor::ReactorEvent::ConnectionClosed {
+                    peer_id,
+                    connection_id,
+                    info,
+                }) => Ok(Some(ReactorEvent {
+                    kind: 1,
+                    connection_id,
+                    peer_id,
+                    call_id: 0,
+                    header_payload: None,
+                    header_flags: 0,
+                    request_payload: None,
+                    request_flags: 0,
+                    sender: StdMutex::new(None),
+                    request_receiver: StdMutex::new(None),
+                    cancel_flag: None,
+                    close_kind: Some(info.kind),
+                    close_code: info.code,
+                    close_reason: info.reason,
+                })),
                 None => Ok(None),
             }
         })
@@ -1125,7 +1363,10 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IrohSendStream>()?;
     m.add_class::<IrohRecvStream>()?;
     m.add_class::<ReactorHandle>()?;
+    m.add_class::<ReactorEvent>()?;
     m.add_class::<ReactorResponseSender>()?;
+    m.add_class::<ReactorRequestReceiver>()?;
+    m.add_class::<ReactorCancelFlag>()?;
     m.add_class::<ReactorFeeder>()?;
     m.add_function(wrap_pyfunction!(net_client, m)?)?;
     m.add_function(wrap_pyfunction!(create_endpoint, m)?)?;

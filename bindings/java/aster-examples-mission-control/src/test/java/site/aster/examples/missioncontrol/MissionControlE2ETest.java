@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import site.aster.client.AsterClient;
 import site.aster.client.BidiCall;
+import site.aster.client.ClientSession;
 import site.aster.codec.ForyCodec;
 import site.aster.examples.missioncontrol.types.Assignment;
 import site.aster.examples.missioncontrol.types.Command;
@@ -89,19 +90,18 @@ final class MissionControlE2ETest {
   void sessionScopedRegisterReturnsAssignment() throws Exception {
     try (Fixture f = Fixture.start()) {
       Heartbeat hb = new Heartbeat("agent-7", List.of("gpu", "cuda12"), 0.42d);
-      Assignment assignment =
-          f.client
-              .<Heartbeat, Assignment>call(
-                  f.serverAddr,
-                  AgentSessionDispatcher.SERVICE_NAME,
-                  "register",
-                  hb,
-                  Assignment.class)
-              .orTimeout(15, TimeUnit.SECONDS)
-              .get();
+      try (ClientSession session =
+          f.client.openSession(f.serverAddr).orTimeout(15, TimeUnit.SECONDS).get()) {
+        Assignment assignment =
+            session
+                .<Heartbeat, Assignment>call(
+                    AgentSessionDispatcher.SERVICE_NAME, "register", hb, Assignment.class)
+                .orTimeout(15, TimeUnit.SECONDS)
+                .get();
 
-      assertEquals("train-42", assignment.taskId());
-      assertEquals("python train.py", assignment.command());
+        assertEquals("train-42", assignment.taskId());
+        assertEquals("python train.py", assignment.command());
+      }
     }
   }
 
@@ -109,19 +109,18 @@ final class MissionControlE2ETest {
   void sessionScopedRegisterWithoutGpuFallsBack() throws Exception {
     try (Fixture f = Fixture.start()) {
       Heartbeat hb = new Heartbeat("agent-8", List.of("cpu"), 0.10d);
-      Assignment assignment =
-          f.client
-              .<Heartbeat, Assignment>call(
-                  f.serverAddr,
-                  AgentSessionDispatcher.SERVICE_NAME,
-                  "register",
-                  hb,
-                  Assignment.class)
-              .orTimeout(15, TimeUnit.SECONDS)
-              .get();
+      try (ClientSession session =
+          f.client.openSession(f.serverAddr).orTimeout(15, TimeUnit.SECONDS).get()) {
+        Assignment assignment =
+            session
+                .<Heartbeat, Assignment>call(
+                    AgentSessionDispatcher.SERVICE_NAME, "register", hb, Assignment.class)
+                .orTimeout(15, TimeUnit.SECONDS)
+                .get();
 
-      assertEquals("idle", assignment.taskId());
-      assertEquals("sleep 60", assignment.command());
+        assertEquals("idle", assignment.taskId());
+        assertEquals("sleep 60", assignment.command());
+      }
     }
   }
 
@@ -214,40 +213,35 @@ final class MissionControlE2ETest {
       List<Command> cmds =
           List.of(new Command("ls -l"), new Command("echo hello"), new Command("uptime"));
 
-      List<CommandResult> results =
-          f.client
-              .<Command, CommandResult>callBidiStream(
-                  f.serverAddr,
-                  AgentSessionDispatcher.SERVICE_NAME,
-                  "runCommand",
-                  cmds,
-                  CommandResult.class)
-              .orTimeout(15, TimeUnit.SECONDS)
-              .get();
+      try (ClientSession session =
+          f.client.openSession(f.serverAddr).orTimeout(15, TimeUnit.SECONDS).get()) {
+        List<CommandResult> results =
+            session
+                .<Command, CommandResult>callBidiStream(
+                    AgentSessionDispatcher.SERVICE_NAME, "runCommand", cmds, CommandResult.class)
+                .orTimeout(15, TimeUnit.SECONDS)
+                .get();
 
-      assertEquals(3, results.size());
-      assertEquals("ran: ls -l", results.get(0).stdout());
-      assertEquals("ran: echo hello", results.get(1).stdout());
-      assertEquals("ran: uptime", results.get(2).stdout());
-      for (CommandResult r : results) {
-        assertEquals(0, r.exitCode());
-        assertEquals("", r.stderr());
+        assertEquals(3, results.size());
+        assertEquals("ran: ls -l", results.get(0).stdout());
+        assertEquals("ran: echo hello", results.get(1).stdout());
+        assertEquals("ran: uptime", results.get(2).stdout());
+        for (CommandResult r : results) {
+          assertEquals(0, r.exitCode());
+          assertEquals("", r.stderr());
+        }
       }
     }
   }
 
   @Test
   void interleavedBidiRunCommandPingPong() throws Exception {
-    try (Fixture f = Fixture.start()) {
+    try (Fixture f = Fixture.start();
+        ClientSession session =
+            f.client.openSession(f.serverAddr).orTimeout(15, TimeUnit.SECONDS).get()) {
       try (BidiCall<Command, CommandResult> call =
-          f.client
-              .<Command, CommandResult>openBidiStream(
-                  f.serverAddr,
-                  AgentSessionDispatcher.SERVICE_NAME,
-                  "runCommand",
-                  CommandResult.class)
-              .orTimeout(15, TimeUnit.SECONDS)
-              .get()) {
+          session.<Command, CommandResult>openBidiStream(
+              AgentSessionDispatcher.SERVICE_NAME, "runCommand", CommandResult.class)) {
 
         // True ping-pong: send one command, immediately receive its result, then send the next.
         // The buffered callBidiStream can't model this — it materializes all requests first.
@@ -279,16 +273,12 @@ final class MissionControlE2ETest {
   @Test
   void bidiRunCommandCancellationPropagates() throws Exception {
     AgentSession.lastRunCommandExitReason = "";
-    try (Fixture f = Fixture.start()) {
+    try (Fixture f = Fixture.start();
+        ClientSession session =
+            f.client.openSession(f.serverAddr).orTimeout(15, TimeUnit.SECONDS).get()) {
       try (BidiCall<Command, CommandResult> call =
-          f.client
-              .<Command, CommandResult>openBidiStream(
-                  f.serverAddr,
-                  AgentSessionDispatcher.SERVICE_NAME,
-                  "runCommand",
-                  CommandResult.class)
-              .orTimeout(15, TimeUnit.SECONDS)
-              .get()) {
+          session.<Command, CommandResult>openBidiStream(
+              AgentSessionDispatcher.SERVICE_NAME, "runCommand", CommandResult.class)) {
 
         call.send(new Command("ls"));
         CommandResult r1 = call.recv();

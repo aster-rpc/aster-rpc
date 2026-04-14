@@ -44,46 +44,65 @@ public final class Reactor implements AutoCloseable {
   // ============================================================================
 
   /**
-   * Memory layout of {@code aster_reactor_call_t}. 88 bytes total with 4-byte alignment padding.
+   * Memory layout of {@code aster_reactor_call_t}. 104 bytes total.
    *
-   * <p>{@code stream_id} was added in G.2 so session-scoped services can key on {@code (peer,
-   * stream, service)} and stop collapsing concurrent sessions from the same peer.
+   * <p>Multiplexed-streams update (spec §6/§7.5):
+   *
+   * <ul>
+   *   <li>{@code event_kind} discriminates {@link #EVENT_KIND_CALL} vs {@link
+   *       #EVENT_KIND_CONNECTION_CLOSED}. ConnectionClosed events populate only {@code event_kind},
+   *       {@code connection_id}, and {@code peer_*}; all other fields are zero/NULL.
+   *   <li>{@code connection_id} (new) — used together with {@code StreamHeader.sessionId} to key
+   *       per-session state. The same id is reused across every call from one connection and
+   *       emitted again on the terminal ConnectionClosed event so the binding can drop session
+   *       state for that connection.
+   *   <li>{@code is_session_call} (removed) — the binding now decodes {@code sessionId} from the
+   *       {@code StreamHeader} payload.
+   * </ul>
    */
   public static final MemoryLayout CALL_LAYOUT =
       MemoryLayout.structLayout(
-          ValueLayout.JAVA_LONG.withName("call_id"), //                0
-          ValueLayout.JAVA_LONG.withName("stream_id"), //              8
-          ValueLayout.ADDRESS.withName("header_ptr"), //              16
-          ValueLayout.JAVA_INT.withName("header_len"), //             24
-          ValueLayout.JAVA_BYTE.withName("header_flags"), //          28
-          MemoryLayout.paddingLayout(3), //                           29
-          ValueLayout.ADDRESS.withName("request_ptr"), //             32
-          ValueLayout.JAVA_INT.withName("request_len"), //            40
-          ValueLayout.JAVA_BYTE.withName("request_flags"), //         44
-          MemoryLayout.paddingLayout(3), //                           45
-          ValueLayout.ADDRESS.withName("peer_ptr"), //                48
-          ValueLayout.JAVA_INT.withName("peer_len"), //               56
-          ValueLayout.JAVA_BYTE.withName("is_session_call"), //       60
-          MemoryLayout.paddingLayout(3), //                           61
-          ValueLayout.JAVA_LONG.withName("header_buffer"), //         64
-          ValueLayout.JAVA_LONG.withName("request_buffer"), //        72
-          ValueLayout.JAVA_LONG.withName("peer_buffer") //            80
+          ValueLayout.JAVA_BYTE.withName("event_kind"), //              0
+          MemoryLayout.paddingLayout(7), //                             1
+          ValueLayout.JAVA_LONG.withName("call_id"), //                 8
+          ValueLayout.JAVA_LONG.withName("connection_id"), //          16
+          ValueLayout.JAVA_LONG.withName("stream_id"), //              24
+          ValueLayout.ADDRESS.withName("header_ptr"), //               32
+          ValueLayout.JAVA_INT.withName("header_len"), //              40
+          ValueLayout.JAVA_BYTE.withName("header_flags"), //           44
+          MemoryLayout.paddingLayout(3), //                            45
+          ValueLayout.ADDRESS.withName("request_ptr"), //              48
+          ValueLayout.JAVA_INT.withName("request_len"), //             56
+          ValueLayout.JAVA_BYTE.withName("request_flags"), //          60
+          MemoryLayout.paddingLayout(3), //                            61
+          ValueLayout.ADDRESS.withName("peer_ptr"), //                 64
+          ValueLayout.JAVA_INT.withName("peer_len"), //                72
+          MemoryLayout.paddingLayout(4), //                            76
+          ValueLayout.JAVA_LONG.withName("header_buffer"), //          80
+          ValueLayout.JAVA_LONG.withName("request_buffer"), //         88
+          ValueLayout.JAVA_LONG.withName("peer_buffer") //             96
           );
 
-  public static final long OFFSET_CALL_ID = 0;
-  public static final long OFFSET_STREAM_ID = 8;
-  public static final long OFFSET_HEADER_PTR = 16;
-  public static final long OFFSET_HEADER_LEN = 24;
-  public static final long OFFSET_HEADER_FLAGS = 28;
-  public static final long OFFSET_REQUEST_PTR = 32;
-  public static final long OFFSET_REQUEST_LEN = 40;
-  public static final long OFFSET_REQUEST_FLAGS = 44;
-  public static final long OFFSET_PEER_PTR = 48;
-  public static final long OFFSET_PEER_LEN = 56;
-  public static final long OFFSET_IS_SESSION_CALL = 60;
-  public static final long OFFSET_HEADER_BUFFER = 64;
-  public static final long OFFSET_REQUEST_BUFFER = 72;
-  public static final long OFFSET_PEER_BUFFER = 80;
+  public static final long OFFSET_EVENT_KIND = 0;
+  public static final long OFFSET_CALL_ID = 8;
+  public static final long OFFSET_CONNECTION_ID = 16;
+  public static final long OFFSET_STREAM_ID = 24;
+  public static final long OFFSET_HEADER_PTR = 32;
+  public static final long OFFSET_HEADER_LEN = 40;
+  public static final long OFFSET_HEADER_FLAGS = 44;
+  public static final long OFFSET_REQUEST_PTR = 48;
+  public static final long OFFSET_REQUEST_LEN = 56;
+  public static final long OFFSET_REQUEST_FLAGS = 60;
+  public static final long OFFSET_PEER_PTR = 64;
+  public static final long OFFSET_PEER_LEN = 72;
+  public static final long OFFSET_HEADER_BUFFER = 80;
+  public static final long OFFSET_REQUEST_BUFFER = 88;
+  public static final long OFFSET_PEER_BUFFER = 96;
+
+  /** Event-kind constants matching {@code ASTER_EVENT_KIND_*} in {@code ffi/iroh_ffi.h}. */
+  public static final byte EVENT_KIND_CALL = 0;
+
+  public static final byte EVENT_KIND_CONNECTION_CLOSED = 1;
 
   // ============================================================================
   // Method handles

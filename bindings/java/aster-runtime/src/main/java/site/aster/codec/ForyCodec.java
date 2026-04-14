@@ -26,8 +26,19 @@ public final class ForyCodec implements Codec {
   private final ThreadSafeFory fory;
 
   public ForyCodec() {
+    // NOTE: buildThreadSafeFory() in Fory 0.16 returns ThreadLocalFory, which allocates a fresh
+    // Fory per thread on first use. Under newVirtualThreadPerTaskExecutor (every call = new VT)
+    // that's a brand-new Fory + codec recompile on every RPC — ~200 µs per StreamHeader decode.
+    // buildThreadSafeForyPool forces a ClassLoaderForyPooled, which is a true shared pool across
+    // threads/VTs. Pool size is min=2, max=max(CPU/2, 2), matching Fory's own recommendation for
+    // VT workloads.
+    int cpu = Math.max(Runtime.getRuntime().availableProcessors(), 2);
+    int max = Math.max(cpu / 2, 2);
     this.fory =
-        Fory.builder().withLanguage(Language.XLANG).withRefTracking(true).buildThreadSafeFory();
+        Fory.builder()
+            .withLanguage(Language.XLANG)
+            .withRefTracking(true)
+            .buildThreadSafeForyPool(2, max);
   }
 
   public ForyCodec(ThreadSafeFory fory) {

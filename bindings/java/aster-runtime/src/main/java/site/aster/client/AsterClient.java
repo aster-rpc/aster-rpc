@@ -5,12 +5,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 import site.aster.codec.Codec;
 import site.aster.codec.ForyCodec;
 import site.aster.config.AsterConfig;
+import site.aster.ffi.AsterCall;
 import site.aster.handle.IrohConnection;
 import site.aster.handle.IrohEndpoint;
-import site.aster.handle.IrohStream;
 import site.aster.interceptors.Interceptor;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
@@ -26,11 +27,11 @@ import site.aster.server.wire.StreamHeader;
  * connection cache keyed by peer id, a {@link Codec} for request/response serialization, and an
  * interceptor chain.
  *
- * <p>Day-0 scope: {@link #connect(NodeAddr)} opens a live connection to a target peer and {@link
- * #close()} tears everything down. The {@link #call(NodeAddr, String, String, Object, Class)}
- * network round-trip lands alongside the Kotlin MissionControl sample in commit G, where
- * cross-language framing can be validated against the Python reference in {@code
- * bindings/python/aster/transport/iroh.py}.
+ * <p>All outbound calls flow through the multiplexed-streams primitive ({@code aster_call_*}): each
+ * call acquires a handle from the connection's per-connection pool (spec §8), sends framed request
+ * bytes, drains the response frames through the trailer, and releases the handle so the underlying
+ * stream returns to the pool. The framing state machine lives in {@code core}; this class is a thin
+ * shim.
  */
 public final class AsterClient implements AutoCloseable {
 
@@ -40,6 +41,7 @@ public final class AsterClient implements AutoCloseable {
   private final AsterConfig config;
   private final List<Interceptor> interceptors;
   private final Map<String, IrohConnection> connectionCache = new ConcurrentHashMap<>();
+  private final Executor callExecutor = CallExecutor.INSTANCE;
 
   private AsterClient(Builder b, IrohEndpoint endpoint) {
     this.endpoint = endpoint;
@@ -50,9 +52,6 @@ public final class AsterClient implements AutoCloseable {
   }
 
   private static ForyCodec registerFrameworkWireTypes(Codec userCodec) {
-    // Symmetric with AsterServer: StreamHeader / CallHeader / RpcStatus are always Fory xlang.
-    // If the user chose ForyCodec, register them on its Fory so header and payload share one
-    // pump. Otherwise, build a dedicated Fory purely for framework wire types.
     ForyCodec header = userCodec instanceof ForyCodec fc ? fc : new ForyCodec();
     try {
       header.fory().register(StreamHeader.class, "_aster/StreamHeader");
@@ -90,11 +89,6 @@ public final class AsterClient implements AutoCloseable {
     return interceptors;
   }
 
-  /**
-   * Return (or open) a connection to the given peer on the Aster ALPN. Connections are cached by
-   * peer id — the first call to a peer opens a new connection, subsequent calls to the same peer
-   * reuse it.
-   */
   public CompletableFuture<IrohConnection> connect(NodeAddr target) {
     String peerId = target.endpointId();
     IrohConnection existing = connectionCache.get(peerId);
@@ -114,62 +108,44 @@ public final class AsterClient implements AutoCloseable {
             });
   }
 
-  /**
-   * Make a unary RPC call.
-   *
-   * <p>Opens a fresh bidirectional stream on the cached connection, writes the {@link StreamHeader}
-   * as the first frame ({@code HEADER} flag), writes the serialized request as the second frame,
-   * finishes the send side, then reads response frames until a {@code TRAILER} frame is seen.
-   * Mirrors {@code bindings/python/aster/transport/iroh.py} streaming shape — Python's unary path
-   * fuses these steps into a single FFI call ({@code IrohConnection.unary_call}) but the wire is
-   * identical.
-   *
-   * @param target the destination node address
-   * @param service service name (e.g. {@code "MissionControl"})
-   * @param method method name on that service
-   * @param request the request object — encoded via the user codec
-   * @param responseType Java class of the response — passed to the codec on decode (Fory xlang uses
-   *     the embedded type tag so this is advisory)
-   * @return a future that completes with the decoded response, or fails with an {@link RpcError}
-   *     for non-OK trailers
-   */
+  /** Make a unary RPC call against a SHARED-scoped service (sessionId=0). */
   public <Req, Resp> CompletableFuture<Resp> call(
       NodeAddr target, String service, String method, Req request, Class<Resp> responseType) {
     return connect(target)
-        .thenCompose(
-            conn ->
-                conn.openBiAsync()
-                    .thenCompose(stream -> doCall(stream, service, method, request, responseType)));
+        .thenComposeAsync(
+            conn -> runUnary(conn, 0, service, method, request, responseType), callExecutor);
+  }
+
+  /**
+   * Open a session for the given peer (multiplexed-streams spec §6 / §7.5). Allocates a fresh
+   * monotonic {@code sessionId} on the underlying connection; subsequent calls through the returned
+   * {@link ClientSession} carry that {@code sessionId} on every {@code StreamHeader} so the server
+   * can route them to the same per-peer SESSION-scoped service instance.
+   *
+   * <p>There is no "open session" RPC — sessions are created implicitly server-side on first
+   * arrival of a stream with a fresh {@code sessionId}. This call only allocates the id locally.
+   * Returned sessions need not be explicitly closed: server-side reap happens when the connection
+   * drops.
+   */
+  public CompletableFuture<ClientSession> openSession(NodeAddr target) {
+    return connect(target).thenApply(conn -> new ClientSession(this, conn, conn.nextSessionId()));
   }
 
   /**
    * Make a server-streaming RPC call: one request frame out, N response frames in until a {@code
    * TRAILER} closes the stream. The returned future completes with the full list of responses once
-   * the trailer lands — this is the simplest shape that proves the wire. A {@link
-   * java.util.concurrent.Flow.Publisher}-based variant that delivers frames incrementally is a
-   * later addition.
+   * the trailer lands.
    */
   public <Req, Resp> CompletableFuture<List<Resp>> callServerStream(
       NodeAddr target, String service, String method, Req request, Class<Resp> responseType) {
     return connect(target)
-        .thenCompose(
-            conn ->
-                conn.openBiAsync()
-                    .thenCompose(
-                        stream ->
-                            doServerStreamCall(stream, service, method, request, responseType)));
+        .thenComposeAsync(
+            conn -> runServerStream(conn, 0, service, method, request, responseType), callExecutor);
   }
 
   /**
    * Make a client-streaming RPC call: N request frames out (last marked with {@link
-   * AsterFraming#FLAG_END_STREAM}), one response frame in, then a {@code TRAILER}. The returned
-   * future completes with the single decoded response.
-   *
-   * <p>Buffered shape — all request objects are materialized up front. A streaming variant that
-   * pushes frames as the caller produces them is a later addition.
-   *
-   * @throws IllegalArgumentException if {@code requests} is empty (the wire format requires at
-   *     least one request frame to bootstrap the call delivery)
+   * AsterFraming#FLAG_END_STREAM}), one response frame in, then a {@code TRAILER}. Buffered shape.
    */
   public <Req, Resp> CompletableFuture<Resp> callClientStream(
       NodeAddr target,
@@ -177,25 +153,22 @@ public final class AsterClient implements AutoCloseable {
       String method,
       Iterable<Req> requests,
       Class<Resp> responseType) {
+    List<Req> materialized = materialize(requests);
+    if (materialized.isEmpty()) {
+      return CompletableFuture.failedFuture(
+          new IllegalArgumentException(
+              "callClientStream requires at least one request frame; the wire format delivers"
+                  + " the first frame inline with the call to bootstrap the dispatcher"));
+    }
     return connect(target)
-        .thenCompose(
-            conn ->
-                conn.openBiAsync()
-                    .thenCompose(
-                        stream ->
-                            doClientStreamCall(stream, service, method, requests, responseType)));
+        .thenComposeAsync(
+            conn -> runClientStream(conn, 0, service, method, materialized, responseType),
+            callExecutor);
   }
 
   /**
-   * Make a bidirectional-streaming RPC call: N request frames out (last marked with {@link
-   * AsterFraming#FLAG_END_STREAM}), M response frames in, then a {@code TRAILER}.
-   *
-   * <p>Buffered shape — all requests are sent before any response is read. This is sufficient for
-   * ping-pong style bidi where the server processes the full request stream then emits its response
-   * stream, but it does NOT support true interleaved bidi (where the server starts emitting
-   * responses while the client is still sending requests). True interleaving requires a different
-   * API surface (e.g. a {@code BidiCall} object with explicit {@code send} / {@code complete}
-   * methods plus a {@link java.util.concurrent.Flow.Publisher} for responses) and is open work.
+   * Make a buffered bidirectional-streaming RPC call: all requests are sent before any response is
+   * read. Use {@link #openBidiStream} for true interleaving.
    */
   public <Req, Resp> CompletableFuture<List<Resp>> callBidiStream(
       NodeAddr target,
@@ -203,395 +176,308 @@ public final class AsterClient implements AutoCloseable {
       String method,
       Iterable<Req> requests,
       Class<Resp> responseType) {
+    List<Req> materialized = materialize(requests);
+    if (materialized.isEmpty()) {
+      return CompletableFuture.failedFuture(
+          new IllegalArgumentException(
+              "callBidiStream requires at least one request frame; the wire format delivers"
+                  + " the first frame inline with the call to bootstrap the dispatcher"));
+    }
     return connect(target)
-        .thenCompose(
-            conn ->
-                conn.openBiAsync()
-                    .thenCompose(
-                        stream ->
-                            doBidiStreamCall(stream, service, method, requests, responseType)));
+        .thenComposeAsync(
+            conn -> runBidiBuffered(conn, 0, service, method, materialized, responseType),
+            callExecutor);
   }
 
   /**
    * Open a true interleaved bidi-streaming call. Returns a {@link BidiCall} object the caller
-   * drives directly: call {@link BidiCall#send(Object)} to push request frames, {@link
-   * BidiCall#recv()} to pull response frames as they arrive (blocking until the next one or
-   * end-of-stream), and {@link BidiCall#complete()} to signal end-of-request.
-   *
-   * <p>Use this instead of {@link #callBidiStream} when the server emits responses while the client
-   * is still sending requests (ping-pong patterns, request-response loops, server-driven
-   * backpressure). For simple "send N, get N" batched bidi the buffered {@link #callBidiStream} is
-   * still the lighter API.
+   * drives directly via {@link BidiCall#send}, {@link BidiCall#recv}, {@link BidiCall#complete}.
    */
   public <Req, Resp> CompletableFuture<BidiCall<Req, Resp>> openBidiStream(
       NodeAddr target, String service, String method, Class<Resp> responseType) {
-    StreamHeader header =
-        new StreamHeader(
-            service,
-            method,
-            1,
-            0,
-            (short) 0,
-            StreamHeader.SERIALIZATION_XLANG,
-            List.of(),
-            List.of());
-    byte[] headerBytes = headerCodec.encode(header);
-    byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
     return connect(target)
-        .thenCompose(conn -> conn.openBiAsync())
-        .thenCompose(
-            stream ->
-                stream
-                    .sendAsync(headerFrame)
-                    .thenApply(
-                        v -> new BidiCall<Req, Resp>(stream, codec, headerCodec, responseType)));
+        .thenApplyAsync(
+            conn -> openBidiStreamOn(conn, 0, service, method, responseType), callExecutor);
   }
 
-  private <Req, Resp> CompletableFuture<Resp> doCall(
-      IrohStream stream, String service, String method, Req request, Class<Resp> responseType) {
-    CompletableFuture<Resp> result = new CompletableFuture<>();
+  <Req, Resp> BidiCall<Req, Resp> openBidiStreamOn(
+      IrohConnection conn, int sessionId, String service, String method, Class<Resp> responseType) {
+    AsterCall call = acquireStreamingOn(conn);
     try {
-      StreamHeader header =
-          new StreamHeader(
-              service,
-              method,
-              1,
-              0,
-              (short) 0,
-              StreamHeader.SERIALIZATION_XLANG,
-              List.of(),
-              List.of());
-      byte[] headerBytes = headerCodec.encode(header);
-      byte[] requestBytes = codec.encode(request);
-
-      byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
-      byte[] requestFrame = AsterFraming.encodeFrame(requestBytes, (byte) 0);
-
-      ClientFrameReader reader = new ClientFrameReader(stream);
-      stream
-          .sendAsync(headerFrame)
-          .thenCompose(v -> stream.sendAsync(requestFrame))
-          .thenCompose(v -> stream.finishAsync())
-          .thenCompose(v -> readUntilTrailer(reader, responseType))
-          .whenComplete(
-              (resp, err) -> {
-                try {
-                  stream.close();
-                } catch (Exception ignored) {
-                  // Best-effort — stream may already be closed.
-                }
-                if (err != null) {
-                  result.completeExceptionally(unwrap(err));
-                } else {
-                  result.complete(resp);
-                }
-              });
+      sendStreamHeader(call, sessionId, service, method);
     } catch (Throwable t) {
-      try {
-        stream.close();
-      } catch (Exception ignored) {
-      }
-      result.completeExceptionally(t);
+      call.discard();
+      throw reThrow(t);
     }
-    return result;
+    return new BidiCall<Req, Resp>(call, codec, headerCodec, responseType);
   }
 
-  private <Resp> CompletableFuture<Resp> readUntilTrailer(
-      ClientFrameReader reader, Class<Resp> responseType) {
-    List<byte[]> responsePayloads = new ArrayList<>();
+  <Req, Resp> CompletableFuture<Resp> runUnary(
+      IrohConnection conn,
+      int sessionId,
+      String service,
+      String method,
+      Req request,
+      Class<Resp> responseType) {
     CompletableFuture<Resp> out = new CompletableFuture<>();
-    readNextFrame(reader, responseType, responsePayloads, out);
+    callExecutor.execute(
+        () -> {
+          try {
+            byte[] headerBytes = headerCodec.encode(buildStreamHeader(sessionId, service, method));
+            byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
+            byte[] requestBytes = codec.encode(request);
+            byte[] requestFrame =
+                AsterFraming.encodeFrame(requestBytes, AsterFraming.FLAG_END_STREAM);
+            byte[] requestPair = new byte[headerFrame.length + requestFrame.length];
+            System.arraycopy(headerFrame, 0, requestPair, 0, headerFrame.length);
+            System.arraycopy(requestFrame, 0, requestPair, headerFrame.length, requestFrame.length);
+
+            long probeT0 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
+            AsterCall.UnaryResult result =
+                AsterCall.unary(
+                    conn.runtime().nativeHandle(), conn.nativeHandle(), sessionId, requestPair);
+            if (site.aster.probe.AsterProbes.ENABLED) {
+              site.aster.probe.AsterProbes.recordClient(probeT0, System.nanoTime());
+            }
+
+            // Decode trailer first; non-OK status surfaces as RpcError.
+            RpcStatus status =
+                result.trailerPayload().length == 0
+                    ? RpcStatus.ok()
+                    : (RpcStatus) headerCodec.decode(result.trailerPayload(), RpcStatus.class);
+            if (status.code() != RpcStatus.OK) {
+              throw new RpcError(
+                  StatusCode.fromValue(status.code()),
+                  status.message() == null ? "" : status.message());
+            }
+            if (result.responsePayload() == null) {
+              throw new RpcError(StatusCode.INTERNAL, "OK trailer with no response frame");
+            }
+            @SuppressWarnings("unchecked")
+            Resp decoded = (Resp) codec.decode(result.responsePayload(), responseType);
+            out.complete(decoded);
+          } catch (Throwable t) {
+            out.completeExceptionally(unwrap(t));
+          }
+        });
     return out;
   }
 
-  private <Resp> void readNextFrame(
-      ClientFrameReader reader,
-      Class<Resp> responseType,
-      List<byte[]> responsePayloads,
-      CompletableFuture<Resp> out) {
-    reader
-        .readFrame()
-        .whenComplete(
-            (frame, err) -> {
-              if (err != null) {
-                out.completeExceptionally(unwrap(err));
-                return;
-              }
-              byte flags = frame.flags();
-              if ((flags & AsterFraming.FLAG_TRAILER) != 0) {
-                try {
-                  RpcStatus status =
-                      frame.payload().length == 0
-                          ? RpcStatus.ok()
-                          : (RpcStatus) headerCodec.decode(frame.payload(), RpcStatus.class);
-                  if (status.code() != RpcStatus.OK) {
-                    out.completeExceptionally(
-                        new RpcError(
-                            StatusCode.fromValue(status.code()),
-                            status.message() == null ? "" : status.message()));
-                    return;
-                  }
-                  if (responsePayloads.isEmpty()) {
-                    out.completeExceptionally(
-                        new RpcError(StatusCode.INTERNAL, "OK trailer with no response frame"));
-                    return;
-                  }
-                  if (responsePayloads.size() > 1) {
-                    out.completeExceptionally(
-                        new RpcError(
-                            StatusCode.INTERNAL,
-                            "unary call received " + responsePayloads.size() + " response frames"));
-                    return;
-                  }
-                  @SuppressWarnings("unchecked")
-                  Resp decoded = (Resp) codec.decode(responsePayloads.get(0), responseType);
-                  out.complete(decoded);
-                } catch (Throwable t) {
-                  out.completeExceptionally(t);
-                }
-                return;
-              }
-              if ((flags & AsterFraming.FLAG_ROW_SCHEMA) != 0) {
-                // §5.5.2: skip row schema frames on unary — no row-mode support yet.
-                readNextFrame(reader, responseType, responsePayloads, out);
-                return;
-              }
-              responsePayloads.add(frame.payload());
-              readNextFrame(reader, responseType, responsePayloads, out);
-            });
-  }
-
-  private <Req, Resp> CompletableFuture<List<Resp>> doServerStreamCall(
-      IrohStream stream, String service, String method, Req request, Class<Resp> responseType) {
-    CompletableFuture<List<Resp>> result = new CompletableFuture<>();
-    try {
-      StreamHeader header =
-          new StreamHeader(
-              service,
-              method,
-              1,
-              0,
-              (short) 0,
-              StreamHeader.SERIALIZATION_XLANG,
-              List.of(),
-              List.of());
-      byte[] headerBytes = headerCodec.encode(header);
-      byte[] requestBytes = codec.encode(request);
-
-      byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
-      byte[] requestFrame = AsterFraming.encodeFrame(requestBytes, (byte) 0);
-
-      ClientFrameReader reader = new ClientFrameReader(stream);
-      stream
-          .sendAsync(headerFrame)
-          .thenCompose(v -> stream.sendAsync(requestFrame))
-          .thenCompose(v -> stream.finishAsync())
-          .thenCompose(v -> collectUntilTrailer(reader, responseType))
-          .whenComplete(
-              (payloads, err) -> {
-                try {
-                  stream.close();
-                } catch (Exception ignored) {
-                  // Best-effort — stream may already be closed.
-                }
-                if (err != null) {
-                  result.completeExceptionally(unwrap(err));
-                } else {
-                  result.complete(payloads);
-                }
-              });
-    } catch (Throwable t) {
-      try {
-        stream.close();
-      } catch (Exception ignored) {
-      }
-      result.completeExceptionally(t);
-    }
-    return result;
-  }
-
-  private <Req, Resp> CompletableFuture<Resp> doClientStreamCall(
-      IrohStream stream,
+  <Req, Resp> CompletableFuture<List<Resp>> runServerStream(
+      IrohConnection conn,
+      int sessionId,
       String service,
       String method,
-      Iterable<Req> requests,
+      Req request,
       Class<Resp> responseType) {
-    CompletableFuture<Resp> result = new CompletableFuture<>();
-    try {
-      List<Req> requestList = new ArrayList<>();
-      requests.forEach(requestList::add);
-      if (requestList.isEmpty()) {
-        throw new IllegalArgumentException(
-            "callClientStream requires at least one request frame; the wire format delivers"
-                + " the first frame inline with the call to bootstrap the dispatcher");
-      }
-
-      StreamHeader header =
-          new StreamHeader(
-              service,
-              method,
-              1,
-              0,
-              (short) 0,
-              StreamHeader.SERIALIZATION_XLANG,
-              List.of(),
-              List.of());
-      byte[] headerBytes = headerCodec.encode(header);
-      byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
-
-      ClientFrameReader reader = new ClientFrameReader(stream);
-      CompletableFuture<Void> sendChain = stream.sendAsync(headerFrame);
-      for (int i = 0; i < requestList.size(); i++) {
-        byte[] reqBytes = codec.encode(requestList.get(i));
-        byte flags = (i == requestList.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
-        final byte[] frame = AsterFraming.encodeFrame(reqBytes, flags);
-        sendChain = sendChain.thenCompose(v -> stream.sendAsync(frame));
-      }
-
-      sendChain
-          .thenCompose(v -> stream.finishAsync())
-          .thenCompose(v -> readUntilTrailer(reader, responseType))
-          .whenComplete(
-              (resp, err) -> {
-                try {
-                  stream.close();
-                } catch (Exception ignored) {
-                  // Best-effort.
-                }
-                if (err != null) {
-                  result.completeExceptionally(unwrap(err));
-                } else {
-                  result.complete(resp);
-                }
-              });
-    } catch (Throwable t) {
-      try {
-        stream.close();
-      } catch (Exception ignored) {
-      }
-      result.completeExceptionally(t);
-    }
-    return result;
-  }
-
-  private <Req, Resp> CompletableFuture<List<Resp>> doBidiStreamCall(
-      IrohStream stream,
-      String service,
-      String method,
-      Iterable<Req> requests,
-      Class<Resp> responseType) {
-    CompletableFuture<List<Resp>> result = new CompletableFuture<>();
-    try {
-      List<Req> requestList = new ArrayList<>();
-      requests.forEach(requestList::add);
-      if (requestList.isEmpty()) {
-        throw new IllegalArgumentException(
-            "callBidiStream requires at least one request frame; the wire format delivers"
-                + " the first frame inline with the call to bootstrap the dispatcher");
-      }
-
-      StreamHeader header =
-          new StreamHeader(
-              service,
-              method,
-              1,
-              0,
-              (short) 0,
-              StreamHeader.SERIALIZATION_XLANG,
-              List.of(),
-              List.of());
-      byte[] headerBytes = headerCodec.encode(header);
-      byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
-
-      ClientFrameReader reader = new ClientFrameReader(stream);
-      CompletableFuture<Void> sendChain = stream.sendAsync(headerFrame);
-      for (int i = 0; i < requestList.size(); i++) {
-        byte[] reqBytes = codec.encode(requestList.get(i));
-        byte flags = (i == requestList.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
-        final byte[] frame = AsterFraming.encodeFrame(reqBytes, flags);
-        sendChain = sendChain.thenCompose(v -> stream.sendAsync(frame));
-      }
-
-      sendChain
-          .thenCompose(v -> stream.finishAsync())
-          .thenCompose(v -> collectUntilTrailer(reader, responseType))
-          .whenComplete(
-              (payloads, err) -> {
-                try {
-                  stream.close();
-                } catch (Exception ignored) {
-                }
-                if (err != null) {
-                  result.completeExceptionally(unwrap(err));
-                } else {
-                  result.complete(payloads);
-                }
-              });
-    } catch (Throwable t) {
-      try {
-        stream.close();
-      } catch (Exception ignored) {
-      }
-      result.completeExceptionally(t);
-    }
-    return result;
-  }
-
-  private <Resp> CompletableFuture<List<Resp>> collectUntilTrailer(
-      ClientFrameReader reader, Class<Resp> responseType) {
-    List<Resp> collected = new ArrayList<>();
     CompletableFuture<List<Resp>> out = new CompletableFuture<>();
-    collectNextFrame(reader, responseType, collected, out);
+    callExecutor.execute(
+        () -> {
+          AsterCall call = null;
+          try {
+            call = acquireStreamingOn(conn);
+            sendStreamHeader(call, sessionId, service, method);
+            byte[] requestBytes = codec.encode(request);
+            call.sendFrame(AsterFraming.encodeFrame(requestBytes, AsterFraming.FLAG_END_STREAM));
+            List<Resp> collected = drainStreaming(call, responseType);
+            call.release();
+            call = null;
+            out.complete(collected);
+          } catch (Throwable t) {
+            if (call != null) call.discard();
+            out.completeExceptionally(unwrap(t));
+          }
+        });
     return out;
   }
 
-  private <Resp> void collectNextFrame(
-      ClientFrameReader reader,
-      Class<Resp> responseType,
-      List<Resp> collected,
-      CompletableFuture<List<Resp>> out) {
-    reader
-        .readFrame()
-        .whenComplete(
-            (frame, err) -> {
-              if (err != null) {
-                out.completeExceptionally(unwrap(err));
-                return;
-              }
-              byte flags = frame.flags();
-              if ((flags & AsterFraming.FLAG_TRAILER) != 0) {
-                try {
-                  RpcStatus status =
-                      frame.payload().length == 0
-                          ? RpcStatus.ok()
-                          : (RpcStatus) headerCodec.decode(frame.payload(), RpcStatus.class);
-                  if (status.code() != RpcStatus.OK) {
-                    out.completeExceptionally(
-                        new RpcError(
-                            StatusCode.fromValue(status.code()),
-                            status.message() == null ? "" : status.message()));
-                    return;
-                  }
-                  out.complete(collected);
-                } catch (Throwable t) {
-                  out.completeExceptionally(t);
-                }
-                return;
-              }
-              if ((flags & AsterFraming.FLAG_ROW_SCHEMA) != 0) {
-                collectNextFrame(reader, responseType, collected, out);
-                return;
-              }
-              try {
-                @SuppressWarnings("unchecked")
-                Resp decoded = (Resp) codec.decode(frame.payload(), responseType);
-                collected.add(decoded);
-              } catch (Throwable t) {
-                out.completeExceptionally(t);
-                return;
-              }
-              collectNextFrame(reader, responseType, collected, out);
-            });
+  <Req, Resp> CompletableFuture<Resp> runClientStream(
+      IrohConnection conn,
+      int sessionId,
+      String service,
+      String method,
+      List<Req> requests,
+      Class<Resp> responseType) {
+    CompletableFuture<Resp> out = new CompletableFuture<>();
+    callExecutor.execute(
+        () -> {
+          AsterCall call = null;
+          try {
+            call = acquireStreamingOn(conn);
+            sendStreamHeader(call, sessionId, service, method);
+            for (int i = 0; i < requests.size(); i++) {
+              byte[] reqBytes = codec.encode(requests.get(i));
+              byte flags = (i == requests.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
+              call.sendFrame(AsterFraming.encodeFrame(reqBytes, flags));
+            }
+            UnaryResult<Resp> result = drainUnary(call, responseType);
+            call.release();
+            call = null;
+            out.complete(result.value());
+          } catch (Throwable t) {
+            if (call != null) call.discard();
+            out.completeExceptionally(unwrap(t));
+          }
+        });
+    return out;
+  }
+
+  <Req, Resp> CompletableFuture<List<Resp>> runBidiBuffered(
+      IrohConnection conn,
+      int sessionId,
+      String service,
+      String method,
+      List<Req> requests,
+      Class<Resp> responseType) {
+    CompletableFuture<List<Resp>> out = new CompletableFuture<>();
+    callExecutor.execute(
+        () -> {
+          AsterCall call = null;
+          try {
+            call = acquireStreamingOn(conn);
+            sendStreamHeader(call, sessionId, service, method);
+            for (int i = 0; i < requests.size(); i++) {
+              byte[] reqBytes = codec.encode(requests.get(i));
+              byte flags = (i == requests.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
+              call.sendFrame(AsterFraming.encodeFrame(reqBytes, flags));
+            }
+            List<Resp> collected = drainStreaming(call, responseType);
+            call.release();
+            call = null;
+            out.complete(collected);
+          } catch (Throwable t) {
+            if (call != null) call.discard();
+            out.completeExceptionally(unwrap(t));
+          }
+        });
+    return out;
+  }
+
+  // -------------------------------------------------------------------------
+  // Shared helpers
+  // -------------------------------------------------------------------------
+
+  private AsterCall acquireOn(IrohConnection conn, int sessionId) {
+    // Spec §6: sessionId == 0 selects the SHARED pool for stateless calls; non-zero acquires
+    // from (or lazily creates) the per-session pool keyed on this id.
+    return AsterCall.acquire(conn.runtime().nativeHandle(), conn.nativeHandle(), sessionId);
+  }
+
+  /**
+   * Acquire a call handle for a <strong>streaming</strong> RPC pattern (server-stream,
+   * client-stream, bidi). Bypasses the per-connection multiplexed-stream pool entirely and opens a
+   * dedicated substream — per {@code ffi_spec/Aster-multiplexed-streams.md} §3 line 65, "streaming
+   * substreams don't count against any pool." Without this bypass, a streaming call would hold a
+   * pool slot and block concurrent unary calls on the same session (spec §4.4). The session id
+   * still ships in the {@code StreamHeader}; only pool accounting is bypassed.
+   */
+  private AsterCall acquireStreamingOn(IrohConnection conn) {
+    return AsterCall.acquireStreaming(conn.runtime().nativeHandle(), conn.nativeHandle());
+  }
+
+  private void sendStreamHeader(AsterCall call, int sessionId, String service, String method) {
+    byte[] headerBytes = headerCodec.encode(buildStreamHeader(sessionId, service, method));
+    call.sendFrame(AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER));
+  }
+
+  private static StreamHeader buildStreamHeader(int sessionId, String service, String method) {
+    return new StreamHeader(
+        service,
+        method,
+        1,
+        0,
+        (short) 0,
+        StreamHeader.SERIALIZATION_XLANG,
+        List.of(),
+        List.of(),
+        sessionId);
+  }
+
+  /** Record-style holder for drainUnary — lets us distinguish "empty OK" from "no frame". */
+  private record UnaryResult<T>(T value) {}
+
+  private <Resp> UnaryResult<Resp> drainUnary(AsterCall call, Class<Resp> responseType) {
+    byte[] responsePayload = null;
+    int frameCount = 0;
+    while (true) {
+      AsterCall.RecvFrame frame = call.recvFrame(0);
+      if (frame instanceof AsterCall.RecvFrame.EndOfStream) {
+        throw new RpcError(StatusCode.INTERNAL, "stream ended before trailer");
+      }
+      if (frame instanceof AsterCall.RecvFrame.Timeout) {
+        // timeout_ms=0 means block indefinitely in the FFI contract, so this
+        // branch is unreachable in practice; treat as a transport error.
+        throw new RpcError(StatusCode.INTERNAL, "unexpected recv timeout");
+      }
+      AsterCall.RecvFrame.Ok ok = (AsterCall.RecvFrame.Ok) frame;
+      byte flags = ok.flags();
+      if ((flags & AsterFraming.FLAG_TRAILER) != 0) {
+        RpcStatus status =
+            ok.payload().length == 0
+                ? RpcStatus.ok()
+                : (RpcStatus) headerCodec.decode(ok.payload(), RpcStatus.class);
+        if (status.code() != RpcStatus.OK) {
+          throw new RpcError(
+              StatusCode.fromValue(status.code()),
+              status.message() == null ? "" : status.message());
+        }
+        if (responsePayload == null) {
+          throw new RpcError(StatusCode.INTERNAL, "OK trailer with no response frame");
+        }
+        if (frameCount > 1) {
+          throw new RpcError(
+              StatusCode.INTERNAL, "unary call received " + frameCount + " response frames");
+        }
+        @SuppressWarnings("unchecked")
+        Resp decoded = (Resp) codec.decode(responsePayload, responseType);
+        return new UnaryResult<>(decoded);
+      }
+      if ((flags & AsterFraming.FLAG_ROW_SCHEMA) != 0) {
+        // skip row-schema frames (no row-mode support yet)
+        continue;
+      }
+      responsePayload = ok.payload();
+      frameCount++;
+    }
+  }
+
+  private <Resp> List<Resp> drainStreaming(AsterCall call, Class<Resp> responseType) {
+    List<Resp> collected = new ArrayList<>();
+    while (true) {
+      AsterCall.RecvFrame frame = call.recvFrame(0);
+      if (frame instanceof AsterCall.RecvFrame.EndOfStream) {
+        throw new RpcError(StatusCode.INTERNAL, "stream ended before trailer");
+      }
+      if (frame instanceof AsterCall.RecvFrame.Timeout) {
+        throw new RpcError(StatusCode.INTERNAL, "unexpected recv timeout");
+      }
+      AsterCall.RecvFrame.Ok ok = (AsterCall.RecvFrame.Ok) frame;
+      byte flags = ok.flags();
+      if ((flags & AsterFraming.FLAG_TRAILER) != 0) {
+        RpcStatus status =
+            ok.payload().length == 0
+                ? RpcStatus.ok()
+                : (RpcStatus) headerCodec.decode(ok.payload(), RpcStatus.class);
+        if (status.code() != RpcStatus.OK) {
+          throw new RpcError(
+              StatusCode.fromValue(status.code()),
+              status.message() == null ? "" : status.message());
+        }
+        return collected;
+      }
+      if ((flags & AsterFraming.FLAG_ROW_SCHEMA) != 0) {
+        continue;
+      }
+      @SuppressWarnings("unchecked")
+      Resp decoded = (Resp) codec.decode(ok.payload(), responseType);
+      collected.add(decoded);
+    }
+  }
+
+  private static <T> List<T> materialize(Iterable<T> items) {
+    List<T> list = new ArrayList<>();
+    items.forEach(list::add);
+    return list;
   }
 
   private static Throwable unwrap(Throwable t) {
@@ -600,13 +486,18 @@ public final class AsterClient implements AutoCloseable {
         : t;
   }
 
+  private static RuntimeException reThrow(Throwable t) {
+    if (t instanceof RuntimeException re) return re;
+    if (t instanceof Error err) throw err;
+    return new RuntimeException(t);
+  }
+
   @Override
   public void close() {
     for (IrohConnection conn : connectionCache.values()) {
       try {
         conn.close();
       } catch (Exception ignored) {
-        // Best-effort
       }
     }
     connectionCache.clear();

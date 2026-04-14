@@ -1,7 +1,10 @@
 package site.aster.examples.missioncontrol;
 
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -16,6 +19,7 @@ import site.aster.examples.missioncontrol.types.StatusRequest;
 import site.aster.examples.missioncontrol.types.StatusResponse;
 import site.aster.examples.missioncontrol.types.SubmitLogResult;
 import site.aster.node.NodeAddr;
+import site.aster.probe.AsterProbes;
 import site.aster.server.AsterServer;
 
 /**
@@ -39,6 +43,31 @@ final class MissionControlBenchmark {
   private static final int WARMUP = 50;
   private static final int UNARY_ITERATIONS = 1000;
 
+  /**
+   * If {@code ASTER_BENCH_ENDPOINT_ID} is set in the environment, the benchmark skips starting a
+   * local server and instead builds a {@link NodeAddr} from the env-var triple {@code
+   * ASTER_BENCH_ENDPOINT_ID / ASTER_BENCH_RELAY_URL / ASTER_BENCH_DIRECT_ADDRS} (direct addresses
+   * comma-separated). This lets the same benchmark target an external Python or TypeScript server
+   * by feeding it the components that server prints on startup. When unset, the benchmark runs
+   * in-process Java↔Java as before.
+   */
+  private static NodeAddr externalAddrFromEnv() {
+    String endpointId = System.getenv("ASTER_BENCH_ENDPOINT_ID");
+    if (endpointId == null || endpointId.isEmpty()) {
+      return null;
+    }
+    String relayUrl = System.getenv("ASTER_BENCH_RELAY_URL");
+    if (relayUrl == null) relayUrl = "";
+    String direct = System.getenv("ASTER_BENCH_DIRECT_ADDRS");
+    List<String> directList;
+    if (direct == null || direct.isEmpty()) {
+      directList = Collections.emptyList();
+    } else {
+      directList = Arrays.asList(direct.split(","));
+    }
+    return new NodeAddr(endpointId, relayUrl, directList);
+  }
+
   @Test
   void runFullBenchmarkSuite() throws Exception {
     ForyCodec serverCodec = new ForyCodec();
@@ -46,25 +75,32 @@ final class MissionControlBenchmark {
     ForyCodec clientCodec = new ForyCodec();
     Server.registerWireTypes(clientCodec);
 
-    MissionControl missionControl = new MissionControl();
-
-    AsterServer server =
-        AsterServer.builder()
-            .codec(serverCodec)
-            .service(missionControl)
-            .sessionService(AgentSession.class, AgentSession::new)
-            .build()
-            .get(15, TimeUnit.SECONDS);
+    NodeAddr externalAddr = externalAddrFromEnv();
+    String targetLabel;
+    AsterServer server = null;
+    if (externalAddr == null) {
+      MissionControl missionControl = new MissionControl();
+      server =
+          AsterServer.builder()
+              .codec(serverCodec)
+              .service(missionControl)
+              .sessionService(AgentSession.class, AgentSession::new)
+              .build()
+              .get(15, TimeUnit.SECONDS);
+      targetLabel = "in-process Java server";
+    } else {
+      targetLabel = "external server " + externalAddr.endpointId().substring(0, 16) + "...";
+    }
 
     long memStartMb = heapUsedMb();
 
     try (AsterClient client =
         AsterClient.builder().codec(clientCodec).build().get(15, TimeUnit.SECONDS)) {
-      NodeAddr addr = server.node().nodeAddr();
+      NodeAddr addr = externalAddr != null ? externalAddr : server.node().nodeAddr();
 
       System.out.println();
       System.out.println("════════════════════════════════════════════════════════════════════");
-      System.out.println(" Mission Control Java↔Java in-process benchmark");
+      System.out.println(" Mission Control Java client benchmark → " + targetLabel);
       System.out.println("════════════════════════════════════════════════════════════════════");
       System.out.println(" jvm heap used at start: " + memStartMb + " MB");
       System.out.println(" iterations per unary stage: " + UNARY_ITERATIONS);
@@ -72,9 +108,16 @@ final class MissionControlBenchmark {
       System.out.println("────────────────────────────────────────────────────────────────────");
 
       warmup(client, addr);
+      AsterProbes.reset();
 
       benchmarkUnaryGetStatus(client, addr);
+      maybeDumpProbes("getStatus");
+      AsterProbes.reset();
+
       benchmarkUnarySubmitLog(client, addr);
+      maybeDumpProbes("submitLog");
+      AsterProbes.reset();
+
       benchmarkClientStreamIngestMetrics(client, addr);
       benchmarkConcurrentGetStatus(client, addr);
 
@@ -90,7 +133,9 @@ final class MissionControlBenchmark {
               + "MB");
       System.out.println("════════════════════════════════════════════════════════════════════");
     } finally {
-      server.close();
+      if (server != null) {
+        server.close();
+      }
     }
   }
 
@@ -238,6 +283,17 @@ final class MissionControlBenchmark {
     System.out.printf(
         "  %-22s  %,12.0f req/s   p50=%6.2fms  p90=%6.2fms  p99=%6.2fms%n",
         label, rps, p50, p90, p99);
+  }
+
+  private static void maybeDumpProbes(String stage) {
+    if (!AsterProbes.ENABLED) return;
+    try {
+      Path dir = Paths.get("target", "probes");
+      AsterProbes.dump(dir, stage);
+      System.out.println("  [probes] dumped " + stage + " → " + dir.toAbsolutePath());
+    } catch (Exception e) {
+      System.out.println("  [probes] dump failed: " + e.getMessage());
+    }
   }
 
   private static long heapUsedMb() {

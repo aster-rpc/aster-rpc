@@ -7,6 +7,7 @@
 use napi_derive::napi;
 
 mod blobs;
+mod call;
 mod contract;
 mod docs;
 mod error;
@@ -14,6 +15,7 @@ mod gossip;
 mod hooks;
 mod net;
 mod node;
+mod reactor;
 mod ticket;
 
 /// Module version (matches package.json).
