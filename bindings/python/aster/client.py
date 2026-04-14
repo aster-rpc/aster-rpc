@@ -448,16 +448,26 @@ def create_client(
             fory_config=fory_config,
         )
 
-    # Session-scoped services need a SessionStub via create_session (async).
-    # create_client is sync -- callers using AsterClient.client() get the
-    # async dispatch automatically; direct callers should use create_session
-    # explicitly when working with session-scoped services.
+    # Session-scoped services need their sessionId threaded into every
+    # StreamHeader (spec Sec. 6 / 7.5). The easiest way to get that is
+    # `AsterClient.open_session()` which hands back a ClientSession
+    # bound to a monotonic id. But a caller that has ALREADY built a
+    # session-bound IrohTransport (via ClientSession.client, or
+    # manually) knows what it's doing -- we only reject session-scoped
+    # classes when the caller passed a raw connection and would end up
+    # with sessionId=0.
     if service_info.scoped == RpcScope.SESSION:
-        raise ClientError(
-            f"{service_class.__name__} is session-scoped and cannot be created "
-            f"via create_client(). Use aster.session.create_session() (async) "
-            f"or AsterClient.client() which handles both cases."
-        )
+        if transport is None:
+            raise ClientError(
+                f"{service_class.__name__} is session-scoped and cannot be "
+                f"created via create_client() with just a connection. Use "
+                f"AsterClient.open_session() or AsterClient.client(), which "
+                f"handle the session-id wiring automatically."
+            )
+        # Transport was passed; trust that it already carries the
+        # session binding. ClientSession.client takes this path --
+        # it builds an IrohTransport(session_id=self._session_id)
+        # before calling create_client(..., transport=transport).
 
     if transport is None:
         if connection is None:

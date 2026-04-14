@@ -54,6 +54,7 @@ export function createXlangCodec(): ForyCodec {
       serializationMode: Type.int8(),
       metadataKeys: Type.array(Type.string()),
       metadataValues: Type.array(Type.string()),
+      sessionId: Type.int32(),
     },
     { withConstructor: true },
   );

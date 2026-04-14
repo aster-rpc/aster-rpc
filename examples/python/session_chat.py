@@ -1,5 +1,5 @@
 """
-Session-scoped Chat Service — Aster RPC Example.
+Session-scoped Chat Service -- Aster RPC Example.
 
 Demonstrates session-scoped services (``@service(scoped="session")``), where
 each connection gets its own service instance with private state.
@@ -14,14 +14,14 @@ Architecture:
   - A chat room service tracks per-session state (nickname, message history)
   - The producer hosts the service
   - The consumer opens a session, sets a nickname, sends messages, and
-    retrieves history — all on the same session-scoped instance
+    retrieves history -- all on the same session-scoped instance
 
 Usage (two terminals):
 
-  # Terminal 1 — producer
+  # Terminal 1 -- producer
   python session_chat.py producer
 
-  # Terminal 2 — consumer
+  # Terminal 2 -- consumer
   ASTER_ENDPOINT_ADDR=<printed by producer> python session_chat.py consumer
 """
 from __future__ import annotations
@@ -68,7 +68,7 @@ class SendMessageResponse:
 @wire_type("example.chat/HistoryRequest")
 @dataclass
 class HistoryRequest:
-    """Empty request — just asking for the history."""
+    """Empty request -- just asking for the history."""
     pass
 
 
@@ -159,15 +159,15 @@ async def run_producer() -> None:
 
 
 async def run_consumer() -> None:
-    from aster.session import create_session
-
     async with AsterClient() as c:
         print(f"[consumer] Connected. Services: {[s.name for s in c.services]}")
 
-        # Open a session to the ChatRoomService.
-        # create_session returns a SessionStub with typed methods.
-        conn = await c._rpc_conn_for(c.services[0].channels["rpc"])
-        session = await create_session(ChatRoomService, connection=conn)
+        # Open a typed session stub to the ChatRoomService. Every call
+        # made via this stub threads the same sessionId into its
+        # StreamHeader, so the server routes them to the same session
+        # instance (spec Sec. 6).
+        client_session = await c.open_session(service_cls=ChatRoomService)
+        session = await client_session.client(ChatRoomService)
 
         try:
             # 1. Set a nickname (first RPC call on this session)
@@ -186,7 +186,7 @@ async def run_consumer() -> None:
                 print(f"    #{item.sequence} [{item.nickname}] {item.text}")
 
         finally:
-            await session.close()
+            await client_session.close()
 
     print("[consumer] Done.")
 
@@ -198,8 +198,8 @@ def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] not in ("producer", "consumer"):
         print("Usage: python session_chat.py <producer|consumer>")
         print()
-        print("  producer  — start the chat room service")
-        print("  consumer  — connect and chat (requires ASTER_ENDPOINT_ADDR)")
+        print("  producer  -- start the chat room service")
+        print("  consumer  -- connect and chat (requires ASTER_ENDPOINT_ADDR)")
         sys.exit(1)
 
     role = sys.argv[1]

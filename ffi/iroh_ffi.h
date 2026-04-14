@@ -16,6 +16,59 @@
 #define IROH_ABI_VERSION_PATCH 0
 
 /**
+ * Result codes returned by `aster_call_recv_frame`. Mirrors the
+ * `aster_reactor_recv_frame` triplet for consistency across surfaces.
+ */
+#define ASTER_CALL_RECV_OK 0
+
+#define ASTER_CALL_RECV_END_OF_STREAM 1
+
+#define ASTER_CALL_RECV_TIMEOUT 2
+
+/**
+ * Acquire-error subcodes returned by `aster_call_acquire` as negative
+ * values. Bindings can map these to typed exceptions per spec §5.
+ */
+#define ASTER_CALL_ERR_POOL_FULL -10
+
+#define ASTER_CALL_ERR_QUIC_LIMIT_REACHED -11
+
+#define ASTER_CALL_ERR_PEER_STREAM_LIMIT_TOO_LOW -12
+
+#define ASTER_CALL_ERR_STREAM_OPEN_FAILED -13
+
+#define ASTER_CALL_ERR_POOL_CLOSED -14
+
+/**
+ * Event-kind discriminator for `aster_reactor_call_t` (spec §7.5).
+ * Bindings MUST check `event_kind` before reading any other field — a
+ * `ConnectionClosed` event populates only `event_kind`, `connection_id`,
+ * `peer_*` (peer_id of the closed connection); all other fields are zero
+ * or NULL.
+ */
+#define ASTER_EVENT_KIND_CALL 0
+
+#define ASTER_EVENT_KIND_CONNECTION_CLOSED 1
+
+/**
+ * Result codes returned by `aster_reactor_recv_frame` in addition to the
+ * usual `iroh_status_t` codes for error cases.
+ */
+#define ASTER_RECV_FRAME_OK 0
+
+/**
+ * Per-call request channel was closed cleanly (peer signalled END_STREAM
+ * or its recv stream EOF'd). No frame was written; the binding should
+ * stop calling recv_frame for this call_id.
+ */
+#define ASTER_RECV_FRAME_END_OF_STREAM 1
+
+/**
+ * Timeout expired with no frame available. The binding may retry.
+ */
+#define ASTER_RECV_FRAME_TIMEOUT 2
+
+/**
  * Status codes
  */
 typedef enum iroh_status_t {
@@ -171,62 +224,95 @@ typedef struct iroh_transport_metrics_t {
   uint64_t net_reports_full;
 } iroh_transport_metrics_t;
 
+typedef uint64_t aster_call_t;
+
+typedef uint64_t iroh_buffer_t;
+
 typedef uint64_t aster_reactor_t;
 
 /**
- * C-visible call descriptor returned by aster_reactor_poll.
+ * C-visible event descriptor returned by aster_reactor_poll.
+ *
+ * Despite the historical `aster_reactor_call_t` name, this struct now
+ * carries either an inbound call (`event_kind == ASTER_EVENT_KIND_CALL`)
+ * or a connection-closed event
+ * (`event_kind == ASTER_EVENT_KIND_CONNECTION_CLOSED`). Bindings that
+ * support session lifecycle reaping (spec §7.5) MUST handle both kinds.
  */
 typedef struct aster_reactor_call_t {
   /**
-   * Reactor-assigned call ID (for submit correlation).
+   * Event-kind discriminator. See `ASTER_EVENT_KIND_*` constants.
+   */
+  uint8_t event_kind;
+  /**
+   * Reactor-assigned call ID (for submit correlation). Zero on
+   * ConnectionClosed events.
    */
   uint64_t call_id;
   /**
+   * Reactor-assigned unique ID for the QUIC connection this event
+   * belongs to (spec §7.5). Same id is reused across every call from
+   * this connection and emitted with the terminal ConnectionClosed
+   * event so the binding can drop per-connection state. A peer that
+   * disconnects and reconnects gets a fresh `connection_id`.
+   */
+  uint64_t connection_id;
+  /**
+   * Reactor-assigned unique ID for the QUIC bi-stream this call arrived
+   * on. Multiplexed streams (spec §6) carry many calls per bi-stream,
+   * so DO NOT key per-session state on `stream_id` — use
+   * `(connection_id, StreamHeader.sessionId)` from the binding-decoded
+   * header instead. Zero on ConnectionClosed events.
+   */
+  uint64_t stream_id;
+  /**
    * Pointer to header payload bytes (owned by buffer registry).
+   * NULL on ConnectionClosed events.
    */
   const uint8_t *header_ptr;
   /**
-   * Length of header payload.
+   * Length of header payload. Zero on ConnectionClosed events.
    */
   uint32_t header_len;
   /**
-   * Header frame flags.
+   * Header frame flags. Zero on ConnectionClosed events.
    */
   uint8_t header_flags;
   /**
    * Pointer to request payload bytes (owned by buffer registry).
+   * NULL on ConnectionClosed events.
    */
   const uint8_t *request_ptr;
   /**
-   * Length of request payload.
+   * Length of request payload. Zero on ConnectionClosed events.
    */
   uint32_t request_len;
   /**
-   * Request frame flags.
+   * Request frame flags. Zero on ConnectionClosed events.
    */
   uint8_t request_flags;
   /**
-   * Pointer to peer ID string (UTF-8, not null-terminated, owned by buffer registry).
+   * Pointer to peer ID string (UTF-8, not null-terminated, owned by
+   * buffer registry). Populated on both Call and ConnectionClosed.
    */
   const uint8_t *peer_ptr;
   /**
-   * Length of peer ID string.
+   * Length of peer ID string. Populated on both Call and
+   * ConnectionClosed.
    */
   uint32_t peer_len;
   /**
-   * 1 if this is a session call, 0 otherwise.
-   */
-  uint8_t is_session_call;
-  /**
-   * Buffer ID for the header payload (release after processing).
+   * Buffer ID for the header payload (release after processing). Zero
+   * on ConnectionClosed events.
    */
   uint64_t header_buffer;
   /**
-   * Buffer ID for the request payload.
+   * Buffer ID for the request payload. Zero on ConnectionClosed events.
    */
   uint64_t request_buffer;
   /**
-   * Buffer ID for the peer ID string.
+   * Buffer ID for the peer ID string. Populated on both Call and
+   * ConnectionClosed.
    */
   uint64_t peer_buffer;
 } aster_reactor_call_t;
@@ -861,28 +947,6 @@ int32_t aster_canonical_bytes(const uint8_t *type_name_ptr,
                               uintptr_t *out_len);
 
 /**
- * Encode a frame: `[4-byte LE length][flags][payload]`.
- */
-int32_t aster_frame_encode(const uint8_t *payload_ptr,
-                           uintptr_t payload_len,
-                           uint8_t flags,
-                           uint8_t *out_buf,
-                           uintptr_t *out_len);
-
-/**
- * Decode a frame. Writes payload to `out_payload`, flags byte to `*out_flags`.
- *
- * `*out_payload_len` must be set to the capacity of `out_payload` on entry.
- * On success it is set to the actual payload length.
- * On BUFFER_TOO_SMALL it is set to the required payload size.
- */
-int32_t aster_frame_decode(const uint8_t *data_ptr,
-                           uintptr_t data_len,
-                           uint8_t *out_payload,
-                           uintptr_t *out_payload_len,
-                           uint8_t *out_flags);
-
-/**
  * Compute canonical signing bytes from credential JSON.
  *
  * The JSON must contain a `"kind"` field (`"producer"` or `"consumer"`)
@@ -949,6 +1013,336 @@ int32_t aster_ticket_decode(const uint8_t *ticket_ptr,
                             uintptr_t *out_len);
 
 /**
+ * Return the current wall-clock epoch-millis as seen by the Rust runtime.
+ * Single shared clock across all bindings prevents time-skew in lease freshness checks.
+ */
+int64_t aster_registry_now_epoch_ms(void);
+
+/**
+ * Report whether a lease is still fresh given the lease duration window.
+ * `lease_json` is a single EndpointLease JSON object.
+ * Returns 1 = fresh, 0 = expired, negative = error (see set_last_error).
+ */
+int32_t aster_registry_is_fresh(const uint8_t *lease_json_ptr,
+                                uintptr_t lease_json_len,
+                                int32_t lease_duration_s);
+
+/**
+ * Report whether a health status string is routable (READY or DEGRADED).
+ * `status_json` is a UTF-8 string (not JSON-quoted).
+ */
+int32_t aster_registry_is_routable(const uint8_t *status_ptr, uintptr_t status_len);
+
+/**
+ * Apply mandatory filters + ranking to a list of EndpointLease JSON objects.
+ *
+ * Input:
+ * - `leases_json`: a JSON array of EndpointLease objects.
+ * - `opts_json`: a ResolveOptions JSON object with fields:
+ *   service (string), version (int|null), channel (string|null),
+ *   contract_id (string|null), strategy (string), caller_alpn (string),
+ *   caller_serialization_modes (array), caller_policy_realm (string|null),
+ *   lease_duration_s (int).
+ *
+ * Output (written to `out_buf`): a JSON array of EndpointLease objects in
+ * ranked order. The top element is the resolved winner. If the output buffer
+ * is too small, returns `BUFFER_TOO_SMALL` and sets `*out_len` to the
+ * required size.
+ *
+ * Note: the round-robin rotation state is reset on every call (stateless).
+ * Stateful multi-call round-robin will be added when the async resolve FFI
+ * lands; for now, bindings should maintain their own rotation counter or
+ * accept per-call randomization.
+ */
+int32_t aster_registry_filter_and_rank(const uint8_t *leases_json_ptr,
+                                       uintptr_t leases_json_len,
+                                       const uint8_t *opts_json_ptr,
+                                       uintptr_t opts_json_len,
+                                       uint8_t *out_buf,
+                                       uintptr_t *out_len);
+
+/**
+ * Return one of the registry key-schema strings by kind, for all bindings to share.
+ *
+ * `kind` values:
+ *   0 = contract_key(arg1)
+ *   1 = version_key(arg1, arg2 as int)
+ *   2 = channel_key(arg1, arg2)
+ *   3 = lease_key(arg1, arg2, arg3)
+ *   4 = lease_prefix(arg1, arg2)
+ *   5 = acl_key(arg1)
+ *
+ * `arg1/arg2/arg3` are UTF-8 strings. For version_key, arg2 must parse as i32.
+ */
+int32_t aster_registry_key(int32_t kind,
+                           const uint8_t *arg1_ptr,
+                           uintptr_t arg1_len,
+                           const uint8_t *arg2_ptr,
+                           uintptr_t arg2_len,
+                           const uint8_t *arg3_ptr,
+                           uintptr_t arg3_len,
+                           uint8_t *out_buf,
+                           uintptr_t *out_len);
+
+/**
+ * Async resolve: pointer lookup → list_leases → seq filter → mandatory filters → rank.
+ *
+ * Inputs:
+ * - `doc`: a doc handle previously returned by `iroh_doc_create` / `iroh_doc_join`.
+ * - `opts_json`: ResolveOptions JSON (same shape as `aster_registry_filter_and_rank`).
+ *
+ * On success emits `IROH_EVENT_REGISTRY_RESOLVED`. The event payload is the JSON
+ * of the winning EndpointLease, or empty with `IROH_STATUS_NOT_FOUND` if no
+ * candidate survived the filters.
+ */
+int32_t aster_registry_resolve(iroh_runtime_t runtime,
+                               uint64_t doc,
+                               struct iroh_bytes_t opts_json,
+                               uint64_t user_data,
+                               iroh_operation_t *out_operation);
+
+/**
+ * Publish a lease and/or an artifact in a single op.
+ *
+ * Either or both of `lease_json` / `artifact_json` may be provided (pass an
+ * empty `iroh_bytes_t` to skip). For artifact publication, `service` and
+ * `version` must be set; `channel` is optional. `gossip_topic` is a topic
+ * handle to broadcast the corresponding GossipEvent on, or 0 to skip.
+ *
+ * Emits `IROH_EVENT_REGISTRY_PUBLISHED` on success.
+ */
+int32_t aster_registry_publish(iroh_runtime_t runtime,
+                               uint64_t doc,
+                               struct iroh_bytes_t author_id,
+                               struct iroh_bytes_t lease_json,
+                               struct iroh_bytes_t artifact_json,
+                               struct iroh_bytes_t service,
+                               int32_t version,
+                               struct iroh_bytes_t channel,
+                               uint64_t gossip_topic,
+                               uint64_t user_data,
+                               iroh_operation_t *out_operation);
+
+/**
+ * Renew an existing lease in place. Reads the current row, bumps lease_seq +
+ * timestamps, updates health/load, rewrites it.
+ *
+ * `load` uses NaN as a sentinel for "no load reported".
+ * Emits `IROH_EVENT_REGISTRY_RENEWED` on success.
+ */
+int32_t aster_registry_renew_lease(iroh_runtime_t runtime,
+                                   uint64_t doc,
+                                   struct iroh_bytes_t author_id,
+                                   struct iroh_bytes_t service,
+                                   struct iroh_bytes_t contract_id,
+                                   struct iroh_bytes_t endpoint_id,
+                                   struct iroh_bytes_t health,
+                                   float load,
+                                   int32_t lease_duration_s,
+                                   uint64_t gossip_topic,
+                                   uint64_t user_data,
+                                   iroh_operation_t *out_operation);
+
+/**
+ * Add an author to the per-doc registry ACL writer set, persisting it to the
+ * doc under `_aster/acl/writers`. Switches the ACL out of open mode if it was
+ * in open mode. Emits `IROH_EVENT_REGISTRY_ACL_UPDATED` on success.
+ */
+int32_t aster_registry_acl_add_writer(iroh_runtime_t runtime,
+                                      uint64_t doc,
+                                      struct iroh_bytes_t author_id,
+                                      struct iroh_bytes_t writer_id,
+                                      uint64_t user_data,
+                                      iroh_operation_t *out_operation);
+
+/**
+ * Remove an author from the per-doc registry ACL writer set and persist the
+ * updated list. Emits `IROH_EVENT_REGISTRY_ACL_UPDATED` on success.
+ */
+int32_t aster_registry_acl_remove_writer(iroh_runtime_t runtime,
+                                         uint64_t doc,
+                                         struct iroh_bytes_t author_id,
+                                         struct iroh_bytes_t writer_id,
+                                         uint64_t user_data,
+                                         iroh_operation_t *out_operation);
+
+/**
+ * List the current writer set for the per-doc registry ACL.
+ *
+ * Emits `IROH_EVENT_REGISTRY_ACL_LISTED`. The event payload is a JSON array
+ * of AuthorId strings. If the ACL is in open mode (no writers added yet),
+ * the array is empty.
+ */
+int32_t aster_registry_acl_list_writers(iroh_runtime_t runtime,
+                                        uint64_t doc,
+                                        uint64_t user_data,
+                                        iroh_operation_t *out_operation);
+
+/**
+ * Acquire a call handle from the connection's per-connection
+ * multiplexed-stream pool. `session_id == 0` selects the SHARED
+ * pool; non-zero selects the session pool keyed by that id.
+ *
+ * Blocks (on the FFI thread, via `block_on`) up to the pool's
+ * configured `stream_acquire_timeout`. On success, writes a non-zero
+ * call handle to `*out_call`. On failure, returns one of the
+ * `ASTER_CALL_ERR_*` codes (negative) or an `iroh_status_t` code.
+ */
+int32_t aster_call_acquire(iroh_runtime_t runtime,
+                           iroh_connection_t connection,
+                           uint32_t session_id,
+                           aster_call_t *out_call);
+
+/**
+ * Acquire a **streaming** call handle. Unlike `aster_call_acquire`,
+ * this bypasses the per-connection pool entirely and opens a
+ * dedicated multiplexed substream via `CoreConnection::open_bi` —
+ * per `ffi_spec/Aster-multiplexed-streams.md` §3 line 65, "streaming
+ * substreams don't count against any pool." Use this for
+ * server-stream / client-stream / bidi calls.
+ *
+ * The substream is bounded only by the QUIC `max_concurrent_streams`
+ * ceiling. It is closed on `aster_call_release` or `aster_call_discard`.
+ *
+ * `session_id` is not used by this entry point — the binding carries
+ * the session id in the `StreamHeader` it sends itself. Kept out of
+ * the signature to make the "no pool involvement" intent unambiguous.
+ */
+int32_t aster_call_acquire_streaming(iroh_runtime_t runtime,
+                                     iroh_connection_t connection,
+                                     aster_call_t *out_call);
+
+/**
+ * Push a frame on a call's request side.
+ *
+ * `frame_ptr` / `frame_len` point to already-framed bytes (including
+ * the 4-byte little-endian length prefix and 1-byte flags). The
+ * binding is responsible for framing — this matches
+ * `aster_reactor_submit_frame`'s contract.
+ *
+ * Blocks on the FFI thread until the underlying QUIC `write_all`
+ * completes.
+ */
+int32_t aster_call_send_frame(iroh_runtime_t runtime,
+                              aster_call_t call,
+                              const uint8_t *frame_ptr,
+                              uint32_t frame_len);
+
+/**
+ * Pull the next response frame on a call. Blocks up to `timeout_ms`
+ * waiting for the next frame on the recv side.
+ *
+ * On `ASTER_CALL_RECV_OK` (return value 0), writes:
+ * - `*out_payload_ptr` — pointer to payload bytes (owned by
+ *   `CALL_BUFFERS`; release via `aster_call_buffer_release`).
+ * - `*out_payload_len` — payload length in bytes.
+ * - `*out_flags` — frame flags byte. Bindings inspect `FLAG_TRAILER`
+ *   to detect end-of-call.
+ * - `*out_buffer_id` — buffer registry id for releasing the payload.
+ *
+ * On `ASTER_CALL_RECV_TIMEOUT` (return value 2), no out parameters
+ * are touched and the call remains valid for further recv attempts.
+ *
+ * On `ASTER_CALL_RECV_END_OF_STREAM` (return value 1), the underlying
+ * QUIC recv side has closed; further recvs will keep returning EOF.
+ * The binding should release/discard the call.
+ *
+ * Negative return values are `iroh_status_t` error codes.
+ */
+int32_t aster_call_recv_frame(iroh_runtime_t runtime,
+                              aster_call_t call,
+                              uint32_t timeout_ms,
+                              const uint8_t **out_payload_ptr,
+                              uint32_t *out_payload_len,
+                              uint8_t *out_flags,
+                              iroh_buffer_t *out_buffer_id);
+
+/**
+ * Release a call on the success path. The underlying multiplexed
+ * stream returns to the connection's pool (LIFO) for reuse by the
+ * next acquire.
+ *
+ * MUST be called only when no concurrent `send_frame` / `recv_frame`
+ * is in flight on this call. Calling release with leftover unread
+ * bytes on the recv side would corrupt the next call that reuses
+ * the stream — the binding MUST drain to the trailer first.
+ */
+int32_t aster_call_release(iroh_runtime_t runtime, aster_call_t call);
+
+/**
+ * Discard a call on the error path. The underlying multiplexed
+ * stream is dropped (not returned to the pool); the pool slot is
+ * freed and any blocked waiter is woken to either reuse a freed
+ * slot or surface the same transport error.
+ *
+ * Use this when:
+ * - A `send_frame` or `recv_frame` returned an error.
+ * - The call was cancelled mid-flight (FLAG_CANCEL).
+ * - The recv side returned `ASTER_CALL_RECV_END_OF_STREAM` before
+ *   the trailer was seen.
+ */
+int32_t aster_call_discard(iroh_runtime_t runtime, aster_call_t call);
+
+/**
+ * Release a buffer obtained from `aster_call_recv_frame`. Each
+ * buffer id returned by recv MUST be released exactly once.
+ */
+int32_t aster_call_buffer_release(iroh_runtime_t runtime, iroh_buffer_t buffer);
+
+/**
+ * Unary fast-path (spec §8). Collapses
+ * `acquire` + `send_frame(header)` + `send_frame(request)` +
+ * `recv_frame(response)` + `recv_frame(trailer)` + `release` into a
+ * single FFI entry point and a single `block_on`. Bindings whose
+ * hot-path is dominated by FFI roundtrips (e.g. Java FFM, where every
+ * `block_on` parks a platform thread) see ~5-6× fewer FFI hops per
+ * unary call.
+ *
+ * `request_pair_ptr` / `request_pair_len` is a single buffer holding
+ * the already-framed StreamHeader frame *concatenated with* the
+ * already-framed request frame:
+ *
+ * ```text
+ *   [4B LE len][1B FLAG_HEADER][header_payload]
+ *   [4B LE len][1B request_flags][request_payload]
+ * ```
+ *
+ * The Rust side writes the whole buffer in one `write_all` so Quinn's
+ * flow control sees one logical write.
+ *
+ * On success, populates four sets of out parameters:
+ * - `out_response_*` — the FIRST non-row-schema response frame on the
+ *   stream, or zero-length if the dispatcher only sent a trailer.
+ * - `out_trailer_*` — the trailer frame's payload (an encoded
+ *   `RpcStatus`). Always populated on success; zero-length if the
+ *   dispatcher sent an empty OK trailer.
+ *
+ * Each populated payload comes with its own buffer id; bindings MUST
+ * call `aster_call_buffer_release` for every non-zero buffer id
+ * returned. Skipped row-schema frames are released internally.
+ *
+ * On error returns the appropriate `ASTER_CALL_ERR_*` (acquire failure)
+ * or `IROH_STATUS_INTERNAL` (transport / framing failure); no out
+ * parameters are populated. The pool slot is freed on every error path.
+ */
+int32_t aster_call_unary(iroh_runtime_t runtime,
+                         iroh_connection_t connection,
+                         uint32_t session_id,
+                         const uint8_t *request_pair_ptr,
+                         uint32_t request_pair_len,
+                         const uint8_t **out_response_ptr,
+                         uint32_t *out_response_len,
+                         uint8_t *out_response_flags,
+                         iroh_buffer_t *out_response_buffer,
+                         const uint8_t **out_trailer_ptr,
+                         uint32_t *out_trailer_len,
+                         iroh_buffer_t *out_trailer_buffer);
+
+void aster_probe_reset(void);
+
+int32_t aster_probe_dump_unary_csv(const uint8_t *path_ptr, uint32_t path_len);
+
+/**
  * Create a reactor attached to a node. The reactor starts accepting
  * connections and delivering calls via the SPSC ring.
  *
@@ -983,12 +1377,12 @@ uint32_t aster_reactor_poll(iroh_runtime_t runtime,
                             uint32_t timeout_ms);
 
 /**
- * Submit a response for a call received via aster_reactor_poll.
+ * Submit a unary response (single response frame + trailer) in one FFI call.
  *
- * `response_ptr`/`response_len` is the response frame bytes.
- * `trailer_ptr`/`trailer_len` is the trailer frame bytes.
+ * Convenience wrapper over `aster_reactor_submit_frame` + `aster_reactor_submit_trailer`
+ * for the unary path. For server-streaming or bidi, call `submit_frame` N times
+ * then `submit_trailer` once.
  *
- * The reactor writes both frames to the QUIC stream and finishes it.
  * After this call, the call_id is no longer valid.
  */
 int32_t aster_reactor_submit(iroh_runtime_t runtime,
@@ -1000,155 +1394,86 @@ int32_t aster_reactor_submit(iroh_runtime_t runtime,
                              uint32_t trailer_len);
 
 /**
+ * Submit one streaming response frame for a call. May be called multiple
+ * times per call; each call enqueues one Frame on the reactor's mpsc channel.
+ * The call_id remains valid until `aster_reactor_submit_trailer` is called.
+ *
+ * `frame_ptr`/`frame_len` point to already-framed bytes (including the 4-byte
+ * length prefix and 1-byte flags). The binding is responsible for framing.
+ */
+int32_t aster_reactor_submit_frame(iroh_runtime_t runtime,
+                                   aster_reactor_t reactor,
+                                   uint64_t call_id,
+                                   const uint8_t *frame_ptr,
+                                   uint32_t frame_len);
+
+/**
+ * Submit the trailer for a call and close the stream. After this call, the
+ * `call_id` is no longer valid. The trailer payload may be empty — the
+ * reactor still finishes the send side cleanly.
+ */
+int32_t aster_reactor_submit_trailer(iroh_runtime_t runtime,
+                                     aster_reactor_t reactor,
+                                     uint64_t call_id,
+                                     const uint8_t *trailer_ptr,
+                                     uint32_t trailer_len);
+
+/**
+ * Pull the next ADDITIONAL request frame for a client-streaming or
+ * bidi-streaming call. Blocks up to `timeout_ms` waiting for a frame.
+ *
+ * On `ASTER_RECV_FRAME_OK` (return value 0), the function writes:
+ * - `*out_payload_ptr`: pointer to payload bytes (owned by the reactor's
+ *   buffer registry — must be released via `aster_reactor_buffer_release`)
+ * - `*out_payload_len`: payload length in bytes
+ * - `*out_flags`: frame flags byte (peer may set `FLAG_END_STREAM` here on
+ *   the last frame; the binding may use that as a hint but is not required
+ *   to — the reactor will also surface end-of-stream as
+ *   `ASTER_RECV_FRAME_END_OF_STREAM` on the next call)
+ * - `*out_buffer_id`: registry id for releasing the payload buffer
+ *
+ * On `ASTER_RECV_FRAME_END_OF_STREAM` (return value 1) or
+ * `ASTER_RECV_FRAME_TIMEOUT` (return value 2), no out parameters are
+ * touched and the call_id remains valid for further recv attempts (in the
+ * timeout case) or is now drained (end-of-stream case — further calls
+ * will continue to return end-of-stream).
+ *
+ * Negative return values are `iroh_status_t` error codes (e.g.
+ * `IROH_STATUS_NOT_FOUND` if the call_id is unknown).
+ *
+ * The first request frame is delivered inline via `aster_reactor_poll`'s
+ * `request_ptr` / `request_len` / `request_flags` fields. This function
+ * is for SUBSEQUENT frames only.
+ */
+int32_t aster_reactor_recv_frame(iroh_runtime_t runtime,
+                                 aster_reactor_t reactor,
+                                 uint64_t call_id,
+                                 uint32_t timeout_ms,
+                                 const uint8_t **out_payload_ptr,
+                                 uint32_t *out_payload_len,
+                                 uint8_t *out_flags,
+                                 uint64_t *out_buffer_id);
+
+/**
+ * Check whether the given call has been cancelled by the peer (or by a
+ * stream-level error). Streaming dispatchers should poll this from any
+ * long-running emit loop and stop early when it returns 1.
+ *
+ * Returns:
+ *   0 — call is alive (no cancellation observed yet)
+ *   1 — call has been cancelled (peer sent FLAG_CANCEL or stream errored)
+ *  <0 — `iroh_status_t` error code (e.g. NOT_FOUND if the call_id is unknown,
+ *       which the binding may treat as "no longer cancellable" — typically
+ *       maps to "already completed")
+ */
+int32_t aster_reactor_check_cancelled(iroh_runtime_t runtime,
+                                      aster_reactor_t reactor,
+                                      uint64_t call_id);
+
+/**
  * Release a buffer obtained from a reactor call descriptor.
  * Each buffer ID from aster_reactor_call_t must be released exactly once.
  */
 int32_t aster_reactor_buffer_release(iroh_runtime_t runtime,
                                      aster_reactor_t reactor,
                                      uint64_t buffer);
-
-/* ==========================================================================
- * Registry FFI (Aster-SPEC.md §11)
- *
- * Synchronous pure-function entry points that centralize the resolution
- * logic (mandatory filters + ranking) and key-schema helpers in Rust so
- * all language bindings get identical behavior.
- * ========================================================================== */
-
-/**
- * Return the current epoch-millis as seen by the Rust runtime. Bindings should
- * use this instead of language-local clocks so lease freshness checks agree.
- */
-int64_t aster_registry_now_epoch_ms(void);
-
-/**
- * Return 1 if the given EndpointLease JSON is fresh within the provided window,
- * 0 if expired. Negative values indicate an error (see iroh_last_error).
- */
-int32_t aster_registry_is_fresh(const uint8_t *lease_json_ptr,
-                                uintptr_t lease_json_len,
-                                int32_t lease_duration_s);
-
-/** Return 1 if the health status bytes are READY or DEGRADED, else 0. */
-int32_t aster_registry_is_routable(const uint8_t *status_ptr, uintptr_t status_len);
-
-/**
- * Apply the 5 mandatory filters and ranking strategy (§11.9) to a JSON array
- * of EndpointLease objects. Returns a JSON array of ranked survivors (the
- * top element is the resolved winner) in `out_buf`. On BUFFER_TOO_SMALL,
- * `*out_len` is set to the required size.
- *
- * `opts_json` is a ResolveOptions JSON object; unknown fields are ignored
- * and sensible defaults are applied for missing fields.
- */
-int32_t aster_registry_filter_and_rank(const uint8_t *leases_json_ptr,
-                                       uintptr_t leases_json_len,
-                                       const uint8_t *opts_json_ptr,
-                                       uintptr_t opts_json_len,
-                                       uint8_t *out_buf,
-                                       uintptr_t *out_len);
-
-/**
- * Produce a UTF-8 registry doc key for the given kind. `kind` maps:
- *   0 = contract_key(arg1)
- *   1 = version_key(arg1, arg2 parsed as int)
- *   2 = channel_key(arg1, arg2)
- *   3 = lease_key(arg1, arg2, arg3)
- *   4 = lease_prefix(arg1, arg2)
- *   5 = acl_key(arg1)
- */
-int32_t aster_registry_key(int32_t kind,
-                           const uint8_t *arg1_ptr, uintptr_t arg1_len,
-                           const uint8_t *arg2_ptr, uintptr_t arg2_len,
-                           const uint8_t *arg3_ptr, uintptr_t arg3_len,
-                           uint8_t *out_buf, uintptr_t *out_len);
-
-/* ==========================================================================
- * Registry FFI — async doc-backed operations
- *
- * These follow the standard event-based op model: each call returns an
- * operation handle and emits a registry event on completion (kinds 80–84).
- * Round-robin rotation and stale-seq filtering are persisted on the bridge,
- * so they survive across calls. ACLs are stored per-doc on the bridge and
- * are lazily created in open mode on first touch.
- * ========================================================================== */
-
-/**
- * Async resolve: pointer lookup → list_leases → seq filter → mandatory filters
- * → rank. Emits IROH_EVENT_REGISTRY_RESOLVED (80) on completion. Payload is
- * EndpointLease JSON. If no candidate survives, status is NOT_FOUND.
- */
-int32_t aster_registry_resolve(iroh_runtime_t runtime,
-                               uint64_t doc,
-                               struct iroh_bytes_t opts_json,
-                               uint64_t user_data,
-                               iroh_operation_t *out_operation);
-
-/**
- * Publish a lease and/or an artifact in a single op. Pass an empty
- * iroh_bytes_t for either to skip. `gossip_topic` is a topic handle to
- * broadcast the corresponding GossipEvent on, or 0 to skip. Emits
- * IROH_EVENT_REGISTRY_PUBLISHED (81) on completion.
- */
-int32_t aster_registry_publish(iroh_runtime_t runtime,
-                               uint64_t doc,
-                               struct iroh_bytes_t author_id,
-                               struct iroh_bytes_t lease_json,
-                               struct iroh_bytes_t artifact_json,
-                               struct iroh_bytes_t service,
-                               int32_t version,
-                               struct iroh_bytes_t channel,
-                               uint64_t gossip_topic,
-                               uint64_t user_data,
-                               iroh_operation_t *out_operation);
-
-/**
- * Renew an existing lease in place: bumps lease_seq + timestamps, updates
- * health/load, rewrites the row. `load` uses NaN as the sentinel for "no
- * load reported". Emits IROH_EVENT_REGISTRY_RENEWED (82).
- */
-int32_t aster_registry_renew_lease(iroh_runtime_t runtime,
-                                   uint64_t doc,
-                                   struct iroh_bytes_t author_id,
-                                   struct iroh_bytes_t service,
-                                   struct iroh_bytes_t contract_id,
-                                   struct iroh_bytes_t endpoint_id,
-                                   struct iroh_bytes_t health,
-                                   float load,
-                                   int32_t lease_duration_s,
-                                   uint64_t gossip_topic,
-                                   uint64_t user_data,
-                                   iroh_operation_t *out_operation);
-
-/**
- * Add an author to the per-doc registry ACL writer set, persisting the
- * updated list to the doc under _aster/acl/writers. Emits
- * IROH_EVENT_REGISTRY_ACL_UPDATED (83).
- */
-int32_t aster_registry_acl_add_writer(iroh_runtime_t runtime,
-                                      uint64_t doc,
-                                      struct iroh_bytes_t author_id,
-                                      struct iroh_bytes_t writer_id,
-                                      uint64_t user_data,
-                                      iroh_operation_t *out_operation);
-
-/**
- * Remove an author from the per-doc registry ACL writer set and persist the
- * updated list. Emits IROH_EVENT_REGISTRY_ACL_UPDATED (83).
- */
-int32_t aster_registry_acl_remove_writer(iroh_runtime_t runtime,
-                                         uint64_t doc,
-                                         struct iroh_bytes_t author_id,
-                                         struct iroh_bytes_t writer_id,
-                                         uint64_t user_data,
-                                         iroh_operation_t *out_operation);
-
-/**
- * List the current writer set for the per-doc registry ACL. Emits
- * IROH_EVENT_REGISTRY_ACL_LISTED (84). Payload is a JSON array of AuthorId
- * strings; empty if the ACL is still in open mode.
- */
-int32_t aster_registry_acl_list_writers(iroh_runtime_t runtime,
-                                        uint64_t doc,
-                                        uint64_t user_data,
-                                        iroh_operation_t *out_operation);

@@ -3,15 +3,32 @@ package site.aster.handle;
 import java.lang.foreign.*;
 import java.util.HexFormat;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import site.aster.ffi.*;
 
 public class IrohConnection extends IrohHandle {
 
   private final IrohRuntime runtime;
 
+  /**
+   * Monotonic per-connection session-id allocator (spec §6). Starts at 0. {@link #nextSessionId()}
+   * returns {@code counter.incrementAndGet()}, so the first session is {@code 1}, the second {@code
+   * 2}, and so on — {@code 0} is reserved for the SHARED (stateless) pool.
+   */
+  private final AtomicInteger sessionIdAllocator = new AtomicInteger(0);
+
   public IrohConnection(IrohRuntime runtime, long handle) {
     super(handle);
     this.runtime = runtime;
+  }
+
+  /**
+   * Allocate the next session id on this connection. Guaranteed monotonic and non-zero. The spec
+   * requires a {@code u32}; Java's signed {@code int} gives 2^31 - 1 values before wraparound,
+   * which is well beyond any realistic workload.
+   */
+  public int nextSessionId() {
+    return sessionIdAllocator.incrementAndGet();
   }
 
   @Override

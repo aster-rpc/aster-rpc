@@ -80,6 +80,14 @@ pub struct IrohNode {
     inner: CoreNode,
 }
 
+impl IrohNode {
+    /// Borrow a clone of the underlying `CoreNode` for sibling modules
+    /// (reactor) that need to start the accept loop on this node.
+    pub(crate) fn core_clone(&self) -> CoreNode {
+        self.inner.clone()
+    }
+}
+
 #[napi]
 impl IrohNode {
     /// Create an in-memory Iroh node with all protocols.

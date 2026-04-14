@@ -44,6 +44,7 @@ public final class AgentSessionDispatcher implements ServiceDispatcher {
     m.put("register", new Register());
     m.put("heartbeat", new HeartbeatRpc());
     m.put("runCommand", new RunCommand());
+    m.put("chaosFail", new ChaosFail());
     this.methods = Map.copyOf(m);
   }
 
@@ -146,6 +147,35 @@ public final class AgentSessionDispatcher implements ServiceDispatcher {
     public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) {
       Heartbeat hb = (Heartbeat) codec.decode(requestBytes, Heartbeat.class);
       Assignment assignment = ((AgentSession) impl).heartbeat(hb);
+      return codec.encode(assignment);
+    }
+  }
+
+  /**
+   * Test-only method dispatcher: always throws. Wired through the chaos test suite to verify
+   * handler exceptions don't leak session state.
+   */
+  private static final class ChaosFail implements UnaryDispatcher {
+    private static final MethodDescriptor DESCRIPTOR =
+        new MethodDescriptor(
+            "chaosFail",
+            StreamingKind.UNARY,
+            RequestStyle.EXPLICIT,
+            Heartbeat.FORY_TAG,
+            List.of(),
+            Assignment.FORY_TAG,
+            false,
+            false);
+
+    @Override
+    public MethodDescriptor descriptor() {
+      return DESCRIPTOR;
+    }
+
+    @Override
+    public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) {
+      Heartbeat hb = (Heartbeat) codec.decode(requestBytes, Heartbeat.class);
+      Assignment assignment = ((AgentSession) impl).chaosFail(hb);
       return codec.encode(assignment);
     }
   }

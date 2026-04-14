@@ -110,6 +110,11 @@ func (r *Reactor) Poll(maxCalls int, timeoutMs uint32) ([]ReactorCall, error) {
 			peerID = C.GoStringN((*C.char)(unsafe.Pointer(slot.peer_ptr)), C.int(slot.peer_len))
 		}
 
+		// Multiplexed-streams migration (spec §6/§7): is_session_call
+		// removed from the FFI struct; sessionId now lives inside
+		// StreamHeader. Go binding still builds the legacy ReactorCall
+		// shape with IsSession=false until the Go migration lands
+		// (Objective 4 — compile-only for this branch).
 		calls[i] = ReactorCall{
 			CallID:       uint64(slot.call_id),
 			Header:       header,
@@ -117,7 +122,7 @@ func (r *Reactor) Poll(maxCalls int, timeoutMs uint32) ([]ReactorCall, error) {
 			Request:      request,
 			RequestFlags: byte(slot.request_flags),
 			PeerID:       peerID,
-			IsSession:    slot.is_session_call != 0,
+			IsSession:    false,
 		}
 
 		// Release native buffers immediately after copy

@@ -52,6 +52,14 @@ public final class AgentSession {
   }
 
   /**
+   * Test-only method that always throws. Used by the tier-2 chaos suite to prove a handler
+   * exception on one session does not poison that session's instance or leak across sessions.
+   */
+  public Assignment chaosFail(Heartbeat hb) {
+    throw new RuntimeException("chaos/expected-throw agentId=" + hb.agentId());
+  }
+
+  /**
    * Bidi-streaming: drain commands from {@code in}, "execute" each one (a deterministic fake that
    * returns {@code "ran: <command>"} as stdout), and emit a {@link CommandResult} per command via
    * {@code out}. Returns when {@code in.receive()} reports end-of-stream.
