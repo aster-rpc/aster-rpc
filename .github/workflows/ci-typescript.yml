@@ -80,6 +80,13 @@ jobs:
         working-directory: bindings/typescript/packages/aster
         run: npx tsc --noEmit
 
+      - name: Build (required for aster-gen scanner tests)
+        # tests/typescript/unit/aster-gen.test.ts invokes the compiled
+        # dist/cli/gen.js; `tsc --noEmit` above doesn't emit it, so we
+        # run the real build here before vitest.
+        working-directory: bindings/typescript/packages/aster
+        run: bun run build
+
       - name: Run tests (bun + vitest)
         working-directory: bindings/typescript/packages/aster
         run: bun run test
