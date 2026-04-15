@@ -1,0 +1,16 @@
+{
+  "name": "@apache-fory/core",
+  "version": "0.17.0-alpha.0",
+  "description": "Vendored copy of Apache Fory JS core. Apache Fory has not yet published to npm; this is pinned at the commit we use. See ../../../../docs/_internal/fory/ for the upstream source. Apache-2.0 licensed.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "tslib": "^2.4.0"
+  }
+}
