@@ -572,73 +572,79 @@ pub unsafe extern "C" fn aster_call_unary(
     let key = pool_key_for(session_id);
 
     let probe_enabled = *crate::probe::ENABLED;
-    let result: Result<(Option<(Vec<u8>, u8)>, Vec<u8>), UnaryErr> =
-        bridge.runtime.handle().block_on(async move {
-            let t_a = if probe_enabled { crate::probe::now_ns() } else { 0 };
-            let handle = match conn.acquire_stream(key).await {
-                Ok(h) => h,
-                Err(e) => return Err(UnaryErr::Acquire(e)),
-            };
-            // Pull the send/recv refs before any awaits so handle stays
-            // owned by this scope (RAII drop returns to pool / discards
-            // depending on which terminator path we take below).
-            let (send, recv) = {
-                let pair = handle.get();
-                (pair.0.clone(), pair.1.clone())
-            };
+    let result: UnaryResult = bridge.runtime.handle().block_on(async move {
+        let t_a = if probe_enabled {
+            crate::probe::now_ns()
+        } else {
+            0
+        };
+        let handle = match conn.acquire_stream(key).await {
+            Ok(h) => h,
+            Err(e) => return Err(UnaryErr::Acquire(e)),
+        };
+        // Pull the send/recv refs before any awaits so handle stays
+        // owned by this scope (RAII drop returns to pool / discards
+        // depending on which terminator path we take below).
+        let (send, recv) = {
+            let pair = handle.get();
+            (pair.0.clone(), pair.1.clone())
+        };
 
-            // 1. Send the framed header+request as one write_all.
-            if send.write_all(request_pair).await.is_err() {
-                handle.discard();
-                return Err(UnaryErr::Transport);
-            }
-            let t_b = if probe_enabled { crate::probe::now_ns() } else { 0 };
+        // 1. Send the framed header+request as one write_all.
+        if send.write_all(request_pair).await.is_err() {
+            handle.discard();
+            return Err(UnaryErr::Transport);
+        }
+        let t_b = if probe_enabled {
+            crate::probe::now_ns()
+        } else {
+            0
+        };
 
-            // 2. Drain frames until trailer. Capture the first non-row-schema
-            //    data frame as the response; ignore extras (server contract
-            //    for unary is "exactly one"; binding can validate from
-            //    out_trailer status if it cares).
-            let mut response: Option<(Vec<u8>, u8)> = None;
-            let mut t_c: u64 = 0;
-            let trailer_payload = loop {
-                match read_one_frame(&recv).await {
-                    Ok((payload, flags)) => {
-                        if flags & FLAG_TRAILER != 0 {
-                            break payload;
-                        }
-                        if flags & FLAG_ROW_SCHEMA != 0 {
-                            // Skip row-schema metadata frames silently.
-                            continue;
-                        }
-                        if response.is_none() {
-                            response = Some((payload, flags));
-                            if probe_enabled && t_c == 0 {
-                                t_c = crate::probe::now_ns();
-                            }
-                        }
-                        // Extra response frames (>1) are ignored — the trailer
-                        // is what closes the call.
+        // 2. Drain frames until trailer. Capture the first non-row-schema
+        //    data frame as the response; ignore extras (server contract
+        //    for unary is "exactly one"; binding can validate from
+        //    out_trailer status if it cares).
+        let mut response: Option<(Vec<u8>, u8)> = None;
+        let mut t_c: u64 = 0;
+        let trailer_payload = loop {
+            match read_one_frame(&recv).await {
+                Ok((payload, flags)) => {
+                    if flags & FLAG_TRAILER != 0 {
+                        break payload;
                     }
-                    Err(_) => {
-                        handle.discard();
-                        return Err(UnaryErr::Transport);
+                    if flags & FLAG_ROW_SCHEMA != 0 {
+                        // Skip row-schema metadata frames silently.
+                        continue;
                     }
+                    if response.is_none() {
+                        response = Some((payload, flags));
+                        if probe_enabled && t_c == 0 {
+                            t_c = crate::probe::now_ns();
+                        }
+                    }
+                    // Extra response frames (>1) are ignored — the trailer
+                    // is what closes the call.
                 }
-            };
-            let t_d = if probe_enabled { crate::probe::now_ns() } else { 0 };
-            if probe_enabled {
-                crate::probe::record_unary(crate::probe::UnaryProbe {
-                    t_a,
-                    t_b,
-                    t_c,
-                    t_d,
-                });
+                Err(_) => {
+                    handle.discard();
+                    return Err(UnaryErr::Transport);
+                }
             }
+        };
+        let t_d = if probe_enabled {
+            crate::probe::now_ns()
+        } else {
+            0
+        };
+        if probe_enabled {
+            crate::probe::record_unary(crate::probe::UnaryProbe { t_a, t_b, t_c, t_d });
+        }
 
-            // 3. Stream returns to the pool on drop (release path).
-            drop(handle);
-            Ok((response, trailer_payload))
-        });
+        // 3. Stream returns to the pool on drop (release path).
+        drop(handle);
+        Ok((response, trailer_payload))
+    });
 
     match result {
         Ok((response, trailer_payload)) => {
@@ -692,3 +698,6 @@ enum UnaryErr {
     Acquire(AcquireError),
     Transport,
 }
+
+/// Unary call result: (optional row-schema preamble `(bytes, flag)`, response body).
+type UnaryResult = Result<(Option<(Vec<u8>, u8)>, Vec<u8>), UnaryErr>;
