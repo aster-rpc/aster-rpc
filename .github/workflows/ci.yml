@@ -188,6 +188,15 @@ jobs:
     runs-on: ${{ matrix.runner }}
     name: test-full (${{ matrix.label }})
     steps:
+      # build.yml's linux job runs maturin-action inside a manylinux2_28
+      # container which executes as root and writes root-owned files into
+      # target/. If that job (or any prior self-hosted Linux job that used
+      # a rootful container) leaves stale files in the shared runner
+      # workspace, actions/checkout can't `rm -rf` them and the job dies
+      # with EACCES. Mirror build.yml's pre-checkout sudo cleanup.
+      - name: Fix ownership of stale Docker artifacts
+        if: runner.os == 'Linux'
+        run: sudo rm -rf "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/target" || true
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -243,6 +252,10 @@ jobs:
         run: cargo test -p aster_transport_ffi
 
   # ── Rust sanitizers (ASan + LSan + TSan) ──────────────────────────
+  # `-Z sanitizer=*` is a nightly-only rustc flag. The miri job below
+  # gets this right; this one used to copy env.RUST_TOOLCHAIN (stable)
+  # and would fail instantly with "help: consider switching to a
+  # nightly toolchain".
   test-rust-sanitize:
     needs: lint
     runs-on: [self-hosted, Linux, X64]
@@ -254,7 +267,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: nightly
       - name: Run ${{ matrix.sanitizer }} sanitizer tests
         env:
           RUSTFLAGS: "-Z sanitizer=${{ matrix.sanitizer }}"

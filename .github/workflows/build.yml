@@ -83,6 +83,13 @@ jobs:
           args: --release --out dist -m bindings/python/rust/Cargo.toml
           manylinux: 2_28
       - name: Fix ownership of Docker-created files
+        # `if: always()` is critical. maturin-action writes root-owned
+        # files into target/ via its manylinux container. If the build
+        # step fails partway, these files stay root-owned and poison
+        # the next checkout on this runner (EACCES on CACHEDIR.TAG etc).
+        # The chown must run even on build failure to leave a clean
+        # runner workspace behind.
+        if: always()
         run: sudo chown -R "$(id -u):$(id -g)" target/ dist/ 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         with:
