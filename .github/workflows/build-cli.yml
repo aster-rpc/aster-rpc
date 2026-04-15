@@ -101,7 +101,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # 3.13 matches what's pre-cached on the self-hosted mac-arm runner.
+          # setup-python hardcodes /Users/runner paths in its installer, so
+          # falling back to download fails on runners that don't run as the
+          # `runner` user. Stick to cached versions.
+          python-version: "3.13"
       - name: Cache Nuitka C compilation
         uses: actions/cache@v4
         with:
