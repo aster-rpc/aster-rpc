@@ -252,13 +252,21 @@ jobs:
         run: cargo test -p aster_transport_ffi
 
   # ── Rust sanitizers (ASan + LSan + TSan) ──────────────────────────
-  # `-Z sanitizer=*` is a nightly-only rustc flag. The miri job below
-  # gets this right; this one used to copy env.RUST_TOOLCHAIN (stable)
-  # and would fail instantly with "help: consider switching to a
-  # nightly toolchain".
+  # `-Z sanitizer=*` is a nightly-only rustc flag. We pin to a specific
+  # nightly rather than tracking latest: vergen-lib (transitive via
+  # iroh-relay) uses rustversion for nightly detection, which has
+  # repeatedly broken on bleeding-edge nightly releases (both nightly()
+  # cfg-gated functions get emitted, causing E0428). A pinned nightly
+  # keeps this deterministic.
+  #
+  # `continue-on-error: true` makes sanitizer failures non-blocking
+  # for merges -- the signal is still visible in the UI but future
+  # nightly/rustversion drift won't gate the dev pipeline. Upgrade
+  # the pin deliberately when revisiting.
   test-rust-sanitize:
     needs: lint
     runs-on: [self-hosted, Linux, X64]
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -267,7 +275,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: nightly-2025-10-15
       - name: Run ${{ matrix.sanitizer }} sanitizer tests
         env:
           RUSTFLAGS: "-Z sanitizer=${{ matrix.sanitizer }}"
