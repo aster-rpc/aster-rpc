@@ -7,11 +7,22 @@
 
     <groupId>site.aster</groupId>
     <artifactId>aster-parent</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.2.0-SNAPSHOT</version>
     <packaging>pom</packaging>
 
     <name>Aster Parent</name>
     <description>Aster Java multi-module parent</description>
+
+    <distributionManagement>
+        <repository>
+            <id>github</id>
+            <url>https://maven.pkg.github.com/aster-rpc/aster-rpc-internal</url>
+        </repository>
+        <snapshotRepository>
+            <id>github</id>
+            <url>https://maven.pkg.github.com/aster-rpc/aster-rpc-internal</url>
+        </snapshotRepository>
+    </distributionManagement>
 
     <modules>
         <module>aster-annotations</module>

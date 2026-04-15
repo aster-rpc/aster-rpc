@@ -14,7 +14,7 @@ config, no shared state with the developer's machine.
 
 ```bash
 
-cd /Users/emrul/dev/emrul/iroh-python
+cd /Users/emrul/dev/aster/aster-rpc-internal
 ./scripts/build.sh
 
 ```
@@ -42,8 +42,8 @@ cp docs/_internal/day0/testing-instructions.md $DAY0_HOME/testing-instructions.m
 cd $DAY0_HOME
 
 # Install the framework and CLI from local wheels
-uv pip install /Users/emrul/dev/emrul/iroh-python/bindings/python/target/wheels/aster_rpc-*.whl
-uv pip install /Users/emrul/dev/emrul/iroh-python/cli/
+uv pip install /Users/emrul/dev/aster/aster-rpc-internal/bindings/python/target/wheels/aster_rpc-*.whl
+uv pip install /Users/emrul/dev/aster/aster-rpc-internal/cli/
 
 # Verify clean state
 echo "Home: $HOME"

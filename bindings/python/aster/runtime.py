@@ -676,8 +676,8 @@ class AsterServer:
                 contract = ServiceContract.from_service_info(info, type_hashes)
                 contract_bytes = canonical_xlang_bytes(contract)
 
-                import blake3 as _blake3
-                contract_id = _blake3.blake3(contract_bytes).hexdigest()
+                from aster._aster import blake3_hex as _blake3_hex
+                contract_id = _blake3_hex(contract_bytes)
 
                 # Build collection with full method schemas
                 entries = build_collection(contract, type_defs, service_info=info)

@@ -40,10 +40,17 @@ class RequestStyle:
 
 @dataclass
 class InlineParam:
-    """A single inline parameter on a Mode 2 handler."""
+    """A single inline parameter on a Mode 2 handler.
+
+    The ``description`` / ``tags`` fields capture any ``Description(...)``
+    marker found in an ``Annotated[T, Description(...)]`` annotation so the
+    metadata can be attached to the synthesized request type's fields.
+    """
     name: str
     annotation: Any
     default: Any  # inspect.Parameter.empty means "no default provided"
+    description: str = ""
+    tags: list[str] = dataclasses.field(default_factory=list)
 
 
 # ── Detection and synthesis ────────────────────────────────────────────────────
@@ -85,6 +92,26 @@ def _looks_inline(tp: Any) -> bool:
     return False
 
 
+def _split_annotated(annotation: Any) -> tuple[Any, str, list[str]]:
+    """Strip ``Annotated[T, Description(...), ...]`` -> ``(T, description, tags)``.
+
+    Non-Annotated annotations pass through unchanged with empty description.
+    """
+    from aster.metadata import Description
+
+    if not hasattr(annotation, "__metadata__"):
+        return annotation, "", []
+    import typing
+    args = typing.get_args(annotation)
+    if not args:
+        return annotation, "", []
+    inner = args[0]
+    for marker in args[1:]:
+        if isinstance(marker, Description):
+            return inner, marker.text, list(marker.tags)
+    return inner, "", []
+
+
 def classify_method(
     method: Callable,
     hints: dict[str, Any],
@@ -101,6 +128,14 @@ def classify_method(
       user's chosen name, e.g. ``ctx`` / ``context`` / ``call_ctx``), else
       None.
     """
+    # Resolve hints with include_extras=True so Annotated[T, Description(...)]
+    # wrappers survive and we can strip them while preserving the marker.
+    import typing
+    try:
+        extras_hints = typing.get_type_hints(method, include_extras=True)
+    except Exception:
+        extras_hints = hints
+
     sig = inspect.signature(method)
     params: list[inspect.Parameter] = []
     ctx_param_name: str | None = None
@@ -118,21 +153,30 @@ def classify_method(
     if len(params) == 0:
         return RequestStyle.INLINE, [], ctx_param_name
 
-    # One param → Mode 2 only if the type is a primitive/container we can
-    # safely default. Dataclasses, forward refs, and unknown types default
-    # to Mode 1 pass-through for backward compatibility.
+    def _build_inline_param(p: inspect.Parameter) -> InlineParam:
+        """Build an InlineParam, stripping any Annotated[T, Description(...)] wrapper."""
+        raw_ann = extras_hints.get(p.name, p.annotation)
+        inner, desc, tags = _split_annotated(raw_ann)
+        return InlineParam(
+            name=p.name,
+            annotation=inner,
+            default=p.default,
+            description=desc,
+            tags=tags,
+        )
+
+    # One param → Mode 2 only if the (unwrapped) type is a primitive/container
+    # we can safely default. Dataclasses, forward refs, and unknown types
+    # default to Mode 1 pass-through for backward compatibility.
     if len(params) == 1:
         sole = params[0]
-        ann = hints.get(sole.name, sole.annotation)
-        if _looks_inline(ann):
-            return RequestStyle.INLINE, [InlineParam(sole.name, ann, sole.default)], ctx_param_name
+        ip = _build_inline_param(sole)
+        if _looks_inline(ip.annotation):
+            return RequestStyle.INLINE, [ip], ctx_param_name
         return RequestStyle.EXPLICIT, [], ctx_param_name
 
     # Multiple params → Mode 2. Each param must be something we can synthesize.
-    inline: list[InlineParam] = []
-    for p in params:
-        ann = hints.get(p.name, p.annotation)
-        inline.append(InlineParam(name=p.name, annotation=ann, default=p.default))
+    inline: list[InlineParam] = [_build_inline_param(p) for p in params]
     return RequestStyle.INLINE, inline, ctx_param_name
 
 
@@ -243,6 +287,18 @@ def synthesize_request_type(
             fld = dataclasses.field(default=p.default)
         else:
             fld = _field_default(p.name, p.annotation)
+        # Attach Aster metadata from any Description(...) marker on the
+        # original annotation so it flows into the manifest.
+        if p.description or p.tags:
+            aster_meta = {"description": p.description, "tags": list(p.tags)}
+            # dataclasses.field doesn't let us update metadata after the fact,
+            # so rebuild the field with the original default/factory + metadata.
+            kwargs: dict[str, Any] = {"metadata": {"aster": aster_meta}}
+            if fld.default is not dataclasses.MISSING:
+                kwargs["default"] = fld.default
+            if fld.default_factory is not dataclasses.MISSING:
+                kwargs["default_factory"] = fld.default_factory
+            fld = dataclasses.field(**kwargs)
         fields_spec.append((p.name, p.annotation, fld))
 
     module = getattr(service_cls, "__module__", "") or ""

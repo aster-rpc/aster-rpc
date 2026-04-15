@@ -91,6 +91,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+dist-cli/
 downloads/
 eggs/
 .eggs/
@@ -278,3 +279,6 @@ bindings/typescript/package-lock.json
 # .NET build artifacts
 bindings/dotnet/**/bin/
 bindings/dotnet/**/obj/
+
+# JMH benchmark result snapshots -- local run artifacts, not source.
+**/jmh-result*.text

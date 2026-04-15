@@ -72,12 +72,118 @@ jobs:
           name: aster-cli-dist
           path: dist
 
+  # ── Native binaries (Nuitka onefile + standalone dist) ─────────────
+  # Produces TWO artifacts per platform:
+  #   1. Onefile binary `aster-<suffix>`  -- single file, ~2.8s first-run
+  #      extraction cost, ~190ms thereafter. Distributed via curl|sh and winget.
+  #   2. Standalone tarball `aster-dist-<suffix>.tar.gz` (zip on Windows) -- the
+  #      unpacked dist directory. Always-fast startup. Distributed via Homebrew
+  #      and any layout that wants a dist/ + symlink shape.
+  #
+  # Status: macOS (aarch64) only initially. Linux x86_64/aarch64 and Windows
+  # x86_64 are planned -- see docs/_internal/cli_native_binaries/README.md.
+  native:
+    needs: [version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: [self-hosted, macOS, ARM64]
+            suffix: macos-aarch64
+            archive_ext: tar.gz
+            binary_name: aster
+    runs-on: ${{ matrix.runner }}
+    env:
+      NUITKA_CACHE_DIR: nuitka-cache
+      RUST_TOOLCHAIN: "1.94.1"
+      ASTER_VERSION: ${{ needs.version.outputs.cli_version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cache Nuitka C compilation
+        uses: actions/cache@v4
+        with:
+          path: nuitka-cache
+          key: nuitka-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/**', 'bindings/python/python/**') }}
+          restore-keys: |
+            nuitka-${{ runner.os }}-${{ runner.arch }}-
+      - name: Stamp version
+        # Keep `aster --version` in sync with the dev build tag. Nuitka reads
+        # the installed package metadata, so stamp cli/pyproject.toml too
+        # rather than relying on --product-version alone.
+        run: sed -i '' 's/^version\s*=.*/version = "${{ needs.version.outputs.cli_version }}"/' cli/pyproject.toml
+      - name: Install build tools
+        run: pip install nuitka ordered-set zstandard
+      - name: Build aster-rpc from source
+        uses: PyO3/maturin-action@v1
+        with:
+          command: develop
+          args: --release -m bindings/python/rust/Cargo.toml
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install CLI (with deps so Nuitka auto-follows imports)
+        run: pip install -e cli/
+      # ── Onefile binary ─────────────────────────────────────────────
+      # --onefile-no-compression: skip zstd -- ~190ms cached startup
+      # --onefile-tempdir-spec: cache extraction at {CACHE_DIR}/aster_cli/{VERSION}
+      #   so upgrades extract to a new path and the OS GCs the old one.
+      # --product-version: required for {VERSION} substitution.
+      - name: Build onefile binary
+        run: >
+          python -m nuitka
+          --onefile
+          --onefile-no-compression
+          --onefile-tempdir-spec={CACHE_DIR}/aster_cli/{VERSION}
+          --product-name=Aster
+          --product-version=${{ env.ASTER_VERSION }}
+          --output-filename=aster-${{ matrix.suffix }}${{ matrix.suffix == 'windows-x86_64' && '.exe' || '' }}
+          --output-dir=dist-cli/
+          --include-package=aster
+          --include-package=aster_cli
+          --include-package=pyfory
+          --include-package-data=aster_cli
+          --nofollow-import-to=pyfory.tests
+          --nofollow-import-to=pytest
+          --nofollow-import-to=numpy
+          --nofollow-import-to=pyarrow
+          --assume-yes-for-downloads
+          cli/aster_entry.py
+        shell: bash
+      - name: Smoke test onefile
+        run: dist-cli/aster-${{ matrix.suffix }}${{ matrix.suffix == 'windows-x86_64' && '.exe' || '' }} --version
+        shell: bash
+      # ── Standalone dist tarball ────────────────────────────────────
+      # The onefile build keeps `aster_entry.dist/` by default. Rename
+      # the inner binary to `aster` (or `aster.exe`) and tar/zip it.
+      - name: Package standalone dist (unix)
+        if: matrix.archive_ext == 'tar.gz'
+        run: |
+          mv dist-cli/aster_entry.dist/aster_entry.bin dist-cli/aster_entry.dist/aster
+          mv dist-cli/aster_entry.dist aster-${{ matrix.suffix }}
+          tar -czf dist-cli/aster-dist-${{ matrix.suffix }}.tar.gz aster-${{ matrix.suffix }}
+        shell: bash
+      - name: Package standalone dist (windows)
+        if: matrix.archive_ext == 'zip'
+        run: |
+          Move-Item dist-cli\aster_entry.dist\aster_entry.exe dist-cli\aster_entry.dist\aster.exe
+          Move-Item dist-cli\aster_entry.dist aster-${{ matrix.suffix }}
+          Compress-Archive -Path aster-${{ matrix.suffix }} -DestinationPath dist-cli\aster-dist-${{ matrix.suffix }}.zip
+        shell: pwsh
+      # ── Upload both artifacts ──────────────────────────────────────
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-native-${{ matrix.suffix }}
+          path: |
+            dist-cli/aster-${{ matrix.suffix }}*
+            dist-cli/aster-dist-${{ matrix.suffix }}.${{ matrix.archive_ext }}
+
   # ── Create GitHub Release (cli-v* tags only) ───────────────────────
   release:
     name: Create GitHub Release
     runs-on: [self-hosted, Linux, X64]
     if: startsWith(github.ref, 'refs/tags/cli-v')
-    needs: [build, version]
+    needs: [build, native, version]
     permissions:
       contents: write
     steps:
@@ -85,9 +191,18 @@ jobs:
         with:
           name: aster-cli-dist
           path: dist
-      # softprops/action-gh-release is self-contained and does not depend
-      # on `gh` CLI being installed on the runner -- the self-hosted box
-      # does not have gh, so `gh release create` fails with exit 127.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-native-*
+          merge-multiple: true
+          path: dist
+      - name: List artifacts
+        run: ls -lh dist/
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum aster-* > SHA256SUMS
+          cat SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -101,7 +216,7 @@ jobs:
     name: Publish aster-cli to PyPI
     runs-on: [self-hosted, Linux, X64]
     if: startsWith(github.ref, 'refs/tags/cli-v')
-    needs: [build, version]
+    needs: [build, native, version]
     environment: pypi
     permissions:
       id-token: write
@@ -113,3 +228,80 @@ jobs:
       - name: List artifacts
         run: ls -lh dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # ── Dev release (main pushes, keep last 2) ─────────────────────────
+  # Publishes the Nuitka native binary + standalone dist + wheel/sdist to
+  # the internal GH Releases page under tag `cli-dev-<run>`, marked as
+  # prerelease so `cli-v*` stays the "Latest". Mirrors build.yml's
+  # `dev-release` shape.
+  dev-release:
+    name: Publish CLI Dev Release
+    runs-on: [self-hosted, Linux, X64]
+    if: ${{ needs.version.outputs.is_release == 'false' }}
+    needs: [build, native, version]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aster-cli-dist
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-native-*
+          merge-multiple: true
+          path: dist
+      - name: List artifacts
+        run: ls -lh dist/
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum aster-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create dev release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cli-dev-${{ github.run_number }}
+          name: "aster-cli Dev Build #${{ github.run_number }} (${{ needs.version.outputs.cli_version }})"
+          prerelease: true
+          make_latest: false
+          body: |
+            Automated dev build from `main` at ${{ github.sha }}.
+
+            **Version:** `${{ needs.version.outputs.cli_version }}`
+            **Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            Built platforms: **macOS (aarch64)** only. Other platforms will
+            be wired up once the pipeline is proven out.
+
+            ## Try it out (macOS ARM)
+            ```bash
+            gh release download cli-dev-${{ github.run_number }} \
+              --repo ${{ github.repository }} \
+              --pattern 'aster-macos-aarch64' \
+              --dir /tmp/aster-cli
+            chmod +x /tmp/aster-cli/aster-macos-aarch64
+            /tmp/aster-cli/aster-macos-aarch64 --version
+            ```
+          files: dist/*
+      - name: Prune old cli-dev releases (keep last 2)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const releases = await github.paginate(
+              github.rest.repos.listReleases, { owner, repo }
+            );
+            const devReleases = releases
+              .filter(r => r.tag_name.startsWith('cli-dev-'))
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            const toDelete = devReleases.slice(2);
+            for (const rel of toDelete) {
+              console.log(`Deleting release ${rel.tag_name} (${rel.id})`);
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: rel.id });
+              try {
+                await github.rest.git.deleteRef({ owner, repo, ref: `tags/${rel.tag_name}` });
+              } catch (e) {
+                console.log(`Tag ${rel.tag_name} already gone: ${e.message}`);
+              }
+            }

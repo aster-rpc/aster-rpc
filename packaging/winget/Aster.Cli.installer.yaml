@@ -1,0 +1,28 @@
+## Installer manifest -- describes the binary to fetch and install.
+##
+## We ship the *onefile* binary (single .exe) for winget. The standalone
+## dist would also work but requires a real installer (.msi). The portable
+## install model is simpler and matches how `gh`, `bun`, etc. distribute
+## via winget.
+##
+## InstallerType: portable -- winget copies the file into its package
+## links directory and adds that to PATH automatically. No registry keys,
+## no MSI, no admin required.
+##
+## Update steps when releasing:
+##   - PackageVersion + Installers[*].InstallerUrl: bump version segment
+##   - Installers[*].InstallerSha256: paste from SHA256SUMS
+
+PackageIdentifier: Aster.Cli
+PackageVersion: 0.1.2
+InstallerType: portable
+Scope: user
+ReleaseDate: 2026-04-15
+Commands:
+  - aster
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/aster-rpc/aster-rpc/releases/download/cli-v0.1.2/aster-windows-x86_64.exe
+    InstallerSha256: REPLACE_WITH_WINDOWS_X86_64_EXE_SHA256
+ManifestType: installer
+ManifestVersion: 1.6.0

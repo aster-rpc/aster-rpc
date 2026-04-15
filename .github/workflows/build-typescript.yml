@@ -14,6 +14,10 @@ concurrency:
   group: build-ts-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  packages: write
+
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.94.1"
@@ -290,3 +294,55 @@ jobs:
         run: |
           cd artifacts/npm-aster
           npm publish --access public --tag ${{ steps.tag.outputs.dist_tag }} --ignore-scripts
+
+  # ── Publish dev builds to GitHub Packages (main pushes) ─────────────
+  publish-dev:
+    name: Publish dev to GitHub Packages
+    needs: [version, build-native, build-transport, build-aster]
+    if: ${{ needs.version.outputs.is_release == 'false' }}
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://npm.pkg.github.com'
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: npm-*
+
+      - name: Set GitHub Packages registry in all package.json files
+        run: |
+          for pkg in artifacts/npm-*/package.json; do
+            node -e "
+              const fs = require('fs');
+              const p = JSON.parse(fs.readFileSync('$pkg', 'utf8'));
+              p.publishConfig = { registry: 'https://npm.pkg.github.com', access: 'restricted' };
+              fs.writeFileSync('$pkg', JSON.stringify(p, null, 2) + '\n');
+            "
+          done
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for dir in artifacts/npm-linux-x64-gnu artifacts/npm-linux-arm64-gnu artifacts/npm-darwin-arm64 artifacts/npm-darwin-x64 artifacts/npm-win32-x64-msvc; do
+            [ -d "$dir" ] || continue
+            echo "─── Publishing $dir ───"
+            (cd "$dir" && npm publish --tag dev --ignore-scripts) || true
+          done
+
+      - name: Publish @aster-rpc/transport (loader)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd artifacts/npm-transport
+          npm publish --tag dev --ignore-scripts || true
+
+      - name: Publish @aster-rpc/aster
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd artifacts/npm-aster
+          npm publish --tag dev --ignore-scripts || true

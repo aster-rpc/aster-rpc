@@ -102,6 +102,16 @@ def build_collection(
                 "fields": [],
             })
 
+    # Pull top-level description/tags from service_info.metadata when
+    # available (non-canonical; does not feed contract_id).
+    service_description = ""
+    service_tags: list[str] = []
+    if service_info is not None:
+        md = getattr(service_info, "metadata", None)
+        if md is not None:
+            service_description = str(getattr(md, "description", "") or "")
+            service_tags = list(getattr(md, "tags", []) or [])
+
     # Manifest JSON
     manifest = ContractManifest(
         service=contract.name,
@@ -114,6 +124,8 @@ def build_collection(
         methods=methods,
         serialization_modes=ser_modes,
         scoped=scoped_str,
+        description=service_description,
+        tags=service_tags,
     )
     manifest_bytes = manifest.to_json().encode("utf-8")
     entries.append(("manifest.json", manifest_bytes))
@@ -268,7 +280,7 @@ async def fetch_contract(
     Raises:
         ValueError: if the fetched bytes fail the BLAKE3 hash check.
     """
-    import blake3  # type: ignore[import]
+    from aster._aster import blake3_hex
 
     if collection_hash is None or collection_hash == contract_id:
         # Single-blob mode: the blob hash IS the contract_id.
@@ -284,7 +296,7 @@ async def fetch_contract(
         return None
 
     # Integrity check
-    actual_id = blake3.blake3(contract_bytes).hexdigest()
+    actual_id = blake3_hex(contract_bytes)
     if actual_id != contract_id:
         raise ValueError(
             f"fetch_contract: hash mismatch for contract {contract_id[:12]}: "

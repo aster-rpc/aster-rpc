@@ -26,7 +26,7 @@ jobs:
           # Rewrite every commit message on HEAD to scrub LLM
           # co-author attribution before the public mirror push.
           # Scoped to this ephemeral workspace only -- the private repo
-          # (emrul/aster-rpc) history is not touched. Legitimate human
+          # (aster-rpc/aster-rpc-internal) history is not touched. Legitimate human
           # Co-Authored-By lines are preserved.
           #
           # The previous version only stripped lines that *started*

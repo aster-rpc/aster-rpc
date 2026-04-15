@@ -1,0 +1,25 @@
+## Locale manifest -- user-facing metadata in en-US.
+
+PackageIdentifier: Aster.Cli
+PackageVersion: 0.1.2
+PackageLocale: en-US
+Publisher: Aster
+PublisherUrl: https://aster.site
+PublisherSupportUrl: https://github.com/aster-rpc/aster-rpc/issues
+PackageName: Aster CLI
+PackageUrl: https://aster.site
+License: Apache-2.0
+LicenseUrl: https://github.com/aster-rpc/aster-rpc/blob/main/LICENSE
+ShortDescription: Command-line tools for the Aster RPC framework.
+Description: |-
+  The Aster CLI is the operator-facing tool for the Aster RPC framework:
+  generate identities, enroll producers and consumers, publish service
+  contracts, and inspect a running mesh from the terminal.
+Tags:
+  - aster
+  - rpc
+  - cli
+  - p2p
+  - iroh
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

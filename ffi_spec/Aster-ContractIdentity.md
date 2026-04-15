@@ -313,6 +313,30 @@ otherwise:
 This is required because those fields are part of normal Fory messages, not a
 wire-level union construct.
 
+#### Non-canonical metadata (descriptions and tags)
+
+Human-readable descriptions and semantic tags for services, methods, and
+fields are carried in `ContractManifest` JSON (see `Aster-SPEC.md` §11.4 —
+`ContractManifest`), **not** in `ServiceContract` / `MethodDef` / `TypeDef`.
+They do not feed `contract_id`. Consequences:
+
+- Editing a description or adding/removing a tag may be re-published without
+  changing `contract_id`, without a version bump, and without invalidating
+  existing deployed endpoints.
+- Two `ContractManifest` JSON documents with identical canonical fields but
+  different descriptions or tags are equivalent from the identity layer's
+  perspective (same `contract_id`), but distinct from a manifest-content
+  perspective. Consumers that rely on tag-based policy (e.g. an MCP
+  `confirm=["tag:destructive"]` filter) depend on the manifest, not on the
+  `contract_id`, and should be prepared to observe tag changes across
+  manifest versions with the same identity.
+- Compliance or documentation tooling that inventories descriptions and tags
+  across a fleet must read `ContractManifest`, not `ServiceContract`. The
+  canonical schema is deliberately minimal.
+
+See `docs/_internal/rich_metadata/` for the design rationale and rollout
+plan.
+
 These rules mean canonical hashing is coupled not just to "Fory XLANG in
 general" but to a precisely pinned subset of it.
 

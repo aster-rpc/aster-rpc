@@ -39,6 +39,8 @@ class ToolFilter:
             approved = await filt.confirm_call("DataService.write_record", {"id": 1})
     """
 
+    _TAG_PATTERN_PREFIX = "tag:"
+
     def __init__(
         self,
         allow: list[str] | None = None,
@@ -49,30 +51,54 @@ class ToolFilter:
         self._deny = deny or []
         self._confirm = confirm or []
 
-    def is_visible(self, tool_name: str) -> bool:
+    @classmethod
+    def _matches(cls, pattern: str, tool_name: str, tags: list[str]) -> bool:
+        """Match a pattern against either a tag (``tag:NAME``) or the tool name.
+
+        Tag patterns are exact-case, case-sensitive. Name patterns use
+        ``fnmatch`` globbing as before. This lets service authors declare
+        semantic policy (``tag:destructive``) instead of enumerating every
+        matching method name.
+        """
+        if pattern.startswith(cls._TAG_PATTERN_PREFIX):
+            tag = pattern[len(cls._TAG_PATTERN_PREFIX):]
+            return tag in tags
+        return fnmatch.fnmatch(tool_name, pattern)
+
+    def is_visible(self, tool_name: str, tags: list[str] | None = None) -> bool:
         """Should this tool appear in tools/list?
 
         Rules:
         - If tool matches any deny pattern → hidden
         - If allow patterns exist and tool matches none → hidden
         - Otherwise → visible
+
+        Patterns starting with ``tag:`` match against the tool's ``tags`` list
+        (exact, case-sensitive); all other patterns glob-match the tool name.
         """
+        tags = tags or []
+
         # Deny wins
         for pattern in self._deny:
-            if fnmatch.fnmatch(tool_name, pattern):
+            if self._matches(pattern, tool_name, tags):
                 return False
 
         # If allow patterns specified, must match at least one
         if self._allow:
-            return any(fnmatch.fnmatch(tool_name, p) for p in self._allow)
+            return any(self._matches(p, tool_name, tags) for p in self._allow)
 
         return True
 
-    def needs_confirmation(self, tool_name: str) -> bool:
-        """Should this tool call require human approval?"""
+    def needs_confirmation(self, tool_name: str, tags: list[str] | None = None) -> bool:
+        """Should this tool call require human approval?
+
+        Patterns starting with ``tag:`` match against the tool's ``tags`` list;
+        all other patterns glob-match the tool name.
+        """
         if not self._confirm:
             return False
-        return any(fnmatch.fnmatch(tool_name, p) for p in self._confirm)
+        tags = tags or []
+        return any(self._matches(p, tool_name, tags) for p in self._confirm)
 
     async def confirm_call(
         self, tool_name: str, arguments: dict[str, Any]

@@ -14,7 +14,7 @@ existing config, no shared state with the developer's machine.
 
 ```bash
 
-cd /Users/emrul/dev/emrul/iroh-python
+cd /Users/emrul/dev/aster/aster-rpc-internal
 ./scripts/build.sh
 
 ```
@@ -31,7 +31,7 @@ import `@aster-rpc/transport`.
 
 ```bash
 
-cd /Users/emrul/dev/emrul/iroh-python/bindings/typescript/native
+cd /Users/emrul/dev/aster/aster-rpc-internal/bindings/typescript/native
 npx napi build --release --platform
 
 ```
@@ -45,7 +45,7 @@ This produces `aster-transport.<platform>.node` next to the hand-written
 
 ```bash
 
-cd /Users/emrul/dev/emrul/iroh-python/bindings/typescript
+cd /Users/emrul/dev/aster/aster-rpc-internal/bindings/typescript
 bun install --ignore-scripts
 npx tsc -p packages/aster/tsconfig.json
 
@@ -65,8 +65,8 @@ export HOME=$DAY0_HOME
 export XDG_CONFIG_HOME=$DAY0_HOME/.config
 
 # Copy the guide and test instructions
-cp /Users/emrul/dev/emrul/iroh-python/examples/mission-control/GUIDE_TypeScript.md $DAY0_HOME/GUIDE.md
-cp /Users/emrul/dev/emrul/iroh-python/docs/_internal/day0/testing-instructions-typescript.md $DAY0_HOME/testing-instructions.md
+cp /Users/emrul/dev/aster/aster-rpc-internal/examples/mission-control/GUIDE_TypeScript.md $DAY0_HOME/GUIDE.md
+cp /Users/emrul/dev/aster/aster-rpc-internal/docs/_internal/day0/testing-instructions-typescript.md $DAY0_HOME/testing-instructions.md
 cd $DAY0_HOME
 
 # Symlink the published @aster-rpc/* packages straight from the monorepo.
@@ -77,8 +77,8 @@ cd $DAY0_HOME
 # already populated the workspace tree under bindings/typescript.
 echo '{"name":"day0-ts-test","type":"module"}' > package.json
 mkdir -p node_modules/@aster-rpc
-ln -sf /Users/emrul/dev/emrul/iroh-python/bindings/typescript/packages/aster node_modules/@aster-rpc/aster
-ln -sf /Users/emrul/dev/emrul/iroh-python/bindings/typescript/native node_modules/@aster-rpc/transport
+ln -sf /Users/emrul/dev/aster/aster-rpc-internal/bindings/typescript/packages/aster node_modules/@aster-rpc/aster
+ln -sf /Users/emrul/dev/aster/aster-rpc-internal/bindings/typescript/native node_modules/@aster-rpc/transport
 
 # Set up Python venv for CLI tools (aster shell, aster call, etc.).
 #
@@ -90,8 +90,8 @@ ln -sf /Users/emrul/dev/emrul/iroh-python/bindings/typescript/native node_module
 uv venv $DAY0_HOME/pyvenv --python 3.13
 source $DAY0_HOME/pyvenv/bin/activate
 uv pip install --reinstall \
-  /Users/emrul/dev/emrul/iroh-python/bindings/python/target/wheels/aster_rpc-*.whl \
-  /Users/emrul/dev/emrul/iroh-python/cli/
+  /Users/emrul/dev/aster/aster-rpc-internal/bindings/python/target/wheels/aster_rpc-*.whl \
+  /Users/emrul/dev/aster/aster-rpc-internal/cli/
 
 # Verify clean state
 echo "Home: $HOME"

@@ -98,6 +98,8 @@ class Display:
         table.add_column("Methods", justify="right")
         table.add_column("Version", justify="right", style="dim")
         table.add_column("Scope", style="dim")
+        table.add_column("Tags", style="yellow")
+        table.add_column("Description", style="dim", overflow="ellipsis")
 
         for svc in services:
             scoped = svc.get("scoped", "shared")
@@ -111,11 +113,16 @@ class Display:
                 if scoped in ("session", "stream")
                 else name
             )
+            tags = list(svc.get("tags", []) or [])
+            tag_str = " ".join(f"[{escape(t)}]" for t in tags)
+            description = str(svc.get("description", "") or "")
             table.add_row(
                 display_name,
                 str(svc.get("method_count", "?")),
                 f"v{svc.get('version', '?')}",
                 scoped,
+                tag_str,
+                description,
             )
 
         self.console.print(table)
@@ -136,15 +143,25 @@ class Display:
         table.add_column("Method", style="green")
         table.add_column("Pattern", style="dim")
         table.add_column("Signature")
+        table.add_column("Tags", style="yellow")
+        table.add_column("Description", style="dim", overflow="ellipsis")
         table.add_column("Timeout", justify="right", style="dim")
 
         for m in methods:
             sig = m.get("signature", "")
             timeout = f"{m['timeout']}s" if m.get("timeout") else ""
+            tags = list(m.get("tags", []) or [])
+            tag_str = " ".join(f"[{escape(t)}]" for t in tags)
+            description = str(m.get("description", "") or "")
+            if m.get("deprecated"):
+                description = f"[DEPRECATED] {description}".strip()
+            method_name = m.get("name", "?")
             table.add_row(
-                m.get("name", "?"),
+                method_name,
                 m.get("pattern", "unary"),
                 sig,
+                tag_str,
+                description,
                 timeout,
             )
 
@@ -232,6 +249,15 @@ class Display:
         if cid:
             tree.add(f"[dim]contract_id:[/dim] {cid[:16]}…")
 
+        # Service-level description and tags
+        svc_description = contract.get("description", "")
+        svc_tags = list(contract.get("tags", []) or [])
+        if svc_description:
+            tree.add(f"[dim]{escape(svc_description)}[/dim]")
+        if svc_tags:
+            chips = " ".join(f"[yellow][{escape(t)}][/yellow]" for t in svc_tags)
+            tree.add(f"[dim]tags:[/dim] {chips}")
+
         # Methods
         methods = contract.get("methods", [])
         if methods:
@@ -240,10 +266,21 @@ class Display:
                 m_name = m.get("name", "?")
                 pattern = m.get("pattern", "unary")
                 sig = m.get("signature", "")
+                m_tags = list(m.get("tags", []) or [])
+                tag_chips = " ".join(f"[yellow][{escape(t)}][/yellow]" for t in m_tags)
+
                 label = f"[green]{escape(m_name)}[/green] ({pattern})"
                 if sig:
                     label += f"  [dim]{escape(sig)}[/dim]"
+                if tag_chips:
+                    label += f"  {tag_chips}"
+                if m.get("deprecated"):
+                    label = f"[strike]{label}[/strike] [red](deprecated)[/red]"
                 method_node = methods_branch.add(label)
+
+                m_desc = m.get("description", "")
+                if m_desc:
+                    method_node.add(f"[dim]{escape(m_desc)}[/dim]")
 
                 # Capabilities
                 requires = m.get("requires")

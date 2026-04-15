@@ -1,0 +1,146 @@
+name: Build & Publish .NET
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - 'bindings/dotnet/**'
+      - 'ffi/**'
+      - 'core/**'
+      - '.github/workflows/build-dotnet.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-dotnet-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  DOTNET_VERSION: "9.0.x"
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.94.1"
+
+jobs:
+  # ── Compute version ─────────────────────────────────────────────────
+  version:
+    runs-on: [self-hosted, Linux, X64]
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      is_release: ${{ steps.ver.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compute version
+        id: ver
+        run: |
+          BASE="0.2.0"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${BASE}-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Build native FFI lib ────────────────────────────────────────────
+  build-native:
+    needs: [version]
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: [self-hosted, Linux, X64]
+            lib: libaster_transport_ffi.so
+            rid: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            runner: [self-hosted, Linux, ARM64]
+            lib: libaster_transport_ffi.so
+            rid: linux-arm64
+          - target: aarch64-apple-darwin
+            runner: [self-hosted, macOS, ARM64]
+            lib: libaster_transport_ffi.dylib
+            rid: osx-arm64
+          - target: x86_64-pc-windows-msvc
+            runner: [self-hosted, Windows, X64]
+            lib: aster_transport_ffi.dll
+            rid: win-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Build FFI lib
+        run: cargo build --release -p aster_transport_ffi
+      - name: Upload native lib
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-native-${{ matrix.rid }}
+          path: target/release/${{ matrix.lib }}
+
+  # ── Build + pack NuGet ──────────────────────────────────────────────
+  pack:
+    needs: [version, build-native]
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Download all native libs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dotnet-native-*
+          path: native-libs
+
+      - name: Stage native libs into runtimes layout
+        run: |
+          for rid_dir in native-libs/dotnet-native-*; do
+            RID="${rid_dir##*dotnet-native-}"
+            mkdir -p "bindings/dotnet/src/Aster/runtimes/$RID/native"
+            cp "$rid_dir"/* "bindings/dotnet/src/Aster/runtimes/$RID/native/"
+          done
+          find bindings/dotnet/src/Aster/runtimes -type f | sort
+
+      - name: Build and pack
+        working-directory: bindings/dotnet
+        run: |
+          dotnet build src/Aster/Aster.csproj -c Release \
+            /p:Version=${{ needs.version.outputs.version }}
+          dotnet pack src/Aster/Aster.csproj -c Release --no-build \
+            /p:Version=${{ needs.version.outputs.version }} \
+            -o ./dist
+
+      - name: List packages
+        run: ls -lh bindings/dotnet/dist/
+
+      - name: Upload NuGet package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-nupkg
+          path: bindings/dotnet/dist/*.nupkg
+
+  # ── Publish dev to GitHub Packages (main pushes) ────────────────────
+  publish-dev:
+    name: Publish dev to GitHub Packages
+    needs: [version, pack]
+    if: ${{ needs.version.outputs.is_release == 'false' }}
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dotnet-nupkg
+          path: dist
+      - name: Push to GitHub Packages
+        run: |
+          dotnet nuget push dist/*.nupkg \
+            --source "https://nuget.pkg.github.com/aster-rpc/index.json" \
+            --api-key ${{ secrets.GITHUB_TOKEN }} \
+            --skip-duplicate

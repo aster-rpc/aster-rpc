@@ -124,8 +124,8 @@ jobs:
           uv venv .venv
           source .venv/bin/activate
           uv pip install pytest pytest-asyncio pytest-timeout maturin
-          uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
-          uv run maturin develop -m bindings/python/rust/Cargo.toml
+          uv pip install "pyfory==0.16.0" "zstandard>=0.25.0"
+          uv run maturin develop --release -m bindings/python/rust/Cargo.toml
           uv pip install -e cli/
           uv run pytest tests/python/ tests/chaos/ -v --timeout=30 \
             -m "not network and not iroh_primitives"
@@ -156,8 +156,8 @@ jobs:
           uv venv .venv
           source .venv/bin/activate
           uv pip install pytest pytest-asyncio pytest-timeout pytest-rerunfailures maturin
-          uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
-          uv run maturin develop -m bindings/python/rust/Cargo.toml
+          uv pip install "pyfory==0.16.0" "zstandard>=0.25.0"
+          uv run maturin develop --release -m bindings/python/rust/Cargo.toml
           uv pip install -e cli/
           uv run pytest tests/python/ -v --timeout=60 --reruns=2 --reruns-delay=2 \
             -m "iroh_primitives"
@@ -207,8 +207,8 @@ jobs:
           uv venv .venv
           source .venv/bin/activate
           uv pip install pytest pytest-asyncio pytest-timeout pytest-rerunfailures maturin
-          uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
-          uv run maturin develop -m bindings/python/rust/Cargo.toml
+          uv pip install "pyfory==0.16.0" "zstandard>=0.25.0"
+          uv run maturin develop --release -m bindings/python/rust/Cargo.toml
           uv pip install -e cli/
           uv run pytest tests/python/ tests/chaos/ -v --timeout=60 --reruns=2 --reruns-delay=2 \
             -m "not iroh_primitives"
@@ -222,8 +222,8 @@ jobs:
           uv venv .venv
           .venv\Scripts\activate
           uv pip install pytest pytest-asyncio pytest-timeout pytest-rerunfailures maturin
-          uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
-          uv run maturin develop -m bindings/python/rust/Cargo.toml
+          uv pip install "pyfory==0.16.0" "zstandard>=0.25.0"
+          uv run maturin develop --release -m bindings/python/rust/Cargo.toml
           uv pip install -e cli/
           uv run pytest tests/python/ tests/chaos/ -v --timeout=60 --reruns=2 --reruns-delay=2 -m "not iroh_primitives"
         shell: pwsh
@@ -299,8 +299,8 @@ jobs:
           uv venv .venv
           source .venv/bin/activate
           uv pip install maturin pdoc
-          uv pip install "blake3>=1.0.8" "pyfory==0.16.0" "zstandard>=0.25.0"
-          uv run maturin develop -m bindings/python/rust/Cargo.toml
+          uv pip install "pyfory==0.16.0" "zstandard>=0.25.0"
+          uv run maturin develop --release -m bindings/python/rust/Cargo.toml
           uv run pdoc --no-include-undocumented -o docs/python aster.public
         shell: bash
       - name: Upload docs artifact

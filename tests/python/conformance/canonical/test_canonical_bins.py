@@ -11,7 +11,7 @@ The id_to_filename() helper encodes/decodes this mapping.
 
 from pathlib import Path
 import json
-import blake3
+from aster._aster import blake3_hex
 import pytest
 
 HERE = Path(__file__).parent
@@ -47,7 +47,7 @@ def test_canonical_bin_hash(vector_id: str) -> None:
     assert bin_path.exists(), f"Binary file not found: {bin_path}"
 
     bin_bytes = bin_path.read_bytes()
-    actual_hash = blake3.blake3(bin_bytes).hexdigest()
+    actual_hash = blake3_hex(bin_bytes)
     expected_hash = HASHES[vector_id]
 
     assert actual_hash == expected_hash, (

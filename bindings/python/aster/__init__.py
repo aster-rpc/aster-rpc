@@ -143,7 +143,7 @@ from .transport.base import (
 )
 from .transport.iroh import IrohTransport
 from .transport.local import LocalTransport
-from .metadata import Metadata
+from .metadata import Metadata, describe, Description
 from .decorators import (
     service,
     rpc,
@@ -256,6 +256,8 @@ __all__ = [
     "RpcStatus",
     "wire_type",
     "Metadata",
+    "describe",
+    "Description",
     "ForyCodec",
     "ForyConfig",
     "DEFAULT_COMPRESSION_THRESHOLD",

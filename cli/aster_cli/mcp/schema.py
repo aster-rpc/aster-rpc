@@ -83,16 +83,32 @@ def aster_type_to_json_schema(type_name: str) -> dict[str, Any]:
 def field_to_json_schema(field: dict[str, Any]) -> dict[str, Any]:
     """Convert an Aster FieldSchema dict to a JSON Schema property.
 
+    Propagates:
+        - ``description`` into the schema's ``description`` key.
+        - ``tags`` into an ``x-aster-tags`` extension keyword and appended
+          as ``[tag1, tag2]`` suffix to ``description`` (so LLMs see it
+          even if they ignore extensions).
+
     Args:
-        field: Dict with keys: name, type, required, default, description.
+        field: Dict with keys: name, type, required, default, description, tags.
 
     Returns:
         JSON Schema property dict.
     """
     schema = aster_type_to_json_schema(field.get("type", "str"))
 
-    if field.get("description"):
-        schema["description"] = field["description"]
+    description = field.get("description") or ""
+    tags = list(field.get("tags", []) or [])
+
+    if tags:
+        suffix = f"[{', '.join(tags)}]"
+        description = f"{description} {suffix}".strip()
+
+    if description:
+        schema["description"] = description
+
+    if tags:
+        schema["x-aster-tags"] = tags
 
     if field.get("default") is not None:
         schema["default"] = field["default"]
@@ -182,15 +198,41 @@ def method_to_tool_definition(
     if method.get("timeout"):
         timeout_note = f" Timeout: {method['timeout']}s."
 
-    description = (
+    synthetic = (
         f"{pattern} RPC method on {service_name}. {sig}{timeout_note}"
     ).strip()
 
-    return {
+    # Prefer author-supplied description. Still append the synthetic
+    # signature + timeout note in parentheses so LLMs get both the semantic
+    # intent (author) and the concrete shape (synthetic).
+    author_desc = (method.get("description") or "").strip()
+    if author_desc:
+        if sig or timeout_note:
+            description = f"{author_desc} ({synthetic})"
+        else:
+            description = author_desc
+    else:
+        description = synthetic
+
+    # Append tags as a bracketed suffix and as an x-aster-tags extension.
+    # Also flag deprecated methods in the description prefix.
+    tags = list(method.get("tags", []) or [])
+    if method.get("deprecated"):
+        description = f"[DEPRECATED] {description}"
+    if tags:
+        description = f"{description} [tags: {', '.join(tags)}]"
+
+    result: dict[str, Any] = {
         "name": f"{service_name}.{method_name}",
         "description": description,
         "inputSchema": input_schema,
     }
+    if tags:
+        result["x-aster-tags"] = tags
+    if method.get("deprecated"):
+        result["x-aster-deprecated"] = True
+
+    return result
 
 
 def service_to_tool_definitions(service: dict[str, Any]) -> list[dict[str, Any]]:

@@ -210,6 +210,58 @@ jobs:
         run: ls -lh dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
-  # ── Upload dev wheels to run artifacts (main pushes) ───────────────
-  # Dev builds are available as downloadable artifacts from the Actions run.
-  # Tagged releases get a proper GitHub Release above.
+  # ── Dev release (main pushes, keep last 2) ─────────────────────────
+  dev-release:
+    name: Publish Dev Release
+    runs-on: [self-hosted, Linux, X64]
+    if: ${{ needs.version.outputs.is_release == 'false' }}
+    needs: [linux, macos, windows, sdist, version]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: List artifacts
+        run: ls -lh dist/
+      - name: Create dev release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-${{ github.run_number }}
+          name: "Dev Build #${{ github.run_number }} (${{ needs.version.outputs.python_version }})"
+          prerelease: true
+          make_latest: false
+          body: |
+            Automated dev build from `main` at ${{ github.sha }}.
+
+            **Version:** `${{ needs.version.outputs.python_version }}`
+            **Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            ```bash
+            gh release download dev-${{ github.run_number }} --repo ${{ github.repository }} --pattern '*.whl' --dir /tmp/wheels
+            pip install /tmp/wheels/aster_rpc-*.whl
+            ```
+          files: dist/*
+      - name: Prune old dev releases (keep last 2)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const releases = await github.paginate(
+              github.rest.repos.listReleases, { owner, repo }
+            );
+            const devReleases = releases
+              .filter(r => r.tag_name.startsWith('dev-'))
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            const toDelete = devReleases.slice(2);
+            for (const rel of toDelete) {
+              console.log(`Deleting release ${rel.tag_name} (${rel.id})`);
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: rel.id });
+              try {
+                await github.rest.git.deleteRef({ owner, repo, ref: `tags/${rel.tag_name}` });
+              } catch (e) {
+                console.log(`Tag ${rel.tag_name} already gone: ${e.message}`);
+              }
+            }

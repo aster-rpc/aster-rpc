@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-import blake3
+from aster._aster import blake3_hex
 from aster.contract.manifest import ContractManifest
 
 from aster_cli.aster_service import (
@@ -134,7 +134,7 @@ def _canonical_manifest_json(manifest: dict[str, Any]) -> str:
 
 def _directory_contract_id(manifest: dict[str, Any]) -> tuple[str, str]:
     manifest_json = _canonical_manifest_json(manifest)
-    return manifest_json, blake3.blake3(manifest_json.encode("utf-8")).hexdigest()
+    return manifest_json, blake3_hex(manifest_json.encode("utf-8"))
 
 
 def _build_publish_payload(

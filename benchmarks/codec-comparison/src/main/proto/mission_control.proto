@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package mission_control;
+
+option java_package = "site.aster.codecbench.proto";
+option java_outer_classname = "MissionControlProto";
+
+message StatusRequest {
+  string agent_id = 1;
+}
+
+message StatusResponse {
+  string agent_id = 1;
+  string status = 2;
+  int64 uptime_secs = 3;
+}
+
+message LogEntry {
+  double timestamp = 1;
+  string level = 2;
+  string message = 3;
+  string agent_id = 4;
+}
+
+message SubmitLogResult {
+  bool accepted = 1;
+}

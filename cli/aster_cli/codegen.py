@@ -522,6 +522,36 @@ def _gen_service_client(
         is_inline = method.get("request_style") == "inline"
         inline_params = method.get("inline_params", []) or []
 
+        # Render a docstring from the manifest's rich metadata. Surfaces in
+        # IDE tooltips and help() output; non-canonical, sourced from the
+        # service author's Metadata(description=..., tags=...).
+        method_description = (method.get("description") or "").strip()
+        method_tags = list(method.get("tags", []) or [])
+        method_deprecated = bool(method.get("deprecated", False))
+
+        def _docstring_lines(indent: str) -> list[str]:
+            if not (method_description or method_tags or method_deprecated):
+                return []
+            parts: list[str] = []
+            if method_deprecated:
+                parts.append("[DEPRECATED]")
+            if method_description:
+                parts.append(method_description)
+            header = " ".join(parts).strip()
+
+            out: list[str] = []
+            if method_tags:
+                # Multi-line docstring with tags footer.
+                out.append(f'{indent}"""{header}')
+                out.append("")
+                tag_chips = ", ".join(method_tags)
+                out.append(f"{indent}Tags: {tag_chips}")
+                out.append(f'{indent}"""')
+            else:
+                # Single-line docstring.
+                out.append(f'{indent}"""{header}"""')
+            return out
+
         lines.append("")
 
         # Helper: render inline params into a signature + body construction.
@@ -546,12 +576,15 @@ def _gen_service_client(
             ctor = f"{req_cls}({kwargs})" if inline_params else f"{req_cls}()"
             return sig, ctor
 
+        doc_lines = _docstring_lines("        ")
+
         if pattern == "unary":
             if is_inline:
                 sig, ctor = _inline_signature()
                 lines.append(f"    async def {mname}(")
                 lines.append(f"        {sig}")
                 lines.append(f"    ) -> {resp_cls}:")
+                lines.extend(doc_lines)
                 lines.append(f"        return await self._call_unary(")
                 lines.append(f"            method_info=self._mi_{mname},")
                 lines.append(f"            request={ctor},")
@@ -561,6 +594,7 @@ def _gen_service_client(
                 lines.append(f"    async def {mname}(")
                 lines.append(f"        self, request: {req_cls}, *, timeout: float | None = None")
                 lines.append(f"    ) -> {resp_cls}:")
+                lines.extend(doc_lines)
                 lines.append(f"        return await self._call_unary(")
                 lines.append(f"            method_info=self._mi_{mname},")
                 lines.append(f"            request=request,")
@@ -573,6 +607,7 @@ def _gen_service_client(
                 lines.append(f"    def {mname}(")
                 lines.append(f"        {sig}")
                 lines.append(f"    ) -> AsyncIterator[{resp_cls}]:")
+                lines.extend(doc_lines)
                 lines.append(f"        return self._call_server_stream(")
                 lines.append(f"            method_info=self._mi_{mname},")
                 lines.append(f"            request={ctor},")
@@ -582,6 +617,7 @@ def _gen_service_client(
                 lines.append(f"    def {mname}(")
                 lines.append(f"        self, request: {req_cls}, *, timeout: float | None = None")
                 lines.append(f"    ) -> AsyncIterator[{resp_cls}]:")
+                lines.extend(doc_lines)
                 lines.append(f"        return self._call_server_stream(")
                 lines.append(f"            method_info=self._mi_{mname},")
                 lines.append(f"            request=request,")
@@ -592,6 +628,7 @@ def _gen_service_client(
             lines.append(f"    async def {mname}(")
             lines.append(f"        self, requests: AsyncIterator[{req_cls}], *, timeout: float | None = None")
             lines.append(f"    ) -> {resp_cls}:")
+            lines.extend(doc_lines)
             lines.append(f"        return await self._call_client_stream(")
             lines.append(f"            method_info=self._mi_{mname},")
             lines.append(f"            requests=requests,")
@@ -602,6 +639,7 @@ def _gen_service_client(
             lines.append(f"    def {mname}(")
             lines.append(f"        self, *, timeout: float | None = None")
             lines.append(f"    ) -> BidiChannel:")
+            lines.extend(doc_lines)
             lines.append(f"        return self._call_bidi_stream(")
             lines.append(f"            method_info=self._mi_{mname},")
             lines.append(f"            timeout=timeout,")

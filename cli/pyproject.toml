@@ -4,14 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name    = "aster-cli"
-version = "0.1.2"
+version = "0.2.0"
 description = "Aster RPC framework command-line tools"
 requires-python = ">=3.9,<3.14"
 dependencies = [
     "aster-rpc>=0.1.2",
     "prompt-toolkit>=3.0",
     "rich>=13.0",
-    "mcp>=1.0",
     "keyring>=25.0",
 ]
 

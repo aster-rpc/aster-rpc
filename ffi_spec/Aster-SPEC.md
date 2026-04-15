@@ -1919,11 +1919,47 @@ ContractManifest {
     type_count: int32                // number of distinct types in closure
     type_hashes: list<string>        // all TypeDef hashes (transitive closure)
     method_count: int32
+    methods: list<MethodDescriptor>  // per-method descriptors incl. fields[]
     serialization_modes: list<string>   // ordered by producer preference
     alpn: string
     deprecated: bool
+
+    // Non-canonical metadata (does NOT feed contract_id; see below)
+    description: string              // human-readable service description
+    tags: list<string>               // open-vocabulary semantic tags
+
     published_by: AuthorId
     published_at_epoch_ms: int64
+}
+
+MethodDescriptor {
+    name: string
+    pattern: string                  // "unary" | "server_stream" | "client_stream" | "bidi_stream"
+    request_type: string
+    response_type: string
+    timeout: float?
+    idempotent: bool
+    fields: list<FieldDescriptor>    // request type fields
+    response_fields: list<FieldDescriptor>
+
+    // Non-canonical metadata
+    description: string              // method description
+    tags: list<string>               // semantic tags
+    deprecated: bool
+}
+
+FieldDescriptor {
+    name: string
+    kind: string                     // "string" | "int" | "bool" | ... | "list" | "map" | "ref" | "enum"
+    required: bool
+    nullable: bool
+    default_value: any
+    default_kind: string
+
+    // Non-canonical metadata
+    description: string
+    tags: list<string>               // advisory only; see "Tag enforcement" below
+    // ... type-specific keys (ref_name, wire_tag, item_kind, etc.)
 }
 ```
 
@@ -1931,6 +1967,66 @@ The `type_hashes` field allows a consumer to verify the type closure without
 walking the Merkle DAG. The authoritative type graph is encoded in the
 `TypeDef` references themselves; `type_hashes` is an optimisation for
 prefetching and integrity checking.
+
+**Non-canonical metadata.** `description` and `tags` at every level of the
+manifest, plus `deprecated` on methods, are **not** part of the canonical
+`ServiceContract` / `TypeDef` bytes that feed `contract_id`. Changes to
+these fields may be re-published without a version bump and without
+invalidating deployed endpoints. See `docs/_internal/rich_metadata/` for
+the design and `Aster-ContractIdentity.md` §"Non-canonical metadata" for
+the canonicalization rule.
+
+**Tag enforcement boundaries.** Aster enforces selected service- and
+method-level tags (e.g., MCP confirmation gates triggered by `destructive`,
+transport policy hooks keyed on `experimental`, client-side warnings for
+`deprecated`). **Field-level tags are advisory metadata only.** The
+framework guarantees their faithful round-trip through the manifest but
+does not act on them — field-level policy (redaction, masking, audit
+logging) is the application's responsibility. Tools that consume the
+manifest (shells, MCP servers, code generators, compliance scanners) are
+encouraged to surface field tags but should not assume any framework-level
+enforcement.
+
+**Conventional tag vocabulary** (open set, framework does not validate):
+
+Service / method tags (framework may act on these):
+
+- `readonly` — no side effects
+- `sensitive` — privileged or auth-gated
+- `destructive` — irreversible
+- `deprecated` — scheduled for removal
+- `experimental` — API may change
+- `expensive` — high-cost operation
+
+Field tags (advisory only):
+
+- `pii` — personally identifiable information
+- `secret` — credentials, tokens, keys
+- `redacted` — should be masked in logs/displays
+- `internal` — implementation detail; clients should ignore
+- `derived` — computed/cached, not authoritative
+- `large` — may be very large (blobs, file content)
+- `experimental` — may change
+
+Teams may define additional project-specific tags without a framework
+release. A future opt-in linter could warn on unknown tags; not shipping
+now.
+
+**Binding adoption checklist.** New bindings (beyond Python, TypeScript,
+Java as of this writing) adopting rich metadata MUST:
+
+1. Provide an explicit authoring path for `description` and `tags` at
+   service, method, and field level.
+2. Provide a doc-comment fallback for `description` only
+   (Python docstring, JSDoc, Javadoc, XML `<summary>`, Go `go/doc`).
+3. Route metadata through a dispatcher SPI, not language-specific
+   reflection — so hand-written services participate equally.
+4. Emit metadata into this manifest schema without affecting
+   `contract_id`.
+5. Pass the cross-binding conformance test for description and tag
+   round-trip.
+6. Surface field tags with `x-aster-tags` extension in any JSON-schema
+   consumer, and append to description for plain-text consumers.
 
 **Fetching a contract:** A consumer that knows a `contract_id` reads the
 `ArtifactRef` from `contracts/{contract_id}` in docs, fetches the Iroh

@@ -45,10 +45,10 @@ def derive_gossip_topic(root_pubkey: bytes, salt: bytes) -> bytes:
 
     The salt keeps the topic private to admitted producers.
     """
-    import blake3  # type: ignore[import]
+    from aster._aster import blake3_digest
 
     data = root_pubkey + b"aster-producer-mesh" + salt
-    return blake3.blake3(data).digest()
+    return blake3_digest(data)
 
 
 # ── Canonical signing bytes ───────────────────────────────────────────────────
@@ -97,11 +97,10 @@ def sign_producer_message(
     Returns:
         A fully signed ``ProducerMessage``.
     """
-    from .signing import load_private_key
+    from aster._aster import ed25519_sign
 
     to_sign = producer_message_signing_bytes(msg_type, payload, sender, epoch_ms)
-    privkey = load_private_key(signing_key_raw)
-    signature = privkey.sign(to_sign)
+    signature = ed25519_sign(signing_key_raw, to_sign)
     return ProducerMessage(
         type=msg_type,
         payload=payload,
@@ -116,19 +115,12 @@ def verify_producer_message(msg: ProducerMessage, peer_pubkey_raw: bytes) -> boo
 
     Returns True on success, False on any verification failure.
     """
-    from cryptography.exceptions import InvalidSignature
+    from aster._aster import ed25519_verify
 
-    from .signing import load_public_key
-
-    try:
-        to_verify = producer_message_signing_bytes(
-            msg.type, msg.payload, msg.sender, msg.epoch_ms
-        )
-        pubkey = load_public_key(peer_pubkey_raw)
-        pubkey.verify(msg.signature, to_verify)
-        return True
-    except (InvalidSignature, Exception):  # noqa: BLE001
-        return False
+    to_verify = producer_message_signing_bytes(
+        msg.type, msg.payload, msg.sender, msg.epoch_ms
+    )
+    return ed25519_verify(peer_pubkey_raw, to_verify, msg.signature)
 
 
 # ── Gossip handler ────────────────────────────────────────────────────────────

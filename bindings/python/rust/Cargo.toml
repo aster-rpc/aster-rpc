@@ -1,6 +1,6 @@
 [package]
 name    = "aster_rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -21,3 +21,8 @@ serde_json  = "1"
 # Common dependencies
 tokio       = { workspace = true }
 hex         = "0.4"
+
+# Crypto primitives (exposed to Python, replacing cryptography + blake3 packages)
+blake3          = "1"
+ed25519-dalek   = { version = "=3.0.0-pre.6", features = ["rand_core"] }
+getrandom       = "0.3"
