@@ -156,6 +156,12 @@ jobs:
     env:
       NUITKA_CACHE_DIR: nuitka-cache
       ASTER_VERSION: ${{ needs.version.outputs.cli_version }}
+      # setup-python@v5 hardcodes /Users/runner/hostedtoolcache on macOS;
+      # our mac runner runs as `emrul`, not `runner`, so point the tool
+      # cache at a user-writable path. .env on the runner already sets
+      # this, but we also set it here so fresh runs work before the
+      # runner service is restarted.
+      AGENT_TOOLSDIRECTORY: /Users/emrul/hostedtoolcache
     steps:
       - uses: actions/checkout@v6
         with:
