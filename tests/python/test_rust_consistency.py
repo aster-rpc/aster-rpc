@@ -229,9 +229,9 @@ class TestTypeHashConsistency:
     """Python BLAKE3 == Rust BLAKE3."""
 
     def test_hash_matches(self):
-        import blake3
+        from aster._aster import blake3_digest
         data = b"test data for hashing"
-        py_hash = blake3.blake3(data).digest()
+        py_hash = blake3_digest(data)
         rust_hash = compute_type_hash(data)
         assert py_hash == rust_hash
 

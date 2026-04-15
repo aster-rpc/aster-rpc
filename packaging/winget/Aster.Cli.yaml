@@ -1,0 +1,18 @@
+## Aster CLI -- winget version manifest (root)
+##
+## Submitted to: github.com/microsoft/winget-pkgs under
+##   manifests/a/Aster/Cli/<version>/
+##
+## Three files together: this version manifest, the installer manifest,
+## and the locale manifest. winget validates them as a set.
+##
+## Update steps when releasing:
+##   1. Bump PackageVersion in all three files.
+##   2. Update InstallerSha256 in the installer manifest.
+##   3. Submit a PR to winget-pkgs (or use `winget submit` once stable).
+
+PackageIdentifier: Aster.Cli
+PackageVersion: 0.1.2
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

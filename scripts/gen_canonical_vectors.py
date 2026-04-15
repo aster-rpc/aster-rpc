@@ -25,7 +25,7 @@ from pathlib import Path
 _repo_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_repo_root / "bindings"))
 
-import blake3  # noqa: E402
+from aster._aster import blake3_hex  # noqa: E402
 
 from aster.contract.canonical import (  # noqa: E402
     write_bytes_field,
@@ -68,13 +68,13 @@ class Vector:
 def make_vector(vid: str, description: str, obj) -> Vector:
     """Serialize obj, hash it, return a Vector."""
     data = canonical_xlang_bytes(obj)
-    h = blake3.blake3(data).hexdigest()
+    h = blake3_hex(data)
     return Vector(id=vid, description=description, bytes_hex=data.hex(), hash_hex=h)
 
 
 def make_vector_raw(vid: str, description: str, data: bytes) -> Vector:
     """Make a vector from raw bytes (for micro-fixtures)."""
-    h = blake3.blake3(data).hexdigest()
+    h = blake3_hex(data)
     return Vector(id=vid, description=description, bytes_hex=data.hex(), hash_hex=h)
 
 

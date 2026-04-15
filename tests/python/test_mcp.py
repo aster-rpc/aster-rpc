@@ -87,6 +87,27 @@ class TestFieldToJsonSchema:
         assert result["description"] == "The count"
 
 
+class TestFieldSchemaTagsAndDescription:
+    """Field-level description and tags flow into JSON Schema properties."""
+
+    def test_description_only(self):
+        result = field_to_json_schema({"name": "x", "type": "str", "description": "hello"})
+        assert result["description"] == "hello"
+        assert "x-aster-tags" not in result
+
+    def test_tags_only(self):
+        result = field_to_json_schema({"name": "x", "type": "str", "tags": ["pii"]})
+        assert result["description"] == "[pii]"
+        assert result["x-aster-tags"] == ["pii"]
+
+    def test_description_with_tags(self):
+        result = field_to_json_schema(
+            {"name": "x", "type": "str", "description": "User name.", "tags": ["pii", "required"]}
+        )
+        assert result["description"] == "User name. [pii, required]"
+        assert result["x-aster-tags"] == ["pii", "required"]
+
+
 class TestMethodToToolDefinition:
     def test_unary_method(self):
         tool = method_to_tool_definition("Svc", {
@@ -139,6 +160,62 @@ class TestMethodToToolDefinition:
             "fields": [],
         })
         assert "15.0s" in tool["description"]
+
+    def test_author_description_preferred_over_synthetic(self):
+        tool = method_to_tool_definition("Svc", {
+            "name": "greet",
+            "pattern": "unary",
+            "request_type": "GreetRequest",
+            "fields": [],
+            "description": "Greet the user by name.",
+        })
+        assert tool["description"].startswith("Greet the user by name.")
+        # Synthetic appended in parens so LLMs still see the shape.
+        assert "(" in tool["description"] and "Request: GreetRequest" in tool["description"]
+
+    def test_tags_appended_to_description_and_extension(self):
+        tool = method_to_tool_definition("Svc", {
+            "name": "remove",
+            "pattern": "unary",
+            "fields": [],
+            "description": "Remove a record.",
+            "tags": ["destructive", "sensitive"],
+        })
+        assert "[tags: destructive, sensitive]" in tool["description"]
+        assert tool["x-aster-tags"] == ["destructive", "sensitive"]
+
+    def test_deprecated_flag_surfaces(self):
+        tool = method_to_tool_definition("Svc", {
+            "name": "old",
+            "pattern": "unary",
+            "fields": [],
+            "description": "Old method.",
+            "deprecated": True,
+        })
+        assert tool["description"].startswith("[DEPRECATED]")
+        assert tool["x-aster-deprecated"] is True
+
+    def test_no_author_description_falls_back_to_synthetic(self):
+        tool = method_to_tool_definition("Svc", {
+            "name": "m",
+            "pattern": "unary",
+            "fields": [],
+        })
+        assert "unary RPC method on Svc" in tool["description"]
+
+    def test_field_description_flows_into_input_schema(self):
+        tool = method_to_tool_definition("Svc", {
+            "name": "m",
+            "pattern": "unary",
+            "fields": [
+                {"name": "user", "type": "str", "required": True,
+                 "description": "User handle.", "tags": ["pii"]},
+            ],
+        })
+        user_schema = tool["inputSchema"]["properties"]["user"]
+        assert "User handle." in user_schema["description"]
+        assert "[pii]" in user_schema["description"]
+        assert user_schema["x-aster-tags"] == ["pii"]
 
 
 class TestServiceToToolDefinitions:
@@ -224,6 +301,49 @@ class TestToolFilter:
         filt = ToolFilter(deny=["Admin*.*"])
         assert not filt.is_visible("AdminService.anything")
         assert filt.is_visible("UserService.anything")
+
+
+class TestToolFilterTagPatterns:
+    """`tag:NAME` patterns match against the tool's tags list, not its name.
+
+    Lets service authors own policy (``tag:destructive``) instead of forcing
+    MCP operators to enumerate every matching method name.
+    """
+
+    def test_tag_allow(self):
+        filt = ToolFilter(allow=["tag:public"])
+        assert filt.is_visible("Svc.anything", tags=["public"])
+        assert not filt.is_visible("Svc.anything", tags=["internal"])
+        # Missing tags list → treated as empty
+        assert not filt.is_visible("Svc.anything")
+
+    def test_tag_deny(self):
+        filt = ToolFilter(deny=["tag:deprecated"])
+        assert not filt.is_visible("Svc.old", tags=["deprecated"])
+        assert filt.is_visible("Svc.fresh", tags=["new"])
+
+    def test_tag_deny_wins_over_tag_allow(self):
+        filt = ToolFilter(allow=["tag:readonly"], deny=["tag:sensitive"])
+        assert filt.is_visible("Svc.get", tags=["readonly"])
+        # readonly+sensitive: deny wins
+        assert not filt.is_visible("Svc.peek_secret", tags=["readonly", "sensitive"])
+
+    def test_tag_confirm(self):
+        filt = ToolFilter(confirm=["tag:destructive"])
+        assert filt.needs_confirmation("Svc.drop_table", tags=["destructive"])
+        assert not filt.needs_confirmation("Svc.read", tags=["readonly"])
+
+    def test_mixed_glob_and_tag_patterns(self):
+        filt = ToolFilter(confirm=["tag:destructive", "Admin*.*"])
+        assert filt.needs_confirmation("Svc.delete", tags=["destructive"])
+        assert filt.needs_confirmation("AdminSvc.anything", tags=[])
+        assert not filt.needs_confirmation("UserSvc.read", tags=["readonly"])
+
+    def test_tag_exact_match_not_glob(self):
+        # Tag matching is exact, not fnmatch.
+        filt = ToolFilter(deny=["tag:sens*"])
+        assert not filt.is_visible("Svc.a", tags=["sens*"])  # exact match on literal
+        assert filt.is_visible("Svc.b", tags=["sensitive"])  # different literal
 
 
 # ── Server setup tests ────────────────────────────────────────────────────────

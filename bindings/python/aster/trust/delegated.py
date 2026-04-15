@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from aster.status import RpcError, StatusCode
-from aster.trust.signing import load_public_key
 
 logger = logging.getLogger(__name__)
 
@@ -116,12 +115,13 @@ def verify_attestation(
     }
 
     try:
-        from cryptography.exceptions import InvalidSignature
-        root_pubkey = load_public_key(bytes.fromhex(aster_root_pubkey_hex))
-        root_pubkey.verify(
-            bytes.fromhex(attestation.root_signature),
+        from aster._aster import ed25519_verify
+        if not ed25519_verify(
+            bytes.fromhex(aster_root_pubkey_hex),
             _canonical_json_bytes(payload),
-        )
+            bytes.fromhex(attestation.root_signature),
+        ):
+            raise ValueError("signature invalid")
     except Exception as exc:
         raise RpcError(
             StatusCode.UNAUTHENTICATED,
@@ -170,12 +170,13 @@ def verify_token(
     }
 
     try:
-        from cryptography.exceptions import InvalidSignature
-        signing_pubkey = load_public_key(bytes.fromhex(attestation.signing_pubkey))
-        signing_pubkey.verify(
-            bytes.fromhex(token.signature),
+        from aster._aster import ed25519_verify
+        if not ed25519_verify(
+            bytes.fromhex(attestation.signing_pubkey),
             _canonical_json_bytes(token_payload),
-        )
+            bytes.fromhex(token.signature),
+        ):
+            raise ValueError("signature invalid")
     except Exception as exc:
         raise RpcError(
             StatusCode.UNAUTHENTICATED,
@@ -209,12 +210,13 @@ def verify_proof_of_possession(
     Raises RpcError on failure.
     """
     try:
-        from cryptography.exceptions import InvalidSignature
-        consumer_pubkey = load_public_key(bytes.fromhex(consumer_pubkey_hex))
-        consumer_pubkey.verify(
-            bytes.fromhex(signature_hex),
+        from aster._aster import ed25519_verify
+        if not ed25519_verify(
+            bytes.fromhex(consumer_pubkey_hex),
             challenge_bytes,
-        )
+            bytes.fromhex(signature_hex),
+        ):
+            raise ValueError("signature invalid")
     except Exception as exc:
         raise RpcError(
             StatusCode.UNAUTHENTICATED,

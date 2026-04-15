@@ -33,7 +33,7 @@ def _keygen_root(args) -> int:
     Also writes a JSON file to ``--out`` as a backup/export.
     """
     from aster.trust.signing import generate_root_keypair
-    from aster_cli.credentials import store_root_privkey, has_keyring
+    from aster_cli.credentials import store_root_privkey, has_keyring, last_keyring_error
     from aster_cli.profile import _load_config, _save_config, _active_profile
 
     profile_name = getattr(args, "profile", None) or os.environ.get("ASTER_PROFILE")
@@ -57,9 +57,13 @@ def _keygen_root(args) -> int:
     stored_in_keyring = store_root_privkey(profile_name, priv_hex)
     if stored_in_keyring:
         print(f"  Root private key stored in OS keyring (profile: {profile_name})")
-    else:
+    elif not has_keyring():
         print("  WARNING: keyring not available -- private key NOT securely stored.")
         print("  Install keyring: pip install keyring")
+    else:
+        err = last_keyring_error()
+        print(f"  WARNING: keyring write failed -- private key NOT securely stored.")
+        print(f"  Reason: {err}")
 
     # Store public key in profile config
     profiles[profile_name]["root_pubkey"] = pub_hex

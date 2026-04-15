@@ -4,12 +4,10 @@ build-backend = "maturin"
 
 [project]
 name    = "aster-rpc"
-version = "0.1.2"
+version = "0.2.0"
 description = "Aster RPC framework with Iroh P2P transport (Python bindings)"
 requires-python = ">=3.9,<3.14"
 dependencies = [
-    "blake3>=1.0.8",
-    "cryptography>=42",
     "pyfory==0.16.0",
     "zstandard>=0.25.0",
     "tomli>=2.0; python_version < '3.11'",

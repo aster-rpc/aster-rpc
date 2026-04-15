@@ -247,10 +247,10 @@ def test_topic_different_pubkey():
 
 def test_topic_derivation_known_vector():
     """Verify the blake3 derivation against a pre-computed vector."""
-    import blake3
+    from aster._aster import blake3_digest
     pubkey = b"\xca\xfe" * 16
     salt = b"\xde\xad" * 16
-    expected = blake3.blake3(pubkey + b"aster-producer-mesh" + salt).digest()
+    expected = blake3_digest(pubkey + b"aster-producer-mesh" + salt)
     assert derive_gossip_topic(pubkey, salt) == expected
 
 

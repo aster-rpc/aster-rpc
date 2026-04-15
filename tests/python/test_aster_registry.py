@@ -694,9 +694,9 @@ async def test_publish_and_resolve_single_node():
     doc = await dc.create()
     author = await dc.create_author()
 
-    import blake3
+    from aster._aster import blake3_hex
     contract_bytes = b"fake_canonical_xlang_bytes_for_test"
-    contract_id = blake3.blake3(contract_bytes).hexdigest()
+    contract_id = blake3_hex(contract_bytes)
 
     # Publisher
     publisher = RegistryPublisher(doc, author)
@@ -741,9 +741,9 @@ async def test_publish_and_resolve_cross_node():
     doc_a = await dc_a.create()
     author_a = await dc_a.create_author()
 
-    import blake3
+    from aster._aster import blake3_hex
     contract_bytes = b"cross_node_contract_bytes"
-    contract_id = blake3.blake3(contract_bytes).hexdigest()
+    contract_id = blake3_hex(contract_bytes)
 
     # Node A publishes
     publisher = RegistryPublisher(doc_a, author_a)
@@ -819,9 +819,9 @@ async def test_withdraw_endpoint_down_gossip():
     rg_a = RegistryGossip(handle_a)
     rg_b = RegistryGossip(handle_b)
 
-    import blake3
+    from aster._aster import blake3_hex
     contract_bytes = b"withdraw_test_bytes"
-    contract_id = blake3.blake3(contract_bytes).hexdigest()
+    contract_id = blake3_hex(contract_bytes)
 
     publisher = RegistryPublisher(doc_a, author_a, gossip=rg_a)
     await publisher.register_endpoint(
@@ -870,9 +870,9 @@ async def test_acl_excludes_untrusted_author_entries():
     trusted_author = await dc.create_author()
     untrusted_author = await dc.create_author()
 
-    import blake3
+    from aster._aster import blake3_hex
     contract_bytes = b"acl_test_contract"
-    contract_id = blake3.blake3(contract_bytes).hexdigest()
+    contract_id = blake3_hex(contract_bytes)
 
     # Trusted author writes version pointer + lease
     await doc.set_bytes(
@@ -1010,7 +1010,7 @@ async def test_publication_round_trip():
         canonical_xlang_bytes,
         compute_contract_id,
     )
-    import blake3
+    from aster._aster import blake3_hex
 
     node = await IrohNode.memory()
     bc = blobs_client(node)
@@ -1049,7 +1049,7 @@ async def test_publication_round_trip():
     assert fetched == contract_bytes
 
     # Integrity: BLAKE3(fetched) == contract_id
-    assert blake3.blake3(fetched).hexdigest() == contract_id
+    assert blake3_hex(fetched) == contract_id
 
     await node.shutdown()
 
@@ -1067,7 +1067,7 @@ async def test_publish_contract_full_collection_via_publisher():
         compute_contract_id,
     )
     from aster.contract.publication import fetch_contract
-    import blake3
+    from aster._aster import blake3_hex
 
     node = await IrohNode.memory()
     dc = docs_client(node)
@@ -1109,7 +1109,7 @@ async def test_publish_contract_full_collection_via_publisher():
     client = RegistryClient(doc, caller_alpn="aster/1", blobs=bc)
     fetched = await client.fetch_contract(contract_id)
     assert fetched is not None
-    assert blake3.blake3(fetched).hexdigest() == contract_id
+    assert blake3_hex(fetched) == contract_id
 
     await publisher.close()
     await node.shutdown()

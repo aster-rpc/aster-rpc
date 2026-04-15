@@ -7,19 +7,30 @@
     <Nullable>enable</Nullable>
     <RootNamespace>Aster</RootNamespace>
     <AssemblyName>Aster</AssemblyName>
-    <!-- Library, not executable -->
     <OutputType>Library</OutputType>
+
+    <!-- NuGet package metadata -->
+    <PackageId>Aster</PackageId>
+    <Authors>aster-rpc</Authors>
+    <Description>Aster RPC .NET bindings for peer-to-peer networking</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/aster-rpc/aster-rpc-internal</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 
   <!-- Native library configuration -->
   <PropertyGroup>
-    <!-- Path to the built Rust FFI library -->
-    <NativeLibraryPath Condition="'$(NativeLibraryPath)' == ''">/Users/emrul/dev/emrul/iroh-python/target/release</NativeLibraryPath>
+    <NativeLibraryPath Condition="'$(NativeLibraryPath)' == ''">$(MSBuildThisFileDirectory)../../../../target/release</NativeLibraryPath>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Embed the C header for reference; not compiled -->
-    <None Include="$(NativeLibraryPath)/libaster_transport_ffi.dylib" Link="libaster_transport_ffi.dylib">
+    <None Include="$(NativeLibraryPath)/libaster_transport_ffi.dylib" Condition="Exists('$(NativeLibraryPath)/libaster_transport_ffi.dylib')" Link="libaster_transport_ffi.dylib">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="$(NativeLibraryPath)/libaster_transport_ffi.so" Condition="Exists('$(NativeLibraryPath)/libaster_transport_ffi.so')" Link="libaster_transport_ffi.so">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="$(NativeLibraryPath)/aster_transport_ffi.dll" Condition="Exists('$(NativeLibraryPath)/aster_transport_ffi.dll')" Link="aster_transport_ffi.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Include="$(MSBuildThisFileDirectory)../../../../ffi_spec/iroh_bridge.h" Link="iroh_bridge.h" />

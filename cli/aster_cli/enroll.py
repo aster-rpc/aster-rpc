@@ -30,11 +30,9 @@ def _derive_endpoint_id(secret_key_bytes: bytes) -> str:
 
     Pure cryptographic operation -- no iroh runtime needed.
     """
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from aster._aster import ed25519_public_from_secret
 
-    priv = Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
-    pub = priv.public_key()
-    pub_raw = pub.public_bytes_raw()
+    pub_raw = ed25519_public_from_secret(secret_key_bytes)
     return pub_raw.hex()
 
 

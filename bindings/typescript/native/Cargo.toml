@@ -1,6 +1,6 @@
 [package]
 name = "aster-transport-napi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "NAPI-RS bindings for Aster transport (Iroh P2P)"
 license = "Apache-2.0"

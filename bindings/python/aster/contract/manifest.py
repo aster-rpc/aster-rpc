@@ -16,7 +16,7 @@ from typing import Any
 import dataclasses
 from dataclasses import asdict, dataclass, field
 
-import blake3
+from aster._aster import blake3_hex
 
 FIELD_SCHEMA_VERSION = 1
 
@@ -72,6 +72,16 @@ class ContractManifest:
 
     scoped: str = "shared"
     """Service scope: "shared" or "session"."""
+
+    description: str = ""
+    """Human-readable description of the service. Non-canonical -- does not
+    affect ``contract_id``. See ``docs/_internal/rich_metadata/``."""
+
+    tags: list[str] = field(default_factory=list)
+    """Open-vocabulary service-level semantic tags. Non-canonical. Conventional
+    values (``readonly``, ``sensitive``, ``deprecated``, ``experimental``,
+    ``expensive``) are framework-recognized; arbitrary values round-trip
+    faithfully without enforcement. See ``docs/_internal/rich_metadata/``."""
 
     deprecated: bool = False
     """Whether this contract version is deprecated."""
@@ -219,7 +229,7 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
                 hints = {}
             for f in dataclasses.fields(req_type):
                 ftype = hints.get(f.name, f.type)
-                fields.append(build_field_v1(f, ftype))
+                fields.append(build_field_v1(f, ftype, owner_class=req_type))
 
         resp_type = getattr(method_info, "response_type", None)
 
@@ -244,7 +254,7 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
                 resp_hints = {}
             for f in dataclasses.fields(resp_type):
                 ftype = resp_hints.get(f.name, f.type)
-                resp_fields.append(build_field_v1(f, ftype))
+                resp_fields.append(build_field_v1(f, ftype, owner_class=resp_type))
 
         # Capture Mode 2 inline params so codegen and the shell can render
         # inline signatures. For Mode 1 we leave this empty and the consumer
@@ -263,6 +273,14 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
                 if fdict is not None:
                     inline_param_dicts.append(fdict)
 
+        # Rich metadata (description, tags, deprecated) -- non-canonical;
+        # surfaces in MCP, shell, and generated client docstrings but does
+        # not affect contract_id. See docs/_internal/rich_metadata/.
+        md = getattr(method_info, "metadata", None)
+        method_description = getattr(md, "description", "") if md is not None else ""
+        method_tags = list(getattr(md, "tags", []) or []) if md is not None else []
+        method_deprecated = bool(getattr(md, "deprecated", False)) if md is not None else False
+
         methods_out.append({
             "name": method_name,
             "pattern": getattr(method_info, "pattern", "unary"),
@@ -276,6 +294,9 @@ def extract_method_descriptors(service_info: object) -> list[dict]:
             "response_fields": resp_fields,
             "request_style": request_style,
             "inline_params": inline_param_dicts,
+            "description": method_description,
+            "tags": method_tags,
+            "deprecated": method_deprecated,
         })
 
     methods_out.sort(key=lambda m: m["name"])
@@ -489,12 +510,19 @@ def _classify_type(tp: object) -> dict[str, Any]:
     return result
 
 
-def build_field_v1(f: dataclasses.Field, resolved_type: object) -> dict[str, Any]:
+def build_field_v1(
+    f: dataclasses.Field,
+    resolved_type: object,
+    owner_class: type | None = None,
+) -> dict[str, Any]:
     """Build a v1 schema field dict from a dataclass field.
 
     Args:
         f: The dataclass Field object.
         resolved_type: The resolved type hint for this field.
+        owner_class: Optional owning class, used to pick up Aster metadata
+            declared via ``@wire_type(..., metadata={...})`` (i.e. stored on
+            ``owner_class.__wire_type_field_metadata__``).
 
     Returns:
         A v1 field schema dict.
@@ -521,6 +549,36 @@ def build_field_v1(f: dataclasses.Field, resolved_type: object) -> dict[str, Any
         else:
             default_kind = "factory"
 
+    # Pull Aster metadata (description, tags) from any of the supported
+    # authoring paths:
+    #  1. ``describe(...)`` / ``dataclasses.field(metadata={"aster": {...}})``
+    #     -- per-field metadata mapping on the dataclass Field.
+    #  2. ``@wire_type("tag", metadata={"field_name": Metadata(...)})``
+    #     -- class-level mapping stored on ``__wire_type_field_metadata__``.
+    # Non-canonical: surfaces in MCP schemas, shell, and generated client
+    # docstrings but does not feed contract_id.
+    aster_meta: dict[str, Any] = {}
+    try:
+        aster_meta = (f.metadata or {}).get("aster", {}) or {}
+    except Exception:
+        aster_meta = {}
+    field_description = str(aster_meta.get("description", "") or "")
+    field_tags = list(aster_meta.get("tags", []) or [])
+
+    if owner_class is not None:
+        wt_meta_map = getattr(owner_class, "__wire_type_field_metadata__", None)
+        if wt_meta_map and f.name in wt_meta_map:
+            wt_entry = wt_meta_map[f.name]
+            # Entry is expected to be a Metadata instance but be defensive.
+            wt_desc = getattr(wt_entry, "description", "") or ""
+            wt_tags = list(getattr(wt_entry, "tags", []) or [])
+            # Field-level ``describe()`` wins over class-level declaration,
+            # so only fill in missing pieces.
+            if not field_description:
+                field_description = wt_desc
+            if not field_tags:
+                field_tags = wt_tags
+
     field_dict: dict[str, Any] = {
         "name": f.name,
         "kind": info.get("kind", "string"),
@@ -528,6 +586,8 @@ def build_field_v1(f: dataclasses.Field, resolved_type: object) -> dict[str, Any
         "required": not has_default,
         "default_value": default_value,
         "default_kind": default_kind,
+        "description": field_description,
+        "tags": field_tags,
     }
 
     # Type-specific keys (only include when set)
@@ -608,6 +668,8 @@ def upgrade_legacy_field(old: dict[str, Any]) -> dict[str, Any]:
         "required": required,
         "default_value": default_value,
         "default_kind": default_kind,
+        "description": str(old.get("description", "") or ""),
+        "tags": list(old.get("tags", []) or []),
         **extra,
         "properties": {},
     }
@@ -673,7 +735,7 @@ def verify_manifest_or_fatal(
         json.JSONDecodeError: If the manifest file is malformed.
     """
     manifest = ContractManifest.from_file(manifest_path)
-    actual_id = blake3.blake3(live_contract_bytes).hexdigest()
+    actual_id = blake3_hex(live_contract_bytes)
 
     if actual_id != manifest.contract_id:
         raise FatalContractMismatch(

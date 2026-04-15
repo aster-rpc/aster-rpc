@@ -86,8 +86,6 @@ from .mesh import (
 from .nonces import InMemoryNonceStore, NonceStore
 from .signing import (
     generate_root_keypair,
-    load_private_key,
-    load_public_key,
     sign_credential,
     verify_signature,
 )
@@ -106,8 +104,6 @@ __all__ = [
     "ATTR_IID_ROLE_ARN",
     # Signing (canonical_json/canonical_signing_bytes removed -- use Rust core)
     "generate_root_keypair",
-    "load_private_key",
-    "load_public_key",
     "sign_credential",
     "verify_signature",
     # Admission

@@ -18,6 +18,7 @@ use pyo3::prelude::*;
 mod blobs;
 mod call;
 mod contract;
+mod crypto;
 mod docs;
 mod error;
 mod gossip;
@@ -72,6 +73,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     monitor::register(py, m)?;
     contract::register(py, m)?;
     ticket::register(py, m)?;
+    crypto::register(py, m)?;
 
     Ok(())
 }

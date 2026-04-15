@@ -12,7 +12,7 @@ Run with: pytest tests/python/test_pyfory_spike.py -v -s
 If any test fails, it means pyfory cannot be used directly for canonical contract
 hashing, and a custom canonical encoder will be needed (see ASTER_PLAN.md §11.7).
 
-Pre-requisite: pip install pyfory==0.16.0 blake3
+Pre-requisite: pip install pyfory==0.16.0
 """
 
 import subprocess
@@ -32,12 +32,7 @@ try:
 except ImportError:
     HAS_PYFORY = False
 
-try:
-    import blake3 as blake3_mod
-
-    HAS_BLAKE3 = True
-except ImportError:
-    HAS_BLAKE3 = False
+from aster._aster import blake3_hex
 
 pytestmark = pytest.mark.skipif(not HAS_PYFORY, reason="pyfory not installed")
 
@@ -465,7 +460,6 @@ class TestCrossProcessDeterminism:
 # ── Test 6: BLAKE3 hashing of serialized bytes ─────────────────────────────
 
 
-@pytest.mark.skipif(not HAS_BLAKE3, reason="blake3 not installed")
 class TestBlake3ContractHashing:
     """
     Test that BLAKE3 hashing of serialized bytes produces stable, reproducible hashes.
@@ -480,8 +474,8 @@ class TestBlake3ContractHashing:
         bytes_1 = f.serialize(msg)
         bytes_2 = f.serialize(msg)
 
-        hash_1 = blake3_mod.blake3(bytes(bytes_1)).hexdigest()
-        hash_2 = blake3_mod.blake3(bytes(bytes_2)).hexdigest()
+        hash_1 = blake3_hex(bytes(bytes_1))
+        hash_2 = blake3_hex(bytes(bytes_2))
 
         assert hash_1 == hash_2
 
@@ -491,8 +485,8 @@ class TestBlake3ContractHashing:
         msg_a = SimpleMessage(name="a", value=1, active=True)
         msg_b = SimpleMessage(name="b", value=2, active=False)
 
-        hash_a = blake3_mod.blake3(bytes(f.serialize(msg_a))).hexdigest()
-        hash_b = blake3_mod.blake3(bytes(f.serialize(msg_b))).hexdigest()
+        hash_a = blake3_hex(bytes(f.serialize(msg_a)))
+        hash_b = blake3_hex(bytes(f.serialize(msg_b)))
 
         assert hash_a != hash_b
 
@@ -500,7 +494,7 @@ class TestBlake3ContractHashing:
         """BLAKE3 hash is 64 hex characters (256 bits)."""
         f = create_fory(SimpleMessage)
         msg = SimpleMessage(name="test", value=0, active=False)
-        h = blake3_mod.blake3(bytes(f.serialize(msg))).hexdigest()
+        h = blake3_hex(bytes(f.serialize(msg)))
         assert len(h) == 64
         assert all(c in "0123456789abcdef" for c in h)
 
@@ -522,7 +516,7 @@ class TestBlake3ContractHashing:
         hashes = set()
         for _ in range(50):
             data = f.serialize(contract)
-            h = blake3_mod.blake3(bytes(data)).hexdigest()
+            h = blake3_hex(bytes(data))
             hashes.add(h)
 
         assert len(hashes) == 1, (
@@ -758,7 +752,6 @@ class TestDiagnostic:
             hex_preview = bytes(data[:32]).hex()
             print(f"{name:<30} {len(data):<15} {hex_preview}")
 
-    @pytest.mark.skipif(not HAS_BLAKE3, reason="blake3 not installed")
     def test_print_hash_examples(self):
         """Print example BLAKE3 hashes for reference."""
         f = create_fory(SimpleMessage)
@@ -773,7 +766,7 @@ class TestDiagnostic:
         print("-" * 80)
         for msg in cases:
             data = f.serialize(msg)
-            h = blake3_mod.blake3(bytes(data)).hexdigest()
+            h = blake3_hex(bytes(data))
             print(f"{str(msg):<50} {h[:16]}...")
 
     def test_report_fory_config(self):

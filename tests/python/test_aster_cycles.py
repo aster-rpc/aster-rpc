@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import blake3
+from aster._aster import blake3_hex
 import pytest
 
 from aster.contract.identity import (
@@ -90,7 +90,7 @@ def test_vector_B1_treenode_self_reference(vectors):
     td = _make_treenode_typedef()
     data = canonical_xlang_bytes(td)
     assert data.hex() == vectors["B.1"]["bytes_hex"], "B.1 bytes mismatch"
-    assert blake3.blake3(data).hexdigest() == vectors["B.1"]["hash_hex"], "B.1 hash mismatch"
+    assert blake3_hex(data) == vectors["B.1"]["hash_hex"], "B.1 hash mismatch"
 
 
 # ── B.2: Book/Author mutual reference ─────────────────────────────────────────
@@ -125,7 +125,7 @@ def test_vector_B2_book_hashed_first(vectors):
     )
     data_book = canonical_xlang_bytes(td_book)
     assert data_book.hex() == vectors["B.2"]["bytes_hex"], "B.2 bytes mismatch"
-    assert blake3.blake3(data_book).hexdigest() == vectors["B.2"]["hash_hex"], "B.2 hash mismatch"
+    assert blake3_hex(data_book) == vectors["B.2"]["hash_hex"], "B.2 hash mismatch"
 
 
 def test_vector_B2_author_references_book(vectors):
@@ -186,7 +186,7 @@ def test_vector_B2_author_references_book(vectors):
     data_author = canonical_xlang_bytes(td_author)
     assert data_author.hex() == vectors["B.2-author"]["bytes_hex"], "B.2-author bytes mismatch"
     assert (
-        blake3.blake3(data_author).hexdigest() == vectors["B.2-author"]["hash_hex"]
+        blake3_hex(data_author) == vectors["B.2-author"]["hash_hex"]
     ), "B.2-author hash mismatch"
 
 
@@ -214,7 +214,7 @@ def test_vector_B3_gamma_three_type_cycle(vectors):
     )
     data_g = canonical_xlang_bytes(td_gamma)
     assert data_g.hex() == vectors["B.3"]["bytes_hex"], "B.3 bytes mismatch"
-    assert blake3.blake3(data_g).hexdigest() == vectors["B.3"]["hash_hex"], "B.3 hash mismatch"
+    assert blake3_hex(data_g) == vectors["B.3"]["hash_hex"], "B.3 hash mismatch"
 
 
 # ── B.4: C with SELF_REF to A ─────────────────────────────────────────────────
@@ -241,7 +241,7 @@ def test_vector_B4_c_self_ref_to_a(vectors):
     )
     data_c = canonical_xlang_bytes(td_c)
     assert data_c.hex() == vectors["B.4"]["bytes_hex"], "B.4 bytes mismatch"
-    assert blake3.blake3(data_c).hexdigest() == vectors["B.4"]["hash_hex"], "B.4 hash mismatch"
+    assert blake3_hex(data_c) == vectors["B.4"]["hash_hex"], "B.4 hash mismatch"
 
 
 # ── resolve_with_cycles smoke test ────────────────────────────────────────────

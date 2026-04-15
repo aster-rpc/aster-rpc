@@ -106,9 +106,8 @@ class LocalSigner:
 
     @staticmethod
     def _derive_pubkey(privkey: bytes) -> bytes:
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        priv = Ed25519PrivateKey.from_private_bytes(privkey)
-        return priv.public_key().public_bytes_raw()
+        from aster._aster import ed25519_public_from_secret
+        return ed25519_public_from_secret(privkey)
 
     def sign(self, credential: object, root_pubkey: bytes) -> bytes:
         assert self._privkey is not None

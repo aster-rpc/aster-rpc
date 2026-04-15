@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from aster.trust.signing import load_private_key
+from aster._aster import ed25519_sign
 from aster_cli.codegen import generate_python_clients
 from aster_cli.credentials import get_root_privkey
 from aster_cli.profile import get_active_profile, get_aster_service_config
@@ -159,7 +159,7 @@ def build_signed_envelope(
         )
 
     payload_json = canonical_payload_json(payload)
-    signature = load_private_key(bytes.fromhex(priv_hex)).sign(payload_json.encode("utf-8")).hex()
+    signature = ed25519_sign(bytes.fromhex(priv_hex), payload_json.encode("utf-8")).hex()
     return SignedEnvelope(
         payload=payload,
         payload_json=payload_json,

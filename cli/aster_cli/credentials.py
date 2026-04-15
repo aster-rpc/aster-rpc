@@ -28,10 +28,17 @@ except ImportError:
 
 SERVICE_NAME = "aster"
 
+_last_error: Optional[str] = None
+
 
 def has_keyring() -> bool:
     """Check if keyring support is available."""
     return _HAS_KEYRING
+
+
+def last_keyring_error() -> Optional[str]:
+    """Return the most recent keyring exception message, if any."""
+    return _last_error
 
 
 def store_root_privkey(profile: str, privkey_hex: str) -> bool:
@@ -42,14 +49,17 @@ def store_root_privkey(profile: str, privkey_hex: str) -> bool:
         privkey_hex: Hex-encoded 32-byte ed25519 private key seed.
 
     Returns:
-        True if stored successfully, False if keyring unavailable.
+        True if stored successfully, False if keyring unavailable or write failed.
     """
+    global _last_error
     if _HAS_KEYRING:
         try:
             keyring.set_password(SERVICE_NAME, f"root_privkey:{profile}", privkey_hex)
             logger.debug("Root private key stored in keyring for profile '%s'", profile)
+            _last_error = None
             return True
         except Exception as e:
+            _last_error = str(e)
             logger.warning("Failed to store root key in keyring: %s", e)
     return False
 

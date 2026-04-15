@@ -129,9 +129,9 @@ class RegistryPublisher:
         Returns:
             contract_id (64-char hex string).
         """
-        import blake3  # type: ignore[import]
+        from aster._aster import blake3_hex
 
-        contract_id = blake3.blake3(contract_bytes).hexdigest()
+        contract_id = blake3_hex(contract_bytes)
 
         # Determine collection format and hash
         collection_hash = contract_id       # default: single-blob

@@ -106,28 +106,10 @@ def generate_root_keypair() -> tuple[bytes, bytes]:
         scalars using the standard Raw encoding.
 
     Note: ``private_key_bytes`` is the 32-byte seed (not the 64-byte PKCS8
-    blob).  Use ``load_private_key(private_key_bytes)`` to reload it.
+    blob).
     """
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    privkey = Ed25519PrivateKey.generate()
-    priv_raw = privkey.private_bytes_raw()   # 32-byte seed
-    pub_raw = privkey.public_key().public_bytes_raw()  # 32-byte pubkey
-    return priv_raw, pub_raw
-
-
-def load_private_key(priv_raw: bytes):
-    """Load an ed25519 private key from its 32-byte raw seed."""
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    return Ed25519PrivateKey.from_private_bytes(priv_raw)
-
-
-def load_public_key(pub_raw: bytes):
-    """Load an ed25519 public key from its 32-byte raw encoding."""
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
-    return Ed25519PublicKey.from_public_bytes(pub_raw)
+    from aster._aster import ed25519_generate_keypair
+    return ed25519_generate_keypair()
 
 
 def sign_credential(
@@ -139,9 +121,9 @@ def sign_credential(
     Returns the 64-byte ed25519 signature.  The credential's ``signature``
     field is NOT mutated -- the caller assigns the return value.
     """
-    privkey = load_private_key(root_privkey_raw)
+    from aster._aster import ed25519_sign
     msg = _canonical_signing_bytes(cred)
-    return privkey.sign(msg)
+    return ed25519_sign(root_privkey_raw, msg)
 
 
 def verify_signature(
@@ -157,13 +139,8 @@ def verify_signature(
     Returns True on success, False on any failure (invalid signature,
     wrong key, malformed bytes, etc.).
     """
-    from cryptography.exceptions import InvalidSignature
+    from aster._aster import ed25519_verify
 
     pubkey_bytes = root_pubkey_raw if root_pubkey_raw is not None else cred.root_pubkey
-    try:
-        pubkey = load_public_key(pubkey_bytes)
-        msg = _canonical_signing_bytes(cred)
-        pubkey.verify(cred.signature, msg)
-        return True
-    except (InvalidSignature, Exception):  # noqa: BLE001
-        return False
+    msg = _canonical_signing_bytes(cred)
+    return ed25519_verify(pubkey_bytes, msg, cred.signature)

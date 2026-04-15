@@ -510,7 +510,7 @@ def test_mesh_hook_admission_alpns_in_frozenset():
 
 def test_cli_keygen_produces_valid_key_pair():
     from aster_cli.trust import _keygen_command
-    from aster.trust.signing import load_private_key, load_public_key
+    from aster._aster import ed25519_sign, ed25519_verify
 
     with tempfile.TemporaryDirectory() as d:
         key_path = Path(d) / "root.key"
@@ -539,11 +539,9 @@ def test_cli_keygen_produces_valid_key_pair():
         assert pub_data["public_key"] == key_data["public_key"]
 
         # Verify key pair is consistent: sign something and verify
-        privkey = load_private_key(priv_raw)
-        pubkey = load_public_key(pub_raw)
         msg = b"test message"
-        sig = privkey.sign(msg)
-        pubkey.verify(sig, msg)  # raises on failure
+        sig = ed25519_sign(priv_raw, msg)
+        assert ed25519_verify(pub_raw, msg, sig)
 
 
 def test_cli_keygen_refuses_existing_file():

@@ -1,6 +1,6 @@
 {
   "name": "@aster-rpc/transport",
-  "version": "0.1.0-alpha.0",
+  "version": "0.2.0",
   "description": "Iroh P2P transport bindings for Aster RPC (NAPI-RS native addon)",
   "main": "index.js",
   "types": "index.d.ts",
@@ -50,11 +50,11 @@
     "build:debug": "napi build --platform"
   },
   "optionalDependencies": {
-    "@aster-rpc/transport-darwin-arm64": "0.1.0-alpha.0",
-    "@aster-rpc/transport-darwin-x64": "0.1.0-alpha.0",
-    "@aster-rpc/transport-linux-x64-gnu": "0.1.0-alpha.0",
-    "@aster-rpc/transport-linux-arm64-gnu": "0.1.0-alpha.0",
-    "@aster-rpc/transport-win32-x64-msvc": "0.1.0-alpha.0"
+    "@aster-rpc/transport-darwin-arm64": "0.2.0",
+    "@aster-rpc/transport-darwin-x64": "0.2.0",
+    "@aster-rpc/transport-linux-x64-gnu": "0.2.0",
+    "@aster-rpc/transport-linux-arm64-gnu": "0.2.0",
+    "@aster-rpc/transport-win32-x64-msvc": "0.2.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.6.0"

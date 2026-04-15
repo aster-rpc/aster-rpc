@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import blake3
+from aster._aster import blake3_hex
 import pytest
 
 from aster.contract.identity import (
@@ -67,7 +67,7 @@ def test_vector_A2_minimal_service_contract(vectors):
     )
     data = canonical_xlang_bytes(sc)
     assert data.hex() == vectors["A.2"]["bytes_hex"], "A.2 bytes mismatch"
-    assert blake3.blake3(data).hexdigest() == vectors["A.2"]["hash_hex"], "A.2 hash mismatch"
+    assert blake3_hex(data) == vectors["A.2"]["hash_hex"], "A.2 hash mismatch"
 
 
 def test_vector_A3_minimal_typedef_enum(vectors):
@@ -86,7 +86,7 @@ def test_vector_A3_minimal_typedef_enum(vectors):
     )
     data = canonical_xlang_bytes(td)
     assert data.hex() == vectors["A.3"]["bytes_hex"], "A.3 bytes mismatch"
-    assert blake3.blake3(data).hexdigest() == vectors["A.3"]["hash_hex"], "A.3 hash mismatch"
+    assert blake3_hex(data) == vectors["A.3"]["hash_hex"], "A.3 hash mismatch"
 
 
 def test_vector_A4_typedef_with_type_reference(vectors):
@@ -111,7 +111,7 @@ def test_vector_A4_typedef_with_type_reference(vectors):
     )
     data = canonical_xlang_bytes(td4)
     assert data.hex() == vectors["A.4"]["bytes_hex"], "A.4 bytes mismatch"
-    assert blake3.blake3(data).hexdigest() == vectors["A.4"]["hash_hex"], "A.4 hash mismatch"
+    assert blake3_hex(data) == vectors["A.4"]["hash_hex"], "A.4 hash mismatch"
 
 
 def test_vector_A5_methoddef_with_requires(vectors):
@@ -129,7 +129,7 @@ def test_vector_A5_methoddef_with_requires(vectors):
     )
     data = canonical_xlang_bytes(md5)
     assert data.hex() == vectors["A.5"]["bytes_hex"], "A.5 bytes mismatch"
-    assert blake3.blake3(data).hexdigest() == vectors["A.5"]["hash_hex"], "A.5 hash mismatch"
+    assert blake3_hex(data) == vectors["A.5"]["hash_hex"], "A.5 hash mismatch"
 
 
 def test_vector_A6_methoddef_without_requires(vectors):
@@ -147,7 +147,7 @@ def test_vector_A6_methoddef_without_requires(vectors):
     )
     data = canonical_xlang_bytes(md6)
     assert data.hex() == vectors["A.6"]["bytes_hex"], "A.6 bytes mismatch"
-    assert blake3.blake3(data).hexdigest() == vectors["A.6"]["hash_hex"], "A.6 hash mismatch"
+    assert blake3_hex(data) == vectors["A.6"]["hash_hex"], "A.6 hash mismatch"
 
 
 # ── Scope distinctness ────────────────────────────────────────────────────────
