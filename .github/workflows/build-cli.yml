@@ -1,5 +1,17 @@
 name: Build & Publish aster-cli
 
+# Triggers:
+#   - push to main on cli/** or this file: rebuild CLI (sdist/wheel + Nuitka
+#     native binary). Native job consumes the latest published aster-rpc
+#     dev wheel rather than rebuilding the pyo3 module from source.
+#   - cli-v* tag: full release flow (sdist/wheel/native + GH Release + PyPI).
+#     Native job pip-installs aster-rpc from PyPI.
+#   - workflow_run after Build & Publish Wheels completes on main: rebuild
+#     CLI native so it picks up the just-published aster-rpc dev wheel.
+#     Scoped to main only -- v* tags don't auto-trigger a CLI release
+#     (CLI is independently versioned via cli-v*).
+#   - workflow_dispatch.
+
 on:
   push:
     branches: [main]
@@ -7,6 +19,10 @@ on:
     paths:
       - 'cli/**'
       - '.github/workflows/build-cli.yml'
+  workflow_run:
+    workflows: ["Build & Publish Wheels"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -17,36 +33,74 @@ permissions:
   contents: read
 
 jobs:
-  # ── Compute version ───────────────────────────────────────────────
+  # ── Compute version + resolve aster-rpc wheel source ─────────────
   # aster-cli versioning is independent of aster-rpc. The source of
   # truth is cli/pyproject.toml. Dev builds append .devN for the run.
+  #
+  # The native job needs an aster-rpc wheel installed before Nuitka.
+  # We resolve where it comes from here so the native job is dumb:
+  #   - cli-v* tag: PyPI (assumes framework already published)
+  #   - main push / workflow_run: latest dev-<N> internal release
   version:
     runs-on: [self-hosted, Linux, X64]
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     outputs:
       cli_version: ${{ steps.ver.outputs.cli_version }}
       is_release: ${{ steps.ver.outputs.is_release }}
+      checkout_ref: ${{ steps.ver.outputs.checkout_ref }}
+      wheel_source: ${{ steps.ver.outputs.wheel_source }}
+      wheel_release: ${{ steps.ver.outputs.wheel_release }}
     steps:
       - uses: actions/checkout@v6
-      - name: Compute version
+      - name: Compute version + wheel source
         id: ver
         run: |
           BASE_VERSION=$(grep '^version' cli/pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          if [[ "$GITHUB_REF" == refs/tags/cli-v* ]]; then
-            TAG_VERSION="${GITHUB_REF#refs/tags/cli-v}"
+
+          # Resolve effective ref (workflow_run carries the real branch/tag
+          # via head_branch; direct events use GITHUB_REF).
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            REF="refs/heads/${{ github.event.workflow_run.head_branch }}"
+            echo "checkout_ref=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            REF="$GITHUB_REF"
+            echo "checkout_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ "$REF" == refs/tags/cli-v* ]]; then
+            TAG_VERSION="${REF#refs/tags/cli-v}"
             if [[ "$TAG_VERSION" != "$BASE_VERSION" ]]; then
               echo "::error::Tag cli-v${TAG_VERSION} does not match cli/pyproject.toml version ${BASE_VERSION}"
               exit 1
             fi
             echo "cli_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
             echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "wheel_source=pypi" >> "$GITHUB_OUTPUT"
+            echo "wheel_release=" >> "$GITHUB_OUTPUT"
           else
             echo "cli_version=${BASE_VERSION}.dev${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
             echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "wheel_source=internal" >> "$GITHUB_OUTPUT"
+            LATEST=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 \
+                --json tagName --jq '.[].tagName' \
+              | grep '^dev-' | head -1 || true)
+            if [[ -z "$LATEST" ]]; then
+              # Bootstrap path: no aster-rpc dev release exists yet. The
+              # native job is skipped; workflow_run from build.yml will
+              # re-fire once dev-1 has been published.
+              echo "::warning::No dev-* aster-rpc release found yet. Native job will skip; workflow_run from build.yml will re-fire."
+            fi
+            echo "wheel_release=${LATEST}" >> "$GITHUB_OUTPUT"
           fi
-      - name: Show version
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Show resolved values
         run: |
-          echo "aster-cli version: ${{ steps.ver.outputs.cli_version }}"
-          echo "Release:           ${{ steps.ver.outputs.is_release }}"
+          echo "cli_version:   ${{ steps.ver.outputs.cli_version }}"
+          echo "is_release:    ${{ steps.ver.outputs.is_release }}"
+          echo "checkout_ref:  ${{ steps.ver.outputs.checkout_ref }}"
+          echo "wheel_source:  ${{ steps.ver.outputs.wheel_source }}"
+          echo "wheel_release: ${{ steps.ver.outputs.wheel_release }}"
 
   # ── Build sdist + wheel (pure-Python, single job) ─────────────────
   build:
@@ -54,6 +108,8 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.version.outputs.checkout_ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -84,6 +140,9 @@ jobs:
   # x86_64 are planned -- see docs/_internal/cli_native_binaries/README.md.
   native:
     needs: [version]
+    # Skip cleanly if no upstream aster-rpc wheel source resolved (pypi or
+    # internal dev release). Bootstrap will resolve via workflow_run.
+    if: ${{ needs.version.outputs.wheel_source == 'pypi' || needs.version.outputs.wheel_release != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -92,13 +151,15 @@ jobs:
             suffix: macos-aarch64
             archive_ext: tar.gz
             binary_name: aster
+            wheel_pattern: "*macosx*arm64*.whl"
     runs-on: ${{ matrix.runner }}
     env:
       NUITKA_CACHE_DIR: nuitka-cache
-      RUST_TOOLCHAIN: "1.94.1"
       ASTER_VERSION: ${{ needs.version.outputs.cli_version }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.version.outputs.checkout_ref }}
       - uses: actions/setup-python@v5
         with:
           # 3.13 matches what's pre-cached on the self-hosted mac-arm runner.
@@ -119,15 +180,32 @@ jobs:
         # rather than relying on --product-version alone.
         run: sed -i '' 's/^version\s*=.*/version = "${{ needs.version.outputs.cli_version }}"/' cli/pyproject.toml
       - name: Install build tools
-        run: pip install nuitka ordered-set zstandard
-      - name: Build aster-rpc from source
-        uses: PyO3/maturin-action@v1
-        with:
-          command: develop
-          args: --release -m bindings/python/rust/Cargo.toml
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+        run: pip install --upgrade pip nuitka ordered-set zstandard
+      # ── Install aster-rpc (pyo3 wheel) from the right source ──────
+      # We don't rebuild the pyo3 module from source -- that's what
+      # build.yml already did. For dev flow, pull the matching mac-arm
+      # wheel from the latest dev-<N> internal release. For tag flow,
+      # use PyPI.
+      - name: Install aster-rpc from internal dev release
+        if: ${{ needs.version.outputs.wheel_source == 'internal' }}
+        run: |
+          mkdir -p wheels
+          gh release download "${{ needs.version.outputs.wheel_release }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '${{ matrix.wheel_pattern }}' \
+            --dir wheels
+          ls -lh wheels/
+          pip install --pre wheels/*.whl
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Install aster-rpc from PyPI
+        if: ${{ needs.version.outputs.wheel_source == 'pypi' }}
+        run: pip install "aster-rpc==${{ needs.version.outputs.cli_version }}"
       - name: Install CLI (with deps so Nuitka auto-follows imports)
-        run: pip install -e cli/
+        # --pre allows the dev-stamped aster-rpc that's already installed
+        # to satisfy the `aster-rpc>=0.2.0` dep without pip re-resolving
+        # against PyPI.
+        run: pip install --pre -e cli/
       # ── Onefile binary ─────────────────────────────────────────────
       # --onefile-no-compression: skip zstd -- ~190ms cached startup
       # --onefile-tempdir-spec: cache extraction at {CACHE_DIR}/aster_cli/{VERSION}
