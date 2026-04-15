@@ -279,8 +279,16 @@ jobs:
       - name: Run ${{ matrix.sanitizer }} sanitizer tests
         env:
           RUSTFLAGS: "-Z sanitizer=${{ matrix.sanitizer }}"
+        # Explicit per-binary invocations so we can skip cq_concurrency_loom
+        # (loom::model holds per-iteration state that LSan false-positives as
+        # a leak; see the comment at the top of the test file). Auto-discovery
+        # over ffi/tests/*.rs keeps this maintenance-free as new tests land.
         run: |
-          cargo test -p aster_transport_ffi --lib --tests
+          cargo test -p aster_transport_ffi --lib
+          for t in $(ls ffi/tests/*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//'); do
+            [ "$t" = "cq_concurrency_loom" ] && continue
+            cargo test -p aster_transport_ffi --test "$t"
+          done
 
   # ── Miri (interpreter for unsafe code validation) ─────────────────
   test-rust-miri:

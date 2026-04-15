@@ -14,6 +14,19 @@
 //! - Cancelling an op removes it from every wait structure exactly once
 //! - Dropping a connection resolves all dependent ops with ERROR
 //! - No completion can outlive the handle generation it belongs to
+//!
+//! ## Excluded from sanitizer/miri runs
+//!
+//! Loom's `model()` holds per-iteration thread-local state alive across
+//! explorations (one ~256-byte allocation per `loom::model` call), which
+//! LSan reports as "leaked" at process exit. Miri has the same issue
+//! (loom uses its own runtime). Both false-positive.
+//!
+//! The exclusion is enforced at the workflow level (`ci.yml`'s
+//! test-rust-sanitize job runs per-test-binary and skips this one)
+//! rather than via `#[cfg(not(sanitize = "..."))]` -- `cfg(sanitize)`
+//! is experimental and only works on nightly, which would break the
+//! stable `test-rust` job's compile.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
