@@ -16,16 +16,33 @@ fi
 
 echo "pre-push: checking Rust lint..."
 
-if ! cargo fmt --manifest-path bindings/python/rust/Cargo.toml --check >/dev/null 2>&1; then
-    echo -e "${RED}pre-push: cargo fmt check failed${RESET}"
-    echo "  Run: cargo fmt --manifest-path bindings/python/rust/Cargo.toml"
-    exit 1
-fi
+# Mirrors ci.yml and ci-typescript.yml exactly -- six checks, same scope.
+# Keep this list in sync with those workflows so the hook and CI agree.
+FMT_CHECKS=(
+    "--manifest-path bindings/python/rust/Cargo.toml"
+    "-p aster-transport-napi"
+)
+CLIPPY_CHECKS=(
+    "--manifest-path bindings/python/rust/Cargo.toml"
+    "-p aster_transport_core"
+    "-p aster_transport_ffi"
+    "-p aster-transport-napi"
+)
 
-if ! cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings 2>&1 | tail -1 | grep -q "Finished"; then
-    echo -e "${RED}pre-push: cargo clippy failed${RESET}"
-    echo "  Run: cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings"
-    exit 1
-fi
+for args in "${FMT_CHECKS[@]}"; do
+    if ! cargo fmt $args --check >/dev/null 2>&1; then
+        echo -e "${RED}pre-push: cargo fmt check failed ($args)${RESET}"
+        echo "  Run: cargo fmt $args"
+        exit 1
+    fi
+done
+
+for args in "${CLIPPY_CHECKS[@]}"; do
+    if ! cargo clippy $args -- -D warnings 2>&1 | tail -1 | grep -q "Finished"; then
+        echo -e "${RED}pre-push: cargo clippy failed ($args)${RESET}"
+        echo "  Run: cargo clippy $args -- -D warnings"
+        exit 1
+    fi
+done
 
 echo -e "${GREEN}pre-push: lint OK${RESET}"

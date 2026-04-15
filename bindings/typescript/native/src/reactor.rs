@@ -95,7 +95,9 @@ impl ReactorResponseSender {
 #[napi]
 pub struct ReactorRequestReceiver {
     inner: Arc<
-        tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<core_reactor::RequestFrame>>>,
+        tokio::sync::Mutex<
+            Option<tokio::sync::mpsc::UnboundedReceiver<core_reactor::RequestFrame>>,
+        >,
     >,
 }
 
@@ -217,7 +219,9 @@ impl ReactorEvent {
 
     #[napi(getter)]
     pub fn header_payload(&self) -> Option<Buffer> {
-        self.header_payload.as_ref().map(|b| Buffer::from(b.clone()))
+        self.header_payload
+            .as_ref()
+            .map(|b| Buffer::from(b.clone()))
     }
 
     #[napi(getter)]
@@ -227,7 +231,9 @@ impl ReactorEvent {
 
     #[napi(getter)]
     pub fn request_payload(&self) -> Option<Buffer> {
-        self.request_payload.as_ref().map(|b| Buffer::from(b.clone()))
+        self.request_payload
+            .as_ref()
+            .map(|b| Buffer::from(b.clone()))
     }
 
     #[napi(getter)]

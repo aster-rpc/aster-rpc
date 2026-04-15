@@ -150,7 +150,10 @@ impl AsterCall {
     pub async fn acquire(conn: &IrohConnection, session_id: u32) -> Result<AsterCall> {
         let core = conn.core_clone();
         let key = pool_key_for(session_id);
-        let handle = core.acquire_stream(key).await.map_err(acquire_err_to_napi)?;
+        let handle = core
+            .acquire_stream(key)
+            .await
+            .map_err(acquire_err_to_napi)?;
         Ok(AsterCall {
             handle: Arc::new(StdMutex::new(Some(CallStream::Pooled(handle)))),
         })
@@ -211,7 +214,10 @@ impl AsterCall {
     ) -> Result<UnaryFastPathResult> {
         let core = conn.core_clone();
         let key = pool_key_for(session_id);
-        let handle = core.acquire_stream(key).await.map_err(acquire_err_to_napi)?;
+        let handle = core
+            .acquire_stream(key)
+            .await
+            .map_err(acquire_err_to_napi)?;
 
         // Pull send/recv refs before any awaits so `handle` stays
         // owned by this scope (RAII drop returns the stream to the
