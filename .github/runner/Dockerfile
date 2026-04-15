@@ -28,6 +28,9 @@ ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ── System packages ──────────────────────────────────────────────────
+# Note: setup-java@v4 installs the JDK but NOT Maven, so we provide
+# `maven` here for the Java binding workflow. Without it, build-java.yml
+# fails with `mvn: command not found`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
@@ -37,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     libssl-dev \
     lsb-release \
+    maven \
     pkg-config \
     software-properties-common \
     sudo \
