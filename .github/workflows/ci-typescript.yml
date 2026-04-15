@@ -30,7 +30,7 @@ env:
 jobs:
   # ── Rust lint (NAPI-RS crate) ──────────────────────────────────────
   lint:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
@@ -43,13 +43,24 @@ jobs:
         run: cargo clippy -p aster-transport-napi -- -D warnings
 
   # ── TypeScript: typecheck + unit tests ─────────────────────────────
+  # Matrix covers the two platforms we actually ship: Linux x64 and
+  # macOS ARM64 (Mac Intel dropped in build-typescript's cross target).
+  # Node matrix trimmed to 22 (current LTS); 20 is maintenance-only as
+  # of April 2026.
   test:
     needs: lint
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        node: [20, 22]
-    runs-on: ${{ matrix.os }}
+        include:
+          - label: linux-x64
+            runs-on: [self-hosted, Linux, X64]
+            node: 22
+          - label: macos-arm64
+            runs-on: [self-hosted, macOS, ARM64]
+            node: 22
+    runs-on: ${{ matrix.runs-on }}
+    name: test (${{ matrix.label }}, node-${{ matrix.node }})
     steps:
       - uses: actions/checkout@v6
 
@@ -81,9 +92,15 @@ jobs:
   napi-check:
     needs: lint
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - label: linux-x64
+            runs-on: [self-hosted, Linux, X64]
+          - label: macos-arm64
+            runs-on: [self-hosted, macOS, ARM64]
+    runs-on: ${{ matrix.runs-on }}
+    name: napi-check (${{ matrix.label }})
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
