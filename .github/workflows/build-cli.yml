@@ -177,11 +177,17 @@ jobs:
           key: nuitka-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/**', 'bindings/python/python/**') }}
           restore-keys: |
             nuitka-${{ runner.os }}-${{ runner.arch }}-
-      - name: Stamp version
+      - name: Stamp version + relax dep bound for dev
         # Keep `aster --version` in sync with the dev build tag. Nuitka reads
-        # the installed package metadata, so stamp cli/pyproject.toml too
-        # rather than relying on --product-version alone.
-        run: sed -i '' 's/^version\s*=.*/version = "${{ needs.version.outputs.cli_version }}"/' cli/pyproject.toml
+        # the installed package metadata, so stamp cli/pyproject.toml.
+        # Also relax the aster-rpc lower bound for dev builds: PEP 440
+        # defines 0.2.0.dev51 < 0.2.0, so `>=0.2.0` rejects the dev wheel
+        # we just installed. Stamping `>=0.2.0.dev0` makes pip accept it.
+        # The real pyproject.toml (committed, shipped to PyPI on cli-v* tags)
+        # keeps the clean `>=0.2.0` bound.
+        run: |
+          sed -i '' 's/^version\s*=.*/version = "${{ needs.version.outputs.cli_version }}"/' cli/pyproject.toml
+          sed -i '' 's/"aster-rpc>=0.2.0"/"aster-rpc>=0.2.0.dev0"/' cli/pyproject.toml
       - name: Install build tools
         run: pip install --upgrade pip nuitka ordered-set zstandard
       # ── Install aster-rpc (pyo3 wheel) from the right source ──────
