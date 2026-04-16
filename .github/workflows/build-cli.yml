@@ -167,15 +167,13 @@ jobs:
       # underlying python-versions tarball setup.sh). Our self-hosted mac
       # runner runs as emrul with Python 3.13 already available via pyenv.
       - name: Create venv
-        # Use the absolute path to pyenv's Python 3.13.5 — NOT the shim.
-        # The mac runner has MacPorts Python 3.13 at /opt/local/bin/python3.13
-        # which pyenv's shim falls through to (because .python-version says
-        # "3.13" but pyenv has "3.13.5", no exact match). MacPorts' Python
-        # links against /opt/local/lib/libbz2 etc. which Nuitka's dependency
-        # scanner can't handle. pyenv's own build under ~/.pyenv/versions/
-        # has clean, self-contained paths.
+        # Use Homebrew's Python 3.13, not pyenv's source-compiled build.
+        # pyenv's Python links against Homebrew's libb2/libomp at runtime
+        # (/opt/homebrew/opt/libb2/lib/libb2.1.dylib etc.) which Nuitka's
+        # macOS dependency scanner can't bundle. Homebrew's bottle Python
+        # is self-contained (stdlib .so files only link /usr/lib/libSystem).
         run: |
-          /Users/emrul/.pyenv/versions/3.13.5/bin/python3.13 -m venv .venv
+          /opt/homebrew/opt/python@3.13/bin/python3.13 -m venv .venv
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           .venv/bin/python --version
       - name: Cache Nuitka C compilation
