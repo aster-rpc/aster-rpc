@@ -256,9 +256,14 @@ jobs:
       - name: Package standalone dist (unix)
         if: matrix.archive_ext == 'tar.gz'
         run: |
-          # Nuitka names the standalone binary aster_entry.bin on Linux,
-          # aster_entry (no suffix) on macOS. Find whichever exists.
-          bin=$(ls dist-cli/aster_entry.dist/aster_entry.bin dist-cli/aster_entry.dist/aster_entry 2>/dev/null | head -1)
+          echo "=== dist contents ==="
+          ls -la dist-cli/aster_entry.dist/
+          # Find the main executable — Nuitka uses varying names across
+          # platforms (aster_entry.bin, aster_entry, or just the entry
+          # point name). Find the executable file that isn't a .so/.dylib.
+          bin=$(find dist-cli/aster_entry.dist -maxdepth 1 -type f -perm +111 \
+            ! -name '*.so' ! -name '*.dylib' | head -1)
+          echo "Found binary: $bin"
           mv "$bin" dist-cli/aster_entry.dist/aster
           mv dist-cli/aster_entry.dist aster-${{ matrix.suffix }}
           tar -czf dist-cli/aster-dist-${{ matrix.suffix }}.tar.gz aster-${{ matrix.suffix }}
