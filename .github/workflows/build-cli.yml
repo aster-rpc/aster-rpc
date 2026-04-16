@@ -231,7 +231,7 @@ jobs:
           --onefile-no-compression
           --onefile-tempdir-spec={CACHE_DIR}/aster_cli/{VERSION}
           --product-name=Aster
-          --product-version=${{ env.ASTER_VERSION }}
+          --product-version=$(echo "$ASTER_VERSION" | sed 's/\.dev.*//')
           --output-filename=aster-${{ matrix.suffix }}${{ matrix.suffix == 'windows-x86_64' && '.exe' || '' }}
           --output-dir=dist-cli/
           --include-package=aster
