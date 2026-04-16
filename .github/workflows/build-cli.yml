@@ -189,7 +189,7 @@ jobs:
           sed -i '' 's/^version\s*=.*/version = "${{ needs.version.outputs.cli_version }}"/' cli/pyproject.toml
           sed -i '' 's/"aster-rpc>=0.2.0"/"aster-rpc>=0.2.0.dev0"/' cli/pyproject.toml
       - name: Install build tools
-        run: pip install --upgrade pip nuitka ordered-set zstandard
+        run: python3 -m pip install --upgrade pip nuitka ordered-set zstandard
       # ── Install aster-rpc (pyo3 wheel) from the right source ──────
       # We don't rebuild the pyo3 module from source -- that's what
       # build.yml already did. For dev flow, pull the matching mac-arm
@@ -204,17 +204,17 @@ jobs:
             --pattern '${{ matrix.wheel_pattern }}' \
             --dir wheels
           ls -lh wheels/
-          pip install --pre wheels/*.whl
+          python3 -m pip install --pre wheels/*.whl
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Install aster-rpc from PyPI
         if: ${{ needs.version.outputs.wheel_source == 'pypi' }}
-        run: pip install "aster-rpc==${{ needs.version.outputs.cli_version }}"
+        run: python3 -m pip install "aster-rpc==${{ needs.version.outputs.cli_version }}"
       - name: Install CLI (with deps so Nuitka auto-follows imports)
         # --pre allows the dev-stamped aster-rpc that's already installed
         # to satisfy the `aster-rpc>=0.2.0` dep without pip re-resolving
         # against PyPI.
-        run: pip install --pre -e cli/
+        run: python3 -m pip install --pre -e cli/
       # ── Onefile binary ─────────────────────────────────────────────
       # --onefile-no-compression: skip zstd -- ~190ms cached startup
       # --onefile-tempdir-spec: cache extraction at {CACHE_DIR}/aster_cli/{VERSION}
@@ -222,7 +222,7 @@ jobs:
       # --product-version: required for {VERSION} substitution.
       - name: Build onefile binary
         run: >
-          python -m nuitka
+          python3 -m nuitka
           --onefile
           --onefile-no-compression
           --onefile-tempdir-spec={CACHE_DIR}/aster_cli/{VERSION}
