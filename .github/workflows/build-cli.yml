@@ -167,10 +167,11 @@ jobs:
       # underlying python-versions tarball setup.sh). Our self-hosted mac
       # runner runs as emrul with Python 3.13 already available via pyenv.
       - name: Create venv
-        # System Python (pyenv 3.13) has PEP 668 externally-managed-environment
-        # protection. All pip installs + Nuitka must run inside a venv.
+        # System Python via pyenv. Pin to 3.13 explicitly — pyenv's global
+        # `python3` may resolve to 3.14 which aster-rpc's requires-python
+        # (<3.14) rejects. PEP 668 requires a venv for pip installs.
         run: |
-          python3 -m venv .venv
+          python3.13 -m venv .venv
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           .venv/bin/python --version
       - name: Cache Nuitka C compilation
