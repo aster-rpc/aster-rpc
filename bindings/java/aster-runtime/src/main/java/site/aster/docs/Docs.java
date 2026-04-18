@@ -123,9 +123,15 @@ public class Docs {
         .thenApply(
             event -> {
               if (event.kind() == IrohEventKind.AUTHOR_CREATED) {
-                byte[] authorBytes = event.data().asByteBuffer().array();
+                byte[] authorBytes =
+                    event.dataLen() > 0
+                        ? event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE)
+                        : new byte[0];
+                if (event.hasBuffer()) {
+                  runtime.releaseBuffer(event.buffer());
+                }
                 String authorHex = new String(authorBytes, StandardCharsets.UTF_8).trim();
-                return AuthorId.of(authorHex.trim());
+                return AuthorId.of(authorHex);
               }
               throw new IrohException("createAuthor failed: unexpected event " + event.kind());
             });

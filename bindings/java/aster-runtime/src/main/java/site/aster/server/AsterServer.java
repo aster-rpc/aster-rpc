@@ -87,6 +87,17 @@ public final class AsterServer implements AutoCloseable {
   private final Thread nonRpcAcceptThread;
 
   /**
+   * 64-char hex doc-id of the registry doc created by {@link
+   * site.aster.contract.ContractPublisher}, advertised in consumer-admission responses. Empty until
+   * {@link Builder#build()}'s post-construction publish step completes; blank-supplier behaviour
+   * otherwise.
+   */
+  private volatile String registryNamespace = "";
+
+  /** Populated by {@link site.aster.contract.ContractPublisher} after publication. */
+  private final Map<String, String> publishedContractIds = new ConcurrentHashMap<>();
+
+  /**
    * Per-connection session state (spec §7.5). Mutated only from the poll thread; the dispatcher
    * threads read the resolved session instance via {@link SessionRegistry} so they don't need to
    * touch this map. Concurrent-hash-map is overkill for the current single-poll-thread design but
@@ -124,7 +135,8 @@ public final class AsterServer implements AutoCloseable {
     // consumer that opens the aster.consumer_admission ALPN. Auth-mode credential
     // verification is tracked as tasks #14/#15.
     this.admissionHandler =
-        new site.aster.trust.ConsumerAdmissionHandler(this::buildServiceSummaries);
+        new site.aster.trust.ConsumerAdmissionHandler(
+            this::buildServiceSummaries, () -> registryNamespace);
     this.nonRpcAcceptThread =
         Thread.ofPlatform()
             .daemon(true)
@@ -195,18 +207,44 @@ public final class AsterServer implements AutoCloseable {
   }
 
   private List<site.aster.registry.ServiceSummary> buildServiceSummaries() {
+    // Populate channels["rpc"] with the server's own node addr (base64). Consumers use this
+    // to dial the RPC endpoint via the aster/1 ALPN without going through the admission peer
+    // again — mirrors Python's ServiceSummary population in runtime.py:397.
+    String rpcAddr = node.nodeAddr().toBase64();
     List<site.aster.registry.ServiceSummary> out = new ArrayList<>();
     for (RegisteredService rs : services.values()) {
       var summary = new site.aster.registry.ServiceSummary();
       summary.name = rs.descriptor.name();
       summary.version = rs.descriptor.version();
-      String cid = contractId(rs.descriptor.name());
+      // Prefer the cached contract_id populated by ContractPublisher. Fall back to computing it
+      // on demand when publication is disabled or hasn't completed (e.g. tests that instantiate
+      // AsterServer without going through the public Builder.build() path).
+      String cid = publishedContractIds.get(rs.descriptor.name());
+      if (cid == null || cid.isEmpty()) {
+        cid = contractId(rs.descriptor.name());
+      }
       summary.contractId = cid == null ? "" : cid;
       summary.pattern = rs.descriptor.scope() == Scope.SHARED ? "shared" : "session";
       summary.serializationModes = List.of("xlang");
+      summary.channels.put("rpc", rpcAddr);
       out.add(summary);
     }
     return List.copyOf(out);
+  }
+
+  /**
+   * 64-char hex doc-id of the registry doc that hosts this server's published contract manifests.
+   * Empty until {@link Builder#build()} finishes its publication step, or when the server was
+   * instantiated without publication. Consumers use this (via the admission response) to {@code
+   * join_and_subscribe_namespace} and fetch manifests by {@code contract_id}.
+   */
+  public String registryNamespace() {
+    return registryNamespace;
+  }
+
+  void setPublicationResult(String namespace, java.util.Map<String, String> contractIds) {
+    this.registryNamespace = namespace == null ? "" : namespace;
+    this.publishedContractIds.putAll(contractIds);
   }
 
   /** The node ID of this server (hex string). */
@@ -817,17 +855,48 @@ public final class AsterServer implements AutoCloseable {
       }
 
       Builder self = this;
-      return nodeFuture.thenApply(
-          node -> {
-            try {
-              Reactor reactor =
-                  new Reactor(node.runtime().nativeHandle(), node.nodeHandle(), ringCapacity);
-              return new AsterServer(self, node, reactor);
-            } catch (Exception e) {
-              node.close();
-              throw new IrohException("Failed to create reactor: " + e.getMessage());
-            }
-          });
+      return nodeFuture
+          .thenApply(
+              node -> {
+                try {
+                  Reactor reactor =
+                      new Reactor(node.runtime().nativeHandle(), node.nodeHandle(), ringCapacity);
+                  return new AsterServer(self, node, reactor);
+                } catch (Exception e) {
+                  node.close();
+                  throw new IrohException("Failed to create reactor: " + e.getMessage());
+                }
+              })
+          .thenCompose(
+              server -> {
+                // Publish each registered service's contract collection into a fresh registry
+                // doc. Mirrors Python's AsterServer._publish_contracts so the same consumer-side
+                // tooling (aster contract gen-client, registry shell) works against Java
+                // producers. Non-fatal: on failure we still return the server so local-only use
+                // cases (e.g. tests without docs backing) continue to work.
+                List<site.aster.server.spi.ServiceDispatcher> dispatchers = new ArrayList<>();
+                for (RegisteredService rs : server.services.values()) {
+                  dispatchers.add(rs.dispatcher);
+                }
+                if (dispatchers.isEmpty()) {
+                  return CompletableFuture.completedFuture(server);
+                }
+                return site.aster.contract.ContractPublisher.publishAll(server.node, dispatchers)
+                    .handle(
+                        (published, err) -> {
+                          if (err == null && published != null) {
+                            server.setPublicationResult(
+                                published.registryNamespace(), published.contractIds());
+                          } else if (err != null) {
+                            // Non-fatal: publication is an extra. Tests that spin up without
+                            // docs backing still get a working server.
+                            System.err.println(
+                                "AsterServer: contract publication failed (non-fatal): " + err);
+                            err.printStackTrace(System.err);
+                          }
+                          return server;
+                        });
+              });
     }
   }
 

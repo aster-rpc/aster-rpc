@@ -56,6 +56,26 @@ public final class AgentSessionDispatcher implements ServiceDispatcher {
   }
 
   @Override
+  public Map<String, Class<?>> requestClasses() {
+    LinkedHashMap<String, Class<?>> m = new LinkedHashMap<>();
+    m.put("register", Heartbeat.class);
+    m.put("heartbeat", Heartbeat.class);
+    m.put("runCommand", Command.class);
+    m.put("chaosFail", Heartbeat.class);
+    return Map.copyOf(m);
+  }
+
+  @Override
+  public Map<String, Class<?>> responseClasses() {
+    LinkedHashMap<String, Class<?>> m = new LinkedHashMap<>();
+    m.put("register", Assignment.class);
+    m.put("heartbeat", Assignment.class);
+    m.put("runCommand", CommandResult.class);
+    m.put("chaosFail", Assignment.class);
+    return Map.copyOf(m);
+  }
+
+  @Override
   public void registerTypes(Fory fory) {
     safeRegister(fory, Heartbeat.class, Heartbeat.FORY_TAG);
     safeRegister(fory, Assignment.class, Assignment.FORY_TAG);

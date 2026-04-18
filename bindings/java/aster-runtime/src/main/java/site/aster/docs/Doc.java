@@ -62,6 +62,27 @@ public class Doc {
   }
 
   /**
+   * The 64-char hex namespace id of this document (spec §11.2). Used by consumer admission to
+   * advertise the registry doc so consumers can {@code join_and_subscribe_namespace} and fetch
+   * published contract manifests.
+   */
+  public String docId() {
+    IrohLibrary lib = IrohLibrary.getInstance();
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment outBuf = arena.allocate(128);
+      MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
+      outLen.set(ValueLayout.JAVA_LONG, 0, 128L);
+      int status = lib.docId(runtime.nativeHandle(), docHandle, outBuf, outLen);
+      if (status != 0) {
+        throw new IrohException(IrohStatus.fromCode(status), "iroh_doc_id failed: " + status);
+      }
+      long written = outLen.get(ValueLayout.JAVA_LONG, 0);
+      byte[] bytes = outBuf.asSlice(0, written).toArray(ValueLayout.JAVA_BYTE);
+      return new String(bytes, StandardCharsets.UTF_8);
+    }
+  }
+
+  /**
    * Set bytes in the document.
    *
    * @param author the author ID
@@ -74,22 +95,17 @@ public class Doc {
     Arena confined = Arena.ofConfined();
     var alloc = confined;
 
+    // iroh_doc_set_bytes takes three iroh_bytes_t by value; pass each as (ptr, len) separately
+    // so FFM marshals them into the consecutive registers the struct-by-value ABI expects.
     byte[] authorBytes = author.hex().getBytes(StandardCharsets.UTF_8);
     byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
 
-    var authorSeg = alloc.allocate(authorBytes.length);
-    authorSeg.copyFrom(MemorySegment.ofArray(authorBytes));
-    var authorBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
-    authorBytesSeg.set(ValueLayout.ADDRESS, 0, authorSeg);
-    authorBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) authorBytes.length);
-
-    var keySeg = alloc.allocate(keyBytes.length);
-    keySeg.copyFrom(MemorySegment.ofArray(keyBytes));
-    var keyBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
-    keyBytesSeg.set(ValueLayout.ADDRESS, 0, keySeg);
-    keyBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) keyBytes.length);
-
-    var valueBytesSeg = toBytesSegment(value, alloc);
+    MemorySegment authorPtr = alloc.allocate(authorBytes.length);
+    authorPtr.copyFrom(MemorySegment.ofArray(authorBytes));
+    MemorySegment keyPtr = alloc.allocate(keyBytes.length);
+    keyPtr.copyFrom(MemorySegment.ofArray(keyBytes));
+    MemorySegment valuePtr = alloc.allocate(value.length);
+    valuePtr.copyFrom(MemorySegment.ofArray(value));
 
     var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
@@ -98,9 +114,12 @@ public class Doc {
           lib.docSetBytes(
               runtime.nativeHandle(),
               docHandle,
-              authorBytesSeg,
-              keyBytesSeg,
-              valueBytesSeg,
+              authorPtr,
+              authorBytes.length,
+              keyPtr,
+              keyBytes.length,
+              valuePtr,
+              value.length,
               0L,
               opSeg);
       if (status != 0) {
@@ -172,7 +191,14 @@ public class Doc {
                 if (event.status() == IrohStatus.NOT_FOUND.code) {
                   return null;
                 }
-                return parseDocEntry(event.data().asByteBuffer().array());
+                byte[] bytes =
+                    event.dataLen() > 0
+                        ? event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE)
+                        : new byte[0];
+                if (event.hasBuffer()) {
+                  runtime.releaseBuffer(event.buffer());
+                }
+                return parseDocEntry(bytes);
               }
               throw new IrohException("getExact failed: unexpected event " + event.kind());
             });
@@ -219,7 +245,14 @@ public class Doc {
         .thenApply(
             event -> {
               if (event.kind() == IrohEventKind.DOC_QUERY) {
-                return parseDocEntryList(event.data().asByteBuffer().array());
+                byte[] bytes =
+                    event.dataLen() > 0
+                        ? event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE)
+                        : new byte[0];
+                if (event.hasBuffer()) {
+                  runtime.releaseBuffer(event.buffer());
+                }
+                return parseDocEntryList(bytes);
               }
               throw new IrohException("query failed: unexpected event " + event.kind());
             });
@@ -266,7 +299,10 @@ public class Doc {
         .thenApply(
             event -> {
               if (event.kind() == IrohEventKind.DOC_GET) {
-                byte[] data = event.data().asByteBuffer().array();
+                byte[] data =
+                    event.dataLen() > 0
+                        ? event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE)
+                        : new byte[0];
                 if (event.hasBuffer()) {
                   runtime.releaseBuffer(event.buffer());
                 }
@@ -308,7 +344,13 @@ public class Doc {
         .thenApply(
             event -> {
               if (event.kind() == IrohEventKind.DOC_SHARED) {
-                byte[] data = event.data().asByteBuffer().array();
+                byte[] data =
+                    event.dataLen() > 0
+                        ? event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE)
+                        : new byte[0];
+                if (event.hasBuffer()) {
+                  runtime.releaseBuffer(event.buffer());
+                }
                 return new String(data, StandardCharsets.UTF_8).trim();
               }
               throw new IrohException("share failed: unexpected event " + event.kind());

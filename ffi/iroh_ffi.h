@@ -549,6 +549,15 @@ int32_t iroh_recv_stream_free(iroh_runtime_t runtime, iroh_recv_stream_t stream)
 
 int32_t iroh_doc_free(iroh_runtime_t runtime, uint64_t doc);
 
+/**
+ * Synchronous: write the 64-char hex namespace id of the doc to out_buf.
+ * On BUFFER_TOO_SMALL, sets *out_len to required size (64).
+ */
+int32_t iroh_doc_id(iroh_runtime_t runtime,
+                    uint64_t doc,
+                    uint8_t *out_buf,
+                    uintptr_t *out_len);
+
 int32_t iroh_gossip_topic_free(iroh_runtime_t runtime, uint64_t topic);
 
 int32_t iroh_blobs_add_bytes(iroh_runtime_t runtime,

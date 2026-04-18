@@ -66,6 +66,26 @@ public final class MissionControlDispatcher implements ServiceDispatcher {
   }
 
   @Override
+  public Map<String, Class<?>> requestClasses() {
+    LinkedHashMap<String, Class<?>> m = new LinkedHashMap<>();
+    m.put("getStatus", StatusRequest.class);
+    m.put("submitLog", LogEntry.class);
+    m.put("tailLogs", TailRequest.class);
+    m.put("ingestMetrics", MetricPoint.class);
+    return Map.copyOf(m);
+  }
+
+  @Override
+  public Map<String, Class<?>> responseClasses() {
+    LinkedHashMap<String, Class<?>> m = new LinkedHashMap<>();
+    m.put("getStatus", StatusResponse.class);
+    m.put("submitLog", SubmitLogResult.class);
+    // tailLogs: server-stream delivers via ResponseStream; no Java return type
+    m.put("ingestMetrics", IngestResult.class);
+    return Map.copyOf(m);
+  }
+
+  @Override
   public void registerTypes(Fory fory) {
     safeRegister(fory, StatusRequest.class, StatusRequest.FORY_TAG);
     safeRegister(fory, StatusResponse.class, StatusResponse.FORY_TAG);

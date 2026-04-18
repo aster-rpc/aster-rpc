@@ -81,9 +81,19 @@ public final class ConsumerAdmissionWire {
     }
 
     public static Response admitted(List<ServiceSummary> services) {
+      return admitted(services, "");
+    }
+
+    /**
+     * Dev-mode admit with a registry namespace. {@code registryNamespace} is the 64-char hex doc-id
+     * of the producer's registry doc so the consumer can {@code join_and_subscribe_namespace} and
+     * fetch contract manifests.
+     */
+    public static Response admitted(List<ServiceSummary> services, String registryNamespace) {
       Response r = new Response();
       r.admitted = true;
       r.services = services;
+      r.registryNamespace = registryNamespace == null ? "" : registryNamespace;
       return r;
     }
 

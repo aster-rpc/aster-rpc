@@ -29,11 +29,23 @@ public final class ConsumerAdmissionHandler implements AutoCloseable {
   private static final int MAX_REQUEST_BYTES = 64 * 1024;
 
   private final Supplier<List<ServiceSummary>> servicesSupplier;
+  private final Supplier<String> registryNamespaceSupplier;
   private final ExecutorService executor;
   private volatile boolean closed;
 
   public ConsumerAdmissionHandler(Supplier<List<ServiceSummary>> services) {
+    this(services, () -> "");
+  }
+
+  /**
+   * Construct the handler with a supplier for the registry namespace hex. The namespace is the
+   * 64-char hex doc-id of the producer's registry doc; consumers use it to {@code
+   * join_and_subscribe_namespace} and sync published contract manifests (spec §3.2).
+   */
+  public ConsumerAdmissionHandler(
+      Supplier<List<ServiceSummary>> services, Supplier<String> registryNamespace) {
     this.servicesSupplier = services;
+    this.registryNamespaceSupplier = registryNamespace == null ? () -> "" : registryNamespace;
     this.executor = Executors.newVirtualThreadPerTaskExecutor();
   }
 
@@ -80,7 +92,8 @@ public final class ConsumerAdmissionHandler implements AutoCloseable {
         }
 
         ConsumerAdmissionWire.Response resp =
-            ConsumerAdmissionWire.Response.admitted(servicesSupplier.get());
+            ConsumerAdmissionWire.Response.admitted(
+                servicesSupplier.get(), registryNamespaceSupplier.get());
         stream.sendAsync(resp.toJsonBytes()).get();
         stream.finishAsync().get();
       } finally {
@@ -89,9 +102,12 @@ public final class ConsumerAdmissionHandler implements AutoCloseable {
     } catch (Exception e) {
       // Per-connection failures must not take the server down. Log-once / metrics hook is
       // future work; for now swallow so one malformed client cannot block others.
-    } finally {
-      conn.close();
     }
+    // NOTE: do NOT call conn.close() here. Closing the QUIC connection sends CONNECTION_CLOSE
+    // which terminates in-flight data before the consumer's read_to_end() can observe the
+    // stream-finished signal, surfacing as "read error: connection lost" on the client. Let
+    // QUIC drain the streams naturally — matches Python's handle_consumer_admission_connection
+    // in bindings/python/aster/trust/consumer.py (line 355).
   }
 
   @Override
