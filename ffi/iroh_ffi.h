@@ -947,6 +947,23 @@ int32_t aster_canonical_bytes(const uint8_t *type_name_ptr,
                               uintptr_t *out_len);
 
 /**
+ * BLAKE3 hash of arbitrary bytes → 64-char lowercase hex.
+ *
+ * General-purpose primitive for bindings that need to hash canonical output from
+ * [`aster_canonical_bytes`] (e.g. per-TypeDef hashing when assembling a
+ * [`ServiceContract`](aster_transport_core::contract::ServiceContract) for
+ * [`aster_contract_id`]). Mirrors what PyO3 already exposes to Python as
+ * `_native.contract.compute_type_hash`.
+ *
+ * Writes 64 bytes of hex to `out_buf`. On `BUFFER_TOO_SMALL`, sets `*out_len` to
+ * the required size (64). `bytes_len == 0` is valid and hashes the empty input.
+ */
+int32_t aster_blake3_hex(const uint8_t *bytes_ptr,
+                         uintptr_t bytes_len,
+                         uint8_t *out_buf,
+                         uintptr_t *out_len);
+
+/**
  * Compute canonical signing bytes from credential JSON.
  *
  * The JSON must contain a `"kind"` field (`"producer"` or `"consumer"`)

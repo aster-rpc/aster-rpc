@@ -74,6 +74,53 @@ public final class ContractIdentity {
   }
 
   /**
+   * BLAKE3-hash arbitrary bytes, returning 64-char lowercase hex. Wraps the general-purpose {@code
+   * aster_blake3_hex} FFI — keeps bindings away from local BLAKE3 (spec §11.3.2.3).
+   *
+   * <p>Compose with {@link #computeCanonicalBytes(String, String)} for per-TypeDef hashing during
+   * contract_id derivation: canonicalize the TypeDef JSON, hash the resulting bytes, embed the
+   * 32-byte digest (as hex) as a {@code type_ref} in the parent TypeDef / MethodDef.
+   */
+  public static String blake3Hex(byte[] bytes) {
+    IrohLibrary lib = IrohLibrary.getInstance();
+    int inputLen = bytes == null ? 0 : bytes.length;
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment inputSeg;
+      if (inputLen == 0) {
+        inputSeg = MemorySegment.NULL;
+      } else {
+        inputSeg = arena.allocate(inputLen);
+        inputSeg.copyFrom(MemorySegment.ofArray(bytes));
+      }
+
+      MemorySegment outBuf = arena.allocate(CONTRACT_ID_BUF_SIZE);
+      MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
+      outLen.set(ValueLayout.JAVA_LONG, 0, CONTRACT_ID_BUF_SIZE);
+
+      int status = lib.asterBlake3Hex(inputSeg, inputLen, outBuf, outLen);
+      if (status != 0) {
+        throw new IllegalArgumentException("aster_blake3_hex failed with status " + status);
+      }
+      long written = outLen.get(ValueLayout.JAVA_LONG, 0);
+      byte[] result = new byte[(int) written];
+      MemorySegment.copy(outBuf, ValueLayout.JAVA_BYTE, 0, result, 0, (int) written);
+      return new String(result, StandardCharsets.UTF_8);
+    }
+  }
+
+  /**
+   * Convenience: canonicalize a TypeDef JSON and return its 64-char hex BLAKE3 hash.
+   *
+   * <p>Equivalent to {@code blake3Hex(computeCanonicalBytes("TypeDef", json))}. Matches Python's
+   * {@code compute_type_hash(canonical_xlang_bytes(td))} composition — the per-type building block
+   * for contract_id derivation (§11.3.2.2).
+   */
+  public static String computeTypeHash(String typeDefJson) {
+    byte[] canonical = computeCanonicalBytes("TypeDef", typeDefJson);
+    return blake3Hex(canonical);
+  }
+
+  /**
    * Compute canonical bytes for a named type from JSON.
    *
    * @param typeName one of "ServiceContract", "TypeDef", "MethodDef"

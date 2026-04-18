@@ -1952,7 +1952,7 @@ public final class IrohLibrary implements SymbolLookup {
           ValueLayout.JAVA_INT.withName("flags") // 76
           );
 
-  // --- Aster contract identity (aster_contract_id, aster_canonical_bytes) ---
+  // --- Aster contract identity (aster_contract_id, aster_canonical_bytes, aster_blake3_hex) ---
 
   /**
    * Compute the contract_id (64-char hex BLAKE3) from a ServiceContract JSON.
@@ -2019,6 +2019,32 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.ADDRESS,
                       ValueLayout.ADDRESS))
               .invoke(typeNamePtr, typeNameLen, jsonPtr, jsonLen, outBuf, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * BLAKE3 hash of arbitrary bytes → 64-char lowercase hex. Keeps the "no local hashing in
+   * bindings" rule (§11.3.2.3) intact: bindings compose this with {@link #asterCanonicalBytes} when
+   * they need per-TypeDef hashes during contract_id derivation.
+   *
+   * <p>C signature: {@code int32_t aster_blake3_hex(const uint8_t *bytes_ptr, uintptr_t bytes_len,
+   * uint8_t *out_buf, uintptr_t *out_len);}
+   */
+  public int asterBlake3Hex(
+      MemorySegment bytesPtr, long bytesLen, MemorySegment outBuf, MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_blake3_hex",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(bytesPtr, bytesLen, outBuf, outLen);
     } catch (Throwable t) {
       throw new AssertionError(t);
     }
