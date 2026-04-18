@@ -2,6 +2,7 @@ package site.aster.codegen.core.model;
 
 import com.palantir.javapoet.ClassName;
 import java.util.List;
+import java.util.Map;
 import site.aster.annotations.Scope;
 
 /**
@@ -11,6 +12,11 @@ import site.aster.annotations.Scope;
  * <p>{@code description} and {@code tags} are non-canonical. They flow into the published {@code
  * ContractManifest} JSON and surface in MCP / shell views, but do not affect the contract identity
  * hash.
+ *
+ * <p>{@code wireTypeTags} maps from a {@link com.palantir.javapoet.TypeName#toString() TypeName
+ * string} (the same key the emitter uses for deduping registrations) to an explicit Fory XLANG tag
+ * sourced from {@code @WireType}. Types not present in this map fall back to derivation from the
+ * Java package + simple name.
  */
 public record ServiceModel(
     String name,
@@ -19,17 +25,31 @@ public record ServiceModel(
     ClassName implClass,
     List<MethodModel> methods,
     String description,
-    List<String> tags) {
+    List<String> tags,
+    Map<String, String> wireTypeTags) {
 
   public ServiceModel {
     methods = List.copyOf(methods);
     description = description == null ? "" : description;
     tags = tags == null ? List.of() : List.copyOf(tags);
+    wireTypeTags = wireTypeTags == null ? Map.of() : Map.copyOf(wireTypeTags);
   }
 
-  /** Legacy constructor for callers not yet supplying metadata. */
+  /** Legacy constructor (pre-metadata). */
   public ServiceModel(
       String name, int version, Scope scope, ClassName implClass, List<MethodModel> methods) {
-    this(name, version, scope, implClass, methods, "", List.of());
+    this(name, version, scope, implClass, methods, "", List.of(), Map.of());
+  }
+
+  /** Legacy constructor (pre-wire-tag). */
+  public ServiceModel(
+      String name,
+      int version,
+      Scope scope,
+      ClassName implClass,
+      List<MethodModel> methods,
+      String description,
+      List<String> tags) {
+    this(name, version, scope, implClass, methods, description, tags, Map.of());
   }
 }

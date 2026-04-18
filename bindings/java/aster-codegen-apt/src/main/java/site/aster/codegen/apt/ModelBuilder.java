@@ -29,6 +29,7 @@ import site.aster.annotations.Description;
 import site.aster.annotations.Rpc;
 import site.aster.annotations.ServerStream;
 import site.aster.annotations.Service;
+import site.aster.annotations.WireType;
 import site.aster.codegen.core.model.FieldModel;
 import site.aster.codegen.core.model.MethodModel;
 import site.aster.codegen.core.model.ParamModel;
@@ -74,13 +75,14 @@ final class ModelBuilder {
     ClassName implClass =
         ClassName.get(pkg.getQualifiedName().toString(), serviceType.getSimpleName().toString());
 
+    LinkedHashMap<String, String> wireTypeTags = new LinkedHashMap<>();
     List<MethodModel> methods = new ArrayList<>();
     for (Element member : serviceType.getEnclosedElements()) {
       if (member.getKind() != ElementKind.METHOD) {
         continue;
       }
       ExecutableElement exec = (ExecutableElement) member;
-      MethodModel mm = classifyMethod(exec);
+      MethodModel mm = classifyMethod(exec, wireTypeTags);
       if (mm != null) {
         methods.add(mm);
       }
@@ -98,10 +100,11 @@ final class ModelBuilder {
         implClass,
         methods,
         description,
-        List.of(serviceAnn.tags()));
+        List.of(serviceAnn.tags()),
+        wireTypeTags);
   }
 
-  private MethodModel classifyMethod(ExecutableElement exec) {
+  private MethodModel classifyMethod(ExecutableElement exec, Map<String, String> wireTypeTags) {
     StreamingKind streaming = streamingKindFor(exec);
     if (streaming == null) {
       return null; // Not an RPC method.
@@ -137,6 +140,7 @@ final class ModelBuilder {
             Diagnostic.Kind.ERROR, "Could not resolve parameter type for " + p.getSimpleName(), p);
         return null;
       }
+      recordWireTag(ptype, tn, wireTypeTags);
       Description paramDesc = p.getAnnotation(Description.class);
       String pDescText = paramDesc != null ? paramDesc.value() : "";
       List<String> pTags =
@@ -171,6 +175,9 @@ final class ModelBuilder {
       messager.printMessage(
           Diagnostic.Kind.ERROR, "Could not resolve return type for " + exec.getSimpleName(), exec);
       return null;
+    }
+    if (responseType != null) {
+      recordWireTag(exec.getReturnType(), responseType, wireTypeTags);
     }
 
     MethodMetaAnn meta = readMethodMeta(exec);
@@ -253,6 +260,23 @@ final class ModelBuilder {
       }
     }
     return out;
+  }
+
+  /**
+   * Record any {@code @WireType} tag declared on {@code mirror} under the {@code tn} key that the
+   * emitter uses for lookup. Called for every non-context parameter type and for the response type.
+   * Missing annotations are simply skipped — the emitter falls back to Java package + simple name.
+   */
+  private static void recordWireTag(TypeMirror mirror, TypeName tn, Map<String, String> out) {
+    if (mirror.getKind() != TypeKind.DECLARED) {
+      return;
+    }
+    TypeElement te = (TypeElement) ((DeclaredType) mirror).asElement();
+    WireType ann = te.getAnnotation(WireType.class);
+    if (ann == null || ann.value().isEmpty()) {
+      return;
+    }
+    out.put(tn.toString(), ann.value());
   }
 
   private record MethodMetaAnn(String description, List<String> tags, boolean deprecated) {}

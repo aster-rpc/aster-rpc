@@ -280,7 +280,7 @@ public final class DispatcherEmitter {
     for (MethodModel m : svc.methods()) {
       if (m.requestStyle() == RequestStyle.EXPLICIT && m.requestType() != null) {
         TypeName t = m.requestType();
-        String tag = foryTagFor(t);
+        String tag = foryTagFor(t, svc);
         emits.putIfAbsent(t.toString(), CodeBlock.of("safeRegister(fory, $T.class, $S)", t, tag));
       } else if (m.requestStyle() == RequestStyle.INLINE) {
         ClassName reqName = NameConventions.inlineRequestClassName(svc, m);
@@ -290,12 +290,12 @@ public final class DispatcherEmitter {
       }
       if (m.responseType() != null) {
         TypeName t = m.responseType();
-        String tag = foryTagFor(t);
+        String tag = foryTagFor(t, svc);
         emits.putIfAbsent(t.toString(), CodeBlock.of("safeRegister(fory, $T.class, $S)", t, tag));
       }
       for (ParamModel p : m.inlineParams()) {
         if (p.type() instanceof ClassName cn && !isJavaLangType(cn)) {
-          String tag = foryTagFor(cn);
+          String tag = foryTagFor(cn, svc);
           emits.putIfAbsent(
               cn.toString(), CodeBlock.of("safeRegister(fory, $T.class, $S)", cn, tag));
         }
@@ -365,8 +365,8 @@ public final class DispatcherEmitter {
     String requestTag =
         method.requestStyle() == RequestStyle.INLINE
             ? NameConventions.inlineRequestForyTag(svc, method)
-            : foryTagFor(method.requestType());
-    String responseTag = foryTagFor(method.responseType());
+            : foryTagFor(method.requestType(), svc);
+    String responseTag = foryTagFor(method.responseType(), svc);
 
     CodeBlock.Builder paramsList = CodeBlock.builder().add("$T.of(", List.class);
     boolean first = true;
@@ -541,9 +541,19 @@ public final class DispatcherEmitter {
     return b.build();
   }
 
-  private static String foryTagFor(TypeName type) {
+  /**
+   * Resolve the Fory XLANG tag for {@code type} used by this service. When the caller supplied a
+   * {@code @WireType}-derived tag via {@link ServiceModel#wireTypeTags()}, use it verbatim so Java
+   * matches Python's / TS's on-wire identity for the same logical type. Otherwise derive from the
+   * Java package + simple name.
+   */
+  private static String foryTagFor(TypeName type, ServiceModel svc) {
     if (type == null) {
       return "";
+    }
+    String explicit = svc.wireTypeTags().get(type.toString());
+    if (explicit != null && !explicit.isEmpty()) {
+      return explicit;
     }
     if (type instanceof ClassName cn) {
       return cn.packageName() + "/" + cn.simpleName();
