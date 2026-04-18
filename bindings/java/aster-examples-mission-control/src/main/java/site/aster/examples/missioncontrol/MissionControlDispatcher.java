@@ -98,7 +98,7 @@ public final class MissionControlDispatcher implements ServiceDispatcher {
 
   private static void safeRegister(Fory fory, Class<?> cls, String tag) {
     try {
-      fory.register(cls, tag);
+      site.aster.codec.ForyTags.register(fory, cls, tag);
     } catch (Throwable ignored) {
       // duplicate registration is fine
     }

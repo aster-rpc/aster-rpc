@@ -714,15 +714,16 @@ public final class AsterServer implements AutoCloseable {
     // purely for framework wire types.
     ForyCodec headerCodec = userCodec instanceof ForyCodec fc ? fc : new ForyCodec();
     try {
-      headerCodec.fory().register(StreamHeader.class, "_aster/StreamHeader");
+      site.aster.codec.ForyTags.register(
+          headerCodec.fory(), StreamHeader.class, "_aster/StreamHeader");
     } catch (Throwable ignored) {
     }
     try {
-      headerCodec.fory().register(CallHeader.class, "_aster/CallHeader");
+      site.aster.codec.ForyTags.register(headerCodec.fory(), CallHeader.class, "_aster/CallHeader");
     } catch (Throwable ignored) {
     }
     try {
-      headerCodec.fory().register(RpcStatus.class, "_aster/RpcStatus");
+      site.aster.codec.ForyTags.register(headerCodec.fory(), RpcStatus.class, "_aster/RpcStatus");
     } catch (Throwable ignored) {
     }
     return headerCodec;

@@ -20,9 +20,9 @@ import site.aster.server.wire.StreamHeader;
 final class StreamHeaderRoundTripTest {
 
   private static ForyCodec registerAll(ForyCodec c) {
-    c.fory().register(StreamHeader.class, "_aster/StreamHeader");
-    c.fory().register(CallHeader.class, "_aster/CallHeader");
-    c.fory().register(RpcStatus.class, "_aster/RpcStatus");
+    site.aster.codec.ForyTags.register(c.fory(), StreamHeader.class, "_aster/StreamHeader");
+    site.aster.codec.ForyTags.register(c.fory(), CallHeader.class, "_aster/CallHeader");
+    site.aster.codec.ForyTags.register(c.fory(), RpcStatus.class, "_aster/RpcStatus");
     return c;
   }
 

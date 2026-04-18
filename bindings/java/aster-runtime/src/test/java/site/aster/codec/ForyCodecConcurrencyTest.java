@@ -31,7 +31,7 @@ final class ForyCodecConcurrencyTest {
   @Test
   void sharedCodecSurvivesManyConcurrentVirtualThreads() throws Exception {
     ForyCodec codec = new ForyCodec();
-    codec.fory().register(StreamHeader.class, "_aster/StreamHeader");
+    site.aster.codec.ForyTags.register(codec.fory(), StreamHeader.class, "_aster/StreamHeader");
 
     ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     CountDownLatch startGate = new CountDownLatch(1);
