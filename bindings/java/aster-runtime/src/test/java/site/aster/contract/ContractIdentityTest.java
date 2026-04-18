@@ -130,4 +130,49 @@ final class ContractIdentityTest {
         ContractIdentity.computeCanonicalBytes("ServiceContract", MINIMAL_SERVICE_CONTRACT);
     assertTrue(java.util.Arrays.equals(bytes, again), "canonical bytes are deterministic");
   }
+
+  @Test
+  void blake3HexOfEmptyInputMatchesKnownDigest() {
+    // BLAKE3 hash of the empty input is a well-known test vector.
+    String empty = ContractIdentity.blake3Hex(new byte[0]);
+    assertEquals(
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        empty,
+        "BLAKE3(\"\") is a stable, published digest — mismatch means the FFI is wrong.");
+    // null is treated the same as empty bytes.
+    assertEquals(empty, ContractIdentity.blake3Hex(null));
+  }
+
+  @Test
+  void blake3HexIsDeterministicForNonEmptyInput() {
+    byte[] payload = "the quick brown fox jumps over the lazy dog".getBytes();
+    String first = ContractIdentity.blake3Hex(payload);
+    String second = ContractIdentity.blake3Hex(payload);
+    assertEquals(first, second);
+    assertEquals(64, first.length());
+    assertTrue(first.matches("[0-9a-f]{64}"));
+  }
+
+  @Test
+  void computeTypeHashMatchesCanonicalBytesPlusBlake3() {
+    // Minimal TypeDef JSON matching core::contract::TypeDef serde shape.
+    String typeDefJson =
+        "{"
+            + "\"kind\":\"message\","
+            + "\"package\":\"test\","
+            + "\"name\":\"Empty\","
+            + "\"fields\":[],"
+            + "\"enum_values\":[],"
+            + "\"union_variants\":[]"
+            + "}";
+
+    // Convenience composer matches manual two-step composition byte-for-byte.
+    String composed = ContractIdentity.computeTypeHash(typeDefJson);
+    byte[] bytes = ContractIdentity.computeCanonicalBytes("TypeDef", typeDefJson);
+    String manual = ContractIdentity.blake3Hex(bytes);
+
+    assertEquals(manual, composed);
+    assertEquals(64, composed.length());
+    assertTrue(composed.matches("[0-9a-f]{64}"));
+  }
 }

@@ -5952,6 +5952,38 @@ pub unsafe extern "C" fn aster_canonical_bytes(
     }
 }
 
+/// BLAKE3 hash of arbitrary bytes → 64-char lowercase hex.
+///
+/// General-purpose primitive for bindings that need to hash canonical output from
+/// [`aster_canonical_bytes`] (e.g. per-TypeDef hashing when assembling a
+/// [`ServiceContract`](aster_transport_core::contract::ServiceContract) for
+/// [`aster_contract_id`]). Mirrors what PyO3 already exposes to Python as
+/// `_native.contract.compute_type_hash`.
+///
+/// Writes 64 bytes of hex to `out_buf`. On `BUFFER_TOO_SMALL`, sets `*out_len` to
+/// the required size (64). `bytes_len == 0` is valid and hashes the empty input.
+#[no_mangle]
+pub unsafe extern "C" fn aster_blake3_hex(
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    if bytes_ptr.is_null() && bytes_len != 0 {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let input = if bytes_len == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(bytes_ptr, bytes_len)
+    };
+    let hex = hex::encode(aster_transport_core::contract::compute_type_hash(input));
+    write_to_caller_buf(hex.as_bytes(), out_buf, out_len) as i32
+}
+
 /// Compute canonical signing bytes from credential JSON.
 ///
 /// The JSON must contain a `"kind"` field (`"producer"` or `"consumer"`)
