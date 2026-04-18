@@ -9,4 +9,13 @@ import java.lang.annotation.Target;
 @Target(ElementType.METHOD)
 public @interface ClientStream {
   String name() default "";
+
+  /** See {@link Rpc#description()}. */
+  String description() default "";
+
+  /** See {@link Rpc#tags()}. */
+  String[] tags() default {};
+
+  /** See {@link Rpc#deprecated()}. */
+  boolean deprecated() default false;
 }

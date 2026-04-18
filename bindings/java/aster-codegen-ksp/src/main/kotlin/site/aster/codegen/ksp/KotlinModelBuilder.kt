@@ -12,9 +12,11 @@ import com.palantir.javapoet.ClassName
 import com.palantir.javapoet.TypeName
 import site.aster.annotations.BidiStream
 import site.aster.annotations.ClientStream
+import site.aster.annotations.Description
 import site.aster.annotations.Rpc
 import site.aster.annotations.ServerStream
 import site.aster.annotations.Service
+import site.aster.codegen.core.model.FieldModel
 import site.aster.codegen.core.model.MethodModel
 import site.aster.codegen.core.model.ParamModel
 import site.aster.codegen.core.model.RequestStyle
@@ -55,7 +57,18 @@ internal class KotlinModelBuilder(private val logger: KSPLogger) {
       .mapNotNull { classifyFunction(it) }
       .toList()
 
-    return ServiceModel(serviceAnn.name, serviceAnn.version, serviceAnn.scoped, implClass, methods)
+    val description = serviceAnn.description.ifEmpty { firstParagraph(svc.docString) }
+    val tags = serviceAnn.tags.toList()
+
+    return ServiceModel(
+      serviceAnn.name,
+      serviceAnn.version,
+      serviceAnn.scoped,
+      implClass,
+      methods,
+      description,
+      tags,
+    )
   }
 
   private fun classifyFunction(fn: KSFunctionDeclaration): MethodModel? {
@@ -88,7 +101,10 @@ internal class KotlinModelBuilder(private val logger: KSPLogger) {
         )
         return null
       }
-      nonCtxParams.add(ParamModel(p.name?.asString() ?: "arg", tn))
+      val paramAnn = p.getAnnotationsByType(Description::class).firstOrNull()
+      val paramDesc = paramAnn?.value.orEmpty()
+      val paramTags = paramAnn?.tags?.toList().orEmpty()
+      nonCtxParams.add(ParamModel(p.name?.asString() ?: "arg", tn, paramDesc, paramTags))
     }
 
     val style: RequestStyle
@@ -106,6 +122,16 @@ internal class KotlinModelBuilder(private val logger: KSPLogger) {
 
     val responseType = fn.returnType?.resolve()?.let { ksTypeToTypeName(it) }
 
+    val meta = readMethodMeta(fn)
+    val description = meta.description.ifEmpty { firstParagraph(fn.docString) }
+    val fieldMeta: Map<String, FieldModel> = if (style == RequestStyle.INLINE) {
+      inlineParams
+        .filter { it.description().isNotEmpty() || it.tags().isNotEmpty() }
+        .associate { it.name() to FieldModel(it.name(), it.description(), it.tags()) }
+    } else {
+      emptyMap()
+    }
+
     return MethodModel(
       fn.simpleName.asString(),
       wireName,
@@ -117,7 +143,49 @@ internal class KotlinModelBuilder(private val logger: KSPLogger) {
       hasContextParam,
       /* idempotent */ false,
       isSuspend,
+      description,
+      meta.tags,
+      meta.deprecated,
+      fieldMeta,
     )
+  }
+
+  private data class MethodMeta(
+    val description: String,
+    val tags: List<String>,
+    val deprecated: Boolean,
+  )
+
+  private fun readMethodMeta(fn: KSFunctionDeclaration): MethodMeta {
+    fn.getAnnotationsByType(Rpc::class).firstOrNull()?.let {
+      return MethodMeta(it.description, it.tags.toList(), it.deprecated)
+    }
+    fn.getAnnotationsByType(ServerStream::class).firstOrNull()?.let {
+      return MethodMeta(it.description, it.tags.toList(), it.deprecated)
+    }
+    fn.getAnnotationsByType(ClientStream::class).firstOrNull()?.let {
+      return MethodMeta(it.description, it.tags.toList(), it.deprecated)
+    }
+    fn.getAnnotationsByType(BidiStream::class).firstOrNull()?.let {
+      return MethodMeta(it.description, it.tags.toList(), it.deprecated)
+    }
+    return MethodMeta("", emptyList(), false)
+  }
+
+  private fun firstParagraph(doc: String?): String {
+    if (doc.isNullOrBlank()) return ""
+    val sb = StringBuilder()
+    for (raw in doc.split("\n")) {
+      val line = raw.trim()
+      if (line.startsWith("@")) break
+      if (line.isEmpty()) {
+        if (sb.isNotEmpty()) break
+        continue
+      }
+      if (sb.isNotEmpty()) sb.append(' ')
+      sb.append(line)
+    }
+    return sb.toString()
   }
 
   private fun streamingKindFor(fn: KSFunctionDeclaration): StreamingKind? {
