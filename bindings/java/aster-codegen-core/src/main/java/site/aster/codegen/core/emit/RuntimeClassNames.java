@@ -34,5 +34,8 @@ public final class RuntimeClassNames {
   public static final ClassName SCOPE = ClassName.get(ANNOTATIONS_PKG, "Scope");
   public static final ClassName FORY = ClassName.get(FORY_PKG, "Fory");
 
+  public static final ClassName METHOD_METADATA = ClassName.get(SPI_PKG, "MethodMetadata");
+  public static final ClassName FIELD_METADATA = ClassName.get(SPI_PKG, "FieldMetadata");
+
   private RuntimeClassNames() {}
 }

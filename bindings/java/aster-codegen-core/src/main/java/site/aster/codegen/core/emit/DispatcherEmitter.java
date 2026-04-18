@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import javax.annotation.processing.Generated;
 import javax.lang.model.element.Modifier;
+import site.aster.codegen.core.model.FieldModel;
 import site.aster.codegen.core.model.MethodModel;
 import site.aster.codegen.core.model.ParamModel;
 import site.aster.codegen.core.model.RequestStyle;
@@ -68,6 +69,8 @@ public final class DispatcherEmitter {
             .addModifiers(Modifier.PRIVATE, Modifier.FINAL)
             .build());
 
+    buildMetadataFields(svc).forEach(type::addField);
+
     type.addMethod(buildConstructor(svc));
     type.addMethod(
         MethodSpec.methodBuilder("descriptor")
@@ -83,6 +86,7 @@ public final class DispatcherEmitter {
             .returns(methodsMapType)
             .addStatement("return METHODS")
             .build());
+    buildMetadataAccessors(svc).forEach(type::addMethod);
     type.addMethod(buildRegisterTypes(svc));
     type.addMethod(buildSafeRegisterHelper());
 
@@ -110,6 +114,140 @@ public final class DispatcherEmitter {
         .addModifiers(Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
         .initializer(init)
         .build();
+  }
+
+  private static List<FieldSpec> buildMetadataFields(ServiceModel svc) {
+    List<FieldSpec> out = new java.util.ArrayList<>();
+    out.add(
+        FieldSpec.builder(String.class, "DESCRIPTION")
+            .addModifiers(Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
+            .initializer("$S", svc.description())
+            .build());
+
+    ParameterizedTypeName tagsType =
+        ParameterizedTypeName.get(ClassName.get(List.class), ClassName.get(String.class));
+    out.add(
+        FieldSpec.builder(tagsType, "TAGS")
+            .addModifiers(Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
+            .initializer(buildStringListLiteral(svc.tags()))
+            .build());
+
+    ParameterizedTypeName metaMapType =
+        ParameterizedTypeName.get(
+            ClassName.get(Map.class),
+            ClassName.get(String.class),
+            RuntimeClassNames.METHOD_METADATA);
+    out.add(
+        FieldSpec.builder(metaMapType, "METHOD_METADATA")
+            .addModifiers(Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
+            .initializer(buildMethodMetadataMap(svc))
+            .build());
+    return out;
+  }
+
+  private static CodeBlock buildMethodMetadataMap(ServiceModel svc) {
+    CodeBlock.Builder b = CodeBlock.builder().add("$T.ofEntries(", Map.class);
+    boolean first = true;
+    for (MethodModel m : svc.methods()) {
+      if (isMethodMetadataEmpty(m)) {
+        continue;
+      }
+      if (!first) {
+        b.add(",\n      ");
+      } else {
+        b.add("\n      ");
+      }
+      first = false;
+      b.add(
+          "$T.entry($S, new $T($S, $L, $L, $L))",
+          Map.class,
+          m.wireName(),
+          RuntimeClassNames.METHOD_METADATA,
+          m.description(),
+          buildStringListLiteral(m.tags()),
+          m.deprecated(),
+          buildFieldMetadataMap(m));
+    }
+    b.add(")");
+    return b.build();
+  }
+
+  private static CodeBlock buildFieldMetadataMap(MethodModel m) {
+    if (m.fieldMetadata().isEmpty()) {
+      return CodeBlock.of("$T.of()", Map.class);
+    }
+    CodeBlock.Builder b = CodeBlock.builder().add("$T.ofEntries(", Map.class);
+    boolean first = true;
+    for (FieldModel fm : m.fieldMetadata().values()) {
+      if (!first) {
+        b.add(",\n        ");
+      } else {
+        b.add("\n        ");
+      }
+      first = false;
+      b.add(
+          "$T.entry($S, new $T($S, $L))",
+          Map.class,
+          fm.name(),
+          RuntimeClassNames.FIELD_METADATA,
+          fm.description(),
+          buildStringListLiteral(fm.tags()));
+    }
+    b.add(")");
+    return b.build();
+  }
+
+  private static boolean isMethodMetadataEmpty(MethodModel m) {
+    return m.description().isEmpty()
+        && m.tags().isEmpty()
+        && !m.deprecated()
+        && m.fieldMetadata().isEmpty();
+  }
+
+  private static CodeBlock buildStringListLiteral(List<String> items) {
+    if (items.isEmpty()) {
+      return CodeBlock.of("$T.of()", List.class);
+    }
+    CodeBlock.Builder b = CodeBlock.builder().add("$T.of(", List.class);
+    for (int i = 0; i < items.size(); i++) {
+      if (i > 0) {
+        b.add(", ");
+      }
+      b.add("$S", items.get(i));
+    }
+    b.add(")");
+    return b.build();
+  }
+
+  private static List<MethodSpec> buildMetadataAccessors(ServiceModel svc) {
+    ParameterizedTypeName tagsType =
+        ParameterizedTypeName.get(ClassName.get(List.class), ClassName.get(String.class));
+
+    MethodSpec description =
+        MethodSpec.methodBuilder("description")
+            .addAnnotation(Override.class)
+            .addModifiers(Modifier.PUBLIC)
+            .returns(String.class)
+            .addStatement("return DESCRIPTION")
+            .build();
+    MethodSpec tags =
+        MethodSpec.methodBuilder("tags")
+            .addAnnotation(Override.class)
+            .addModifiers(Modifier.PUBLIC)
+            .returns(tagsType)
+            .addStatement("return TAGS")
+            .build();
+    MethodSpec methodMeta =
+        MethodSpec.methodBuilder("methodMetadata")
+            .addAnnotation(Override.class)
+            .addModifiers(Modifier.PUBLIC)
+            .addParameter(String.class, "methodName")
+            .returns(RuntimeClassNames.METHOD_METADATA)
+            .addStatement(
+                "return METHOD_METADATA.getOrDefault(methodName, $T.EMPTY)",
+                RuntimeClassNames.METHOD_METADATA)
+            .build();
+    return List.of(description, tags, methodMeta);
   }
 
   private static MethodSpec buildConstructor(ServiceModel svc) {
