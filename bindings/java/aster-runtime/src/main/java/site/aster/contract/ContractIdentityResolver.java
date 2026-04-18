@@ -216,9 +216,11 @@ public final class ContractIdentityResolver {
     List<String> postOrder = new ArrayList<>();
     dfsPost(start, spanningTreeEdges, visited, postOrder);
 
-    List<String> reversed = new ArrayList<>(postOrder);
-    Collections.reverse(reversed);
-    return reversed;
+    // DFS post-order visits children before parents, i.e. leaves first — exactly the order we
+    // need for bottom-up hashing (a parent's REF to a child embeds the child's already-computed
+    // hash). Returning the reverse would put SCC roots first and produce zero-placeholder REFs
+    // for every forward edge in the root's TypeDef.
+    return postOrder;
   }
 
   private static void dfsPost(
@@ -391,9 +393,17 @@ public final class ContractIdentityResolver {
       if (hash != null) {
         return new ResolvedType(TypeKind.REF, "", hash, "");
       }
-      // Forward-ref into the same SCC that hasn't been hashed yet — placeholder zero hash.
-      // Matches Python's fallback in _resolve_field_type.
-      return new ResolvedType(TypeKind.REF, "", "00".repeat(32), "");
+      // With sccProcessingOrder visiting leaves first, every forward edge MUST already be in
+      // typeHashes. Hitting this branch means either the back-edge classifier missed something
+      // or the walker failed to discover this type — both are bugs, raise loudly.
+      throw new IllegalStateException(
+          "Could not resolve type_ref for "
+              + fqn
+              + " (Java class: "
+              + cls.getName()
+              + "). Type is reachable but was not hashed before the parent TypeDef. "
+              + "Known hashes: "
+              + new java.util.TreeSet<>(typeHashes.keySet()));
     }
     return new ResolvedType(TypeKind.ANY, "", "", "");
   }
