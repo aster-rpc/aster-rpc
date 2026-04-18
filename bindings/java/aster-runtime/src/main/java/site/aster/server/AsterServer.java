@@ -48,11 +48,6 @@ import site.aster.server.wire.StreamHeader;
  * StreamHeader} frames from the reactor's poll loop, resolves the right method dispatcher, runs the
  * interceptor chain, and dispatches by sealed {@link MethodDispatcher} subtype.
  *
- * <p>Unary dispatch is fully operational. Streaming methods are discovered and their method
- * descriptors are published but invocation currently returns an {@link StatusCode#UNIMPLEMENTED}
- * trailer — the Kotlin / Flow bridging needed for real streaming lands in commit G alongside the
- * MissionControl sample.
- *
  * <p>Manifest submission (via {@code RegistryAsync.publishAsync}) is not yet hooked; the manifest
  * is built at startup and exposed via {@link #manifest()} but not actually published. Hook dispatch
  * ({@code IROH_EVENT_HOOK_*} → user callbacks) is likewise deferred.
