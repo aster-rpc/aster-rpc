@@ -142,7 +142,68 @@ public final class DispatcherEmitter {
             .addModifiers(Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
             .initializer(buildMethodMetadataMap(svc))
             .build());
+
+    ParameterizedTypeName classMapType =
+        ParameterizedTypeName.get(
+            ClassName.get(Map.class),
+            ClassName.get(String.class),
+            ParameterizedTypeName.get(
+                ClassName.get(Class.class),
+                com.palantir.javapoet.WildcardTypeName.subtypeOf(Object.class)));
+    out.add(
+        FieldSpec.builder(classMapType, "REQUEST_CLASSES")
+            .addModifiers(Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
+            .initializer(buildRequestClassMap(svc))
+            .build());
+    out.add(
+        FieldSpec.builder(classMapType, "RESPONSE_CLASSES")
+            .addModifiers(Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
+            .initializer(buildResponseClassMap(svc))
+            .build());
     return out;
+  }
+
+  private static CodeBlock buildRequestClassMap(ServiceModel svc) {
+    CodeBlock.Builder b = CodeBlock.builder().add("$T.ofEntries(", Map.class);
+    boolean first = true;
+    for (MethodModel m : svc.methods()) {
+      TypeName t;
+      if (m.requestStyle() == RequestStyle.EXPLICIT && m.requestType() != null) {
+        t = m.requestType();
+      } else if (m.requestStyle() == RequestStyle.INLINE) {
+        t = NameConventions.inlineRequestClassName(svc, m);
+      } else {
+        continue;
+      }
+      if (!first) {
+        b.add(",\n      ");
+      } else {
+        b.add("\n      ");
+      }
+      first = false;
+      b.add("$T.entry($S, $T.class)", Map.class, m.wireName(), t);
+    }
+    b.add(")");
+    return b.build();
+  }
+
+  private static CodeBlock buildResponseClassMap(ServiceModel svc) {
+    CodeBlock.Builder b = CodeBlock.builder().add("$T.ofEntries(", Map.class);
+    boolean first = true;
+    for (MethodModel m : svc.methods()) {
+      if (m.responseType() == null) {
+        continue;
+      }
+      if (!first) {
+        b.add(",\n      ");
+      } else {
+        b.add("\n      ");
+      }
+      first = false;
+      b.add("$T.entry($S, $T.class)", Map.class, m.wireName(), m.responseType());
+    }
+    b.add(")");
+    return b.build();
   }
 
   private static CodeBlock buildMethodMetadataMap(ServiceModel svc) {
@@ -247,7 +308,29 @@ public final class DispatcherEmitter {
                 "return METHOD_METADATA.getOrDefault(methodName, $T.EMPTY)",
                 RuntimeClassNames.METHOD_METADATA)
             .build();
-    return List.of(description, tags, methodMeta);
+
+    ParameterizedTypeName classMapType =
+        ParameterizedTypeName.get(
+            ClassName.get(Map.class),
+            ClassName.get(String.class),
+            ParameterizedTypeName.get(
+                ClassName.get(Class.class),
+                com.palantir.javapoet.WildcardTypeName.subtypeOf(Object.class)));
+    MethodSpec requestClasses =
+        MethodSpec.methodBuilder("requestClasses")
+            .addAnnotation(Override.class)
+            .addModifiers(Modifier.PUBLIC)
+            .returns(classMapType)
+            .addStatement("return REQUEST_CLASSES")
+            .build();
+    MethodSpec responseClasses =
+        MethodSpec.methodBuilder("responseClasses")
+            .addAnnotation(Override.class)
+            .addModifiers(Modifier.PUBLIC)
+            .returns(classMapType)
+            .addStatement("return RESPONSE_CLASSES")
+            .build();
+    return List.of(description, tags, methodMeta, requestClasses, responseClasses);
   }
 
   private static MethodSpec buildConstructor(ServiceModel svc) {

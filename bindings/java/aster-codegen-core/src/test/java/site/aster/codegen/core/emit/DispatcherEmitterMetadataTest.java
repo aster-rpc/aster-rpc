@@ -87,11 +87,18 @@ final class DispatcherEmitterMetadataTest {
             "MissionControl", 1, Scope.SHARED, SERVICE, List.of(rich, empty), "", List.of());
     String src = DispatcherEmitter.emit(svc).toString();
 
-    assertTrue(src.contains("Map.entry(\"getStatus\""), src);
-    assertTrue(src.contains("\"Return current agent status.\""), src);
-    assertTrue(src.contains("List.of(\"readonly\")"), src);
-    // empty metadata for "ping" should not land in the map
-    assertFalse(src.contains("Map.entry(\"ping\""), src);
+    // Narrow the assertions to the METHOD_METADATA literal — the new REQUEST_CLASSES /
+    // RESPONSE_CLASSES maps also produce Map.entry(...) lines for every method.
+    int methodMetaStart = src.indexOf("METHOD_METADATA =");
+    int methodMetaEnd = src.indexOf("REQUEST_CLASSES =", methodMetaStart);
+    assertTrue(methodMetaStart >= 0, src);
+    assertTrue(methodMetaEnd > methodMetaStart, src);
+    String methodMetaLiteral = src.substring(methodMetaStart, methodMetaEnd);
+    assertTrue(methodMetaLiteral.contains("Map.entry(\"getStatus\""), methodMetaLiteral);
+    assertTrue(methodMetaLiteral.contains("\"Return current agent status.\""), methodMetaLiteral);
+    assertTrue(methodMetaLiteral.contains("List.of(\"readonly\")"), methodMetaLiteral);
+    // empty metadata for "ping" should not land in METHOD_METADATA (but WILL in RESPONSE_CLASSES).
+    assertFalse(methodMetaLiteral.contains("Map.entry(\"ping\""), methodMetaLiteral);
 
     assertTrue(src.contains("public MethodMetadata methodMetadata(String methodName)"), src);
     assertTrue(src.contains("METHOD_METADATA.getOrDefault(methodName, MethodMetadata.EMPTY)"), src);

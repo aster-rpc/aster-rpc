@@ -188,9 +188,13 @@ final class DispatcherEmitterTest {
             false);
     String src = DispatcherEmitter.emit(sharedService(a, b)).toString();
 
-    int respCount = src.split("StatusResponse\\.class", -1).length - 1;
+    // The emitter now references StatusResponse.class in several places (fory.register +
+    // REQUEST/RESPONSE_CLASSES maps); check the register-call specifically.
+    int registerCount = src.split("safeRegister\\(fory, StatusResponse\\.class", -1).length - 1;
     assertEquals(
-        1, respCount, "StatusResponse should only be registered once even when used by 2 methods");
+        1,
+        registerCount,
+        "StatusResponse should only be registered with Fory once even when used by 2 methods");
   }
 
   @Test
