@@ -127,10 +127,24 @@ public final class ContractManifestBuilder {
 
   private static String hashFor(Class<?> cls, ContractIdentityResolver.ResolvedTypes resolved) {
     if (cls == null) {
+      // Genuinely no type for this method slot (e.g. a server-stream method whose responses
+      // flow through ResponseStream so the dispatcher declares no Java return type). Matches
+      // Python's _resolve_type_hash(None).
       return "00".repeat(32);
     }
     String fqn = WireIdentity.of(cls).fqn();
-    return resolved.typeHashes().getOrDefault(fqn, "00".repeat(32));
+    String hash = resolved.typeHashes().get(fqn);
+    if (hash == null) {
+      throw new IllegalStateException(
+          "Could not resolve type hash for "
+              + fqn
+              + " (Java class: "
+              + cls.getName()
+              + "). The type must be reachable from the service's request / response / inline-"
+              + "param types so the type-graph walker sees it. Known wire FQNs: "
+              + new java.util.TreeSet<>(resolved.typeHashes().keySet()));
+    }
+    return hash;
   }
 
   // ── Method dict (v1 field schema + rich metadata) ─────────────────────────

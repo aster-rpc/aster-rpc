@@ -314,46 +314,55 @@ class ServiceContract:
 def _resolve_type_hash(tp: type | None, type_hashes: dict[str, bytes]) -> bytes:
     """Resolve a Python type to its 32-byte canonical hash.
 
-    Returns 32 zero bytes if the type is unknown (primitive types get
-    a placeholder hash).
-
     Args:
         tp: The Python type to resolve. May be a string (forward reference).
         type_hashes: Mapping of fully-qualified name to 32-byte hash.
 
     Returns:
         32-byte hash.
+
+    Raises:
+        LookupError: If the type is not a primitive and its canonical FQN is
+            not in ``type_hashes``. Previously this path returned 32 zero
+            bytes which silently degraded ``contract_id`` identity -- a type
+            schema mismatch would hash to the same value as a service that
+            never declared the type at all. We are well past stubs; missing
+            hashes are programmer errors.
     """
     if tp is None:
         return b"\x00" * 32
 
-    # Handle string forward references (unresolved type annotations)
+    # Handle string forward references (unresolved type annotations). Match by short name
+    # against the wire-tag FQN keys.
     if isinstance(tp, str):
-        # Check type_hashes by short name
         for fqn, h in type_hashes.items():
             if fqn.endswith(f".{tp}") or fqn == tp:
                 return h
-        return b"\x00" * 32
+        raise LookupError(
+            f"Could not resolve type hash for forward reference {tp!r}. "
+            f"Known wire FQNs: {sorted(type_hashes.keys())!r}"
+        )
 
-    # Primitives get a well-known placeholder
+    # Primitives get a well-known placeholder (hash of the primitive name).
     _PRIMITIVE_TYPES = {int, float, str, bool, bytes}
     if tp in _PRIMITIVE_TYPES:
-        # Hash of the primitive name string as a stand-in
         name = {int: "int64", float: "float64", str: "string",
                 bool: "bool", bytes: "binary"}[tp]
         return compute_type_hash(name.encode("utf-8"))
 
-    # Look up by fully-qualified name
-    fqn = f"{tp.__module__}.{tp.__qualname__}"
+    # Use the wire-tag FQN (language-neutral) -- matches Java / TS / ... so @wire_type-decorated
+    # types look up correctly. Previously used `tp.__module__ + tp.__qualname__` which disagreed
+    # with type_hashes (keyed by _get_fqn) whenever @wire_type was applied.
+    fqn = _get_fqn(tp)
     if fqn in type_hashes:
         return type_hashes[fqn]
 
-    # Try just the qualified name
-    if tp.__qualname__ in type_hashes:
-        return type_hashes[tp.__qualname__]
-
-    # Unknown type: return zeros
-    return b"\x00" * 32
+    raise LookupError(
+        f"Could not resolve type hash for {fqn!r} "
+        f"(Python class: {tp.__module__}.{tp.__qualname__}). "
+        f"The type must be reachable from the service's @rpc method signatures so the "
+        f"type-graph walker sees it. Known wire FQNs: {sorted(type_hashes.keys())!r}"
+    )
 
 
 # ── Canonical serialization (delegated to Rust core) ─────────────────────────
@@ -728,8 +737,21 @@ def _resolve_field_type(
             return TypeKind.SELF_REF, "", b"", fqn
         if fqn in type_hashes:
             return TypeKind.REF, "", type_hashes[fqn], ""
-        # Unknown (forward ref or missing hash)
-        return TypeKind.REF, "", b"\x00" * 32, ""
+        # TODO(cycles): Forward ref within the same multi-node SCC -- hit when
+        # `_scc_processing_order` visits the root before its children (reversed
+        # post-order). The zero placeholder here produces a known-wrong hash for
+        # the root of the SCC and is load-bearing for the B.3 golden vector today.
+        # Tightening this to raise requires auditing the SCC traversal order
+        # against the Java port; tracked as a follow-up to the contract_id parity
+        # work.
+        if scc_members is not None and fqn in scc_members:
+            return TypeKind.REF, "", b"\x00" * 32, ""
+        raise LookupError(
+            f"Could not resolve type_ref for field: type {fqn!r} "
+            f"(Python class: {tp.__module__}.{tp.__qualname__}) is reachable "
+            f"from this field but was not hashed before this TypeDef. "
+            f"Known hashes: {sorted(type_hashes.keys())!r}"
+        )
 
     # Any other type: treat as ANY
     return TypeKind.ANY, "", b"", ""

@@ -574,18 +574,20 @@ def test_manifest_roundtrip(tmp_path):
 
 def test_service_to_contract():
     """ServiceInfo → ServiceContract (from @service decorated class)."""
+    from typing import get_type_hints
+
     from aster.codec import wire_type
     from aster.decorators import rpc, service
 
     @wire_type("test.contract/PingRequest")
     @dataclass
     class PingRequest:
-        message: str
+        message: str = ""
 
     @wire_type("test.contract/PingResponse")
     @dataclass
     class PingResponse:
-        reply: str
+        reply: str = ""
 
     @service(name="PingService2", version=1)
     class PingServiceClass:
@@ -595,7 +597,16 @@ def test_service_to_contract():
 
     service_info = PingServiceClass.__aster_service_info__
 
-    # Build type graph
+    # With `from __future__ import annotations`, service_info.methods[*].request_type is the
+    # string "PingRequest"; resolve it to the real class so the type-graph walker sees a type,
+    # not a forward reference. This mirrors what runtime dispatch does at call time.
+    local_ns = {"PingRequest": PingRequest, "PingResponse": PingResponse}
+    for mi in service_info.methods.values():
+        if isinstance(mi.request_type, str):
+            mi.request_type = local_ns[mi.request_type]
+        if isinstance(mi.response_type, str):
+            mi.response_type = local_ns[mi.response_type]
+
     root_types = []
     for mi in service_info.methods.values():
         if mi.request_type:
@@ -606,7 +617,6 @@ def test_service_to_contract():
     type_graph = build_type_graph(root_types)
     type_defs = resolve_with_cycles(type_graph)
 
-    # Compute type hashes
     type_hashes: dict[str, bytes] = {}
     for fqn, td in type_defs.items():
         type_hashes[fqn] = compute_type_hash(canonical_xlang_bytes(td))
@@ -619,7 +629,12 @@ def test_service_to_contract():
     assert contract.methods[0].name == "ping"
     assert contract.scoped == ScopeKind.SHARED
 
-    # Should be serializable
+    # Request and response hashes now flow through (previously this silently returned zeros
+    # when @wire_type was applied because _resolve_type_hash used module.__qualname__ instead
+    # of the wire-tag FQN).
+    assert contract.methods[0].request_type != b"\x00" * 32
+    assert contract.methods[0].response_type != b"\x00" * 32
+
     data = canonical_xlang_bytes(contract)
     assert len(data) > 0
 
