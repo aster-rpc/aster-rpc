@@ -737,15 +737,10 @@ def _resolve_field_type(
             return TypeKind.SELF_REF, "", b"", fqn
         if fqn in type_hashes:
             return TypeKind.REF, "", type_hashes[fqn], ""
-        # TODO(cycles): Forward ref within the same multi-node SCC -- hit when
-        # `_scc_processing_order` visits the root before its children (reversed
-        # post-order). The zero placeholder here produces a known-wrong hash for
-        # the root of the SCC and is load-bearing for the B.3 golden vector today.
-        # Tightening this to raise requires auditing the SCC traversal order
-        # against the Java port; tracked as a follow-up to the contract_id parity
-        # work.
-        if scc_members is not None and fqn in scc_members:
-            return TypeKind.REF, "", b"\x00" * 32, ""
+        # With `_scc_processing_order` visiting leaves first (post-order, NOT reversed), every
+        # forward edge in a MESSAGE TypeDef must already be in `type_hashes`. If we hit this
+        # branch, either (a) a non-back edge wasn't classified by `_spanning_tree_dfs`, or
+        # (b) the walker missed the type entirely. Both are correctness bugs -- raise loudly.
         raise LookupError(
             f"Could not resolve type_ref for field: type {fqn!r} "
             f"(Python class: {tp.__module__}.{tp.__qualname__}) is reachable "
@@ -1122,5 +1117,9 @@ def _scc_processing_order(
 
     dfs_post(start)
 
-    # Reverse post-order = processing order (leaves first)
-    return list(reversed(post_order))
+    # DFS post-order visits children before parents, i.e. leaves first -- exactly the order we
+    # need for bottom-up hashing (a parent's REF to a child can embed the child's hash because
+    # the child was hashed in an earlier iteration). Previously this returned the REVERSED
+    # post-order (roots first), which caused every non-leaf in a multi-node SCC to emit
+    # zero-placeholder REFs for its forward edges into the same SCC.
+    return post_order
