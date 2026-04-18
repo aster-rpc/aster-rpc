@@ -16,6 +16,7 @@ import site.aster.annotations.Description
 import site.aster.annotations.Rpc
 import site.aster.annotations.ServerStream
 import site.aster.annotations.Service
+import site.aster.annotations.WireType
 import site.aster.codegen.core.model.FieldModel
 import site.aster.codegen.core.model.MethodModel
 import site.aster.codegen.core.model.ParamModel
@@ -52,9 +53,10 @@ internal class KotlinModelBuilder(private val logger: KSPLogger) {
     val pkg = svc.packageName.asString()
     val implClass = ClassName.get(pkg, svc.simpleName.asString())
 
+    val wireTypeTags = linkedMapOf<String, String>()
     val methods = svc.declarations
       .filterIsInstance<KSFunctionDeclaration>()
-      .mapNotNull { classifyFunction(it) }
+      .mapNotNull { classifyFunction(it, wireTypeTags) }
       .toList()
 
     val description = serviceAnn.description.ifEmpty { firstParagraph(svc.docString) }
@@ -68,10 +70,14 @@ internal class KotlinModelBuilder(private val logger: KSPLogger) {
       methods,
       description,
       tags,
+      wireTypeTags,
     )
   }
 
-  private fun classifyFunction(fn: KSFunctionDeclaration): MethodModel? {
+  private fun classifyFunction(
+    fn: KSFunctionDeclaration,
+    wireTypeTags: MutableMap<String, String>,
+  ): MethodModel? {
     val streaming = streamingKindFor(fn) ?: return null
     if (Modifier.PRIVATE in fn.modifiers || Modifier.PROTECTED in fn.modifiers) {
       logger.error("RPC functions must be public: ${fn.simpleName.asString()}", fn)
@@ -101,6 +107,7 @@ internal class KotlinModelBuilder(private val logger: KSPLogger) {
         )
         return null
       }
+      recordWireTag(paramType, tn, wireTypeTags)
       val paramAnn = p.getAnnotationsByType(Description::class).firstOrNull()
       val paramDesc = paramAnn?.value.orEmpty()
       val paramTags = paramAnn?.tags?.toList().orEmpty()
@@ -120,7 +127,11 @@ internal class KotlinModelBuilder(private val logger: KSPLogger) {
       inlineParams = nonCtxParams
     }
 
-    val responseType = fn.returnType?.resolve()?.let { ksTypeToTypeName(it) }
+    val resolvedReturn = fn.returnType?.resolve()
+    val responseType = resolvedReturn?.let { ksTypeToTypeName(it) }
+    if (resolvedReturn != null && responseType != null) {
+      recordWireTag(resolvedReturn, responseType, wireTypeTags)
+    }
 
     val meta = readMethodMeta(fn)
     val description = meta.description.ifEmpty { firstParagraph(fn.docString) }
@@ -210,6 +221,14 @@ internal class KotlinModelBuilder(private val logger: KSPLogger) {
 
   private fun isCallContext(t: KSType): Boolean =
     t.declaration.qualifiedName?.asString() == "site.aster.interceptors.CallContext"
+
+  private fun recordWireTag(t: KSType, tn: TypeName, out: MutableMap<String, String>) {
+    val decl = t.declaration as? KSClassDeclaration ?: return
+    val ann = decl.getAnnotationsByType(WireType::class).firstOrNull() ?: return
+    if (ann.value.isNotEmpty()) {
+      out[tn.toString()] = ann.value
+    }
+  }
 
   private fun looksLikeWireType(tn: TypeName): Boolean {
     if (tn !is ClassName) return false
