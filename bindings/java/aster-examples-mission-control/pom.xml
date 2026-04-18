@@ -18,9 +18,8 @@
     <description>
         Java port of the Python Mission Control sample (examples/python/mission_control).
         Demonstrates a fleet-wide MissionControl service (shared scope) plus a per-agent
-        AgentSession service (session scope), exposed over Aster RPC. Currently implements
-        unary and server-streaming methods only — client-streaming (ingestMetrics) and
-        bidi-streaming (runCommand) await reactor read-side multi-frame support.
+        AgentSession service (session scope), exposed over Aster RPC. Mirrors all four
+        Python RPC patterns: unary, server-stream, client-stream, and bidi-stream.
     </description>
 
     <dependencies>

@@ -25,9 +25,6 @@ import site.aster.server.spi.UnaryDispatcher;
 /**
  * Hand-written {@link ServiceDispatcher} for {@link AgentSession}. SESSION-scoped — the runtime
  * allocates one instance per (peerId, streamId) pair via the user-supplied factory.
- *
- * <p>Implements {@code register} and {@code heartbeat}; the bidi-streaming {@code runCommand}
- * method from the Python sample is omitted until reactor read-side multi-frame support lands.
  */
 public final class AgentSessionDispatcher implements ServiceDispatcher {
 

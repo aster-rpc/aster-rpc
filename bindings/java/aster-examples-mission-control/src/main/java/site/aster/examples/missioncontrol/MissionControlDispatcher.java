@@ -34,8 +34,7 @@ import site.aster.server.spi.UnaryDispatcher;
  *
  * <p>Wire identity matches {@code examples/python/mission_control/services.py}: service name {@code
  * MissionControl}, version {@code 1}, methods {@code getStatus} / {@code submitLog} / {@code
- * tailLogs}. The {@code ingestMetrics} client-streaming method from the Python sample is omitted —
- * callers attempting it will get an {@code unknown method} UNIMPLEMENTED trailer.
+ * tailLogs} / {@code ingestMetrics}.
  */
 public final class MissionControlDispatcher implements ServiceDispatcher {
 

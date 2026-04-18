@@ -19,16 +19,14 @@ import site.aster.server.spi.ResponseStream;
  * Fleet-wide mission-control service. SHARED scope — one instance, all peers see the same state.
  * Mirrors the Python {@code MissionControl} class in {@code examples/python/mission_control}.
  *
- * <p>Implements three of the five Python methods:
+ * <p>Implements all four Python methods:
  *
  * <ul>
  *   <li>{@code getStatus} — unary
  *   <li>{@code submitLog} — unary
  *   <li>{@code tailLogs} — server-streaming
+ *   <li>{@code ingestMetrics} — client-streaming
  * </ul>
- *
- * <p>The {@code ingestMetrics} client-streaming method is omitted until reactor read-side
- * multi-frame support lands.
  */
 public final class MissionControl {
 

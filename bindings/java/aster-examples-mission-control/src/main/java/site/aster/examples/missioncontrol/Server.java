@@ -20,9 +20,8 @@ import site.aster.server.AsterServer;
  * session-scoped {@link AgentSession} services, prints the node address, and parks until
  * interrupted (Ctrl-C).
  *
- * <p>Java port of {@code examples/python/mission_control/server.py}. Implements unary +
- * server-streaming methods only; client-streaming and bidi-streaming methods from the Python sample
- * are not yet wired (reactor read-side multi-frame support is open work).
+ * <p>Java port of {@code examples/python/mission_control/server.py}. Mirrors all four Python RPC
+ * patterns: unary, server-stream, client-stream, and bidi-stream.
  *
  * <p>Usage: {@code mvn -P fast -pl aster-examples-mission-control exec:java
  * -Dexec.mainClass=site.aster.examples.missioncontrol.Server}
