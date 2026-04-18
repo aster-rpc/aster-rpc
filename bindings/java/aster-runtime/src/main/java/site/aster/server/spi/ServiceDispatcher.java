@@ -54,4 +54,24 @@ public interface ServiceDispatcher {
   default MethodMetadata methodMetadata(String methodName) {
     return MethodMetadata.EMPTY;
   }
+
+  /**
+   * Per-method request type class, keyed by wire method name. For Mode 2 inline methods this is the
+   * synthesized {@code {Method}Request} record that the emitter generated. Consumed by the contract
+   * manifest builder when walking the type graph and building field schemas.
+   *
+   * <p>Default returns an empty map so hand-written dispatchers remain binary-compatible; the
+   * generated dispatcher emitter overrides with the class literals it already has.
+   */
+  default Map<String, Class<?>> requestClasses() {
+    return Map.of();
+  }
+
+  /**
+   * Per-method response type class, keyed by wire method name. Methods that return {@code void}
+   * (server-stream handlers delivering via {@link ResponseStream}) should omit the entry.
+   */
+  default Map<String, Class<?>> responseClasses() {
+    return Map.of();
+  }
 }

@@ -4,7 +4,6 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import java.util.List;
 
 /**
@@ -60,10 +59,6 @@ public record ServiceContract(
 
   /** Serialize this contract to JSON using the canonical shape Rust's serde expects. */
   public String toJson() {
-    try {
-      return ContractJson.mapper().writeValueAsString(this);
-    } catch (JsonProcessingException e) {
-      throw new IllegalStateException("serialize ServiceContract failed", e);
-    }
+    return ContractJson.toJson(this);
   }
 }

@@ -19,7 +19,12 @@ public final class ContractJson {
 
   private ContractJson() {}
 
-  public static ObjectMapper mapper() {
+  /**
+   * Access the shared mapper. Package-private to keep the ObjectMapper from being exposed on the
+   * module's public surface (spotbugs EI_EXPOSE_REP) — serialization callers should use {@link
+   * #toJson} / {@link #fromJson} instead.
+   */
+  static ObjectMapper mapper() {
     return MAPPER;
   }
 

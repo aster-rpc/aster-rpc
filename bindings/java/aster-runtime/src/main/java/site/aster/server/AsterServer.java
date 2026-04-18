@@ -165,6 +165,31 @@ public final class AsterServer implements AutoCloseable {
     return manifest;
   }
 
+  /**
+   * Build and return the canonical {@link site.aster.contract.ContractManifest} JSON for one
+   * registered service. Walks the service's type graph, computes each TypeDef's BLAKE3 hash via the
+   * Rust FFI, derives {@code contract_id} via the Rust canonicalizer, and assembles the full
+   * manifest (methods, field schemas, metadata).
+   *
+   * <p>Returns {@code null} if no service with {@code serviceName} is registered on this server.
+   */
+  public String manifestJson(String serviceName) {
+    RegisteredService rs = services.get(serviceName);
+    if (rs == null) {
+      return null;
+    }
+    return site.aster.contract.ContractManifestBuilder.build(rs.dispatcher()).toJson();
+  }
+
+  /** Compute only the {@code contract_id} for a registered service; {@code null} if unknown. */
+  public String contractId(String serviceName) {
+    RegisteredService rs = services.get(serviceName);
+    if (rs == null) {
+      return null;
+    }
+    return site.aster.contract.ContractManifestBuilder.computeContractId(rs.dispatcher());
+  }
+
   @Override
   public void close() {
     if (!running.compareAndSet(true, false)) {
