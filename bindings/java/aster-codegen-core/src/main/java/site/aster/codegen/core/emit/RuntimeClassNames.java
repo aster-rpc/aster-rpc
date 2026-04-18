@@ -30,6 +30,7 @@ public final class RuntimeClassNames {
   public static final ClassName REQUEST_STREAM = ClassName.get(SPI_PKG, "RequestStream");
 
   public static final ClassName CODEC = ClassName.get(CODEC_PKG, "Codec");
+  public static final ClassName FORY_TAGS = ClassName.get(CODEC_PKG, "ForyTags");
   public static final ClassName CALL_CONTEXT = ClassName.get(INTERCEPTORS_PKG, "CallContext");
   public static final ClassName SCOPE = ClassName.get(ANNOTATIONS_PKG, "Scope");
   public static final ClassName FORY = ClassName.get(FORY_PKG, "Fory");

@@ -54,15 +54,15 @@ public final class AsterClient implements AutoCloseable {
   private static ForyCodec registerFrameworkWireTypes(Codec userCodec) {
     ForyCodec header = userCodec instanceof ForyCodec fc ? fc : new ForyCodec();
     try {
-      header.fory().register(StreamHeader.class, "_aster/StreamHeader");
+      site.aster.codec.ForyTags.register(header.fory(), StreamHeader.class, "_aster/StreamHeader");
     } catch (Throwable ignored) {
     }
     try {
-      header.fory().register(CallHeader.class, "_aster/CallHeader");
+      site.aster.codec.ForyTags.register(header.fory(), CallHeader.class, "_aster/CallHeader");
     } catch (Throwable ignored) {
     }
     try {
-      header.fory().register(RpcStatus.class, "_aster/RpcStatus");
+      site.aster.codec.ForyTags.register(header.fory(), RpcStatus.class, "_aster/RpcStatus");
     } catch (Throwable ignored) {
     }
     return header;

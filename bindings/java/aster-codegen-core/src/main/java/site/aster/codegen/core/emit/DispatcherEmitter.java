@@ -403,11 +403,7 @@ public final class DispatcherEmitter {
         .addParameter(String.class, "tag")
         .returns(void.class)
         .beginControlFlow("try")
-        .beginControlFlow("if (tag == null || tag.isEmpty())")
-        .addStatement("fory.register(cls)")
-        .nextControlFlow("else")
-        .addStatement("fory.register(cls, tag)")
-        .endControlFlow()
+        .addStatement("$T.register(fory, cls, tag)", RuntimeClassNames.FORY_TAGS)
         .nextControlFlow("catch ($T ignored)", Throwable.class)
         .endControlFlow()
         .build();

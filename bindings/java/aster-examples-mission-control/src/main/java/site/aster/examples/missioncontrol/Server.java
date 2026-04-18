@@ -71,17 +71,18 @@ public final class Server {
    * responsibility.
    */
   public static void registerWireTypes(ForyCodec codec) {
-    codec.fory().register(StatusRequest.class, StatusRequest.FORY_TAG);
-    codec.fory().register(StatusResponse.class, StatusResponse.FORY_TAG);
-    codec.fory().register(LogEntry.class, LogEntry.FORY_TAG);
-    codec.fory().register(SubmitLogResult.class, SubmitLogResult.FORY_TAG);
-    codec.fory().register(TailRequest.class, TailRequest.FORY_TAG);
-    codec.fory().register(Heartbeat.class, Heartbeat.FORY_TAG);
-    codec.fory().register(Assignment.class, Assignment.FORY_TAG);
-    codec.fory().register(MetricPoint.class, MetricPoint.FORY_TAG);
-    codec.fory().register(IngestResult.class, IngestResult.FORY_TAG);
-    codec.fory().register(Command.class, Command.FORY_TAG);
-    codec.fory().register(CommandResult.class, CommandResult.FORY_TAG);
+    var fory = codec.fory();
+    site.aster.codec.ForyTags.register(fory, StatusRequest.class, StatusRequest.FORY_TAG);
+    site.aster.codec.ForyTags.register(fory, StatusResponse.class, StatusResponse.FORY_TAG);
+    site.aster.codec.ForyTags.register(fory, LogEntry.class, LogEntry.FORY_TAG);
+    site.aster.codec.ForyTags.register(fory, SubmitLogResult.class, SubmitLogResult.FORY_TAG);
+    site.aster.codec.ForyTags.register(fory, TailRequest.class, TailRequest.FORY_TAG);
+    site.aster.codec.ForyTags.register(fory, Heartbeat.class, Heartbeat.FORY_TAG);
+    site.aster.codec.ForyTags.register(fory, Assignment.class, Assignment.FORY_TAG);
+    site.aster.codec.ForyTags.register(fory, MetricPoint.class, MetricPoint.FORY_TAG);
+    site.aster.codec.ForyTags.register(fory, IngestResult.class, IngestResult.FORY_TAG);
+    site.aster.codec.ForyTags.register(fory, Command.class, Command.FORY_TAG);
+    site.aster.codec.ForyTags.register(fory, CommandResult.class, CommandResult.FORY_TAG);
   }
 
   private Server() {}

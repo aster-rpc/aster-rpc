@@ -71,7 +71,10 @@ class RpcStatus:
     the RPC to the peer.
     """
 
-    code: int = 0
+    # Explicit int32 (not bare int / int64) so the Fory schema hash matches the
+    # other bindings, where status codes are a 32-bit integer by convention --
+    # same rationale as the int32/int16/int8 annotations on StreamHeader above.
+    code: pyfory.int32 = 0
     message: str = ""
     detailKeys: list[str] = field(default_factory=list)
     detailValues: list[str] = field(default_factory=list)
