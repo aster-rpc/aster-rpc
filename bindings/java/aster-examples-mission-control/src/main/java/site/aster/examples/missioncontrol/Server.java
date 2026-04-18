@@ -44,7 +44,12 @@ public final class Server {
 
     System.out.println("Mission Control server started");
     System.out.println("  node id   : " + server.nodeId());
-    System.out.println("  node addr : " + server.node().nodeAddr());
+    site.aster.node.NodeAddr addr = server.node().nodeAddr();
+    System.out.println("  node addr : " + addr);
+    // Emit the aster1… ticket on its own line — matrix harness and cross-language clients
+    // consume this verbatim. printed LAST among address lines so that downstream `grep
+    // -oE 'aster1[A-Za-z0-9]*'` parses unambiguously.
+    System.out.println(addr.toTicket());
     System.out.println("  services  :");
     server.manifest().forEach(d -> System.out.println("    - " + d.name() + " v" + d.version()));
     System.out.println("Ctrl-C to stop.");

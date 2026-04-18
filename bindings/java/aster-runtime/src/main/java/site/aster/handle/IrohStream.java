@@ -32,6 +32,7 @@ public class IrohStream implements AutoCloseable {
   private final MethodHandle streamWrite;
   private final MethodHandle streamFinish;
   private final MethodHandle streamRead;
+  private final MethodHandle streamReadToEnd;
   private final MethodHandle streamStop;
   private final MethodHandle sendStreamFree;
   private final MethodHandle recvStreamFree;
@@ -105,6 +106,17 @@ public class IrohStream implements AutoCloseable {
                 ValueLayout.JAVA_LONG,
                 ValueLayout.JAVA_LONG,
                 ValueLayout.ADDRESS));
+
+    this.streamReadToEnd =
+        lib.getHandle(
+            "iroh_stream_read_to_end",
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_INT,
+                ValueLayout.JAVA_LONG, // runtime
+                ValueLayout.JAVA_LONG, // recv_stream
+                ValueLayout.JAVA_LONG, // max_size
+                ValueLayout.JAVA_LONG, // user_data
+                ValueLayout.ADDRESS)); // out_operation
 
     this.streamStop =
         lib.getHandle(
@@ -299,6 +311,52 @@ public class IrohStream implements AutoCloseable {
     // Track so FRAME_RECEIVED handler can complete this future with the frame bytes
     pendingReads.put(opId, readFuture);
     return readFuture;
+  }
+
+  /**
+   * Read all remaining bytes on this stream until the peer finishes it (mirrors Python's {@code
+   * recv.read_to_end(max_size)}). Used by the non-framed Aster protocols — e.g. {@code
+   * aster.consumer_admission} — that write a single JSON payload and call {@code finish()} on the
+   * send side. Returns the complete payload as one byte array. Fails if the peer writes more than
+   * {@code maxSize} bytes before finishing.
+   *
+   * <p>Unlike {@link #readAsync(long)} (which consumes {@code FRAME_RECEIVED} events fired as
+   * inbound notifications), {@code iroh_stream_read_to_end} emits exactly one {@code BYTES_RESULT}
+   * event on completion — the usual operation-future path via the runtime registry.
+   */
+  public CompletableFuture<byte[]> readToEndAsync(long maxSize) {
+    var lib = IrohLibrary.getInstance();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
+    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+
+    try {
+      int status =
+          (int) streamReadToEnd.invoke(runtime.nativeHandle(), recvHandle, maxSize, 0L, opSeg);
+      if (status != 0) {
+        throw new IrohException(
+            IrohStatus.fromCode(status), "iroh_stream_read_to_end failed: " + status);
+      }
+    } catch (Throwable t) {
+      throw new IrohException("iroh_stream_read_to_end threw: " + t.getMessage());
+    }
+
+    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+    return runtime
+        .registry()
+        .register(opId)
+        .thenApply(
+            event -> {
+              if (event.dataLen() <= 0) {
+                return new byte[0];
+              }
+              byte[] bytes =
+                  event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE);
+              if (event.hasBuffer()) {
+                runtime.releaseBuffer(event.buffer());
+              }
+              return bytes;
+            });
   }
 
   /**

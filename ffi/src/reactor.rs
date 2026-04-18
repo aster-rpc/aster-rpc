@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aster_transport_core::reactor::{
-    self, OutgoingFrame, ReactorEvent, ReactorHandle, RequestFrame,
+    self, OutgoingFrame, ReactorEvent, RequestFrame,
 };
 use aster_transport_core::ring;
 use tokio::sync::mpsc;
@@ -161,6 +161,12 @@ pub(crate) struct ReactorState {
     /// `aster_reactor_recv_frame` to `block_on` the per-call receiver from
     /// the binding's (non-runtime) poll thread.
     rt_handle: tokio::runtime::Handle,
+    /// Non-rpc aster-ALPN connections awaiting dispatch. Drained by
+    /// `aster_reactor_accept_non_rpc`. Tokio mutex because the binding polls
+    /// it through an async await inside a spawned task.
+    non_rpc_rx: tokio::sync::Mutex<
+        tokio::sync::mpsc::Receiver<(Vec<u8>, aster_transport_core::CoreConnection)>,
+    >,
 }
 
 // ============================================================================
@@ -175,13 +181,13 @@ pub(crate) static REACTORS: once_cell::sync::Lazy<HandleRegistry<ReactorState>> 
 // ============================================================================
 
 async fn pump_task(
-    mut handle: ReactorHandle,
+    mut event_rx: tokio::sync::mpsc::Receiver<ReactorEvent>,
     mut producer: ring::Producer<RingCall>,
     buffers: Arc<BufferRegistry>,
     stopped: Arc<AtomicBool>,
 ) {
     while !stopped.load(Ordering::Relaxed) {
-        let event = match handle.next_event().await {
+        let event = match event_rx.recv().await {
             Some(e) => e,
             None => break, // reactor shut down
         };
@@ -300,6 +306,11 @@ pub unsafe extern "C" fn aster_reactor_create(
     let rt_handle = bridge.runtime.handle().clone();
     let reactor_handle = reactor::start_reactor_on(&rt_handle, (*core_node).clone(), capacity);
 
+    // Split the handle: the pump task owns the RPC event stream; ReactorState
+    // keeps the non-rpc receiver so the binding can long-poll for admission /
+    // manifest connections via `aster_reactor_accept_non_rpc`.
+    let (event_rx, non_rpc_rx) = reactor_handle.into_parts();
+
     // Create the SPSC ring.
     let (producer, consumer) = ring::spsc::<RingCall>(capacity);
 
@@ -309,12 +320,7 @@ pub unsafe extern "C" fn aster_reactor_create(
     // Spawn the pump task.
     let pump_stopped = stopped.clone();
     let pump_buffers = buffers.clone();
-    rt_handle.spawn(pump_task(
-        reactor_handle,
-        producer,
-        pump_buffers,
-        pump_stopped,
-    ));
+    rt_handle.spawn(pump_task(event_rx, producer, pump_buffers, pump_stopped));
 
     let state = ReactorState {
         consumer: Mutex::new(consumer),
@@ -324,6 +330,7 @@ pub unsafe extern "C" fn aster_reactor_create(
         stopped,
         buffers,
         rt_handle: rt_handle.clone(),
+        non_rpc_rx: tokio::sync::Mutex::new(non_rpc_rx),
     };
 
     let handle_id = REACTORS.insert(state);
@@ -345,6 +352,72 @@ pub unsafe extern "C" fn aster_reactor_destroy(
         }
         None => iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
     }
+}
+
+/// Long-poll for the next non-rpc aster-ALPN connection accepted by the reactor.
+/// Fires `IROH_EVENT_ASTER_ACCEPTED` when a connection arrives, with the same
+/// payload shape as `iroh_node_accept_aster`: `event.handle` = connection handle,
+/// `event.data_ptr/len` = ALPN bytes, `event.buffer` = lease to release via
+/// `iroh_buffer_release`. Returns `IROH_STATUS_OK` on successful dispatch of the
+/// async wait; the caller awaits completion via the usual operation registry.
+///
+/// When the reactor is shut down (its non_rpc sender dropped) the async task
+/// emits an error event instead of blocking forever.
+#[no_mangle]
+pub unsafe extern "C" fn aster_reactor_accept_non_rpc(
+    runtime: iroh_runtime_t,
+    reactor: aster_reactor_t,
+    user_data: u64,
+    out_operation: *mut crate::iroh_operation_t,
+) -> i32 {
+    use crate::{iroh_event_kind_t, iroh_status_t, EventInternal};
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match crate::load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let state = match REACTORS.get(reactor) {
+        Some(s) => s,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    let state = state.clone();
+    bridge.runtime.spawn(async move {
+        if crate::check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        let mut rx = state.non_rpc_rx.lock().await;
+        match rx.recv().await {
+            Some((alpn, conn)) => {
+                let conn_handle = bridge2.connections.insert(conn);
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_ASTER_ACCEPTED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    conn_handle,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, alpn);
+            }
+            None => {
+                bridge2.emit_error(op_id, user_data, "reactor non_rpc channel closed");
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
 }
 
 /// Poll for incoming calls. Drains up to `max_calls` from the ring buffer

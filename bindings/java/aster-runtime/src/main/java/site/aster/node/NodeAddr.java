@@ -23,6 +23,7 @@ public record NodeAddr(
 
   private static final ObjectMapper TICKET_MAPPER = new ObjectMapper();
   private static final int TICKET_DECODE_BUF_SIZE = 8192;
+  private static final int TICKET_ENCODE_BUF_SIZE = 4096;
 
   /**
    * Parse an {@code aster1…} ticket string into its structured {@link NodeAddr}.
@@ -75,6 +76,117 @@ public record NodeAddr(
       }
       return new NodeAddr(endpointId, relayAddr, List.copyOf(directAddrs));
     }
+  }
+
+  /**
+   * Encode this address into an {@code aster1<base58>} ticket string (open credential, no access
+   * token). Delegates to the {@code aster_ticket_encode} Rust FFI — the same encoder Python and
+   * TypeScript use — so cross-language addresses round-trip byte-identically.
+   *
+   * <p>The Rust ticket format requires {@code SocketAddr} ({@code ip:port}) strings for the relay
+   * and direct addresses. If this {@link NodeAddr}'s {@code relayUrl} is a URL (e.g. {@code
+   * https://…}) it is OMITTED from the ticket; callers with a resolved relay should use {@link
+   * #toTicket(String, java.util.List)} instead.
+   */
+  public String toTicket() {
+    return toTicket(isIpPort(relayUrl) ? relayUrl : null, directAddresses);
+  }
+
+  /**
+   * Encode an {@code aster1<base58>} ticket with explicit relay and direct-address lists. Caller is
+   * responsible for providing {@code ip:port} form (no URLs). Pass {@code null} for {@code
+   * relayIpPort} to omit the relay entirely.
+   */
+  public String toTicket(String relayIpPort, List<String> directIpPorts) {
+    if (endpointId == null || endpointId.isEmpty()) {
+      throw new IllegalStateException("endpointId must be set to encode a ticket");
+    }
+    if (relayIpPort != null && !isIpPort(relayIpPort)) {
+      throw new IllegalArgumentException(
+          "relay must be in ip:port form for ticket encoding; got: " + relayIpPort);
+    }
+    List<String> directs = directIpPorts == null ? List.of() : directIpPorts;
+    for (String d : directs) {
+      if (!isIpPort(d)) {
+        throw new IllegalArgumentException(
+            "direct addresses must be in ip:port form for ticket encoding; got: " + d);
+      }
+    }
+
+    IrohLibrary lib = IrohLibrary.getInstance();
+    try (Arena arena = Arena.ofConfined()) {
+      byte[] hexBytes = endpointId.getBytes(StandardCharsets.UTF_8);
+      MemorySegment hexSeg = arena.allocate(hexBytes.length);
+      hexSeg.copyFrom(MemorySegment.ofArray(hexBytes));
+
+      MemorySegment relaySeg = MemorySegment.NULL;
+      long relayLen = 0L;
+      if (relayIpPort != null) {
+        byte[] relayBytes = relayIpPort.getBytes(StandardCharsets.UTF_8);
+        relaySeg = arena.allocate(relayBytes.length);
+        relaySeg.copyFrom(MemorySegment.ofArray(relayBytes));
+        relayLen = relayBytes.length;
+      }
+
+      MemorySegment directSeg = MemorySegment.NULL;
+      long directLen = 0L;
+      if (!directs.isEmpty()) {
+        StringBuilder json = new StringBuilder("[");
+        for (int i = 0; i < directs.size(); i++) {
+          if (i > 0) json.append(',');
+          json.append('"').append(directs.get(i)).append('"');
+        }
+        json.append(']');
+        byte[] directBytes = json.toString().getBytes(StandardCharsets.UTF_8);
+        directSeg = arena.allocate(directBytes.length);
+        directSeg.copyFrom(MemorySegment.ofArray(directBytes));
+        directLen = directBytes.length;
+      }
+
+      MemorySegment outBuf = arena.allocate(TICKET_ENCODE_BUF_SIZE);
+      MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
+      outLen.set(ValueLayout.JAVA_LONG, 0, TICKET_ENCODE_BUF_SIZE);
+
+      int status =
+          lib.asterTicketEncode(
+              hexSeg,
+              hexBytes.length,
+              relaySeg,
+              relayLen,
+              directSeg,
+              directLen,
+              MemorySegment.NULL,
+              0L,
+              MemorySegment.NULL,
+              0L,
+              outBuf,
+              outLen);
+      if (status != 0) {
+        throw new IllegalStateException("aster_ticket_encode failed with status " + status);
+      }
+      long written = outLen.get(ValueLayout.JAVA_LONG, 0);
+      byte[] ticketBytes = new byte[(int) written];
+      MemorySegment.copy(outBuf, ValueLayout.JAVA_BYTE, 0, ticketBytes, 0, (int) written);
+      return new String(ticketBytes, StandardCharsets.UTF_8);
+    }
+  }
+
+  private static boolean isIpPort(String s) {
+    if (s == null || s.isEmpty()) {
+      return false;
+    }
+    int colon = s.lastIndexOf(':');
+    if (colon <= 0 || colon == s.length() - 1) {
+      return false;
+    }
+    String port = s.substring(colon + 1);
+    for (int i = 0; i < port.length(); i++) {
+      if (!Character.isDigit(port.charAt(i))) {
+        return false;
+      }
+    }
+    String host = s.substring(0, colon);
+    return !host.contains("://") && !host.contains("/");
   }
 
   private static final MemoryLayout LAYOUT = IrohLibrary.IROH_NODE_ADDR;

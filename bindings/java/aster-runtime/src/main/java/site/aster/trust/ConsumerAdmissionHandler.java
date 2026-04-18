@@ -1,0 +1,102 @@
+package site.aster.trust;
+
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Supplier;
+import site.aster.handle.IrohConnection;
+import site.aster.handle.IrohStream;
+import site.aster.registry.ServiceSummary;
+
+/**
+ * Server-side handler for the {@code aster.consumer_admission} ALPN (Aster-SPEC §3.2).
+ *
+ * <p>Accepts a bi-directional stream on each connection routed to it, reads the {@code
+ * ConsumerAdmissionRequest} JSON to end, builds a {@code ConsumerAdmissionResponse}, writes it
+ * back, finishes the stream. In dev/open-gate mode every request is admitted without credential
+ * checks; auth-mode verification is future work (see tasks #14/#15).
+ *
+ * <p>The caller (typically {@link site.aster.server.AsterServer}) drives a reactor-based accept
+ * loop and invokes {@link #onConnection(IrohConnection)} for connections negotiating the admission
+ * ALPN.
+ */
+public final class ConsumerAdmissionHandler implements AutoCloseable {
+
+  public static final String ALPN_STRING = "aster.consumer_admission";
+  public static final byte[] ALPN = ALPN_STRING.getBytes(StandardCharsets.UTF_8);
+
+  private static final int MAX_REQUEST_BYTES = 64 * 1024;
+
+  private final Supplier<List<ServiceSummary>> servicesSupplier;
+  private final ExecutorService executor;
+  private volatile boolean closed;
+
+  public ConsumerAdmissionHandler(Supplier<List<ServiceSummary>> services) {
+    this.servicesSupplier = services;
+    this.executor = Executors.newVirtualThreadPerTaskExecutor();
+  }
+
+  /** Match a raw ALPN byte sequence against {@link #ALPN}. */
+  public static boolean matches(byte[] alpn) {
+    if (alpn == null || alpn.length != ALPN.length) {
+      return false;
+    }
+    for (int i = 0; i < ALPN.length; i++) {
+      if (alpn[i] != ALPN[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Handle one inbound admission connection. Runs the read/respond/finish exchange on the handler's
+   * virtual-thread executor; returns immediately.
+   */
+  public void onConnection(IrohConnection conn) {
+    if (closed) {
+      conn.close();
+      return;
+    }
+    executor.submit(() -> handle(conn));
+  }
+
+  private void handle(IrohConnection conn) {
+    try {
+      IrohStream stream = conn.acceptBiAsync().get();
+      try {
+        byte[] reqBytes = stream.readToEndAsync(MAX_REQUEST_BYTES).get();
+        // Parse purely for validation — open-gate ignores credential content but we still
+        // reject a syntactically broken request so misconfigured clients see an actionable
+        // denial instead of a silent admit.
+        try {
+          ConsumerAdmissionWire.Request.fromJson(reqBytes);
+        } catch (Exception parseErr) {
+          byte[] denied = ConsumerAdmissionWire.Response.denied().toJsonBytes();
+          stream.sendAsync(denied).get();
+          stream.finishAsync().get();
+          return;
+        }
+
+        ConsumerAdmissionWire.Response resp =
+            ConsumerAdmissionWire.Response.admitted(servicesSupplier.get());
+        stream.sendAsync(resp.toJsonBytes()).get();
+        stream.finishAsync().get();
+      } finally {
+        stream.close();
+      }
+    } catch (Exception e) {
+      // Per-connection failures must not take the server down. Log-once / metrics hook is
+      // future work; for now swallow so one malformed client cannot block others.
+    } finally {
+      conn.close();
+    }
+  }
+
+  @Override
+  public void close() {
+    closed = true;
+    executor.shutdownNow();
+  }
+}
