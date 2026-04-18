@@ -2050,6 +2050,33 @@ public final class IrohLibrary implements SymbolLookup {
     }
   }
 
+  /**
+   * Decode an {@code aster1…} ticket string into its structured parts. The output buffer receives a
+   * UTF-8 JSON object: {@code {endpoint_id, relay_addr, direct_addrs, credential_type,
+   * credential_data_hex}}. See the Rust {@code aster_transport_core::ticket::AsterTicket} for field
+   * semantics.
+   *
+   * <p>C signature: {@code int32_t aster_ticket_decode(const uint8_t *ticket_ptr, uintptr_t
+   * ticket_len, uint8_t *out_buf, uintptr_t *out_len);}
+   */
+  public int asterTicketDecode(
+      MemorySegment ticketPtr, long ticketLen, MemorySegment outBuf, MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_ticket_decode",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(ticketPtr, ticketLen, outBuf, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
   // --- Registry FFI (§11) ------------------------------------------------
 
   /** C signature: {@code int64_t aster_registry_now_epoch_ms(void);} */

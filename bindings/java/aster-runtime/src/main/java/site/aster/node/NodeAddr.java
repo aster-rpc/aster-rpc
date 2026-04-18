@@ -1,10 +1,14 @@
 package site.aster.node;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.lang.foreign.Arena;
 import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SegmentAllocator;
 import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import site.aster.ffi.IrohLibrary;
 
@@ -16,6 +20,62 @@ public record NodeAddr(
     String relayUrl,
     /** Direct addresses for direct IP connectivity. */
     List<String> directAddresses) {
+
+  private static final ObjectMapper TICKET_MAPPER = new ObjectMapper();
+  private static final int TICKET_DECODE_BUF_SIZE = 8192;
+
+  /**
+   * Parse an {@code aster1…} ticket string into its structured {@link NodeAddr}.
+   *
+   * <p>Delegates to the {@code aster_ticket_decode} Rust FFI — the same parser Python and
+   * TypeScript use — so cross-language addresses round-trip byte-identically. The ticket's
+   * credential payload (if any) is discarded here; {@link NodeAddr} models the transport
+   * coordinates only.
+   *
+   * @throws IllegalArgumentException if the ticket is not a valid {@code aster1…} string
+   */
+  public static NodeAddr fromTicket(String ticket) {
+    if (ticket == null || ticket.isEmpty()) {
+      throw new IllegalArgumentException("ticket must not be empty");
+    }
+    byte[] ticketBytes = ticket.getBytes(StandardCharsets.UTF_8);
+    IrohLibrary lib = IrohLibrary.getInstance();
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment ticketSeg = arena.allocate(ticketBytes.length);
+      ticketSeg.copyFrom(MemorySegment.ofArray(ticketBytes));
+
+      MemorySegment outBuf = arena.allocate(TICKET_DECODE_BUF_SIZE);
+      MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
+      outLen.set(ValueLayout.JAVA_LONG, 0, TICKET_DECODE_BUF_SIZE);
+
+      int status = lib.asterTicketDecode(ticketSeg, ticketBytes.length, outBuf, outLen);
+      if (status != 0) {
+        throw new IllegalArgumentException(
+            "aster_ticket_decode failed with status " + status + " for ticket: " + ticket);
+      }
+      long written = outLen.get(ValueLayout.JAVA_LONG, 0);
+      byte[] jsonBytes = new byte[(int) written];
+      MemorySegment.copy(outBuf, ValueLayout.JAVA_BYTE, 0, jsonBytes, 0, (int) written);
+      String json = new String(jsonBytes, StandardCharsets.UTF_8);
+
+      JsonNode node;
+      try {
+        node = TICKET_MAPPER.readTree(json);
+      } catch (Exception e) {
+        throw new IllegalStateException("aster_ticket_decode returned invalid JSON: " + json, e);
+      }
+      String endpointId = node.path("endpoint_id").asText();
+      String relayAddr = node.path("relay_addr").isNull() ? null : node.path("relay_addr").asText();
+      List<String> directAddrs = new ArrayList<>();
+      JsonNode arr = node.path("direct_addrs");
+      if (arr.isArray()) {
+        for (JsonNode entry : arr) {
+          directAddrs.add(entry.asText());
+        }
+      }
+      return new NodeAddr(endpointId, relayAddr, List.copyOf(directAddrs));
+    }
+  }
 
   private static final MemoryLayout LAYOUT = IrohLibrary.IROH_NODE_ADDR;
 
