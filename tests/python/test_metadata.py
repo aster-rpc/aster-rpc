@@ -72,6 +72,41 @@ class _RespNoDesc:
     ok: bool = False
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _contract_id_for(svc_cls, *, root_types, local_ns):
+    """Compute a ServiceContract's contract_id, threading through the same pipeline the
+    runtime uses.
+
+    Needed because several tests below define wire types inside a function scope: with
+    ``from __future__ import annotations`` active, ``typing.get_type_hints`` can't see
+    closure-local names, so ``service_info.methods[*].request_type`` remains a string.
+    This helper resolves the strings via the caller-supplied ``local_ns`` before walking
+    the type graph.
+    """
+    from aster.contract.identity import (
+        ServiceContract, build_type_graph, canonical_xlang_bytes,
+        compute_contract_id, compute_type_hash, resolve_with_cycles,
+    )
+
+    for mi in svc_cls.__aster_service_info__.methods.values():
+        if isinstance(mi.request_type, str):
+            mi.request_type = local_ns[mi.request_type]
+        if isinstance(mi.response_type, str):
+            mi.response_type = local_ns[mi.response_type]
+
+    type_defs = resolve_with_cycles(build_type_graph(root_types))
+    type_hashes = {
+        fqn: compute_type_hash(canonical_xlang_bytes(td))
+        for fqn, td in type_defs.items()
+    }
+    contract = ServiceContract.from_service_info(
+        svc_cls.__aster_service_info__, type_hashes
+    )
+    return compute_contract_id(canonical_xlang_bytes(contract))
+
+
 # ── Contract identity independence ──────────────────────────────────────────────
 
 
@@ -80,9 +115,6 @@ class TestMetadataDoesNotAffectContractId:
 
     def test_service_with_and_without_metadata_same_contract_id(self):
         """Adding metadata to @service must not change the contract ID."""
-        from aster.contract.identity import (
-            ServiceContract, canonical_xlang_bytes, compute_contract_id,
-        )
 
         @wire_type("meta_test/Req1")
         @dataclass
@@ -104,14 +136,9 @@ class TestMetadataDoesNotAffectContractId:
             @rpc(metadata=Metadata(description="Does a thing"))
             async def do_thing(self, req: Req1) -> Resp1: ...
 
-        contract_no_meta = ServiceContract.from_service_info(NoMetaService.__aster_service_info__)
-        contract_with_meta = ServiceContract.from_service_info(WithMetaService.__aster_service_info__)
-
-        bytes_no_meta = canonical_xlang_bytes(contract_no_meta)
-        bytes_with_meta = canonical_xlang_bytes(contract_with_meta)
-
-        id_no_meta = compute_contract_id(bytes_no_meta)
-        id_with_meta = compute_contract_id(bytes_with_meta)
+        ns = {"Req1": Req1, "Resp1": Resp1}
+        id_no_meta = _contract_id_for(NoMetaService, root_types=[Req1, Resp1], local_ns=ns)
+        id_with_meta = _contract_id_for(WithMetaService, root_types=[Req1, Resp1], local_ns=ns)
 
         assert id_no_meta == id_with_meta, (
             f"Metadata changed contract ID! "
@@ -119,23 +146,26 @@ class TestMetadataDoesNotAffectContractId:
         )
 
     def test_wire_type_field_metadata_does_not_affect_contract_id(self):
-        """Adding field metadata to @wire_type must not change the contract ID."""
-        from aster.contract.identity import (
-            ServiceContract, canonical_xlang_bytes, compute_contract_id,
-        )
+        """Adding field metadata to @wire_type must not change the contract ID.
 
-        @wire_type("meta_test/PlainReq")
+        Uses the same @wire_type tag on both the plain and annotated variants so they
+        resolve to the same FQN in the type graph. Field metadata lives on
+        ``__wire_type_field_metadata__`` and doesn't feed the canonical bytes; changing it
+        must not perturb contract_id.
+        """
+
+        @wire_type("meta_test_fields/Req")
         @dataclass
         class PlainReq:
             amount: int = 0
             name: str = ""
 
-        @wire_type("meta_test/PlainResp")
+        @wire_type("meta_test_fields/Resp")
         @dataclass
         class PlainResp:
             ok: bool = False
 
-        @wire_type("meta_test/AnnotatedReq", metadata={
+        @wire_type("meta_test_fields/Req", metadata={
             "amount": Metadata(description="Total in cents"),
             "name": Metadata(description="Customer name"),
         })
@@ -144,7 +174,7 @@ class TestMetadataDoesNotAffectContractId:
             amount: int = 0
             name: str = ""
 
-        @wire_type("meta_test/AnnotatedResp")
+        @wire_type("meta_test_fields/Resp")
         @dataclass
         class AnnotatedResp:
             ok: bool = False
@@ -159,13 +189,17 @@ class TestMetadataDoesNotAffectContractId:
             @rpc
             async def do_it(self, req: AnnotatedReq) -> AnnotatedResp: ...
 
-        c1 = ServiceContract.from_service_info(PlainSvc.__aster_service_info__)
-        c2 = ServiceContract.from_service_info(AnnotatedSvc.__aster_service_info__)
+        id1 = _contract_id_for(
+            PlainSvc,
+            root_types=[PlainReq, PlainResp],
+            local_ns={"PlainReq": PlainReq, "PlainResp": PlainResp},
+        )
+        id2 = _contract_id_for(
+            AnnotatedSvc,
+            root_types=[AnnotatedReq, AnnotatedResp],
+            local_ns={"AnnotatedReq": AnnotatedReq, "AnnotatedResp": AnnotatedResp},
+        )
 
-        id1 = compute_contract_id(canonical_xlang_bytes(c1))
-        id2 = compute_contract_id(canonical_xlang_bytes(c2))
-
-        # Same structure, different metadata -- same contract ID
         assert id1 == id2, (
             f"Field metadata changed contract ID! "
             f"plain={id1[:16]}... annotated={id2[:16]}..."
@@ -470,10 +504,6 @@ class TestContractIdStabilityUnderTagChanges:
     non-canonical metadata invariant)."""
 
     def test_service_tags_do_not_change_contract_id(self):
-        from aster.contract.identity import (
-            ServiceContract, canonical_xlang_bytes, compute_contract_id,
-        )
-
         @wire_type("tags_test/Req")
         @dataclass
         class Req:
@@ -494,11 +524,9 @@ class TestContractIdStabilityUnderTagChanges:
             @rpc(metadata=Metadata(tags=["slow"]))
             async def do_it(self, req: Req) -> Resp: ...
 
-        c1 = ServiceContract.from_service_info(TaggedSvc.__aster_service_info__)
-        c2 = ServiceContract.from_service_info(RetaggedSvc.__aster_service_info__)
-
-        id1 = compute_contract_id(canonical_xlang_bytes(c1))
-        id2 = compute_contract_id(canonical_xlang_bytes(c2))
+        ns = {"Req": Req, "Resp": Resp}
+        id1 = _contract_id_for(TaggedSvc, root_types=[Req, Resp], local_ns=ns)
+        id2 = _contract_id_for(RetaggedSvc, root_types=[Req, Resp], local_ns=ns)
 
         assert id1 == id2, (
             f"Tag changes altered contract_id -- "
@@ -507,16 +535,15 @@ class TestContractIdStabilityUnderTagChanges:
 
     def test_field_description_and_tags_do_not_change_contract_id(self):
         from aster import describe
-        from aster.contract.identity import (
-            ServiceContract, canonical_xlang_bytes, compute_contract_id,
-        )
 
-        @wire_type("tags_field_test/ReqPlain")
+        # Use the same @wire_type tag on both so they resolve to the same FQN -- only
+        # the non-canonical field-level describe() metadata differs between them.
+        @wire_type("tags_field_test/Req")
         @dataclass
         class ReqPlain:
             name: str = ""
 
-        @wire_type("tags_field_test/ReqDescribed")
+        @wire_type("tags_field_test/Req")
         @dataclass
         class ReqDescribed:
             name: str = describe("Name of the user.", tags=["pii"])
@@ -536,11 +563,16 @@ class TestContractIdStabilityUnderTagChanges:
             @rpc
             async def act(self, req: ReqDescribed) -> Resp: ...
 
-        c1 = ServiceContract.from_service_info(PlainSvc.__aster_service_info__)
-        c2 = ServiceContract.from_service_info(DescribedSvc.__aster_service_info__)
-
-        id1 = compute_contract_id(canonical_xlang_bytes(c1))
-        id2 = compute_contract_id(canonical_xlang_bytes(c2))
+        id1 = _contract_id_for(
+            PlainSvc,
+            root_types=[ReqPlain, Resp],
+            local_ns={"ReqPlain": ReqPlain, "Resp": Resp},
+        )
+        id2 = _contract_id_for(
+            DescribedSvc,
+            root_types=[ReqDescribed, Resp],
+            local_ns={"ReqDescribed": ReqDescribed, "Resp": Resp},
+        )
 
         assert id1 == id2, (
             f"Field description/tags altered contract_id -- "
@@ -635,7 +667,8 @@ class TestManifestPropagation:
 
     def test_service_description_flows_to_contract_manifest(self):
         from aster.contract.identity import (
-            ServiceContract, build_type_graph, resolve_with_cycles,
+            ServiceContract, build_type_graph, canonical_xlang_bytes,
+            compute_type_hash, resolve_with_cycles,
         )
         from aster.contract.publication import build_collection
 
@@ -646,15 +679,20 @@ class TestManifestPropagation:
             async def do_it(self, req: _PlainNoDesc) -> _RespNoDesc: ...
 
         svc_info = DocSvcMfest.__aster_service_info__
-        roots: list[type] = []
+        # Resolve any stringified annotations to real classes before walking the graph.
+        ns = {"_PlainNoDesc": _PlainNoDesc, "_RespNoDesc": _RespNoDesc}
         for m in svc_info.methods.values():
-            if isinstance(m.request_type, type):
-                roots.append(m.request_type)
-            if isinstance(m.response_type, type):
-                roots.append(m.response_type)
-        types = build_type_graph(roots)
-        type_defs = resolve_with_cycles(types)
-        contract = ServiceContract.from_service_info(svc_info)
+            if isinstance(m.request_type, str):
+                m.request_type = ns[m.request_type]
+            if isinstance(m.response_type, str):
+                m.response_type = ns[m.response_type]
+
+        type_defs = resolve_with_cycles(build_type_graph([_PlainNoDesc, _RespNoDesc]))
+        type_hashes = {
+            fqn: compute_type_hash(canonical_xlang_bytes(td))
+            for fqn, td in type_defs.items()
+        }
+        contract = ServiceContract.from_service_info(svc_info, type_hashes)
 
         entries = build_collection(contract, type_defs, service_info=svc_info)
         by_name = dict(entries)
