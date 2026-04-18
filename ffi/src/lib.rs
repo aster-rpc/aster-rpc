@@ -3143,6 +3143,35 @@ pub unsafe extern "C" fn iroh_doc_free(runtime: iroh_runtime_t, doc: u64) -> i32
     }
 }
 
+/// Synchronous: write the 64-char hex namespace id of the doc to `out_buf`.
+///
+/// Mirrors `CoreDoc::doc_id()` — used by consumer-admission responses to
+/// carry the registry namespace so a client can `join_and_subscribe_namespace`
+/// the doc and fetch published contract manifests.
+///
+/// On BUFFER_TOO_SMALL, sets `*out_len` to required size.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_id(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if out_len.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    let id_hex = doc_arc.doc_id();
+    write_to_caller_buf(id_hex.as_bytes(), out_buf, out_len) as i32
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn iroh_gossip_topic_free(runtime: iroh_runtime_t, topic: u64) -> i32 {
     let bridge = match load_runtime(runtime) {

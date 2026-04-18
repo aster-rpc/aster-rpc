@@ -3,6 +3,7 @@ package site.aster.contract;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.RecordComponent;
 import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -43,6 +44,59 @@ public final class ContractManifestBuilder {
   private ContractManifestBuilder() {}
 
   public static ContractManifest build(ServiceDispatcher dispatcher) {
+    return compile(dispatcher).manifest();
+  }
+
+  /**
+   * Build the publishable collection artifacts for one service. Returns the canonical bytes of the
+   * {@link ServiceContract} ({@code contract.bin}), the canonical bytes of every {@link TypeDef} in
+   * the type graph (one per {@code types/<hash>.bin} entry), and the manifest JSON — everything a
+   * producer needs to upload a native HashSeq collection.
+   */
+  public static PublicationArtifacts buildForPublication(ServiceDispatcher dispatcher) {
+    CompileResult cr = compile(dispatcher);
+
+    byte[] contractCanonical =
+        ContractIdentity.computeCanonicalBytes("ServiceContract", cr.contract().toJson());
+
+    List<Map.Entry<String, byte[]>> typeEntries = new ArrayList<>();
+    for (Map.Entry<String, TypeDef> e : cr.resolved().typeDefs().entrySet()) {
+      String fqn = e.getKey();
+      byte[] bytes =
+          ContractIdentity.computeCanonicalBytes("TypeDef", ContractJson.toJson(e.getValue()));
+      String hashHex = cr.resolved().typeHashes().get(fqn);
+      typeEntries.add(Map.entry("types/" + hashHex + ".bin", bytes));
+    }
+    typeEntries.sort(Map.Entry.comparingByKey());
+
+    byte[] manifestBytes = cr.manifest().toJson().getBytes(StandardCharsets.UTF_8);
+
+    return new PublicationArtifacts(
+        cr.manifest().service(),
+        cr.manifest().version(),
+        cr.manifest().contractId(),
+        contractCanonical,
+        List.copyOf(typeEntries),
+        manifestBytes,
+        cr.manifest());
+  }
+
+  /** Bundle of everything a publisher needs to write one service into the registry + blob store. */
+  public record PublicationArtifacts(
+      String serviceName,
+      int serviceVersion,
+      String contractId,
+      byte[] contractCanonicalBytes,
+      List<Map.Entry<String, byte[]>> typeEntries,
+      byte[] manifestJsonBytes,
+      ContractManifest manifest) {}
+
+  private record CompileResult(
+      ContractManifest manifest,
+      ServiceContract contract,
+      ContractIdentityResolver.ResolvedTypes resolved) {}
+
+  private static CompileResult compile(ServiceDispatcher dispatcher) {
     ServiceDescriptor sd = dispatcher.descriptor();
 
     Set<Class<?>> roots = new LinkedHashSet<>();
@@ -100,29 +154,31 @@ public final class ContractManifestBuilder {
     List<String> typeHashesSorted = new ArrayList<>(resolved.typeHashes().values());
     Collections.sort(typeHashesSorted);
 
-    return new ContractManifest(
-        ContractManifest.FIELD_SCHEMA_VERSION,
-        sd.name(),
-        sd.version(),
-        contractId,
-        "fory-xlang/0.15",
-        resolved.typeDefs().size(),
-        typeHashesSorted,
-        methodDefs.size(),
-        methodDicts,
-        List.of("xlang"),
-        "",
-        ScopeKind.fromAnnotation(sd.scope()).wire(),
-        dispatcher.description(),
-        dispatcher.tags(),
-        false,
-        null,
-        null,
-        null,
-        null,
-        null,
-        "",
-        0L);
+    ContractManifest manifest =
+        new ContractManifest(
+            ContractManifest.FIELD_SCHEMA_VERSION,
+            sd.name(),
+            sd.version(),
+            contractId,
+            "fory-xlang/0.15",
+            resolved.typeDefs().size(),
+            typeHashesSorted,
+            methodDefs.size(),
+            methodDicts,
+            List.of("xlang"),
+            "",
+            ScopeKind.fromAnnotation(sd.scope()).wire(),
+            dispatcher.description(),
+            dispatcher.tags(),
+            false,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "",
+            0L);
+    return new CompileResult(manifest, sc, resolved);
   }
 
   private static String hashFor(Class<?> cls, ContractIdentityResolver.ResolvedTypes resolved) {

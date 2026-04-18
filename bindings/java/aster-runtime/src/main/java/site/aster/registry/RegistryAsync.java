@@ -119,7 +119,11 @@ public final class RegistryAsync {
     byte[] chn = channel == null ? new byte[0] : channel.getBytes(StandardCharsets.UTF_8);
     long topicHandle = topic == null ? 0L : topic.handle();
 
-    Arena arena = Arena.ofConfined();
+    // GC-managed arena: the whenComplete that would otherwise close a confined arena runs on
+    // the poll thread (different from the caller), which raises WrongThreadException. An auto
+    // arena lets the GC reclaim the native buffers after the caller's future chain has
+    // finished using them, so we can drop the explicit close entirely.
+    Arena arena = Arena.ofAuto();
     long opId;
     try {
       MemorySegment authorSeg = bytesToSegment(arena, author);
@@ -147,20 +151,21 @@ public final class RegistryAsync {
               0L,
               opSeg);
       if (status != 0) {
-        arena.close();
         return CompletableFuture.failedFuture(
             new IrohException(IrohStatus.fromCode(status), "aster_registry_publish: " + status));
       }
       opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
     } catch (Throwable t) {
-      arena.close();
       return CompletableFuture.failedFuture(
           new IrohException("aster_registry_publish threw: " + t.getMessage()));
     }
+    // Keep the arena alive through the whenComplete so the GC doesn't reclaim the native
+    // buffers before the Rust side has finished writing to the registry doc.
+    final Arena arenaRef = arena;
     return doc.runtime()
         .registry()
         .register(opId)
-        .whenComplete((u, e) -> arena.close())
+        .whenComplete((u, e) -> java.util.Objects.requireNonNull(arenaRef))
         .thenApply(
             event -> {
               if (event.kind() != IrohEventKind.REGISTRY_PUBLISHED) {

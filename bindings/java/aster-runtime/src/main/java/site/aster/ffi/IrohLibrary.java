@@ -772,10 +772,17 @@ public final class IrohLibrary implements SymbolLookup {
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
    */
+  /**
+   * Invoke {@code iroh_blobs_add_collection}. The C signature takes an {@code iroh_bytes_t} by
+   * value; we split it into (ptr, len) so FFM places the pointer + length in the two consecutive
+   * registers that the struct-by-value ABI uses on AAPCS64 / SysV AMD64. Matches the working
+   * convention in {@link #asterRegistryPublish}.
+   */
   public int blobsAddCollection(
       long runtimeHandle,
       long nodeHandle,
-      MemorySegment entriesJsonSegment,
+      MemorySegment entriesJsonPtr,
+      long entriesJsonLen,
       MemorySegment outOpId) {
     try {
       return (int)
@@ -783,12 +790,13 @@ public final class IrohLibrary implements SymbolLookup {
                   "iroh_blobs_add_collection",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS))
-              .invoke(runtimeHandle, nodeHandle, entriesJsonSegment, 0L, outOpId);
+                      ValueLayout.JAVA_LONG, // runtime
+                      ValueLayout.JAVA_LONG, // node
+                      ValueLayout.ADDRESS, // entries_json ptr
+                      ValueLayout.JAVA_LONG, // entries_json len
+                      ValueLayout.JAVA_LONG, // user data
+                      ValueLayout.ADDRESS)) // out op
+              .invoke(runtimeHandle, nodeHandle, entriesJsonPtr, entriesJsonLen, 0L, outOpId);
     } catch (Throwable t) {
       throw new AssertionError(t);
     }
@@ -1480,12 +1488,21 @@ public final class IrohLibrary implements SymbolLookup {
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
    */
+  /**
+   * Invoke {@code iroh_doc_set_bytes}. The C signature takes three {@code iroh_bytes_t} args by
+   * value; we split each into (ptr, len) so FFM places the pointer + length in consecutive
+   * registers per AAPCS64 §6.8.2 / SysV AMD64 §3.2.3. Same convention as {@link
+   * #asterRegistryPublish}.
+   */
   public int docSetBytes(
       long runtimeHandle,
       long docHandle,
-      MemorySegment authorSegment,
-      MemorySegment keySegment,
-      MemorySegment valueSegment,
+      MemorySegment authorPtr,
+      long authorLen,
+      MemorySegment keyPtr,
+      long keyLen,
+      MemorySegment valuePtr,
+      long valueLen,
       long userData,
       MemorySegment outOpId) {
     try {
@@ -1494,19 +1511,25 @@ public final class IrohLibrary implements SymbolLookup {
                   "iroh_doc_set_bytes",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS,
-                      ValueLayout.ADDRESS,
-                      ValueLayout.ADDRESS,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS))
+                      ValueLayout.JAVA_LONG, // runtime
+                      ValueLayout.JAVA_LONG, // doc
+                      ValueLayout.ADDRESS, // author ptr
+                      ValueLayout.JAVA_LONG, // author len
+                      ValueLayout.ADDRESS, // key ptr
+                      ValueLayout.JAVA_LONG, // key len
+                      ValueLayout.ADDRESS, // value ptr
+                      ValueLayout.JAVA_LONG, // value len
+                      ValueLayout.JAVA_LONG, // user data
+                      ValueLayout.ADDRESS)) // out op
               .invoke(
                   runtimeHandle,
                   docHandle,
-                  authorSegment,
-                  keySegment,
-                  valueSegment,
+                  authorPtr,
+                  authorLen,
+                  keyPtr,
+                  keyLen,
+                  valuePtr,
+                  valueLen,
                   userData,
                   outOpId);
     } catch (Throwable t) {
@@ -1874,6 +1897,27 @@ public final class IrohLibrary implements SymbolLookup {
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG))
               .invoke(runtimeHandle, docHandle);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Synchronously read the 64-char hex namespace id of a doc. Writes to {@code outBuf}, sets {@code
+   * *outLen} to the byte count. Returns 0 on success.
+   */
+  public int docId(long runtimeHandle, long docHandle, MemorySegment outBuf, MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_doc_id",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, outBuf, outLen);
     } catch (Throwable t) {
       throw new AssertionError(t);
     }

@@ -164,11 +164,18 @@ public class IrohBlobs {
     Arena confined = Arena.ofConfined();
     var alloc = confined;
 
-    var jsonSeg = toStringSegment(entriesJson, alloc);
+    // The Rust FFI takes the JSON as an iroh_bytes_t by value. Pass (ptr, len) as two separate
+    // arguments so FFM places them in the two consecutive registers the struct-by-value ABI
+    // uses on AAPCS64 / SysV AMD64 — see IrohLibrary#blobsAddCollection.
+    byte[] jsonBytes = entriesJson.getBytes(StandardCharsets.UTF_8);
+    MemorySegment jsonPtr = alloc.allocate(jsonBytes.length);
+    jsonPtr.copyFrom(MemorySegment.ofArray(jsonBytes));
     var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
     try {
-      int status = lib.blobsAddCollection(runtime.nativeHandle(), nodeHandle, jsonSeg, opSeg);
+      int status =
+          lib.blobsAddCollection(
+              runtime.nativeHandle(), nodeHandle, jsonPtr, jsonBytes.length, opSeg);
       if (status != 0) {
         throw new IrohException(
             IrohStatus.fromCode(status), "iroh_blobs_add_collection failed: " + status);
@@ -187,7 +194,13 @@ public class IrohBlobs {
         .thenApply(
             event -> {
               if (event.kind() == IrohEventKind.BLOB_COLLECTION_ADDED) {
-                byte[] hashBytes = event.data().asByteBuffer().array();
+                byte[] hashBytes =
+                    event.dataLen() > 0
+                        ? event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE)
+                        : new byte[0];
+                if (event.hasBuffer()) {
+                  runtime.releaseBuffer(event.buffer());
+                }
                 String hashHex = new String(hashBytes, StandardCharsets.UTF_8);
                 return BlobId.of(hashHex.trim());
               }

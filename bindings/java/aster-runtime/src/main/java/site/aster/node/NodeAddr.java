@@ -26,6 +26,24 @@ public record NodeAddr(
   private static final int TICKET_ENCODE_BUF_SIZE = 4096;
 
   /**
+   * Serialize this {@link NodeAddr} to the canonical byte form used in consumer-admission responses
+   * and registry documents. Matches Python's {@code NodeAddr.to_bytes} (see {@code
+   * bindings/python/rust/src/net.rs} line 71): {@code endpoint_id\n relay_url\n
+   * direct_addresses-newline-joined}. Empty relay URL renders as an empty line; direct addresses
+   * are joined with {@code \n}.
+   */
+  public byte[] toBytes() {
+    String relay = relayUrl == null ? "" : relayUrl;
+    String direct = directAddresses == null ? "" : String.join("\n", directAddresses);
+    return (endpointId + "\n" + relay + "\n" + direct).getBytes(StandardCharsets.UTF_8);
+  }
+
+  /** Base64-encoded {@link #toBytes()} — the value stored in {@code channels[\"rpc\"]}. */
+  public String toBase64() {
+    return java.util.Base64.getEncoder().encodeToString(toBytes());
+  }
+
+  /**
    * Parse an {@code aster1…} ticket string into its structured {@link NodeAddr}.
    *
    * <p>Delegates to the {@code aster_ticket_decode} Rust FFI — the same parser Python and
