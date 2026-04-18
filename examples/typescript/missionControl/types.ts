@@ -1,13 +1,16 @@
 /**
  * Wire types for the Mission Control example.
  *
- * Each type has a stable wire identity via @WireType so Python (or any
- * other Aster binding) can interoperate. Tags match the Python example
- * exactly — that's how cross-language RPC works.
+ * Each type has a stable wire identity via @WireType so any Aster binding
+ * that declares the same contract can interoperate. Tags and field names
+ * match the Python example byte-for-byte, making Python+TS a single shared
+ * contract for this service.
  *
- * Field names use snake_case to match the cross-language wire format.
- * Python's codec normalizes camelCase→snake_case, so snake_case here
- * ensures both directions work without conversion.
+ * Field names are snake_case because the Python example declared them that
+ * way and this TS example chose to implement the same contract. The codec
+ * does no name normalization — producer wins, consumers mirror. If a
+ * language wants camelCase fields for the same service, it is declaring a
+ * different contract and will receive a different contract_id.
  */
 
 import { WireType } from '@aster-rpc/aster';

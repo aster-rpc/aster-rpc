@@ -126,8 +126,20 @@ pub enum ReactorEvent {
     },
 }
 
+/// Aster RPC ALPN. Connections negotiating this ALPN flow into the reactor's RPC
+/// pipeline; connections on any other aster ALPN (e.g. `aster.consumer_admission`)
+/// are forwarded to the reactor's non-rpc channel so bindings can dispatch them
+/// to higher-level handlers.
+pub const RPC_ALPN: &[u8] = b"aster/1";
+
 pub struct ReactorHandle {
     event_rx: mpsc::Receiver<ReactorEvent>,
+    /// Non-rpc accept queue. Populated by `accept_loop` when a connection
+    /// negotiates an ALPN other than `aster/1` (e.g. `aster.consumer_admission`).
+    /// Bindings drain this via [`next_non_rpc`] and dispatch to the right
+    /// per-ALPN handler. Always present — `start_reactor*` wires it even when no
+    /// non-rpc ALPNs are registered; stays empty in that case.
+    non_rpc_rx: mpsc::Receiver<(Vec<u8>, CoreConnection)>,
 }
 
 impl ReactorHandle {
@@ -136,6 +148,32 @@ impl ReactorHandle {
     /// from this API.
     pub async fn next_event(&mut self) -> Option<ReactorEvent> {
         self.event_rx.recv().await
+    }
+
+    /// Pull the next non-rpc aster-ALPN connection from the reactor's internal
+    /// dispatch channel. Returns `(alpn, connection)` — the alpn is whichever
+    /// non-`aster/1` protocol the peer negotiated (e.g. `aster.consumer_admission`,
+    /// `aster.producer_admission`). Returns `None` when the reactor is shut down.
+    ///
+    /// Intended for server bindings that register custom ALPNs on the node and
+    /// want to multiplex admission / registry / manifest handlers alongside the
+    /// RPC pipeline owned by the reactor. The binding is responsible for
+    /// dispatching the connection to the right handler based on the alpn bytes.
+    pub async fn next_non_rpc(&mut self) -> Option<(Vec<u8>, CoreConnection)> {
+        self.non_rpc_rx.recv().await
+    }
+
+    /// Consume this handle and split it into its two independent receivers. The
+    /// FFI layer needs this so a background pump task can own the RPC event
+    /// stream while the non-rpc receiver is retained in reactor state for
+    /// synchronous long-poll access.
+    pub fn into_parts(
+        self,
+    ) -> (
+        mpsc::Receiver<ReactorEvent>,
+        mpsc::Receiver<(Vec<u8>, CoreConnection)>,
+    ) {
+        (self.event_rx, self.non_rpc_rx)
     }
 
     /// Back-compat convenience: pull the next **Call** event,
@@ -186,8 +224,15 @@ pub fn create_reactor(
     channel_capacity: usize,
 ) -> (ReactorHandle, ReactorFeeder) {
     let (event_tx, event_rx) = mpsc::channel(channel_capacity);
+    // The non-rpc channel is unused in `create_reactor` mode (caller owns the
+    // accept loop and dispatches themselves) but we wire it so `ReactorHandle`
+    // has the same shape in both entry points.
+    let (_non_rpc_tx, non_rpc_rx) = mpsc::channel(channel_capacity);
     (
-        ReactorHandle { event_rx },
+        ReactorHandle {
+            event_rx,
+            non_rpc_rx,
+        },
         ReactorFeeder {
             event_tx,
             rt_handle: handle.clone(),
@@ -198,8 +243,12 @@ pub fn create_reactor(
 /// Start a reactor that owns the accept loop.
 pub fn start_reactor(node: CoreNode, channel_capacity: usize) -> ReactorHandle {
     let (event_tx, event_rx) = mpsc::channel(channel_capacity);
-    tokio::spawn(accept_loop(node, event_tx));
-    ReactorHandle { event_rx }
+    let (non_rpc_tx, non_rpc_rx) = mpsc::channel(channel_capacity);
+    tokio::spawn(accept_loop(node, event_tx, non_rpc_tx));
+    ReactorHandle {
+        event_rx,
+        non_rpc_rx,
+    }
 }
 
 /// Same as `start_reactor` but takes an explicit runtime handle.
@@ -209,16 +258,36 @@ pub fn start_reactor_on(
     channel_capacity: usize,
 ) -> ReactorHandle {
     let (event_tx, event_rx) = mpsc::channel(channel_capacity);
-    handle.spawn(accept_loop(node, event_tx));
-    ReactorHandle { event_rx }
+    let (non_rpc_tx, non_rpc_rx) = mpsc::channel(channel_capacity);
+    handle.spawn(accept_loop(node, event_tx, non_rpc_tx));
+    ReactorHandle {
+        event_rx,
+        non_rpc_rx,
+    }
 }
 
-async fn accept_loop(node: CoreNode, event_tx: mpsc::Sender<ReactorEvent>) {
+async fn accept_loop(
+    node: CoreNode,
+    event_tx: mpsc::Sender<ReactorEvent>,
+    non_rpc_tx: mpsc::Sender<(Vec<u8>, CoreConnection)>,
+) {
     loop {
         match node.accept_aster().await {
-            Ok((_alpn, conn)) => {
-                let tx = event_tx.clone();
-                tokio::spawn(connection_loop(conn, tx));
+            Ok((alpn, conn)) => {
+                // Filter by ALPN: aster/1 → RPC pipeline, everything else →
+                // non-rpc queue for the binding to dispatch (admission, etc.).
+                // Previously the reactor accepted every aster-ALPN connection
+                // and mis-routed admission streams into the RPC parser, which
+                // silently dropped the handshake. See task #31.
+                if alpn == RPC_ALPN {
+                    let tx = event_tx.clone();
+                    tokio::spawn(connection_loop(conn, tx));
+                } else if non_rpc_tx.send((alpn, conn)).await.is_err() {
+                    // Binding dropped the non-rpc receiver. That means nothing
+                    // is listening — drop the connection. The peer will see a
+                    // closed stream; it can retry or error its client.
+                    tracing::debug!("non-rpc aster connection dropped: no receiver");
+                }
             }
             Err(e) => {
                 if event_tx.is_closed() {

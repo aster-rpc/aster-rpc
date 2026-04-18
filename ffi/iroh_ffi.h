@@ -1377,6 +1377,19 @@ int32_t aster_reactor_create(iroh_runtime_t runtime,
 int32_t aster_reactor_destroy(iroh_runtime_t runtime, aster_reactor_t reactor);
 
 /**
+ * Long-poll for the next non-rpc aster-ALPN connection accepted by the reactor.
+ * Fires IROH_EVENT_ASTER_ACCEPTED when a connection arrives (same payload shape
+ * as iroh_node_accept_aster): event.handle = connection handle, event.data_ptr/len
+ * = ALPN bytes, event.buffer = lease to release via iroh_buffer_release. Lets a
+ * server binding run a single accept loop that dispatches RPC via the reactor and
+ * admission / manifest / etc via per-ALPN handlers.
+ */
+int32_t aster_reactor_accept_non_rpc(iroh_runtime_t runtime,
+                                     aster_reactor_t reactor,
+                                     uint64_t user_data,
+                                     iroh_operation_t *out_operation);
+
+/**
  * Poll for incoming calls. Drains up to `max_calls` from the ring buffer
  * into the caller-provided `out_calls` array. Returns the number of calls
  * written.

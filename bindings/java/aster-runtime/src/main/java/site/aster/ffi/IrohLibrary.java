@@ -282,6 +282,29 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   /**
+   * Long-poll the reactor for the next non-rpc aster-ALPN connection. Emits {@code
+   * IROH_EVENT_ASTER_ACCEPTED} on arrival: event.handle = connection handle, event.data = ALPN
+   * bytes. See {@code aster_reactor_accept_non_rpc} in the C header.
+   */
+  public int asterReactorAcceptNonRpc(
+      long runtimeHandle, long reactorHandle, long userData, MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_reactor_accept_non_rpc",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG, // runtime
+                      ValueLayout.JAVA_LONG, // reactor
+                      ValueLayout.JAVA_LONG, // user_data
+                      ValueLayout.ADDRESS)) // out_operation
+              .invoke(runtimeHandle, reactorHandle, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
    * Close a node asynchronously.
    *
    * @param runtimeHandle the runtime handle
@@ -2072,6 +2095,68 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.ADDRESS,
                       ValueLayout.ADDRESS))
               .invoke(ticketPtr, ticketLen, outBuf, outLen);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Encode a {@code (endpoint_id, relay_addr, direct_addrs, credential)} tuple into an {@code
+   * aster1<base58>} ticket string. All string arguments are UTF-8 byte pointers; pass a null
+   * pointer with length 0 to omit optional fields (relay, direct addrs, credential). Output buffer
+   * receives the ticket string; {@code outLen} is in/out — set to buffer size on entry, actual
+   * length on success.
+   *
+   * <p>C signature: {@code int32_t aster_ticket_encode(const uint8_t *endpoint_id_hex_ptr,
+   * uintptr_t endpoint_id_hex_len, const uint8_t *relay_addr_ptr, uintptr_t relay_addr_len, const
+   * uint8_t *direct_addrs_json_ptr, uintptr_t direct_addrs_json_len, const uint8_t
+   * *credential_type_ptr, uintptr_t credential_type_len, const uint8_t *credential_data_ptr,
+   * uintptr_t credential_data_len, uint8_t *out_buf, uintptr_t *out_len);}
+   */
+  public int asterTicketEncode(
+      MemorySegment endpointIdHex,
+      long endpointIdHexLen,
+      MemorySegment relayAddr,
+      long relayAddrLen,
+      MemorySegment directAddrsJson,
+      long directAddrsJsonLen,
+      MemorySegment credentialType,
+      long credentialTypeLen,
+      MemorySegment credentialData,
+      long credentialDataLen,
+      MemorySegment outBuf,
+      MemorySegment outLen) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_ticket_encode",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS,
+                      ValueLayout.ADDRESS))
+              .invoke(
+                  endpointIdHex,
+                  endpointIdHexLen,
+                  relayAddr,
+                  relayAddrLen,
+                  directAddrsJson,
+                  directAddrsJsonLen,
+                  credentialType,
+                  credentialTypeLen,
+                  credentialData,
+                  credentialDataLen,
+                  outBuf,
+                  outLen);
     } catch (Throwable t) {
       throw new AssertionError(t);
     }

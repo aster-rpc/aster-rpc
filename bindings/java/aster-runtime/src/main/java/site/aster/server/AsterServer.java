@@ -55,6 +55,7 @@ import site.aster.server.wire.StreamHeader;
 public final class AsterServer implements AutoCloseable {
 
   public static final String ASTER_ALPN = "aster/1";
+  public static final String CONSUMER_ADMISSION_ALPN = "aster.consumer_admission";
   private static final int DEFAULT_RING_CAPACITY = 256;
   private static final int DEFAULT_POLL_BATCH = 32;
   private static final int POLL_TIMEOUT_MS = 100;
@@ -82,6 +83,8 @@ public final class AsterServer implements AutoCloseable {
   private final Thread pollThread;
   private final ExecutorService callExecutor;
   private final ExecutorService streamingExecutor;
+  private final site.aster.trust.ConsumerAdmissionHandler admissionHandler;
+  private final Thread nonRpcAcceptThread;
 
   /**
    * Per-connection session state (spec §7.5). Mutated only from the poll thread; the dispatcher
@@ -117,6 +120,93 @@ public final class AsterServer implements AutoCloseable {
             });
     this.pollThread =
         Thread.ofPlatform().daemon(true).name("aster-server-poll").start(this::pollLoop);
+    // Consumer admission (open-gate): serve the service summaries for every
+    // consumer that opens the aster.consumer_admission ALPN. Auth-mode credential
+    // verification is tracked as tasks #14/#15.
+    this.admissionHandler =
+        new site.aster.trust.ConsumerAdmissionHandler(this::buildServiceSummaries);
+    this.nonRpcAcceptThread =
+        Thread.ofPlatform()
+            .daemon(true)
+            .name("aster-server-non-rpc-accept")
+            .start(this::nonRpcAcceptLoop);
+  }
+
+  /**
+   * Drives the reactor's non-rpc accept queue: for each aster-ALPN connection negotiated with an
+   * ALPN other than {@code aster/1}, dispatch to the appropriate per-ALPN handler. This is the
+   * Java-side mirror of Python's {@code _accept_loop} in {@code runtime.py} (lines 837-894), scoped
+   * to the ALPNs Java currently supports (consumer admission today; producer admission / manifest
+   * serving are follow-up tasks).
+   */
+  private void nonRpcAcceptLoop() {
+    site.aster.ffi.IrohLibrary lib = site.aster.ffi.IrohLibrary.getInstance();
+    long runtimeHandle = node.runtime().nativeHandle();
+    long reactorHandle = reactor.handle();
+    while (running.get()) {
+      try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+        java.lang.foreign.MemorySegment opSeg =
+            arena.allocate(java.lang.foreign.ValueLayout.JAVA_LONG);
+        int status = lib.asterReactorAcceptNonRpc(runtimeHandle, reactorHandle, 0L, opSeg);
+        if (status != 0) {
+          // Reactor shut down or error — exit quietly.
+          return;
+        }
+        long opId = opSeg.get(java.lang.foreign.ValueLayout.JAVA_LONG, 0);
+        java.util.concurrent.CompletableFuture<site.aster.event.IrohEvent> fut =
+            node.runtime().registry().register(opId);
+        site.aster.event.IrohEvent event;
+        try {
+          event = fut.get();
+        } catch (Exception e) {
+          if (!running.get()) {
+            return;
+          }
+          continue;
+        }
+        if (event.kind() != site.aster.ffi.IrohEventKind.ASTER_ACCEPTED) {
+          continue;
+        }
+        long connHandle = event.handle();
+        byte[] alpnBytes = new byte[0];
+        if (event.dataLen() > 0) {
+          alpnBytes =
+              event
+                  .data()
+                  .asSlice(0, event.dataLen())
+                  .toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
+          if (event.hasBuffer()) {
+            node.runtime().releaseBuffer(event.buffer());
+          }
+        }
+        site.aster.handle.IrohConnection conn =
+            new site.aster.handle.IrohConnection(node.runtime(), connHandle);
+        if (site.aster.trust.ConsumerAdmissionHandler.matches(alpnBytes)) {
+          admissionHandler.onConnection(conn);
+        } else {
+          conn.close();
+        }
+      } catch (Exception e) {
+        if (!running.get()) {
+          return;
+        }
+      }
+    }
+  }
+
+  private List<site.aster.registry.ServiceSummary> buildServiceSummaries() {
+    List<site.aster.registry.ServiceSummary> out = new ArrayList<>();
+    for (RegisteredService rs : services.values()) {
+      var summary = new site.aster.registry.ServiceSummary();
+      summary.name = rs.descriptor.name();
+      summary.version = rs.descriptor.version();
+      String cid = contractId(rs.descriptor.name());
+      summary.contractId = cid == null ? "" : cid;
+      summary.pattern = rs.descriptor.scope() == Scope.SHARED ? "shared" : "session";
+      summary.serializationModes = List.of("xlang");
+      out.add(summary);
+    }
+    return List.copyOf(out);
   }
 
   /** The node ID of this server (hex string). */
@@ -203,6 +293,7 @@ public final class AsterServer implements AutoCloseable {
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
+    admissionHandler.close();
     sessionRegistry.clear();
     connections.clear();
     reactor.close();
@@ -622,7 +713,7 @@ public final class AsterServer implements AutoCloseable {
     private final Map<String, RegisteredService> services = new LinkedHashMap<>();
     private SessionRegistry sessionRegistry = new InMemorySessionRegistry();
     private List<Interceptor> interceptors = List.of();
-    private List<String> alpns = List.of(ASTER_ALPN);
+    private List<String> alpns = List.of(ASTER_ALPN, CONSUMER_ADMISSION_ALPN);
     private int ringCapacity = DEFAULT_RING_CAPACITY;
     private int maxSessionsPerConnection = DEFAULT_MAX_SESSIONS_PER_CONNECTION;
 
@@ -649,9 +740,9 @@ public final class AsterServer implements AutoCloseable {
     }
 
     public Builder alpns(List<String> extraAlpns) {
-      var all = new ArrayList<>(List.of(ASTER_ALPN));
+      var all = new ArrayList<>(List.of(ASTER_ALPN, CONSUMER_ADMISSION_ALPN));
       for (String a : extraAlpns) {
-        if (!a.equals(ASTER_ALPN)) {
+        if (!a.equals(ASTER_ALPN) && !a.equals(CONSUMER_ADMISSION_ALPN)) {
           all.add(a);
         }
       }
