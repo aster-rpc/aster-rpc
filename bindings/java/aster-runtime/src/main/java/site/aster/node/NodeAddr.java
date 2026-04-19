@@ -121,7 +121,6 @@ public record NodeAddr(
         throw new IllegalStateException("aster_ticket_decode returned invalid JSON: " + json, e);
       }
       String endpointId = node.path("endpoint_id").asText();
-      String relayAddr = node.path("relay_addr").isNull() ? null : node.path("relay_addr").asText();
       List<String> directAddrs = new ArrayList<>();
       JsonNode arr = node.path("direct_addrs");
       if (arr.isArray()) {
@@ -129,7 +128,17 @@ public record NodeAddr(
           directAddrs.add(entry.asText());
         }
       }
-      return new NodeAddr(endpointId, relayAddr, List.copyOf(directAddrs));
+      // `relay_addr` is a STUN-resolved ip:port, NOT a RelayUrl — appending it
+      // as a direct address hint matches TypeScript's parseTicket path and
+      // avoids the Rust core's `RelayUrl::parse` failing on "5.6.7.8:443".
+      JsonNode relayNode = node.path("relay_addr");
+      if (!relayNode.isMissingNode() && !relayNode.isNull()) {
+        String relayAddr = relayNode.asText();
+        if (relayAddr != null && !relayAddr.isEmpty()) {
+          directAddrs.add(relayAddr);
+        }
+      }
+      return new NodeAddr(endpointId, null, List.copyOf(directAddrs));
     }
   }
 
