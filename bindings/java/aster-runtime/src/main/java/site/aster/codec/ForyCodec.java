@@ -37,11 +37,15 @@ public final class ForyCodec implements Codec {
     this.fory =
         Fory.builder()
             .withLanguage(Language.XLANG)
-            // STRICT + XLANG, no ref tracking. Must match pyfory's defaults (xlang=True,
-            // ref=False, strict=True) so the schema-hash Fory embeds in each XLANG payload
-            // comes out byte-identical on both sides; any config drift here surfaces as
-            // `Hash X is not consistent with Y for type T` on the receiver.
-            .withRefTracking(false)
+            // Aster's baseline Fory config: XLANG + ref-tracking + strict. Must match the
+            // matching Python config in bindings/python/aster/codec.py verbatim -- any drift
+            // re-introduces cross-binding schema-hash divergence (see
+            // docs/_internal/fory-cross-binding.md).
+            //   XLANG:    cross-language binary format (Java <-> Python <-> Go <-> ...).
+            //   refs:     duplicate objects serialize once + circular refs survive decode.
+            //   strict:   every type must be registered; unknown types raise at encode time
+            //             instead of smuggling arbitrary classes through the wire.
+            .withRefTracking(true)
             .requireClassRegistration(true)
             .buildThreadSafeForyPool(2, max);
   }

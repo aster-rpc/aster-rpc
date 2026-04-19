@@ -53,9 +53,21 @@ class ForyConfig:
         return mode == SerializationMode.XLANG
 
     def to_kwargs(self, mode: SerializationMode) -> dict[str, Any]:
-        """Convert the config into ``pyfory.Fory`` constructor kwargs."""
+        """Convert the config into ``pyfory.Fory`` constructor kwargs.
+
+        Aster's Fory baseline is XLANG + ref-tracking + strict. pyfory
+        defaults ``xlang=False``, ``ref=False``, ``strict=True`` -- we flip
+        xlang / ref to match Java's ``ForyCodec`` (see
+        ``bindings/java/.../ForyCodec.java`` and
+        ``docs/_internal/fory-cross-binding.md`` for the rationale).
+        """
         kwargs = dict(self.extra_kwargs)
         kwargs.setdefault("xlang", self.resolved_xlang(mode))
+        kwargs.setdefault("ref", True)
+        # pyfory's strict=True is already the default, but set it
+        # explicitly so any future pyfory release flipping the default
+        # doesn't silently change our behaviour.
+        kwargs.setdefault("strict", True)
         return kwargs
 
 

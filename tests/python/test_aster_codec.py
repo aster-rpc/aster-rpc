@@ -227,7 +227,11 @@ class TestForyCodecInit:
 
         ForyCodec(mode=SerializationMode.XLANG, types=[])
 
-        assert seen["kwargs"] == {"xlang": True}
+        # ref=True and strict=True are part of Aster's Fory baseline
+        # (XLANG + ref-tracking + strict) so the Python config stays in
+        # lockstep with Java's `ForyCodec`. See
+        # docs/_internal/fory-cross-binding.md.
+        assert seen["kwargs"] == {"xlang": True, "ref": True, "strict": True}
 
     def test_fory_config_defaults_to_non_xlang_for_native_mode(self, monkeypatch):
         seen: dict[str, object] = {}
@@ -242,7 +246,7 @@ class TestForyCodecInit:
 
         ForyCodec(mode=SerializationMode.NATIVE, types=[])
 
-        assert seen["kwargs"] == {"xlang": False}
+        assert seen["kwargs"] == {"xlang": False, "ref": True, "strict": True}
 
     def test_fory_config_allows_explicit_override(self, monkeypatch):
         seen: dict[str, object] = {}
@@ -264,6 +268,8 @@ class TestForyCodecInit:
         assert seen["kwargs"] == {
             "xlang": False,
             "require_class_registration": True,
+            "ref": True,
+            "strict": True,
         }
 
     def test_xlang_mode_creation(self):
