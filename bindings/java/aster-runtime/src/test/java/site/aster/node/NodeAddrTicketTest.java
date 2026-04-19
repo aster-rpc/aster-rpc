@@ -36,9 +36,14 @@ final class NodeAddrTicketTest {
         new NodeAddr(ENDPOINT_ID, "5.223.60.113:443", List.of("192.168.1.2:56089", "10.0.0.5:443"));
     String ticket = orig.toTicket();
     NodeAddr decoded = NodeAddr.fromTicket(ticket);
+    // The ticket's `relay_addr` is a STUN-resolved ip:port (not a RelayUrl), so fromTicket
+    // surfaces it as a direct-address hint and leaves relayUrl null — matching TypeScript's
+    // parseTicket path. core_to_endpoint_addr would otherwise fail RelayUrl::parse on ip:port.
     assertEquals(ENDPOINT_ID, decoded.endpointId());
-    assertEquals("5.223.60.113:443", decoded.relayUrl());
-    assertEquals(List.of("192.168.1.2:56089", "10.0.0.5:443"), decoded.directAddresses());
+    assertNull(decoded.relayUrl());
+    assertTrue(decoded.directAddresses().contains("192.168.1.2:56089"));
+    assertTrue(decoded.directAddresses().contains("10.0.0.5:443"));
+    assertTrue(decoded.directAddresses().contains("5.223.60.113:443"));
   }
 
   @Test

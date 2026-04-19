@@ -115,8 +115,13 @@ public class IrohPollThread {
     // Error events — always complete exceptionally
     if (event.kind() == IrohEventKind.ERROR || event.kind() == IrohEventKind.OPERATION_CANCELLED) {
       IrohStatus status = IrohStatus.fromCode(event.status());
+      String detail = readErrorPayload(event);
+      String message =
+          detail.isEmpty()
+              ? "operation failed: " + status.name()
+              : "operation failed: " + status.name() + ": " + detail;
       registry.completeExceptionally(
-          event.operation(), IrohException.forStatus(status, "operation failed: " + status.name()));
+          event.operation(), IrohException.forStatus(status, message));
       return;
     }
 
@@ -146,5 +151,18 @@ public class IrohPollThread {
 
   public boolean isRunning() {
     return running;
+  }
+
+  private static String readErrorPayload(IrohEvent event) {
+    if (event.dataLen() <= 0 || event.data() == null || event.data().address() == 0) {
+      return "";
+    }
+    try {
+      long len = Math.min(event.dataLen(), 4096L);
+      byte[] bytes = event.data().asSlice(0, len).toArray(ValueLayout.JAVA_BYTE);
+      return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+    } catch (Throwable t) {
+      return "";
+    }
   }
 }
