@@ -105,6 +105,15 @@ public final class AsterServer implements AutoCloseable {
    */
   private final Map<Long, ConnectionState> connections = new ConcurrentHashMap<>();
 
+  /**
+   * Per-peer admission attributes merged into every {@link CallContext#attributes()} built for
+   * calls from that peer. Populated by the admission / auth layer (dev mode leaves it empty,
+   * auth-mode populates {@code aster.role} from validated credentials); consumed by the {@link
+   * site.aster.interceptors.CapabilityInterceptor}. Key is {@code AsterCall#peerId()}, which is
+   * stable for the lifetime of a QUIC connection.
+   */
+  private final Map<String, Map<String, String>> peerAttributes = new ConcurrentHashMap<>();
+
   private AsterServer(Builder b, IrohNode node, Reactor reactor) {
     this.node = node;
     this.reactor = reactor;
@@ -286,6 +295,44 @@ public final class AsterServer implements AutoCloseable {
 
   public List<ServiceDescriptor> manifest() {
     return manifest;
+  }
+
+  /**
+   * Live view of the registered {@link ServiceDispatcher}s keyed by service name. Intended for
+   * wiring {@link site.aster.interceptors.CapabilityInterceptor} so it can look up the service- and
+   * method-level {@code @Requires} at call time without each caller maintaining its own map.
+   */
+  public Map<String, site.aster.server.spi.ServiceDispatcher> serviceDispatchers() {
+    java.util.LinkedHashMap<String, site.aster.server.spi.ServiceDispatcher> out =
+        new java.util.LinkedHashMap<>();
+    for (Map.Entry<String, RegisteredService> e : services.entrySet()) {
+      out.put(e.getKey(), e.getValue().dispatcher());
+    }
+    return java.util.Collections.unmodifiableMap(out);
+  }
+
+  /**
+   * Attach admission attributes (e.g. {@code aster.role} → comma-separated capability list) to
+   * every subsequent call from {@code peerId}. Called by the auth / admission layer after a peer
+   * passes credential validation; merged into {@link CallContext#attributes()} before interceptors
+   * run. Pass {@code null} or an empty map to clear.
+   */
+  public void setPeerAttributes(String peerId, Map<String, String> attributes) {
+    if (peerId == null) {
+      return;
+    }
+    if (attributes == null || attributes.isEmpty()) {
+      peerAttributes.remove(peerId);
+      return;
+    }
+    peerAttributes.put(peerId, Map.copyOf(attributes));
+  }
+
+  /** Drop any cached admission attributes for {@code peerId}. */
+  public void clearPeerAttributes(String peerId) {
+    if (peerId != null) {
+      peerAttributes.remove(peerId);
+    }
   }
 
   /**
@@ -662,9 +709,15 @@ public final class AsterServer implements AutoCloseable {
     for (int i = 0; i < n; i++) {
       metadata.put(keys.get(i), vals.get(i));
     }
+    Map<String, String> attributes = new HashMap<>();
+    Map<String, String> peerAttrs = peerAttributes.get(call.peerId());
+    if (peerAttrs != null) {
+      attributes.putAll(peerAttrs);
+    }
     return CallContext.builder(header.service(), header.method())
         .peer(call.peerId())
         .metadata(metadata)
+        .attributes(attributes)
         .deadlineFromRelativeSecs(header.deadline())
         .streaming(method.descriptor().streaming().name().endsWith("STREAM"))
         .pattern(method.descriptor().streaming().name().toLowerCase())

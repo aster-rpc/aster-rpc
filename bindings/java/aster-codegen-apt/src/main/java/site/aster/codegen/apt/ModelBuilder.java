@@ -26,6 +26,7 @@ import javax.tools.Diagnostic;
 import site.aster.annotations.BidiStream;
 import site.aster.annotations.ClientStream;
 import site.aster.annotations.Description;
+import site.aster.annotations.Requires;
 import site.aster.annotations.Rpc;
 import site.aster.annotations.ServerStream;
 import site.aster.annotations.Service;
@@ -34,6 +35,7 @@ import site.aster.codegen.core.model.FieldModel;
 import site.aster.codegen.core.model.MethodModel;
 import site.aster.codegen.core.model.ParamModel;
 import site.aster.codegen.core.model.RequestStyle;
+import site.aster.codegen.core.model.RequiresSpec;
 import site.aster.codegen.core.model.ServiceModel;
 import site.aster.codegen.core.model.StreamingKind;
 
@@ -101,7 +103,29 @@ final class ModelBuilder {
         methods,
         description,
         List.of(serviceAnn.tags()),
-        wireTypeTags);
+        wireTypeTags,
+        readRequires(serviceType));
+  }
+
+  private RequiresSpec readRequires(Element element) {
+    Requires req = element.getAnnotation(Requires.class);
+    if (req == null) {
+      return null;
+    }
+    String[] roles = req.roles();
+    if (roles.length == 0) {
+      messager.printMessage(
+          Diagnostic.Kind.ERROR, "@Requires must declare at least one role: " + element, element);
+      return null;
+    }
+    if (req.kind() == site.aster.annotations.RequiresKind.ROLE && roles.length != 1) {
+      messager.printMessage(
+          Diagnostic.Kind.ERROR,
+          "@Requires(kind=ROLE) must declare exactly one role; use ANY_OF or ALL_OF for multiple",
+          element);
+      return null;
+    }
+    return new RequiresSpec(req.kind(), Arrays.asList(roles));
   }
 
   private MethodModel classifyMethod(ExecutableElement exec, Map<String, String> wireTypeTags) {
@@ -206,7 +230,8 @@ final class ModelBuilder {
         meta.description(),
         meta.tags(),
         meta.deprecated(),
-        fieldMeta);
+        fieldMeta,
+        readRequires(exec));
   }
 
   private static Map<String, FieldModel> fieldMetadataFromInline(List<ParamModel> params) {

@@ -10,6 +10,7 @@ public final class RuntimeClassNames {
   public static final String CODEC_PKG = "site.aster.codec";
   public static final String INTERCEPTORS_PKG = "site.aster.interceptors";
   public static final String ANNOTATIONS_PKG = "site.aster.annotations";
+  public static final String CONTRACT_PKG = "site.aster.contract";
   public static final String FORY_PKG = "org.apache.fory";
 
   public static final ClassName SERVICE_DISPATCHER = ClassName.get(SPI_PKG, "ServiceDispatcher");
@@ -37,6 +38,10 @@ public final class RuntimeClassNames {
 
   public static final ClassName METHOD_METADATA = ClassName.get(SPI_PKG, "MethodMetadata");
   public static final ClassName FIELD_METADATA = ClassName.get(SPI_PKG, "FieldMetadata");
+
+  public static final ClassName CAPABILITY_REQUIREMENT =
+      ClassName.get(CONTRACT_PKG, "CapabilityRequirement");
+  public static final ClassName CAPABILITY_KIND = ClassName.get(CONTRACT_PKG, "CapabilityKind");
 
   private RuntimeClassNames() {}
 }

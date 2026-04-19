@@ -26,7 +26,8 @@ public record ServiceModel(
     List<MethodModel> methods,
     String description,
     List<String> tags,
-    Map<String, String> wireTypeTags) {
+    Map<String, String> wireTypeTags,
+    RequiresSpec requires) {
 
   public ServiceModel {
     methods = List.copyOf(methods);
@@ -38,7 +39,7 @@ public record ServiceModel(
   /** Legacy constructor (pre-metadata). */
   public ServiceModel(
       String name, int version, Scope scope, ClassName implClass, List<MethodModel> methods) {
-    this(name, version, scope, implClass, methods, "", List.of(), Map.of());
+    this(name, version, scope, implClass, methods, "", List.of(), Map.of(), null);
   }
 
   /** Legacy constructor (pre-wire-tag). */
@@ -50,6 +51,19 @@ public record ServiceModel(
       List<MethodModel> methods,
       String description,
       List<String> tags) {
-    this(name, version, scope, implClass, methods, description, tags, Map.of());
+    this(name, version, scope, implClass, methods, description, tags, Map.of(), null);
+  }
+
+  /** Legacy constructor (pre-{@code requires}). */
+  public ServiceModel(
+      String name,
+      int version,
+      Scope scope,
+      ClassName implClass,
+      List<MethodModel> methods,
+      String description,
+      List<String> tags,
+      Map<String, String> wireTypeTags) {
+    this(name, version, scope, implClass, methods, description, tags, wireTypeTags, null);
   }
 }

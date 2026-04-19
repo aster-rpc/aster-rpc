@@ -1,6 +1,7 @@
 package site.aster.server.spi;
 
 import site.aster.annotations.Scope;
+import site.aster.contract.CapabilityRequirement;
 
 /**
  * Identity and lifetime metadata for a service exposed by a {@link ServiceDispatcher}.
@@ -11,5 +12,14 @@ import site.aster.annotations.Scope;
  *     instance per client connection)
  * @param implClass the user's annotated implementation class — the runtime uses this to match a
  *     registered instance (or factory, for SESSION) against a discovered dispatcher
+ * @param requires service-level capability baseline emitted from a class-level {@code @Requires};
+ *     {@code null} means no service-wide gate. Checked before the method-level requirement.
  */
-public record ServiceDescriptor(String name, int version, Scope scope, Class<?> implClass) {}
+public record ServiceDescriptor(
+    String name, int version, Scope scope, Class<?> implClass, CapabilityRequirement requires) {
+
+  /** Legacy constructor for callers not yet supplying a {@code requires} argument. */
+  public ServiceDescriptor(String name, int version, Scope scope, Class<?> implClass) {
+    this(name, version, scope, implClass, null);
+  }
+}

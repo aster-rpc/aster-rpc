@@ -103,17 +103,52 @@ public final class DispatcherEmitter {
   private static FieldSpec buildDescriptorField(ServiceModel svc) {
     CodeBlock init =
         CodeBlock.of(
-            "new $T($S, $L, $T.$L, $T.class)",
+            "new $T($S, $L, $T.$L, $T.class, $L)",
             RuntimeClassNames.SERVICE_DESCRIPTOR,
             svc.name(),
             svc.version(),
             RuntimeClassNames.SCOPE,
             svc.scope().name(),
-            svc.implClass());
+            svc.implClass(),
+            buildRequiresLiteral(svc.requires()));
     return FieldSpec.builder(RuntimeClassNames.SERVICE_DESCRIPTOR, "DESCRIPTOR")
         .addModifiers(Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
         .initializer(init)
         .build();
+  }
+
+  /**
+   * Emit a {@code new CapabilityRequirement(CapabilityKind.X, List.of(...))} literal, or {@code
+   * null} if {@code spec} is null. Used for both the service-level descriptor and the per-method
+   * descriptor so the runtime {@code CapabilityInterceptor} can read the requirement directly from
+   * the dispatcher without walking the manifest.
+   */
+  private static CodeBlock buildRequiresLiteral(site.aster.codegen.core.model.RequiresSpec spec) {
+    if (spec == null) {
+      return CodeBlock.of("null");
+    }
+    CodeBlock.Builder roles = CodeBlock.builder().add("$T.of(", List.class);
+    boolean first = true;
+    for (String role : spec.roles()) {
+      if (!first) {
+        roles.add(", ");
+      }
+      first = false;
+      roles.add("$S", role);
+    }
+    roles.add(")");
+    String kindName =
+        switch (spec.kind()) {
+          case ROLE -> "ROLE";
+          case ANY_OF -> "ANY_OF";
+          case ALL_OF -> "ALL_OF";
+        };
+    return CodeBlock.of(
+        "new $T($T.$L, $L)",
+        RuntimeClassNames.CAPABILITY_REQUIREMENT,
+        RuntimeClassNames.CAPABILITY_KIND,
+        kindName,
+        roles.build());
   }
 
   private static List<FieldSpec> buildMetadataFields(ServiceModel svc) {
@@ -465,7 +500,7 @@ public final class DispatcherEmitter {
 
     CodeBlock init =
         CodeBlock.of(
-            "new $T($S, $T.$L, $T.$L, $S, $L, $S, $L, $L)",
+            "new $T($S, $T.$L, $T.$L, $S, $L, $S, $L, $L, $L)",
             RuntimeClassNames.METHOD_DESCRIPTOR,
             method.wireName(),
             RuntimeClassNames.STREAMING_KIND,
@@ -476,7 +511,8 @@ public final class DispatcherEmitter {
             paramsList.build(),
             responseTag == null ? "" : responseTag,
             method.hasContextParam(),
-            method.idempotent());
+            method.idempotent(),
+            buildRequiresLiteral(method.requires()));
 
     return FieldSpec.builder(RuntimeClassNames.METHOD_DESCRIPTOR, "DESCRIPTOR")
         .addModifiers(Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
