@@ -131,7 +131,7 @@ public final class ContractManifestBuilder {
               respHash,
               mdesc.idempotent(),
               0.0,
-              null));
+              mdesc.requires()));
     }
 
     ServiceContract sc =
@@ -141,7 +141,7 @@ public final class ContractManifestBuilder {
             methodDefs,
             List.of("xlang"),
             ScopeKind.fromAnnotation(sd.scope()),
-            null,
+            sd.requires(),
             "");
     String contractId = ContractIdentity.computeContractId(sc.toJson());
 

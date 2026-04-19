@@ -35,7 +35,8 @@ public record MethodModel(
     String description,
     List<String> tags,
     boolean deprecated,
-    Map<String, FieldModel> fieldMetadata) {
+    Map<String, FieldModel> fieldMetadata,
+    RequiresSpec requires) {
 
   public MethodModel {
     inlineParams = List.copyOf(inlineParams);
@@ -70,6 +71,41 @@ public record MethodModel(
         "",
         List.of(),
         false,
-        Map.of());
+        Map.of(),
+        null);
+  }
+
+  /** Legacy constructor (pre-{@code requires}). */
+  public MethodModel(
+      String name,
+      String wireName,
+      StreamingKind streaming,
+      RequestStyle requestStyle,
+      List<ParamModel> inlineParams,
+      TypeName requestType,
+      TypeName responseType,
+      boolean hasContextParam,
+      boolean idempotent,
+      boolean isSuspend,
+      String description,
+      List<String> tags,
+      boolean deprecated,
+      Map<String, FieldModel> fieldMetadata) {
+    this(
+        name,
+        wireName,
+        streaming,
+        requestStyle,
+        inlineParams,
+        requestType,
+        responseType,
+        hasContextParam,
+        idempotent,
+        isSuspend,
+        description,
+        tags,
+        deprecated,
+        fieldMetadata,
+        null);
   }
 }

@@ -10,9 +10,11 @@ import com.google.devtools.ksp.symbol.KSType
 import com.google.devtools.ksp.symbol.Modifier
 import com.palantir.javapoet.ClassName
 import com.palantir.javapoet.TypeName
+import com.google.devtools.ksp.symbol.KSAnnotated
 import site.aster.annotations.BidiStream
 import site.aster.annotations.ClientStream
 import site.aster.annotations.Description
+import site.aster.annotations.Requires
 import site.aster.annotations.Rpc
 import site.aster.annotations.ServerStream
 import site.aster.annotations.Service
@@ -21,6 +23,7 @@ import site.aster.codegen.core.model.FieldModel
 import site.aster.codegen.core.model.MethodModel
 import site.aster.codegen.core.model.ParamModel
 import site.aster.codegen.core.model.RequestStyle
+import site.aster.codegen.core.model.RequiresSpec
 import site.aster.codegen.core.model.ServiceModel
 import site.aster.codegen.core.model.StreamingKind
 
@@ -71,7 +74,26 @@ internal class KotlinModelBuilder(private val logger: KSPLogger) {
       description,
       tags,
       wireTypeTags,
+      readRequires(svc),
     )
+  }
+
+  private fun readRequires(node: KSAnnotated): RequiresSpec? {
+    val req = node.getAnnotationsByType(Requires::class).firstOrNull() ?: return null
+    val roles = req.roles.toList()
+    val symbol = node as? com.google.devtools.ksp.symbol.KSNode
+    if (roles.isEmpty()) {
+      logger.error("@Requires must declare at least one role", symbol)
+      return null
+    }
+    if (req.kind == site.aster.annotations.RequiresKind.ROLE && roles.size != 1) {
+      logger.error(
+        "@Requires(kind=ROLE) must declare exactly one role; use ANY_OF or ALL_OF for multiple",
+        symbol,
+      )
+      return null
+    }
+    return RequiresSpec(req.kind, roles)
   }
 
   private fun classifyFunction(
@@ -158,6 +180,7 @@ internal class KotlinModelBuilder(private val logger: KSPLogger) {
       meta.tags,
       meta.deprecated,
       fieldMeta,
+      readRequires(fn),
     )
   }
 

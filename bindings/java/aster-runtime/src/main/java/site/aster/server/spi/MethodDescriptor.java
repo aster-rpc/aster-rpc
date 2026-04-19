@@ -1,6 +1,7 @@
 package site.aster.server.spi;
 
 import java.util.List;
+import site.aster.contract.CapabilityRequirement;
 
 /**
  * Metadata describing one method on a {@link ServiceDispatcher}. Produced by the codegen layer and
@@ -17,6 +18,10 @@ import java.util.List;
  * @param hasContextParam {@code true} if the user's method declared a trailing {@code CallContext}
  *     parameter to be injected at dispatch time
  * @param idempotent {@code true} if this method is safe to retry
+ * @param requires capability requirement emitted from {@code @Requires}; {@code null} means the
+ *     method is callable without any role (subject to the service-level requirement). Consumed by
+ *     {@code site.aster.interceptors.CapabilityInterceptor} and published verbatim in the service
+ *     contract's {@code MethodDef.requires}.
  */
 public record MethodDescriptor(
     String name,
@@ -26,9 +31,32 @@ public record MethodDescriptor(
     List<ParamDescriptor> inlineParams,
     String responseType,
     boolean hasContextParam,
-    boolean idempotent) {
+    boolean idempotent,
+    CapabilityRequirement requires) {
 
   public MethodDescriptor {
     inlineParams = List.copyOf(inlineParams);
+  }
+
+  /** Legacy constructor for callers not yet supplying a {@code requires} argument. */
+  public MethodDescriptor(
+      String name,
+      StreamingKind streaming,
+      RequestStyle requestStyle,
+      String requestType,
+      List<ParamDescriptor> inlineParams,
+      String responseType,
+      boolean hasContextParam,
+      boolean idempotent) {
+    this(
+        name,
+        streaming,
+        requestStyle,
+        requestType,
+        inlineParams,
+        responseType,
+        hasContextParam,
+        idempotent,
+        null);
   }
 }
