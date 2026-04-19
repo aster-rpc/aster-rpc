@@ -3,6 +3,7 @@ package site.aster.trust;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -18,7 +19,8 @@ import site.aster.registry.ServiceSummary;
  */
 public final class ConsumerAdmissionWire {
 
-  static final ObjectMapper MAPPER = new ObjectMapper();
+  static final ObjectMapper MAPPER =
+      new ObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
   private ConsumerAdmissionWire() {}
 
@@ -41,6 +43,32 @@ public final class ConsumerAdmissionWire {
         throw new IllegalArgumentException(
             "ConsumerAdmissionRequest JSON parse failed: " + e.getMessage(), e);
       }
+    }
+
+    /** Build a request with the given inner credential JSON (empty string = open-gate). */
+    public static Request of(String credentialJson, String iidToken) {
+      Request r = new Request();
+      r.credentialJson = credentialJson == null ? "" : credentialJson;
+      r.iidToken = iidToken == null ? "" : iidToken;
+      return r;
+    }
+
+    public byte[] toJsonBytes() {
+      try {
+        return MAPPER.writeValueAsBytes(this);
+      } catch (JsonProcessingException e) {
+        throw new IllegalStateException("ConsumerAdmissionRequest serialization failed", e);
+      }
+    }
+  }
+
+  /** Parse a {@link Response} from its wire-format JSON bytes. */
+  public static Response parseResponse(byte[] bytes) {
+    try {
+      return MAPPER.readValue(bytes, Response.class);
+    } catch (Exception e) {
+      throw new IllegalArgumentException(
+          "ConsumerAdmissionResponse JSON parse failed: " + e.getMessage(), e);
     }
   }
 

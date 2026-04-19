@@ -168,21 +168,7 @@ final class MissionControlAuthE2ETest {
       AsterClient client =
           AsterClient.builder().codec(clientCodec).build().get(15, TimeUnit.SECONDS);
       assertNotNull(server.node().nodeAddr(), "server should expose a node addr");
-      // AsterClient.nodeId() currently double-hexes the FFI-returned NodeId string: the FFI
-      // already hex-formats the NodeId into the output buffer, and the Java wrapper then hex-
-      // encodes those ASCII bytes again. Server-side, the reactor's peer_id arrives in the
-      // single-hex form, so we decode the double-hex here until the underlying bug in
-      // IrohNode.nodeId() / IrohEndpoint.nodeId() is fixed.
-      String peerId = decodeDoubleHex(client.nodeId());
-      return new AuthFixture(server, client, missionControl, peerId);
-    }
-
-    private static String decodeDoubleHex(String doubleHex) {
-      if (doubleHex.length() != 128) {
-        return doubleHex;
-      }
-      byte[] bytes = java.util.HexFormat.of().parseHex(doubleHex);
-      return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+      return new AuthFixture(server, client, missionControl, client.nodeId());
     }
 
     /**

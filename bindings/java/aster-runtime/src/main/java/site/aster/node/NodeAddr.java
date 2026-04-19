@@ -44,6 +44,43 @@ public record NodeAddr(
   }
 
   /**
+   * Inverse of {@link #toBase64()}: parse the base64-wrapped {@code endpoint_id\n relay_url\n
+   * direct_addresses-newline-joined} form served by consumer-admission responses and registry
+   * documents (spec §3.2). Empty relay line yields a {@code null} {@code relayUrl}; empty direct
+   * line yields an empty list.
+   *
+   * @throws IllegalArgumentException if the input is not valid base64 or does not contain at least
+   *     two newlines (endpointId line + relay line + direct-addresses line).
+   */
+  public static NodeAddr fromBase64(String b64) {
+    if (b64 == null || b64.isEmpty()) {
+      throw new IllegalArgumentException("addr base64 must not be empty");
+    }
+    byte[] decoded;
+    try {
+      decoded = java.util.Base64.getDecoder().decode(b64);
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException("invalid base64 for NodeAddr: " + e.getMessage(), e);
+    }
+    String text = new String(decoded, StandardCharsets.UTF_8);
+    String[] parts = text.split("\n", -1);
+    if (parts.length < 2) {
+      throw new IllegalArgumentException(
+          "NodeAddr base64 missing required newlines (got " + parts.length + " segments): " + text);
+    }
+    String endpointId = parts[0];
+    String relay = parts[1];
+    String relayUrl = relay.isEmpty() ? null : relay;
+    List<String> direct = new ArrayList<>();
+    for (int i = 2; i < parts.length; i++) {
+      if (!parts[i].isEmpty()) {
+        direct.add(parts[i]);
+      }
+    }
+    return new NodeAddr(endpointId, relayUrl, List.copyOf(direct));
+  }
+
+  /**
    * Parse an {@code aster1…} ticket string into its structured {@link NodeAddr}.
    *
    * <p>Delegates to the {@code aster_ticket_decode} Rust FFI — the same parser Python and

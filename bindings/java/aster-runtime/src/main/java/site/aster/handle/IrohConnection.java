@@ -1,7 +1,6 @@
 package site.aster.handle;
 
 import java.lang.foreign.*;
-import java.util.HexFormat;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import site.aster.ffi.*;
@@ -156,16 +155,20 @@ public class IrohConnection extends IrohHandle {
   }
 
   /**
-   * Get the remote peer's node ID as a hex string.
+   * Get the remote peer's node ID as a 64-char hex string.
    *
-   * @return the remote node ID as a hex string
+   * <p>The FFI's {@code iroh_connection_remote_id} returns the id already hex-formatted — the Rust
+   * side calls {@code NodeId::to_string()} and copies those ASCII bytes into the output buffer — so
+   * the Java wrapper decodes them as UTF-8 rather than hex-encoding again. Re-hexing was a
+   * long-standing bug that doubled the length to 128 chars, diverging from the single-hex form the
+   * reactor's peer_id carries.
    */
   public String remoteId() {
     var lib = IrohLibrary.getInstance();
     Arena confined = Arena.ofConfined();
     var alloc = confined;
 
-    // Node IDs are 32 bytes. Reserve extra capacity for hex encoding.
+    // Hex-encoded NodeId is 64 ASCII bytes.
     var bufSeg = alloc.allocate(64);
     var lenSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
@@ -186,7 +189,7 @@ public class IrohConnection extends IrohHandle {
     }
 
     byte[] bytes = bufSeg.asSlice(0, len).toArray(ValueLayout.JAVA_BYTE);
-    return HexFormat.of().formatHex(bytes);
+    return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
   }
 
   /**

@@ -1,7 +1,6 @@
 package site.aster.handle;
 
 import java.lang.foreign.*;
-import java.util.HexFormat;
 import java.util.concurrent.*;
 import site.aster.config.ConnectionConfig;
 import site.aster.ffi.*;
@@ -34,17 +33,18 @@ public class IrohEndpoint extends IrohHandle {
   }
 
   /**
-   * Get this endpoint's node ID as a hex string.
+   * Get this endpoint's node ID as a 64-char hex string.
    *
-   * @return the node ID string
-   * @throws IrohException if the ID cannot be retrieved
+   * <p>The FFI {@code iroh_endpoint_id} returns an already-hex-encoded ASCII buffer (Rust's {@code
+   * NodeId::to_string()}); the Java wrapper decodes those bytes as UTF-8 rather than hex-encoding
+   * them again. Re-hexing was a latent bug that doubled the length to 128 chars.
    */
   public String nodeId() {
     var lib = IrohLibrary.getInstance();
     Arena confined = Arena.ofConfined();
     var alloc = confined;
 
-    // Node IDs are typically 32 bytes (256 bits). Reserve extra capacity for hex encoding.
+    // Hex-encoded NodeId is 64 ASCII bytes.
     var bufSeg = alloc.allocate(64);
     var lenSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
@@ -59,8 +59,7 @@ public class IrohEndpoint extends IrohHandle {
     }
 
     byte[] bytes = bufSeg.asSlice(0, len).toArray(ValueLayout.JAVA_BYTE);
-    // Hex-encode: node IDs are displayed as hex strings
-    return HexFormat.of().formatHex(bytes);
+    return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
   }
 
   /**

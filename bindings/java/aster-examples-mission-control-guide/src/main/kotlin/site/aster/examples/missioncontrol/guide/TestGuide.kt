@@ -1,5 +1,6 @@
 package site.aster.examples.missioncontrol.guide
 
+import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 import kotlinx.coroutines.Dispatchers
@@ -13,6 +14,8 @@ import site.aster.examples.missioncontrol.AgentSessionDispatcher
 import site.aster.examples.missioncontrol.MissionControlDispatcher
 import site.aster.examples.missioncontrol.Server
 import site.aster.examples.missioncontrol.types.Assignment
+import site.aster.examples.missioncontrol.types.Command
+import site.aster.examples.missioncontrol.types.CommandResult
 import site.aster.examples.missioncontrol.types.Heartbeat
 import site.aster.examples.missioncontrol.types.IngestResult
 import site.aster.examples.missioncontrol.types.LogEntry
@@ -21,6 +24,8 @@ import site.aster.examples.missioncontrol.types.StatusRequest
 import site.aster.examples.missioncontrol.types.StatusResponse
 import site.aster.examples.missioncontrol.types.SubmitLogResult
 import site.aster.examples.missioncontrol.types.TailRequest
+import site.aster.interceptors.RpcError
+import site.aster.interceptors.StatusCode
 import site.aster.node.NodeAddr
 
 /**
@@ -287,11 +292,226 @@ private suspend fun runDevMode(addrStr: String) {
   }
 }
 
-private fun runAuthMode(addrStr: String, keysDir: String) {
+// ─── Chapter 5: auth ─────────────────────────────────────────────────────────
+
+private fun isPermissionDenied(t: Throwable): Boolean {
+  var cur: Throwable? = t
+  while (cur != null) {
+    if (cur is RpcError && cur.code() == StatusCode.PERMISSION_DENIED) return true
+    val msg = cur.message ?: ""
+    if (msg.contains("PERMISSION_DENIED") || msg.lowercase().contains("permission")) return true
+    cur = cur.cause
+  }
+  return false
+}
+
+private suspend fun buildClient(addrStr: String, identityPath: Path?): Pair<AsterClient?, NodeAddr?> {
+  val addr =
+      try {
+        NodeAddr.fromTicket(addrStr)
+      } catch (e: Throwable) {
+        fail("Ch5 parse addr", unwrap(e).toString())
+        return null to null
+      }
+  val codec = ForyCodec()
+  Server.registerWireTypes(codec)
+  val builder = AsterClient.builder().codec(codec)
+  if (identityPath != null) {
+    builder.identity(identityPath)
+  }
+  val client =
+      try {
+        builder.build().get(15, TimeUnit.SECONDS)
+      } catch (e: Throwable) {
+        fail("Ch5 build client", unwrap(e).toString())
+        return null to null
+      }
+  return client to addr
+}
+
+/** No credential → admission should deny. Works against strict-mode servers only. */
+private suspend fun testCh5NoCredential(addrStr: String) {
+  val (client, addr) = buildClient(addrStr, null)
+  if (client == null || addr == null) return
+  try {
+    client
+        .call<StatusRequest, StatusResponse>(
+            addr,
+            MissionControlDispatcher.SERVICE_NAME,
+            "getStatus",
+            StatusRequest("probe"),
+            StatusResponse::class.java)
+        .orTimeout(15, TimeUnit.SECONDS)
+        .await()
+    fail("Ch5 no-cred denied", "call succeeded — admission should have denied")
+  } catch (e: Throwable) {
+    if (isPermissionDenied(unwrap(e))) {
+      ok("Ch5 no credential → denied")
+    } else {
+      fail("Ch5 no-cred denied", "unexpected error: ${unwrap(e)}")
+    }
+  } finally {
+    try {
+      client.close()
+    } catch (_: Throwable) {}
+  }
+}
+
+/** Edge credential: getStatus OK (has ops.status), tailLogs DENIED, runCommand DENIED. */
+private suspend fun testCh5EdgeCredential(addrStr: String, edgeCred: Path) {
+  val (client, addr) = buildClient(addrStr, edgeCred)
+  if (client == null || addr == null) return
+  try {
+    try {
+      val r =
+          client
+              .call<StatusRequest, StatusResponse>(
+                  addr,
+                  MissionControlDispatcher.SERVICE_NAME,
+                  "getStatus",
+                  StatusRequest("edge-7"),
+                  StatusResponse::class.java)
+              .orTimeout(15, TimeUnit.SECONDS)
+              .await()
+      if (r.status() == "running") {
+        ok("Ch5 edge getStatus → OK (has ops.status)")
+      } else {
+        fail("Ch5 edge getStatus", "unexpected: $r")
+      }
+    } catch (e: Throwable) {
+      fail("Ch5 edge getStatus", unwrap(e).toString())
+    }
+
+    try {
+      client
+          .callServerStream<TailRequest, LogEntry>(
+              addr,
+              MissionControlDispatcher.SERVICE_NAME,
+              "tailLogs",
+              TailRequest("", "info"),
+              LogEntry::class.java)
+          .orTimeout(15, TimeUnit.SECONDS)
+          .await()
+      fail("Ch5 edge tailLogs denied", "stream succeeded — should have been denied")
+    } catch (e: Throwable) {
+      if (isPermissionDenied(unwrap(e))) {
+        ok("Ch5 edge tailLogs → DENIED (lacks ops.logs)")
+      } else {
+        fail("Ch5 edge tailLogs denied", "unexpected error: ${unwrap(e)}")
+      }
+    }
+
+    try {
+      val session = client.openSession(addr).orTimeout(15, TimeUnit.SECONDS).await()
+      session.use { s ->
+        s.callBidiStream<Command, CommandResult>(
+                AgentSessionDispatcher.SERVICE_NAME,
+                "runCommand",
+                listOf(Command("echo hello")),
+                CommandResult::class.java)
+            .orTimeout(15, TimeUnit.SECONDS)
+            .await()
+      }
+      fail("Ch5 edge runCommand denied", "bidi succeeded — should have been denied")
+    } catch (e: Throwable) {
+      if (isPermissionDenied(unwrap(e))) {
+        ok("Ch5 edge runCommand → DENIED (bidi auth check)")
+      } else {
+        fail("Ch5 edge runCommand denied", "unexpected error: ${unwrap(e)}")
+      }
+    }
+  } finally {
+    try {
+      client.close()
+    } catch (_: Throwable) {}
+  }
+}
+
+/** Ops credential: getStatus OK, tailLogs OK (any_of(LOGS, ADMIN)), runCommand OK. */
+private suspend fun testCh5OpsCredential(addrStr: String, opsCred: Path) {
+  val (client, addr) = buildClient(addrStr, opsCred)
+  if (client == null || addr == null) return
+  try {
+    try {
+      val r =
+          client
+              .call<StatusRequest, StatusResponse>(
+                  addr,
+                  MissionControlDispatcher.SERVICE_NAME,
+                  "getStatus",
+                  StatusRequest("ops"),
+                  StatusResponse::class.java)
+              .orTimeout(15, TimeUnit.SECONDS)
+              .await()
+      if (r.status() == "running") {
+        ok("Ch5 ops getStatus → OK")
+      } else {
+        fail("Ch5 ops getStatus", "unexpected: $r")
+      }
+    } catch (e: Throwable) {
+      fail("Ch5 ops getStatus", unwrap(e).toString())
+    }
+
+    val expectedMsg = "ops-auth-${System.nanoTime()}"
+    val now = System.currentTimeMillis() / 1000.0
+    val streamFuture =
+        client
+            .callServerStream<TailRequest, LogEntry>(
+                addr,
+                MissionControlDispatcher.SERVICE_NAME,
+                "tailLogs",
+                TailRequest("", "info"),
+                LogEntry::class.java)
+            .orTimeout(15, TimeUnit.SECONDS)
+    delay(150L)
+    try {
+      client
+          .call<LogEntry, SubmitLogResult>(
+              addr,
+              MissionControlDispatcher.SERVICE_NAME,
+              "submitLog",
+              LogEntry(now, "info", expectedMsg, "ops"),
+              SubmitLogResult::class.java)
+          .orTimeout(5, TimeUnit.SECONDS)
+          .await()
+    } catch (e: Throwable) {
+      streamFuture.cancel(true)
+      fail("Ch5 ops tailLogs setup", "submitLog failed: ${unwrap(e)}")
+      return
+    }
+    try {
+      val entries = streamFuture.await()
+      if (entries.any { it.message() == expectedMsg }) {
+        ok("Ch5 ops tailLogs → OK ($expectedMsg)")
+      } else {
+        fail("Ch5 ops tailLogs", "stream didn't deliver the marker entry: $entries")
+      }
+    } catch (e: Throwable) {
+      fail("Ch5 ops tailLogs", unwrap(e).toString())
+    }
+  } finally {
+    try {
+      client.close()
+    } catch (_: Throwable) {}
+  }
+}
+
+private suspend fun runAuthMode(addrStr: String, keysDir: String) {
   section("Auth mode (Chapter 5)")
-  fail("Ch5", "Kotlin auth-mode client not yet implemented (Phase 3b)")
-  @Suppress("UNUSED_PARAMETER") addrStr
-  @Suppress("UNUSED_PARAMETER") keysDir
+  val edgeCred = Path.of(keysDir, "edge.cred")
+  val opsCred = Path.of(keysDir, "ops.cred")
+  if (!edgeCred.toFile().exists()) {
+    fail("Ch5 setup", "missing ${edgeCred} — run setup_auth.sh first")
+    return
+  }
+  if (!opsCred.toFile().exists()) {
+    fail("Ch5 setup", "missing ${opsCred} — run setup_auth.sh first")
+    return
+  }
+
+  testCh5NoCredential(addrStr)
+  testCh5EdgeCredential(addrStr, edgeCred)
+  testCh5OpsCredential(addrStr, opsCred)
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -348,6 +568,7 @@ private suspend fun mainImpl(args: Array<String>): Int {
       return 2
     }
   }
+  // keepAlive — addrStr + mode handled above; nothing else
 
   if (!quiet) {
     println(

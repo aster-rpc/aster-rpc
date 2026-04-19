@@ -5,7 +5,6 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SegmentAllocator;
 import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
-import java.util.HexFormat;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
 import site.aster.blobs.IrohBlobs;
@@ -88,7 +87,10 @@ public class IrohNode implements AutoCloseable {
     return bytes;
   }
 
-  /** Node's endpoint ID as a hex string. */
+  /**
+   * Node's endpoint ID as a 64-char hex string. The FFI returns already-hex-encoded ASCII bytes; we
+   * decode as UTF-8 rather than hex-encode again (the latter would double-hex to 128 chars).
+   */
   public String nodeId() {
     IrohLibrary lib = IrohLibrary.getInstance();
     Arena confined = Arena.ofConfined();
@@ -104,7 +106,7 @@ public class IrohNode implements AutoCloseable {
     int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);
     if (len == 0) return "";
     byte[] bytes = bufSeg.asSlice(0, len).toArray(ValueLayout.JAVA_BYTE);
-    return HexFormat.of().formatHex(bytes);
+    return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
   }
 
   /** Structured node address info. */
