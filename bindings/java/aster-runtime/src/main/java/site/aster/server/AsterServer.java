@@ -493,6 +493,24 @@ public final class AsterServer implements AutoCloseable {
       }
       CallContext ctx = buildCallContext(header, method, call);
 
+      // Run the server-side interceptor chain's onRequest hook. Capability-style gates
+      // (and the dev-mode metadata-to-attributes shim used by Mission Control auth tests)
+      // throw RpcError here; any other Exception is surfaced as INTERNAL. The call's raw
+      // request bytes are passed as the opaque request value — user interceptors that
+      // need the decoded payload should hook in a higher layer.
+      if (!interceptors.isEmpty()) {
+        try {
+          site.aster.interceptors.InterceptorChain.applyRequest(interceptors, ctx, call.request());
+        } catch (RpcError e) {
+          submitErrorTrailer(callId, e.code(), e.rpcMessage());
+          return;
+        } catch (Exception e) {
+          submitErrorTrailer(
+              callId, StatusCode.INTERNAL, e.getMessage() == null ? "error" : e.getMessage());
+          return;
+        }
+      }
+
       // Trampoline streaming dispatchers (client-stream / bidi) onto a platform-thread
       // executor so their blocking Reactor.recvFrame calls don't pin a virtual-thread
       // carrier. Unary + server-stream stay on the VT executor (they don't block on
@@ -865,24 +883,46 @@ public final class AsterServer implements AutoCloseable {
      * classpath.
      */
     public Builder service(Object instance) {
-      ServiceDispatcher d = findDispatcherFor(instance.getClass());
-      if (d.descriptor().scope() != Scope.SHARED) {
+      return service(instance, findDispatcherFor(instance.getClass()));
+    }
+
+    /**
+     * Register a SHARED-scope service instance with an explicit {@link ServiceDispatcher}. Use this
+     * when you want to bypass {@link java.util.ServiceLoader} discovery — typically for auth-mode /
+     * test dispatchers that intentionally aren't published via {@code META-INF/services} to avoid
+     * clashing with a default dispatcher for the same impl class.
+     */
+    public Builder service(Object instance, ServiceDispatcher dispatcher) {
+      if (dispatcher.descriptor().scope() != Scope.SHARED) {
         throw new IllegalArgumentException(
             "service() requires a SHARED-scope service; use sessionService() for "
-                + d.descriptor().scope());
+                + dispatcher.descriptor().scope());
       }
-      services.put(d.descriptor().name(), new RegisteredService(d.descriptor(), d, instance, null));
+      services.put(
+          dispatcher.descriptor().name(),
+          new RegisteredService(dispatcher.descriptor(), dispatcher, instance, null));
       return this;
     }
 
     /** Register a SESSION-scope service class with a per-peer factory. */
     public Builder sessionService(Class<?> implClass, Function<String, Object> factory) {
-      ServiceDispatcher d = findDispatcherFor(implClass);
-      if (d.descriptor().scope() != Scope.SESSION) {
+      return sessionService(implClass, factory, findDispatcherFor(implClass));
+    }
+
+    /**
+     * Register a SESSION-scope service with an explicit {@link ServiceDispatcher}; see {@link
+     * #service(Object, ServiceDispatcher)} for when to prefer the explicit form.
+     */
+    public Builder sessionService(
+        Class<?> implClass, Function<String, Object> factory, ServiceDispatcher dispatcher) {
+      if (dispatcher.descriptor().scope() != Scope.SESSION) {
         throw new IllegalArgumentException(
-            "sessionService() requires a SESSION-scope service; got " + d.descriptor().scope());
+            "sessionService() requires a SESSION-scope service; got "
+                + dispatcher.descriptor().scope());
       }
-      services.put(d.descriptor().name(), new RegisteredService(d.descriptor(), d, null, factory));
+      services.put(
+          dispatcher.descriptor().name(),
+          new RegisteredService(dispatcher.descriptor(), dispatcher, null, factory));
       return this;
     }
 
