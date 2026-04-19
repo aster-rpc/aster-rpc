@@ -27,6 +27,12 @@ WORK_DIR="$SCRIPT_DIR/.work"
 QUIET=0
 ONLY=""
 
+# Java/Kotlin is opt-in because it requires a Maven build and the native FFI dylib on the path.
+# Set ASTER_MATRIX_INCLUDE_JAVA=1 to include {java,kotlin} in the server/client lists.
+INCLUDE_JAVA="${ASTER_MATRIX_INCLUDE_JAVA:-0}"
+JAVA_BINDINGS_DIR="$REPO_ROOT/bindings/java"
+JAVA_FFI_LIB="${IROH_LIB_PATH:-$REPO_ROOT/target/release/libaster_transport_ffi.dylib}"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -q|--quiet) QUIET=1; shift ;;
@@ -163,13 +169,56 @@ start_ts_server() {
   return 1
 }
 
+start_java_server() {
+  local mode="$1"
+  local pid_file="$WORK_DIR/server.pid"
+  local addr_file="$WORK_DIR/server.addr"
+  local log_file="$WORK_DIR/server.log"
+
+  rm -f "$pid_file" "$addr_file" "$log_file"
+
+  if [[ "$mode" == "auth" ]]; then
+    # ServerAuth arrives with Phase 3c. Until then, surface a clear skip marker.
+    echo "SKIP: java auth-mode server not yet wired into matrix (Phase 3c)" > "$log_file"
+    return 1
+  fi
+
+  # mvn exec:java re-uses installed classes, but we still invoke in-module so no
+  # `install` step is required. Spotbugs/fmt/checkstyle are skipped for speed.
+  cd "$JAVA_BINDINGS_DIR"
+  IROH_LIB_PATH="$JAVA_FFI_LIB" \
+    mvn -pl aster-examples-mission-control exec:java \
+      -Dexec.mainClass=site.aster.examples.missioncontrol.Server \
+      -Dspotbugs.skip=true -Dfmt.skip=true -Dcheckstyle.skip=true -q \
+    > "$addr_file" 2> "$log_file" &
+
+  echo $! > "$pid_file"
+
+  local i=0
+  while [[ $i -lt 60 ]]; do
+    if [[ -s "$addr_file" ]] && grep -q '^aster1' "$addr_file"; then
+      return 0
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+
+  echo "ERROR: java server did not start within 30s. Log:" >&2
+  cat "$log_file" >&2
+  return 1
+}
+
 stop_server() {
   local pid_file="$WORK_DIR/server.pid"
   if [[ -f "$pid_file" ]]; then
     local pid
     pid=$(cat "$pid_file")
     kill "$pid" 2>/dev/null || true
+    # mvn exec:java spawns child JVMs; kill the whole process group too.
+    kill -- "-$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
+    # Any leftover mvn/java processes spawned by the Java server path.
+    pkill -f "site.aster.examples.missioncontrol.Server" 2>/dev/null || true
     rm -f "$pid_file"
   fi
 }
@@ -205,6 +254,22 @@ run_ts_client() {
   bun run "$SCRIPT_DIR/test_guide.ts" "$address" --mode "$mode" $extra $q_flag
 }
 
+run_kotlin_client() {
+  local address="$1"
+  local mode="$2"
+  local extra_args=""
+  [[ "$mode" == "auth" ]] && extra_args="--keys-dir $WORK_DIR"
+  local q_flag=""
+  [[ $QUIET -eq 1 ]] && q_flag="-q"
+
+  cd "$JAVA_BINDINGS_DIR"
+  IROH_LIB_PATH="$JAVA_FFI_LIB" \
+    mvn -pl aster-examples-mission-control-guide exec:java \
+      -Dexec.mainClass=site.aster.examples.missioncontrol.guide.TestGuideKt \
+      -Dexec.args="$address --mode $mode $extra_args $q_flag" \
+      -Dspotbugs.skip=true -Dfmt.skip=true -Dcheckstyle.skip=true -q
+}
+
 run_combo_with_server() {
   local server_lang="$1"
   local client_lang="$2"
@@ -219,17 +284,31 @@ run_combo_with_server() {
   [[ $QUIET -eq 0 ]] && echo -e "\n${C_BOLD}━━━ $label ━━━${C_RESET}"
 
   # Start the right server
-  if [[ "$server_lang" == "python" ]]; then
-    if ! start_python_server "$mode"; then
+  case "$server_lang" in
+    python)
+      if ! start_python_server "$mode"; then
+        run_combo "$label" 1 0 1
+        return
+      fi
+      ;;
+    ts)
+      if ! start_ts_server "$mode"; then
+        run_combo "$label" 1 0 1
+        return
+      fi
+      ;;
+    java)
+      if ! start_java_server "$mode"; then
+        run_combo "$label" 1 0 1
+        return
+      fi
+      ;;
+    *)
+      echo "ERROR: unknown server lang: $server_lang" >&2
       run_combo "$label" 1 0 1
       return
-    fi
-  else
-    if ! start_ts_server "$mode"; then
-      run_combo "$label" 1 0 1
-      return
-    fi
-  fi
+      ;;
+  esac
 
   local address
   address=$(extract_addr)
@@ -242,11 +321,17 @@ run_combo_with_server() {
 
   # Run the client
   local client_output
-  if [[ "$client_lang" == "python" ]]; then
-    client_output=$(run_python_client "$address" "$mode" 2>&1)
-  else
-    client_output=$(run_ts_client "$address" "$mode" 2>&1)
-  fi
+  case "$client_lang" in
+    python) client_output=$(run_python_client "$address" "$mode" 2>&1) ;;
+    ts) client_output=$(run_ts_client "$address" "$mode" 2>&1) ;;
+    kotlin) client_output=$(run_kotlin_client "$address" "$mode" 2>&1) ;;
+    *)
+      echo "ERROR: unknown client lang: $client_lang" >&2
+      stop_server
+      run_combo "$label" 1 0 1
+      return
+      ;;
+  esac
   local client_rc=$?
 
   # Print the client output
@@ -276,9 +361,18 @@ fi
 # Trap to ensure server cleanup on exit/interrupt
 trap 'stop_server' EXIT INT TERM
 
+# Assemble the server / client lists based on the include flag.
+SERVERS=(python ts)
+CLIENTS=(python ts)
+if [[ "$INCLUDE_JAVA" == "1" ]]; then
+  SERVERS+=(java)
+  CLIENTS+=(kotlin)
+  [[ $QUIET -eq 0 ]] && echo -e "${C_DIM}Java server + Kotlin client included (ASTER_MATRIX_INCLUDE_JAVA=1)${C_RESET}"
+fi
+
 # Run the matrix
-for server in python ts; do
-  for client in python ts; do
+for server in "${SERVERS[@]}"; do
+  for client in "${CLIENTS[@]}"; do
     for mode in dev auth; do
       run_combo_with_server "$server" "$client" "$mode"
     done
