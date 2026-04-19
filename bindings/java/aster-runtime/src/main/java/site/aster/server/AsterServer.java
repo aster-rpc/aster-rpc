@@ -145,7 +145,10 @@ public final class AsterServer implements AutoCloseable {
     // verification is tracked as tasks #14/#15.
     this.admissionHandler =
         new site.aster.trust.ConsumerAdmissionHandler(
-            this::buildServiceSummaries, () -> registryNamespace);
+            this::buildServiceSummaries,
+            () -> registryNamespace,
+            this::setPeerAttributes,
+            () -> this.config == null || this.config.allowAllConsumers());
     this.nonRpcAcceptThread =
         Thread.ofPlatform()
             .daemon(true)

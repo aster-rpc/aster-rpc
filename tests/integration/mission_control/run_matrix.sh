@@ -177,18 +177,22 @@ start_java_server() {
 
   rm -f "$pid_file" "$addr_file" "$log_file"
 
-  if [[ "$mode" == "auth" ]]; then
-    # ServerAuth arrives with Phase 3c. Until then, surface a clear skip marker.
-    echo "SKIP: java auth-mode server not yet wired into matrix (Phase 3c)" > "$log_file"
-    return 1
-  fi
-
   # mvn exec:java re-uses installed classes, but we still invoke in-module so no
   # `install` step is required. Spotbugs/fmt/checkstyle are skipped for speed.
   cd "$JAVA_BINDINGS_DIR"
+  local main_class exec_args
+  if [[ "$mode" == "auth" ]]; then
+    main_class=site.aster.examples.missioncontrol.ServerAuth
+    exec_args="--strict"
+  else
+    main_class=site.aster.examples.missioncontrol.Server
+    exec_args=""
+  fi
+
   IROH_LIB_PATH="$JAVA_FFI_LIB" \
     mvn -pl aster-examples-mission-control exec:java \
-      -Dexec.mainClass=site.aster.examples.missioncontrol.Server \
+      -Dexec.mainClass="$main_class" \
+      -Dexec.args="$exec_args" \
       -Dspotbugs.skip=true -Dfmt.skip=true -Dcheckstyle.skip=true -q \
     > "$addr_file" 2> "$log_file" &
 
@@ -219,6 +223,7 @@ stop_server() {
     wait "$pid" 2>/dev/null || true
     # Any leftover mvn/java processes spawned by the Java server path.
     pkill -f "site.aster.examples.missioncontrol.Server" 2>/dev/null || true
+    pkill -f "site.aster.examples.missioncontrol.ServerAuth" 2>/dev/null || true
     rm -f "$pid_file"
   fi
 }
@@ -337,10 +342,12 @@ run_combo_with_server() {
   # Print the client output
   echo "$client_output"
 
-  # Parse pass/fail counts from the last line (format: "X pass, Y fail")
+  # Parse pass/fail counts from the "Result: X passed, Y failed" line (or the quiet
+  # "kt-client dev: X pass, Y fail" form). Tail window is generous because the Kotlin
+  # client's JVM-shutdown Cleaner messages tail the stream on stderr.
   local pass fail
-  pass=$(echo "$client_output" | tail -5 | grep -oE '[0-9]+ pass' | grep -oE '[0-9]+' | tail -1)
-  fail=$(echo "$client_output" | tail -5 | grep -oE '[0-9]+ fail' | grep -oE '[0-9]+' | tail -1)
+  pass=$(echo "$client_output" | tail -30 | grep -oE '[0-9]+ pass' | grep -oE '[0-9]+' | tail -1)
+  fail=$(echo "$client_output" | tail -30 | grep -oE '[0-9]+ fail' | grep -oE '[0-9]+' | tail -1)
   [[ -z "$pass" ]] && pass=0
   [[ -z "$fail" ]] && fail=0
 

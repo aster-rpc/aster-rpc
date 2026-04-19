@@ -1,14 +1,17 @@
 package site.aster.client;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import site.aster.codec.Codec;
 import site.aster.codec.ForyCodec;
 import site.aster.config.AsterConfig;
+import site.aster.config.AsterIdentity;
 import site.aster.ffi.AsterCall;
 import site.aster.handle.IrohConnection;
 import site.aster.handle.IrohEndpoint;
@@ -16,11 +19,15 @@ import site.aster.interceptors.Interceptor;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
 import site.aster.node.NodeAddr;
+import site.aster.registry.ServiceSummary;
 import site.aster.server.AsterFraming;
 import site.aster.server.AsterServer;
 import site.aster.server.wire.CallHeader;
 import site.aster.server.wire.RpcStatus;
 import site.aster.server.wire.StreamHeader;
+import site.aster.trust.ConsumerAdmissionClient;
+import site.aster.trust.ConsumerAdmissionHandler;
+import site.aster.trust.ConsumerAdmissionWire;
 
 /**
  * Client-side entry point for calling Aster RPC services. Manages one {@link IrohEndpoint}, a
@@ -43,12 +50,32 @@ public final class AsterClient implements AutoCloseable {
   private final Map<String, IrohConnection> connectionCache = new ConcurrentHashMap<>();
   private final Executor callExecutor = CallExecutor.INSTANCE;
 
+  /**
+   * Inner credential JSON to present during consumer admission. Empty string ⇒ open-gate / dev
+   * mode; non-empty ⇒ the consumer-role {@code [[peers]]} entry from an {@code .aster-identity}
+   * file, serialized via {@link AsterIdentity#credentialJson}.
+   */
+  private final String admissionCredentialJson;
+
+  private final String admissionIidToken;
+
+  /**
+   * After successful admission against a given {@link NodeAddr}, the RPC endpoint address for that
+   * peer (taken from any returned service's {@code channels["rpc"]}). Keyed by the caller-supplied
+   * admission target's endpoint id; value is the decoded RPC-channel {@link NodeAddr}. Misses here
+   * fall through to using the caller-supplied address directly.
+   */
+  private final Map<String, NodeAddr> admittedRpcAddr = new ConcurrentHashMap<>();
+
   private AsterClient(Builder b, IrohEndpoint endpoint) {
     this.endpoint = endpoint;
     this.codec = b.codec != null ? b.codec : new ForyCodec();
     this.headerCodec = registerFrameworkWireTypes(this.codec);
     this.config = b.config;
     this.interceptors = List.copyOf(b.interceptors);
+    this.admissionCredentialJson =
+        b.admissionCredentialJson == null ? "" : b.admissionCredentialJson;
+    this.admissionIidToken = b.admissionIidToken == null ? "" : b.admissionIidToken;
   }
 
   private static ForyCodec registerFrameworkWireTypes(Codec userCodec) {
@@ -89,23 +116,75 @@ public final class AsterClient implements AutoCloseable {
     return interceptors;
   }
 
+  /**
+   * Connect to {@code target} on the RPC ALPN, performing the {@code aster.consumer_admission}
+   * handshake on the first visit so the producer registers the peer and hands back the RPC-channel
+   * address to dial. Subsequent calls reuse both the admission outcome (cached by target's endpoint
+   * id) and the underlying QUIC connection (cached by RPC peer id).
+   */
   public CompletableFuture<IrohConnection> connect(NodeAddr target) {
-    String peerId = target.endpointId();
-    IrohConnection existing = connectionCache.get(peerId);
-    if (existing != null) {
-      return CompletableFuture.completedFuture(existing);
-    }
-    return endpoint
-        .connectNodeAddrAsync(target, AsterServer.ASTER_ALPN)
-        .thenApply(
-            conn -> {
-              IrohConnection prior = connectionCache.putIfAbsent(peerId, conn);
-              if (prior != null) {
-                conn.close();
-                return prior;
+    return admit(target)
+        .thenCompose(
+            rpcAddr -> {
+              String rpcPeerId = rpcAddr.endpointId();
+              IrohConnection existing = connectionCache.get(rpcPeerId);
+              if (existing != null) {
+                return CompletableFuture.completedFuture(existing);
               }
-              return conn;
+              return endpoint
+                  .connectNodeAddrAsync(rpcAddr, AsterServer.ASTER_ALPN)
+                  .thenApply(
+                      conn -> {
+                        IrohConnection prior = connectionCache.putIfAbsent(rpcPeerId, conn);
+                        if (prior != null) {
+                          conn.close();
+                          return prior;
+                        }
+                        return conn;
+                      });
             });
+  }
+
+  /**
+   * Present the configured credential (or empty in dev mode) to {@code target} over the {@code
+   * aster.consumer_admission} ALPN. Memoises the returned RPC-channel address so repeated calls to
+   * the same target skip the handshake. Denied admissions surface as {@link RpcError} with code
+   * {@link StatusCode#PERMISSION_DENIED}.
+   */
+  CompletableFuture<NodeAddr> admit(NodeAddr target) {
+    String targetKey = target.endpointId();
+    NodeAddr cached = admittedRpcAddr.get(targetKey);
+    if (cached != null) {
+      return CompletableFuture.completedFuture(cached);
+    }
+    return ConsumerAdmissionClient.performAdmission(
+            endpoint, target, admissionCredentialJson, admissionIidToken)
+        .thenApply(
+            resp -> {
+              if (!resp.admitted) {
+                throw new RpcError(
+                    StatusCode.PERMISSION_DENIED,
+                    "consumer admission denied by " + target.endpointId());
+              }
+              NodeAddr rpcAddr = rpcAddrFrom(resp, target);
+              admittedRpcAddr.putIfAbsent(targetKey, rpcAddr);
+              return rpcAddr;
+            });
+  }
+
+  private static NodeAddr rpcAddrFrom(ConsumerAdmissionWire.Response resp, NodeAddr fallback) {
+    if (resp.services == null) return fallback;
+    for (ServiceSummary s : resp.services) {
+      if (s.channels == null) continue;
+      String b64 = s.channels.get("rpc");
+      if (b64 == null || b64.isEmpty()) continue;
+      try {
+        return NodeAddr.fromBase64(b64);
+      } catch (RuntimeException ignored) {
+        // Malformed channel entry — fall through to the next service or the fallback.
+      }
+    }
+    return fallback;
   }
 
   /** Make a unary RPC call against a SHARED-scoped service (sessionId=0). */
@@ -512,11 +591,17 @@ public final class AsterClient implements AutoCloseable {
     private AsterConfig config;
     private Codec codec;
     private List<Interceptor> interceptors = List.of();
+    private byte[] secretKey;
+    String admissionCredentialJson = "";
+    String admissionIidToken = "";
 
     private Builder() {}
 
     public Builder config(AsterConfig config) {
       this.config = config;
+      if (config != null && config.secretKey() != null && this.secretKey == null) {
+        this.secretKey = config.secretKey();
+      }
       return this;
     }
 
@@ -530,10 +615,60 @@ public final class AsterClient implements AutoCloseable {
       return this;
     }
 
+    /** 32-byte ed25519 seed for the local endpoint. Stabilises this consumer's peer id. */
+    public Builder secretKey(byte[] secretKey) {
+      this.secretKey = secretKey;
+      return this;
+    }
+
+    /**
+     * Load an {@code .aster-identity} TOML file and apply both the node secret key and a consumer
+     * peer entry as the admission credential. Peer selection is by role — the first {@code
+     * [[peers]]} with {@code role = "consumer"}, matching Python's {@code AsterClient(identity=…)}
+     * default. Open-gate servers ignore the credential body; auth-mode servers verify it.
+     */
+    public Builder identity(Path path) {
+      AsterIdentity id = AsterIdentity.load(path);
+      if (id.nodeSecretKey() != null) {
+        this.secretKey = id.nodeSecretKey();
+      }
+      Optional<AsterIdentity.PeerEntry> consumer = id.findByRole("consumer");
+      if (consumer.isEmpty() && !id.peers().isEmpty()) {
+        consumer = Optional.of(id.peers().get(0));
+      }
+      consumer.ifPresent(p -> this.admissionCredentialJson = AsterIdentity.credentialJson(p));
+      return this;
+    }
+
+    public Builder identity(String path) {
+      return identity(Path.of(path));
+    }
+
+    /** Override the peer name selection used by {@link #identity(Path)}. */
+    public Builder identity(Path path, String peerName) {
+      AsterIdentity id = AsterIdentity.load(path);
+      if (id.nodeSecretKey() != null) {
+        this.secretKey = id.nodeSecretKey();
+      }
+      id.findByName(peerName)
+          .ifPresent(p -> this.admissionCredentialJson = AsterIdentity.credentialJson(p));
+      return this;
+    }
+
+    /** Optional cloud IID token presented alongside the credential (default: empty). */
+    public Builder iidToken(String token) {
+      this.admissionIidToken = token == null ? "" : token;
+      return this;
+    }
+
     public CompletableFuture<AsterClient> build() {
       site.aster.handle.IrohRuntime runtime = site.aster.handle.IrohRuntime.create();
       site.aster.config.EndpointConfig endpointConfig =
-          new site.aster.config.EndpointConfig().alpns(List.of(AsterServer.ASTER_ALPN));
+          new site.aster.config.EndpointConfig()
+              .alpns(List.of(AsterServer.ASTER_ALPN, ConsumerAdmissionHandler.ALPN_STRING));
+      if (secretKey != null && secretKey.length > 0) {
+        endpointConfig.secretKey(secretKey);
+      }
       Builder self = this;
       return runtime.endpointCreateAsync(endpointConfig).thenApply(ep -> new AsterClient(self, ep));
     }

@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import site.aster.codec.ForyCodec;
+import site.aster.config.AsterConfig;
 import site.aster.examples.missioncontrol.auth.AgentSessionAuthDispatcher;
 import site.aster.examples.missioncontrol.auth.MetadataRoleInterceptor;
 import site.aster.examples.missioncontrol.auth.MissionControlAuthDispatcher;
@@ -31,8 +32,16 @@ public final class ServerAuth {
 
     MissionControl missionControl = new MissionControl();
 
+    boolean strict = false;
+    for (String a : args) {
+      if ("--strict".equals(a)) strict = true;
+    }
+
     AsterServer server =
-        buildWithAuth(codec, missionControl, AgentSession::new).get(15, TimeUnit.SECONDS);
+        (strict
+                ? buildStrictAuth(codec, missionControl, AgentSession::new)
+                : buildWithAuth(codec, missionControl, AgentSession::new))
+            .get(15, TimeUnit.SECONDS);
 
     System.out.println("Mission Control auth server started");
     System.out.println("  node id   : " + server.nodeId());
@@ -80,6 +89,37 @@ public final class ServerAuth {
 
     return AsterServer.builder()
         .codec(codec)
+        .interceptors(chain)
+        .service(missionControl, mcDispatcher)
+        .sessionService(AgentSession.class, agentFactory::apply, asDispatcher)
+        .build();
+  }
+
+  /**
+   * Strict variant of {@link #buildWithAuth} that requires every admitting peer to present a
+   * non-empty credential; empty credentials are denied at the admission handshake itself. Mirrors
+   * the Python {@code ASTER_ALLOW_ALL_CONSUMERS=false} setting used by the matrix auth tests.
+   */
+  public static java.util.concurrent.CompletableFuture<AsterServer> buildStrictAuth(
+      ForyCodec codec,
+      MissionControl missionControl,
+      java.util.function.Function<String, AgentSession> agentFactory) {
+    MissionControlAuthDispatcher mcDispatcher = new MissionControlAuthDispatcher();
+    AgentSessionAuthDispatcher asDispatcher = new AgentSessionAuthDispatcher();
+
+    Map<String, ServiceDispatcher> services =
+        Map.of(
+            MissionControlAuthDispatcher.SERVICE_NAME, mcDispatcher,
+            AgentSessionAuthDispatcher.SERVICE_NAME, asDispatcher);
+
+    List<Interceptor> chain =
+        List.of(new MetadataRoleInterceptor(), new CapabilityInterceptor(services));
+
+    AsterConfig config = AsterConfig.builder().allowAllConsumers(false).build();
+
+    return AsterServer.builder()
+        .codec(codec)
+        .config(config)
         .interceptors(chain)
         .service(missionControl, mcDispatcher)
         .sessionService(AgentSession.class, agentFactory::apply, asDispatcher)
