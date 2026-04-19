@@ -383,7 +383,16 @@ def _gen_header(source: str, contract_id: str) -> str:
 
 
 def _gen_type_class(rec: _TypeRecord, known_types: dict[str, str]) -> str:
-    """Generate a Python dataclass for a type record."""
+    """Generate a Python dataclass for a type record.
+
+    Every field is emitted with ``pyfory.field(id=N)`` using the 0-based index
+    from the manifest. This locks the Fory struct-fingerprint to the tag IDs
+    instead of field names, which is required for cross-binding XLANG decode:
+    Java Fory's fingerprint snake-cases field names (``detailKeys`` ->
+    ``detail_keys``) while pyfory leaves them verbatim, so without IDs the two
+    sides hash-mismatch with ``Hash X is not consistent with Y for type T``
+    even for structurally identical types.
+    """
     lines = []
     if rec.wire_tag:
         lines.append(f'@wire_type("{rec.wire_tag}")')
@@ -394,15 +403,25 @@ def _gen_type_class(rec: _TypeRecord, known_types: dict[str, str]) -> str:
         lines.append("    pass")
         return "\n".join(lines)
 
-    for f in rec.fields:
+    for index, f in enumerate(rec.fields):
         fname = f["name"]
         ftype_str = _py_type_from_field(f, known_types)
         default = _py_default_from_field(f)
 
-        if default is not None:
-            lines.append(f"    {fname}: {ftype_str} = {default}")
+        # Emit through ``pyfory.field`` so the tag ID rides with the field
+        # declaration. ``_py_default_from_field`` returns ``None`` for no
+        # default, ``"dataclasses.field(default_factory=<factory>)"`` for
+        # mutable containers (Python 3.13 refuses literal ``{}`` / ``[]``
+        # defaults), or a bare literal expression otherwise.
+        if default is None:
+            field_expr = f"pyfory.field({index})"
+        elif default.startswith("dataclasses.field(default_factory="):
+            factory = default[len("dataclasses.field(default_factory=") : -1]
+            field_expr = f"pyfory.field({index}, default_factory={factory})"
         else:
-            lines.append(f"    {fname}: {ftype_str} = None")
+            field_expr = f"pyfory.field({index}, default={default})"
+
+        lines.append(f"    {fname}: {ftype_str} = {field_expr}")
 
     return "\n".join(lines)
 
@@ -691,7 +710,7 @@ def generate_python_clients(
     contract_id = first_manifest.get("contract_id", "")
 
     # Common imports for type files
-    _type_imports = "\nimport dataclasses\nfrom typing import Any, Optional\n\nfrom aster.codec import wire_type\n"
+    _type_imports = "\nimport dataclasses\nfrom typing import Any, Optional\n\nimport pyfory\nfrom aster.codec import wire_type\n"
 
     # Step 4a: Generate shared type files
     for rec in sorted(shared_types, key=lambda r: r.display_name):

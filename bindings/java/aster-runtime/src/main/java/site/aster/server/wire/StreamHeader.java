@@ -2,6 +2,7 @@ package site.aster.server.wire;
 
 import java.util.List;
 import java.util.Objects;
+import org.apache.fory.annotation.ForyField;
 
 /**
  * First frame on every QUIC stream (HEADER flag). Carries service routing, contract identity, call
@@ -24,13 +25,31 @@ public final class StreamHeader {
   public static final byte SERIALIZATION_ROW = 2;
   public static final byte SERIALIZATION_JSON = 3;
 
+  // Explicit ForyField(id=N) on every field keeps the Fory struct fingerprint tag-ID based, so
+  // Java's snake-case field-name conversion doesn't make its hash diverge from Python's (which
+  // uses the raw field name). IDs must stay in sync with bindings/python/aster/protocol.py.
+  @ForyField(id = 0)
   public String service = "";
+
+  @ForyField(id = 1)
   public String method = "";
+
+  @ForyField(id = 2)
   public int version;
+
+  @ForyField(id = 3)
   public int callId;
+
+  @ForyField(id = 4)
   public short deadline;
+
+  @ForyField(id = 5)
   public byte serializationMode;
+
+  @ForyField(id = 6)
   public List<String> metadataKeys = List.of();
+
+  @ForyField(id = 7)
   public List<String> metadataValues = List.of();
 
   /**
@@ -40,6 +59,7 @@ public final class StreamHeader {
    * Treated as 4-byte little-endian on the wire; a signed {@code int} suffices because the counter
    * never reaches 2^31 in practice.
    */
+  @ForyField(id = 8)
   public int sessionId;
 
   public StreamHeader() {}

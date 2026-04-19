@@ -37,7 +37,12 @@ public final class ForyCodec implements Codec {
     this.fory =
         Fory.builder()
             .withLanguage(Language.XLANG)
-            .withRefTracking(true)
+            // STRICT + XLANG, no ref tracking. Must match pyfory's defaults (xlang=True,
+            // ref=False, strict=True) so the schema-hash Fory embeds in each XLANG payload
+            // comes out byte-identical on both sides; any config drift here surfaces as
+            // `Hash X is not consistent with Y for type T` on the receiver.
+            .withRefTracking(false)
+            .requireClassRegistration(true)
             .buildThreadSafeForyPool(2, max);
   }
 

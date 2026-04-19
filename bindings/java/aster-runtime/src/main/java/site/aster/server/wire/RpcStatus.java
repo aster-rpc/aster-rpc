@@ -2,6 +2,7 @@ package site.aster.server.wire;
 
 import java.util.List;
 import java.util.Objects;
+import org.apache.fory.annotation.ForyField;
 
 /**
  * Trailing status frame (TRAILER flag). Sent as the last frame on a stream to communicate the
@@ -10,6 +11,14 @@ import java.util.Objects;
  * <p>Matches the Python reference type {@code _aster/RpcStatus} defined in {@code
  * bindings/python/aster/protocol.py}. Plain class (not a record) for the same Fory-collection
  * reason called out on {@link StreamHeader}.
+ *
+ * <p>Every field carries an explicit {@link ForyField#id()}. This locks the wire schema-hash
+ * (Fory's per-struct fingerprint that SCHEMA_CONSISTENT XLANG embeds in every payload) to an
+ * identity built from tag IDs only, with no dependence on the field name's Java / Python
+ * capitalisation. Without the IDs, Java would fingerprint {@code detail_keys} (post snake-case
+ * conversion) while Python fingerprints {@code detailKeys} verbatim, and the receiver rejects the
+ * payload with {@code Hash X is not consistent with Y for type RpcStatus}. IDs must stay in sync
+ * with {@code bindings/python/aster/protocol.py}.
  */
 public final class RpcStatus {
 
@@ -26,9 +35,16 @@ public final class RpcStatus {
   public static final int INTERNAL = 13;
   public static final int UNAVAILABLE = 14;
 
+  @ForyField(id = 0)
   public int code;
+
+  @ForyField(id = 1)
   public String message = "";
+
+  @ForyField(id = 2)
   public List<String> detailKeys = List.of();
+
+  @ForyField(id = 3)
   public List<String> detailValues = List.of();
 
   public RpcStatus() {}
