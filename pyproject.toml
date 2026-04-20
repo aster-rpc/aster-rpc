@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Aster RPC framework with Iroh P2P transport (Python bindings)"
 requires-python = ">=3.9,<3.14"
 dependencies = [
-    "pyfory==0.16.0",
+    "pyfory==0.17.0",
     "zstandard>=0.25.0",
     "tomli>=2.0; python_version < '3.11'",
     # uvloop: libuv-backed asyncio replacement, ~20-25% faster on the
