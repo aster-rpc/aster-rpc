@@ -223,6 +223,40 @@ public final class AsterClient implements AutoCloseable {
   }
 
   /**
+   * Open an incremental server-streaming call. Unlike {@link #callServerStream} which buffers the
+   * whole response list until the trailer arrives, this variant returns a {@link ServerStreamCall}
+   * the caller drives via {@code recv()}/{@code close()}. Required for open-ended streams (e.g. log
+   * tails) that never terminate on their own — closing the call tears down the QUIC stream, which
+   * is the portable way to stop the server generator.
+   */
+  public <Req, Resp> CompletableFuture<ServerStreamCall<Resp>> openServerStream(
+      NodeAddr target, String service, String method, Req request, Class<Resp> responseType) {
+    return connect(target)
+        .thenApplyAsync(
+            conn -> openServerStreamOn(conn, 0, service, method, request, responseType),
+            callExecutor);
+  }
+
+  <Req, Resp> ServerStreamCall<Resp> openServerStreamOn(
+      IrohConnection conn,
+      int sessionId,
+      String service,
+      String method,
+      Req request,
+      Class<Resp> responseType) {
+    AsterCall call = acquireStreamingOn(conn);
+    try {
+      sendStreamHeader(call, sessionId, service, method);
+      byte[] reqBytes = codec.encode(request);
+      call.sendFrame(AsterFraming.encodeFrame(reqBytes, AsterFraming.FLAG_END_STREAM));
+    } catch (Throwable t) {
+      call.discard();
+      throw reThrow(t);
+    }
+    return new ServerStreamCall<>(call, codec, headerCodec, responseType);
+  }
+
+  /**
    * Make a client-streaming RPC call: N request frames out (last marked with {@link
    * AsterFraming#FLAG_END_STREAM}), one response frame in, then a {@code TRAILER}. Buffered shape.
    */

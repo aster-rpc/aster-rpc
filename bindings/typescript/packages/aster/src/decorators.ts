@@ -66,7 +66,7 @@ export interface ServiceOptions {
 export function Service(options: ServiceOptions) {
   return function <T extends new (...args: any[]) => any>(
     target: T,
-    _context: ClassDecoratorContext,
+    _context?: ClassDecoratorContext,
   ): T {
     // Collect methods that were decorated with @Rpc etc.
     const methods = new Map<string, MethodInfo>();
@@ -147,12 +147,22 @@ interface RpcOptions {
 }
 
 function methodDecorator(pattern: RpcPattern, options?: RpcOptions) {
-  return function <T extends (...args: any[]) => any>(
-    target: T,
-    _context: ClassMethodDecoratorContext,
-  ): T {
+  // Dual-mode: handles both TC39 Stage-3 and TS/Bun experimental
+  // ("Stage-1") method decorator call shapes.
+  //
+  // Stage 3 (TS 5.0+ default): `(value, context)`; `value` is the
+  // method function, `context` is `{ kind, name, ... }`.
+  // Experimental / Stage 1 (still the only mode bun >=1.2 implements
+  // for .ts files today, regardless of `experimentalDecorators`):
+  // `(target, propertyKey, descriptor)`; `target` is the prototype,
+  // `propertyKey` is a string/symbol, `descriptor` is the property
+  // descriptor whose `.value` is the method function.
+  //
+  // In both shapes we stamp `METHOD_INFO_KEY` on the method FUNCTION
+  // so `@Service`'s prototype scan can pick it up identically.
+  return function (this: unknown, ...args: any[]): any {
     const info: MethodInfo = {
-      name: options?.name ?? '', // explicit name or filled in by @Service
+      name: options?.name ?? '',
       pattern,
       requestType: options?.request,
       responseType: options?.response,
@@ -160,10 +170,29 @@ function methodDecorator(pattern: RpcPattern, options?: RpcOptions) {
       idempotent: options?.idempotent ?? false,
       serialization: options?.serialization,
       requires: options?.requires as CapabilityRequirement | undefined,
-      handler: undefined, // filled in by @Service
+      handler: undefined,
       metadata: options?.metadata,
     };
 
+    // Stage-1 shape: 3 args, second is property key (string|symbol),
+    // third is a property descriptor with a `.value` method function.
+    if (
+      args.length >= 3 &&
+      (typeof args[1] === 'string' || typeof args[1] === 'symbol') &&
+      args[2] &&
+      typeof args[2] === 'object' &&
+      'value' in args[2]
+    ) {
+      const descriptor = args[2] as PropertyDescriptor;
+      const method = descriptor.value;
+      if (typeof method === 'function') {
+        (method as any)[METHOD_INFO_KEY] = info;
+      }
+      return descriptor;
+    }
+
+    // Stage-3 shape: first arg is the method function; stamp directly.
+    const target = args[0];
     (target as any)[METHOD_INFO_KEY] = info;
     return target;
   };

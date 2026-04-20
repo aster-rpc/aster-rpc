@@ -2,7 +2,6 @@ package site.aster.examples.missioncontrol.types;
 
 import java.util.List;
 import java.util.Objects;
-import org.apache.fory.annotation.ForyField;
 
 /**
  * Plain class (not a record) because Fory v0.16 fails to round-trip Java records that carry
@@ -12,13 +11,8 @@ import org.apache.fory.annotation.ForyField;
 public final class Heartbeat {
   public static final String FORY_TAG = "mission/Heartbeat";
 
-  @ForyField(id = 0)
   public String agentId = "";
-
-  @ForyField(id = 1)
   public List<String> capabilities = List.of();
-
-  @ForyField(id = 2)
   public double loadAvg;
 
   public Heartbeat() {}

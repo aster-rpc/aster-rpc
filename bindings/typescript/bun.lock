@@ -21,7 +21,7 @@
       "name": "@aster-examples/mission-control",
       "version": "0.0.0",
       "dependencies": {
-        "@aster-rpc/aster": "^0.1.2",
+        "@aster-rpc/aster": "workspace:*",
       },
       "devDependencies": {
         "@types/node": "^22",
@@ -82,16 +82,6 @@
     "@aster-rpc/aster": ["@aster-rpc/aster@workspace:packages/aster"],
 
     "@aster-rpc/transport": ["@aster-rpc/transport@workspace:native"],
-
-    "@aster-rpc/transport-darwin-arm64": ["@aster-rpc/transport-darwin-arm64@0.1.2", "", { "os": "darwin", "cpu": "arm64" }, "sha512-yHlTEl2tbEZMPlmb10T/wOZC9y2hlwLhumFuv+wcWChJq4B3x1kmi/MbqGbcsmLpn+eCIdRGxz5GnOVYDTlDDw=="],
-
-    "@aster-rpc/transport-darwin-x64": ["@aster-rpc/transport-darwin-x64@0.1.2", "", { "os": "darwin", "cpu": "x64" }, "sha512-+Lp4NSMXif54011t3RLZHZCqmC1YTY/WcFdBeGpLq3ZtPGc+I7BLfQIsVR9ow4MO3kk38pjxl0qw99Zdw/lemg=="],
-
-    "@aster-rpc/transport-linux-arm64-gnu": ["@aster-rpc/transport-linux-arm64-gnu@0.1.2", "", { "os": "linux", "cpu": "arm64" }, "sha512-lMp6/6Bsb+4MoOPERWok16al3AiApzrWE00OZ1DpGH/S+FMxmyl+b2XJ24jXUtrr8/CsLpd/zmCEJInLxFm/jQ=="],
-
-    "@aster-rpc/transport-linux-x64-gnu": ["@aster-rpc/transport-linux-x64-gnu@0.1.2", "", { "os": "linux", "cpu": "x64" }, "sha512-RhnPVk3IeqD9rzafZDh1bKhNbBSNZtV7cyuByrL0jDLizXunXVAWTXj9sjRfRz7tAOuN60n/l5Z5Nt/T3cqZlA=="],
-
-    "@aster-rpc/transport-win32-x64-msvc": ["@aster-rpc/transport-win32-x64-msvc@0.1.2", "", { "os": "win32", "cpu": "x64" }, "sha512-XZ0k2mvHgw4CB6xrHdahqGfda2+eQIfK4gfWLfDdArqOAK1Z4PRx6XJraRggXQ6afg/Q4mM93RWhC6HH4sb++Q=="],
 
     "@aster-tests/mission-control": ["@aster-tests/mission-control@workspace:../../tests/integration/mission_control"],
 
@@ -653,8 +643,6 @@
 
     "yaml": ["yaml@2.8.3", "", { "bin": { "yaml": "bin.mjs" } }, "sha512-AvbaCLOO2Otw/lW5bmh9d/WEdcDFdQp2Z2ZUH3pX9U2ihyUY0nvLv7J6TrWowklRGPYbB/IuIMfYgxaCPg5Bpg=="],
 
-    "@aster-examples/mission-control/@aster-rpc/aster": ["@aster-rpc/aster@0.1.2", "", { "dependencies": { "@aster-rpc/transport": "0.1.2" } }, "sha512-KYJdmMj9g16/lilEOWfOublxTASl9jcePfEL1kFFnm+VAan3CGVZysDAWesOgdyHkgGUy7KwKpQ2gG0QlhVyUQ=="],
-
     "@aster-rpc/aster/@apache-fory/core": ["@apache-fory/core@file:vendored/fory-core", { "dependencies": { "tslib": "^2.4.0" } }],
 
     "@aster-rpc/aster/@types/node": ["@types/node@25.5.2", "", { "dependencies": { "undici-types": "~7.18.0" } }, "sha512-tO4ZIRKNC+MDWV4qKVZe3Ql/woTnmHDr5JD8UI5hn2pwBrHEwOEMZK7WlNb5RKB6EoJ02gwmQS9OrjuFnZYdpg=="],
@@ -676,8 +664,6 @@
     "wrap-ansi-cjs/string-width": ["string-width@4.2.3", "", { "dependencies": { "emoji-regex": "^8.0.0", "is-fullwidth-code-point": "^3.0.0", "strip-ansi": "^6.0.1" } }, "sha512-wKyQRQpjJ0sIp62ErSZdGsjMJWsap5oRNihHhu6G7JVO/9jIB6UyevL+tXuOqrng8j/cxKTWyWUwvSTriiZz/g=="],
 
     "wrap-ansi-cjs/strip-ansi": ["strip-ansi@6.0.1", "", { "dependencies": { "ansi-regex": "^5.0.1" } }, "sha512-Y38VPSHcqkFrCpFnQ9vuSXmquuv5oXOKpGeT6aGrr3o3Gc9AlVa6JBfUSOCnbxGGZF+/0ooI7KrPuUSztUdU5A=="],
-
-    "@aster-examples/mission-control/@aster-rpc/aster/@aster-rpc/transport": ["@aster-rpc/transport@0.1.2", "", { "optionalDependencies": { "@aster-rpc/transport-darwin-arm64": "0.1.2", "@aster-rpc/transport-darwin-x64": "0.1.2", "@aster-rpc/transport-linux-arm64-gnu": "0.1.2", "@aster-rpc/transport-linux-x64-gnu": "0.1.2", "@aster-rpc/transport-win32-x64-msvc": "0.1.2" } }, "sha512-Sscyl0ZHToIb6NsyXwpqyvSomJpUmb6Cc07EFRBicXZ+OosN9ir3HbHGOKL7NRQIvOb/GL07ybr3ziZBT/B9Dw=="],
 
     "@aster-rpc/aster/@types/node/undici-types": ["undici-types@7.18.2", "", {}, "sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w=="],
 

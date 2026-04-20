@@ -1,5 +1,37 @@
 # Mission Control Matrix — Known Bugs & Audit Gaps
 
+## Status snapshot (2026-04-20)
+
+Full matrix (12 combos × {dev, auth}): all green. Java + Kotlin joined
+the matrix across the 2026-04-18 → 2026-04-20 sessions.
+
+Three pre-existing items closed on 2026-04-19/20:
+
+- **#42 Java server JSON body codec** — `AsterServer.java` now sniffs the
+  first header byte (`'{'` ⇒ JSON, else Fory) and threads
+  `serializationMode` through request/response/trailer paths. Two JSON
+  codecs: `jsonFrameworkCodec` (default Jackson) for camelCase framework
+  wire types (`StreamHeader` / `RpcStatus`), and
+  `jsonUserCodec = JsonCodec.forUserTypes()` with
+  `PropertyNamingStrategies.SNAKE_CASE` for user types — same
+  camelCase↔snake_case convergence Fory gives you via name-based
+  fingerprint. Service summaries advertise `["xlang", "json"]`. Unblocks
+  every ja-py (proxy path) and ja-ts combo.
+- **#43 TS server "method not found" regression** — bun 1.2.x invokes
+  method decorators with the Stage-1 experimental signature regardless
+  of tsconfig. Dual-mode `methodDecorator` in
+  `bindings/typescript/packages/aster/src/decorators.ts` handles both
+  shapes. Also fixed a stale `"^0.1.2"` pin in
+  `examples/typescript/missionControl/package.json` that was resolving
+  to a cached 0.1.2 dist instead of the workspace. See
+  `memory/project_bun_decorators.md` for the diagnostic pattern.
+- **#44 py-ko tailLogs streaming timeout** — Kotlin only had
+  `callServerStream: CompletableFuture<List<Resp>>` which drains to
+  trailer, but Python/TS `tailLogs` is an infinite generator. Added
+  incremental `ServerStreamCall<Resp>` (sibling to `BidiCall`, reader-
+  only) + `AsterClient.openServerStream(...)` factory. Kotlin test
+  consumes-then-closes in a `try/finally`.
+
 ## Status snapshot (2026-04-10)
 
 Full matrix: **58/58 pass** across all 8 combos.

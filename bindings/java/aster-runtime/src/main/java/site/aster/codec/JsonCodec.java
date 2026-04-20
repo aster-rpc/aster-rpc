@@ -3,6 +3,7 @@ package site.aster.codec;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -42,6 +43,21 @@ public final class JsonCodec implements Codec {
 
   public JsonCodec(ObjectMapper mapper) {
     this.mapper = mapper;
+  }
+
+  /**
+   * JSON codec configured for cross-binding user-type naming convergence: camelCase Java fields
+   * serialize as snake_case on the wire and vice-versa. Matches the convention Fory's name-based
+   * fingerprint uses (Python ships {@code agent_id} verbatim; Java's auto-snake-case maps {@code
+   * agentId} ↔ {@code agent_id}). Framework wire types ({@code StreamHeader}, {@code RpcStatus}, …)
+   * are camelCase on the wire in every binding, so the default {@link #JsonCodec()} continues to
+   * decode/encode them straight through — server code uses this factory only for user request /
+   * response payloads.
+   */
+  public static JsonCodec forUserTypes() {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
+    return new JsonCodec(mapper);
   }
 
   @Override

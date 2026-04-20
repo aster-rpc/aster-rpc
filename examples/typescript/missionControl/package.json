@@ -9,7 +9,7 @@
     "start:auth": "npm run build && node server.ts --auth"
   },
   "dependencies": {
-    "@aster-rpc/aster": "^0.1.2"
+    "@aster-rpc/aster": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22"

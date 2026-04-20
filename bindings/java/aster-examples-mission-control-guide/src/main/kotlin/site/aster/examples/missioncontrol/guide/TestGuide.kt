@@ -100,56 +100,60 @@ private suspend fun testCh2bTailLogs(client: AsterClient, addr: NodeAddr) {
   val expectedMsg = "kt-ch2-tail-${System.nanoTime()}"
   val now = System.currentTimeMillis() / 1000.0
 
-  val streamFuture =
-      client
-          .callServerStream<TailRequest, LogEntry>(
-              addr,
-              MissionControlDispatcher.SERVICE_NAME,
-              "tailLogs",
-              TailRequest("", "info"),
-              LogEntry::class.java)
-          .orTimeout(15, TimeUnit.SECONDS)
-
-  // Let the stream open before submitting. If we submit first the server may drain the queue and
-  // idle out before we've opened the stream, which would race the test.
-  delay(150L)
-
-  try {
-    client
-        .call<LogEntry, SubmitLogResult>(
-            addr,
-            MissionControlDispatcher.SERVICE_NAME,
-            "submitLog",
-            LogEntry(now, "info", expectedMsg, "edge-7"),
-            SubmitLogResult::class.java)
-        .orTimeout(5, TimeUnit.SECONDS)
-        .await()
-  } catch (e: Throwable) {
-    streamFuture.cancel(true)
-    fail("Ch2b tailLogs setup", "submitLog failed: ${unwrap(e)}")
-    return
-  }
-
-  val entries: List<LogEntry> =
+  // Open an incremental server-stream. The Python/TS `tailLogs` generator is open-ended — there's
+  // no trailer to wait for — so we must consume-and-close rather than drain to trailer.
+  val streamCall =
       try {
-        streamFuture.await()
+        client
+            .openServerStream<TailRequest, LogEntry>(
+                addr,
+                MissionControlDispatcher.SERVICE_NAME,
+                "tailLogs",
+                TailRequest("", "info"),
+                LogEntry::class.java)
+            .orTimeout(5, TimeUnit.SECONDS)
+            .await()
       } catch (e: Throwable) {
-        fail("Ch2b tailLogs", unwrap(e).toString())
+        fail("Ch2b tailLogs open", unwrap(e).toString())
         return
       }
 
-  if (entries.isEmpty()) {
-    fail("Ch2b tailLogs", "no entries received within the idle window")
-    return
+  try {
+    // Let the stream reach the server before submitting. If we submit first the server may emit
+    // the marker entry before our reader loop is ready to receive it (the tailLogs generator is
+    // blocked on the log queue either way, but opening is racey).
+    delay(150L)
+
+    try {
+      client
+          .call<LogEntry, SubmitLogResult>(
+              addr,
+              MissionControlDispatcher.SERVICE_NAME,
+              "submitLog",
+              LogEntry(now, "info", expectedMsg, "edge-7"),
+              SubmitLogResult::class.java)
+          .orTimeout(5, TimeUnit.SECONDS)
+          .await()
+    } catch (e: Throwable) {
+      fail("Ch2b tailLogs setup", "submitLog failed: ${unwrap(e)}")
+      return
+    }
+
+    val entry: LogEntry? = streamCall.recvWithTimeout(5, TimeUnit.SECONDS)
+    if (entry == null) {
+      fail("Ch2b tailLogs", "no entry received within 5s")
+      return
+    }
+    if (entry.message() != expectedMsg) {
+      fail(
+          "Ch2b tailLogs",
+          "first entry was '${entry.message()}', expected '$expectedMsg' — stream is yielding stale/buffered entries")
+      return
+    }
+    ok("Ch2b tailLogs received live entry ($expectedMsg)")
+  } finally {
+    streamCall.close()
   }
-  val first = entries[0]
-  if (first.message() != expectedMsg) {
-    fail(
-        "Ch2b tailLogs",
-        "first entry was '${first.message()}', expected '$expectedMsg' — stream is yielding stale/buffered entries")
-    return
-  }
-  ok("Ch2b tailLogs received live entry ($expectedMsg)")
 }
 
 private suspend fun testCh2aSubmitLog(client: AsterClient, addr: NodeAddr) {
@@ -454,40 +458,49 @@ private suspend fun testCh5OpsCredential(addrStr: String, opsCred: Path) {
 
     val expectedMsg = "ops-auth-${System.nanoTime()}"
     val now = System.currentTimeMillis() / 1000.0
-    val streamFuture =
+    val streamCall =
+        try {
+          client
+              .openServerStream<TailRequest, LogEntry>(
+                  addr,
+                  MissionControlDispatcher.SERVICE_NAME,
+                  "tailLogs",
+                  TailRequest("", "info"),
+                  LogEntry::class.java)
+              .orTimeout(5, TimeUnit.SECONDS)
+              .await()
+        } catch (e: Throwable) {
+          fail("Ch5 ops tailLogs open", unwrap(e).toString())
+          return
+        }
+    try {
+      delay(150L)
+      try {
         client
-            .callServerStream<TailRequest, LogEntry>(
+            .call<LogEntry, SubmitLogResult>(
                 addr,
                 MissionControlDispatcher.SERVICE_NAME,
-                "tailLogs",
-                TailRequest("", "info"),
-                LogEntry::class.java)
-            .orTimeout(15, TimeUnit.SECONDS)
-    delay(150L)
-    try {
-      client
-          .call<LogEntry, SubmitLogResult>(
-              addr,
-              MissionControlDispatcher.SERVICE_NAME,
-              "submitLog",
-              LogEntry(now, "info", expectedMsg, "ops"),
-              SubmitLogResult::class.java)
-          .orTimeout(5, TimeUnit.SECONDS)
-          .await()
-    } catch (e: Throwable) {
-      streamFuture.cancel(true)
-      fail("Ch5 ops tailLogs setup", "submitLog failed: ${unwrap(e)}")
-      return
-    }
-    try {
-      val entries = streamFuture.await()
-      if (entries.any { it.message() == expectedMsg }) {
-        ok("Ch5 ops tailLogs → OK ($expectedMsg)")
-      } else {
-        fail("Ch5 ops tailLogs", "stream didn't deliver the marker entry: $entries")
+                "submitLog",
+                LogEntry(now, "info", expectedMsg, "ops"),
+                SubmitLogResult::class.java)
+            .orTimeout(5, TimeUnit.SECONDS)
+            .await()
+      } catch (e: Throwable) {
+        fail("Ch5 ops tailLogs setup", "submitLog failed: ${unwrap(e)}")
+        return
       }
-    } catch (e: Throwable) {
-      fail("Ch5 ops tailLogs", unwrap(e).toString())
+      try {
+        val entry: LogEntry? = streamCall.recvWithTimeout(5, TimeUnit.SECONDS)
+        if (entry != null && entry.message() == expectedMsg) {
+          ok("Ch5 ops tailLogs → OK ($expectedMsg)")
+        } else {
+          fail("Ch5 ops tailLogs", "stream didn't deliver the marker entry: $entry")
+        }
+      } catch (e: Throwable) {
+        fail("Ch5 ops tailLogs", unwrap(e).toString())
+      }
+    } finally {
+      streamCall.close()
     }
   } finally {
     try {
