@@ -15,6 +15,10 @@ export interface CallOptions {
   deadlineSecs?: number;
   serializationMode?: number;
   callId?: number;
+  /** Hint type for serialization: the request class constructor (e.g. StatusRequest).
+   *  Used by ForyCodec to convert plain object literals to typed instances before
+   *  encoding, enabling cross-language wire compatibility. */
+  hintType?: unknown;
 }
 
 /**

@@ -48,7 +48,7 @@ function hex(data: Uint8Array | Buffer): string {
 
 describe('native contract identity (Rust core via NAPI)', () => {
   it.skipIf(!available)('version() returns crate version', () => {
-    expect(native.version()).toBe('0.1.0');
+    expect(native.version()).toBe('0.2.0');
   });
 
   it.skipIf(!available)('golden vector 1: Echo — canonical bytes', () => {
@@ -61,9 +61,9 @@ describe('native contract identity (Rust core via NAPI)', () => {
     });
     const bytes = native.canonicalBytesFromJson('ServiceContract', json);
     expect(hex(bytes)).toBe(
-      '124563686f02010c126563686f00200000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000fd000c00fd'
+      '124563686f02010c126563686f00200000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000fd000c00fd02'
     );
-    expect(bytes.length).toBe(94);
+    expect(bytes.length).toBe(95);
   });
 
   it.skipIf(!available)('golden vector 1: Echo — BLAKE3 hash', () => {
@@ -75,7 +75,7 @@ describe('native contract identity (Rust core via NAPI)', () => {
       serialization_modes: [], scoped: "shared", requires: null,
     });
     expect(native.computeContractIdFromJson(json)).toBe(
-      '73ac6c9e70c7dcdd825221a4eb1d1ac9432d890685e65987f7d8d74c8d3191be'
+      'ac4495d03d0fe1ee8249e725b8aff0b66fdaecc0e76b27e26149225d1ccba68f'
     );
   });
 
@@ -89,7 +89,7 @@ describe('native contract identity (Rust core via NAPI)', () => {
       serialization_modes: [], scoped: "shared", requires: null,
     });
     expect(native.computeContractIdFromJson(json)).toBe(
-      '868a03134159c5797f36016c8445febf2e703456f0eb98eb02fa7dbc0d69bf89'
+      'bb4e859ac2a8d9865f4c0fa7766c0197fdf830d925ca7753a34fe0ffe757c20e'
     );
   });
 
@@ -104,7 +104,7 @@ describe('native contract identity (Rust core via NAPI)', () => {
       serialization_modes: [], scoped: "shared", requires: null,
     });
     expect(native.computeContractIdFromJson(json)).toBe(
-      '4fcf7d24f1407d32ecda0526c5c087985086b5362ea8ed344c6838859c11d2d9'
+      '9b37cf43f3135e50905f8d9c0feed7530c06e7f7190c50f072e07f76116b5e05'
     );
   });
 
@@ -117,7 +117,7 @@ describe('native contract identity (Rust core via NAPI)', () => {
       serialization_modes: [], scoped: "session", requires: null,
     });
     expect(native.computeContractIdFromJson(json)).toBe(
-      'e49ce2b5992b58dc06d348511e05ebdb1fcf7ec504e12a931611913c5ea76ace'
+      '3f767eaa700b1c92ea6098b32d8c98e2f4ccabe1b6e614c459660abb366fa847'
     );
   });
 

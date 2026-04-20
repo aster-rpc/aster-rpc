@@ -15,7 +15,9 @@ import { createLogger, type AsterLogger } from './logging.js';
 import { HealthServer } from './health.js';
 import { DEFAULT_BACKOFF, RpcPattern, RpcScope, type ExponentialBackoff } from './types.js';
 import { JsonCodec } from './codec.js';
+import { createXlangCodec, getXlangForyAndType } from './xlang.js';
 import { RpcServer } from './server.js';
+
 import { handleConsumerAdmissionConnection, performAdmission, type ConsumerAdmissionOpts, type ServiceSummary } from './trust/consumer.js';
 import type { ConsumerEnrollmentCredential } from './trust/credentials.js';
 import { loadIdentity, parseSimpleToml } from './config.js';
@@ -105,7 +107,7 @@ export class AdmissionDeniedError extends Error {
  * @group Server and Client
  */
 /** Well-known filename emitted by `npx aster-gen`. */
-const GENERATED_FILENAME = 'aster-rpc.generated.js';
+const GENERATED_FILENAME = 'aster-rpc.generated.ts';
 
 export interface AsterServerOptions {
   services: object[];
@@ -115,7 +117,7 @@ export interface AsterServerOptions {
    * directory. Pass this only when the auto-import can't work (e.g.
    * bundled apps where dynamic import paths aren't resolvable).
    */
-  generated?: Pick<RegisterGeneratedOptions, 'SERVICES' | 'WIRE_TYPES'>;
+  generated?: Pick<RegisterGeneratedOptions, 'SERVICES' | 'WIRE_TYPES' | 'buildAllTypes'>;
   config?: Partial<AsterConfig>;
   /** Path to .aster-identity file. Overrides config.identityFile. */
   identity?: string;
@@ -205,9 +207,24 @@ export class AsterServer {
     if (this._node) return;
 
     // ── Register generated metadata + services ──────────────────────
+    // Create the xlang codec early so BUILD_ALL_TYPES (if present in the
+    // generated file) can register all @WireType classes before we build
+    // the RpcServer. Reuse the same codec instance for RpcServer.
+    let xlangCodec: ReturnType<typeof createXlangCodec> | undefined;
     if (this._pendingServices.length > 0) {
+      const { fory, Type } = getXlangForyAndType();
+      xlangCodec = createXlangCodec(fory, Type);
+
       if (this._explicitGenerated) {
-        registerGenerated(this._explicitGenerated);
+        // Explicit generated: caller provided the object directly. Pass the
+        // codec so Fory types can be registered if buildAllTypes is present.
+        registerGenerated({
+          ...this._explicitGenerated,
+          codec: xlangCodec,
+          buildAllTypes: (this._explicitGenerated as any).buildAllTypes,
+          fory,
+          Type,
+        });
       } else {
         try {
           const resolved = await import(
@@ -215,9 +232,16 @@ export class AsterServer {
             require('node:path').resolve(process.cwd(), GENERATED_FILENAME)
           );
           if (resolved.SERVICES && resolved.WIRE_TYPES) {
-            registerGenerated({ SERVICES: resolved.SERVICES, WIRE_TYPES: resolved.WIRE_TYPES });
+            registerGenerated({
+              SERVICES: resolved.SERVICES,
+              WIRE_TYPES: resolved.WIRE_TYPES,
+              codec: xlangCodec,
+              buildAllTypes: resolved.BUILD_ALL_TYPES,
+              fory,
+              Type,
+            });
           }
-        } catch {
+        } catch (err: unknown) {
           this.logger.warn(
             `[aster] ${GENERATED_FILENAME} not found in working directory. ` +
             `The runtime will fall back to reflection for type metadata, which ` +
@@ -275,10 +299,9 @@ export class AsterServer {
         pattern: info.scoped ?? 'shared',
         methods: Object.keys(info.methods),
         channels: { rpc: rpcAddr },
-        // TS binding only speaks JSON until @apache-fory/core JS becomes
-        // XLANG-compliant. Cross-language consumers see this and pick the
-        // matching codec.
-        serializationModes: ['json'],
+        // TS binding speaks XLANG (Fory) by default.
+        // Cross-language consumers see this and pick the matching codec.
+        serializationModes: ['xlang'],
       });
     }
 
@@ -304,10 +327,10 @@ export class AsterServer {
       interceptors.unshift(cap);
     }
 
-    // Create the RPC server (uses JsonCodec for cross-language compat)
+    // Create the RPC server with Fory XLANG codec.
     this._rpcServer = new RpcServer({
       registry: this.registry,
-      codec: new JsonCodec(),
+      codec: xlangCodec!,
       interceptors,
       logger: this.logger,
       peerStore: this._peerStore,
@@ -595,9 +618,8 @@ export class AsterServer {
       typeHashes: [],
       methodCount: methods.length,
       methods,
-      // The TypeScript binding only speaks JSON on the wire — Fory JS is not
-      // yet XLANG-compliant. Cross-language consumers reading the manifest
-      // must use SerializationMode.JSON (3) for any call to this server.
+      // The TypeScript binding speaks XLANG on the wire.
+      // Cross-language consumers reading the manifest use SerializationMode.JSON.
       serializationModes: ['json'],
       scoped: (info.scoped === RpcScope.SESSION || info.scoped === 'stream') ? RpcScope.SESSION : RpcScope.SHARED,
       deprecated: false,
@@ -961,6 +983,12 @@ export interface AsterClientOptions {
   enrollmentCredentialFile?: string;
   /** Retry configuration for reconnection. */
   retryBackoff?: ExponentialBackoff;
+  /** Pre-generated type metadata from aster-gen (same as AsterServer.generated). */
+  generated?: {
+    SERVICES: readonly any[];
+    WIRE_TYPES: readonly any[];
+    buildAllTypes?: (fory: any, Type: any, codec: any) => Map<string, any>;
+  };
 }
 
 /**
@@ -1078,6 +1106,11 @@ export class AsterClientWrapper {
   private _inlineCredential: ConsumerEnrollmentCredential | null = null;
   private _enrollmentCredentialFile: string | undefined;
   private _identitySecretKey: Uint8Array | null = null;
+  private readonly _generated?: {
+    SERVICES: readonly any[];
+    WIRE_TYPES: readonly any[];
+    buildAllTypes?: (fory: any, Type: any, codec: any) => Map<string, any>;
+  };
 
   constructor(opts: AsterClientOptions) {
     this.config = { ...configFromEnv(), ...opts.config } as AsterConfig;
@@ -1086,6 +1119,7 @@ export class AsterClientWrapper {
     }
     this._address = opts.address ?? opts.endpointAddr as string | undefined;
     this.backoff = opts.retryBackoff ?? DEFAULT_BACKOFF;
+    this._generated = opts.generated;
 
     // Load identity file (.aster-identity) if present. The first consumer-role
     // peer entry IS the credential — mirrors Python AsterClient behaviour.
@@ -1250,10 +1284,26 @@ export class AsterClientWrapper {
     this._registryNamespace = admissionResponse.registryNamespace ?? '';
     this._gossipTopic = admissionResponse.gossipTopic ?? '';
 
+    // Pick codec based on server's advertised serialization modes.
+    // JsonCodec when all services are JSON-only; ForyCodec otherwise.
+    const allJsonOnly = this._services.every((svc) => {
+      const modes = svc.serializationModes;
+      if (!modes || modes.length === 0) return false;
+      return modes.includes('json') && !modes.includes('xlang');
+    });
+    const codec = allJsonOnly ? new JsonCodec() : createXlangCodec();
+
+    // If ForyCodec and generated metadata provided, register wire types
+    // so the client can encode requests without "Failed to detect Fory type" errors.
+    if (!allJsonOnly && this._generated?.buildAllTypes) {
+      const { fory, Type } = getXlangForyAndType();
+      this._generated.buildAllTypes(fory, Type, codec);
+    }
+
     // Open RPC connection and create transport
     const rpcConn = await doConnect(Buffer.from(RPC_ALPN));
     const { IrohTransport: IrohTx } = await import('./transport/iroh.js');
-    this.transport = new IrohTx(rpcConn);
+    this.transport = new IrohTx(rpcConn, codec);
     this._connected = true;
   }
 

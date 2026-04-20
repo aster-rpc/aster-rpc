@@ -133,6 +133,7 @@ export function createClient<T extends new (...args: any[]) => any>(
         const opts: CallOptions = {
           ...callOpts,
           metadata: { ...options?.metadata, ...callOpts?.metadata },
+          hintType: methodInfo.requestType,
         };
 
         if (options?.timeout && !opts.deadlineSecs) {

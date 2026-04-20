@@ -18,6 +18,7 @@
 
 import type { Codec } from './codec.js';
 import { JsonCodec } from './codec.js';
+import { createXlangCodec } from './xlang.js';
 import { createClient, type AsterClient, type ClientOptions } from './client.js';
 import { RpcError, StatusCode } from './status.js';
 import {
@@ -29,10 +30,13 @@ import type { ServiceSummary } from './trust/consumer.js';
 
 export type { ServiceSummary } from './trust/consumer.js';
 
-/** Decide whether to fall back to JSON when the producer only advertises
- *  JSON support. Mirrors `runtime.py:1803` JsonProxyCodec auto-pick. The
+/** Decide which codec to use based on server capabilities.
+ *  Mirrors `runtime.py:1803` JsonProxyCodec auto-pick. The
  *  advertised modes are strings ("xlang", "json", "row", "native") as
- *  carried on `ServiceSummary.serializationModes` from admission. */
+ *  carried on `ServiceSummary.serializationModes` from admission.
+ *
+ *  ForyCodec (XLANG) is preferred when the server advertises xlang support.
+ *  JsonCodec is used only when the server is JSON-only. */
 function pickCodec(
   explicit: Codec | undefined,
   services: readonly ServiceSummary[] | undefined,
@@ -46,11 +50,9 @@ function pickCodec(
     });
     if (allJsonOnly) return new JsonCodec();
   }
-  // Default to JsonCodec. Callers that want the XLANG codec pass it
-  // explicitly via `codec:` — same as the existing AsterClientWrapper.
-  // A Fory-registered codec is a heavyweight construct; we don't
-  // instantiate one unless the caller asks for it.
-  return new JsonCodec();
+  // Default to ForyCodec (XLANG) — the TS binding now speaks Fory natively.
+  // Callers that need JSON pass it explicitly via `codec:`.
+  return createXlangCodec();
 }
 
 /** Options for [`AsterClient2`]. */

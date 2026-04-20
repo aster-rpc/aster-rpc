@@ -29,7 +29,7 @@ export function getWireType(cls: unknown): string | undefined {
 export interface Codec {
   encode(obj: unknown, hintType?: unknown): Uint8Array;
   decode(payload: Uint8Array, hintType?: unknown): unknown;
-  encodeCompressed(obj: unknown): [data: Uint8Array, compressed: boolean];
+  encodeCompressed(obj: unknown, hintType?: unknown): [data: Uint8Array, compressed: boolean];
   decodeCompressed(payload: Uint8Array, compressed: boolean, hintType?: unknown): unknown;
 }
 
@@ -115,7 +115,7 @@ export class JsonCodec implements Codec {
     return parsed;
   }
 
-  encodeCompressed(obj: unknown): [Uint8Array, boolean] {
+  encodeCompressed(obj: unknown, _hintType?: unknown): [Uint8Array, boolean] {
     const data = this.encode(obj);
     if (data.byteLength > this.threshold && _zstdAvailable) {
       const compressed = zstdCompress(data);
@@ -551,7 +551,15 @@ export class ForyCodec implements Codec {
     }
   }
 
-  encode(obj: unknown, _hintType?: unknown): Uint8Array {
+  encode(obj: unknown, hintType?: unknown): Uint8Array {
+    // Convert plain object literals to typed instances when a hint type is provided.
+    // This enables cross-language wire compatibility: plain { agent_id: 'x' } becomes
+    // `new StatusRequest({ agent_id: 'x' })` so Fory can serialize it with the
+    // correct wire tag instead of throwing "Failed to detect the Fory type".
+    if (hintType && typeof hintType === 'function' && obj !== null && typeof obj === 'object' && !Array.isArray(obj)) {
+      const ctor = hintType as new (...args: any[]) => any;
+      obj = new ctor(obj);
+    }
     const result = this.fory.serialize(obj);
     return new Uint8Array(result);
   }
@@ -560,8 +568,8 @@ export class ForyCodec implements Codec {
     return this.fory.deserialize(payload);
   }
 
-  encodeCompressed(obj: unknown): [Uint8Array, boolean] {
-    const data = this.encode(obj);
+  encodeCompressed(obj: unknown, hintType?: unknown): [Uint8Array, boolean] {
+    const data = this.encode(obj, hintType);
     if (data.byteLength > this.threshold && _zstdAvailable) {
       const compressed = zstdCompress(data);
       if (compressed && compressed.byteLength < data.byteLength) {

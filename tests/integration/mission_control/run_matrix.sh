@@ -146,6 +146,18 @@ start_ts_server() {
 
   cd "$REPO_ROOT/bindings/typescript"
 
+  # Copy aster-rpc.generated.ts to bindings/typescript/ so the runtime's
+  # dynamic import (process.cwd() = bindings/typescript/) finds it.
+  # The generated file's relative imports (./types.js, ./services.js) must
+  # point to the missionControl/ source tree as .ts files, so rewrite them here.
+  local generated_src="$REPO_ROOT/examples/typescript/missionControl/aster-rpc.generated.ts"
+  if [[ -f "$generated_src" ]]; then
+    sed -e "s|from './types.js'|from '$REPO_ROOT/examples/typescript/missionControl/types.ts'|g" \
+        -e "s|from './services.js'|from '$REPO_ROOT/examples/typescript/missionControl/services.ts'|g" \
+        -e "s|from './services-auth.js'|from '$REPO_ROOT/examples/typescript/missionControl/services-auth.ts'|g" \
+        "$generated_src" > "$REPO_ROOT/bindings/typescript/aster-rpc.generated.ts"
+  fi
+
   if [[ "$mode" == "auth" ]]; then
     ASTER_ROOT_PUBKEY_FILE="$WORK_DIR/root.pub" \
       bun run "$SCRIPT_DIR/_ts_server_auth.ts" > "$addr_file" 2> "$log_file" &

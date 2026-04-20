@@ -3,9 +3,9 @@
 // Regenerate with: npx aster-gen
 
 import { RpcPattern } from '@aster-rpc/aster';
-import { Assignment as T0_Assignment, Command as T1_Command, CommandResult as T2_CommandResult, Heartbeat as T3_Heartbeat, IngestResult as T4_IngestResult, LogEntry as T5_LogEntry, MetricPoint as T6_MetricPoint, StatusRequest as T7_StatusRequest, StatusResponse as T8_StatusResponse, SubmitLogResult as T9_SubmitLogResult, TailRequest as T10_TailRequest } from './types.js';
-import { MissionControl as T11_MissionControl, AgentSession as T12_AgentSession } from './services.js';
-import { MissionControl as T13_MissionControl, AgentSession as T14_AgentSession } from './services-auth.js';
+import { Assignment as T0_Assignment, Command as T1_Command, CommandResult as T2_CommandResult, Heartbeat as T3_Heartbeat, IngestResult as T4_IngestResult, LogEntry as T5_LogEntry, MetricPoint as T6_MetricPoint, StatusRequest as T7_StatusRequest, StatusResponse as T8_StatusResponse, SubmitLogResult as T9_SubmitLogResult, TailRequest as T10_TailRequest } from '/Users/emrul/dev/aster/aster-rpc-internal/examples/typescript/missionControl/types.ts';
+import { MissionControl as T11_MissionControl, AgentSession as T12_AgentSession } from '/Users/emrul/dev/aster/aster-rpc-internal/examples/typescript/missionControl/services.ts';
+import { MissionControl as T13_MissionControl, AgentSession as T14_AgentSession } from '/Users/emrul/dev/aster/aster-rpc-internal/examples/typescript/missionControl/services-auth.ts';
 
 export const WIRE_TYPES = [
   {
