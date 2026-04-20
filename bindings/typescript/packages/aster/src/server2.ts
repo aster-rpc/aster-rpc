@@ -328,7 +328,8 @@ export class AsterServer2 {
       if (event.headerPayload === null || event.headerPayload.byteLength === 0) {
         throw new Error('missing StreamHeader payload on inbound call');
       }
-      header = this.codec.decode(event.headerPayload) as StreamHeader;
+      const decoded = this.codec.decode(event.headerPayload);
+      header = decoded as StreamHeader;
     } catch (e) {
       this.submitErrorTrailer(
         sender,

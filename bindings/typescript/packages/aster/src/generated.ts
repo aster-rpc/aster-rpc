@@ -218,6 +218,23 @@ export interface RegisterGeneratedOptions {
    * JSON-only services this can be omitted.
    */
   codec?: GeneratedCodec;
+  /**
+   * Optional BUILD_ALL_TYPES function from `aster-rpc.generated.ts`.
+   * When provided, called with (fory, Type, codec) to register all
+   * @WireType classes with Fory using Type.struct() — replacing the
+   * legacy foryTypeInfo path.
+   */
+  buildAllTypes?: (fory: any, Type: any, codec: GeneratedCodec) => Map<string, any>;
+  /**
+   * The Fory instance from @apache-fory/core. Required when
+   * buildAllTypes is provided.
+   */
+  fory?: any;
+  /**
+   * The Type namespace from @apache-fory/core. Required when
+   * buildAllTypes is provided.
+   */
+  Type?: any;
 }
 
 /**
@@ -243,23 +260,18 @@ export interface RegisterGeneratedOptions {
  * Calling this more than once is safe — later calls overwrite any
  * previous registration for the same class.
  */
+let _registerGeneratedCallCount = 0;
 export function registerGenerated(opts: RegisterGeneratedOptions): void {
   // Phase 1: wire types — shape registry + WIRE_TYPE_KEY + optional Fory.
   for (const shape of opts.WIRE_TYPES) {
     (shape.ctor as any)[WIRE_TYPE_KEY] = shape.tag;
     _wireShapeRegistry.set(shape.ctor, shape);
   }
-  if (opts.codec) {
-    for (const shape of opts.WIRE_TYPES) {
-      // `foryTypeInfo` is null in v1 generated files — the Fory JS
-      // API currently needs a user-supplied `buildTypeInfo` callback
-      // (see `ForyCodec.registerTypeGraph`). Skip when null so users
-      // can still opt into the generated ServiceInfo path while
-      // feeding Fory via the existing runtime path.
-      if (shape.foryTypeInfo != null) {
-        opts.codec.registerType(shape.foryTypeInfo);
-      }
-    }
+  // New path (aster-gen v2): BUILD_ALL_TYPES uses Type.struct() to build
+  // and register all Fory type structs in one pass. Replaces the legacy
+  // foryTypeInfo path which required a user-supplied callback.
+  if (opts.buildAllTypes && opts.fory && opts.Type && opts.codec) {
+    opts.buildAllTypes(opts.fory, opts.Type, opts.codec);
   }
 
   // Phase 2: services — build ServiceInfo per class and stamp it on

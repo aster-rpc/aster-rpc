@@ -116,7 +116,7 @@ export class IrohTransport implements AsterTransport {
           }),
         );
         const headerFrame = encodeFrame(headerBytes, HEADER);
-        const [reqPayload, compressed] = this.codec.encodeCompressed(request);
+        const [reqPayload, compressed] = this.codec.encodeCompressed(request, opts?.hintType);
         const requestFrame = encodeFrame(
           reqPayload,
           (compressed ? COMPRESSED : 0) | END_STREAM,

@@ -16,6 +16,26 @@
 import { ForyCodec } from './codec.js';
 import { StreamHeader, CallHeader, RpcStatus } from './protocol.js';
 
+// Cached Fory instance and Type - shared across all modules
+let _cachedFory: any | undefined;
+let _cachedType: any | undefined;
+let _cachedCodec: ForyCodec | undefined;
+
+/**
+ * Get the shared Fory instance and Type, creating them if needed.
+ * All modules should use this instead of creating their own Fory instances.
+ */
+export function getXlangForyAndType(): { fory: any; Type: any } {
+  if (_cachedFory) return { fory: _cachedFory, Type: _cachedType! };
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const foryModule = require('@apache-fory/core');
+  const Fory = foryModule.default;
+  const Type = foryModule.Type;
+  _cachedFory = new Fory({ ref: true });
+  _cachedType = Type;
+  return { fory: _cachedFory, Type };
+}
+
 /**
  * Create a ForyCodec pre-configured for cross-language (XLANG) interop.
  *
@@ -23,23 +43,28 @@ import { StreamHeader, CallHeader, RpcStatus } from './protocol.js';
  * with explicit int8/int16/int32 field types matching the IDL spec.
  *
  * Requires `@apache-fory/core` to be installed.
+ *
+ * When called without arguments, uses a cached Fory instance shared across
+ * all calls (suitable for client-side usage). When called with arguments,
+ * uses the provided Fory instance (suitable for server-side where the same
+ * Fory instance must be shared with BUILD_ALL_TYPES).
+ *
+ * @param fory - Optional pre-created Fory instance (from getXlangForyAndType)
+ * @param Type - Optional Type namespace from @apache-fory/core
  */
-export function createXlangCodec(): ForyCodec {
-  let Fory: any;
-  let Type: any;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const foryModule = require('@apache-fory/core');
-    Fory = foryModule.default;
-    Type = foryModule.Type;
-  } catch {
-    throw new Error(
-      'Cross-language (XLANG) codec requires @apache-fory/core. ' +
-      'Install it with: bun add @apache-fory/core',
-    );
+export function createXlangCodec(fory?: any, Type?: any): ForyCodec {
+  // If called with no args and we have a cached codec, return it
+  if (!fory && !Type && _cachedCodec) {
+    return _cachedCodec;
   }
 
-  const fory = new Fory({ ref: true });
+  // If called with no args, use the shared cached Fory instance
+  if (!fory || !Type) {
+    const cached = getXlangForyAndType();
+    fory = cached.fory;
+    Type = cached.Type;
+  }
+
   const codec = new ForyCodec(fory);
 
   // StreamHeader: explicit field types matching Python pyfory annotations
@@ -89,6 +114,11 @@ export function createXlangCodec(): ForyCodec {
   );
   rpcStatusType.initMeta(RpcStatus);
   codec.registerType(rpcStatusType);
+
+  // Cache the codec if created without explicit fory/Type arguments
+  if (!_cachedCodec) {
+    _cachedCodec = codec;
+  }
 
   return codec;
 }

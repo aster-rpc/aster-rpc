@@ -179,6 +179,17 @@ const BRAND_WIRE: Record<string, string> = {
   f32: 'float32', f64: 'float64',
 };
 
+/** Maps TypeScript primitive type names to their Aster wire primitive. */
+const PRIMITIVE_WIRE: Record<string, string> = {
+  string: 'string',
+  number: 'float64',
+  boolean: 'bool',
+  int8: 'int8', int16: 'int16', int32: 'int32', int64: 'int64',
+  uint8: 'uint8', uint16: 'uint16', uint32: 'uint32', uint64: 'uint64',
+  Float32: 'float32', Float64: 'float64',
+  undefined: 'string', // fallback for unknown
+};
+
 /** Spec §11.3.2.3 suspicious-field regex for `number` fields. */
 const SUSPICIOUS_NUMBER_FIELD_RE =
   /(count|id|size|length|index|offset|timestamp|epoch|nanos|micros|millis|seconds|bytes|total|version)/i;
@@ -341,6 +352,42 @@ function typeToFieldInner(
     const key = typeToField(ctx, `${name}[key]`, args[0]!, loc);
     const value = typeToField(ctx, `${name}[value]`, args[1]!, loc);
     return { name, kind: 'map', key, value, nullable: false };
+  }
+
+  // Record<string, V> — treated as map with string keys. Common TypeScript
+  // idiom for dictionaries; the spec's restriction on map keys (string or
+  // number only) is satisfied by Record's key constraint.
+  // Record is a type alias so getTypeArguments returns [] after resolution.
+  // Parse the type string (e.g. "Record<string, string>") to get args.
+  const typeStr = checker.typeToString(t);
+  if (typeStr.startsWith('Record<') && typeStr.endsWith('>')) {
+    const inner = typeStr.slice(7, -1); // "string, string"
+    const commaIdx = inner.indexOf(',');
+    if (commaIdx === -1) {
+      throw new ScanError(`Record field '${name}' must have two type arguments`, loc);
+    }
+    const keyStr = inner.slice(0, commaIdx).trim();
+    const valueStr = inner.slice(commaIdx + 1).trim();
+    // Build key field: only string is valid for Record keys
+    if (keyStr !== 'string') {
+      throw new ScanError(
+        `Record field '${name}' has non-string key '${keyStr}'. ` +
+        `Only Record<string, V> is supported (V must be a wire primitive).`,
+        loc,
+      );
+    }
+    // Build value field from the primitive type string
+    const valuePrimitive = PRIMITIVE_WIRE[valueStr];
+    if (!valuePrimitive) {
+      throw new ScanError(
+        `Record field '${name}' value type '${valueStr}' is not a wire primitive. ` +
+        `Use Map<K, V> for complex value types.`,
+        loc,
+      );
+    }
+    const keyField: ScanField = { name: `${name}[key]`, kind: 'primitive', wire: 'string', nullable: false };
+    const valueField: ScanField = { name: `${name}[value]`, kind: 'primitive', wire: valuePrimitive, nullable: false };
+    return { name, kind: 'map', key: keyField, value: valueField, nullable: false };
   }
 
   // @WireType class reference
@@ -1022,19 +1069,96 @@ ${fieldExprs}
     fieldNameSet: new Set([${fieldNames}]),
     nestedTypes: new Map([${nestedEntries.join(', ')}]),
     elementTypes: new Map([${elementEntries.join(', ')}]),
-    // foryTypeInfo is intentionally null: the current Fory JS API
-    // requires user code to build a typeInfo with a \`buildTypeInfo\`
-    // callback (see \`ForyCodec.registerTypeGraph\`). The scanner
-    // doesn't know Fory's internal shape. Follow-up: once the Fory
-    // JS binding exposes a declarative schema form, the scanner can
-    // emit it here and \`registerGenerated\` will feed it to Fory
-    // directly — no user callback needed.
-    foryTypeInfo: null,
   },`,
     );
   }
-  return `export const WIRE_TYPES = [\n${entries.join('\n')}\n] as const;`;
+
+  // BUILD_ALL_TYPES: constructs and registers all Fory type structs using
+  // Type.struct(), in dependency order (leaves first via topological sort).
+  //
+  // Iterates over WIRE_TYPES so that entry.ctor is the actual class ref
+  // (not a string that needs Function() eval). For 'ref' fields, looks up
+  // the target type from typesByTag by refTag — all deps are registered
+  // before their referrers because wireTypes is topologically sorted.
+  const buildAllTypesBody = wireTypes.map(w => {
+    const fieldsCode = w.fields.map(f => {
+      function fieldToTypeExpr(fld: typeof f): string {
+        const wrap = fld.nullable ? 'Type.optional(' : '';
+        const close = fld.nullable ? ')' : '';
+        switch (fld.kind) {
+          case 'primitive':
+            return `${wrap}Type.${fld.wire}()${close}`;
+          case 'ref':
+            // typesByTag has the type registered when we reach this field.
+            return `${wrap}typesByTag.get(${JSON.stringify(fld.refTag)})${close}`;
+          case 'list':
+            return `${wrap}Type.array(${fieldToTypeExpr(fld.element)})${close}`;
+          case 'set':
+            return `${wrap}Type.set(${fieldToTypeExpr(fld.element)})${close}`;
+          case 'map':
+            return `${wrap}Type.map(${fieldToTypeExpr(fld.key)}, ${fieldToTypeExpr(fld.value)})${close}`;
+        }
+      }
+      return `      ${JSON.stringify(f.name)}: ${fieldToTypeExpr(f)}`;
+    }).join(',\n');
+    return `  // ${w.tag}
+  {
+    const [ns, typeName] = ${JSON.stringify(w.tag)}.split('/');
+    const typeStruct = Type.struct(
+      { namespace: ns, typeName },
+      {
+${fieldsCode}
+      },
+      { withConstructor: true },
+    );
+    // entry.ctor is the actual class constructor from WIRE_TYPES.
+    // initMeta can only be called once per class (sets non-configurable property).
+    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
+    const proto = entry.ctor.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(entry.ctor);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
+    }
+    codec.registerType(typeStruct);
+    typesByTag.set(${JSON.stringify(w.tag)}, typeStruct);
+  }`;
+  }).join('\n');
+
+  return `export const WIRE_TYPES = [
+${entries.join('\n')}
+] as const;
+
+/**
+ * Build and register all @WireType classes with Fory, using Type.struct()
+ * to describe each struct's fields with explicit wire types.
+ *
+ * Iterates over WIRE_TYPES so that entry.ctor is the actual class ref.
+ * For 'ref' fields, looks up the target type from typesByTag by refTag.
+ * Types are registered in topological order (leaves first), so all
+ * dependencies are available when any given type is being registered.
+ *
+ * @returns Map<tag, typeStruct> — each registered Fory type struct, keyed
+ *   by wire tag (e.g. "sample/StatusRequest"). Callers can use this to
+ *   look up any type after registration.
+ */
+export function BUILD_ALL_TYPES(
+  fory: any,
+  Type: any,
+  codec: { registerType(typeInfo: any): void },
+): Map<string, any> {
+  const typesByTag = new Map();
+  for (const entry of WIRE_TYPES) {
+${buildAllTypesBody}
+  }
+  return typesByTag;
 }
+`;
+}
+
 
 function emitServices(
   wireTypes: ScannedWireType[],

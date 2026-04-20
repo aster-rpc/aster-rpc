@@ -194,19 +194,22 @@ export class RpcServer {
       }
 
       // Sniff the first byte: '{' (0x7B) means JSON, anything else is binary
-      // (Fory XLANG). The TypeScript binding only speaks JSON because Fory JS
-      // is not yet XLANG-compliant — refuse binary requests with a clear,
-      // JSON-encoded error trailer the peer can decode either way.
-      if (!payload || payload[0] !== 0x7b /* '{' */) {
-        await this.writeErrorTrailer(
-          send,
-          StatusCode.INVALID_ARGUMENT,
-          'this server only supports JSON serialization (mode 3); resend the StreamHeader as JSON',
-        );
-        return false;
+      // (Fory XLANG). Try JSON decoding first if payload looks like JSON,
+      // since clients may send JSON even when the server advertises Fory
+      // (e.g., if the manifest incorrectly said JSON-only).
+      let header: StreamHeader | null = null;
+      if (payload && payload[0] === 0x7b /* '{' */) {
+        // Try JSON decoding first
+        try {
+          const jsonCodec = new JsonCodec();
+          header = jsonCodec.decode(payload) as StreamHeader;
+        } catch {
+          // JSON decode failed, try Fory
+        }
       }
-
-      const header = this.codec.decode(payload) as StreamHeader;
+      if (!header) {
+        header = this.codec.decode(payload) as StreamHeader;
+      }
 
       if (!header.service) {
         await this.writeErrorTrailer(send, StatusCode.INVALID_ARGUMENT, 'missing service name');
@@ -430,7 +433,8 @@ export class RpcServer {
     // Write response + trailer. Spec §6: don't finish the send side —
     // the outer loop in `handleStream` will read the next StreamHeader
     // on this multiplexed bi-stream.
-    const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
+    const respType = methodInfo.responseType as unknown;
+    const [respPayload, respCompressed] = this.codec.encodeCompressed(response, respType);
     await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
     await this.writeOkTrailer(send);
   }
@@ -460,13 +464,14 @@ export class RpcServer {
         : handler.call(svcInfo.instance, request),
     );
     const deadlineMs = Date.now() + this.handlerTimeoutMs(callCtx);
+    const respType = methodInfo.responseType as unknown;
     for await (let response of gen) {
       if (Date.now() > deadlineMs) {
         await this.writeErrorTrailer(send, StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
         return;
       }
       response = await applyResponseInterceptors(this.interceptors, callCtx, response);
-      const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
+      const [respPayload, respCompressed] = this.codec.encodeCompressed(response, respType);
       await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
     }
 
@@ -545,7 +550,8 @@ export class RpcServer {
     }
     response = await applyResponseInterceptors(this.interceptors, callCtx, response);
 
-    const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
+    const respType = methodInfo.responseType as unknown;
+    const [respPayload, respCompressed] = this.codec.encodeCompressed(response, respType);
     await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
     await this.writeOkTrailer(send);
     // Spec §6: don't finish — let `handleStream` loop for the next call.
@@ -597,12 +603,13 @@ export class RpcServer {
         : handler.call(svcInfo.instance, requestIter()),
     );
     const deadlineMs = Date.now() + this.handlerTimeoutMs(callCtx);
+    const respType = methodInfo.responseType as unknown;
     for await (const response of gen) {
       if (Date.now() > deadlineMs) {
         await this.writeErrorTrailer(send, StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
         return;
       }
-      const [respPayload, respCompressed] = this.codec.encodeCompressed(response);
+      const [respPayload, respCompressed] = this.codec.encodeCompressed(response, respType);
       await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
     }
 
