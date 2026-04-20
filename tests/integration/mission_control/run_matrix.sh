@@ -220,7 +220,11 @@ stop_server() {
     kill "$pid" 2>/dev/null || true
     # mvn exec:java spawns child JVMs; kill the whole process group too.
     kill -- "-$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    # TypeScript bun server/client: pkill is more reliable than wait/SIGTERM
+    # since bun may not exit promptly on SIGTERM (Fory 0.17 async stream
+    # shutdown can leave the runtime in an interruptible sleep).
+    pkill -f "mission_control/_ts_server" 2>/dev/null || true
+    pkill -f "mission_control/test_guide" 2>/dev/null || true
     # Any leftover mvn/java processes spawned by the Java server path.
     pkill -f "site.aster.examples.missioncontrol.Server" 2>/dev/null || true
     pkill -f "site.aster.examples.missioncontrol.ServerAuth" 2>/dev/null || true

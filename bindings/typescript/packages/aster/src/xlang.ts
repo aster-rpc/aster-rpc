@@ -39,7 +39,7 @@ export function createXlangCodec(): ForyCodec {
     );
   }
 
-  const fory = new Fory({ refTracking: false });
+  const fory = new Fory({ ref: true });
   const codec = new ForyCodec(fory);
 
   // StreamHeader: explicit field types matching Python pyfory annotations
