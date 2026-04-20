@@ -24,9 +24,25 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from typing import Any
 
 from aster.codec import wire_type
+
+
+_CAMEL_SPLIT_1 = re.compile(r"(.)([A-Z][a-z]+)")
+_CAMEL_SPLIT_2 = re.compile(r"([a-z0-9])([A-Z])")
+
+
+def _to_snake_case(name: str) -> str:
+    """Convert camelCase / PascalCase to snake_case.
+
+    Idempotent on already-snake_case names. Matches Fory Java / Fory TS's
+    automatic fingerprint casing so the synthesized Python type's
+    attribute names align with the cross-binding wire token set.
+    """
+    s1 = _CAMEL_SPLIT_1.sub(r"\1_\2", name)
+    return _CAMEL_SPLIT_2.sub(r"\1_\2", s1).lower()
 
 logger = logging.getLogger(__name__)
 
@@ -224,15 +240,25 @@ class DynamicTypeFactory:
     def _synthesize_type(
         self, tag: str, name: str, fields: list[dict[str, Any]]
     ) -> type:
-        """Create a dataclass with the given wire_type tag and fields."""
+        """Create a dataclass with the given wire_type tag and fields.
+
+        Field names are snake-cased from whatever the manifest declares,
+        so a Java-published contract with ``agentId`` surfaces as a
+        Python attribute ``agent_id``. This keeps the Python wire
+        fingerprint (pyfory uses the raw attribute name) aligned with
+        Java/TS Fory's automatic snake-case fingerprinting, and it keeps
+        user code idiomatic (dicts keyed by ``agent_id`` work against
+        any-binding contracts).
+        """
         dc_fields: list[tuple[str, type, Any]] = []
         for f in fields:
             py_type = self._resolve_field_type(f)
             default = self._resolve_field_default(f)
+            pyname = _to_snake_case(f["name"])
             if isinstance(default, dataclasses.Field):
-                dc_fields.append((f["name"], py_type, default))
+                dc_fields.append((pyname, py_type, default))
             else:
-                dc_fields.append((f["name"], py_type, dataclasses.field(default=default)))
+                dc_fields.append((pyname, py_type, dataclasses.field(default=default)))
 
         cls = dataclasses.make_dataclass(name, dc_fields)
 

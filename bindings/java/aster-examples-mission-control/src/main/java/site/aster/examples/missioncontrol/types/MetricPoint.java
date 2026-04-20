@@ -2,7 +2,6 @@ package site.aster.examples.missioncontrol.types;
 
 import java.util.Map;
 import java.util.Objects;
-import org.apache.fory.annotation.ForyField;
 
 /**
  * Plain class (not a record) because Fory v0.16 fails to round-trip Java records that carry
@@ -11,16 +10,9 @@ import org.apache.fory.annotation.ForyField;
 public final class MetricPoint {
   public static final String FORY_TAG = "mission/MetricPoint";
 
-  @ForyField(id = 0)
   public String name = "";
-
-  @ForyField(id = 1)
   public double value;
-
-  @ForyField(id = 2)
   public double timestamp;
-
-  @ForyField(id = 3)
   public Map<String, String> tags = Map.of();
 
   public MetricPoint() {}

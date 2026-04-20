@@ -3,16 +3,19 @@ aster.protocol -- Wire-protocol dataclasses.
 
 Spec reference: §6.2 (StreamHeader), §6.4 (RpcStatus/trailer)
 
-These types are always serialized with Fory XLANG, regardless of the
-service's negotiated serialization mode. Every field uses
-``pyfory.field(id=N)`` so the Fory struct-fingerprint is tag-ID based and
-stable across bindings -- without explicit IDs Java's Fory would snake_case
-the field name when computing its fingerprint while Python leaves it
-verbatim, and the two sides hash-mismatch with
-``Hash X is not consistent with Y for type T`` at decode time. IDs here
-MUST stay in sync with the ``@ForyField(id = N)`` annotations on the
-matching Java types under
-``bindings/java/aster-runtime/src/main/java/site/aster/server/wire/``.
+These types are always serialized with Fory XLANG regardless of the
+service's negotiated serialization mode. They are the one place in
+Aster where every field carries an explicit ``pyfory.field(id=N)`` tag
+-- user types under ``docs/_internal/fory-cross-binding.md`` use
+name-based fingerprinting instead, which converges cross-binding by
+convention. Framework-internal types take the ID-based route because
+their wire layout is pinned by Aster-SPEC §5 and MUST stay stable
+across spec revisions regardless of field renames.
+
+IDs here MUST stay in sync with the ``@ForyField(id = N)`` annotations
+on the matching Java types under
+``bindings/java/aster-runtime/src/main/java/site/aster/server/wire/``
+(and the TypeScript equivalents). Drift there is a framework-spec bug.
 """
 
 from __future__ import annotations

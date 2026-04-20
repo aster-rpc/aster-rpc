@@ -385,13 +385,14 @@ def _gen_header(source: str, contract_id: str) -> str:
 def _gen_type_class(rec: _TypeRecord, known_types: dict[str, str]) -> str:
     """Generate a Python dataclass for a type record.
 
-    Every field is emitted with ``pyfory.field(id=N)`` using the 0-based index
-    from the manifest. This locks the Fory struct-fingerprint to the tag IDs
-    instead of field names, which is required for cross-binding XLANG decode:
-    Java Fory's fingerprint snake-cases field names (``detailKeys`` ->
-    ``detail_keys``) while pyfory leaves them verbatim, so without IDs the two
-    sides hash-mismatch with ``Hash X is not consistent with Y for type T``
-    even for structurally identical types.
+    Fields are emitted as plain ``dataclasses.field(...)`` descriptors
+    without Fory tag IDs. Under Aster's wire-fingerprint rule, every
+    binding defaults to name-based fingerprinting: pyfory uses the raw
+    (snake_case by Python convention) attribute name, Fory Java and Fory
+    TS auto-snake-case their native camelCase fields, and the three
+    converge on the same snake_case token set by construction. See
+    Aster-ContractIdentity §11.3.2.3 (fingerprint strategy) and
+    ``docs/_internal/fory-cross-binding.md``.
     """
     lines = []
     if rec.wire_tag:
@@ -403,25 +404,23 @@ def _gen_type_class(rec: _TypeRecord, known_types: dict[str, str]) -> str:
         lines.append("    pass")
         return "\n".join(lines)
 
-    for index, f in enumerate(rec.fields):
-        fname = f["name"]
+    for f in rec.fields:
+        # Snake-case whatever the server's manifest declared so the
+        # generated Python attribute follows Python convention
+        # (``agent_id`` rather than ``agentId``). pyfory's fingerprint
+        # uses the raw attribute name, and Fory Java/TS auto-snake-case
+        # at fingerprint time, so normalizing here keeps the wire tokens
+        # aligned cross-binding.
+        fname = _to_snake_case(f["name"])
         ftype_str = _py_type_from_field(f, known_types)
         default = _py_default_from_field(f)
 
-        # Emit through ``pyfory.field`` so the tag ID rides with the field
-        # declaration. ``_py_default_from_field`` returns ``None`` for no
-        # default, ``"dataclasses.field(default_factory=<factory>)"`` for
-        # mutable containers (Python 3.13 refuses literal ``{}`` / ``[]``
-        # defaults), or a bare literal expression otherwise.
         if default is None:
-            field_expr = f"pyfory.field({index})"
+            lines.append(f"    {fname}: {ftype_str}")
         elif default.startswith("dataclasses.field(default_factory="):
-            factory = default[len("dataclasses.field(default_factory=") : -1]
-            field_expr = f"pyfory.field({index}, default_factory={factory})"
+            lines.append(f"    {fname}: {ftype_str} = {default}")
         else:
-            field_expr = f"pyfory.field({index}, default={default})"
-
-        lines.append(f"    {fname}: {ftype_str} = {field_expr}")
+            lines.append(f"    {fname}: {ftype_str} = {default}")
 
     return "\n".join(lines)
 

@@ -4,7 +4,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.List;
-import site.aster.codec.ForyCodec;
+import site.aster.codec.Codec;
 import site.aster.ffi.Reactor;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
@@ -24,13 +24,19 @@ final class ReactorResponseStream implements ResponseStream {
 
   private final Reactor reactor;
   private final long callId;
-  private final ForyCodec headerCodec;
+  private final Codec trailerCodec;
   private boolean terminated;
 
-  ReactorResponseStream(Reactor reactor, long callId, ForyCodec headerCodec) {
+  /**
+   * @param trailerCodec codec used to encode the {@link RpcStatus} trailer at stream end. For
+   *     JSON-mode calls this is a {@code JsonCodec}; otherwise the server's {@code ForyCodec}. Must
+   *     match the StreamHeader's serializationMode so the client decodes the trailer on the same
+   *     axis it decoded the body.
+   */
+  ReactorResponseStream(Reactor reactor, long callId, Codec trailerCodec) {
     this.reactor = reactor;
     this.callId = callId;
-    this.headerCodec = headerCodec;
+    this.trailerCodec = trailerCodec;
   }
 
   @Override
@@ -52,7 +58,7 @@ final class ReactorResponseStream implements ResponseStream {
       return;
     }
     terminated = true;
-    byte[] trailerPayload = headerCodec.encode(RpcStatus.ok());
+    byte[] trailerPayload = trailerCodec.encode(RpcStatus.ok());
     byte[] trailerFrame = AsterFraming.encodeFrame(trailerPayload, AsterFraming.FLAG_TRAILER);
     submitTrailerFrame(trailerFrame);
   }
@@ -74,7 +80,7 @@ final class ReactorResponseStream implements ResponseStream {
     }
     RpcStatus status =
         new RpcStatus(code.value(), message == null ? "" : message, List.of(), List.of());
-    byte[] trailerPayload = headerCodec.encode(status);
+    byte[] trailerPayload = trailerCodec.encode(status);
     byte[] trailerFrame = AsterFraming.encodeFrame(trailerPayload, AsterFraming.FLAG_TRAILER);
     submitTrailerFrame(trailerFrame);
   }

@@ -7,6 +7,8 @@ TypeScript (or any other Aster binding) can interoperate.
 
 from dataclasses import dataclass, field
 
+import pyfory
+
 from aster import wire_type
 
 
@@ -58,14 +60,17 @@ class MetricPoint:
     name: str = ""
     value: float = 0.0
     timestamp: float = 0.0
-    tags: dict = field(default_factory=dict)
+    tags: dict[str, str] = field(default_factory=dict)
 
 
 @wire_type("mission/IngestResult")
 @dataclass
 class IngestResult:
-    accepted: int = 0
-    dropped: int = 0
+    # Java peers declare these as ``int`` (32-bit); pyfory's bare ``int``
+    # defaults to ``int64`` and the fingerprint tuple diverges, so pin
+    # the wire width explicitly.
+    accepted: pyfory.int32 = 0
+    dropped: pyfory.int32 = 0
 
 
 # -- Chapter 4: Sessions & Commands -------------------------------------------
@@ -74,7 +79,7 @@ class IngestResult:
 @dataclass
 class Heartbeat:
     agent_id: str = ""
-    capabilities: list = field(default_factory=list)
+    capabilities: list[str] = field(default_factory=list)
     load_avg: float = 0.0
 
 
@@ -96,4 +101,5 @@ class Command:
 class CommandResult:
     stdout: str = ""
     stderr: str = ""
-    exit_code: int = -1
+    # Java peers declare ``int`` (32-bit); pin to match.
+    exit_code: pyfory.int32 = -1

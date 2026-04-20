@@ -120,8 +120,7 @@ public class IrohPollThread {
           detail.isEmpty()
               ? "operation failed: " + status.name()
               : "operation failed: " + status.name() + ": " + detail;
-      registry.completeExceptionally(
-          event.operation(), IrohException.forStatus(status, message));
+      registry.completeExceptionally(event.operation(), IrohException.forStatus(status, message));
       return;
     }
 

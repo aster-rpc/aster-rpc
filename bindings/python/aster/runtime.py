@@ -2491,8 +2491,16 @@ class ProxyClient:
             raise RuntimeError(f"{self._service_name} has no rpc channel")
 
         conn = await self._client._rpc_conn_for(rpc_addr)
+
         # Proxy uses JSON mode -- no type registration needed.
         # The server sniffs JSON frames and decodes accordingly.
+        #
+        # Known gap (tracked): producers that advertise only ``xlang``
+        # (currently Java) cannot decode the JSON bodies the proxy
+        # emits. For those producers, use the typed client path
+        # (``client.client(ServiceCls)``) or the generated client
+        # (``aster contract gen-client``) - both speak native Fory
+        # XLANG and work cross-binding.
         self._codec = JsonProxyCodec()
         self._transport = IrohTransport(conn, codec=self._codec)
 

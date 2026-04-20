@@ -2,14 +2,13 @@
 
 Aster uses Apache Fory (`fory-core` for Java, `pyfory` for Python, similar for
 the other bindings) as its canonical XLANG codec. Getting Fory to round-trip
-payloads across bindings requires three things to be identical on every
-producer and consumer: the Fory **build config**, the per-type
-**(namespace, typename) registration key**, and the per-field **tag-ID
-annotations** that drive the schema-hash.
+payloads across bindings requires two things to be identical on every producer
+and consumer: the Fory **build config** and the per-type
+**(namespace, typename) registration key**.
 
-This note captures the decisions and the two Fory quirks that bit us during
-the Python ↔ Java Option B work, so the next engineer picking this up
-doesn't rediscover them from a hash-mismatch error.
+This note captures the decisions and the Fory quirks that shaped them, so the
+next engineer picking this up doesn't rediscover them from a hash-mismatch
+error.
 
 ## The baseline Fory config (both bindings)
 
@@ -39,7 +38,55 @@ per-struct schema hash in every XLANG payload, and the hash algorithm reads
 several of these flags. Drift → `Hash X is not consistent with Y for type
 T` on the receiver and the connection is dead.
 
-## Quirk #1: Java Fory's 2-arg `register(cls, tag)` splits on `.`, not `/`
+## Field identity: names, not IDs (except for framework types)
+
+The field-level contract across bindings — and the one that bit us hardest —
+is how per-field identifiers feed the schema fingerprint. Fory offers two
+modes: IDs (`@ForyField(id=N)` / `pyfory.field(id=N)`) and names
+(absent annotation, pick whichever default the binding provides). Aster
+picks **names** for user types; only the three framework-internal types
+(`StreamHeader`, `CallHeader`, `RpcStatus`) use IDs.
+
+**Why names**: in Fory's name-based fingerprint, Python uses the raw
+attribute name while Java and TypeScript auto-snake-case. Python convention
+is already snake_case, so `agent_id` (Python) and `agentId` (Java,
+snake-cased to `agent_id`) converge automatically. Users never pick IDs;
+there are no IDs to accidentally mismatch. See
+[`Aster-ContractIdentity.md` §11.3.2.3](../../ffi_spec/Aster-ContractIdentity.md)
+for the full spec.
+
+**Why IDs for framework types**: `StreamHeader` / `CallHeader` / `RpcStatus`
+are defined by Aster-SPEC §5 and their wire IDs are pinned across all
+bindings regardless of field renames. These types are small and
+version-stable; manual ID agreement is tractable.
+
+**Why not IDs everywhere**: mixing ID-based and name-based types in the same
+contract is impossible to catch at compile time. We hit exactly this during
+Phase 3c — Java MC types had `@ForyField(id=N)`, Python MC types didn't, and
+cross-binding RPC silently hashed differently on every call. Stripping user
+IDs makes the mistake unrepresentable.
+
+### Caveats of the name-based strategy
+
+- **Double-capital abbreviations.** Fory Java's snake-caser splits `userID`
+  to `user_i_d`, while a Python author would spell the same field `user_id`.
+  Mismatches happen only on non-idiomatic Java identifiers; style guides
+  already steer developers away from this.
+- **Unicode identifiers.** Fory's snake-caser is ASCII-only. Non-ASCII field
+  names match only when both sides spell them identically. Aster bindings
+  don't attempt NFC normalization at Fory fingerprint time — producers using
+  Unicode identifiers SHOULD register a custom Fory name resolver.
+- **Schema-metadata overhead on first message.** Fory transmits struct
+  schemas on first send per connection. Name-based schemas are ~N bytes per
+  field larger than ID-based. Amortized across the connection lifetime.
+- **Generic container element types MUST match.** Python's bare `list` or
+  `dict` fingerprints differently from `list[str]` / `dict[str, str]`. The
+  snake-case-name convergence only saves you on the *field name*; the
+  *field type* is part of the fingerprint and must agree. Declare generics
+  precisely in Python (`list[str]` not `list`) when targeting cross-binding
+  contracts.
+
+## Quirk: Java Fory's 2-arg `register(cls, tag)` splits on `.`, not `/`
 
 Aster's wire-tag convention (shared with Python's `@wire_type`) is
 `"namespace/Typename"`, e.g. `"_aster/RpcStatus"`. Apache Fory Java's 2-arg
@@ -56,61 +103,20 @@ on the Java side. It splits the tag on `/` and invokes Fory's explicit
 3-arg `register(cls, namespace, typename)` form. The Python side already
 does this inside `@wire_type` so no wrapper is needed there.
 
-## Quirk #2: Java Fory snake-cases field names in the schema fingerprint
-
-The schema hash that SCHEMA_CONSISTENT XLANG embeds in each payload is a
-hash of a text fingerprint — a sorted list of
-`<field-id>,<type-id>,<ref>,<nullable>;` tuples, one per field. When a
-field carries no `@ForyField(id=N)` annotation, Java Fory substitutes its
-**snake-cased** field name (`detailKeys` → `detail_keys`) for the
-`<field-id>` slot. pyfory in the same situation uses the raw field name
-(`detailKeys`). So a Java `RpcStatus` and a pyfory `RpcStatus` with
-byte-identical field layouts produce different fingerprints and different
-hashes, and the receiver rejects the payload.
-
-This is upstream behaviour — it's in
-`org.apache.fory.serializer.struct.Fingerprint.computeStructFingerprint`.
-We don't know for certain why Fory-Java does the snake-case conversion;
-the most plausible explanation is that its authors wanted Java types
-(which use `camelCase` by convention) to produce the same fingerprint as
-their Python / Rust / Go siblings (which use `snake_case`), as a
-convenience for users who keep their type definitions in lockstep across
-languages. **In practice this breaks — the other bindings don't do the
-same normalization, so the "convenience" silently breaks any payload
-with non-snake-case fields.** File an upstream issue if this still
-happens in a later Fory release; for now we work around it.
-
-**Mitigation:** annotate every field with a stable tag ID on every
-binding. When an ID is present, Fingerprint uses the ID string instead of
-the (snake-cased or raw) field name, and the two bindings produce
-identical fingerprints. This is also recommended upstream for stable wire
-identity across field renames.
-
-In practice:
-
-- **Framework wire types** (`StreamHeader`, `CallHeader`, `RpcStatus`)
-  carry `@ForyField(id = N)` / `pyfory.field(N)` on every field in both
-  bindings. IDs run 0..n-1 in declaration order and MUST stay in sync
-  across the two.
-- **User types declared in hand-written code** must add the same
-  annotations. The Mission Control example under
-  `bindings/java/aster-examples-mission-control/` does this.
-- **User types generated by `aster contract gen-client`** get the IDs
-  automatically: the Python codegen emits `pyfory.field(N)` where N is
-  the 0-based index of the field in the producer's published manifest.
-  The TypeScript codegen has an equivalent (TODO: confirm + link when
-  the TS binding follows suit).
-
 ## What to do when you see "Hash X is not consistent with Y for type T"
 
-1. Confirm both bindings are built from the same Aster commit — config
-   drift in `ForyCodec` / `ForyConfig` causes this.
-2. Confirm the type has `@ForyField(id = N)` / `pyfory.field(N)` on every
-   field on both sides, with identical IDs for each field.
-3. Confirm the declared field types match (Java `int` ↔ Python
-   `pyfory.int32`, Java `long` ↔ Python `pyfory.int64`, etc. — a bare
-   Python `int` hashes as int64, not int32).
-4. If all three are identical, print the fingerprint from each side (see
-   `compute_struct_fingerprint` in pyfory and `Fingerprint
-   .computeStructFingerprint` in Java Fory) and diff them. The string
-   that differs tells you which knob is off.
+1. **Config drift.** Confirm both bindings are built from the same Aster
+   commit — drift in `ForyCodec` / `ForyConfig` causes this.
+2. **Field type mismatch.** Confirm the declared field types match across
+   bindings. Python `list` ≠ `list[str]`, Python `int` ≠ `pyfory.int32`.
+   Bare generic containers are a common culprit.
+3. **Naming-convention mismatch.** Confirm Java field names snake-case to
+   the Python names (`agentId` ↔ `agent_id`). Double-capital
+   abbreviations (`userID`) fail because Java's snake-caser mangles them.
+4. **Leaked `@ForyField(id=N)` / `pyfory.field(id=N)`** on a user type. All
+   three bindings must agree on ID-vs-name; mixing modes hashes differently.
+   Strip the annotation and re-test.
+5. **Compare the fingerprints directly.** Print the text fingerprint from
+   each side (`compute_struct_fingerprint` in pyfory and
+   `Fingerprint.computeStructFingerprint` in Java Fory) and diff them. The
+   string that differs tells you which knob is off.

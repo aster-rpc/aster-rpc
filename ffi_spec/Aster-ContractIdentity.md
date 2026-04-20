@@ -814,6 +814,117 @@ declaration order does not match NFC-sort order will produce new
 `contract_id`s after binding implementations update. Acceptable per the
 pre-production status of all current contracts.
 
+###### Normative Algorithm for `contract_id` canonicalization
+
+Every binding MUST canonicalize field IDs from the NFC-sorted field
+names when computing `contract_id`:
+
+```
+# Inputs:  the message type T (dataclass / POJO / TS class)
+# Output:  ordered list [(field_name, field_id)] used ONLY inside the
+#          canonical FieldDef encoding fed to the BLAKE3 hasher.
+
+def assign_field_ids(T):
+    fields = collect_all_fields(T)
+        # Includes inherited fields. Excludes fields marked
+        # non-wire (e.g. @wire_skip, static, synthetic).
+
+    for f in fields:
+        f.sort_key = unicodedata_nfc(f.name)
+
+    sort fields by (sort_key codepoint-wise, strict ascending)
+
+    for (i, f) in enumerate(fields, start=1):
+        f.contract_field_id = i
+
+    return fields
+```
+
+Duplicate NFC-normalized names within a message are forbidden; the
+binding MUST raise a decoration-time error naming the collision. The
+sort is total; no tie-breaker rule is needed.
+
+This algorithm is what `ContractIdentityResolver` (Java) / the Rust
+canonicalizer (Python, TS) uses when producing the canonical
+`TypeDef.FieldDef[]` bytes that feed `contract_id`. It is independent
+of what the *wire serializer* (Fory) does at RPC time.
+
+###### Fory Wire Fingerprint — Name-Based, Not ID-Based
+
+Aster's wire serializer is Apache Fory in XLANG mode, and Fory computes
+its own schema fingerprint per struct. That fingerprint is separate
+from `contract_id`: `contract_id` is Aster's identity hash over the
+canonical TypeDef bytes; the Fory fingerprint is Fory's internal
+schema-match check before decoding a struct.
+
+Every binding MUST configure its Fory instance so that the fingerprint
+strategy agrees across the three bindings. Aster picks the
+**name-based** strategy (no `@ForyField(id=N)` / `pyfory.field(id=N)` /
+TS Fory ID annotations on user types):
+
+- **pyfory** uses the raw Python attribute name. Python convention is
+  snake_case, so user fields already appear as e.g. `agent_id`.
+- **Fory Java** auto-snake-cases the reflected field name at
+  fingerprint time, turning `agentId` into `agent_id`.
+- **Fory TypeScript** auto-snake-cases at fingerprint time too.
+
+Convergence is by construction: every binding's fingerprint token set
+is the snake-case rendering of the field name in that binding, and
+those renderings are identical across bindings when authors follow
+standard language naming conventions (camelCase in Java/TS, snake_case
+in Python).
+
+Rationale for picking names over IDs:
+
+1. **Fewer source-level footguns.** Mixing ID-based and name-based
+   types in the same contract (the failure mode that motivated this
+   section) is impossible when nobody annotates IDs.
+2. **Consistent with the "rename is a new contract" rule.** Renames
+   shift fingerprints; that is the intended behaviour.
+3. **`contract_id` remains the identity layer.** The Fory fingerprint
+   is a transport-level integrity check; `contract_id` (which *does*
+   use canonical integer IDs, per the algorithm above) is the stable
+   cross-binding identity handle. The two layers are deliberately
+   decoupled.
+
+Bindings MUST NOT annotate user types with `@ForyField(id=N)` /
+`pyfory.field(id=N)`. Annotations that pre-date this rule and persist
+in user source SHOULD be stripped; if they cannot be (third-party
+types), the binding MAY emit a warning but MUST NOT inject additional
+annotations to compensate.
+
+###### Name-Based Fingerprint — Caveats
+
+- **Double-capital abbreviations.** Fory Java's default snake-caser
+  splits `userID` to `user_i_d`, while Python convention would spell
+  the same field `user_id`. Mismatches happen only on non-idiomatic
+  Java identifiers; style guides already steer developers away from
+  this. When it bites, the fix is rename (`userID` → `userId`), which
+  is a contract-level change anyway.
+- **Unicode identifiers.** Fory's snake-caser is ASCII-only. Field
+  names containing non-ASCII letters will match only when both sides
+  spell them identically. Producers targeting Unicode identifiers
+  SHOULD register a custom Fory name resolver to NFC-normalize; this
+  is out of scope for the default behaviour.
+- **First-message schema-metadata overhead.** Fory transmits struct
+  schemas on first send of each type per connection. Name-based
+  schemas are larger than ID-based by ~N bytes per field name (on the
+  order of a few hundred bytes per struct). This cost is amortized
+  across the connection lifetime.
+
+###### Framework-Internal Wire Types
+
+This section applies to USER contract types only. Aster's own
+framework-internal wire types — `StreamHeader`, `CallHeader`,
+`RpcStatus` and any other types defined by Aster-SPEC §5 as part of
+the transport protocol — are governed by the wire-spec section that
+defines them, not by this section. These types retain explicit
+`@ForyField(id=N)` / `pyfory.field(id=N)` annotations in every
+binding, with IDs pinned by Aster-SPEC §5 so that every binding's
+transport layer can negotiate the same wire format regardless of how
+the type is spelt in source. Bindings MUST keep those annotations in
+sync across bindings; drift is a spec-level bug.
+
 ##### Map Key Type Set
 
 Map keys are constrained to types that are hashable and comparable in
