@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::canonical::{
-    write_bool, write_bytes_field, write_float64, write_list_header, write_optional_absent,
-    write_optional_present_prefix, write_string, write_varint, write_zigzag_i32,
+    expect_eof, read_bool, read_bytes_field, read_float64, read_list_header, read_optional_present,
+    read_string, read_varint, read_zigzag_i32, write_bool, write_bytes_field, write_float64,
+    write_list_header, write_optional_absent, write_optional_present_prefix, write_string,
+    write_varint, write_zigzag_i32,
 };
 
 // ── Enum types (§11.3.3, fixed normative values) ─────────────────────────────
@@ -436,6 +438,264 @@ pub fn canonical_xlang_bytes_method_def(md: &MethodDef) -> Vec<u8> {
     let mut buf = Vec::new();
     write_method_def(&mut buf, md);
     buf
+}
+
+// ── Canonical deserialization (reader counterparts to write_*) ───────────────
+//
+// Each reader mirrors its writer counterpart 1:1 in field order. Enum
+// discriminants decode via explicit match tables to reject unknown values.
+// Hash-bearing `bytes` fields decode to hex strings to match the struct
+// definitions (which store them hex-encoded for JSON round-tripping).
+
+fn type_kind_from_u64(v: u64) -> Result<TypeKind> {
+    match v {
+        0 => Ok(TypeKind::Primitive),
+        1 => Ok(TypeKind::Ref),
+        2 => Ok(TypeKind::SelfRef),
+        3 => Ok(TypeKind::Any),
+        other => bail!("canonical: unknown TypeKind discriminant {}", other),
+    }
+}
+
+fn container_kind_from_u64(v: u64) -> Result<ContainerKind> {
+    match v {
+        0 => Ok(ContainerKind::None),
+        1 => Ok(ContainerKind::List),
+        2 => Ok(ContainerKind::Set),
+        3 => Ok(ContainerKind::Map),
+        other => bail!("canonical: unknown ContainerKind discriminant {}", other),
+    }
+}
+
+fn type_def_kind_from_u64(v: u64) -> Result<TypeDefKind> {
+    match v {
+        0 => Ok(TypeDefKind::Message),
+        1 => Ok(TypeDefKind::Enum),
+        2 => Ok(TypeDefKind::Union),
+        other => bail!("canonical: unknown TypeDefKind discriminant {}", other),
+    }
+}
+
+fn method_pattern_from_u64(v: u64) -> Result<MethodPattern> {
+    match v {
+        0 => Ok(MethodPattern::Unary),
+        1 => Ok(MethodPattern::ServerStream),
+        2 => Ok(MethodPattern::ClientStream),
+        3 => Ok(MethodPattern::BidiStream),
+        other => bail!("canonical: unknown MethodPattern discriminant {}", other),
+    }
+}
+
+fn capability_kind_from_u64(v: u64) -> Result<CapabilityKind> {
+    match v {
+        0 => Ok(CapabilityKind::Role),
+        1 => Ok(CapabilityKind::AnyOf),
+        2 => Ok(CapabilityKind::AllOf),
+        other => bail!("canonical: unknown CapabilityKind discriminant {}", other),
+    }
+}
+
+fn scope_kind_from_u64(v: u64) -> Result<ScopeKind> {
+    match v {
+        0 => Ok(ScopeKind::Shared),
+        1 => Ok(ScopeKind::Session),
+        other => bail!("canonical: unknown ScopeKind discriminant {}", other),
+    }
+}
+
+fn read_field_def(buf: &[u8], pos: &mut usize) -> Result<FieldDef> {
+    let id = read_zigzag_i32(buf, pos)?;
+    let name = read_string(buf, pos)?;
+    let type_kind = type_kind_from_u64(read_varint(buf, pos)?)?;
+    let type_primitive = read_string(buf, pos)?;
+    let type_ref = hex::encode(read_bytes_field(buf, pos)?);
+    let self_ref_name = read_string(buf, pos)?;
+    let optional = read_bool(buf, pos)?;
+    let ref_tracked = read_bool(buf, pos)?;
+    let container = container_kind_from_u64(read_varint(buf, pos)?)?;
+    let container_key_kind = type_kind_from_u64(read_varint(buf, pos)?)?;
+    let container_key_primitive = read_string(buf, pos)?;
+    let container_key_ref = hex::encode(read_bytes_field(buf, pos)?);
+    let required = read_bool(buf, pos)?;
+    let default_value = hex::encode(read_bytes_field(buf, pos)?);
+    Ok(FieldDef {
+        id,
+        name,
+        type_kind,
+        type_primitive,
+        type_ref,
+        self_ref_name,
+        optional,
+        ref_tracked,
+        container,
+        container_key_kind,
+        container_key_primitive,
+        container_key_ref,
+        required,
+        default_value,
+    })
+}
+
+fn read_enum_value_def(buf: &[u8], pos: &mut usize) -> Result<EnumValueDef> {
+    let name = read_string(buf, pos)?;
+    let value = read_zigzag_i32(buf, pos)?;
+    Ok(EnumValueDef { name, value })
+}
+
+fn read_union_variant_def(buf: &[u8], pos: &mut usize) -> Result<UnionVariantDef> {
+    let name = read_string(buf, pos)?;
+    let id = read_zigzag_i32(buf, pos)?;
+    let type_ref = hex::encode(read_bytes_field(buf, pos)?);
+    Ok(UnionVariantDef { name, id, type_ref })
+}
+
+fn read_type_def(buf: &[u8], pos: &mut usize) -> Result<TypeDef> {
+    let kind = type_def_kind_from_u64(read_varint(buf, pos)?)?;
+    let package = read_string(buf, pos)?;
+    let name = read_string(buf, pos)?;
+
+    let n_fields = read_list_header(buf, pos)?;
+    let mut fields = Vec::with_capacity(n_fields);
+    for _ in 0..n_fields {
+        fields.push(read_field_def(buf, pos)?);
+    }
+
+    let n_evs = read_list_header(buf, pos)?;
+    let mut enum_values = Vec::with_capacity(n_evs);
+    for _ in 0..n_evs {
+        enum_values.push(read_enum_value_def(buf, pos)?);
+    }
+
+    let n_uvs = read_list_header(buf, pos)?;
+    let mut union_variants = Vec::with_capacity(n_uvs);
+    for _ in 0..n_uvs {
+        union_variants.push(read_union_variant_def(buf, pos)?);
+    }
+
+    Ok(TypeDef {
+        kind,
+        package,
+        name,
+        fields,
+        enum_values,
+        union_variants,
+    })
+}
+
+fn read_capability_requirement(buf: &[u8], pos: &mut usize) -> Result<CapabilityRequirement> {
+    let kind = capability_kind_from_u64(read_varint(buf, pos)?)?;
+    let n_roles = read_list_header(buf, pos)?;
+    let mut roles = Vec::with_capacity(n_roles);
+    for _ in 0..n_roles {
+        roles.push(read_string(buf, pos)?);
+    }
+    Ok(CapabilityRequirement { kind, roles })
+}
+
+fn read_method_def(buf: &[u8], pos: &mut usize) -> Result<MethodDef> {
+    let name = read_string(buf, pos)?;
+    let pattern = method_pattern_from_u64(read_varint(buf, pos)?)?;
+    let request_type = hex::encode(read_bytes_field(buf, pos)?);
+    let response_type = hex::encode(read_bytes_field(buf, pos)?);
+    let idempotent = read_bool(buf, pos)?;
+    let default_timeout = read_float64(buf, pos)?;
+    let requires = if read_optional_present(buf, pos)? {
+        Some(read_capability_requirement(buf, pos)?)
+    } else {
+        None
+    };
+    Ok(MethodDef {
+        name,
+        pattern,
+        request_type,
+        response_type,
+        idempotent,
+        default_timeout,
+        requires,
+    })
+}
+
+fn read_service_contract(buf: &[u8], pos: &mut usize) -> Result<ServiceContract> {
+    let name = read_string(buf, pos)?;
+    let version = read_zigzag_i32(buf, pos)?;
+
+    let n_methods = read_list_header(buf, pos)?;
+    let mut methods = Vec::with_capacity(n_methods);
+    for _ in 0..n_methods {
+        methods.push(read_method_def(buf, pos)?);
+    }
+
+    let n_modes = read_list_header(buf, pos)?;
+    let mut serialization_modes = Vec::with_capacity(n_modes);
+    for _ in 0..n_modes {
+        serialization_modes.push(read_string(buf, pos)?);
+    }
+
+    let scoped = scope_kind_from_u64(read_varint(buf, pos)?)?;
+
+    let requires = if read_optional_present(buf, pos)? {
+        Some(read_capability_requirement(buf, pos)?)
+    } else {
+        None
+    };
+
+    let producer_language = read_string(buf, pos)?;
+
+    Ok(ServiceContract {
+        name,
+        version,
+        methods,
+        serialization_modes,
+        scoped,
+        requires,
+        producer_language,
+    })
+}
+
+/// Decode canonical XLANG bytes of a `TypeDef` back into the struct form.
+///
+/// The input must be the exact output of
+/// [`canonical_xlang_bytes_type_def`] — canonical framing is schema-
+/// consistent and strictly deterministic, so any drift or trailing bytes
+/// are rejected with an error.
+pub fn decode_type_def_bytes(bytes: &[u8]) -> Result<TypeDef> {
+    let mut pos = 0;
+    let td = read_type_def(bytes, &mut pos)?;
+    expect_eof(bytes, pos)?;
+    Ok(td)
+}
+
+/// Decode canonical XLANG bytes of a `ServiceContract` back into the
+/// struct form. See [`decode_type_def_bytes`] for semantics.
+pub fn decode_service_contract_bytes(bytes: &[u8]) -> Result<ServiceContract> {
+    let mut pos = 0;
+    let sc = read_service_contract(bytes, &mut pos)?;
+    expect_eof(bytes, pos)?;
+    Ok(sc)
+}
+
+/// Decode canonical XLANG bytes of a `MethodDef` back into the struct
+/// form. See [`decode_type_def_bytes`] for semantics.
+pub fn decode_method_def_bytes(bytes: &[u8]) -> Result<MethodDef> {
+    let mut pos = 0;
+    let md = read_method_def(bytes, &mut pos)?;
+    expect_eof(bytes, pos)?;
+    Ok(md)
+}
+
+/// Decode canonical bytes to a JSON representation, matching the
+/// `#[serde(rename_all = "snake_case")]` conventions of the struct types.
+/// Used by FFI callers (NAPI, PyO3, JNI) that want the decoded payload in
+/// a language-neutral form rather than a Rust struct reference.
+pub fn canonical_bytes_to_json(type_name: &str, bytes: &[u8]) -> Result<String> {
+    match type_name {
+        "TypeDef" => Ok(serde_json::to_string(&decode_type_def_bytes(bytes)?)?),
+        "ServiceContract" => Ok(serde_json::to_string(&decode_service_contract_bytes(
+            bytes,
+        )?)?),
+        "MethodDef" => Ok(serde_json::to_string(&decode_method_def_bytes(bytes)?)?),
+        _ => bail!("unknown type: {}", type_name),
+    }
 }
 
 /// BLAKE3 hash of canonical bytes -> 32-byte digest.
@@ -1415,5 +1675,277 @@ mod tests {
             "'required' (no default) must differ from 'default = zero-value' \
              per §11.3.2.3"
         );
+    }
+
+    // ── Round-trip: canonical bytes encoder/decoder ─────────────────────
+
+    /// `decode(encode(td))` returns the canonical form of `td`. Because
+    /// canonicalization normalizes field IDs (NFC-name-sorted position)
+    /// and sorts enum values / union variants, the returned struct may
+    /// differ from the input — re-encoding must produce identical bytes.
+    fn assert_type_def_roundtrip(td: &TypeDef) {
+        let bytes = canonical_xlang_bytes_type_def(td);
+        let decoded = decode_type_def_bytes(&bytes).unwrap();
+        let reencoded = canonical_xlang_bytes_type_def(&decoded);
+        assert_eq!(
+            bytes, reencoded,
+            "TypeDef canonical bytes must survive decode→encode unchanged"
+        );
+    }
+
+    fn assert_service_contract_roundtrip(sc: &ServiceContract) {
+        let bytes = canonical_xlang_bytes_service_contract(sc);
+        let decoded = decode_service_contract_bytes(&bytes).unwrap();
+        let reencoded = canonical_xlang_bytes_service_contract(&decoded);
+        assert_eq!(
+            bytes, reencoded,
+            "ServiceContract canonical bytes must survive decode→encode unchanged"
+        );
+    }
+
+    #[test]
+    fn roundtrip_typedef_message_primitives_only() {
+        let td = TypeDef {
+            kind: TypeDefKind::Message,
+            package: "example".to_string(),
+            name: "Person".to_string(),
+            fields: vec![
+                simple_primitive_field(1, "id", "int64"),
+                simple_primitive_field(2, "name", "string"),
+                simple_primitive_field(3, "height", "float64"),
+                simple_primitive_field(4, "active", "bool"),
+            ],
+            enum_values: vec![],
+            union_variants: vec![],
+        };
+        assert_type_def_roundtrip(&td);
+
+        // Also check the decoded struct's fields round-trip by name.
+        let decoded = decode_type_def_bytes(&canonical_xlang_bytes_type_def(&td)).unwrap();
+        let names: Vec<&str> = decoded.fields.iter().map(|f| f.name.as_str()).collect();
+        // NFC sort of [id, name, height, active] → [active, height, id, name]
+        assert_eq!(names, vec!["active", "height", "id", "name"]);
+    }
+
+    #[test]
+    fn roundtrip_typedef_with_containers_and_refs() {
+        let book_hash = "ebbd3f0620150dc212f93cb17cda130c5303bdd7f1f8c7d7c9c6e52cb16677f2";
+        let td = TypeDef {
+            kind: TypeDefKind::Message,
+            package: "example".to_string(),
+            name: "Shelf".to_string(),
+            fields: vec![
+                field_def(
+                    1,
+                    "books",
+                    TypeKind::Ref,
+                    "",
+                    book_hash,
+                    "",
+                    false,
+                    false,
+                    ContainerKind::List,
+                    TypeKind::Primitive,
+                    "",
+                    "",
+                ),
+                self_ref_field(2, "parent", "example.Shelf", true),
+            ],
+            enum_values: vec![],
+            union_variants: vec![],
+        };
+        assert_type_def_roundtrip(&td);
+
+        let decoded = decode_type_def_bytes(&canonical_xlang_bytes_type_def(&td)).unwrap();
+        let books = decoded.fields.iter().find(|f| f.name == "books").unwrap();
+        assert_eq!(books.type_kind, TypeKind::Ref);
+        assert_eq!(books.type_ref, book_hash);
+        assert_eq!(books.container, ContainerKind::List);
+        let parent = decoded.fields.iter().find(|f| f.name == "parent").unwrap();
+        assert_eq!(parent.type_kind, TypeKind::SelfRef);
+        assert_eq!(parent.self_ref_name, "example.Shelf");
+        assert!(parent.optional);
+    }
+
+    #[test]
+    fn roundtrip_typedef_enum() {
+        let td = TypeDef {
+            kind: TypeDefKind::Enum,
+            package: "example".to_string(),
+            name: "Color".to_string(),
+            fields: vec![],
+            enum_values: vec![
+                EnumValueDef {
+                    name: "RED".into(),
+                    value: 0,
+                },
+                EnumValueDef {
+                    name: "GREEN".into(),
+                    value: 1,
+                },
+                EnumValueDef {
+                    name: "BLUE".into(),
+                    value: 2,
+                },
+            ],
+            union_variants: vec![],
+        };
+        assert_type_def_roundtrip(&td);
+
+        let decoded = decode_type_def_bytes(&canonical_xlang_bytes_type_def(&td)).unwrap();
+        assert_eq!(decoded.kind, TypeDefKind::Enum);
+        assert_eq!(decoded.enum_values.len(), 3);
+    }
+
+    #[test]
+    fn roundtrip_typedef_union() {
+        let td = TypeDef {
+            kind: TypeDefKind::Union,
+            package: "example".to_string(),
+            name: "Event".to_string(),
+            fields: vec![],
+            enum_values: vec![],
+            union_variants: vec![
+                UnionVariantDef {
+                    name: "Opened".into(),
+                    id: 1,
+                    type_ref: "aa".repeat(32),
+                },
+                UnionVariantDef {
+                    name: "Closed".into(),
+                    id: 2,
+                    type_ref: "bb".repeat(32),
+                },
+            ],
+        };
+        assert_type_def_roundtrip(&td);
+    }
+
+    #[test]
+    fn roundtrip_typedef_field_with_default() {
+        let mut fd = simple_primitive_field(1, "count", "int32");
+        fd.required = false;
+        // Canonical bytes of default zero-value int32: varint(0) → [0x00]
+        fd.default_value = "00".to_string();
+        let td = TypeDef {
+            kind: TypeDefKind::Message,
+            package: "example".to_string(),
+            name: "Counter".to_string(),
+            fields: vec![fd],
+            enum_values: vec![],
+            union_variants: vec![],
+        };
+        assert_type_def_roundtrip(&td);
+
+        let decoded = decode_type_def_bytes(&canonical_xlang_bytes_type_def(&td)).unwrap();
+        let f = &decoded.fields[0];
+        assert!(!f.required);
+        assert_eq!(f.default_value, "00");
+    }
+
+    #[test]
+    fn roundtrip_service_contract_empty() {
+        let sc = ServiceContract {
+            name: "EmptyService".to_string(),
+            version: 1,
+            methods: vec![],
+            serialization_modes: vec!["xlang".to_string()],
+            scoped: ScopeKind::Shared,
+            requires: None,
+            producer_language: String::new(),
+        };
+        assert_service_contract_roundtrip(&sc);
+    }
+
+    #[test]
+    fn roundtrip_service_contract_with_methods_and_capabilities() {
+        let sc = ServiceContract {
+            name: "Orders".to_string(),
+            version: 2,
+            methods: vec![
+                MethodDef {
+                    name: "place".to_string(),
+                    pattern: MethodPattern::Unary,
+                    request_type: "aa".repeat(32),
+                    response_type: "bb".repeat(32),
+                    idempotent: false,
+                    default_timeout: 30.0,
+                    requires: Some(CapabilityRequirement {
+                        kind: CapabilityKind::AnyOf,
+                        roles: vec!["admin".into(), "operator".into()],
+                    }),
+                },
+                MethodDef {
+                    name: "stream_updates".to_string(),
+                    pattern: MethodPattern::ServerStream,
+                    request_type: "cc".repeat(32),
+                    response_type: "dd".repeat(32),
+                    idempotent: true,
+                    default_timeout: 0.0,
+                    requires: None,
+                },
+            ],
+            serialization_modes: vec!["xlang".to_string(), "native".to_string()],
+            scoped: ScopeKind::Session,
+            requires: Some(CapabilityRequirement {
+                kind: CapabilityKind::Role,
+                roles: vec!["authenticated".into()],
+            }),
+            producer_language: "python".to_string(),
+        };
+        assert_service_contract_roundtrip(&sc);
+
+        // Also verify field fidelity.
+        let bytes = canonical_xlang_bytes_service_contract(&sc);
+        let decoded = decode_service_contract_bytes(&bytes).unwrap();
+        assert_eq!(decoded.name, "Orders");
+        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.methods.len(), 2);
+        assert_eq!(decoded.scoped, ScopeKind::Session);
+        assert_eq!(decoded.producer_language, "python");
+        let place = decoded.methods.iter().find(|m| m.name == "place").unwrap();
+        assert_eq!(place.pattern, MethodPattern::Unary);
+        assert_eq!(place.default_timeout, 30.0);
+        let req = place.requires.as_ref().unwrap();
+        assert_eq!(req.kind, CapabilityKind::AnyOf);
+    }
+
+    #[test]
+    fn decode_bytes_roundtrip_via_json_bridge() {
+        let json = r#"{"kind":"message","package":"example","name":"Ping","fields":[],"enum_values":[],"union_variants":[]}"#;
+        let bytes = canonical_bytes_from_json("TypeDef", json).unwrap();
+        let json_back = canonical_bytes_to_json("TypeDef", &bytes).unwrap();
+        // Re-encode the decoded JSON; must produce identical bytes.
+        let bytes_back = canonical_bytes_from_json("TypeDef", &json_back).unwrap();
+        assert_eq!(bytes, bytes_back);
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let sc = ServiceContract {
+            name: "X".to_string(),
+            version: 1,
+            methods: vec![],
+            serialization_modes: vec!["xlang".to_string()],
+            scoped: ScopeKind::Shared,
+            requires: None,
+            producer_language: String::new(),
+        };
+        let mut bytes = canonical_xlang_bytes_service_contract(&sc);
+        bytes.push(0xFF); // extra byte
+        assert!(decode_service_contract_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_unknown_enum_discriminant() {
+        // Handcraft a TypeDef byte stream with kind=99 (unknown).
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 99); // kind — invalid
+        write_string(&mut buf, "pkg");
+        write_string(&mut buf, "Name");
+        write_list_header(&mut buf, 0);
+        write_list_header(&mut buf, 0);
+        write_list_header(&mut buf, 0);
+        assert!(decode_type_def_bytes(&buf).is_err());
     }
 }
