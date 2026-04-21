@@ -342,3 +342,282 @@ class DynamicTypeFactory:
     @property
     def type_count(self) -> int:
         return len(self._types)
+
+    def register_from_type_defs(
+        self,
+        roots: list[str],
+        type_defs_by_tag: dict[str, dict[str, Any]],
+        type_defs_by_hash: dict[str, dict[str, Any]],
+    ) -> set[str]:
+        """Synthesize Python dataclasses from canonical ``TypeDef`` dicts.
+
+        The flat-manifest path (:meth:`register_from_manifest`) loses
+        information whenever a field references a nested struct: the
+        manifest only carries leaf ``kind`` strings, so the dynamic
+        proxy has to fall back to ``object`` for refs and the producer-
+        side Fory hash diverges from what we build at the consumer.
+        The TypeDef graph carries the full tree -- hex-hash refs for
+        every nested type -- so the hash we compute here matches the
+        producer byte-for-byte.
+
+        Mirrors the TS ``DynamicTypeFactory.registerFromTypeDefs``
+        (bindings/typescript/packages/aster/src/dynamic.ts) so all
+        bindings that consume ``types/{hash}.bin`` blobs converge on a
+        single code path.
+
+        Args:
+            roots: Wire tags ("package/name") to start the walk from --
+                typically every method's request/response wire tag.
+            type_defs_by_tag: Tag -> decoded TypeDef dict.
+            type_defs_by_hash: Hex BLAKE3 hash -> decoded TypeDef dict.
+                Nested ``ref`` fields carry the hex hash of the target
+                type, so we resolve them by hash.
+
+        Returns:
+            The set of wire tags that were reached + registered. Callers
+            can diff against ``roots`` to decide whether to fall back
+            to the flat manifest path for any unresolved roots.
+        """
+        resolved: set[str] = set()
+        ordered = _topo_sort_reachable(roots, type_defs_by_tag, type_defs_by_hash)
+
+        for tag in ordered:
+            if tag in self._types:
+                resolved.add(tag)
+                continue
+            td = type_defs_by_tag.get(tag)
+            if td is None:
+                continue
+            name = td.get("name", "")
+            if not name:
+                continue
+            cls = self._synthesize_from_type_def(tag, name, td, type_defs_by_hash)
+            self._types[tag] = cls
+            resolved.add(tag)
+
+        return resolved
+
+    def _synthesize_from_type_def(
+        self,
+        tag: str,
+        name: str,
+        td: dict[str, Any],
+        type_defs_by_hash: dict[str, dict[str, Any]],
+    ) -> type:
+        """Build a dataclass for one canonical TypeDef.
+
+        Field types are resolved from ``(type_kind, type_primitive,
+        type_ref, container, container_key_*)``. Nested refs are looked
+        up by hex hash in ``type_defs_by_hash``; topo-sort guarantees
+        leaf types are already in ``self._types`` when we reach a
+        parent that references them.
+        """
+        dc_fields: list[tuple[str, type, Any]] = []
+        for f in td.get("fields", []):
+            py_type = self._canonical_field_type(f, type_defs_by_hash)
+            default = self._canonical_field_default(f)
+            pyname = _to_snake_case(f["name"])
+            if isinstance(default, dataclasses.Field):
+                dc_fields.append((pyname, py_type, default))
+            else:
+                dc_fields.append((pyname, py_type, dataclasses.field(default=default)))
+
+        cls = dataclasses.make_dataclass(name, dc_fields)
+        cls.__wire_type__ = tag
+        if "/" in tag:
+            ns, tn = tag.rsplit("/", 1)
+        elif "." in tag:
+            parts = tag.rsplit(".", 1)
+            ns = parts[0]
+            tn = parts[1]
+        else:
+            ns = ""
+            tn = tag
+        cls.__fory_namespace__ = ns
+        cls.__fory_typename__ = tn
+        return cls
+
+    def _canonical_field_type(
+        self,
+        f: dict[str, Any],
+        type_defs_by_hash: dict[str, dict[str, Any]],
+    ) -> type:
+        container = f.get("container", "none")
+        if container in ("list", "set"):
+            elem = self._canonical_leaf_type(
+                f.get("type_kind", "primitive"),
+                f.get("type_primitive", "string"),
+                f.get("type_ref", ""),
+                type_defs_by_hash,
+            )
+            return list[elem] if elem is not object else list
+        if container == "map":
+            key = self._canonical_leaf_type(
+                f.get("container_key_kind", "primitive"),
+                f.get("container_key_primitive", "string"),
+                f.get("container_key_ref", ""),
+                type_defs_by_hash,
+            )
+            val = self._canonical_leaf_type(
+                f.get("type_kind", "primitive"),
+                f.get("type_primitive", "string"),
+                f.get("type_ref", ""),
+                type_defs_by_hash,
+            )
+            if key is object or val is object:
+                return dict
+            return dict[key, val]
+        return self._canonical_leaf_type(
+            f.get("type_kind", "primitive"),
+            f.get("type_primitive", "string"),
+            f.get("type_ref", ""),
+            type_defs_by_hash,
+        )
+
+    def _canonical_leaf_type(
+        self,
+        type_kind: str,
+        type_primitive: str,
+        type_ref_hex: str,
+        type_defs_by_hash: dict[str, dict[str, Any]],
+    ) -> Any:
+        if type_kind == "primitive":
+            return _primitive_to_py().get(type_primitive, object)
+        if type_kind == "ref":
+            nested_td = type_defs_by_hash.get(type_ref_hex)
+            if nested_td is None:
+                return object
+            nested_tag = f"{nested_td.get('package', '')}/{nested_td.get('name', '')}"
+            nested_cls = self._types.get(nested_tag)
+            return nested_cls if nested_cls is not None else object
+        return object
+
+    @staticmethod
+    def _canonical_field_default(f: dict[str, Any]) -> Any:
+        container = f.get("container", "none")
+        if container in ("list", "set"):
+            return dataclasses.field(default_factory=list)
+        if container == "map":
+            return dataclasses.field(default_factory=dict)
+        type_kind = f.get("type_kind", "primitive")
+        if type_kind == "primitive":
+            prim = f.get("type_primitive", "string")
+            if prim in _PRIMITIVE_DEFAULTS:
+                return _PRIMITIVE_DEFAULTS[prim]
+        return None
+
+
+# Canonical ``type_primitive`` → Python annotation. pyfory distinguishes
+# bit-widths through its ``TypeVar`` markers (``pyfory.int32`` etc.): a
+# struct declared with ``accepted: int`` hashes differently from one
+# declared with ``accepted: pyfory.int32``, so if we want the client-
+# side synthesised dataclass to interop byte-for-byte with a producer
+# that used ``pyfory.int32``, we must surface the same TypeVar here.
+# Missing entries fall through to ``object``.
+def _build_primitive_map() -> dict[str, Any]:
+    # Imported lazily so pyfory remains an optional dependency path-wise
+    # -- ``register_from_manifest`` alone doesn't need these markers.
+    import pyfory
+
+    return {
+        "bool": bool,
+        "string": str,
+        "binary": bytes,
+        "int8": pyfory.int8,
+        "int16": pyfory.int16,
+        "int32": pyfory.int32,
+        "int64": pyfory.int64,
+        # Fory xlang models uint via the signed int of the same width.
+        "uint8": pyfory.int8,
+        "uint16": pyfory.int16,
+        "uint32": pyfory.int32,
+        "uint64": pyfory.int64,
+        "float32": pyfory.float32,
+        "float64": pyfory.float64,
+        # Timestamps are carried as i64 millis in pyfory's xlang.
+        "timestamp": pyfory.int64,
+        "uuid": str,
+    }
+
+
+_PRIMITIVE_TO_PY: dict[str, Any] | None = None
+
+
+def _primitive_to_py() -> dict[str, Any]:
+    global _PRIMITIVE_TO_PY
+    if _PRIMITIVE_TO_PY is None:
+        _PRIMITIVE_TO_PY = _build_primitive_map()
+    return _PRIMITIVE_TO_PY
+
+
+# Default values per primitive. pyfory's TypeVar markers aren't hashable
+# as plain ``type`` instances, so we key by name instead.
+_PRIMITIVE_DEFAULTS: dict[str, Any] = {
+    "bool": False,
+    "string": "",
+    "binary": b"",
+    "int8": 0,
+    "int16": 0,
+    "int32": 0,
+    "int64": 0,
+    "uint8": 0,
+    "uint16": 0,
+    "uint32": 0,
+    "uint64": 0,
+    "float32": 0.0,
+    "float64": 0.0,
+    "timestamp": 0,
+    "uuid": "",
+}
+
+
+def _topo_sort_reachable(
+    roots: list[str],
+    by_tag: dict[str, dict[str, Any]],
+    by_hash: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Return wire tags reachable from ``roots``, leaves first.
+
+    Back-edges (cycles via ``self_ref``) are broken by visit order: a
+    node already on the DFS stack is treated as a self-reference and
+    skipped. Mirrors the TS ``topoSortReachable`` in dynamic.ts.
+    """
+    ordered: list[str] = []
+    visited: set[str] = set()
+    on_stack: set[str] = set()
+
+    def ref_tag(hash_hex: str) -> str | None:
+        nested = by_hash.get(hash_hex)
+        if nested is None:
+            return None
+        return f"{nested.get('package', '')}/{nested.get('name', '')}"
+
+    def collect_children(td: dict[str, Any]) -> list[str]:
+        out: list[str] = []
+        for f in td.get("fields", []):
+            if f.get("type_kind") == "ref":
+                tag = ref_tag(f.get("type_ref", ""))
+                if tag:
+                    out.append(tag)
+            if f.get("container", "none") != "none" and f.get("container_key_kind") == "ref":
+                tag = ref_tag(f.get("container_key_ref", ""))
+                if tag:
+                    out.append(tag)
+        return out
+
+    def visit(tag: str) -> None:
+        if tag in visited or tag in on_stack:
+            return
+        td = by_tag.get(tag)
+        if td is None:
+            return
+        on_stack.add(tag)
+        for child in collect_children(td):
+            visit(child)
+        on_stack.discard(tag)
+        visited.add(tag)
+        ordered.append(tag)
+
+    for r in roots:
+        visit(r)
+    return ordered
