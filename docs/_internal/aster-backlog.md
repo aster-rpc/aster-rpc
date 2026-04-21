@@ -16,26 +16,6 @@ When an item is completed, move it to the `## Done` section at the bottom with t
 
 ## Open
 
-### TS publisher: emit `types/{hash}.bin` to match spec
-
-**Why.** Spec `ffi_spec/Aster-ContractIdentity.md:108` says contract collections are `contract.xlang` + one `types/{type_hash}.xlang` blob per TypeDef. Python publisher (`bindings/python/aster/contract/publication.py:80`) does this. TS publisher (`bindings/typescript/packages/aster/src/contract/publication.ts:32-49 buildCollection`) only emits `manifest.json` + `contract.bin`. That means:
-
-- TS-produced contract collections aren't spec-compliant.
-- Cross-binding interop is blocked whenever a consumer wants to walk the canonical type graph from a TS-published contract (this is what the Path B canonical reader needs to consume).
-
-**What.** Extend `buildCollection` to include one `types/{hex_hash}.bin` entry per TypeDef referenced by the contract. The hash and canonical bytes are already computed at scan time for `requestTypeHash` / `responseTypeHash` via the NAPI `canonicalBytesFromJson`; wire those into the collection builder. Verify by fetching a TS-published contract from Python and running `fetch_contract_type_defs`.
-
-**Where.**
-- `bindings/typescript/packages/aster/src/contract/publication.ts` — `buildCollection`.
-- `bindings/typescript/packages/aster/src/runtime.ts` — caller that builds the collection (search for `publishContract` / `buildCollection` callers).
-- `bindings/typescript/packages/aster/src/cli/gen.ts` — scanner already emits `requestTypeHash` / `responseTypeHash`; extend to emit canonical bytes alongside.
-
-**Blockers.** None. Independent of the Path B dynamic proxy work, but Path B ts-ts-dev validation is cleaner if this lands first (consumes real TS-produced collections in tests).
-
-**Origin.** 2026-04-21 session, Path B plan. See `docs/_internal/fory_upgrade/dynamic-proxy-async.md`.
-
----
-
 ### Python ProxyClient: migrate to canonical-bytes decoder
 
 **Why.** Python's dynamic proxy today reads `ContractManifest.methods[*].fields` (flat; no nested TypeDefs). Works for py-py by relying on pyfory's by-name nested-type resolution at runtime. When Path B lands the Rust-core canonical reader for TS, Python should converge onto the same path so we have one source of truth per binding.
@@ -115,4 +95,4 @@ When an item is completed, move it to the `## Done` section at the bottom with t
 
 ## Done
 
-_Move items here with resolution commit + date as they close out. Or delete if no longer relevant._
+- **TS publisher spec parity (`types/{hash}.bin`)** — resolved by commit `e0373ac` (2026-04-21). Scanner now stamps `typeHashHex` + `typeDefBytes` on every `WireTypeShape`; runtime `_publishContracts` walks reachable types and passes the map to `buildCollection`. Cross-binding dynamic clients can now decode TS-published contract collections byte-for-byte.
