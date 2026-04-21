@@ -32,14 +32,16 @@ export function getXlangForyAndType(): { fory: any; Type: any } {
   const Fory = foryModule.default;
   const Type = foryModule.Type;
   // `compatible: true` picks NAMED_COMPATIBLE_STRUCT layout (what
-  // pyfory / fory-java use by default at XLANG); `refTracking: true`
-  // matches `pyfory.Fory(xlang=True, ref=True)` and Fory Java's
-  // `withRefTracking(true)`. The option name is `refTracking` (not
-  // `ref`) -- `@apache-fory/core`'s Config silently drops unknown
-  // keys, so `{ ref: true }` used to leave refs disabled on the TS
-  // side while Python/Java had them on, producing an asymmetric
-  // wire format and cross-binding decode failures.
-  _cachedFory = new Fory({ refTracking: true, compatible: true });
+  // pyfory / fory-java use by default at XLANG); `ref: true` matches
+  // `pyfory.Fory(xlang=True, ref=True)` and Fory Java's
+  // `withRefTracking(true)`. Stable `@apache-fory/core@0.17.0` reads
+  // this as `config.ref` (flowed into `typeResolver.trackingRef`);
+  // the dev source in docs/_internal uses `refTracking` but the
+  // release ships `ref`. Config silently drops unknown keys, so the
+  // name matters -- `refTracking: true` on stable 0.17.0 is a no-op
+  // and wire bytes come out with NotNullValueFlag (0xff) instead of
+  // RefValueFlag (0x00), mismatching pyfory/fory-java.
+  _cachedFory = new Fory({ ref: true, compatible: true });
   _cachedType = Type;
   return { fory: _cachedFory, Type };
 }
@@ -54,7 +56,7 @@ export function newXlangFory(): { fory: any; Type: any } {
   const foryModule = require('@apache-fory/core');
   const Fory = foryModule.default;
   const Type = foryModule.Type;
-  return { fory: new Fory({ refTracking: true, compatible: true }), Type };
+  return { fory: new Fory({ ref: true, compatible: true }), Type };
 }
 
 /**
