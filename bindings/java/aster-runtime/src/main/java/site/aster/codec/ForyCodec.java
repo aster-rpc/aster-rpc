@@ -39,15 +39,27 @@ public final class ForyCodec implements Codec {
     this.fory =
         Fory.builder()
             .withLanguage(Language.XLANG)
-            // Aster's baseline Fory config: XLANG + ref-tracking + strict. Must match the
-            // matching Python config in bindings/python/aster/codec.py verbatim -- any drift
-            // re-introduces cross-binding schema-hash divergence (see
+            // Aster's baseline Fory config: XLANG + ref-tracking + strict +
+            // compatible-mode. Must match the matching Python config in
+            // bindings/python/aster/codec.py verbatim -- any drift re-introduces
+            // cross-binding schema-hash divergence (see
             // docs/_internal/fory-cross-binding.md).
-            //   XLANG:    cross-language binary format (Java <-> Python <-> Go <-> ...).
-            //   refs:     duplicate objects serialize once + circular refs survive decode.
-            //   strict:   every type must be registered; unknown types raise at encode time
-            //             instead of smuggling arbitrary classes through the wire.
+            //   XLANG:      cross-language binary format.
+            //   refs:       duplicate objects serialize once + circular refs
+            //               survive decode.
+            //   strict:     every type must be registered; unknown types raise
+            //               at encode time instead of smuggling arbitrary
+            //               classes through the wire.
+            //   compatible: NAMED_COMPATIBLE_STRUCT layout (schema meta-share
+            //               with struct hash check). pyfory sets compatible=
+            //               True by default at XLANG; without withCompatibleMode
+            //               here, Java emits SCHEMA_CONSISTENT bytes and any
+            //               py<->java call fails with "Read class version is
+            //               not consistent" or "read objects are: [null]".
+            //               Verified at Fory 0.17: pyfory + java produce
+            //               byte-identical output with this set on both sides.
             .withRefTracking(true)
+            .withCompatibleMode(org.apache.fory.config.CompatibleMode.COMPATIBLE)
             .requireClassRegistration(true)
             .buildThreadSafeForyPool(poolSize);
   }

@@ -33,57 +33,83 @@ When an item is completed, move it to the `## Done` section at the bottom with t
 
 ---
 
-### Cross-binding matrix: register every wire type by numeric `type_id`, not by (namespace, typename)
+### Cross-binding matrix: TS Fory 0.17 TypeMeta is not byte-compatible with pyfory / fory-java
 
-**Why.** Fory 0.17 is **not** broken across bindings — we were registering types the wrong way. Proof (minimal struct, no Aster layer in between):
+**Why.** The name-based registration approach the spec mandates in §11.3.2.3 ("Fory Wire Fingerprint — Name-Based, Not ID-Based") **works at Fory 0.17** between pyfory and fory-java. Proven with a minimal struct, no Aster layer:
 
 ```
-pyfory.Fory(xlang=True, ref=True, compatible=True)      \
-  register_type(Point, type_id=100)                     \   same 21 bytes
-  Point with pyfory.field(id=1) / pyfory.field(id=2)    /
-
-Fory.builder().withXlang(true).withRefTracking(true)                    \
-  .withCompatibleMode(COMPATIBLE).buildThreadSafeFory()                 \   same 21 bytes
-  register(Point.class, 100L) with @ForyField(id=1) / @ForyField(id=2)  /
+pyfory.Fory(xlang=True, ref=True, compatible=True) + register_type(Point, namespace='demo', typename='Point')
+Fory.builder().withXlang(true).withRefTracking(true).withCompatibleMode(COMPATIBLE)  \
+  + fory.register(Point.class, "demo", "Point")
 ```
 
-`02 00 1c 00 07 c1 b1 c2 42 9a 22 4c 02 1c 64 c4 05 c8 05 14 28` both sides. `pyfory.deserialize(javaBytes)` returns `Point(x=10, y=20)` cleanly.
+→ both produce `02 00 1e 00 10 01 d2 92 ce 5f 2b 73 22 0d 0c 8c 70 13 bd c8 6c c0 40 05 5c 40 05 60 14 28` (30 bytes) and `java.deserialize(pyBytes) == Point(x=10, y=20)` cleanly.
 
-The Aster matrix today registers by `(namespace, typename)` on every binding. Fory's conformance tests and FDL-generated code use numeric `type_id` + `@ForyField(id=N)` / `pyfory.field(id=N)` everywhere. The name-keyed path writes a different TypeMeta preamble than the id-keyed path — enough to make the bytes incompatible across bindings even when all other flags match.
+Our Aster Java side had been missing `.withCompatibleMode(CompatibleMode.COMPATIBLE)`. Adding it (1 line in `bindings/java/aster-runtime/src/main/java/site/aster/codec/ForyCodec.java`) flipped **all** py↔java combos to green. No spec change, no field-ID refactor, no type_id refactor.
 
-**Matrix snapshot before the fix (2026-04-21, `fory-017-upgrade` branch):**
+**Matrix after that one-line Java fix:**
 
 | Combo | Pass/Total |
 |-------|-----------|
 | py-py-dev | **10/10** |
 | ts-ts-dev | **7/7** |
 | ja-ko-dev | **6/6** |
-| py-ko-dev | 0/5 |
-| ja-py-dev | 3/9 |
+| py-ko-dev | **6/6** ✓ (was 0/5) |
+| ja-py-dev | **10/10** ✓ (was 3/9) |
 | py-ts-dev | 1/5 |
 | ts-py-dev | 2/9 |
 | ts-ko-dev | 0/5 |
+| ja-ts-dev | 1/5 |
 
-**What.** Switch every Aster wire type to register via a **stable numeric `type_id`**, and annotate every field with an **explicit `id`**. Concretely:
+The remaining red combos all involve TypeScript. TS Fory 0.17 produces a different TypeMeta preamble than pyfory / fory-java for the same logical struct. Verified with minimal Point test: TS emits a 7-byte hash region in the TypeMeta that doesn't match what pyfory / fory-java emit. Even with `refTracking: true, compatible: true` (stable `@apache-fory/core` 0.17.0) and matching primitive types (`Type.varInt32()` where pyfory emits spec varint32). py→ts decode sometimes works (the simpler structs where TS is lenient on the preamble); ts→py always fails (pyfory strict-matches and falls through to class defaults).
 
-1. **Contract identity.** Our canonical `TypeDef` already carries a 32-byte BLAKE3 hash per type; we need to derive a stable numeric `user_type_id` from it (the low 32 bits of the hash are a natural candidate — Fory accepts `0..0xFFFFFFFE`). This becomes the cross-binding numeric id every binding registers the struct with.
-2. **Python.** `@wire_type` currently stamps `__wire_type__`. Add field-id assignment: either wrap `@wire_type` to attach `pyfory.field(id=N)` to every field (N derived from field name alphabetical order or declaration order), or emit explicit `field(id=…)` in the @dataclass fields. Register via `fory.register_type(Cls, type_id=…)` instead of `namespace=, typename=`.
-3. **Java.** `@WireType` → add `@ForyField(id=N)` to each field (scanner / annotation processor). `ForyCodec.java` gains `.withCompatibleMode(CompatibleMode.COMPATIBLE)` and registers via `fory.register(Cls, typeIdLong)`.
-4. **TypeScript.** Scanner emits `setId(N)` on every field + `setId(userTypeId)` on the struct. `ForyCodec.registerType` passes the numeric id through. `xlang.ts` already has `refTracking: true, compatible: true`.
-5. **DynamicTypeFactory (all bindings).** When building types from canonical `TypeDef` bytes, include the numeric id derived in step 1, and assign field ids in the same deterministic order the publisher used.
+This is **specific to the TS binding** of Fory — pyfory and fory-java agree byte-for-byte; only the JS runtime disagrees.
+
+**What.** Two realistic paths:
+
+1. **Fix upstream Fory JS or wait for it.** Fory's `integration_tests/idl_tests/` has no JavaScript runner — the TS binding's xlang output has never been cross-validated against another binding. Filing an upstream issue with a minimal reproducer is the right move; the test case is small (see repro recipe below).
+2. **Route TS Fory through Rust core via NAPI** (see sibling entry "Route TS Fory through Rust core"). Guarantees byte identity with pyfory/fory-java since Python's pyfory is effectively the reference. Needed if we want production py↔ts soon and upstream moves slowly.
+
+**Minimal reproducer for an upstream bug report:**
+
+```python
+# pyfory 0.17.0 (PyPI)
+import pyfory, dataclasses
+@dataclasses.dataclass
+class Point:
+    x: pyfory.int32 = 0
+    y: pyfory.int32 = 0
+f = pyfory.Fory(xlang=True, ref=True, compatible=True)
+f.register_type(Point, namespace='demo', typename='Point')
+print(f.serialize(Point(x=10, y=20)).hex(' '))
+# -> 02 00 1e 00 10 01 d2 92 ce 5f 2b 73 22 0d ... (30 bytes)
+```
+
+```typescript
+// @apache-fory/core 0.17.0 (stable npm)
+import Fory, { Type } from '@apache-fory/core';
+const f = new Fory({ refTracking: true, compatible: true });
+class Point { x = 0; y = 0; }
+const ti = Type.struct({ namespace: 'demo', typeName: 'Point' },
+  { x: Type.varInt32(), y: Type.varInt32() }, { withConstructor: true });
+ti.initMeta(Point); f.register(Point);
+console.log(Array.from(f.register(Point).serialize({ x: 10, y: 20 })));
+// -> 02 ff 1e 00 10 00 00 a4 25 9d bf 56 22 0d ... (30 bytes)
+//    ^^                ^^^^^^^^^^^^^^^^^
+//    byte 1: refTracking:true does not flip    TypeMeta hash bytes 5-11 disagree
+//    this bit (stays ff vs pyfory's 00)
+```
+
+Same length (30), same field count, same type names, same declared primitive types. Byte-for-byte identical in the field descriptors (`22 0d 0c 8c 70 13 bd c8 6c c0 40 05 5c 40 05 60`) and values (`14 28`). Bytes 1 and 5-11 diverge — that's the full extent of the incompat.
 
 **Where.**
-- Spec: `ffi_spec/Aster-ContractIdentity.md` — add a section on how the numeric `user_type_id` is derived from `typeHashHex` so every binding produces the same id.
-- Python: `bindings/python/aster/codec.py` `wire_type` decorator, `bindings/python/aster/contract/identity.py` TypeDef build, `bindings/python/aster/dynamic.py` DynamicTypeFactory.
-- Java: `bindings/java/aster-runtime/src/main/java/site/aster/codec/ForyCodec.java` (compatible mode), scanner that generates contract metadata, `@WireType` processor, `DynamicTypeFactory` / `UnknownStruct` path.
-- TS: `bindings/typescript/packages/aster/src/cli/gen.ts` (emit `setId`), `src/codec.ts` `ForyCodec.registerType`, `src/dynamic.ts` `registerFromTypeDefs`.
-- Cross-binding validation: `tests/integration/mission_control/run_matrix.sh` — should become green once all three bindings share the numeric-id convention.
+- Upstream: `docs/_internal/fory/javascript/packages/core/` — TypeMeta write path, ref-tracking bitmap flag.
+- Option 2: see sibling entry "Route TS Fory through Rust core via NAPI" for a phased plan.
+- Our Aster-side: `bindings/typescript/packages/aster/src/xlang.ts` (already configured correctly), `dynamic.ts` (primitive map is spec-correct). No further Aster-side work available — the gap is under the Fory JS wire-format layer.
 
-**Blockers.** None technical — this is a systematic refactor across bindings. Behavior-preserving for same-binding flows (already using matching internal configs). Largest unknowns:
-- Pinning the `user_type_id` derivation rule so every binding derives the same id from the same `TypeDef`.
-- Field id assignment order for @wire_type types that don't carry explicit ids today — either alphabetical (Fory's own default) or declaration order.
+**Blockers.** Option 1 is upstream; option 2 is a medium rebuild (phased plan in the sibling backlog entry). Nothing blocks us from filing the upstream issue right now.
 
-**Origin.** 2026-04-21 session. Proof that Fory is fine lived in `/tmp/forytest2` minimal repro before cleanup; the config that works is captured above.
+**Origin.** 2026-04-21 session. Fory conformance experiment in `/tmp/forytest*` (since cleaned) proved py↔java interop works with the correct config; TS remains the lone outlier.
 
 ---
 
