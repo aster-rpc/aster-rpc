@@ -26,9 +26,9 @@ import { MeshEndpointHook } from './trust/hooks.js';
 import { PeerAttributeStore } from './peer-store.js';
 import { CapabilityInterceptor } from './interceptors/capability.js';
 import type { Interceptor } from './interceptors/base.js';
-import { canonicalXlangBytes, contractIdFromContract, fromServiceInfo } from './contract/identity.js';
+import { buildTypeGraph, canonicalXlangBytes, contractIdFromContract, fromServiceInfo } from './contract/identity.js';
 import type { ContractManifest, ManifestMethod, ManifestField } from './contract/manifest.js';
-import { getGeneratedMethodFields, registerGenerated, type RegisterGeneratedOptions } from './generated.js';
+import { getGeneratedMethodFields, getWireShape, registerGenerated, type RegisterGeneratedOptions } from './generated.js';
 import { IrohTransport } from './transport/iroh.js';
 import { StatusCode, RpcError } from './status.js';
 
@@ -378,10 +378,16 @@ export class AsterServer {
         const manifest = this._buildManifest(info, contractId);
         const canonicalBytes = canonicalXlangBytes(contract);
 
+        // Collect canonical TypeDef bytes for every wire type reachable
+        // from this service's methods. Emitted as `types/{hash}.bin`
+        // entries per spec §11.4 so cross-language dynamic clients can
+        // walk the canonical type graph without re-running a scanner.
+        const typeDefs = this._collectReachableTypeDefs(info);
+
         // Build collection and upload to blob store
         const { buildCollection: build } =
           await import('./contract/publication.js');
-        const entries = build(manifest, canonicalBytes);
+        const entries = build(manifest, canonicalBytes, typeDefs);
         const collectionHash = await bc.addCollection(
           entries.map(([name, data]) => [name, Buffer.from(data)] as [string, Buffer]),
         );
@@ -446,6 +452,33 @@ export class AsterServer {
         `will see empty method tables. Cause: ${msg}`,
       );
     }
+  }
+
+  /**
+   * Walk every wire type reachable from this service's methods
+   * (request + response types, transitively through nested `@WireType`
+   * fields) and collect their canonical TypeDef bytes keyed by
+   * hex-encoded type hash. The scanner (`aster-gen`) stamps both
+   * `typeHashHex` and `typeDefBytes` on each WireTypeShape; if either
+   * is missing on a type we simply skip it — the publisher falls back
+   * to emitting a manifest-only collection, which is still spec-valid
+   * but limits cross-language dynamic clients to the flat manifest
+   * view.
+   */
+  private _collectReachableTypeDefs(info: any): Map<string, Uint8Array> {
+    const typeDefs = new Map<string, Uint8Array>();
+    const roots: (new (...args: any[]) => any)[] = [];
+    for (const [, m] of info.methods as Map<string, any>) {
+      if (m.request_type) roots.push(m.request_type);
+      if (m.response_type) roots.push(m.response_type);
+    }
+    const reachable = buildTypeGraph(roots);
+    for (const cls of reachable) {
+      const shape = getWireShape(cls);
+      if (!shape?.typeHashHex || !shape?.typeDefBytes) continue;
+      typeDefs.set(shape.typeHashHex, shape.typeDefBytes);
+    }
+    return typeDefs;
   }
 
   /**
