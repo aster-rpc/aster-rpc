@@ -33,7 +33,97 @@ When an item is completed, move it to the `## Done` section at the bottom with t
 
 ---
 
-### Cross-binding matrix: TS Fory 0.17 TypeMeta is not byte-compatible with pyfory / fory-java
+### Fory JS 0.17 upstream bugs — NUM_HASH_BITS mismatch, mis-documented config key
+
+**Why.** With Aster-side configs fully aligned (commits `f175632` for Java, followup for TS `ref: true` in `xlang.ts`), pyfory 0.17 ↔ fory-java 0.17 interop is **byte-identical**. The outstanding cross-binding failures are all TS-involving, and come down to concrete bugs in `@apache-fory/core@0.17.0`:
+
+**Bug 1: `refTracking` vs `ref` config key.** Stable 0.17.0 (`node_modules/@apache-fory/core/dist/lib/fory.js:initConfig`) reads the config as `ref: Boolean(config?.ref)` — not `refTracking`. The dev source in `docs/_internal/fory/javascript/packages/core/lib/fory.ts` uses `refTracking` (a forward-looking rename). The docs ambiguity is enough to silently disable ref tracking on a stable install: `new Fory({ refTracking: true, compatible: true })` leaves refs off, producing `NotNullValueFlag` (0xff) at byte 1 instead of pyfory's `RefValueFlag` (0x00). Our commit `dec54e1` hit this via my mis-rename.
+
+**Fix on our side:** use `ref: true` for the stable 0.17.0 npm release. Upstream should either honour both keys or bump the release to match the source.
+
+**Bug 2: `NUM_HASH_BITS` diverges from pyfory / fory-java.**
+
+| Binding | File | Value |
+|---------|------|-------|
+| pyfory 0.17 | `docs/_internal/fory/python/pyfory/meta/typedef.py:37` | **50** |
+| fory-java 0.17 | `docs/_internal/fory/java/fory-core/src/main/java/org/apache/fory/meta/TypeDef.java:77` | **50** |
+| @apache-fory/core 0.17 | `docs/_internal/fory/javascript/packages/core/lib/meta/TypeMeta.ts` + the published dist | **41** |
+
+`prependHeader` in all three bindings does `hash << (64 - NUM_HASH_BITS)` before ORing with metaSize / flags. The shift amount determines which bits of the MurmurHash3 x64hash128 land in the int64 TypeMeta header. A 9-bit shift mismatch means the int64 header that all three bindings write to the wire simply doesn't agree. Verified experimentally: locally patching `NUM_HASH_BITS` to 50 in the installed JS made 7 of the 8 differing bytes in our Point repro line up with pyfory / fory-java. (The last remaining byte appears to be additional drift in the Fory JS hash-extraction path — worth a closer read once NUM_HASH_BITS is upstreamed.)
+
+**Fix upstream:** change `const NUM_HASH_BITS = 41;` to `50` in `docs/_internal/fory/javascript/packages/core/lib/meta/TypeMeta.ts`. One line.
+
+**Minimal reproducer for the upstream issue tracker:**
+
+```python
+# pyfory 0.17.0
+import pyfory, dataclasses
+@dataclasses.dataclass
+class Point:
+    x: pyfory.int32 = 0
+    y: pyfory.int32 = 0
+f = pyfory.Fory(xlang=True, ref=True, compatible=True)
+f.register_type(Point, namespace='demo', typename='Point')
+print(f.serialize(Point(x=10, y=20)).hex(' '))
+# -> 02 00 1e 00 10 01 d2 92 ce 5f 2b 73 22 0d 0c 8c ...
+```
+
+```java
+// fory-core 0.17.0
+Fory fory = Fory.builder().withXlang(true).withRefTracking(true)
+    .withCompatibleMode(CompatibleMode.COMPATIBLE).build();
+fory.register(Point.class, "demo", "Point");
+byte[] b = fory.serialize(new Point(10, 20));
+// identical to pyfory output above
+```
+
+```typescript
+// @apache-fory/core 0.17.0
+const f = new Fory({ ref: true, compatible: true });
+class Point { x = 0; y = 0; }
+const ti = Type.struct({ namespace: 'demo', typeName: 'Point' },
+  { x: Type.varInt32(), y: Type.varInt32() }, { withConstructor: true });
+ti.initMeta(Point); const reg = f.register(Point);
+console.log(Array.from(reg.serialize({ x: 10, y: 20 })).map(b => b.toString(16).padStart(2, '0')).join(' '));
+// -> 02 00 1e 00 10 00 00 a4 25 9d bf 56 22 0d 0c 8c ...
+//                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//                   8-byte int64 header, high bits encode hash << 23
+//                   instead of hash << 14 (NUM_HASH_BITS=41 vs 50).
+```
+
+Same TypeMeta body bytes from `22 0d` onward in all three; only the 8-byte prependHeader int64 diverges.
+
+**Matrix state (2026-04-21, with Java compatible-mode fix in f175632):**
+
+| Combo | Pass/Total |
+|-------|-----------|
+| py-py-dev | **10/10** |
+| ts-ts-dev | **7/7** |
+| ja-ko-dev | **6/6** |
+| py-ko-dev | **6/6** ✓ |
+| ja-py-dev | **10/10** ✓ |
+| py-ts-dev | 1/5 (blocked on bug 2) |
+| ts-py-dev | 2/9 (blocked on bug 2) |
+| ts-ko-dev | 0/5 (blocked on bug 2) |
+| ja-ts-dev | 1/5 (blocked on bug 2) |
+
+**What.**
+
+1. File upstream issues against Fory JS with the two reproducers above. The `NUM_HASH_BITS` fix is a one-line PR.
+2. Meanwhile, optionally vendor-patch `@apache-fory/core` locally by either (a) rebuilding from `docs/_internal/fory/javascript` source with the patched constant, or (b) a `postinstall` script that rewrites the single line. Neither is production-quality, so option (c) is preferable: use `@apache-fory/core` as-is for same-binding use and route cross-binding through Rust core (see sibling "Route TS Fory through Rust core" entry).
+
+**Where.**
+- Our Aster-side TS config is now correct: `bindings/typescript/packages/aster/src/xlang.ts` uses `{ ref: true, compatible: true }`.
+- Upstream Fory JS: `docs/_internal/fory/javascript/packages/core/lib/meta/TypeMeta.ts` — change `const NUM_HASH_BITS = 41` to `50`.
+- Upstream Fory JS config naming: `docs/_internal/fory/javascript/packages/core/lib/fory.ts` — keep or alias `ref` so the stable release's published config key is discoverable from the source.
+
+**Blockers.** None for filing upstream. Waiting on upstream turnaround is the main question.
+
+**Origin.** 2026-04-21 session. `/tmp/ts_after_patch.ts` + `NUM_HASH_BITS=50` local patch proved the hash-bit shift is the root cause.
+
+---
+
+
 
 **Why.** The name-based registration approach the spec mandates in §11.3.2.3 ("Fory Wire Fingerprint — Name-Based, Not ID-Based") **works at Fory 0.17** between pyfory and fory-java. Proven with a minimal struct, no Aster layer:
 
