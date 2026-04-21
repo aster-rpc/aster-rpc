@@ -545,7 +545,7 @@ def _call_command(args: argparse.Namespace) -> int:
 
             # Detect session-scoped services and use session proxy
             try:
-                proxy = client.proxy(service_name)
+                proxy = await client.proxy(service_name)
                 method = getattr(proxy, method_name)
                 result = await method(payload)
             except TypeError as te:

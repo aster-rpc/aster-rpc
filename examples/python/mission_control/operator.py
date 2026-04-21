@@ -19,7 +19,7 @@ from aster import AsterClient
 async def run(address: str) -> None:
     client = AsterClient(address=address)
     await client.connect()
-    mc = client.proxy("MissionControl")
+    mc = await client.proxy("MissionControl")
 
     print("Tailing logs (Ctrl+C to stop)...")
     try:

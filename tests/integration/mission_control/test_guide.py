@@ -265,7 +265,7 @@ async def test_ch5_edge_credential(address: str, edge_cred: str) -> None:
         fail("Ch5 edge connect", str(e))
         return
 
-    mc = client.proxy("MissionControl")
+    mc = await client.proxy("MissionControl")
 
     # getStatus must succeed (has ops.status)
     try:
@@ -332,7 +332,7 @@ async def test_ch5_ops_credential(address: str, ops_cred: str) -> None:
         fail("Ch5 ops connect", str(e))
         return
 
-    mc = client.proxy("MissionControl")
+    mc = await client.proxy("MissionControl")
 
     # getStatus
     try:
@@ -508,7 +508,7 @@ async def run_dev_mode(address: str, work_dir: str | None) -> None:
         fail("connect", str(e))
         return
 
-    mc = client.proxy("MissionControl")
+    mc = await client.proxy("MissionControl")
     await test_ch1_unary(mc)
     # Ch2b BEFORE Ch2a so Ch2a's submit doesn't pollute Ch2b's tailLogs queue.
     # Each test must be order-independent of the others; we run Ch2b first

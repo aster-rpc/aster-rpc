@@ -521,9 +521,19 @@ export class ForyCodec implements Codec {
     this.threshold = compressionThreshold;
   }
 
-  /** Register a type for serialization. */
+  /**
+   * Register a type for serialization.
+   *
+   * If the typeInfo has been linked to a class via `initMeta(cls)`, pass the
+   * class to `fory.registerSerializer` so Fory's code-generator receives the
+   * `creator` option — without that, decode emits `new options.creator()`
+   * against an undefined reference. When there's no linked class, fall back
+   * to registering the typeInfo directly (used for stripped-down schemas).
+   */
   registerType(typeInfo: any): void {
-    const { serialize, deserialize } = this.fory.registerSerializer(typeInfo);
+    const creator = typeInfo?.options?.creator;
+    const arg = typeof creator === 'function' ? creator : typeInfo;
+    const { serialize, deserialize } = this.fory.registerSerializer(arg);
     const name = typeInfo?.options?.typeName ?? typeInfo?.tag ?? String(typeInfo);
     this.serializers.set(name, { serialize, deserialize });
   }

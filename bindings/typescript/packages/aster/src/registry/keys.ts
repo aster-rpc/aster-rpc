@@ -10,6 +10,17 @@ export function contractKey(contractId: string): string {
   return `contracts/${contractId}`;
 }
 
+/** Key for an inline manifest shortcut.
+ *
+ * The ArtifactRef at `contracts/{contractId}` points at a blob collection;
+ * reading `manifest.json` from it needs a round-trip. The server also writes
+ * the manifest JSON inline at this key so dynamic consumers can skip the blob
+ * download.
+ */
+export function manifestKey(contractId: string): string {
+  return `manifests/${contractId}`;
+}
+
 /** Key for a service version pointer. */
 export function versionKey(serviceName: string, version: number): string {
   return `services/${serviceName}/versions/v${version}`;

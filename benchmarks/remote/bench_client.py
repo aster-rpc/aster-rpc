@@ -29,7 +29,7 @@ async def bench_aster(address):
 
     client = AsterClient(address=address)
     await client.connect()
-    mc = client.proxy("MissionControl")
+    mc = await client.proxy("MissionControl")
 
     for _ in range(50):
         await mc.getStatus({"agent_id": "warmup"})

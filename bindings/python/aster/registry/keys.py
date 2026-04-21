@@ -21,6 +21,17 @@ def contract_key(contract_id: str) -> bytes:
     return f"contracts/{contract_id}".encode()
 
 
+def manifest_key(contract_id: str) -> bytes:
+    """Key for an inline manifest shortcut: ``manifests/{contract_id}``.
+
+    The ArtifactRef at ``contracts/{contract_id}`` points at a blob
+    collection; reading ``manifest.json`` from it needs a round-trip.
+    The server also writes the manifest JSON inline at this key so
+    dynamic consumers can skip the blob download.
+    """
+    return f"manifests/{contract_id}".encode()
+
+
 def version_key(name: str, version: int) -> bytes:
     """Key for a version pointer: ``services/{name}/versions/v{version}``."""
     return f"services/{name}/versions/v{version}".encode()

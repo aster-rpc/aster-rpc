@@ -21,7 +21,7 @@ from aster import AsterClient
 async def run(address: str) -> None:
     client = AsterClient(address=address)
     await client.connect()
-    mc = client.proxy("MissionControl")
+    mc = await client.proxy("MissionControl")
 
     # Chapter 1: check in
     status = await mc.getStatus({"agent_id": "py-agent-1"})

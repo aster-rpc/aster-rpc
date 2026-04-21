@@ -21,7 +21,7 @@ if (!address) {
 
 const client = new AsterClientWrapper({ address });
 await client.connect();
-const mc = client.proxy("MissionControl");
+const mc = await client.proxy("MissionControl");
 
 // Chapter 1: check in
 const status = await mc.getStatus({ agent_id: "ts-agent-1" });

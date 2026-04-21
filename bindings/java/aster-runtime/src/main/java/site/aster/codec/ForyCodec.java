@@ -33,7 +33,9 @@ public final class ForyCodec implements Codec {
     // threads/VTs. Pool size is min=2, max=max(CPU/2, 2), matching Fory's own recommendation for
     // VT workloads.
     int cpu = Math.max(Runtime.getRuntime().availableProcessors(), 2);
-    int max = Math.max(cpu / 2, 2);
+    // Fory 0.17: buildThreadSafeForyPool takes a single poolSize arg (was min,max in 0.16).
+    // Size to CPU/2 (rounded up to >= 2) — same sizing logic, just the single-arg form.
+    int poolSize = Math.max((cpu + 1) / 2, 2);
     this.fory =
         Fory.builder()
             .withLanguage(Language.XLANG)
@@ -47,7 +49,7 @@ public final class ForyCodec implements Codec {
             //             instead of smuggling arbitrary classes through the wire.
             .withRefTracking(true)
             .requireClassRegistration(true)
-            .buildThreadSafeForyPool(2, max);
+            .buildThreadSafeForyPool(poolSize);
   }
 
   public ForyCodec(ThreadSafeFory fory) {

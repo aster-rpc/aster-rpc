@@ -46,6 +46,17 @@ def _to_snake_case(name: str) -> str:
 
 logger = logging.getLogger(__name__)
 
+# V1 schema `kind` → Python type (for dict/list inner-type annotations).
+# Must keep Fory field-hash parity with the codegen path in
+# cli/aster_cli/codegen.py -- same mapping there as `_KIND_TO_PY`.
+_KIND_TO_PY: dict[str, type] = {
+    "string": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "bytes": bytes,
+}
+
 # Aster type name → Python type for dataclass field annotations
 _TYPE_MAP: dict[str, type] = {
     "str": str,
@@ -187,8 +198,23 @@ class DynamicTypeFactory:
                         nested = self._ensure_type(item_tag)
                         if nested is not None:
                             return list[nested]
+                inner = _KIND_TO_PY.get(item_kind)
+                if inner is not None:
+                    return list[inner]
                 return list
             if kind == "map":
+                key_py = _KIND_TO_PY.get(f.get("key_kind", "string"), str)
+                val_kind = f.get("value_kind", "string")
+                if val_kind == "ref":
+                    val_tag = f.get("value_wire_tag", "")
+                    if val_tag:
+                        nested = self._ensure_type(val_tag)
+                        if nested is not None:
+                            return dict[key_py, nested]
+                    return dict
+                val_py = _KIND_TO_PY.get(val_kind)
+                if val_py is not None:
+                    return dict[key_py, val_py]
                 return dict
             return object
 

@@ -46,7 +46,7 @@ async def main():
     print("─" * 72)
 
     # ── Dynamic proxy ─────────────────────────────────────────────────
-    mc = client.proxy("MissionControl")
+    mc = await client.proxy("MissionControl")
 
     for _ in range(20):
         await mc.getStatus({"agent_id": "warmup"})

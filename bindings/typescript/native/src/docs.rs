@@ -59,6 +59,29 @@ impl DocsClient {
             events: Some(DocEventReceiver { inner: receiver }),
         })
     }
+
+    /// Join a document by namespace id (hex) and peer endpoint id (hex),
+    /// subscribing to events. Mirrors Python's
+    /// ``docs_client.join_and_subscribe_namespace`` so dynamic proxy
+    /// / consumer code can pull the producer's registry doc from just
+    /// the bits returned in the admission response.
+    #[napi]
+    pub async fn join_and_subscribe_namespace(
+        &self,
+        namespace_id_hex: String,
+        peer_node_id_hex: String,
+    ) -> Result<DocWithEvents> {
+        let (doc, receiver) = self
+            .inner
+            .clone()
+            .join_and_subscribe_namespace(namespace_id_hex, peer_node_id_hex)
+            .await
+            .map_err(to_napi_err)?;
+        Ok(DocWithEvents {
+            doc: Some(DocHandle { inner: doc }),
+            events: Some(DocEventReceiver { inner: receiver }),
+        })
+    }
 }
 
 #[napi]
