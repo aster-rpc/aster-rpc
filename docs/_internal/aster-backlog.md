@@ -16,23 +16,6 @@ When an item is completed, move it to the `## Done` section at the bottom with t
 
 ## Open
 
-### Python ProxyClient: migrate to canonical-bytes decoder
-
-**Why.** Python's dynamic proxy today reads `ContractManifest.methods[*].fields` (flat; no nested TypeDefs). Works for py-py by relying on pyfory's by-name nested-type resolution at runtime. When Path B lands the Rust-core canonical reader for TS, Python should converge onto the same path so we have one source of truth per binding.
-
-**What.** Rewire `bindings/python/aster/runtime.py` `_ensure_manifest` / `ProxyClient._ensure_transport` to fetch the contract collection, iterate `types/*.bin`, decode each via the new Rust-core `decode_type_def_bytes` exposed through PyO3, build the type graph, and register transitively via `DynamicTypeFactory`. Keep the fast-path manifest read for flat types; fall through to canonical decoding when a nested ref appears. (Same hybrid as TS decision (b).)
-
-**Where.**
-- `bindings/python/aster/runtime.py` — `_ensure_manifest` (lines ~2300–2400 depending on drift).
-- `bindings/python/aster/dynamic.py` — `DynamicTypeFactory`; add transitive walk.
-- `bindings/python/rust/src/contract.rs` or sibling — add PyO3 wrapper around `core::contract::decode_type_def_bytes`.
-
-**Blockers.** Rust-core canonical reader (Path B).
-
-**Origin.** 2026-04-21 session, Phase 7 convergence plan.
-
----
-
 ### Java dynamic proxy: migrate to canonical-bytes decoder
 
 **Why.** Java today uses `UnknownStruct` as the dynamic-decode fallback. Like Python, this is a different path from what TS will use under Path B. Converge on the shared Rust-core decoder via JNI for architectural cleanliness and to eliminate per-binding codec drift.
@@ -50,50 +33,36 @@ When an item is completed, move it to the `## Done` section at the bottom with t
 
 ---
 
-### Manifest bit-width gap: carry int/float bit-width on ManifestField
+### Cross-binding matrix: py↔ts Fory interop still red
 
-**Why.** `pyfory.int32` / `pyfory.int64` are `TypeVar` markers, not classes. Python's `manifest._classify_type` (`bindings/python/aster/contract/manifest.py:_classify_type`) doesn't recognise them and falls through to `"kind": "string"`. Surfaces two ways:
+**Why.** After the Python Path B migration + compatible mode on both sides landed, py-py-dev is 10/10 and ts-ts-dev is 7/7, but the cross-binding combos still fail with *different* errors than before:
 
-- `aster contract gen-client --lang python` emits broken `accepted: str = 0` fields (cosmetic; typed clients work because they register real classes directly and never read the generated field kinds).
-- `DynamicTypeFactory` can't reconstruct `int32` from the manifest, so a synthesised request/response type produces a different Fory hash than the server's real class. Manifests built from int32-declaring services fail Fory's consistency check on the proxy path.
-- Surfaced by Mission Control Ch3 `ingestMetrics` in py-py-dev (1/10 failing test).
+- **py-server + ts-client:** `Invalid character value for LOWER_SPECIAL: 30` — TS Fory's metastring decoder trips on a byte value (30) that isn't a valid char in the LOWER_SPECIAL alphabet {a-z, ".", "_", "$", "|"}. Either (a) pyfory writes a metastring with a different encoding than @apache-fory/core 0.17 expects, (b) the TypeMeta framing is out-of-phase (decoder reading at the wrong offset), or (c) the two codecs disagree about when to write the TypeMeta vs when to read it.
+- **ts-server + py-client:** `client_stream got OK trailer with no response frame`, `unary_fast_path: write_all failed: sending stopped by peer: error 0`, empty-string scalars in the decoded response. Looks like a mix of encode-side (pyfory refusing to write?) and decode-side (producing wrong shape) problems.
 
-**What.** Extend `ManifestField` with an optional `bit_width: int` on `int` / `float` kinds. Teach `_classify_type` to recognise pyfory's TypeVar markers and emit the correct bit width. Teach `DynamicTypeFactory` to reconstruct `int32` / `int64` / `float32` / `float64` from that field. Parallel change on the TS side (`bindings/typescript/packages/aster/src/contract/manifest.ts` ManifestField).
+Path B registration itself works on both sides — the debug prints show the Python client resolves all 7 TypeDefs correctly and ends up with the right pyfory TypeVars (`~float64`, `dict[str, str]`, etc.). The interop gap is below the TypeDef layer.
 
-**Where.**
-- `bindings/python/aster/contract/manifest.py` — `ManifestField`, `_classify_type`.
-- `bindings/python/aster/dynamic.py` — `DynamicTypeFactory.synthesize_for_method` field-kind reconstruction.
-- `bindings/typescript/packages/aster/src/contract/manifest.ts` — `ManifestField` interface.
-- `bindings/typescript/packages/aster/src/dynamic.ts` — parallel field reconstruction.
+**What.** Debug one combo end-to-end (py-ts first; the LOWER_SPECIAL trace is the most specific). Concrete probes:
 
-**Blockers.** None, but Path B (canonical-bytes decoder) may subsume this entirely: `TypeDef` already carries bit-width via `type_primitive: "int32"` etc. If Path B lands and the dynamic proxy reads TypeDefs directly, the manifest-side fix may become unnecessary. Revisit after Path B ships and see whether the gap still manifests.
-
-**Origin.** 2026-04-21 session, follow-up from `docs/_internal/fory_upgrade/dynamic-proxy-async.md:86-90`.
-
----
-
-### Ch4 investigation: `"string" argument must be of type string ... Received an instance of Array`
-
-**Why.** ts-ts-dev Ch4 (RunCommand bidi stream) fails with what looks like a native-binding or session-lifecycle crash, not a codec issue. Surfaces only when the proxy path is exercised, which is why it showed up after the async proxy change; root cause may be older. Unrelated to the two Fory-codec failures (Ch1 typeId 29 and Ch3 requestWireTag).
-
-**What.** Reproduce under `ts-ts-dev` Ch4 and capture the full stack trace. Likely culprits to investigate first:
-
-- `joinAndSubscribeNamespace` native call in `AsterClientWrapper.proxy` — check whether a `string[]` vs `string` is being passed to a NAPI arg.
-- Session-lifecycle interaction in `SessionProxyClient` — the error may surface during session teardown when the bidi stream closes.
-- The error message "Received an instance of Array" suggests a `Buffer.from()` or `String()` call receiving an array where a string is expected.
+- Dump the raw bytes of a single unary response at both (a) post-encode on the Python server and (b) pre-decode on the TS client. Find the first byte that diverges from what Fory's struct layout predicts.
+- Compare TS's `readTypeMeta` flow (`gen/struct.ts` NAMED_COMPATIBLE_STRUCT case) against pyfory's XLANG writer. Fory 0.17 may have a protocol drift between bindings — check the `.agents/testing/integration-tests.md` xlang tests for the golden form.
+- Check whether pyfory's `compatible=True` actually produces NAMED_COMPATIBLE_STRUCT bytes (the error suggests it's writing something else the TS side doesn't recognise).
 
 **Where.**
-- `bindings/typescript/packages/aster/src/runtime.ts` — `SessionProxyClient`, `AsterClientWrapper.proxy`.
-- `bindings/typescript/napi/src/` — the NAPI side of `joinAndSubscribeNamespace` and related.
-- `examples/typescript/missionControl/test_guide/ch4*.ts` — repro harness.
+- `bindings/python/aster/codec.py` — `ForyConfig.to_kwargs` now sets `compatible=True` for XLANG.
+- `bindings/typescript/packages/aster/src/xlang.ts` — `getXlangForyAndType` / `newXlangFory` set `compatible: true`.
+- `docs/_internal/fory/javascript/packages/core/lib/gen/struct.ts` — `readTypeInfo` + `read` (line 176-) in the NAMED_COMPATIBLE_STRUCT case.
+- Fory upstream xlang tests under `docs/_internal/fory/integration_tests/` may have a reproducer.
 
-**Blockers.** None. Can proceed in parallel with Path B.
+**Blockers.** None. Requires cross-binding Fory protocol knowledge; may need upstream Fory work.
 
-**Origin.** 2026-04-21 session, third of the three follow-ups in `docs/_internal/fory_upgrade/dynamic-proxy-async.md:95`.
+**Origin.** 2026-04-21 session, after py-py-dev 10/10 + compatible-mode alignment landed but cross-lang still red.
 
 ---
 
 ## Done
+
+- **Python Path B migration (py-py-dev 10/10)** — resolved 2026-04-21 (same session as ts-ts-dev). Three changes landed together: (1) PyO3 wrapper `canonical_bytes_to_json` exposes the Rust-core TypeDef reader to Python; (2) `DynamicTypeFactory.register_from_type_defs` walks the canonical TypeDef graph transitively (topo-sort + hex-hash ref resolution, mirroring TS `registerFromTypeDefs`); (3) the publisher-side bit-width gap is closed — `_resolve_field_type` now recognises pyfory's TypeVar markers (`pyfory.int32` / `int64` / `float32` etc) and emits the correct `type_primitive`. Consumers then reconstruct synthesized dataclasses with matching pyfory TypeVars, so the Fory struct hash lines up with the producer's real class and the Ch3 `ingestMetrics` consistency guard passes. Also aligned TS Fory + pyfory to `compatible=True` (both bindings use the same NAMED_COMPATIBLE_STRUCT layout). Obsoletes the "Manifest bit-width gap" backlog entry: `TypeDef.type_primitive` now carries the bit-width for free.
 
 - **ts-ts-dev matrix (7/7 green)** — resolved 2026-04-21. Four fixes landed in the same session: (1) scanner's `BUILD_ALL_TYPES` was wrapping each per-type block in a shared `for (const entry of WIRE_TYPES)` loop but hardcoding `entry.ctor` — all blocks after the first silently skipped `initMeta` and registered a typeInfo with no `options.creator`, crashing Fory's decoder with `new options.creator()`; (2) `canonicalToManifestField` in `dynamic.ts` dropped the `kind` field, so container defaults fell through to `null` and Fory rejected `tags` as non-nullable; (3) map default was a plain object but Fory calls `.entries()` which only exists on `Map`; (4) `IrohTransport` server-streaming / client-streaming / bidi `send` paths never threaded `opts?.hintType` into `encodeCompressed`. Also fixed `JsonCodec.decode` to fall back to Fory for non-JSON first bytes (matches Python `JsonProxyCodec`), so the scope-mismatch guard's JSON transport survives Fory-encoded error trailers.
 

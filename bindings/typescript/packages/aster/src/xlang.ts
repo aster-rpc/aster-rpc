@@ -31,7 +31,13 @@ export function getXlangForyAndType(): { fory: any; Type: any } {
   const foryModule = require('@apache-fory/core');
   const Fory = foryModule.default;
   const Type = foryModule.Type;
-  _cachedFory = new Fory({ ref: true });
+  // Schema-consistent "compatible" mode is required for cross-binding
+  // interop: non-compatible mode writes a fixed 32-bit struct hash into
+  // the payload and rejects on read mismatch, whereas Python/Java default
+  // to the NAMED_COMPATIBLE_STRUCT layout (reads TypeMeta with getHash()
+  // check). Without this, any py↔ts call fails with "Read class version
+  // is not consistent".
+  _cachedFory = new Fory({ ref: true, compatible: true });
   _cachedType = Type;
   return { fory: _cachedFory, Type };
 }
@@ -46,7 +52,7 @@ export function newXlangFory(): { fory: any; Type: any } {
   const foryModule = require('@apache-fory/core');
   const Fory = foryModule.default;
   const Type = foryModule.Type;
-  return { fory: new Fory({ ref: true }), Type };
+  return { fory: new Fory({ ref: true, compatible: true }), Type };
 }
 
 /**

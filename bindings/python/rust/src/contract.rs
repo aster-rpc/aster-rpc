@@ -22,6 +22,16 @@ fn canonical_bytes_from_json(type_name: &str, json_str: &str) -> PyResult<PyByte
     Ok(PyBytesResult(bytes))
 }
 
+/// Decode canonical XLANG bytes of a `ServiceContract`, `TypeDef`, or
+/// `MethodDef` back to a JSON string. Dynamic clients that fetched
+/// `types/{hash}.bin` blobs from a publisher use this to walk the
+/// canonical type graph without reimplementing the reader in Python.
+#[pyfunction]
+fn canonical_bytes_to_json(type_name: &str, data: &[u8]) -> PyResult<String> {
+    aster_transport_core::contract::canonical_bytes_to_json(type_name, data)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
 /// BLAKE3 hash of input bytes -> 32-byte digest.
 #[pyfunction]
 fn compute_type_hash(data: &[u8]) -> PyBytesResult {
@@ -68,6 +78,7 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new(py, "contract")?;
     m.add_function(wrap_pyfunction!(compute_contract_id_from_json, &m)?)?;
     m.add_function(wrap_pyfunction!(canonical_bytes_from_json, &m)?)?;
+    m.add_function(wrap_pyfunction!(canonical_bytes_to_json, &m)?)?;
     m.add_function(wrap_pyfunction!(compute_type_hash, &m)?)?;
     m.add_function(wrap_pyfunction!(encode_frame, &m)?)?;
     m.add_function(wrap_pyfunction!(decode_frame, &m)?)?;

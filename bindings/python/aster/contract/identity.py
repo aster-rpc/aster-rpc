@@ -554,6 +554,35 @@ _PYTHON_TO_XLANG_PRIMITIVE: dict[type, str] = {
 }
 
 
+# pyfory exposes bit-width-specific integer/float markers as ``TypeVar``
+# instances (``pyfory.int32`` etc). They are NOT Python types, so they
+# miss the ``_PYTHON_TO_XLANG_PRIMITIVE`` lookup and used to fall through
+# to TypeKind.ANY, which made the published TypeDef lossy: a producer
+# declaring ``accepted: pyfory.int32`` emitted the same canonical bytes
+# as one declaring ``accepted: <Any>``. Consumers (dynamic proxy) could
+# not reconstruct a matching Fory struct hash and Ch3 ingestMetrics
+# tripped the ``Hash ... is not consistent`` guard. We intercept the
+# TypeVar identity here and emit the correct primitive name.
+def _pyfory_typevar_primitive(tp: Any) -> str | None:
+    try:
+        import pyfory  # type: ignore[import-untyped]
+    except ImportError:
+        return None
+    if tp is pyfory.int8:
+        return "int8"
+    if tp is pyfory.int16:
+        return "int16"
+    if tp is pyfory.int32:
+        return "int32"
+    if tp is pyfory.int64:
+        return "int64"
+    if tp is pyfory.float32:
+        return "float32"
+    if tp is pyfory.float64:
+        return "float64"
+    return None
+
+
 def _get_type_args(tp: Any) -> tuple[Any, ...]:
     """Return the type arguments of a generic alias."""
     return getattr(tp, "__args__", None) or ()
@@ -728,7 +757,11 @@ def _resolve_field_type(
     if tp is None or tp is type(None):
         return TypeKind.PRIMITIVE, "null", b"", ""
 
-    if tp in _PYTHON_TO_XLANG_PRIMITIVE:
+    prim_name = _pyfory_typevar_primitive(tp)
+    if prim_name is not None:
+        return TypeKind.PRIMITIVE, prim_name, b"", ""
+
+    if isinstance(tp, type) and tp in _PYTHON_TO_XLANG_PRIMITIVE:
         return TypeKind.PRIMITIVE, _PYTHON_TO_XLANG_PRIMITIVE[tp], b"", ""
 
     if dataclasses.is_dataclass(tp) and isinstance(tp, type):

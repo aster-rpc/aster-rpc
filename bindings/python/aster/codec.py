@@ -62,12 +62,21 @@ class ForyConfig:
         ``docs/_internal/fory-cross-binding.md`` for the rationale).
         """
         kwargs = dict(self.extra_kwargs)
-        kwargs.setdefault("xlang", self.resolved_xlang(mode))
+        xlang = self.resolved_xlang(mode)
+        kwargs.setdefault("xlang", xlang)
         kwargs.setdefault("ref", True)
         # pyfory's strict=True is already the default, but set it
         # explicitly so any future pyfory release flipping the default
         # doesn't silently change our behaviour.
         kwargs.setdefault("strict", True)
+        # Compatible mode enables the NAMED_COMPATIBLE_STRUCT layout
+        # (meta-share TypeMeta with struct-hash check instead of the
+        # non-compatible 32-bit version prefix). Every other binding's
+        # Fory XLANG default is compatible=true (Java/Kotlin via
+        # ForyBuilder.withCompatibleMode, TS via `createXlangCodec`),
+        # so opting in here is required for cross-binding interop.
+        if xlang:
+            kwargs.setdefault("compatible", True)
         return kwargs
 
 

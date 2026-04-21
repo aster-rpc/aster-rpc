@@ -1549,6 +1549,15 @@ class AsterClient:
         self._registry_event_rx: Any | None = None
         self._registry_join_lock: asyncio.Lock | None = None
         self._manifest_cache: dict[tuple[str, int], Any] = {}
+        # Populated lazily by ``_ensure_type_defs`` on the first
+        # ``proxy()`` call for each contract. Keyed by contract_id;
+        # value is ``(by_tag, by_hash)`` of canonical TypeDef dicts
+        # decoded from ``types/{hash}.bin`` collection entries. Empty
+        # maps mean the producer is legacy (pre-§11.4) and callers
+        # should fall back to the flat manifest path.
+        self._type_def_cache: dict[
+            str, tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]
+        ] = {}
 
     async def connect(self) -> None:
         """Create endpoint, run admission if credential present, store services.
@@ -1857,6 +1866,86 @@ class AsterClient:
             self._manifest_cache[key] = manifest
         return manifest
 
+    async def _ensure_type_defs(
+        self, contract_id: str
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Fetch ``types/{hash}.bin`` blobs for ``contract_id`` and decode
+        each into the canonical TypeDef dict via the Rust-core reader
+        exposed through PyO3.
+
+        Returns ``(by_tag, by_hash)``. When the producer didn't emit
+        per-type blobs (legacy publisher pre-§11.4), both maps are empty
+        and callers fall back to the flat-manifest proxy path. Mirrors
+        the TS ``ensureTypeDefs`` in runtime.ts.
+        """
+        cached = self._type_def_cache.get(contract_id)
+        if cached is not None:
+            return cached
+
+        empty: tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]] = ({}, {})
+
+        doc = await self._ensure_registry_doc()
+        if doc is None:
+            return empty
+
+        import json as _json
+        from .registry.keys import contract_key
+
+        try:
+            entries = await doc.query_key_exact(contract_key(contract_id))
+            if not entries:
+                return empty
+            content = await doc.read_entry_content(entries[0].content_hash)
+            artifact = _json.loads(content)
+            collection_hash = artifact.get("collection_hash", "")
+            if not collection_hash:
+                return empty
+
+            bc = blobs_client(self._node)
+
+            # Pull the collection + child blobs into the local store so
+            # subsequent list/read succeed. Mirrors the same flow used
+            # by ``_ensure_manifest`` for the manifest.json fetch.
+            addr = _coerce_node_addr(self._endpoint_addr_in)
+            remote_node_id = addr.endpoint_id or ""
+            if remote_node_id:
+                try:
+                    await bc.download_collection_hash(collection_hash, remote_node_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            entries_list = await bc.list_collection(collection_hash)
+            from aster._aster import contract as _contract_native
+
+            by_tag: dict[str, dict[str, Any]] = {}
+            by_hash: dict[str, dict[str, Any]] = {}
+            import re as _re
+
+            type_entry = _re.compile(r"^types/([0-9a-f]{64})\.bin$")
+            for name, entry_hash, _size in entries_list:
+                m = type_entry.match(name)
+                if not m:
+                    continue
+                try:
+                    raw = await bc.read_to_bytes(entry_hash)
+                    td_json = _contract_native.canonical_bytes_to_json("TypeDef", bytes(raw))
+                    td = _json.loads(td_json)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "type-def decode failed for %s: %s", m.group(1)[:12], exc
+                    )
+                    continue
+                hash_hex = m.group(1)
+                by_hash[hash_hex] = td
+                by_tag[f"{td.get('package', '')}/{td.get('name', '')}"] = td
+
+            out = (by_tag, by_hash)
+            self._type_def_cache[contract_id] = out
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("_ensure_type_defs failed for %s: %s", contract_id[:12], exc)
+            return empty
+
     async def _build_dynamic_codec(
         self, summary: "ServiceSummary"
     ) -> tuple[Any, Any | None, dict[str, dict[str, Any]]]:
@@ -1883,7 +1972,44 @@ class AsterClient:
                     from .codec import ForyCodec
 
                     factory = DynamicTypeFactory()
-                    factory.register_from_manifest(manifest.methods)
+
+                    # Hybrid path mirroring TS: prefer the canonical
+                    # TypeDef graph (types/{hash}.bin blobs) when the
+                    # publisher emitted it. The full tree including
+                    # hex-hash refs lets us reconstruct every struct
+                    # with the same Fory hash the producer computed.
+                    # Fall back to the flat manifest for any root tag
+                    # the TypeDef graph didn't resolve (legacy
+                    # publishers, or methods without inferable wire
+                    # tags).
+                    contract_id = getattr(summary, "contract_id", "") or ""
+                    resolved: set[str] = set()
+                    if contract_id:
+                        by_tag, by_hash = await self._ensure_type_defs(contract_id)
+                        if by_tag:
+                            roots: list[str] = []
+                            for m in manifest.methods:
+                                req = m.get("request_wire_tag", "")
+                                res = m.get("response_wire_tag", "")
+                                if req:
+                                    roots.append(req)
+                                if res:
+                                    roots.append(res)
+                            resolved = factory.register_from_type_defs(
+                                roots, by_tag, by_hash
+                            )
+
+                    manifest_fallback = [
+                        m
+                        for m in manifest.methods
+                        if not (
+                            (not m.get("request_wire_tag") or m["request_wire_tag"] in resolved)
+                            and (not m.get("response_wire_tag") or m["response_wire_tag"] in resolved)
+                        )
+                    ]
+                    if manifest_fallback:
+                        factory.register_from_manifest(manifest_fallback)
+
                     codec = ForyCodec(
                         mode=SerializationMode.XLANG,
                         types=factory.get_all_types(),
