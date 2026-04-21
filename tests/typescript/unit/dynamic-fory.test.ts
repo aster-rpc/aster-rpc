@@ -94,3 +94,101 @@ describe('DynamicTypeFactory + Fory registration', () => {
     expect(decoded.name).toBe('X');
   });
 });
+
+describe('DynamicTypeFactory.registerFromTypeDefs (canonical hybrid path)', () => {
+  // Use the real NAPI binding to build canonical TypeDef bytes so the
+  // round-trip exercises the full scanner → canonical → decode pipeline.
+  it('registers a nested REF graph and round-trips through Fory', async () => {
+    const { setNativeContract, canonicalXlangBytes, decodeTypeDefBytes, ContractTypeKind, ContainerKind, TypeDefKind } =
+      await import('../../../bindings/typescript/packages/aster/dist/index.js');
+    const { createRequire } = await import('node:module');
+    const { resolve, dirname } = await import('node:path');
+    const { existsSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const req = createRequire(import.meta.url);
+    const nativePath = resolve(here, '../../../bindings/typescript/native/aster-transport.darwin-arm64.node');
+    if (!existsSync(nativePath)) {
+      // Skip on non-darwin CI; dynamic-fory coverage runs on mac locally.
+      return;
+    }
+    const native = req(nativePath);
+    setNativeContract(native);
+
+    // Build two TypeDefs: Inner (leaf) + Outer (holds an Inner ref).
+    const innerJson = {
+      kind: 'message',
+      package: 'test.dynamic',
+      name: 'Inner',
+      fields: [
+        { id: 0, name: 'value', type_kind: 'primitive', type_primitive: 'string',
+          type_ref: '', self_ref_name: '', optional: false, ref_tracked: false,
+          container: 'none', container_key_kind: 'primitive',
+          container_key_primitive: '', container_key_ref: '',
+          required: true, default_value: '' },
+      ],
+      enum_values: [], union_variants: [],
+    };
+    const innerBytes = native.canonicalBytesFromJson('TypeDef', JSON.stringify(innerJson));
+    const innerHash = Array.from(new Uint8Array(native.computeTypeHash(innerBytes)),
+      b => b.toString(16).padStart(2, '0')).join('');
+
+    const outerJson = {
+      kind: 'message',
+      package: 'test.dynamic',
+      name: 'Outer',
+      fields: [
+        { id: 0, name: 'nested', type_kind: 'ref', type_primitive: '',
+          type_ref: innerHash, self_ref_name: '', optional: false, ref_tracked: false,
+          container: 'none', container_key_kind: 'primitive',
+          container_key_primitive: '', container_key_ref: '',
+          required: true, default_value: '' },
+      ],
+      enum_values: [], union_variants: [],
+    };
+    const outerBytes = native.canonicalBytesFromJson('TypeDef', JSON.stringify(outerJson));
+    const outerHash = Array.from(new Uint8Array(native.computeTypeHash(outerBytes)),
+      b => b.toString(16).padStart(2, '0')).join('');
+
+    // Decode back and build the two lookup views.
+    const inner = decodeTypeDefBytes(innerBytes);
+    const outer = decodeTypeDefBytes(outerBytes);
+    const byTag = new Map<string, any>([
+      ['test.dynamic/Inner', inner],
+      ['test.dynamic/Outer', outer],
+    ]);
+    const byHash = new Map<string, any>([
+      [innerHash, inner],
+      [outerHash, outer],
+    ]);
+
+    const { fory, Type, codec } = freshCodec();
+    const factory = new DynamicTypeFactory();
+    const resolved = factory.registerFromTypeDefs(
+      ['test.dynamic/Outer'],
+      { byTag, byHash },
+      Type as any,
+      codec as any,
+    );
+
+    // Both tags resolved via the TypeDef graph — no flat-manifest fallback needed.
+    expect(resolved.has('test.dynamic/Inner')).toBe(true);
+    expect(resolved.has('test.dynamic/Outer')).toBe(true);
+
+    // Build an Outer instance with a nested Inner and round-trip it.
+    const InnerCls = factory.get('test.dynamic/Inner');
+    const OuterCls = factory.get('test.dynamic/Outer');
+    expect(InnerCls).toBeDefined();
+    expect(OuterCls).toBeDefined();
+    const innerInst = new (InnerCls as any)({ value: 'hello' });
+    const outerInst = new (OuterCls as any)({ nested: innerInst });
+
+    const bytes = codec.encode(outerInst);
+    // Should not be JSON.
+    expect(bytes[0]).not.toBe(0x7b);
+
+    const decoded = codec.decode(bytes) as any;
+    expect(decoded.nested).toBeDefined();
+    expect(decoded.nested.value).toBe('hello');
+  });
+});

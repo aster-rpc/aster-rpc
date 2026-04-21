@@ -1150,6 +1150,15 @@ export class AsterClientWrapper {
   private _registryDoc: any = null;
   private _registryJoinPromise: Promise<any> | null = null;
   private _manifestCache: Map<string, ContractManifest> = new Map();
+  // Decoded canonical TypeDef graph per contractId. Keyed by hex hash
+  // and by `{package}/{name}` tag for O(1) lookup from either side.
+  // Populated lazily by `ensureTypeDefs` on the first proxy() call for
+  // a given contract — the blob collection fetch is then re-used.
+  private _typeDefCache: Map<
+    string,
+    { byTag: Map<string, import('./contract/identity.js').CanonicalTypeDef>;
+      byHash: Map<string, import('./contract/identity.js').CanonicalTypeDef> }
+  > = new Map();
   // Remote endpoint id (hex) captured during connect() so the dynamic
   // proxy path can join the producer's registry doc via
   // docsClient.joinAndSubscribeNamespace(namespace, peer).
@@ -1517,6 +1526,63 @@ export class AsterClientWrapper {
   }
 
   /**
+   * Fetch + decode the canonical TypeDef graph for ``contractId``.
+   * Returns two lookup views (by tag and by hex hash) sharing the same
+   * underlying CanonicalTypeDef objects. Cached per contract.
+   *
+   * When the publisher didn't emit `types/{hash}.bin` blobs (legacy TS
+   * pre-§11.4 parity, or third-party bindings that don't yet match),
+   * the resulting maps are empty — callers then fall back to the flat
+   * manifest-field proxy path.
+   */
+  private async ensureTypeDefs(
+    contractId: string,
+  ): Promise<{
+    byTag: Map<string, import('./contract/identity.js').CanonicalTypeDef>;
+    byHash: Map<string, import('./contract/identity.js').CanonicalTypeDef>;
+  }> {
+    const cached = this._typeDefCache.get(contractId);
+    if (cached) return cached;
+
+    const empty = {
+      byTag: new Map<string, import('./contract/identity.js').CanonicalTypeDef>(),
+      byHash: new Map<string, import('./contract/identity.js').CanonicalTypeDef>(),
+    };
+
+    const doc = await this.ensureRegistryDoc();
+    if (!doc) return empty;
+
+    try {
+      const { contractKey } = await import('./registry/keys.js');
+      const entries: string[] = await doc.queryKeyExact(contractKey(contractId));
+      if (!entries.length) return empty;
+      const contentHash = entries[0].split(':').slice(-1)[0];
+      const bytes: Buffer = await doc.readEntryContent(contentHash);
+      const artifactRef = JSON.parse(new TextDecoder().decode(bytes));
+      const collectionHash = artifactRef.collection_hash;
+      if (!collectionHash) return empty;
+
+      const { fetchContractTypeDefBytes } = await import('./contract/publication.js');
+      const { decodeTypeDefBytes } = await import('./contract/identity.js');
+      const blobs = this._node.blobsClient();
+      const rawByHash = await fetchContractTypeDefBytes(blobs, collectionHash);
+
+      const byTag = new Map<string, import('./contract/identity.js').CanonicalTypeDef>();
+      const byHash = new Map<string, import('./contract/identity.js').CanonicalTypeDef>();
+      for (const [hashHex, rawBytes] of rawByHash) {
+        const td = decodeTypeDefBytes(rawBytes);
+        byHash.set(hashHex, td);
+        byTag.set(`${td.package}/${td.name}`, td);
+      }
+      const out = { byTag, byHash };
+      this._typeDefCache.set(contractId, out);
+      return out;
+    } catch {
+      return empty;
+    }
+  }
+
+  /**
    * Register request/response types for a service against the live Fory
    * codec, so dynamic proxy / session calls encode as Fory XLANG instead
    * of failing with "Failed to detect Fory type" on a plain object.
@@ -1549,7 +1615,38 @@ export class AsterClientWrapper {
         || (m.responseWireTag && !this._dynamicRegisteredTags.has(m.responseWireTag)),
       );
       if (needsRegister) {
-        factory.registerWithFory(methods, fory, Type, this._codec);
+        // Hybrid path: prefer canonical TypeDef registration when the
+        // publisher emitted per-type blobs — that gives us the full
+        // type graph including nested refs, which the flat manifest
+        // alone can't express. Fall back to manifest-field registration
+        // for any root wire tag the TypeDef graph didn't resolve (e.g.
+        // legacy publishers or methods without inferable wire tags).
+        const typeDefs = summary.contractId
+          ? await this.ensureTypeDefs(summary.contractId)
+          : { byTag: new Map(), byHash: new Map() };
+
+        let resolved = new Set<string>();
+        if (typeDefs.byTag.size > 0) {
+          const roots: string[] = [];
+          for (const m of methods) {
+            if (m.requestWireTag) roots.push(m.requestWireTag);
+            if (m.responseWireTag) roots.push(m.responseWireTag);
+          }
+          resolved = factory.registerFromTypeDefs(roots, typeDefs, Type, this._codec);
+        }
+
+        // Flat-manifest fallback for any method whose root types
+        // weren't covered by the TypeDef graph. Keeps backward compat
+        // with legacy publishers and handles @ClientStream methods
+        // without inferable request types (tracked in aster-backlog.md).
+        const manifestFallback = methods.filter(m => {
+          const reqOk = !m.requestWireTag || resolved.has(m.requestWireTag);
+          const resOk = !m.responseWireTag || resolved.has(m.responseWireTag);
+          return !(reqOk && resOk);
+        });
+        if (manifestFallback.length > 0) {
+          factory.registerWithFory(manifestFallback, fory, Type, this._codec);
+        }
         for (const m of methods) {
           if (m.requestWireTag) this._dynamicRegisteredTags.add(m.requestWireTag);
           if (m.responseWireTag) this._dynamicRegisteredTags.add(m.responseWireTag);

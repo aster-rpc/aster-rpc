@@ -113,6 +113,26 @@ export async function fetchContract(
 }
 
 /**
+ * Fetch the raw canonical TypeDef bytes keyed by hex hash from a
+ * contract collection. Returns an empty map when the collection
+ * contains no `types/*.bin` entries (legacy TS publisher pre-§11.4
+ * parity). Callers decode the bytes via
+ * `decodeTypeDefBytes` from `contract/identity.ts`.
+ */
+export async function fetchContractTypeDefBytes(
+  blobsClient: { listCollection(hash: string): Promise<Array<{ name: string; hash: string; size: number }>>; read(hash: string): Promise<Uint8Array> },
+  collectionHash: string,
+): Promise<Map<string, Uint8Array>> {
+  const entries = await fetchFromCollection(blobsClient, collectionHash);
+  const out = new Map<string, Uint8Array>();
+  for (const [name, bytes] of entries) {
+    const m = name.match(/^types\/([0-9a-f]{64})\.bin$/);
+    if (m) out.set(m[1]!, bytes);
+  }
+  return out;
+}
+
+/**
  * Publish a contract collection to the blob store.
  *
  * This is the high-level function called by AsterServer on startup.
