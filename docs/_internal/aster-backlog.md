@@ -16,6 +16,36 @@ When an item is completed, move it to the `## Done` section at the bottom with t
 
 ## Open
 
+### ts-ts-dev Ch1: `new options.creator()` is undefined (Path B integration bug)
+
+**Why.** After Path B lands end-to-end (commits `0b9cf73`, `831adc3`, `e0373ac`, `197a7f7`, `a9d5654`), ts-ts-dev Ch1 fails with `TypeError: undefined is not a constructor (evaluating 'new options.creator()')` on the **server** side while decoding `StatusRequest`. The client correctly fetches `types/{hash}.bin`, decodes 7 TypeDefs, topo-sorts them, and registers the dynamic classes via `DynamicTypeFactory.registerFromTypeDefs`. Unit tests for this path pass (see `dynamic-fory.test.ts` "canonical hybrid path" case) — the bug is specifically cross-process.
+
+The error pattern suggests one of these:
+
+1. Client's encode writes a namespace/typeName combination the server doesn't have registered (name mismatch — `mission/StatusRequest` vs `mission.StatusRequest`, or similar).
+2. Server registered the struct but `options.creator` on the struct typeInfo is `undefined`. In that case Fory's `registerSerializer(typeInfo)` falls through to the "no ForyTypeInfoSymbol on prototype" branch and generates a decoder that does `new undefined()`.
+3. The client's encode produces a struct header that points to a nested ref using a name the server resolves differently (dynamic vs scanner-produced `@WireType` tag drift).
+
+**What.** Investigate by:
+
+- Adding a server-side diagnostic that logs `typeInfo.options.creator` after each `codec.registerType` call in `_publishContracts` / BUILD_ALL_TYPES. If `creator` is defined server-side, the bug is encode-side on the client.
+- Comparing the exact wire bytes the client produces (capture via `codec.encode(statusRequest)`) against what the server's `BUILD_ALL_TYPES`-registered type expects. The `e2e-quic.test.ts` path works end-to-end in-process, so the golden bytes from that path are a good reference.
+- Check if `Type.struct` called in `registerFromTypeDefs` produces a struct with the same `TypeMeta.computeStructHash()` as `BUILD_ALL_TYPES` does for the same logical class. Fory's TypeMeta sorts fields via `groupFieldsByType` (primitives by size desc, then name asc); if our client-side field ordering differs from the server-side, the hash differs → decoder rejects.
+- Also investigate Ch3 `Field "tags" is not nullable` — `canonicalToManifestField` in `dynamic.ts` hardcodes `default: undefined`, so `defaultForField` for container types falls through to `null` (should be `[]` for list, `{}` for map). Two separate bugs likely tangled together.
+
+**Where.**
+- `bindings/typescript/packages/aster/src/dynamic.ts` — `registerFromTypeDefs`, `foryFieldTypeFromCanonical`, `canonicalToManifestField`.
+- `bindings/typescript/packages/aster/src/runtime.ts` — `_registerDynamicTypesForService` (the hybrid integration point).
+- `bindings/typescript/packages/aster/src/contract/identity.ts` — `decodeTypeDefBytes` (sanity-check the returned shape).
+- Reference working path: `bindings/typescript/packages/aster/src/cli/gen.ts` `BUILD_ALL_TYPES` body (leaves-first, identical shape).
+- Reference working path: `tests/typescript/integration/e2e-quic.test.ts` — round-trips structs in-process with Fory XLANG.
+
+**Blockers.** None. This is the direct follow-up to Path B's cross-process validation.
+
+**Origin.** 2026-04-21 session, after `a9d5654` landed. Matrix output captured in the commit message. Ch2 (`read failed before trailer`), Ch4 (`options.creator` again), and scope mismatch guard (`Failed to detect the Fory type`) likely all share the same root cause or are cascading failures from Ch1 — fix Ch1 first, then re-run.
+
+---
+
 ### Python ProxyClient: migrate to canonical-bytes decoder
 
 **Why.** Python's dynamic proxy today reads `ContractManifest.methods[*].fields` (flat; no nested TypeDefs). Works for py-py by relying on pyfory's by-name nested-type resolution at runtime. When Path B lands the Rust-core canonical reader for TS, Python should converge onto the same path so we have one source of truth per binding.
