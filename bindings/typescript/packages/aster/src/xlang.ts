@@ -31,13 +31,15 @@ export function getXlangForyAndType(): { fory: any; Type: any } {
   const foryModule = require('@apache-fory/core');
   const Fory = foryModule.default;
   const Type = foryModule.Type;
-  // Schema-consistent "compatible" mode is required for cross-binding
-  // interop: non-compatible mode writes a fixed 32-bit struct hash into
-  // the payload and rejects on read mismatch, whereas Python/Java default
-  // to the NAMED_COMPATIBLE_STRUCT layout (reads TypeMeta with getHash()
-  // check). Without this, any py↔ts call fails with "Read class version
-  // is not consistent".
-  _cachedFory = new Fory({ ref: true, compatible: true });
+  // `compatible: true` picks NAMED_COMPATIBLE_STRUCT layout (what
+  // pyfory / fory-java use by default at XLANG); `refTracking: true`
+  // matches `pyfory.Fory(xlang=True, ref=True)` and Fory Java's
+  // `withRefTracking(true)`. The option name is `refTracking` (not
+  // `ref`) -- `@apache-fory/core`'s Config silently drops unknown
+  // keys, so `{ ref: true }` used to leave refs disabled on the TS
+  // side while Python/Java had them on, producing an asymmetric
+  // wire format and cross-binding decode failures.
+  _cachedFory = new Fory({ refTracking: true, compatible: true });
   _cachedType = Type;
   return { fory: _cachedFory, Type };
 }
@@ -52,7 +54,7 @@ export function newXlangFory(): { fory: any; Type: any } {
   const foryModule = require('@apache-fory/core');
   const Fory = foryModule.default;
   const Type = foryModule.Type;
-  return { fory: new Fory({ ref: true, compatible: true }), Type };
+  return { fory: new Fory({ refTracking: true, compatible: true }), Type };
 }
 
 /**
