@@ -60,6 +60,58 @@ impl BlobsClient {
         Ok(Buffer::from(data))
     }
 
+    /// Download a contract collection (HashSeq) by ticket. Pulls the
+    /// HashSeq and all child blobs into the local store. Returns the
+    /// (name, data) entries for callers that want to consume them
+    /// immediately; local reads via `list_collection` / `read` also
+    /// work afterward because the collection is now persisted.
+    #[napi]
+    pub async fn download_collection(
+        &self,
+        ticket: String,
+    ) -> Result<Vec<CollectionFile>> {
+        let files = self
+            .inner
+            .clone()
+            .download_collection(ticket)
+            .await
+            .map_err(to_napi_err)?;
+        Ok(files
+            .into_iter()
+            .map(|(name, data)| CollectionFile {
+                name,
+                data: Buffer::from(data),
+            })
+            .collect())
+    }
+
+    /// Download a HashSeq collection by raw hash + node id. The ticket-
+    /// less variant used when the caller already knows the collection
+    /// hash (e.g. from the registry doc's ArtifactRef) and the remote
+    /// peer's endpoint id (captured at connect time). Unlike
+    /// `download_collection` this sets `BlobFormat::HashSeq` explicitly,
+    /// which is required for HashSeq collections to pull child blobs.
+    #[napi]
+    pub async fn download_collection_hash(
+        &self,
+        hash_hex: String,
+        node_id_hex: String,
+    ) -> Result<Vec<CollectionFile>> {
+        let files = self
+            .inner
+            .clone()
+            .download_collection_hash(hash_hex, node_id_hex)
+            .await
+            .map_err(to_napi_err)?;
+        Ok(files
+            .into_iter()
+            .map(|(name, data)| CollectionFile {
+                name,
+                data: Buffer::from(data),
+            })
+            .collect())
+    }
+
     /// Add bytes as a named collection entry, returns collection hash.
     #[napi]
     pub async fn add_bytes_as_collection(&self, name: String, data: Buffer) -> Result<String> {
@@ -247,4 +299,11 @@ pub struct CollectionEntry {
     pub name: String,
     pub hash: String,
     pub size: f64,
+}
+
+/// A (name, data) pair returned by `download_collection`.
+#[napi(object)]
+pub struct CollectionFile {
+    pub name: String,
+    pub data: Buffer,
 }
