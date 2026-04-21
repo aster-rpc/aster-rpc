@@ -67,8 +67,8 @@ export const WIRE_TYPES = [
  * Build and register all @WireType classes with Fory, using Type.struct()
  * to describe each struct's fields with explicit wire types.
  *
- * Iterates over WIRE_TYPES so that entry.ctor is the actual class ref.
- * For 'ref' fields, looks up the target type from typesByTag by refTag.
+ * Each block references its class by aliased import name directly. For
+ * 'ref' fields, looks up the target type from typesByTag by refTag.
  * Types are registered in topological order (leaves first), so all
  * dependencies are available when any given type is being registered.
  *
@@ -82,12 +82,10 @@ export function BUILD_ALL_TYPES(
   codec: { registerType(typeInfo: any): void },
 ): Map<string, any> {
   const typesByTag = new Map();
-  for (const entry of WIRE_TYPES) {
   // sample/StatusResponse
   {
-    const [ns, typeName] = "sample/StatusResponse".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "sample", typeName: "StatusResponse" },
       {
       "status": Type.string(),
       "uptime": Type.int32(),
@@ -95,13 +93,12 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T0_StatusResponse.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T0_StatusResponse);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -112,9 +109,8 @@ export function BUILD_ALL_TYPES(
   }
   // sample/StatusEvent
   {
-    const [ns, typeName] = "sample/StatusEvent".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "sample", typeName: "StatusEvent" },
       {
       "at": Type.timestamp(),
       "status": typesByTag.get("sample/StatusResponse"),
@@ -122,13 +118,12 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T1_StatusEvent.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T1_StatusEvent);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -139,22 +134,20 @@ export function BUILD_ALL_TYPES(
   }
   // sample/StatusRequest
   {
-    const [ns, typeName] = "sample/StatusRequest".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "sample", typeName: "StatusRequest" },
       {
       "agentId": Type.string(),
       "nonce": Type.int64()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T2_StatusRequest.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T2_StatusRequest);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -165,22 +158,20 @@ export function BUILD_ALL_TYPES(
   }
   // sample/WatchRequest
   {
-    const [ns, typeName] = "sample/WatchRequest".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "sample", typeName: "WatchRequest" },
       {
       "agentId": Type.string(),
       "includeWarnings": Type.bool()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T3_WatchRequest.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T3_WatchRequest);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -188,7 +179,6 @@ export function BUILD_ALL_TYPES(
     }
     codec.registerType(typeStruct);
     typesByTag.set("sample/WatchRequest", typeStruct);
-  }
   }
   return typesByTag;
 }

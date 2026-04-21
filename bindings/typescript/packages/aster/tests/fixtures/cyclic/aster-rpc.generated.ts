@@ -50,8 +50,8 @@ export const WIRE_TYPES = [
  * Build and register all @WireType classes with Fory, using Type.struct()
  * to describe each struct's fields with explicit wire types.
  *
- * Iterates over WIRE_TYPES so that entry.ctor is the actual class ref.
- * For 'ref' fields, looks up the target type from typesByTag by refTag.
+ * Each block references its class by aliased import name directly. For
+ * 'ref' fields, looks up the target type from typesByTag by refTag.
  * Types are registered in topological order (leaves first), so all
  * dependencies are available when any given type is being registered.
  *
@@ -65,25 +65,22 @@ export function BUILD_ALL_TYPES(
   codec: { registerType(typeInfo: any): void },
 ): Map<string, any> {
   const typesByTag = new Map();
-  for (const entry of WIRE_TYPES) {
   // tree/Entry
   {
-    const [ns, typeName] = "tree/Entry".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "tree", typeName: "Entry" },
       {
       "name": Type.string(),
       "children": Type.array(typesByTag.get("tree/Entry"))
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T0_Entry.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T0_Entry);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -94,21 +91,19 @@ export function BUILD_ALL_TYPES(
   }
   // tree/TreeRequest
   {
-    const [ns, typeName] = "tree/TreeRequest".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "tree", typeName: "TreeRequest" },
       {
       "root": typesByTag.get("tree/Entry")
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T1_TreeRequest.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T1_TreeRequest);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -119,21 +114,19 @@ export function BUILD_ALL_TYPES(
   }
   // tree/TreeResponse
   {
-    const [ns, typeName] = "tree/TreeResponse".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "tree", typeName: "TreeResponse" },
       {
       "tree": typesByTag.get("tree/Entry")
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T2_TreeResponse.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T2_TreeResponse);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -141,7 +134,6 @@ export function BUILD_ALL_TYPES(
     }
     codec.registerType(typeStruct);
     typesByTag.set("tree/TreeResponse", typeStruct);
-  }
   }
   return typesByTag;
 }

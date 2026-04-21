@@ -161,7 +161,7 @@ export class IrohTransport implements AsterTransport {
       await this.writeHeader(send, service, method, opts);
 
       // Write request
-      const [payload, compressed] = this.codec.encodeCompressed(request);
+      const [payload, compressed] = this.codec.encodeCompressed(request, opts?.hintType);
       await writeFrame(send, payload, compressed ? COMPRESSED : 0);
       await send.finish();
 
@@ -199,7 +199,7 @@ export class IrohTransport implements AsterTransport {
     try {
       await this.writeHeader(send, service, method, opts);
 
-      const [payload, compressed] = this.codec.encodeCompressed(request);
+      const [payload, compressed] = this.codec.encodeCompressed(request, opts?.hintType);
       await writeFrame(send, payload, compressed ? COMPRESSED : 0);
       await send.finish();
 
@@ -234,7 +234,7 @@ export class IrohTransport implements AsterTransport {
       await this.writeHeader(send, service, method, opts);
 
       for await (const req of requests) {
-        const [payload, compressed] = this.codec.encodeCompressed(req);
+        const [payload, compressed] = this.codec.encodeCompressed(req, opts?.hintType);
         await writeFrame(send, payload, compressed ? COMPRESSED : 0);
       }
       await send.finish();
@@ -286,7 +286,7 @@ export class IrohTransport implements AsterTransport {
     const channel: BidiChannel = {
       async send(msg: unknown): Promise<void> {
         await streamReady;
-        const [payload, compressed] = codec.encodeCompressed(msg);
+        const [payload, compressed] = codec.encodeCompressed(msg, opts?.hintType);
         await writeFrame(sendStream!, payload, compressed ? COMPRESSED : 0);
       },
 

@@ -18,6 +18,8 @@ export const WIRE_TYPES = [
     fieldNameSet: new Set(["task_id", "command"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
+    typeHashHex: "4cbd6a77df2249226b3d68ce7456423037de08bd13b9f00aedd0ce14718c36e4",
+    typeDefBytes: new Uint8Array([0x00, 0x1e, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x2a, 0x41, 0x73, 0x73, 0x69, 0x67, 0x6e, 0x6d, 0x65, 0x6e, 0x74, 0x02, 0x0c, 0x02, 0x1e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x1e, 0x74, 0x61, 0x73, 0x6b, 0x5f, 0x69, 0x64, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
     ctor: T1_Command,
@@ -28,6 +30,8 @@ export const WIRE_TYPES = [
     fieldNameSet: new Set(["command"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
+    typeHashHex: "55b79e2056cbb1104040ca2294a477e1ab38b708686a732ccb870870a731ffa2",
+    typeDefBytes: new Uint8Array([0x00, 0x1e, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x1e, 0x43, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x01, 0x0c, 0x02, 0x1e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
     ctor: T2_CommandResult,
@@ -40,6 +44,8 @@ export const WIRE_TYPES = [
     fieldNameSet: new Set(["stdout", "stderr", "exit_code"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
+    typeHashHex: "8b76e39fd9b2f2bf7bf931399e19fade4a642f2e9d691ace0b69ce0f5b851611",
+    typeDefBytes: new Uint8Array([0x00, 0x1e, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x36, 0x43, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x52, 0x65, 0x73, 0x75, 0x6c, 0x74, 0x03, 0x0c, 0x02, 0x26, 0x65, 0x78, 0x69, 0x74, 0x5f, 0x63, 0x6f, 0x64, 0x65, 0x00, 0x1e, 0x66, 0x6c, 0x6f, 0x61, 0x74, 0x36, 0x34, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x1a, 0x73, 0x74, 0x64, 0x65, 0x72, 0x72, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x1a, 0x73, 0x74, 0x64, 0x6f, 0x75, 0x74, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
     ctor: T3_Heartbeat,
@@ -52,6 +58,8 @@ export const WIRE_TYPES = [
     fieldNameSet: new Set(["agent_id", "capabilities", "load_avg"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
+    typeHashHex: "d4dc17a89c4d12ac449611875ae70b9b399e8eb1fcc40be1f7b6896306a51756",
+    typeDefBytes: new Uint8Array([0x00, 0x1e, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x26, 0x48, 0x65, 0x61, 0x72, 0x74, 0x62, 0x65, 0x61, 0x74, 0x03, 0x0c, 0x02, 0x22, 0x61, 0x67, 0x65, 0x6e, 0x74, 0x5f, 0x69, 0x64, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x32, 0x63, 0x61, 0x70, 0x61, 0x62, 0x69, 0x6c, 0x69, 0x74, 0x69, 0x65, 0x73, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x22, 0x6c, 0x6f, 0x61, 0x64, 0x5f, 0x61, 0x76, 0x67, 0x00, 0x1e, 0x66, 0x6c, 0x6f, 0x61, 0x74, 0x36, 0x34, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
     ctor: T4_IngestResult,
@@ -63,6 +71,8 @@ export const WIRE_TYPES = [
     fieldNameSet: new Set(["accepted", "dropped"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
+    typeHashHex: "7ed8dcfc8899dee40ff907b20aff0020bd0afc4e939f3d06fecfd2db121d376d",
+    typeDefBytes: new Uint8Array([0x00, 0x1e, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x32, 0x49, 0x6e, 0x67, 0x65, 0x73, 0x74, 0x52, 0x65, 0x73, 0x75, 0x6c, 0x74, 0x02, 0x0c, 0x02, 0x22, 0x61, 0x63, 0x63, 0x65, 0x70, 0x74, 0x65, 0x64, 0x00, 0x1e, 0x66, 0x6c, 0x6f, 0x61, 0x74, 0x36, 0x34, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x1e, 0x64, 0x72, 0x6f, 0x70, 0x70, 0x65, 0x64, 0x00, 0x1e, 0x66, 0x6c, 0x6f, 0x61, 0x74, 0x36, 0x34, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
     ctor: T5_LogEntry,
@@ -76,6 +86,8 @@ export const WIRE_TYPES = [
     fieldNameSet: new Set(["timestamp", "level", "message", "agent_id"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
+    typeHashHex: "073da48b884e6a49f3352b35d8dea12841834ab0e167e5a5149c6c463881f7b3",
+    typeDefBytes: new Uint8Array([0x00, 0x1e, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x22, 0x4c, 0x6f, 0x67, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x04, 0x0c, 0x02, 0x22, 0x61, 0x67, 0x65, 0x6e, 0x74, 0x5f, 0x69, 0x64, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x16, 0x6c, 0x65, 0x76, 0x65, 0x6c, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x1e, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x08, 0x26, 0x74, 0x69, 0x6d, 0x65, 0x73, 0x74, 0x61, 0x6d, 0x70, 0x00, 0x1e, 0x66, 0x6c, 0x6f, 0x61, 0x74, 0x36, 0x34, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
     ctor: T6_MetricPoint,
@@ -89,6 +101,8 @@ export const WIRE_TYPES = [
     fieldNameSet: new Set(["name", "value", "timestamp", "tags"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
+    typeHashHex: "13869d74e3169c25521b5515712120f43e4aaf821f6dcbfdf91031dada31a56f",
+    typeDefBytes: new Uint8Array([0x00, 0x1e, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x2e, 0x4d, 0x65, 0x74, 0x72, 0x69, 0x63, 0x50, 0x6f, 0x69, 0x6e, 0x74, 0x04, 0x0c, 0x02, 0x12, 0x6e, 0x61, 0x6d, 0x65, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x12, 0x74, 0x61, 0x67, 0x73, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x01, 0x00, 0x06, 0x26, 0x74, 0x69, 0x6d, 0x65, 0x73, 0x74, 0x61, 0x6d, 0x70, 0x00, 0x1e, 0x66, 0x6c, 0x6f, 0x61, 0x74, 0x36, 0x34, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x08, 0x16, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x00, 0x1e, 0x66, 0x6c, 0x6f, 0x61, 0x74, 0x36, 0x34, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
     ctor: T7_StatusRequest,
@@ -99,6 +113,8 @@ export const WIRE_TYPES = [
     fieldNameSet: new Set(["agent_id"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
+    typeHashHex: "c07e2ac3df1fa1914d97c7cfac33d9d867d0710bacc60ea81b7f93f62d92e7ce",
+    typeDefBytes: new Uint8Array([0x00, 0x1e, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x36, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x01, 0x0c, 0x02, 0x22, 0x61, 0x67, 0x65, 0x6e, 0x74, 0x5f, 0x69, 0x64, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
     ctor: T8_StatusResponse,
@@ -111,6 +127,8 @@ export const WIRE_TYPES = [
     fieldNameSet: new Set(["agent_id", "status", "uptime_secs"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
+    typeHashHex: "5e231e0139195802ddba06027abd70b5b4afbac376dcf49eae961cd18ab79593",
+    typeDefBytes: new Uint8Array([0x00, 0x1e, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x3a, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x03, 0x0c, 0x02, 0x22, 0x61, 0x67, 0x65, 0x6e, 0x74, 0x5f, 0x69, 0x64, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x1a, 0x73, 0x74, 0x61, 0x74, 0x75, 0x73, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x2e, 0x75, 0x70, 0x74, 0x69, 0x6d, 0x65, 0x5f, 0x73, 0x65, 0x63, 0x73, 0x00, 0x1e, 0x66, 0x6c, 0x6f, 0x61, 0x74, 0x36, 0x34, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
     ctor: T9_SubmitLogResult,
@@ -121,6 +139,8 @@ export const WIRE_TYPES = [
     fieldNameSet: new Set(["accepted"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
+    typeHashHex: "518979579675203341847750c3b8733b058bc35ed55baa695aed49d87db81f49",
+    typeDefBytes: new Uint8Array([0x00, 0x1e, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x3e, 0x53, 0x75, 0x62, 0x6d, 0x69, 0x74, 0x4c, 0x6f, 0x67, 0x52, 0x65, 0x73, 0x75, 0x6c, 0x74, 0x01, 0x0c, 0x02, 0x22, 0x61, 0x63, 0x63, 0x65, 0x70, 0x74, 0x65, 0x64, 0x00, 0x12, 0x62, 0x6f, 0x6f, 0x6c, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
     ctor: T10_TailRequest,
@@ -132,6 +152,8 @@ export const WIRE_TYPES = [
     fieldNameSet: new Set(["agent_id", "level"]),
     nestedTypes: new Map([]),
     elementTypes: new Map([]),
+    typeHashHex: "598a60c1a2779cbd1e252dde0214bc45d96fb706ae89069d8c46d81552927383",
+    typeDefBytes: new Uint8Array([0x00, 0x1e, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x2e, 0x54, 0x61, 0x69, 0x6c, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x02, 0x0c, 0x02, 0x22, 0x61, 0x67, 0x65, 0x6e, 0x74, 0x5f, 0x69, 0x64, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x16, 0x6c, 0x65, 0x76, 0x65, 0x6c, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
 ] as const;
 
@@ -139,8 +161,8 @@ export const WIRE_TYPES = [
  * Build and register all @WireType classes with Fory, using Type.struct()
  * to describe each struct's fields with explicit wire types.
  *
- * Iterates over WIRE_TYPES so that entry.ctor is the actual class ref.
- * For 'ref' fields, looks up the target type from typesByTag by refTag.
+ * Each block references its class by aliased import name directly. For
+ * 'ref' fields, looks up the target type from typesByTag by refTag.
  * Types are registered in topological order (leaves first), so all
  * dependencies are available when any given type is being registered.
  *
@@ -154,53 +176,57 @@ export function BUILD_ALL_TYPES(
   codec: { registerType(typeInfo: any): void },
 ): Map<string, any> {
   const typesByTag = new Map();
-  for (const entry of WIRE_TYPES) {
   // mission/Assignment
   {
-    const [ns, typeName] = "mission/Assignment".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "Assignment" },
       {
       "task_id": Type.string(),
       "command": Type.string()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T0_Assignment.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T0_Assignment);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/Assignment", typeStruct);
   }
   // mission/Command
   {
-    const [ns, typeName] = "mission/Command".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "Command" },
       {
       "command": Type.string()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T1_Command.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T1_Command);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/Command", typeStruct);
   }
   // mission/CommandResult
   {
-    const [ns, typeName] = "mission/CommandResult".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "CommandResult" },
       {
       "stdout": Type.string(),
       "stderr": Type.string(),
@@ -208,21 +234,24 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T2_CommandResult.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T2_CommandResult);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/CommandResult", typeStruct);
   }
   // mission/Heartbeat
   {
-    const [ns, typeName] = "mission/Heartbeat".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "Heartbeat" },
       {
       "agent_id": Type.string(),
       "capabilities": Type.array(Type.string()),
@@ -230,42 +259,48 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T3_Heartbeat.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T3_Heartbeat);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/Heartbeat", typeStruct);
   }
   // mission/IngestResult
   {
-    const [ns, typeName] = "mission/IngestResult".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "IngestResult" },
       {
       "accepted": Type.float64(),
       "dropped": Type.float64()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T4_IngestResult.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T4_IngestResult);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/IngestResult", typeStruct);
   }
   // mission/LogEntry
   {
-    const [ns, typeName] = "mission/LogEntry".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "LogEntry" },
       {
       "timestamp": Type.float64(),
       "level": Type.string(),
@@ -274,21 +309,24 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T5_LogEntry.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T5_LogEntry);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/LogEntry", typeStruct);
   }
   // mission/MetricPoint
   {
-    const [ns, typeName] = "mission/MetricPoint".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "MetricPoint" },
       {
       "name": Type.string(),
       "value": Type.float64(),
@@ -297,41 +335,47 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T6_MetricPoint.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T6_MetricPoint);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/MetricPoint", typeStruct);
   }
   // mission/StatusRequest
   {
-    const [ns, typeName] = "mission/StatusRequest".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "StatusRequest" },
       {
       "agent_id": Type.string()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T7_StatusRequest.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T7_StatusRequest);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/StatusRequest", typeStruct);
   }
   // mission/StatusResponse
   {
-    const [ns, typeName] = "mission/StatusResponse".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "StatusResponse" },
       {
       "agent_id": Type.string(),
       "status": Type.string(),
@@ -339,13 +383,12 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T8_StatusResponse.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T8_StatusResponse);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -356,45 +399,50 @@ export function BUILD_ALL_TYPES(
   }
   // mission/SubmitLogResult
   {
-    const [ns, typeName] = "mission/SubmitLogResult".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "SubmitLogResult" },
       {
       "accepted": Type.bool()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T9_SubmitLogResult.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T9_SubmitLogResult);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/SubmitLogResult", typeStruct);
   }
   // mission/TailRequest
   {
-    const [ns, typeName] = "mission/TailRequest".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "TailRequest" },
       {
       "agent_id": Type.string(),
       "level": Type.string()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T10_TailRequest.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T10_TailRequest);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/TailRequest", typeStruct);
-  }
   }
   return typesByTag;
 }
@@ -461,7 +509,7 @@ export const SERVICES = [
     {
       name: "ingestMetrics",
       pattern: RpcPattern.CLIENT_STREAM,
-      requestType: undefined,
+      requestType: T6_MetricPoint,
       responseType: T4_IngestResult,
       acceptsCtx: false,
       idempotent: false,
@@ -469,9 +517,9 @@ export const SERVICES = [
       serialization: undefined,
       requires: undefined,
       metadata: undefined,
-      requestFields: [],
+      requestFields: [{"name":"name","type":"str","required":true,"default":""},{"name":"value","type":"float","required":true,"default":0},{"name":"timestamp","type":"float","required":true,"default":0},{"name":"tags","type":"dict","required":true,"default":{}}],
       responseFields: [{"name":"accepted","type":"float","required":true,"default":0},{"name":"dropped","type":"float","required":true,"default":0}],
-      requestTypeHash: undefined,
+      requestTypeHash: new Uint8Array([0x13, 0x86, 0x9d, 0x74, 0xe3, 0x16, 0x9c, 0x25, 0x52, 0x1b, 0x55, 0x15, 0x71, 0x21, 0x20, 0xf4, 0x3e, 0x4a, 0xaf, 0x82, 0x1f, 0x6d, 0xcb, 0xfd, 0xf9, 0x10, 0x31, 0xda, 0xda, 0x31, 0xa5, 0x6f]),
       responseTypeHash: new Uint8Array([0x7e, 0xd8, 0xdc, 0xfc, 0x88, 0x99, 0xde, 0xe4, 0x0f, 0xf9, 0x07, 0xb2, 0x0a, 0xff, 0x00, 0x20, 0xbd, 0x0a, 0xfc, 0x4e, 0x93, 0x9f, 0x3d, 0x06, 0xfe, 0xcf, 0xd2, 0xdb, 0x12, 0x1d, 0x37, 0x6d]),
     },
     ],
@@ -520,7 +568,7 @@ export const SERVICES = [
     {
       name: "runCommand",
       pattern: RpcPattern.BIDI_STREAM,
-      requestType: undefined,
+      requestType: T1_Command,
       responseType: T2_CommandResult,
       acceptsCtx: false,
       idempotent: false,
@@ -528,9 +576,9 @@ export const SERVICES = [
       serialization: undefined,
       requires: undefined,
       metadata: undefined,
-      requestFields: [],
+      requestFields: [{"name":"command","type":"str","required":true,"default":""}],
       responseFields: [{"name":"stdout","type":"str","required":true,"default":""},{"name":"stderr","type":"str","required":true,"default":""},{"name":"exit_code","type":"float","required":true,"default":0}],
-      requestTypeHash: undefined,
+      requestTypeHash: new Uint8Array([0x55, 0xb7, 0x9e, 0x20, 0x56, 0xcb, 0xb1, 0x10, 0x40, 0x40, 0xca, 0x22, 0x94, 0xa4, 0x77, 0xe1, 0xab, 0x38, 0xb7, 0x08, 0x68, 0x6a, 0x73, 0x2c, 0xcb, 0x87, 0x08, 0x70, 0xa7, 0x31, 0xff, 0xa2]),
       responseTypeHash: new Uint8Array([0x8b, 0x76, 0xe3, 0x9f, 0xd9, 0xb2, 0xf2, 0xbf, 0x7b, 0xf9, 0x31, 0x39, 0x9e, 0x19, 0xfa, 0xde, 0x4a, 0x64, 0x2f, 0x2e, 0x9d, 0x69, 0x1a, 0xce, 0x0b, 0x69, 0xce, 0x0f, 0x5b, 0x85, 0x16, 0x11]),
     },
     ],
@@ -595,7 +643,7 @@ export const SERVICES = [
     {
       name: "ingestMetrics",
       pattern: RpcPattern.CLIENT_STREAM,
-      requestType: undefined,
+      requestType: T6_MetricPoint,
       responseType: T4_IngestResult,
       acceptsCtx: false,
       idempotent: false,
@@ -603,9 +651,9 @@ export const SERVICES = [
       serialization: undefined,
       requires: undefined,
       metadata: undefined,
-      requestFields: [],
+      requestFields: [{"name":"name","type":"str","required":true,"default":""},{"name":"value","type":"float","required":true,"default":0},{"name":"timestamp","type":"float","required":true,"default":0},{"name":"tags","type":"dict","required":true,"default":{}}],
       responseFields: [{"name":"accepted","type":"float","required":true,"default":0},{"name":"dropped","type":"float","required":true,"default":0}],
-      requestTypeHash: undefined,
+      requestTypeHash: new Uint8Array([0x13, 0x86, 0x9d, 0x74, 0xe3, 0x16, 0x9c, 0x25, 0x52, 0x1b, 0x55, 0x15, 0x71, 0x21, 0x20, 0xf4, 0x3e, 0x4a, 0xaf, 0x82, 0x1f, 0x6d, 0xcb, 0xfd, 0xf9, 0x10, 0x31, 0xda, 0xda, 0x31, 0xa5, 0x6f]),
       responseTypeHash: new Uint8Array([0x7e, 0xd8, 0xdc, 0xfc, 0x88, 0x99, 0xde, 0xe4, 0x0f, 0xf9, 0x07, 0xb2, 0x0a, 0xff, 0x00, 0x20, 0xbd, 0x0a, 0xfc, 0x4e, 0x93, 0x9f, 0x3d, 0x06, 0xfe, 0xcf, 0xd2, 0xdb, 0x12, 0x1d, 0x37, 0x6d]),
     },
     ],
@@ -654,7 +702,7 @@ export const SERVICES = [
     {
       name: "runCommand",
       pattern: RpcPattern.BIDI_STREAM,
-      requestType: undefined,
+      requestType: T1_Command,
       responseType: T2_CommandResult,
       acceptsCtx: false,
       idempotent: false,
@@ -662,9 +710,9 @@ export const SERVICES = [
       serialization: undefined,
       requires: undefined,
       metadata: undefined,
-      requestFields: [],
+      requestFields: [{"name":"command","type":"str","required":true,"default":""}],
       responseFields: [{"name":"stdout","type":"str","required":true,"default":""},{"name":"stderr","type":"str","required":true,"default":""},{"name":"exit_code","type":"float","required":true,"default":0}],
-      requestTypeHash: undefined,
+      requestTypeHash: new Uint8Array([0x55, 0xb7, 0x9e, 0x20, 0x56, 0xcb, 0xb1, 0x10, 0x40, 0x40, 0xca, 0x22, 0x94, 0xa4, 0x77, 0xe1, 0xab, 0x38, 0xb7, 0x08, 0x68, 0x6a, 0x73, 0x2c, 0xcb, 0x87, 0x08, 0x70, 0xa7, 0x31, 0xff, 0xa2]),
       responseTypeHash: new Uint8Array([0x8b, 0x76, 0xe3, 0x9f, 0xd9, 0xb2, 0xf2, 0xbf, 0x7b, 0xf9, 0x31, 0x39, 0x9e, 0x19, 0xfa, 0xde, 0x4a, 0x64, 0x2f, 0x2e, 0x9d, 0x69, 0x1a, 0xce, 0x0b, 0x69, 0xce, 0x0f, 0x5b, 0x85, 0x16, 0x11]),
     },
     ],

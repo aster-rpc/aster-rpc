@@ -539,14 +539,58 @@ function foryFieldTypeFromCanonical(
 }
 
 function canonicalToManifestField(f: CanonicalFieldDef): ManifestField {
-  return {
+  // `defaultForField` branches on `kind` to produce container defaults
+  // (empty list / empty Map). Without a correct `kind` here, container
+  // fields fall through to `null`, which Fory then rejects at encode
+  // time as "field X is not nullable". We also emit a legacy `type`
+  // string so flat-manifest consumers still work.
+  let kind: 'string' | 'int' | 'float' | 'bool' | 'bytes' | 'list' | 'map' | 'ref';
+  let legacyType: string;
+  if (f.container === ContainerKind.LIST || f.container === ContainerKind.SET) {
+    kind = 'list';
+    legacyType = 'list';
+  } else if (f.container === ContainerKind.MAP) {
+    kind = 'map';
+    legacyType = 'map';
+  } else if (f.typeKind === TypeKind.PRIMITIVE) {
+    kind = primitiveToManifestKind(f.typePrimitive);
+    legacyType = f.typePrimitive;
+  } else if (f.typeKind === TypeKind.REF) {
+    kind = 'ref';
+    legacyType = 'ref';
+  } else {
+    kind = 'string';
+    legacyType = 'string';
+  }
+  const field: ManifestField & { kind: typeof kind } = {
     name: f.name,
-    type: f.container === ContainerKind.NONE
-      ? (f.typeKind === TypeKind.PRIMITIVE ? f.typePrimitive : 'dict')
-      : 'list',
+    type: legacyType,
     required: f.required,
     default: undefined,
+    kind,
   };
+  return field;
+}
+
+function primitiveToManifestKind(
+  primName: string,
+): 'string' | 'int' | 'float' | 'bool' | 'bytes' {
+  switch (primName) {
+    case 'string':
+    case 'uuid':
+      return 'string';
+    case 'bool':
+      return 'bool';
+    case 'binary':
+      return 'bytes';
+    case 'float32':
+    case 'float64':
+      return 'float';
+    default:
+      // int8/16/32/64, uint8/16/32/64, timestamp, etc. all default to
+      // int — defaultForField only needs a numeric default here.
+      return 'int';
+  }
 }
 
 /** Get a default value from a v1-schema field dict, falling back to the legacy
@@ -568,7 +612,10 @@ function defaultForField(field: ManifestField): unknown {
       case 'list':
         return [];
       case 'map':
-        return {};
+        // Fory's xlang map serializer calls `.entries()` and `.size`,
+        // which only exist on real Map objects. Plain `{}` here produces
+        // "v.tags.entries is not a function" at encode time.
+        return new Map();
       case 'ref':
         return null;
       default:
@@ -599,7 +646,7 @@ function defaultForType(typeStr: string): unknown {
       return new Uint8Array(0);
     default:
       if (typeStr.startsWith('list[') || typeStr.startsWith('List[')) return [];
-      if (typeStr.startsWith('dict[') || typeStr.startsWith('Dict[') || typeStr.startsWith('Map[')) return {};
+      if (typeStr.startsWith('dict[') || typeStr.startsWith('Dict[') || typeStr.startsWith('Map[')) return new Map();
       return null;
   }
 }
