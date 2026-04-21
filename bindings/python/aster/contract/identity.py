@@ -543,10 +543,15 @@ def contract_id_from_service(service_cls: type) -> str:
 
 # ── Type graph construction ───────────────────────────────────────────────────
 
-# Mapping of Python primitive types to XLANG primitive names
+# Mapping of Python primitive types to XLANG primitive names. Plain
+# ``int`` maps to ``varint64`` because pyfory's default for an unannotated
+# ``int`` field is type id 7 (varint64), NOT 6 (int64 / fixed). Labeling
+# it ``int64`` here would make the published TypeDef claim "fixed 8-byte
+# int" while pyfory's encoder writes a zigzag varint -- cross-binding
+# consumers would then read the wrong width. See xlang_type_mapping.md.
 _PYTHON_TO_XLANG_PRIMITIVE: dict[type, str] = {
     str: "string",
-    int: "int64",
+    int: "varint64",
     float: "float64",
     bool: "bool",
     bytes: "binary",
@@ -564,6 +569,16 @@ _PYTHON_TO_XLANG_PRIMITIVE: dict[type, str] = {
 # tripped the ``Hash ... is not consistent`` guard. We intercept the
 # TypeVar identity here and emit the correct primitive name.
 def _pyfory_typevar_primitive(tp: Any) -> str | None:
+    """Map a pyfory TypeVar to its Fory xlang primitive name.
+
+    Critical: pyfory distinguishes fixed-width vs. variable-width encodings
+    via separate TypeVars per the xlang type mapping spec
+    (docs/specification/xlang_type_mapping.md). pyfory.int32 serializes as
+    spec "varint32" (type id 5), NOT spec "int32" (type id 4) -- the
+    latter is pyfory.fixed_int32. Mis-labeling here caused cross-binding
+    hash drift: a producer declaring pyfory.int64 emitted bytes that TS
+    interpreted as fixed int64, which is a different wire format.
+    """
     try:
         import pyfory  # type: ignore[import-untyped]
     except ImportError:
@@ -573,9 +588,29 @@ def _pyfory_typevar_primitive(tp: Any) -> str | None:
     if tp is pyfory.int16:
         return "int16"
     if tp is pyfory.int32:
-        return "int32"
+        return "varint32"
     if tp is pyfory.int64:
+        return "varint64"
+    fixed_i32 = getattr(pyfory, "fixed_int32", None)
+    fixed_i64 = getattr(pyfory, "fixed_int64", None)
+    if fixed_i32 is not None and tp is fixed_i32:
+        return "int32"
+    if fixed_i64 is not None and tp is fixed_i64:
         return "int64"
+    if tp is pyfory.uint8:
+        return "uint8"
+    if tp is pyfory.uint16:
+        return "uint16"
+    if tp is pyfory.uint32:
+        return "var_uint32"
+    if tp is pyfory.uint64:
+        return "var_uint64"
+    fixed_u32 = getattr(pyfory, "fixed_uint32", None)
+    fixed_u64 = getattr(pyfory, "fixed_uint64", None)
+    if fixed_u32 is not None and tp is fixed_u32:
+        return "uint32"
+    if fixed_u64 is not None and tp is fixed_u64:
+        return "uint64"
     if tp is pyfory.float32:
         return "float32"
     if tp is pyfory.float64:
