@@ -132,6 +132,20 @@ describe('aster-gen scanner', () => {
     expect(generatedSource).toContain('name: "MissionControl"');
     expect(generatedSource).toMatch(/name: "getStatus"[\s\S]*?pattern: RpcPattern\.UNARY/);
     expect(generatedSource).toMatch(/name: "watchStatus"[\s\S]*?pattern: RpcPattern\.SERVER_STREAM/);
+    expect(generatedSource).toMatch(/name: "ingestEvents"[\s\S]*?pattern: RpcPattern\.CLIENT_STREAM/);
+    expect(generatedSource).toMatch(/name: "exchange"[\s\S]*?pattern: RpcPattern\.BIDI_STREAM/);
+  });
+
+  it('unwraps AsyncIterable<T> for @ClientStream / @BidiStream request types', () => {
+    const ingestIdx = generatedSource.indexOf('name: "ingestEvents"');
+    const ingestBlock = generatedSource.slice(ingestIdx, ingestIdx + 1500);
+    expect(ingestBlock).toMatch(/requestType: T\d+_StatusEvent/);
+    expect(ingestBlock).toMatch(/requestTypeHash: new Uint8Array\(\[0x[0-9a-f]{2}/);
+
+    const exchangeIdx = generatedSource.indexOf('name: "exchange"');
+    const exchangeBlock = generatedSource.slice(exchangeIdx, exchangeIdx + 1500);
+    expect(exchangeBlock).toMatch(/requestType: T\d+_StatusRequest/);
+    expect(exchangeBlock).toMatch(/responseType: T\d+_StatusEvent/);
   });
 
   it('detects acceptsCtx from CallContext parameter type', () => {

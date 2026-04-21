@@ -1,4 +1,4 @@
-import { Service, Rpc, ServerStream, CallContext } from '@aster-rpc/aster';
+import { Service, Rpc, ServerStream, ClientStream, BidiStream, CallContext } from '@aster-rpc/aster';
 import { StatusRequest, StatusResponse, WatchRequest, StatusEvent } from './types.js';
 
 @Service({ name: 'MissionControl', version: 1 })
@@ -20,6 +20,18 @@ export class MissionControlService {
   @ServerStream()
   async *watchStatus(req: WatchRequest): AsyncGenerator<StatusEvent> {
     void req;
+    yield new StatusEvent();
+  }
+
+  @ClientStream()
+  async ingestEvents(stream: AsyncIterable<StatusEvent>): Promise<StatusResponse> {
+    for await (const _ of stream) void _;
+    return new StatusResponse();
+  }
+
+  @BidiStream()
+  async *exchange(stream: AsyncIterable<StatusRequest>): AsyncGenerator<StatusEvent> {
+    for await (const _ of stream) void _;
     yield new StatusEvent();
   }
 }

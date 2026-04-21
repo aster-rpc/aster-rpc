@@ -168,10 +168,15 @@ export function BUILD_ALL_TYPES(
     );
     // entry.ctor is the actual class constructor from WIRE_TYPES.
     // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
+    const proto = entry.ctor.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(entry.ctor);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/Assignment", typeStruct);
@@ -188,10 +193,15 @@ export function BUILD_ALL_TYPES(
     );
     // entry.ctor is the actual class constructor from WIRE_TYPES.
     // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
+    const proto = entry.ctor.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(entry.ctor);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/Command", typeStruct);
@@ -210,10 +220,15 @@ export function BUILD_ALL_TYPES(
     );
     // entry.ctor is the actual class constructor from WIRE_TYPES.
     // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
+    const proto = entry.ctor.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(entry.ctor);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/CommandResult", typeStruct);
@@ -232,10 +247,15 @@ export function BUILD_ALL_TYPES(
     );
     // entry.ctor is the actual class constructor from WIRE_TYPES.
     // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
+    const proto = entry.ctor.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(entry.ctor);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/Heartbeat", typeStruct);
@@ -253,10 +273,15 @@ export function BUILD_ALL_TYPES(
     );
     // entry.ctor is the actual class constructor from WIRE_TYPES.
     // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
+    const proto = entry.ctor.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(entry.ctor);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/IngestResult", typeStruct);
@@ -276,10 +301,15 @@ export function BUILD_ALL_TYPES(
     );
     // entry.ctor is the actual class constructor from WIRE_TYPES.
     // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
+    const proto = entry.ctor.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(entry.ctor);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/LogEntry", typeStruct);
@@ -299,10 +329,15 @@ export function BUILD_ALL_TYPES(
     );
     // entry.ctor is the actual class constructor from WIRE_TYPES.
     // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
+    const proto = entry.ctor.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(entry.ctor);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/MetricPoint", typeStruct);
@@ -319,10 +354,15 @@ export function BUILD_ALL_TYPES(
     );
     // entry.ctor is the actual class constructor from WIRE_TYPES.
     // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
+    const proto = entry.ctor.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(entry.ctor);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/StatusRequest", typeStruct);
@@ -366,10 +406,15 @@ export function BUILD_ALL_TYPES(
     );
     // entry.ctor is the actual class constructor from WIRE_TYPES.
     // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
+    const proto = entry.ctor.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(entry.ctor);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/SubmitLogResult", typeStruct);
@@ -387,10 +432,15 @@ export function BUILD_ALL_TYPES(
     );
     // entry.ctor is the actual class constructor from WIRE_TYPES.
     // initMeta can only be called once per class (sets non-configurable property).
-    try {
-      typeStruct.initMeta(entry.ctor);
-    } catch (e: any) {
-      // already initialized — skip
+    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
+    const proto = entry.ctor.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(entry.ctor);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/TailRequest", typeStruct);
@@ -461,7 +511,7 @@ export const SERVICES = [
     {
       name: "ingestMetrics",
       pattern: RpcPattern.CLIENT_STREAM,
-      requestType: undefined,
+      requestType: T6_MetricPoint,
       responseType: T4_IngestResult,
       acceptsCtx: false,
       idempotent: false,
@@ -469,9 +519,9 @@ export const SERVICES = [
       serialization: undefined,
       requires: undefined,
       metadata: undefined,
-      requestFields: [],
+      requestFields: [{"name":"name","type":"str","required":true,"default":""},{"name":"value","type":"float","required":true,"default":0},{"name":"timestamp","type":"float","required":true,"default":0},{"name":"tags","type":"dict","required":true,"default":{}}],
       responseFields: [{"name":"accepted","type":"float","required":true,"default":0},{"name":"dropped","type":"float","required":true,"default":0}],
-      requestTypeHash: undefined,
+      requestTypeHash: new Uint8Array([0x13, 0x86, 0x9d, 0x74, 0xe3, 0x16, 0x9c, 0x25, 0x52, 0x1b, 0x55, 0x15, 0x71, 0x21, 0x20, 0xf4, 0x3e, 0x4a, 0xaf, 0x82, 0x1f, 0x6d, 0xcb, 0xfd, 0xf9, 0x10, 0x31, 0xda, 0xda, 0x31, 0xa5, 0x6f]),
       responseTypeHash: new Uint8Array([0x7e, 0xd8, 0xdc, 0xfc, 0x88, 0x99, 0xde, 0xe4, 0x0f, 0xf9, 0x07, 0xb2, 0x0a, 0xff, 0x00, 0x20, 0xbd, 0x0a, 0xfc, 0x4e, 0x93, 0x9f, 0x3d, 0x06, 0xfe, 0xcf, 0xd2, 0xdb, 0x12, 0x1d, 0x37, 0x6d]),
     },
     ],
@@ -520,7 +570,7 @@ export const SERVICES = [
     {
       name: "runCommand",
       pattern: RpcPattern.BIDI_STREAM,
-      requestType: undefined,
+      requestType: T1_Command,
       responseType: T2_CommandResult,
       acceptsCtx: false,
       idempotent: false,
@@ -528,9 +578,9 @@ export const SERVICES = [
       serialization: undefined,
       requires: undefined,
       metadata: undefined,
-      requestFields: [],
+      requestFields: [{"name":"command","type":"str","required":true,"default":""}],
       responseFields: [{"name":"stdout","type":"str","required":true,"default":""},{"name":"stderr","type":"str","required":true,"default":""},{"name":"exit_code","type":"float","required":true,"default":0}],
-      requestTypeHash: undefined,
+      requestTypeHash: new Uint8Array([0x55, 0xb7, 0x9e, 0x20, 0x56, 0xcb, 0xb1, 0x10, 0x40, 0x40, 0xca, 0x22, 0x94, 0xa4, 0x77, 0xe1, 0xab, 0x38, 0xb7, 0x08, 0x68, 0x6a, 0x73, 0x2c, 0xcb, 0x87, 0x08, 0x70, 0xa7, 0x31, 0xff, 0xa2]),
       responseTypeHash: new Uint8Array([0x8b, 0x76, 0xe3, 0x9f, 0xd9, 0xb2, 0xf2, 0xbf, 0x7b, 0xf9, 0x31, 0x39, 0x9e, 0x19, 0xfa, 0xde, 0x4a, 0x64, 0x2f, 0x2e, 0x9d, 0x69, 0x1a, 0xce, 0x0b, 0x69, 0xce, 0x0f, 0x5b, 0x85, 0x16, 0x11]),
     },
     ],
@@ -595,7 +645,7 @@ export const SERVICES = [
     {
       name: "ingestMetrics",
       pattern: RpcPattern.CLIENT_STREAM,
-      requestType: undefined,
+      requestType: T6_MetricPoint,
       responseType: T4_IngestResult,
       acceptsCtx: false,
       idempotent: false,
@@ -603,9 +653,9 @@ export const SERVICES = [
       serialization: undefined,
       requires: undefined,
       metadata: undefined,
-      requestFields: [],
+      requestFields: [{"name":"name","type":"str","required":true,"default":""},{"name":"value","type":"float","required":true,"default":0},{"name":"timestamp","type":"float","required":true,"default":0},{"name":"tags","type":"dict","required":true,"default":{}}],
       responseFields: [{"name":"accepted","type":"float","required":true,"default":0},{"name":"dropped","type":"float","required":true,"default":0}],
-      requestTypeHash: undefined,
+      requestTypeHash: new Uint8Array([0x13, 0x86, 0x9d, 0x74, 0xe3, 0x16, 0x9c, 0x25, 0x52, 0x1b, 0x55, 0x15, 0x71, 0x21, 0x20, 0xf4, 0x3e, 0x4a, 0xaf, 0x82, 0x1f, 0x6d, 0xcb, 0xfd, 0xf9, 0x10, 0x31, 0xda, 0xda, 0x31, 0xa5, 0x6f]),
       responseTypeHash: new Uint8Array([0x7e, 0xd8, 0xdc, 0xfc, 0x88, 0x99, 0xde, 0xe4, 0x0f, 0xf9, 0x07, 0xb2, 0x0a, 0xff, 0x00, 0x20, 0xbd, 0x0a, 0xfc, 0x4e, 0x93, 0x9f, 0x3d, 0x06, 0xfe, 0xcf, 0xd2, 0xdb, 0x12, 0x1d, 0x37, 0x6d]),
     },
     ],
@@ -654,7 +704,7 @@ export const SERVICES = [
     {
       name: "runCommand",
       pattern: RpcPattern.BIDI_STREAM,
-      requestType: undefined,
+      requestType: T1_Command,
       responseType: T2_CommandResult,
       acceptsCtx: false,
       idempotent: false,
@@ -662,9 +712,9 @@ export const SERVICES = [
       serialization: undefined,
       requires: undefined,
       metadata: undefined,
-      requestFields: [],
+      requestFields: [{"name":"command","type":"str","required":true,"default":""}],
       responseFields: [{"name":"stdout","type":"str","required":true,"default":""},{"name":"stderr","type":"str","required":true,"default":""},{"name":"exit_code","type":"float","required":true,"default":0}],
-      requestTypeHash: undefined,
+      requestTypeHash: new Uint8Array([0x55, 0xb7, 0x9e, 0x20, 0x56, 0xcb, 0xb1, 0x10, 0x40, 0x40, 0xca, 0x22, 0x94, 0xa4, 0x77, 0xe1, 0xab, 0x38, 0xb7, 0x08, 0x68, 0x6a, 0x73, 0x2c, 0xcb, 0x87, 0x08, 0x70, 0xa7, 0x31, 0xff, 0xa2]),
       responseTypeHash: new Uint8Array([0x8b, 0x76, 0xe3, 0x9f, 0xd9, 0xb2, 0xf2, 0xbf, 0x7b, 0xf9, 0x31, 0x39, 0x9e, 0x19, 0xfa, 0xde, 0x4a, 0x64, 0x2f, 0x2e, 0x9d, 0x69, 0x1a, 0xce, 0x0b, 0x69, 0xce, 0x0f, 0x5b, 0x85, 0x16, 0x11]),
     },
     ],
