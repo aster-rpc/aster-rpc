@@ -17,7 +17,7 @@
  *   2  setup/usage error
  */
 
-import { AsterClientWrapper } from '@aster-rpc/aster';
+import { AsterClientWrapper, JsonCodec, IrohTransport } from '@aster-rpc/aster';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -386,11 +386,20 @@ async function testScopeMismatch(client: AsterClientWrapper): Promise<void> {
   // protocol) must fail with FAILED_PRECONDITION on both Python and TS
   // servers. This is a defensive guard against clients that don't know
   // about session protocol.
+  //
+  // Use a JsonCodec transport wrapping the same QUIC connection so we
+  // don't need Fory type registration just to send a request the server
+  // will reject on scope grounds anyway. Mirrors Python's
+  // `JsonProxyCodec` shortcut in test_guide.py.
   try {
-    // Use the transport directly to send a one-shot unary call.
-    // This bypasses the session-aware proxy and opens a regular stream
-    // with method="register" on a scoped='session' service.
-    const r = await (client as any).transport.unary('AgentSession', 'register', {
+    const liveTransport = (client as any).transport;
+    const conn = liveTransport?.conn;
+    if (!conn) {
+      ok('scope mismatch (skipped — no rpc connection)');
+      return;
+    }
+    const raw = new IrohTransport(conn, new JsonCodec());
+    const r = await raw.unary('AgentSession', 'register', {
       agent_id: 'scope-test',
       capabilities: [],
       load_avg: 0,

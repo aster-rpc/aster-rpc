@@ -108,6 +108,23 @@ export class JsonCodec implements Codec {
   }
 
   decode(payload: Uint8Array, hintType?: unknown): unknown {
+    // Fall back to Fory XLANG when the first byte isn't '{' (0x7B).
+    // A JSON-codec client may receive Fory-encoded protocol frames
+    // (e.g. RpcStatus error trailers) from a server whose default
+    // codec is XLANG Fory; mirroring Python's JsonProxyCodec keeps
+    // the scope-mismatch and admission paths decodable when the
+    // client hasn't registered any types with Fory.
+    if (payload.length > 0 && payload[0] !== 0x7b /* '{' */) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { createXlangCodec } = require('./xlang.js');
+        const fallback = createXlangCodec();
+        return fallback.decode(payload, hintType);
+      } catch {
+        // Fory decode failed too — fall through to JSON parse so the
+        // caller sees a meaningful error.
+      }
+    }
     const parsed = JSON.parse(this.decoder.decode(payload));
     if (hintType && typeof hintType === 'function') {
       validateContractShape(parsed, hintType as new (...args: any[]) => any);

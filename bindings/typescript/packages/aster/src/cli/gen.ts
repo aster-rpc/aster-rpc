@@ -1116,11 +1116,18 @@ ${fieldExprs}
   // BUILD_ALL_TYPES: constructs and registers all Fory type structs using
   // Type.struct(), in dependency order (leaves first via topological sort).
   //
-  // Iterates over WIRE_TYPES so that entry.ctor is the actual class ref
-  // (not a string that needs Function() eval). For 'ref' fields, looks up
-  // the target type from typesByTag by refTag — all deps are registered
-  // before their referrers because wireTypes is topologically sorted.
+  // Each block references the class by its aliased import name directly
+  // (NOT via a shared `entry` loop variable — a previous version of this
+  // emitter wrapped the blocks in `for (const entry of WIRE_TYPES)` and
+  // used `entry.ctor`, which meant every block after the first in a given
+  // iteration silently skipped initMeta and registered a struct with
+  // `options.creator === undefined`, causing cross-process decodes to
+  // crash with `new options.creator()` undefined). For 'ref' fields,
+  // looks up the target type from typesByTag by refTag — all deps are
+  // registered before their referrers because wireTypes is topologically
+  // sorted.
   const buildAllTypesBody = wireTypes.map(w => {
+    const ctorAlias = aliasFor.get(w.sym)!;
     const fieldsCode = w.fields.map(f => {
       function fieldToTypeExpr(fld: typeof f): string {
         const wrap = fld.nullable ? 'Type.optional(' : '';
@@ -1143,21 +1150,19 @@ ${fieldExprs}
     }).join(',\n');
     return `  // ${w.tag}
   {
-    const [ns, typeName] = ${JSON.stringify(w.tag)}.split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: ${JSON.stringify(w.tag.split('/')[0] ?? '')}, typeName: ${JSON.stringify(w.tag.split('/')[1] ?? w.tag)} },
       {
 ${fieldsCode}
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = ${ctorAlias}.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(${ctorAlias});
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -1176,8 +1181,8 @@ ${entries.join('\n')}
  * Build and register all @WireType classes with Fory, using Type.struct()
  * to describe each struct's fields with explicit wire types.
  *
- * Iterates over WIRE_TYPES so that entry.ctor is the actual class ref.
- * For 'ref' fields, looks up the target type from typesByTag by refTag.
+ * Each block references its class by aliased import name directly. For
+ * 'ref' fields, looks up the target type from typesByTag by refTag.
  * Types are registered in topological order (leaves first), so all
  * dependencies are available when any given type is being registered.
  *
@@ -1191,9 +1196,7 @@ export function BUILD_ALL_TYPES(
   codec: { registerType(typeInfo: any): void },
 ): Map<string, any> {
   const typesByTag = new Map();
-  for (const entry of WIRE_TYPES) {
 ${buildAllTypesBody}
-  }
   return typesByTag;
 }
 `;

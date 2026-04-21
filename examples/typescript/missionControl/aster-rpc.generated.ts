@@ -161,8 +161,8 @@ export const WIRE_TYPES = [
  * Build and register all @WireType classes with Fory, using Type.struct()
  * to describe each struct's fields with explicit wire types.
  *
- * Iterates over WIRE_TYPES so that entry.ctor is the actual class ref.
- * For 'ref' fields, looks up the target type from typesByTag by refTag.
+ * Each block references its class by aliased import name directly. For
+ * 'ref' fields, looks up the target type from typesByTag by refTag.
  * Types are registered in topological order (leaves first), so all
  * dependencies are available when any given type is being registered.
  *
@@ -176,25 +176,22 @@ export function BUILD_ALL_TYPES(
   codec: { registerType(typeInfo: any): void },
 ): Map<string, any> {
   const typesByTag = new Map();
-  for (const entry of WIRE_TYPES) {
   // mission/Assignment
   {
-    const [ns, typeName] = "mission/Assignment".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "Assignment" },
       {
       "task_id": Type.string(),
       "command": Type.string()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T0_Assignment.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T0_Assignment);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -205,21 +202,19 @@ export function BUILD_ALL_TYPES(
   }
   // mission/Command
   {
-    const [ns, typeName] = "mission/Command".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "Command" },
       {
       "command": Type.string()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T1_Command.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T1_Command);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -230,9 +225,8 @@ export function BUILD_ALL_TYPES(
   }
   // mission/CommandResult
   {
-    const [ns, typeName] = "mission/CommandResult".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "CommandResult" },
       {
       "stdout": Type.string(),
       "stderr": Type.string(),
@@ -240,13 +234,12 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T2_CommandResult.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T2_CommandResult);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -257,9 +250,8 @@ export function BUILD_ALL_TYPES(
   }
   // mission/Heartbeat
   {
-    const [ns, typeName] = "mission/Heartbeat".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "Heartbeat" },
       {
       "agent_id": Type.string(),
       "capabilities": Type.array(Type.string()),
@@ -267,13 +259,12 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T3_Heartbeat.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T3_Heartbeat);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -284,22 +275,20 @@ export function BUILD_ALL_TYPES(
   }
   // mission/IngestResult
   {
-    const [ns, typeName] = "mission/IngestResult".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "IngestResult" },
       {
       "accepted": Type.float64(),
       "dropped": Type.float64()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T4_IngestResult.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T4_IngestResult);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -310,9 +299,8 @@ export function BUILD_ALL_TYPES(
   }
   // mission/LogEntry
   {
-    const [ns, typeName] = "mission/LogEntry".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "LogEntry" },
       {
       "timestamp": Type.float64(),
       "level": Type.string(),
@@ -321,13 +309,12 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T5_LogEntry.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T5_LogEntry);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -338,9 +325,8 @@ export function BUILD_ALL_TYPES(
   }
   // mission/MetricPoint
   {
-    const [ns, typeName] = "mission/MetricPoint".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "MetricPoint" },
       {
       "name": Type.string(),
       "value": Type.float64(),
@@ -349,13 +335,12 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T6_MetricPoint.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T6_MetricPoint);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -366,21 +351,19 @@ export function BUILD_ALL_TYPES(
   }
   // mission/StatusRequest
   {
-    const [ns, typeName] = "mission/StatusRequest".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "StatusRequest" },
       {
       "agent_id": Type.string()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T7_StatusRequest.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T7_StatusRequest);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -391,9 +374,8 @@ export function BUILD_ALL_TYPES(
   }
   // mission/StatusResponse
   {
-    const [ns, typeName] = "mission/StatusResponse".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "StatusResponse" },
       {
       "agent_id": Type.string(),
       "status": Type.string(),
@@ -401,13 +383,12 @@ export function BUILD_ALL_TYPES(
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T8_StatusResponse.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T8_StatusResponse);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -418,21 +399,19 @@ export function BUILD_ALL_TYPES(
   }
   // mission/SubmitLogResult
   {
-    const [ns, typeName] = "mission/SubmitLogResult".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "SubmitLogResult" },
       {
       "accepted": Type.bool()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T9_SubmitLogResult.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T9_SubmitLogResult);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -443,22 +422,20 @@ export function BUILD_ALL_TYPES(
   }
   // mission/TailRequest
   {
-    const [ns, typeName] = "mission/TailRequest".split('/');
     const typeStruct = Type.struct(
-      { namespace: ns, typeName },
+      { namespace: "mission", typeName: "TailRequest" },
       {
       "agent_id": Type.string(),
       "level": Type.string()
       },
       { withConstructor: true },
     );
-    // entry.ctor is the actual class constructor from WIRE_TYPES.
-    // initMeta can only be called once per class (sets non-configurable property).
-    // Skip if already initialized (prototype already has ForyTypeInfoSymbol set).
-    const proto = entry.ctor.prototype;
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T10_TailRequest.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(entry.ctor);
+        typeStruct.initMeta(T10_TailRequest);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -466,7 +443,6 @@ export function BUILD_ALL_TYPES(
     }
     codec.registerType(typeStruct);
     typesByTag.set("mission/TailRequest", typeStruct);
-  }
   }
   return typesByTag;
 }
