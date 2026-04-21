@@ -185,6 +185,9 @@ export {
   type ResolvedForyConfig,
 } from './codec.js';
 
+// XLANG Fory helpers
+export { createXlangCodec, getXlangForyAndType, newXlangFory } from './xlang.js';
+
 // Transport
 export {
   type AsterTransport,

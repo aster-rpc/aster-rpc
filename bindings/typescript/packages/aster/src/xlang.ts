@@ -37,6 +37,19 @@ export function getXlangForyAndType(): { fory: any; Type: any } {
 }
 
 /**
+ * Build a fresh, uncached Fory instance + Type helper. Primarily for tests
+ * that need isolation between register calls; production code should use
+ * {@link getXlangForyAndType}.
+ */
+export function newXlangFory(): { fory: any; Type: any } {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const foryModule = require('@apache-fory/core');
+  const Fory = foryModule.default;
+  const Type = foryModule.Type;
+  return { fory: new Fory({ ref: true }), Type };
+}
+
+/**
  * Create a ForyCodec pre-configured for cross-language (XLANG) interop.
  *
  * Registers the Aster protocol types (StreamHeader, CallHeader, RpcStatus)

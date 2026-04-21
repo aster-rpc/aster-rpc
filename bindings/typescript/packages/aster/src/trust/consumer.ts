@@ -39,8 +39,9 @@ export interface ServiceSummary {
   channels?: Record<string, string>;
   /** Serialization modes the server supports for this service.
    *  Values: "xlang" (Fory), "json", "row", "native". A consumer must
-   *  pick one of these for any RPC call. The TypeScript binding only
-   *  publishes "json" because Fory JS is not yet XLANG-compliant. */
+   *  pick one of these for any RPC call. TS clients default to Fory
+   *  when the server advertises both xlang and json; the JSON-only
+   *  fallback path is retained for legacy servers and is deprecated. */
   serializationModes?: string[];
 }
 
@@ -119,10 +120,23 @@ export async function performAdmission(
     throw new Error('admission failed: server returned empty response (may be overloaded, retry)');
   }
   const d = JSON.parse(respText);
+  // Wire format uses snake_case; normalise ServiceSummary fields to the TS
+  // camelCase shape so `summary.contractId` / `summary.serializationModes`
+  // are populated (dynamic proxy reads these to fetch the manifest).
+  const rawServices: any[] = d.services ?? [];
+  const services: ServiceSummary[] = rawServices.map((s: any) => ({
+    name: s.name,
+    version: s.version,
+    contractId: s.contractId ?? s.contract_id ?? '',
+    pattern: s.pattern,
+    methods: s.methods ?? [],
+    channels: s.channels,
+    serializationModes: s.serializationModes ?? s.serialization_modes,
+  }));
   const response: ConsumerAdmissionResponse = {
     admitted: d.admitted,
     reason: d.reason,
-    services: d.services ?? [],
+    services,
     registryNamespace: d.registry_namespace ?? d.registryNamespace ?? '',
     attributes: d.attributes ?? {},
     rootPubkey: d.root_pubkey ?? d.rootPubkey ?? '',

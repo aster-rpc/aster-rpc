@@ -260,7 +260,6 @@ export interface RegisterGeneratedOptions {
  * Calling this more than once is safe — later calls overwrite any
  * previous registration for the same class.
  */
-let _registerGeneratedCallCount = 0;
 export function registerGenerated(opts: RegisterGeneratedOptions): void {
   // Phase 1: wire types — shape registry + WIRE_TYPE_KEY + optional Fory.
   for (const shape of opts.WIRE_TYPES) {

@@ -50,7 +50,7 @@ if (!address) {
 const memStart = memMB();
 const client = new AsterClientWrapper({ address });
 await client.connect();
-const mc = client.proxy("MissionControl");
+const mc = await client.proxy("MissionControl");
 
 console.log(`Connected to ${address.slice(0, 30)}...`);
 console.log(`Client memory at start: ${memStart.toFixed(1)} MB`);

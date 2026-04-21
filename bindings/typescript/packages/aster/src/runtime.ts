@@ -388,7 +388,7 @@ export class AsterServer {
         const ticket = bc.createCollectionTicket(collectionHash);
 
         // Write ArtifactRef to registry doc
-        const { contractKey, versionKey } = await import('./registry/keys.js');
+        const { contractKey, manifestKey, versionKey } = await import('./registry/keys.js');
         const artifactRef = {
           contract_id: contractId,
           collection_hash: collectionHash,
@@ -408,7 +408,7 @@ export class AsterServer {
         const { manifestToJson } = await import('./contract/manifest.js');
         await registryDoc.setBytes(
           authorId,
-          `manifests/${contractId}`,
+          manifestKey(contractId),
           Buffer.from(encoder.encode(manifestToJson(manifest))),
         );
 
@@ -1111,6 +1111,23 @@ export class AsterClientWrapper {
     WIRE_TYPES: readonly any[];
     buildAllTypes?: (fory: any, Type: any, codec: any) => Map<string, any>;
   };
+  // Populated lazily on the first dynamic-proxy / session call. Typed
+  // clients don't need the registry doc, so we avoid the join cost at
+  // connect() time and pay it only when someone actually calls proxy().
+  private _registryDoc: any = null;
+  private _registryJoinPromise: Promise<any> | null = null;
+  private _manifestCache: Map<string, ContractManifest> = new Map();
+  // Remote endpoint id (hex) captured during connect() so the dynamic
+  // proxy path can join the producer's registry doc via
+  // docsClient.joinAndSubscribeNamespace(namespace, peer).
+  private _remoteEndpointId = '';
+  // The codec picked in connect() — held here so the dynamic proxy /
+  // session path can register manifest-derived types against the same
+  // Fory instance the underlying IrohTransport is already using.
+  private _codec: any = null;
+  // Wire-tags already registered with the codec via DynamicTypeFactory,
+  // so concurrent proxy() / session() calls don't double-register.
+  private _dynamicRegisteredTags: Set<string> = new Set();
 
   constructor(opts: AsterClientOptions) {
     this.config = { ...configFromEnv(), ...opts.config } as AsterConfig;
@@ -1242,6 +1259,8 @@ export class AsterClientWrapper {
       endpointId = this._address;
     }
 
+    this._remoteEndpointId = endpointId;
+
     const directAddrs = allDirectAddrs.length ? allDirectAddrs : undefined;
 
     // Helper: connect using full address info when available, else bare endpoint ID
@@ -1292,6 +1311,7 @@ export class AsterClientWrapper {
       return modes.includes('json') && !modes.includes('xlang');
     });
     const codec = allJsonOnly ? new JsonCodec() : createXlangCodec();
+    this._codec = codec;
 
     // If ForyCodec and generated metadata provided, register wire types
     // so the client can encode requests without "Failed to detect Fory type" errors.
@@ -1320,22 +1340,211 @@ export class AsterClientWrapper {
   /**
    * Create a dynamic proxy client for a service.
    *
+   * On the first call per service, fetches the producer's published
+   * manifest from the registry doc, synthesises request/response types
+   * via {@link DynamicTypeFactory}, and registers them with the Fory
+   * codec so proxy calls speak the same wire as the typed client.
+   * Subsequent `proxy(sameName)` calls reuse the cached registration.
+   *
    * @example
    * ```ts
-   * const mc = client.proxy("MissionControl");
+   * const mc = await client.proxy("MissionControl");
    * const result = await mc.getStatus({ agentId: "edge-1" });
    * console.log(result.status);
    * ```
    */
-  proxy(serviceName: string): ProxyClient {
-    // Check if this is a session-scoped service from the admission summary.
-    // If so, return a SessionProxyClient that multiplexes calls over a
-    // single bidi stream using the session protocol.
+  async proxy(serviceName: string): Promise<ProxyClient> {
     const summary = this._services.find(s => s.name === serviceName);
+    const hintTypes = await this._registerDynamicTypesForService(summary);
     if (summary && (summary.pattern === 'session' || summary.pattern === 'stream')) {
-      return new SessionProxyClient(serviceName, this._node, this.transport) as any;
+      return new SessionProxyClient(
+        serviceName, this._node, this.transport, this._codec, hintTypes,
+      ) as any;
     }
-    return new ProxyClient(serviceName, this.transport);
+    return new ProxyClient(serviceName, this.transport, hintTypes);
+  }
+
+  /**
+   * Join the producer's registry doc lazily on first dynamic call.
+   * Typed clients (generated from the contract) don't need it, so we
+   * avoid the cost at connect() time.
+   */
+  private async ensureRegistryDoc(): Promise<any | null> {
+    if (this._registryDoc) return this._registryDoc;
+    if (!this._registryNamespace || !this._node) return null;
+    if (!this._remoteEndpointId) return null;
+    if (this._registryJoinPromise) return this._registryJoinPromise;
+
+    this._registryJoinPromise = (async () => {
+      try {
+        const dc = this._node.docsClient();
+        const result = await dc.joinAndSubscribeNamespace(
+          this._registryNamespace,
+          this._remoteEndpointId,
+        );
+        const doc = result.takeDoc();
+        const events = result.takeEvents();
+
+        // Best-effort sync wait: bail out when sync_finished arrives or a
+        // contracts/ entry shows up, whichever comes first. Short total
+        // deadline because the producer writes these synchronously on
+        // startup so the initial pull is usually quick.
+        const deadline = Date.now() + 6000;
+        while (Date.now() < deadline) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) break;
+          const waitMs = Math.min(remaining, 1000);
+          const ev = await Promise.race<any>([
+            events.recv(),
+            new Promise<null>(r => setTimeout(() => r(null), waitMs)),
+          ]);
+          if (ev && ev.kind === 'sync_finished') {
+            await new Promise(r => setTimeout(r, 100));
+            break;
+          }
+          if (!ev) {
+            try {
+              const entries: string[] = await doc.queryKeyPrefix('contracts/');
+              if (entries.length) break;
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+        this._registryDoc = doc;
+        return doc;
+      } catch (e) {
+        this._registryJoinPromise = null;
+        throw e;
+      }
+    })();
+    return this._registryJoinPromise;
+  }
+
+  /**
+   * Fetch and cache a contract manifest for ``(serviceName, version)``.
+   * Tries the ``manifests/{contractId}`` shortcut first, falls back to the
+   * blob collection via ``fetchContract`` when the shortcut is missing.
+   */
+  private async ensureManifest(
+    serviceName: string,
+    version: number,
+  ): Promise<ContractManifest | null> {
+    const key = `${serviceName}/v${version}`;
+    const cached = this._manifestCache.get(key);
+    if (cached) return cached;
+
+    const summary = this._services.find(
+      s => s.name === serviceName && s.version === version,
+    );
+    if (!summary || !summary.contractId) return null;
+
+    const doc = await this.ensureRegistryDoc();
+    if (!doc) return null;
+
+    const { manifestFromJson } = await import('./contract/manifest.js');
+    const { contractKey, manifestKey } = await import('./registry/keys.js');
+
+    let manifest: ContractManifest | null = null;
+
+    // Fast path: inline shortcut.
+    try {
+      const entries: string[] = await doc.queryKeyExact(manifestKey(summary.contractId));
+      if (entries.length) {
+        const contentHash = entries[0].split(':').slice(-1)[0];
+        const bytes: Buffer = await doc.readEntryContent(contentHash);
+        manifest = manifestFromJson(new TextDecoder().decode(bytes));
+      }
+    } catch {
+      /* fall through to slow path */
+    }
+
+    // Slow path: read ArtifactRef → fetch collection from blobs.
+    if (!manifest) {
+      try {
+        const entries: string[] = await doc.queryKeyExact(contractKey(summary.contractId));
+        if (entries.length) {
+          const contentHash = entries[0].split(':').slice(-1)[0];
+          const bytes: Buffer = await doc.readEntryContent(contentHash);
+          const artifactRef = JSON.parse(new TextDecoder().decode(bytes));
+          const collectionHash = artifactRef.collection_hash;
+          if (collectionHash) {
+            const { fetchContract } = await import('./contract/publication.js');
+            const blobs = this._node.blobsClient();
+            manifest = await fetchContract(blobs, collectionHash);
+          }
+        }
+      } catch {
+        /* surface as "no manifest available" */
+      }
+    }
+
+    if (manifest) this._manifestCache.set(key, manifest);
+    return manifest;
+  }
+
+  /**
+   * Register request/response types for a service against the live Fory
+   * codec, so dynamic proxy / session calls encode as Fory XLANG instead
+   * of failing with "Failed to detect Fory type" on a plain object.
+   * No-op when the service advertises json-only, or when the codec is
+   * not Fory (shell-style JsonCodec path).
+   */
+  private async _registerDynamicTypesForService(
+    summary: ServiceSummary | undefined,
+  ): Promise<Map<string, new (init?: any) => any> | undefined> {
+    if (!summary) return undefined;
+    if (!this._codec || typeof this._codec.registerType !== 'function') return undefined;
+    const modes = summary.serializationModes;
+    if (modes && modes.length > 0 && !modes.includes('xlang')) return undefined;
+
+    const manifest = await this.ensureManifest(summary.name, summary.version);
+    if (!manifest || !manifest.methods?.length) return undefined;
+
+    const methods = manifest.methods as unknown as ManifestMethod[];
+
+    try {
+      const { DynamicTypeFactory } = await import('./dynamic.js');
+      const { fory, Type } = getXlangForyAndType();
+      const factory = new DynamicTypeFactory();
+
+      // Only run the Fory registration the first time we see each wire
+      // tag — factory.registerWithFory is idempotent but the codec
+      // dedupes by typename, so doing it once per tag is cheaper.
+      const needsRegister = methods.some(m =>
+        (m.requestWireTag && !this._dynamicRegisteredTags.has(m.requestWireTag))
+        || (m.responseWireTag && !this._dynamicRegisteredTags.has(m.responseWireTag)),
+      );
+      if (needsRegister) {
+        factory.registerWithFory(methods, fory, Type, this._codec);
+        for (const m of methods) {
+          if (m.requestWireTag) this._dynamicRegisteredTags.add(m.requestWireTag);
+          if (m.responseWireTag) this._dynamicRegisteredTags.add(m.responseWireTag);
+        }
+      } else {
+        // Need class handles even on the cached path; populate factory
+        // types without re-registering with Fory.
+        for (const m of methods) {
+          if (m.requestWireTag) factory.synthesizeForMethod(m);
+          if (m.responseWireTag) factory.synthesizeForMethod(m);
+        }
+      }
+
+      // Build {methodName → request ctor} so the ProxyClient can thread
+      // the class as Fory `hintType` at call time. Without this, Fory's
+      // encode(plainObject) fails with "Failed to detect the Fory type".
+      const hintTypes = new Map<string, new (init?: any) => any>();
+      for (const m of methods) {
+        if (!m.requestWireTag) continue;
+        const cls = factory.get(m.requestWireTag);
+        if (cls) hintTypes.set(m.name, cls as unknown as new (init?: any) => any);
+      }
+      return hintTypes;
+    } catch {
+      // Swallow and let the call fail at encode time with a clearer
+      // error — better than a partially-registered codec state.
+      return undefined;
+    }
   }
 
   /** Reconnect with exponential backoff. */
@@ -1399,29 +1608,50 @@ export class ProxyClient {
   constructor(
     private readonly serviceName: string,
     private readonly transport: AsterTransport,
+    // Optional: per-method request class used as Fory `hintType`. When
+    // present, a plain-dict payload is wrapped into a typed instance
+    // inside the codec so Fory can detect the wire tag. Populated by
+    // `AsterClientWrapper.proxy()` from manifest-synthesised types.
+    private readonly _hintTypes?: Map<string, new (init?: any) => any>,
   ) {
     return new Proxy(this, {
       get(target, prop: string) {
         if (prop in target || typeof prop === 'symbol') {
           return (target as any)[prop];
         }
-        return _proxyMethod(target.serviceName, prop, target.transport);
+        // `await client.proxy(name)` returns a Promise<ProxyClient>; when it
+        // resolves, the Promise machinery sniffs `.then` on the result to
+        // check if it's a thenable and chain. Our Proxy's default behaviour
+        // synthesises a fn for any string prop — so `.then` would look like
+        // a fn, the runtime would call `.then(resolve, reject)`, and our
+        // _proxyMethod would treat `resolve` as the RPC payload. Explicitly
+        // short-circuit Promise-chain property names to `undefined` so the
+        // resolved value is treated as a plain object.
+        if (prop === 'then' || prop === 'catch' || prop === 'finally') {
+          return undefined;
+        }
+        const hintType = target._hintTypes?.get(prop);
+        return _proxyMethod(target.serviceName, prop, target.transport, hintType);
       },
     });
   }
 }
 
 /** A bound proxy method supporting all RPC patterns. */
-function _proxyMethod(serviceName: string, methodName: string, transport: AsterTransport) {
+function _proxyMethod(
+  serviceName: string,
+  methodName: string,
+  transport: AsterTransport,
+  hintType?: new (init?: any) => any,
+) {
   // The callable: detects async iterables for client streaming, else unary
   const fn = async (payload?: unknown) => {
     // Detect client streaming: payload is an async iterable (but not a plain object)
     if (payload != null && typeof payload === 'object' && Symbol.asyncIterator in payload) {
-      return transport.clientStream(
-        serviceName,
-        methodName,
-        payload as AsyncIterable<unknown>,
-      );
+      const wrapped = hintType
+        ? _wrapAsyncIterable(payload as AsyncIterable<unknown>, hintType)
+        : (payload as AsyncIterable<unknown>);
+      return transport.clientStream(serviceName, methodName, wrapped);
     }
     // Default: unary. If the user accidentally calls a server-streaming
     // method via `await proxy.method(...)`, the underlying transport will
@@ -1429,7 +1659,7 @@ function _proxyMethod(serviceName: string, methodName: string, transport: AsterT
     // frames". Catch that and re-raise with an actionable hint pointing
     // at `proxy.method.stream(...)` / `.bidi()`.
     try {
-      return await transport.unary(serviceName, methodName, payload ?? {});
+      return await transport.unary(serviceName, methodName, payload ?? {}, { hintType });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('multiple response frames')) {
@@ -1448,7 +1678,7 @@ function _proxyMethod(serviceName: string, methodName: string, transport: AsterT
 
   // .stream() — server streaming
   fn.stream = (payload?: unknown): AsyncIterable<unknown> => {
-    return transport.serverStream(serviceName, methodName, payload ?? {});
+    return transport.serverStream(serviceName, methodName, payload ?? {}, { hintType });
   };
 
   // .bidi() — bidirectional streaming. Returns a lazy wrapper so callers
@@ -1456,10 +1686,23 @@ function _proxyMethod(serviceName: string, methodName: string, transport: AsterT
   // mirrors Python's _ProxyBidiChannel behaviour. Opening eagerly here
   // would force every call site to handle the connect failure synchronously.
   fn.bidi = (): ProxyBidiChannel => {
-    return new ProxyBidiChannel(serviceName, methodName, transport);
+    return new ProxyBidiChannel(serviceName, methodName, transport, hintType);
   };
 
   return fn;
+}
+
+async function* _wrapAsyncIterable(
+  source: AsyncIterable<unknown>,
+  ctor: new (init?: any) => any,
+): AsyncIterable<unknown> {
+  for await (const item of source) {
+    if (item && typeof item === 'object' && !Array.isArray(item) && !(item instanceof ctor)) {
+      yield new ctor(item);
+    } else {
+      yield item;
+    }
+  }
 }
 
 /**
@@ -1473,6 +1716,7 @@ export class ProxyBidiChannel {
     private readonly serviceName: string,
     private readonly methodName: string,
     private readonly transport: AsterTransport,
+    private readonly _hintType?: new (init?: any) => any,
   ) {}
 
   async open(): Promise<void> {
@@ -1482,7 +1726,12 @@ export class ProxyBidiChannel {
 
   async send(payload: unknown): Promise<void> {
     if (!this._channel) await this.open();
-    await this._channel!.send(payload);
+    const wired = this._hintType
+      && payload && typeof payload === 'object' && !Array.isArray(payload)
+      && !(payload instanceof this._hintType)
+      ? new this._hintType(payload)
+      : payload;
+    await this._channel!.send(wired);
   }
 
   async close(): Promise<void> {
@@ -1522,12 +1771,16 @@ class SessionProxyClient {
   private readonly _sessionTransport: AsterTransport;
   private _closed = false;
   private static _sessionIdCounter = 0;
+  private readonly _hintTypes?: Map<string, new (init?: any) => any>;
 
   constructor(
     private readonly serviceName: string,
     _node: any,
     transport: AsterTransport,
+    codec?: any,
+    hintTypes?: Map<string, new (init?: any) => any>,
   ) {
+    this._hintTypes = hintTypes;
     // Reach through the v1 transport to get its underlying QUIC
     // connection. We build a fresh transport on the same connection
     // but pinned to a freshly-allocated sessionId, so each outbound
@@ -1541,15 +1794,21 @@ class SessionProxyClient {
       );
     }
     const sessionId = ++SessionProxyClient._sessionIdCounter;
-    // `new IrohTransport(conn, codec, { sessionId })` threads the id
-    // into every StreamHeader this transport writes. JSON codec is
-    // the only one the legacy proxy supported.
-    this._sessionTransport = new IrohTransport(conn, new JsonCodec(), { sessionId });
+    // Reuse the parent transport's codec so manifest-synthesised types
+    // (registered via DynamicTypeFactory at proxy() time) are visible on
+    // this session's stream header frames too. Fall back to the raw
+    // codec on the transport when one isn't supplied explicitly.
+    const activeCodec = codec ?? (transport as any).codec ?? new JsonCodec();
+    this._sessionTransport = new IrohTransport(conn, activeCodec, { sessionId });
 
     return new Proxy(this, {
       get(target, prop: string) {
         if (prop in target || typeof prop === 'symbol') {
           return (target as any)[prop];
+        }
+        // Same thenable guard as ProxyClient — see the comment there.
+        if (prop === 'then' || prop === 'catch' || prop === 'finally') {
+          return undefined;
         }
         return target._sessionMethod(prop);
       },
@@ -1558,14 +1817,16 @@ class SessionProxyClient {
 
   private _sessionMethod(methodName: string) {
     const self = this;
+    const hintType = self._hintTypes?.get(methodName);
     const fn = async (payload?: unknown): Promise<unknown> => {
-      return self._callUnary(methodName, payload ?? {});
+      return self._callUnary(methodName, payload ?? {}, hintType);
     };
     fn.stream = (payload?: unknown): AsyncIterable<unknown> => {
       return self._sessionTransport.serverStream(
         self.serviceName,
         methodName,
         payload ?? {},
+        { hintType },
       );
     };
     fn.bidi = (): ProxyBidiChannel => {
@@ -1577,11 +1838,15 @@ class SessionProxyClient {
     return fn;
   }
 
-  private async _callUnary(method: string, request: unknown): Promise<unknown> {
+  private async _callUnary(
+    method: string,
+    request: unknown,
+    hintType?: new (init?: any) => any,
+  ): Promise<unknown> {
     if (this._closed) {
       throw new RpcError(StatusCode.FAILED_PRECONDITION, 'SessionProxyClient is closed');
     }
-    return await this._sessionTransport.unary(this.serviceName, method, request);
+    return await this._sessionTransport.unary(this.serviceName, method, request, { hintType });
   }
 
   /**

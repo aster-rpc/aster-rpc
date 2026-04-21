@@ -185,7 +185,7 @@ async function testCh4Session(client: AsterClientWrapper): Promise<void> {
   //
   // NOTE: If the proxy client cannot drive session-scoped services in TS yet,
   // this test will surface that as a clear failure.
-  const agent = client.proxy('AgentSession');
+  const agent = await client.proxy('AgentSession');
 
   // 4a: register with GPU
   try {
@@ -256,7 +256,7 @@ async function testCh5EdgeCredential(address: string, edgeCred: string): Promise
     return;
   }
 
-  const mc = client.proxy('MissionControl');
+  const mc = await client.proxy('MissionControl');
 
   // getStatus should succeed
   try {
@@ -286,7 +286,7 @@ async function testCh5EdgeCredential(address: string, edgeCred: string): Promise
 
   // runCommand bidi should be denied (the auth bypass test)
   try {
-    const agent = client.proxy('AgentSession');
+    const agent = await client.proxy('AgentSession');
     const ch = agent.runCommand.bidi();
     await ch.open();
     await ch.send({ command: 'echo hello' });
@@ -326,7 +326,7 @@ async function testCh5OpsCredential(address: string, opsCred: string): Promise<v
     return;
   }
 
-  const mc = client.proxy('MissionControl');
+  const mc = await client.proxy('MissionControl');
 
   try {
     const r = await mc.getStatus({ agent_id: 'ops' });
@@ -417,7 +417,7 @@ async function runDevMode(address: string): Promise<void> {
     return;
   }
 
-  const mc = client.proxy('MissionControl');
+  const mc = await client.proxy('MissionControl');
   await testCh1Unary(mc);
   await testCh2Streaming(mc);
   await testCh3ClientStream(mc);

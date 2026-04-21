@@ -55,7 +55,7 @@ async def main():
     mem_start = mem_mb()
     client = AsterClient(address=address)
     await client.connect()
-    mc = client.proxy("MissionControl")
+    mc = await client.proxy("MissionControl")
 
     print(f"Connected to {address[:30]}...")
     print(f"Client memory at start: {mem_start:.1f} MB")

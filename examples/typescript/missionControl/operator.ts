@@ -21,7 +21,7 @@ if (!address) {
 
 const client = new AsterClientWrapper({ address });
 await client.connect();
-const mc = client.proxy("MissionControl");
+const mc = await client.proxy("MissionControl");
 
 console.log("Tailing logs (Ctrl+C to stop)...");
 

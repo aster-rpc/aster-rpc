@@ -715,10 +715,9 @@ class AsterServer:
                         manifest_data = edata
                         break
                 if manifest_data:
-                    from .registry.keys import version_key as _vk
-                    manifest_key = f"manifests/{contract_id}".encode()
+                    from .registry.keys import manifest_key as _mk
                     await registry_doc.set_bytes(
-                        author_id, manifest_key, manifest_data
+                        author_id, _mk(contract_id), manifest_data
                     )
 
                 # Version pointer
@@ -1543,6 +1542,13 @@ class AsterClient:
         self._reconnect_attempts: int = 0
         self._max_reconnect_attempts: int = 5
         self._reconnect_base_delay: float = 1.0  # seconds
+        # Registry doc joined lazily on first dynamic-proxy call; typed
+        # clients don't need it. Manifests cached by (name, version) so a
+        # second `proxy("X")` doesn't re-fetch.
+        self._registry_doc: Any | None = None
+        self._registry_event_rx: Any | None = None
+        self._registry_join_lock: asyncio.Lock | None = None
+        self._manifest_cache: dict[tuple[str, int], Any] = {}
 
     async def connect(self) -> None:
         """Create endpoint, run admission if credential present, store services.
@@ -1718,6 +1724,183 @@ class AsterClient:
         current = self._session_id_counters.get(rpc_addr_b64, 0) + 1
         self._session_id_counters[rpc_addr_b64] = current
         return current
+
+    async def _ensure_registry_doc(self) -> Any | None:
+        """Join the producer's registry doc lazily. Only called from dynamic
+        proxy / session paths; typed clients don't need manifests at runtime.
+        Returns the joined doc handle, or ``None`` if the producer didn't
+        share a registry namespace (e.g. a local-transport test fixture).
+        """
+        if self._registry_doc is not None:
+            return self._registry_doc
+        if not self._registry_namespace or self._node is None:
+            return None
+        if self._registry_join_lock is None:
+            self._registry_join_lock = asyncio.Lock()
+        async with self._registry_join_lock:
+            if self._registry_doc is not None:
+                return self._registry_doc
+            remote_node_id = ""
+            try:
+                addr = _coerce_node_addr(self._endpoint_addr_in)
+                remote_node_id = addr.endpoint_id or ""
+            except Exception:
+                return None
+            if not remote_node_id:
+                return None
+            dc = docs_client(self._node)
+            doc, receiver = await dc.join_and_subscribe_namespace(
+                self._registry_namespace, remote_node_id
+            )
+            # Best-effort sync wait: read events until either sync_finished
+            # or any contracts/ entry lands. Short timeout because the
+            # producer writes the entries synchronously on startup so the
+            # peer sync is usually immediate.
+            sync_done = False
+            deadline = asyncio.get_event_loop().time() + 6.0
+            while asyncio.get_event_loop().time() < deadline and not sync_done:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    event = await asyncio.wait_for(
+                        receiver.recv(), timeout=min(remaining, 1.0)
+                    )
+                    kind = getattr(event, "kind", str(event))
+                    if kind == "sync_finished":
+                        await asyncio.sleep(0.1)
+                        sync_done = True
+                        break
+                except asyncio.TimeoutError:
+                    try:
+                        entries = await doc.query_key_prefix(b"contracts/")
+                        if entries:
+                            sync_done = True
+                            break
+                    except Exception:
+                        pass
+            self._registry_doc = doc
+            self._registry_event_rx = receiver
+            return doc
+
+    async def _ensure_manifest(
+        self, service_name: str, version: int
+    ) -> Any | None:
+        """Fetch and cache the contract manifest for (name, version). Uses the
+        ``manifests/{contract_id}`` fast-path shortcut when available, falls
+        back to the slow blob-collection path. Returns ``None`` if the
+        producer didn't publish a manifest (e.g. an older producer).
+        """
+        key = (service_name, version)
+        cached = self._manifest_cache.get(key)
+        if cached is not None:
+            return cached
+
+        summary: ServiceSummary | None = None
+        for s in self._services:
+            if s.name == service_name and s.version == version:
+                summary = s
+                break
+        if summary is None or not getattr(summary, "contract_id", ""):
+            return None
+
+        doc = await self._ensure_registry_doc()
+        if doc is None:
+            return None
+
+        import json as _json
+        from .contract.manifest import ContractManifest
+        from .registry.keys import contract_key, manifest_key
+
+        # Fast path: inline manifest shortcut.
+        manifest: ContractManifest | None = None
+        try:
+            shortcut = await doc.query_key_exact(manifest_key(summary.contract_id))
+            if shortcut:
+                manifest_bytes = await doc.read_entry_content(shortcut[0].content_hash)
+                manifest = ContractManifest.from_json(manifest_bytes.decode())
+        except Exception as exc:
+            logger.debug("manifest shortcut read failed for %s: %s", service_name, exc)
+
+        # Slow path: ArtifactRef → blob collection → manifest.json.
+        if manifest is None:
+            try:
+                from .contract.publication import fetch_from_collection
+
+                entries = await doc.query_key_exact(contract_key(summary.contract_id))
+                if entries:
+                    content = await doc.read_entry_content(entries[0].content_hash)
+                    artifact = _json.loads(content)
+                    collection_hash = artifact.get("collection_hash", "")
+                    if collection_hash:
+                        bc = blobs_client(self._node)
+                        addr = _coerce_node_addr(self._endpoint_addr_in)
+                        remote_node_id = addr.endpoint_id or ""
+                        if remote_node_id:
+                            try:
+                                await bc.download_collection_hash(
+                                    collection_hash, remote_node_id
+                                )
+                            except Exception:
+                                pass
+                        manifest_bytes = await fetch_from_collection(
+                            bc, collection_hash, "manifest.json"
+                        )
+                        if manifest_bytes:
+                            manifest = ContractManifest.from_json(
+                                manifest_bytes.decode()
+                            )
+            except Exception as exc:
+                logger.debug("manifest blob fetch failed for %s: %s", service_name, exc)
+
+        if manifest is not None:
+            self._manifest_cache[key] = manifest
+        return manifest
+
+    async def _build_dynamic_codec(
+        self, summary: "ServiceSummary"
+    ) -> tuple[Any, Any | None, dict[str, dict[str, Any]]]:
+        """Build a codec suitable for dynamic proxy / session against
+        ``summary``. Prefers Fory XLANG with manifest-synthesised types
+        so requests ride the same wire the typed client uses. Falls back
+        to JSON only when the server advertises json-only, or when the
+        manifest is unavailable (older producer missing the shortcut).
+
+        Returns ``(codec, factory_or_None, method_map)`` where
+        ``method_map`` is ``{method_name: method_descriptor_dict}`` so
+        callers can build typed request instances from dicts before
+        encoding. On the JSON fallback path, ``factory`` is ``None`` and
+        ``method_map`` may be empty.
+        """
+        modes = list(getattr(summary, "serialization_modes", None) or [])
+        server_supports_xlang = not modes or "xlang" in modes
+
+        if server_supports_xlang:
+            manifest = await self._ensure_manifest(summary.name, summary.version)
+            if manifest is not None and manifest.methods:
+                try:
+                    from .dynamic import DynamicTypeFactory
+                    from .codec import ForyCodec
+
+                    factory = DynamicTypeFactory()
+                    factory.register_from_manifest(manifest.methods)
+                    codec = ForyCodec(
+                        mode=SerializationMode.XLANG,
+                        types=factory.get_all_types(),
+                    )
+                    method_map = {m.get("name"): m for m in manifest.methods if m.get("name")}
+                    return codec, factory, method_map
+                except Exception as exc:
+                    logger.debug(
+                        "dynamic Fory codec build failed for %s: %s "
+                        "-- falling back to JSON",
+                        summary.name,
+                        exc,
+                    )
+
+        from aster.json_codec import JsonProxyCodec
+
+        return JsonProxyCodec(), None, {}
 
     async def _resolve_service(
         self,
@@ -1936,14 +2119,19 @@ class AsterClient:
         """
         return self._open_gate
 
-    def proxy(self, service_name: str) -> "ProxyClient":
+    async def proxy(self, service_name: str) -> "ProxyClient":
         """Create a dynamic proxy client for a shared (stream-per-call) service.
 
-        The proxy discovers methods from the service contract and builds
-        method stubs at runtime. No local type definitions needed -- call
-        methods with dicts and receive dicts back::
+        On first call per service, fetches the published contract manifest
+        from the producer's registry doc, synthesises request/response types
+        via :class:`DynamicTypeFactory`, and builds a Fory XLANG codec that
+        speaks the same wire as the typed client. Subsequent calls to
+        ``proxy(...)`` for the same service reuse the cached manifest.
 
-            mc = client.proxy("MissionControl")
+        No local type definitions needed -- call methods with dicts and
+        receive dicts back::
+
+            mc = await client.proxy("MissionControl")
             result = await mc.getStatus({"agent_id": "edge-1"})
             print(result["status"])
 
@@ -1967,10 +2155,17 @@ class AsterClient:
             raise TypeError(
                 f"'{service_name}' is session-scoped. "
                 f"Use 'await client.session(\"{service_name}\")' instead of "
-                f"'client.proxy(\"{service_name}\")'."
+                f"'await client.proxy(\"{service_name}\")'."
             )
 
-        return ProxyClient(service_name=service_name, aster_client=self)
+        codec, factory, method_map = await self._build_dynamic_codec(summary)
+        return ProxyClient(
+            service_name=service_name,
+            aster_client=self,
+            codec=codec,
+            factory=factory,
+            method_map=method_map,
+        )
 
     async def session(self, service_name: str) -> "SessionProxyClient":
         """Create a dynamic proxy client for a session-scoped service.
@@ -2003,15 +2198,7 @@ class AsterClient:
 
         conn = await self._rpc_conn_for(summary.channels.get(channel_key, ""))
 
-        codec = None
-        modes = list(getattr(summary, "serialization_modes", None) or [])
-        if modes and "xlang" not in modes and "json" in modes:
-            from aster.json_codec import JsonProxyCodec
-            codec = JsonProxyCodec()
-
-        if codec is None:
-            from aster.json_codec import JsonProxyCodec
-            codec = JsonProxyCodec()
+        codec, factory, method_map = await self._build_dynamic_codec(summary)
         session_id = self._next_session_id(summary.channels.get(channel_key, ""))
         session_client = SessionProxyClient(
             aster_client=self,
@@ -2019,6 +2206,8 @@ class AsterClient:
             service_name=service_name,
             session_id=session_id,
             codec=codec,
+            factory=factory,
+            method_map=method_map,
         )
         self._clients.append(session_client)
         return session_client
@@ -2206,10 +2395,11 @@ class SessionProxyClient:
     """Dict-in / dict-out dynamic proxy for a session-scoped service.
 
     Created via :meth:`AsterClient.session`. Works without local type
-    definitions -- every call is JSON-encoded, so the consumer can talk
-    to a producer without importing the service contract. All calls on
-    one proxy share the same monotonic `sessionId` so the server routes
-    them to the same session instance (spec Sec. 6 / 7.5).
+    definitions: at construction time the producer's manifest is fetched
+    and request/response types are synthesised via ``DynamicTypeFactory``
+    so calls ride the same Fory XLANG wire as the typed client. All calls
+    on one proxy share the same monotonic ``sessionId`` so the server
+    routes them to the same session instance (spec Sec. 6 / 7.5).
     """
 
     def __init__(
@@ -2220,12 +2410,16 @@ class SessionProxyClient:
         service_name: str,
         session_id: int,
         codec: Any,
+        factory: Any | None = None,
+        method_map: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         from aster.transport.iroh import IrohTransport
         self._aster_client = aster_client
         self._service_name = service_name
         self._session_id = session_id
         self._codec = codec
+        self._factory = factory
+        self._method_map: dict[str, dict[str, Any]] = method_map or {}
         self._closed = False
         self._transport = IrohTransport(
             connection, codec=codec, session_id=session_id,
@@ -2235,16 +2429,44 @@ class SessionProxyClient:
     def session_id(self) -> int:
         return self._session_id
 
+    def _wrap_request(self, method: str, payload: Any) -> Any:
+        """Wrap a dict payload into the method's synthesised request
+        type so Fory encodes with the right wire tag. See
+        :meth:`ProxyClient._wrap_request` for the rationale.
+        """
+        if self._factory is None or not isinstance(payload, dict):
+            return payload
+        method_meta = self._method_map.get(method)
+        if not method_meta:
+            return payload
+        try:
+            return self._factory.build_request(method_meta, payload)
+        except KeyError:
+            return payload
+
     async def call(self, method: str, request: dict | None = None) -> Any:
         """Call a unary method on this session. Returns decoded response."""
         if self._closed:
             raise RuntimeError("SessionProxyClient is closed")
-        return await self._transport.unary(
+        from aster.json_codec import JsonProxyCodec
+
+        # Codec is JSON only on the legacy fallback path (older producer
+        # without manifest). Everywhere else we're on XLANG Fory.
+        mode = (
+            SerializationMode.JSON.value
+            if isinstance(self._codec, JsonProxyCodec)
+            else SerializationMode.XLANG.value
+        )
+        wire_payload = self._wrap_request(method, request or {})
+        result = await self._transport.unary(
             self._service_name,
             method,
-            request or {},
-            serialization_mode=SerializationMode.JSON.value,
+            wire_payload,
+            serialization_mode=mode,
         )
+        if _is_dataclass_instance(result):
+            return _dataclasses_asdict(result)
+        return result
 
     async def close(self) -> None:
         if self._closed:
@@ -2448,10 +2670,10 @@ def _coerce_node_addr(addr: NodeAddr | str | bytes) -> NodeAddr:
 class ProxyClient:
     """Dynamic proxy client that invokes RPC methods without local type definitions.
 
-    Created via ``AsterClient.proxy("ServiceName")``. Methods are discovered
-    from the service contract and accept/return dicts::
+    Created via ``await AsterClient.proxy("ServiceName")``. Methods are
+    discovered from the service contract and accept/return dicts::
 
-        mc = client.proxy("MissionControl")
+        mc = await client.proxy("MissionControl")
         result = await mc.getStatus({"agent_id": "edge-1"})
         print(result["status"])
 
@@ -2461,19 +2683,44 @@ class ProxyClient:
             print(entry)
     """
 
-    def __init__(self, service_name: str, aster_client: AsterClient) -> None:
+    def __init__(
+        self,
+        service_name: str,
+        aster_client: AsterClient,
+        codec: Any | None = None,
+        factory: Any | None = None,
+        method_map: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         self._service_name = service_name
         self._client = aster_client
         self._transport: Any = None
-        self._codec: Any = None
+        self._codec: Any = codec
+        self._factory = factory
+        self._method_map: dict[str, dict[str, Any]] = method_map or {}
         self._method_cache: dict[str, "_ProxyMethod"] = {}
+
+    def _wrap_request(self, method_name: str, payload: Any) -> Any:
+        """If this proxy is backed by a DynamicTypeFactory + Fory codec,
+        and the given ``payload`` is a plain dict whose method has a
+        synthesised request type, wrap the dict into a typed instance so
+        Fory emits the correct wire tag. Otherwise return ``payload``
+        unchanged.
+        """
+        if self._factory is None or not isinstance(payload, dict):
+            return payload
+        method_meta = self._method_map.get(method_name)
+        if not method_meta:
+            return payload
+        try:
+            return self._factory.build_request(method_meta, payload)
+        except KeyError:
+            return payload
 
     async def _ensure_transport(self) -> None:
         if self._transport is not None:
             return
 
         from .transport.iroh import IrohTransport
-        from .json_codec import JsonProxyCodec
 
         summary = None
         for s in self._client._services:
@@ -2485,23 +2732,14 @@ class ProxyClient:
 
         rpc_addr = summary.channels.get("rpc", "") if hasattr(summary, 'channels') and summary.channels else ""
         if not rpc_addr:
-            # Fall back to the default RPC address (same endpoint as admission)
             rpc_addr = self._client._endpoint_addr_in if hasattr(self._client, '_endpoint_addr_in') else ""
         if not rpc_addr:
             raise RuntimeError(f"{self._service_name} has no rpc channel")
 
         conn = await self._client._rpc_conn_for(rpc_addr)
 
-        # Proxy uses JSON mode -- no type registration needed.
-        # The server sniffs JSON frames and decodes accordingly.
-        #
-        # Known gap (tracked): producers that advertise only ``xlang``
-        # (currently Java) cannot decode the JSON bodies the proxy
-        # emits. For those producers, use the typed client path
-        # (``client.client(ServiceCls)``) or the generated client
-        # (``aster contract gen-client``) - both speak native Fory
-        # XLANG and work cross-binding.
-        self._codec = JsonProxyCodec()
+        if self._codec is None:
+            self._codec = await self._client._build_dynamic_codec(summary)
         self._transport = IrohTransport(conn, codec=self._codec)
 
     def __getattr__(self, method_name: str) -> "_ProxyMethod":
@@ -2517,6 +2755,20 @@ class ProxyClient:
         m = _ProxyMethod(self, method_name)
         cache[method_name] = m
         return m
+
+
+async def _wrap_async_iter(
+    proxy: "ProxyClient",
+    method_name: str,
+    source: Any,
+) -> Any:
+    """Wrap each dict emitted by ``source`` into the synthesised request
+    type for ``method_name`` so Fory can encode it with the right wire
+    tag. Used by client-streaming paths where the user hands us an
+    async iterator of dicts.
+    """
+    async for item in source:
+        yield proxy._wrap_request(method_name, item)
 
 
 class _ProxyMethod:
@@ -2543,10 +2795,11 @@ class _ProxyMethod:
             and not isinstance(payload, (dict, str, bytes))
             and hasattr(payload, "__aiter__")
         ):
+            wrapped_stream = _wrap_async_iter(proxy, self._method_name, payload)
             result = await proxy._transport.client_stream(
                 proxy._service_name,
                 self._method_name,
-                payload,
+                wrapped_stream,
             )
             if _is_dataclass_instance(result):
                 return _dataclasses_asdict(result)
@@ -2558,11 +2811,16 @@ class _ProxyMethod:
         elif isinstance(payload, dict) and kwargs:
             payload = {**payload, **kwargs}
 
+        wire_payload = proxy._wrap_request(
+            self._method_name,
+            payload if isinstance(payload, dict) else (payload or {}),
+        )
+
         try:
             result = await proxy._transport.unary(
                 proxy._service_name,
                 self._method_name,
-                payload if isinstance(payload, dict) else (payload or {}),
+                wire_payload,
             )
         except Exception as exc:
             # When the user calls a server-streaming method via the unary
@@ -2604,10 +2862,12 @@ class _ProxyMethod:
         elif isinstance(payload, dict) and kwargs:
             payload = {**payload, **kwargs}
 
+        wire_payload = self._proxy._wrap_request(self._method_name, payload or {})
+
         async for item in self._proxy._transport.server_stream(
             self._proxy._service_name,
             self._method_name,
-            payload or {},
+            wire_payload,
         ):
             import dataclasses
             if dataclasses.is_dataclass(item) and not isinstance(item, type):
@@ -2650,7 +2910,8 @@ class _ProxyBidiChannel:
         """Send a message on the bidi stream."""
         if self._channel is None:
             await self.open()
-        await self._channel.send(payload)
+        wire_payload = self._proxy._wrap_request(self._method_name, payload)
+        await self._channel.send(wire_payload)
 
     async def close(self) -> None:
         """Close the send side of the bidi stream."""

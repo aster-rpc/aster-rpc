@@ -537,7 +537,7 @@ def _gen_session_client(
         f'(did you connect to the right address?)");'
     )
     lines.append("    }")
-    lines.append(f'    const inner = client.proxy("{svc_name}");')
+    lines.append(f'    const inner = await client.proxy("{svc_name}");')
     lines.append(f"    return new {cls}(inner);")
     lines.append("  }")
     lines.append("")

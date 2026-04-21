@@ -52,8 +52,9 @@
  * const client = new AsterClientWrapper({ address: "aster1..." });
  * await client.connect();
  *
- * // Dynamic proxy: speaks JSON, no local types needed
- * const greeter = client.proxy("Greeter");
+ * // Dynamic proxy: synthesises types from the producer's manifest
+ * // and speaks Fory XLANG — no local type definitions needed
+ * const greeter = await client.proxy("Greeter");
  * const reply = await greeter.greet({ name: "World" });
  * console.log(reply.message);
  *
