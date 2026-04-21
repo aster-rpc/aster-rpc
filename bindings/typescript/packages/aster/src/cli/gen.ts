@@ -540,7 +540,10 @@ function scanService(
 
     if (params.length > 0) {
       const reqParam = params[0]!;
-      const reqType = ctx.checker.getTypeAtLocation(reqParam);
+      let reqType = ctx.checker.getTypeAtLocation(reqParam);
+      if (pattern === 'client_stream' || pattern === 'bidi_stream') {
+        reqType = unwrapStreamInput(ctx.checker, reqType) ?? reqType;
+      }
       const reqSym = reqType.getSymbol();
       if (reqSym) requestTypeSym = reqSym;
     }
@@ -593,6 +596,16 @@ function unwrapAsyncReturn(checker: ts.TypeChecker, t: ts.Type): ts.Type | undef
     if (args.length >= 1) return args[0];
   }
   return t;
+}
+
+function unwrapStreamInput(checker: ts.TypeChecker, t: ts.Type): ts.Type | undefined {
+  const sym = t.getSymbol();
+  const symName = sym?.getName();
+  if (symName === 'AsyncIterable' || symName === 'AsyncIterableIterator' || symName === 'AsyncGenerator') {
+    const args = checker.getTypeArguments(t as ts.TypeReference);
+    if (args.length >= 1) return args[0];
+  }
+  return undefined;
 }
 
 // ─── Dependency ordering (Tarjan SCC) ────────────────────────────────────────
