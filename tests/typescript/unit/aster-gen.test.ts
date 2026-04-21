@@ -171,6 +171,23 @@ describe('aster-gen scanner', () => {
     expect(generatedSource).toMatch(/responseFields: \[\{"name":"status"/);
   });
 
+  it('emits typeHashHex and typeDefBytes on every WIRE_TYPES entry (spec §11.4 publisher parity)', () => {
+    // Each wire type needs both fields so the runtime publisher can
+    // build spec-compliant `types/{hash}.bin` collection entries
+    // without re-running the scanner. Missing either field would
+    // silently revert to manifest-only collections (Python loses
+    // interop with TS-published contracts).
+    expect(generatedSource).toMatch(/typeHashHex: "[0-9a-f]{64}"/);
+    expect(generatedSource).toMatch(/typeDefBytes: new Uint8Array\(\[0x[0-9a-f]{2}/);
+    // One pair per @WireType in the fixture. Count is an upper bound —
+    // at minimum, every @WireType class we discovered above must emit
+    // both fields.
+    const hashCount = (generatedSource.match(/typeHashHex:/g) ?? []).length;
+    const bytesCount = (generatedSource.match(/typeDefBytes:/g) ?? []).length;
+    expect(hashCount).toBeGreaterThanOrEqual(4);
+    expect(hashCount).toBe(bytesCount);
+  });
+
   it('emits precomputed per-method type hashes (spec §11.3 cross-language parity)', () => {
     // Every method should get both request and response hashes as real
     // Uint8Array literals, not `undefined`. The whole point of this

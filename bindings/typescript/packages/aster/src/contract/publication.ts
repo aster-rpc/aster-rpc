@@ -22,16 +22,28 @@ export interface ArtifactRef {
 /**
  * Build a collection of contract artifacts for blob storage.
  *
- * Returns a list of [name, data] pairs suitable for upload:
- * - "manifest.json" — human/machine-readable contract metadata
- * - "contract.bin" — canonical XLANG bytes (for hash verification)
+ * Returns a list of [name, data] pairs suitable for upload. Layout
+ * matches spec `Aster-ContractIdentity.md` §11.4:
+ *
+ * - `contract.bin` — canonical XLANG bytes of the ServiceContract
+ * - `manifest.json` — human/machine-readable ContractManifest
+ * - `types/{hex_hash}.bin` — one entry per TypeDef referenced by the
+ *   contract, when a non-empty `typeDefs` map is passed
+ *
+ * Publishing TypeDef blobs lets cross-language dynamic clients decode
+ * the canonical type graph directly rather than relying on the flat
+ * manifest view. Optional so legacy callers that don't yet track
+ * per-type canonical bytes keep working (the resulting collection is
+ * spec-valid but missing the type blobs — Python parity requires them).
  *
  * @param manifest - The contract manifest
  * @param canonicalBytes - The canonical XLANG bytes of the ServiceContract
+ * @param typeDefs - Optional map of hex BLAKE3 hash → canonical TypeDef bytes
  */
 export function buildCollection(
   manifest: ContractManifest,
   canonicalBytes: Uint8Array,
+  typeDefs?: ReadonlyMap<string, Uint8Array>,
 ): [name: string, data: Uint8Array][] {
   const encoder = new TextEncoder();
   const manifestJson = manifestToJson(manifest);
@@ -40,6 +52,15 @@ export function buildCollection(
     ['manifest.json', encoder.encode(manifestJson)],
     ['contract.bin', canonicalBytes],
   ];
+
+  if (typeDefs) {
+    // Sort by hash for deterministic collection ordering — matches the
+    // Python publisher (bindings/python/aster/contract/publication.py:82).
+    const sortedHashes = [...typeDefs.keys()].sort();
+    for (const hashHex of sortedHashes) {
+      entries.push([`types/${hashHex}.bin`, typeDefs.get(hashHex)!]);
+    }
+  }
 
   if (entries.length > MAX_COLLECTION_INDEX_ENTRIES) {
     throw new Error(`collection has ${entries.length} entries, max is ${MAX_COLLECTION_INDEX_ENTRIES}`);

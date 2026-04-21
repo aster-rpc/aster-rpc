@@ -95,6 +95,21 @@ export interface WireTypeShape {
    * ForyCodec understands its shape.
    */
   foryTypeInfo: unknown;
+  /**
+   * Hex-encoded BLAKE3 hash (64 chars) of this type's canonical XLANG
+   * bytes. Populated by `aster-gen`; used by the publisher to key the
+   * `types/{hash}.bin` collection entries and by dynamic clients to
+   * cross-reference TypeDefs in the fetched contract collection.
+   */
+  typeHashHex?: string;
+  /**
+   * Canonical XLANG bytes of this type's TypeDef. Populated by
+   * `aster-gen` so the publisher can emit `types/{hash}.bin` without
+   * re-running the scanner. Kept optional so legacy generated files
+   * without this field still load — publication falls back to
+   * manifest-only collection in that case.
+   */
+  typeDefBytes?: Uint8Array;
 }
 
 /**

@@ -951,11 +951,13 @@ function wireTypeToTypeDef(
  */
 function computeTypeHashes(wireTypes: ScannedWireType[]): {
   hashes: Map<string, string>;
+  canonicalBytes: Map<string, Uint8Array>;
   ordered: ScannedWireType[];
 } {
   const native = loadNativeBinding();
   const sccs = tarjanSccs(wireTypes);
   const hashes = new Map<string, string>();
+  const canonicalBytes = new Map<string, Uint8Array>();
   const ordered: ScannedWireType[] = [];
 
   for (const scc of sccs) {
@@ -966,10 +968,14 @@ function computeTypeHashes(wireTypes: ScannedWireType[]): {
       const canonical = native.canonicalBytesFromJson('TypeDef', JSON.stringify(td));
       const hash = native.computeTypeHash(canonical);
       hashes.set(w.tag, bytesToHex(hash));
+      // Preserve the canonical TypeDef bytes alongside the hash so the
+      // runtime can publish `types/{hash}.bin` without re-running the
+      // scanner (spec §11.3.2.3 contract collection layout).
+      canonicalBytes.set(w.tag, new Uint8Array(canonical));
       ordered.push(w);
     }
   }
-  return { hashes, ordered };
+  return { hashes, canonicalBytes, ordered };
 }
 
 /**
@@ -982,6 +988,15 @@ function emitHashLiteral(hex: string): string {
   const parts: string[] = [];
   for (let i = 0; i < hex.length; i += 2) {
     parts.push('0x' + hex.substr(i, 2));
+  }
+  return `new Uint8Array([${parts.join(', ')}])`;
+}
+
+/** Emit a Uint8Array literal from raw bytes. Same shape as emitHashLiteral. */
+function emitByteArrayLiteral(bytes: Uint8Array): string {
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.length; i++) {
+    parts.push('0x' + bytes[i]!.toString(16).padStart(2, '0'));
   }
   return `new Uint8Array([${parts.join(', ')}])`;
 }
@@ -1051,6 +1066,8 @@ function emitField(f: ScanField): string {
 function emitWireTypes(
   wireTypes: ScannedWireType[],
   aliasFor: Map<ts.Symbol, string>,
+  typeHashes: Map<string, string>,
+  canonicalBytes: Map<string, Uint8Array>,
 ): string {
   const entries: string[] = [];
   for (const w of wireTypes) {
@@ -1072,6 +1089,14 @@ function emitWireTypes(
         }
       }
     }
+    const typeHashHex = typeHashes.get(w.tag);
+    const typeDefBytes = canonicalBytes.get(w.tag);
+    if (!typeHashHex || !typeDefBytes) {
+      throw new Error(
+        `internal: missing canonical bytes/hash for ${w.tag} — ` +
+        `computeTypeHashes() must run before emitWireTypes()`,
+      );
+    }
     entries.push(
       `  {
     ctor: ${alias},
@@ -1082,6 +1107,8 @@ ${fieldExprs}
     fieldNameSet: new Set([${fieldNames}]),
     nestedTypes: new Map([${nestedEntries.join(', ')}]),
     elementTypes: new Map([${elementEntries.join(', ')}]),
+    typeHashHex: ${JSON.stringify(typeHashHex)},
+    typeDefBytes: ${emitByteArrayLiteral(typeDefBytes)},
   },`,
     );
   }
@@ -1438,7 +1465,7 @@ function emit(
   services: ScannedService[],
 ): string {
   const outPath = path.resolve(cli.out);
-  const { hashes: typeHashes, ordered } = computeTypeHashes(wireTypes);
+  const { hashes: typeHashes, canonicalBytes, ordered } = computeTypeHashes(wireTypes);
   const { header, aliasFor } = buildImports(outPath, ordered, services);
 
   return [
@@ -1449,7 +1476,7 @@ function emit(
     `import { RpcPattern } from '@aster-rpc/aster';`,
     header,
     '',
-    emitWireTypes(ordered, aliasFor),
+    emitWireTypes(ordered, aliasFor, typeHashes, canonicalBytes),
     '',
     emitServices(ordered, services, aliasFor, typeHashes),
     '',
