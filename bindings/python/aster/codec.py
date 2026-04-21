@@ -64,6 +64,11 @@ class ForyConfig:
         kwargs = dict(self.extra_kwargs)
         xlang = self.resolved_xlang(mode)
         kwargs.setdefault("xlang", xlang)
+        # ref=True matches Fory's FDL-generated Python for xlang + the
+        # Java ForyBuilder defaults of withRefTracking(true). Byte-for-
+        # byte identity across pyfory 0.17 and fory-java 0.17 was
+        # verified with a minimal Point(x,y) struct registered by
+        # type_id with matching pyfory.field(id=N) / @ForyField(id=N).
         kwargs.setdefault("ref", True)
         # pyfory's strict=True is already the default, but set it
         # explicitly so any future pyfory release flipping the default

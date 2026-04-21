@@ -33,24 +33,61 @@ When an item is completed, move it to the `## Done` section at the bottom with t
 
 ---
 
-### Cross-binding matrix: Fory 0.17 is not wire-compatible across its own language implementations
+### Cross-binding matrix: register every wire type by numeric `type_id`, not by (namespace, typename)
 
-**Why.** Every same-binding combo is green. **Every cross-binding combo is red.** It's not "TS is broken"; it's that pyfory 0.17, @apache-fory/core 0.17, and fory-java 0.17 each produce internally-consistent NAMED_COMPATIBLE_STRUCT bytes that **none of the others can read**. The memory confirms the cross-binding matrix was green on `main` before the Fory 0.17 upgrade, so this is a 0.17 regression in all three implementations at once.
+**Why.** Fory 0.17 is **not** broken across bindings — we were registering types the wrong way. Proof (minimal struct, no Aster layer in between):
 
-**Matrix snapshot (2026-04-21, `fory-017-upgrade` branch, Aster-level wrappers spec-aligned):**
+```
+pyfory.Fory(xlang=True, ref=True, compatible=True)      \
+  register_type(Point, type_id=100)                     \   same 21 bytes
+  Point with pyfory.field(id=1) / pyfory.field(id=2)    /
 
-| Combo | Pass/Total | Symptom |
-|-------|-----------|---------|
-| py-py-dev | **10/10** | — |
-| ts-ts-dev | **7/7** | — |
-| ja-ko-dev | **6/6** | — (Fory Java round-trips itself cleanly) |
-| py-ko-dev | 0/5 | `DeserializationException: read objects are: [null]` |
-| ja-py-dev | 3/9 | `Buffer out of bound: 2 + 21 > 4` |
-| py-ts-dev | 1/5 | `Out of bounds access` in TS Fory reader |
-| ts-py-dev | 2/9 | `Meta share read context must be set when compatible mode is enabled` |
-| ts-ko-dev | 0/5 | `DeserializationException: read objects are: []` |
+Fory.builder().withXlang(true).withRefTracking(true)                    \
+  .withCompatibleMode(COMPATIBLE).buildThreadSafeFory()                 \   same 21 bytes
+  register(Point.class, 100L) with @ForyField(id=1) / @ForyField(id=2)  /
+```
 
-All primitive-type mismatches are already resolved per the xlang type mapping spec in commit `51615ac` (`pyfory.int32 == spec "varint32"`, etc.). Our publisher / consumer / Path B code uses spec-correct names. The break is below the Aster wrapper layer, inside the Fory implementations' `NAMED_COMPATIBLE_STRUCT` wire format.
+`02 00 1c 00 07 c1 b1 c2 42 9a 22 4c 02 1c 64 c4 05 c8 05 14 28` both sides. `pyfory.deserialize(javaBytes)` returns `Point(x=10, y=20)` cleanly.
+
+The Aster matrix today registers by `(namespace, typename)` on every binding. Fory's conformance tests and FDL-generated code use numeric `type_id` + `@ForyField(id=N)` / `pyfory.field(id=N)` everywhere. The name-keyed path writes a different TypeMeta preamble than the id-keyed path — enough to make the bytes incompatible across bindings even when all other flags match.
+
+**Matrix snapshot before the fix (2026-04-21, `fory-017-upgrade` branch):**
+
+| Combo | Pass/Total |
+|-------|-----------|
+| py-py-dev | **10/10** |
+| ts-ts-dev | **7/7** |
+| ja-ko-dev | **6/6** |
+| py-ko-dev | 0/5 |
+| ja-py-dev | 3/9 |
+| py-ts-dev | 1/5 |
+| ts-py-dev | 2/9 |
+| ts-ko-dev | 0/5 |
+
+**What.** Switch every Aster wire type to register via a **stable numeric `type_id`**, and annotate every field with an **explicit `id`**. Concretely:
+
+1. **Contract identity.** Our canonical `TypeDef` already carries a 32-byte BLAKE3 hash per type; we need to derive a stable numeric `user_type_id` from it (the low 32 bits of the hash are a natural candidate — Fory accepts `0..0xFFFFFFFE`). This becomes the cross-binding numeric id every binding registers the struct with.
+2. **Python.** `@wire_type` currently stamps `__wire_type__`. Add field-id assignment: either wrap `@wire_type` to attach `pyfory.field(id=N)` to every field (N derived from field name alphabetical order or declaration order), or emit explicit `field(id=…)` in the @dataclass fields. Register via `fory.register_type(Cls, type_id=…)` instead of `namespace=, typename=`.
+3. **Java.** `@WireType` → add `@ForyField(id=N)` to each field (scanner / annotation processor). `ForyCodec.java` gains `.withCompatibleMode(CompatibleMode.COMPATIBLE)` and registers via `fory.register(Cls, typeIdLong)`.
+4. **TypeScript.** Scanner emits `setId(N)` on every field + `setId(userTypeId)` on the struct. `ForyCodec.registerType` passes the numeric id through. `xlang.ts` already has `refTracking: true, compatible: true`.
+5. **DynamicTypeFactory (all bindings).** When building types from canonical `TypeDef` bytes, include the numeric id derived in step 1, and assign field ids in the same deterministic order the publisher used.
+
+**Where.**
+- Spec: `ffi_spec/Aster-ContractIdentity.md` — add a section on how the numeric `user_type_id` is derived from `typeHashHex` so every binding produces the same id.
+- Python: `bindings/python/aster/codec.py` `wire_type` decorator, `bindings/python/aster/contract/identity.py` TypeDef build, `bindings/python/aster/dynamic.py` DynamicTypeFactory.
+- Java: `bindings/java/aster-runtime/src/main/java/site/aster/codec/ForyCodec.java` (compatible mode), scanner that generates contract metadata, `@WireType` processor, `DynamicTypeFactory` / `UnknownStruct` path.
+- TS: `bindings/typescript/packages/aster/src/cli/gen.ts` (emit `setId`), `src/codec.ts` `ForyCodec.registerType`, `src/dynamic.ts` `registerFromTypeDefs`.
+- Cross-binding validation: `tests/integration/mission_control/run_matrix.sh` — should become green once all three bindings share the numeric-id convention.
+
+**Blockers.** None technical — this is a systematic refactor across bindings. Behavior-preserving for same-binding flows (already using matching internal configs). Largest unknowns:
+- Pinning the `user_type_id` derivation rule so every binding derives the same id from the same `TypeDef`.
+- Field id assignment order for @wire_type types that don't carry explicit ids today — either alphabetical (Fory's own default) or declaration order.
+
+**Origin.** 2026-04-21 session. Proof that Fory is fine lived in `/tmp/forytest2` minimal repro before cleanup; the config that works is captured above.
+
+---
+
+
 
 **Empirical reproduction (all runs on Fory 0.17 with `xlang=true, compatible=true, ref=true`):**
 
