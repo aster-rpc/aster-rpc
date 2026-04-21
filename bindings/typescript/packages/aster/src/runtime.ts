@@ -469,15 +469,19 @@ export class AsterServer {
     const typeDefs = new Map<string, Uint8Array>();
     const roots: (new (...args: any[]) => any)[] = [];
     for (const [, m] of info.methods as Map<string, any>) {
-      if (m.request_type) roots.push(m.request_type);
-      if (m.response_type) roots.push(m.response_type);
+      if (m.requestType) roots.push(m.requestType);
+      if (m.responseType) roots.push(m.responseType);
     }
     const reachable = buildTypeGraph(roots);
+    // eslint-disable-next-line no-console
+    console.error(`[ASTER-DEBUG-SRV] collect ${info.name}: roots=${roots.length} reachable=${reachable.length}`);
     for (const cls of reachable) {
       const shape = getWireShape(cls);
       if (!shape?.typeHashHex || !shape?.typeDefBytes) continue;
       typeDefs.set(shape.typeHashHex, shape.typeDefBytes);
     }
+    // eslint-disable-next-line no-console
+    console.error(`[ASTER-DEBUG-SRV] collect ${info.name}: ${typeDefs.size} typeDefs`);
     return typeDefs;
   }
 
@@ -1266,6 +1270,13 @@ export class AsterClientWrapper {
       throw new Error('Aster native addon not found.');
     }
 
+    // Wire the native contract binding for this process. `AsterServer`
+    // does this inside `start()`; clients need it too as soon as the
+    // dynamic-proxy path starts decoding canonical TypeDef bytes via
+    // `decodeTypeDefBytes`. Re-setting is idempotent.
+    const { setNativeContract } = await import('./contract/identity.js');
+    setNativeContract(native);
+
     // Create an in-memory client node. When an identity file provided a
     // secret key, pass it through so the client's endpoint id matches the
     // credential's enrolled endpoint_id.
@@ -1550,7 +1561,11 @@ export class AsterClientWrapper {
     };
 
     const doc = await this.ensureRegistryDoc();
-    if (!doc) return empty;
+    if (!doc) {
+      // eslint-disable-next-line no-console
+      console.error(`[ASTER-DEBUG] ensureTypeDefs: ensureRegistryDoc returned null`);
+      return empty;
+    }
 
     try {
       const { contractKey } = await import('./registry/keys.js');
@@ -1562,17 +1577,45 @@ export class AsterClientWrapper {
       const collectionHash = artifactRef.collection_hash;
       if (!collectionHash) return empty;
 
+      const blobs = this._node.blobsClient();
+
+      // The contract collection was produced on the remote peer; its
+      // HashSeq + child blobs aren't yet in our local store. Pull the
+      // whole collection via the ticket stored alongside the ArtifactRef
+      // before listing/reading. This mirrors the `fetchContract` flow a
+      // manifest-only consumer would take on the slow path.
+      // The contract collection was authored on the remote peer, so we
+      // need to pull the HashSeq + all child blobs into the local store
+      // before listing / reading them. downloadCollectionHash sets
+      // BlobFormat::HashSeq explicitly so child blobs come down in the
+      // same round trip (ticket-based downloadCollection misses this and
+      // fails with "hash not found" on read). Mirrors Python's flow at
+      // runtime.py:1841.
+      if (this._remoteEndpointId) {
+        try {
+          await blobs.downloadCollectionHash(collectionHash, this._remoteEndpointId);
+        } catch {
+          // Silently retry via direct reads below — covers the case
+          // where the collection is already present locally (e.g. same-
+          // process in-memory tests).
+        }
+      }
+
       const { fetchContractTypeDefBytes } = await import('./contract/publication.js');
       const { decodeTypeDefBytes } = await import('./contract/identity.js');
-      const blobs = this._node.blobsClient();
       const rawByHash = await fetchContractTypeDefBytes(blobs, collectionHash);
 
       const byTag = new Map<string, import('./contract/identity.js').CanonicalTypeDef>();
       const byHash = new Map<string, import('./contract/identity.js').CanonicalTypeDef>();
       for (const [hashHex, rawBytes] of rawByHash) {
-        const td = decodeTypeDefBytes(rawBytes);
-        byHash.set(hashHex, td);
-        byTag.set(`${td.package}/${td.name}`, td);
+        try {
+          const td = decodeTypeDefBytes(rawBytes);
+          byHash.set(hashHex, td);
+          byTag.set(`${td.package}/${td.name}`, td);
+        } catch {
+          // Skip individual malformed blobs so a single bad entry
+          // doesn't block the rest of the graph.
+        }
       }
       const out = { byTag, byHash };
       this._typeDefCache.set(contractId, out);
