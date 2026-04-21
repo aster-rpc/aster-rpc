@@ -33,30 +33,29 @@ When an item is completed, move it to the `## Done` section at the bottom with t
 
 ---
 
-### Cross-binding matrix: py↔ts Fory interop still red
+### Cross-binding matrix: Fory TS 0.17 is not wire-compatible with pyfory 0.17
 
-**Why.** After the Python Path B migration + compatible mode on both sides landed, py-py-dev is 10/10 and ts-ts-dev is 7/7, but the cross-binding combos still fail with *different* errors than before:
+**Why.** After exhaustive debugging:
 
-- **py-server + ts-client:** `Invalid character value for LOWER_SPECIAL: 30` — TS Fory's metastring decoder trips on a byte value (30) that isn't a valid char in the LOWER_SPECIAL alphabet {a-z, ".", "_", "$", "|"}. Either (a) pyfory writes a metastring with a different encoding than @apache-fory/core 0.17 expects, (b) the TypeMeta framing is out-of-phase (decoder reading at the wrong offset), or (c) the two codecs disagree about when to write the TypeMeta vs when to read it.
-- **ts-server + py-client:** `client_stream got OK trailer with no response frame`, `unary_fast_path: write_all failed: sending stopped by peer: error 0`, empty-string scalars in the decoded response. Looks like a mix of encode-side (pyfory refusing to write?) and decode-side (producing wrong shape) problems.
+- All primitive-type mismatches between pyfory and @apache-fory/core have been resolved per the xlang type mapping spec. `pyfory.int32 == spec "varint32"`, etc. TS `Type.int32()` vs `Type.varInt32()` map distinct type ids 4 vs 5. Our publisher / consumer / Path B code on both sides uses the correct spec names.
+- With the wire-types fully aligned, **pyfory still cannot decode @apache-fory/core-emitted bytes and vice versa** for the same logical struct in `xlang=true, compatible=true, ref=true` mode. Empirically confirmed: pyfory decodes TS-produced `StreamHeader` as all-zero/empty fields (every field falls through to its default), and TS trips `Out of bounds access` when decoding pyfory-produced `RpcStatus` trailers. Field IDs, field name casing, type ids are all individually aligned; the wire layout / TypeMeta framing still diverges.
+- Specifically the first ~12 bytes after the xlang bitmap differ between the two bindings for identical logical structs, and the metastring encoding chosen differs (pyfory trips `LOWER_SPECIAL: 30` in older traces; TS runs off the end of the payload).
 
-Path B registration itself works on both sides — the debug prints show the Python client resolves all 7 TypeDefs correctly and ends up with the right pyfory TypeVars (`~float64`, `dict[str, str]`, etc.). The interop gap is below the TypeDef layer.
+This is a **Fory upstream issue at 0.17**: the TS binding (`@apache-fory/core@0.17.0-alpha.0`) lacks the wire-compatibility matrix that Java/Python/Rust/Go go through in `integration_tests/idl_tests/`. No JavaScript/TS runner exists there, so the TS binding's xlang output has never been validated against any other binding.
 
-**What.** Debug one combo end-to-end (py-ts first; the LOWER_SPECIAL trace is the most specific). Concrete probes:
+**What.** Realistic options:
 
-- Dump the raw bytes of a single unary response at both (a) post-encode on the Python server and (b) pre-decode on the TS client. Find the first byte that diverges from what Fory's struct layout predicts.
-- Compare TS's `readTypeMeta` flow (`gen/struct.ts` NAMED_COMPATIBLE_STRUCT case) against pyfory's XLANG writer. Fory 0.17 may have a protocol drift between bindings — check the `.agents/testing/integration-tests.md` xlang tests for the golden form.
-- Check whether pyfory's `compatible=True` actually produces NAMED_COMPATIBLE_STRUCT bytes (the error suggests it's writing something else the TS side doesn't recognise).
+1. Wait / track upstream Fory TS fixes. We need JavaScript in `integration_tests/idl_tests/` plus whatever wire alignment work that surfaces.
+2. Replace `@apache-fory/core` on the TS side with a thin NAPI wrapper around the Rust core xlang codec (`core/src/contract.rs` already has `canonical_bytes_to_json` / `canonical_bytes_from_json`; extending to runtime xlang encode/decode is a moderate amount of work). Guarantees byte identity because both py and ts route through the same Rust implementation.
+3. Fall back to the JSON codec for cross-binding calls and reserve Fory XLANG for same-binding performance. Lossy and perf-costly but unblocks users today.
 
 **Where.**
-- `bindings/python/aster/codec.py` — `ForyConfig.to_kwargs` now sets `compatible=True` for XLANG.
-- `bindings/typescript/packages/aster/src/xlang.ts` — `getXlangForyAndType` / `newXlangFory` set `compatible: true`.
-- `docs/_internal/fory/javascript/packages/core/lib/gen/struct.ts` — `readTypeInfo` + `read` (line 176-) in the NAMED_COMPATIBLE_STRUCT case.
-- Fory upstream xlang tests under `docs/_internal/fory/integration_tests/` may have a reproducer.
+- Fory upstream: `docs/_internal/fory/javascript/packages/core/` + `integration_tests/idl_tests/`.
+- Option 2 sketch: `core/src/contract.rs` + new `core::codec::xlang` module; expose via `bindings/typescript/native/src/codec.rs` (NAPI) and `bindings/python/rust/src/codec.rs` (PyO3).
 
-**Blockers.** None. Requires cross-binding Fory protocol knowledge; may need upstream Fory work.
+**Blockers.** Option 1 is upstream; option 2 is a medium rebuild of the encode/decode surface; option 3 is a config change in `_build_dynamic_codec` + `_registerDynamicTypesForService` with known perf regression.
 
-**Origin.** 2026-04-21 session, after py-py-dev 10/10 + compatible-mode alignment landed but cross-lang still red.
+**Origin.** 2026-04-21 session. All our Aster-level wrappers are correct; the break is in the Fory implementations themselves.
 
 ---
 

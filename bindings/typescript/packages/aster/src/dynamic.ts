@@ -396,6 +396,10 @@ interface ForyTypeNamespace {
   int16(): any;
   int32(): any;
   int64(): any;
+  varInt32(): any;
+  varInt64(): any;
+  varUInt32(): any;
+  varUInt64(): any;
   float32(): any;
   float64(): any;
   binary(): any;
@@ -405,6 +409,15 @@ interface ForyTypeNamespace {
   optional?(inner: any): any;
 }
 
+// Canonical ``type_primitive`` -> TS Fory Type factory. Keys MUST match
+// the Fory xlang type mapping spec byte-for-byte
+// (docs/specification/xlang_type_mapping.md). Notably "int32" is fixed
+// 4 bytes (Type.int32()) while "varint32" is zigzag varint
+// (Type.varInt32()) -- these are distinct type ids on the wire, and
+// pyfory emits pyfory.int32 as spec "varint32" (NOT "int32"). Mapping
+// both to Type.int32() here would cause a cross-binding length
+// mismatch: pyfory writes 1 byte for small ints while TS would expect
+// 4, so the reader runs off the payload with "Out of bounds access".
 const PRIMITIVE_TO_FORY: Record<string, (T: ForyTypeNamespace) => any> = {
   bool: T => T.bool(),
   string: T => T.string(),
@@ -413,14 +426,18 @@ const PRIMITIVE_TO_FORY: Record<string, (T: ForyTypeNamespace) => any> = {
   int16: T => T.int16(),
   int32: T => T.int32(),
   int64: T => T.int64(),
+  varint32: T => T.varInt32(),
+  varint64: T => T.varInt64(),
   uint8: T => T.int8(),
   uint16: T => T.int16(),
   uint32: T => T.int32(),
   uint64: T => T.int64(),
+  var_uint32: T => T.varUInt32(),
+  var_uint64: T => T.varUInt64(),
   float32: T => T.float32(),
   float64: T => T.float64(),
-  // Timestamp is carried as a tagged primitive in TS land; wire as i64.
-  timestamp: T => T.int64(),
+  // Timestamps are carried as varint64 millis in pyfory's xlang.
+  timestamp: T => T.varInt64(),
   uuid: T => T.string(),
 };
 

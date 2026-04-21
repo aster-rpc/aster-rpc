@@ -517,7 +517,20 @@ class DynamicTypeFactory:
 def _build_primitive_map() -> dict[str, Any]:
     # Imported lazily so pyfory remains an optional dependency path-wise
     # -- ``register_from_manifest`` alone doesn't need these markers.
+    #
+    # The map follows the xlang type mapping spec
+    # (docs/specification/xlang_type_mapping.md): ``type_primitive``
+    # "int32"  -> fixed 4 bytes  -> pyfory.fixed_int32
+    # "varint32" -> zigzag varint -> pyfory.int32
+    # Mis-mapping here would make the consumer synthesise a field with a
+    # different wire width than the producer wrote, and Fory's struct-
+    # hash check on read would trip.
     import pyfory
+
+    fixed_i32 = getattr(pyfory, "fixed_int32", pyfory.int32)
+    fixed_i64 = getattr(pyfory, "fixed_int64", pyfory.int64)
+    fixed_u32 = getattr(pyfory, "fixed_uint32", getattr(pyfory, "uint32", pyfory.int32))
+    fixed_u64 = getattr(pyfory, "fixed_uint64", getattr(pyfory, "uint64", pyfory.int64))
 
     return {
         "bool": bool,
@@ -525,16 +538,19 @@ def _build_primitive_map() -> dict[str, Any]:
         "binary": bytes,
         "int8": pyfory.int8,
         "int16": pyfory.int16,
-        "int32": pyfory.int32,
-        "int64": pyfory.int64,
-        # Fory xlang models uint via the signed int of the same width.
-        "uint8": pyfory.int8,
-        "uint16": pyfory.int16,
-        "uint32": pyfory.int32,
-        "uint64": pyfory.int64,
+        "int32": fixed_i32,
+        "int64": fixed_i64,
+        "varint32": pyfory.int32,
+        "varint64": pyfory.int64,
+        "uint8": pyfory.uint8,
+        "uint16": pyfory.uint16,
+        "uint32": fixed_u32,
+        "uint64": fixed_u64,
+        "var_uint32": pyfory.uint32,
+        "var_uint64": pyfory.uint64,
         "float32": pyfory.float32,
         "float64": pyfory.float64,
-        # Timestamps are carried as i64 millis in pyfory's xlang.
+        # Timestamps are carried as varint64 millis in pyfory's xlang.
         "timestamp": pyfory.int64,
         "uuid": str,
     }
@@ -560,10 +576,14 @@ _PRIMITIVE_DEFAULTS: dict[str, Any] = {
     "int16": 0,
     "int32": 0,
     "int64": 0,
+    "varint32": 0,
+    "varint64": 0,
     "uint8": 0,
     "uint16": 0,
     "uint32": 0,
     "uint64": 0,
+    "var_uint32": 0,
+    "var_uint64": 0,
     "float32": 0.0,
     "float64": 0.0,
     "timestamp": 0,
