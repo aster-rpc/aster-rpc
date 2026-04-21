@@ -10,6 +10,14 @@
 
 import { WIRE_TYPE_KEY } from './decorators.js';
 import type { ManifestMethod, ManifestField } from './contract/manifest.js';
+import type {
+  CanonicalFieldDef,
+  CanonicalTypeDef,
+} from './contract/identity.js';
+import {
+  ContainerKind,
+  TypeKind,
+} from './contract/identity.js';
 
 /** A dynamically synthesized type class. */
 export interface DynamicType {
@@ -302,6 +310,243 @@ export class DynamicTypeFactory {
     }
     return type;
   }
+
+  /**
+   * Register Fory types by walking the canonical TypeDef graph. This is
+   * the high-fidelity path used when the client has fetched the full
+   * contract collection (`types/{hash}.bin` blobs) and decoded them via
+   * `decodeTypeDefBytes`. Unlike `registerWithFory`, this walks
+   * transitively — nested user types in `REF` fields are resolved via
+   * the typeDef graph and registered recursively.
+   *
+   * @param rootWireTags wire tags to start the walk from (method
+   *   request/response types).
+   * @param typeDefs two lookup views of the same set of TypeDefs: by
+   *   `{package}/{name}` tag, and by hex BLAKE3 hash. Callers build both
+   *   once per contract and pass them in.
+   * @returns the set of wire tags that were resolved via the typeDef
+   *   graph. Callers can diff against `rootWireTags` to decide whether
+   *   to fall back to the flat manifest path for unresolved roots.
+   */
+  registerFromTypeDefs(
+    rootWireTags: readonly string[],
+    typeDefs: {
+      byTag: ReadonlyMap<string, CanonicalTypeDef>;
+      byHash: ReadonlyMap<string, CanonicalTypeDef>;
+    },
+    Type: ForyTypeNamespace,
+    codec: { registerType(typeInfo: unknown): void },
+  ): Set<string> {
+    const resolved = new Set<string>();
+    const ordered = topoSortReachable(rootWireTags, typeDefs);
+    // typesByTag carries the in-progress Fory struct typeInfo for each
+    // already-registered tag, so nested REF fields can reference the
+    // real typeInfo object (not a name placeholder) when building the
+    // parent struct. Mirrors the `typesByTag.get(tag)` pattern in the
+    // scanner-generated `BUILD_ALL_TYPES` body.
+    const typesByTag = new Map<string, any>();
+
+    for (const tag of ordered) {
+      if (this.foryRegistered.has(tag)) {
+        resolved.add(tag);
+        continue;
+      }
+      const td = typeDefs.byTag.get(tag);
+      if (!td) continue;
+
+      const cls = this.getOrCreateFromTypeDef(tag, td);
+
+      const foryFields: Record<string, unknown> = {};
+      for (const f of td.fields) {
+        foryFields[f.name] = foryFieldTypeFromCanonical(f, Type, typeDefs, typesByTag);
+      }
+
+      const { namespace, typeName } = splitWireTag(tag);
+      const typeStruct = Type.struct(
+        { namespace, typeName },
+        foryFields,
+        { withConstructor: true },
+      );
+      (typeStruct as { initMeta: (ctor: unknown) => void }).initMeta(cls);
+      codec.registerType(typeStruct);
+      this.foryRegistered.add(tag);
+      typesByTag.set(tag, typeStruct);
+      resolved.add(tag);
+    }
+    return resolved;
+  }
+
+  private getOrCreateFromTypeDef(tag: string, td: CanonicalTypeDef): DynamicType {
+    let type = this.types.get(tag);
+    if (!type) {
+      type = createDynamicType(tag, td.fields.map(canonicalToManifestField));
+      this.types.set(tag, type);
+    }
+    return type;
+  }
+}
+
+// ── CanonicalTypeDef-driven helpers ─────────────────────────────────────────
+
+interface ForyTypeNamespace {
+  struct(opts: unknown, fields: unknown, meta?: unknown): any;
+  string(): any;
+  bool(): any;
+  int8(): any;
+  int16(): any;
+  int32(): any;
+  int64(): any;
+  float32(): any;
+  float64(): any;
+  binary(): any;
+  array(element: any): any;
+  set(element: any): any;
+  map(key: any, value: any): any;
+  optional?(inner: any): any;
+}
+
+const PRIMITIVE_TO_FORY: Record<string, (T: ForyTypeNamespace) => any> = {
+  bool: T => T.bool(),
+  string: T => T.string(),
+  binary: T => T.binary(),
+  int8: T => T.int8(),
+  int16: T => T.int16(),
+  int32: T => T.int32(),
+  int64: T => T.int64(),
+  uint8: T => T.int8(),
+  uint16: T => T.int16(),
+  uint32: T => T.int32(),
+  uint64: T => T.int64(),
+  float32: T => T.float32(),
+  float64: T => T.float64(),
+  // Timestamp is carried as a tagged primitive in TS land; wire as i64.
+  timestamp: T => T.int64(),
+  uuid: T => T.string(),
+};
+
+function foryPrimitiveForCanonical(primName: string, Type: ForyTypeNamespace): any {
+  const fn = PRIMITIVE_TO_FORY[primName];
+  if (fn) return fn(Type);
+  // Unknown primitive name — fall back to string so decode surfaces a
+  // stringified value rather than crashing. The server-side Fory hash
+  // check would reject a mismatched type anyway; we never silently
+  // encode wrong bytes.
+  return Type.string();
+}
+
+/**
+ * Topologically sort the set of TypeDefs reachable from `roots`, leaves
+ * first. Used by `registerFromTypeDefs` so nested struct types are
+ * registered before parents reference them — matches the ordering
+ * emitted by the `aster-gen` scanner into `WIRE_TYPES`.
+ *
+ * Back-edges (cycles via SELF_REF) are broken by visit order: a node
+ * that re-enters the DFS while already on the stack is ignored as a
+ * self-reference, exactly like the scanner's SCC handling.
+ */
+function topoSortReachable(
+  roots: readonly string[],
+  typeDefs: { byTag: ReadonlyMap<string, CanonicalTypeDef>; byHash: ReadonlyMap<string, CanonicalTypeDef> },
+): string[] {
+  const ordered: string[] = [];
+  const visited = new Set<string>();
+  const onStack = new Set<string>();
+
+  const refTag = (hashHex: string): string | undefined => {
+    const nested = typeDefs.byHash.get(hashHex);
+    return nested ? `${nested.package}/${nested.name}` : undefined;
+  };
+
+  const collectChildren = (td: CanonicalTypeDef): string[] => {
+    const out: string[] = [];
+    for (const f of td.fields) {
+      if (f.typeKind === TypeKind.REF) {
+        const tag = refTag(f.typeRef);
+        if (tag) out.push(tag);
+      }
+      if (f.container !== ContainerKind.NONE && f.containerKeyKind === TypeKind.REF) {
+        const tag = refTag(f.containerKeyRef);
+        if (tag) out.push(tag);
+      }
+    }
+    return out;
+  };
+
+  const visit = (tag: string): void => {
+    if (visited.has(tag) || onStack.has(tag)) return;
+    const td = typeDefs.byTag.get(tag);
+    if (!td) return;
+    onStack.add(tag);
+    for (const child of collectChildren(td)) visit(child);
+    onStack.delete(tag);
+    visited.add(tag);
+    ordered.push(tag);
+  };
+
+  for (const r of roots) visit(r);
+  return ordered;
+}
+
+function foryFieldTypeFromCanonical(
+  f: CanonicalFieldDef,
+  Type: ForyTypeNamespace,
+  typeDefs: { byTag: ReadonlyMap<string, CanonicalTypeDef>; byHash: ReadonlyMap<string, CanonicalTypeDef> },
+  typesByTag: ReadonlyMap<string, any>,
+): any {
+  const wrap = (inner: any) =>
+    f.optional && typeof Type.optional === 'function' ? Type.optional(inner) : inner;
+
+  const resolveRef = (typeRefHex: string): any | undefined => {
+    const nested = typeDefs.byHash.get(typeRefHex);
+    if (!nested) return undefined;
+    const nestedTag = `${nested.package}/${nested.name}`;
+    return typesByTag.get(nestedTag);
+  };
+
+  const resolveLeaf = (kind: number, primitive: string, typeRefHex: string): any => {
+    if (kind === TypeKind.PRIMITIVE) return foryPrimitiveForCanonical(primitive, Type);
+    if (kind === TypeKind.REF) {
+      const ref = resolveRef(typeRefHex);
+      if (ref) return ref;
+      // Nested struct wasn't registered yet — topological sort should
+      // prevent this, so reaching here means either a missing TypeDef
+      // blob or a cycle not caught by SELF_REF. Fall back to string.
+      return Type.string();
+    }
+    return Type.string();
+  };
+
+  if (f.container === ContainerKind.LIST || f.container === ContainerKind.SET) {
+    const element = resolveLeaf(f.typeKind, f.typePrimitive, f.typeRef);
+    const container = f.container === ContainerKind.SET
+      ? Type.set(element)
+      : Type.array(element);
+    return wrap(container);
+  }
+  if (f.container === ContainerKind.MAP) {
+    const keyType = resolveLeaf(f.containerKeyKind, f.containerKeyPrimitive, f.containerKeyRef);
+    const valType = resolveLeaf(f.typeKind, f.typePrimitive, f.typeRef);
+    return wrap(Type.map(keyType, valType));
+  }
+  if (f.typeKind === TypeKind.REF) {
+    const ref = resolveRef(f.typeRef);
+    return wrap(ref ?? Type.string());
+  }
+  if (f.typeKind === TypeKind.PRIMITIVE) {
+    return wrap(foryPrimitiveForCanonical(f.typePrimitive, Type));
+  }
+  return wrap(Type.string());
+}
+
+function canonicalToManifestField(f: CanonicalFieldDef): ManifestField {
+  return {
+    name: f.name,
+    type: f.container === ContainerKind.NONE
+      ? (f.typeKind === TypeKind.PRIMITIVE ? f.typePrimitive : 'dict')
+      : 'list',
+    required: f.required,
+    default: undefined,
+  };
 }
 
 /** Get a default value from a v1-schema field dict, falling back to the legacy
