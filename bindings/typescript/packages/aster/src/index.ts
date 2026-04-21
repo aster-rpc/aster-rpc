@@ -237,6 +237,7 @@ export {
   buildTypeGraph,
   fromServiceInfo,
   setNativeContract,
+  decodeTypeDefBytes,
   TypeKind as ContractTypeKind,
   ContainerKind,
   TypeDefKind,
@@ -246,6 +247,10 @@ export {
   type ServiceContract,
   type MethodDef as ContractMethodDef,
   type CapabilityRequirement as ContractCapabilityRequirement,
+  type CanonicalTypeDef,
+  type CanonicalFieldDef,
+  type CanonicalEnumValueDef,
+  type CanonicalUnionVariantDef,
 } from './contract/identity.js';
 
 // Contract manifest and publication

@@ -96,6 +96,7 @@ function contractToJson(contract: ServiceContract): string {
 
 interface NativeContract {
   canonicalBytesFromJson(typeName: string, json: string): Uint8Array;
+  canonicalBytesToJson(typeName: string, data: Uint8Array): string;
   computeTypeHash(data: Uint8Array): Uint8Array;
   computeContractIdFromJson(json: string): string;
 }
@@ -145,6 +146,129 @@ export function contractIdFromJson(contract: ServiceContract): string {
 /** Alias for contractIdFromJson. */
 export function contractIdFromContract(contract: ServiceContract): string {
   return contractIdFromJson(contract);
+}
+
+// -- Canonical decoder: bytes → struct ---------------------------------------
+
+/**
+ * Decoded `FieldDef` shape matching the Rust core struct. Lives here
+ * rather than in `manifest.ts` because it's the canonical view — the
+ * manifest's `ManifestField` is a human-friendly projection on top of
+ * it. Hex-encoded fields (type_ref, container_key_ref, default_value)
+ * are kept as hex strings to round-trip the canonical byte form.
+ */
+export interface CanonicalFieldDef {
+  id: number;
+  name: string;
+  typeKind: number;
+  typePrimitive: string;
+  typeRef: string;
+  selfRefName: string;
+  optional: boolean;
+  refTracked: boolean;
+  container: number;
+  containerKeyKind: number;
+  containerKeyPrimitive: string;
+  containerKeyRef: string;
+  required: boolean;
+  defaultValue: string;
+}
+
+export interface CanonicalEnumValueDef {
+  name: string;
+  value: number;
+}
+
+export interface CanonicalUnionVariantDef {
+  name: string;
+  id: number;
+  typeRef: string;
+}
+
+export interface CanonicalTypeDef {
+  kind: number;
+  package: string;
+  name: string;
+  fields: CanonicalFieldDef[];
+  enumValues: CanonicalEnumValueDef[];
+  unionVariants: CanonicalUnionVariantDef[];
+}
+
+// Rust `#[serde(rename_all = "snake_case")]` renders the enum variants
+// as strings; we map them back to the numeric constants exposed on this
+// module (TypeKind, ContainerKind, TypeDefKind) so call-site code stays
+// symbolic rather than stringly-typed.
+const TYPE_KIND_FROM_STR: Record<string, number> = {
+  primitive: TypeKind.PRIMITIVE,
+  ref: TypeKind.REF,
+  self_ref: TypeKind.SELF_REF,
+  any: TypeKind.ANY,
+};
+
+const CONTAINER_KIND_FROM_STR: Record<string, number> = {
+  none: ContainerKind.NONE,
+  list: ContainerKind.LIST,
+  set: ContainerKind.SET,
+  map: ContainerKind.MAP,
+};
+
+const TYPEDEF_KIND_FROM_STR: Record<string, number> = {
+  message: TypeDefKind.MESSAGE,
+  enum: TypeDefKind.ENUM,
+  union: TypeDefKind.UNION,
+};
+
+function mustLookup(table: Record<string, number>, value: unknown, kind: string): number {
+  if (typeof value !== 'string' || !(value in table)) {
+    throw new Error(`canonical decode: unknown ${kind} value ${JSON.stringify(value)}`);
+  }
+  return table[value]!;
+}
+
+function fieldDefFromJson(raw: any): CanonicalFieldDef {
+  return {
+    id: raw.id,
+    name: raw.name,
+    typeKind: mustLookup(TYPE_KIND_FROM_STR, raw.type_kind, 'TypeKind'),
+    typePrimitive: raw.type_primitive,
+    typeRef: raw.type_ref,
+    selfRefName: raw.self_ref_name,
+    optional: raw.optional,
+    refTracked: raw.ref_tracked,
+    container: mustLookup(CONTAINER_KIND_FROM_STR, raw.container, 'ContainerKind'),
+    containerKeyKind: mustLookup(TYPE_KIND_FROM_STR, raw.container_key_kind, 'TypeKind'),
+    containerKeyPrimitive: raw.container_key_primitive,
+    containerKeyRef: raw.container_key_ref,
+    required: raw.required,
+    defaultValue: raw.default_value,
+  };
+}
+
+/**
+ * Decode canonical XLANG bytes of a `TypeDef` (produced by
+ * `canonicalXlangBytes` on a single type graph node) back into the
+ * struct form. Hash-bearing bytes fields are returned hex-encoded.
+ *
+ * Wraps `canonicalBytesToJson("TypeDef", bytes)` in the NAPI binding.
+ * Callers that only need the field list (dynamic proxy nested-type
+ * resolution) can read `.fields` directly; the decoded shape mirrors
+ * the Rust `TypeDef` struct one-to-one.
+ */
+export function decodeTypeDefBytes(bytes: Uint8Array): CanonicalTypeDef {
+  const native = requireNative();
+  const raw = JSON.parse(native.canonicalBytesToJson('TypeDef', bytes));
+  return {
+    kind: mustLookup(TYPEDEF_KIND_FROM_STR, raw.kind, 'TypeDefKind'),
+    package: raw.package,
+    name: raw.name,
+    fields: (raw.fields ?? []).map(fieldDefFromJson),
+    enumValues: (raw.enum_values ?? []).map((e: any) => ({ name: e.name, value: e.value })),
+    unionVariants: (raw.union_variants ?? []).map((u: any) => ({
+      name: u.name,
+      id: u.id,
+      typeRef: u.type_ref,
+    })),
+  };
 }
 
 /**

@@ -21,6 +21,15 @@ pub fn canonical_bytes_from_json(type_name: String, json_str: String) -> Result<
     Ok(Buffer::from(bytes))
 }
 
+/// Decode canonical bytes of a `ServiceContract`, `TypeDef`, or
+/// `MethodDef` back to the JSON form used by `canonical_bytes_from_json`.
+/// Used by dynamic clients that need to walk the canonical type graph.
+#[napi]
+pub fn canonical_bytes_to_json(type_name: String, data: Buffer) -> Result<String> {
+    aster_transport_core::contract::canonical_bytes_to_json(&type_name, &data)
+        .map_err(|e| napi::Error::from_reason(format!("{:#}", e)))
+}
+
 /// BLAKE3 hash of input bytes -> 32-byte digest.
 #[napi]
 pub fn compute_type_hash(data: Buffer) -> Buffer {

@@ -146,4 +146,54 @@ describe('native contract identity (Rust core via NAPI)', () => {
     const h2 = native.computeContractIdFromJson(makeJson(2));
     expect(h1).not.toBe(h2);
   });
+
+  it.skipIf(!available)('canonicalBytesToJson round-trips TypeDef bytes', async () => {
+    const { setNativeContract, decodeTypeDefBytes, ContractTypeKind, TypeDefKind, ContainerKind } =
+      await import('../../../bindings/typescript/packages/aster/dist/index.js');
+    setNativeContract(native);
+
+    const tdJson = JSON.stringify({
+      kind: 'message',
+      package: 'example',
+      name: 'Person',
+      fields: [
+        { id: 0, name: 'id', type_kind: 'primitive', type_primitive: 'int64',
+          type_ref: '', self_ref_name: '', optional: false, ref_tracked: false,
+          container: 'none', container_key_kind: 'primitive',
+          container_key_primitive: '', container_key_ref: '',
+          required: true, default_value: '' },
+        { id: 0, name: 'name', type_kind: 'primitive', type_primitive: 'string',
+          type_ref: '', self_ref_name: '', optional: false, ref_tracked: false,
+          container: 'none', container_key_kind: 'primitive',
+          container_key_primitive: '', container_key_ref: '',
+          required: true, default_value: '' },
+      ],
+      enum_values: [],
+      union_variants: [],
+    });
+    const bytes = native.canonicalBytesFromJson('TypeDef', tdJson);
+
+    const decoded = decodeTypeDefBytes(bytes);
+    expect(decoded.name).toBe('Person');
+    expect(decoded.package).toBe('example');
+    expect(decoded.kind).toBe(TypeDefKind.MESSAGE);
+    expect(decoded.fields).toHaveLength(2);
+    // Canonical normalisation sorts fields by NFC name — id comes before name.
+    expect(decoded.fields.map(f => f.name)).toEqual(['id', 'name']);
+    expect(decoded.fields[0]!.typeKind).toBe(ContractTypeKind.PRIMITIVE);
+    expect(decoded.fields[0]!.container).toBe(ContainerKind.NONE);
+    expect(decoded.fields[0]!.typePrimitive).toBe('int64');
+  });
+
+  it.skipIf(!available)('canonicalBytesToJson rejects trailing bytes', () => {
+    const tdJson = JSON.stringify({
+      kind: 'message', package: '', name: 'X',
+      fields: [], enum_values: [], union_variants: [],
+    });
+    const bytes = native.canonicalBytesFromJson('TypeDef', tdJson);
+    const trailing = new Uint8Array(bytes.length + 1);
+    trailing.set(new Uint8Array(bytes));
+    trailing[bytes.length] = 0xFF;
+    expect(() => native.canonicalBytesToJson('TypeDef', trailing)).toThrow();
+  });
 });
