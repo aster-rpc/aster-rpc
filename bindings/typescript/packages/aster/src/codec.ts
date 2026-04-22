@@ -541,16 +541,22 @@ export class ForyCodec implements Codec {
   /**
    * Register a type for serialization.
    *
-   * If the typeInfo has been linked to a class via `initMeta(cls)`, pass the
-   * class to `fory.registerSerializer` so Fory's code-generator receives the
+   * If the typeInfo has been linked to a class via `initMeta(cls)`, pass
+   * the class to `fory.register` so Fory's code-generator receives the
    * `creator` option — without that, decode emits `new options.creator()`
-   * against an undefined reference. When there's no linked class, fall back
-   * to registering the typeInfo directly (used for stripped-down schemas).
+   * against an undefined reference. When there's no linked class, fall
+   * back to registering the typeInfo directly (used for stripped-down
+   * schemas). Fory 0.17 renamed the instance method from
+   * `registerSerializer` to `register`; call whichever exists so this
+   * compiles against either release.
    */
   registerType(typeInfo: any): void {
     const creator = typeInfo?.options?.creator;
     const arg = typeof creator === 'function' ? creator : typeInfo;
-    const { serialize, deserialize } = this.fory.registerSerializer(arg);
+    const registerFn = typeof this.fory.register === 'function'
+      ? this.fory.register.bind(this.fory)
+      : this.fory.registerSerializer.bind(this.fory);
+    const { serialize, deserialize } = registerFn(arg);
     const name = typeInfo?.options?.typeName ?? typeInfo?.tag ?? String(typeInfo);
     this.serializers.set(name, { serialize, deserialize });
   }

@@ -56,6 +56,13 @@ function isDeniedOrScopeMismatch(e: unknown): boolean {
 
 // ── Chapter tests ───────────────────────────────────────────────────────────
 
+// BigInt-safe stringify for error messages. A Python server returning
+// `uptime_secs: int` (wire type varint64) decodes on the TS side as
+// `bigint`, and plain `JSON.stringify` throws "cannot serialize BigInt".
+function dumpForError(r: unknown): string {
+  return JSON.stringify(r, (_k, v) => typeof v === 'bigint' ? String(v) : v);
+}
+
 async function testCh1Unary(mc: any): Promise<void> {
   try {
     const r = await mc.getStatus({ agent_id: 'edge-7' });
@@ -64,15 +71,22 @@ async function testCh1Unary(mc: any): Promise<void> {
       return;
     }
     if (r.agent_id !== 'edge-7') {
-      fail('Ch1 getStatus', `agent_id mismatch: ${JSON.stringify(r)}`);
+      fail('Ch1 getStatus', `agent_id mismatch: ${dumpForError(r)}`);
       return;
     }
     if (r.status !== 'running') {
-      fail('Ch1 getStatus', `status mismatch: ${JSON.stringify(r)}`);
+      fail('Ch1 getStatus', `status mismatch: ${dumpForError(r)}`);
       return;
     }
-    if (typeof r.uptime_secs !== 'number' || r.uptime_secs <= 0) {
-      fail('Ch1 getStatus', `uptime_secs invalid: ${JSON.stringify(r)}`);
+    // Accept number or bigint: a Python server wrapping
+    // `uptime_secs: int` sends varint64, which pyfory/fory-js decode
+    // as bigint. A TS server sending from `uptime_secs: number` sends
+    // float64. Either is a valid positive uptime value.
+    const uptime = r.uptime_secs;
+    const uptimeOk = (typeof uptime === 'number' && uptime > 0)
+      || (typeof uptime === 'bigint' && uptime > 0n);
+    if (!uptimeOk) {
+      fail('Ch1 getStatus', `uptime_secs invalid: ${dumpForError(r)}`);
       return;
     }
     ok('Ch1 getStatus returns typed response');

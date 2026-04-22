@@ -67,7 +67,13 @@ async def test_ch1_unary(mc) -> None:
         if r.get("status") != "running":
             fail("Ch1 getStatus", f"status mismatch: {r}")
             return
-        if not isinstance(r.get("uptime_secs"), int) or r["uptime_secs"] <= 0:
+        # Accept int or float: different bindings pick different wire
+        # widths for a plain "number of seconds" field (TS' scanner maps
+        # bare `number` to float64 per spec §11.3.2.3, while Python's
+        # `int` maps to varint64). The round-trip value is semantically
+        # a positive number either way.
+        uptime = r.get("uptime_secs")
+        if not isinstance(uptime, (int, float)) or isinstance(uptime, bool) or uptime <= 0:
             fail("Ch1 getStatus", f"uptime_secs invalid: {r}")
             return
         ok("Ch1 getStatus returns typed response")

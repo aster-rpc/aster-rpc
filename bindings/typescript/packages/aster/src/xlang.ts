@@ -90,48 +90,62 @@ export function createXlangCodec(fory?: any, Type?: any): ForyCodec {
 
   const codec = new ForyCodec(fory);
 
-  // StreamHeader: explicit field types matching Python pyfory annotations
+  // Framework-internal wire types per Aster-ContractIdentity.md
+  // §11.3.2.3 "Framework-Internal Wire Types" — these carry explicit
+  // Fory field IDs matching the Python `pyfory.field(id=N)` / Java
+  // `@ForyField(id=N)` declarations. The IDs are pinned by Aster-SPEC
+  // §5 so every binding's transport layer encodes and decodes them
+  // with the same TypeMeta field-ID layout. Without these setId
+  // calls, TS emits a name-keyed TypeMeta (~153 bytes for
+  // StreamHeader) that pyfory's id-keyed decoder reads as all-zero
+  // fields -- the Python server then rejects the request with
+  // "Missing service name".
+
+  // StreamHeader: ids 0..8 match bindings/python/aster/protocol.py.
+  // `Type.varInt32()` matches Python's `pyfory.int32` — that TypeVar
+  // is spec `varint32` (type id 5), not fixed `int32` (type id 4). See
+  // docs/_internal/fory/docs/specification/xlang_type_mapping.md.
   const streamHeaderType = Type.struct(
     { namespace: '_aster', typeName: 'StreamHeader' },
     {
-      service: Type.string(),
-      method: Type.string(),
-      version: Type.int32(),
-      callId: Type.int32(),
-      deadline: Type.int16(),
-      serializationMode: Type.int8(),
-      metadataKeys: Type.array(Type.string()),
-      metadataValues: Type.array(Type.string()),
-      sessionId: Type.int32(),
+      service: Type.string().setId(0),
+      method: Type.string().setId(1),
+      version: Type.varInt32().setId(2),
+      callId: Type.varInt32().setId(3),
+      deadline: Type.int16().setId(4),
+      serializationMode: Type.int8().setId(5),
+      metadataKeys: Type.array(Type.string()).setId(6),
+      metadataValues: Type.array(Type.string()).setId(7),
+      sessionId: Type.varInt32().setId(8),
     },
     { withConstructor: true },
   );
   streamHeaderType.initMeta(StreamHeader);
   codec.registerType(streamHeaderType);
 
-  // CallHeader: explicit field types
+  // CallHeader: ids 0..4.
   const callHeaderType = Type.struct(
     { namespace: '_aster', typeName: 'CallHeader' },
     {
-      method: Type.string(),
-      callId: Type.int32(),
-      deadline: Type.int16(),
-      metadataKeys: Type.array(Type.string()),
-      metadataValues: Type.array(Type.string()),
+      method: Type.string().setId(0),
+      callId: Type.varInt32().setId(1),
+      deadline: Type.int16().setId(2),
+      metadataKeys: Type.array(Type.string()).setId(3),
+      metadataValues: Type.array(Type.string()).setId(4),
     },
     { withConstructor: true },
   );
   callHeaderType.initMeta(CallHeader);
   codec.registerType(callHeaderType);
 
-  // RpcStatus: all fields are already naturally typed (int32, string, list<string>)
+  // RpcStatus: ids 0..3.
   const rpcStatusType = Type.struct(
     { namespace: '_aster', typeName: 'RpcStatus' },
     {
-      code: Type.int32(),
-      message: Type.string(),
-      detailKeys: Type.array(Type.string()),
-      detailValues: Type.array(Type.string()),
+      code: Type.varInt32().setId(0),
+      message: Type.string().setId(1),
+      detailKeys: Type.array(Type.string()).setId(2),
+      detailValues: Type.array(Type.string()).setId(3),
     },
     { withConstructor: true },
   );
