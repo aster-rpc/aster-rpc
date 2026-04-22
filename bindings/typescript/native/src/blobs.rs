@@ -66,10 +66,7 @@ impl BlobsClient {
     /// immediately; local reads via `list_collection` / `read` also
     /// work afterward because the collection is now persisted.
     #[napi]
-    pub async fn download_collection(
-        &self,
-        ticket: String,
-    ) -> Result<Vec<CollectionFile>> {
+    pub async fn download_collection(&self, ticket: String) -> Result<Vec<CollectionFile>> {
         let files = self
             .inner
             .clone()
