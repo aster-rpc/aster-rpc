@@ -255,6 +255,7 @@ bindings/typescript/packages/aster/docs-api/
 docs/python/
 **/_internal/*/
 !**/_internal/day0/
+!**/_internal/java/
 
 .aster/
 .aster-identity
@@ -282,3 +283,8 @@ bindings/dotnet/**/obj/
 
 # JMH benchmark result snapshots -- local run artifacts, not source.
 **/jmh-result*.text
+
+# Bundled FFI native libraries — produced by bindings/java/scripts/bundle-ffi.sh
+# during `mvn package` so the runtime jar ships with the host platform's lib.
+# These are build outputs, not source.
+bindings/java/aster-runtime/src/main/resources/native/

@@ -137,10 +137,11 @@ class TestPyforyAvailability:
         assert f is not None
 
     def test_version(self):
-        """pyfory version is 0.16.x."""
+        """pyfory version is 0.17.x -- the cross-binding baseline as of the
+        2026-04-22 fory upgrade (see project_fory_017_upgrade.md)."""
         version = getattr(pyfory, "__version__", "unknown")
         print(f"\npyfory version: {version}")
-        assert version.startswith("0.16"), f"Expected 0.16.x, got {version}"
+        assert version.startswith("0.17"), f"Expected 0.17.x, got {version}"
 
     def test_register_type_with_namespace_typename(self):
         """Can register a dataclass with namespace+typename."""

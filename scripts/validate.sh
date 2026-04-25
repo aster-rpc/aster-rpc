@@ -3,11 +3,11 @@
 # Usage: ./scripts/validate.sh
 #
 # Mirrors the jobs in .github/workflows/ci.yml + ci-typescript.yml:
-#   1. cargo fmt --check (Python Rust)
-#   2. cargo clippy -- -D warnings (Python Rust)
+#   1. cargo fmt --all --check (workspace)
+#   2. cargo clippy --workspace --all-targets -- -D warnings (NAPI excluded)
 #   3. uv run maturin develop (build the extension)
 #   4. uv run pytest tests/python/
-#   5. cargo fmt + clippy (TypeScript NAPI Rust)
+#   5. cargo clippy (NAPI, lib only)
 #   6. tsc --noEmit + vitest run (tests/typescript/)
 
 set -euo pipefail
@@ -43,17 +43,20 @@ else
     fail "Failed to pin fork deps"
 fi
 
-# ── 1. Rust formatting ─────────────────────────────────────────────
-step "cargo fmt --check"
-if cargo fmt --manifest-path bindings/python/rust/Cargo.toml --check; then
+# ── 1. Rust formatting (entire workspace) ─────────────────────────
+step "cargo fmt --all --check"
+if cargo fmt --all -- --check; then
     pass "Formatting OK"
 else
-    fail "Formatting issues found. Run: cargo fmt --manifest-path bindings/python/rust/Cargo.toml"
+    fail "Formatting issues found. Run: cargo fmt --all"
 fi
 
-# ── 2. Clippy (treats warnings as errors, same as CI) ──────────────
-step "cargo clippy -- -D warnings"
-if cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings; then
+# ── 2. Clippy (workspace, all targets, treats warnings as errors) ──
+# NAPI is excluded here because its [lib] is `cdylib`-only — `--all-targets`
+# rebuilds it as a lib-test and mis-flags `#[napi]`-exported symbols as
+# dead. NAPI is linted on its own below.
+step "cargo clippy --workspace --all-targets -- -D warnings"
+if cargo clippy --workspace --all-targets --exclude aster-transport-napi -- -D warnings; then
     pass "Clippy OK"
 else
     fail "Clippy found errors. Fix the issues above."
@@ -85,16 +88,12 @@ else
     echo "  Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
 fi
 
-# ── 5. TypeScript: Rust fmt + clippy (NAPI crate) ─────────────────
-step "cargo fmt --check (NAPI)"
-if cargo fmt --manifest-path bindings/typescript/native/Cargo.toml --check; then
-    pass "NAPI formatting OK"
-else
-    fail "NAPI formatting issues. Run: cargo fmt --manifest-path bindings/typescript/native/Cargo.toml"
-fi
-
+# ── 5. TypeScript: clippy (NAPI crate, lib-only) ──────────────────
+# fmt is already covered by `cargo fmt --all` above; clippy on the
+# napi crate stays scoped to the lib (no --all-targets) for the same
+# reason it's excluded from the workspace clippy step.
 step "cargo clippy (NAPI)"
-if cargo clippy --manifest-path bindings/typescript/native/Cargo.toml -- -D warnings; then
+if cargo clippy -p aster-transport-napi -- -D warnings; then
     pass "NAPI clippy OK"
 else
     fail "NAPI clippy found errors."

@@ -1171,17 +1171,10 @@ mod tests {
         );
 
         // Invariants after quiescence.
-        for (key, bound) in [
-            (None, 2usize),
-            (Some(vec![0xAA]), 1),
-            (Some(vec![0xBB]), 1),
-        ] {
+        for (key, bound) in [(None, 2usize), (Some(vec![0xAA]), 1), (Some(vec![0xBB]), 1)] {
             let open = pool.open_count(&key);
             let free = pool.free_count(&key);
-            assert!(
-                open <= bound,
-                "{key:?}: open_count {open} > bound {bound}"
-            );
+            assert!(open <= bound, "{key:?}: open_count {open} > bound {bound}");
             assert_eq!(
                 open, free,
                 "{key:?}: open {open} != free {free} — handle leaked"

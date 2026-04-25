@@ -64,6 +64,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.2.15"
@@ -75,6 +79,14 @@ jobs:
       - name: Install dependencies
         working-directory: bindings/typescript
         run: bun install
+
+      - name: Build NAPI binding (.node)
+        # Tests load `@aster-rpc/transport` which dispatches to a local
+        # `aster-transport.<platform>.node` next to native/index.js. Without
+        # this step the loader falls through to the published platform
+        # package, which doesn't exist in CI and breaks aster-gen tests.
+        working-directory: bindings/typescript/native
+        run: bun run build
 
       - name: Typecheck
         working-directory: bindings/typescript/packages/aster

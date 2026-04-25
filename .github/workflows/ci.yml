@@ -49,6 +49,10 @@ concurrency:
 
 permissions:
   contents: read
+  # dorny/paths-filter@v3 (the `changes` job) calls the GitHub API to
+  # diff the PR head against base on `pull_request` events; without
+  # this it errors with "Resource not accessible by integration".
+  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -66,14 +70,13 @@ jobs:
           components: rustfmt, clippy
       - name: aster-cli ↔ aster-rpc version compat
         run: python3 scripts/check-cli-compat.py
-      - name: cargo fmt
-        run: cargo fmt --manifest-path bindings/python/rust/Cargo.toml --check
-      - name: cargo clippy (bindings)
-        run: cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings
-      - name: cargo clippy (core)
-        run: cargo clippy -p aster_transport_core -- -D warnings
-      - name: cargo clippy (ffi)
-        run: cargo clippy -p aster_transport_ffi -- -D warnings
+      - name: cargo fmt (workspace)
+        run: cargo fmt --all -- --check
+      # NAPI is excluded here because its [lib] is `cdylib`-only — `--all-targets`
+      # rebuilds it as a lib-test, which mis-flags `#[napi]`-exported symbols as
+      # dead. NAPI is linted separately in ci-typescript.yml.
+      - name: cargo clippy (workspace, all targets)
+        run: cargo clippy --workspace --all-targets --exclude aster-transport-napi -- -D warnings
 
   # ── Detect what changed (used by gating tests) ────────────────────
   changes:
@@ -251,13 +254,21 @@ jobs:
       - name: cargo test (ffi)
         run: cargo test -p aster_transport_ffi
 
-  # ── Rust sanitizers (ASan + LSan + TSan) ──────────────────────────
+  # ── Rust sanitizers (ASan + LSan) ─────────────────────────────────
   # `-Z sanitizer=*` is a nightly-only rustc flag. We pin to a specific
   # nightly rather than tracking latest: vergen-lib (transitive via
   # iroh-relay) uses rustversion for nightly detection, which has
   # repeatedly broken on bleeding-edge nightly releases (both nightly()
   # cfg-gated functions get emitted, causing E0428). A pinned nightly
   # keeps this deterministic.
+  #
+  # ThreadSanitizer is intentionally NOT in the matrix: TSan requires
+  # every transitive crate to be built with the same `-Zsanitizer` flag
+  # (E0635-class "ABI mismatch" against `slab`, `object`, `gimli`, etc.).
+  # The fix is `-Zbuild-std=panic_abort,std --target=...` plus rust-src,
+  # which roughly triples build time. ASan + LSan link cleanly with
+  # uninstrumented deps, so we keep them on and accept the gap. Revisit
+  # if a data-race regression slips past loom + ASan.
   #
   # `continue-on-error: true` makes sanitizer failures non-blocking
   # for merges -- the signal is still visible in the UI but future
@@ -270,7 +281,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sanitizer: [address, leak, thread]
+        sanitizer: [address, leak]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master

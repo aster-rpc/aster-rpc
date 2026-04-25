@@ -18,8 +18,8 @@ unsafe fn poll_for_event(
         std::thread::sleep(Duration::from_millis(10));
         let mut events = [std::mem::zeroed(); 8];
         let count = iroh_poll_events(runtime, events.as_mut_ptr(), 8, 5);
-        for i in 0..count {
-            if events[i as usize].kind == event_kind as u32 {
+        for ev in events.iter().take(count) {
+            if ev.kind == event_kind as u32 {
                 return true;
             }
         }

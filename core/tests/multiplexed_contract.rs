@@ -126,17 +126,17 @@ async fn drive_unary_call(
     }
 }
 
+type AckBinding = (
+    Arc<Mutex<Vec<IncomingCall>>>,
+    Arc<Mutex<Vec<u64>>>, // connection_ids seen in ConnectionClosed
+    tokio::task::JoinHandle<()>,
+);
+
 /// Spin up a "binding" task that reads calls off the reactor event
 /// channel, logs them into the shared sink, and trivially acks each
 /// with an empty OK trailer so the client-side stream drain returns.
 /// Returns the sink so tests can assert on the calls received.
-fn spawn_ack_binding(
-    mut reactor: aster_transport_core::reactor::ReactorHandle,
-) -> (
-    Arc<Mutex<Vec<IncomingCall>>>,
-    Arc<Mutex<Vec<u64>>>, // connection_ids seen in ConnectionClosed
-    tokio::task::JoinHandle<()>,
-) {
+fn spawn_ack_binding(mut reactor: aster_transport_core::reactor::ReactorHandle) -> AckBinding {
     let calls = Arc::new(Mutex::new(Vec::<IncomingCall>::new()));
     let closed = Arc::new(Mutex::new(Vec::<u64>::new()));
     let calls_c = calls.clone();
@@ -472,11 +472,7 @@ async fn connection_closed_emitted_once_per_connection() -> Result<()> {
 
     // Drive one call so we know a Call event preceded the close.
     let handle = conn.acquire_stream(None).await.unwrap();
-    timeout(
-        STEP_TIMEOUT,
-        drive_unary_call(handle.get(), b"h", b"r"),
-    )
-    .await??;
+    timeout(STEP_TIMEOUT, drive_unary_call(handle.get(), b"h", b"r")).await??;
     drop(handle);
 
     // Tear the connection down. Dropping `CoreConnection` does NOT
@@ -551,9 +547,7 @@ async fn connection_closed_emitted_with_in_flight_calls() -> Result<()> {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "ConnectionClosed never fired after closing a connection with a call in flight"
-            );
+            panic!("ConnectionClosed never fired after closing a connection with a call in flight");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -638,18 +632,14 @@ fn shared_harness() -> &'static AdversarialHarness {
 /// margin so the test covers the "frame decodes, router processes it"
 /// branch as well as the "length-prefix rejected" branch.
 fn any_framed_blob() -> impl Strategy<Value = Vec<u8>> {
-    (
-        any::<u8>(),
-        proptest::collection::vec(any::<u8>(), 0..256),
-    )
-        .prop_map(|(flags, payload)| {
-            let body_len = (payload.len() + 1) as u32;
-            let mut out = Vec::with_capacity(4 + payload.len() + 1);
-            out.extend_from_slice(&body_len.to_le_bytes());
-            out.push(flags);
-            out.extend_from_slice(&payload);
-            out
-        })
+    (any::<u8>(), proptest::collection::vec(any::<u8>(), 0..256)).prop_map(|(flags, payload)| {
+        let body_len = (payload.len() + 1) as u32;
+        let mut out = Vec::with_capacity(4 + payload.len() + 1);
+        out.extend_from_slice(&body_len.to_le_bytes());
+        out.push(flags);
+        out.extend_from_slice(&payload);
+        out
+    })
 }
 
 /// Generate adversarial wire bytes. Three shapes:

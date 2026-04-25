@@ -679,12 +679,15 @@ fn test_connection_info_struct_size() {
         "Connection info struct should have non-zero size"
     );
 
-    // Verify struct fields are accessible
+    // Verify struct fields are accessible — round-trip a few values.
     unsafe {
         let mut info: iroh_connection_info_t = std::mem::zeroed();
         info.struct_size = expected_size;
         info.connection_type = 2; // UdpDirect
         info.is_connected = 1;
+        assert_eq!(info.struct_size, expected_size);
+        assert_eq!(info.connection_type, 2);
+        assert_eq!(info.is_connected, 1);
     }
 }
 
@@ -696,12 +699,15 @@ fn test_remote_info_struct_size() {
         "Remote info struct should have non-zero size"
     );
 
-    // Verify struct fields are accessible
+    // Verify struct fields are accessible — round-trip a few values.
     unsafe {
         let mut info: iroh_remote_info_t = std::mem::zeroed();
         info.struct_size = expected_size;
         info.connection_type = 2; // UdpDirect
         info.is_connected = 1;
+        assert_eq!(info.struct_size, expected_size);
+        assert_eq!(info.connection_type, 2);
+        assert_eq!(info.is_connected, 1);
     }
 }
 
