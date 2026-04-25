@@ -13,9 +13,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aster_transport_core::reactor::{
-    self, OutgoingFrame, ReactorEvent, RequestFrame,
-};
+use aster_transport_core::reactor::{self, OutgoingFrame, ReactorEvent, RequestFrame};
 use aster_transport_core::ring;
 use tokio::sync::mpsc;
 

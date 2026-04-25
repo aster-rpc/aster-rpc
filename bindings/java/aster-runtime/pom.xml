@@ -127,6 +127,26 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
             </plugin>
+            <!--
+              Default (classifier-less) jar always excludes native libs.
+              The per-platform classifier jar is produced by the
+              `natives` profile (activated with -Dnative.classifier=...).
+              See the profile at the bottom of this pom.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>default-jar</id>
+                        <configuration>
+                            <excludes>
+                                <exclude>native/**</exclude>
+                            </excludes>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
             <plugin>
                 <groupId>org.openjdk.jmh</groupId>
                 <artifactId>jmh-maven-plugin</artifactId>
@@ -152,4 +172,69 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+          Per-platform classifier jar.
+
+          Activated by passing -Dnative.classifier=<os>-<arch>
+          (e.g. linux-x86_64, macos-aarch64). When active, mvn package
+          produces an extra `aster-runtime-<v>-<classifier>.jar` containing
+          ONLY the native lib at native/<classifier>/lib...
+
+          Consumers depend on the main jar plus the matching classifier:
+
+              <dependency>
+                <groupId>site.aster</groupId>
+                <artifactId>aster-runtime</artifactId>
+                <version>${aster.version}</version>
+              </dependency>
+              <dependency>
+                <groupId>site.aster</groupId>
+                <artifactId>aster-runtime</artifactId>
+                <version>${aster.version}</version>
+                <classifier>${os.detected.classifier}</classifier>
+              </dependency>
+
+          (use os-maven-plugin or Gradle's osdetector to expand
+          ${os.detected.classifier} at the consumer site.)
+
+          The bundle script (bindings/java/scripts/bundle-ffi.sh) copies
+          the FFI lib into src/main/resources/native/<classifier>/ before
+          mvn package — keep the classifier value in sync between the
+          script invocation and -Dnative.classifier so the right jar
+          ships with the right contents.
+        -->
+        <profile>
+            <id>natives</id>
+            <activation>
+                <property>
+                    <name>native.classifier</name>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-jar-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>natives-jar</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                                <configuration>
+                                    <classifier>${native.classifier}</classifier>
+                                    <includes>
+                                        <include>native/**</include>
+                                    </includes>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

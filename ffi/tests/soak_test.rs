@@ -179,8 +179,7 @@ fn run_soak_cycle(runtime: iroh_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
         if count == 0 {
             break;
         }
-        for i in 0..count {
-            let ev = events[i as usize];
+        for ev in events.iter().take(count) {
             // Only record accept events (skip node creation/close events)
             if ev.operation == accept_op {
                 if ev.status == iroh_status_t::IROH_STATUS_OK as u32 {
@@ -232,8 +231,8 @@ fn poll_for_event(runtime: iroh_runtime_t, kind: iroh_event_kind_t, timeout_ms: 
         // SAFETY: zeroed() is unsafe but we own this memory and poll_events writes to it
         let mut events = unsafe { [std::mem::zeroed::<iroh_event_t>(); 4] };
         let count = unsafe { iroh_poll_events(runtime, events.as_mut_ptr(), 4, 50) };
-        for i in 0..count {
-            if events[i as usize].kind == kind as u32 {
+        for ev in events.iter().take(count) {
+            if ev.kind == kind as u32 {
                 return true;
             }
         }
@@ -277,7 +276,7 @@ fn run_soak_test(duration_secs: u64) {
         let _cycle_duration = _cycle_start.elapsed();
         cycle_count += 1;
 
-        if cycle_count % print_interval == 0 || !success {
+        if cycle_count.is_multiple_of(print_interval) || !success {
             let elapsed = start.elapsed();
             let ops_sub = metrics.ops_submitted.load(Ordering::Relaxed);
             let ops_comp = metrics.ops_completed.load(Ordering::Relaxed);

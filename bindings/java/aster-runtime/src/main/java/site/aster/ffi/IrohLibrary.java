@@ -1,5 +1,7 @@
 package site.aster.ffi;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -9,25 +11,118 @@ import java.lang.foreign.SegmentAllocator;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.Locale;
 import java.util.Optional;
 
 /**
  * Loads the native iroh library and provides typed {@link MethodHandle} access to all FFI functions
  * defined in the C ABI.
  *
- * <p>Uses {@code SymbolLookup.libraryLookup} to load the native library and resolve symbols.
+ * <p>Resolution order, first hit wins:
+ *
+ * <ol>
+ *   <li>System property {@code aster.ffi.lib} — explicit absolute path
+ *   <li>Env var {@code IROH_LIB_PATH} — explicit absolute path
+ *   <li>Workspace-relative {@code target/{release,debug}/lib<name>.<ext>} (walks up looking for a
+ *       Cargo workspace root), so running {@code mvn test} in a source tree picks up a freshly-
+ *       built {@code cargo build} lib without further config
+ *   <li>Classpath resource {@code /native/<os>-<arch>/lib<name>.<ext>}, extracted to a temp file
+ * </ol>
+ *
+ * <p>The classpath path is what ships in the published jar — see {@code
+ * bindings/java/scripts/bundle-ffi.sh} which copies the lib into {@code
+ * src/main/resources/native/<os>-<arch>/} before {@code mvn package}.
  */
 public final class IrohLibrary implements SymbolLookup {
 
-  private static volatile IrohLibrary INSTANCE;
+  private static final String LIB_NAME = "aster_transport_ffi";
+  private static final String LIB_FILE = System.mapLibraryName(LIB_NAME);
 
-  private static final String LIB_PATH =
-      System.getenv("IROH_LIB_PATH") != null
-          ? System.getenv("IROH_LIB_PATH")
-          : "/Users/emrul/dev/emrul/iroh-python/target/release/libaster_transport_ffi.dylib";
+  private static volatile IrohLibrary INSTANCE;
+  private static final String LIB_PATH = resolveLibPath();
 
   static {
     System.load(LIB_PATH);
+  }
+
+  private static String resolveLibPath() {
+    String override = System.getProperty("aster.ffi.lib");
+    if (override == null || override.isEmpty()) {
+      override = System.getenv("IROH_LIB_PATH");
+    }
+    if (override != null && !override.isEmpty()) {
+      Path p = Path.of(override);
+      if (!Files.exists(p)) {
+        throw new ExceptionInInitializerError(
+            new UnsatisfiedLinkError(
+                "aster.ffi.lib / IROH_LIB_PATH set but file does not exist: " + override));
+      }
+      return p.toAbsolutePath().toString();
+    }
+
+    Path workspaceLib = findWorkspaceLib();
+    if (workspaceLib != null) {
+      return workspaceLib.toAbsolutePath().toString();
+    }
+
+    String resource = "/native/" + platformDir() + "/" + LIB_FILE;
+    try (InputStream in = IrohLibrary.class.getResourceAsStream(resource)) {
+      if (in == null) {
+        throw new ExceptionInInitializerError(
+            new UnsatisfiedLinkError(
+                "Native library "
+                    + LIB_FILE
+                    + " not found at classpath resource "
+                    + resource
+                    + ". Set -Daster.ffi.lib=<path> or IROH_LIB_PATH env var to override."));
+      }
+      Path tmp = Files.createTempFile("aster_ffi_", "_" + LIB_FILE);
+      tmp.toFile().deleteOnExit();
+      Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+      return tmp.toAbsolutePath().toString();
+    } catch (IOException e) {
+      throw new ExceptionInInitializerError(
+          new UnsatisfiedLinkError(
+              "Failed to extract native library " + resource + ": " + e.getMessage()));
+    }
+  }
+
+  private static Path findWorkspaceLib() {
+    Path dir = Path.of("").toAbsolutePath();
+    for (int i = 0; i < 12 && dir != null; i++, dir = dir.getParent()) {
+      if (!Files.exists(dir.resolve("Cargo.toml"))) {
+        continue;
+      }
+      for (String profile : new String[] {"release", "debug"}) {
+        Path candidate = dir.resolve("target").resolve(profile).resolve(LIB_FILE);
+        if (Files.exists(candidate)) {
+          return candidate;
+        }
+      }
+    }
+    return null;
+  }
+
+  private static String platformDir() {
+    return osName() + "-" + osArch();
+  }
+
+  private static String osName() {
+    String n = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+    if (n.contains("linux")) return "linux";
+    if (n.contains("mac") || n.contains("darwin")) return "macos";
+    if (n.contains("win")) return "windows";
+    throw new ExceptionInInitializerError("Unsupported os.name: " + n);
+  }
+
+  private static String osArch() {
+    String a = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
+    if (a.equals("amd64") || a.equals("x86_64")) return "x86_64";
+    if (a.equals("aarch64") || a.equals("arm64")) return "aarch64";
+    throw new ExceptionInInitializerError("Unsupported os.arch: " + a);
   }
 
   private final SymbolLookup impl;

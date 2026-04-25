@@ -29,8 +29,6 @@
 //! and `iroh_node_accept_aster` / `iroh_connect`.
 
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use aster_transport_ffi::*;
@@ -49,8 +47,8 @@ unsafe fn poll_for_event(
         std::thread::sleep(Duration::from_millis(10));
         let mut events = [std::mem::zeroed(); 8];
         let count = iroh_poll_events(runtime, events.as_mut_ptr(), 8, 5);
-        for i in 0..count {
-            if events[i as usize].kind == event_kind as u32 {
+        for ev in events.iter().take(count) {
+            if ev.kind == event_kind as u32 {
                 return true;
             }
         }
@@ -62,73 +60,6 @@ unsafe fn poll_for_event(
 unsafe fn wait_for_node_creation(runtime: iroh_runtime_t) {
     let created = poll_for_event(runtime, iroh_event_kind_t::IROH_EVENT_NODE_CREATED, 100);
     assert!(created, "Node should have been created within 1 second");
-}
-
-// ─── Helper types ─────────────────────────────────────────────────────────
-
-/// A latch that starts locked and releases when count reaches zero.
-#[derive(Debug)]
-struct TestLatch {
-    count: Arc<AtomicU32>,
-}
-
-impl TestLatch {
-    fn new(initial: u32) -> Self {
-        Self {
-            count: Arc::new(AtomicU32::new(initial)),
-        }
-    }
-
-    /// Wait for the latch to be released (count reaches 0).
-    async fn wait(&self) {
-        while self.count.load(Ordering::SeqCst) != 0 {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    /// Release one count.
-    fn release(&self) {
-        self.count.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// Track how many events of each kind were observed.
-#[derive(Debug, Default)]
-struct EventTracker {
-    connected: AtomicU64,
-    accepted: AtomicU64,
-    read: AtomicU64,
-    finished: AtomicU64,
-    reset: AtomicU64,
-    error: AtomicU64,
-    cancelled: AtomicU64,
-    closed: AtomicU64,
-}
-
-impl EventTracker {
-    fn record(&self, kind: iroh_event_kind_t) {
-        match kind {
-            iroh_event_kind_t::IROH_EVENT_CONNECTED => {
-                self.connected.fetch_add(1, Ordering::SeqCst);
-            }
-            iroh_event_kind_t::IROH_EVENT_CONNECTION_ACCEPTED => {
-                self.accepted.fetch_add(1, Ordering::SeqCst);
-            }
-            iroh_event_kind_t::IROH_EVENT_FRAME_RECEIVED => {
-                self.read.fetch_add(1, Ordering::SeqCst);
-            }
-            iroh_event_kind_t::IROH_EVENT_STREAM_FINISHED => {
-                self.finished.fetch_add(1, Ordering::SeqCst);
-            }
-            iroh_event_kind_t::IROH_EVENT_STREAM_RESET => {
-                self.reset.fetch_add(1, Ordering::SeqCst);
-            }
-            iroh_event_kind_t::IROH_EVENT_ERROR => {
-                self.error.fetch_add(1, Ordering::SeqCst);
-            }
-            _ => {}
-        }
-    }
 }
 
 // ─── Test: accept_submit_then_close ──────────────────────────────────────
@@ -351,11 +282,11 @@ fn test_many_outstanding_on_cq() {
         const N: usize = 100;
         let mut ops = [0u64; N];
 
-        for i in 0..N {
+        for (i, slot) in ops.iter_mut().enumerate().take(N) {
             let mut op: iroh_operation_t = 0;
             let status = iroh_node_accept_aster(runtime, 1, i as u64, &mut op);
             if status == iroh_status_t::IROH_STATUS_OK as i32 {
-                ops[i] = op;
+                *slot = op;
             }
         }
 
@@ -372,9 +303,7 @@ fn test_many_outstanding_on_cq() {
             if count == 0 {
                 break;
             }
-            for i in 0..count {
-                all_events.push(events[i]);
-            }
+            all_events.extend_from_slice(&events[..count]);
             if count < 16 {
                 break;
             }
@@ -471,15 +400,8 @@ fn test_peer_disconnect_mid_read() {
         let mut events = [std::mem::zeroed(); 8];
         let count = iroh_poll_events(runtime, events.as_mut_ptr(), 8, 200);
 
-        // accept_op should have ERROR (not OK) since node was closed
-        let accept_error_count = events[..count]
-            .iter()
-            .filter(|e| {
-                e.operation == accept_op
-                    && e.kind == iroh_event_kind_t::IROH_EVENT_CONNECT_FAILED as u32
-            })
-            .count();
-
+        // accept_op may have ERROR (or nothing) since node was closed; we only
+        // assert the negative — never an ACCEPTED post-close.
         let accept_closed_count = events[..count]
             .iter()
             .filter(|e| {
@@ -535,11 +457,11 @@ fn test_batch_completion_delivery() {
         const N: usize = 16; // Small batch for predictable testing
         let mut ops = [0u64; N];
 
-        for i in 0..N {
+        for (i, slot) in ops.iter_mut().enumerate().take(N) {
             let mut op: iroh_operation_t = 0;
             let status = iroh_node_accept_aster(runtime, 1, i as u64, &mut op);
             if status == iroh_status_t::IROH_STATUS_OK as i32 {
-                ops[i] = op;
+                *slot = op;
             }
         }
 
@@ -564,8 +486,8 @@ fn test_batch_completion_delivery() {
 
             total_events += count as u32;
 
-            for i in 0..count {
-                let op = events[i].operation;
+            for ev in events.iter().take(count) {
+                let op = ev.operation;
                 assert!(
                     all_op_ids.insert(op),
                     "Duplicate event for op {} (event should only appear once)",
@@ -600,7 +522,7 @@ fn test_many_nodes_share_runtime_cq() {
         const N: usize = 20;
         let mut node_ops = [0u64; N];
 
-        for i in 0..N {
+        for (i, slot) in node_ops.iter_mut().enumerate().take(N) {
             let alpns = [b"aster".as_ptr()];
             let alpn_lens = [5];
 
@@ -610,7 +532,7 @@ fn test_many_nodes_share_runtime_cq() {
                 alpn_lens.as_ptr(),
                 1,
                 i as u64,
-                &mut node_ops[i],
+                slot,
             );
             assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
         }
@@ -631,9 +553,7 @@ fn test_many_nodes_share_runtime_cq() {
                 }
                 continue;
             }
-            for i in 0..count {
-                all_events.push(events[i]);
-            }
+            all_events.extend_from_slice(&events[..count]);
             if count < 8 {
                 break; // Got less than full batch, probably done
             }

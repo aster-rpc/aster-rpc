@@ -37,9 +37,8 @@
 //! the trace format and schema, and provide a framework for future conformance
 //! testing via the Java and Go harnesses.
 
+use std::fs;
 use std::path::Path;
-use std::time::Duration;
-use std::{fs, thread};
 
 #[cfg(test)]
 mod tests {
@@ -149,7 +148,7 @@ mod tests {
             let entries = scenario
                 .get("entries")
                 .and_then(|e| e.as_array())
-                .expect(&format!("{} should have entries array", name));
+                .unwrap_or_else(|| panic!("{} should have entries array", name));
             assert!(
                 !entries.is_empty(),
                 "{} should have at least one entry",
