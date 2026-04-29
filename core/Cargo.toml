@@ -23,6 +23,12 @@ unicode-normalization = "0.1"
 hex = "0.4"
 bs58 = "0.5"
 ed25519-dalek = { version = "=3.0.0-pre.6", features = ["rand_core"] }
+# Prerelease pins to keep ed25519-dalek 3.0.0-pre.6 compiling.
+# Mirrors iroh's own pin in iroh's workspace Cargo.toml.
+# Drop these once ed25519-dalek stabilises against pkcs8 0.11 final.
+der   = "=0.8.0-rc.10"
+pkcs8 = "=0.11.0-rc.10"
+spki  = "=0.8.0-rc.4"
 crossbeam-utils = { workspace = true }
 
 [dev-dependencies]

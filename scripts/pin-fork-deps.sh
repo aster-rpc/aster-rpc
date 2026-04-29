@@ -22,9 +22,9 @@ if [ ! -f Cargo.lock ]; then
     cargo generate-lockfile >/dev/null 2>&1
 fi
 
-# Pin hickory-proto and hickory-net to beta.1 (matches aster-rpc/iroh's pin on
-# hickory-resolver). Silently succeeds if already pinned.
-cargo update -p hickory-proto --precise 0.26.0-beta.1 >/dev/null 2>&1 || true
-cargo update -p hickory-net   --precise 0.26.0-beta.1 >/dev/null 2>&1 || true
+# NOTE (2026-04-29, iroh 0.98 upgrade): iroh 0.98 explicitly pins hickory-proto
+# and hickory-net to 0.26.0-beta.4 in its own Cargo.toml, so the prior beta.1
+# downgrade is now incompatible. This script is a no-op until a new transitive
+# semver mismatch surfaces.
 
-echo "✓ Fork transitive deps pinned (hickory-proto, hickory-net → 0.26.0-beta.1)"
+echo "✓ Fork transitive deps OK (hickory pins handled inline by iroh 0.98)"
