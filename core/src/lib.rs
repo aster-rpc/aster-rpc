@@ -16,13 +16,14 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::address_lookup::MdnsAddressLookup;
 use iroh::endpoint::{
-    presets, AfterHandshakeOutcome, BeforeConnectOutcome, Connection, ConnectionError,
-    ConnectionInfo, Endpoint, EndpointHooks, PathInfo, PortmapperConfig, RelayMode, VarInt,
+    presets, AfterHandshakeOutcome, BeforeConnectOutcome, Closed, Connection, ConnectionError,
+    Endpoint, EndpointHooks, PathEvent, PortmapperConfig, RelayMode, VarInt,
+    WeakConnectionHandle,
 };
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{EndpointAddr, EndpointId, RelayMap, RelayUrl, SecretKey, TransportAddr, Watcher};
+use iroh::{EndpointAddr, EndpointId, RelayMap, RelayUrl, SecretKey, TransportAddr};
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::Store as BlobStore;
 use iroh_blobs::format::collection::Collection;
@@ -356,15 +357,15 @@ impl Default for CoreRemoteAggregate {
 }
 
 impl CoreRemoteAggregate {
-    fn update_from_path(&mut self, path: &PathInfo) {
+    fn update_from_path_stats(&mut self, addr: &TransportAddr, stats: &iroh::endpoint::PathStats) {
         self.last_update = SystemTime::now();
-        if path.is_ip() {
+        if addr.is_ip() {
             self.ip_path = true;
         }
-        if path.is_relay() {
+        if addr.is_relay() {
             self.relay_path = true;
         }
-        if let Some(stats) = path.stats() {
+        if stats.rtt != Duration::ZERO {
             self.rtt_min = self.rtt_min.min(stats.rtt);
             self.rtt_max = self.rtt_max.max(stats.rtt);
         }
@@ -375,25 +376,25 @@ impl CoreRemoteAggregate {
 #[derive(Debug, Default)]
 struct RemoteInfoEntry {
     aggregate: CoreRemoteAggregate,
-    connections: HashMap<u64, ConnectionInfo>,
+    connections: HashMap<u64, WeakConnectionHandle>,
 }
 
 impl RemoteInfoEntry {
-    fn is_active(&self) -> bool {
-        !self.connections.is_empty()
-    }
-
     fn to_core_remote_info(&self, node_id: &str) -> CoreRemoteInfo {
-        // Determine connection type from active connections
-        let conn_type = if self.connections.is_empty() {
+        // Upgrade weak handles to inspect current state.
+        let live: Vec<Connection> = self
+            .connections
+            .values()
+            .filter_map(WeakConnectionHandle::upgrade)
+            .collect();
+
+        let conn_type = if live.is_empty() {
             ConnectionType::NotConnected
         } else {
-            // Check selected path of any active connection
-            let detail = self
-                .connections
-                .values()
+            let detail = live
+                .iter()
                 .find_map(|c| {
-                    c.selected_path().map(|p| {
+                    c.paths().iter().find(|p| p.is_selected()).map(|p| {
                         if p.is_relay() {
                             ConnectionTypeDetail::UdpRelay
                         } else if p.is_ip() {
@@ -407,14 +408,11 @@ impl RemoteInfoEntry {
             ConnectionType::Connected(detail)
         };
 
-        // Sum bytes from stats of active connections
-        let (bytes_sent, bytes_received) = self
-            .connections
-            .values()
-            .filter_map(|c| c.stats())
-            .fold((0u64, 0u64), |(s, r), stats| {
-                (s + stats.udp_tx.bytes, r + stats.udp_rx.bytes)
-            });
+        // Sum bytes from stats of currently-live connections.
+        let (bytes_sent, bytes_received) = live.iter().fold((0u64, 0u64), |(s, r), c| {
+            let stats = c.stats();
+            (s + stats.udp_tx.bytes, r + stats.udp_rx.bytes)
+        });
 
         CoreRemoteInfo {
             node_id: node_id.to_string(),
@@ -431,35 +429,50 @@ impl RemoteInfoEntry {
             ),
             bytes_sent: bytes_sent.max(self.aggregate.total_bytes_sent),
             bytes_received: bytes_received.max(self.aggregate.total_bytes_received),
-            is_connected: self.is_active(),
+            is_connected: !live.is_empty(),
         }
     }
 }
 
 type RemoteMapInner = Arc<RwLock<HashMap<String, RemoteInfoEntry>>>;
 
+/// Pairing of a connection's remote endpoint id (captured at handshake time)
+/// with a weak handle to the connection. Modeled after the `remote-info.rs`
+/// example in iroh 1.0.0-rc.0: storing a `WeakConnectionHandle` rather than a
+/// strong `Connection` lets the monitor avoid keeping connections alive past
+/// the application's last reference.
+#[derive(Debug, Clone)]
+struct TrackedConnection {
+    remote_id: String,
+    handle: WeakConnectionHandle,
+}
+
 /// Connection monitor that tracks remote endpoint information.
 ///
-/// Implements `EndpointHooks` to capture `ConnectionInfo` from `after_handshake`,
-/// then spawns background tasks to track path changes and connection close events.
-/// This is modeled after the `remote-info.rs` example in iroh 0.97.0.
+/// Implements `EndpointHooks` to capture a `WeakConnectionHandle` from
+/// `after_handshake`, then spawns background tasks to watch path events and
+/// connection close events.
 #[derive(Clone, Debug)]
 pub struct CoreMonitor {
     map: RemoteMapInner,
     #[allow(dead_code)]
-    tx: mpsc::Sender<ConnectionInfo>,
+    tx: mpsc::Sender<TrackedConnection>,
     _task: Arc<tokio::task::AbortHandle>,
 }
 
 /// Hook portion of the monitor — installed on the endpoint builder.
 #[derive(Debug)]
 struct MonitorHook {
-    tx: mpsc::Sender<ConnectionInfo>,
+    tx: mpsc::Sender<TrackedConnection>,
 }
 
 impl EndpointHooks for MonitorHook {
-    async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
-        self.tx.send(conn.clone()).await.ok();
+    async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
+        let tracked = TrackedConnection {
+            remote_id: conn.remote_id().to_string(),
+            handle: conn.weak_handle(),
+        };
+        self.tx.send(tracked).await.ok();
         AfterHandshakeOutcome::Accept
     }
 }
@@ -483,7 +496,7 @@ impl CoreMonitor {
         (hook, monitor)
     }
 
-    async fn run(mut rx: mpsc::Receiver<ConnectionInfo>, map: RemoteMapInner) {
+    async fn run(mut rx: mpsc::Receiver<TrackedConnection>, map: RemoteMapInner) {
         let mut conn_id: u64 = 0;
         let mut tasks = tokio::task::JoinSet::new();
 
@@ -522,54 +535,75 @@ impl CoreMonitor {
         tasks: &mut tokio::task::JoinSet<()>,
         map: RemoteMapInner,
         conn_id: u64,
-        conn: ConnectionInfo,
+        tracked: TrackedConnection,
     ) {
-        let remote_id = conn.remote_id().to_string();
+        let remote_id = tracked.remote_id.clone();
+        let handle = tracked.handle.clone();
 
-        // Store connection info
+        // Store the weak handle.
         {
             let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
             let entry = inner.entry(remote_id.clone()).or_default();
-            entry.connections.insert(conn_id, conn.clone());
+            entry.connections.insert(conn_id, handle.clone());
             entry.aggregate.last_update = SystemTime::now();
         }
 
-        // Track connection close
+        // Track connection close. `WeakConnectionHandle::closed` does not keep
+        // the connection alive but still resolves with final stats.
         tasks.spawn({
-            let conn = conn.clone();
             let map = map.clone();
             let remote_id = remote_id.clone();
+            let closed_fut = handle.closed();
             async move {
-                if let Some((_, stats)) = conn.closed().await {
-                    let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
-                    let entry = inner.entry(remote_id).or_default();
-                    entry.connections.remove(&conn_id);
-                    entry.aggregate.last_update = SystemTime::now();
+                let final_stats = closed_fut.await;
+                let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
+                let entry = inner.entry(remote_id).or_default();
+                entry.connections.remove(&conn_id);
+                entry.aggregate.last_update = SystemTime::now();
+                if let Some(Closed { stats, .. }) = final_stats {
                     entry.aggregate.total_bytes_sent += stats.udp_tx.bytes;
                     entry.aggregate.total_bytes_received += stats.udp_rx.bytes;
-                } else {
-                    let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
-                    let entry = inner.entry(remote_id).or_default();
-                    entry.connections.remove(&conn_id);
-                    entry.aggregate.last_update = SystemTime::now();
                 }
             }
         });
 
-        // Track path changes
-        tasks.spawn({
-            let map = map.clone();
-            async move {
-                let mut path_updates = conn.paths().stream();
-                while let Some(paths) = path_updates.next().await {
-                    let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
-                    let entry = inner.entry(remote_id.clone()).or_default();
-                    for path in paths {
-                        entry.aggregate.update_from_path(&path);
+        // Track path changes. We briefly upgrade to obtain a `PathEventStream`;
+        // matching the upstream `remote-info.rs` example.
+        if let Some(mut path_events) =
+            handle.upgrade().map(|conn| conn.path_events())
+        {
+            tasks.spawn({
+                let map = map.clone();
+                let handle = handle.clone();
+                async move {
+                    while let Some(event) = path_events.next().await {
+                        let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
+                        let entry = inner.entry(remote_id.clone()).or_default();
+                        match event {
+                            PathEvent::Closed {
+                                remote_addr,
+                                last_stats,
+                                ..
+                            } => {
+                                entry
+                                    .aggregate
+                                    .update_from_path_stats(&remote_addr, &last_stats);
+                            }
+                            _ => {
+                                if let Some(conn) = handle.upgrade() {
+                                    for path in conn.paths().iter() {
+                                        let stats = path.stats();
+                                        entry
+                                            .aggregate
+                                            .update_from_path_stats(path.remote_addr(), &stats);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
     }
 
     /// Query information about a specific remote endpoint.
@@ -662,11 +696,11 @@ impl EndpointHooks for CoreHooksAdapter {
         }
     }
 
-    async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
+    async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         let info = CoreHookHandshakeInfo {
             remote_endpoint_id: conn.remote_id().to_string(),
             alpn: conn.alpn().to_vec(),
-            is_alive: conn.is_alive(),
+            is_alive: conn.close_reason().is_none(),
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -1502,9 +1536,9 @@ impl CoreConnection {
     // ============================================================================
 
     pub fn connection_info(&self) -> CoreConnectionInfo {
-        let info = self.inner.to_info();
-        let stats = info.stats();
-        let selected_path = info.selected_path();
+        let stats = self.inner.stats();
+        let paths = self.inner.paths();
+        let selected_path = paths.iter().find(|p| p.is_selected());
 
         let connection_type = match selected_path.as_ref() {
             Some(path) if path.is_relay() => ConnectionTypeDetail::UdpRelay,
@@ -1513,15 +1547,18 @@ impl CoreConnection {
             None => ConnectionTypeDetail::Other("unknown".to_string()),
         };
 
+        let rtt_ns = selected_path.as_ref().and_then(|p| {
+            let rtt = p.rtt();
+            (rtt != Duration::ZERO).then(|| rtt.as_nanos().min(u64::MAX as u128) as u64)
+        });
+
         CoreConnectionInfo {
             connection_type,
-            bytes_sent: stats.as_ref().map(|s| s.udp_tx.bytes).unwrap_or(0),
-            bytes_received: stats.as_ref().map(|s| s.udp_rx.bytes).unwrap_or(0),
-            rtt_ns: selected_path
-                .and_then(|p| p.rtt())
-                .map(|d| d.as_nanos().min(u64::MAX as u128) as u64),
-            alpn: info.alpn().to_vec(),
-            is_connected: info.is_alive(),
+            bytes_sent: stats.udp_tx.bytes,
+            bytes_received: stats.udp_rx.bytes,
+            rtt_ns,
+            alpn: self.inner.alpn().to_vec(),
+            is_connected: self.inner.close_reason().is_none(),
         }
     }
 
@@ -1533,30 +1570,30 @@ impl CoreConnection {
     /// Returns 0.0 if no path is selected or RTT is not yet measured.
     pub fn rtt_ms(&self) -> f64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.rtt())
-            .map(|d| d.as_secs_f64() * 1000.0)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.rtt().as_secs_f64() * 1000.0)
             .unwrap_or(0.0)
     }
 
     /// Total bytes sent on the selected path (UDP layer).
     pub fn bytes_sent(&self) -> u64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.udp_tx.bytes)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().udp_tx.bytes)
             .unwrap_or(0)
     }
 
     /// Total bytes received on the selected path (UDP layer).
     pub fn bytes_recv(&self) -> u64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.udp_rx.bytes)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().udp_rx.bytes)
             .unwrap_or(0)
     }
 
@@ -1564,40 +1601,40 @@ impl CoreConnection {
     /// Returns 0 if not available.
     pub fn congestion_window(&self) -> u64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.cwnd)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().cwnd)
             .unwrap_or(0)
     }
 
     /// Number of lost packets on the selected path.
     pub fn lost_packets(&self) -> u64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.lost_packets)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().lost_packets)
             .unwrap_or(0)
     }
 
     /// Number of congestion events on the selected path.
     pub fn congestion_events(&self) -> u64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.congestion_events)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().congestion_events)
             .unwrap_or(0)
     }
 
     /// Current path MTU in bytes.
     pub fn current_mtu(&self) -> u16 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.current_mtu)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().current_mtu)
             .unwrap_or(0)
     }
 
@@ -1876,7 +1913,7 @@ impl CoreRecvStream {
 
     pub async fn read(&self, max_len: usize) -> Result<Option<Vec<u8>>> {
         let mut s = self.inner.lock().await;
-        Ok(s.read_chunk(max_len).await?.map(|c| c.bytes.to_vec()))
+        Ok(s.read_chunk(max_len).await?.map(|b| b.to_vec()))
     }
 
     pub async fn read_exact(&self, n: usize) -> Result<Vec<u8>> {
@@ -1992,7 +2029,7 @@ impl CoreBlobsClient {
             hash_hex.parse::<Hash>()?,
             BlobFormat::Raw,
         )
-        .serialize())
+        .encode_string())
     }
 
     /// Store bytes as a single-file Collection (HashSeq), compatible with sendme.
@@ -2226,11 +2263,11 @@ impl CoreBlobsClient {
             hash_hex.parse::<Hash>()?,
             BlobFormat::HashSeq,
         )
-        .serialize())
+        .encode_string())
     }
 
     pub async fn download_blob(&self, ticket_str: String) -> Result<Vec<u8>> {
-        let ticket = BlobTicket::deserialize(&ticket_str)?;
+        let ticket = BlobTicket::decode_string(&ticket_str)?;
         let hash = ticket.hash();
         let format = ticket.format();
         let (addr, _, _) = ticket.into_parts();
@@ -2321,7 +2358,7 @@ impl CoreBlobsClient {
 
     /// Download a collection and return list of (name, data) pairs.
     pub async fn download_collection(&self, ticket_str: String) -> Result<Vec<(String, Vec<u8>)>> {
-        let ticket = BlobTicket::deserialize(&ticket_str)?;
+        let ticket = BlobTicket::decode_string(&ticket_str)?;
         let hash = ticket.hash();
         let (addr, _, _) = ticket.into_parts();
         if let Ok(lookup) = self.endpoint.address_lookup() {
@@ -2367,7 +2404,7 @@ impl CoreDocsClient {
     }
 
     pub async fn join(&self, ticket_str: String) -> Result<CoreDoc> {
-        let ticket = DocTicket::deserialize(&ticket_str)?;
+        let ticket = DocTicket::decode_string(&ticket_str)?;
         if let Ok(lookup) = self.endpoint.address_lookup() {
             for node_addr in &ticket.nodes {
                 let mem = MemoryLookup::new();
@@ -2387,7 +2424,7 @@ impl CoreDocsClient {
         &self,
         ticket_str: String,
     ) -> Result<(CoreDoc, CoreDocEventReceiver)> {
-        let ticket = DocTicket::deserialize(&ticket_str)?;
+        let ticket = DocTicket::decode_string(&ticket_str)?;
         if let Ok(lookup) = self.endpoint.address_lookup() {
             for node_addr in &ticket.nodes {
                 let mem = MemoryLookup::new();
@@ -2559,7 +2596,7 @@ impl CoreDoc {
             .doc
             .share(share_mode, AddrInfoOptions::Id)
             .await?
-            .serialize())
+            .encode_string())
     }
 
     /// Start syncing this document with the given peers (by endpoint ID hex string).
@@ -2615,7 +2652,7 @@ impl CoreDoc {
             .doc
             .share(share_mode, AddrInfoOptions::RelayAndAddresses)
             .await?
-            .serialize())
+            .encode_string())
     }
 }
 
