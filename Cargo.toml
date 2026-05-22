@@ -6,12 +6,14 @@ resolver = "2"
 [workspace.dependencies]
 # Core Iroh
 # Declared as crates.io versions; [patch.crates-io] below rewrites them
-# to the aster-rpc forks (read_into, poll_driver — see UPGRADE_0.98.md).
-iroh        = "0.98.0"
-iroh-blobs  = "0.100.0"
-iroh-docs   = "0.98.0"
-iroh-gossip = "0.98.0"
-iroh-tickets = "0.5.0"
+# to the aster-rpc forks (read_into, poll_driver — see UPGRADE_1.0.0-rc.0.md).
+iroh        = "=1.0.0-rc.0"
+iroh-blobs  = "0.101.0"
+iroh-docs   = "0.99.0"
+iroh-gossip = "0.99.0"
+iroh-tickets = "=1.0.0-rc.0"
+# mDNS lookup moved to a separate crate in iroh 1.0.0-rc.0.
+iroh-mdns-address-lookup = "0.2"
 
 # Python FFI
 pyo3        = { version = "0.28.2", features = ["extension-module", "abi3-py39"] }
@@ -38,12 +40,12 @@ crossbeam-utils = "0.8"
 # iroh from crates.io) must also resolve to the fork. A regular dep override
 # only affects the top-level use; [patch] rewires every resolution.
 [patch.crates-io]
-iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "ae33aa590c2eaf80dabdefdd58ff216ba5378e96" }
-iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "ae33aa590c2eaf80dabdefdd58ff216ba5378e96" }
-iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "ae33aa590c2eaf80dabdefdd58ff216ba5378e96" }
-iroh-blobs  = { git = "https://github.com/aster-rpc/iroh-blobs",  rev = "fc85abf0b286c2cdcf4bc6d18221e8d54add77e3" }
-iroh-docs   = { git = "https://github.com/aster-rpc/iroh-docs",   rev = "970c4d18105cb67fc8be48379b537ff2ee1f375f" }
-iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "aa46a548079c5b7714cb297741ca249cac840123" }
-noq         = { git = "https://github.com/aster-rpc/noq",         rev = "567919965474964b012d70a0f34c793a8be58c09" }
-noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "567919965474964b012d70a0f34c793a8be58c09" }
-noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "567919965474964b012d70a0f34c793a8be58c09" }
+iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "77a68a5477c15db261c66e7740a77ef752d9685f" }
+iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "77a68a5477c15db261c66e7740a77ef752d9685f" }
+iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "77a68a5477c15db261c66e7740a77ef752d9685f" }
+iroh-blobs  = { git = "https://github.com/aster-rpc/iroh-blobs",  rev = "ede454c774b24e1e4674aa713a37573b4144517d" }
+iroh-docs   = { git = "https://github.com/aster-rpc/iroh-docs",   rev = "be04181e05e566adb033af786e09c4d20ac9390f" }
+iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "d7d13582ba81d1b266cce758daccacad3ab5357c" }
+noq         = { git = "https://github.com/aster-rpc/noq",         rev = "617899fe7e983f794e0162d15d8558258fa8c375" }
+noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "617899fe7e983f794e0162d15d8558258fa8c375" }
+noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "617899fe7e983f794e0162d15d8558258fa8c375" }
