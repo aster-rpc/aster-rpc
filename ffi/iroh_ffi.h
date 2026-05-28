@@ -573,6 +573,29 @@ int32_t iroh_blobs_read(iroh_runtime_t runtime,
                         iroh_operation_t *out_operation);
 
 /**
+ * Import a file by path into the blob store (Copy mode, never TryReference).
+ * On success emits `IROH_EVENT_BLOB_ADDED` carrying the hash hex as the event
+ * payload. `path` is the UTF-8 filesystem path.
+ */
+int32_t iroh_blobs_add_path(iroh_runtime_t runtime,
+                            iroh_node_t node,
+                            struct iroh_bytes_t path,
+                            uint64_t user_data,
+                            iroh_operation_t *out_operation);
+
+/**
+ * Import a file by path and set a persistent named tag in one step. On success
+ * emits `IROH_EVENT_BLOB_ADDED` carrying the hash hex as the event payload.
+ * `path` and `tag_name` are UTF-8.
+ */
+int32_t iroh_blobs_add_path_with_named_tag(iroh_runtime_t runtime,
+                                           iroh_node_t node,
+                                           struct iroh_bytes_t path,
+                                           struct iroh_bytes_t tag_name,
+                                           uint64_t user_data,
+                                           iroh_operation_t *out_operation);
+
+/**
  * Store bytes as a single-file Collection (HashSeq), compatible with sendme.
  * Emits IROH_EVENT_BLOB_ADDED with the collection hash in the payload.
  */

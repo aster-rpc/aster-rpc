@@ -3428,6 +3428,139 @@ pub unsafe extern "C" fn iroh_blobs_read(
     iroh_status_t::IROH_STATUS_OK as i32
 }
 
+/// Import a file by path into the blob store (Copy mode, never TryReference).
+/// On success emits `IROH_EVENT_BLOB_ADDED` carrying the hash hex as the event
+/// payload. `path` is the UTF-8 filesystem path.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_blobs_add_path(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    path: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let blobs = node_arc.blobs_client();
+    let path_str = match unsafe { read_string(&path) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match blobs.add_path(path_str).await {
+            Ok(hash) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_BLOB_ADDED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, hash.into_bytes());
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Import a file by path and set a persistent named tag in one step. On success
+/// emits `IROH_EVENT_BLOB_ADDED` carrying the hash hex as the event payload.
+/// `path` and `tag_name` are UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_blobs_add_path_with_named_tag(
+    runtime: iroh_runtime_t,
+    node: iroh_node_t,
+    path: iroh_bytes_t,
+    tag_name: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let blobs = node_arc.blobs_client();
+    let path_str = match unsafe { read_string(&path) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let tag_str = match unsafe { read_string(&tag_name) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match blobs.add_path_with_named_tag(path_str, tag_str).await {
+            Ok(hash) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_BLOB_ADDED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    node,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, hash.into_bytes());
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
 // ============================================================================
 // C FFI Functions - Blobs: Collection (sendme-compatible)
 // ============================================================================

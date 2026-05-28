@@ -122,6 +122,34 @@ impl BlobsClient {
         })
     }
 
+    /// Import a file by path (Copy mode, never TryReference) and return the
+    /// BLAKE3 hash as a hex string. Like `add_bytes`, an auto-tag keeps the blob
+    /// alive; use `add_path_with_named_tag` for a deterministic GC-keyed tag.
+    fn add_path<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(
+            py,
+            async move { client.add_path(path).await.map_err(err_to_py) },
+        )
+    }
+
+    /// Import a file by path and set a persistent named tag in one step,
+    /// returning the BLAKE3 hash as a hex string.
+    fn add_path_with_named_tag<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        tag_name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            client
+                .add_path_with_named_tag(path, tag_name)
+                .await
+                .map_err(err_to_py)
+        })
+    }
+
     /// Read a blob by its BLAKE3 hash hex string. Returns bytes or raises IrohError.
     fn read_to_bytes<'py>(&self, py: Python<'py>, hash_hex: String) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();

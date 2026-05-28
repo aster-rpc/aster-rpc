@@ -66,6 +66,55 @@ async def test_blob_empty_data():
     await node.shutdown()
 
 
+async def test_add_path_imports_file(tmp_path):
+    """add_path imports a file (Copy mode) and the blob is readable by hash."""
+    from aster import IrohNode, blobs_client
+
+    node = await IrohNode.memory()
+    blobs = blobs_client(node)
+
+    contents = b"imported via add_path"
+    src = tmp_path / "import-me.bin"
+    src.write_bytes(contents)
+
+    hash_hex = await blobs.add_path(str(src))
+    assert isinstance(hash_hex, str)
+    assert len(hash_hex) > 0
+
+    assert await blobs.blob_has(hash_hex) is True
+    assert await blobs.read_to_bytes(hash_hex) == contents
+
+    # Same bytes via add_bytes must hash identically (content addressing).
+    assert hash_hex == await blobs.add_bytes(contents)
+
+    await node.shutdown()
+
+
+async def test_add_path_with_named_tag_sets_deterministic_tag(tmp_path):
+    """add_path_with_named_tag imports and tags the blob with a caller-chosen name."""
+    from aster import IrohNode, TagInfo, blobs_client
+
+    node = await IrohNode.memory()
+    blobs = blobs_client(node)
+
+    contents = b"tagged via add_path_with_named_tag"
+    src = tmp_path / "tagged.bin"
+    src.write_bytes(contents)
+
+    tag_name = "portal-sync/t1/blob"
+    hash_hex = await blobs.add_path_with_named_tag(str(src), tag_name)
+    assert isinstance(hash_hex, str)
+    assert await blobs.blob_has(hash_hex) is True
+
+    tag = await blobs.tag_get(tag_name)
+    assert tag is not None
+    assert isinstance(tag, TagInfo)
+    assert tag.name == tag_name
+    assert tag.hash == hash_hex
+
+    await node.shutdown()
+
+
 # ============================================================================
 # Phase 1c.1: Tag Tests
 # ============================================================================

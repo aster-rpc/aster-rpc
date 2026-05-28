@@ -209,6 +209,66 @@ impl CoreNode {
 
 Verify `send_datagram` and `read_datagram` work correctly end-to-end.
 
+#### 3.1.7 Portal-sync persistence surfaces (path import, persistent docs, clean shutdown)
+
+Added so consumers (e.g. portal-sync) can build on Aster's persistence without
+reaching into the underlying `iroh-blobs` / `iroh-docs` store handles.
+
+```rust
+impl CoreBlobsClient {
+    /// Import a file into the blob store and return its hash (hex).
+    /// Uses ImportMode::Copy (the reflink-or-copy import path, never
+    /// TryReference), so the store owns the data. Like add_bytes, an auto-tag
+    /// keeps the blob alive.
+    pub async fn add_path(&self, path: String) -> Result<String>;
+
+    /// Import a file and set a persistent named tag in one step, returning the
+    /// hash (hex). The blob is protected by the caller-chosen tag_name rather
+    /// than an anonymous auto-tag, so it can be GC'd deterministically by
+    /// deleting the tag. portal-sync keys tag names by (tree_id, blob_hash).
+    pub async fn add_path_with_named_tag(&self, path: String, tag_name: String) -> Result<String>;
+}
+
+impl CoreDocsClient {
+    /// Open an existing local namespace by ID (hex), without a ticket or peer.
+    /// Returns None if absent. This is the access path for a persistent node
+    /// after restart: namespaces/authors/entries written before close() are
+    /// reloaded from docs.redb.
+    pub async fn open(&self, namespace_id_hex: String) -> Result<Option<CoreDoc>>;
+}
+```
+
+**Persistent docs.** `CoreNode::persistent` / `persistent_with_alpns` now back
+the docs protocol with `Docs::persistent(path)` (was `Docs::memory()`), so
+namespaces/authors/entries survive restart. `docs.redb` + `default-author` live
+alongside the blob store's `blobs.db` in the same node directory. Memory nodes
+(`CoreNode::memory*`) keep using `Docs::memory()`.
+
+**Clean shutdown.** `CoreNode::close()` now flushes the blob store with
+`store.sync_db()` **before** `router.shutdown()`. The router shuts the store
+actor down (via `BlobsProtocol::shutdown()`), so the flush must precede it or it
+races a dead actor. This makes tags/entries added before close durable for an
+FsStore; it is a harmless no-op for a MemStore. All bindings inherit this
+automatically since their node-close routes to `CoreNode::close()`.
+
+**FFI C ABI functions:** `iroh_blobs_add_path` and
+`iroh_blobs_add_path_with_named_tag` (see §3.2.5). Persistent docs and the
+shutdown flush need no new C surface — they ride the existing
+`iroh_node_persistent` / `iroh_node_close` entry points.
+
+**Language binding requirements:**
+- All bindings expose `add_path` / `add_path_with_named_tag` on their blobs client.
+- The Java binding also gains `tagSet(name, hash, format)` (the C `iroh_tags_set`
+  already existed; only the FFM declaration was missing) to complete deterministic
+  tag parity with Python/TS.
+
+#### 3.1.8 Note on event payload reads (binding implementers)
+
+`IROH_EVENT_BLOB_ADDED` (and other `emit_with_data` events) carry their payload
+in a **native** buffer. Bindings must copy it out via a native-segment read
+(e.g. Java `event.data().asSlice(0, event.dataLen()).toArray(JAVA_BYTE)`), not
+via a heap-array view like `ByteBuffer.array()`, which throws on a direct buffer.
+
 ### 3.2 `aster_transport_ffi` Complete Rewrite
 
 The FFI layer gets a ground-up rewrite based on the completion queue architecture.
@@ -608,6 +668,28 @@ iroh_status_t iroh_blobs_download(
     iroh_runtime_t runtime,
     uint64_t node,
     const uint8_t* ticket_ptr, size_t ticket_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+// Import a file from disk (ImportMode::Copy — reflink-or-copy, never
+// TryReference). Emits IROH_EVENT_BLOB_ADDED with the blob hash hex in the
+// payload. Like iroh_blobs_add_bytes, an auto-tag keeps the blob alive.
+iroh_status_t iroh_blobs_add_path(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* path_ptr, size_t path_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+// Import a file from disk AND set a persistent named tag in one step. The
+// caller-chosen tag (portal-sync keys it by (tree_id, blob_hash)) protects the
+// blob from GC instead of an anonymous auto-tag. Emits IROH_EVENT_BLOB_ADDED
+// with the blob hash hex in the payload.
+iroh_status_t iroh_blobs_add_path_with_named_tag(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* path_ptr, size_t path_len,
+    const uint8_t* tag_name_ptr, size_t tag_name_len,
     uint64_t user_data,
     iroh_operation_t* out_operation
 );
