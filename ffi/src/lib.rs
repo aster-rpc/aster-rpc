@@ -4877,14 +4877,27 @@ pub unsafe extern "C" fn iroh_doc_share(
 pub enum iroh_doc_query_mode_t {
     IROH_DOC_QUERY_KEY_EXACT = 0,
     IROH_DOC_QUERY_KEY_PREFIX = 1,
+    /// Return only the latest entry for the key (across all authors), or nothing if the
+    /// latest write was a deletion. Always emits 0 or 1 entries; `limit` is ignored.
+    IROH_DOC_QUERY_LATEST_EXACT = 2,
+    /// List the latest entry for each distinct key under the prefix (across all authors),
+    /// omitting keys whose latest write was a deletion. `limit` caps the number of keys.
+    IROH_DOC_QUERY_LATEST_PREFIX = 3,
 }
 
+/// Query a doc by key.
+///
+/// `limit` caps the number of entries returned by a prefix (`IROH_DOC_QUERY_KEY_PREFIX`)
+/// or exact (`IROH_DOC_QUERY_KEY_EXACT`) query; pass `0` for an unbounded result. It is
+/// ignored by `IROH_DOC_QUERY_LATEST_EXACT`, which always returns at most one entry (the
+/// latest writer for the key, or none if the latest write was a deletion).
 #[no_mangle]
 pub unsafe extern "C" fn iroh_doc_query(
     runtime: iroh_runtime_t,
     doc: u64,
     mode: u32,
     key: iroh_bytes_t,
+    limit: u64,
     user_data: u64,
     out_operation: *mut iroh_operation_t,
 ) -> i32 {
@@ -4915,10 +4928,18 @@ pub unsafe extern "C" fn iroh_doc_query(
             return;
         }
 
+        let limit = if limit == 0 { None } else { Some(limit) };
         let result = if mode == iroh_doc_query_mode_t::IROH_DOC_QUERY_KEY_PREFIX as u32 {
-            doc_arc.query_key_prefix(key_bytes).await
+            doc_arc.query_key_prefix(key_bytes, limit).await
+        } else if mode == iroh_doc_query_mode_t::IROH_DOC_QUERY_LATEST_PREFIX as u32 {
+            doc_arc.query_latest_prefix(key_bytes, limit).await
+        } else if mode == iroh_doc_query_mode_t::IROH_DOC_QUERY_LATEST_EXACT as u32 {
+            doc_arc
+                .query_latest_exact(key_bytes)
+                .await
+                .map(|opt| opt.into_iter().collect::<Vec<_>>())
         } else {
-            doc_arc.query_key_exact(key_bytes).await
+            doc_arc.query_key_exact(key_bytes, limit).await
         };
 
         match result {

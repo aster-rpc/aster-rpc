@@ -757,6 +757,7 @@ iroh_status_t iroh_doc_query(
     uint64_t doc,
     uint32_t mode,  // 0=key_exact, 1=key_prefix
     const uint8_t* key_ptr, size_t key_len,
+    uint64_t limit,  // caps prefix-query results; 0=unbounded. Ignored for key_exact.
     uint64_t user_data,
     iroh_operation_t* out_operation
 );  // Returns DOC_QUERY event with packed entries in payload, entry count in flags
@@ -1848,11 +1849,39 @@ pub struct CoreDocEntry {
 }
 
 impl CoreDoc {
-    /// Query all entries for an exact key, across all authors.
-    pub async fn query_key_exact(&self, key: Vec<u8>) -> Result<Vec<CoreDocEntry>>;
+    /// Query all entries for an exact key, across all authors. Ordered by author id, NOT
+    /// timestamp, so `limit` truncates by author and may drop the latest writer — use it
+    /// only to enumerate authors (e.g. before a trust filter); `None` reads them all.
+    pub async fn query_key_exact(
+        &self,
+        key: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>>;
 
-    /// Query all entries matching a key prefix, across all authors.
-    pub async fn query_key_prefix(&self, prefix: Vec<u8>) -> Result<Vec<CoreDocEntry>>;
+    /// Read the single latest entry for an exact key (highest timestamp across authors),
+    /// or `None` if never written or the latest write was a deletion. Independent of
+    /// author count — the canonical "current value of a key" read.
+    pub async fn query_latest_exact(&self, key: Vec<u8>) -> Result<Option<CoreDocEntry>>;
+
+    /// Query all entries matching a key prefix, across all authors — one row per
+    /// (author, key). A prefix query is a listing (every key is distinct), so the cap is
+    /// the caller's: `Some(n)` to bound the result set, `None` for an unbounded listing.
+    pub async fn query_key_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>>;
+
+    /// List the latest entry for each distinct key under a prefix (collapsing multi-author
+    /// keys to their highest-timestamp entry, omitting deletions). The deduped counterpart
+    /// to `query_key_prefix`, for directory-style listings. Do NOT use where freshness is
+    /// tracked by an in-payload sequence number (e.g. leases) — enumerate and dedupe on
+    /// that field instead. `limit` caps the number of distinct keys.
+    pub async fn query_latest_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>>;
 
     /// Read the content bytes for a given content hash (from a CoreDocEntry).
     pub async fn read_entry_content(&self, content_hash_hex: String) -> Result<Vec<u8>>;
@@ -1863,17 +1892,20 @@ impl CoreDoc {
 
 ```c
 typedef enum iroh_doc_query_mode_e {
-    IROH_DOC_QUERY_KEY_EXACT = 0,
-    IROH_DOC_QUERY_KEY_PREFIX = 1,
+    IROH_DOC_QUERY_KEY_EXACT = 0,      // all authors' entries for the key
+    IROH_DOC_QUERY_KEY_PREFIX = 1,     // all (author, key) rows under the prefix
+    IROH_DOC_QUERY_LATEST_EXACT = 2,   // 0 or 1 entries: latest writer of the key
+    IROH_DOC_QUERY_LATEST_PREFIX = 3,  // latest entry per distinct key under the prefix
 } iroh_doc_query_mode_t;
 
-// Query entries by key (exact or prefix), returning all authors' entries.
+// Query entries by key (exact/prefix/latest), returning packed entries.
 // Emits IROH_EVENT_DOC_QUERY with packed entries in payload, entry count in event.flags.
 iroh_status_t iroh_doc_query(
     iroh_runtime_t runtime,
     uint64_t doc,
     uint32_t mode,  // iroh_doc_query_mode_t
     iroh_bytes_t key,
+    uint64_t limit,  // caps prefix/exact results; 0=unbounded. Ignored for latest_exact.
     uint64_t user_data,
     iroh_operation_t* out_operation
 );

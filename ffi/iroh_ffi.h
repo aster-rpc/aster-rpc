@@ -199,6 +199,24 @@ typedef struct iroh_connection_info_t {
   uint32_t is_connected;
 } iroh_connection_info_t;
 
+/**
+ * Snapshot of the currently selected QUIC path for a connection.
+ * `path_kind` discriminates the populated fields:
+ *   0 = no path selected (connection dropped or not yet negotiated)
+ *   1 = direct UDP — `peer_host` and `peer_port` are populated
+ *   2 = relay     — `relay_url` is populated
+ * `rtt_micros` is `UINT64_MAX` when RTT has not yet been measured.
+ */
+typedef struct iroh_transport_snapshot_t {
+  uint32_t struct_size;
+  uint32_t path_kind;
+  struct iroh_bytes_t peer_host;
+  uint16_t peer_port;
+  uint16_t _pad;
+  struct iroh_bytes_t relay_url;
+  uint64_t rtt_micros;
+} iroh_transport_snapshot_t;
+
 typedef uint64_t iroh_hook_invocation_t;
 
 /**
@@ -315,6 +333,15 @@ typedef struct aster_reactor_call_t {
    * ConnectionClosed.
    */
   uint64_t peer_buffer;
+  /**
+   * Borrowed `iroh_connection_t` handle for the QUIC connection this
+   * event arrived on. Populated on both Call and ConnectionClosed.
+   * Same handle for every event from the same `connection_id`; freed
+   * internally by the reactor when ConnectionClosed is consumed.
+   * Bindings MUST NOT call `iroh_connection_free` on this handle —
+   * the reactor owns its lifetime.
+   */
+  uint64_t connection_handle;
 } aster_reactor_call_t;
 
 uint32_t iroh_abi_version_major(void);
@@ -489,6 +516,35 @@ int32_t iroh_accept_bi(iroh_runtime_t runtime,
                        uint64_t user_data,
                        iroh_operation_t *out_operation);
 
+/**
+ * Synchronous: authorize a TCP tunnel on `connection` to `host:port`.
+ * On success, writes the 32-byte ticket bytes to `out_ticket` (must
+ * point to ≥32 bytes). The bytes go into the RPC response payload
+ * the handler returns to the peer.
+ *
+ * `host` is read as a UTF-8 string from `iroh_bytes_t`.
+ * `ttl_secs == 0` uses the node default (30s).
+ */
+int32_t iroh_connection_authorize_tunnel_tcp(iroh_runtime_t runtime,
+                                             iroh_connection_t connection,
+                                             struct iroh_bytes_t host,
+                                             uint16_t port,
+                                             uint32_t ttl_secs,
+                                             uint8_t *out_ticket);
+
+/**
+ * Async: redeem a 32-byte tunnel ticket on `connection`. Emits
+ * IROH_EVENT_STREAM_OPENED with the (send, recv) pair on success.
+ * The streams are raw — bytes after this carry application data.
+ *
+ * `ticket` must point to exactly 32 readable bytes.
+ */
+int32_t iroh_connection_open_tunnel(iroh_runtime_t runtime,
+                                    iroh_connection_t connection,
+                                    const uint8_t *ticket,
+                                    uint64_t user_data,
+                                    iroh_operation_t *out_operation);
+
 int32_t iroh_open_uni(iroh_runtime_t runtime,
                       iroh_connection_t connection,
                       uint64_t user_data,
@@ -550,13 +606,15 @@ int32_t iroh_recv_stream_free(iroh_runtime_t runtime, iroh_recv_stream_t stream)
 int32_t iroh_doc_free(iroh_runtime_t runtime, uint64_t doc);
 
 /**
- * Synchronous: write the 64-char hex namespace id of the doc to out_buf.
- * On BUFFER_TOO_SMALL, sets *out_len to required size (64).
+ * Synchronous: write the 64-char hex namespace id of the doc to `out_buf`.
+ *
+ * Mirrors `CoreDoc::doc_id()` — used by consumer-admission responses to
+ * carry the registry namespace so a client can `join_and_subscribe_namespace`
+ * the doc and fetch published contract manifests.
+ *
+ * On BUFFER_TOO_SMALL, sets `*out_len` to required size.
  */
-int32_t iroh_doc_id(iroh_runtime_t runtime,
-                    uint64_t doc,
-                    uint8_t *out_buf,
-                    uintptr_t *out_len);
+int32_t iroh_doc_id(iroh_runtime_t runtime, uint64_t doc, uint8_t *out_buf, uintptr_t *out_len);
 
 int32_t iroh_gossip_topic_free(iroh_runtime_t runtime, uint64_t topic);
 
@@ -799,10 +857,19 @@ int32_t iroh_doc_share(iroh_runtime_t runtime,
                        uint64_t user_data,
                        iroh_operation_t *out_operation);
 
+/**
+ * Query a doc by key.
+ *
+ * `limit` caps the number of entries returned by a prefix (`IROH_DOC_QUERY_KEY_PREFIX`)
+ * or exact (`IROH_DOC_QUERY_KEY_EXACT`) query; pass `0` for an unbounded result. It is
+ * ignored by `IROH_DOC_QUERY_LATEST_EXACT`, which always returns at most one entry (the
+ * latest writer for the key, or none if the latest write was a deletion).
+ */
 int32_t iroh_doc_query(iroh_runtime_t runtime,
                        uint64_t doc,
                        uint32_t mode,
                        struct iroh_bytes_t key,
+                       uint64_t limit,
                        uint64_t user_data,
                        iroh_operation_t *out_operation);
 
@@ -929,6 +996,16 @@ int32_t iroh_endpoint_remote_info_list(iroh_runtime_t runtime,
 int32_t iroh_connection_info(iroh_runtime_t runtime,
                              iroh_connection_t connection,
                              struct iroh_connection_info_t *out_info);
+
+/**
+ * Snapshot the currently selected QUIC path for `connection`. See
+ * `iroh_transport_snapshot_t` for the discriminator semantics. The
+ * caller must free `peer_host` and `relay_url` via `iroh_buffer_free`
+ * (empty buffers — `len == 0` — are safe no-ops).
+ */
+int32_t iroh_connection_transport_snapshot(iroh_runtime_t runtime,
+                                           iroh_connection_t connection,
+                                           struct iroh_transport_snapshot_t *out_snapshot);
 
 /**
  * Respond to a pending before_connect hook invocation.
@@ -1410,11 +1487,14 @@ int32_t aster_reactor_destroy(iroh_runtime_t runtime, aster_reactor_t reactor);
 
 /**
  * Long-poll for the next non-rpc aster-ALPN connection accepted by the reactor.
- * Fires IROH_EVENT_ASTER_ACCEPTED when a connection arrives (same payload shape
- * as iroh_node_accept_aster): event.handle = connection handle, event.data_ptr/len
- * = ALPN bytes, event.buffer = lease to release via iroh_buffer_release. Lets a
- * server binding run a single accept loop that dispatches RPC via the reactor and
- * admission / manifest / etc via per-ALPN handlers.
+ * Fires `IROH_EVENT_ASTER_ACCEPTED` when a connection arrives, with the same
+ * payload shape as `iroh_node_accept_aster`: `event.handle` = connection handle,
+ * `event.data_ptr/len` = ALPN bytes, `event.buffer` = lease to release via
+ * `iroh_buffer_release`. Returns `IROH_STATUS_OK` on successful dispatch of the
+ * async wait; the caller awaits completion via the usual operation registry.
+ *
+ * When the reactor is shut down (its non_rpc sender dropped) the async task
+ * emits an error event instead of blocking forever.
  */
 int32_t aster_reactor_accept_non_rpc(iroh_runtime_t runtime,
                                      aster_reactor_t reactor,

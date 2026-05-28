@@ -132,15 +132,27 @@ class RegistryClient:
 
     # ── Doc reads ─────────────────────────────────────────────────────────────
 
-    async def _read_pointer(self, key: bytes) -> str | None:
-        """Read a plain text pointer (contract_id) at ``key``."""
-        entries = await self._doc.query_key_exact(key)
+    async def _latest_entry(self, key: bytes):
+        """Return the latest entry for an exact ``key``, honoring the ACL trust filter.
+
+        iroh-docs orders exact-key results by author id, not timestamp, so picking the
+        latest writer means reading *all* authors' entries (unbounded), then taking the
+        most recent -- never a truncated subset, which could omit the latest writer. With
+        an ACL we filter to trusted authors first, so a more-recent untrusted writer
+        cannot mask the latest trusted value.
+        """
+        entries = await self._doc.query_key_exact(key)  # unbounded: every author
         if self._acl is not None:
             entries = self._acl.filter_trusted(entries)
         if not entries:
             return None
-        # Pick the most recent by timestamp
-        entry = max(entries, key=lambda e: e.timestamp)
+        return max(entries, key=lambda e: e.timestamp)
+
+    async def _read_pointer(self, key: bytes) -> str | None:
+        """Read a plain text pointer (contract_id) at ``key``."""
+        entry = await self._latest_entry(key)
+        if entry is None:
+            return None
         raw = await self._doc.read_entry_content(entry.content_hash)
         if not raw:
             return None
@@ -333,12 +345,9 @@ class RegistryClient:
 
         Returns None if not found locally or if the blob store is not configured.
         """
-        entries = await self._doc.query_key_exact(contract_key(contract_id))
-        if self._acl is not None:
-            entries = self._acl.filter_trusted(entries)
-        if not entries:
+        entry = await self._latest_entry(contract_key(contract_id))
+        if entry is None:
             return None
-        entry = max(entries, key=lambda e: e.timestamp)
         raw = await self._doc.read_entry_content(entry.content_hash)
         if not raw:
             return None

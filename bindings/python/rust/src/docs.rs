@@ -342,26 +342,77 @@ impl DocHandle {
         })
     }
 
-    /// Query all entries for an exact key, across all authors.
-    /// Returns a list of DocEntry with metadata.
-    fn query_key_exact<'py>(&self, py: Python<'py>, key: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+    /// Query all entries for an exact key, across all authors. Entries are ordered by
+    /// author id, not timestamp, so `limit` truncates by author and may drop the latest
+    /// writer — use it only to enumerate authors. To read a key's current value, use
+    /// `query_latest_exact`. `limit` omitted (or None) reads every author's entry.
+    #[pyo3(signature = (key, limit=None))]
+    fn query_key_exact<'py>(
+        &self,
+        py: Python<'py>,
+        key: Vec<u8>,
+        limit: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.inner.clone();
         future_into_py(py, async move {
-            let entries = doc.query_key_exact(key).await.map_err(err_to_py)?;
+            let entries = doc.query_key_exact(key, limit).await.map_err(err_to_py)?;
             Ok(entries.into_iter().map(DocEntry::from).collect::<Vec<_>>())
         })
     }
 
+    /// Read the single latest entry for an exact key, across all authors. Returns the
+    /// DocEntry with the highest timestamp, or None if the key was never written or its
+    /// latest write was a deletion. Unaffected by how many authors have written the key.
+    fn query_latest_exact<'py>(
+        &self,
+        py: Python<'py>,
+        key: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.inner.clone();
+        future_into_py(py, async move {
+            let entry = doc.query_latest_exact(key).await.map_err(err_to_py)?;
+            Ok(entry.map(DocEntry::from))
+        })
+    }
+
     /// Query all entries matching a key prefix, across all authors.
-    /// Returns a list of DocEntry with metadata.
+    /// Returns a list of DocEntry with metadata. `limit` caps the result set;
+    /// omit it (or pass None) for an unbounded listing.
+    #[pyo3(signature = (prefix, limit=None))]
     fn query_key_prefix<'py>(
         &self,
         py: Python<'py>,
         prefix: Vec<u8>,
+        limit: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.inner.clone();
         future_into_py(py, async move {
-            let entries = doc.query_key_prefix(prefix).await.map_err(err_to_py)?;
+            let entries = doc
+                .query_key_prefix(prefix, limit)
+                .await
+                .map_err(err_to_py)?;
+            Ok(entries.into_iter().map(DocEntry::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// List the latest entry for each distinct key under a prefix, across all authors.
+    /// Collapses each key to its highest-timestamp entry (omitting keys whose latest
+    /// write was a deletion), so a key written by multiple authors appears once — use
+    /// this for directory-style listings. `limit` caps the number of distinct keys;
+    /// omit it (or pass None) for an unbounded listing.
+    #[pyo3(signature = (prefix, limit=None))]
+    fn query_latest_prefix<'py>(
+        &self,
+        py: Python<'py>,
+        prefix: Vec<u8>,
+        limit: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.inner.clone();
+        future_into_py(py, async move {
+            let entries = doc
+                .query_latest_prefix(prefix, limit)
+                .await
+                .map_err(err_to_py)?;
             Ok(entries.into_iter().map(DocEntry::from).collect::<Vec<_>>())
         })
     }
