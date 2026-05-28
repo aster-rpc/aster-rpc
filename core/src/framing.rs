@@ -15,6 +15,11 @@ pub const FLAG_CANCEL: u8 = 0x20;
 /// call. Tells the reactor to close the per-call request channel and stop
 /// reading more request frames for this call.
 pub const FLAG_END_STREAM: u8 = 0x40;
+/// Tunnel-redeem stream marker. Set on the first (and only framed) frame of
+/// a stream that is redeeming a tunnel capability. Payload is the 32-byte
+/// `TunnelTicket`. After this frame the stream switches to raw mode and the
+/// acceptor splices bytes to the backend socket. See `Aster-tunneling.md`.
+pub const FLAG_TUNNEL: u8 = 0x80;
 
 /// Maximum frame body size: 16 MiB.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;

@@ -7,6 +7,7 @@ pub mod registry;
 pub mod ring;
 pub mod signing;
 pub mod ticket;
+pub mod tunnel;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -18,12 +19,10 @@ use bytes::Bytes;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{
     presets, AfterHandshakeOutcome, BeforeConnectOutcome, Closed, Connection, ConnectionError,
-    Endpoint, EndpointHooks, PathEvent, PortmapperConfig, RelayMode, VarInt,
-    WeakConnectionHandle,
+    Endpoint, EndpointHooks, PathEvent, PortmapperConfig, RelayMode, VarInt, WeakConnectionHandle,
 };
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{EndpointAddr, EndpointId, RelayMap, RelayUrl, SecretKey, TransportAddr};
-use iroh_mdns_address_lookup::MdnsAddressLookup;
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::Store as BlobStore;
 use iroh_blobs::format::collection::Collection;
@@ -41,11 +40,16 @@ use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
 use iroh_gossip::ALPN as GOSSIP_ALPN;
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use iroh_tickets::Ticket;
 use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+use crate::framing::{encode_frame, FLAG_TUNNEL};
 use crate::pool::{AcquireError, PoolConfig, PoolKey, StreamFactory, StreamHandle, StreamPool};
+use crate::tunnel::{
+    AuthorizeTunnelError, TunnelConfig, TunnelRegistry, TunnelTarget, TunnelTicket,
+};
 use tokio_stream::StreamExt;
 use tracing::debug;
 use url::Url;
@@ -289,6 +293,23 @@ pub struct CoreConnectionInfo {
     pub rtt_ns: Option<u64>,
     pub alpn: Vec<u8>,
     pub is_connected: bool,
+}
+
+/// Snapshot of the selected QUIC path for a connection at one instant.
+/// Cheap to compute (clones a SmallVec entry) and intended for
+/// per-call CallContext population. Exactly one of `peer_addr` /
+/// `relay_url` is populated when a path is selected; both are `None`
+/// only when the connection has no selected path (e.g. dropped).
+#[derive(Clone, Debug, Default)]
+pub struct CoreTransportSnapshot {
+    /// Peer's UDP socket address when the selected path is direct.
+    pub peer_addr: Option<SocketAddr>,
+    /// Relay server URL when the selected path goes through a relay.
+    /// The peer's own IP is not visible through a relay path.
+    pub relay_url: Option<String>,
+    /// RTT for the selected path, in microseconds. `None` if no path
+    /// is selected or RTT has not yet been measured.
+    pub rtt_micros: Option<u64>,
 }
 
 // ============================================================================
@@ -569,9 +590,7 @@ impl CoreMonitor {
 
         // Track path changes. We briefly upgrade to obtain a `PathEventStream`;
         // matching the upstream `remote-info.rs` example.
-        if let Some(mut path_events) =
-            handle.upgrade().map(|conn| conn.path_events())
-        {
+        if let Some(mut path_events) = handle.upgrade().map(|conn| conn.path_events()) {
             tasks.spawn({
                 let map = map.clone();
                 let handle = handle.clone();
@@ -1412,6 +1431,11 @@ pub struct CoreConnection {
     /// wraps `Connection::open_bi`. SHARED-pool (None) and
     /// per-session (Some(sessionId)) streams both live here.
     pool: MultiplexedStreamPool,
+    /// Per-connection tunnel ticket registry. Ticket entries map to
+    /// `TunnelTarget`s and never cross the wire — see
+    /// `ffi_spec/Aster-tunneling.md`. Dropped with the connection,
+    /// which mass-revokes any unredeemed tickets.
+    tunnels: Arc<TunnelRegistry>,
 }
 
 impl CoreConnection {
@@ -1430,7 +1454,11 @@ impl CoreConnection {
             })
         });
         let pool = StreamPool::new(config, factory);
-        Self { inner, pool }
+        Self {
+            inner,
+            pool,
+            tunnels: Arc::new(TunnelRegistry::new(TunnelConfig::default())),
+        }
     }
 
     /// Borrow the per-connection multiplexed-stream pool. Callers can
@@ -1473,9 +1501,94 @@ impl CoreConnection {
         Ok((CoreSendStream::new(send), CoreRecvStream::new(recv)))
     }
 
+    /// Accept the next inbound bidi stream verbatim. **Does not** peek
+    /// for `FLAG_TUNNEL` — the caller gets whatever bytes the peer
+    /// wrote, in the protocol's native format. Use this for non-Aster
+    /// protocols (trust admission, etc.).
     pub async fn accept_bi(&self) -> Result<(CoreSendStream, CoreRecvStream)> {
         let (send, recv) = self.inner.accept_bi().await?;
         Ok((CoreSendStream::new(send), CoreRecvStream::new(recv)))
+    }
+
+    /// Accept the next inbound bidi stream that is **not** a tunnel
+    /// redeem, on a connection that speaks the Aster RPC framing
+    /// protocol. Tunnel-redeem streams (those whose first frame carries
+    /// `FLAG_TUNNEL`) are dispatched transparently to the per-connection
+    /// tunnel registry inside this method — the caller never sees them.
+    /// See `ffi_spec/Aster-tunneling.md` §6 ("Dispatch site").
+    ///
+    /// For non-tunnel streams the peeked first frame is re-prepended
+    /// onto the returned `CoreRecvStream`, so the caller observes a
+    /// normal length-prefixed stream starting from the StreamHeader.
+    ///
+    /// Only call this when you know the connection's ALPN means every
+    /// inbound stream's first frame uses Aster framing
+    /// (`[4B le len][1B flags][payload]`). For non-Aster ALPNs (trust
+    /// admission, custom protocols), use [`accept_bi`] instead.
+    pub async fn accept_aster_bi(&self) -> Result<(CoreSendStream, CoreRecvStream)> {
+        loop {
+            let (send, recv) = self.inner.accept_bi().await?;
+            let send = CoreSendStream::new(send);
+            let recv = CoreRecvStream::new(recv);
+
+            let (payload, flags) = match recv.read_one_frame().await {
+                Ok(f) => f,
+                Err(e) => {
+                    debug!("accept_aster_bi: first-frame read error, dropping stream: {e}");
+                    continue;
+                }
+            };
+
+            if flags & FLAG_TUNNEL != 0 {
+                let registry = self.tunnels.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::tunnel::handle_tunnel_redeem(send, recv, payload, registry).await
+                    {
+                        debug!("tunnel redeem error: {e}");
+                    }
+                });
+                continue;
+            }
+
+            // Non-tunnel: re-encode the frame and prepend so the caller
+            // reads it as the first frame of a normal RPC stream.
+            let frame = encode_frame(&payload, flags)?;
+            recv.prepend(frame).await;
+            return Ok((send, recv));
+        }
+    }
+
+    /// Mint a tunnel capability covering one or more targets. Called by
+    /// an RPC handler that has already validated the peer's request —
+    /// `core` performs no policy checks. `targets` is an ordered
+    /// preference list; at redeem the acceptor tries each in order and
+    /// splices the first one that connects. The returned 32 bytes go
+    /// into the RPC response; the peer redeems with [`open_tunnel`].
+    /// See `ffi_spec/Aster-tunneling.md`.
+    pub fn authorize_tunnel(
+        &self,
+        targets: Vec<TunnelTarget>,
+        ttl: Duration,
+    ) -> Result<TunnelTicket, AuthorizeTunnelError> {
+        self.tunnels.authorize(targets, ttl)
+    }
+
+    /// Open a tunnel by redeeming a ticket received from the peer.
+    /// Sends the `[FLAG_TUNNEL][ticket]` handshake frame internally,
+    /// then returns the bidi stream pair. Bytes after the handshake
+    /// are raw — the caller speaks the backend protocol directly
+    /// (e.g. RFB for VNC).
+    pub async fn open_tunnel(
+        &self,
+        ticket: TunnelTicket,
+    ) -> Result<(CoreSendStream, CoreRecvStream)> {
+        let (send, recv) = self.inner.open_bi().await?;
+        let send = CoreSendStream::new(send);
+        let recv = CoreRecvStream::new(recv);
+        let frame = encode_frame(ticket.as_bytes(), FLAG_TUNNEL)?;
+        send.write_all(frame).await?;
+        Ok((send, recv))
     }
 
     pub async fn open_uni(&self) -> Result<CoreSendStream> {
@@ -1534,6 +1647,33 @@ impl CoreConnection {
     // ============================================================================
     // Phase 1b: Connection Info
     // ============================================================================
+
+    /// Snapshot of the currently selected network path. Cheap; safe to
+    /// call once per RPC dispatch. Returns all-`None` fields if the
+    /// connection has been dropped or no path is selected yet.
+    pub fn transport_snapshot(&self) -> CoreTransportSnapshot {
+        let paths = self.inner.paths();
+        let Some(path) = paths.iter().find(|p| p.is_selected()) else {
+            return CoreTransportSnapshot::default();
+        };
+        let (peer_addr, relay_url) = match path.remote_addr() {
+            TransportAddr::Ip(socket) => (Some(*socket), None),
+            TransportAddr::Relay(url) => (None, Some(url.to_string())),
+            // Custom or future transports: surface RTT but no addr/url.
+            _ => (None, None),
+        };
+        let rtt = path.rtt();
+        let rtt_micros = if rtt == Duration::ZERO {
+            None
+        } else {
+            Some(rtt.as_micros().min(u64::MAX as u128) as u64)
+        };
+        CoreTransportSnapshot {
+            peer_addr,
+            relay_url,
+            rtt_micros,
+        }
+    }
 
     pub fn connection_info(&self) -> CoreConnectionInfo {
         let stats = self.inner.stats();
@@ -1899,27 +2039,67 @@ impl CoreSendStream {
 // CoreRecvStream - QUIC recv stream
 // ============================================================================
 
+struct RecvInner {
+    stream: iroh::endpoint::RecvStream,
+    /// Bytes peeked off the wire ahead of the caller — populated by
+    /// [`CoreConnection::accept_bi`] when it consumes the first frame
+    /// for `FLAG_TUNNEL` dispatch and the stream turns out to be a
+    /// regular RPC stream. Reads drain this buffer before going to
+    /// QUIC so the caller sees an unmodified length-prefixed stream.
+    front: Vec<u8>,
+}
+
+impl RecvInner {
+    fn drain_front(&mut self, buf: &mut [u8]) -> usize {
+        if self.front.is_empty() || buf.is_empty() {
+            return 0;
+        }
+        let take = self.front.len().min(buf.len());
+        buf[..take].copy_from_slice(&self.front[..take]);
+        self.front.drain(..take);
+        take
+    }
+}
+
 #[derive(Clone)]
 pub struct CoreRecvStream {
-    inner: Arc<Mutex<iroh::endpoint::RecvStream>>,
+    inner: Arc<Mutex<RecvInner>>,
 }
 
 impl CoreRecvStream {
     fn new(stream: iroh::endpoint::RecvStream) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(stream)),
+            inner: Arc::new(Mutex::new(RecvInner {
+                stream,
+                front: Vec::new(),
+            })),
         }
+    }
+
+    /// Stash `bytes` at the front of the stream so the next read(s) drain
+    /// them before going to the wire. Used by `CoreConnection::accept_bi`
+    /// to put back the first frame after peeking it for `FLAG_TUNNEL`.
+    /// Caller must ensure the stream has not been read from yet — this
+    /// is enforced in debug builds.
+    pub(crate) async fn prepend(&self, bytes: Vec<u8>) {
+        let mut s = self.inner.lock().await;
+        debug_assert!(s.front.is_empty(), "CoreRecvStream::prepend called twice");
+        s.front = bytes;
     }
 
     pub async fn read(&self, max_len: usize) -> Result<Option<Vec<u8>>> {
         let mut s = self.inner.lock().await;
-        Ok(s.read_chunk(max_len).await?.map(|b| b.to_vec()))
+        if !s.front.is_empty() {
+            let take = s.front.len().min(max_len);
+            let chunk: Vec<u8> = s.front.drain(..take).collect();
+            return Ok(Some(chunk));
+        }
+        Ok(s.stream.read_chunk(max_len).await?.map(|b| b.to_vec()))
     }
 
     pub async fn read_exact(&self, n: usize) -> Result<Vec<u8>> {
-        let mut s = self.inner.lock().await;
         let mut buf = vec![0u8; n];
-        s.read_exact(&mut buf).await?;
+        self.read_exact_into(&mut buf).await?;
         Ok(buf)
     }
 
@@ -1931,9 +2111,9 @@ impl CoreRecvStream {
     /// ready to receive data.
     pub async fn read_exact_into(&self, buf: &mut [u8]) -> Result<()> {
         let mut s = self.inner.lock().await;
-        let mut filled = 0;
+        let mut filled = s.drain_front(buf);
         while filled < buf.len() {
-            match s.read_into(&mut buf[filled..]).await? {
+            match s.stream.read_into(&mut buf[filled..]).await? {
                 Some(0) | None => {
                     return Err(anyhow!(
                         "stream ended with {} bytes remaining",
@@ -1948,7 +2128,40 @@ impl CoreRecvStream {
 
     pub async fn read_to_end(&self, max_size: usize) -> Result<Vec<u8>> {
         let mut s = self.inner.lock().await;
-        Ok(s.read_to_end(max_size).await?.to_vec())
+        let mut out = std::mem::take(&mut s.front);
+        if out.len() > max_size {
+            return Err(anyhow!(
+                "prepended buffer ({} bytes) exceeds max_size ({})",
+                out.len(),
+                max_size
+            ));
+        }
+        let remaining = max_size - out.len();
+        let tail = s.stream.read_to_end(remaining).await?;
+        out.extend_from_slice(&tail);
+        Ok(out)
+    }
+
+    /// Read one length-prefixed frame: `[4B LE len][1B flags][payload]`.
+    /// Used by `CoreConnection::accept_bi` for the `FLAG_TUNNEL` peek and
+    /// by the reactor's per-stream frame reader.
+    pub(crate) async fn read_one_frame(&self) -> Result<(Vec<u8>, u8)> {
+        let mut len_bytes = [0u8; 4];
+        self.read_exact_into(&mut len_bytes).await?;
+        let frame_body_len = u32::from_le_bytes(len_bytes) as usize;
+        if frame_body_len == 0 {
+            return Err(anyhow!("zero-length frame"));
+        }
+        if frame_body_len > crate::framing::MAX_FRAME_SIZE as usize {
+            return Err(anyhow!("frame too large: {}", frame_body_len));
+        }
+        let mut flags_buf = [0u8; 1];
+        self.read_exact_into(&mut flags_buf).await?;
+        let flags = flags_buf[0];
+        let payload_len = frame_body_len - 1;
+        let mut payload = vec![0u8; payload_len];
+        self.read_exact_into(&mut payload).await?;
+        Ok((payload, flags))
     }
 
     pub fn stop(&self, code: u64) -> Result<()> {
@@ -1956,7 +2169,7 @@ impl CoreRecvStream {
             .inner
             .try_lock()
             .map_err(|_| anyhow!("recv stream is busy"))?;
-        s.stop(u64_to_varint(code)?)?;
+        s.stream.stop(u64_to_varint(code)?)?;
         Ok(())
     }
 }

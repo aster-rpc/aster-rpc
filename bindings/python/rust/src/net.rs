@@ -9,10 +9,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::tokio::future_into_py;
 
+use aster_transport_core::tunnel::{TunnelTarget, TunnelTicket};
 use aster_transport_core::{
     ConnectionType, ConnectionTypeDetail, CoreConnection, CoreConnectionInfo, CoreEndpointConfig,
     CoreNetClient, CoreNodeAddr, CoreRecvStream, CoreRemoteInfo, CoreSendStream,
-    CoreTransportMetrics,
+    CoreTransportMetrics, CoreTransportSnapshot,
 };
 
 use crate::error::err_to_py;
@@ -319,6 +320,42 @@ impl From<CoreRemoteInfo> for RemoteInfo {
             bytes_sent: info.bytes_sent,
             bytes_received: info.bytes_received,
             is_connected: info.is_connected,
+        }
+    }
+}
+
+// ============================================================================
+// TransportSnapshot — selected QUIC path info, populated on CallContext
+// ============================================================================
+
+/// Snapshot of the selected network path at one instant.
+///
+/// `peer_addr` and `relay_url` are mutually exclusive — exactly one is
+/// populated when a path is selected. Both are ``None`` only if the
+/// connection has been dropped or no path has been negotiated yet.
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+pub struct TransportSnapshot {
+    /// Peer's UDP socket address as ``(host, port)`` when the selected
+    /// path is direct. ``None`` when relayed.
+    #[pyo3(get)]
+    pub peer_addr: Option<(String, u16)>,
+    /// Relay server URL when the selected path goes through a relay.
+    /// The peer's own IP is not visible through a relay path.
+    #[pyo3(get)]
+    pub relay_url: Option<String>,
+    /// RTT for the selected path in microseconds, or ``None`` if not
+    /// yet measured.
+    #[pyo3(get)]
+    pub rtt_micros: Option<u64>,
+}
+
+impl From<CoreTransportSnapshot> for TransportSnapshot {
+    fn from(snap: CoreTransportSnapshot) -> Self {
+        Self {
+            peer_addr: snap.peer_addr.map(|s| (s.ip().to_string(), s.port())),
+            relay_url: snap.relay_url,
+            rtt_micros: snap.rtt_micros,
         }
     }
 }
@@ -749,6 +786,12 @@ impl IrohConnection {
         ConnectionInfo::from(self.inner.connection_info())
     }
 
+    /// Snapshot of the currently selected network path. Cheap; safe to
+    /// call once per RPC dispatch.
+    fn transport_snapshot(&self) -> TransportSnapshot {
+        TransportSnapshot::from(self.inner.transport_snapshot())
+    }
+
     // ========================================================================
     // Per-connection metrics (for routing / HA)
     // ========================================================================
@@ -787,6 +830,75 @@ impl IrohConnection {
     fn current_mtu(&self) -> u16 {
         self.inner.current_mtu()
     }
+
+    // ========================================================================
+    // Tunneling — see ffi_spec/Aster-tunneling.md
+    // ========================================================================
+
+    /// Authorize a tunnel covering one or more targets. Called by an RPC
+    /// handler after it has validated the peer's request. `targets` is
+    /// an ordered preference list `[(kind, host, port), ...]` where
+    /// `kind` is currently only `"tcp"` (UDP / HttpProxy land in §11).
+    /// At redeem the acceptor tries each target in order and splices
+    /// the first one that connects; if all fail the stream closes
+    /// silently. Returns 32 raw bytes — embed in the RPC response.
+    /// `ttl_secs == 0` uses the node default (30s).
+    fn authorize_tunnel<'py>(
+        &self,
+        py: Python<'py>,
+        targets: Vec<(String, String, u16)>,
+        ttl_secs: u64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let mut core_targets = Vec::with_capacity(targets.len());
+        for (kind, host, port) in &targets {
+            match kind.as_str() {
+                "tcp" => core_targets.push(TunnelTarget::Tcp {
+                    addr: parse_socket_addr(host, *port)?,
+                }),
+                other => {
+                    return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                        "tunnel kind {other:?} not supported in v1 (TCP only)"
+                    )))
+                }
+            }
+        }
+        let ticket = self
+            .inner
+            .authorize_tunnel(core_targets, std::time::Duration::from_secs(ttl_secs))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(PyBytes::new(py, ticket.as_bytes()))
+    }
+
+    /// Open a tunnel by redeeming a 32-byte ticket previously received
+    /// from the peer. Returns `(send, recv)` raw QUIC streams; bytes
+    /// after this call are application data (e.g. RFB for VNC).
+    fn open_tunnel<'py>(&self, py: Python<'py>, ticket: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        if ticket.len() != 32 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ticket must be 32 bytes, got {}",
+                ticket.len()
+            )));
+        }
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&ticket);
+        let ticket = TunnelTicket(buf);
+        let conn = self.inner.clone();
+        future_into_py(py, async move {
+            let (send, recv) = conn.open_tunnel(ticket).await.map_err(err_to_py)?;
+            Ok((IrohSendStream::from(send), IrohRecvStream::from(recv)))
+        })
+    }
+}
+
+fn parse_socket_addr(host: &str, port: u16) -> PyResult<std::net::SocketAddr> {
+    let addr_str = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    addr_str
+        .parse()
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bad address: {e}")))
 }
 
 // ============================================================================
@@ -1140,6 +1252,10 @@ pub struct ReactorEvent {
     peer_id: String,
     // Call-only fields. Populated iff kind == 0.
     call_id: u64,
+    /// Clone of the underlying connection this call arrived on. Used by
+    /// the server dispatcher to construct a `TunnelHandle` (and anything
+    /// else connection-scoped) for the handler's `CallContext`.
+    connection: StdMutex<Option<IrohConnection>>,
     header_payload: Option<Vec<u8>>,
     header_flags: u8,
     request_payload: Option<Vec<u8>>,
@@ -1206,6 +1322,15 @@ impl ReactorEvent {
         guard.take()
     }
 
+    /// Take the connection clone out of this Call event. May be called
+    /// once; returns `None` on subsequent calls or for non-Call events.
+    /// The high-level server uses this to attach a `TunnelHandle` to
+    /// the handler's `CallContext`.
+    fn take_connection(&self) -> Option<IrohConnection> {
+        let mut guard = self.connection.lock().ok()?;
+        guard.take()
+    }
+
     /// Take the request receiver out of this Call event. May be called
     /// once; returns `None` on subsequent calls or for non-Call events.
     /// Only client-streaming and bidi dispatchers need this — unary and
@@ -1265,11 +1390,13 @@ impl ReactorHandle {
                     let cancel_flag = ReactorCancelFlag {
                         inner: call.cancelled,
                     };
+                    let connection = IrohConnection::from(call.connection);
                     Ok(Some(ReactorEvent {
                         kind: 0,
                         connection_id: call.connection_id,
                         peer_id: call.peer_id,
                         call_id: call.call_id,
+                        connection: StdMutex::new(Some(connection)),
                         header_payload: Some(call.header_payload),
                         header_flags: call.header_flags,
                         request_payload: Some(call.request_payload),
@@ -1291,6 +1418,7 @@ impl ReactorHandle {
                     connection_id,
                     peer_id,
                     call_id: 0,
+                    connection: StdMutex::new(None),
                     header_payload: None,
                     header_flags: 0,
                     request_payload: None,
@@ -1356,6 +1484,7 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NodeAddr>()?;
     m.add_class::<EndpointConfig>()?;
     m.add_class::<ConnectionInfo>()?;
+    m.add_class::<TransportSnapshot>()?;
     m.add_class::<RemoteInfo>()?;
     m.add_class::<TransportMetrics>()?;
     m.add_class::<NetClient>()?;

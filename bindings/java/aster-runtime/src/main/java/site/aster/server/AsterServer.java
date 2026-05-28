@@ -467,6 +467,7 @@ public final class AsterServer implements AutoCloseable {
     byte requestFlags = slot.get(ValueLayout.JAVA_BYTE, Reactor.OFFSET_REQUEST_FLAGS);
     MemorySegment peerPtr = slot.get(ValueLayout.ADDRESS, Reactor.OFFSET_PEER_PTR);
     int peerLen = slot.get(ValueLayout.JAVA_INT, Reactor.OFFSET_PEER_LEN);
+    long connectionHandle = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_CONNECTION_HANDLE);
 
     byte[] header =
         headerLen > 0
@@ -482,7 +483,15 @@ public final class AsterServer implements AutoCloseable {
                 peerPtr.reinterpret(peerLen).toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8)
             : "";
     return new AsterCall(
-        callId, connectionId, streamId, header, headerFlags, request, requestFlags, peerId);
+        callId,
+        connectionId,
+        streamId,
+        header,
+        headerFlags,
+        request,
+        requestFlags,
+        peerId,
+        connectionHandle);
   }
 
   // ───── Dispatch ──────────────────────────────────────────────────────────
@@ -811,6 +820,27 @@ public final class AsterServer implements AutoCloseable {
     if (peerAttrs != null) {
       attributes.putAll(peerAttrs);
     }
+
+    // Pull the selected QUIC path snapshot via the borrowed connection
+    // handle the reactor put on the call slot. The reactor owns its
+    // lifetime — we call the static FFI helper to avoid constructing a
+    // transient IrohConnection wrapper (whose Cleaner would log noise).
+    java.net.InetSocketAddress peerAddr = null;
+    String relayUrl = null;
+    java.time.Duration rtt = null;
+    if (call.connectionHandle() != 0) {
+      try {
+        var snap =
+            site.aster.handle.IrohConnection.transportSnapshot(
+                node.runtime(), call.connectionHandle());
+        peerAddr = snap.peerAddr();
+        relayUrl = snap.relayUrl();
+        rtt = snap.rtt();
+      } catch (RuntimeException ignored) {
+        // Connection may have closed between dispatch and snapshot.
+      }
+    }
+
     return CallContext.builder(header.service(), header.method())
         .peer(call.peerId())
         .metadata(metadata)
@@ -819,6 +849,9 @@ public final class AsterServer implements AutoCloseable {
         .streaming(method.descriptor().streaming().name().endsWith("STREAM"))
         .pattern(method.descriptor().streaming().name().toLowerCase())
         .idempotent(method.descriptor().idempotent())
+        .peerAddr(peerAddr)
+        .relayUrl(relayUrl)
+        .rtt(rtt)
         .build();
   }
 
