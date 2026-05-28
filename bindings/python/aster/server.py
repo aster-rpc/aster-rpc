@@ -209,6 +209,24 @@ class _ReactorConnStub:
         return self._peer
 
 
+def _connection_transport_snapshot(
+    connection: Any,
+) -> tuple[tuple[str, int] | None, str | None, int | None]:
+    """Pull (peer_addr, relay_url, rtt_micros) from a real IrohConnection.
+
+    Returns ``(None, None, None)`` if ``connection`` is ``None``, is a
+    test stub without ``transport_snapshot``, or the snapshot call
+    raises (e.g. connection already closed).
+    """
+    if connection is None or not hasattr(connection, "transport_snapshot"):
+        return None, None, None
+    try:
+        snap = connection.transport_snapshot()
+    except Exception:
+        return None, None, None
+    return snap.peer_addr, snap.relay_url, snap.rtt_micros
+
+
 # ── Server ──────────────────────────────────────────────────────────────────
 
 
@@ -398,6 +416,7 @@ class Server:
                         continue
                     request_receiver = event.take_request_receiver()
                     cancel_flag = event.cancel_flag
+                    connection = event.take_connection()
                     asyncio.create_task(
                         self._dispatch_reactor_call(
                             event.call_id,
@@ -410,6 +429,7 @@ class Server:
                             response_sender,
                             request_receiver,
                             cancel_flag,
+                            connection,
                         )
                     )
                 elif event.kind == "connection_closed":
@@ -472,6 +492,7 @@ class Server:
         response_sender: Any,
         request_receiver: Any = None,
         cancel_flag: Any = None,
+        connection: Any = None,
     ) -> None:
         import struct as _struct
 
@@ -565,6 +586,7 @@ class Server:
             # request frames are decoded. This guarantees auth fires on
             # every pattern -- including bidi/client streams that might
             # never produce a request frame.
+            peer_addr, relay_url, rtt_micros = _connection_transport_snapshot(connection)
             pre_call_ctx = build_call_context(
                 service=header.service,
                 method=header.method,
@@ -579,7 +601,13 @@ class Server:
                     self._peer_store.get_attributes(peer_id)
                     if self._peer_store and peer_id else {}
                 ),
+                peer_addr=peer_addr,
+                relay_url=relay_url,
+                rtt_micros=rtt_micros,
             )
+            if connection is not None:
+                from aster.tunnel import TunnelHandle
+                pre_call_ctx.tunnel = TunnelHandle(connection)
             pre_interceptors = self._resolve_interceptors(service_info)
             try:
                 await apply_request_interceptors(pre_interceptors, pre_call_ctx, None)
@@ -604,7 +632,7 @@ class Server:
                     await self._dispatch_reactor_streaming(
                         pattern, header, service_info, method_info,
                         handler_method, peer_id, request_payload, request_flags,
-                        response_sender, request_receiver,
+                        response_sender, request_receiver, connection,
                     )
                 return
 
@@ -634,7 +662,13 @@ class Server:
                     self._peer_store.get_attributes(peer_id)
                     if self._peer_store and peer_id else {}
                 ),
+                peer_addr=peer_addr,
+                relay_url=relay_url,
+                rtt_micros=rtt_micros,
             )
+            if connection is not None:
+                from aster.tunnel import TunnelHandle
+                call_ctx.tunnel = TunnelHandle(connection)
             interceptors = self._resolve_interceptors(service_info)
             request = await apply_request_interceptors(interceptors, call_ctx, request)
 
@@ -705,6 +739,7 @@ class Server:
         first_request_flags: int,
         response_sender: Any,
         request_receiver: Any,
+        connection: Any = None,
     ) -> None:
         """Drive a streaming RPC through the reactor channels.
 
@@ -726,8 +761,13 @@ class Server:
         send_adapter = _ReactorSendAdapter(response_sender)
         recv_adapter = _ReactorRecvAdapter(request_receiver, first_frame_bytes)
 
+        # Use the real `IrohConnection` when the reactor surfaced one so
+        # `ctx.tunnel.authorize(...)` works inside streaming handlers; fall
+        # back to the legacy peer-only stub otherwise (e.g. tests that drive
+        # the streaming dispatch path without a connection).
+        conn_obj = connection if connection is not None else _ReactorConnStub(peer_id)
         conn_ctx = ConnectionContext(
-            connection=_ReactorConnStub(peer_id),  # type: ignore[arg-type]
+            connection=conn_obj,  # type: ignore[arg-type]
             server=self,
         )
 
@@ -900,7 +940,9 @@ class Server:
         if self._peer_store is not None and peer:
             attributes = self._peer_store.get_attributes(peer)
 
-        return build_call_context(
+        peer_addr, relay_url, rtt_micros = _connection_transport_snapshot(ctx.connection)
+
+        call_ctx = build_call_context(
             service=header.service,
             method=header.method,
             metadata=_validated_metadata(header.metadataKeys, header.metadataValues),
@@ -911,7 +953,21 @@ class Server:
             idempotent=method_info.idempotent,
             call_id=header.callId,
             attributes=attributes,
+            peer_addr=peer_addr,
+            relay_url=relay_url,
+            rtt_micros=rtt_micros,
         )
+
+        # Attach a TunnelHandle when the connection is the real
+        # `IrohConnection` (it exposes `authorize_tunnel_many`). Stub
+        # connections used by older tests / dispatch shims expose only
+        # `remote_id()` and skip cleanly with `tunnel=None`.
+        conn = getattr(ctx, "connection", None)
+        if conn is not None and hasattr(conn, "authorize_tunnel_many"):
+            from aster.tunnel import TunnelHandle
+            call_ctx.tunnel = TunnelHandle(conn)
+
+        return call_ctx
 
     async def _decode_request_frame(
         self,

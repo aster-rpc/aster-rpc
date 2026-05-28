@@ -288,3 +288,4 @@ bindings/dotnet/**/obj/
 # during `mvn package` so the runtime jar ships with the host platform's lib.
 # These are build outputs, not source.
 bindings/java/aster-runtime/src/main/resources/native/
+.envrc

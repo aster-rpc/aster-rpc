@@ -195,6 +195,7 @@ dependencies = [
  "crossbeam-utils",
  "ed25519-dalek",
  "futures-lite",
+ "getrandom 0.2.17",
  "hex",
  "iroh",
  "iroh-blobs",

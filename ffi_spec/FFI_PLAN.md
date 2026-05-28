@@ -18,6 +18,7 @@
 5d. [Phase 1d: Endpoint Builder Gaps](#3d-phase-1d-endpoint-builder-gaps)
 5f. [Phase 1f: Cross-Language Contract Identity, Framing & Signing](#3f-phase-1f-cross-language-contract-identity-framing--signing)
 5g. [Phase 1g: Per-Connection Metrics & Prometheus Export](#phase-1g-per-connection-metrics--prometheus-export--done)
+5j. [Phase 1j: CallContext Transport Snapshot](#phase-1j-callcontext-transport-snapshot--done)
 6. [Phase 2: Python Bindings Update](#4-phase-2-python-bindings-update)
 7. [Phase 3: Java FFM Bindings](#5-phase-3-java-ffm-bindings)
 8. [C ABI Reference](#6-c-abi-reference)
@@ -2094,7 +2095,55 @@ iroh_status_t iroh_connection_info(
     iroh_connection_t connection,
     iroh_connection_info_t* out_info
 );
+
+iroh_status_t iroh_connection_transport_snapshot(
+    iroh_runtime_t runtime,
+    iroh_connection_t connection,
+    iroh_transport_snapshot_t* out_snapshot
+);
 ```
+
+#### Transport Snapshot (added 2026-05-04)
+
+`iroh_connection_transport_snapshot` returns a per-call snapshot of the
+currently selected QUIC path, intended for population of the binding's
+`CallContext` on every dispatch. It mirrors a single `PathInfo`
+selected via `Connection::to_info().selected_path()` in iroh 0.98.
+
+```c
+typedef struct iroh_transport_snapshot_t {
+    uint32_t struct_size;
+    uint32_t path_kind;        // 0=none, 1=direct UDP, 2=relay
+    iroh_bytes_t peer_host;    // populated when path_kind == 1
+    uint16_t peer_port;        // populated when path_kind == 1
+    uint16_t _pad;
+    iroh_bytes_t relay_url;    // populated when path_kind == 2
+    uint64_t rtt_micros;       // UINT64_MAX when not yet measured
+} iroh_transport_snapshot_t;
+```
+
+Memory ownership: `peer_host` and `relay_url` buffers are heap-allocated
+by Rust via `alloc_string`. The caller MUST free each one via
+`iroh_string_release(ptr, len)`; release on a zero-length buffer is a
+safe no-op. The discriminator semantics (`path_kind` plus mutual
+exclusion of `peer_host`/`relay_url`) reflect that iroh paths are
+either direct IP or relay — never both — and that the peer's IP is
+not visible through a relay path.
+
+Bindings:
+- Python: `IrohConnection.transport_snapshot()` → `TransportSnapshot`
+  pyclass with `peer_addr: tuple[str, int] | None`, `relay_url`,
+  `rtt_micros` fields. Populated on `CallContext` at every dispatch
+  site in `bindings/python/aster/server.py`.
+- TypeScript (NAPI): `IrohConnection.transportSnapshot()` →
+  `TransportSnapshot { peerAddr, relayUrl, rttMicros }`. Wired into
+  `RpcServer.handleStream()` and the legacy `SessionServer.handleSession()`
+  in `bindings/typescript/packages/aster/src/`.
+- Java: `IrohConnection.transportSnapshot()` (instance) and
+  `IrohConnection.transportSnapshot(runtime, connectionHandle)`
+  (static, for borrowed handles delivered by the reactor). Returns a
+  `TransportSnapshot(InetSocketAddress peerAddr, String relayUrl,
+  Duration rtt)` record.
 
 ### 3b.3a Screening / Connection Admission Control
 
@@ -3463,6 +3512,88 @@ return aster_metrics + "\n" + transport_metrics
    5. Write JUnit tests
    6. Write integration tests matching the Python test scenarios
    7. Document Java API with Javadoc
+
+### Phase 1j (CallContext Transport Snapshot) — DONE
+
+**Status:** Implemented
+**Date:** 2026-05-04
+
+Surfaces selected QUIC path information (peer IP, relay URL, RTT) on the
+per-call `CallContext` of every binding. Handlers can now log, rate-limit,
+or make policy decisions based on whether a call is direct-vs-relayed and
+the peer's address — previously this was only reachable by walking the
+core's monitoring path.
+
+**Core (`core/src/lib.rs`):**
+
+```rust
+pub struct CoreTransportSnapshot {
+    pub peer_addr: Option<SocketAddr>,  // Some when path is direct
+    pub relay_url: Option<String>,      // Some when path is relay
+    pub rtt_micros: Option<u64>,        // None when not yet measured
+}
+
+impl CoreConnection {
+    pub fn transport_snapshot(&self) -> CoreTransportSnapshot;
+}
+```
+
+Built from `Connection::to_info().selected_path()`. Mutually exclusive
+fields reflect that iroh `TransportAddr` is `Ip(SocketAddr)` |
+`Relay(RelayUrl)` | `Custom(_)` — never both. The peer's IP is not
+visible through a relay path.
+
+**FFI (`ffi/src/lib.rs`):**
+
+`iroh_connection_transport_snapshot(runtime, connection, out_snapshot)` returns
+an `iroh_transport_snapshot_t` with discriminator semantics; see §3b.2 for
+the struct layout.
+
+**Reactor slot extension (`ffi/src/reactor.rs`, 2026-05-04):**
+
+`aster_reactor_call_t` gained a `connection_handle: u64` field — a
+borrowed `iroh_connection_t` registered by the pump task in the runtime's
+connection registry. Stable for the connection's lifetime; freed by the
+reactor on `ConnectionClosed`. Bindings MUST NOT close it themselves.
+Total slot size grew from 104 to 112 bytes.
+
+This brings parity with Python's PyO3 reactor — which has always shipped
+the `IrohConnection` directly on the call event via `event.take_connection()`
+— so Java (and any future C-ABI binding) can populate connection-scoped
+`CallContext` fields without an out-of-band lookup. See
+`docs/_internal/reactor-ffi-guide.md` for the full updated descriptor.
+
+**Bindings:**
+
+| Binding | Surface | CallContext fields |
+|--------|---------|--------------------|
+| Python (PyO3) | `IrohConnection.transport_snapshot()` → `TransportSnapshot` pyclass | `peer_addr: tuple[str, int] \| None`, `relay_url`, `rtt_micros` |
+| TypeScript (NAPI) | `IrohConnection.transportSnapshot()` → `{ peerAddr, relayUrl, rttMicros }` | `peerAddr: PeerAddr \| undefined`, `relayUrl`, `rttMicros` |
+| Java (FFM) | `IrohConnection.transportSnapshot()` instance + `(runtime, handle)` static | `peerAddr: InetSocketAddress`, `relayUrl: String`, `rtt: Duration` |
+| C ABI | `iroh_connection_transport_snapshot` | n/a — direct struct populator |
+
+**Wire/FFI representation:**
+
+- `peer_addr`: socket address; surfaced as language-idiomatic types
+  (Python tuple, TS object, Java `InetSocketAddress`).
+- `relay_url`: UTF-8 string allocated via `alloc_string`, freed by the
+  caller via `iroh_string_release`.
+- `rtt`: integer microseconds (`u64`) on the FFI surface — chosen for
+  cross-language consistency. Each binding maps to its idiomatic
+  Duration type (Python `timedelta`, Java `Duration.ofNanos(micros *
+  1000)`, TS `rttMicros: number` since JS has no native Duration).
+  `UINT64_MAX` (or `Long.MAX_VALUE` Java-side) signals "not measured".
+
+**Test coverage:**
+
+- Python: `tests/python/test_phase1b.py::test_transport_snapshot_direct_local`
+  exercises a loopback QUIC pair; asserts `peer_addr` is populated and
+  `relay_url` is `None` on both sides.
+- TypeScript: existing 292-test suite passes with the new wiring; no
+  dedicated snapshot test added.
+- Java: `MissionControlAuthE2ETest` and `MissionControlE2ETest` continue
+  to pass at the same baseline (4/5 and 8/10 — pre-existing flakes are
+  unrelated to this change).
 
 ## 3h. Phase 1h: Compact Aster Ticket Format
 

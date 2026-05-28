@@ -372,7 +372,7 @@ Write proxying: when a replica receives a write request (join, publish, grant), 
 The signed DNS TXT record can contain multiple nodes:
 
 ```
-_aster-registry.aster.site TXT "v=aster1 nodes=<nid1>,<nid2>,<nid3> relay=<url> ts=<epoch> sig=<hex>"
+_aster-registry.aster0.net TXT "v=aster1 nodes=<nid1>,<nid2>,<nid3> relay=<url> ts=<epoch> sig=<hex>"
 ```
 
 CLI tries each node, connects to the first that responds. Natural geographic affinity if relays are region-aware.

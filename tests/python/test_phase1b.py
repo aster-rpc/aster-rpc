@@ -8,6 +8,7 @@ import pytest_asyncio
 from aster import (
     create_endpoint,
     ConnectionInfo,
+    TransportSnapshot,
 )
 
 ALPN = b"test/phase1b/1"
@@ -128,6 +129,47 @@ async def test_connection_info_after_connect(endpoint_pair):
         assert isinstance(info, ConnectionInfo)
         send, recv = await conn.open_bi()
         await send.write_all(b"info test")
+        await send.finish()
+        await server_done.wait()
+
+    await asyncio.wait_for(asyncio.gather(server_side(), client_side()), timeout=30)
+
+
+# ============================================================================
+# Transport Snapshot Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_transport_snapshot_direct_local(endpoint_pair):
+    """Local-loopback connection: selected path is direct, peer_addr
+    is a (host, port) tuple, relay_url is None."""
+    ep_server, ep_client = endpoint_pair
+    server_done = asyncio.Event()
+
+    async def server_side():
+        conn = await ep_server.accept()
+        snap = conn.transport_snapshot()
+        assert isinstance(snap, TransportSnapshot)
+        assert snap.peer_addr is not None, "expected direct path on loopback"
+        host, port = snap.peer_addr
+        assert isinstance(host, str) and host
+        assert isinstance(port, int) and port > 0
+        assert snap.relay_url is None
+        # rtt_micros may be None until handshake-RTT is sampled
+        assert snap.rtt_micros is None or isinstance(snap.rtt_micros, int)
+        send, recv = await conn.accept_bi()
+        await recv.read_to_end(65536)
+        server_done.set()
+
+    async def client_side():
+        await asyncio.sleep(0.2)
+        conn = await ep_client.connect_node_addr(ep_server.endpoint_addr_info(), ALPN)
+        snap = conn.transport_snapshot()
+        assert snap.peer_addr is not None
+        assert snap.relay_url is None
+        send, recv = await conn.open_bi()
+        await send.write_all(b"snapshot test")
         await send.finish()
         await server_done.wait()
 

@@ -235,6 +235,33 @@ int32_t iroh_accept_uni(iroh_runtime_t runtime,
                         uint64_t user_data,
                         iroh_operation_t *out_operation);
 
+/* Tunneling — see ffi_spec/Aster-tunneling.md.
+ *
+ * iroh_connection_authorize_tunnel_tcp: synchronous. Mints a 32-byte
+ * capability token authorising a TCP tunnel to host:port. Writes the
+ * token to out_ticket (must point to >=32 bytes). The handler embeds
+ * the bytes in its RPC response. ttl_secs == 0 uses the node default
+ * (30s). Errors: NOT_FOUND if connection is gone; INTERNAL if the
+ * registry rejects (over-cap, over-TTL).
+ *
+ * iroh_connection_open_tunnel: async. Redeems a 32-byte ticket on
+ * the connection. Emits IROH_EVENT_STREAM_OPENED on success carrying
+ * the (send, recv) handle pair. Bytes flowing on the streams after
+ * this point are raw application data.
+ */
+int32_t iroh_connection_authorize_tunnel_tcp(iroh_runtime_t runtime,
+                                             iroh_connection_t connection,
+                                             struct iroh_bytes_t host,
+                                             uint16_t port,
+                                             uint32_t ttl_secs,
+                                             uint8_t *out_ticket);
+
+int32_t iroh_connection_open_tunnel(iroh_runtime_t runtime,
+                                    iroh_connection_t connection,
+                                    const uint8_t *ticket,
+                                    uint64_t user_data,
+                                    iroh_operation_t *out_operation);
+
 int32_t iroh_stream_write(iroh_runtime_t runtime,
                           iroh_send_stream_t send_stream,
                           struct iroh_bytes_t data,

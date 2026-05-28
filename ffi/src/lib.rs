@@ -2519,6 +2519,125 @@ pub unsafe extern "C" fn iroh_accept_bi(
     iroh_status_t::IROH_STATUS_OK as i32
 }
 
+// ============================================================================
+// Tunneling — see ffi_spec/Aster-tunneling.md
+// ============================================================================
+
+/// Synchronous: authorize a TCP tunnel on `connection` to `host:port`.
+/// On success, writes the 32-byte ticket bytes to `out_ticket` (must
+/// point to ≥32 bytes). The bytes go into the RPC response payload
+/// the handler returns to the peer.
+///
+/// `host` is read as a UTF-8 string from `iroh_bytes_t`.
+/// `ttl_secs == 0` uses the node default (30s).
+#[no_mangle]
+pub unsafe extern "C" fn iroh_connection_authorize_tunnel_tcp(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    host: iroh_bytes_t,
+    port: u16,
+    ttl_secs: u32,
+    out_ticket: *mut u8,
+) -> i32 {
+    if out_ticket.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+    let host_str = match unsafe { read_string(&host) } {
+        Ok(s) => s,
+        Err(s) => return s,
+    };
+    let addr_str = if host_str.contains(':') && !host_str.starts_with('[') {
+        format!("[{host_str}]:{port}")
+    } else {
+        format!("{host_str}:{port}")
+    };
+    let addr: std::net::SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(e) => return set_last_error(format!("bad address: {e}")),
+    };
+    let ticket = match conn_arc.authorize_tunnel(
+        vec![aster_transport_core::tunnel::TunnelTarget::Tcp { addr }],
+        Duration::from_secs(ttl_secs as u64),
+    ) {
+        Ok(t) => t,
+        Err(e) => return set_last_error(e),
+    };
+    unsafe {
+        ptr::copy_nonoverlapping(ticket.as_bytes().as_ptr(), out_ticket, 32);
+    }
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Async: redeem a 32-byte tunnel ticket on `connection`. Emits
+/// IROH_EVENT_STREAM_OPENED with the (send, recv) pair on success.
+/// The streams are raw — bytes after this carry application data.
+///
+/// `ticket` must point to exactly 32 readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_connection_open_tunnel(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    ticket: *const u8,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() || ticket.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let mut ticket_bytes = [0u8; 32];
+    unsafe { ptr::copy_nonoverlapping(ticket, ticket_bytes.as_mut_ptr(), 32) };
+    let ticket = aster_transport_core::tunnel::TunnelTicket(ticket_bytes);
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        match conn_arc.open_tunnel(ticket).await {
+            Ok((send, recv)) => {
+                let send_handle = bridge2.send_streams.insert(send);
+                let recv_handle = bridge2.recv_streams.insert(recv);
+                bridge2.emit_simple(
+                    iroh_event_kind_t::IROH_EVENT_STREAM_OPENED,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    send_handle,
+                    recv_handle,
+                    user_data,
+                    0,
+                );
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn iroh_open_uni(
     runtime: iroh_runtime_t,
@@ -5549,6 +5668,24 @@ pub struct iroh_connection_info_t {
     pub is_connected: u32,
 }
 
+/// Snapshot of the currently selected QUIC path for a connection.
+/// `path_kind` discriminates the populated fields:
+///   0 = no path selected (connection dropped or not yet negotiated)
+///   1 = direct UDP — `peer_host` and `peer_port` are populated
+///   2 = relay     — `relay_url` is populated
+/// `rtt_micros` is `UINT64_MAX` when RTT has not yet been measured.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct iroh_transport_snapshot_t {
+    pub struct_size: u32,
+    pub path_kind: u32,
+    pub peer_host: iroh_bytes_t,
+    pub peer_port: u16,
+    pub _pad: u16,
+    pub relay_url: iroh_bytes_t,
+    pub rtt_micros: u64,
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn iroh_endpoint_remote_info(
     runtime: iroh_runtime_t,
@@ -5730,6 +5867,62 @@ pub unsafe extern "C" fn iroh_connection_info(
             rtt_ns: info.rtt_ns.unwrap_or(0),
             alpn: alpn_bytes,
             is_connected: if info.is_connected { 1 } else { 0 },
+        };
+    }
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Snapshot the currently selected QUIC path for `connection`. See
+/// `iroh_transport_snapshot_t` for the discriminator semantics. The
+/// caller must free `peer_host` and `relay_url` via `iroh_buffer_free`
+/// (empty buffers — `len == 0` — are safe no-ops).
+#[no_mangle]
+pub unsafe extern "C" fn iroh_connection_transport_snapshot(
+    runtime: iroh_runtime_t,
+    connection: iroh_connection_t,
+    out_snapshot: *mut iroh_transport_snapshot_t,
+) -> i32 {
+    if out_snapshot.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let conn_arc = match bridge.connections.get(connection) {
+        Some(c) => c,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let snap = conn_arc.transport_snapshot();
+
+    let empty = iroh_bytes_t {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    let (path_kind, peer_host, peer_port, relay_url) = match (snap.peer_addr, snap.relay_url) {
+        (Some(addr), _) => (
+            1u32,
+            alloc_string(addr.ip().to_string()),
+            addr.port(),
+            empty,
+        ),
+        (None, Some(url)) => (2u32, empty, 0u16, alloc_string(url)),
+        (None, None) => (0u32, empty, 0u16, empty),
+    };
+
+    unsafe {
+        *out_snapshot = iroh_transport_snapshot_t {
+            struct_size: std::mem::size_of::<iroh_transport_snapshot_t>() as u32,
+            path_kind,
+            peer_host,
+            peer_port,
+            _pad: 0,
+            relay_url,
+            rtt_micros: snap.rtt_micros.unwrap_or(u64::MAX),
         };
     }
 

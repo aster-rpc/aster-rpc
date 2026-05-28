@@ -46,6 +46,23 @@ Hosted credential lifecycle: issuance, rotation, revocation, audit logs.
 - Enterprises don't want to manage PKI — they want to declare policy and have
   it enforced
 
+**Anchor-tier tooling (paid add-on for organisations adopting the two-tier
+identity model from `aster-trust-architecture.md`):**
+
+- HSM integration for the offline anchor key (PKCS#11, cloud KMS, YubiHSM)
+- CI/CD plugin that performs per-deployment signing of deployment-root
+  ownership attestations (anchor → deployment root)
+- Key ceremony scripts and runbooks for anchor generation and rotation
+- Audit log of every delegation (every anchor → deployment-root attestation
+  ever issued)
+- Anchor rotation tooling (cross-signing flow, handle re-binding)
+- Compliance reporting templates (SOC2, ISO27001 evidence)
+
+The protocol bits (one extra signature verification per session, one extra
+config field) ship in the free tier — even solo devs benefit if they later
+upgrade. The operational tooling is where orgs pay. Same revenue model as
+code-signing infra organisations already pay for.
+
 ### 3. Fleet Observability
 
 Dashboard showing mesh topology, admitted peers, RPC call patterns, credential

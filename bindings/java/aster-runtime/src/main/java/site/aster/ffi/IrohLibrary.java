@@ -742,6 +742,48 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   /**
+   * Snapshot the currently selected QUIC path for {@code connectionHandle}. The returned struct's
+   * {@code peer_host} and {@code relay_url} buffers are heap-allocated by Rust; the caller MUST
+   * free them with {@link #stringRelease}, but it is safe to call {@code stringRelease} on a
+   * zero-length buffer (no-op).
+   *
+   * @return status code (0 = OK)
+   */
+  public int connectionTransportSnapshot(
+      long runtimeHandle, long connectionHandle, MemorySegment outSnapshot) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_connection_transport_snapshot",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, connectionHandle, outSnapshot);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Release a string buffer previously returned in an {@code iroh_bytes_t} struct (e.g. from {@link
+   * #connectionTransportSnapshot}). Safe to call on a null/zero-length buffer.
+   */
+  public int stringRelease(MemorySegment ptr, long len) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_string_release",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG))
+              .invoke(ptr, len);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
    * Get the available datagram send buffer space.
    *
    * @param runtimeHandle the runtime handle
@@ -2030,6 +2072,25 @@ public final class IrohLibrary implements SymbolLookup {
       MemoryLayout.structLayout(
           ValueLayout.ADDRESS.withName("items"), // 0
           ValueLayout.JAVA_LONG.withName("len") // 8
+          );
+
+  /**
+   * iroh_transport_snapshot_t: struct_size, path_kind, peer_host (16), peer_port (u16), _pad (u16),
+   * [4-byte tail-padding for 8-byte align], relay_url (16), rtt_micros (u64). Total 56 bytes.
+   *
+   * <p>Rust's #[repr(C)] inserts 4 bytes of padding after `_pad` so that the next field
+   * (`relay_url`, which contains a pointer) starts at an 8-byte boundary. This layout matches that.
+   */
+  public static final MemoryLayout IROH_TRANSPORT_SNAPSHOT =
+      MemoryLayout.structLayout(
+          ValueLayout.JAVA_INT.withName("struct_size"), // 0
+          ValueLayout.JAVA_INT.withName("path_kind"), // 4
+          IROH_BYTES.withName("peer_host"), // 8
+          ValueLayout.JAVA_SHORT.withName("peer_port"), // 24
+          ValueLayout.JAVA_SHORT.withName("_pad"), // 26
+          MemoryLayout.paddingLayout(4), // 28
+          IROH_BYTES.withName("relay_url"), // 32
+          ValueLayout.JAVA_LONG.withName("rtt_micros") // 48
           );
 
   /**

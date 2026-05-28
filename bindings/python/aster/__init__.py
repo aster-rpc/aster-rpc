@@ -84,6 +84,7 @@ try:
         NodeAddr,
         EndpointConfig,
         ConnectionInfo,
+        TransportSnapshot,
         RemoteInfo,
         NetClient,
         IrohConnection,
@@ -111,6 +112,9 @@ except ImportError as e:
     ) from e
 
 from .config import load_endpoint_config, AsterConfig
+
+# ── Tunneling - handler-side ticket issuance (see aster.tunnel) ──────────────
+from .tunnel import Tcp, Udp, HttpProxy, TunnelHandle, TunnelTarget
 
 # ── Aster RPC framework ───────────────────────────────────────────────────────
 
@@ -216,6 +220,7 @@ __all__ = [
     "NodeAddr",
     "EndpointConfig",
     "ConnectionInfo",
+    "TransportSnapshot",
     "RemoteInfo",
     "NetClient",
     "IrohConnection",
@@ -303,4 +308,10 @@ __all__ = [
     "ClientSession",
     "AdmissionDeniedError",
     "RPC_ALPN",
+    # ── Tunneling ──
+    "Tcp",
+    "Udp",
+    "HttpProxy",
+    "TunnelHandle",
+    "TunnelTarget",
 ]

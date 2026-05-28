@@ -366,6 +366,47 @@ The service never talks to aster.site during the connection. The consumer obtain
 
 ---
 
+## Notes harvested from retired trust-anchor-inversion
+
+The `trust-anchor-inversion.md` working idea has been superseded — its mechanism (offline anchor signs ephemeral CI-issued deployment root, chain walks via reciprocal attestations) is now in [`working_ideas/ownership-attestations.md`](working_ideas/ownership-attestations.md), which generalises it to N-tier delegation chains using a single primitive (statement codes `0x0010 ANCHOR_AUTHORISED_ROOT` / `0x0011 ROOT_AUTHORISED_BY_ANCHOR` already in the registry). Three orphan ideas from that doc landed here for capture before its retirement.
+
+### Mental model: deployment certificates, not certificate chains
+
+The two-tier identity (anchor + deployment root) is closer to **SSH host certificates** (one CA signs short-lived host certs) than to **X.509 PKI** (multi-level CAs, CRLs, OCSP). Producers carry one delegation hop per tier, not a chain of N negotiated through ASN.1. The simplicity is the point — verification stays bounded and auditable, no path-validation footguns.
+
+### Handle binding rebound to anchor (architectural decision)
+
+In the current DNS layout, `<handle>.id.aster0.net` resolves to the operator's root key. Once root keys become CI-issued deployment roots (via the inversion / ownership-attestation mechanism), that record would thrash on every CI run.
+
+**Decision needed:** bind `@aster` handles to the *anchor* pubkey, not the deployment root.
+
+```
+@maersk → anchor pubkey            (in @aster handle registry, decade-stable)
+        → deployment root pubkey   (signed by anchor via ownership attestation, rotates per CI)
+        → endpoint endorsements    (signed by deployment root, today's model)
+```
+
+`@aster`'s job shrinks: handle ↔ anchor binding only. Single record per operator, updated maybe once a decade. This makes the registry small enough to be fully transparency-logged (every handle ↔ anchor binding ever asserted is publicly auditable — narrow scope, big audit value). Deployment-root rotation happens entirely within the operator's CI without `@aster` involvement.
+
+### Policy attributes on a delegation (open question)
+
+A delegation from anchor to deployment root may want to carry constraints the deployment root must honour:
+
+- Allowed environments (`env=prod` only, not `staging`)
+- Allowed contract IDs (this deployment can only serve `ShippingAPI`, not `BillingAPI`)
+- Regions / clusters
+- Maximum sub-delegation depth (probably 0 for the deployment-root tier — i.e. it can sign nodes but not further intermediates)
+
+The locked v1 ownership-attestation schema (`AttestationBody = {v, epoch, statements, authority_hints}`) does not carry these as first-class fields. Three options:
+
+- Allocate dedicated statement codes (`POLICY_ENV`, `POLICY_CONTRACT`, etc.) — explodes the registry.
+- Use the per-statement `ext` field for deployment-local policy — narrow (16 bits) and not portable across deployments.
+- Add a `policy: bytes` field in a `v2` `AttestationBody` schema — clean but interacts with the never-add-defaulted-fields evolution rule.
+
+Decide before policy use cases land in production. Until then, the v1 schema ships without policy fields and the constraint surface is "the deployment root can do whatever it wants, audited via the transparency log."
+
+---
+
 ## Open Questions
 
 - **Log storage:** Should the transparency log be stored in iroh-blobs (eating our own dogfood)? Pros: content-addressed, replicated, peers can cache. Cons: adds dependency on iroh availability for log verification.

@@ -25,6 +25,7 @@ hex = "0.4"
 bs58 = "0.5"
 ed25519-dalek = { version = "=3.0.0-pre.7", features = ["rand_core"] }
 crossbeam-utils = { workspace = true }
+getrandom = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
