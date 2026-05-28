@@ -976,7 +976,7 @@ impl CoreNode {
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         let mem_store = MemStore::new();
         let store: BlobStore = (*mem_store).clone();
-        Self::finalize(endpoint, store, aster_alpns, monitor, hook_receiver).await
+        Self::finalize(endpoint, store, None, aster_alpns, monitor, hook_receiver).await
     }
 
     pub async fn persistent(path: String) -> Result<Self> {
@@ -991,24 +991,44 @@ impl CoreNode {
         endpoint_config: Option<CoreEndpointConfig>,
     ) -> Result<Self> {
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
-        let fs_store = FsStore::load(path).await?;
+        let root = std::path::PathBuf::from(&path);
+        let fs_store = FsStore::load(&root).await?;
         let store: BlobStore = fs_store.into();
-        Self::finalize(endpoint, store, aster_alpns, monitor, hook_receiver).await
+        Self::finalize(
+            endpoint,
+            store,
+            Some(root),
+            aster_alpns,
+            monitor,
+            hook_receiver,
+        )
+        .await
     }
 
     /// Shared tail of both constructors: wire blobs/docs/gossip protocols +
     /// one `AsterQueueHandler` per entry in `aster_alpns` onto a Router, then
     /// assemble `CoreNodeInner`.
+    ///
+    /// `docs_root` mirrors the store backing: `Some(path)` for a persistent
+    /// node uses `Docs::persistent(path)` so namespaces/authors/entries survive
+    /// restart (`docs.redb` + `default-author` live alongside the blob
+    /// `blobs.db` in the same directory); `None` for a memory node uses
+    /// `Docs::memory()`.
     async fn finalize(
         endpoint: Endpoint,
         store: BlobStore,
+        docs_root: Option<std::path::PathBuf>,
         aster_alpns: Vec<Vec<u8>>,
         monitor: Option<CoreMonitor>,
         hook_receiver: Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
     ) -> Result<Self> {
         let blobs = BlobsProtocol::new(&store, None);
         let gossip = Gossip::builder().spawn(endpoint.clone());
-        let docs = Docs::memory()
+        let docs_builder = match docs_root {
+            Some(path) => Docs::persistent(path),
+            None => Docs::memory(),
+        };
+        let docs = docs_builder
             .spawn(endpoint.clone(), store.clone(), gossip.clone())
             .await?;
 
@@ -1060,10 +1080,19 @@ impl CoreNode {
         format!("{:?}", self.inner.endpoint.addr())
     }
     pub async fn close(&self) {
+        // Flush blob-store metadata to disk while the store actor is still
+        // alive. `router.shutdown()` below shuts the store down (via
+        // `BlobsProtocol::shutdown()` -> `store.shutdown()`), so a `sync_db()`
+        // afterwards would race a dead actor and silently skip the flush. For a
+        // persistent FsStore this guarantees durability of tags/entries added
+        // before close; for a MemStore it is a harmless no-op.
+        if let Err(err) = self.inner.store.sync_db().await {
+            debug!("CoreNode::close: store.sync_db error: {err}");
+        }
         // router.shutdown() drains protocol handlers (so in-flight
         // AsterQueueHandler::accept futures resolve), drops handlers (closing
-        // the aster channel), then closes the endpoint. See iroh-0.97.0
-        // protocol.rs:490-495.
+        // the aster channel), stops the docs engine, shuts the blob store down,
+        // then closes the endpoint.
         if let Err(err) = self.inner.router.shutdown().await {
             debug!("CoreNode::close: router.shutdown join error: {err}");
         }
@@ -2228,6 +2257,39 @@ impl CoreBlobsClient {
         Ok(self.store.add_slice(&data).await?.hash.to_string())
     }
 
+    /// Import a file from `path` into the blob store and return its hash (hex).
+    ///
+    /// Uses `ImportMode::Copy` (the reflink-or-copy import path, never
+    /// `TryReference`), so the imported data is owned by the store and cannot be
+    /// corrupted by later edits to the source file. Like [`Self::add_bytes`], an
+    /// auto-created tag keeps the blob alive; callers that need a deterministic,
+    /// GC-controllable tag should use [`Self::add_path_with_named_tag`].
+    pub async fn add_path(&self, path: String) -> Result<String> {
+        let tag = self
+            .store
+            .blobs()
+            .add_path(std::path::PathBuf::from(path))
+            .await?;
+        Ok(tag.hash.to_string())
+    }
+
+    /// Import a file from `path` and set a persistent named tag in one step,
+    /// returning the blob hash (hex).
+    ///
+    /// Same `ImportMode::Copy` import as [`Self::add_path`], but the blob is
+    /// protected by the caller-chosen `tag_name` instead of an anonymous
+    /// auto-tag. portal-sync keys the tag name by `(tree_id, blob_hash)` so it
+    /// can GC blobs deterministically by deleting the tag.
+    pub async fn add_path_with_named_tag(&self, path: String, tag_name: String) -> Result<String> {
+        let haf = self
+            .store
+            .blobs()
+            .add_path(std::path::PathBuf::from(path))
+            .with_named_tag(tag_name.as_bytes())
+            .await?;
+        Ok(haf.hash.to_string())
+    }
+
     pub async fn read_to_bytes(&self, hash_hex: String) -> Result<Vec<u8>> {
         Ok(self
             .store
@@ -2614,6 +2676,54 @@ impl CoreDocsClient {
 
     pub async fn create_author(&self) -> Result<String> {
         Ok(self.inner.api().author_create().await?.to_string())
+    }
+
+    /// Open an existing local namespace by its ID (hex), without a ticket or a
+    /// peer to sync from. Returns `None` if the namespace is not present in the
+    /// local replica store.
+    ///
+    /// This is the access path for a persistent node after restart: the
+    /// namespace/authors/entries written before [`CoreNode::close`] are reloaded
+    /// from `docs.redb`, and `open` hands back a usable [`CoreDoc`].
+    pub async fn open(&self, namespace_id_hex: String) -> Result<Option<CoreDoc>> {
+        let ns_bytes = hex::decode(&namespace_id_hex)?;
+        if ns_bytes.len() != 32 {
+            return Err(anyhow!("namespace_id must be 32 bytes (64 hex chars)"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&ns_bytes);
+        let ns_id = NamespaceId::from(arr);
+        // Upstream `DocsApi::open` propagates a "Replica not found" error for an
+        // unknown namespace instead of returning `Ok(None)` (its `Option` is
+        // vestigial — it only ever yields `Some`). To honour our documented
+        // `None`-on-missing contract, an error is reconciled against `list()`:
+        // a genuinely absent namespace maps to `Ok(None)`, any other failure is
+        // re-raised. The happy path stays a single `open()` call (no scan).
+        match self.inner.api().open(ns_id).await {
+            Ok(opt) => Ok(opt.map(|doc| CoreDoc {
+                doc,
+                store: self.store.clone(),
+            })),
+            Err(err) => {
+                if self.namespace_exists(ns_id).await? {
+                    Err(err)
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Whether `ns_id` is present in the local replica store. Used to
+    /// disambiguate a "not found" open from a real error (see [`Self::open`]).
+    async fn namespace_exists(&self, ns_id: NamespaceId) -> Result<bool> {
+        let mut stream = self.inner.api().list().await?;
+        while let Some(item) = stream.next().await {
+            if item?.0 == ns_id {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub async fn join(&self, ticket_str: String) -> Result<CoreDoc> {

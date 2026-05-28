@@ -5,6 +5,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SegmentAllocator;
 import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -103,6 +104,176 @@ public class IrohBlobs {
                 return BlobId.of(hashHex.trim());
               }
               throw new IrohException("addBytes failed: unexpected event " + event.kind());
+            });
+  }
+
+  /**
+   * Import a file by path into the blob store (Copy mode, never TryReference).
+   *
+   * <p>Like {@link #addBytesAsync}, an auto-created tag keeps the blob alive. For a deterministic,
+   * GC-controllable tag use {@link #addPathWithNamedTagAsync}.
+   *
+   * @param path the file to import
+   * @return a future that completes with the blob ID
+   */
+  public CompletableFuture<BlobId> addPathAsync(Path path) {
+    var lib = IrohLibrary.getInstance();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
+
+    byte[] pathBytes = path.toString().getBytes(StandardCharsets.UTF_8);
+    var pathSeg = alloc.allocate(pathBytes.length);
+    pathSeg.copyFrom(MemorySegment.ofArray(pathBytes));
+    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+
+    try {
+      int status =
+          lib.blobsAddPath(runtime.nativeHandle(), nodeHandle, pathSeg, pathBytes.length, opSeg);
+      if (status != 0) {
+        throw new IrohException(
+            IrohStatus.fromCode(status), "iroh_blobs_add_path failed: " + status);
+      }
+    } catch (IrohException e) {
+      return CompletableFuture.failedFuture(e);
+    } catch (Throwable t) {
+      return CompletableFuture.failedFuture(
+          new IrohException("iroh_blobs_add_path threw: " + t.getMessage()));
+    }
+
+    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+    return runtime
+        .registry()
+        .register(opId)
+        .thenApply(
+            event -> {
+              if (event.kind() == IrohEventKind.BLOB_ADDED) {
+                // event.data() is a native MemorySegment; read it via asSlice +
+                // toArray (a direct ByteBuffer has no backing array()).
+                byte[] hashBytes =
+                    event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE);
+                String hashHex = new String(hashBytes, StandardCharsets.UTF_8);
+                return BlobId.of(hashHex.trim());
+              }
+              throw new IrohException("addPath failed: unexpected event " + event.kind());
+            });
+  }
+
+  /**
+   * Import a file by path and set a persistent named tag in one step.
+   *
+   * <p>The blob is protected by the caller-chosen {@code tagName} rather than an anonymous
+   * auto-tag, so it can be garbage-collected deterministically by deleting the tag.
+   *
+   * @param path the file to import
+   * @param tagName the persistent tag name to set on the imported blob
+   * @return a future that completes with the blob ID
+   */
+  public CompletableFuture<BlobId> addPathWithNamedTagAsync(Path path, String tagName) {
+    var lib = IrohLibrary.getInstance();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
+
+    byte[] pathBytes = path.toString().getBytes(StandardCharsets.UTF_8);
+    var pathSeg = alloc.allocate(pathBytes.length);
+    pathSeg.copyFrom(MemorySegment.ofArray(pathBytes));
+    byte[] tagBytes = tagName.getBytes(StandardCharsets.UTF_8);
+    var tagSeg = alloc.allocate(tagBytes.length);
+    tagSeg.copyFrom(MemorySegment.ofArray(tagBytes));
+    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+
+    try {
+      int status =
+          lib.blobsAddPathWithNamedTag(
+              runtime.nativeHandle(),
+              nodeHandle,
+              pathSeg,
+              pathBytes.length,
+              tagSeg,
+              tagBytes.length,
+              opSeg);
+      if (status != 0) {
+        throw new IrohException(
+            IrohStatus.fromCode(status), "iroh_blobs_add_path_with_named_tag failed: " + status);
+      }
+    } catch (IrohException e) {
+      return CompletableFuture.failedFuture(e);
+    } catch (Throwable t) {
+      return CompletableFuture.failedFuture(
+          new IrohException("iroh_blobs_add_path_with_named_tag threw: " + t.getMessage()));
+    }
+
+    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+    return runtime
+        .registry()
+        .register(opId)
+        .thenApply(
+            event -> {
+              if (event.kind() == IrohEventKind.BLOB_ADDED) {
+                // event.data() is a native MemorySegment; read it via asSlice +
+                // toArray (a direct ByteBuffer has no backing array()).
+                byte[] hashBytes =
+                    event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE);
+                String hashHex = new String(hashBytes, StandardCharsets.UTF_8);
+                return BlobId.of(hashHex.trim());
+              }
+              throw new IrohException(
+                  "addPathWithNamedTag failed: unexpected event " + event.kind());
+            });
+  }
+
+  /**
+   * Set a persistent named tag on an existing blob hash.
+   *
+   * @param name the tag name (portal-sync keys this by {@code (tree_id, blob_hash)})
+   * @param hash the blob the tag points at
+   * @param format {@code "raw"} or {@code "hash_seq"}
+   * @return a future that completes when the tag is set
+   */
+  public CompletableFuture<Void> tagSet(String name, BlobId hash, String format) {
+    var lib = IrohLibrary.getInstance();
+    Arena confined = Arena.ofConfined();
+    var alloc = confined;
+
+    byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+    var nameSeg = alloc.allocate(nameBytes.length);
+    nameSeg.copyFrom(MemorySegment.ofArray(nameBytes));
+    byte[] hashBytes = hash.hex().getBytes(StandardCharsets.UTF_8);
+    var hashSeg = alloc.allocate(hashBytes.length);
+    hashSeg.copyFrom(MemorySegment.ofArray(hashBytes));
+    int fmt = "hash_seq".equals(format) ? 1 : 0;
+    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+
+    try {
+      int status =
+          lib.tagsSet(
+              runtime.nativeHandle(),
+              nodeHandle,
+              nameSeg,
+              nameBytes.length,
+              hashSeg,
+              hashBytes.length,
+              fmt,
+              opSeg);
+      if (status != 0) {
+        throw new IrohException(IrohStatus.fromCode(status), "iroh_tags_set failed: " + status);
+      }
+    } catch (IrohException e) {
+      return CompletableFuture.failedFuture(e);
+    } catch (Throwable t) {
+      return CompletableFuture.failedFuture(
+          new IrohException("iroh_tags_set threw: " + t.getMessage()));
+    }
+
+    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+    return runtime
+        .registry()
+        .register(opId)
+        .thenApply(
+            event -> {
+              if (event.kind() == IrohEventKind.TAG_SET) {
+                return null;
+              }
+              throw new IrohException("tagSet failed: unexpected event " + event.kind());
             });
   }
 

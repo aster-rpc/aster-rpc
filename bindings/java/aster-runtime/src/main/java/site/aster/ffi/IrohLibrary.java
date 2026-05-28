@@ -867,6 +867,118 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   /**
+   * Import a file by path into the blob store. The C signature takes the path as an {@code
+   * iroh_bytes_t} by value; we split it into (ptr, len) per the working struct-by-value convention
+   * (see {@link #blobsAddCollection} / {@link #asterRegistryPublish}). Emits {@code
+   * IROH_EVENT_BLOB_ADDED} with the hash hex as the payload.
+   *
+   * @return status code (0 = OK)
+   */
+  public int blobsAddPath(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment pathPtr,
+      long pathLen,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_add_path",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG, // runtime
+                      ValueLayout.JAVA_LONG, // node
+                      ValueLayout.ADDRESS, // path ptr
+                      ValueLayout.JAVA_LONG, // path len
+                      ValueLayout.JAVA_LONG, // user data
+                      ValueLayout.ADDRESS)) // out op
+              .invoke(runtimeHandle, nodeHandle, pathPtr, pathLen, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Import a file by path and set a persistent named tag in one step. Both {@code path} and {@code
+   * tagName} are {@code iroh_bytes_t} by value, each split into (ptr, len). Emits {@code
+   * IROH_EVENT_BLOB_ADDED} with the hash hex as the payload.
+   *
+   * @return status code (0 = OK)
+   */
+  public int blobsAddPathWithNamedTag(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment pathPtr,
+      long pathLen,
+      MemorySegment tagPtr,
+      long tagLen,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_add_path_with_named_tag",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG, // runtime
+                      ValueLayout.JAVA_LONG, // node
+                      ValueLayout.ADDRESS, // path ptr
+                      ValueLayout.JAVA_LONG, // path len
+                      ValueLayout.ADDRESS, // tag ptr
+                      ValueLayout.JAVA_LONG, // tag len
+                      ValueLayout.JAVA_LONG, // user data
+                      ValueLayout.ADDRESS)) // out op
+              .invoke(runtimeHandle, nodeHandle, pathPtr, pathLen, tagPtr, tagLen, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Set a persistent named tag on an existing hash. {@code name} and {@code hashHex} are passed as
+   * (ptr, len); {@code format} is 0 = raw, 1 = hash_seq. Emits {@code IROH_EVENT_TAG_SET}.
+   *
+   * @return status code (0 = OK)
+   */
+  public int tagsSet(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment namePtr,
+      long nameLen,
+      MemorySegment hashPtr,
+      long hashLen,
+      int format,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_tags_set",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG, // runtime
+                      ValueLayout.JAVA_LONG, // node
+                      ValueLayout.ADDRESS, // name ptr
+                      ValueLayout.JAVA_LONG, // name len
+                      ValueLayout.ADDRESS, // hash ptr
+                      ValueLayout.JAVA_LONG, // hash len
+                      ValueLayout.JAVA_INT, // format
+                      ValueLayout.JAVA_LONG, // user data
+                      ValueLayout.ADDRESS)) // out op
+              .invoke(
+                  runtimeHandle,
+                  nodeHandle,
+                  namePtr,
+                  nameLen,
+                  hashPtr,
+                  hashLen,
+                  format,
+                  0L,
+                  outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
    * Add bytes as a named collection entry.
    *
    * @param runtimeHandle the runtime handle
