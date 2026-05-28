@@ -425,16 +425,25 @@ async fn read_pointer(
     key: Vec<u8>,
     acl: Option<&RegistryAcl>,
 ) -> Result<Option<String>> {
-    let mut entries = doc.query_key_exact(key).await?;
-    if let Some(acl) = acl {
-        entries = acl.filter_trusted(entries);
-    }
-    if entries.is_empty() {
-        return Ok(None);
-    }
-    entries.sort_by_key(|e| e.timestamp);
-    let entry = entries.last().unwrap();
-    let bytes = doc.read_entry_content(entry.content_hash.clone()).await?;
+    let content_hash = match acl {
+        // With a trust filter we must consider every author's entry (the latest writer
+        // may be untrusted), so read them all and pick the latest trusted one.
+        Some(acl) => {
+            let mut entries = acl.filter_trusted(doc.query_key_exact(key, None).await?);
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            entries.sort_by_key(|e| e.timestamp);
+            entries.pop().unwrap().content_hash
+        }
+        // No trust filter: let the store collapse to the single latest entry. This is
+        // unaffected by author count and treats a latest-deletion as absent.
+        None => match doc.query_latest_exact(key).await? {
+            Some(entry) => entry.content_hash,
+            None => return Ok(None),
+        },
+    };
+    let bytes = doc.read_entry_content(content_hash).await?;
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -474,7 +483,7 @@ pub async fn list_leases(
     acl: Option<&RegistryAcl>,
 ) -> Result<Vec<EndpointLease>> {
     let prefix = lease_prefix(service, contract_id);
-    let mut entries = doc.query_key_prefix(prefix).await?;
+    let mut entries = doc.query_key_prefix(prefix, None).await?;
     if let Some(acl) = acl {
         entries = acl.filter_trusted(entries);
     }
@@ -613,18 +622,14 @@ pub async fn renew_lease(
     gossip: Option<&CoreGossipTopic>,
 ) -> Result<()> {
     let key = lease_key(service, contract_id, endpoint_id);
-    let entries = doc.query_key_exact(key.clone()).await?;
-    let entry = entries
-        .into_iter()
-        .max_by_key(|e| e.timestamp)
-        .ok_or_else(|| {
-            anyhow!(
-                "no lease found for {}/{}/{}",
-                service,
-                contract_id,
-                endpoint_id
-            )
-        })?;
+    let entry = doc.query_latest_exact(key.clone()).await?.ok_or_else(|| {
+        anyhow!(
+            "no lease found for {}/{}/{}",
+            service,
+            contract_id,
+            endpoint_id
+        )
+    })?;
     let bytes = doc.read_entry_content(entry.content_hash).await?;
     let mut lease: EndpointLease = serde_json::from_slice(&bytes)?;
 
@@ -729,8 +734,8 @@ impl RegistryAcl {
 }
 
 async fn read_acl_list(doc: &CoreDoc, subkey: &str) -> Result<Option<Vec<String>>> {
-    let entries = doc.query_key_exact(acl_key(subkey)).await?;
-    let Some(entry) = entries.into_iter().next() else {
+    // The current ACL list is the latest write to the key, not an arbitrary author's.
+    let Some(entry) = doc.query_latest_exact(acl_key(subkey)).await? else {
         return Ok(None);
     };
     let bytes = doc.read_entry_content(entry.content_hash).await?;

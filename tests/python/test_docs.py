@@ -169,6 +169,103 @@ async def test_query_key_prefix_returns_matching_entries():
 
 
 @pytest.mark.asyncio
+async def test_query_key_prefix_is_unbounded_by_default():
+    """A prefix query is a listing: it returns every matching key, not a small cap."""
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+
+    doc = await dc.create()
+    author = await dc.create_author()
+
+    for i in range(10):
+        await doc.set_bytes(author, f"items/{i:02d}".encode(), b"v")
+
+    entries = await doc.query_key_prefix(b"items/")
+    assert len(entries) == 10
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_query_key_prefix_respects_caller_limit():
+    """A caller-supplied limit caps the result set (e.g. for pagination)."""
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+
+    doc = await dc.create()
+    author = await dc.create_author()
+
+    for i in range(10):
+        await doc.set_bytes(author, f"items/{i:02d}".encode(), b"v")
+
+    entries = await doc.query_key_prefix(b"items/", limit=4)
+    assert len(entries) == 4
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_query_latest_exact_returns_newest_across_authors():
+    """query_latest_exact returns the highest-timestamp entry regardless of author count."""
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+
+    doc = await dc.create()
+    # Five authors write the same key; the latest write must win even though that is
+    # more than the old 3-entry exact-query cap and unrelated to author-id ordering.
+    latest_hash = None
+    for i in range(5):
+        author = await dc.create_author()
+        latest_hash = await doc.set_bytes(author, b"k", f"v{i}".encode())
+
+    entry = await doc.query_latest_exact(b"k")
+    assert entry is not None
+    assert entry.content_hash == latest_hash
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_query_latest_exact_missing_returns_none():
+    """query_latest_exact returns None for a key that was never written."""
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+
+    doc = await dc.create()
+    assert await doc.query_latest_exact(b"nope") is None
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_query_latest_prefix_dedupes_keys_across_authors():
+    """query_latest_prefix returns one entry per key (the latest), not one per author."""
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+
+    doc = await dc.create()
+    a1 = await dc.create_author()
+    a2 = await dc.create_author()
+
+    # Two authors both write the same child key; a third key has a single author.
+    await doc.set_bytes(a1, b"dir/x", b"x_a1")
+    latest_x = await doc.set_bytes(a2, b"dir/x", b"x_a2")
+    await doc.set_bytes(a1, b"dir/y", b"y_a1")
+
+    # Plain prefix query sees the duplicate key (one row per author).
+    plain = await doc.query_key_prefix(b"dir/")
+    assert len(plain) == 3
+
+    # Latest-per-key collapses dir/x to its newest entry: 2 distinct keys.
+    latest = await doc.query_latest_prefix(b"dir/")
+    by_key = {bytes(e.key): e for e in latest}
+    assert set(by_key) == {b"dir/x", b"dir/y"}
+    assert by_key[b"dir/x"].content_hash == latest_x
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_query_key_prefix_no_match_returns_empty():
     """query_key_prefix returns empty list when no keys match the prefix."""
     node = await IrohNode.memory()

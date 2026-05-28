@@ -129,10 +129,6 @@ pub struct CoreGossipEvent {
     pub data: Option<Vec<u8>>,
 }
 
-/// Maximum number of entries returned per query.
-/// Limits result sets to prevent unbounded reads when multiple authors write to the same key.
-pub const QUERY_ENTRY_LIMIT: u64 = 3;
-
 /// A document entry returned from queries, containing metadata about who wrote it and what they wrote.
 #[derive(Clone, Debug)]
 pub struct CoreDocEntry {
@@ -2856,8 +2852,23 @@ impl CoreDoc {
 
     /// Query all entries for an exact key, across all authors.
     /// Returns a list of CoreDocEntry with metadata (author, content hash, timestamp, etc.)
-    pub async fn query_key_exact(&self, key: Vec<u8>) -> Result<Vec<CoreDocEntry>> {
-        let query = Query::key_exact(key).limit(QUERY_ENTRY_LIMIT).build();
+    ///
+    /// iroh-docs stores one entry per (author, key) and orders the result by author id
+    /// (ascending), NOT by timestamp — so a `limit` truncates by author id, which can
+    /// exclude the most-recent writer. Use this only when you genuinely need every
+    /// author's entry (e.g. to apply a trust filter before picking a winner); pass
+    /// `None` for an unbounded read. To read the single latest value of a key, use
+    /// [`CoreDoc::query_latest_exact`] instead.
+    pub async fn query_key_exact(
+        &self,
+        key: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>> {
+        let mut builder = Query::key_exact(key);
+        if let Some(limit) = limit {
+            builder = builder.limit(limit);
+        }
+        let query = builder.build();
         let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
         let mut results = Vec::new();
         while let Some(entry) = entries_stream.next().await {
@@ -2873,10 +2884,86 @@ impl CoreDoc {
         Ok(results)
     }
 
+    /// Read the single latest entry for an exact key, across all authors.
+    ///
+    /// Asks the store to collapse the per-author entries to the one with the highest
+    /// timestamp (iroh-docs' `single_latest_per_key`), so the result is independent of
+    /// how many authors have written the key — the most-recent writer always wins.
+    /// Returns `None` if the key was never written, or if the latest write was a
+    /// deletion (tombstone). This is the correct primitive for reading the current
+    /// value of a key; [`CoreDoc::query_key_exact`] is for enumerating all authors.
+    pub async fn query_latest_exact(&self, key: Vec<u8>) -> Result<Option<CoreDocEntry>> {
+        let query = Query::single_latest_per_key().key_exact(key).build();
+        let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
+        match entries_stream.next().await {
+            Some(entry) => {
+                let entry = entry?;
+                Ok(Some(CoreDocEntry {
+                    author_id: entry.author().to_string(),
+                    key: entry.key().to_vec(),
+                    content_hash: entry.content_hash().to_hex().to_string(),
+                    content_len: entry.content_len(),
+                    timestamp: entry.timestamp(),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Query all entries matching a key prefix, across all authors.
     /// Returns a list of CoreDocEntry with metadata (author, content hash, timestamp, etc.)
-    pub async fn query_key_prefix(&self, prefix: Vec<u8>) -> Result<Vec<CoreDocEntry>> {
-        let query = Query::key_prefix(prefix).limit(QUERY_ENTRY_LIMIT).build();
+    ///
+    /// A prefix query is a listing: every matching key is distinct, so there is no
+    /// natural small bound. `limit` is the caller's responsibility — pass `Some(n)` to
+    /// cap the result set (e.g. for pagination), or `None` for an unbounded listing.
+    pub async fn query_key_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>> {
+        let mut builder = Query::key_prefix(prefix);
+        if let Some(limit) = limit {
+            builder = builder.limit(limit);
+        }
+        let query = builder.build();
+        let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
+        let mut results = Vec::new();
+        while let Some(entry) = entries_stream.next().await {
+            let entry = entry?;
+            results.push(CoreDocEntry {
+                author_id: entry.author().to_string(),
+                key: entry.key().to_vec(),
+                content_hash: entry.content_hash().to_hex().to_string(),
+                content_len: entry.content_len(),
+                timestamp: entry.timestamp(),
+            });
+        }
+        Ok(results)
+    }
+
+    /// List the latest entry for each distinct key under a prefix, across all authors.
+    ///
+    /// This is the listing counterpart to [`CoreDoc::query_latest_exact`]: where
+    /// [`query_key_prefix`](CoreDoc::query_key_prefix) returns one row per (author, key)
+    /// — so a key written by N authors appears N times — this collapses each key to its
+    /// single highest-timestamp entry (iroh-docs' `single_latest_per_key`). Keys whose
+    /// latest write was a deletion are omitted. Use it for directory-style listings,
+    /// where duplicate keys would be a bug. `limit` caps the number of distinct keys
+    /// returned; pass `None` for an unbounded listing.
+    ///
+    /// Note: this collapses by document timestamp. Do NOT use it where freshness is
+    /// tracked by an in-payload sequence number (e.g. endpoint leases); enumerate with
+    /// [`query_key_prefix`](CoreDoc::query_key_prefix) and dedupe on that field instead.
+    pub async fn query_latest_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>> {
+        let mut builder = Query::single_latest_per_key().key_prefix(prefix);
+        if let Some(limit) = limit {
+            builder = builder.limit(limit);
+        }
+        let query = builder.build();
         let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
         let mut results = Vec::new();
         while let Some(entry) = entries_stream.next().await {
