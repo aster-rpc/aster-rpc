@@ -1,3 +1,5 @@
+#[cfg(feature = "attestation")]
+pub mod attestation;
 pub mod canonical;
 pub mod contract;
 pub mod framing;
@@ -35,7 +37,9 @@ use iroh_docs::api::Doc;
 use iroh_docs::engine::LiveEvent;
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::{DownloadPolicy, FilterKind, Query};
-use iroh_docs::{AuthorId, Capability, DocTicket, NamespaceId, ALPN as DOCS_ALPN};
+use iroh_docs::{
+    Author, AuthorId, Capability, DocTicket, NamespaceId, NamespaceSecret, ALPN as DOCS_ALPN,
+};
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
@@ -952,6 +956,27 @@ async fn build_node_endpoint(
     }
 }
 
+/// A node's default docs [`Author`] — its own identity key, so `AuthorId == NodeId`.
+///
+/// Aster uses the node's endpoint key as the docs author: a doc entry's author is
+/// exactly the node that wrote it, directly verifiable against the attestation
+/// chain and the QUIC handshake, with no separate author↔node binding to publish.
+///
+/// Consequence: on a persistent node this writes the node secret into the docs
+/// author store (`docs.redb`). Aster never surfaces author export (neither `core`
+/// nor any binding wraps iroh-docs `author_export`), so the secret cannot be
+/// extracted via the docs API; the only sanctioned way to obtain the node
+/// identity is [`CoreNode::export_secret_key`].
+fn node_docs_author(node_secret: &[u8; 32]) -> Author {
+    Author::from_bytes(node_secret)
+}
+
+/// The default-docs `AuthorId` (hex) for a node with this secret — equals the
+/// node id, since Aster uses the node identity key as the docs author.
+pub fn default_docs_author_id(node_secret: &[u8; 32]) -> String {
+    node_docs_author(node_secret).id().to_string()
+}
+
 impl CoreNode {
     pub async fn memory() -> Result<Self> {
         Self::memory_with_alpns(Vec::new(), None).await
@@ -1027,6 +1052,17 @@ impl CoreNode {
         let docs = docs_builder
             .spawn(endpoint.clone(), store.clone(), gossip.clone())
             .await?;
+
+        // Default docs author = the node's own identity key, so `AuthorId == NodeId`
+        // — a doc entry's author is exactly the node that wrote it (free, direct
+        // attribution). Idempotent across restarts. See [`node_docs_author`] for
+        // the on-disk-secret consequence and why author export is not surfaced.
+        {
+            let author = node_docs_author(&endpoint.secret_key().to_bytes());
+            let author_id = author.id();
+            docs.api().author_import(author).await?;
+            docs.api().author_set_default(author_id).await?;
+        }
 
         let (aster_tx, aster_rx) = mpsc::channel::<(Vec<u8>, Connection)>(ASTER_QUEUE_CAPACITY);
 
@@ -2672,6 +2708,53 @@ impl CoreDocsClient {
 
     pub async fn create_author(&self) -> Result<String> {
         Ok(self.inner.api().author_create().await?.to_string())
+    }
+
+    /// Return the node-wide default author (hex). On a persistent node this
+    /// author is created on first start and its key is saved in the data
+    /// directory, so it is stable across restarts — the recommended "current
+    /// node author" for callers that don't manage their own authors.
+    pub async fn default_author(&self) -> Result<String> {
+        Ok(self.inner.api().author_default().await?.to_string())
+    }
+
+    /// Open-or-import a **writable** namespace from a deterministic 32-byte
+    /// secret (e.g. a BLAKE3 seed). The namespace id is derived from the secret
+    /// (`doc.id() == NamespaceSecret::id()`), so the same secret resolves to the
+    /// same namespace across peers and restarts.
+    ///
+    /// Idempotent and capability-upgrading: if the namespace is absent it is
+    /// imported with write capability; if it is already present **read-only**
+    /// (a prior [`Self::import_read_namespace`]) the stored capability is
+    /// upgraded to write and a writable [`CoreDoc`] is returned; if already
+    /// writable it simply reattaches. Backed by iroh-docs `import_namespace`,
+    /// which merges capabilities in-place.
+    pub async fn import_write_namespace(&self, secret_bytes: Vec<u8>) -> Result<CoreDoc> {
+        if secret_bytes.len() != 32 {
+            return Err(anyhow!("namespace secret must be 32 bytes"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&secret_bytes);
+        let capability = Capability::Write(NamespaceSecret::from_bytes(&arr));
+        Ok(CoreDoc {
+            doc: self.inner.api().import_namespace(capability).await?,
+            store: self.store.clone(),
+        })
+    }
+
+    /// Open-or-import a **read-only** namespace from its public 32-byte id.
+    /// Idempotent; never downgrades an existing write capability to read.
+    pub async fn import_read_namespace(&self, namespace_id_bytes: Vec<u8>) -> Result<CoreDoc> {
+        if namespace_id_bytes.len() != 32 {
+            return Err(anyhow!("namespace id must be 32 bytes"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&namespace_id_bytes);
+        let capability = Capability::Read(NamespaceId::from(arr));
+        Ok(CoreDoc {
+            doc: self.inner.api().import_namespace(capability).await?,
+            store: self.store.clone(),
+        })
     }
 
     /// Open an existing local namespace by its ID (hex), without a ticket or a

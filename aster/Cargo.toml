@@ -1,0 +1,30 @@
+[package]
+name = "aster"
+version = "0.2.0"
+edition = "2021"
+description = "Native Rust API for Aster — peer-to-peer transport (blobs, docs, gossip) over iroh."
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["blobs", "docs", "gossip", "attestation"]
+blobs = []
+docs = []
+gossip = []
+attestation = ["aster_transport_core/attestation"]
+discovery = []
+hooks = []
+metrics = []
+
+[dependencies]
+aster_transport_core = { path = "../core" }
+# Used only to derive a NamespaceId from a NamespaceSecret without leaking
+# iroh-docs types through the public API.
+iroh-docs = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = "2"
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"
