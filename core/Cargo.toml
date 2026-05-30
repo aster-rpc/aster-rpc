@@ -26,6 +26,15 @@ bs58 = "0.5"
 ed25519-dalek = { version = "=3.0.0-pre.7", features = ["rand_core"] }
 crossbeam-utils = { workspace = true }
 getrandom = "0.2"
+fory-core = { version = "1.1.0-rc.1", optional = true }
+fory-derive = { version = "1.1.0-rc.1", optional = true }
+thiserror = { version = "2", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[features]
+# Ownership-attestation chain (pulls in Apache Fory for the wire format).
+# Off by default so the pyo3 / ffi consumers don't compile Fory unless wanted.
+attestation = ["dep:fory-core", "dep:fory-derive", "dep:thiserror", "dep:base64"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

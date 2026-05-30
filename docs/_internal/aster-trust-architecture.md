@@ -368,7 +368,7 @@ The service never talks to aster.site during the connection. The consumer obtain
 
 ## Notes harvested from retired trust-anchor-inversion
 
-The `trust-anchor-inversion.md` working idea has been superseded — its mechanism (offline anchor signs ephemeral CI-issued deployment root, chain walks via reciprocal attestations) is now in [`working_ideas/ownership-attestations.md`](working_ideas/ownership-attestations.md), which generalises it to N-tier delegation chains using a single primitive (statement codes `0x0010 ANCHOR_AUTHORISED_ROOT` / `0x0011 ROOT_AUTHORISED_BY_ANCHOR` already in the registry). Three orphan ideas from that doc landed here for capture before its retirement.
+The `trust-anchor-inversion.md` working idea has been superseded — its mechanism (offline anchor signs ephemeral CI-issued deployment root, chain walks via reciprocal attestations) is now in [`ownership-attestations.md`](ownership-attestations.md), which generalises it to N-tier delegation chains using a single primitive (statement codes `0x0010 ANCHOR_AUTHORISED_ROOT` / `0x0011 ROOT_AUTHORISED_BY_ANCHOR` already in the registry). Three orphan ideas from that doc landed here for capture before its retirement.
 
 ### Mental model: deployment certificates, not certificate chains
 
