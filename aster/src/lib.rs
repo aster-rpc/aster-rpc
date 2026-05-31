@@ -48,7 +48,9 @@ mod admission;
 mod config;
 mod error;
 mod id;
+mod net;
 mod node;
+mod ticket;
 
 #[cfg(feature = "attestation")]
 pub mod attestation;
@@ -59,13 +61,15 @@ mod docs;
 #[cfg(feature = "gossip")]
 mod gossip;
 
-pub use admission::{Admission, ConnectRequest, HandshakeRequest};
+pub use admission::{alpns, Admission, ConnectRequest, Gate0, HandshakeRequest};
 pub use config::{AsterConfig, AsterConfigBuilder, RelayMode};
 pub use error::{Error, Result};
 pub use id::{
     AuthorId, Hash, NamespaceId, NamespaceSecret, NodeAddr, NodeId, PublicKey, SecretKey,
 };
+pub use net::{Connection, RecvStream, SendStream};
 pub use node::Node;
+pub use ticket::{Credential, Ticket};
 
 #[cfg(feature = "blobs")]
 pub use blobs::{BlobFormat, BlobStatus, Blobs};

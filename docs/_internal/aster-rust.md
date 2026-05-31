@@ -297,8 +297,31 @@ disabled + bind `127.0.0.1:0` + `add_peer` (no network / no `online()`).
   `start_sync`, `leave`, `subscribe`, `set/get_download_policy`. Free fn
   `aster::default_author_id(&SecretKey) -> AuthorId` (offline derivation).
 - `Gossip`/`GossipTopic`: `subscribe`, `broadcast`, `recv`.
+- Custom-ALPN connections: `Node::start_with_alpns`, `Node::connect(&peer, alpn)`
+  (outbound by id), `Node::connect_addr(NodeAddr, alpn)` (outbound by address
+  material — e.g. to present a credential before a docs join),
+  `Node::add_node_addr(NodeAddr)` (register a peer's address book entry so later
+  by-id connects / docs joins resolve), `Node::accept() -> (alpn, Connection)`
+  (inbound). `Connection`: `peer`, `alpn`, `open_bi`/`accept_bi` → (`SendStream`,
+  `RecvStream`), `close`, `closed` (keep-alive until the peer is done).
+  `SendStream`: `write_all`, `finish`. `RecvStream`: `read`, `read_exact`,
+  `read_to_end`, `stop`.
+- `Ticket`: compact base58 address-material + optional `Credential`
+  (`Open`/`ConsumerRcan`/`Enrollment`/`RegistryRead`). `new`, `from_node_addr`
+  (mint from `node.addr()` — the first-class path), `from_base58`, `to_base58`,
+  `node_id`, `relay`, `direct_addresses`, `credential`, `to_node_addr() ->
+  Result<NodeAddr>` (retains all dialable material). Wraps core `AsterTicket`;
+  Aster owns the relay interpretation — `from_node_addr` folds an IP-based relay
+  URL into the compact IP:port slot (a DNS-hostname relay is deferred to
+  discovery-by-id), and `to_node_addr` reconstructs it as `https://<ip>:<port>`.
+  Consumers never decompose the `aster1` token by hand: `Node::connect_ticket`
+  dials straight from a ticket and `Node::add_ticket_addr` registers it
+  (returning the peer `NodeId`).
 - `Admission`: `next_handshake()` (inbound Gate 0), `next_connect()` (outbound);
-  `accept()` / `reject(code, reason)`.
+  `accept()` / `reject(code, reason)`. `Gate0` policy (clone-shared): `admit`,
+  `revoke`, `is_admitted`, `should_allow(&peer, alpn)` (admission ALPNs always
+  open, else peer must be admitted). `alpns::{PRODUCER_ADMISSION,
+  CONSUMER_ADMISSION, DELEGATED_ADMISSION}`.
 - `attestation`: `Chain`, `attest_root_node`, `verify_chain`, `public_key`,
   `AttestOptions`; `Verified { node, anchor, intermediates, depth }` with role
   predicates `is_node` / `is_anchor` / `is_intermediate` / `role_of` and the
@@ -398,10 +421,22 @@ chain cannot be read from the handshake itself, so the supported model is:
     `verify_chain(&chain, &trusted_anchors, &PublicKey::from_hex(req.peer.as_str())?)`.
     `accept()` iff the chain is present **and** verifies; else `reject(403, …)`.
     Fully offline.
-- **Bootstrap-ALPN (future, needs an API addition).** Admit an unknown peer on a
-  dedicated `aster.attestation`/bootstrap ALPN only, receive + verify its chain on
-  that connection, then admit later docs/blobs/gossip. This requires a
-  raw accept/connection surface the facade does not yet expose (a Step-2 / new-API
-  item) — **not available now**.
+- **Bootstrap-ALPN (now available).** Admit an unknown peer on a dedicated
+  admission ALPN, verify its chain on that connection, then allow it on normal
+  ALPNs. Uses the custom-ALPN connection API + `Gate0`:
+  - Start with the admission ALPN registered:
+    `Node::start_with_alpns(cfg.hooks(true), vec![alpns::PRODUCER_ADMISSION.into(), b"portal.rpc".into()])`,
+    and a shared `let gate = Gate0::new();`.
+  - **Hook loop** (gate normal ALPNs): take `Admission`; for each
+    `next_handshake()`, `req.accept()` iff `gate.should_allow(&req.peer, &req.alpn)`
+    (admission ALPNs are always allowed), else `reject(403, …)`.
+  - **Admission accept loop**: `node.accept()` → on the admission ALPN,
+    `conn.accept_bi()`, read the chain bytes, `verify_chain(&Chain::from_bytes(..),
+    &anchors, &PublicKey::from_hex(conn.peer().as_str())?)`; on success
+    `gate.admit(conn.peer())` and reply, keeping the connection alive with
+    `conn.closed().await` until the peer has read.
+  - Thereafter the peer's normal-ALPN connections pass the hook.
+  Proven end-to-end by `aster/tests/connection.rs::bootstrap_alpn_admission_gates_normal_alpn`.
+  (`Gate0`'s admitted set is in-memory; persist/expire it in your daemon if needed.)
 
 **Caveats / deferred:** epoch replay-cache is not enforced in the stateless verifier (no per-root state) — callers track epochs if needed. Cross-binding wire compat is unproven: the Rust crate is Fory **1.1.0-rc.1** while pyfory here is **0.17** — likely incompatible until the Fory upgrade lands; portal-sync is Rust↔Rust today. Intermediate (multi-edge) **minting**, revocation, and trust publication remain future work — the verifier already validates N-tier chains (incl. `intermediate→intermediate`), so only the mint helpers are missing.

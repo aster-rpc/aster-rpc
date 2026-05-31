@@ -24,6 +24,9 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = "2"
 hex = "0.4"
+# Parse a peer's relay URL to extract its IP:port for the compact ticket
+# (the wire format stores relay as a socket address — see Ticket::from_node_addr).
+url = "2"
 
 [dev-dependencies]
 tokio = { workspace = true }
