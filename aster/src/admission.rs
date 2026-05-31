@@ -12,7 +12,96 @@ use crate::id::NodeId;
 use aster_transport_core::{
     CoreAfterHandshakeDecision, CoreHookConnectInfo, CoreHookHandshakeInfo, CoreHookReceiver,
 };
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use tokio::sync::oneshot;
+
+/// Well-known admission ALPNs — connections on these are let through to present
+/// a credential, even from peers not yet admitted (see [`Gate0`]).
+pub mod alpns {
+    /// Producer (mesh-join) admission.
+    pub const PRODUCER_ADMISSION: &[u8] = b"aster.producer_admission";
+    /// Consumer admission.
+    pub const CONSUMER_ADMISSION: &[u8] = b"aster.consumer_admission";
+    /// Delegated (@aster-issued token) admission.
+    pub const DELEGATED_ADMISSION: &[u8] = b"aster.admission";
+}
+
+/// Gate-0 admission policy: the rule an [`Admission`] handler applies per
+/// inbound connection. **Admission ALPNs are always allowed** (so an unknown
+/// peer can connect to present a credential); any other ALPN is allowed only
+/// once the peer has been [`admit`](Gate0::admit)ted (e.g. after a successful
+/// admission handshake).
+///
+/// Clone-cheap and internally shared, so the same `Gate0` can be held by both
+/// the [`Admission::next_handshake`] loop (which calls [`should_allow`](Gate0::should_allow))
+/// and the admission accept loop (which calls [`admit`](Gate0::admit)).
+#[derive(Clone)]
+pub struct Gate0 {
+    admitted: Arc<RwLock<HashSet<NodeId>>>,
+    admission_alpns: Arc<Vec<Vec<u8>>>,
+    allow_unadmitted: bool,
+}
+
+impl Default for Gate0 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Gate0 {
+    /// A gate seeded with the well-known admission ALPNs ([`alpns`]).
+    pub fn new() -> Self {
+        Self::with_admission_alpns(vec![
+            alpns::PRODUCER_ADMISSION.to_vec(),
+            alpns::CONSUMER_ADMISSION.to_vec(),
+            alpns::DELEGATED_ADMISSION.to_vec(),
+        ])
+    }
+
+    /// A gate whose only always-open ALPNs are the ones given.
+    pub fn with_admission_alpns(admission_alpns: Vec<Vec<u8>>) -> Self {
+        Self {
+            admitted: Arc::new(RwLock::new(HashSet::new())),
+            admission_alpns: Arc::new(admission_alpns),
+            allow_unadmitted: false,
+        }
+    }
+
+    /// Allow connections from un-admitted peers on any ALPN (dev/local only).
+    pub fn allow_unadmitted(mut self, yes: bool) -> Self {
+        self.allow_unadmitted = yes;
+        self
+    }
+
+    /// Mark a peer admitted (e.g. after verifying its attestation chain on an
+    /// admission ALPN). Subsequent connections from it on normal ALPNs pass.
+    pub fn admit(&self, peer: NodeId) {
+        self.admitted.write().unwrap().insert(peer);
+    }
+
+    /// Revoke a peer's admission.
+    pub fn revoke(&self, peer: &NodeId) {
+        self.admitted.write().unwrap().remove(peer);
+    }
+
+    /// Whether `peer` is currently admitted.
+    pub fn is_admitted(&self, peer: &NodeId) -> bool {
+        self.admitted.read().unwrap().contains(peer)
+    }
+
+    /// The Gate-0 decision for a `(peer, alpn)` pair: admission ALPNs are always
+    /// allowed; otherwise the peer must be admitted (or `allow_unadmitted`).
+    pub fn should_allow(&self, peer: &NodeId, alpn: &[u8]) -> bool {
+        if self.admission_alpns.iter().any(|a| a.as_slice() == alpn) {
+            return true;
+        }
+        if self.is_admitted(peer) {
+            return true;
+        }
+        self.allow_unadmitted
+    }
+}
 
 /// Admission handle. Not clonable — there is a single decision stream per node.
 pub struct Admission {

@@ -84,6 +84,14 @@ impl Blobs {
         Ok(self.inner.read_to_bytes(hash.as_str().to_string()).await?)
     }
 
+    /// Read a byte range from a blob in the local store.
+    pub async fn read_range(&self, hash: &Hash, offset: u64, len: u64) -> Result<Vec<u8>> {
+        Ok(self
+            .inner
+            .read_range(hash.as_str().to_string(), offset, len)
+            .await?)
+    }
+
     /// Whether the blob is fully present locally.
     pub async fn has(&self, hash: &Hash) -> Result<bool> {
         Ok(self.inner.blob_has(hash.as_str().to_string()).await?)

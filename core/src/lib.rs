@@ -1165,6 +1165,18 @@ impl CoreNode {
         Ok(())
     }
 
+    /// Register address material for an arbitrary peer (id + relay + direct
+    /// addresses) in this node's address lookup, so subsequent connects and
+    /// docs joins addressed by node id can reach it without discovery. Unlike
+    /// [`Self::add_node_addr`], the peer need not be a local `CoreNode`.
+    pub fn add_node_addr_info(&self, addr: CoreNodeAddr) -> Result<()> {
+        let endpoint_addr = core_to_endpoint_addr(&addr)?;
+        let memory_lookup = MemoryLookup::new();
+        memory_lookup.add_endpoint_info(endpoint_addr);
+        self.inner.endpoint.address_lookup()?.add(memory_lookup);
+        Ok(())
+    }
+
     pub fn blobs_client(&self) -> CoreBlobsClient {
         CoreBlobsClient {
             store: self.inner.store.clone(),
@@ -2328,6 +2340,16 @@ impl CoreBlobsClient {
             .get_bytes(hash_hex.parse::<Hash>()?)
             .await?
             .to_vec())
+    }
+
+    pub async fn read_range(&self, hash_hex: String, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let end = offset.saturating_add(len);
+        Ok(self
+            .store
+            .blobs()
+            .export_ranges(hash_hex.parse::<Hash>()?, offset..end)
+            .concatenate()
+            .await?)
     }
 
     pub fn create_ticket(&self, hash_hex: String) -> Result<String> {

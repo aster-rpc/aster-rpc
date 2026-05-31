@@ -4,6 +4,7 @@ use crate::admission::Admission;
 use crate::config::AsterConfig;
 use crate::error::{Error, Result};
 use crate::id::{NodeAddr, NodeId, SecretKey};
+use crate::net::Connection;
 use aster_transport_core::CoreNode;
 
 #[cfg(feature = "blobs")]
@@ -89,6 +90,75 @@ impl Node {
     /// [`Admission::next_handshake`].
     pub fn take_admission(&self) -> Option<Admission> {
         self.inner.take_hook_receiver().map(Admission::new)
+    }
+
+    /// Dial `peer` on a custom `alpn`, returning a [`Connection`]. The ALPN must
+    /// be one the peer accepts (a built-in protocol ALPN or one it registered via
+    /// [`start_with_alpns`](Node::start_with_alpns)).
+    pub async fn connect(&self, peer: &NodeId, alpn: impl Into<Vec<u8>>) -> Result<Connection> {
+        let conn = self
+            .inner
+            .net_client()
+            .connect(peer.as_str().to_string(), alpn.into())
+            .await?;
+        Ok(Connection::new(conn))
+    }
+
+    /// Accept the next inbound connection on any custom ALPN registered via
+    /// [`start_with_alpns`](Node::start_with_alpns). Returns the ALPN it arrived
+    /// on plus the [`Connection`] (demultiplex your protocols by the ALPN). Errors
+    /// once the node is closed.
+    pub async fn accept(&self) -> Result<(Vec<u8>, Connection)> {
+        let (alpn, conn) = self.inner.accept_aster().await?;
+        Ok((alpn, Connection::new(conn)))
+    }
+
+    /// Dial a peer using full address material (id + relay + direct addresses)
+    /// on a custom `alpn`. Use when you have a peer's [`NodeAddr`] (e.g. from a
+    /// [`Ticket`](crate::Ticket)) but it isn't yet in the address book — e.g. to
+    /// present a credential *before* a docs join.
+    pub async fn connect_addr(
+        &self,
+        addr: NodeAddr,
+        alpn: impl Into<Vec<u8>>,
+    ) -> Result<Connection> {
+        let conn = self
+            .inner
+            .net_client()
+            .connect_node_addr(addr.to_core(), alpn.into())
+            .await?;
+        Ok(Connection::new(conn))
+    }
+
+    /// Register a peer's address material (id + relay + direct addresses) in this
+    /// node's address book, so later operations addressed by node id —
+    /// [`connect`](Node::connect), docs joins — can reach it without discovery.
+    pub fn add_node_addr(&self, addr: NodeAddr) -> Result<()> {
+        self.inner.add_node_addr_info(addr.to_core())?;
+        Ok(())
+    }
+
+    /// Dial a peer straight from a [`Ticket`](crate::Ticket) on a custom `alpn`.
+    /// All dialable material in the ticket — direct addresses and relay — is
+    /// used; Aster owns decoding the `aster1` token, so callers never decompose
+    /// it by hand. Use to present a credential before a docs join.
+    pub async fn connect_ticket(
+        &self,
+        ticket: &crate::ticket::Ticket,
+        alpn: impl Into<Vec<u8>>,
+    ) -> Result<Connection> {
+        self.connect_addr(ticket.to_node_addr()?, alpn).await
+    }
+
+    /// Register a peer's [`Ticket`](crate::Ticket) address material (id + relay +
+    /// direct addresses) in this node's address book, so later by-id operations —
+    /// [`connect`](Node::connect), docs joins — can reach it. Returns the peer's
+    /// [`NodeId`] for convenience.
+    pub fn add_ticket_addr(&self, ticket: &crate::ticket::Ticket) -> Result<NodeId> {
+        let addr = ticket.to_node_addr()?;
+        let id = addr.node_id.clone();
+        self.add_node_addr(addr)?;
+        Ok(id)
     }
 
     /// Blob store client.

@@ -213,3 +213,13 @@ pub struct NodeAddr {
     /// Known direct socket addresses.
     pub direct_addresses: Vec<String>,
 }
+
+impl NodeAddr {
+    pub(crate) fn to_core(&self) -> aster_transport_core::CoreNodeAddr {
+        aster_transport_core::CoreNodeAddr {
+            endpoint_id: self.node_id.as_str().to_string(),
+            relay_url: self.relay_url.clone(),
+            direct_addresses: self.direct_addresses.clone(),
+        }
+    }
+}
