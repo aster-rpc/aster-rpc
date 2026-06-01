@@ -2660,6 +2660,38 @@ impl CoreBlobsClient {
         }
     }
 
+    /// Download a blob by hash from a specific node **into the local store
+    /// without reading it back into memory**. Use this when the caller only
+    /// needs the blob resident locally (e.g. to serve it later via ranged
+    /// reads) and would otherwise discard the returned bytes: unlike
+    /// [`Self::download_hash`], this skips the trailing
+    /// `store.get_bytes(hash).to_vec()` round-trip, which materializes the
+    /// whole blob twice in memory (the `Bytes` plus its `Vec` clone) — a ~2×
+    /// transient RSS spike on large blobs. The `Downloader` streams the blob
+    /// to the on-disk store, so this returns only once the blob is resident.
+    pub async fn download_hash_to_store(
+        &self,
+        hash_hex: String,
+        node_id_hex: String,
+        format: String,
+    ) -> Result<()> {
+        let hash: Hash = hash_hex.parse()?;
+        let node_id: EndpointId = node_id_hex.parse()?;
+        let blob_format = if format == "hash_seq" {
+            BlobFormat::HashSeq
+        } else {
+            BlobFormat::Raw
+        };
+        let haf = HashAndFormat {
+            hash,
+            format: blob_format,
+        };
+        Downloader::new(&self.store, &self.endpoint)
+            .download(haf, vec![node_id])
+            .await?;
+        Ok(())
+    }
+
     /// Download a collection by hash from a specific node, returning (name, data) pairs.
     pub async fn download_collection_hash(
         &self,
