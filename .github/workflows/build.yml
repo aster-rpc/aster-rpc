@@ -83,6 +83,12 @@ jobs:
         run: sed -i 's/^version.*=.*".*"/version = "${{ needs.version.outputs.python_version }}"/' pyproject.toml
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          # The runner image sets RUSTC_WRAPPER=sccache globally, but
+          # maturin-action's spawned cargo doesn't reliably see sccache on
+          # PATH ("could not execute process `sccache`"). Dev wheels don't
+          # need the cache — disable the wrapper for this step.
+          RUSTC_WRAPPER: ""
         with:
           target: ${{ matrix.target }}
           args: --release --out dist -m bindings/python/rust/Cargo.toml
@@ -168,6 +174,8 @@ jobs:
         run: sed -i 's/^version.*=.*".*"/version = "${{ needs.version.outputs.python_version }}"/' pyproject.toml
       - name: Build sdist
         uses: PyO3/maturin-action@v1
+        env:
+          RUSTC_WRAPPER: ""  # see Build wheels — sccache isn't on maturin-action's PATH
         with:
           command: sdist
           args: --out dist -m bindings/python/rust/Cargo.toml
