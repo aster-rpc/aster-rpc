@@ -123,6 +123,27 @@ impl Blobs {
             .await?)
     }
 
+    /// Download a blob by hash from a specific peer into the local store
+    /// **without** returning its bytes — for callers that only need the blob
+    /// resident (to serve it later via ranged reads). Avoids the whole-blob
+    /// `get_bytes().to_vec()` copy that [`Self::download_hash`] pays to hand
+    /// the data back (a ~2× transient RSS spike on large blobs).
+    pub async fn download_hash_to_store(
+        &self,
+        hash: &Hash,
+        from: &NodeId,
+        format: BlobFormat,
+    ) -> Result<()> {
+        Ok(self
+            .inner
+            .download_hash_to_store(
+                hash.as_str().to_string(),
+                from.as_str().to_string(),
+                format.as_core(),
+            )
+            .await?)
+    }
+
     // ── Tags ───────────────────────────────────────────────────────────────
 
     /// Set a persistent named tag pointing at a blob.
