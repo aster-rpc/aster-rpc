@@ -30,6 +30,25 @@ impl BlobsClient {
             .map_err(to_napi_err)
     }
 
+    /// Import a file by path (Copy mode, never TryReference) and return the
+    /// hash hex string. Like `addBytes`, an auto-tag keeps the blob alive; use
+    /// `addPathWithNamedTag` for a deterministic GC-keyed tag.
+    #[napi]
+    pub async fn add_path(&self, path: String) -> Result<String> {
+        self.inner.clone().add_path(path).await.map_err(to_napi_err)
+    }
+
+    /// Import a file by path and set a persistent named tag in one step,
+    /// returning the hash hex string.
+    #[napi]
+    pub async fn add_path_with_named_tag(&self, path: String, tag_name: String) -> Result<String> {
+        self.inner
+            .clone()
+            .add_path_with_named_tag(path, tag_name)
+            .await
+            .map_err(to_napi_err)
+    }
+
     /// Read a blob by hash hex string.
     #[napi]
     pub async fn read(&self, hash_hex: String) -> Result<Buffer> {

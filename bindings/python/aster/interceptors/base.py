@@ -35,6 +35,16 @@ class CallContext:
         pattern: RPC pattern (``"unary"``, ``"server_stream"``, etc.).
         idempotent: ``True`` if the method is safe to retry.
         attempt: Current retry attempt number (starts at 1).
+        tunnel: Server-side handle for minting tunnel tickets bound to
+            this RPC's connection. ``None`` on the client side or when
+            the dispatch path doesn't surface a connection.
+        peer_addr: Peer's UDP ``(host, port)`` tuple when the selected
+            QUIC path is direct. ``None`` when relayed.
+        relay_url: Relay server URL when the selected path goes through
+            a relay. ``None`` for direct paths. The peer's own IP is
+            not visible through a relay path.
+        rtt_micros: Round-trip-time for the selected path in
+            microseconds, or ``None`` if not yet measured.
     """
 
     service: str
@@ -49,6 +59,10 @@ class CallContext:
     pattern: str | None = None
     idempotent: bool = False
     attempt: int = 1
+    tunnel: Any = None  # aster.tunnel.TunnelHandle | None - Any to avoid circular import
+    peer_addr: tuple[str, int] | None = None
+    relay_url: str | None = None
+    rtt_micros: int | None = None
 
     _current: ClassVar[contextvars.ContextVar["CallContext | None"]] = (
         contextvars.ContextVar("aster_call_context", default=None)
@@ -106,6 +120,9 @@ def build_call_context(
     call_id: int = 0,
     session_id: str | None = None,
     attributes: dict[str, str] | None = None,
+    peer_addr: tuple[str, int] | None = None,
+    relay_url: str | None = None,
+    rtt_micros: int | None = None,
 ) -> CallContext:
     return CallContext(
         service=service,
@@ -119,6 +136,9 @@ def build_call_context(
         is_streaming=is_streaming,
         pattern=pattern,
         idempotent=idempotent,
+        peer_addr=peer_addr,
+        relay_url=relay_url,
+        rtt_micros=rtt_micros,
     )
 
 

@@ -1,6 +1,11 @@
 package site.aster.handle;
 
 import java.lang.foreign.*;
+import java.lang.foreign.MemoryLayout.PathElement;
+import java.lang.invoke.VarHandle;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import site.aster.ffi.*;
@@ -330,6 +335,96 @@ public class IrohConnection extends IrohHandle {
     long size = sizeSeg.get(ValueLayout.JAVA_LONG, 0);
     return java.util.OptionalInt.of((int) size);
   }
+
+  /**
+   * Snapshot of the currently selected QUIC path. Cheap; safe to call once per RPC dispatch.
+   * Returns a snapshot whose {@link TransportSnapshot#peerAddr()} and {@link
+   * TransportSnapshot#relayUrl()} are mutually exclusive — exactly one is non-null when a path is
+   * selected. Both are null only if the connection has been dropped or no path is selected yet.
+   */
+  public TransportSnapshot transportSnapshot() {
+    return transportSnapshot(runtime, nativeHandle());
+  }
+
+  /**
+   * Snapshot the selected QUIC path for an {@code iroh_connection_t} handle directly. Used by
+   * callers that hold a borrowed handle (e.g. {@link
+   * site.aster.server.AsterCall#connectionHandle()} delivered by the reactor) and don't want to
+   * construct a transient {@link IrohConnection} wrapper just to read the snapshot.
+   */
+  public static TransportSnapshot transportSnapshot(IrohRuntime runtime, long connectionHandle) {
+    var lib = IrohLibrary.getInstance();
+    try (Arena confined = Arena.ofConfined()) {
+      var snapSeg = confined.allocate(IrohLibrary.IROH_TRANSPORT_SNAPSHOT);
+      int status =
+          lib.connectionTransportSnapshot(runtime.nativeHandle(), connectionHandle, snapSeg);
+      if (status != 0) {
+        throw new IrohException(
+            IrohStatus.fromCode(status), "iroh_connection_transport_snapshot failed: " + status);
+      }
+
+      int pathKind = (int) SNAPSHOT_PATH_KIND.get(snapSeg, 0L);
+      MemorySegment peerHostPtr = (MemorySegment) SNAPSHOT_PEER_HOST_PTR.get(snapSeg, 0L);
+      long peerHostLen = (long) SNAPSHOT_PEER_HOST_LEN.get(snapSeg, 0L);
+      int peerPort = Short.toUnsignedInt((short) SNAPSHOT_PEER_PORT.get(snapSeg, 0L));
+      MemorySegment relayUrlPtr = (MemorySegment) SNAPSHOT_RELAY_URL_PTR.get(snapSeg, 0L);
+      long relayUrlLen = (long) SNAPSHOT_RELAY_URL_LEN.get(snapSeg, 0L);
+      long rttMicros = (long) SNAPSHOT_RTT_MICROS.get(snapSeg, 0L);
+
+      InetSocketAddress peerAddr = null;
+      String relayUrl = null;
+      try {
+        if (pathKind == 1 && peerHostLen > 0) {
+          var hostBytes =
+              peerHostPtr
+                  .reinterpret(peerHostLen)
+                  .asSlice(0, peerHostLen)
+                  .toArray(ValueLayout.JAVA_BYTE);
+          peerAddr =
+              InetSocketAddress.createUnresolved(
+                  new String(hostBytes, StandardCharsets.UTF_8), peerPort);
+        } else if (pathKind == 2 && relayUrlLen > 0) {
+          var urlBytes =
+              relayUrlPtr
+                  .reinterpret(relayUrlLen)
+                  .asSlice(0, relayUrlLen)
+                  .toArray(ValueLayout.JAVA_BYTE);
+          relayUrl = new String(urlBytes, StandardCharsets.UTF_8);
+        }
+      } finally {
+        // Always free both buffers (release on a null/zero-length buffer
+        // is a safe no-op on the Rust side).
+        lib.stringRelease(peerHostPtr, peerHostLen);
+        lib.stringRelease(relayUrlPtr, relayUrlLen);
+      }
+
+      Duration rtt = rttMicros == Long.MAX_VALUE ? null : Duration.ofNanos(rttMicros * 1_000L);
+      return new TransportSnapshot(peerAddr, relayUrl, rtt);
+    }
+  }
+
+  // VarHandles into iroh_transport_snapshot_t for transportSnapshot().
+  private static final VarHandle SNAPSHOT_PATH_KIND =
+      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(PathElement.groupElement("path_kind"));
+  private static final VarHandle SNAPSHOT_PEER_HOST_PTR =
+      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(
+          PathElement.groupElement("peer_host"), PathElement.groupElement("ptr"));
+  private static final VarHandle SNAPSHOT_PEER_HOST_LEN =
+      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(
+          PathElement.groupElement("peer_host"), PathElement.groupElement("len"));
+  private static final VarHandle SNAPSHOT_PEER_PORT =
+      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(PathElement.groupElement("peer_port"));
+  private static final VarHandle SNAPSHOT_RELAY_URL_PTR =
+      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(
+          PathElement.groupElement("relay_url"), PathElement.groupElement("ptr"));
+  private static final VarHandle SNAPSHOT_RELAY_URL_LEN =
+      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(
+          PathElement.groupElement("relay_url"), PathElement.groupElement("len"));
+  private static final VarHandle SNAPSHOT_RTT_MICROS =
+      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(PathElement.groupElement("rtt_micros"));
+
+  /** Snapshot of the selected QUIC path returned by {@link #transportSnapshot()}. */
+  public record TransportSnapshot(InetSocketAddress peerAddr, String relayUrl, Duration rtt) {}
 
   /**
    * Get the available datagram send buffer space.

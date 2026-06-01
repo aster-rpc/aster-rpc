@@ -3,9 +3,55 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use aster_transport_core::{CoreConnection, CoreRecvStream, CoreSendStream};
+use aster_transport_core::tunnel::{TunnelTarget, TunnelTicket};
+use aster_transport_core::{CoreConnection, CoreRecvStream, CoreSendStream, CoreTransportSnapshot};
 
 use crate::error::to_napi_err;
+
+/// JS-side tunnel-target payload. Mirrors the `TunnelTarget` discriminated
+/// union exposed by the high-level binding (see `aster.tunnel`). Only
+/// `kind = "tcp"` is supported by core in v1.
+#[napi(object)]
+pub struct TunnelTargetJs {
+    pub kind: String,
+    pub host: String,
+    pub port: u32,
+}
+
+/// Selected QUIC path snapshot exposed to JS. `peerAddr` and `relayUrl`
+/// are mutually exclusive — exactly one is populated when a path is
+/// selected. The peer's IP is not visible through a relay path.
+#[napi(object)]
+pub struct TransportSnapshot {
+    /// Peer's UDP address `{ host, port }` when the selected path is
+    /// direct. `null` when relayed.
+    pub peer_addr: Option<PeerAddr>,
+    /// Relay server URL when the selected path goes through a relay.
+    /// `null` for direct paths.
+    pub relay_url: Option<String>,
+    /// RTT for the selected path in microseconds, or `null` if not yet
+    /// measured.
+    pub rtt_micros: Option<f64>,
+}
+
+#[napi(object)]
+pub struct PeerAddr {
+    pub host: String,
+    pub port: u32,
+}
+
+impl From<CoreTransportSnapshot> for TransportSnapshot {
+    fn from(snap: CoreTransportSnapshot) -> Self {
+        Self {
+            peer_addr: snap.peer_addr.map(|s| PeerAddr {
+                host: s.ip().to_string(),
+                port: s.port() as u32,
+            }),
+            relay_url: snap.relay_url,
+            rtt_micros: snap.rtt_micros.map(|v| v as f64),
+        }
+    }
+}
 
 // ============================================================================
 // IrohConnection
@@ -113,6 +159,13 @@ impl IrohConnection {
         format!("{:?}", self.inner.connection_info())
     }
 
+    /// Snapshot of the currently selected network path. Cheap; safe to
+    /// call once per RPC dispatch.
+    #[napi]
+    pub fn transport_snapshot(&self) -> TransportSnapshot {
+        TransportSnapshot::from(self.inner.transport_snapshot())
+    }
+
     /// Close the connection.
     #[napi]
     pub fn close(&self, error_code: u32, reason: String) -> Result<()> {
@@ -164,6 +217,82 @@ impl IrohConnection {
     pub fn current_mtu(&self) -> u32 {
         self.inner.current_mtu() as u32
     }
+
+    // ── Tunneling — see ffi_spec/Aster-tunneling.md ──
+
+    /// Authorize a tunnel covering one or more targets. `targets` is an
+    /// ordered preference list `[{ kind, host, port }, ...]` where
+    /// `kind` is `"tcp"` for now (UDP / HttpProxy land in §11). At
+    /// redeem the acceptor tries each in order and splices the first
+    /// one that connects; if all fail the stream closes silently.
+    /// Returns the 32-byte opaque capability for the handler's RPC
+    /// response. `ttlSecs == 0` uses the node default (30s).
+    #[napi]
+    pub fn authorize_tunnel(&self, targets: Vec<TunnelTargetJs>, ttl_secs: u32) -> Result<Buffer> {
+        let mut core_targets = Vec::with_capacity(targets.len());
+        for t in &targets {
+            match t.kind.as_str() {
+                "tcp" => {
+                    let port = u16::try_from(t.port).map_err(|_| {
+                        napi::Error::from_reason(format!("port out of range: {}", t.port))
+                    })?;
+                    core_targets.push(TunnelTarget::Tcp {
+                        addr: parse_socket_addr(&t.host, port)?,
+                    });
+                }
+                other => {
+                    return Err(napi::Error::from_reason(format!(
+                        "tunnel kind {other:?} not supported in v1 (TCP only)"
+                    )))
+                }
+            }
+        }
+        let ticket = self
+            .inner
+            .authorize_tunnel(
+                core_targets,
+                std::time::Duration::from_secs(ttl_secs as u64),
+            )
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(Buffer::from(ticket.as_bytes().to_vec()))
+    }
+
+    /// Open a tunnel by redeeming a 32-byte ticket previously returned
+    /// by the peer. Bytes after this call are raw application data.
+    #[napi]
+    pub async fn open_tunnel(&self, ticket: Buffer) -> Result<IrohBiStream> {
+        let bytes = ticket.to_vec();
+        if bytes.len() != 32 {
+            return Err(napi::Error::from_reason(format!(
+                "ticket must be 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&bytes);
+        let ticket = TunnelTicket(buf);
+        let (send, recv) = self
+            .inner
+            .clone()
+            .open_tunnel(ticket)
+            .await
+            .map_err(to_napi_err)?;
+        Ok(IrohBiStream {
+            send: Some(IrohSendStream { inner: send }),
+            recv: Some(IrohRecvStream { inner: recv }),
+        })
+    }
+}
+
+fn parse_socket_addr(host: &str, port: u16) -> Result<std::net::SocketAddr> {
+    let addr_str = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    addr_str
+        .parse()
+        .map_err(|e| napi::Error::from_reason(format!("bad address: {e}")))
 }
 
 // ============================================================================

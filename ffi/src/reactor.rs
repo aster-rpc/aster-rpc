@@ -89,6 +89,13 @@ pub struct aster_reactor_call_t {
     /// Buffer ID for the peer ID string. Populated on both Call and
     /// ConnectionClosed.
     pub peer_buffer: u64,
+    /// Borrowed `iroh_connection_t` handle for the QUIC connection this
+    /// event arrived on. Populated on both Call and ConnectionClosed.
+    /// Same handle for every event from the same `connection_id`; freed
+    /// internally by the reactor when ConnectionClosed is consumed.
+    /// Bindings MUST NOT call `iroh_connection_free` on this handle —
+    /// the reactor owns its lifetime.
+    pub connection_handle: u64,
 }
 
 /// Internal ring slot: holds either an IncomingCall (event_kind=0) or a
@@ -111,6 +118,7 @@ struct RingCall {
     peer_buffer: u64,
     peer_ptr: *const u8,
     peer_len: u32,
+    connection_handle: u64,
     response_sender: Option<mpsc::UnboundedSender<OutgoingFrame>>,
     /// Per-call receiver for ADDITIONAL request frames (after the first).
     /// Stashed into `ReactorState::request_receivers` on `aster_reactor_poll`
@@ -182,8 +190,18 @@ async fn pump_task(
     mut event_rx: tokio::sync::mpsc::Receiver<ReactorEvent>,
     mut producer: ring::Producer<RingCall>,
     buffers: Arc<BufferRegistry>,
+    bridge: Arc<crate::BridgeRuntime>,
     stopped: Arc<AtomicBool>,
 ) {
+    // Per-reactor cache mapping core reactor `connection_id` → bridge
+    // `iroh_connection_t` handle. The reactor's `connection_id` is its own
+    // counter (not a bridge handle); we register the `CoreConnection` once
+    // per connection here so every Call slot from the same connection
+    // shares one borrowed handle, then evict + free on ConnectionClosed.
+    // Bindings see a stable handle for the connection's lifetime and never
+    // need to manage its lifecycle themselves.
+    let mut handle_cache: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+
     while !stopped.load(Ordering::Relaxed) {
         let event = match event_rx.recv().await {
             Some(e) => e,
@@ -195,6 +213,10 @@ async fn pump_task(
                 let (header_buf_id, header_arc) = buffers.insert(call.header_payload);
                 let (request_buf_id, request_arc) = buffers.insert(call.request_payload);
                 let (peer_buf_id, peer_arc) = buffers.insert(call.peer_id.into_bytes());
+
+                let conn_handle = *handle_cache
+                    .entry(call.connection_id)
+                    .or_insert_with(|| bridge.connections.insert(call.connection.clone()));
 
                 RingCall {
                     event_kind: ASTER_EVENT_KIND_CALL,
@@ -212,6 +234,7 @@ async fn pump_task(
                     peer_buffer: peer_buf_id,
                     peer_ptr: peer_arc.as_ptr(),
                     peer_len: peer_arc.len() as u32,
+                    connection_handle: conn_handle,
                     response_sender: Some(call.response_sender),
                     request_receiver: Some(call.request_receiver),
                     cancelled: Some(call.cancelled),
@@ -223,6 +246,15 @@ async fn pump_task(
                 ..
             } => {
                 let (peer_buf_id, peer_arc) = buffers.insert(peer_id.into_bytes());
+
+                // Evict + drop the bridge-side Arc. After this the binding
+                // can still see `connection_handle` on the closed event but
+                // any FFI call against it will return NOT_FOUND, which is
+                // the correct semantic for "the connection is gone".
+                let conn_handle = handle_cache.remove(&connection_id).unwrap_or(0);
+                if conn_handle != 0 {
+                    bridge.connections.remove(conn_handle);
+                }
 
                 RingCall {
                     event_kind: ASTER_EVENT_KIND_CONNECTION_CLOSED,
@@ -240,6 +272,7 @@ async fn pump_task(
                     peer_buffer: peer_buf_id,
                     peer_ptr: peer_arc.as_ptr(),
                     peer_len: peer_arc.len() as u32,
+                    connection_handle: conn_handle,
                     response_sender: None,
                     request_receiver: None,
                     cancelled: None,
@@ -318,7 +351,14 @@ pub unsafe extern "C" fn aster_reactor_create(
     // Spawn the pump task.
     let pump_stopped = stopped.clone();
     let pump_buffers = buffers.clone();
-    rt_handle.spawn(pump_task(event_rx, producer, pump_buffers, pump_stopped));
+    let pump_bridge = bridge.clone();
+    rt_handle.spawn(pump_task(
+        event_rx,
+        producer,
+        pump_buffers,
+        pump_bridge,
+        pump_stopped,
+    ));
 
     let state = ReactorState {
         consumer: Mutex::new(consumer),
@@ -469,6 +509,7 @@ pub unsafe extern "C" fn aster_reactor_poll(
             header_buffer: ring_call.header_buffer,
             request_buffer: ring_call.request_buffer,
             peer_buffer: ring_call.peer_buffer,
+            connection_handle: ring_call.connection_handle,
         };
         unsafe {
             ptr::write(out_calls.add(written as usize), desc);
@@ -528,6 +569,7 @@ pub unsafe extern "C" fn aster_reactor_poll(
                     header_buffer: ring_call.header_buffer,
                     request_buffer: ring_call.request_buffer,
                     peer_buffer: ring_call.peer_buffer,
+                    connection_handle: ring_call.connection_handle,
                 };
                 unsafe {
                     ptr::write(out_calls.add(written as usize), desc);

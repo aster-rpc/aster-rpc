@@ -133,13 +133,16 @@ impl DocHandle {
         self.inner.doc_id()
     }
 
-    /// Query entries by exact key.
+    /// Query entries by exact key. Entries are ordered by author id, not timestamp, so
+    /// `limit` truncates by author and may drop the latest writer — use it only to
+    /// enumerate authors. To read a key's current value, use `queryLatestExact`. Omit
+    /// `limit` to read every author's entry.
     #[napi]
-    pub async fn query_key_exact(&self, key: String) -> Result<Vec<String>> {
+    pub async fn query_key_exact(&self, key: String, limit: Option<i64>) -> Result<Vec<String>> {
         let entries = self
             .inner
             .clone()
-            .query_key_exact(key.into_bytes())
+            .query_key_exact(key.into_bytes(), limit.map(|n| n as u64))
             .await
             .map_err(to_napi_err)?;
         Ok(entries
@@ -148,13 +151,55 @@ impl DocHandle {
             .collect())
     }
 
-    /// Query entries by key prefix.
+    /// Read the single latest entry for an exact key, across all authors. Returns
+    /// `"<author>:<content_hash>"`, or null if the key was never written or its latest
+    /// write was a deletion. Unaffected by how many authors have written the key.
     #[napi]
-    pub async fn query_key_prefix(&self, prefix: String) -> Result<Vec<String>> {
+    pub async fn query_latest_exact(&self, key: String) -> Result<Option<String>> {
+        let entry = self
+            .inner
+            .clone()
+            .query_latest_exact(key.into_bytes())
+            .await
+            .map_err(to_napi_err)?;
+        Ok(entry.map(|e| format!("{}:{}", e.author_id, e.content_hash)))
+    }
+
+    /// Query entries by key prefix. `limit` caps the result set; omit it for an
+    /// unbounded listing.
+    #[napi]
+    pub async fn query_key_prefix(
+        &self,
+        prefix: String,
+        limit: Option<i64>,
+    ) -> Result<Vec<String>> {
         let entries = self
             .inner
             .clone()
-            .query_key_prefix(prefix.into_bytes())
+            .query_key_prefix(prefix.into_bytes(), limit.map(|n| n as u64))
+            .await
+            .map_err(to_napi_err)?;
+        Ok(entries
+            .into_iter()
+            .map(|e| format!("{}:{}", e.author_id, e.content_hash))
+            .collect())
+    }
+
+    /// List the latest entry for each distinct key under a prefix, across all authors.
+    /// Collapses each key to its highest-timestamp entry (omitting keys whose latest
+    /// write was a deletion), so a key written by multiple authors appears once — use
+    /// this for directory-style listings. `limit` caps the number of distinct keys; omit
+    /// it for an unbounded listing.
+    #[napi]
+    pub async fn query_latest_prefix(
+        &self,
+        prefix: String,
+        limit: Option<i64>,
+    ) -> Result<Vec<String>> {
+        let entries = self
+            .inner
+            .clone()
+            .query_latest_prefix(prefix.into_bytes(), limit.map(|n| n as u64))
             .await
             .map_err(to_napi_err)?;
         Ok(entries

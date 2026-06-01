@@ -80,7 +80,8 @@ public final class Reactor implements AutoCloseable {
           MemoryLayout.paddingLayout(4), //                            76
           ValueLayout.JAVA_LONG.withName("header_buffer"), //          80
           ValueLayout.JAVA_LONG.withName("request_buffer"), //         88
-          ValueLayout.JAVA_LONG.withName("peer_buffer") //             96
+          ValueLayout.JAVA_LONG.withName("peer_buffer"), //            96
+          ValueLayout.JAVA_LONG.withName("connection_handle") //      104
           );
 
   public static final long OFFSET_EVENT_KIND = 0;
@@ -98,6 +99,7 @@ public final class Reactor implements AutoCloseable {
   public static final long OFFSET_HEADER_BUFFER = 80;
   public static final long OFFSET_REQUEST_BUFFER = 88;
   public static final long OFFSET_PEER_BUFFER = 96;
+  public static final long OFFSET_CONNECTION_HANDLE = 104;
 
   /** Event-kind constants matching {@code ASTER_EVENT_KIND_*} in {@code ffi/iroh_ffi.h}. */
   public static final byte EVENT_KIND_CALL = 0;
