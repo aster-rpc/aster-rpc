@@ -63,7 +63,11 @@ jobs:
             runner: [self-hosted, Linux, X64]
           - target: aarch64
             runner: [self-hosted, Linux, ARM64]
-    runs-on: ${{ matrix.runner }}
+    # Tagged (PyPI) builds need real manylinux, which maturin-action produces
+    # via a Docker container — but the self-hosted runners are now containers
+    # with no Docker. So tagged builds run on GitHub-hosted runners; dev builds
+    # (main pushes) run on the self-hosted containers and build natively.
+    runs-on: ${{ startsWith(github.ref, 'refs/tags/v') && 'ubuntu-latest' || matrix.runner }}
     steps:
       - name: Fix ownership of stale Docker artifacts
         run: |
@@ -80,8 +84,12 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          target: ${{ matrix.target }}
           args: --release --out dist -m bindings/python/rust/Cargo.toml
-          manylinux: 2_28
+          # Tag → manylinux via Docker (GitHub-hosted). Dev → native on the
+          # self-hosted container (no Docker available there).
+          manylinux: ${{ startsWith(github.ref, 'refs/tags/v') && '2_28' || 'off' }}
+          container: ${{ startsWith(github.ref, 'refs/tags/v') && 'auto' || 'off' }}
       - name: Fix ownership of Docker-created files
         # `if: always()` is critical. maturin-action writes root-owned
         # files into target/ via its manylinux container. If the build
