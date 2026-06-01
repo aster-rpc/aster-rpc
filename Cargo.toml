@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "ffi", "aster", "bindings/python/rust", "bindings/typescript/native"]
+members = ["core", "ffi", "aster", "aster-macros", "bindings/python/rust", "bindings/typescript/native"]
 exclude = ["core/fuzz", "ffi/fuzz"]
 resolver = "2"
 

@@ -60,6 +60,8 @@ mod blobs;
 mod docs;
 #[cfg(feature = "gossip")]
 mod gossip;
+#[cfg(feature = "rpc")]
+pub mod rpc;
 
 pub use admission::{alpns, Admission, ConnectRequest, Gate0, HandshakeRequest};
 pub use config::{AsterConfig, AsterConfigBuilder, RelayMode};
@@ -79,3 +81,8 @@ pub use docs::{
 };
 #[cfg(feature = "gossip")]
 pub use gossip::{Gossip, GossipEvent, GossipTopic};
+
+// Convenience: `#[aster::service]` and `#[derive(aster::AsterType)]` at the crate
+// root (both also available under `aster::rpc`).
+#[cfg(feature = "rpc")]
+pub use rpc::{service, AsterType};

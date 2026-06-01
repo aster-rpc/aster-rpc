@@ -159,13 +159,27 @@ name = "aster"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "aster-macros",
  "aster_transport_core",
+ "async-trait",
+ "fory-core",
+ "fory-derive",
  "hex",
  "iroh-docs",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "aster-macros"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

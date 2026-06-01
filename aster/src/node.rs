@@ -161,6 +161,29 @@ impl Node {
         Ok(id)
     }
 
+    /// Open an RPC connection to `peer` on the Aster RPC ALPN (`aster/1`). The
+    /// peer must be serving RPC (started with the RPC ALPN registered and an
+    /// [`rpc::Server`](crate::rpc::Server) running). Requires the `rpc` feature.
+    #[cfg(feature = "rpc")]
+    pub async fn rpc_connect(&self, peer: &NodeId) -> Result<crate::rpc::RpcConnection> {
+        let conn = self
+            .inner
+            .net_client()
+            .connect(
+                peer.as_str().to_string(),
+                aster_transport_core::reactor::RPC_ALPN.to_vec(),
+            )
+            .await?;
+        Ok(crate::rpc::RpcConnection::from_core(conn))
+    }
+
+    /// Clone of the underlying core node — used by [`rpc::Server`](crate::rpc::Server)
+    /// to own the reactor accept loop.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn core(&self) -> CoreNode {
+        self.inner.clone()
+    }
+
     /// Blob store client.
     #[cfg(feature = "blobs")]
     pub fn blobs(&self) -> Blobs {

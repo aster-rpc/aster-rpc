@@ -31,6 +31,17 @@ pub enum Error {
     #[error("attestation error: {0}")]
     Attestation(String),
 
+    /// An RPC call returned a non-OK status (the `rpc` feature). `code` is the
+    /// [`StatusCode`](crate::rpc::StatusCode) value; `details` are the trailer's
+    /// key/value pairs.
+    #[cfg(feature = "rpc")]
+    #[error("rpc error [{code}]: {message}")]
+    Rpc {
+        code: i32,
+        message: String,
+        details: Vec<(String, String)>,
+    },
+
     /// Any other failure propagated from the transport core.
     #[error(transparent)]
     Transport(#[from] anyhow::Error),

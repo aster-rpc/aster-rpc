@@ -1,6 +1,6 @@
 # Aster: native Rust crate
 
-> Status: **Step 1 implemented** (`aster/` crate — node + blobs/docs/gossip + admission + deterministic namespaces; 8 integration tests + example green). Step 2 (Rust RPC) is designed but deferred. See "Implementation status & portal-sync migration" at the end.
+> Status: **Step 1 implemented** (`aster/` crate — node + blobs/docs/gossip + admission + deterministic namespaces). Step 2 (Rust RPC, `rpc` feature) **in progress** (2026-06-01): codec (envelope + payload), status/errors, server dispatch + client stub for **all four call patterns** (steps 1–3), **identity + manifest publication (step 4)**, and **Gate-3 auth (step 5)** are implemented and tested. Contract identity is **cross-binding-verified** — `#[derive(AsterType)]` reproduces the Python reference producer's golden contract-ids byte-for-byte (`scripts/cross_lang_echo_contract_id.py`); `publish_contract`/`fetch_and_verify_contract` round-trip a contract collection + manifest through a registry doc with `blake3(contract.bin)==contract_id` verification. Gate 3: `ServiceDispatch::{service,method}_requires` + an `AttributeStore` the app populates → the server rejects calls lacking the required capability with `PERMISSION_DENIED` before dispatch (Gate 1 enrollment + Gate 2 session-authorize remain deferred — see "Outstanding"). **Step 6 (`#[aster::service]` macro)** generates, for **all four call patterns**, a `…Server<T>` dispatcher, a `…Client` stub, and a cross-binding `ServiceContract` (verified: the generated contract's request type matches the golden, and each method's `pattern` is recorded). Streaming methods are declared with `#[rpc(server_stream|client_stream|bidi_stream)]` and typed stream handles — server handlers take a `RequestStream<Req>` and/or `ResponseSink<Resp>`; clients return a `MessageStream<Resp>`. `#[rpc(requires = …)]` wires Gate-3. **Step 7 (interceptors)** is implemented: an `RpcConnection` carries a `Pipeline` (`with_interceptor`/`with_retry`/`with_circuit_breaker`/`with_deadline`) that wraps unary calls — an `Interceptor` chain (`on_request`/`on_response`/`on_error`), a `RetryPolicy` (retryable status codes + exponential backoff), per-attempt deadline → `DEADLINE_EXCEEDED`, and a `CircuitBreaker` that fails fast when open; no-op by default. **2A (Rust-native RPC) is complete** and green against the iroh/noq rc1 forks (45 aster + 35 core-contract tests). Remaining: the deferred **2B** cross-binding payload work (Fory version gap) and **Gate 1/2 auth** (see "Outstanding"). Cross-binding RPC *payloads* remain deferred on the Fory version gap (2B); manifests/contract-ids are cross-binding now. Step 1 details are under "Implementation status & portal-sync migration" at the end.
 
 ## Context
 
@@ -220,38 +220,148 @@ The `[patch.crates-io]` block is **mandatory** for any external consumer — pat
 
 ---
 
-## Step 2 — Rust-native RPC services (designed, deferred)
+## Step 2 — Rust-native RPC services (designed 2026-06-01; Rust↔Rust first)
 
-### Already in Rust (reuse, don't rebuild)
+Behind a new opt-in `rpc` Cargo feature on `aster` (off in the default set, so Step-1 consumers
+pull nothing new). The work is **a codec + a dispatch loop + a client stub + manifest/identity
+glue + a call-time auth gate** over plumbing that already exists — not new transport.
 
-- `core/src/framing.rs` — full frame codec: `[4B LE len][1B flags][payload]`; flags `COMPRESSED/TRAILER/HEADER/ROW_SCHEMA/CALL/CANCEL/END_STREAM/TUNNEL`; `encode_frame` / `decode_frame`.
-- `core/src/reactor.rs` — accept loop + dispatch for **all four** patterns (unary/server/client/bidi), multiplexed streams, cancel/end-stream, per-call channels. Payload-opaque: `IncomingCall` carries `header_payload` / `request_payload` as `Vec<u8>`; the binding supplies serialization + method dispatch.
-- `core/src/pool.rs` — stream pool (shared + per-session). `core/src/contract.rs` + `canonical.rs` — contract-identity hashing.
+### Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| First target | **Rust-native RPC (Rust↔Rust)**; cross-binding payloads deferred | portal-sync is Rust↔Rust; the Fory wire gap (below) blocks cross-binding payloads, not Rust↔Rust |
+| Call patterns | **All four** (unary / server-stream / client-stream / bidi) | the reactor already dispatches all four; do them together |
+| RPC payload codec | Apache Fory **Rust** crate (`fory` 1.1.x, `#[derive(ForyStruct)]`, `register_by_name`, `xlang(true).compatible(true)`) | same machinery as `core/src/attestation.rs` |
+| JSON serialization mode (`=3`) | **Not implemented in Rust** | per decision; XLANG-only on the Rust wire |
+| Manifest / contract identity | **Cross-binding-correct now** | identity is computed by `canonical.rs` (hand-rolled, **Fory-version-independent**), so manifests/contract-ids interoperate with Python/Java/TS regardless of the Fory gap |
+| Auth | **Gate 3 (per-call capability check) with app-injected attributes** | real call-time auth without porting the enrollment/rcan subsystems; Gate 1/2 explicitly deferred (see "Outstanding") |
+
+**The Fory wire gap (why cross-binding *payloads* are deferred).** The Rust `fory` crate is
+`1.1.x`; pyfory/Java/TS are `0.17`. Apache Fory does not guarantee binary compatibility across
+majors, and the Rust `#[derive(ForyStruct)]` has **no field-level ID** support — so we cannot
+hand-match pyfory's `field(id=N)`-pinned framework types from Rust. Sticking to the Rust crate's
+own documented API gives correct Rust↔Rust wire; cross-binding RPC payloads wait on a Fory
+alignment (2B). This does **not** affect manifests/identity, which never touch the Fory library.
+
+### Reuse — don't rebuild
+
+**Transport** (`aster_transport_core`, all `pub`):
+- `framing` — `encode_frame`/`decode_frame`; flags `COMPRESSED/TRAILER/HEADER/ROW_SCHEMA/CALL/CANCEL/END_STREAM/TUNNEL`.
+- `reactor` — `ReactorHandle::next_event()` → `ReactorEvent::Call(IncomingCall)` (+ `ConnectionClosed`). `IncomingCall` is payload-opaque: `header_payload`/`request_payload: Vec<u8>`, a `response_sender` (`OutgoingFrame::{Frame,Trailer,CompleteUnary}`), a `request_receiver` for client-stream/bidi, and a `cancelled` flag (flips on `FLAG_CANCEL`). `RPC_ALPN = b"aster/1"`.
+- `CoreConnection` — `unary_call(header, request) -> UnaryCallResult`, `acquire_stream(key)`, `open_streaming_substream()`, `session_unary_call(...)`. Client connect: `CoreNetClient::connect(node_id, b"aster/1")`.
+
+**Manifest / identity** (already in `core` — the bulk of the manifest work):
+- `contract` — `ServiceContract`, `TypeDef`/`FieldDef`/`MethodDef`/`EnumValueDef`/`UnionVariantDef`, `canonical_xlang_bytes_service_contract[_checked]`, `canonical_xlang_bytes_type_def`, `compute_contract_id` (hex BLAKE3), `compute_type_hash` (`[u8;32]`), `tarjan_scc` (type-graph cycle detection). `FieldDef.id` is **re-derived from NFC-name-sorted position** during canonicalization, so generated `TypeDef`s only need field *names + kinds + container + optional* — not IDs. `producer_language = ""` for xlang mode (no allowlist change for Rust).
+- `registry` — `ArtifactRef{contract_id, collection_hash, provider_endpoint_id, relay_url, ticket, published_by, published_at_epoch_ms, collection_format}`, `publish_artifact(doc, author, &ref, service, version, channel, gossip)` (writes `contracts/{cid}` + `services/{name}/versions/v{n}`), `resolve(...)` (lease listing + health/freshness/ALPN filter + ranking), `contract_key`/`version_key`/`channel_key`, `EndpointLease`.
+- blobs — `add_collection(entries)` → collection hash; `download_collection_hash(...)`.
 
 ### To build
 
-1. **Envelope codec — static Fory registration.** `StreamHeader` / `RpcStatus` (defined today only in `bindings/python/aster/protocol.py`, tags `_aster/StreamHeader`, `_aster/RpcStatus`) are Fory-XLANG bytes. Define the two structs in Rust with `#[derive(ForyObject)]` under the same wire tags and register them at startup. Keeps Rust on the same Fory machinery as the other bindings — no hand-rolled byte format to maintain. The envelope types are fixed and fully known at compile time, so Rust Fory's dynamic-registration limitation never applies to them.
-2. **Payload codec — static Fory registration.** Same mechanism: a Rust service registers its own contract types (`#[derive(ForyObject)]` + wire tag). This is exactly the case Rust Fory supports. The documented blocker (`docs/_internal/fory-untyped-encode-investigation.md:67-70`) is the **dynamic** case (a peer sends a type not registered locally) — relevant only to a generic proxy, which is out of scope. Typed services (portal-sync owns its contract types) are fully supported. Add `fory` to the workspace deps when this lands.
-3. **Service definition + dispatch.** Trait-based:
-   ```rust
-   #[aster::service(name = "AgentControl", version = 1)]
-   trait AgentControl {
-       async fn assign_task(&self, req: TaskAssignment) -> Result<TaskAck>;     // unary
-       async fn step_updates(&self, req: TaskId) -> BoxStream<'_, StepUpdate>;   // server-stream
-       // client-stream / bidi via impl Stream args + returns
-   }
-   ```
-   A proc-macro (new `aster-macros` crate) generates: a `ServiceInfo` (name/version/method table), a server dispatcher driven by `core`'s reactor `ReactorEvent::Call`, and a client stub that frames `StreamHeader` + payloads over streams.
-4. **Client.** Build on `CoreConnection` + `pool.rs` (`acquire_stream` / `unary_call`). Read trailers → `RpcStatus`.
-5. **Interceptors.** Port the Python chain (`deadline`, `retry`, `circuit-breaker`) as a Rust trait with `on_request` / `on_response` / `on_error`.
-6. **Wire-compat tests.** Cross-binding round-trip (Rust ↔ Python/Java/TS) for header, status, and a representative payload — the acceptance gate, mirroring the existing matrix work.
+**A. Codec** (`aster/src/rpc/codec.rs`). Envelope structs mirroring `bindings/python/aster/protocol.py`
+field-for-field (`i8`/`i16`/`i32`/`String`/`Vec<String>` all supported by the Rust crate, so
+`StreamHeader{ deadline: i16, serialization_mode: i8, … }` maps 1:1): `StreamHeader`, `RpcStatus`,
+`CallHeader`, each `#[derive(ForyStruct)]`, registered once in a shared `OnceLock<Fory>` under the
+`_aster` namespace (`register_by_name::<StreamHeader>("_aster", "StreamHeader")`). Payload types use
+the same derive. `SerializationMode::Xlang` only. Golden tests pin **our own** bytes (Rust-internal
+stability), not cross-binding goldens.
 
-### Sequencing (follow-up)
+**B. Status / errors** (`aster/src/rpc/status.rs`). `StatusCode` enum mirroring Python `status.py`;
+`RpcStatus` ↔ `StatusCode`; new `Error::Rpc { code, message, details }` variant on `aster::Error`.
 
-1. Integrate Apache Fory's Rust crate; define + register `StreamHeader` / `RpcStatus` (and contract types) with `#[derive(ForyObject)]` under their wire tags; verify against golden bytes captured from the Python binding.
-2. Land envelope + payload codec with golden-byte tests **before** any macro work.
-3. Server dispatcher over the existing reactor → client stub → proc-macro sugar → interceptors.
-4. Gate the whole thing behind an `rpc` Cargo feature on `aster` so Step 1 users don't pull RPC deps.
+**C. Server dispatch** (`aster/src/rpc/server.rs`). A loop over `ReactorHandle::next_event()`:
+`Call(c)` → decode `StreamHeader` from `c.header_payload` → look up `(service, version)` → `MethodInfo`
+→ pre-dispatch auth (E) → decode `c.request_payload` → run handler → frame response(s) + `RpcStatus`
+trailer onto `c.response_sender`; `ConnectionClosed{..}` → reap per-connection session/attribute state.
+Pattern → primitive mapping:
+
+| Pattern | Requests | Responses |
+|---|---|---|
+| Unary | `request_payload` | `CompleteUnary(resp ‖ trailer)` |
+| Server-stream | `request_payload` | N× `Frame(item)` then `Trailer(status)`; poll `cancelled` |
+| Client-stream | `request_payload` + drain `request_receiver` to EOF | one `Frame` + `Trailer` |
+| Bidi | `request_payload` + `request_receiver` (concurrent) | N× `Frame` + `Trailer` |
+
+`request_receiver` closes on `FLAG_END_STREAM`/EOF and `cancelled` flips on `FLAG_CANCEL` — so
+streaming termination is free.
+
+**D. Client stub** (`aster/src/rpc/client.rs`). Unary via `conn.unary_call(header, request)`; streaming
+via `conn.open_streaming_substream()` (streaming bypasses the shared pool per the multiplexed-streams
+spec). `check_trailer` decodes `RpcStatus` → non-OK ⇒ `Err(Error::Rpc{..})`.
+
+**E. Identity + manifest** (cross-binding-correct). A new `#[derive(AsterType)]` emits **two** things
+per payload type: the `ForyStruct` wire impl **and** a compile-time `core::contract::TypeDef`
+(field-kind mapping per ContractIdentity §11.3 so the canonical bytes — and thus `type_hash` /
+`contract_id` — match the other bindings). `#[aster::service]` assembles a `ServiceContract`
+(method patterns + request/response `type_hash`es + `requires`). Publish: build collection entries
+`contract.bin` + `manifest.json` + `types/{type_hash}.bin` → `add_collection` → `publish_artifact`
+(+ manifest shortcut). Consume: `resolve` → fetch collection → assert `blake3(contract.bin)==contract_id`.
+**Small additive `core` changes:** `contract::ContractManifest` struct + JSON (`serde_json`),
+`registry::manifest_key("manifests/{cid}")`, a `contract::build_contract_collection(...)` helper, and
+`contract::evaluate_capability(req, attrs) -> bool` (port of Python `trust/rcan.py`).
+
+**F. Auth — Gate 3** (`aster/src/rpc/server.rs` + a peer-attribute store). Pre-dispatch capability
+check before request decode: read service/method `requires: CapabilityRequirement` off the registered
+contract, evaluate with `core::contract::evaluate_capability` against a `CallContext.attributes` map
+sourced from a per-peer **attribute store** that the **application injects** (portal-sync already
+verifies attestation chains at admission and knows each peer's role). Failure ⇒ `PERMISSION_DENIED`
+trailer, no payload decoded. Gate 0 (connection admission) already exists in the facade
+(`Admission`/`Gate0`).
+
+**G. `#[aster::service]` + `aster-macros`** (new proc-macro crate). Generates the `ServiceInfo`/method
+table, the server `Dispatch` impl (decode→call→encode, registered by `(name, version)`), and the
+client stub. **Hand-write C+D for one 4-pattern test service first; then make the macro generate
+exactly that shape.**
+
+```rust
+#[aster::service(name = "AgentControl", version = 1)]
+trait AgentControl {
+    #[rpc(requires = role("operator"))]
+    async fn assign_task(&self, req: TaskAssignment) -> Result<TaskAck>;        // unary
+    async fn step_updates(&self, req: TaskId) -> BoxStream<'_, Result<StepUpdate>>; // server-stream
+    async fn upload(&self, reqs: impl Stream<Item = Chunk>) -> Result<UploadAck>;   // client-stream
+    async fn chat(&self, reqs: impl Stream<Item = Msg>) -> BoxStream<'_, Result<Msg>>; // bidi
+}
+```
+
+**H. Interceptors** (`aster/src/rpc/interceptor.rs`). Rust trait `on_request`/`on_response`/`on_error`
+over `CallContext`; port `deadline`, `retry`, `circuit-breaker`.
+
+### Outstanding (explicitly deferred from this cut)
+
+- **Gate 1 — enrollment → attributes.** Rust port of `trust/credentials.py` (signed
+  `EnrollmentCredential` / `ConsumerEnrollmentCredential` → verified attributes), IID checks
+  (`trust/iid.py`), nonce/replay store (`trust/nonces.py`). Until then, attributes are **injected by
+  the application** into the attribute store; the RPC layer does not derive them from credentials itself.
+- **Gate 2 — session authorize → rcan.** `authorize()` minting per-session capability grants
+  (`ScopeKind::Session`). v1 supports `Shared` services; session-scoped services + rcan are future work.
+- **Cross-binding RPC payloads (2B).** Gated on Fory version alignment (no JSON-mode bridge, by
+  decision). Begins with a golden-byte diff of `StreamHeader`/`RpcStatus`/a sample payload vs pyfory
+  0.17. Note: manifests/contract-ids are **already** cross-binding (Fory-independent), so only call
+  payloads are blocked.
+
+### portal-sync impact
+
+**Zero today.** `rpc` is off by default and the `core` additions are additive; portal-sync consumes
+only the stable facade. If portal-sync later wants to *expose* an RPC service it opts into `rpc` and
+injects peer attributes from its existing admission/attestation verdict — additive, no breakage.
+
+### Files
+
+- New (`aster`, `rpc` feature): `aster/src/rpc/{mod,codec,status,service,server,client,interceptor}.rs`; new `aster-macros/` proc-macro crate (`#[derive(AsterType)]`, `#[aster::service]`); tests `aster/tests/rpc_*.rs`.
+- Edit (`core`, additive): `contract.rs` (`ContractManifest` + JSON, `build_contract_collection`, `evaluate_capability`), `registry.rs` (`manifest_key`).
+- Edit: `aster/Cargo.toml` (`rpc = ["dep:fory-core","dep:fory-derive","dep:aster-macros"]`), root `Cargo.toml` (`aster-macros` member).
+
+### Sequencing
+
+1. **Codec** (A) + golden self-byte tests — **before any macro work**.
+2. **Status/errors** (B).
+3. **Hand-written dispatch + stub** (C, D), all four patterns, Rust↔Rust round-trip tests.
+4. **Identity + manifest** (E) incl. the additive `core` bits; publish/resolve/verify test.
+5. **Auth Gate 3** (F).
+6. **`#[aster::service]` macro** (G) generating 3–4's shape.
+7. **Interceptors** (H).
+8. **`rpc` feature wiring** + `--no-default-features` compile matrix.
 
 ---
 
@@ -268,7 +378,7 @@ The `[patch.crates-io]` block is **mandatory** for any external consumer — pat
 - Git-dependency sanity check: in a scratch crate **outside** the workspace, depend on `aster` via git + the copied `[patch.crates-io]` block and run the quickstart — confirms external consumption resolves the forks.
 - No regression to `core`: `cargo test -p aster_transport_core` and `uv run pytest tests/python/ -q`.
 
-**Step 2 (follow-up):** golden-byte tests for `StreamHeader` / `RpcStatus` vs Python output; cross-binding RPC matrix (Rust client ↔ Python server and vice-versa) as the acceptance gate.
+**Step 2 (2A — Rust-native) acceptance:** `cargo build -p aster --features rpc` and `--no-default-features --features rpc`; golden self-byte tests pinning `StreamHeader`/`RpcStatus`/`CallHeader`; Rust↔Rust round-trip per call pattern (unary/server/client/bidi), mirroring the hermetic `aster/tests/facade.rs` style; manifest publish→resolve→`blake3==contract_id` verify; a `requires`-gated method rejected with `PERMISSION_DENIED` when the peer lacks the attribute and admitted when present. **2B (cross-binding payloads):** golden-byte diff of envelope + a sample payload vs pyfory 0.17, then the Rust↔Python/Java/TS RPC matrix — gated on Fory alignment. (Manifest/contract-id cross-binding parity can be asserted earlier, since identity is Fory-independent.)
 
 ---
 
