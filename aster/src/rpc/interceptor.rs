@@ -169,9 +169,11 @@ impl Pipeline {
     }
 
     /// Run a unary call through the pipeline. `invoke` performs one transport
-    /// round-trip for the (possibly interceptor-modified) request bytes, with
-    /// the per-attempt deadline applied; `deadline_secs` is written into the
-    /// wire header by the caller.
+    /// round-trip for the (interceptor-transformed) request bytes. Each attempt
+    /// re-runs `on_request` on the *original* request with the current
+    /// `ctx.attempt`, applies the deadline, then runs `on_response`; any failure
+    /// in that sequence (request/invoke/deadline/response) is routed through
+    /// `on_error` and considered for retry, and updates the circuit breaker.
     pub(crate) async fn run_unary<F, Fut>(
         &self,
         mut ctx: CallContext,
@@ -182,18 +184,11 @@ impl Pipeline {
         F: Fn(Vec<u8>) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<u8>>>,
     {
-        // on_request chain.
-        let mut req = request;
-        for i in &self.interceptors {
-            req = i.on_request(&ctx, req).await?;
-        }
-
-        let max_attempts = self.retry.as_ref().map(|r| r.max_attempts).unwrap_or(1);
         let mut attempt = 1u32;
         loop {
             ctx.attempt = attempt;
 
-            // Circuit breaker fail-fast.
+            // Circuit breaker: fail fast (no retry) while open.
             if let Some(cb) = &self.circuit_breaker {
                 if !cb.allow() {
                     let err = Error::Rpc {
@@ -205,27 +200,10 @@ impl Pipeline {
                 }
             }
 
-            // Invoke with the deadline applied to this attempt.
-            let fut = invoke(req.clone());
-            let result = match self.deadline {
-                Some(d) => match tokio::time::timeout(d, fut).await {
-                    Ok(r) => r,
-                    Err(_) => Err(Error::Rpc {
-                        code: StatusCode::DeadlineExceeded.as_i32(),
-                        message: format!("deadline exceeded after {d:?}"),
-                        details: Vec::new(),
-                    }),
-                },
-                None => fut.await,
-            };
-
-            match result {
-                Ok(mut resp) => {
+            match self.attempt_once(&ctx, request.clone(), &invoke).await {
+                Ok(resp) => {
                     if let Some(cb) = &self.circuit_breaker {
                         cb.record_success();
-                    }
-                    for i in &self.interceptors {
-                        resp = i.on_response(&ctx, resp).await?;
                     }
                     return Ok(resp);
                 }
@@ -234,18 +212,56 @@ impl Pipeline {
                         cb.record_failure();
                     }
                     let err = self.apply_on_error(&ctx, err).await;
-                    let retry = self.retry.as_ref();
-                    if attempt < max_attempts
-                        && retry.map(|r| r.is_retryable(&err)).unwrap_or(false)
-                    {
-                        tokio::time::sleep(retry.unwrap().backoff(attempt)).await;
-                        attempt += 1;
-                        continue;
+                    if let Some(retry) = &self.retry {
+                        if attempt < retry.max_attempts && retry.is_retryable(&err) {
+                            tokio::time::sleep(retry.backoff(attempt)).await;
+                            attempt += 1;
+                            continue;
+                        }
                     }
                     return Err(err);
                 }
             }
         }
+    }
+
+    /// One attempt: `on_request` (from the original bytes) → invoke (deadline) →
+    /// `on_response`. Any step's error short-circuits the attempt.
+    async fn attempt_once<F, Fut>(
+        &self,
+        ctx: &CallContext,
+        original: Vec<u8>,
+        invoke: &F,
+    ) -> Result<Vec<u8>>
+    where
+        F: Fn(Vec<u8>) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<u8>>>,
+    {
+        let mut req = original;
+        for i in &self.interceptors {
+            req = i.on_request(ctx, req).await?;
+        }
+
+        let fut = invoke(req);
+        let resp = match self.deadline {
+            Some(d) => match tokio::time::timeout(d, fut).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    return Err(Error::Rpc {
+                        code: StatusCode::DeadlineExceeded.as_i32(),
+                        message: format!("deadline exceeded after {d:?}"),
+                        details: Vec::new(),
+                    })
+                }
+            },
+            None => fut.await?,
+        };
+
+        let mut resp = resp;
+        for i in &self.interceptors {
+            resp = i.on_response(ctx, resp).await?;
+        }
+        Ok(resp)
     }
 
     async fn apply_on_error(&self, ctx: &CallContext, mut error: Error) -> Error {

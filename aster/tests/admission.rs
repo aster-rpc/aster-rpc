@@ -1,3 +1,4 @@
+#![cfg(feature = "blobs")]
 //! Gate 0 admission: an inbound peer is surfaced post-handshake and can be
 //! rejected (blocking the connection) or accepted (letting it through).
 

@@ -1,3 +1,4 @@
+#![cfg(feature = "attestation")]
 //! Custom-ALPN connections + the bootstrap-ALPN admission flow:
 //! unknown peer is blocked on a normal ALPN, presents an attestation chain on
 //! the admission ALPN, is admitted, and is then allowed on the normal ALPN.

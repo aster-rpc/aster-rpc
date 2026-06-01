@@ -22,9 +22,12 @@
 //! )
 //! .await?;
 //!
+//! # #[cfg(feature = "blobs")]
+//! # {
 //! let hash = node.blobs().add_bytes(b"hello".to_vec()).await?;
 //! let bytes = node.blobs().read_to_bytes(&hash).await?;
 //! assert_eq!(bytes, b"hello");
+//! # }
 //!
 //! node.shutdown().await;
 //! # Ok(())
