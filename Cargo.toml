@@ -44,7 +44,7 @@ iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "2f9f374
 iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "2f9f374298bd44b063e1eb2df02781124305a790" }
 iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "2f9f374298bd44b063e1eb2df02781124305a790" }
 iroh-blobs  = { git = "https://github.com/aster-rpc/iroh-blobs",  rev = "c23a66acc63cd60c73f9593b71139817d8c11371" }
-iroh-docs   = { git = "https://github.com/aster-rpc/iroh-docs",   rev = "5acb0f3fd510336b8c1eba51ebc5c7f971bc8477" }
+iroh-docs   = { git = "https://github.com/aster-rpc/iroh-docs",   rev = "4ae3eaf6cba5c9eaac6a601f8ed70c6813f637b5" }
 iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "fdecec8a622b726b44e781e1252bf2452eb0f846" }
 noq         = { git = "https://github.com/aster-rpc/noq",         rev = "e968659c47057b18210a4a03dc2366c65fe8f654" }
 noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "e968659c47057b18210a4a03dc2366c65fe8f654" }
