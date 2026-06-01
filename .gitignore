@@ -289,3 +289,6 @@ bindings/dotnet/**/obj/
 # These are build outputs, not source.
 bindings/java/aster-runtime/src/main/resources/native/
 .envrc
+
+# Self-hosted runner secrets (PAT) — never commit
+.github/runner/.env
