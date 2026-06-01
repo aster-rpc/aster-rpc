@@ -43,6 +43,12 @@ hex = "0.4"
 # (the wire format stores relay as a socket address — see Ticket::from_node_addr).
 url = "2"
 
+# The quickstart example uses blobs + docs; skip it when those features are off
+# (e.g. the `--no-default-features --features rpc` build matrix).
+[[example]]
+name = "quickstart"
+required-features = ["blobs", "docs"]
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"

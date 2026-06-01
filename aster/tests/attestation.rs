@@ -1,3 +1,4 @@
+#![cfg(feature = "attestation")]
 //! Ownership-attestation facade: mint a root↔node chain and verify it offline,
 //! including the reject paths a Gate-0 admission check relies on.
 

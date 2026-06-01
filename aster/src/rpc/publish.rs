@@ -26,13 +26,13 @@ pub struct PublishedContract {
     pub collection_hash: Hash,
 }
 
-/// A contract fetched from the registry and verified against its id.
+/// A contract fetched from the registry and **verified** against its id —
+/// returning this value means `blake3(contract.bin) == contract_id` and the
+/// manifest's self-reported id matched. Verification failures are errors.
 #[derive(Debug, Clone)]
 pub struct FetchedContract {
     pub contract_id: String,
     pub manifest: ContractManifest,
-    /// `true` iff `blake3(contract.bin) == contract_id`.
-    pub verified: bool,
 }
 
 /// Publish `sc` (+ its `type_defs`) into the `registry` doc: build + upload the
@@ -117,19 +117,33 @@ pub async fn fetch_and_verify_contract(
         .download_collection(&collection_hash, producer)
         .await?;
     let contract_bytes = collection_entry(&entries, "contract.bin")?;
-    let manifest_json = collection_entry(&entries, "manifest.json")?;
 
-    let verified = compute_contract_id(&contract_bytes) == contract_id;
+    // Fail closed: the fetched contract.bin MUST hash to the resolved id.
+    let actual = compute_contract_id(&contract_bytes);
+    if actual != contract_id {
+        return Err(Error::Transport(anyhow::anyhow!(
+            "contract integrity check failed: blake3(contract.bin) = {actual}, expected {contract_id}"
+        )));
+    }
+
+    let manifest_json = collection_entry(&entries, "manifest.json")?;
     let manifest = ContractManifest::from_json(
         std::str::from_utf8(&manifest_json)
             .map_err(|_| Error::InvalidArgument("manifest.json is not UTF-8".into()))?,
     )
     .map_err(|e| Error::Transport(anyhow::anyhow!("manifest decode: {e}")))?;
 
+    // The manifest's self-reported id must also match the resolved id.
+    if manifest.contract_id != contract_id {
+        return Err(Error::Transport(anyhow::anyhow!(
+            "manifest contract_id = {}, expected {contract_id}",
+            manifest.contract_id
+        )));
+    }
+
     Ok(FetchedContract {
         contract_id,
         manifest,
-        verified,
     })
 }
 

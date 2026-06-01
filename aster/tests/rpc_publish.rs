@@ -116,11 +116,7 @@ async fn publish_then_fetch_and_cross_node_collection() {
         1,
     ))
     .await
-    .unwrap();
-    assert!(
-        fetched.verified,
-        "blake3(contract.bin) must equal contract_id"
-    );
+    .unwrap(); // Ok means verified — a hash/id mismatch returns Err.
     assert_eq!(fetched.contract_id, GOLDEN_CID);
     assert_eq!(fetched.manifest.service, "EchoService");
     assert_eq!(fetched.manifest.version, 1);

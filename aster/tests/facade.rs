@@ -1,3 +1,4 @@
+#![cfg(all(feature = "blobs", feature = "docs"))]
 //! Cross-node integration: two in-memory nodes connect, round-trip a blob via
 //! `download_hash` (from a specific peer) and sync a doc entry, observing the
 //! live `InsertRemote { from }` event.

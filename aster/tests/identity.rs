@@ -1,3 +1,4 @@
+#![cfg(feature = "docs")]
 //! A persistent node restored from the same secret key + data dir keeps its
 //! identity. This is the restart-stable-identity contract portal-sync relies on.
 

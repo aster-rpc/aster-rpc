@@ -795,8 +795,24 @@ pub struct ManifestMethod {
     pub request_type: String,
     pub response_type: String,
     pub idempotent: bool,
+    /// Default timeout in seconds. Tolerant of a JSON `null` — other bindings
+    /// (e.g. Python's publisher) emit `null` for an unset timeout — decoded as `0.0`.
+    #[serde(default, deserialize_with = "de_nullable_f64")]
     pub timeout: f64,
 }
+
+/// Deserialize a possibly-`null`/missing JSON number into an `f64` (`null` ⇒ 0.0).
+fn de_nullable_f64<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<f64, D::Error> {
+    Ok(<Option<f64> as serde::Deserialize>::deserialize(d)?.unwrap_or(0.0))
+}
+
+/// Caps for parsing an untrusted `manifest.json` (mirrors `bindings/python/aster/limits.py`).
+pub const MAX_MANIFEST_METHODS: usize = 10_000;
+/// Cap on `type_hashes` length when parsing a manifest.
+pub const MAX_MANIFEST_TYPE_HASHES: usize = 100_000;
+/// Cap on the raw `manifest.json` byte length, enforced before deserialization
+/// to bound allocation from a hostile producer.
+pub const MAX_MANIFEST_JSON_BYTES: usize = 1024 * 1024;
 
 /// Published, human-readable record of a contract's identity (Aster-SPEC §11.4).
 /// Field names mirror `bindings/python/aster/contract/manifest.py` so the JSON
@@ -870,9 +886,32 @@ impl ContractManifest {
         Ok(serde_json::to_string(self)?)
     }
 
-    /// Parse from a JSON string.
+    /// Parse from a JSON string, enforcing size caps on untrusted input: the
+    /// raw byte length, the method count, and the type-hash count.
     pub fn from_json(text: &str) -> Result<Self> {
-        Ok(serde_json::from_str(text)?)
+        if text.len() > MAX_MANIFEST_JSON_BYTES {
+            bail!(
+                "manifest.json is {} bytes, exceeds cap {}",
+                text.len(),
+                MAX_MANIFEST_JSON_BYTES
+            );
+        }
+        let m: ContractManifest = serde_json::from_str(text)?;
+        if m.methods.len() > MAX_MANIFEST_METHODS {
+            bail!(
+                "manifest declares {} methods, exceeds cap {}",
+                m.methods.len(),
+                MAX_MANIFEST_METHODS
+            );
+        }
+        if m.type_hashes.len() > MAX_MANIFEST_TYPE_HASHES {
+            bail!(
+                "manifest declares {} type hashes, exceeds cap {}",
+                m.type_hashes.len(),
+                MAX_MANIFEST_TYPE_HASHES
+            );
+        }
+        Ok(m)
     }
 }
 
@@ -1530,6 +1569,24 @@ mod tests {
         expected_hashes.sort();
         assert_eq!(manifest.type_hashes, expected_hashes);
         assert_eq!(manifest.canonical_encoding, "fory-xlang/0.15");
+    }
+
+    #[test]
+    fn manifest_from_json_null_timeout_and_caps() {
+        // A `null` timeout (as other bindings emit) decodes to 0.0.
+        let json = r#"{"service":"S","methods":[{"name":"m","pattern":"unary",
+            "request_type":"","response_type":"","idempotent":false,"timeout":null}]}"#;
+        let m = ContractManifest::from_json(json).unwrap();
+        assert_eq!(m.methods[0].timeout, 0.0);
+
+        // Oversized raw input is rejected before parsing.
+        let big = "x".repeat(MAX_MANIFEST_JSON_BYTES + 1);
+        assert!(ContractManifest::from_json(&big).is_err());
+
+        // Too many methods is rejected.
+        let methods = vec![r#"{"name":"m"}"#; MAX_MANIFEST_METHODS + 1].join(",");
+        let json = format!(r#"{{"service":"S","methods":[{methods}]}}"#);
+        assert!(ContractManifest::from_json(&json).is_err());
     }
 
     // ---- B.1: Direct self-recursion (TreeNode) ----

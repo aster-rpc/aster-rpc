@@ -89,6 +89,25 @@ impl Interceptor for LogInterceptor {
     }
 }
 
+/// Records the `ctx.attempt` seen by each `on_request`, and counts `on_response`.
+#[derive(Clone)]
+struct CountInterceptor {
+    attempts: Arc<Mutex<Vec<u32>>>,
+    responses: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl Interceptor for CountInterceptor {
+    async fn on_request(&self, ctx: &CallContext, request: Vec<u8>) -> aster::Result<Vec<u8>> {
+        self.attempts.lock().unwrap().push(ctx.attempt);
+        Ok(request)
+    }
+    async fn on_response(&self, _ctx: &CallContext, response: Vec<u8>) -> aster::Result<Vec<u8>> {
+        self.responses.fetch_add(1, Ordering::SeqCst);
+        Ok(response)
+    }
+}
+
 fn cfg() -> AsterConfig {
     AsterConfig::builder()
         .relay(RelayMode::Disabled)
@@ -164,14 +183,33 @@ async fn interceptor_pipeline_policies() {
     assert_eq!(resp, b"ok".to_vec());
     assert_eq!(*log.lock().unwrap(), vec!["req:echo", "resp:echo"]);
 
-    // 2. Retry recovers the flaky method (2 UNAVAILABLE then OK).
-    let conn = base.clone().with_retry(retry_policy());
+    // 2. Retry recovers the flaky method (2 UNAVAILABLE then OK), and the
+    //    interceptor's on_request runs once per attempt with ctx.attempt set.
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let responses = Arc::new(AtomicU32::new(0));
+    let conn = base
+        .clone()
+        .with_retry(retry_policy())
+        .with_interceptor(CountInterceptor {
+            attempts: attempts.clone(),
+            responses: responses.clone(),
+        });
     let resp = within(conn.unary(&header("flaky"), vec![1])).await.unwrap();
     assert_eq!(resp, b"recovered".to_vec());
     assert_eq!(
         state.flaky_calls.load(Ordering::SeqCst),
         3,
         "1 try + 2 retries"
+    );
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        vec![1, 2, 3],
+        "on_request runs once per attempt with ctx.attempt"
+    );
+    assert_eq!(
+        responses.load(Ordering::SeqCst),
+        1,
+        "on_response runs once, on the successful attempt"
     );
 
     // 3. Deadline: the slow method exceeds a short client deadline.

@@ -1,3 +1,4 @@
+#![cfg(feature = "docs")]
 //! Deterministic namespaces from a 32-byte secret, idempotent import, and the
 //! read→write capability upgrade.
 
