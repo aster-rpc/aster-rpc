@@ -4,11 +4,12 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-iroh = { workspace = true, features = ["address-lookup-mdns"] }
+iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 iroh-docs = { workspace = true }
 iroh-gossip = { workspace = true }
 iroh-tickets = { workspace = true }
+iroh-mdns-address-lookup = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 bytes = { workspace = true }
@@ -22,14 +23,18 @@ serde_json = "1"
 unicode-normalization = "0.1"
 hex = "0.4"
 bs58 = "0.5"
-ed25519-dalek = { version = "=3.0.0-pre.6", features = ["rand_core"] }
-# Prerelease pins to keep ed25519-dalek 3.0.0-pre.6 compiling.
-# Mirrors iroh's own pin in iroh's workspace Cargo.toml.
-# Drop these once ed25519-dalek stabilises against pkcs8 0.11 final.
-der   = "=0.8.0-rc.10"
-pkcs8 = "=0.11.0-rc.10"
-spki  = "=0.8.0-rc.4"
+ed25519-dalek = { version = "=3.0.0-pre.7", features = ["rand_core"] }
 crossbeam-utils = { workspace = true }
+getrandom = "0.2"
+fory-core = { version = "1.1.0-rc.1", optional = true }
+fory-derive = { version = "1.1.0-rc.1", optional = true }
+thiserror = { version = "2", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[features]
+# Ownership-attestation chain (pulls in Apache Fory for the wire format).
+# Off by default so the pyo3 / ffi consumers don't compile Fory unless wanted.
+attestation = ["dep:fory-core", "dep:fory-derive", "dep:thiserror", "dep:base64"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

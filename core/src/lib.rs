@@ -1,3 +1,5 @@
+#[cfg(feature = "attestation")]
+pub mod attestation;
 pub mod canonical;
 pub mod contract;
 pub mod framing;
@@ -7,6 +9,7 @@ pub mod registry;
 pub mod ring;
 pub mod signing;
 pub mod ticket;
+pub mod tunnel;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -16,13 +19,12 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::address_lookup::MdnsAddressLookup;
 use iroh::endpoint::{
-    presets, AfterHandshakeOutcome, BeforeConnectOutcome, Connection, ConnectionError,
-    ConnectionInfo, Endpoint, EndpointHooks, PathInfo, PortmapperConfig, RelayMode, VarInt,
+    presets, AfterHandshakeOutcome, BeforeConnectOutcome, Closed, Connection, ConnectionError,
+    Endpoint, EndpointHooks, PathEvent, PortmapperConfig, RelayMode, VarInt, WeakConnectionHandle,
 };
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{EndpointAddr, EndpointId, RelayMap, RelayUrl, SecretKey, TransportAddr, Watcher};
+use iroh::{EndpointAddr, EndpointId, RelayMap, RelayUrl, SecretKey, TransportAddr};
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::Store as BlobStore;
 use iroh_blobs::format::collection::Collection;
@@ -35,16 +37,23 @@ use iroh_docs::api::Doc;
 use iroh_docs::engine::LiveEvent;
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::{DownloadPolicy, FilterKind, Query};
-use iroh_docs::{AuthorId, Capability, DocTicket, NamespaceId, ALPN as DOCS_ALPN};
+use iroh_docs::{
+    Author, AuthorId, Capability, DocTicket, NamespaceId, NamespaceSecret, ALPN as DOCS_ALPN,
+};
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
 use iroh_gossip::ALPN as GOSSIP_ALPN;
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use iroh_tickets::Ticket;
 use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+use crate::framing::{encode_frame, FLAG_TUNNEL};
 use crate::pool::{AcquireError, PoolConfig, PoolKey, StreamFactory, StreamHandle, StreamPool};
+use crate::tunnel::{
+    AuthorizeTunnelError, TunnelConfig, TunnelRegistry, TunnelTarget, TunnelTicket,
+};
 use tokio_stream::StreamExt;
 use tracing::debug;
 use url::Url;
@@ -123,10 +132,6 @@ pub struct CoreGossipEvent {
     pub event_type: String,
     pub data: Option<Vec<u8>>,
 }
-
-/// Maximum number of entries returned per query.
-/// Limits result sets to prevent unbounded reads when multiple authors write to the same key.
-pub const QUERY_ENTRY_LIMIT: u64 = 3;
 
 /// A document entry returned from queries, containing metadata about who wrote it and what they wrote.
 #[derive(Clone, Debug)]
@@ -290,6 +295,23 @@ pub struct CoreConnectionInfo {
     pub is_connected: bool,
 }
 
+/// Snapshot of the selected QUIC path for a connection at one instant.
+/// Cheap to compute (clones a SmallVec entry) and intended for
+/// per-call CallContext population. Exactly one of `peer_addr` /
+/// `relay_url` is populated when a path is selected; both are `None`
+/// only when the connection has no selected path (e.g. dropped).
+#[derive(Clone, Debug, Default)]
+pub struct CoreTransportSnapshot {
+    /// Peer's UDP socket address when the selected path is direct.
+    pub peer_addr: Option<SocketAddr>,
+    /// Relay server URL when the selected path goes through a relay.
+    /// The peer's own IP is not visible through a relay path.
+    pub relay_url: Option<String>,
+    /// RTT for the selected path, in microseconds. `None` if no path
+    /// is selected or RTT has not yet been measured.
+    pub rtt_micros: Option<u64>,
+}
+
 // ============================================================================
 // Hooks Types (v0.97.0-compatible)
 // ============================================================================
@@ -356,15 +378,15 @@ impl Default for CoreRemoteAggregate {
 }
 
 impl CoreRemoteAggregate {
-    fn update_from_path(&mut self, path: &PathInfo) {
+    fn update_from_path_stats(&mut self, addr: &TransportAddr, stats: &iroh::endpoint::PathStats) {
         self.last_update = SystemTime::now();
-        if path.is_ip() {
+        if addr.is_ip() {
             self.ip_path = true;
         }
-        if path.is_relay() {
+        if addr.is_relay() {
             self.relay_path = true;
         }
-        if let Some(stats) = path.stats() {
+        if stats.rtt != Duration::ZERO {
             self.rtt_min = self.rtt_min.min(stats.rtt);
             self.rtt_max = self.rtt_max.max(stats.rtt);
         }
@@ -375,25 +397,25 @@ impl CoreRemoteAggregate {
 #[derive(Debug, Default)]
 struct RemoteInfoEntry {
     aggregate: CoreRemoteAggregate,
-    connections: HashMap<u64, ConnectionInfo>,
+    connections: HashMap<u64, WeakConnectionHandle>,
 }
 
 impl RemoteInfoEntry {
-    fn is_active(&self) -> bool {
-        !self.connections.is_empty()
-    }
-
     fn to_core_remote_info(&self, node_id: &str) -> CoreRemoteInfo {
-        // Determine connection type from active connections
-        let conn_type = if self.connections.is_empty() {
+        // Upgrade weak handles to inspect current state.
+        let live: Vec<Connection> = self
+            .connections
+            .values()
+            .filter_map(WeakConnectionHandle::upgrade)
+            .collect();
+
+        let conn_type = if live.is_empty() {
             ConnectionType::NotConnected
         } else {
-            // Check selected path of any active connection
-            let detail = self
-                .connections
-                .values()
+            let detail = live
+                .iter()
                 .find_map(|c| {
-                    c.selected_path().map(|p| {
+                    c.paths().iter().find(|p| p.is_selected()).map(|p| {
                         if p.is_relay() {
                             ConnectionTypeDetail::UdpRelay
                         } else if p.is_ip() {
@@ -407,14 +429,11 @@ impl RemoteInfoEntry {
             ConnectionType::Connected(detail)
         };
 
-        // Sum bytes from stats of active connections
-        let (bytes_sent, bytes_received) = self
-            .connections
-            .values()
-            .filter_map(|c| c.stats())
-            .fold((0u64, 0u64), |(s, r), stats| {
-                (s + stats.udp_tx.bytes, r + stats.udp_rx.bytes)
-            });
+        // Sum bytes from stats of currently-live connections.
+        let (bytes_sent, bytes_received) = live.iter().fold((0u64, 0u64), |(s, r), c| {
+            let stats = c.stats();
+            (s + stats.udp_tx.bytes, r + stats.udp_rx.bytes)
+        });
 
         CoreRemoteInfo {
             node_id: node_id.to_string(),
@@ -431,35 +450,50 @@ impl RemoteInfoEntry {
             ),
             bytes_sent: bytes_sent.max(self.aggregate.total_bytes_sent),
             bytes_received: bytes_received.max(self.aggregate.total_bytes_received),
-            is_connected: self.is_active(),
+            is_connected: !live.is_empty(),
         }
     }
 }
 
 type RemoteMapInner = Arc<RwLock<HashMap<String, RemoteInfoEntry>>>;
 
+/// Pairing of a connection's remote endpoint id (captured at handshake time)
+/// with a weak handle to the connection. Modeled after the `remote-info.rs`
+/// example in iroh 1.0.0-rc.0: storing a `WeakConnectionHandle` rather than a
+/// strong `Connection` lets the monitor avoid keeping connections alive past
+/// the application's last reference.
+#[derive(Debug, Clone)]
+struct TrackedConnection {
+    remote_id: String,
+    handle: WeakConnectionHandle,
+}
+
 /// Connection monitor that tracks remote endpoint information.
 ///
-/// Implements `EndpointHooks` to capture `ConnectionInfo` from `after_handshake`,
-/// then spawns background tasks to track path changes and connection close events.
-/// This is modeled after the `remote-info.rs` example in iroh 0.97.0.
+/// Implements `EndpointHooks` to capture a `WeakConnectionHandle` from
+/// `after_handshake`, then spawns background tasks to watch path events and
+/// connection close events.
 #[derive(Clone, Debug)]
 pub struct CoreMonitor {
     map: RemoteMapInner,
     #[allow(dead_code)]
-    tx: mpsc::Sender<ConnectionInfo>,
+    tx: mpsc::Sender<TrackedConnection>,
     _task: Arc<tokio::task::AbortHandle>,
 }
 
 /// Hook portion of the monitor — installed on the endpoint builder.
 #[derive(Debug)]
 struct MonitorHook {
-    tx: mpsc::Sender<ConnectionInfo>,
+    tx: mpsc::Sender<TrackedConnection>,
 }
 
 impl EndpointHooks for MonitorHook {
-    async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
-        self.tx.send(conn.clone()).await.ok();
+    async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
+        let tracked = TrackedConnection {
+            remote_id: conn.remote_id().to_string(),
+            handle: conn.weak_handle(),
+        };
+        self.tx.send(tracked).await.ok();
         AfterHandshakeOutcome::Accept
     }
 }
@@ -483,7 +517,7 @@ impl CoreMonitor {
         (hook, monitor)
     }
 
-    async fn run(mut rx: mpsc::Receiver<ConnectionInfo>, map: RemoteMapInner) {
+    async fn run(mut rx: mpsc::Receiver<TrackedConnection>, map: RemoteMapInner) {
         let mut conn_id: u64 = 0;
         let mut tasks = tokio::task::JoinSet::new();
 
@@ -522,54 +556,73 @@ impl CoreMonitor {
         tasks: &mut tokio::task::JoinSet<()>,
         map: RemoteMapInner,
         conn_id: u64,
-        conn: ConnectionInfo,
+        tracked: TrackedConnection,
     ) {
-        let remote_id = conn.remote_id().to_string();
+        let remote_id = tracked.remote_id.clone();
+        let handle = tracked.handle.clone();
 
-        // Store connection info
+        // Store the weak handle.
         {
             let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
             let entry = inner.entry(remote_id.clone()).or_default();
-            entry.connections.insert(conn_id, conn.clone());
+            entry.connections.insert(conn_id, handle.clone());
             entry.aggregate.last_update = SystemTime::now();
         }
 
-        // Track connection close
+        // Track connection close. `WeakConnectionHandle::closed` does not keep
+        // the connection alive but still resolves with final stats.
         tasks.spawn({
-            let conn = conn.clone();
             let map = map.clone();
             let remote_id = remote_id.clone();
+            let closed_fut = handle.closed();
             async move {
-                if let Some((_, stats)) = conn.closed().await {
-                    let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
-                    let entry = inner.entry(remote_id).or_default();
-                    entry.connections.remove(&conn_id);
-                    entry.aggregate.last_update = SystemTime::now();
+                let final_stats = closed_fut.await;
+                let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
+                let entry = inner.entry(remote_id).or_default();
+                entry.connections.remove(&conn_id);
+                entry.aggregate.last_update = SystemTime::now();
+                if let Some(Closed { stats, .. }) = final_stats {
                     entry.aggregate.total_bytes_sent += stats.udp_tx.bytes;
                     entry.aggregate.total_bytes_received += stats.udp_rx.bytes;
-                } else {
-                    let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
-                    let entry = inner.entry(remote_id).or_default();
-                    entry.connections.remove(&conn_id);
-                    entry.aggregate.last_update = SystemTime::now();
                 }
             }
         });
 
-        // Track path changes
-        tasks.spawn({
-            let map = map.clone();
-            async move {
-                let mut path_updates = conn.paths().stream();
-                while let Some(paths) = path_updates.next().await {
-                    let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
-                    let entry = inner.entry(remote_id.clone()).or_default();
-                    for path in paths {
-                        entry.aggregate.update_from_path(&path);
+        // Track path changes. We briefly upgrade to obtain a `PathEventStream`;
+        // matching the upstream `remote-info.rs` example.
+        if let Some(mut path_events) = handle.upgrade().map(|conn| conn.path_events()) {
+            tasks.spawn({
+                let map = map.clone();
+                let handle = handle.clone();
+                async move {
+                    while let Some(event) = path_events.next().await {
+                        let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
+                        let entry = inner.entry(remote_id.clone()).or_default();
+                        match event {
+                            PathEvent::Closed {
+                                remote_addr,
+                                last_stats,
+                                ..
+                            } => {
+                                entry
+                                    .aggregate
+                                    .update_from_path_stats(&remote_addr, &last_stats);
+                            }
+                            _ => {
+                                if let Some(conn) = handle.upgrade() {
+                                    for path in conn.paths().iter() {
+                                        let stats = path.stats();
+                                        entry
+                                            .aggregate
+                                            .update_from_path_stats(path.remote_addr(), &stats);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
     }
 
     /// Query information about a specific remote endpoint.
@@ -662,11 +715,11 @@ impl EndpointHooks for CoreHooksAdapter {
         }
     }
 
-    async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
+    async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         let info = CoreHookHandshakeInfo {
             remote_endpoint_id: conn.remote_id().to_string(),
             alpn: conn.alpn().to_vec(),
-            is_alive: conn.is_alive(),
+            is_alive: conn.close_reason().is_none(),
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -903,6 +956,27 @@ async fn build_node_endpoint(
     }
 }
 
+/// A node's default docs [`Author`] — its own identity key, so `AuthorId == NodeId`.
+///
+/// Aster uses the node's endpoint key as the docs author: a doc entry's author is
+/// exactly the node that wrote it, directly verifiable against the attestation
+/// chain and the QUIC handshake, with no separate author↔node binding to publish.
+///
+/// Consequence: on a persistent node this writes the node secret into the docs
+/// author store (`docs.redb`). Aster never surfaces author export (neither `core`
+/// nor any binding wraps iroh-docs `author_export`), so the secret cannot be
+/// extracted via the docs API; the only sanctioned way to obtain the node
+/// identity is [`CoreNode::export_secret_key`].
+fn node_docs_author(node_secret: &[u8; 32]) -> Author {
+    Author::from_bytes(node_secret)
+}
+
+/// The default-docs `AuthorId` (hex) for a node with this secret — equals the
+/// node id, since Aster uses the node identity key as the docs author.
+pub fn default_docs_author_id(node_secret: &[u8; 32]) -> String {
+    node_docs_author(node_secret).id().to_string()
+}
+
 impl CoreNode {
     pub async fn memory() -> Result<Self> {
         Self::memory_with_alpns(Vec::new(), None).await
@@ -923,7 +997,7 @@ impl CoreNode {
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         let mem_store = MemStore::new();
         let store: BlobStore = (*mem_store).clone();
-        Self::finalize(endpoint, store, aster_alpns, monitor, hook_receiver).await
+        Self::finalize(endpoint, store, None, aster_alpns, monitor, hook_receiver).await
     }
 
     pub async fn persistent(path: String) -> Result<Self> {
@@ -938,26 +1012,57 @@ impl CoreNode {
         endpoint_config: Option<CoreEndpointConfig>,
     ) -> Result<Self> {
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
-        let fs_store = FsStore::load(path).await?;
+        let root = std::path::PathBuf::from(&path);
+        let fs_store = FsStore::load(&root).await?;
         let store: BlobStore = fs_store.into();
-        Self::finalize(endpoint, store, aster_alpns, monitor, hook_receiver).await
+        Self::finalize(
+            endpoint,
+            store,
+            Some(root),
+            aster_alpns,
+            monitor,
+            hook_receiver,
+        )
+        .await
     }
 
     /// Shared tail of both constructors: wire blobs/docs/gossip protocols +
     /// one `AsterQueueHandler` per entry in `aster_alpns` onto a Router, then
     /// assemble `CoreNodeInner`.
+    ///
+    /// `docs_root` mirrors the store backing: `Some(path)` for a persistent
+    /// node uses `Docs::persistent(path)` so namespaces/authors/entries survive
+    /// restart (`docs.redb` + `default-author` live alongside the blob
+    /// `blobs.db` in the same directory); `None` for a memory node uses
+    /// `Docs::memory()`.
     async fn finalize(
         endpoint: Endpoint,
         store: BlobStore,
+        docs_root: Option<std::path::PathBuf>,
         aster_alpns: Vec<Vec<u8>>,
         monitor: Option<CoreMonitor>,
         hook_receiver: Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
     ) -> Result<Self> {
         let blobs = BlobsProtocol::new(&store, None);
         let gossip = Gossip::builder().spawn(endpoint.clone());
-        let docs = Docs::memory()
+        let docs_builder = match docs_root {
+            Some(path) => Docs::persistent(path),
+            None => Docs::memory(),
+        };
+        let docs = docs_builder
             .spawn(endpoint.clone(), store.clone(), gossip.clone())
             .await?;
+
+        // Default docs author = the node's own identity key, so `AuthorId == NodeId`
+        // — a doc entry's author is exactly the node that wrote it (free, direct
+        // attribution). Idempotent across restarts. See [`node_docs_author`] for
+        // the on-disk-secret consequence and why author export is not surfaced.
+        {
+            let author = node_docs_author(&endpoint.secret_key().to_bytes());
+            let author_id = author.id();
+            docs.api().author_import(author).await?;
+            docs.api().author_set_default(author_id).await?;
+        }
 
         let (aster_tx, aster_rx) = mpsc::channel::<(Vec<u8>, Connection)>(ASTER_QUEUE_CAPACITY);
 
@@ -1007,10 +1112,19 @@ impl CoreNode {
         format!("{:?}", self.inner.endpoint.addr())
     }
     pub async fn close(&self) {
+        // Flush blob-store metadata to disk while the store actor is still
+        // alive. `router.shutdown()` below shuts the store down (via
+        // `BlobsProtocol::shutdown()` -> `store.shutdown()`), so a `sync_db()`
+        // afterwards would race a dead actor and silently skip the flush. For a
+        // persistent FsStore this guarantees durability of tags/entries added
+        // before close; for a MemStore it is a harmless no-op.
+        if let Err(err) = self.inner.store.sync_db().await {
+            debug!("CoreNode::close: store.sync_db error: {err}");
+        }
         // router.shutdown() drains protocol handlers (so in-flight
         // AsterQueueHandler::accept futures resolve), drops handlers (closing
-        // the aster channel), then closes the endpoint. See iroh-0.97.0
-        // protocol.rs:490-495.
+        // the aster channel), stops the docs engine, shuts the blob store down,
+        // then closes the endpoint.
         if let Err(err) = self.inner.router.shutdown().await {
             debug!("CoreNode::close: router.shutdown join error: {err}");
         }
@@ -1047,6 +1161,18 @@ impl CoreNode {
         let addr = other.inner.endpoint.addr();
         let memory_lookup = MemoryLookup::new();
         memory_lookup.add_endpoint_info(addr);
+        self.inner.endpoint.address_lookup()?.add(memory_lookup);
+        Ok(())
+    }
+
+    /// Register address material for an arbitrary peer (id + relay + direct
+    /// addresses) in this node's address lookup, so subsequent connects and
+    /// docs joins addressed by node id can reach it without discovery. Unlike
+    /// [`Self::add_node_addr`], the peer need not be a local `CoreNode`.
+    pub fn add_node_addr_info(&self, addr: CoreNodeAddr) -> Result<()> {
+        let endpoint_addr = core_to_endpoint_addr(&addr)?;
+        let memory_lookup = MemoryLookup::new();
+        memory_lookup.add_endpoint_info(endpoint_addr);
         self.inner.endpoint.address_lookup()?.add(memory_lookup);
         Ok(())
     }
@@ -1378,6 +1504,11 @@ pub struct CoreConnection {
     /// wraps `Connection::open_bi`. SHARED-pool (None) and
     /// per-session (Some(sessionId)) streams both live here.
     pool: MultiplexedStreamPool,
+    /// Per-connection tunnel ticket registry. Ticket entries map to
+    /// `TunnelTarget`s and never cross the wire — see
+    /// `ffi_spec/Aster-tunneling.md`. Dropped with the connection,
+    /// which mass-revokes any unredeemed tickets.
+    tunnels: Arc<TunnelRegistry>,
 }
 
 impl CoreConnection {
@@ -1396,7 +1527,11 @@ impl CoreConnection {
             })
         });
         let pool = StreamPool::new(config, factory);
-        Self { inner, pool }
+        Self {
+            inner,
+            pool,
+            tunnels: Arc::new(TunnelRegistry::new(TunnelConfig::default())),
+        }
     }
 
     /// Borrow the per-connection multiplexed-stream pool. Callers can
@@ -1439,9 +1574,94 @@ impl CoreConnection {
         Ok((CoreSendStream::new(send), CoreRecvStream::new(recv)))
     }
 
+    /// Accept the next inbound bidi stream verbatim. **Does not** peek
+    /// for `FLAG_TUNNEL` — the caller gets whatever bytes the peer
+    /// wrote, in the protocol's native format. Use this for non-Aster
+    /// protocols (trust admission, etc.).
     pub async fn accept_bi(&self) -> Result<(CoreSendStream, CoreRecvStream)> {
         let (send, recv) = self.inner.accept_bi().await?;
         Ok((CoreSendStream::new(send), CoreRecvStream::new(recv)))
+    }
+
+    /// Accept the next inbound bidi stream that is **not** a tunnel
+    /// redeem, on a connection that speaks the Aster RPC framing
+    /// protocol. Tunnel-redeem streams (those whose first frame carries
+    /// `FLAG_TUNNEL`) are dispatched transparently to the per-connection
+    /// tunnel registry inside this method — the caller never sees them.
+    /// See `ffi_spec/Aster-tunneling.md` §6 ("Dispatch site").
+    ///
+    /// For non-tunnel streams the peeked first frame is re-prepended
+    /// onto the returned `CoreRecvStream`, so the caller observes a
+    /// normal length-prefixed stream starting from the StreamHeader.
+    ///
+    /// Only call this when you know the connection's ALPN means every
+    /// inbound stream's first frame uses Aster framing
+    /// (`[4B le len][1B flags][payload]`). For non-Aster ALPNs (trust
+    /// admission, custom protocols), use [`accept_bi`] instead.
+    pub async fn accept_aster_bi(&self) -> Result<(CoreSendStream, CoreRecvStream)> {
+        loop {
+            let (send, recv) = self.inner.accept_bi().await?;
+            let send = CoreSendStream::new(send);
+            let recv = CoreRecvStream::new(recv);
+
+            let (payload, flags) = match recv.read_one_frame().await {
+                Ok(f) => f,
+                Err(e) => {
+                    debug!("accept_aster_bi: first-frame read error, dropping stream: {e}");
+                    continue;
+                }
+            };
+
+            if flags & FLAG_TUNNEL != 0 {
+                let registry = self.tunnels.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::tunnel::handle_tunnel_redeem(send, recv, payload, registry).await
+                    {
+                        debug!("tunnel redeem error: {e}");
+                    }
+                });
+                continue;
+            }
+
+            // Non-tunnel: re-encode the frame and prepend so the caller
+            // reads it as the first frame of a normal RPC stream.
+            let frame = encode_frame(&payload, flags)?;
+            recv.prepend(frame).await;
+            return Ok((send, recv));
+        }
+    }
+
+    /// Mint a tunnel capability covering one or more targets. Called by
+    /// an RPC handler that has already validated the peer's request —
+    /// `core` performs no policy checks. `targets` is an ordered
+    /// preference list; at redeem the acceptor tries each in order and
+    /// splices the first one that connects. The returned 32 bytes go
+    /// into the RPC response; the peer redeems with [`open_tunnel`].
+    /// See `ffi_spec/Aster-tunneling.md`.
+    pub fn authorize_tunnel(
+        &self,
+        targets: Vec<TunnelTarget>,
+        ttl: Duration,
+    ) -> Result<TunnelTicket, AuthorizeTunnelError> {
+        self.tunnels.authorize(targets, ttl)
+    }
+
+    /// Open a tunnel by redeeming a ticket received from the peer.
+    /// Sends the `[FLAG_TUNNEL][ticket]` handshake frame internally,
+    /// then returns the bidi stream pair. Bytes after the handshake
+    /// are raw — the caller speaks the backend protocol directly
+    /// (e.g. RFB for VNC).
+    pub async fn open_tunnel(
+        &self,
+        ticket: TunnelTicket,
+    ) -> Result<(CoreSendStream, CoreRecvStream)> {
+        let (send, recv) = self.inner.open_bi().await?;
+        let send = CoreSendStream::new(send);
+        let recv = CoreRecvStream::new(recv);
+        let frame = encode_frame(ticket.as_bytes(), FLAG_TUNNEL)?;
+        send.write_all(frame).await?;
+        Ok((send, recv))
     }
 
     pub async fn open_uni(&self) -> Result<CoreSendStream> {
@@ -1501,10 +1721,37 @@ impl CoreConnection {
     // Phase 1b: Connection Info
     // ============================================================================
 
+    /// Snapshot of the currently selected network path. Cheap; safe to
+    /// call once per RPC dispatch. Returns all-`None` fields if the
+    /// connection has been dropped or no path is selected yet.
+    pub fn transport_snapshot(&self) -> CoreTransportSnapshot {
+        let paths = self.inner.paths();
+        let Some(path) = paths.iter().find(|p| p.is_selected()) else {
+            return CoreTransportSnapshot::default();
+        };
+        let (peer_addr, relay_url) = match path.remote_addr() {
+            TransportAddr::Ip(socket) => (Some(*socket), None),
+            TransportAddr::Relay(url) => (None, Some(url.to_string())),
+            // Custom or future transports: surface RTT but no addr/url.
+            _ => (None, None),
+        };
+        let rtt = path.rtt();
+        let rtt_micros = if rtt == Duration::ZERO {
+            None
+        } else {
+            Some(rtt.as_micros().min(u64::MAX as u128) as u64)
+        };
+        CoreTransportSnapshot {
+            peer_addr,
+            relay_url,
+            rtt_micros,
+        }
+    }
+
     pub fn connection_info(&self) -> CoreConnectionInfo {
-        let info = self.inner.to_info();
-        let stats = info.stats();
-        let selected_path = info.selected_path();
+        let stats = self.inner.stats();
+        let paths = self.inner.paths();
+        let selected_path = paths.iter().find(|p| p.is_selected());
 
         let connection_type = match selected_path.as_ref() {
             Some(path) if path.is_relay() => ConnectionTypeDetail::UdpRelay,
@@ -1513,15 +1760,18 @@ impl CoreConnection {
             None => ConnectionTypeDetail::Other("unknown".to_string()),
         };
 
+        let rtt_ns = selected_path.as_ref().and_then(|p| {
+            let rtt = p.rtt();
+            (rtt != Duration::ZERO).then(|| rtt.as_nanos().min(u64::MAX as u128) as u64)
+        });
+
         CoreConnectionInfo {
             connection_type,
-            bytes_sent: stats.as_ref().map(|s| s.udp_tx.bytes).unwrap_or(0),
-            bytes_received: stats.as_ref().map(|s| s.udp_rx.bytes).unwrap_or(0),
-            rtt_ns: selected_path
-                .and_then(|p| p.rtt())
-                .map(|d| d.as_nanos().min(u64::MAX as u128) as u64),
-            alpn: info.alpn().to_vec(),
-            is_connected: info.is_alive(),
+            bytes_sent: stats.udp_tx.bytes,
+            bytes_received: stats.udp_rx.bytes,
+            rtt_ns,
+            alpn: self.inner.alpn().to_vec(),
+            is_connected: self.inner.close_reason().is_none(),
         }
     }
 
@@ -1533,30 +1783,30 @@ impl CoreConnection {
     /// Returns 0.0 if no path is selected or RTT is not yet measured.
     pub fn rtt_ms(&self) -> f64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.rtt())
-            .map(|d| d.as_secs_f64() * 1000.0)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.rtt().as_secs_f64() * 1000.0)
             .unwrap_or(0.0)
     }
 
     /// Total bytes sent on the selected path (UDP layer).
     pub fn bytes_sent(&self) -> u64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.udp_tx.bytes)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().udp_tx.bytes)
             .unwrap_or(0)
     }
 
     /// Total bytes received on the selected path (UDP layer).
     pub fn bytes_recv(&self) -> u64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.udp_rx.bytes)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().udp_rx.bytes)
             .unwrap_or(0)
     }
 
@@ -1564,40 +1814,40 @@ impl CoreConnection {
     /// Returns 0 if not available.
     pub fn congestion_window(&self) -> u64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.cwnd)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().cwnd)
             .unwrap_or(0)
     }
 
     /// Number of lost packets on the selected path.
     pub fn lost_packets(&self) -> u64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.lost_packets)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().lost_packets)
             .unwrap_or(0)
     }
 
     /// Number of congestion events on the selected path.
     pub fn congestion_events(&self) -> u64 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.congestion_events)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().congestion_events)
             .unwrap_or(0)
     }
 
     /// Current path MTU in bytes.
     pub fn current_mtu(&self) -> u16 {
         self.inner
-            .to_info()
-            .selected_path()
-            .and_then(|p| p.stats())
-            .map(|s| s.current_mtu)
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats().current_mtu)
             .unwrap_or(0)
     }
 
@@ -1862,27 +2112,67 @@ impl CoreSendStream {
 // CoreRecvStream - QUIC recv stream
 // ============================================================================
 
+struct RecvInner {
+    stream: iroh::endpoint::RecvStream,
+    /// Bytes peeked off the wire ahead of the caller — populated by
+    /// [`CoreConnection::accept_bi`] when it consumes the first frame
+    /// for `FLAG_TUNNEL` dispatch and the stream turns out to be a
+    /// regular RPC stream. Reads drain this buffer before going to
+    /// QUIC so the caller sees an unmodified length-prefixed stream.
+    front: Vec<u8>,
+}
+
+impl RecvInner {
+    fn drain_front(&mut self, buf: &mut [u8]) -> usize {
+        if self.front.is_empty() || buf.is_empty() {
+            return 0;
+        }
+        let take = self.front.len().min(buf.len());
+        buf[..take].copy_from_slice(&self.front[..take]);
+        self.front.drain(..take);
+        take
+    }
+}
+
 #[derive(Clone)]
 pub struct CoreRecvStream {
-    inner: Arc<Mutex<iroh::endpoint::RecvStream>>,
+    inner: Arc<Mutex<RecvInner>>,
 }
 
 impl CoreRecvStream {
     fn new(stream: iroh::endpoint::RecvStream) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(stream)),
+            inner: Arc::new(Mutex::new(RecvInner {
+                stream,
+                front: Vec::new(),
+            })),
         }
+    }
+
+    /// Stash `bytes` at the front of the stream so the next read(s) drain
+    /// them before going to the wire. Used by `CoreConnection::accept_bi`
+    /// to put back the first frame after peeking it for `FLAG_TUNNEL`.
+    /// Caller must ensure the stream has not been read from yet — this
+    /// is enforced in debug builds.
+    pub(crate) async fn prepend(&self, bytes: Vec<u8>) {
+        let mut s = self.inner.lock().await;
+        debug_assert!(s.front.is_empty(), "CoreRecvStream::prepend called twice");
+        s.front = bytes;
     }
 
     pub async fn read(&self, max_len: usize) -> Result<Option<Vec<u8>>> {
         let mut s = self.inner.lock().await;
-        Ok(s.read_chunk(max_len).await?.map(|c| c.bytes.to_vec()))
+        if !s.front.is_empty() {
+            let take = s.front.len().min(max_len);
+            let chunk: Vec<u8> = s.front.drain(..take).collect();
+            return Ok(Some(chunk));
+        }
+        Ok(s.stream.read_chunk(max_len).await?.map(|b| b.to_vec()))
     }
 
     pub async fn read_exact(&self, n: usize) -> Result<Vec<u8>> {
-        let mut s = self.inner.lock().await;
         let mut buf = vec![0u8; n];
-        s.read_exact(&mut buf).await?;
+        self.read_exact_into(&mut buf).await?;
         Ok(buf)
     }
 
@@ -1894,9 +2184,9 @@ impl CoreRecvStream {
     /// ready to receive data.
     pub async fn read_exact_into(&self, buf: &mut [u8]) -> Result<()> {
         let mut s = self.inner.lock().await;
-        let mut filled = 0;
+        let mut filled = s.drain_front(buf);
         while filled < buf.len() {
-            match s.read_into(&mut buf[filled..]).await? {
+            match s.stream.read_into(&mut buf[filled..]).await? {
                 Some(0) | None => {
                     return Err(anyhow!(
                         "stream ended with {} bytes remaining",
@@ -1911,7 +2201,40 @@ impl CoreRecvStream {
 
     pub async fn read_to_end(&self, max_size: usize) -> Result<Vec<u8>> {
         let mut s = self.inner.lock().await;
-        Ok(s.read_to_end(max_size).await?.to_vec())
+        let mut out = std::mem::take(&mut s.front);
+        if out.len() > max_size {
+            return Err(anyhow!(
+                "prepended buffer ({} bytes) exceeds max_size ({})",
+                out.len(),
+                max_size
+            ));
+        }
+        let remaining = max_size - out.len();
+        let tail = s.stream.read_to_end(remaining).await?;
+        out.extend_from_slice(&tail);
+        Ok(out)
+    }
+
+    /// Read one length-prefixed frame: `[4B LE len][1B flags][payload]`.
+    /// Used by `CoreConnection::accept_bi` for the `FLAG_TUNNEL` peek and
+    /// by the reactor's per-stream frame reader.
+    pub(crate) async fn read_one_frame(&self) -> Result<(Vec<u8>, u8)> {
+        let mut len_bytes = [0u8; 4];
+        self.read_exact_into(&mut len_bytes).await?;
+        let frame_body_len = u32::from_le_bytes(len_bytes) as usize;
+        if frame_body_len == 0 {
+            return Err(anyhow!("zero-length frame"));
+        }
+        if frame_body_len > crate::framing::MAX_FRAME_SIZE as usize {
+            return Err(anyhow!("frame too large: {}", frame_body_len));
+        }
+        let mut flags_buf = [0u8; 1];
+        self.read_exact_into(&mut flags_buf).await?;
+        let flags = flags_buf[0];
+        let payload_len = frame_body_len - 1;
+        let mut payload = vec![0u8; payload_len];
+        self.read_exact_into(&mut payload).await?;
+        Ok((payload, flags))
     }
 
     pub fn stop(&self, code: u64) -> Result<()> {
@@ -1919,7 +2242,7 @@ impl CoreRecvStream {
             .inner
             .try_lock()
             .map_err(|_| anyhow!("recv stream is busy"))?;
-        s.stop(u64_to_varint(code)?)?;
+        s.stream.stop(u64_to_varint(code)?)?;
         Ok(())
     }
 }
@@ -1978,6 +2301,39 @@ impl CoreBlobsClient {
         Ok(self.store.add_slice(&data).await?.hash.to_string())
     }
 
+    /// Import a file from `path` into the blob store and return its hash (hex).
+    ///
+    /// Uses `ImportMode::Copy` (the reflink-or-copy import path, never
+    /// `TryReference`), so the imported data is owned by the store and cannot be
+    /// corrupted by later edits to the source file. Like [`Self::add_bytes`], an
+    /// auto-created tag keeps the blob alive; callers that need a deterministic,
+    /// GC-controllable tag should use [`Self::add_path_with_named_tag`].
+    pub async fn add_path(&self, path: String) -> Result<String> {
+        let tag = self
+            .store
+            .blobs()
+            .add_path(std::path::PathBuf::from(path))
+            .await?;
+        Ok(tag.hash.to_string())
+    }
+
+    /// Import a file from `path` and set a persistent named tag in one step,
+    /// returning the blob hash (hex).
+    ///
+    /// Same `ImportMode::Copy` import as [`Self::add_path`], but the blob is
+    /// protected by the caller-chosen `tag_name` instead of an anonymous
+    /// auto-tag. portal-sync keys the tag name by `(tree_id, blob_hash)` so it
+    /// can GC blobs deterministically by deleting the tag.
+    pub async fn add_path_with_named_tag(&self, path: String, tag_name: String) -> Result<String> {
+        let haf = self
+            .store
+            .blobs()
+            .add_path(std::path::PathBuf::from(path))
+            .with_named_tag(tag_name.as_bytes())
+            .await?;
+        Ok(haf.hash.to_string())
+    }
+
     pub async fn read_to_bytes(&self, hash_hex: String) -> Result<Vec<u8>> {
         Ok(self
             .store
@@ -1986,13 +2342,23 @@ impl CoreBlobsClient {
             .to_vec())
     }
 
+    pub async fn read_range(&self, hash_hex: String, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let end = offset.saturating_add(len);
+        Ok(self
+            .store
+            .blobs()
+            .export_ranges(hash_hex.parse::<Hash>()?, offset..end)
+            .concatenate()
+            .await?)
+    }
+
     pub fn create_ticket(&self, hash_hex: String) -> Result<String> {
         Ok(BlobTicket::new(
             self.endpoint.addr(),
             hash_hex.parse::<Hash>()?,
             BlobFormat::Raw,
         )
-        .serialize())
+        .encode_string())
     }
 
     /// Store bytes as a single-file Collection (HashSeq), compatible with sendme.
@@ -2226,11 +2592,11 @@ impl CoreBlobsClient {
             hash_hex.parse::<Hash>()?,
             BlobFormat::HashSeq,
         )
-        .serialize())
+        .encode_string())
     }
 
     pub async fn download_blob(&self, ticket_str: String) -> Result<Vec<u8>> {
-        let ticket = BlobTicket::deserialize(&ticket_str)?;
+        let ticket = BlobTicket::decode_string(&ticket_str)?;
         let hash = ticket.hash();
         let format = ticket.format();
         let (addr, _, _) = ticket.into_parts();
@@ -2294,6 +2660,38 @@ impl CoreBlobsClient {
         }
     }
 
+    /// Download a blob by hash from a specific node **into the local store
+    /// without reading it back into memory**. Use this when the caller only
+    /// needs the blob resident locally (e.g. to serve it later via ranged
+    /// reads) and would otherwise discard the returned bytes: unlike
+    /// [`Self::download_hash`], this skips the trailing
+    /// `store.get_bytes(hash).to_vec()` round-trip, which materializes the
+    /// whole blob twice in memory (the `Bytes` plus its `Vec` clone) — a ~2×
+    /// transient RSS spike on large blobs. The `Downloader` streams the blob
+    /// to the on-disk store, so this returns only once the blob is resident.
+    pub async fn download_hash_to_store(
+        &self,
+        hash_hex: String,
+        node_id_hex: String,
+        format: String,
+    ) -> Result<()> {
+        let hash: Hash = hash_hex.parse()?;
+        let node_id: EndpointId = node_id_hex.parse()?;
+        let blob_format = if format == "hash_seq" {
+            BlobFormat::HashSeq
+        } else {
+            BlobFormat::Raw
+        };
+        let haf = HashAndFormat {
+            hash,
+            format: blob_format,
+        };
+        Downloader::new(&self.store, &self.endpoint)
+            .download(haf, vec![node_id])
+            .await?;
+        Ok(())
+    }
+
     /// Download a collection by hash from a specific node, returning (name, data) pairs.
     pub async fn download_collection_hash(
         &self,
@@ -2321,7 +2719,7 @@ impl CoreBlobsClient {
 
     /// Download a collection and return list of (name, data) pairs.
     pub async fn download_collection(&self, ticket_str: String) -> Result<Vec<(String, Vec<u8>)>> {
-        let ticket = BlobTicket::deserialize(&ticket_str)?;
+        let ticket = BlobTicket::decode_string(&ticket_str)?;
         let hash = ticket.hash();
         let (addr, _, _) = ticket.into_parts();
         if let Ok(lookup) = self.endpoint.address_lookup() {
@@ -2366,8 +2764,103 @@ impl CoreDocsClient {
         Ok(self.inner.api().author_create().await?.to_string())
     }
 
+    /// Return the node-wide default author (hex). On a persistent node this
+    /// author is created on first start and its key is saved in the data
+    /// directory, so it is stable across restarts — the recommended "current
+    /// node author" for callers that don't manage their own authors.
+    pub async fn default_author(&self) -> Result<String> {
+        Ok(self.inner.api().author_default().await?.to_string())
+    }
+
+    /// Open-or-import a **writable** namespace from a deterministic 32-byte
+    /// secret (e.g. a BLAKE3 seed). The namespace id is derived from the secret
+    /// (`doc.id() == NamespaceSecret::id()`), so the same secret resolves to the
+    /// same namespace across peers and restarts.
+    ///
+    /// Idempotent and capability-upgrading: if the namespace is absent it is
+    /// imported with write capability; if it is already present **read-only**
+    /// (a prior [`Self::import_read_namespace`]) the stored capability is
+    /// upgraded to write and a writable [`CoreDoc`] is returned; if already
+    /// writable it simply reattaches. Backed by iroh-docs `import_namespace`,
+    /// which merges capabilities in-place.
+    pub async fn import_write_namespace(&self, secret_bytes: Vec<u8>) -> Result<CoreDoc> {
+        if secret_bytes.len() != 32 {
+            return Err(anyhow!("namespace secret must be 32 bytes"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&secret_bytes);
+        let capability = Capability::Write(NamespaceSecret::from_bytes(&arr));
+        Ok(CoreDoc {
+            doc: self.inner.api().import_namespace(capability).await?,
+            store: self.store.clone(),
+        })
+    }
+
+    /// Open-or-import a **read-only** namespace from its public 32-byte id.
+    /// Idempotent; never downgrades an existing write capability to read.
+    pub async fn import_read_namespace(&self, namespace_id_bytes: Vec<u8>) -> Result<CoreDoc> {
+        if namespace_id_bytes.len() != 32 {
+            return Err(anyhow!("namespace id must be 32 bytes"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&namespace_id_bytes);
+        let capability = Capability::Read(NamespaceId::from(arr));
+        Ok(CoreDoc {
+            doc: self.inner.api().import_namespace(capability).await?,
+            store: self.store.clone(),
+        })
+    }
+
+    /// Open an existing local namespace by its ID (hex), without a ticket or a
+    /// peer to sync from. Returns `None` if the namespace is not present in the
+    /// local replica store.
+    ///
+    /// This is the access path for a persistent node after restart: the
+    /// namespace/authors/entries written before [`CoreNode::close`] are reloaded
+    /// from `docs.redb`, and `open` hands back a usable [`CoreDoc`].
+    pub async fn open(&self, namespace_id_hex: String) -> Result<Option<CoreDoc>> {
+        let ns_bytes = hex::decode(&namespace_id_hex)?;
+        if ns_bytes.len() != 32 {
+            return Err(anyhow!("namespace_id must be 32 bytes (64 hex chars)"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&ns_bytes);
+        let ns_id = NamespaceId::from(arr);
+        // Upstream `DocsApi::open` propagates a "Replica not found" error for an
+        // unknown namespace instead of returning `Ok(None)` (its `Option` is
+        // vestigial — it only ever yields `Some`). To honour our documented
+        // `None`-on-missing contract, an error is reconciled against `list()`:
+        // a genuinely absent namespace maps to `Ok(None)`, any other failure is
+        // re-raised. The happy path stays a single `open()` call (no scan).
+        match self.inner.api().open(ns_id).await {
+            Ok(opt) => Ok(opt.map(|doc| CoreDoc {
+                doc,
+                store: self.store.clone(),
+            })),
+            Err(err) => {
+                if self.namespace_exists(ns_id).await? {
+                    Err(err)
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Whether `ns_id` is present in the local replica store. Used to
+    /// disambiguate a "not found" open from a real error (see [`Self::open`]).
+    async fn namespace_exists(&self, ns_id: NamespaceId) -> Result<bool> {
+        let mut stream = self.inner.api().list().await?;
+        while let Some(item) = stream.next().await {
+            if item?.0 == ns_id {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub async fn join(&self, ticket_str: String) -> Result<CoreDoc> {
-        let ticket = DocTicket::deserialize(&ticket_str)?;
+        let ticket = DocTicket::decode_string(&ticket_str)?;
         if let Ok(lookup) = self.endpoint.address_lookup() {
             for node_addr in &ticket.nodes {
                 let mem = MemoryLookup::new();
@@ -2387,7 +2880,7 @@ impl CoreDocsClient {
         &self,
         ticket_str: String,
     ) -> Result<(CoreDoc, CoreDocEventReceiver)> {
-        let ticket = DocTicket::deserialize(&ticket_str)?;
+        let ticket = DocTicket::decode_string(&ticket_str)?;
         if let Ok(lookup) = self.endpoint.address_lookup() {
             for node_addr in &ticket.nodes {
                 let mem = MemoryLookup::new();
@@ -2496,8 +2989,23 @@ impl CoreDoc {
 
     /// Query all entries for an exact key, across all authors.
     /// Returns a list of CoreDocEntry with metadata (author, content hash, timestamp, etc.)
-    pub async fn query_key_exact(&self, key: Vec<u8>) -> Result<Vec<CoreDocEntry>> {
-        let query = Query::key_exact(key).limit(QUERY_ENTRY_LIMIT).build();
+    ///
+    /// iroh-docs stores one entry per (author, key) and orders the result by author id
+    /// (ascending), NOT by timestamp — so a `limit` truncates by author id, which can
+    /// exclude the most-recent writer. Use this only when you genuinely need every
+    /// author's entry (e.g. to apply a trust filter before picking a winner); pass
+    /// `None` for an unbounded read. To read the single latest value of a key, use
+    /// [`CoreDoc::query_latest_exact`] instead.
+    pub async fn query_key_exact(
+        &self,
+        key: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>> {
+        let mut builder = Query::key_exact(key);
+        if let Some(limit) = limit {
+            builder = builder.limit(limit);
+        }
+        let query = builder.build();
         let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
         let mut results = Vec::new();
         while let Some(entry) = entries_stream.next().await {
@@ -2513,10 +3021,86 @@ impl CoreDoc {
         Ok(results)
     }
 
+    /// Read the single latest entry for an exact key, across all authors.
+    ///
+    /// Asks the store to collapse the per-author entries to the one with the highest
+    /// timestamp (iroh-docs' `single_latest_per_key`), so the result is independent of
+    /// how many authors have written the key — the most-recent writer always wins.
+    /// Returns `None` if the key was never written, or if the latest write was a
+    /// deletion (tombstone). This is the correct primitive for reading the current
+    /// value of a key; [`CoreDoc::query_key_exact`] is for enumerating all authors.
+    pub async fn query_latest_exact(&self, key: Vec<u8>) -> Result<Option<CoreDocEntry>> {
+        let query = Query::single_latest_per_key().key_exact(key).build();
+        let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
+        match entries_stream.next().await {
+            Some(entry) => {
+                let entry = entry?;
+                Ok(Some(CoreDocEntry {
+                    author_id: entry.author().to_string(),
+                    key: entry.key().to_vec(),
+                    content_hash: entry.content_hash().to_hex().to_string(),
+                    content_len: entry.content_len(),
+                    timestamp: entry.timestamp(),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Query all entries matching a key prefix, across all authors.
     /// Returns a list of CoreDocEntry with metadata (author, content hash, timestamp, etc.)
-    pub async fn query_key_prefix(&self, prefix: Vec<u8>) -> Result<Vec<CoreDocEntry>> {
-        let query = Query::key_prefix(prefix).limit(QUERY_ENTRY_LIMIT).build();
+    ///
+    /// A prefix query is a listing: every matching key is distinct, so there is no
+    /// natural small bound. `limit` is the caller's responsibility — pass `Some(n)` to
+    /// cap the result set (e.g. for pagination), or `None` for an unbounded listing.
+    pub async fn query_key_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>> {
+        let mut builder = Query::key_prefix(prefix);
+        if let Some(limit) = limit {
+            builder = builder.limit(limit);
+        }
+        let query = builder.build();
+        let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
+        let mut results = Vec::new();
+        while let Some(entry) = entries_stream.next().await {
+            let entry = entry?;
+            results.push(CoreDocEntry {
+                author_id: entry.author().to_string(),
+                key: entry.key().to_vec(),
+                content_hash: entry.content_hash().to_hex().to_string(),
+                content_len: entry.content_len(),
+                timestamp: entry.timestamp(),
+            });
+        }
+        Ok(results)
+    }
+
+    /// List the latest entry for each distinct key under a prefix, across all authors.
+    ///
+    /// This is the listing counterpart to [`CoreDoc::query_latest_exact`]: where
+    /// [`query_key_prefix`](CoreDoc::query_key_prefix) returns one row per (author, key)
+    /// — so a key written by N authors appears N times — this collapses each key to its
+    /// single highest-timestamp entry (iroh-docs' `single_latest_per_key`). Keys whose
+    /// latest write was a deletion are omitted. Use it for directory-style listings,
+    /// where duplicate keys would be a bug. `limit` caps the number of distinct keys
+    /// returned; pass `None` for an unbounded listing.
+    ///
+    /// Note: this collapses by document timestamp. Do NOT use it where freshness is
+    /// tracked by an in-payload sequence number (e.g. endpoint leases); enumerate with
+    /// [`query_key_prefix`](CoreDoc::query_key_prefix) and dedupe on that field instead.
+    pub async fn query_latest_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>> {
+        let mut builder = Query::single_latest_per_key().key_prefix(prefix);
+        if let Some(limit) = limit {
+            builder = builder.limit(limit);
+        }
+        let query = builder.build();
         let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
         let mut results = Vec::new();
         while let Some(entry) = entries_stream.next().await {
@@ -2559,7 +3143,7 @@ impl CoreDoc {
             .doc
             .share(share_mode, AddrInfoOptions::Id)
             .await?
-            .serialize())
+            .encode_string())
     }
 
     /// Start syncing this document with the given peers (by endpoint ID hex string).
@@ -2615,7 +3199,7 @@ impl CoreDoc {
             .doc
             .share(share_mode, AddrInfoOptions::RelayAndAddresses)
             .await?
-            .serialize())
+            .encode_string())
     }
 }
 

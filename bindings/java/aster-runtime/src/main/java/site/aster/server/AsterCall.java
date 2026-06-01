@@ -20,6 +20,9 @@ package site.aster.server;
  * @param request de-framed request payload (contains the serialized RPC request)
  * @param requestFlags the flags byte from the request frame
  * @param peerId hex-encoded node ID of the remote peer
+ * @param connectionHandle borrowed {@code iroh_connection_t} handle for the QUIC connection this
+ *     call arrived on. Stable for the connection's lifetime; reactor frees it on {@code
+ *     ConnectionClosed}. Bindings MUST NOT close it themselves.
  */
 public record AsterCall(
     long callId,
@@ -29,4 +32,5 @@ public record AsterCall(
     byte headerFlags,
     byte[] request,
     byte requestFlags,
-    String peerId) {}
+    String peerId,
+    long connectionHandle) {}

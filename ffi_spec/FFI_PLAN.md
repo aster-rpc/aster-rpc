@@ -18,6 +18,7 @@
 5d. [Phase 1d: Endpoint Builder Gaps](#3d-phase-1d-endpoint-builder-gaps)
 5f. [Phase 1f: Cross-Language Contract Identity, Framing & Signing](#3f-phase-1f-cross-language-contract-identity-framing--signing)
 5g. [Phase 1g: Per-Connection Metrics & Prometheus Export](#phase-1g-per-connection-metrics--prometheus-export--done)
+5j. [Phase 1j: CallContext Transport Snapshot](#phase-1j-callcontext-transport-snapshot--done)
 6. [Phase 2: Python Bindings Update](#4-phase-2-python-bindings-update)
 7. [Phase 3: Java FFM Bindings](#5-phase-3-java-ffm-bindings)
 8. [C ABI Reference](#6-c-abi-reference)
@@ -207,6 +208,66 @@ impl CoreNode {
 #### 3.1.6 Add datagram support to core (already exists, verify completeness)
 
 Verify `send_datagram` and `read_datagram` work correctly end-to-end.
+
+#### 3.1.7 Portal-sync persistence surfaces (path import, persistent docs, clean shutdown)
+
+Added so consumers (e.g. portal-sync) can build on Aster's persistence without
+reaching into the underlying `iroh-blobs` / `iroh-docs` store handles.
+
+```rust
+impl CoreBlobsClient {
+    /// Import a file into the blob store and return its hash (hex).
+    /// Uses ImportMode::Copy (the reflink-or-copy import path, never
+    /// TryReference), so the store owns the data. Like add_bytes, an auto-tag
+    /// keeps the blob alive.
+    pub async fn add_path(&self, path: String) -> Result<String>;
+
+    /// Import a file and set a persistent named tag in one step, returning the
+    /// hash (hex). The blob is protected by the caller-chosen tag_name rather
+    /// than an anonymous auto-tag, so it can be GC'd deterministically by
+    /// deleting the tag. portal-sync keys tag names by (tree_id, blob_hash).
+    pub async fn add_path_with_named_tag(&self, path: String, tag_name: String) -> Result<String>;
+}
+
+impl CoreDocsClient {
+    /// Open an existing local namespace by ID (hex), without a ticket or peer.
+    /// Returns None if absent. This is the access path for a persistent node
+    /// after restart: namespaces/authors/entries written before close() are
+    /// reloaded from docs.redb.
+    pub async fn open(&self, namespace_id_hex: String) -> Result<Option<CoreDoc>>;
+}
+```
+
+**Persistent docs.** `CoreNode::persistent` / `persistent_with_alpns` now back
+the docs protocol with `Docs::persistent(path)` (was `Docs::memory()`), so
+namespaces/authors/entries survive restart. `docs.redb` + `default-author` live
+alongside the blob store's `blobs.db` in the same node directory. Memory nodes
+(`CoreNode::memory*`) keep using `Docs::memory()`.
+
+**Clean shutdown.** `CoreNode::close()` now flushes the blob store with
+`store.sync_db()` **before** `router.shutdown()`. The router shuts the store
+actor down (via `BlobsProtocol::shutdown()`), so the flush must precede it or it
+races a dead actor. This makes tags/entries added before close durable for an
+FsStore; it is a harmless no-op for a MemStore. All bindings inherit this
+automatically since their node-close routes to `CoreNode::close()`.
+
+**FFI C ABI functions:** `iroh_blobs_add_path` and
+`iroh_blobs_add_path_with_named_tag` (see §3.2.5). Persistent docs and the
+shutdown flush need no new C surface — they ride the existing
+`iroh_node_persistent` / `iroh_node_close` entry points.
+
+**Language binding requirements:**
+- All bindings expose `add_path` / `add_path_with_named_tag` on their blobs client.
+- The Java binding also gains `tagSet(name, hash, format)` (the C `iroh_tags_set`
+  already existed; only the FFM declaration was missing) to complete deterministic
+  tag parity with Python/TS.
+
+#### 3.1.8 Note on event payload reads (binding implementers)
+
+`IROH_EVENT_BLOB_ADDED` (and other `emit_with_data` events) carry their payload
+in a **native** buffer. Bindings must copy it out via a native-segment read
+(e.g. Java `event.data().asSlice(0, event.dataLen()).toArray(JAVA_BYTE)`), not
+via a heap-array view like `ByteBuffer.array()`, which throws on a direct buffer.
 
 ### 3.2 `aster_transport_ffi` Complete Rewrite
 
@@ -610,6 +671,28 @@ iroh_status_t iroh_blobs_download(
     uint64_t user_data,
     iroh_operation_t* out_operation
 );
+// Import a file from disk (ImportMode::Copy — reflink-or-copy, never
+// TryReference). Emits IROH_EVENT_BLOB_ADDED with the blob hash hex in the
+// payload. Like iroh_blobs_add_bytes, an auto-tag keeps the blob alive.
+iroh_status_t iroh_blobs_add_path(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* path_ptr, size_t path_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
+// Import a file from disk AND set a persistent named tag in one step. The
+// caller-chosen tag (portal-sync keys it by (tree_id, blob_hash)) protects the
+// blob from GC instead of an anonymous auto-tag. Emits IROH_EVENT_BLOB_ADDED
+// with the blob hash hex in the payload.
+iroh_status_t iroh_blobs_add_path_with_named_tag(
+    iroh_runtime_t runtime,
+    uint64_t node,
+    const uint8_t* path_ptr, size_t path_len,
+    const uint8_t* tag_name_ptr, size_t tag_name_len,
+    uint64_t user_data,
+    iroh_operation_t* out_operation
+);
 
 // ─── Blobs: Collection / sendme-compatible ───
 // Store bytes wrapped in a Collection (HashSeq format), compatible with sendme CLI.
@@ -674,6 +757,7 @@ iroh_status_t iroh_doc_query(
     uint64_t doc,
     uint32_t mode,  // 0=key_exact, 1=key_prefix
     const uint8_t* key_ptr, size_t key_len,
+    uint64_t limit,  // caps prefix-query results; 0=unbounded. Ignored for key_exact.
     uint64_t user_data,
     iroh_operation_t* out_operation
 );  // Returns DOC_QUERY event with packed entries in payload, entry count in flags
@@ -1765,11 +1849,39 @@ pub struct CoreDocEntry {
 }
 
 impl CoreDoc {
-    /// Query all entries for an exact key, across all authors.
-    pub async fn query_key_exact(&self, key: Vec<u8>) -> Result<Vec<CoreDocEntry>>;
+    /// Query all entries for an exact key, across all authors. Ordered by author id, NOT
+    /// timestamp, so `limit` truncates by author and may drop the latest writer — use it
+    /// only to enumerate authors (e.g. before a trust filter); `None` reads them all.
+    pub async fn query_key_exact(
+        &self,
+        key: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>>;
 
-    /// Query all entries matching a key prefix, across all authors.
-    pub async fn query_key_prefix(&self, prefix: Vec<u8>) -> Result<Vec<CoreDocEntry>>;
+    /// Read the single latest entry for an exact key (highest timestamp across authors),
+    /// or `None` if never written or the latest write was a deletion. Independent of
+    /// author count — the canonical "current value of a key" read.
+    pub async fn query_latest_exact(&self, key: Vec<u8>) -> Result<Option<CoreDocEntry>>;
+
+    /// Query all entries matching a key prefix, across all authors — one row per
+    /// (author, key). A prefix query is a listing (every key is distinct), so the cap is
+    /// the caller's: `Some(n)` to bound the result set, `None` for an unbounded listing.
+    pub async fn query_key_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>>;
+
+    /// List the latest entry for each distinct key under a prefix (collapsing multi-author
+    /// keys to their highest-timestamp entry, omitting deletions). The deduped counterpart
+    /// to `query_key_prefix`, for directory-style listings. Do NOT use where freshness is
+    /// tracked by an in-payload sequence number (e.g. leases) — enumerate and dedupe on
+    /// that field instead. `limit` caps the number of distinct keys.
+    pub async fn query_latest_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: Option<u64>,
+    ) -> Result<Vec<CoreDocEntry>>;
 
     /// Read the content bytes for a given content hash (from a CoreDocEntry).
     pub async fn read_entry_content(&self, content_hash_hex: String) -> Result<Vec<u8>>;
@@ -1780,17 +1892,20 @@ impl CoreDoc {
 
 ```c
 typedef enum iroh_doc_query_mode_e {
-    IROH_DOC_QUERY_KEY_EXACT = 0,
-    IROH_DOC_QUERY_KEY_PREFIX = 1,
+    IROH_DOC_QUERY_KEY_EXACT = 0,      // all authors' entries for the key
+    IROH_DOC_QUERY_KEY_PREFIX = 1,     // all (author, key) rows under the prefix
+    IROH_DOC_QUERY_LATEST_EXACT = 2,   // 0 or 1 entries: latest writer of the key
+    IROH_DOC_QUERY_LATEST_PREFIX = 3,  // latest entry per distinct key under the prefix
 } iroh_doc_query_mode_t;
 
-// Query entries by key (exact or prefix), returning all authors' entries.
+// Query entries by key (exact/prefix/latest), returning packed entries.
 // Emits IROH_EVENT_DOC_QUERY with packed entries in payload, entry count in event.flags.
 iroh_status_t iroh_doc_query(
     iroh_runtime_t runtime,
     uint64_t doc,
     uint32_t mode,  // iroh_doc_query_mode_t
     iroh_bytes_t key,
+    uint64_t limit,  // caps prefix/exact results; 0=unbounded. Ignored for latest_exact.
     uint64_t user_data,
     iroh_operation_t* out_operation
 );
@@ -2094,7 +2209,55 @@ iroh_status_t iroh_connection_info(
     iroh_connection_t connection,
     iroh_connection_info_t* out_info
 );
+
+iroh_status_t iroh_connection_transport_snapshot(
+    iroh_runtime_t runtime,
+    iroh_connection_t connection,
+    iroh_transport_snapshot_t* out_snapshot
+);
 ```
+
+#### Transport Snapshot (added 2026-05-04)
+
+`iroh_connection_transport_snapshot` returns a per-call snapshot of the
+currently selected QUIC path, intended for population of the binding's
+`CallContext` on every dispatch. It mirrors a single `PathInfo`
+selected via `Connection::to_info().selected_path()` in iroh 0.98.
+
+```c
+typedef struct iroh_transport_snapshot_t {
+    uint32_t struct_size;
+    uint32_t path_kind;        // 0=none, 1=direct UDP, 2=relay
+    iroh_bytes_t peer_host;    // populated when path_kind == 1
+    uint16_t peer_port;        // populated when path_kind == 1
+    uint16_t _pad;
+    iroh_bytes_t relay_url;    // populated when path_kind == 2
+    uint64_t rtt_micros;       // UINT64_MAX when not yet measured
+} iroh_transport_snapshot_t;
+```
+
+Memory ownership: `peer_host` and `relay_url` buffers are heap-allocated
+by Rust via `alloc_string`. The caller MUST free each one via
+`iroh_string_release(ptr, len)`; release on a zero-length buffer is a
+safe no-op. The discriminator semantics (`path_kind` plus mutual
+exclusion of `peer_host`/`relay_url`) reflect that iroh paths are
+either direct IP or relay — never both — and that the peer's IP is
+not visible through a relay path.
+
+Bindings:
+- Python: `IrohConnection.transport_snapshot()` → `TransportSnapshot`
+  pyclass with `peer_addr: tuple[str, int] | None`, `relay_url`,
+  `rtt_micros` fields. Populated on `CallContext` at every dispatch
+  site in `bindings/python/aster/server.py`.
+- TypeScript (NAPI): `IrohConnection.transportSnapshot()` →
+  `TransportSnapshot { peerAddr, relayUrl, rttMicros }`. Wired into
+  `RpcServer.handleStream()` and the legacy `SessionServer.handleSession()`
+  in `bindings/typescript/packages/aster/src/`.
+- Java: `IrohConnection.transportSnapshot()` (instance) and
+  `IrohConnection.transportSnapshot(runtime, connectionHandle)`
+  (static, for borrowed handles delivered by the reactor). Returns a
+  `TransportSnapshot(InetSocketAddress peerAddr, String relayUrl,
+  Duration rtt)` record.
 
 ### 3b.3a Screening / Connection Admission Control
 
@@ -3463,6 +3626,88 @@ return aster_metrics + "\n" + transport_metrics
    5. Write JUnit tests
    6. Write integration tests matching the Python test scenarios
    7. Document Java API with Javadoc
+
+### Phase 1j (CallContext Transport Snapshot) — DONE
+
+**Status:** Implemented
+**Date:** 2026-05-04
+
+Surfaces selected QUIC path information (peer IP, relay URL, RTT) on the
+per-call `CallContext` of every binding. Handlers can now log, rate-limit,
+or make policy decisions based on whether a call is direct-vs-relayed and
+the peer's address — previously this was only reachable by walking the
+core's monitoring path.
+
+**Core (`core/src/lib.rs`):**
+
+```rust
+pub struct CoreTransportSnapshot {
+    pub peer_addr: Option<SocketAddr>,  // Some when path is direct
+    pub relay_url: Option<String>,      // Some when path is relay
+    pub rtt_micros: Option<u64>,        // None when not yet measured
+}
+
+impl CoreConnection {
+    pub fn transport_snapshot(&self) -> CoreTransportSnapshot;
+}
+```
+
+Built from `Connection::to_info().selected_path()`. Mutually exclusive
+fields reflect that iroh `TransportAddr` is `Ip(SocketAddr)` |
+`Relay(RelayUrl)` | `Custom(_)` — never both. The peer's IP is not
+visible through a relay path.
+
+**FFI (`ffi/src/lib.rs`):**
+
+`iroh_connection_transport_snapshot(runtime, connection, out_snapshot)` returns
+an `iroh_transport_snapshot_t` with discriminator semantics; see §3b.2 for
+the struct layout.
+
+**Reactor slot extension (`ffi/src/reactor.rs`, 2026-05-04):**
+
+`aster_reactor_call_t` gained a `connection_handle: u64` field — a
+borrowed `iroh_connection_t` registered by the pump task in the runtime's
+connection registry. Stable for the connection's lifetime; freed by the
+reactor on `ConnectionClosed`. Bindings MUST NOT close it themselves.
+Total slot size grew from 104 to 112 bytes.
+
+This brings parity with Python's PyO3 reactor — which has always shipped
+the `IrohConnection` directly on the call event via `event.take_connection()`
+— so Java (and any future C-ABI binding) can populate connection-scoped
+`CallContext` fields without an out-of-band lookup. See
+`docs/_internal/reactor-ffi-guide.md` for the full updated descriptor.
+
+**Bindings:**
+
+| Binding | Surface | CallContext fields |
+|--------|---------|--------------------|
+| Python (PyO3) | `IrohConnection.transport_snapshot()` → `TransportSnapshot` pyclass | `peer_addr: tuple[str, int] \| None`, `relay_url`, `rtt_micros` |
+| TypeScript (NAPI) | `IrohConnection.transportSnapshot()` → `{ peerAddr, relayUrl, rttMicros }` | `peerAddr: PeerAddr \| undefined`, `relayUrl`, `rttMicros` |
+| Java (FFM) | `IrohConnection.transportSnapshot()` instance + `(runtime, handle)` static | `peerAddr: InetSocketAddress`, `relayUrl: String`, `rtt: Duration` |
+| C ABI | `iroh_connection_transport_snapshot` | n/a — direct struct populator |
+
+**Wire/FFI representation:**
+
+- `peer_addr`: socket address; surfaced as language-idiomatic types
+  (Python tuple, TS object, Java `InetSocketAddress`).
+- `relay_url`: UTF-8 string allocated via `alloc_string`, freed by the
+  caller via `iroh_string_release`.
+- `rtt`: integer microseconds (`u64`) on the FFI surface — chosen for
+  cross-language consistency. Each binding maps to its idiomatic
+  Duration type (Python `timedelta`, Java `Duration.ofNanos(micros *
+  1000)`, TS `rttMicros: number` since JS has no native Duration).
+  `UINT64_MAX` (or `Long.MAX_VALUE` Java-side) signals "not measured".
+
+**Test coverage:**
+
+- Python: `tests/python/test_phase1b.py::test_transport_snapshot_direct_local`
+  exercises a loopback QUIC pair; asserts `peer_addr` is populated and
+  `relay_url` is `None` on both sides.
+- TypeScript: existing 292-test suite passes with the new wiring; no
+  dedicated snapshot test added.
+- Java: `MissionControlAuthE2ETest` and `MissionControlE2ETest` continue
+  to pass at the same baseline (4/5 and 8/10 — pre-existing flakes are
+  unrelated to this change).
 
 ## 3h. Phase 1h: Compact Aster Ticket Format
 

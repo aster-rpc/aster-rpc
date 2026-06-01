@@ -34,7 +34,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
-use crate::framing::{FLAG_CANCEL, FLAG_END_STREAM, FLAG_HEADER, MAX_FRAME_SIZE};
+use crate::framing::{FLAG_CANCEL, FLAG_END_STREAM, FLAG_HEADER};
 use crate::{CoreClosedInfo, CoreConnection, CoreNode, CoreRecvStream, CoreSendStream};
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -65,6 +65,10 @@ pub struct IncomingCall {
     /// connection drops, the reactor emits a `ConnectionClosed` event with
     /// the same `connection_id` so the binding can reap state.
     pub connection_id: u64,
+    /// Clone of the `CoreConnection` this call arrived on. Lets the
+    /// binding hand a `TunnelHandle` (or anything else connection-scoped)
+    /// to the RPC handler via `CallContext`. Cheap — Arc bump only.
+    pub connection: CoreConnection,
     pub header_payload: Vec<u8>,
     pub header_flags: u8,
     pub request_payload: Vec<u8>,
@@ -303,10 +307,20 @@ async fn connection_loop(conn: CoreConnection, event_tx: mpsc::Sender<ReactorEve
     let peer_id = conn.remote_id();
     let connection_id = next_connection_id();
 
-    while let Ok((send, recv)) = conn.accept_bi().await {
+    // `accept_aster_bi` transparently dispatches `FLAG_TUNNEL` streams
+    // via the per-connection tunnel registry, so the reactor only ever
+    // sees regular RPC streams here. See `Aster-tunneling.md` §6.
+    while let Ok((send, recv)) = conn.accept_aster_bi().await {
         let tx = event_tx.clone();
         let peer = peer_id.clone();
-        tokio::spawn(handle_stream(send, recv, peer, connection_id, tx));
+        let conn_clone = conn.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                handle_stream_inner(send, recv, peer, connection_id, conn_clone, tx).await
+            {
+                tracing::debug!("reactor stream error: {e}");
+            }
+        });
     }
 
     // Connection closed or accept_bi returned an error — emit a
@@ -326,18 +340,6 @@ async fn connection_loop(conn: CoreConnection, event_tx: mpsc::Sender<ReactorEve
         .await;
 }
 
-async fn handle_stream(
-    send: CoreSendStream,
-    recv: CoreRecvStream,
-    peer_id: String,
-    connection_id: u64,
-    call_tx: mpsc::Sender<ReactorEvent>,
-) {
-    if let Err(e) = handle_stream_inner(send, recv, peer_id, connection_id, call_tx).await {
-        tracing::debug!("reactor stream error: {}", e);
-    }
-}
-
 /// One frame as read off the wire by the per-stream reader task.
 struct WireFrame {
     payload: Vec<u8>,
@@ -351,7 +353,7 @@ struct WireFrame {
 /// signals the dispatch loop that no more frames are coming.
 async fn read_all_frames(recv: CoreRecvStream, frame_tx: mpsc::UnboundedSender<WireFrame>) {
     loop {
-        match read_one_frame(&recv).await {
+        match recv.read_one_frame().await {
             Ok((payload, flags)) => {
                 if frame_tx.send(WireFrame { payload, flags }).is_err() {
                     return;
@@ -367,6 +369,7 @@ async fn handle_stream_inner(
     recv: CoreRecvStream,
     peer_id: String,
     connection_id: u64,
+    connection: CoreConnection,
     call_tx: mpsc::Sender<ReactorEvent>,
 ) -> Result<()> {
     let stream_id = next_stream_id();
@@ -381,6 +384,7 @@ async fn handle_stream_inner(
         send,
         peer_id,
         connection_id,
+        connection,
         stream_id,
         call_tx,
     )
@@ -418,11 +422,13 @@ enum CallOutcome {
 /// Routing between SHARED-pool and session-bound calls happens entirely
 /// in the binding via the `StreamHeader.sessionId` field; core stays
 /// payload-opaque and treats every stream identically.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_stream(
     frame_rx: &mut mpsc::UnboundedReceiver<WireFrame>,
     send: CoreSendStream,
     peer_id: String,
     connection_id: u64,
+    connection: CoreConnection,
     stream_id: u64,
     call_tx: mpsc::Sender<ReactorEvent>,
 ) -> Result<()> {
@@ -451,6 +457,7 @@ async fn dispatch_stream(
             frame_rx,
             &peer_id,
             connection_id,
+            &connection,
             stream_id,
             &call_tx,
             header.payload,
@@ -478,6 +485,7 @@ async fn dispatch_one_call(
     frame_rx: &mut mpsc::UnboundedReceiver<WireFrame>,
     peer_id: &str,
     connection_id: u64,
+    connection: &CoreConnection,
     stream_id: u64,
     call_tx: &mpsc::Sender<ReactorEvent>,
     header_payload: Vec<u8>,
@@ -497,6 +505,7 @@ async fn dispatch_one_call(
             call_id: next_call_id(),
             stream_id,
             connection_id,
+            connection: connection.clone(),
             header_payload,
             header_flags,
             request_payload: first_request_payload,
@@ -631,31 +640,4 @@ async fn dispatch_one_call(
             }
         }
     }
-}
-
-async fn read_one_frame(recv: &CoreRecvStream) -> Result<(Vec<u8>, u8)> {
-    // Stack-allocated length header (no heap alloc)
-    let mut len_bytes = [0u8; 4];
-    recv.read_exact_into(&mut len_bytes).await?;
-    let frame_body_len = u32::from_le_bytes(len_bytes) as usize;
-
-    if frame_body_len == 0 {
-        return Err(anyhow!("zero-length frame"));
-    }
-    if frame_body_len > MAX_FRAME_SIZE as usize {
-        return Err(anyhow!("frame too large: {}", frame_body_len));
-    }
-
-    // Read flags + payload directly into a pre-allocated Vec using read_into.
-    // This eliminates the `body[1..].to_vec()` copy by reading the flags byte
-    // separately and the payload into its own buffer.
-    let mut flags_buf = [0u8; 1];
-    recv.read_exact_into(&mut flags_buf).await?;
-    let flags = flags_buf[0];
-
-    let payload_len = frame_body_len - 1;
-    let mut payload = vec![0u8; payload_len];
-    recv.read_exact_into(&mut payload).await?;
-
-    Ok((payload, flags))
 }

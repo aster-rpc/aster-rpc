@@ -1,5 +1,7 @@
 package site.aster.interceptors;
 
+import java.net.InetSocketAddress;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -63,6 +65,9 @@ public final class CallContext {
   private final String pattern;
   private final boolean idempotent;
   private int attempt;
+  private final InetSocketAddress peerAddr;
+  private final String relayUrl;
+  private final Duration rtt;
 
   private CallContext(Builder builder) {
     this.service = builder.service;
@@ -77,6 +82,9 @@ public final class CallContext {
     this.pattern = builder.pattern;
     this.idempotent = builder.idempotent;
     this.attempt = builder.attempt;
+    this.peerAddr = builder.peerAddr;
+    this.relayUrl = builder.relayUrl;
+    this.rtt = builder.rtt;
   }
 
   public String service() {
@@ -133,6 +141,28 @@ public final class CallContext {
   }
 
   /**
+   * Peer's UDP socket address when the selected QUIC path is direct. Returns {@code null} when the
+   * call is being relayed; in that case the peer's IP is not visible (use {@link #relayUrl()}
+   * instead).
+   */
+  public InetSocketAddress peerAddr() {
+    return peerAddr;
+  }
+
+  /**
+   * Relay server URL when the selected QUIC path goes through a relay. Returns {@code null} for
+   * direct paths.
+   */
+  public String relayUrl() {
+    return relayUrl;
+  }
+
+  /** Round-trip-time for the selected QUIC path, or {@code null} if not yet measured. */
+  public Duration rtt() {
+    return rtt;
+  }
+
+  /**
    * Returns the number of seconds remaining until the deadline, or {@code null} if no deadline is
    * set.
    */
@@ -167,6 +197,9 @@ public final class CallContext {
     private String pattern;
     private boolean idempotent;
     private int attempt = 1;
+    private InetSocketAddress peerAddr;
+    private String relayUrl;
+    private Duration rtt;
 
     private Builder(String service, String method) {
       this.service = service;
@@ -229,6 +262,21 @@ public final class CallContext {
 
     public Builder attempt(int attempt) {
       this.attempt = attempt;
+      return this;
+    }
+
+    public Builder peerAddr(InetSocketAddress peerAddr) {
+      this.peerAddr = peerAddr;
+      return this;
+    }
+
+    public Builder relayUrl(String relayUrl) {
+      this.relayUrl = relayUrl;
+      return this;
+    }
+
+    public Builder rtt(Duration rtt) {
+      this.rtt = rtt;
       return this;
     }
 

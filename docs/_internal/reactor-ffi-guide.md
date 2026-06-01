@@ -124,29 +124,81 @@ Stops the reactor's pump task and frees its state. After this returns, no furthe
 
 ---
 
-## The call descriptor
+## The event descriptor
+
+The struct is named `aster_reactor_call_t` for backwards compatibility, but
+it now carries either an inbound RPC call (`event_kind == 0`) or a
+connection-closed event (`event_kind == 1`). Bindings that support session
+lifecycle reaping (spec §7.5) MUST handle both kinds.
 
 ```c
 typedef struct aster_reactor_call_t {
-    uint64_t call_id;          // for submit correlation
-    const uint8_t *header_ptr; // owned by reactor's buffer registry
+    uint8_t  event_kind;        // 0=Call, 1=ConnectionClosed
+    // 7 bytes padding
+    uint64_t call_id;           // for submit correlation; 0 on ConnectionClosed
+    uint64_t connection_id;     // reactor-assigned per-QUIC-connection id
+    uint64_t stream_id;         // reactor-assigned per-bi-stream id; 0 on ConnectionClosed
+    const uint8_t *header_ptr;  // owned by reactor's buffer registry
     uint32_t header_len;
-    uint8_t header_flags;
+    uint8_t  header_flags;
+    // 3 bytes padding
     const uint8_t *request_ptr;
     uint32_t request_len;
-    uint8_t request_flags;
-    const uint8_t *peer_ptr;   // peer ID UTF-8 bytes (not null-terminated)
+    uint8_t  request_flags;
+    // 3 bytes padding
+    const uint8_t *peer_ptr;    // peer ID UTF-8 bytes (not null-terminated)
     uint32_t peer_len;
-    uint8_t is_session_call;   // 1 if this is a session-mode call
-    uint64_t header_buffer;    // release after reading header_ptr
-    uint64_t request_buffer;   // release after reading request_ptr
-    uint64_t peer_buffer;      // release after reading peer_ptr
+    // 4 bytes padding
+    uint64_t header_buffer;     // release after reading header_ptr
+    uint64_t request_buffer;    // release after reading request_ptr
+    uint64_t peer_buffer;       // release after reading peer_ptr
+    uint64_t connection_handle; // borrowed iroh_connection_t (added 2026-05-04)
 } aster_reactor_call_t;
 ```
 
-Total size: **80 bytes**. The struct is `repr(C)` with 4-byte padding after each `uint8_t` field to maintain 8-byte alignment for the following pointer/long. If your language's struct mapping computes a different size, your layout is wrong.
+Total size: **112 bytes**. The struct is `repr(C)` with explicit padding to
+maintain 8-byte alignment for the long/pointer fields. If your language's
+struct mapping computes a different size, your layout is wrong.
 
-The three pointers (`header_ptr`, `request_ptr`, `peer_ptr`) point into a per-reactor buffer registry. They remain valid until you call `aster_reactor_buffer_release` for the corresponding buffer ID. **Holding pointers past the release call is undefined behavior.**
+The three pointers (`header_ptr`, `request_ptr`, `peer_ptr`) point into a
+per-reactor buffer registry. They remain valid until you call
+`aster_reactor_buffer_release` for the corresponding buffer ID. **Holding
+pointers past the release call is undefined behavior.**
+
+### Event kinds
+
+- **`event_kind == 0` (Call)**: every field is populated except
+  `connection_handle` may be 0 if the reactor was unable to register the
+  underlying connection (e.g. it had already dropped). Use
+  `(connection_id, StreamHeader.sessionId)` as the per-session state key
+  (spec §7.5); do NOT key on `stream_id` because multiplexed streams
+  carry many calls per bi-stream.
+- **`event_kind == 1` (ConnectionClosed)**: only `event_kind`,
+  `connection_id`, the `peer_*` fields, and `connection_handle` are
+  populated; the rest are zero/NULL. Emitted exactly once per connection
+  after every stream on it has been accepted or the connection itself
+  has errored. Bindings should drop per-connection / per-session state
+  on receipt. After this event, any FFI call against `connection_handle`
+  returns `IROH_STATUS_NOT_FOUND` because the reactor evicts it.
+
+### Borrowed connection handle (added 2026-05-04)
+
+`connection_handle` is an `iroh_connection_t` registered by the reactor's
+pump task in the runtime's connection registry. It is **borrowed**: stable
+for the connection's lifetime, the same value across every Call event from
+one `connection_id`, and freed by the reactor when the corresponding
+ConnectionClosed event is consumed.
+
+**Bindings MUST NOT call `iroh_connection_free` (or `iroh_connection_close`)
+on this handle.** Doing so would race with the reactor's own cleanup and
+break other in-flight calls on the same connection.
+
+The handle exists so that bindings can call connection-scoped surfaces
+(currently `iroh_connection_transport_snapshot`; future per-call surfaces
+will follow the same pattern) at dispatch time. Mirrors what Python's PyO3
+reactor already exposes via `event.take_connection()` — both bindings can
+now populate `CallContext.peer_addr` / `relay_url` / `rtt_micros` on every
+RPC dispatch.
 
 ---
 

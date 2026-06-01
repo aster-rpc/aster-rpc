@@ -24,5 +24,5 @@ hex         = "0.4"
 
 # Crypto primitives (exposed to Python, replacing cryptography + blake3 packages)
 blake3          = "1"
-ed25519-dalek   = { version = "=3.0.0-pre.6", features = ["rand_core"] }
+ed25519-dalek   = { version = "=3.0.0-pre.7", features = ["rand_core"] }
 getrandom       = "0.3"

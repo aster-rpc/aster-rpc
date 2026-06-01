@@ -63,6 +63,9 @@ export class SessionServer {
     _streamHeader: StreamHeader,
     peer?: string,
     attributes?: Record<string, string>,
+    peerAddr?: { host: string; port: number },
+    relayUrl?: string,
+    rttMicros?: number,
   ): Promise<void> {
     // Create a fresh service instance per session so each client gets
     // its own state (matches Python SessionServer behaviour).
@@ -129,6 +132,9 @@ export class SessionServer {
         idempotent: methodInfo.idempotent,
         attributes,
         deadlineSecs: callHeader.deadline || 0,
+        peerAddr,
+        relayUrl,
+        rttMicros,
       });
 
       // Run auth interceptors before reading the request

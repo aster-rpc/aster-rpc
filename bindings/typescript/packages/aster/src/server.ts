@@ -43,6 +43,11 @@ interface ServerConnection {
   acceptBi(): Promise<{ takeSend(): ServerSendStream; takeRecv(): ServerRecvStream }>;
   remoteNodeId(): string;
   close(code: number, reason: string): void;
+  transportSnapshot?(): {
+    peerAddr?: { host: string; port: number };
+    relayUrl?: string;
+    rttMicros?: number;
+  };
 }
 
 /** Send stream interface (matches NAPI IrohSendStream). */
@@ -265,8 +270,25 @@ export class RpcServer {
           if (m.size > 0) attributes = Object.fromEntries(m);
         }
 
+        let sessionPeerAddr: { host: string; port: number } | undefined;
+        let sessionRelayUrl: string | undefined;
+        let sessionRttMicros: number | undefined;
+        try {
+          const snap = conn.transportSnapshot?.();
+          if (snap) {
+            if (snap.peerAddr) {
+              sessionPeerAddr = { host: snap.peerAddr.host, port: snap.peerAddr.port };
+            }
+            sessionRelayUrl = snap.relayUrl ?? undefined;
+            sessionRttMicros = snap.rttMicros ?? undefined;
+          }
+        } catch { /* ignore */ }
+
         const sessionServer = new SessionServer(this.codec, this.interceptors);
-        await sessionServer.handleSession(recv, send, svcInfo, header, peerId, attributes);
+        await sessionServer.handleSession(
+          recv, send, svcInfo, header, peerId, attributes,
+          sessionPeerAddr, sessionRelayUrl, sessionRttMicros,
+        );
         // Legacy session protocol owns the whole stream; after it
         // returns the stream is done.
         try { await send.finish(); } catch { /* best effort */ }
@@ -305,6 +327,20 @@ export class RpcServer {
         }
       }
 
+      let peerAddr: { host: string; port: number } | undefined;
+      let relayUrl: string | undefined;
+      let rttMicros: number | undefined;
+      try {
+        const snap = conn.transportSnapshot?.();
+        if (snap) {
+          if (snap.peerAddr) {
+            peerAddr = { host: snap.peerAddr.host, port: snap.peerAddr.port };
+          }
+          relayUrl = snap.relayUrl ?? undefined;
+          rttMicros = snap.rttMicros ?? undefined;
+        }
+      } catch { /* ignore */ }
+
       const callCtx = buildCallContext({
         service: header.service,
         method: header.method,
@@ -315,6 +351,9 @@ export class RpcServer {
         idempotent: methodInfo.idempotent,
         callId: header.callId ? String(header.callId) : undefined,
         attributes,
+        peerAddr,
+        relayUrl,
+        rttMicros,
       });
 
       // Dispatch by pattern

@@ -20,6 +20,12 @@ import type { RpcPattern } from '../types.js';
  */
 const _callContextStorage = new AsyncLocalStorage<CallContext>();
 
+/** Peer's UDP socket address when the selected QUIC path is direct. */
+export interface PeerAddr {
+  host: string;
+  port: number;
+}
+
 /**
  * Context describing a single RPC invocation.
  * @group Interceptors
@@ -37,6 +43,22 @@ export class CallContext {
   pattern: RpcPattern | undefined;
   idempotent: boolean;
   attempt: number;
+  /**
+   * Peer's UDP `{ host, port }` when the selected QUIC path is direct.
+   * `undefined` when the call is being relayed.
+   */
+  peerAddr: PeerAddr | undefined;
+  /**
+   * Relay server URL when the selected path goes through a relay.
+   * `undefined` for direct paths. The peer's own IP is not visible
+   * through a relay path.
+   */
+  relayUrl: string | undefined;
+  /**
+   * Round-trip-time for the selected path in microseconds, or
+   * `undefined` if not yet measured.
+   */
+  rttMicros: number | undefined;
 
   constructor(init: {
     service: string;
@@ -51,6 +73,9 @@ export class CallContext {
     pattern?: RpcPattern;
     idempotent?: boolean;
     attempt?: number;
+    peerAddr?: PeerAddr;
+    relayUrl?: string;
+    rttMicros?: number;
   }) {
     this.service = init.service;
     this.method = init.method;
@@ -64,6 +89,9 @@ export class CallContext {
     this.pattern = init.pattern;
     this.idempotent = init.idempotent ?? false;
     this.attempt = init.attempt ?? 1;
+    this.peerAddr = init.peerAddr;
+    this.relayUrl = init.relayUrl;
+    this.rttMicros = init.rttMicros;
   }
 
   /** Seconds until deadline, or undefined if no deadline set. */
@@ -135,6 +163,9 @@ export function buildCallContext(opts: {
   callId?: string;
   sessionId?: string;
   attributes?: Record<string, string>;
+  peerAddr?: PeerAddr;
+  relayUrl?: string;
+  rttMicros?: number;
 }): CallContext {
   return new CallContext({
     ...opts,

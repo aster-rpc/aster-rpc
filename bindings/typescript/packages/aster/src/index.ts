@@ -216,6 +216,7 @@ export {
   applyErrorInterceptors,
   normalizeError,
   type Interceptor,
+  type PeerAddr,
 } from './interceptors/base.js';
 export { DeadlineInterceptor } from './interceptors/deadline.js';
 export { MetricsInterceptor } from './interceptors/metrics.js';

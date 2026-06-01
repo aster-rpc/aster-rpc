@@ -742,6 +742,48 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   /**
+   * Snapshot the currently selected QUIC path for {@code connectionHandle}. The returned struct's
+   * {@code peer_host} and {@code relay_url} buffers are heap-allocated by Rust; the caller MUST
+   * free them with {@link #stringRelease}, but it is safe to call {@code stringRelease} on a
+   * zero-length buffer (no-op).
+   *
+   * @return status code (0 = OK)
+   */
+  public int connectionTransportSnapshot(
+      long runtimeHandle, long connectionHandle, MemorySegment outSnapshot) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_connection_transport_snapshot",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, connectionHandle, outSnapshot);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Release a string buffer previously returned in an {@code iroh_bytes_t} struct (e.g. from {@link
+   * #connectionTransportSnapshot}). Safe to call on a null/zero-length buffer.
+   */
+  public int stringRelease(MemorySegment ptr, long len) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_string_release",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG))
+              .invoke(ptr, len);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
    * Get the available datagram send buffer space.
    *
    * @param runtimeHandle the runtime handle
@@ -819,6 +861,118 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, nodeHandle, hashHexSegment, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Import a file by path into the blob store. The C signature takes the path as an {@code
+   * iroh_bytes_t} by value; we split it into (ptr, len) per the working struct-by-value convention
+   * (see {@link #blobsAddCollection} / {@link #asterRegistryPublish}). Emits {@code
+   * IROH_EVENT_BLOB_ADDED} with the hash hex as the payload.
+   *
+   * @return status code (0 = OK)
+   */
+  public int blobsAddPath(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment pathPtr,
+      long pathLen,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_add_path",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG, // runtime
+                      ValueLayout.JAVA_LONG, // node
+                      ValueLayout.ADDRESS, // path ptr
+                      ValueLayout.JAVA_LONG, // path len
+                      ValueLayout.JAVA_LONG, // user data
+                      ValueLayout.ADDRESS)) // out op
+              .invoke(runtimeHandle, nodeHandle, pathPtr, pathLen, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Import a file by path and set a persistent named tag in one step. Both {@code path} and {@code
+   * tagName} are {@code iroh_bytes_t} by value, each split into (ptr, len). Emits {@code
+   * IROH_EVENT_BLOB_ADDED} with the hash hex as the payload.
+   *
+   * @return status code (0 = OK)
+   */
+  public int blobsAddPathWithNamedTag(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment pathPtr,
+      long pathLen,
+      MemorySegment tagPtr,
+      long tagLen,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_blobs_add_path_with_named_tag",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG, // runtime
+                      ValueLayout.JAVA_LONG, // node
+                      ValueLayout.ADDRESS, // path ptr
+                      ValueLayout.JAVA_LONG, // path len
+                      ValueLayout.ADDRESS, // tag ptr
+                      ValueLayout.JAVA_LONG, // tag len
+                      ValueLayout.JAVA_LONG, // user data
+                      ValueLayout.ADDRESS)) // out op
+              .invoke(runtimeHandle, nodeHandle, pathPtr, pathLen, tagPtr, tagLen, 0L, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /**
+   * Set a persistent named tag on an existing hash. {@code name} and {@code hashHex} are passed as
+   * (ptr, len); {@code format} is 0 = raw, 1 = hash_seq. Emits {@code IROH_EVENT_TAG_SET}.
+   *
+   * @return status code (0 = OK)
+   */
+  public int tagsSet(
+      long runtimeHandle,
+      long nodeHandle,
+      MemorySegment namePtr,
+      long nameLen,
+      MemorySegment hashPtr,
+      long hashLen,
+      int format,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "iroh_tags_set",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG, // runtime
+                      ValueLayout.JAVA_LONG, // node
+                      ValueLayout.ADDRESS, // name ptr
+                      ValueLayout.JAVA_LONG, // name len
+                      ValueLayout.ADDRESS, // hash ptr
+                      ValueLayout.JAVA_LONG, // hash len
+                      ValueLayout.JAVA_INT, // format
+                      ValueLayout.JAVA_LONG, // user data
+                      ValueLayout.ADDRESS)) // out op
+              .invoke(
+                  runtimeHandle,
+                  nodeHandle,
+                  namePtr,
+                  nameLen,
+                  hashPtr,
+                  hashLen,
+                  format,
+                  0L,
+                  outOpId);
     } catch (Throwable t) {
       throw new AssertionError(t);
     }
@@ -2030,6 +2184,25 @@ public final class IrohLibrary implements SymbolLookup {
       MemoryLayout.structLayout(
           ValueLayout.ADDRESS.withName("items"), // 0
           ValueLayout.JAVA_LONG.withName("len") // 8
+          );
+
+  /**
+   * iroh_transport_snapshot_t: struct_size, path_kind, peer_host (16), peer_port (u16), _pad (u16),
+   * [4-byte tail-padding for 8-byte align], relay_url (16), rtt_micros (u64). Total 56 bytes.
+   *
+   * <p>Rust's #[repr(C)] inserts 4 bytes of padding after `_pad` so that the next field
+   * (`relay_url`, which contains a pointer) starts at an 8-byte boundary. This layout matches that.
+   */
+  public static final MemoryLayout IROH_TRANSPORT_SNAPSHOT =
+      MemoryLayout.structLayout(
+          ValueLayout.JAVA_INT.withName("struct_size"), // 0
+          ValueLayout.JAVA_INT.withName("path_kind"), // 4
+          IROH_BYTES.withName("peer_host"), // 8
+          ValueLayout.JAVA_SHORT.withName("peer_port"), // 24
+          ValueLayout.JAVA_SHORT.withName("_pad"), // 26
+          MemoryLayout.paddingLayout(4), // 28
+          IROH_BYTES.withName("relay_url"), // 32
+          ValueLayout.JAVA_LONG.withName("rtt_micros") // 48
           );
 
   /**
