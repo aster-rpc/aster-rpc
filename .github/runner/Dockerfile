@@ -151,10 +151,16 @@ RUN ARCH=$(case "$(uname -m)" in x86_64) echo x86_64;; aarch64) echo aarch64;; *
 ENV RUSTC_WRAPPER=sccache
 
 # ── Cache directories (mount these as host volumes) ──────────────────
-# These env vars point Cargo/sccache/uv at paths that should be
-# bind-mounted or named volumes from the host for persistence.
-ENV CARGO_TARGET_DIR=/cache/cargo/target \
-    SCCACHE_DIR=/cache/sccache \
+# sccache (the dependency compile cache — the real speed win) and uv persist
+# across the ephemeral job churn via named volumes.
+#
+# We deliberately do NOT set CARGO_TARGET_DIR: cargo writes to
+# <workspace>/target, which is (a) what the artifact-bundling scripts and
+# workflows expect (scripts/bundle-ffi.sh, build-ffi.yml's
+# `path: target/release/...`), and (b) inside the per-job _work, so build
+# artifacts are clean every job. Redirecting it to a shared volume broke the
+# FFI-lib bundling step (the script looked in ./target, cargo wrote elsewhere).
+ENV SCCACHE_DIR=/cache/sccache \
     UV_CACHE_DIR=/cache/uv
 
 # ── GitHub Actions runner ────────────────────────────────────────────
