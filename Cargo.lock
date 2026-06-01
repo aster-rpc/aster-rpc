@@ -1980,8 +1980,8 @@ dependencies = [
 
 [[package]]
 name = "iroh"
-version = "1.0.0-rc.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=77a68a5477c15db261c66e7740a77ef752d9685f#77a68a5477c15db261c66e7740a77ef752d9685f"
+version = "1.0.0-rc.1"
+source = "git+https://github.com/aster-rpc/iroh?rev=2f9f374298bd44b063e1eb2df02781124305a790#2f9f374298bd44b063e1eb2df02781124305a790"
 dependencies = [
  "backon",
  "blake3",
@@ -2032,8 +2032,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-base"
-version = "1.0.0-rc.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=77a68a5477c15db261c66e7740a77ef752d9685f#77a68a5477c15db261c66e7740a77ef752d9685f"
+version = "1.0.0-rc.1"
+source = "git+https://github.com/aster-rpc/iroh?rev=2f9f374298bd44b063e1eb2df02781124305a790#2f9f374298bd44b063e1eb2df02781124305a790"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -2053,8 +2053,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-blobs"
-version = "0.101.0"
-source = "git+https://github.com/aster-rpc/iroh-blobs?rev=ede454c774b24e1e4674aa713a37573b4144517d#ede454c774b24e1e4674aa713a37573b4144517d"
+version = "0.102.0"
+source = "git+https://github.com/aster-rpc/iroh-blobs?rev=c23a66acc63cd60c73f9593b71139817d8c11371#c23a66acc63cd60c73f9593b71139817d8c11371"
 dependencies = [
  "arrayvec",
  "bao-tree",
@@ -2093,8 +2093,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.0.0-rc.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=77a68a5477c15db261c66e7740a77ef752d9685f#77a68a5477c15db261c66e7740a77ef752d9685f"
+version = "1.0.0-rc.1"
+source = "git+https://github.com/aster-rpc/iroh?rev=2f9f374298bd44b063e1eb2df02781124305a790#2f9f374298bd44b063e1eb2df02781124305a790"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -2116,8 +2116,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-docs"
-version = "0.99.0"
-source = "git+https://github.com/aster-rpc/iroh-docs?rev=be04181e05e566adb033af786e09c4d20ac9390f#be04181e05e566adb033af786e09c4d20ac9390f"
+version = "0.100.0"
+source = "git+https://github.com/aster-rpc/iroh-docs?rev=5acb0f3fd510336b8c1eba51ebc5c7f971bc8477#5acb0f3fd510336b8c1eba51ebc5c7f971bc8477"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2155,8 +2155,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-gossip"
-version = "0.99.0"
-source = "git+https://github.com/aster-rpc/iroh-gossip?rev=d7d13582ba81d1b266cce758daccacad3ab5357c#d7d13582ba81d1b266cce758daccacad3ab5357c"
+version = "0.100.0"
+source = "git+https://github.com/aster-rpc/iroh-gossip?rev=fdecec8a622b726b44e781e1252bf2452eb0f846#fdecec8a622b726b44e781e1252bf2452eb0f846"
 dependencies = [
  "blake3",
  "bytes",
@@ -2165,8 +2165,6 @@ dependencies = [
  "derive_more",
  "ed25519-dalek",
  "futures-concurrency",
- "futures-lite",
- "futures-util",
  "hex",
  "indexmap",
  "iroh",
@@ -2198,9 +2196,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-mdns-address-lookup"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21ebbd58234e3ad98d723fa8b03b14b721b023d5923dfb1739c26e97663ef0ba"
+checksum = "4a68d7e131dd029cb533a4e79d819a2f0271b4af9a268d8ef25fd398c1191d83"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -2245,8 +2243,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.0.0-rc.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=77a68a5477c15db261c66e7740a77ef752d9685f#77a68a5477c15db261c66e7740a77ef752d9685f"
+version = "1.0.0-rc.1"
+source = "git+https://github.com/aster-rpc/iroh?rev=2f9f374298bd44b063e1eb2df02781124305a790#2f9f374298bd44b063e1eb2df02781124305a790"
 dependencies = [
  "blake3",
  "bytes",
@@ -2290,9 +2288,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-tickets"
-version = "1.0.0-rc.0"
+version = "1.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a4b7fbfa10582f6b4f6b013eef1d21987d3df5fd42c0f7707d5de6abd34f8e9"
+checksum = "1b5d4051ac9825cd834d88377dab71c1d9d483b65e9740029b2d624cc17ac58d"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -2304,9 +2302,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-util"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7705450a124b2b05f7caad505620ab5ac3bf4eb6b85018e6b9bca36329fd031"
+checksum = "1c37db3548c6cb18b4d27a6a3ad16a4e6c372c5ff6b2efd680f56db110deebb2"
 dependencies = [
  "derive_more",
  "iroh",
@@ -2318,9 +2316,9 @@ dependencies = [
 
 [[package]]
 name = "irpc"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d38567eed2ed120e1040386930eb3b9ce6ca8a94b13c20a1b3b6535f253b00c"
+checksum = "a05799eb70acd04843c327ef939233ccf80f607d30e9ca94857ac7f3d8f18b46"
 dependencies = [
  "futures-buffered",
  "futures-util",
@@ -2340,9 +2338,9 @@ dependencies = [
 
 [[package]]
 name = "irpc-derive"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d8030c02dce4c9a8aecfb6e0870ee13ba3060096d88f6c1309919af8f197793"
+checksum = "445d81dbc1eed4dab6379bf7f97d12ac28ce8e6f3f7d6660c9f333b7b5d8d03b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2828,9 +2826,9 @@ dependencies = [
 
 [[package]]
 name = "netwatch"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5bfbba77b994ce69f1d40fc66fd8abbd23df62ce4aea61fbb34d638106a2549"
+checksum = "2071e0c2b5b229622c459096b84f1ad51afa150cdeeefdad491ef3704e581d91"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2874,8 +2872,8 @@ dependencies = [
 
 [[package]]
 name = "noq"
-version = "1.0.0-rc.0"
-source = "git+https://github.com/aster-rpc/noq?rev=617899fe7e983f794e0162d15d8558258fa8c375#617899fe7e983f794e0162d15d8558258fa8c375"
+version = "1.0.0-rc.1"
+source = "git+https://github.com/aster-rpc/noq?rev=e968659c47057b18210a4a03dc2366c65fe8f654#e968659c47057b18210a4a03dc2366c65fe8f654"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2895,8 +2893,8 @@ dependencies = [
 
 [[package]]
 name = "noq-proto"
-version = "1.0.0-rc.0"
-source = "git+https://github.com/aster-rpc/noq?rev=617899fe7e983f794e0162d15d8558258fa8c375#617899fe7e983f794e0162d15d8558258fa8c375"
+version = "1.0.0-rc.1"
+source = "git+https://github.com/aster-rpc/noq?rev=e968659c47057b18210a4a03dc2366c65fe8f654#e968659c47057b18210a4a03dc2366c65fe8f654"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -2923,8 +2921,8 @@ dependencies = [
 
 [[package]]
 name = "noq-udp"
-version = "1.0.0-rc.0"
-source = "git+https://github.com/aster-rpc/noq?rev=617899fe7e983f794e0162d15d8558258fa8c375#617899fe7e983f794e0162d15d8558258fa8c375"
+version = "1.0.0-rc.1"
+source = "git+https://github.com/aster-rpc/noq?rev=e968659c47057b18210a4a03dc2366c65fe8f654#e968659c47057b18210a4a03dc2366c65fe8f654"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -3335,9 +3333,9 @@ dependencies = [
 
 [[package]]
 name = "portmapper"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aec2a8809e3f7dba624776bb223da9fed49c413c60b3bef21aadcb67a5e35944"
+checksum = "64959cbabf952c8ffcbaea13745308508f1f825922f4068353f3de08d42cf214"
 dependencies = [
  "base64",
  "bytes",
