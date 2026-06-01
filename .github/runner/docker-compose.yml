@@ -1,19 +1,20 @@
-# Docker Compose for self-hosted GitHub Actions runners.
+# Docker Compose for self-hosted GitHub Actions runners (ephemeral / JIT).
+#
+# These runners are EPHEMERAL: each container runs exactly one job from a
+# just-in-time config minted off a PAT, then exits and is restarted clean.
+# That is what keeps _work from ever accumulating a corrupt checkout.
 #
 # Usage:
-#   1. Generate a runner token from GitHub:
-#      Settings > Actions > Runners > New self-hosted runner
-#      Or via API: gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token
+#   1. Create a fine-grained PAT with repo "Administration: read & write"
+#      on the runner repo (or a classic PAT with the `repo` scope).
+#   2. Copy .env.example to .env and fill in GITHUB_URL + GH_PAT (chmod 600).
+#   3. Build + run the service for this machine, e.g. on the x86 box:
+#      docker compose -f .github/runner/docker-compose.yml up -d --build linux-x64
 #
-#   2. Copy .env.example to .env and fill in the values.
-#
-#   3. Run:
-#      docker compose -f .github/runner/docker-compose.yml up -d
-#
-# Each service is a separate runner instance. Deploy the relevant
-# service(s) on each machine in your home lab.
+# Each service is one machine's runner. Deploy the relevant service per host.
 
 x-common: &common
+  image: aster-runner:latest
   build:
     context: .
     dockerfile: Dockerfile
@@ -26,7 +27,7 @@ services:
     <<: *common
     container_name: aster-runner-linux-x64
     environment:
-      RUNNER_NAME: aster-linux-x64
+      RUNNER_NAME_PREFIX: aster-linux-x64
       RUNNER_LABELS: Linux,X64
     volumes:
       - cargo-linux-x64:/cache/cargo
@@ -38,7 +39,7 @@ services:
     <<: *common
     container_name: aster-runner-linux-arm64
     environment:
-      RUNNER_NAME: aster-linux-arm64
+      RUNNER_NAME_PREFIX: aster-linux-arm64
       RUNNER_LABELS: Linux,ARM64
     volumes:
       - cargo-linux-arm64:/cache/cargo

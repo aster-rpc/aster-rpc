@@ -3,14 +3,13 @@
 # Multi-arch: builds on both x86_64 and aarch64.
 # Host-mounted cache volumes keep Cargo/sccache/uv state across restarts.
 #
-# Build:
-#   docker build -t aster-runner .github/runner/
+# Build + run via compose (preferred — see docker-compose.yml):
+#   docker compose -f .github/runner/docker-compose.yml up -d --build linux-x64
 #
-# Run:
-#   docker run -d --name aster-runner \
-#     -e RUNNER_NAME=linux-x64 \
-#     -e GITHUB_URL=https://github.com/<owner>/<repo> \
-#     -e RUNNER_TOKEN=<token> \
+# Or standalone (ephemeral, restarts clean after each job):
+#   docker run -d --name aster-runner --restart unless-stopped \
+#     -e GITHUB_URL=https://github.com/emrul/iroh-python \
+#     -e GH_PAT=<pat> \
 #     -e RUNNER_LABELS=Linux,X64 \
 #     -v aster-cache-cargo:/cache/cargo \
 #     -v aster-cache-sccache:/cache/sccache \
@@ -19,8 +18,12 @@
 
 FROM ubuntu:24.04
 
-ARG RUNNER_VERSION=2.323.0
-ARG RUST_TOOLCHAIN=1.94.1
+ARG RUNNER_VERSION=2.334.0
+# Rust pin — keep in sync with the dev machines. Mac is on 1.96.0 (2026-05-25);
+# the Linux runner hosts are still on 1.94.1 and should be bumped to match.
+ARG RUST_TOOLCHAIN=1.96.0
+# sccache pin — matches the Mac's installed sccache (prebuilt, not cargo-built).
+ARG SCCACHE_VERSION=0.15.0
 ARG PYTHON_VERSION=3.13
 ARG TARGETARCH
 
@@ -77,17 +80,74 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
   && mv /root/.local/bin/uv /usr/local/bin/uv \
   && mv /root/.local/bin/uvx /usr/local/bin/uvx
 
+# ── Node.js (LTS 20 + 22) ────────────────────────────────────────────
+# Seeded into the GitHub Actions hosted-tool-cache so `actions/setup-node`
+# resolves from cache (no per-job download). The newest seeded major is also
+# symlinked onto PATH as the default `node`. AGENT_TOOLSDIRECTORY is the env
+# the runner reads to locate that cache.
+ENV AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+RUN NODEARCH=$(case "$(uname -m)" in x86_64) echo x64;; aarch64) echo arm64;; *) echo x64;; esac) \
+  && for major in 20 22; do \
+       ver=$(curl -fsSL https://nodejs.org/dist/index.json \
+             | jq -r --arg m "v${major}." '[.[] | select(.version | startswith($m))][0].version' \
+             | sed 's/^v//'); \
+       dest="${AGENT_TOOLSDIRECTORY}/node/${ver}/${NODEARCH}"; \
+       mkdir -p "$dest"; \
+       curl -fsSL "https://nodejs.org/dist/v${ver}/node-v${ver}-linux-${NODEARCH}.tar.gz" \
+         | tar -xz --strip-components=1 -C "$dest"; \
+       touch "${AGENT_TOOLSDIRECTORY}/node/${ver}/${NODEARCH}.complete"; \
+       echo "seeded node ${ver} (${NODEARCH})"; \
+     done \
+  && latest=$(ls -1 "${AGENT_TOOLSDIRECTORY}/node" | sort -V | tail -1) \
+  && for b in node npm npx corepack; do \
+       ln -sf "${AGENT_TOOLSDIRECTORY}/node/${latest}/${NODEARCH}/bin/${b}" "/usr/local/bin/${b}"; \
+     done \
+  && chown -R runner:runner "${AGENT_TOOLSDIRECTORY}" \
+  && node --version && npm --version
+
+# ── Bun (pinned to the version oven-sh/setup-bun uses in CI) ─────────
+ARG BUN_VERSION=1.2.15
+RUN BUNARCH=$(case "$(uname -m)" in x86_64) echo x64;; aarch64) echo aarch64;; *) echo x64;; esac) \
+  && curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${BUNARCH}.zip" -o /tmp/bun.zip \
+  && unzip -q /tmp/bun.zip -d /tmp \
+  && install -m 0755 "/tmp/bun-linux-${BUNARCH}/bun" /usr/local/bin/bun \
+  && ln -sf /usr/local/bin/bun /usr/local/bin/bunx \
+  && rm -rf /tmp/bun.zip "/tmp/bun-linux-${BUNARCH}" \
+  && bun --version
+
+# ── .NET SDK (channel matches DOTNET_VERSION=9.0.x in CI) ────────────
+ARG DOTNET_CHANNEL=9.0
+ENV DOTNET_ROOT=/usr/lib/dotnet \
+    DOTNET_INSTALL_DIR=/usr/lib/dotnet \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1
+RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
+  && bash /tmp/dotnet-install.sh --channel "${DOTNET_CHANNEL}" --install-dir "${DOTNET_ROOT}" \
+  && ln -sf "${DOTNET_ROOT}/dotnet" /usr/local/bin/dotnet \
+  && chown -R runner:runner "${DOTNET_ROOT}" \
+  && rm /tmp/dotnet-install.sh \
+  && dotnet --version
+
 # ── Rust toolchain ──────────────────────────────────────────────────
 USER runner
 ENV RUSTUP_HOME=/home/runner/.rustup \
     CARGO_HOME=/home/runner/.cargo
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain ${RUST_TOOLCHAIN} \
-       --component rustfmt clippy
+       --profile minimal --component rustfmt --component clippy
 ENV PATH="/home/runner/.cargo/bin:${PATH}"
 
 # ── sccache (shared compiler cache) ─────────────────────────────────
-RUN cargo install sccache --locked
+# Prebuilt musl binary (pinned to SCCACHE_VERSION) — matches the dev machines
+# and avoids a ~5-minute from-source `cargo install` on every image build.
+# Built natively per-arch (build-amd64 on x86, build-arm64 on aarch64), so
+# `uname -m` selects the right asset.
+RUN ARCH=$(case "$(uname -m)" in x86_64) echo x86_64;; aarch64) echo aarch64;; *) echo x86_64;; esac) \
+  && curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
+     | tar -xz -C /tmp \
+  && install -m 0755 "/tmp/sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl/sccache" "${CARGO_HOME}/bin/sccache" \
+  && rm -rf "/tmp/sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl" \
+  && sccache --version
 ENV RUSTC_WRAPPER=sccache
 
 # ── Cache directories (mount these as host volumes) ──────────────────
