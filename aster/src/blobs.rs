@@ -144,6 +144,26 @@ impl Blobs {
             .await?)
     }
 
+    /// Store a collection (a HashSeq of named blobs) from `(name, bytes)`
+    /// entries; returns the collection hash. Used to publish a contract
+    /// collection (`contract.bin` + `types/*.bin` + `manifest.json`).
+    pub async fn add_collection(&self, entries: Vec<(String, Vec<u8>)>) -> Result<Hash> {
+        Ok(Hash::from_hex(self.inner.add_collection(entries).await?))
+    }
+
+    /// Download a collection by hash from a specific peer; returns its
+    /// `(name, bytes)` entries.
+    pub async fn download_collection(
+        &self,
+        hash: &Hash,
+        from: &NodeId,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(self
+            .inner
+            .download_collection_hash(hash.as_str().to_string(), from.as_str().to_string())
+            .await?)
+    }
+
     // ── Tags ───────────────────────────────────────────────────────────────
 
     /// Set a persistent named tag pointing at a blob.

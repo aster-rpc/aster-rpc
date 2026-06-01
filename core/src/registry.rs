@@ -190,6 +190,12 @@ pub fn contract_key(contract_id: &str) -> Vec<u8> {
     format!("contracts/{}", contract_id).into_bytes()
 }
 
+/// Fast-path docs key holding the `manifest.json` bytes for a contract, so a
+/// consumer can read the manifest without fetching the whole collection.
+pub fn manifest_key(contract_id: &str) -> Vec<u8> {
+    format!("manifests/{}", contract_id).into_bytes()
+}
+
 pub fn version_key(name: &str, version: i32) -> Vec<u8> {
     format!("services/{}/versions/v{}", name, version).into_bytes()
 }

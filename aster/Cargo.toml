@@ -11,12 +11,27 @@ blobs = []
 docs = []
 gossip = []
 attestation = ["aster_transport_core/attestation"]
+# Rust-native RPC (envelope + payload codec, dispatch, client stub). Off by
+# default so Step-1 consumers don't compile Fory. See docs/_internal/aster-rust.md.
+rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros", "dep:serde_json"]
 discovery = []
 hooks = []
 metrics = []
 
 [dependencies]
 aster_transport_core = { path = "../core" }
+# RPC codec (Apache Fory Rust crate). Gated by the `rpc` feature. Pinned to the
+# same version as core's attestation feature. The `#[derive(ForyStruct)]` macro
+# emits `::fory_core::` paths, so both crates are direct deps.
+fory-core = { version = "1.1.0-rc.1", optional = true }
+fory-derive = { version = "1.1.0-rc.1", optional = true }
+# Ergonomic async trait for the RPC service dispatcher (the `#[aster::service]`
+# macro will generate impls of it). Gated by the `rpc` feature.
+async-trait = { version = "0.1", optional = true }
+# Proc-macros: #[derive(AsterType)] (and later #[aster::service]). Gated by `rpc`.
+aster-macros = { path = "../aster-macros", version = "0.2.0", optional = true }
+# JSON for the registry ArtifactRef + manifest publication. Gated by `rpc`.
+serde_json = { version = "1", optional = true }
 # Used only to derive a NamespaceId from a NamespaceSecret without leaking
 # iroh-docs types through the public API.
 iroh-docs = { workspace = true }
@@ -31,3 +46,9 @@ url = "2"
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
+# For implementing the RPC ServiceDispatch trait in tests (mirrors the macro).
+async-trait = "0.1"
+# For deriving ForyStruct on payload types in rpc tests (the `#[derive(ForyStruct)]`
+# macro emits `::fory_core::` paths, so both are needed in the test crate).
+fory-core = "1.1.0-rc.1"
+fory-derive = "1.1.0-rc.1"

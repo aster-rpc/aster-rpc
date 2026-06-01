@@ -713,6 +713,43 @@ pub fn normalize_identifier(s: &str) -> String {
     s.nfc().collect()
 }
 
+// ── Capability evaluation (Gate 3) ───────────────────────────────────────────
+
+/// The reserved attribute carrying a peer's comma-separated roles.
+pub const ROLE_ATTRIBUTE: &str = "aster.role";
+
+/// Evaluate whether a caller's `attributes` satisfy a [`CapabilityRequirement`]
+/// (Aster-trust-spec, Gate 3). Roles are read from the `aster.role` attribute
+/// (comma-separated). Mirrors the Python `trust/rcan.py` logic:
+/// - `Role`: the single role must be present (empty requirement ⇒ allow);
+/// - `AnyOf`: at least one listed role present (empty ⇒ allow);
+/// - `AllOf`: every listed role present (empty ⇒ allow).
+pub fn evaluate_capability(
+    req: &CapabilityRequirement,
+    attributes: &HashMap<String, String>,
+) -> bool {
+    let caller_roles: HashSet<&str> = attributes
+        .get(ROLE_ATTRIBUTE)
+        .map(|raw| {
+            raw.split(',')
+                .map(|r| r.trim())
+                .filter(|r| !r.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    match req.kind {
+        CapabilityKind::Role => match req.roles.first() {
+            None => true,
+            Some(role) => caller_roles.contains(role.as_str()),
+        },
+        CapabilityKind::AnyOf => {
+            req.roles.is_empty() || req.roles.iter().any(|r| caller_roles.contains(r.as_str()))
+        }
+        CapabilityKind::AllOf => req.roles.iter().all(|r| caller_roles.contains(r.as_str())),
+    }
+}
+
 /// Deserialize a ServiceContract from JSON, compute canonical bytes + BLAKE3 hash.
 /// Validates the `producer_language` invariant per §11.3.2.3 before hashing.
 /// Returns 64-char hex contract_id.
@@ -740,6 +777,185 @@ pub fn canonical_bytes_from_json(type_name: &str, json_str: &str) -> Result<Vec<
         }
         _ => bail!("unknown type: {}", type_name),
     }
+}
+
+// ── Contract manifest + collection (§11.4) ───────────────────────────────────
+
+/// Field-schema version of the manifest layout.
+pub const MANIFEST_FIELD_SCHEMA_VERSION: i32 = 1;
+
+/// A method descriptor in a [`ContractManifest`]. A subset of the rich Python
+/// method dict (name/pattern/types/idempotent/timeout) — enough for discovery;
+/// per-field request schemas are a future enrichment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestMethod {
+    pub name: String,
+    /// `"unary" | "server_stream" | "client_stream" | "bidi_stream"`.
+    pub pattern: String,
+    pub request_type: String,
+    pub response_type: String,
+    pub idempotent: bool,
+    pub timeout: f64,
+}
+
+/// Published, human-readable record of a contract's identity (Aster-SPEC §11.4).
+/// Field names mirror `bindings/python/aster/contract/manifest.py` so the JSON
+/// round-trips across bindings. The manifest is a *discovery* artifact — only
+/// `contract.bin` (the canonical [`ServiceContract`] bytes) determines
+/// `contract_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractManifest {
+    #[serde(default = "default_manifest_v")]
+    pub v: i32,
+    #[serde(default)]
+    pub service: String,
+    #[serde(default = "default_manifest_version")]
+    pub version: i32,
+    #[serde(default)]
+    pub contract_id: String,
+    #[serde(default = "default_canonical_encoding")]
+    pub canonical_encoding: String,
+    #[serde(default)]
+    pub type_count: i32,
+    #[serde(default)]
+    pub type_hashes: Vec<String>,
+    #[serde(default)]
+    pub method_count: i32,
+    #[serde(default)]
+    pub methods: Vec<ManifestMethod>,
+    #[serde(default)]
+    pub serialization_modes: Vec<String>,
+    #[serde(default)]
+    pub producer_language: String,
+    #[serde(default = "default_scoped")]
+    pub scoped: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub deprecated: bool,
+    #[serde(default)]
+    pub semver: Option<String>,
+    #[serde(default)]
+    pub vcs_revision: Option<String>,
+    #[serde(default)]
+    pub vcs_tag: Option<String>,
+    #[serde(default)]
+    pub vcs_url: Option<String>,
+    #[serde(default)]
+    pub changelog: Option<String>,
+    #[serde(default)]
+    pub published_by: String,
+    #[serde(default)]
+    pub published_at_epoch_ms: i64,
+}
+
+fn default_manifest_v() -> i32 {
+    MANIFEST_FIELD_SCHEMA_VERSION
+}
+fn default_manifest_version() -> i32 {
+    1
+}
+fn default_canonical_encoding() -> String {
+    "fory-xlang/0.15".to_string()
+}
+fn default_scoped() -> String {
+    "shared".to_string()
+}
+
+impl ContractManifest {
+    /// Serialize to a JSON string.
+    pub fn to_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    /// Parse from a JSON string.
+    pub fn from_json(text: &str) -> Result<Self> {
+        Ok(serde_json::from_str(text)?)
+    }
+}
+
+fn method_pattern_str(p: MethodPattern) -> &'static str {
+    match p {
+        MethodPattern::Unary => "unary",
+        MethodPattern::ServerStream => "server_stream",
+        MethodPattern::ClientStream => "client_stream",
+        MethodPattern::BidiStream => "bidi_stream",
+    }
+}
+
+fn scope_str(s: ScopeKind) -> &'static str {
+    match s {
+        ScopeKind::Shared => "shared",
+        ScopeKind::Session => "session",
+    }
+}
+
+/// Build the published contract collection: `contract.bin` (canonical
+/// `ServiceContract` bytes), one `types/{hash}.bin` per `TypeDef`, and
+/// `manifest.json`. Returns `(entry_name, bytes)` pairs ready for
+/// `add_collection`. The manifest's `type_hashes` are sorted; `contract.bin`
+/// comes first. Validates `producer_language` (§11.3.2.3).
+pub fn build_contract_collection(
+    sc: &ServiceContract,
+    type_defs: &[TypeDef],
+    published_by: &str,
+    published_at_epoch_ms: i64,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let contract_bytes = canonical_xlang_bytes_service_contract_checked(sc)?;
+    let contract_id = compute_contract_id(&contract_bytes);
+
+    let mut entries: Vec<(String, Vec<u8>)> = vec![("contract.bin".to_string(), contract_bytes)];
+    let mut type_hashes: Vec<String> = Vec::with_capacity(type_defs.len());
+    for td in type_defs {
+        let td_bytes = canonical_xlang_bytes_type_def(td);
+        let h = hex::encode(compute_type_hash(&td_bytes));
+        entries.push((format!("types/{}.bin", h), td_bytes));
+        type_hashes.push(h);
+    }
+    type_hashes.sort();
+
+    let manifest = ContractManifest {
+        v: MANIFEST_FIELD_SCHEMA_VERSION,
+        service: sc.name.clone(),
+        version: sc.version,
+        contract_id,
+        canonical_encoding: default_canonical_encoding(),
+        type_count: type_defs.len() as i32,
+        type_hashes,
+        method_count: sc.methods.len() as i32,
+        methods: sc
+            .methods
+            .iter()
+            .map(|m| ManifestMethod {
+                name: m.name.clone(),
+                pattern: method_pattern_str(m.pattern).to_string(),
+                request_type: m.request_type.clone(),
+                response_type: m.response_type.clone(),
+                idempotent: m.idempotent,
+                timeout: m.default_timeout,
+            })
+            .collect(),
+        serialization_modes: sc.serialization_modes.clone(),
+        producer_language: sc.producer_language.clone(),
+        scoped: scope_str(sc.scoped).to_string(),
+        description: String::new(),
+        tags: Vec::new(),
+        deprecated: false,
+        semver: None,
+        vcs_revision: None,
+        vcs_tag: None,
+        vcs_url: None,
+        changelog: None,
+        published_by: published_by.to_string(),
+        published_at_epoch_ms,
+    };
+    entries.push((
+        "manifest.json".to_string(),
+        manifest.to_json()?.into_bytes(),
+    ));
+    Ok(entries)
 }
 
 // ── Tarjan's SCC algorithm ───────────────────────────────────────────────────
@@ -1175,6 +1391,145 @@ mod tests {
             hash_hex,
             "de4f82d4139d0897f3ecf93899258bfdaca00681beaea041aad0284a9cd9b569"
         );
+    }
+
+    // ---- Capability evaluation (Gate 3) ----
+
+    #[test]
+    fn evaluate_capability_role_any_all() {
+        let attrs = |roles: &str| -> HashMap<String, String> {
+            let mut m = HashMap::new();
+            m.insert(ROLE_ATTRIBUTE.to_string(), roles.to_string());
+            m
+        };
+        let req = |kind, roles: &[&str]| CapabilityRequirement {
+            kind,
+            roles: roles.iter().map(|s| s.to_string()).collect(),
+        };
+
+        // ROLE: the single role must be present.
+        let r = req(CapabilityKind::Role, &["operator"]);
+        assert!(evaluate_capability(&r, &attrs("operator,viewer")));
+        assert!(!evaluate_capability(&r, &attrs("viewer")));
+        assert!(!evaluate_capability(&r, &HashMap::new()));
+
+        // ANY_OF: at least one.
+        let any = req(CapabilityKind::AnyOf, &["admin", "operator"]);
+        assert!(evaluate_capability(&any, &attrs("operator")));
+        assert!(!evaluate_capability(&any, &attrs("viewer")));
+
+        // ALL_OF: every one.
+        let all = req(CapabilityKind::AllOf, &["admin", "operator"]);
+        assert!(evaluate_capability(&all, &attrs("admin,operator,viewer")));
+        assert!(!evaluate_capability(&all, &attrs("admin")));
+
+        // Empty requirements allow.
+        assert!(evaluate_capability(
+            &req(CapabilityKind::Role, &[]),
+            &HashMap::new()
+        ));
+        assert!(evaluate_capability(
+            &req(CapabilityKind::AnyOf, &[]),
+            &HashMap::new()
+        ));
+        assert!(evaluate_capability(
+            &req(CapabilityKind::AllOf, &[]),
+            &HashMap::new()
+        ));
+    }
+
+    // ---- Contract collection (manifest publication) ----
+
+    fn echo_request_td() -> TypeDef {
+        TypeDef {
+            kind: TypeDefKind::Message,
+            package: "echo".to_string(),
+            name: "EchoRequest".to_string(),
+            fields: vec![simple_primitive_field(1, "message", "string")],
+            enum_values: vec![],
+            union_variants: vec![],
+        }
+    }
+
+    fn echo_response_td() -> TypeDef {
+        TypeDef {
+            kind: TypeDefKind::Message,
+            package: "echo".to_string(),
+            name: "EchoResponse".to_string(),
+            fields: vec![simple_primitive_field(1, "reply", "string")],
+            enum_values: vec![],
+            union_variants: vec![],
+        }
+    }
+
+    #[test]
+    fn build_contract_collection_echo_matches_golden() {
+        let req = echo_request_td();
+        let resp = echo_response_td();
+        let req_hash = hex::encode(compute_type_hash(&canonical_xlang_bytes_type_def(&req)));
+        let resp_hash = hex::encode(compute_type_hash(&canonical_xlang_bytes_type_def(&resp)));
+        // Granular cross-binding goldens (from cross_lang_echo_contract_id.py --debug).
+        assert_eq!(
+            req_hash,
+            "4a2fa9b8f8cfbd325d72dc9739e416c86cd3cd5724882f22400ab08d2db49dd6"
+        );
+        assert_eq!(
+            resp_hash,
+            "ef84ecadec2481a55fc7b5b0d011f65814c61441ede296c907dde9a367d2a18f"
+        );
+
+        let sc = ServiceContract {
+            name: "EchoService".to_string(),
+            version: 1,
+            methods: vec![MethodDef {
+                name: "echo".to_string(),
+                pattern: MethodPattern::Unary,
+                request_type: req_hash.clone(),
+                response_type: resp_hash.clone(),
+                idempotent: false,
+                default_timeout: 0.0,
+                requires: None,
+            }],
+            serialization_modes: vec!["xlang".to_string()],
+            scoped: ScopeKind::Shared,
+            requires: None,
+            producer_language: String::new(),
+        };
+
+        let entries =
+            build_contract_collection(&sc, &[req, resp], "test-node", 1_700_000_000_000).unwrap();
+
+        // contract.bin first, and its BLAKE3 is the published contract_id.
+        assert_eq!(entries[0].0, "contract.bin");
+        let cid = compute_contract_id(&entries[0].1);
+        assert_eq!(
+            cid, "12d2f2990f4dd71dfd59f5db470d186f1fcc7dbafdac0ea7fdf838ab263c0578",
+            "contract.bin BLAKE3 must equal the cross-binding contract_id"
+        );
+
+        // One entry per type, plus the manifest.
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&format!("types/{}.bin", req_hash).as_str()));
+        assert!(names.contains(&format!("types/{}.bin", resp_hash).as_str()));
+        assert!(names.contains(&"manifest.json"));
+
+        // Manifest round-trips and carries the right identity + sorted hashes.
+        let manifest_bytes = &entries
+            .iter()
+            .find(|(n, _)| n == "manifest.json")
+            .unwrap()
+            .1;
+        let manifest = ContractManifest::from_json(std::str::from_utf8(manifest_bytes).unwrap())
+            .expect("manifest parses");
+        assert_eq!(manifest.contract_id, cid);
+        assert_eq!(manifest.service, "EchoService");
+        assert_eq!(manifest.type_count, 2);
+        assert_eq!(manifest.method_count, 1);
+        assert_eq!(manifest.methods[0].pattern, "unary");
+        let mut expected_hashes = vec![req_hash, resp_hash];
+        expected_hashes.sort();
+        assert_eq!(manifest.type_hashes, expected_hashes);
+        assert_eq!(manifest.canonical_encoding, "fory-xlang/0.15");
     }
 
     // ---- B.1: Direct self-recursion (TreeNode) ----
