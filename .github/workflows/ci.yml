@@ -56,7 +56,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: "1.94.1"
+  RUST_TOOLCHAIN: "1.96.0"
 
 jobs:
   # ── Rust lint (self-hosted, fast with cached deps) ─────────────────
