@@ -163,8 +163,24 @@ ENV RUSTC_WRAPPER=sccache
 ENV SCCACHE_DIR=/cache/sccache \
     UV_CACHE_DIR=/cache/uv
 
-# ── GitHub Actions runner ────────────────────────────────────────────
+# ── GitHub CLI (gh) ──────────────────────────────────────────────────
+# Release-orchestration workflows (build-cli, build-dotnet) call
+# `gh release list` / `gh release download`. Without gh those steps
+# silently resolve no upstream wheel and skip publishing the dev releases
+# (the native runners had gh installed). Placed late to keep rebuilds cheap.
 USER root
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+     -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+     > /etc/apt/sources.list.d/github-cli.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends gh \
+  && rm -rf /var/lib/apt/lists/* \
+  && gh --version
+
+# ── GitHub Actions runner ────────────────────────────────────────────
 RUN ARCH=$(case ${TARGETARCH} in amd64) echo x64;; arm64) echo arm64;; *) echo x64;; esac) \
   && mkdir -p /opt/actions-runner \
   && cd /opt/actions-runner \
