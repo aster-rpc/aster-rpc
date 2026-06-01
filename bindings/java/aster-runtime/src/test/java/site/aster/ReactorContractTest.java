@@ -25,12 +25,13 @@ public class ReactorContractTest {
 
   @Test
   public void testCallLayoutSize() {
-    // 104 bytes total: see ffi/src/reactor.rs aster_reactor_call_t.
-    // Grew from 88 → 104 in the multiplexed-streams migration: added
-    // event_kind (with 7 bytes alignment padding) and connection_id;
-    // dropped is_session_call (the binding decodes sessionId from the
-    // StreamHeader instead).
-    assertEquals(104, Reactor.CALL_LAYOUT.byteSize());
+    // 112 bytes total: see ffi/src/reactor.rs aster_reactor_call_t.
+    // History: 88 → 104 in the multiplexed-streams migration (added
+    // event_kind with 7 bytes alignment padding + connection_id; dropped
+    // is_session_call, since the binding decodes sessionId from the
+    // StreamHeader); then 104 → 112 by adding connection_handle (the
+    // borrowed iroh_connection_t handle at offset 104).
+    assertEquals(112, Reactor.CALL_LAYOUT.byteSize());
   }
 
   @Test
@@ -50,6 +51,8 @@ public class ReactorContractTest {
     assertEquals(Reactor.OFFSET_HEADER_BUFFER, offsetOf(Reactor.CALL_LAYOUT, "header_buffer"));
     assertEquals(Reactor.OFFSET_REQUEST_BUFFER, offsetOf(Reactor.CALL_LAYOUT, "request_buffer"));
     assertEquals(Reactor.OFFSET_PEER_BUFFER, offsetOf(Reactor.CALL_LAYOUT, "peer_buffer"));
+    assertEquals(
+        Reactor.OFFSET_CONNECTION_HANDLE, offsetOf(Reactor.CALL_LAYOUT, "connection_handle"));
   }
 
   // ─── Lifecycle against native library ─────────────────────────────────────

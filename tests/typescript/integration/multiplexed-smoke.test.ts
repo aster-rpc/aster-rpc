@@ -472,16 +472,25 @@ describe('multiplexed-streams smoke (Session 1)', () => {
           transport.unary('SessionSmoke', 'bump', { message: `u${i}` }),
         ),
       );
-      // bidiEcho's send consumed counter=1; unary bumps see counters
-      // 2..6, regardless of their dispatch order.
+      // The 6 operations on this session (the bidi's first frame + 5
+      // unaries) each increment the shared counter exactly once. Dispatch
+      // order ACROSS substreams is not defined (spec §6) — the bidi frame
+      // and the unaries race, so which one reads counter=1 is arbitrary.
+      // Assert the order-independent property this test exists to prove:
+      // every unary completed with a distinct counter, and together with
+      // the bidi's the six reads are exactly the contiguous set 1..6 — i.e.
+      // the live streaming substream neither blocked nor starved the
+      // concurrent unaries (and nothing double-counted).
       const seen = new Set(
         (unaries as { reply: string }[]).map((r) => Number(r.reply.split(':')[1])),
       );
-      expect(seen).toEqual(new Set([2, 3, 4, 5, 6]));
+      expect(seen.size).toBe(5);
 
       await channel.close();
       await reader;
-      expect(replies).toEqual(['streaming:1']);
+      expect(replies).toHaveLength(1);
+      const bidiCounter = Number(replies[0].split(':')[1]);
+      expect(new Set([...seen, bidiCounter])).toEqual(new Set([1, 2, 3, 4, 5, 6]));
 
       await session.close();
     },
