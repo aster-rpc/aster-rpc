@@ -895,16 +895,10 @@ pub unsafe extern "C" fn aster_reactor_check_cancelled(
         None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
     };
     let map = state.cancelled_flags.lock().unwrap();
-    match map.get(&call_id) {
-        Some(flag) => {
-            if flag.load(std::sync::atomic::Ordering::Acquire) {
-                1
-            } else {
-                0
-            }
-        }
-        None => 0,
-    }
+    let cancelled = map
+        .get(&call_id)
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+    i32::from(cancelled)
 }
 
 /// Release a buffer obtained from a reactor call descriptor.
