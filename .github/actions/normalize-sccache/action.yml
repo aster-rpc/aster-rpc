@@ -1,0 +1,23 @@
+name: Normalize sccache
+description: >
+  Disable RUSTC_WRAPPER for the job when the sccache binary is not on PATH.
+  The self-hosted runner image sets RUSTC_WRAPPER=sccache globally and installs
+  sccache into the cargo bin dir; a pooled runner that lacks it (image drift,
+  a stray native runner sharing the same labels) makes every cargo spawn fail
+  with "could not execute process `sccache`". This keeps the compiler cache
+  where it exists and falls back to plain rustc where it doesn't.
+
+  Place after the rust-toolchain setup and before any cargo / maturin / napi
+  step. No-op when sccache is present.
+runs:
+  using: composite
+  steps:
+    - name: Disable sccache if unavailable
+      shell: bash
+      run: |
+        if ! command -v sccache >/dev/null 2>&1; then
+          echo "sccache not on PATH — disabling RUSTC_WRAPPER for this job"
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+        else
+          echo "sccache present: $(command -v sccache)"
+        fi

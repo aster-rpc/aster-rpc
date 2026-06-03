@@ -37,6 +37,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
+      - uses: ./.github/actions/normalize-sccache
       - name: cargo fmt (NAPI)
         run: cargo fmt -p aster-transport-napi --check
       - name: cargo clippy (NAPI)
@@ -75,6 +76,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+
+      - uses: ./.github/actions/normalize-sccache
 
       - name: Install dependencies
         working-directory: bindings/typescript
@@ -125,5 +128,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: ./.github/actions/normalize-sccache
       - name: cargo check (NAPI crate)
         run: cargo check -p aster-transport-napi

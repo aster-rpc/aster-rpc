@@ -68,6 +68,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
+      - uses: ./.github/actions/normalize-sccache
+        if: runner.os == 'Linux'
       - name: aster-cli ↔ aster-rpc version compat
         run: python3 scripts/check-cli-compat.py
       - name: cargo fmt (workspace)
@@ -115,6 +117,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: ./.github/actions/normalize-sccache
+        if: runner.os == 'Linux'
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -147,6 +151,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: ./.github/actions/normalize-sccache
+        if: runner.os == 'Linux'
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -204,6 +210,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: ./.github/actions/normalize-sccache
+        if: runner.os == 'Linux'
       - uses: actions/setup-python@v5
         if: runner.os == 'Linux'
         with:
@@ -249,6 +257,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: ./.github/actions/normalize-sccache
+        if: runner.os == 'Linux'
       - name: cargo test (core)
         run: cargo test -p aster_transport_core
       - name: cargo test (ffi)
@@ -287,6 +297,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2025-10-15
+      - uses: ./.github/actions/normalize-sccache
+        if: runner.os == 'Linux'
       - name: Run ${{ matrix.sanitizer }} sanitizer tests
         env:
           RUSTFLAGS: "-Z sanitizer=${{ matrix.sanitizer }}"
@@ -311,6 +323,8 @@ jobs:
         with:
           toolchain: nightly
           components: miri
+      - uses: ./.github/actions/normalize-sccache
+        if: runner.os == 'Linux'
       - name: Install miri
         run: cargo miri setup
       - name: cargo miri test (ffi lib)
@@ -328,6 +342,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: ./.github/actions/normalize-sccache
+        if: runner.os == 'Linux'
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
