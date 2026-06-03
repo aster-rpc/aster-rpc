@@ -142,10 +142,18 @@ ENV PATH="/home/runner/.cargo/bin:${PATH}"
 # and avoids a ~5-minute from-source `cargo install` on every image build.
 # Built natively per-arch (build-amd64 on x86, build-arm64 on aarch64), so
 # `uname -m` selects the right asset.
+#
+# Install to /usr/local/bin, NOT ${CARGO_HOME}/bin: jobs run
+# `dtolnay/rust-toolchain`, which can trigger a `rustup self update` that
+# rewrites ~/.cargo/bin and deletes any non-rustup binary living there
+# (sccache included). That clobber is nondeterministic, so it manifested as
+# intermittent "could not execute process `sccache`" failures while
+# RUSTC_WRAPPER=sccache stayed set. /usr/local/bin is on PATH and untouched by
+# rustup, so the wrapper always resolves.
 RUN ARCH=$(case "$(uname -m)" in x86_64) echo x86_64;; aarch64) echo aarch64;; *) echo x86_64;; esac) \
   && curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
      | tar -xz -C /tmp \
-  && install -m 0755 "/tmp/sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl/sccache" "${CARGO_HOME}/bin/sccache" \
+  && sudo install -m 0755 "/tmp/sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl/sccache" /usr/local/bin/sccache \
   && rm -rf "/tmp/sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl" \
   && sccache --version
 ENV RUSTC_WRAPPER=sccache
