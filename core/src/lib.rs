@@ -1169,6 +1169,45 @@ pub fn default_docs_author_id(node_secret: &[u8; 32]) -> String {
     node_docs_author(node_secret).id().to_string()
 }
 
+/// Restrict a persistent node's data directory to the owner (`0700`).
+///
+/// The directory holds secret-bearing state — notably `docs.redb`, whose
+/// authors table stores the node identity secret (see [`node_docs_author`]). A
+/// `0700` directory blocks other local users from traversing into it regardless
+/// of individual file modes, which is the primary protection for a node used as
+/// a trust store.
+///
+/// No-op on non-Unix targets: Windows uses ACLs rather than mode bits, so a
+/// caller needing private storage there must set directory ACLs externally.
+#[cfg(unix)]
+fn harden_dir_private(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn harden_dir_private(_dir: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Restrict an existing file to owner read/write (`0600`). Silently skips a file
+/// that does not exist yet. No-op on non-Unix targets (see
+/// [`harden_dir_private`]).
+#[cfg(unix)]
+fn harden_file_private(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_file_private(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 impl CoreNode {
     pub async fn memory() -> Result<Self> {
         Self::memory_with_alpns(Vec::new(), None).await
@@ -1205,6 +1244,10 @@ impl CoreNode {
     ) -> Result<Self> {
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         let root = std::path::PathBuf::from(&path);
+        // Create the data directory privately *before* the stores write secret
+        // material (notably the node secret in `docs.redb`) into it.
+        std::fs::create_dir_all(&root)?;
+        harden_dir_private(&root)?;
         let fs_store = FsStore::load(&root).await?;
         let store: BlobStore = fs_store.into();
         Self::finalize(
@@ -1237,8 +1280,8 @@ impl CoreNode {
     ) -> Result<Self> {
         let blobs = BlobsProtocol::new(&store, None);
         let gossip = Gossip::builder().spawn(endpoint.clone());
-        let docs_builder = match docs_root {
-            Some(path) => Docs::persistent(path),
+        let docs_builder = match &docs_root {
+            Some(path) => Docs::persistent(path.clone()),
             None => Docs::memory(),
         };
         let docs = docs_builder
@@ -1254,6 +1297,14 @@ impl CoreNode {
             let author_id = author.id();
             docs.api().author_import(author).await?;
             docs.api().author_set_default(author_id).await?;
+        }
+
+        // The author import above persisted the node secret into `docs.redb`.
+        // Restrict it (and the default-author pointer) to the owner as
+        // defense-in-depth behind the `0700` data directory.
+        if let Some(path) = &docs_root {
+            harden_file_private(&path.join("docs.redb"))?;
+            harden_file_private(&path.join("default-author"))?;
         }
 
         let (aster_tx, aster_rx) = mpsc::channel::<(Vec<u8>, Connection)>(ASTER_QUEUE_CAPACITY);
