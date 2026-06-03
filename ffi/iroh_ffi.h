@@ -126,6 +126,11 @@ typedef struct iroh_event_t {
 
 typedef uint64_t iroh_operation_t;
 
+typedef enum iroh_hook_failure_mode_t {
+  IROH_HOOK_FAILURE_FAIL_OPEN = 0,
+  IROH_HOOK_FAILURE_FAIL_CLOSED = 1
+} iroh_hook_failure_mode_t;
+
 typedef struct iroh_bytes_t {
   const uint8_t *ptr;
   uintptr_t len;
@@ -160,6 +165,7 @@ typedef struct iroh_endpoint_config_t {
   struct iroh_bytes_t proxy_url;
   uint32_t proxy_from_env;
   struct iroh_bytes_t data_dir_utf8;
+  uint32_t hook_failure_mode;
 } iroh_endpoint_config_t;
 
 typedef uint64_t iroh_endpoint_t;

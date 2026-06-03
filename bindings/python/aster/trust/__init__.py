@@ -19,6 +19,7 @@ Quick start::
         MeshEndpointHook,
         ALPN_PRODUCER_ADMISSION,
         ALPN_CONSUMER_ADMISSION,
+        ALPN_DELEGATED_ADMISSION,
         admit,
         generate_root_keypair,
         sign_credential,
@@ -69,7 +70,12 @@ from .gossip import (
     start_lease_heartbeat,
     verify_producer_message,
 )
-from .hooks import ALPN_CONSUMER_ADMISSION, ALPN_PRODUCER_ADMISSION, MeshEndpointHook
+from .hooks import (
+    ALPN_CONSUMER_ADMISSION,
+    ALPN_DELEGATED_ADMISSION,
+    ALPN_PRODUCER_ADMISSION,
+    MeshEndpointHook,
+)
 from .iid import IIDBackend, MockIIDBackend, get_iid_backend
 from .mesh import (
     AdmissionRequest,
@@ -126,6 +132,7 @@ __all__ = [
     "MeshEndpointHook",
     "ALPN_PRODUCER_ADMISSION",
     "ALPN_CONSUMER_ADMISSION",
+    "ALPN_DELEGATED_ADMISSION",
     # Phase 12: Producer mesh
     "ProducerMessage",
     "ProducerMessageType",

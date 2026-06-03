@@ -67,6 +67,10 @@ mod gossip;
 pub mod rpc;
 
 pub use admission::{alpns, Admission, ConnectRequest, Gate0, HandshakeRequest};
+pub use aster_transport_core::trust::{
+    AdmissionSource, GateDecision, GatePolicy, HookFailureMode, PeerAdmission, PeerAdmissionStore,
+    TrustMode,
+};
 pub use config::{AsterConfig, AsterConfigBuilder, RelayMode};
 pub use error::{Error, Result};
 pub use id::{
@@ -75,10 +79,6 @@ pub use id::{
 pub use net::{Connection, RecvStream, SendStream};
 pub use node::Node;
 pub use ticket::{Credential, Ticket};
-pub use aster_transport_core::trust::{
-    AdmissionSource, GateDecision, GatePolicy, HookFailureMode, PeerAdmission, PeerAdmissionStore,
-    TrustMode,
-};
 
 #[cfg(feature = "blobs")]
 pub use blobs::{BlobFormat, BlobStatus, Blobs};

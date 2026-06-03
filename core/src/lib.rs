@@ -22,7 +22,8 @@ use bytes::Bytes;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{
     presets, AfterHandshakeOutcome, BeforeConnectOutcome, Closed, Connection, ConnectionError,
-    Endpoint, EndpointHooks, PathEvent, PortmapperConfig, RelayMode, VarInt, WeakConnectionHandle,
+    Endpoint, EndpointHooks, IdleTimeout, PathEvent, PortmapperConfig, QuicTransportConfig,
+    RelayMode, VarInt, WeakConnectionHandle,
 };
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{EndpointAddr, EndpointId, RelayMap, RelayUrl, SecretKey, TransportAddr};
@@ -83,7 +84,9 @@ pub struct CoreEndpointConfig {
     pub enable_hooks: bool,
     /// Timeout in ms for hook replies (default 5000)
     pub hook_timeout_ms: u64,
-    /// Hook fallback when callback channel is closed or times out.
+    /// Post-handshake hook fallback when callback channel is closed or times out.
+    /// `before_connect` falls open unless a low-level adapter is constructed
+    /// with an explicit outbound failure mode.
     pub hook_failure_mode: trust::HookFailureMode,
     /// Bind address string e.g. "0.0.0.0:9000", "127.0.0.1:0", "`[::`]:0"
     pub bind_addr: Option<String>,
@@ -97,6 +100,30 @@ pub struct CoreEndpointConfig {
     pub proxy_url: Option<String>,
     /// Read proxy URL from HTTP_PROXY / HTTPS_PROXY environment variables
     pub proxy_from_env: bool,
+    /// Maximum number of incoming bidirectional QUIC streams.
+    pub transport_max_concurrent_bidi_streams: Option<u64>,
+    /// Maximum number of incoming unidirectional QUIC streams.
+    pub transport_max_concurrent_uni_streams: Option<u64>,
+    /// Per-stream QUIC receive window in bytes.
+    pub transport_stream_receive_window: Option<u64>,
+    /// Per-connection QUIC receive window in bytes.
+    pub transport_receive_window: Option<u64>,
+    /// QUIC send window in bytes.
+    pub transport_send_window: Option<u64>,
+    /// QUIC idle timeout in milliseconds.
+    pub transport_max_idle_timeout_ms: Option<u64>,
+    /// QUIC keep-alive interval in milliseconds.
+    pub transport_keep_alive_interval_ms: Option<u64>,
+    /// Initial QUIC UDP payload size before MTU discovery.
+    pub transport_initial_mtu: Option<u16>,
+    /// Incoming QUIC application datagram buffer in bytes. Zero disables incoming datagrams.
+    pub transport_datagram_receive_buffer_size: Option<usize>,
+    /// Outgoing QUIC application datagram buffer in bytes.
+    pub transport_datagram_send_buffer_size: Option<usize>,
+    /// Whether to use fair scheduling across send streams at the same priority.
+    pub transport_send_fairness: Option<bool>,
+    /// Whether to use UDP generic segmentation offload when supported.
+    pub transport_enable_segmentation_offload: Option<bool>,
     /// Node data directory for persistent state; empty = no persistent state
     pub data_dir: Option<String>,
 }
@@ -119,6 +146,18 @@ impl Default for CoreEndpointConfig {
             portmapper_config: None,
             proxy_url: None,
             proxy_from_env: false,
+            transport_max_concurrent_bidi_streams: None,
+            transport_max_concurrent_uni_streams: None,
+            transport_stream_receive_window: None,
+            transport_receive_window: None,
+            transport_send_window: None,
+            transport_max_idle_timeout_ms: None,
+            transport_keep_alive_interval_ms: None,
+            transport_initial_mtu: None,
+            transport_datagram_receive_buffer_size: None,
+            transport_datagram_send_buffer_size: None,
+            transport_send_fairness: None,
+            transport_enable_segmentation_offload: None,
             data_dir: None,
         }
     }
@@ -663,7 +702,8 @@ pub struct CoreHooksAdapter {
         oneshot::Sender<CoreAfterHandshakeDecision>,
     )>,
     timeout: Duration,
-    failure_mode: trust::HookFailureMode,
+    before_connect_failure_mode: trust::HookFailureMode,
+    after_handshake_failure_mode: trust::HookFailureMode,
 }
 
 /// Receiver side for hook events. Stored in `CoreNetClient`.
@@ -683,10 +723,21 @@ impl CoreHooksAdapter {
         Self::new_with_failure_mode(timeout_ms, trust::HookFailureMode::FailOpen)
     }
 
-    /// Create a new hooks adapter with explicit fallback behavior.
+    /// Create a new hooks adapter with explicit inbound fallback behavior.
+    /// Outbound `before_connect` still falls open by default because common
+    /// Gate-0 loops only drain `after_handshake`.
     pub fn new_with_failure_mode(
         timeout_ms: u64,
         failure_mode: trust::HookFailureMode,
+    ) -> (Self, CoreHookReceiver) {
+        Self::new_with_failure_modes(timeout_ms, trust::HookFailureMode::FailOpen, failure_mode)
+    }
+
+    /// Create a new hooks adapter with explicit fallback behavior for each hook.
+    pub fn new_with_failure_modes(
+        timeout_ms: u64,
+        before_connect_failure_mode: trust::HookFailureMode,
+        after_handshake_failure_mode: trust::HookFailureMode,
     ) -> (Self, CoreHookReceiver) {
         let (bc_tx, bc_rx) = mpsc::channel(16);
         let (ah_tx, ah_rx) = mpsc::channel(16);
@@ -694,7 +745,8 @@ impl CoreHooksAdapter {
             before_connect_tx: bc_tx,
             after_handshake_tx: ah_tx,
             timeout: Duration::from_millis(timeout_ms),
-            failure_mode,
+            before_connect_failure_mode,
+            after_handshake_failure_mode,
         };
         let receiver = CoreHookReceiver {
             before_connect_rx: bc_rx,
@@ -704,14 +756,14 @@ impl CoreHooksAdapter {
     }
 
     fn before_connect_fallback(&self) -> BeforeConnectOutcome {
-        match self.failure_mode {
+        match self.before_connect_failure_mode {
             trust::HookFailureMode::FailOpen => BeforeConnectOutcome::Accept,
             trust::HookFailureMode::FailClosed => BeforeConnectOutcome::Reject,
         }
     }
 
     fn after_handshake_fallback(&self) -> AfterHandshakeOutcome {
-        match self.failure_mode {
+        match self.after_handshake_failure_mode {
             trust::HookFailureMode::FailOpen => AfterHandshakeOutcome::Accept,
             trust::HookFailureMode::FailClosed => AfterHandshakeOutcome::Reject {
                 error_code: VarInt::from_u32(403),
@@ -817,11 +869,119 @@ fn relay_mode_from_config(config: &CoreEndpointConfig) -> Result<RelayMode> {
     }
 }
 
+fn u64_to_varint_field(field: &str, value: u64) -> Result<VarInt> {
+    VarInt::try_from(value).map_err(|_| anyhow!("{field} must be less than 2^62"))
+}
+
+fn idle_timeout_from_millis(field: &str, value: u64) -> Result<IdleTimeout> {
+    if value == 0 {
+        return Err(anyhow!("{field} must be greater than zero"));
+    }
+    IdleTimeout::try_from(Duration::from_millis(value))
+        .map_err(|_| anyhow!("{field} is too large for a QUIC idle timeout"))
+}
+
+fn positive_duration_from_millis(field: &str, value: u64) -> Result<Duration> {
+    if value == 0 {
+        return Err(anyhow!("{field} must be greater than zero"));
+    }
+    Ok(Duration::from_millis(value))
+}
+
+fn build_quic_transport_config(config: &CoreEndpointConfig) -> Result<Option<QuicTransportConfig>> {
+    let mut builder = QuicTransportConfig::builder();
+    let mut configured = false;
+
+    if let Some(value) = config.transport_max_concurrent_bidi_streams {
+        configured = true;
+        builder = builder.max_concurrent_bidi_streams(u64_to_varint_field(
+            "transport_max_concurrent_bidi_streams",
+            value,
+        )?);
+    }
+
+    if let Some(value) = config.transport_max_concurrent_uni_streams {
+        configured = true;
+        builder = builder.max_concurrent_uni_streams(u64_to_varint_field(
+            "transport_max_concurrent_uni_streams",
+            value,
+        )?);
+    }
+
+    if let Some(value) = config.transport_stream_receive_window {
+        configured = true;
+        builder = builder.stream_receive_window(u64_to_varint_field(
+            "transport_stream_receive_window",
+            value,
+        )?);
+    }
+
+    if let Some(value) = config.transport_receive_window {
+        configured = true;
+        builder = builder.receive_window(u64_to_varint_field("transport_receive_window", value)?);
+    }
+
+    if let Some(value) = config.transport_send_window {
+        configured = true;
+        builder = builder.send_window(value);
+    }
+
+    if let Some(value) = config.transport_max_idle_timeout_ms {
+        configured = true;
+        builder = builder.max_idle_timeout(Some(idle_timeout_from_millis(
+            "transport_max_idle_timeout_ms",
+            value,
+        )?));
+    }
+
+    if let Some(value) = config.transport_keep_alive_interval_ms {
+        configured = true;
+        builder = builder.keep_alive_interval(positive_duration_from_millis(
+            "transport_keep_alive_interval_ms",
+            value,
+        )?);
+    }
+
+    if let Some(value) = config.transport_initial_mtu {
+        configured = true;
+        if value < 1200 {
+            return Err(anyhow!("transport_initial_mtu must be at least 1200"));
+        }
+        builder = builder.initial_mtu(value);
+    }
+
+    if let Some(value) = config.transport_datagram_receive_buffer_size {
+        configured = true;
+        builder = builder.datagram_receive_buffer_size(if value == 0 { None } else { Some(value) });
+    }
+
+    if let Some(value) = config.transport_datagram_send_buffer_size {
+        configured = true;
+        builder = builder.datagram_send_buffer_size(value);
+    }
+
+    if let Some(value) = config.transport_send_fairness {
+        configured = true;
+        builder = builder.send_fairness(value);
+    }
+
+    if let Some(value) = config.transport_enable_segmentation_offload {
+        configured = true;
+        builder = builder.enable_segmentation_offload(value);
+    }
+
+    Ok(configured.then(|| builder.build()))
+}
+
 fn build_endpoint_config(config: &CoreEndpointConfig) -> Result<iroh::endpoint::Builder> {
     let relay_mode = relay_mode_from_config(config)?;
     let mut builder = Endpoint::builder(presets::N0)
         .alpns(config.alpns.clone())
         .relay_mode(relay_mode);
+
+    if let Some(transport_config) = build_quic_transport_config(config)? {
+        builder = builder.transport_config(transport_config);
+    }
 
     if let Some(ref secret_key) = config.secret_key {
         let bytes: [u8; 32] = secret_key

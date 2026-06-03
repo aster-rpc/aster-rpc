@@ -74,6 +74,14 @@ pub enum iroh_relay_mode_t {
     IROH_RELAY_MODE_DISABLED = 2,
 }
 
+/// Hook fallback behavior when callback processing is unavailable.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum iroh_hook_failure_mode_t {
+    IROH_HOOK_FAILURE_FAIL_OPEN = 0,
+    IROH_HOOK_FAILURE_FAIL_CLOSED = 1,
+}
+
 /// Event kinds
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -205,6 +213,7 @@ pub struct iroh_endpoint_config_t {
     pub proxy_url: iroh_bytes_t, // HTTP/SOCKS proxy URL string; empty = none
     pub proxy_from_env: u32,     // 1 = read HTTP_PROXY/HTTPS_PROXY from env
     pub data_dir_utf8: iroh_bytes_t, // Node data directory; empty = no persistent state
+    pub hook_failure_mode: u32,  // 0=fail-open (default), 1=fail-closed
 }
 
 #[repr(C)]
@@ -1430,6 +1439,12 @@ pub unsafe extern "C" fn iroh_endpoint_create(
         return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
     }
 
+    let expected_struct_size = std::mem::size_of::<iroh_endpoint_config_t>() as u32;
+    let actual_struct_size = unsafe { (*config).struct_size };
+    if actual_struct_size != expected_struct_size {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
     let bridge = match load_runtime(runtime) {
         Ok(b) => b,
         Err(s) => return s as i32,
@@ -1442,6 +1457,11 @@ pub unsafe extern "C" fn iroh_endpoint_create(
         cfg.hook_timeout_ms
     } else {
         5000
+    };
+    let hook_failure_mode = match cfg.hook_failure_mode {
+        0 => aster_transport_core::trust::HookFailureMode::FailOpen,
+        1 => aster_transport_core::trust::HookFailureMode::FailClosed,
+        _ => return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32,
     };
 
     // Extract secret_key before building core_config so we can store it later
@@ -1471,7 +1491,7 @@ pub unsafe extern "C" fn iroh_endpoint_create(
         enable_monitoring: true, // Always enable monitoring for FFI endpoints
         enable_hooks,
         hook_timeout_ms,
-        hook_failure_mode: Default::default(),
+        hook_failure_mode,
         // Phase 1d fields: read from the C struct (added in iroh_endpoint_config_t).
         bind_addr: unsafe { read_string_opt(&cfg.bind_addr) },
         clear_ip_transports: cfg.clear_ip_transports != 0,
@@ -1483,6 +1503,18 @@ pub unsafe extern "C" fn iroh_endpoint_create(
         },
         proxy_url: unsafe { read_string_opt(&cfg.proxy_url) },
         proxy_from_env: cfg.proxy_from_env != 0,
+        transport_max_concurrent_bidi_streams: None,
+        transport_max_concurrent_uni_streams: None,
+        transport_stream_receive_window: None,
+        transport_receive_window: None,
+        transport_send_window: None,
+        transport_max_idle_timeout_ms: None,
+        transport_keep_alive_interval_ms: None,
+        transport_initial_mtu: None,
+        transport_datagram_receive_buffer_size: None,
+        transport_datagram_send_buffer_size: None,
+        transport_send_fairness: None,
+        transport_enable_segmentation_offload: None,
         data_dir: unsafe { read_string_opt(&cfg.data_dir_utf8) },
     };
 

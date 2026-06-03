@@ -375,8 +375,14 @@ fn test_endpoint_create_invalid_config() {
                 ptr: ptr::null(),
                 len: 0,
             },
+            hook_failure_mode: iroh_hook_failure_mode_t::IROH_HOOK_FAILURE_FAIL_OPEN as u32,
         };
         let status = iroh_endpoint_create(runtime, &config, 0, ptr::null_mut());
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        let mut short_config = config;
+        short_config.struct_size = 0;
+        let status = iroh_endpoint_create(runtime, &short_config, 0, &mut operation);
         assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
 
         iroh_runtime_close(runtime);
@@ -721,6 +727,10 @@ fn test_hook_endpoint_config_fields() {
     let config = common::hooks_endpoint_config();
     assert_eq!(config.enable_hooks, 1);
     assert_eq!(config.hook_timeout_ms, 2000);
+    assert_eq!(
+        config.hook_failure_mode,
+        iroh_hook_failure_mode_t::IROH_HOOK_FAILURE_FAIL_CLOSED as u32
+    );
 }
 
 #[test]

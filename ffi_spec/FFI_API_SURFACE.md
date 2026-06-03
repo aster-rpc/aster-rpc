@@ -221,6 +221,24 @@ Called once or rarely. No performance work needed — correctness only.
 
 ---
 
+## Configuration Data Carriers
+
+These structs are cold-path but ABI-critical because every language binding has to allocate them with the same layout.
+
+### `iroh_endpoint_config_t`
+
+Current bindings use the endpoint config struct for node and endpoint startup. The layout covers relay mode, ALPNs, secret key, hooks, bind address, direct/relay transport selection, portmapper, proxy, data directory, and hook failure behavior fields.
+
+`iroh_endpoint_create` currently requires `struct_size == sizeof(iroh_endpoint_config_t)`. Older or future-sized endpoint config structs are rejected until the FFI grows an explicit versioned reader.
+
+Key requirements for Java/Go/.NET bindings:
+
+- Set `struct_size` to the exact header-defined size for the linked ABI.
+- Do not rely on endpoint-config forward compatibility yet; regenerate from the C header when fields change.
+- Use a `transport_config_flags` presence bitmask. Do not overload zero as "unset" for these fields.
+- Set the presence bit whenever a setter is called, including setters that pass `0` or `false`.
+- Regenerate from the C header where possible. Java FFM code that hardcodes offsets must update the endpoint config layout and tests together.
+
 ## Binding Coverage Matrix
 
 Tracks which FFI functions each language binding exposes.

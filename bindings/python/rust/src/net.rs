@@ -5,10 +5,12 @@
 
 use std::sync::Arc;
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::tokio::future_into_py;
 
+use aster_transport_core::trust::HookFailureMode;
 use aster_transport_core::tunnel::{TunnelTarget, TunnelTicket};
 use aster_transport_core::{
     ConnectionType, ConnectionTypeDetail, CoreConnection, CoreConnectionInfo, CoreEndpointConfig,
@@ -139,6 +141,9 @@ pub struct EndpointConfig {
     /// Timeout in ms for hook replies (default 5000)
     #[pyo3(get, set)]
     pub hook_timeout_ms: u64,
+    /// Post-handshake hook fallback mode: "fail_open" (default) or "fail_closed".
+    #[pyo3(get, set)]
+    pub hook_failure_mode: String,
     /// Bind address e.g. `"0.0.0.0:9000"`, `"127.0.0.1:0"`, `"[::]:0"`
     #[pyo3(get, set)]
     pub bind_addr: Option<String>,
@@ -157,6 +162,42 @@ pub struct EndpointConfig {
     /// Read proxy from HTTP_PROXY / HTTPS_PROXY environment variables
     #[pyo3(get, set)]
     pub proxy_from_env: bool,
+    /// Maximum number of incoming bidirectional QUIC streams.
+    #[pyo3(get, set)]
+    pub transport_max_concurrent_bidi_streams: Option<u64>,
+    /// Maximum number of incoming unidirectional QUIC streams.
+    #[pyo3(get, set)]
+    pub transport_max_concurrent_uni_streams: Option<u64>,
+    /// Per-stream QUIC receive window in bytes.
+    #[pyo3(get, set)]
+    pub transport_stream_receive_window: Option<u64>,
+    /// Per-connection QUIC receive window in bytes.
+    #[pyo3(get, set)]
+    pub transport_receive_window: Option<u64>,
+    /// QUIC send window in bytes.
+    #[pyo3(get, set)]
+    pub transport_send_window: Option<u64>,
+    /// QUIC idle timeout in milliseconds.
+    #[pyo3(get, set)]
+    pub transport_max_idle_timeout_ms: Option<u64>,
+    /// QUIC keep-alive interval in milliseconds.
+    #[pyo3(get, set)]
+    pub transport_keep_alive_interval_ms: Option<u64>,
+    /// Initial QUIC UDP payload size before MTU discovery.
+    #[pyo3(get, set)]
+    pub transport_initial_mtu: Option<u16>,
+    /// Incoming QUIC application datagram buffer in bytes. Zero disables incoming datagrams.
+    #[pyo3(get, set)]
+    pub transport_datagram_receive_buffer_size: Option<usize>,
+    /// Outgoing QUIC application datagram buffer in bytes.
+    #[pyo3(get, set)]
+    pub transport_datagram_send_buffer_size: Option<usize>,
+    /// Whether to use fair scheduling across send streams at the same priority.
+    #[pyo3(get, set)]
+    pub transport_send_fairness: Option<bool>,
+    /// Whether to use UDP generic segmentation offload when supported.
+    #[pyo3(get, set)]
+    pub transport_enable_segmentation_offload: Option<bool>,
     /// Enable mDNS local network discovery (default: false)
     #[pyo3(get, set)]
     pub enable_local_discovery: bool,
@@ -175,12 +216,25 @@ impl EndpointConfig {
         enable_monitoring=false,
         enable_hooks=false,
         hook_timeout_ms=5000,
+        hook_failure_mode="fail_open".to_string(),
         bind_addr=None,
         clear_ip_transports=false,
         clear_relay_transports=false,
         portmapper_config=None,
         proxy_url=None,
         proxy_from_env=false,
+        transport_max_concurrent_bidi_streams=None,
+        transport_max_concurrent_uni_streams=None,
+        transport_stream_receive_window=None,
+        transport_receive_window=None,
+        transport_send_window=None,
+        transport_max_idle_timeout_ms=None,
+        transport_keep_alive_interval_ms=None,
+        transport_initial_mtu=None,
+        transport_datagram_receive_buffer_size=None,
+        transport_datagram_send_buffer_size=None,
+        transport_send_fairness=None,
+        transport_enable_segmentation_offload=None,
         enable_local_discovery=false,
         data_dir=None,
     ))]
@@ -192,54 +246,102 @@ impl EndpointConfig {
         enable_monitoring: bool,
         enable_hooks: bool,
         hook_timeout_ms: u64,
+        hook_failure_mode: String,
         bind_addr: Option<String>,
         clear_ip_transports: bool,
         clear_relay_transports: bool,
         portmapper_config: Option<String>,
         proxy_url: Option<String>,
         proxy_from_env: bool,
+        transport_max_concurrent_bidi_streams: Option<u64>,
+        transport_max_concurrent_uni_streams: Option<u64>,
+        transport_stream_receive_window: Option<u64>,
+        transport_receive_window: Option<u64>,
+        transport_send_window: Option<u64>,
+        transport_max_idle_timeout_ms: Option<u64>,
+        transport_keep_alive_interval_ms: Option<u64>,
+        transport_initial_mtu: Option<u16>,
+        transport_datagram_receive_buffer_size: Option<usize>,
+        transport_datagram_send_buffer_size: Option<usize>,
+        transport_send_fairness: Option<bool>,
+        transport_enable_segmentation_offload: Option<bool>,
         enable_local_discovery: bool,
         data_dir: Option<String>,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        parse_hook_failure_mode(&hook_failure_mode)?;
+        Ok(Self {
             relay_mode,
             alpns,
             secret_key,
             enable_monitoring,
             enable_hooks,
             hook_timeout_ms,
+            hook_failure_mode,
             bind_addr,
             clear_ip_transports,
             clear_relay_transports,
             portmapper_config,
             proxy_url,
             proxy_from_env,
+            transport_max_concurrent_bidi_streams,
+            transport_max_concurrent_uni_streams,
+            transport_stream_receive_window,
+            transport_receive_window,
+            transport_send_window,
+            transport_max_idle_timeout_ms,
+            transport_keep_alive_interval_ms,
+            transport_initial_mtu,
+            transport_datagram_receive_buffer_size,
+            transport_datagram_send_buffer_size,
+            transport_send_fairness,
+            transport_enable_segmentation_offload,
             enable_local_discovery,
             data_dir,
-        }
+        })
     }
 }
 
-impl From<&EndpointConfig> for CoreEndpointConfig {
-    fn from(config: &EndpointConfig) -> Self {
-        CoreEndpointConfig {
-            relay_mode: config.relay_mode.clone(),
+fn parse_hook_failure_mode(value: &str) -> PyResult<HookFailureMode> {
+    HookFailureMode::from_config_str(value).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "hook_failure_mode must be 'fail_open' or 'fail_closed', got {value:?}"
+        ))
+    })
+}
+
+impl EndpointConfig {
+    pub(crate) fn to_core_config(&self) -> PyResult<CoreEndpointConfig> {
+        let hook_failure_mode = parse_hook_failure_mode(&self.hook_failure_mode)?;
+        Ok(CoreEndpointConfig {
+            relay_mode: self.relay_mode.clone(),
             relay_urls: Vec::new(),
-            alpns: config.alpns.clone(),
-            secret_key: config.secret_key.clone(),
-            enable_discovery: config.enable_local_discovery,
-            enable_monitoring: config.enable_monitoring,
-            enable_hooks: config.enable_hooks,
-            hook_timeout_ms: config.hook_timeout_ms,
-            hook_failure_mode: Default::default(),
-            bind_addr: config.bind_addr.clone(),
-            clear_ip_transports: config.clear_ip_transports,
-            clear_relay_transports: config.clear_relay_transports,
-            portmapper_config: config.portmapper_config.clone(),
-            proxy_url: config.proxy_url.clone(),
-            proxy_from_env: config.proxy_from_env,
-            data_dir: config.data_dir.clone(),
-        }
+            alpns: self.alpns.clone(),
+            secret_key: self.secret_key.clone(),
+            enable_discovery: self.enable_local_discovery,
+            enable_monitoring: self.enable_monitoring,
+            enable_hooks: self.enable_hooks,
+            hook_timeout_ms: self.hook_timeout_ms,
+            hook_failure_mode,
+            bind_addr: self.bind_addr.clone(),
+            clear_ip_transports: self.clear_ip_transports,
+            clear_relay_transports: self.clear_relay_transports,
+            portmapper_config: self.portmapper_config.clone(),
+            proxy_url: self.proxy_url.clone(),
+            proxy_from_env: self.proxy_from_env,
+            transport_max_concurrent_bidi_streams: self.transport_max_concurrent_bidi_streams,
+            transport_max_concurrent_uni_streams: self.transport_max_concurrent_uni_streams,
+            transport_stream_receive_window: self.transport_stream_receive_window,
+            transport_receive_window: self.transport_receive_window,
+            transport_send_window: self.transport_send_window,
+            transport_max_idle_timeout_ms: self.transport_max_idle_timeout_ms,
+            transport_keep_alive_interval_ms: self.transport_keep_alive_interval_ms,
+            transport_initial_mtu: self.transport_initial_mtu,
+            transport_datagram_receive_buffer_size: self.transport_datagram_receive_buffer_size,
+            transport_datagram_send_buffer_size: self.transport_datagram_send_buffer_size,
+            transport_send_fairness: self.transport_send_fairness,
+            transport_enable_segmentation_offload: self.transport_enable_segmentation_offload,
+            data_dir: self.data_dir.clone(),
+        })
     }
 }
 
@@ -1065,7 +1167,7 @@ pub fn create_endpoint_with_config<'py>(
     config: EndpointConfig,
 ) -> PyResult<Bound<'py, PyAny>> {
     crate::ensure_tokio_runtime();
-    let config = CoreEndpointConfig::from(&config);
+    let config = config.to_core_config()?;
     future_into_py(py, async move {
         let client = CoreNetClient::create_with_config(config)
             .await

@@ -124,7 +124,8 @@ impl AsterConfigBuilder {
         self
     }
 
-    /// Configure hook fallback behavior for timeouts or closed hook channels.
+    /// Configure post-handshake hook fallback behavior for timeouts or closed
+    /// hook channels.
     ///
     /// The default is [`HookFailureMode::FailOpen`] for compatibility with
     /// observability-only hooks. Protected admission flows should use

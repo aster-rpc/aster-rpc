@@ -392,6 +392,7 @@ export {
   DenyAllPolicy,
   MeshEndpointHook,
   CONSUMER_ADMISSION_ALPN,
+  DELEGATED_ADMISSION_ALPN,
   type ConnectionPolicy,
   type HookDecision,
 } from './trust/hooks.js';

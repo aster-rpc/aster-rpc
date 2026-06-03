@@ -45,6 +45,25 @@ pub enum HookFailureMode {
     FailClosed,
 }
 
+impl HookFailureMode {
+    /// Parse a binding/user config value.
+    pub fn from_config_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fail_open" | "fail-open" | "open" => Some(Self::FailOpen),
+            "fail_closed" | "fail-closed" | "closed" => Some(Self::FailClosed),
+            _ => None,
+        }
+    }
+
+    /// Stable config string for this mode.
+    pub fn as_config_str(self) -> &'static str {
+        match self {
+            Self::FailOpen => "fail_open",
+            Self::FailClosed => "fail_closed",
+        }
+    }
+}
+
 /// Where an admission came from.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdmissionSource {
@@ -375,12 +394,7 @@ impl GatePolicy {
     }
 
     /// Evaluate Gate 0 at `now`.
-    pub fn should_allow_at(
-        &self,
-        endpoint_id: &str,
-        alpn: &[u8],
-        now: SystemTime,
-    ) -> GateDecision {
+    pub fn should_allow_at(&self, endpoint_id: &str, alpn: &[u8], now: SystemTime) -> GateDecision {
         if self
             .admission_alpns
             .iter()
@@ -412,9 +426,15 @@ mod tests {
     fn protected_policy_allows_admission_alpns_for_unknown_peer() {
         let policy = GatePolicy::protected();
 
-        assert!(policy.should_allow(PEER, ALPN_CONSUMER_ADMISSION).is_allowed());
-        assert!(policy.should_allow(PEER, ALPN_PRODUCER_ADMISSION).is_allowed());
-        assert!(policy.should_allow(PEER, ALPN_DELEGATED_ADMISSION).is_allowed());
+        assert!(policy
+            .should_allow(PEER, ALPN_CONSUMER_ADMISSION)
+            .is_allowed());
+        assert!(policy
+            .should_allow(PEER, ALPN_PRODUCER_ADMISSION)
+            .is_allowed());
+        assert!(policy
+            .should_allow(PEER, ALPN_DELEGATED_ADMISSION)
+            .is_allowed());
     }
 
     #[test]

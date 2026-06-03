@@ -28,6 +28,7 @@ import pytest
 
 from aster.trust import (
     ALPN_CONSUMER_ADMISSION,
+    ALPN_DELEGATED_ADMISSION,
     ALPN_PRODUCER_ADMISSION,
     ConsumerEnrollmentCredential,
     EnrollmentCredential,
@@ -473,7 +474,7 @@ async def test_file_nonce_store_missing_file_is_fresh():
 
 def test_mesh_hook_admission_alpn_always_allowed():
     hook = MeshEndpointHook(allow_unenrolled=False)
-    for alpn in [ALPN_PRODUCER_ADMISSION, ALPN_CONSUMER_ADMISSION]:
+    for alpn in [ALPN_PRODUCER_ADMISSION, ALPN_CONSUMER_ADMISSION, ALPN_DELEGATED_ADMISSION]:
         assert hook.should_allow("unknown_peer", alpn) is True
 
 
@@ -503,6 +504,7 @@ def test_mesh_hook_allow_unenrolled_mode():
 def test_mesh_hook_admission_alpns_in_frozenset():
     assert ALPN_PRODUCER_ADMISSION in _ADMISSION_ALPNS
     assert ALPN_CONSUMER_ADMISSION in _ADMISSION_ALPNS
+    assert ALPN_DELEGATED_ADMISSION in _ADMISSION_ALPNS
 
 
 # ── CLI: keygen ───────────────────────────────────────────────────────────────

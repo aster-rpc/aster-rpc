@@ -137,6 +137,19 @@ pub struct CoreEndpointConfig {
     pub portmapper_config: Option<String>, // "enabled" (default) | "disabled"
     pub proxy_url: Option<String>,         // HTTP/SOCKS proxy e.g. "http://proxy:8080"
     pub proxy_from_env: bool,              // read from HTTP_PROXY / HTTPS_PROXY
+    // QUIC transport tuning. None means use iroh/noq defaults.
+    pub transport_max_concurrent_bidi_streams: Option<u64>,
+    pub transport_max_concurrent_uni_streams: Option<u64>,
+    pub transport_stream_receive_window: Option<u64>,
+    pub transport_receive_window: Option<u64>,
+    pub transport_send_window: Option<u64>,
+    pub transport_max_idle_timeout_ms: Option<u64>,
+    pub transport_keep_alive_interval_ms: Option<u64>,
+    pub transport_initial_mtu: Option<u16>,
+    pub transport_datagram_receive_buffer_size: Option<usize>, // Some(0) disables incoming datagrams
+    pub transport_datagram_send_buffer_size: Option<usize>,
+    pub transport_send_fairness: Option<bool>,
+    pub transport_enable_segmentation_offload: Option<bool>,
 }
 ```
 
@@ -844,6 +857,26 @@ typedef struct iroh_endpoint_config_s {
     iroh_bytes_t proxy_url;           // HTTP/SOCKS proxy URL string; empty=none
     uint32_t proxy_from_env;          // 1=read HTTP_PROXY/HTTPS_PROXY from env
     iroh_bytes_t data_dir_utf8;        // Node data directory; empty=no persistent state
+    uint32_t hook_failure_mode;       // 0=fail-open (default), 1=fail-closed
+
+    // Planned ABI extension: optional QUIC transport tuning.
+    // Current endpoint creation rejects any struct_size other than
+    // sizeof(iroh_endpoint_config_t); add a versioned reader before relying
+    // on partial struct_size-based compatibility.
+    uint64_t transport_config_flags;
+    uint64_t transport_max_concurrent_bidi_streams;
+    uint64_t transport_max_concurrent_uni_streams;
+    uint64_t transport_stream_receive_window;
+    uint64_t transport_receive_window;
+    uint64_t transport_send_window;
+    uint64_t transport_max_idle_timeout_ms;
+    uint64_t transport_keep_alive_interval_ms;
+    uint64_t transport_datagram_receive_buffer_size;
+    uint64_t transport_datagram_send_buffer_size;
+    uint16_t transport_initial_mtu;
+    uint16_t transport_reserved0;
+    uint32_t transport_send_fairness;
+    uint32_t transport_enable_segmentation_offload;
 } iroh_endpoint_config_t;
 
 typedef struct iroh_connect_config_s {
@@ -959,7 +992,9 @@ pub extern "C" fn iroh_connect(
 
 ### Overview
 
-The following builder options are now exposed through `CoreEndpointConfig`, the Python `EndpointConfig` class, and the C `iroh_endpoint_config_t` struct. All are **opt-in** — existing callers that don't set these fields get identical behaviour to before.
+The following builder options are exposed through `CoreEndpointConfig` and language endpoint config objects. Phase 1d's bind/proxy/transport-selection fields are already present in the C `iroh_endpoint_config_t` struct. QUIC transport tuning is implemented in core, Python PyO3, and TypeScript NAPI; the C ABI / Java FFM extension is specified below as pending follow-up work.
+
+All fields are **opt-in**. Existing callers that don't set these fields get identical behaviour to before.
 
 ### 3d.1 `bind_addr` — Socket Binding Control
 
@@ -1017,7 +1052,63 @@ Routes all HTTP/HTTPS traffic (relay connections, pkarr lookups) through a proxy
 
 **Wire-through:** `build_endpoint_config()` calls `builder.proxy_url(url)` when `proxy_url` is set, or `builder.proxy_from_env()` when `proxy_from_env` is `true`.
 
-### 3d.6 Python API
+### 3d.6 QUIC transport tuning
+
+**Status:** implemented in `aster_transport_core`, Python `EndpointConfig`, and TypeScript NAPI `EndpointConfig`; pending in C ABI / Java FFM.
+
+These fields map to `QuicTransportConfig::builder()` and are only applied when explicitly set. Leaving every field unset keeps the iroh/noq defaults.
+
+| Core field | Python/TOML/env field | C ABI value field | Flag bit |
+|---|---|---|---|
+| `transport_max_concurrent_bidi_streams` | `transport_max_concurrent_bidi_streams` / `ASTER_TRANSPORT_MAX_CONCURRENT_BIDI_STREAMS` | `transport_max_concurrent_bidi_streams` | `1 << 0` |
+| `transport_max_concurrent_uni_streams` | `transport_max_concurrent_uni_streams` / `ASTER_TRANSPORT_MAX_CONCURRENT_UNI_STREAMS` | `transport_max_concurrent_uni_streams` | `1 << 1` |
+| `transport_stream_receive_window` | `transport_stream_receive_window` / `ASTER_TRANSPORT_STREAM_RECEIVE_WINDOW` | `transport_stream_receive_window` | `1 << 2` |
+| `transport_receive_window` | `transport_receive_window` / `ASTER_TRANSPORT_RECEIVE_WINDOW` | `transport_receive_window` | `1 << 3` |
+| `transport_send_window` | `transport_send_window` / `ASTER_TRANSPORT_SEND_WINDOW` | `transport_send_window` | `1 << 4` |
+| `transport_max_idle_timeout_ms` | `transport_max_idle_timeout_ms` / `ASTER_TRANSPORT_MAX_IDLE_TIMEOUT_MS` | `transport_max_idle_timeout_ms` | `1 << 5` |
+| `transport_keep_alive_interval_ms` | `transport_keep_alive_interval_ms` / `ASTER_TRANSPORT_KEEP_ALIVE_INTERVAL_MS` | `transport_keep_alive_interval_ms` | `1 << 6` |
+| `transport_initial_mtu` | `transport_initial_mtu` / `ASTER_TRANSPORT_INITIAL_MTU` | `transport_initial_mtu` | `1 << 7` |
+| `transport_datagram_receive_buffer_size` | `transport_datagram_receive_buffer_size` / `ASTER_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_SIZE` | `transport_datagram_receive_buffer_size` | `1 << 8` |
+| `transport_datagram_send_buffer_size` | `transport_datagram_send_buffer_size` / `ASTER_TRANSPORT_DATAGRAM_SEND_BUFFER_SIZE` | `transport_datagram_send_buffer_size` | `1 << 9` |
+| `transport_send_fairness` | `transport_send_fairness` / `ASTER_TRANSPORT_SEND_FAIRNESS` | `transport_send_fairness` | `1 << 10` |
+| `transport_enable_segmentation_offload` | `transport_enable_segmentation_offload` / `ASTER_TRANSPORT_ENABLE_SEGMENTATION_OFFLOAD` | `transport_enable_segmentation_offload` | `1 << 11` |
+
+The C ABI must use a presence bitmask instead of "zero means default":
+
+- stream limits of `0` are valid if a binding intentionally wants no incoming streams of that type
+- `transport_datagram_receive_buffer_size = 0` means disable incoming application datagrams
+- boolean values need to distinguish unset from explicitly `false`
+
+Proposed constants:
+
+```c
+#define IROH_TRANSPORT_CFG_MAX_CONCURRENT_BIDI_STREAMS      (1ull << 0)
+#define IROH_TRANSPORT_CFG_MAX_CONCURRENT_UNI_STREAMS       (1ull << 1)
+#define IROH_TRANSPORT_CFG_STREAM_RECEIVE_WINDOW            (1ull << 2)
+#define IROH_TRANSPORT_CFG_RECEIVE_WINDOW                   (1ull << 3)
+#define IROH_TRANSPORT_CFG_SEND_WINDOW                      (1ull << 4)
+#define IROH_TRANSPORT_CFG_MAX_IDLE_TIMEOUT_MS              (1ull << 5)
+#define IROH_TRANSPORT_CFG_KEEP_ALIVE_INTERVAL_MS           (1ull << 6)
+#define IROH_TRANSPORT_CFG_INITIAL_MTU                      (1ull << 7)
+#define IROH_TRANSPORT_CFG_DATAGRAM_RECEIVE_BUFFER_SIZE     (1ull << 8)
+#define IROH_TRANSPORT_CFG_DATAGRAM_SEND_BUFFER_SIZE        (1ull << 9)
+#define IROH_TRANSPORT_CFG_SEND_FAIRNESS                    (1ull << 10)
+#define IROH_TRANSPORT_CFG_ENABLE_SEGMENTATION_OFFLOAD      (1ull << 11)
+```
+
+Validation rules:
+
+- `transport_initial_mtu` must be at least 1200 when set.
+- `transport_max_idle_timeout_ms` and `transport_keep_alive_interval_ms` must be greater than zero when set.
+- varint-backed stream/window fields must fit in QUIC varint range (`< 2^62`).
+
+ABI notes for Java/Go/.NET:
+
+- Current endpoint creation is exact-size only: `struct_size` must equal `sizeof(iroh_endpoint_config_t)`.
+- Do not claim endpoint-config forward compatibility until Rust has a versioned reader that validates `struct_size` before reading fields beyond the caller-provided layout.
+- Java FFM should regenerate from the C header or update offsets and set `struct_size` to the exact linked ABI size whenever endpoint config fields change.
+
+### 3d.7 Python API
 
 ```python
 # Server with a fixed port
@@ -1034,16 +1125,23 @@ EndpointConfig(alpns=[b"myproto/1"], portmapper_config="disabled", proxy_url="ht
 
 # Read proxy from environment
 EndpointConfig(alpns=[b"myproto/1"], proxy_from_env=True)
+
+# QUIC receive/send windows for a measured high-throughput server
+EndpointConfig(
+    alpns=[b"myproto/1"],
+    transport_receive_window=8_000_000,
+    transport_send_window=8_000_000,
+    transport_keep_alive_interval_ms=10_000,
+)
 ```
 
-### 3d.7 What is NOT yet exposed
+### 3d.8 What is NOT yet exposed
 
 The following iroh builder options were evaluated but deferred (see `docs/endpointbuildergaps.md`):
 
 | Option | Reason deferred |
 |---|---|
 | `bind_addr_with_opts` (BindOpts) | Niche multi-NIC routing; simple `bind_addr` covers 99% of use cases |
-| `transport_config` (QUIC tuning) | Deep QUIC knobs; not needed for any current Python application |
 | `dns_resolver` | Custom DNS is niche; system DNS is correct for almost all deployments |
 | `ca_roots_config` | Enterprise PKI only; not needed with public iroh relay infrastructure |
 | `address_lookup` | Custom discovery; relay-based discovery covers standard use cases |

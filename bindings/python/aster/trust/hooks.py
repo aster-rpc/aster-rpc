@@ -15,6 +15,7 @@ make decisions.  See ``run_hook_loop()`` for the recommended wiring.
 ALPN constants:
   ALPN_PRODUCER_ADMISSION = b"aster.producer_admission"
   ALPN_CONSUMER_ADMISSION = b"aster.consumer_admission"
+  ALPN_DELEGATED_ADMISSION = b"aster.admission"
 
 Threat model note:
   If Gate 0 is absent/misconfigured and the NodeID leaks (logs, discovery),
@@ -39,8 +40,11 @@ logger = logging.getLogger(__name__)
 
 ALPN_PRODUCER_ADMISSION = b"aster.producer_admission"
 ALPN_CONSUMER_ADMISSION = b"aster.consumer_admission"
+ALPN_DELEGATED_ADMISSION = b"aster.admission"
 
-_ADMISSION_ALPNS = frozenset([ALPN_PRODUCER_ADMISSION, ALPN_CONSUMER_ADMISSION])
+_ADMISSION_ALPNS = frozenset(
+    [ALPN_PRODUCER_ADMISSION, ALPN_CONSUMER_ADMISSION, ALPN_DELEGATED_ADMISSION]
+)
 
 
 class MeshEndpointHook:
@@ -49,7 +53,8 @@ class MeshEndpointHook:
     Maintains an allowlist of admitted peer endpoint IDs.  The decision logic
     is:
 
-    - Admission ALPNs (``aster.producer_admission``, ``aster.consumer_admission``)
+    - Admission ALPNs (``aster.producer_admission``, ``aster.consumer_admission``,
+      ``aster.admission``)
       → **always allow** (credential presentation must be possible).
     - Any other ALPN, peer in ``admitted`` set → **allow**.
     - Any other ALPN, peer NOT in ``admitted`` and ``allow_unenrolled=False``
