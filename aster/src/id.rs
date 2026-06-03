@@ -220,10 +220,7 @@ impl NamespaceCapability {
 impl fmt::Debug for NamespaceCapability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Read(id) => f
-                .debug_tuple("NamespaceCapability::Read")
-                .field(id)
-                .finish(),
+            Self::Read(_) => f.write_str("NamespaceCapability::Read(<redacted>)"),
             Self::Write(_) => f.write_str("NamespaceCapability::Write(<redacted>)"),
         }
     }

@@ -34,8 +34,8 @@ hpke = { version = "0.13", default-features = false, features = ["alloc", "x2551
 rand_core = { version = "0.9", features = ["os_rng"] }
 
 [features]
-# Ownership-attestation chain (pulls in Apache Fory for the wire format).
-# Off by default so the pyo3 / ffi consumers don't compile Fory unless wanted.
+# Ownership-attestation chain. Apache Fory is now a core dependency because
+# simple trust-config primitives also use Fory XLANG.
 attestation = ["dep:thiserror", "dep:base64"]
 
 [dev-dependencies]

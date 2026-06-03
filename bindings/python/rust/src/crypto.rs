@@ -153,10 +153,8 @@ impl PyNamespaceCapability {
     }
 
     fn __repr__(&self) -> String {
-        match &self.inner {
-            CoreNamespaceCapability::Read(id) => {
-                format!("NamespaceCapability.read({})", hex::encode(id))
-            }
+        match self.inner {
+            CoreNamespaceCapability::Read(_) => "NamespaceCapability.read(<redacted>)".to_string(),
             CoreNamespaceCapability::Write(_) => {
                 "NamespaceCapability.write(<redacted>)".to_string()
             }

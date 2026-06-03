@@ -26,6 +26,8 @@ def test_namespace_capability_fory_round_trip_and_redaction():
     assert decoded_read.can_write is False
     assert decoded_read.namespace_id() == namespace_id
     assert decoded_read.namespace_secret() is None
+    assert "redacted" in repr(decoded_read)
+    assert namespace_id.hex()[:12] not in repr(decoded_read)
 
 
 def test_hpke_envelope_round_trip_with_associated_data():
