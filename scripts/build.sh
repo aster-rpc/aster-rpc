@@ -19,7 +19,7 @@ WHEEL_DIR="bindings/python/target/wheels"
 
 # Build wheel, then install it — single cargo compilation
 uv run maturin build -m "$MANIFEST" --out "$WHEEL_DIR" "$@"
-uv pip install "$WHEEL_DIR"/aster_rpc-*.whl --force-reinstall --no-deps
+uv pip install --offline "$WHEEL_DIR"/aster_rpc-*.whl --force-reinstall --no-deps
 
 echo "✓ Wheel(s) in $WHEEL_DIR"
 
