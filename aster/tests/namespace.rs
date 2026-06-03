@@ -95,7 +95,7 @@ async fn read_import_then_write_import_upgrades_to_writable() {
 }
 
 #[test]
-fn namespace_capability_uses_fory_and_redacts_write_secret() {
+fn namespace_capability_uses_fory_and_redacts_capability_material() {
     let secret = NamespaceSecret::from_bytes([0x33u8; 32]);
     let write = NamespaceCapability::write(secret.clone());
     let read = NamespaceCapability::read(secret.id());
@@ -115,6 +115,10 @@ fn namespace_capability_uses_fory_and_redacts_write_secret() {
     let decoded_read = NamespaceCapability::decode_fory(&read.encode_fory()).unwrap();
     assert!(!decoded_read.can_write());
     assert_eq!(decoded_read.namespace_id(), secret.id());
+
+    let read_text = format!("{decoded_read:?}");
+    assert!(read_text.contains("<redacted>"));
+    assert!(!read_text.contains(&secret.id().to_hex()[..12]));
 }
 
 #[test]

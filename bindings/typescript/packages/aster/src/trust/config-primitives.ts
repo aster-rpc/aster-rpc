@@ -75,10 +75,6 @@ function copyBytes(bytes: Uint8Array): Uint8Array {
   return Uint8Array.from(bytes);
 }
 
-function hex(bytes: Uint8Array): string {
-  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-}
-
 export function namespaceSecretId(secret: Uint8Array): Uint8Array {
   return copyBytes(requireNative().namespaceSecretId(secret));
 }
@@ -155,16 +151,16 @@ export class NamespaceCapability {
 
   toString(): string {
     return this.kind === 'read'
-      ? `NamespaceCapability.read(${hex(this._namespaceId)})`
-      : `NamespaceCapability.write(<redacted>; namespaceId=${hex(this._namespaceId)})`;
+      ? 'NamespaceCapability.read(<redacted>)'
+      : 'NamespaceCapability.write(<redacted>)';
   }
 
   toJSON(): Record<string, unknown> {
     return {
       kind: this.kind,
-      namespaceId: hex(this._namespaceId),
+      namespaceId: '<redacted>',
       canWrite: this.canWrite,
-      material: this.kind === 'write' ? '<redacted>' : hex(this._material),
+      material: '<redacted>',
     };
   }
 

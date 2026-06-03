@@ -4,6 +4,8 @@
 //! Node.js/Bun/Deno via NAPI. Mirrors the PyO3 bindings in
 //! `bindings/python/rust/src/`.
 
+#![allow(dead_code)] // NAPI exports are called from JavaScript, not Rust tests.
+
 use napi_derive::napi;
 
 mod blobs;

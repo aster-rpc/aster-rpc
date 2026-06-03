@@ -30,15 +30,10 @@ pub struct NamespaceCapabilityRecord {
 
 impl fmt::Debug for NamespaceCapabilityRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let material = if self.kind == NAMESPACE_CAPABILITY_WRITE {
-            "<redacted>".to_string()
-        } else {
-            hex::encode(&self.material)
-        };
         f.debug_struct("NamespaceCapabilityRecord")
             .field("v", &self.v)
             .field("kind", &self.kind)
-            .field("material", &material)
+            .field("material", &"<redacted>")
             .finish()
     }
 }
@@ -102,7 +97,7 @@ impl CoreNamespaceCapability {
 impl fmt::Debug for CoreNamespaceCapability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Read(id) => write!(f, "CoreNamespaceCapability::Read({})", hex::encode(id)),
+            Self::Read(_) => f.write_str("CoreNamespaceCapability::Read(<redacted>)"),
             Self::Write(_) => f.write_str("CoreNamespaceCapability::Write(<redacted>)"),
         }
     }
@@ -253,9 +248,13 @@ mod tests {
     }
 
     #[test]
-    fn namespace_capability_debug_redacts_write_secret() {
-        let text = format!("{:?}", CoreNamespaceCapability::Write([9u8; 32]));
-        assert!(text.contains("<redacted>"));
-        assert!(!text.contains("090909"));
+    fn namespace_capability_debug_redacts_capability_material() {
+        let read_text = format!("{:?}", CoreNamespaceCapability::Read([8u8; 32]));
+        assert!(read_text.contains("<redacted>"));
+        assert!(!read_text.contains("080808"));
+
+        let write_text = format!("{:?}", CoreNamespaceCapability::Write([9u8; 32]));
+        assert!(write_text.contains("<redacted>"));
+        assert!(!write_text.contains("090909"));
     }
 }
