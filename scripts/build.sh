@@ -19,9 +19,35 @@ WHEEL_DIR="bindings/python/target/wheels"
 
 # Build wheel, then install it — single cargo compilation
 uv run maturin build -m "$MANIFEST" --out "$WHEEL_DIR" "$@"
-uv pip install --offline "$WHEEL_DIR"/aster_rpc-*.whl --force-reinstall --no-deps
+WHEEL="$(ls -t "$WHEEL_DIR"/aster_rpc-*.whl | head -n 1)"
+uv pip install --offline "$WHEEL" --force-reinstall --no-deps
 
 echo "✓ Wheel(s) in $WHEEL_DIR"
+
+# The repo's Python tests import the source-tree package. `maturin build` only
+# writes the extension into the wheel, so refresh the in-tree extension before
+# importing `aster._aster` for stub generation.
+uv run python - "$WHEEL" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+wheel = pathlib.Path(sys.argv[1])
+out_dir = pathlib.Path("bindings/python/aster")
+with zipfile.ZipFile(wheel) as zf:
+    candidates = [
+        name for name in zf.namelist()
+        if name.startswith("aster/_aster.")
+        and (name.endswith(".so") or name.endswith(".pyd") or name.endswith(".dll"))
+    ]
+    if len(candidates) != 1:
+        raise SystemExit(f"expected one native extension in {wheel}, found {candidates}")
+    member = candidates[0]
+    target = out_dir / pathlib.Path(member).name
+    target.write_bytes(zf.read(member))
+    target.chmod(0o755)
+    print(f"✓ Refreshed {target} from {wheel.name}")
+PY
 
 # Regenerate native-module type stub from the live compiled module.
 uv run python -c "

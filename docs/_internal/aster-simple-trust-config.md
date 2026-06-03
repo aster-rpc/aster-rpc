@@ -192,7 +192,7 @@ Recipient envelope:
 {
   "epoch": 42,
   "recipient": "<node_id>",
-  "alg": "HPKE-X25519-BLAKE3-AEAD",
+  "alg": "HPKE-Base-X25519-HKDF-SHA256-ChaCha20Poly1305",
   "encrypted_key": "<base64url>"
 }
 ```
@@ -214,6 +214,10 @@ as an encryption key. Prefer a separate node encryption key, such as an X25519
 or HPKE key. The root-authored node policy record can publish the encryption
 public key.
 
+The default Aster helper should use HPKE base mode with DHKEM(X25519,
+HKDF-SHA256), HKDF-SHA256, and ChaCha20-Poly1305. Sender authority comes from
+the exact-root-authored Docs record, not from HPKE authenticated mode.
+
 AEAD associated data should bind the ciphertext to its context:
 
 ```text
@@ -221,11 +225,77 @@ namespace_id
 key_path
 epoch
 root_node_id
-schema_version
+record_format_version, if the application record has one
 ```
 
 This prevents ciphertext from being replayed into a different namespace, path,
 or epoch.
+
+Docs record metadata still matters. Applications should use `(path, author,
+timestamp)` to find the latest exact-root-authored record, then use their own
+monotonic generation/epoch fields for rollback policy. The Docs timestamp should
+not be required in AEAD associated data; it is ordering metadata, not durable
+authority.
+
+### Consumer requirement: typed namespace capabilities
+
+Applications such as portal-sync need to distribute Docs namespace capabilities
+as encrypted config, without embedding peer address bootstrap or application
+schema into Aster core.
+
+The useful application model is:
+
+- a logical application id, such as `tree_id`, is policy/UX identity and is not a
+  capability;
+- `NamespaceId` is a read capability for a Docs namespace;
+- `NamespaceSecret` is a write capability for a Docs namespace;
+- `NamespaceSecret::id()` derives the corresponding `NamespaceId`, so a write
+  capability does not need to carry both values;
+- plaintext capability material must never be written to a policy namespace that
+  is readable by more nodes than the intended recipients.
+
+Aster should expose small, typed primitives for this pattern:
+
+- `NamespaceCapability = Read(NamespaceId) | Write(NamespaceSecret)`;
+- Fory XLANG cross-language binary encode/decode for that enum;
+- `NamespaceSecret::id()` in every binding;
+- ticket-free import/open helpers from `NamespaceId` and `NamespaceSecret`;
+- HPKE envelope helpers that encrypt/decrypt a caller-provided binary payload to
+  a recipient node encryption key with caller-provided associated data;
+- redacted `Debug`/display behavior for secrets and decrypted capability
+  payloads.
+
+Application policy can then define records such as
+`/trees/<tree_id>/grants/<node_id>` whose root-authored public portion carries
+only role, generation, expiry, algorithm ids, and ciphertext. The decrypted
+payload is application-owned binary data that contains either the read namespace
+capability or the write namespace capability plus any application metadata needed
+to mount/use that resource.
+
+For small per-recipient capability grants, applications may encrypt the
+capability payload directly to the recipient with HPKE instead of first creating
+a shared epoch content key. For larger config sets, or many records shared by the
+same recipient group, the content-key pattern above is still appropriate.
+
+For a per-node grant record, associated data should bind at least:
+
+```text
+root_policy_namespace_id
+root_node_id
+policy_path
+recipient_node_id
+grant_generation
+role
+record_format_version
+```
+
+The Docs timestamp is not required in associated data.
+
+Aster should not assign meaning to application paths such as
+`/trees/<tree_id>/grants/<node_id>`, and should not require applications to use
+JSON on the wire. JSON examples in design docs are explanatory only; stable
+wire/storage records should use Fory XLANG binary serialization with test
+vectors for every supported language.
 
 ---
 
@@ -257,7 +327,7 @@ Framework core should provide primitives and guardrails:
 - auth-gated docs sync hooks;
 - helpers for exact-author reads;
 - monotonic epoch/version helpers;
-- canonical encoding helpers for policy records;
+- Fory XLANG encoding helpers for policy records;
 - encryption envelope primitives for key wrapping and config encryption;
 - watch helpers for policy prefixes.
 
@@ -313,5 +383,5 @@ Before promoting this beyond an application pattern, the framework should prove:
 - docs sync is consistently gated by the same admission policy;
 - root-authored reads cannot be shadowed by untrusted writers;
 - epoch rollback checks are easy to apply;
-- encryption envelopes have stable canonical encoding and associated data;
+- encryption envelopes have stable Fory XLANG encoding and associated data;
 - key rotation is testable with add/remove/compromise flows.

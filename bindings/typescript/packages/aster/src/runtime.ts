@@ -268,6 +268,8 @@ export class AsterServer {
     // Initialize contract identity binding (needed for _publishContracts)
     const { setNativeContract } = await import('./contract/identity.js');
     setNativeContract(native);
+    const { setNativeTrustConfigPrimitives } = await import('./trust/config-primitives.js');
+    setNativeTrustConfigPrimitives(native);
 
     // Create node with RPC + admission ALPNs.
     //
@@ -1275,6 +1277,8 @@ export class AsterClientWrapper {
     // `decodeTypeDefBytes`. Re-setting is idempotent.
     const { setNativeContract } = await import('./contract/identity.js');
     setNativeContract(native);
+    const { setNativeTrustConfigPrimitives } = await import('./trust/config-primitives.js');
+    setNativeTrustConfigPrimitives(native);
 
     // Create an in-memory client node. When an identity file provided a
     // secret key, pass it through so the client's endpoint id matches the

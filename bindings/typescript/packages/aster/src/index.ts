@@ -188,6 +188,20 @@ export {
 // XLANG Fory helpers
 export { createXlangCodec, getXlangForyAndType, newXlangFory } from './xlang.js';
 
+// Simple trust-config primitives (Rust core + Fory XLANG)
+export {
+  HPKE_ENVELOPE_ALG,
+  NamespaceCapability,
+  HpkeEnvelope,
+  namespaceSecretId,
+  hpkeGenerateKeypair,
+  hpkePublicKeyFromPrivate,
+  hpkeSeal,
+  hpkeOpen,
+  setNativeTrustConfigPrimitives,
+  type HpkeKeyPair,
+} from './trust/config-primitives.js';
+
 // Transport
 export {
   type AsterTransport,

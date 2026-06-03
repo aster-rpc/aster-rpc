@@ -6,6 +6,7 @@
 //! 32-byte arrays.
 
 use crate::error::{Error, Result};
+use aster_transport_core::namespace::CoreNamespaceCapability;
 use std::fmt;
 use std::str::FromStr;
 
@@ -140,6 +141,91 @@ impl fmt::Debug for NamespaceSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Never print the secret bytes.
         f.write_str("NamespaceSecret(<redacted>)")
+    }
+}
+
+/// Typed capability for opening an iroh Docs namespace.
+///
+/// `Read` carries the public namespace id. `Write` carries only the namespace
+/// secret; the read id is derived from that secret with [`NamespaceSecret::id`].
+#[derive(Clone)]
+pub enum NamespaceCapability {
+    Read(NamespaceId),
+    Write(NamespaceSecret),
+}
+
+impl NamespaceCapability {
+    /// Construct a read capability from a public namespace id.
+    pub fn read(id: NamespaceId) -> Self {
+        Self::Read(id)
+    }
+
+    /// Construct a write capability from a namespace secret.
+    pub fn write(secret: NamespaceSecret) -> Self {
+        Self::Write(secret)
+    }
+
+    /// Return the public namespace id represented by this capability.
+    pub fn namespace_id(&self) -> NamespaceId {
+        match self {
+            Self::Read(id) => *id,
+            Self::Write(secret) => secret.id(),
+        }
+    }
+
+    /// Return true if this capability includes write authority.
+    pub fn can_write(&self) -> bool {
+        matches!(self, Self::Write(_))
+    }
+
+    /// Encode this capability as Fory XLANG bytes.
+    pub fn encode_fory(&self) -> Vec<u8> {
+        self.to_core().encode_fory()
+    }
+
+    /// Decode Fory XLANG bytes into a typed namespace capability.
+    pub fn decode_fory(bytes: &[u8]) -> Result<Self> {
+        CoreNamespaceCapability::decode_fory(bytes)
+            .map_err(Error::Transport)
+            .map(Self::from_core)
+    }
+
+    /// Alias for [`Self::encode_fory`].
+    pub fn encode_canonical(&self) -> Vec<u8> {
+        self.encode_fory()
+    }
+
+    /// Alias for [`Self::decode_fory`].
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self> {
+        Self::decode_fory(bytes)
+    }
+
+    pub(crate) fn to_core(&self) -> CoreNamespaceCapability {
+        match self {
+            Self::Read(id) => CoreNamespaceCapability::Read(id.to_bytes()),
+            Self::Write(secret) => CoreNamespaceCapability::Write(secret.to_bytes()),
+        }
+    }
+
+    pub(crate) fn from_core(capability: CoreNamespaceCapability) -> Self {
+        match capability {
+            CoreNamespaceCapability::Read(id) => Self::Read(NamespaceId::from_bytes(id)),
+            CoreNamespaceCapability::Write(secret) => {
+                Self::Write(NamespaceSecret::from_bytes(secret))
+            }
+        }
+    }
+}
+
+impl fmt::Debug for NamespaceCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(id) => f
+                .debug_tuple("NamespaceCapability::Read")
+                .field(id)
+                .finish(),
+            Self::Write(_) => f.write_str("NamespaceCapability::Write(<redacted>)"),
+        }
     }
 }
 

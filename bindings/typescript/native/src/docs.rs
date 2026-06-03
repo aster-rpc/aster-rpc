@@ -34,6 +34,63 @@ impl DocsClient {
         Ok(DocHandle { inner: doc })
     }
 
+    /// Reopen an existing local namespace by public namespace id bytes.
+    /// Returns null if the namespace is not present locally.
+    #[napi]
+    pub async fn open_namespace(&self, namespace_id: Buffer) -> Result<Option<DocHandle>> {
+        if namespace_id.len() != 32 {
+            return Err(Error::from_reason("namespace id must be 32 bytes"));
+        }
+        let namespace_id_hex = hex::encode(namespace_id);
+        let doc = self
+            .inner
+            .clone()
+            .open(namespace_id_hex)
+            .await
+            .map_err(to_napi_err)?;
+        Ok(doc.map(|inner| DocHandle { inner }))
+    }
+
+    /// Reopen an existing local namespace by public namespace id hex.
+    /// Returns null if the namespace is not present locally.
+    #[napi]
+    pub async fn open_namespace_hex(&self, namespace_id_hex: String) -> Result<Option<DocHandle>> {
+        let doc = self
+            .inner
+            .clone()
+            .open(namespace_id_hex)
+            .await
+            .map_err(to_napi_err)?;
+        Ok(doc.map(|inner| DocHandle { inner }))
+    }
+
+    /// Open-or-import a read-only namespace by public namespace id bytes.
+    #[napi]
+    pub async fn open_or_import_read_namespace(&self, namespace_id: Buffer) -> Result<DocHandle> {
+        let doc = self
+            .inner
+            .clone()
+            .import_read_namespace(namespace_id.to_vec())
+            .await
+            .map_err(to_napi_err)?;
+        Ok(DocHandle { inner: doc })
+    }
+
+    /// Open-or-import a writable namespace by namespace secret bytes.
+    #[napi]
+    pub async fn open_or_import_write_namespace(
+        &self,
+        namespace_secret: Buffer,
+    ) -> Result<DocHandle> {
+        let doc = self
+            .inner
+            .clone()
+            .import_write_namespace(namespace_secret.to_vec())
+            .await
+            .map_err(to_napi_err)?;
+        Ok(DocHandle { inner: doc })
+    }
+
     /// Create a new author, returning the author ID (hex).
     #[napi]
     pub async fn create_author(&self) -> Result<String> {
