@@ -49,6 +49,7 @@
 
 mod admission;
 mod config;
+pub mod crypto;
 mod error;
 mod id;
 mod net;
@@ -77,6 +78,10 @@ pub use aster_transport_core::trust::{
     TrustMode,
 };
 pub use config::{AsterConfig, AsterConfigBuilder, RelayMode};
+pub use crypto::{
+    hpke_x25519_public_from_identity, hpke_x25519_public_from_node_id,
+    hpke_x25519_secret_from_identity,
+};
 pub use error::{Error, Result};
 pub use id::{
     AuthorId, Hash, NamespaceCapability, NamespaceId, NamespaceSecret, NodeAddr, NodeId, PublicKey,
