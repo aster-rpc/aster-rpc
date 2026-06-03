@@ -40,6 +40,9 @@ Environment variables::
     ASTER_ENABLE_MONITORING=false
     ASTER_ENABLE_HOOKS=false
     ASTER_HOOK_TIMEOUT_MS=5000
+    ASTER_HOOK_FAILURE_MODE=fail_open|fail_closed
+    ASTER_TRANSPORT_RECEIVE_WINDOW=10485760
+    ASTER_TRANSPORT_MAX_IDLE_TIMEOUT_MS=30000
 
     # Logging / observability
     ASTER_LOG_FORMAT=json|text     # default: text
@@ -70,6 +73,23 @@ from ._aster import EndpointConfig
 
 _BOOL_TRUE = {"1", "true", "yes", "on"}
 _BOOL_FALSE = {"0", "false", "no", "off"}
+_HOOK_FAILURE_MODES = {"fail_open", "fail_closed"}
+_TRANSPORT_INT_FIELDS = (
+    "transport_max_concurrent_bidi_streams",
+    "transport_max_concurrent_uni_streams",
+    "transport_stream_receive_window",
+    "transport_receive_window",
+    "transport_send_window",
+    "transport_max_idle_timeout_ms",
+    "transport_keep_alive_interval_ms",
+    "transport_initial_mtu",
+    "transport_datagram_receive_buffer_size",
+    "transport_datagram_send_buffer_size",
+)
+_TRANSPORT_BOOL_FIELDS = (
+    "transport_send_fairness",
+    "transport_enable_segmentation_offload",
+)
 
 
 def _parse_bool(value: str, var: str) -> bool:
@@ -81,6 +101,17 @@ def _parse_bool(value: str, var: str) -> bool:
     raise ValueError(
         f"{var}: expected true/false/1/0, got {value!r}"
     )
+
+
+def _parse_hook_failure_mode(value: object, var: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{var}: expected fail_open or fail_closed, got {value!r}")
+    mode = value.strip().lower().replace("-", "_")
+    if not mode:
+        return "fail_open"
+    if mode not in _HOOK_FAILURE_MODES:
+        raise ValueError(f"{var}: expected fail_open or fail_closed, got {value!r}")
+    return mode
 
 
 def _parse_alpns(value: str) -> list:
@@ -118,12 +149,15 @@ def load_endpoint_config(
         "enable_monitoring": False,
         "enable_hooks": False,
         "hook_timeout_ms": 5000,
+        "hook_failure_mode": "fail_open",
         "bind_addr": None,
         "clear_ip_transports": False,
         "clear_relay_transports": False,
         "portmapper_config": None,
         "proxy_url": None,
         "proxy_from_env": False,
+        **{field: None for field in _TRANSPORT_INT_FIELDS},
+        **{field: None for field in _TRANSPORT_BOOL_FIELDS},
         "local_discovery": False,
     }
 
@@ -141,12 +175,15 @@ def load_endpoint_config(
         enable_monitoring=data["enable_monitoring"],
         enable_hooks=data["enable_hooks"],
         hook_timeout_ms=data["hook_timeout_ms"],
+        hook_failure_mode=data["hook_failure_mode"],
         bind_addr=data["bind_addr"],
         clear_ip_transports=data["clear_ip_transports"],
         clear_relay_transports=data["clear_relay_transports"],
         portmapper_config=data["portmapper_config"],
         proxy_url=data["proxy_url"],
         proxy_from_env=data["proxy_from_env"],
+        **{field: data[field] for field in _TRANSPORT_INT_FIELDS},
+        **{field: data[field] for field in _TRANSPORT_BOOL_FIELDS},
         enable_local_discovery=data["local_discovery"],
     )
 
@@ -190,6 +227,7 @@ def _merge_toml(data: dict, raw: dict, source: str) -> None:
         "clear_relay_transports",
         "proxy_from_env",
         "local_discovery",
+        *_TRANSPORT_BOOL_FIELDS,
     )
     for field in _BOOL_FIELDS:
         if field in raw:
@@ -203,6 +241,24 @@ def _merge_toml(data: dict, raw: dict, source: str) -> None:
         if not isinstance(v, int) or v < 0:
             raise _err("hook_timeout_ms", "must be a non-negative integer")
         data["hook_timeout_ms"] = v
+
+    if "hook_failure_mode" in raw:
+        try:
+            data["hook_failure_mode"] = _parse_hook_failure_mode(
+                raw["hook_failure_mode"], "hook_failure_mode"
+            )
+        except ValueError as exc:
+            raise _err("hook_failure_mode", str(exc).split(": ", 1)[-1]) from exc
+
+    for field in _TRANSPORT_INT_FIELDS:
+        if field in raw:
+            v = raw[field]
+            if v is None:
+                data[field] = None
+            elif not isinstance(v, int) or v < 0:
+                raise _err(field, "must be a non-negative integer")
+            else:
+                data[field] = v
 
     for field in ("bind_addr", "portmapper_config", "proxy_url"):
         if field in raw:
@@ -239,6 +295,7 @@ def _apply_env(data: dict) -> None:
         "clear_relay_transports",
         "proxy_from_env",
         "local_discovery",
+        *_TRANSPORT_BOOL_FIELDS,
     )
     for field in _BOOL_FIELDS:
         var = f"ASTER_{field.upper()}"
@@ -250,6 +307,24 @@ def _apply_env(data: dict) -> None:
             data["hook_timeout_ms"] = int(v)
         except ValueError as exc:
             raise ValueError(f"ASTER_HOOK_TIMEOUT_MS: must be an integer: {exc}") from exc
+
+    if (v := env.get("ASTER_HOOK_FAILURE_MODE")) is not None:
+        data["hook_failure_mode"] = _parse_hook_failure_mode(v, "ASTER_HOOK_FAILURE_MODE")
+
+    for field in _TRANSPORT_INT_FIELDS:
+        var = f"ASTER_{field.upper()}"
+        if (v := env.get(var)) is not None:
+            stripped = v.strip()
+            if not stripped:
+                data[field] = None
+                continue
+            try:
+                parsed = int(stripped)
+            except ValueError as exc:
+                raise ValueError(f"{var}: must be an integer: {exc}") from exc
+            if parsed < 0:
+                raise ValueError(f"{var}: must be a non-negative integer")
+            data[field] = parsed
 
     for field in ("bind_addr", "portmapper_config", "proxy_url"):
         var = f"ASTER_{field.upper()}"
@@ -353,11 +428,24 @@ class AsterConfig:
     enable_monitoring: bool = False
     enable_hooks: bool = False
     hook_timeout_ms: int = 5000
+    hook_failure_mode: str = "fail_open"
     clear_ip_transports: bool = False
     clear_relay_transports: bool = False
     portmapper_config: str | None = None
     proxy_url: str | None = None
     proxy_from_env: bool = False
+    transport_max_concurrent_bidi_streams: int | None = None
+    transport_max_concurrent_uni_streams: int | None = None
+    transport_stream_receive_window: int | None = None
+    transport_receive_window: int | None = None
+    transport_send_window: int | None = None
+    transport_max_idle_timeout_ms: int | None = None
+    transport_keep_alive_interval_ms: int | None = None
+    transport_initial_mtu: int | None = None
+    transport_datagram_receive_buffer_size: int | None = None
+    transport_datagram_send_buffer_size: int | None = None
+    transport_send_fairness: bool | None = None
+    transport_enable_segmentation_offload: bool | None = None
     local_discovery: bool = False
     """Enable mDNS local network discovery. Nodes on the same LAN can find
     each other without relay servers. Default off.
@@ -559,6 +647,9 @@ class AsterConfig:
             self.portmapper_config, self.proxy_url, self.proxy_from_env,
             self.local_discovery,
             self.hook_timeout_ms != 5000,
+            self.hook_failure_mode != "fail_open",
+            any(getattr(self, field) is not None for field in _TRANSPORT_INT_FIELDS),
+            any(getattr(self, field) is not None for field in _TRANSPORT_BOOL_FIELDS),
         ])
         if not has_custom:
             return None
@@ -569,12 +660,15 @@ class AsterConfig:
             enable_monitoring=self.enable_monitoring,
             enable_hooks=self.enable_hooks,
             hook_timeout_ms=self.hook_timeout_ms,
+            hook_failure_mode=self.hook_failure_mode,
             bind_addr=self.bind_addr,
             clear_ip_transports=self.clear_ip_transports,
             clear_relay_transports=self.clear_relay_transports,
             portmapper_config=self.portmapper_config,
             proxy_url=self.proxy_url,
             proxy_from_env=self.proxy_from_env,
+            **{field: getattr(self, field) for field in _TRANSPORT_INT_FIELDS},
+            **{field: getattr(self, field) for field in _TRANSPORT_BOOL_FIELDS},
             enable_local_discovery=self.local_discovery,
         )
 
@@ -610,6 +704,30 @@ class AsterConfig:
                 ("bind_addr", self.bind_addr or "<any>"),
                 ("enable_monitoring", self.enable_monitoring),
                 ("enable_hooks", self.enable_hooks),
+                (
+                    "transport_receive_window",
+                    self.transport_receive_window
+                    if self.transport_receive_window is not None
+                    else "<default>",
+                ),
+                (
+                    "transport_send_window",
+                    self.transport_send_window
+                    if self.transport_send_window is not None
+                    else "<default>",
+                ),
+                (
+                    "transport_initial_mtu",
+                    self.transport_initial_mtu
+                    if self.transport_initial_mtu is not None
+                    else "<default>",
+                ),
+                (
+                    "transport_enable_segmentation_offload",
+                    self.transport_enable_segmentation_offload
+                    if self.transport_enable_segmentation_offload is not None
+                    else "<default>",
+                ),
             ],
             "storage": [
                 ("path", self.storage_path or "<in-memory>"),
@@ -718,6 +836,18 @@ class AsterConfig:
                 _set(f, bool(network[f]), f"{toml_label} [network]")
         if "hook_timeout_ms" in network:
             _set("hook_timeout_ms", int(network["hook_timeout_ms"]), f"{toml_label} [network]")
+        if "hook_failure_mode" in network:
+            _set(
+                "hook_failure_mode",
+                _parse_hook_failure_mode(network["hook_failure_mode"], f"{toml_label} [network]"),
+                f"{toml_label} [network]",
+            )
+        for f in _TRANSPORT_INT_FIELDS:
+            if f in network:
+                _set(f, int(network[f]) if network[f] is not None else None, f"{toml_label} [network]")
+        for f in _TRANSPORT_BOOL_FIELDS:
+            if f in network:
+                _set(f, bool(network[f]) if network[f] is not None else None, f"{toml_label} [network]")
         if "secret_key" in network and network["secret_key"] is not None:
             _set("secret_key", base64.b64decode(network["secret_key"]), f"{toml_label} [network]")
 
@@ -761,6 +891,20 @@ class AsterConfig:
                 _set(f, _parse_bool(v, var), var)
         if (v := env.get("ASTER_HOOK_TIMEOUT_MS")) is not None:
             _set("hook_timeout_ms", int(v), "ASTER_HOOK_TIMEOUT_MS")
+        if (v := env.get("ASTER_HOOK_FAILURE_MODE")) is not None:
+            _set(
+                "hook_failure_mode",
+                _parse_hook_failure_mode(v, "ASTER_HOOK_FAILURE_MODE"),
+                "ASTER_HOOK_FAILURE_MODE",
+            )
+        for f in _TRANSPORT_INT_FIELDS:
+            var = f"ASTER_{f.upper()}"
+            if (v := env.get(var)) is not None:
+                _set(f, int(v.strip()) if v.strip() else None, var)
+        for f in _TRANSPORT_BOOL_FIELDS:
+            var = f"ASTER_{f.upper()}"
+            if (v := env.get(var)) is not None:
+                _set(f, _parse_bool(v, var), var)
         for f in ("portmapper_config", "proxy_url"):
             var = f"ASTER_{f.upper()}"
             if (v := env.get(var)) is not None:

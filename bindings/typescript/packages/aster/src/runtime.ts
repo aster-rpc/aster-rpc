@@ -31,6 +31,7 @@ import type { ContractManifest, ManifestMethod, ManifestField } from './contract
 import { getGeneratedMethodFields, getWireShape, registerGenerated, type RegisterGeneratedOptions } from './generated.js';
 import { IrohTransport } from './transport/iroh.js';
 import { StatusCode, RpcError } from './status.js';
+import { gate0EndpointConfig } from './gate0.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -281,9 +282,7 @@ export class AsterServer {
       Buffer.from(ALPN_DELEGATED_ADMISSION),
     ];
     const gate0Needed = !this._allowAllConsumers;
-    const endpointConfig = gate0Needed
-      ? { enableHooks: true, hookTimeoutMs: 5000 }
-      : undefined;
+    const endpointConfig = gate0EndpointConfig(gate0Needed);
     this._node = await native.IrohNode.memoryWithAlpns(alpns, endpointConfig);
 
     // Build service summaries for admission response

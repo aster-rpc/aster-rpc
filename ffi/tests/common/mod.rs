@@ -52,6 +52,8 @@ pub fn empty_endpoint_config() -> aster_transport_ffi::iroh_endpoint_config_t {
             ptr: std::ptr::null(),
             len: 0,
         },
+        hook_failure_mode:
+            aster_transport_ffi::iroh_hook_failure_mode_t::IROH_HOOK_FAILURE_FAIL_OPEN as u32,
     }
 }
 
@@ -61,5 +63,7 @@ pub fn hooks_endpoint_config() -> aster_transport_ffi::iroh_endpoint_config_t {
     let mut cfg = empty_endpoint_config();
     cfg.enable_hooks = 1;
     cfg.hook_timeout_ms = 2000;
+    cfg.hook_failure_mode =
+        aster_transport_ffi::iroh_hook_failure_mode_t::IROH_HOOK_FAILURE_FAIL_CLOSED as u32;
     cfg
 }

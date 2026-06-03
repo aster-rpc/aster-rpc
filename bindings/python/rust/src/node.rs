@@ -66,7 +66,9 @@ impl IrohNode {
         endpoint_config: Option<&EndpointConfig>,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_tokio_runtime();
-        let core_cfg = endpoint_config.map(|c| c.into());
+        let core_cfg = endpoint_config
+            .map(EndpointConfig::to_core_config)
+            .transpose()?;
         future_into_py(py, async move {
             CoreNode::memory_with_alpns(aster_alpns, core_cfg)
                 .await
@@ -85,7 +87,9 @@ impl IrohNode {
         endpoint_config: Option<&EndpointConfig>,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_tokio_runtime();
-        let core_cfg = endpoint_config.map(|c| c.into());
+        let core_cfg = endpoint_config
+            .map(EndpointConfig::to_core_config)
+            .transpose()?;
         future_into_py(py, async move {
             CoreNode::persistent_with_alpns(path, aster_alpns, core_cfg)
                 .await

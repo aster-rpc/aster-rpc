@@ -49,9 +49,13 @@ export const PRODUCER_ADMISSION_ALPN: Uint8Array = _encoder.encode('aster.produc
 /** Admission ALPN for consumer enrollment. */
 export const CONSUMER_ADMISSION_ALPN: Uint8Array = _encoder.encode('aster.consumer_admission');
 
+/** Admission ALPN for delegated enrollment. */
+export const DELEGATED_ADMISSION_ALPN: Uint8Array = _encoder.encode('aster.admission');
+
 const _ADMISSION_ALPN_STRINGS: ReadonlySet<string> = new Set([
   'aster.producer_admission',
   'aster.consumer_admission',
+  'aster.admission',
 ]);
 
 // ── MeshEndpointHook ──────────────────────────────────────────────────────────
@@ -61,7 +65,8 @@ const _ADMISSION_ALPN_STRINGS: ReadonlySet<string> = new Set([
  *
  * Maintains an allowlist of admitted peer endpoint IDs. The decision logic is:
  *
- * - Admission ALPNs (aster.producer_admission, aster.consumer_admission)
+ * - Admission ALPNs (aster.producer_admission, aster.consumer_admission,
+ *   aster.admission)
  *   -> always allow (credential presentation must be possible).
  * - Any other ALPN, peer in admitted set -> allow.
  * - Any other ALPN, peer NOT in admitted and allowUnenrolled=false -> deny.

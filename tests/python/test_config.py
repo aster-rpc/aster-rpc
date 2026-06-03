@@ -5,7 +5,7 @@ import os
 import textwrap
 import pytest
 
-from aster import load_endpoint_config, EndpointConfig
+from aster import AsterConfig, load_endpoint_config, EndpointConfig
 
 
 # ---------------------------------------------------------------------------
@@ -34,12 +34,17 @@ def test_defaults_no_args():
     assert cfg.enable_monitoring is False
     assert cfg.enable_hooks is False
     assert cfg.hook_timeout_ms == 5000
+    assert cfg.hook_failure_mode == "fail_open"
     assert cfg.bind_addr is None
     assert cfg.clear_ip_transports is False
     assert cfg.clear_relay_transports is False
     assert cfg.portmapper_config is None
     assert cfg.proxy_url is None
     assert cfg.proxy_from_env is False
+    assert cfg.transport_receive_window is None
+    assert cfg.transport_send_window is None
+    assert cfg.transport_initial_mtu is None
+    assert cfg.transport_enable_segmentation_offload is None
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +59,11 @@ def test_toml_basic(tmp_path):
         portmapper_config = "disabled"
         enable_monitoring = true
         hook_timeout_ms = 2000
+        hook_failure_mode = "fail_closed"
+        transport_receive_window = 8000000
+        transport_send_window = 8000000
+        transport_initial_mtu = 1452
+        transport_enable_segmentation_offload = false
     """)
     cfg = load_endpoint_config(p)
     assert cfg.alpns == [b"myproto/1", b"myproto/2"]
@@ -62,6 +72,11 @@ def test_toml_basic(tmp_path):
     assert cfg.portmapper_config == "disabled"
     assert cfg.enable_monitoring is True
     assert cfg.hook_timeout_ms == 2000
+    assert cfg.hook_failure_mode == "fail_closed"
+    assert cfg.transport_receive_window == 8000000
+    assert cfg.transport_send_window == 8000000
+    assert cfg.transport_initial_mtu == 1452
+    assert cfg.transport_enable_segmentation_offload is False
 
 
 def test_toml_secret_key(tmp_path):
@@ -129,6 +144,12 @@ def test_toml_invalid_bool_field(tmp_path):
 def test_toml_invalid_hook_timeout(tmp_path):
     p = _write_toml(tmp_path, "hook_timeout_ms = -1")
     with pytest.raises(ValueError, match="hook_timeout_ms"):
+        load_endpoint_config(p)
+
+
+def test_toml_invalid_transport_int(tmp_path):
+    p = _write_toml(tmp_path, "transport_receive_window = -1")
+    with pytest.raises(ValueError, match="transport_receive_window"):
         load_endpoint_config(p)
 
 
@@ -220,10 +241,22 @@ def test_env_hook_timeout_ms(monkeypatch):
     assert cfg.hook_timeout_ms == 1000
 
 
+def test_env_hook_failure_mode(monkeypatch):
+    monkeypatch.setenv("ASTER_HOOK_FAILURE_MODE", "fail-closed")
+    cfg = load_endpoint_config()
+    assert cfg.hook_failure_mode == "fail_closed"
+
+
 def test_env_hook_timeout_invalid(monkeypatch):
     monkeypatch.setenv("ASTER_HOOK_TIMEOUT_MS", "fast")
     with pytest.raises(ValueError, match="ASTER_HOOK_TIMEOUT_MS"):
         load_endpoint_config()
+
+
+def test_hook_failure_mode_invalid(tmp_path):
+    p = _write_toml(tmp_path, 'hook_failure_mode = "maybe"')
+    with pytest.raises(ValueError, match="hook_failure_mode"):
+        load_endpoint_config(p)
 
 
 def test_env_clear_ip_transports(monkeypatch):
@@ -248,6 +281,54 @@ def test_env_proxy_from_env(monkeypatch):
     monkeypatch.setenv("ASTER_PROXY_FROM_ENV", "1")
     cfg = load_endpoint_config()
     assert cfg.proxy_from_env is True
+
+
+def test_env_transport_fields(monkeypatch):
+    int_fields = {
+        "transport_max_concurrent_bidi_streams": 512,
+        "transport_max_concurrent_uni_streams": 128,
+        "transport_stream_receive_window": 2_000_000,
+        "transport_receive_window": 8_000_000,
+        "transport_send_window": 8_000_000,
+        "transport_max_idle_timeout_ms": 60_000,
+        "transport_keep_alive_interval_ms": 10_000,
+        "transport_initial_mtu": 1452,
+        "transport_datagram_receive_buffer_size": 1_000_000,
+        "transport_datagram_send_buffer_size": 1_000_000,
+    }
+    bool_fields = {
+        "transport_send_fairness": True,
+        "transport_enable_segmentation_offload": False,
+    }
+    for field, value in int_fields.items():
+        monkeypatch.setenv(f"ASTER_{field.upper()}", str(value))
+    for field, value in bool_fields.items():
+        monkeypatch.setenv(f"ASTER_{field.upper()}", str(value).lower())
+
+    cfg = load_endpoint_config()
+    for field, value in int_fields.items():
+        assert getattr(cfg, field) == value
+    for field, value in bool_fields.items():
+        assert getattr(cfg, field) is value
+
+    app_cfg = AsterConfig.from_env()
+    for field, value in int_fields.items():
+        assert getattr(app_cfg, field) == value
+    for field, value in bool_fields.items():
+        assert getattr(app_cfg, field) is value
+
+
+def test_env_transport_int_empty_clears(monkeypatch, tmp_path):
+    p = _write_toml(tmp_path, "transport_receive_window = 8000000")
+    monkeypatch.setenv("ASTER_TRANSPORT_RECEIVE_WINDOW", "")
+    cfg = load_endpoint_config(p)
+    assert cfg.transport_receive_window is None
+
+
+def test_env_transport_int_invalid(monkeypatch):
+    monkeypatch.setenv("ASTER_TRANSPORT_RECEIVE_WINDOW", "large")
+    with pytest.raises(ValueError, match="ASTER_TRANSPORT_RECEIVE_WINDOW"):
+        load_endpoint_config()
 
 
 # ---------------------------------------------------------------------------

@@ -2660,7 +2660,21 @@ def _build_node_endpoint_config(
     if template is not None:
         for attr in (
             "relay_mode", "secret_key", "enable_monitoring",
-            "enable_hooks", "hook_timeout_ms", "enable_local_discovery",
+            "enable_hooks", "hook_timeout_ms", "hook_failure_mode", "bind_addr",
+            "clear_ip_transports", "clear_relay_transports", "portmapper_config",
+            "proxy_url", "proxy_from_env", "enable_local_discovery", "data_dir",
+            "transport_max_concurrent_bidi_streams",
+            "transport_max_concurrent_uni_streams",
+            "transport_stream_receive_window",
+            "transport_receive_window",
+            "transport_send_window",
+            "transport_max_idle_timeout_ms",
+            "transport_keep_alive_interval_ms",
+            "transport_initial_mtu",
+            "transport_datagram_receive_buffer_size",
+            "transport_datagram_send_buffer_size",
+            "transport_send_fairness",
+            "transport_enable_segmentation_offload",
         ):
             if hasattr(template, attr):
                 val = getattr(template, attr)
@@ -2668,6 +2682,7 @@ def _build_node_endpoint_config(
                     kwargs[attr] = val
     if enable_hooks:
         kwargs["enable_hooks"] = True
+        kwargs["hook_failure_mode"] = "fail_closed"
     return EndpointConfig(**kwargs)
 
 
@@ -2688,8 +2703,24 @@ def _clone_config_with_alpns(
             seen.add(a)
             merged.append(a)
     kwargs: dict[str, Any] = {"alpns": merged}
-    for attr in ("relay_mode", "secret_key", "enable_monitoring", "enable_hooks",
-                  "hook_timeout_ms", "enable_local_discovery"):
+    for attr in (
+        "relay_mode", "secret_key", "enable_monitoring", "enable_hooks",
+        "hook_timeout_ms", "hook_failure_mode", "bind_addr", "clear_ip_transports",
+        "clear_relay_transports", "portmapper_config", "proxy_url",
+        "proxy_from_env", "enable_local_discovery", "data_dir",
+        "transport_max_concurrent_bidi_streams",
+        "transport_max_concurrent_uni_streams",
+        "transport_stream_receive_window",
+        "transport_receive_window",
+        "transport_send_window",
+        "transport_max_idle_timeout_ms",
+        "transport_keep_alive_interval_ms",
+        "transport_initial_mtu",
+        "transport_datagram_receive_buffer_size",
+        "transport_datagram_send_buffer_size",
+        "transport_send_fairness",
+        "transport_enable_segmentation_offload",
+    ):
         if hasattr(template, attr):
             val = getattr(template, attr)
             if val is not None:
