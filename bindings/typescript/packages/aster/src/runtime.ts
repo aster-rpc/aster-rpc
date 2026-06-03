@@ -124,7 +124,7 @@ export interface AsterServerOptions {
   identity?: string;
   /** Peer name for identity file lookup. */
   peer?: string;
-  /** Allow all consumers without credentials (dev mode). Default: true. */
+  /** Allow all consumers without credentials (dev mode). Defaults to resolved config. */
   allowAllConsumers?: boolean;
   interceptors?: unknown[];
 }
@@ -186,7 +186,7 @@ export class AsterServer {
       host: this.config.healthHost,
     });
     this._peerStore = new PeerAttributeStore();
-    this._allowAllConsumers = opts.allowAllConsumers ?? true;
+    this._allowAllConsumers = opts.allowAllConsumers ?? this.config.allowAllConsumers;
     // In dev mode the hook must allow unenrolled peers, otherwise post-admission
     // RPC connections would be denied (they reach Gate 0 before the peer-store
     // entry from admission is checked, and the peer wouldn't be there for
