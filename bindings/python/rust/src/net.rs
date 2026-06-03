@@ -231,6 +231,7 @@ impl From<&EndpointConfig> for CoreEndpointConfig {
             enable_monitoring: config.enable_monitoring,
             enable_hooks: config.enable_hooks,
             hook_timeout_ms: config.hook_timeout_ms,
+            hook_failure_mode: Default::default(),
             bind_addr: config.bind_addr.clone(),
             clear_ip_transports: config.clear_ip_transports,
             clear_relay_transports: config.clear_relay_transports,

@@ -10,21 +10,25 @@
 
 use crate::id::NodeId;
 use aster_transport_core::{
+    trust::{
+        AdmissionSource, GateDecision, GatePolicy, PeerAdmission, ALPN_CONSUMER_ADMISSION,
+        ALPN_DELEGATED_ADMISSION, ALPN_PRODUCER_ADMISSION,
+    },
     CoreAfterHandshakeDecision, CoreHookConnectInfo, CoreHookHandshakeInfo, CoreHookReceiver,
 };
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
 use tokio::sync::oneshot;
 
 /// Well-known admission ALPNs — connections on these are let through to present
 /// a credential, even from peers not yet admitted (see [`Gate0`]).
 pub mod alpns {
+    use aster_transport_core::trust;
+
     /// Producer (mesh-join) admission.
-    pub const PRODUCER_ADMISSION: &[u8] = b"aster.producer_admission";
+    pub const PRODUCER_ADMISSION: &[u8] = trust::ALPN_PRODUCER_ADMISSION;
     /// Consumer admission.
-    pub const CONSUMER_ADMISSION: &[u8] = b"aster.consumer_admission";
+    pub const CONSUMER_ADMISSION: &[u8] = trust::ALPN_CONSUMER_ADMISSION;
     /// Delegated (@aster-issued token) admission.
-    pub const DELEGATED_ADMISSION: &[u8] = b"aster.admission";
+    pub const DELEGATED_ADMISSION: &[u8] = trust::ALPN_DELEGATED_ADMISSION;
 }
 
 /// Gate-0 admission policy: the rule an [`Admission`] handler applies per
@@ -38,9 +42,7 @@ pub mod alpns {
 /// and the admission accept loop (which calls [`admit`](Gate0::admit)).
 #[derive(Clone)]
 pub struct Gate0 {
-    admitted: Arc<RwLock<HashSet<NodeId>>>,
-    admission_alpns: Arc<Vec<Vec<u8>>>,
-    allow_unadmitted: bool,
+    policy: GatePolicy,
 }
 
 impl Default for Gate0 {
@@ -53,53 +55,55 @@ impl Gate0 {
     /// A gate seeded with the well-known admission ALPNs ([`alpns`]).
     pub fn new() -> Self {
         Self::with_admission_alpns(vec![
-            alpns::PRODUCER_ADMISSION.to_vec(),
-            alpns::CONSUMER_ADMISSION.to_vec(),
-            alpns::DELEGATED_ADMISSION.to_vec(),
+            ALPN_PRODUCER_ADMISSION.to_vec(),
+            ALPN_CONSUMER_ADMISSION.to_vec(),
+            ALPN_DELEGATED_ADMISSION.to_vec(),
         ])
     }
 
     /// A gate whose only always-open ALPNs are the ones given.
     pub fn with_admission_alpns(admission_alpns: Vec<Vec<u8>>) -> Self {
         Self {
-            admitted: Arc::new(RwLock::new(HashSet::new())),
-            admission_alpns: Arc::new(admission_alpns),
-            allow_unadmitted: false,
+            policy: GatePolicy::protected().with_admission_alpns(admission_alpns),
         }
     }
 
     /// Allow connections from un-admitted peers on any ALPN (dev/local only).
     pub fn allow_unadmitted(mut self, yes: bool) -> Self {
-        self.allow_unadmitted = yes;
+        self.policy = self.policy.set_mode(if yes {
+            aster_transport_core::trust::TrustMode::OpenDev
+        } else {
+            aster_transport_core::trust::TrustMode::Protected
+        });
         self
     }
 
     /// Mark a peer admitted (e.g. after verifying its attestation chain on an
     /// admission ALPN). Subsequent connections from it on normal ALPNs pass.
     pub fn admit(&self, peer: NodeId) {
-        self.admitted.write().unwrap().insert(peer);
+        self.policy.admit(PeerAdmission::from_source(
+            peer.as_str().to_string(),
+            AdmissionSource::Manual,
+        ));
     }
 
     /// Revoke a peer's admission.
     pub fn revoke(&self, peer: &NodeId) {
-        self.admitted.write().unwrap().remove(peer);
+        self.policy.revoke(peer.as_str());
     }
 
     /// Whether `peer` is currently admitted.
     pub fn is_admitted(&self, peer: &NodeId) -> bool {
-        self.admitted.read().unwrap().contains(peer)
+        self.policy.is_admitted(peer.as_str())
     }
 
     /// The Gate-0 decision for a `(peer, alpn)` pair: admission ALPNs are always
     /// allowed; otherwise the peer must be admitted (or `allow_unadmitted`).
     pub fn should_allow(&self, peer: &NodeId, alpn: &[u8]) -> bool {
-        if self.admission_alpns.iter().any(|a| a.as_slice() == alpn) {
-            return true;
-        }
-        if self.is_admitted(peer) {
-            return true;
-        }
-        self.allow_unadmitted
+        matches!(
+            self.policy.should_allow(peer.as_str(), alpn),
+            GateDecision::Allow
+        )
     }
 }
 

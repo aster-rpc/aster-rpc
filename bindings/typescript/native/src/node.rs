@@ -61,6 +61,7 @@ impl From<EndpointConfig> for CoreEndpointConfig {
             enable_monitoring: c.enable_monitoring.unwrap_or(false),
             enable_hooks: c.enable_hooks.unwrap_or(false),
             hook_timeout_ms: c.hook_timeout_ms.unwrap_or(5000) as u64,
+            hook_failure_mode: Default::default(),
             bind_addr: c.bind_addr,
             clear_ip_transports: c.clear_ip_transports.unwrap_or(false),
             clear_relay_transports: c.clear_relay_transports.unwrap_or(false),

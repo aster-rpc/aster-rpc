@@ -1,7 +1,7 @@
 //! Node configuration and its builder.
 
 use crate::id::SecretKey;
-use aster_transport_core::CoreEndpointConfig;
+use aster_transport_core::{trust::HookFailureMode, CoreEndpointConfig};
 use std::path::PathBuf;
 
 /// How the node uses relay servers.
@@ -117,10 +117,20 @@ impl AsterConfigBuilder {
         self
     }
 
-    /// Timeout (ms) for an admission decision before the connection is
-    /// accepted by default. Only meaningful with [`hooks`](Self::hooks).
+    /// Timeout (ms) for an admission decision before the configured hook
+    /// failure behavior is applied. Only meaningful with [`hooks`](Self::hooks).
     pub fn hook_timeout_ms(mut self, ms: u64) -> Self {
         self.inner.hook_timeout_ms = ms;
+        self
+    }
+
+    /// Configure hook fallback behavior for timeouts or closed hook channels.
+    ///
+    /// The default is [`HookFailureMode::FailOpen`] for compatibility with
+    /// observability-only hooks. Protected admission flows should use
+    /// [`HookFailureMode::FailClosed`].
+    pub fn hook_failure_mode(mut self, mode: HookFailureMode) -> Self {
+        self.inner.hook_failure_mode = mode;
         self
     }
 

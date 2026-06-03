@@ -9,6 +9,7 @@ pub mod registry;
 pub mod ring;
 pub mod signing;
 pub mod ticket;
+pub mod trust;
 pub mod tunnel;
 
 use std::collections::HashMap;
@@ -82,6 +83,8 @@ pub struct CoreEndpointConfig {
     pub enable_hooks: bool,
     /// Timeout in ms for hook replies (default 5000)
     pub hook_timeout_ms: u64,
+    /// Hook fallback when callback channel is closed or times out.
+    pub hook_failure_mode: trust::HookFailureMode,
     /// Bind address string e.g. "0.0.0.0:9000", "127.0.0.1:0", "`[::`]:0"
     pub bind_addr: Option<String>,
     /// Remove all direct IP (UDP/QUIC) transports; relay-only mode
@@ -109,6 +112,7 @@ impl Default for CoreEndpointConfig {
             enable_monitoring: false,
             enable_hooks: false,
             hook_timeout_ms: 5000,
+            hook_failure_mode: trust::HookFailureMode::FailOpen,
             bind_addr: None,
             clear_ip_transports: false,
             clear_relay_transports: false,
@@ -659,6 +663,7 @@ pub struct CoreHooksAdapter {
         oneshot::Sender<CoreAfterHandshakeDecision>,
     )>,
     timeout: Duration,
+    failure_mode: trust::HookFailureMode,
 }
 
 /// Receiver side for hook events. Stored in `CoreNetClient`.
@@ -675,18 +680,44 @@ impl CoreHooksAdapter {
     /// The adapter is installed on the endpoint builder.
     /// The receiver is consumed by the FFI layer to forward events.
     pub fn new(timeout_ms: u64) -> (Self, CoreHookReceiver) {
+        Self::new_with_failure_mode(timeout_ms, trust::HookFailureMode::FailOpen)
+    }
+
+    /// Create a new hooks adapter with explicit fallback behavior.
+    pub fn new_with_failure_mode(
+        timeout_ms: u64,
+        failure_mode: trust::HookFailureMode,
+    ) -> (Self, CoreHookReceiver) {
         let (bc_tx, bc_rx) = mpsc::channel(16);
         let (ah_tx, ah_rx) = mpsc::channel(16);
         let adapter = Self {
             before_connect_tx: bc_tx,
             after_handshake_tx: ah_tx,
             timeout: Duration::from_millis(timeout_ms),
+            failure_mode,
         };
         let receiver = CoreHookReceiver {
             before_connect_rx: bc_rx,
             after_handshake_rx: ah_rx,
         };
         (adapter, receiver)
+    }
+
+    fn before_connect_fallback(&self) -> BeforeConnectOutcome {
+        match self.failure_mode {
+            trust::HookFailureMode::FailOpen => BeforeConnectOutcome::Accept,
+            trust::HookFailureMode::FailClosed => BeforeConnectOutcome::Reject,
+        }
+    }
+
+    fn after_handshake_fallback(&self) -> AfterHandshakeOutcome {
+        match self.failure_mode {
+            trust::HookFailureMode::FailOpen => AfterHandshakeOutcome::Accept,
+            trust::HookFailureMode::FailClosed => AfterHandshakeOutcome::Reject {
+                error_code: VarInt::from_u32(403),
+                reason: b"hook unavailable".to_vec(),
+            },
+        }
     }
 }
 
@@ -702,16 +733,12 @@ impl EndpointHooks for CoreHooksAdapter {
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         if self.before_connect_tx.send((info, reply_tx)).await.is_err() {
-            // Channel closed → allow by default
-            return BeforeConnectOutcome::Accept;
+            return self.before_connect_fallback();
         }
         match tokio::time::timeout(self.timeout, reply_rx).await {
             Ok(Ok(true)) => BeforeConnectOutcome::Accept,
             Ok(Ok(false)) => BeforeConnectOutcome::Reject,
-            _ => {
-                // Timeout or channel error → allow by default
-                BeforeConnectOutcome::Accept
-            }
+            _ => self.before_connect_fallback(),
         }
     }
 
@@ -728,7 +755,7 @@ impl EndpointHooks for CoreHooksAdapter {
             .await
             .is_err()
         {
-            return AfterHandshakeOutcome::Accept;
+            return self.after_handshake_fallback();
         }
         match tokio::time::timeout(self.timeout, reply_rx).await {
             Ok(Ok(CoreAfterHandshakeDecision::Accept)) => AfterHandshakeOutcome::Accept,
@@ -738,7 +765,7 @@ impl EndpointHooks for CoreHooksAdapter {
                     reason,
                 }
             }
-            _ => AfterHandshakeOutcome::Accept,
+            _ => self.after_handshake_fallback(),
         }
     }
 }
@@ -934,7 +961,10 @@ async fn build_node_endpoint(
                 monitor = Some(mon);
             }
             if config.enable_hooks {
-                let (adapter, receiver) = CoreHooksAdapter::new(config.hook_timeout_ms);
+                let (adapter, receiver) = CoreHooksAdapter::new_with_failure_mode(
+                    config.hook_timeout_ms,
+                    config.hook_failure_mode,
+                );
                 builder = builder.hooks(adapter);
                 hook_receiver = Some(Arc::new(std::sync::Mutex::new(Some(receiver))));
             }
@@ -1330,7 +1360,10 @@ impl CoreNetClient {
 
         // Install hooks adapter if requested
         if config.enable_hooks {
-            let (adapter, receiver) = CoreHooksAdapter::new(config.hook_timeout_ms);
+            let (adapter, receiver) = CoreHooksAdapter::new_with_failure_mode(
+                config.hook_timeout_ms,
+                config.hook_failure_mode,
+            );
             builder = builder.hooks(adapter);
             hook_receiver = Some(Arc::new(std::sync::Mutex::new(Some(receiver))));
         }

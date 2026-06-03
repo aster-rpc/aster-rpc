@@ -1471,6 +1471,7 @@ pub unsafe extern "C" fn iroh_endpoint_create(
         enable_monitoring: true, // Always enable monitoring for FFI endpoints
         enable_hooks,
         hook_timeout_ms,
+        hook_failure_mode: Default::default(),
         // Phase 1d fields: read from the C struct (added in iroh_endpoint_config_t).
         bind_addr: unsafe { read_string_opt(&cfg.bind_addr) },
         clear_ip_transports: cfg.clear_ip_transports != 0,
