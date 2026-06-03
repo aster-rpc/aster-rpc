@@ -67,6 +67,11 @@ mod gossip;
 pub mod rpc;
 
 pub use admission::{alpns, Admission, ConnectRequest, Gate0, HandshakeRequest};
+pub use aster_transport_core::hpke_envelope::{
+    hpke_generate_keypair, hpke_open, hpke_public_key_from_private, hpke_seal, HpkeEnvelope,
+    HpkeKeyPair, HPKE_ENVELOPE_ALG,
+};
+pub use aster_transport_core::namespace::DecryptedCapabilityPayload;
 pub use aster_transport_core::trust::{
     AdmissionSource, GateDecision, GatePolicy, HookFailureMode, PeerAdmission, PeerAdmissionStore,
     TrustMode,
@@ -74,7 +79,8 @@ pub use aster_transport_core::trust::{
 pub use config::{AsterConfig, AsterConfigBuilder, RelayMode};
 pub use error::{Error, Result};
 pub use id::{
-    AuthorId, Hash, NamespaceId, NamespaceSecret, NodeAddr, NodeId, PublicKey, SecretKey,
+    AuthorId, Hash, NamespaceCapability, NamespaceId, NamespaceSecret, NodeAddr, NodeId, PublicKey,
+    SecretKey,
 };
 pub use net::{Connection, RecvStream, SendStream};
 pub use node::Node;

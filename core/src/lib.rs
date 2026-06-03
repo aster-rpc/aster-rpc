@@ -3,6 +3,8 @@ pub mod attestation;
 pub mod canonical;
 pub mod contract;
 pub mod framing;
+pub mod hpke_envelope;
+pub mod namespace;
 pub mod pool;
 pub mod reactor;
 pub mod registry;

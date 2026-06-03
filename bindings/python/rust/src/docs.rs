@@ -251,6 +251,72 @@ impl DocsClient {
         })
     }
 
+    /// Reopen an existing local namespace by public namespace id bytes.
+    /// Returns None if the namespace is not present locally.
+    fn open_namespace<'py>(
+        &self,
+        py: Python<'py>,
+        namespace_id: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if namespace_id.len() != 32 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "namespace id must be 32 bytes",
+            ));
+        }
+        let client = self.inner.clone();
+        let namespace_id_hex = hex::encode(namespace_id);
+        future_into_py(py, async move {
+            let doc = client.open(namespace_id_hex).await.map_err(err_to_py)?;
+            Ok(doc.map(DocHandle::from))
+        })
+    }
+
+    /// Reopen an existing local namespace by public namespace id hex.
+    /// Returns None if the namespace is not present locally.
+    fn open_namespace_hex<'py>(
+        &self,
+        py: Python<'py>,
+        namespace_id_hex: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            let doc = client.open(namespace_id_hex).await.map_err(err_to_py)?;
+            Ok(doc.map(DocHandle::from))
+        })
+    }
+
+    /// Open-or-import a read-only namespace by public namespace id bytes.
+    fn open_or_import_read_namespace<'py>(
+        &self,
+        py: Python<'py>,
+        namespace_id: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            let doc = client
+                .import_read_namespace(namespace_id)
+                .await
+                .map_err(err_to_py)?;
+            Ok(DocHandle::from(doc))
+        })
+    }
+
+    /// Open-or-import a writable namespace by namespace secret bytes.
+    fn open_or_import_write_namespace<'py>(
+        &self,
+        py: Python<'py>,
+        namespace_secret: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            let doc = client
+                .import_write_namespace(namespace_secret)
+                .await
+                .map_err(err_to_py)?;
+            Ok(DocHandle::from(doc))
+        })
+    }
+
     /// Join a document and subscribe to live events atomically.
     /// Returns a (DocHandle, DocEventReceiver) tuple.
     fn join_and_subscribe<'py>(

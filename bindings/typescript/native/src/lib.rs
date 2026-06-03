@@ -9,6 +9,7 @@ use napi_derive::napi;
 mod blobs;
 mod call;
 mod contract;
+mod crypto;
 mod docs;
 mod error;
 mod gossip;

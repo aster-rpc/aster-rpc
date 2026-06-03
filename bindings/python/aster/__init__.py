@@ -104,6 +104,15 @@ try:
         NodeHookDecisionSender,
         # Ticket
         AsterTicket,
+        # Trust config primitives
+        NamespaceCapability,
+        HpkeEnvelope,
+        namespace_secret_id,
+        hpke_envelope_alg,
+        hpke_generate_keypair,
+        hpke_public_key_from_private,
+        hpke_seal,
+        hpke_open,
     )
 except ImportError as e:
     raise ImportError(
@@ -239,6 +248,14 @@ __all__ = [
     "NodeHookReceiver",
     "NodeHookDecisionSender",
     "AsterTicket",
+    "NamespaceCapability",
+    "HpkeEnvelope",
+    "namespace_secret_id",
+    "hpke_envelope_alg",
+    "hpke_generate_keypair",
+    "hpke_public_key_from_private",
+    "hpke_seal",
+    "hpke_open",
     # ── Aster RPC framework ──
     "StatusCode",
     "RpcError",

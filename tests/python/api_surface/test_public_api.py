@@ -94,6 +94,8 @@ _CLASS_NAMES = [
     "HookReceiver",
     "HookRegistration",
     "HookManager",
+    "NamespaceCapability",
+    "HpkeEnvelope",
 ]
 
 @pytest.mark.parametrize("name", _CLASS_NAMES)
@@ -123,6 +125,21 @@ def test_is_callable(name):
 
 def test_load_endpoint_config_is_callable():
     assert callable(ap.load_endpoint_config)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "namespace_secret_id",
+        "hpke_envelope_alg",
+        "hpke_generate_keypair",
+        "hpke_public_key_from_private",
+        "hpke_seal",
+        "hpke_open",
+    ],
+)
+def test_trust_config_primitive_function_is_callable(name):
+    assert callable(getattr(ap, name))
 
 
 # ---------------------------------------------------------------------------
