@@ -6,6 +6,7 @@
 //! record that carries the envelope, not HPKE authenticated mode.
 
 use anyhow::{anyhow, bail, Result};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use fory_core::Fory;
 use fory_derive::ForyStruct;
 use hpke::{
@@ -157,6 +158,45 @@ pub fn hpke_public_key_from_private(private_key: &[u8]) -> Result<[u8; 32]> {
     Ok(Kem::sk_to_pk(&private).to_bytes().into())
 }
 
+/// Derive the X25519 HPKE *private* key from an Ed25519 node identity secret.
+///
+/// Uses the standard Ed25519→X25519 scalar derivation: the clamped first 32
+/// bytes of `SHA-512(seed)`, matching libsodium
+/// `crypto_sign_ed25519_sk_to_curve25519`. Total over any 32-byte identity
+/// secret. The result is a valid X25519 static secret whose public key is
+/// [`hpke_x25519_public_from_identity`] of the corresponding Ed25519 public key.
+pub fn hpke_x25519_secret_from_identity(identity_secret: &[u8; 32]) -> [u8; 32] {
+    // `to_scalar_bytes()` is the unclamped `SHA-512(seed)[..32]`. X25519 clamps
+    // on use, but we clamp here so the returned bytes match libsodium exactly.
+    let mut scalar = SigningKey::from_bytes(identity_secret).to_scalar_bytes();
+    scalar[0] &= 248;
+    scalar[31] &= 127;
+    scalar[31] |= 64;
+    scalar
+}
+
+/// Derive the matching X25519 HPKE *public* key from an Ed25519 node identity
+/// public key, via the Edwards→Montgomery birational map (libsodium
+/// `crypto_sign_ed25519_pk_to_curve25519`).
+///
+/// Returns `Err` for an invalid Ed25519 public key: off-curve, non-canonical
+/// encoding (`y >= p`), or a small-order / identity point. Never produces a
+/// usable key from a bad input.
+pub fn hpke_x25519_public_from_identity(identity_public: &[u8; 32]) -> Result<[u8; 32]> {
+    let verifying = VerifyingKey::from_bytes(identity_public)
+        .map_err(|e| anyhow!("invalid Ed25519 public key: off-curve or undecompressable: {e}"))?;
+    // `from_bytes` follows ZIP-215 and accepts non-canonical `y >= p`
+    // encodings. Reject them: the canonical re-encoding must match the input.
+    let edwards = verifying.to_edwards();
+    if edwards.compress().to_bytes() != *identity_public {
+        bail!("invalid Ed25519 public key: non-canonical encoding");
+    }
+    if verifying.is_weak() {
+        bail!("invalid Ed25519 public key: small-order / identity point");
+    }
+    Ok(verifying.to_montgomery().to_bytes())
+}
+
 /// Encrypt caller-owned plaintext to a recipient HPKE public key.
 ///
 /// `associated_data` is authenticated and must be built by the caller from the
@@ -280,6 +320,79 @@ mod tests {
             hpke_public_key_from_private(&keypair.private_key()).unwrap(),
             keypair.public_key()
         );
+    }
+
+    #[test]
+    fn identity_derivation_roundtrips_seal_open() {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let identity_secret = signing.to_bytes();
+        let identity_public = signing.verifying_key().to_bytes();
+
+        let recipient_secret = hpke_x25519_secret_from_identity(&identity_secret);
+        let recipient_public = hpke_x25519_public_from_identity(&identity_public).unwrap();
+
+        let aad = b"root_ns/root_node/path/recipient/generation/role/v1";
+        let plaintext = b"namespace capability payload";
+        let envelope = hpke_seal(&recipient_public, aad, plaintext).unwrap();
+        let decrypted = hpke_open(&recipient_secret, aad, &envelope).unwrap();
+        assert_eq!(decrypted.expose_secret(), plaintext);
+    }
+
+    #[test]
+    fn identity_public_matches_public_from_private() {
+        // public_from_identity(pub) == public_key_from_private(secret_from_identity(secret))
+        for seed in [[1u8; 32], [42u8; 32], [255u8; 32]] {
+            let signing = SigningKey::from_bytes(&seed);
+            let identity_secret = signing.to_bytes();
+            let identity_public = signing.verifying_key().to_bytes();
+
+            let from_public = hpke_x25519_public_from_identity(&identity_public).unwrap();
+            let from_private =
+                hpke_public_key_from_private(&hpke_x25519_secret_from_identity(&identity_secret))
+                    .unwrap();
+            assert_eq!(from_public, from_private);
+        }
+    }
+
+    #[test]
+    fn identity_public_rejects_off_curve_point() {
+        // y = 2 is not the y-coordinate of any curve point (no x satisfies the
+        // curve equation), so decompression fails.
+        let mut off_curve = [0u8; 32];
+        off_curve[0] = 2;
+        assert!(hpke_x25519_public_from_identity(&off_curve).is_err());
+    }
+
+    #[test]
+    fn identity_public_rejects_small_order_point() {
+        // A canonical small-order generator from the standard Ed25519
+        // small-subgroup rejection set (order 8).
+        let small_order = [
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10,
+            0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77,
+            0x92, 0xac, 0x03, 0x7a,
+        ];
+        assert!(hpke_x25519_public_from_identity(&small_order).is_err());
+    }
+
+    #[test]
+    fn identity_public_rejects_non_canonical_encoding() {
+        // y = p (encoded `ed ff..ff 7f`) is the non-canonical encoding of y = 0.
+        // ZIP-215 decompression accepts it; our explicit canonical check must
+        // reject it.
+        let mut non_canonical = [0xffu8; 32];
+        non_canonical[0] = 0xed;
+        non_canonical[31] = 0x7f;
+        assert!(hpke_x25519_public_from_identity(&non_canonical).is_err());
+    }
+
+    #[test]
+    fn identity_secret_matches_libsodium_clamping() {
+        // Clamp bits: low 3 bits clear, bit 254 set, bit 255 clear.
+        let secret = hpke_x25519_secret_from_identity(&[3u8; 32]);
+        assert_eq!(secret[0] & 0b0000_0111, 0);
+        assert_eq!(secret[31] & 0b1000_0000, 0);
+        assert_eq!(secret[31] & 0b0100_0000, 0b0100_0000);
     }
 
     #[test]
