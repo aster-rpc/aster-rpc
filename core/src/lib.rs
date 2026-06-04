@@ -3233,6 +3233,15 @@ impl CoreDoc {
             .to_string())
     }
 
+    /// Delete all entries for `author_hex` whose key starts with `prefix`.
+    ///
+    /// iroh-docs implements this by writing a deletion marker at `prefix`.
+    /// Current-value queries omit entries hidden by that marker.
+    pub async fn del(&self, author_hex: String, prefix: Vec<u8>) -> Result<u64> {
+        let author_id: AuthorId = author_hex.parse()?;
+        Ok(self.doc.del(author_id, Bytes::from(prefix)).await? as u64)
+    }
+
     /// Query all entries for an exact key, across all authors.
     /// Returns a list of CoreDocEntry with metadata (author, content hash, timestamp, etc.)
     ///

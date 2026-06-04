@@ -883,6 +883,56 @@ fn test_doc_leave_unknown_doc_returns_not_found() {
 fn test_doc_event_kind_values() {
     assert_eq!(iroh_event_kind_t::IROH_EVENT_DOC_SUBSCRIBED as u32, 47);
     assert_eq!(iroh_event_kind_t::IROH_EVENT_DOC_EVENT as u32, 48);
+    assert_eq!(iroh_event_kind_t::IROH_EVENT_DOC_DEL as u32, 57);
+}
+
+#[test]
+fn test_doc_del_null_out_operation() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let bytes = iroh_bytes_t {
+            ptr: ptr::null(),
+            len: 0,
+        };
+        let status = iroh_doc_del(
+            runtime,
+            0,
+            bytes,
+            bytes,
+            0,
+            ptr::null_mut(), // null out_operation -> INVALID_ARGUMENT
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+
+        iroh_runtime_close(runtime);
+    }
+}
+
+#[test]
+fn test_doc_del_unknown_doc_returns_not_found() {
+    unsafe {
+        let mut runtime: iroh_runtime_t = 0;
+        iroh_runtime_new(ptr::null(), &mut runtime);
+
+        let bytes = iroh_bytes_t {
+            ptr: ptr::null(),
+            len: 0,
+        };
+        let mut operation: iroh_operation_t = 0;
+        let status = iroh_doc_del(
+            runtime,
+            999999, // unknown doc
+            bytes,
+            bytes,
+            0,
+            &mut operation,
+        );
+        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+
+        iroh_runtime_close(runtime);
+    }
 }
 
 #[test]

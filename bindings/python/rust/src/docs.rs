@@ -371,6 +371,20 @@ impl From<CoreDoc> for DocHandle {
     }
 }
 
+impl DocHandle {
+    fn delete_impl<'py>(
+        &self,
+        py: Python<'py>,
+        author_hex: String,
+        prefix: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.inner.clone();
+        future_into_py(py, async move {
+            doc.del(author_hex, prefix).await.map_err(err_to_py)
+        })
+    }
+}
+
 #[pymethods]
 impl DocHandle {
     /// Get the document's namespace ID as hex string.
@@ -392,6 +406,28 @@ impl DocHandle {
                 .await
                 .map_err(err_to_py)
         })
+    }
+
+    /// Delete all entries for `author_hex` whose key starts with `prefix`.
+    /// Returns the number of removed entries.
+    fn delete<'py>(
+        &self,
+        py: Python<'py>,
+        author_hex: String,
+        prefix: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.delete_impl(py, author_hex, prefix)
+    }
+
+    /// Python-safe alias for the Rust/FFI `del` verb.
+    #[pyo3(name = "del_")]
+    fn del_alias<'py>(
+        &self,
+        py: Python<'py>,
+        author_hex: String,
+        prefix: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.delete_impl(py, author_hex, prefix)
     }
 
     /// Get the value for an exact (author, key) pair. Returns bytes or None.
