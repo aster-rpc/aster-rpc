@@ -275,6 +275,17 @@ impl Doc {
         ))
     }
 
+    /// Delete all entries for `author` whose key starts with `prefix`.
+    ///
+    /// This writes iroh-docs' deletion marker at `prefix` and returns the
+    /// number of removed entries.
+    pub async fn del(&self, author: &AuthorId, prefix: impl Into<Vec<u8>>) -> Result<u64> {
+        Ok(self
+            .inner
+            .del(author.as_str().to_string(), prefix.into())
+            .await?)
+    }
+
     /// Read the value for an exact `(author, key)`, if present.
     pub async fn get_exact(
         &self,

@@ -138,6 +138,8 @@ pub enum iroh_event_kind_t {
     IROH_EVENT_DOC_EVENT = 48,
     /// join_and_subscribe: event.handle = doc_handle, event.related = receiver_handle
     IROH_EVENT_DOC_JOINED_AND_SUBSCRIBED = 49,
+    /// event.payload = removed count as little-endian u64.
+    IROH_EVENT_DOC_DEL = 57,
 
     // Gossip
     IROH_EVENT_GOSSIP_SUBSCRIBED = 50,
@@ -4756,6 +4758,72 @@ pub unsafe extern "C" fn iroh_doc_set_bytes(
                     0,
                 );
                 bridge2.emit_with_data(event, hash.into_bytes());
+            }
+            Err(e) => {
+                bridge2.emit_error(op_id, user_data, &e.to_string());
+            }
+        }
+    });
+
+    iroh_status_t::IROH_STATUS_OK as i32
+}
+
+/// Delete all entries for an author whose key starts with `prefix`.
+///
+/// Emits IROH_EVENT_DOC_DEL with an 8-byte little-endian u64 payload containing
+/// the number of removed entries.
+#[no_mangle]
+pub unsafe extern "C" fn iroh_doc_del(
+    runtime: iroh_runtime_t,
+    doc: u64,
+    author_hex: iroh_bytes_t,
+    prefix: iroh_bytes_t,
+    user_data: u64,
+    out_operation: *mut iroh_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return s as i32,
+    };
+
+    let doc_arc = match bridge.docs.get(doc) {
+        Some(d) => d,
+        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+    };
+
+    let author = match unsafe { read_string(&author_hex) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let prefix_bytes = unsafe { read_bytes(&prefix) };
+
+    let (op_id, cancelled) = bridge.new_operation();
+    unsafe {
+        *out_operation = op_id;
+    }
+
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+
+        match doc_arc.del(author, prefix_bytes).await {
+            Ok(removed) => {
+                let event = EventInternal::new(
+                    iroh_event_kind_t::IROH_EVENT_DOC_DEL,
+                    iroh_status_t::IROH_STATUS_OK,
+                    op_id,
+                    doc,
+                    0,
+                    user_data,
+                    0,
+                );
+                bridge2.emit_with_data(event, removed.to_le_bytes().to_vec());
             }
             Err(e) => {
                 bridge2.emit_error(op_id, user_data, &e.to_string());

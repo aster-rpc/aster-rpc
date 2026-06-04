@@ -36,6 +36,50 @@ async def test_set_get_bytes():
 
 
 @pytest.mark.asyncio
+async def test_del_exact_key_removes_value():
+    """Deleting an exact key removes the author's current value."""
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+
+    doc = await dc.create()
+    author = await dc.create_author()
+
+    await doc.set_bytes(author, b"hello", b"world")
+    removed = await doc.delete(author, b"hello")
+
+    assert removed == 1
+    assert await doc.get_exact(author, b"hello") is None
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_del_prefix_removes_matching_author_entries_only():
+    """Prefix deletion prunes one author's matching entries without touching others."""
+    node = await IrohNode.memory()
+    dc = docs_client(node)
+
+    doc = await dc.create()
+    author_a = await dc.create_author()
+    author_b = await dc.create_author()
+
+    await doc.set_bytes(author_a, b"ops/1", b"one")
+    await doc.set_bytes(author_a, b"ops/2", b"two")
+    await doc.set_bytes(author_a, b"keep/1", b"keep")
+    await doc.set_bytes(author_b, b"ops/1", b"other-author")
+
+    removed = await doc.delete(author_a, b"ops/")
+
+    assert removed == 2
+    assert await doc.get_exact(author_a, b"ops/1") is None
+    assert await doc.get_exact(author_a, b"ops/2") is None
+    assert await doc.get_exact(author_a, b"keep/1") == b"keep"
+    assert await doc.get_exact(author_b, b"ops/1") == b"other-author"
+
+    await node.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_get_missing_key():
     """Getting a non-existent key returns None."""
     node = await IrohNode.memory()

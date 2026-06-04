@@ -850,6 +850,19 @@ int32_t iroh_doc_set_bytes(iroh_runtime_t runtime,
                            uint64_t user_data,
                            iroh_operation_t *out_operation);
 
+/**
+ * Delete all entries for an author whose key starts with `prefix`.
+ *
+ * Emits IROH_EVENT_DOC_DEL with an 8-byte little-endian u64 payload containing
+ * the number of removed entries.
+ */
+int32_t iroh_doc_del(iroh_runtime_t runtime,
+                     uint64_t doc,
+                     struct iroh_bytes_t author_hex,
+                     struct iroh_bytes_t prefix,
+                     uint64_t user_data,
+                     iroh_operation_t *out_operation);
+
 int32_t iroh_doc_get_exact(iroh_runtime_t runtime,
                            uint64_t doc,
                            struct iroh_bytes_t author_hex,

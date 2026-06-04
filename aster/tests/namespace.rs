@@ -94,6 +94,45 @@ async fn read_import_then_write_import_upgrades_to_writable() {
     node.shutdown().await;
 }
 
+#[tokio::test]
+async fn doc_del_prunes_author_prefix() {
+    let secret = NamespaceSecret::from_bytes([0x44u8; 32]);
+    let node = mem_node().await;
+    let doc = node
+        .docs()
+        .open_or_import_write_namespace(secret)
+        .await
+        .unwrap();
+    let author = node.docs().default_author().await.unwrap();
+
+    doc.set_bytes(&author, b"ops/1".to_vec(), b"one".to_vec())
+        .await
+        .unwrap();
+    doc.set_bytes(&author, b"ops/2".to_vec(), b"two".to_vec())
+        .await
+        .unwrap();
+    doc.set_bytes(&author, b"keep/1".to_vec(), b"keep".to_vec())
+        .await
+        .unwrap();
+
+    let removed = doc.del(&author, b"ops/".to_vec()).await.unwrap();
+    assert_eq!(removed, 2);
+    assert_eq!(
+        doc.get_exact(&author, b"ops/1".to_vec()).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        doc.get_exact(&author, b"ops/2".to_vec()).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        doc.get_exact(&author, b"keep/1".to_vec()).await.unwrap(),
+        Some(b"keep".to_vec())
+    );
+
+    node.shutdown().await;
+}
+
 #[test]
 fn namespace_capability_uses_fory_and_redacts_capability_material() {
     let secret = NamespaceSecret::from_bytes([0x33u8; 32]);

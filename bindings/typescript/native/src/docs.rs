@@ -163,6 +163,25 @@ impl DocHandle {
             .map_err(to_napi_err)
     }
 
+    /// Delete entries for an author whose key starts with the prefix.
+    /// Returns the number of removed entries.
+    #[napi]
+    pub async fn del(&self, author_hex: String, prefix: String) -> Result<f64> {
+        let removed = self
+            .inner
+            .clone()
+            .del(author_hex, prefix.into_bytes())
+            .await
+            .map_err(to_napi_err)?;
+        const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+        if removed > MAX_SAFE_INTEGER {
+            return Err(napi::Error::from_reason(
+                "delete count exceeds JavaScript safe integer range",
+            ));
+        }
+        Ok(removed as f64)
+    }
+
     /// Get a value by author + key (returns None if not found).
     #[napi]
     pub async fn get_exact(&self, author_hex: String, key: String) -> Result<Option<Buffer>> {
