@@ -91,8 +91,34 @@ Aster framework metadata. Applications MUST NOT store application values under
 that prefix. Readers MUST NOT match application schema entries against keys
 under `_aster/`.
 
-The schema entry SHOULD be written immediately after namespace creation and
-before the namespace capability is shared with other peers.
+The schema entry MUST be written before any application value covered by the
+schema is written, and before the namespace capability is shared with other
+peers.
+
+### 3.1 Shared Schema Immutability
+
+In v1, a discoverable Docs namespace's schema is immutable once the namespace
+capability has been shared outside the creator process.
+
+After sharing, the schema author MUST NOT overwrite or delete
+`_aster/docs/schema`. A reader that observes multiple trusted schema entries
+for the same namespace MUST treat the namespace as schema-corrupt unless the
+application is explicitly running in a development mode that permits schema
+replacement.
+
+This rule avoids the unsafe live-replication window where one peer observes a
+new schema with old records, while another observes old schema with new records.
+
+Schema iteration before sharing is allowed for local development only. Stable
+applications that need a breaking change MUST use one of these strategies:
+
+- create a new Docs namespace,
+- use a new application key prefix or namespace kind in a new namespace, or
+- design an application-level epoch/content-hash key prefix from the beginning
+  and keep each epoch's records disjoint.
+
+In all cases, records written under a shared schema MUST remain decodable by
+that exact schema for the lifetime of the namespace.
 
 -----
 
@@ -265,6 +291,17 @@ Literal `{` and `}` are forbidden in v1 text templates. If an application needs
 literal braces in keys, it must use `TEXT_EXACT`, `TEXT_PREFIX`, or a bytes
 pattern.
 
+Text pattern validation:
+
+- `TEXT_EXACT`, `TEXT_PREFIX`, and `TEXT_TEMPLATE` MUST set `text` and MUST
+  leave `bytes` empty and `bytes_template.segments` empty.
+- `TEXT_PREFIX` MUST NOT use an empty prefix.
+- `TEXT_TEMPLATE` MUST reject duplicate placeholder names within one pattern.
+- `TEXT_TEMPLATE` MUST reject empty placeholders, placeholders that are not an
+  entire slash-separated segment, and literal `{` or `}` characters.
+- Any text pattern that can match a key beginning with `_aster/` MUST be
+  rejected.
+
 ### 5.2 Bytes Patterns
 
 `BYTES_EXACT`
@@ -287,6 +324,26 @@ Segment semantics:
 
 A `BYTES_TEMPLATE` match succeeds only if all segments match and the key is
 fully consumed. Partial matches are not valid.
+
+Bytes pattern validation:
+
+- `BYTES_EXACT` and `BYTES_PREFIX` MUST set `bytes` and MUST leave `text` empty
+  and `bytes_template.segments` empty.
+- `BYTES_PREFIX` MUST NOT use an empty prefix.
+- `BYTES_TEMPLATE` MUST leave `text` and `bytes` empty.
+- Capture names in `FIXED`, `REST`, and `U16BE_LEN_BYTES` segments MUST match
+  `[A-Za-z_][A-Za-z0-9_]*` and MUST be unique within one pattern.
+- `LITERAL` segments MUST set non-empty `literal`, MUST use empty `name`, and
+  MUST set `width = 0`.
+- `FIXED` segments MUST set `width > 0`, MUST use empty `literal`, and MUST
+  set a valid capture `name`.
+- `REST` segments MUST use empty `literal`, MUST set `width = 0`, MUST set a
+  valid capture `name`, and MUST be the final segment. A template MUST contain
+  at most one `REST` segment.
+- `U16BE_LEN_BYTES` segments MUST use empty `literal`, MUST set `width = 0`,
+  and MUST set a valid capture `name`. The consumed length MUST NOT exceed the
+  configured per-key cap.
+- A `BYTES_TEMPLATE` MUST contain at least one segment.
 
 Examples:
 
@@ -372,6 +429,27 @@ schema author out of band. Examples:
 Application value authorization remains application-specific. `DocsSchema`
 describes how to decode values; it does not grant authority to accept them.
 
+Higher-level Docs helpers and generated decoders MUST carry the source Docs
+entry metadata through the decode path. A generated decoder MUST NOT return a
+bare domain value in contexts where authorization decisions are expected. It
+MUST return or make available at least:
+
+- the value key,
+- the value author,
+- the Docs timestamp,
+- the matched schema entry name,
+- the decoded value.
+
+Decoding a value never implies that the value author is trusted. Helpers MUST
+name this state explicitly, for example by returning
+`authorization = "not_evaluated"` or by requiring the caller to pass an
+application value-author policy before receiving a trusted domain object.
+
+Bindings MUST NOT provide a convenience path that silently reads "latest value
+by any author", decodes it, and presents it as an authorized application record.
+If a caller requests latest-any-author reads, the API name or return type MUST
+make the trust caveat explicit.
+
 -----
 
 ## 8. Publication Flow
@@ -394,11 +472,11 @@ When creating a discoverable Docs namespace:
 1. The application creates or opens the Docs namespace with a schema-author
    write author.
 1. The binding writes `_aster/docs/schema`.
-1. Only after step 7 should the namespace capability be shared or advertised.
+1. Only after step 7 may application values be written.
+1. Only after step 8 may the namespace capability be shared or advertised.
 
-Overwriting `_aster/docs/schema` is allowed while a schema is under development.
-For stable published applications, breaking schema changes SHOULD use a new
-`namespace_kind` or app key prefix.
+Overwriting `_aster/docs/schema` is allowed only before the namespace has been
+shared. After sharing, the immutability rule in §3.1 applies.
 
 -----
 
@@ -422,6 +500,7 @@ When opening a discoverable Docs namespace:
    - match the key against schema entries,
    - reject ambiguous matches,
    - decode using the matched root type,
+   - carry the value author and timestamp with the decoded result,
    - apply application trust and authorization rules.
 
 -----
@@ -531,6 +610,7 @@ Required core functions:
 ```text
 docs_schema_validate(bytes) -> DocsSchemaSummary
 docs_schema_match_key(schema_bytes, key_bytes) -> MatchResult
+docs_schema_match_entry(schema_bytes, key_bytes, author_id, timestamp) -> EntryMatchResult
 docs_schema_type_defs(schema_bytes) -> list[(tag, type_hash, type_def_bytes, root)]
 docs_schema_build_from_type_defs(schema_spec_json) -> bytes
 ```
@@ -553,7 +633,35 @@ int32_t aster_docs_schema_match_key(
     uint8_t       *out_json_ptr,
     uintptr_t     *out_json_len
 );
+
+int32_t aster_docs_schema_match_entry(
+    const uint8_t *schema_ptr,
+    uintptr_t      schema_len,
+    const uint8_t *key_ptr,
+    uintptr_t      key_len,
+    const uint8_t *author_id_ptr,
+    uintptr_t      author_id_len,
+    int64_t        timestamp_ms,
+    uint8_t       *out_json_ptr,
+    uintptr_t     *out_json_len
+);
 ```
+
+For every function with `(out_json_ptr, out_json_len)`:
+
+- `out_json_len` is both input and output.
+- On entry, `*out_json_len` is the caller-owned output buffer capacity in
+  bytes.
+- On success (`0`), the function writes UTF-8 JSON bytes with no trailing NUL,
+  stores the number of bytes written in `*out_json_len`, and never writes past
+  the input capacity.
+- If the buffer is too small, the function returns `BUFFER_TOO_SMALL`, stores
+  the required byte length in `*out_json_len`, and MUST NOT write a partial JSON
+  value.
+- A caller MAY pass `out_json_ptr = NULL` and `*out_json_len = 0` to query the
+  required output size.
+- Negative return values are errors and leave the output buffer contents
+  unspecified.
 
 `aster_docs_schema_match_key` returns JSON describing:
 
@@ -572,19 +680,31 @@ int32_t aster_docs_schema_match_key(
 If no entry matches, `matched` is `false`. If multiple entries match, the
 function returns a schema violation error rather than picking one.
 
+`aster_docs_schema_match_key` is a low-level key matcher. It does not receive a
+value author and MUST NOT be used as an authorization result. Binding-level
+decode helpers MUST operate on a full Docs entry or otherwise carry the value
+author and timestamp beside the match result.
+
+`aster_docs_schema_match_entry` applies the same key matching rules, but echoes
+the supplied Docs entry author and timestamp into the JSON result. It does not
+authorize the value; it only makes it hard for bindings to drop entry metadata
+between matching and application authorization.
+
 -----
 
 ## 12. Security and Resource Limits
 
-Implementations MUST enforce these maximum caps before or during schema decode.
-Inputs above these caps are invalid unless a future spec revision defines a
-larger profile:
+Implementations MUST enforce the raw byte cap before Fory decoding. The raw
+byte cap is authoritative. Count caps are secondary sanity limits for already
+decoded values; in practice the raw byte cap may reject a schema before a count
+cap is reached. Inputs above these caps are invalid unless a future spec
+revision defines a larger profile:
 
 |Limit|Maximum cap|
 |-----|--------------------|
 |Raw `_aster/docs/schema` bytes|1 MiB|
-|`DocsSchema.types` length|100,000|
-|`DocsSchema.entries` length|10,000|
+|`DocsSchema.types` length|4,096|
+|`DocsSchema.entries` length|4,096|
 |Text template length|8 KiB|
 |Bytes exact/prefix length|8 KiB|
 |Bytes template segment count|256|
@@ -597,6 +717,8 @@ Consumers MUST validate before decoding application values:
 - Reject entry refs to missing types.
 - Reject app entries whose key ambiguously matches multiple schema entries.
 - Reject schema entries that target `_aster/` reserved keys.
+- Reject schema replacement after namespace sharing unless explicitly running
+  in development mode.
 - Reject `FORY_XLANG_ROOT_KNOWN` payloads when no local codec support exists
   for the matched root type.
 
@@ -666,13 +788,13 @@ Example entries:
 BYTES_TEMPLATE
   LITERAL 0x01
   FIXED object_id width=16
-  -> portal.tree/ObjectEntry
+  -> portal.tree_manifest/ObjectEntry
 
 BYTES_TEMPLATE
   LITERAL 0x02
   FIXED parent_object_id width=16
   U16BE_LEN_BYTES name
-  -> portal.tree/LinkEntry
+  -> portal.tree_manifest/LinkEntry
 ```
 
 ### 13.4 Required Portal Wire Shape Changes
