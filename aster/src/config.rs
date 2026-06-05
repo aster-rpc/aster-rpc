@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::id::{PublicKey, SecretKey};
 use aster_transport_core::{trust::HookFailureMode, CoreEndpointConfig};
 use base64::Engine;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,47 @@ pub enum RelayMode {
     Staging,
     /// Disable relays entirely (direct connections only).
     Disabled,
+}
+
+/// Published service metadata loaded from `.aster-identity`.
+///
+/// Values are JSON so callers can inspect token/contract metadata without
+/// depending on TOML internals.
+pub type PublishedServices = BTreeMap<String, BTreeMap<String, serde_json::Value>>;
+
+/// A peer entry selected from `.aster-identity`.
+#[derive(Clone, Debug, Default)]
+pub struct AsterIdentityPeer {
+    /// Peer name from the identity file.
+    pub name: Option<String>,
+    /// Peer role, usually `"producer"` or `"consumer"`.
+    pub role: Option<String>,
+    /// Root public key for the mesh this peer belongs to.
+    pub root_pubkey: Option<PublicKey>,
+    /// Credential type (`type` in TOML), for example `"policy"`.
+    pub credential_type: Option<String>,
+    /// Credential expiry timestamp, if present.
+    pub expires_at: Option<i64>,
+    /// Endpoint id for producer credentials.
+    pub endpoint_id: Option<String>,
+    /// Hex-encoded signature.
+    pub signature: Option<String>,
+    /// Peer attributes. `aster.role` and `aster.name` are synthesized from the
+    /// top-level peer fields when absent, matching the TypeScript binding.
+    pub attributes: BTreeMap<String, String>,
+    /// Published-service metadata available to this peer.
+    pub published_services: PublishedServices,
+}
+
+/// Secret key plus selected peer loaded from `.aster-identity`.
+#[derive(Clone, Debug)]
+pub struct LoadedIdentity {
+    /// Path that was loaded.
+    pub path: PathBuf,
+    /// Node secret key from `[node].secret_key`, if present.
+    pub secret_key: Option<SecretKey>,
+    /// Selected peer entry, if any matched the requested name/role.
+    pub peer: Option<AsterIdentityPeer>,
 }
 
 /// Configuration for an Aster [`Node`](crate::Node).
@@ -128,6 +170,12 @@ impl AsterConfig {
         }
     }
 
+    /// Convert this resolved config back into a builder so code assignments can
+    /// intentionally override file/env values.
+    pub fn into_builder(self) -> AsterConfigBuilder {
+        AsterConfigBuilder { config: self }
+    }
+
     /// Build a configuration from `ASTER_*` environment variables.
     ///
     /// Supported variables mirror the high-level bindings: trust fields
@@ -139,6 +187,210 @@ impl AsterConfig {
         let mut config = Self::default();
         config.apply_env()?;
         Ok(config)
+    }
+
+    /// Build a configuration from an `aster.toml` file, then overlay `ASTER_*`
+    /// environment variables.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let mut config = Self::default();
+        config.apply_file(path)?;
+        config.apply_env()?;
+        Ok(config)
+    }
+
+    /// Apply an `aster.toml` file over the current configuration.
+    pub fn apply_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let content = fs::read_to_string(path).map_err(|e| {
+            Error::InvalidArgument(format!("{}: {e}", path.to_string_lossy()))
+        })?;
+        let raw: toml::Value = content.parse().map_err(|e| {
+            Error::InvalidArgument(format!("{}: invalid TOML: {e}", path.to_string_lossy()))
+        })?;
+        self.apply_toml_value(&raw, &path.to_string_lossy())
+    }
+
+    fn apply_toml_value(&mut self, raw: &toml::Value, label: &str) -> Result<()> {
+        if let Some(trust) = toml_section(raw, "trust", label)? {
+            if let Some(value) = toml_string(trust, "root_pubkey", label)? {
+                self.root_pubkey = Some(parse_public_key(&format!("{label} [trust]"), &value)?);
+            }
+            if let Some(value) = toml_path(trust, "root_pubkey_file", label)? {
+                self.root_pubkey_file = Some(value);
+            }
+            if let Some(value) = toml_path(trust, "enrollment_credential", label)? {
+                self.enrollment_credential_file = Some(value);
+            }
+            if let Some(value) = toml_string(trust, "enrollment_credential_iid", label)? {
+                self.enrollment_credential_iid = Some(value);
+            }
+            if let Some(value) = toml_bool(trust, "allow_all_consumers", label)? {
+                self.allow_all_consumers = value;
+            }
+            if let Some(value) = toml_bool(trust, "allow_all_producers", label)? {
+                self.allow_all_producers = value;
+            }
+        }
+
+        if let Some(connect) = toml_section(raw, "connect", label)? {
+            if let Some(value) = toml_string(connect, "endpoint_addr", label)? {
+                self.endpoint_addr = Some(value);
+            }
+        }
+
+        if let Some(storage) = toml_section(raw, "storage", label)? {
+            if let Some(value) = toml_path(storage, "path", label)? {
+                self.set_persistent(value);
+            }
+        }
+
+        if let Some(network) = toml_section(raw, "network", label)? {
+            if let Some(value) = toml_string_allow_empty(network, "secret_key", label)? {
+                if value.trim().is_empty() {
+                    self.set_secret_key(None);
+                } else {
+                    self.set_secret_key(Some(parse_secret_key(
+                        &format!("{label} [network] secret_key"),
+                        &value,
+                    )?));
+                }
+            }
+            if let Some(value) = toml_string(network, "relay_mode", label)? {
+                self.set_relay_mode(parse_relay_mode(&value));
+            }
+            if let Some(value) = toml_string(network, "bind_addr", label)? {
+                self.bind_addr = Some(value.clone());
+                self.inner.bind_addr = Some(value);
+            }
+            if let Some(value) = toml_bool(network, "local_discovery", label)? {
+                self.local_discovery = value;
+                self.inner.enable_discovery = value;
+            }
+            if let Some(value) = toml_bool(network, "enable_monitoring", label)? {
+                self.enable_monitoring = value;
+                self.inner.enable_monitoring = value;
+            }
+            if let Some(value) = toml_bool(network, "enable_hooks", label)? {
+                self.enable_hooks = value;
+                self.inner.enable_hooks = value;
+            }
+            if let Some(value) = toml_u64(network, "hook_timeout_ms", label)? {
+                self.hook_timeout_ms = value;
+                self.inner.hook_timeout_ms = value;
+            }
+            if let Some(value) = toml_string(network, "hook_failure_mode", label)? {
+                let mode = HookFailureMode::from_config_str(&value).ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "{label} [network] hook_failure_mode: expected fail_open or fail_closed, got {value:?}"
+                    ))
+                })?;
+                self.hook_failure_mode = mode;
+                self.inner.hook_failure_mode = mode;
+            }
+            if let Some(value) = toml_bool(network, "clear_ip_transports", label)? {
+                self.clear_ip_transports = value;
+                self.inner.clear_ip_transports = value;
+            }
+            if let Some(value) = toml_bool(network, "clear_relay_transports", label)? {
+                self.clear_relay_transports = value;
+                self.inner.clear_relay_transports = value;
+            }
+            if let Some(value) = toml_string(network, "portmapper_config", label)? {
+                self.portmapper_config = Some(value.clone());
+                self.inner.portmapper_config = Some(value);
+            }
+            if let Some(value) = toml_string(network, "proxy_url", label)? {
+                self.proxy_url = Some(value.clone());
+                self.inner.proxy_url = Some(value);
+            }
+            if let Some(value) = toml_bool(network, "proxy_from_env", label)? {
+                self.proxy_from_env = value;
+                self.inner.proxy_from_env = value;
+            }
+
+            self.transport_max_concurrent_bidi_streams =
+                toml_u64(network, "transport_max_concurrent_bidi_streams", label)?
+                    .or(self.transport_max_concurrent_bidi_streams);
+            self.inner.transport_max_concurrent_bidi_streams =
+                self.transport_max_concurrent_bidi_streams;
+
+            self.transport_max_concurrent_uni_streams =
+                toml_u64(network, "transport_max_concurrent_uni_streams", label)?
+                    .or(self.transport_max_concurrent_uni_streams);
+            self.inner.transport_max_concurrent_uni_streams =
+                self.transport_max_concurrent_uni_streams;
+
+            self.transport_stream_receive_window =
+                toml_u64(network, "transport_stream_receive_window", label)?
+                    .or(self.transport_stream_receive_window);
+            self.inner.transport_stream_receive_window = self.transport_stream_receive_window;
+
+            self.transport_receive_window =
+                toml_u64(network, "transport_receive_window", label)?
+                    .or(self.transport_receive_window);
+            self.inner.transport_receive_window = self.transport_receive_window;
+
+            self.transport_send_window = toml_u64(network, "transport_send_window", label)?
+                .or(self.transport_send_window);
+            self.inner.transport_send_window = self.transport_send_window;
+
+            self.transport_max_idle_timeout_ms =
+                toml_u64(network, "transport_max_idle_timeout_ms", label)?
+                    .or(self.transport_max_idle_timeout_ms);
+            self.inner.transport_max_idle_timeout_ms = self.transport_max_idle_timeout_ms;
+
+            self.transport_keep_alive_interval_ms =
+                toml_u64(network, "transport_keep_alive_interval_ms", label)?
+                    .or(self.transport_keep_alive_interval_ms);
+            self.inner.transport_keep_alive_interval_ms = self.transport_keep_alive_interval_ms;
+
+            self.transport_initial_mtu = toml_u16(network, "transport_initial_mtu", label)?
+                .or(self.transport_initial_mtu);
+            self.inner.transport_initial_mtu = self.transport_initial_mtu;
+
+            self.transport_datagram_receive_buffer_size =
+                toml_usize(network, "transport_datagram_receive_buffer_size", label)?
+                    .or(self.transport_datagram_receive_buffer_size);
+            self.inner.transport_datagram_receive_buffer_size =
+                self.transport_datagram_receive_buffer_size;
+
+            self.transport_datagram_send_buffer_size =
+                toml_usize(network, "transport_datagram_send_buffer_size", label)?
+                    .or(self.transport_datagram_send_buffer_size);
+            self.inner.transport_datagram_send_buffer_size =
+                self.transport_datagram_send_buffer_size;
+
+            self.transport_send_fairness =
+                toml_bool(network, "transport_send_fairness", label)?
+                    .or(self.transport_send_fairness);
+            self.inner.transport_send_fairness = self.transport_send_fairness;
+
+            self.transport_enable_segmentation_offload =
+                toml_bool(network, "transport_enable_segmentation_offload", label)?
+                    .or(self.transport_enable_segmentation_offload);
+            self.inner.transport_enable_segmentation_offload =
+                self.transport_enable_segmentation_offload;
+        }
+
+        if let Some(logging) = toml_section(raw, "logging", label)? {
+            if let Some(value) = toml_string(logging, "format", label)? {
+                self.log_format = value.to_ascii_lowercase();
+            }
+            if let Some(value) = toml_string(logging, "level", label)? {
+                self.log_level = value.to_ascii_lowercase();
+            }
+            if let Some(value) = toml_bool(logging, "mask", label)? {
+                self.log_mask = value;
+            }
+        }
+
+        if let Some(identity) = toml_section(raw, "identity", label)? {
+            if let Some(value) = toml_path(identity, "file", label)? {
+                self.identity_file = Some(value);
+            }
+        }
+
+        Ok(())
     }
 
     /// Apply `ASTER_*` environment variables over the current configuration.
@@ -333,6 +585,54 @@ impl AsterConfig {
         Ok(Some(key))
     }
 
+    /// Resolve the `.aster-identity` path.
+    ///
+    /// Uses [`identity_file`](Self::identity_file) when set, otherwise checks
+    /// for `.aster-identity` in the current working directory. Returns `None`
+    /// when the selected/default file does not exist.
+    pub fn resolve_identity_path(&self) -> Option<PathBuf> {
+        if let Some(path) = self.identity_file.as_ref() {
+            let path = expand_tilde(path);
+            return path.exists().then_some(path);
+        }
+
+        let path = env::current_dir().ok()?.join(".aster-identity");
+        path.exists().then_some(path)
+    }
+
+    /// Load `[node].secret_key` and a selected peer from `.aster-identity`.
+    ///
+    /// Selection matches the high-level bindings: `peer_name` wins; otherwise
+    /// `role` selects the first matching peer; otherwise the first peer is used.
+    /// Returns `Ok(None)` when no identity file is configured or auto-detected.
+    pub fn load_identity(
+        &self,
+        peer_name: Option<&str>,
+        role: Option<&str>,
+    ) -> Result<Option<LoadedIdentity>> {
+        let Some(path) = self.resolve_identity_path() else {
+            return Ok(None);
+        };
+        self.load_identity_from_path(path, peer_name, role).map(Some)
+    }
+
+    /// Load identity data from an explicit TOML path.
+    pub fn load_identity_from_path(
+        &self,
+        path: impl AsRef<Path>,
+        peer_name: Option<&str>,
+        role: Option<&str>,
+    ) -> Result<LoadedIdentity> {
+        let path = path.as_ref();
+        let content = fs::read_to_string(path).map_err(|e| {
+            Error::InvalidArgument(format!("{}: {e}", path.to_string_lossy()))
+        })?;
+        let raw: toml::Value = content.parse().map_err(|e| {
+            Error::InvalidArgument(format!("{}: invalid TOML: {e}", path.to_string_lossy()))
+        })?;
+        parse_identity_value(path, &raw, peer_name, role)
+    }
+
     /// Whether this configuration selects a persistent node.
     pub fn is_persistent(&self) -> bool {
         self.data_dir.is_some()
@@ -425,6 +725,26 @@ pub struct AsterConfigBuilder {
 }
 
 impl AsterConfigBuilder {
+    /// Load `ASTER_*` environment variables into the builder.
+    ///
+    /// Subsequent builder assignments override these values.
+    pub fn load_env(mut self) -> Result<Self> {
+        self.config.apply_env()?;
+        Ok(self)
+    }
+
+    /// Load an `aster.toml` file and then overlay `ASTER_*` environment
+    /// variables.
+    ///
+    /// Subsequent builder assignments override both file and env values, giving
+    /// the complete resolution order:
+    /// defaults < TOML < env < builder assignments.
+    pub fn load_file(mut self, path: impl AsRef<Path>) -> Result<Self> {
+        self.config.apply_file(path)?;
+        self.config.apply_env()?;
+        Ok(self)
+    }
+
     /// Select the relay mode (default: [`RelayMode::Default`]).
     pub fn relay(mut self, mode: RelayMode) -> Self {
         self.config.set_relay_mode(mode);
@@ -610,6 +930,279 @@ fn parse_pubkey_file(path: &Path, content: &str) -> Result<PublicKey> {
     }
 
     parse_public_key(&path.to_string_lossy(), content)
+}
+
+fn toml_section<'a>(
+    raw: &'a toml::Value,
+    section: &str,
+    label: &str,
+) -> Result<Option<&'a toml::Table>> {
+    match raw.get(section) {
+        None => Ok(None),
+        Some(toml::Value::Table(table)) => Ok(Some(table)),
+        Some(_) => Err(Error::InvalidArgument(format!(
+            "{label} [{section}]: expected table"
+        ))),
+    }
+}
+
+fn toml_string(table: &toml::Table, key: &str, label: &str) -> Result<Option<String>> {
+    toml_string_allow_empty(table, key, label).map(|value| {
+        value.and_then(|value| {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        })
+    })
+}
+
+fn toml_string_allow_empty(
+    table: &toml::Table,
+    key: &str,
+    label: &str,
+) -> Result<Option<String>> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(toml::Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(Error::InvalidArgument(format!(
+            "{label}: {key} must be a string"
+        ))),
+    }
+}
+
+fn toml_path(table: &toml::Table, key: &str, label: &str) -> Result<Option<PathBuf>> {
+    Ok(toml_string(table, key, label)?.map(PathBuf::from))
+}
+
+fn toml_bool(table: &toml::Table, key: &str, label: &str) -> Result<Option<bool>> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(toml::Value::Boolean(value)) => Ok(Some(*value)),
+        Some(_) => Err(Error::InvalidArgument(format!(
+            "{label}: {key} must be a boolean"
+        ))),
+    }
+}
+
+fn toml_u64(table: &toml::Table, key: &str, label: &str) -> Result<Option<u64>> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(toml::Value::Integer(value)) if *value >= 0 => Ok(Some(*value as u64)),
+        Some(toml::Value::Integer(_)) => Err(Error::InvalidArgument(format!(
+            "{label}: {key} must be non-negative"
+        ))),
+        Some(_) => Err(Error::InvalidArgument(format!(
+            "{label}: {key} must be an integer"
+        ))),
+    }
+}
+
+fn toml_u16(table: &toml::Table, key: &str, label: &str) -> Result<Option<u16>> {
+    let Some(value) = toml_u64(table, key, label)? else {
+        return Ok(None);
+    };
+    value
+        .try_into()
+        .map(Some)
+        .map_err(|_| Error::InvalidArgument(format!("{label}: {key} must fit in u16")))
+}
+
+fn toml_usize(table: &toml::Table, key: &str, label: &str) -> Result<Option<usize>> {
+    let Some(value) = toml_u64(table, key, label)? else {
+        return Ok(None);
+    };
+    value
+        .try_into()
+        .map(Some)
+        .map_err(|_| Error::InvalidArgument(format!("{label}: {key} must fit in usize")))
+}
+
+fn parse_identity_value(
+    path: &Path,
+    raw: &toml::Value,
+    peer_name: Option<&str>,
+    role: Option<&str>,
+) -> Result<LoadedIdentity> {
+    let label = path.to_string_lossy();
+
+    let secret_key = match raw.get("node") {
+        None => None,
+        Some(toml::Value::Table(node)) => {
+            let secret = toml_string(node, "secret_key", &label)?;
+            match secret {
+                Some(secret) => Some(parse_secret_key(&format!("{label} [node] secret_key"), &secret)?),
+                None => None,
+            }
+        }
+        Some(_) => {
+            return Err(Error::InvalidArgument(format!(
+                "{label} [node]: expected table"
+            )))
+        }
+    };
+
+    let top_published = parse_published_services(raw.get("published_services"), &label)?;
+    let peers: &[toml::Value] = match raw.get("peers") {
+        None => &[],
+        Some(toml::Value::Array(peers)) => peers.as_slice(),
+        Some(_) => {
+            return Err(Error::InvalidArgument(format!(
+                "{label} [[peers]]: expected array of tables"
+            )))
+        }
+    };
+
+    let mut selected: Option<&toml::Table> = None;
+    for peer in peers {
+        let table = peer.as_table().ok_or_else(|| {
+            Error::InvalidArgument(format!("{label} [[peers]]: expected table"))
+        })?;
+
+        let name_matches = peer_name
+            .zip(table.get("name").and_then(|value| value.as_str()))
+            .is_some_and(|(expected, actual)| expected == actual);
+        let role_matches = role
+            .zip(table.get("role").and_then(|value| value.as_str()))
+            .is_some_and(|(expected, actual)| expected == actual);
+
+        if peer_name.is_some() {
+            if name_matches {
+                selected = Some(table);
+                break;
+            }
+        } else if role.is_some() {
+            if role_matches {
+                selected = Some(table);
+                break;
+            }
+        } else {
+            selected = Some(table);
+            break;
+        }
+    }
+
+    let peer = selected
+        .map(|table| parse_identity_peer(&label, table, &top_published))
+        .transpose()?;
+
+    Ok(LoadedIdentity {
+        path: path.to_path_buf(),
+        secret_key,
+        peer,
+    })
+}
+
+fn parse_identity_peer(
+    label: &str,
+    table: &toml::Table,
+    top_published: &PublishedServices,
+) -> Result<AsterIdentityPeer> {
+    let name = toml_string(table, "name", label)?;
+    let role = toml_string(table, "role", label)?;
+    let root_pubkey = toml_string(table, "root_pubkey", label)?
+        .map(|value| parse_public_key(&format!("{label} [[peers]] root_pubkey"), &value))
+        .transpose()?;
+    let credential_type = toml_string(table, "type", label)?;
+    let expires_at = match table.get("expires_at") {
+        None => None,
+        Some(toml::Value::Integer(value)) => Some(*value),
+        Some(_) => {
+            return Err(Error::InvalidArgument(format!(
+                "{label} [[peers]] expires_at must be an integer"
+            )))
+        }
+    };
+    let endpoint_id = toml_string(table, "endpoint_id", label)?;
+    let signature = toml_string(table, "signature", label)?;
+
+    let mut attributes = parse_attributes(table.get("attributes"), label)?;
+    if let Some(role) = role.as_ref() {
+        attributes
+            .entry("aster.role".to_string())
+            .or_insert_with(|| role.clone());
+    }
+    if let Some(name) = name.as_ref() {
+        attributes
+            .entry("aster.name".to_string())
+            .or_insert_with(|| name.clone());
+    }
+
+    let mut published_services = top_published.clone();
+    let peer_published = parse_published_services(table.get("published_services"), label)?;
+    for (service, metadata) in peer_published {
+        published_services.insert(service, metadata);
+    }
+
+    Ok(AsterIdentityPeer {
+        name,
+        role,
+        root_pubkey,
+        credential_type,
+        expires_at,
+        endpoint_id,
+        signature,
+        attributes,
+        published_services,
+    })
+}
+
+fn parse_attributes(
+    value: Option<&toml::Value>,
+    label: &str,
+) -> Result<BTreeMap<String, String>> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let table = value.as_table().ok_or_else(|| {
+        Error::InvalidArgument(format!("{label} attributes: expected table"))
+    })?;
+    let mut out = BTreeMap::new();
+    for (key, value) in table {
+        let value = match value {
+            toml::Value::String(value) => value.clone(),
+            toml::Value::Integer(value) => value.to_string(),
+            toml::Value::Float(value) => value.to_string(),
+            toml::Value::Boolean(value) => value.to_string(),
+            toml::Value::Datetime(value) => value.to_string(),
+            toml::Value::Array(_) | toml::Value::Table(_) => {
+                return Err(Error::InvalidArgument(format!(
+                    "{label} attributes.{key}: expected scalar"
+                )))
+            }
+        };
+        out.insert(key.clone(), value);
+    }
+    Ok(out)
+}
+
+fn parse_published_services(
+    value: Option<&toml::Value>,
+    label: &str,
+) -> Result<PublishedServices> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let table = value.as_table().ok_or_else(|| {
+        Error::InvalidArgument(format!("{label} published_services: expected table"))
+    })?;
+    let mut out = BTreeMap::new();
+    for (service, metadata) in table {
+        let metadata = metadata.as_table().ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "{label} published_services.{service}: expected table"
+            ))
+        })?;
+        let mut service_out = BTreeMap::new();
+        for (key, value) in metadata {
+            let json_value = serde_json::to_value(value.clone()).map_err(|e| {
+                Error::InvalidArgument(format!(
+                    "{label} published_services.{service}.{key}: {e}"
+                ))
+            })?;
+            service_out.insert(key.clone(), json_value);
+        }
+        out.insert(service.clone(), service_out);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -813,6 +1406,77 @@ mod tests {
     }
 
     #[test]
+    fn from_file_env_and_builder_follow_resolution_order() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("aster.toml");
+        let file_root = [5u8; 32];
+        let file_secret = [6u8; 32];
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[trust]
+root_pubkey = "{}"
+allow_all_consumers = false
+allow_all_producers = false
+
+[connect]
+endpoint_addr = "file-endpoint"
+
+[storage]
+path = "{}"
+
+[network]
+secret_key = "{}"
+relay_mode = "disabled"
+bind_addr = "127.0.0.1:1111"
+enable_hooks = true
+transport_receive_window = 12345
+
+[logging]
+format = "json"
+level = "debug"
+mask = false
+"#,
+                hex::encode(file_root),
+                dir.path().join("file-store").display(),
+                base64::engine::general_purpose::STANDARD.encode(file_secret)
+            ),
+        )
+        .unwrap();
+
+        env::set_var("ASTER_BIND_ADDR", "127.0.0.1:2222");
+        env::set_var("ASTER_RELAY_MODE", "staging");
+        env::set_var("ASTER_ALLOW_ALL_CONSUMERS", "true");
+
+        let cfg = AsterConfig::from_file(&config_path).unwrap();
+        assert_eq!(cfg.root_pubkey.unwrap().to_bytes(), file_root);
+        assert!(cfg.allow_all_consumers); // env beats TOML
+        assert!(!cfg.allow_all_producers); // TOML beats default
+        assert_eq!(cfg.endpoint_addr.as_deref(), Some("file-endpoint"));
+        assert_eq!(cfg.secret_key.as_ref().unwrap().to_bytes(), file_secret);
+        assert_eq!(cfg.bind_addr.as_deref(), Some("127.0.0.1:2222"));
+        assert_eq!(cfg.relay_mode, RelayMode::Staging);
+        assert_eq!(cfg.transport_receive_window, Some(12345));
+        assert_eq!(cfg.log_format, "json");
+        assert!(!cfg.log_mask);
+
+        let cfg = AsterConfig::builder()
+            .load_file(&config_path)
+            .unwrap()
+            .bind_addr("127.0.0.1:3333")
+            .relay(RelayMode::Disabled)
+            .build();
+        assert_eq!(cfg.bind_addr.as_deref(), Some("127.0.0.1:3333"));
+        assert_eq!(cfg.relay_mode, RelayMode::Disabled);
+        assert_eq!(cfg.inner.bind_addr.as_deref(), Some("127.0.0.1:3333"));
+        assert_eq!(cfg.inner.relay_mode.as_deref(), Some("disabled"));
+    }
+
+    #[test]
     fn resolve_root_pubkey_reads_hex_and_json_files() {
         let dir = tempfile::tempdir().unwrap();
         let hex_path = dir.path().join("root.pub");
@@ -836,6 +1500,89 @@ mod tests {
         assert_eq!(
             cfg.resolve_root_pubkey().unwrap().unwrap().to_bytes(),
             json_key
+        );
+    }
+
+    #[test]
+    fn load_identity_selects_peer_and_synthesizes_metadata() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join(".aster-identity");
+        let secret = [7u8; 32];
+        let producer_root = [8u8; 32];
+        let consumer_root = [9u8; 32];
+        fs::write(
+            &identity_path,
+            format!(
+                r#"
+[node]
+secret_key = "{}"
+
+[published_services.TaskManager]
+producer_token = "tok_123"
+contract_id = "abc123"
+
+[[peers]]
+name = "billing-producer"
+role = "producer"
+root_pubkey = "{}"
+type = "policy"
+expires_at = 1735689599
+endpoint_id = "endpoint-producer"
+signature = "sig-producer"
+attributes = {{ custom = "yes" }}
+
+[[peers]]
+name = "analytics-consumer"
+role = "consumer"
+root_pubkey = "{}"
+type = "policy"
+expires_at = 1735689600
+signature = "sig-consumer"
+"#,
+                base64::engine::general_purpose::STANDARD.encode(secret),
+                hex::encode(producer_root),
+                hex::encode(consumer_root)
+            ),
+        )
+        .unwrap();
+
+        let cfg = AsterConfig::default();
+        let loaded = cfg
+            .load_identity_from_path(&identity_path, None, Some("consumer"))
+            .unwrap();
+        assert_eq!(loaded.secret_key.unwrap().to_bytes(), secret);
+        let peer = loaded.peer.unwrap();
+        assert_eq!(peer.name.as_deref(), Some("analytics-consumer"));
+        assert_eq!(peer.role.as_deref(), Some("consumer"));
+        assert_eq!(peer.root_pubkey.unwrap().to_bytes(), consumer_root);
+        assert_eq!(
+            peer.attributes.get("aster.role").map(String::as_str),
+            Some("consumer")
+        );
+        assert_eq!(
+            peer.attributes.get("aster.name").map(String::as_str),
+            Some("analytics-consumer")
+        );
+        assert_eq!(
+            peer.published_services["TaskManager"]["producer_token"],
+            serde_json::Value::String("tok_123".into())
+        );
+
+        let mut cfg = AsterConfig::default();
+        cfg.identity_file = Some(identity_path);
+        let loaded = cfg.load_identity(Some("billing-producer"), None).unwrap().unwrap();
+        let peer = loaded.peer.unwrap();
+        assert_eq!(peer.root_pubkey.unwrap().to_bytes(), producer_root);
+        assert_eq!(
+            peer.attributes.get("custom").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(
+            peer.attributes.get("aster.role").map(String::as_str),
+            Some("producer")
         );
     }
 }

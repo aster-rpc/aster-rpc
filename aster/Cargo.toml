@@ -32,6 +32,7 @@ async-trait = { version = "0.1", optional = true }
 aster-macros = { path = "../aster-macros", version = "0.2.0", optional = true }
 # JSON for root public-key files and, with `rpc`, registry manifests.
 serde_json = "1"
+toml = "0.8"
 # Used only to derive a NamespaceId from a NamespaceSecret without leaking
 # iroh-docs types through the public API.
 iroh-docs = { workspace = true }
@@ -50,9 +51,16 @@ url = "2"
 name = "quickstart"
 required-features = ["blobs", "docs"]
 
+# The shell example needs the RPC stack and a real PTY (portable-pty, dev-dep).
+[[example]]
+name = "shell"
+required-features = ["rpc"]
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
+# Real PTY for the `shell` example (allocate a tty, spawn $SHELL, resize ioctl).
+portable-pty = "0.8"
 # For implementing the RPC ServiceDispatch trait in tests (mirrors the macro).
 async-trait = "0.1"
 # For deriving ForyStruct on payload types in rpc tests (the `#[derive(ForyStruct)]`
