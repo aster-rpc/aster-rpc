@@ -201,9 +201,8 @@ impl AsterConfig {
     /// Apply an `aster.toml` file over the current configuration.
     pub fn apply_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let content = fs::read_to_string(path).map_err(|e| {
-            Error::InvalidArgument(format!("{}: {e}", path.to_string_lossy()))
-        })?;
+        let content = fs::read_to_string(path)
+            .map_err(|e| Error::InvalidArgument(format!("{}: {e}", path.to_string_lossy())))?;
         let raw: toml::Value = content.parse().map_err(|e| {
             Error::InvalidArgument(format!("{}: invalid TOML: {e}", path.to_string_lossy()))
         })?;
@@ -325,13 +324,12 @@ impl AsterConfig {
                     .or(self.transport_stream_receive_window);
             self.inner.transport_stream_receive_window = self.transport_stream_receive_window;
 
-            self.transport_receive_window =
-                toml_u64(network, "transport_receive_window", label)?
-                    .or(self.transport_receive_window);
+            self.transport_receive_window = toml_u64(network, "transport_receive_window", label)?
+                .or(self.transport_receive_window);
             self.inner.transport_receive_window = self.transport_receive_window;
 
-            self.transport_send_window = toml_u64(network, "transport_send_window", label)?
-                .or(self.transport_send_window);
+            self.transport_send_window =
+                toml_u64(network, "transport_send_window", label)?.or(self.transport_send_window);
             self.inner.transport_send_window = self.transport_send_window;
 
             self.transport_max_idle_timeout_ms =
@@ -344,8 +342,8 @@ impl AsterConfig {
                     .or(self.transport_keep_alive_interval_ms);
             self.inner.transport_keep_alive_interval_ms = self.transport_keep_alive_interval_ms;
 
-            self.transport_initial_mtu = toml_u16(network, "transport_initial_mtu", label)?
-                .or(self.transport_initial_mtu);
+            self.transport_initial_mtu =
+                toml_u16(network, "transport_initial_mtu", label)?.or(self.transport_initial_mtu);
             self.inner.transport_initial_mtu = self.transport_initial_mtu;
 
             self.transport_datagram_receive_buffer_size =
@@ -360,9 +358,8 @@ impl AsterConfig {
             self.inner.transport_datagram_send_buffer_size =
                 self.transport_datagram_send_buffer_size;
 
-            self.transport_send_fairness =
-                toml_bool(network, "transport_send_fairness", label)?
-                    .or(self.transport_send_fairness);
+            self.transport_send_fairness = toml_bool(network, "transport_send_fairness", label)?
+                .or(self.transport_send_fairness);
             self.inner.transport_send_fairness = self.transport_send_fairness;
 
             self.transport_enable_segmentation_offload =
@@ -484,27 +481,23 @@ impl AsterConfig {
             self.inner.proxy_from_env = value;
         }
 
-        self.transport_max_concurrent_bidi_streams = env_u64(
-            "ASTER_TRANSPORT_MAX_CONCURRENT_BIDI_STREAMS",
-        )?
-        .or(self.transport_max_concurrent_bidi_streams);
+        self.transport_max_concurrent_bidi_streams =
+            env_u64("ASTER_TRANSPORT_MAX_CONCURRENT_BIDI_STREAMS")?
+                .or(self.transport_max_concurrent_bidi_streams);
         self.inner.transport_max_concurrent_bidi_streams =
             self.transport_max_concurrent_bidi_streams;
 
-        self.transport_max_concurrent_uni_streams = env_u64(
-            "ASTER_TRANSPORT_MAX_CONCURRENT_UNI_STREAMS",
-        )?
-        .or(self.transport_max_concurrent_uni_streams);
-        self.inner.transport_max_concurrent_uni_streams =
-            self.transport_max_concurrent_uni_streams;
+        self.transport_max_concurrent_uni_streams =
+            env_u64("ASTER_TRANSPORT_MAX_CONCURRENT_UNI_STREAMS")?
+                .or(self.transport_max_concurrent_uni_streams);
+        self.inner.transport_max_concurrent_uni_streams = self.transport_max_concurrent_uni_streams;
 
-        self.transport_stream_receive_window =
-            env_u64("ASTER_TRANSPORT_STREAM_RECEIVE_WINDOW")?
-                .or(self.transport_stream_receive_window);
+        self.transport_stream_receive_window = env_u64("ASTER_TRANSPORT_STREAM_RECEIVE_WINDOW")?
+            .or(self.transport_stream_receive_window);
         self.inner.transport_stream_receive_window = self.transport_stream_receive_window;
 
-        self.transport_receive_window = env_u64("ASTER_TRANSPORT_RECEIVE_WINDOW")?
-            .or(self.transport_receive_window);
+        self.transport_receive_window =
+            env_u64("ASTER_TRANSPORT_RECEIVE_WINDOW")?.or(self.transport_receive_window);
         self.inner.transport_receive_window = self.transport_receive_window;
 
         self.transport_send_window =
@@ -512,13 +505,11 @@ impl AsterConfig {
         self.inner.transport_send_window = self.transport_send_window;
 
         self.transport_max_idle_timeout_ms =
-            env_u64("ASTER_TRANSPORT_MAX_IDLE_TIMEOUT_MS")?
-                .or(self.transport_max_idle_timeout_ms);
+            env_u64("ASTER_TRANSPORT_MAX_IDLE_TIMEOUT_MS")?.or(self.transport_max_idle_timeout_ms);
         self.inner.transport_max_idle_timeout_ms = self.transport_max_idle_timeout_ms;
 
-        self.transport_keep_alive_interval_ms =
-            env_u64("ASTER_TRANSPORT_KEEP_ALIVE_INTERVAL_MS")?
-                .or(self.transport_keep_alive_interval_ms);
+        self.transport_keep_alive_interval_ms = env_u64("ASTER_TRANSPORT_KEEP_ALIVE_INTERVAL_MS")?
+            .or(self.transport_keep_alive_interval_ms);
         self.inner.transport_keep_alive_interval_ms = self.transport_keep_alive_interval_ms;
 
         self.transport_initial_mtu =
@@ -534,8 +525,7 @@ impl AsterConfig {
         self.transport_datagram_send_buffer_size =
             env_usize("ASTER_TRANSPORT_DATAGRAM_SEND_BUFFER_SIZE")?
                 .or(self.transport_datagram_send_buffer_size);
-        self.inner.transport_datagram_send_buffer_size =
-            self.transport_datagram_send_buffer_size;
+        self.inner.transport_datagram_send_buffer_size = self.transport_datagram_send_buffer_size;
 
         self.transport_send_fairness =
             env_bool("ASTER_TRANSPORT_SEND_FAIRNESS")?.or(self.transport_send_fairness);
@@ -577,9 +567,8 @@ impl AsterConfig {
             return Ok(None);
         }
 
-        let content = fs::read_to_string(&path).map_err(|e| {
-            Error::InvalidArgument(format!("{}: {e}", path.to_string_lossy()))
-        })?;
+        let content = fs::read_to_string(&path)
+            .map_err(|e| Error::InvalidArgument(format!("{}: {e}", path.to_string_lossy())))?;
         let key = parse_pubkey_file(&path, &content)?;
         self.root_pubkey = Some(key);
         Ok(Some(key))
@@ -613,7 +602,8 @@ impl AsterConfig {
         let Some(path) = self.resolve_identity_path() else {
             return Ok(None);
         };
-        self.load_identity_from_path(path, peer_name, role).map(Some)
+        self.load_identity_from_path(path, peer_name, role)
+            .map(Some)
     }
 
     /// Load identity data from an explicit TOML path.
@@ -624,9 +614,8 @@ impl AsterConfig {
         role: Option<&str>,
     ) -> Result<LoadedIdentity> {
         let path = path.as_ref();
-        let content = fs::read_to_string(path).map_err(|e| {
-            Error::InvalidArgument(format!("{}: {e}", path.to_string_lossy()))
-        })?;
+        let content = fs::read_to_string(path)
+            .map_err(|e| Error::InvalidArgument(format!("{}: {e}", path.to_string_lossy())))?;
         let raw: toml::Value = content.parse().map_err(|e| {
             Error::InvalidArgument(format!("{}: invalid TOML: {e}", path.to_string_lossy()))
         })?;
@@ -876,8 +865,7 @@ where
 }
 
 fn parse_public_key(source: &str, value: &str) -> Result<PublicKey> {
-    PublicKey::from_hex(value.trim())
-        .map_err(|e| Error::InvalidArgument(format!("{source}: {e}")))
+    PublicKey::from_hex(value.trim()).map_err(|e| Error::InvalidArgument(format!("{source}: {e}")))
 }
 
 fn parse_secret_key(source: &str, value: &str) -> Result<SecretKey> {
@@ -904,7 +892,9 @@ fn parse_relay_mode(value: &str) -> RelayMode {
 fn expand_tilde(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if raw == "~" {
-        return env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| path.to_path_buf());
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf());
     }
     if let Some(rest) = raw.strip_prefix("~/") {
         if let Some(home) = env::var_os("HOME") {
@@ -955,11 +945,7 @@ fn toml_string(table: &toml::Table, key: &str, label: &str) -> Result<Option<Str
     })
 }
 
-fn toml_string_allow_empty(
-    table: &toml::Table,
-    key: &str,
-    label: &str,
-) -> Result<Option<String>> {
+fn toml_string_allow_empty(table: &toml::Table, key: &str, label: &str) -> Result<Option<String>> {
     match table.get(key) {
         None => Ok(None),
         Some(toml::Value::String(value)) => Ok(Some(value.clone())),
@@ -1029,7 +1015,10 @@ fn parse_identity_value(
         Some(toml::Value::Table(node)) => {
             let secret = toml_string(node, "secret_key", &label)?;
             match secret {
-                Some(secret) => Some(parse_secret_key(&format!("{label} [node] secret_key"), &secret)?),
+                Some(secret) => Some(parse_secret_key(
+                    &format!("{label} [node] secret_key"),
+                    &secret,
+                )?),
                 None => None,
             }
         }
@@ -1053,9 +1042,9 @@ fn parse_identity_value(
 
     let mut selected: Option<&toml::Table> = None;
     for peer in peers {
-        let table = peer.as_table().ok_or_else(|| {
-            Error::InvalidArgument(format!("{label} [[peers]]: expected table"))
-        })?;
+        let table = peer
+            .as_table()
+            .ok_or_else(|| Error::InvalidArgument(format!("{label} [[peers]]: expected table")))?;
 
         let name_matches = peer_name
             .zip(table.get("name").and_then(|value| value.as_str()))
@@ -1145,16 +1134,13 @@ fn parse_identity_peer(
     })
 }
 
-fn parse_attributes(
-    value: Option<&toml::Value>,
-    label: &str,
-) -> Result<BTreeMap<String, String>> {
+fn parse_attributes(value: Option<&toml::Value>, label: &str) -> Result<BTreeMap<String, String>> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
-    let table = value.as_table().ok_or_else(|| {
-        Error::InvalidArgument(format!("{label} attributes: expected table"))
-    })?;
+    let table = value
+        .as_table()
+        .ok_or_else(|| Error::InvalidArgument(format!("{label} attributes: expected table")))?;
     let mut out = BTreeMap::new();
     for (key, value) in table {
         let value = match value {
@@ -1174,10 +1160,7 @@ fn parse_attributes(
     Ok(out)
 }
 
-fn parse_published_services(
-    value: Option<&toml::Value>,
-    label: &str,
-) -> Result<PublishedServices> {
+fn parse_published_services(value: Option<&toml::Value>, label: &str) -> Result<PublishedServices> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -1194,9 +1177,7 @@ fn parse_published_services(
         let mut service_out = BTreeMap::new();
         for (key, value) in metadata {
             let json_value = serde_json::to_value(value.clone()).map_err(|e| {
-                Error::InvalidArgument(format!(
-                    "{label} published_services.{service}.{key}: {e}"
-                ))
+                Error::InvalidArgument(format!("{label} published_services.{service}.{key}: {e}"))
             })?;
             service_out.insert(key.clone(), json_value);
         }
@@ -1493,7 +1474,10 @@ mask = false
 
         let mut cfg = AsterConfig::default();
         cfg.root_pubkey_file = Some(hex_path);
-        assert_eq!(cfg.resolve_root_pubkey().unwrap().unwrap().to_bytes(), hex_key);
+        assert_eq!(
+            cfg.resolve_root_pubkey().unwrap().unwrap().to_bytes(),
+            hex_key
+        );
 
         let mut cfg = AsterConfig::default();
         cfg.root_pubkey_file = Some(json_path);
@@ -1573,7 +1557,10 @@ signature = "sig-consumer"
 
         let mut cfg = AsterConfig::default();
         cfg.identity_file = Some(identity_path);
-        let loaded = cfg.load_identity(Some("billing-producer"), None).unwrap().unwrap();
+        let loaded = cfg
+            .load_identity(Some("billing-producer"), None)
+            .unwrap()
+            .unwrap();
         let peer = loaded.peer.unwrap();
         assert_eq!(peer.root_pubkey.unwrap().to_bytes(), producer_root);
         assert_eq!(

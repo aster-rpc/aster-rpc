@@ -2219,9 +2219,10 @@ public final class IrohLibrary implements SymbolLookup {
   /**
    * iroh_endpoint_config_t: struct_size, relay_mode, secret_key, alpns, relay_urls,
    * enable_discovery, enable_hooks, hook_timeout_ms, bind_addr, clear_ip_transports,
-   * clear_relay_transports, portmapper_config, proxy_url, proxy_from_env, data_dir_utf8.
+   * clear_relay_transports, portmapper_config, proxy_url, proxy_from_env, data_dir_utf8,
+   * hook_failure_mode.
    *
-   * <p>Total: 144 bytes. Matches Rust iroh_endpoint_config_t exactly.
+   * <p>Total: 152 bytes. Matches Rust iroh_endpoint_config_t exactly.
    */
   public static final MemoryLayout IROH_ENDPOINT_CONFIG =
       MemoryLayout.structLayout(
@@ -2241,7 +2242,9 @@ public final class IrohLibrary implements SymbolLookup {
           IROH_BYTES.withName("proxy_url"), // 104 (ptr+len = 16 bytes)
           ValueLayout.JAVA_INT.withName("proxy_from_env"), // 120
           MemoryLayout.paddingLayout(4), // 4 bytes padding → data_dir_utf8 at 128 (8-byte aligned)
-          IROH_BYTES.withName("data_dir_utf8") // 128 (ptr+len = 16 bytes)
+          IROH_BYTES.withName("data_dir_utf8"), // 128 (ptr+len = 16 bytes)
+          ValueLayout.JAVA_INT.withName("hook_failure_mode"), // 144
+          MemoryLayout.paddingLayout(4) // 4 bytes tail padding → total 152
           );
 
   /**
