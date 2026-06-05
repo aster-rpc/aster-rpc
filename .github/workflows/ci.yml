@@ -18,6 +18,7 @@ on:
     #     (each has its own trigger or doesn't need CI)
     paths:
       - 'core/**'
+      - 'aster/**'
       - 'ffi/**'
       - 'bindings/python/**'
       - 'cli/**'
@@ -31,6 +32,7 @@ on:
   pull_request:
     paths:
       - 'core/**'
+      - 'aster/**'
       - 'ffi/**'
       - 'bindings/python/**'
       - 'cli/**'
