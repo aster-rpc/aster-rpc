@@ -162,6 +162,7 @@ dependencies = [
  "aster-macros",
  "aster_transport_core",
  "async-trait",
+ "base64",
  "fory-core",
  "fory-derive",
  "hex",
