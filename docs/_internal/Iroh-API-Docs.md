@@ -12,7 +12,7 @@
 ## Table of Contents
 
 1. [Mental Model: How the Three Crates Fit Together](#1-mental-model-how-the-three-crates-fit-together)
-   - [Endpoint incoming local addresses](#11-endpoint-incoming-local-addresses)
+   - [Connection addressing (accept side and dial side)](#11-connection-addressing-accept-side-and-dial-side)
 2. [iroh-blobs — Content-Addressed Blob Storage & Transfer](#2-iroh-blobs)
 3. [iroh-gossip — Topic-Based Pub-Sub Broadcast](#3-iroh-gossip)
 4. [iroh-docs — Replicated Key-Value Documents](#4-iroh-docs)
@@ -47,32 +47,79 @@
 | `iroh-blobs` | Verified bulk content transport and retention | Tag/GC-managed | None (content addressed by hash) |
 | `iroh-docs` | Replicated signed metadata over blob hashes | Durable (redb) | Dual-signed (namespace + author) |
 
-### 1.1 Endpoint incoming local addresses
+### 1.1 Connection addressing (accept side and dial side)
 
-Incoming connections no longer report the local address as only an IP address.
-Use `IncomingLocalAddr` so direct IP, relay, and custom transports are handled
-without assuming every accepted request arrived on a local socket address.
+Addresses are never assumed to be a bare socket address: a connection may arrive
+over direct IP, a relay, or a custom transport. Two distinct API surfaces exist,
+and which one you use depends on whether the connection is still being accepted
+or already established.
+
+#### Accept side, pre-handshake: `Incoming`
+
+`Endpoint::accept()` yields an `Incoming`. Before you drive it to a `Connection`,
+it exposes the local and remote address of the *pending* attempt:
 
 ```rust
 let incoming = endpoint.accept().await.context("no incoming")?;
 
+// Where the attempt landed locally.
 match incoming.local_addr() {
-    IncomingLocalAddr::Ip(ip) => {
-        println!("direct IP, local ip: {ip:?}");
-    }
-    IncomingLocalAddr::Relay { url } => {
-        println!("via relay {url}");
-    }
-    IncomingLocalAddr::Custom(addr) => {
-        println!("via custom transport: {addr:?}");
-    }
-    _ => {}
+    LocalTransportAddr::Ip(ip)      => println!("direct IP, local ip: {ip:?}"), // Option<IpAddr>
+    LocalTransportAddr::Relay(url)  => println!("via relay {url}"),
+    LocalTransportAddr::Custom(addr) => println!("via custom transport: {addr:?}"), // Option<CustomAddr>
+}
+
+// Who is dialing us.
+match incoming.remote_addr() {
+    IncomingAddr::Ip(socket)               => println!("from {socket}"),
+    IncomingAddr::Relay { url, endpoint_id } => println!("via relay {url} from {endpoint_id}"),
+    IncomingAddr::Custom(addr)             => println!("from custom {addr:?}"),
 }
 ```
 
+> Note the two enums are **not** the same shape:
+> - `local_addr() -> LocalTransportAddr`: `Ip(Option<IpAddr>)`, `Relay(RelayUrl)`, `Custom(Option<CustomAddr>)`
+> - `remote_addr() -> IncomingAddr`: `Ip(SocketAddr)`, `Relay { url, endpoint_id }`, `Custom(CustomAddr)`
+>
+> `IncomingAddr` carries the remote `endpoint_id` on relay paths; `LocalTransportAddr`
+> carries only the relay URL. Both are `#[non_exhaustive]`. The same accessors
+> exist on `Accepting`.
+
+#### Established connection (dial **and** accept): `Connection::paths()`
+
+There is **no** `local_addr()`/`remote_addr()` on an established
+`Connection`. The same `Connection` type is returned by `endpoint.connect(..)`
+(dial side) and by awaiting an `Incoming` (accept side), so the dial-side
+"equivalent" is this multipath API rather than a single address. A live
+connection can hold several paths at once (a relay path plus a direct path after
+holepunching), so iroh gives you a path list, not one socket:
+
+```rust
+let conn = endpoint.connect(addr, ALPN).await?; // or: let conn = incoming.await?;
+
+println!("peer = {}", conn.remote_id());        // EndpointId (identity, not location)
+for path in conn.paths().iter() {
+    println!(
+        "path {:?}: remote={:?} local={:?} selected={} relay={} rtt={:?}",
+        path.id(),
+        path.remote_addr(),   // &TransportAddr
+        path.local_addr(),    // &LocalTransportAddr
+        path.is_selected(),   // currently carrying app data
+        path.is_relay(),      // vs. path.is_ip()
+        path.rtt(),
+    );
+}
+```
+
+`paths()` is a point-in-time snapshot; use `conn.paths_stream()` for snapshots on
+change, or `conn.path_events()` for individual `PathEvent`s (path opened/closed,
+selected-path changed). `conn.side()` reports whether this end is the client or
+server.
+
 This matters for server-side diagnostics, policy, and telemetry. Code that
-stores or logs `local_addr()` should preserve the enum shape instead of
-downcasting it to `SocketAddr` or `IpAddr`.
+stores or logs an address should preserve the enum/path shape instead of
+downcasting to `SocketAddr` or `IpAddr` — and on an established connection it
+should read `paths()`, not reach for a non-existent `remote_addr()`.
 
 ---
 
@@ -1126,10 +1173,15 @@ doc.set_download_policy(DownloadPolicy::NothingExcept(vec![
 
 ## 5. Key Gotchas & Sharp Edges
 
-### Incoming local address is not always an IP
+### Connection addresses are not always an IP, and an established connection has no single address
 
-`incoming.local_addr()` returns `IncomingLocalAddr`, not a bare socket address.
-Match `Ip`, `Relay`, and `Custom` explicitly if connection path matters.
+On the accept side, `incoming.local_addr()` returns `LocalTransportAddr` and
+`incoming.remote_addr()` returns `IncomingAddr` (different variant shapes —
+`remote_addr` carries the relay `endpoint_id`). Match `Ip`, `Relay`, and
+`Custom` explicitly. On an established `Connection` (whether you dialed or
+accepted) there is **no** `remote_addr()`: a connection can hold several paths at
+once, so read `conn.paths()` (or `paths_stream()` / `path_events()`) and use
+`conn.remote_id()` for the peer's identity. See §1.1.
 
 ### Blob retention is tag-driven, not write-once
 

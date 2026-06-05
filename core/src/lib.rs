@@ -340,6 +340,30 @@ pub struct CoreConnectionInfo {
     pub is_connected: bool,
 }
 
+/// The remote address of a single network path.
+#[derive(Clone, Debug)]
+pub enum CorePathRemote {
+    /// A direct UDP path to the peer's socket address.
+    Direct(SocketAddr),
+    /// A relay path via this relay URL. The peer's own IP is not visible.
+    Relay(String),
+    /// A custom or future transport; carries the debug representation.
+    Other(String),
+}
+
+/// One network path of a connection at one instant. A live connection
+/// can hold several paths simultaneously (typically a relay path plus a
+/// direct path after holepunching succeeds).
+#[derive(Clone, Debug)]
+pub struct CorePathInfo {
+    /// The remote address of this path.
+    pub remote: CorePathRemote,
+    /// Whether this path currently carries application data.
+    pub is_selected: bool,
+    /// RTT estimate for this path in microseconds. `None` if not yet measured.
+    pub rtt_micros: Option<u64>,
+}
+
 /// Snapshot of the selected QUIC path for a connection at one instant.
 /// Cheap to compute (clones a SmallVec entry) and intended for
 /// per-call CallContext population. Exactly one of `peer_addr` /
@@ -1992,6 +2016,34 @@ impl CoreConnection {
             relay_url,
             rtt_micros,
         }
+    }
+
+    /// Owned snapshot of every currently-open network path. Unlike
+    /// [`transport_snapshot`](Self::transport_snapshot) (selected path
+    /// only), this returns all paths so callers can see e.g. a relay
+    /// path and a direct path coexisting during holepunching. The
+    /// returned `Vec` is owned and can cross task boundaries, unlike
+    /// iroh's borrow-bound `PathList`.
+    pub fn paths(&self) -> Vec<CorePathInfo> {
+        self.inner
+            .paths()
+            .iter()
+            .map(|p| {
+                let remote = match p.remote_addr() {
+                    TransportAddr::Ip(socket) => CorePathRemote::Direct(*socket),
+                    TransportAddr::Relay(url) => CorePathRemote::Relay(url.to_string()),
+                    other => CorePathRemote::Other(format!("{other:?}")),
+                };
+                let rtt = p.rtt();
+                let rtt_micros =
+                    (rtt != Duration::ZERO).then(|| rtt.as_micros().min(u64::MAX as u128) as u64);
+                CorePathInfo {
+                    remote,
+                    is_selected: p.is_selected(),
+                    rtt_micros,
+                }
+            })
+            .collect()
     }
 
     pub fn connection_info(&self) -> CoreConnectionInfo {

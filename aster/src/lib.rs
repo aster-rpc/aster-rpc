@@ -87,7 +87,7 @@ pub use id::{
     AuthorId, Hash, NamespaceCapability, NamespaceId, NamespaceSecret, NodeAddr, NodeId, PublicKey,
     SecretKey,
 };
-pub use net::{Connection, RecvStream, SendStream};
+pub use net::{Connection, PathInfo, PathRemote, RecvStream, SendStream};
 pub use node::Node;
 pub use ticket::{Credential, Ticket};
 
