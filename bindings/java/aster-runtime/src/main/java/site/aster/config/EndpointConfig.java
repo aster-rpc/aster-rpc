@@ -33,7 +33,8 @@ public class EndpointConfig {
   // portmapper_config: 96 (INT)
   // proxy_url: 104 (IROH_BYTES: ptr at +0, len at +8) → 16 bytes
   // proxy_from_env: 120 (INT)
-  // data_dir_utf8: 128 (IROH_BYTES: ptr at +0, len at +8) → 16 bytes
+  // data_dir_utf8: 128 (IROH_BYTES: ptr at +0, len at +8) -> 16 bytes
+  // hook_failure_mode: 144 (INT)
 
   private int relayMode = 0; // 0=default
   private byte[] secretKey = new byte[0];
@@ -49,6 +50,7 @@ public class EndpointConfig {
   private byte[] proxyUrl = new byte[0];
   private boolean proxyFromEnv = false;
   private byte[] dataDir = new byte[0];
+  private int hookFailureMode = 0; // 0=fail-open, 1=fail-closed
 
   public EndpointConfig relayMode(int mode) {
     this.relayMode = mode;
@@ -126,6 +128,11 @@ public class EndpointConfig {
     return this;
   }
 
+  public EndpointConfig hookFailureMode(int mode) {
+    this.hookFailureMode = mode;
+    return this;
+  }
+
   /**
    * Encode this config into a native {@code iroh_endpoint_config_t} struct allocated from {@code
    * allocator}.
@@ -134,10 +141,10 @@ public class EndpointConfig {
    * with nested struct field access.
    */
   public MemorySegment toNative(SegmentAllocator alloc) {
-    MemorySegment seg = alloc.allocate(144);
+    MemorySegment seg = alloc.allocate(152);
 
     // struct_size at 0
-    seg.set(ValueLayout.JAVA_INT, 0, 144);
+    seg.set(ValueLayout.JAVA_INT, 0, 152);
     // relay_mode at 4
     seg.set(ValueLayout.JAVA_INT, 4, relayMode);
     // enable_discovery at 56
@@ -154,6 +161,8 @@ public class EndpointConfig {
     seg.set(ValueLayout.JAVA_INT, 96, portmapperConfig);
     // proxy_from_env at 120
     seg.set(ValueLayout.JAVA_INT, 120, proxyFromEnv ? 1 : 0);
+    // hook_failure_mode at 144
+    seg.set(ValueLayout.JAVA_INT, 144, hookFailureMode);
 
     // secret_key at 8: ptr at +0, len at +8
     if (secretKey.length > 0) {
