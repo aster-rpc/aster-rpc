@@ -13,7 +13,7 @@ gossip = []
 attestation = ["aster_transport_core/attestation"]
 # Rust-native RPC (envelope + payload codec, dispatch, client stub). Off by
 # default so Step-1 consumers don't compile Fory. See docs/_internal/aster-rust.md.
-rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros", "dep:serde_json"]
+rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros"]
 discovery = []
 hooks = []
 metrics = []
@@ -30,8 +30,8 @@ fory-derive = { version = "1.1.0-rc.1", optional = true }
 async-trait = { version = "0.1", optional = true }
 # Proc-macros: #[derive(AsterType)] (and later #[aster::service]). Gated by `rpc`.
 aster-macros = { path = "../aster-macros", version = "0.2.0", optional = true }
-# JSON for the registry ArtifactRef + manifest publication. Gated by `rpc`.
-serde_json = { version = "1", optional = true }
+# JSON for root public-key files and, with `rpc`, registry manifests.
+serde_json = "1"
 # Used only to derive a NamespaceId from a NamespaceSecret without leaking
 # iroh-docs types through the public API.
 iroh-docs = { workspace = true }
@@ -39,6 +39,7 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = "2"
 hex = "0.4"
+base64 = "0.22"
 # Parse a peer's relay URL to extract its IP:port for the compact ticket
 # (the wire format stores relay as a socket address — see Ticket::from_node_addr).
 url = "2"
