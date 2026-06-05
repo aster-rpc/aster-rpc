@@ -11,6 +11,11 @@ use crate::error::Result;
 use crate::id::NodeId;
 use aster_transport_core::{CoreConnection, CoreRecvStream, CoreSendStream};
 
+/// One network path of a connection and where it leads. Re-exported from
+/// the transport core — Aster is a thin layer over iroh, not a wall around
+/// it. See [`Connection::paths`].
+pub use aster_transport_core::{CorePathInfo as PathInfo, CorePathRemote as PathRemote};
+
 /// A QUIC connection to a peer on a custom ALPN. Cheap to clone.
 #[derive(Clone)]
 pub struct Connection {
@@ -30,6 +35,23 @@ impl Connection {
     /// The negotiated ALPN for this connection.
     pub fn alpn(&self) -> Vec<u8> {
         self.inner.connection_info().alpn
+    }
+
+    /// Snapshot of every currently-open network path. A live connection
+    /// can hold several at once — typically a relay path plus a direct
+    /// path once holepunching succeeds. The returned `Vec` is owned and
+    /// safe to move across tasks. Use [`selected_path`](Self::selected_path)
+    /// for just the path carrying application data right now.
+    pub fn paths(&self) -> Vec<PathInfo> {
+        self.inner.paths()
+    }
+
+    /// The network path currently carrying application data, if any.
+    /// `None` if the connection has been dropped or no path is selected
+    /// yet. This is where you read the live remote address / relay URL
+    /// and RTT (via [`PathRemote`] and `rtt_micros`).
+    pub fn selected_path(&self) -> Option<PathInfo> {
+        self.inner.paths().into_iter().find(|p| p.is_selected)
     }
 
     /// Open a new bidirectional stream (initiator side).
