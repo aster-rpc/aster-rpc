@@ -18,8 +18,9 @@ See [CLAUDE.md](CLAUDE.md) for build commands and architecture overview.
 
 1. Fork the repo and create a branch from `main`.
 2. Make your changes. Add tests for new functionality.
-3. Run `./scripts/validate.sh` to check formatting, linting, and tests.
-4. Open a pull request against `main`.
+3. Run `./scripts/install-git-hooks.sh` once to enable local hooks.
+4. Run `./scripts/validate.sh` to check formatting, linting, and tests.
+5. Open a pull request against `main`.
 
 ## Code style
 
@@ -27,7 +28,9 @@ See [CLAUDE.md](CLAUDE.md) for build commands and architecture overview.
   Use `Optional[T]` not `T | None` in `@wire_type` dataclasses (pyfory
   requirement). No Unicode em dashes in source (the pre-commit hook
   checks this).
-- **Rust:** `cargo fmt` and `cargo clippy -D warnings`.
+- **Rust:** `cargo fmt --all` and `cargo clippy -D warnings`. The
+  pre-commit hook rejects commits when `cargo fmt --all -- --check`
+  fails.
 - **TypeScript:** Follow existing patterns. camelCase for wire protocol
   field names.
 

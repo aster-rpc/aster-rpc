@@ -1,11 +1,18 @@
 #!/bin/sh
-# Pre-commit hook: reject non-ASCII characters in Python source.
+# Pre-commit hook: reject non-ASCII source and unformatted Rust.
 # Import check runs but doesn't block (native module may not be built).
 
 # 1. Non-ASCII check (blocking)
 python3 scripts/check-ascii.py || exit 1
 
-# 2. Import check (warning only -- native module may not be built)
+# 2. Rust workspace formatting check (blocking)
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo "ERROR: Rust formatting check failed."
+    echo "Run: cargo fmt --all"
+    exit 1
+fi
+
+# 3. Import check (warning only -- native module may not be built)
 python3 -c "from aster import AsterServer, AsterClient, service, rpc, wire_type, any_of, all_of, SerializationMode" 2>/dev/null
 if [ $? -ne 0 ]; then
     echo "WARNING: Python aster import check failed (native module not built?)"
