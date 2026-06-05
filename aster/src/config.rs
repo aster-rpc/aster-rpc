@@ -1472,15 +1472,19 @@ mask = false
         )
         .unwrap();
 
-        let mut cfg = AsterConfig::default();
-        cfg.root_pubkey_file = Some(hex_path);
+        let mut cfg = AsterConfig {
+            root_pubkey_file: Some(hex_path),
+            ..Default::default()
+        };
         assert_eq!(
             cfg.resolve_root_pubkey().unwrap().unwrap().to_bytes(),
             hex_key
         );
 
-        let mut cfg = AsterConfig::default();
-        cfg.root_pubkey_file = Some(json_path);
+        let mut cfg = AsterConfig {
+            root_pubkey_file: Some(json_path),
+            ..Default::default()
+        };
         assert_eq!(
             cfg.resolve_root_pubkey().unwrap().unwrap().to_bytes(),
             json_key
@@ -1555,8 +1559,10 @@ signature = "sig-consumer"
             serde_json::Value::String("tok_123".into())
         );
 
-        let mut cfg = AsterConfig::default();
-        cfg.identity_file = Some(identity_path);
+        let cfg = AsterConfig {
+            identity_file: Some(identity_path),
+            ..Default::default()
+        };
         let loaded = cfg
             .load_identity(Some("billing-producer"), None)
             .unwrap()
