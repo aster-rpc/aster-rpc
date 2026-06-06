@@ -34,12 +34,12 @@ use iroh_blobs::api::Store as BlobStore;
 use iroh_blobs::format::collection::Collection;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::mem::MemStore;
-use iroh_blobs::store::{gc_run_once as blobs_gc_run_once, GcConfig};
+use iroh_blobs::store::{gc_run_once as blobs_gc_run_once, GcConfig, ProtectCb, ProtectOutcome};
 use iroh_blobs::ticket::BlobTicket;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat, ALPN as BLOBS_ALPN};
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::api::Doc;
-use iroh_docs::engine::LiveEvent;
+use iroh_docs::engine::{LiveEvent, ProtectCallbackHandler};
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::{DownloadPolicy, FilterKind, Query};
 use iroh_docs::{
@@ -1099,6 +1099,15 @@ struct CoreNodeInner {
     docs: Docs,
     gossip: Gossip,
     store: BlobStore,
+    /// GC protection callback bridging the docs engine to the blob store: when
+    /// invoked it inserts every hash referenced by an open replica into the GC
+    /// `live` set (aborting the sweep on any enumeration error). Wired into the
+    /// periodic GC loop via `GcConfig.add_protected` *and* replayed by
+    /// [`CoreBlobsClient::gc_run_once`], since the manual `gc_run_once` entry
+    /// point does not invoke the callback itself. Without it, the first sweep
+    /// would reclaim docs content (root policies, grants, manifests) — which
+    /// iroh-docs stores as untagged blobs in this same shared store.
+    protect_cb: ProtectCb,
     secret_key_bytes: Vec<u8>,
     /// Receiver half of the aster-ALPN queue. Wrapped in a tokio Mutex so
     /// `accept_aster(&self)` can pull from it across clones. Internal to
@@ -1268,19 +1277,33 @@ impl CoreNode {
         gc_interval: Option<Duration>,
     ) -> Result<Self> {
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
+        // The docs engine stores entry content as untagged blobs in this shared
+        // store, so GC must protect the docs live-content set or the first sweep
+        // deletes synced policy/grant/manifest content. Create the handler/cb
+        // pair unconditionally: the handler is wired into the docs engine in
+        // `finalize`, and the cb is replayed by manual `gc_run_once` even when
+        // the periodic loop is off.
+        let (protect_handler, protect_cb) = ProtectCallbackHandler::new();
         let mem_store = match gc_interval {
             Some(interval) => MemStore::new_with_opts(iroh_blobs::store::mem::Options {
                 gc_config: Some(GcConfig {
                     interval,
-                    // Tags alone protect; an embedder-supplied ProtectCb is a
-                    // future addition (see docs/KNOWN_ISSUES.md).
-                    add_protected: None,
+                    add_protected: Some(protect_cb.clone()),
                 }),
             }),
             None => MemStore::new(),
         };
         let store: BlobStore = (*mem_store).clone();
-        Self::finalize(endpoint, store, None, aster_alpns, monitor, hook_receiver).await
+        Self::finalize(
+            endpoint,
+            store,
+            None,
+            aster_alpns,
+            monitor,
+            hook_receiver,
+            (protect_handler, protect_cb),
+        )
+        .await
     }
 
     pub async fn persistent(path: String) -> Result<Self> {
@@ -1313,13 +1336,16 @@ impl CoreNode {
         // material (notably the node secret in `docs.redb`) into it.
         std::fs::create_dir_all(&root)?;
         harden_dir_private(&root)?;
+        // See `memory_with_alpns_and_gc`: protect the docs live-content set so
+        // GC never reclaims the untagged blobs backing docs entries.
+        let (protect_handler, protect_cb) = ProtectCallbackHandler::new();
         let fs_store = match gc_interval {
             Some(interval) => {
                 // Mirror `FsStore::load`'s db path, then overlay the GC option.
                 let mut options = iroh_blobs::store::fs::options::Options::new(&root);
                 options.gc = Some(GcConfig {
                     interval,
-                    add_protected: None,
+                    add_protected: Some(protect_cb.clone()),
                 });
                 FsStore::load_with_opts(root.join("blobs.db"), options).await?
             }
@@ -1333,6 +1359,7 @@ impl CoreNode {
             aster_alpns,
             monitor,
             hook_receiver,
+            (protect_handler, protect_cb),
         )
         .await
     }
@@ -1353,14 +1380,23 @@ impl CoreNode {
         aster_alpns: Vec<Vec<u8>>,
         monitor: Option<CoreMonitor>,
         hook_receiver: Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
+        // The docs GC protection bridge, created together by
+        // `ProtectCallbackHandler::new()`: the handler half drives the docs
+        // engine, the callback half is stored for manual `gc_run_once` sweeps.
+        gc_protect: (ProtectCallbackHandler, ProtectCb),
     ) -> Result<Self> {
+        let (protect_handler, protect_cb) = gc_protect;
         let blobs = BlobsProtocol::new(&store, None);
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let docs_builder = match &docs_root {
             Some(path) => Docs::persistent(path.clone()),
             None => Docs::memory(),
         };
+        // `protect_handler` is the docs-engine half of the GC protection bridge:
+        // it answers the `protect_cb` with the engine's current live-content
+        // hashes so a sweep never collects blobs still referenced by a doc.
         let docs = docs_builder
+            .protect_handler(protect_handler)
             .spawn(endpoint.clone(), store.clone(), gossip.clone())
             .await?;
 
@@ -1413,6 +1449,7 @@ impl CoreNode {
                 docs,
                 gossip,
                 store,
+                protect_cb,
                 secret_key_bytes,
                 aster_rx: Mutex::new(aster_rx),
                 monitor,
@@ -1500,6 +1537,7 @@ impl CoreNode {
         CoreBlobsClient {
             store: self.inner.store.clone(),
             endpoint: self.inner.endpoint.clone(),
+            protect_cb: self.inner.protect_cb.clone(),
         }
     }
     pub fn docs_client(&self) -> CoreDocsClient {
@@ -2644,6 +2682,11 @@ pub enum CoreBlobStatus {
 pub struct CoreBlobsClient {
     pub store: BlobStore,
     pub endpoint: Endpoint,
+    /// Docs GC protection callback (see [`CoreNodeInner::protect_cb`]). Replayed
+    /// by [`Self::gc_run_once`] to seed the `live` set before a manual sweep, so
+    /// a deterministic sweep protects docs content exactly as the periodic loop
+    /// does.
+    pub protect_cb: ProtectCb,
 }
 
 impl CoreBlobsClient {
@@ -2660,8 +2703,20 @@ impl CoreBlobsClient {
     /// on the timed interval. Safe to call whether or not periodic GC is
     /// configured. GC is **node-wide** over the one shared blob store: it
     /// collects any untagged blob regardless of which tree added it.
+    ///
+    /// Before sweeping, this replays the docs protect callback to seed `live`
+    /// with the docs engine's current content hashes — `blobs_gc_run_once` does
+    /// not invoke the callback itself (only the periodic `run_gc` loop does), so
+    /// without this a manual sweep would reclaim the untagged blobs backing docs
+    /// entries. Matching the periodic loop's fail-safe, an `Abort` from the
+    /// callback (e.g. the docs engine failed to enumerate its hashes) skips the
+    /// sweep entirely rather than risk deleting live content.
     pub async fn gc_run_once(&self) -> Result<()> {
         let mut live = std::collections::HashSet::new();
+        if let ProtectOutcome::Abort = (self.protect_cb)(&mut live).await {
+            tracing::warn!("gc_run_once: protect callback aborted; skipping sweep");
+            return Ok(());
+        }
         blobs_gc_run_once(&self.store, &mut live).await?;
         Ok(())
     }
