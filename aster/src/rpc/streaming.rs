@@ -15,7 +15,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use aster_transport_core::framing::encode_frame;
 use aster_transport_core::reactor::{OutgoingFrame, RequestFrame};
 
-use super::client::ResponseStream;
+use super::client::{BidiSink, ResponseStream};
 use crate::error::{Error, Result};
 
 fn encode_err(e: impl std::fmt::Display) -> Error {
@@ -55,6 +55,41 @@ impl<T: Serializer> ResponseSink<T> {
         self.tx
             .send(OutgoingFrame::Frame(frame))
             .map_err(|_| channel_closed())
+    }
+}
+
+/// Client-side send half of a bidi call, typed (see
+/// [`RpcConnection::bidi_open`](crate::rpc::RpcConnection::bidi_open) and the
+/// generated `*_streaming` stub). Encode-and-send each request as it is produced;
+/// read the paired [`MessageStream`] concurrently. `&self` methods, so share it
+/// across tasks via `Arc`.
+pub struct BidiCall<T> {
+    sink: BidiSink,
+    fory: Arc<Fory>,
+    _t: PhantomData<fn() -> T>,
+}
+
+impl<T> BidiCall<T> {
+    /// Wrap a raw [`BidiSink`] with a payload `Fory`. Called by generated stubs.
+    pub fn new(sink: BidiSink, fory: Arc<Fory>) -> Self {
+        Self {
+            sink,
+            fory,
+            _t: PhantomData,
+        }
+    }
+
+    /// Signal end-of-requests (see [`BidiSink::finish`]).
+    pub async fn finish(&self) -> Result<()> {
+        self.sink.finish().await
+    }
+}
+
+impl<T: Serializer> BidiCall<T> {
+    /// Encode and send one request, flushed immediately.
+    pub async fn send(&self, item: &T) -> Result<()> {
+        let bytes = self.fory.serialize(item).map_err(encode_err)?;
+        self.sink.send(bytes).await
     }
 }
 

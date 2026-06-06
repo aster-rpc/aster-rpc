@@ -61,6 +61,8 @@ tokio = { workspace = true }
 tempfile = "3"
 # Real PTY for the `shell` example (allocate a tty, spawn $SHELL, resize ioctl).
 portable-pty = "0.8"
+# Local terminal raw mode + size for the interactive `shell` client.
+crossterm = "0.27"
 # For implementing the RPC ServiceDispatch trait in tests (mirrors the macro).
 async-trait = "0.1"
 # For deriving ForyStruct on payload types in rpc tests (the `#[derive(ForyStruct)]`

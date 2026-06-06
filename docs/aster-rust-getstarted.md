@@ -85,6 +85,11 @@ let doc  = node.docs().create().await?;
 let topic = node.gossip().subscribe(topic_id).await?;
 ```
 
+> Running an **RPC producer**? Prefer [`AsterServer`](#43-serve-it) — it starts
+> the node, registers the ALPNs, manages identity/persistence, and serves your
+> services from one builder. Drop to `Node` directly only for non-RPC use or
+> custom wiring.
+
 ---
 
 ## 3. Admission (Gate 0) and ownership attestations
@@ -158,6 +163,73 @@ attestation identity *is* the transport identity, so at admission the peer's
 
 Wire your own versioned envelope for admission rather than raw chain bytes
 long-term (e.g. `portalsync-admission/1 chain=…` → `…-response/1 accepted=true`).
+
+### 3.1 Allowlist specific node IDs
+
+When the set of callers is known ahead of time (e.g. only the **root node** from
+your `AsterConfig`, or a fixed list of operators), skip attestation chains and
+gate at Gate 0 directly on the peer's node ID. The hook runs **after** the QUIC/
+TLS handshake, so `req.peer` is the peer's TLS-certificate ed25519 key — it is
+cryptographically authenticated and cannot be spoofed. Rejecting here closes the
+connection before *any* protocol (RPC, blobs, docs, gossip) can be used.
+
+```rust
+use std::collections::HashSet;
+use aster::{AsterConfig, AsterServer, HookFailureMode, NodeId, PublicKey, RelayMode};
+
+# async fn serve(root_pubkey: PublicKey, also_allow: Vec<NodeId>) -> aster::Result<()> {
+// Node IDs allowed to reach this node at all. A node ID *is* an ed25519 public
+// key, so the root key from config goes straight in (compare as hex).
+let mut allowed: HashSet<String> = HashSet::new();
+allowed.insert(root_pubkey.to_hex());
+for id in &also_allow {
+    allowed.insert(id.as_str().to_string());
+}
+
+let config = AsterConfig::builder()
+    .relay(RelayMode::Default)
+    .hooks(true)                                    // enable the admission hook
+    .hook_failure_mode(HookFailureMode::FailClosed) // REQUIRED — see the warning below
+    .build();
+
+let srv = AsterServer::builder()
+    .service(EchoServer::new(EchoImpl))
+    .config(config)
+    .start()
+    .await?;
+
+// Gate-0 loop: fires per inbound connection, before any stream is dispatched.
+let mut admission = srv.take_admission().expect("hooks enabled");
+tokio::spawn(async move {
+    while let Some(req) = admission.next_handshake().await {
+        if allowed.contains(req.peer.as_str()) {
+            req.accept();
+        } else {
+            req.reject(403, b"not allowed".to_vec()); // closes the connection
+        }
+    }
+});
+
+srv.run().await;
+# Ok(())
+# }
+```
+
+For a single allowed identity (e.g. *only* the root node), use a one-element set.
+
+> **You must set `HookFailureMode::FailClosed`.** The hook's default fallback is
+> **fail-open**: if your admission loop stalls past `hook_timeout_ms` (default
+> 5 s) or is dropped, the connection is *accepted*. `FailClosed` flips that to a
+> reject, so a stalled or missing loop denies rather than admits. Also make sure
+> the loop actually runs (`take_admission` returns the handle once) — without a
+> live loop draining `next_handshake`, every decision hits the fallback.
+
+**Per-method instead of per-connection?** If you'd rather admit a broad set but
+restrict only some methods to specific identities, use Gate 3 (§4.6): map each
+allowed node ID to a role at startup (`attrs.set_role(id.as_str(), "root")`) and
+tag those methods `#[rpc(requires = require_role("root"))]`. Gate 3 only checks
+methods that declare `requires` — an untagged method stays open — so for a
+whole-service lockdown the Gate-0 allowlist above is the surer choice.
 
 ---
 
@@ -268,7 +340,53 @@ impl Echo for EchoImpl {
 
 ### 4.3 Serve it
 
-The server node must register the RPC ALPN (`aster::rpc::RPC_ALPN`, `b"aster/1"`).
+Use **`AsterServer`** — the declarative, recommended way to run a producer, and
+the Rust peer of the Python/TS `AsterServer`. One builder resolves config, starts
+the node (RPC + the built-in blobs/docs/gossip ALPNs registered for you), and
+serves your services; it also exposes the protocol clients and a stable identity
+in one place.
+
+```rust
+use aster::rpc::AsterServer;
+
+# async fn serve() -> aster::Result<()> {
+let srv = AsterServer::builder()
+    .service(EchoServer::new(EchoImpl))   // repeat .service(…) per service
+    .identity(".aster-identity")          // restart-stable endpoint key (load-or-create)
+    .persistent("/var/lib/my-app")        // durable blobs / docs / gossip
+    .relay(aster::RelayMode::Default)
+    // .attributes(attrs)                 // shared Gate-3 store (see §4.6)
+    // .hooks(true)                       // enable Gate-0 admission (.take_admission())
+    // .alpn(aster::alpns::PRODUCER_ADMISSION.to_vec())  // extra inbound ALPN (see §3)
+    .start()
+    .await?;
+
+println!("address: {}", srv.address()?); // aster1… ticket — hand this to clients
+let _hash = srv.blobs().add_bytes(b"hi".to_vec()).await?; // blobs/docs/gossip on the same node
+
+srv.run().await;       // serve until the node closes
+// or: srv.shutdown().await;  // graceful close, flushes the store
+# Ok(())
+# }
+```
+
+`EchoServer` is generated from the `Echo` trait. Add one `.service(…)` per
+service (Rust can't hold heterogeneous instances in one `[…]` list the way Python
+does). The server keeps serving as long as you hold `srv` and call
+[`run`](https://docs.rs/aster) — or end it with `shutdown` for a clean,
+store-flushing close (Rust has no `async with`).
+
+`.identity(path)` persists only the endpoint **secret key** (64 hex chars,
+load-or-create) — enough for a restart-stable `NodeId`. Python's `.aster-identity`
+is a richer JSON credential file (root pubkey + enrollment material); Gate-1
+credential plumbing isn't in the Rust crate yet.
+
+#### Low-level: building a `Server` by hand
+
+Reach for this only when you need to own the node yourself — e.g. a custom accept
+loop on a non-RPC ALPN alongside RPC, or to start the node before services exist.
+You register the RPC ALPN (`aster::rpc::RPC_ALPN`, `b"aster/1"`) and wire the
+`Server` directly; `AsterServer` does exactly this for you.
 
 ```rust
 use aster::rpc::{AttributeStore, Server, RPC_ALPN};
@@ -287,18 +405,29 @@ let _server = Server::new(&node)
 
 ### 4.4 Call it
 
+A client dials the producer's `address()` ticket — register its address
+material, then open an RPC connection by id:
+
 ```rust
 use aster::rpc::RpcConnection;
+use aster::Ticket;
 
-# async fn call(node: &Node, peer: &aster::NodeId) -> aster::Result<()> {
-let conn: RpcConnection = node.rpc_connect(peer).await?;
-let client = EchoClient::new(conn);     // EchoClient is generated from `Echo`
+# async fn call(node: &Node, address: &str) -> aster::Result<()> {
+let ticket = Ticket::from_base58(address)?; // the aster1… string from srv.address()
+let peer = node.add_ticket_addr(&ticket)?;  // teach this node how to reach it
+
+let conn: RpcConnection = node.rpc_connect(&peer).await?;
+let client = EchoClient::new(conn);         // EchoClient is generated from `Echo`
 
 let resp = client.echo(EchoRequest { message: "hi".into(), count: 0 }).await?;
 assert_eq!(resp.reply, "echo: hi");
 # Ok(())
 # }
 ```
+
+If the peer is already reachable by id (relay/discovery, or a prior
+`add_ticket_addr`), skip the ticket and call `node.rpc_connect(&peer_id)`
+directly.
 
 ### 4.5 Streaming, client side
 
@@ -328,8 +457,14 @@ caller's attributes in the server's `AttributeStore`. Your admission logic
 populates the store (e.g. after verifying the peer's attestation chain). A
 missing capability fails with `PERMISSION_DENIED`.
 
+Give `AsterServer` the store with `.attributes(store)` (or read it back via
+`srv.attributes()`) and keep a clone to populate from admission:
+
 ```rust
-use aster::rpc::{require_any_of, require_role};
+use aster::rpc::{require_any_of, require_role, AttributeStore};
+
+let attrs = AttributeStore::new();
+// let srv = AsterServer::builder().service(…).attributes(attrs.clone()).start().await?;
 
 // In your admission accept loop, once a peer's chain verifies and you know its role:
 attrs.set_role(conn.peer().as_str(), "operator");

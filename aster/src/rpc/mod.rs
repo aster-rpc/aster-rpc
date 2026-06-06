@@ -26,6 +26,7 @@ pub mod client;
 pub mod codec;
 pub mod contract;
 pub mod interceptor;
+pub mod runtime;
 pub mod server;
 pub mod status;
 pub mod streaming;
@@ -38,7 +39,7 @@ pub use auth::{
     require_all_of, require_any_of, require_role, AttributeStore, CapabilityKind,
     CapabilityRequirement, ROLE_ATTRIBUTE,
 };
-pub use client::{ResponseStream, RpcConnection};
+pub use client::{BidiSink, ResponseStream, RpcConnection};
 pub use codec::{
     new_payload_fory, CallHeader, CodecError, RpcStatus, SerializationMode, StreamHeader,
 };
@@ -52,9 +53,10 @@ pub use interceptor::{CallContext, CircuitBreaker, Interceptor, Pipeline, RetryP
 pub use publish::{
     fetch_and_verify_contract, publish_contract, FetchedContract, PublishedContract,
 };
+pub use runtime::{AsterServer, AsterServerBuilder};
 pub use server::{Call, Server, ServerHandle, ServiceDispatch, RPC_ALPN};
 pub use status::{status_from_error, StatusCode};
-pub use streaming::{MessageStream, RequestStream, ResponseSink};
+pub use streaming::{BidiCall, MessageStream, RequestStream, ResponseSink};
 
 /// The Apache Fory runtime, re-exported for `#[aster::service]`-generated code
 /// (payload ser/de). Build one with [`new_payload_fory`].
