@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// How the node uses relay servers.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -93,6 +94,18 @@ pub struct AsterConfig {
 
     /// Persistent node storage path. `None` selects an in-memory node.
     pub storage_path: Option<PathBuf>,
+
+    /// Enable periodic blob garbage collection at this interval. `None` (the
+    /// default) disables GC entirely — the blob store stays grow-only, with
+    /// tags controlling retention but untagged blobs never reclaimed. When
+    /// `Some(interval)`, the iroh-blobs GC loop sweeps every `interval`,
+    /// collecting any blob no tag (or temp-tag) protects. GC is node-wide over
+    /// the one shared blob store. For a deterministic manual sweep (e.g. in
+    /// tests), see [`Blobs::gc_run_once`](crate::Blobs::gc_run_once).
+    ///
+    /// Currently exposed on the Rust facade only; no FFI/binding surface yet
+    /// (see `docs/KNOWN_ISSUES.md`).
+    pub gc_interval: Option<Duration>,
 
     /// Stable node identity key.
     pub secret_key: Option<SecretKey>,
@@ -672,6 +685,7 @@ impl Default for AsterConfig {
             allow_all_producers: true,
             endpoint_addr: None,
             storage_path: None,
+            gc_interval: None,
             secret_key: None,
             relay_mode: RelayMode::Default,
             bind_addr: None,
@@ -743,6 +757,18 @@ impl AsterConfigBuilder {
     /// Make the node persistent, storing all state under `dir`.
     pub fn persistent(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config.set_persistent(dir.into());
+        self
+    }
+
+    /// Enable periodic blob garbage collection at `interval`.
+    ///
+    /// Off by default: without this, the blob store is grow-only and only tags
+    /// pin retention. With it set, untagged blobs are reclaimed every
+    /// `interval`. See [`AsterConfig::gc_interval`] for full semantics and
+    /// [`Blobs::gc_run_once`](crate::Blobs::gc_run_once) for a deterministic
+    /// manual sweep.
+    pub fn gc_interval(mut self, interval: Duration) -> Self {
+        self.config.gc_interval = Some(interval);
         self
     }
 

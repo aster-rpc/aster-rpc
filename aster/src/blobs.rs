@@ -188,4 +188,22 @@ impl Blobs {
     pub async fn tag_delete_prefix(&self, prefix: impl Into<String>) -> Result<u64> {
         Ok(self.inner.tag_delete_prefix(prefix.into()).await?)
     }
+
+    // ── Garbage collection ──────────────────────────────────────────────────
+
+    /// Run exactly one blob GC mark+sweep pass now and return when it
+    /// completes.
+    ///
+    /// Reclaims every blob not protected by a persistent tag, a live temp-tag,
+    /// or the store's protect callback. Works whether or not periodic GC is
+    /// enabled via [`AsterConfigBuilder::gc_interval`](crate::AsterConfigBuilder::gc_interval),
+    /// giving tests a deterministic reclamation point without waiting on the
+    /// timed interval.
+    ///
+    /// GC is **node-wide** over the one shared blob store: it collects any
+    /// untagged blob regardless of which tree added it. Keep a live tag for
+    /// every blob you want to retain.
+    pub async fn gc_run_once(&self) -> Result<()> {
+        Ok(self.inner.gc_run_once().await?)
+    }
 }
