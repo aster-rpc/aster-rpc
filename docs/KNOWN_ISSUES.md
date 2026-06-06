@@ -60,9 +60,17 @@ binding is a thin wrapper — no further core work needed:
   - TypeScript — `bindings/typescript/native/src/node.rs`, `blobs.rs`
   - FFI (Java/Kotlin/Go/.NET) — `ffi/src/lib.rs` (+ `ffi/iroh_ffi.h`)
 
-**Embedder protect callback (not yet exposed):** the core constructors pass
-`add_protected: None` to iroh-blobs' `GcConfig`, so tags (and temp-tags) are the
-sole retention root. iroh-blobs also supports a `ProtectCb` with abort-on-error
-semantics for embedders that compute a protected set out-of-band. It is a Rust
-closure that does not cross the FFI boundary, so exposing it is deferred until a
-concrete consumer needs more than tag-driven retention.
+**Retention roots (what GC protects):** tags, temp-tags, **and** the iroh-docs
+live-content set. The core constructors wire iroh-docs' own GC protect callback
+into `GcConfig.add_protected` (and replay it in `gc_run_once`), because iroh-docs
+stores entry content as *untagged* blobs in the shared store — without this a
+sweep would delete synced docs content. This is internal and abort-on-error (a
+failed enumeration skips the sweep rather than over-collecting); see
+`docs/portal-blob-gc-requirements.md`.
+
+**Embedder-supplied protect callback (not yet exposed):** beyond the internal
+docs callback, iroh-blobs' `GcConfig` accepts an arbitrary `ProtectCb` for
+embedders that compute an *additional* protected set out-of-band. It is a Rust
+closure that does not cross the FFI boundary, so exposing a user-supplied one is
+deferred until a concrete consumer needs more than tag- and docs-driven
+retention.
