@@ -10,6 +10,7 @@
 //! All nodes run with relay disabled so the test stays offline and fast.
 
 use std::path::Path;
+use std::time::Duration;
 
 use aster_transport_core::{CoreEndpointConfig, CoreNode};
 
@@ -22,6 +23,25 @@ async fn open_node(dir: &Path) -> CoreNode {
     CoreNode::persistent_with_alpns(dir.to_string_lossy().into_owned(), Vec::new(), Some(cfg))
         .await
         .expect("open persistent node")
+}
+
+/// Like [`open_node`], but with blob GC enabled. The interval is long enough
+/// that the background loop never fires during a test — reclamation is driven
+/// deterministically via `gc_run_once`. Enabling GC at all still exercises the
+/// `GcConfig.add_protected` wiring at construction.
+async fn open_node_with_gc(dir: &Path) -> CoreNode {
+    let cfg = CoreEndpointConfig {
+        relay_mode: Some("disabled".to_string()),
+        ..Default::default()
+    };
+    CoreNode::persistent_with_alpns_and_gc(
+        dir.to_string_lossy().into_owned(),
+        Vec::new(),
+        Some(cfg),
+        Some(Duration::from_secs(3600)),
+    )
+    .await
+    .expect("open persistent node with gc")
 }
 
 /// Unique temp directory for one test run; removed on drop.
@@ -128,6 +148,97 @@ async fn persistent_docs_and_blobs_survive_close_and_reopen() {
         .await
         .expect("open of an unknown namespace must not error");
     assert!(missing.is_none(), "unknown namespace should open to None");
+
+    node.close().await;
+}
+
+/// Regression: blob GC must not reclaim the blobs backing iroh-docs entry
+/// content. iroh-docs stores each entry's value as an *untagged* content blob in
+/// the shared store and protects it via the docs engine's GC protect callback
+/// (not via tags). If Aster enables GC without wiring that callback into both
+/// the periodic loop and `gc_run_once`, the first sweep deletes synced docs
+/// content and subsequent reads fail with `NotFound`. This reproduced portal's
+/// "reading root policy record … Io(Kind(NotFound))" control-plane failure.
+///
+/// The control assertion (an untagged non-docs blob *is* collected) proves the
+/// callback protects docs content specifically rather than disabling GC
+/// wholesale — and that the docs `protect_handler` is actually wired, since an
+/// unwired callback would `Abort` every sweep and leave the untagged blob alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docs_entry_content_survives_blob_gc() {
+    let dir = TempDir::new("docs-gc");
+    let node = open_node_with_gc(dir.path()).await;
+
+    let key = b"portal/root-policy".to_vec();
+    let value = b"root policy record payload".to_vec();
+
+    // A doc entry: its content is stored as an untagged blob in the shared store.
+    let docs = node.docs_client();
+    let author = docs.create_author().await.expect("create_author");
+    let doc = docs.create().await.expect("create doc");
+    let namespace_id = doc.doc_id();
+    let content_hash = doc
+        .set_bytes(author.clone(), key.clone(), value.clone())
+        .await
+        .expect("set_bytes");
+
+    // A plain blob with no protection: this is the control — GC must reclaim it.
+    // `add_bytes` creates a persistent auto-tag, so drop every tag pointing at
+    // the blob to leave it genuinely unprotected.
+    let blobs = node.blobs_client();
+    let untagged_hash = blobs
+        .add_bytes(b"collectable untagged blob".to_vec())
+        .await
+        .expect("add_bytes");
+    for tag in blobs.tag_list().await.expect("tag_list") {
+        if tag.hash == untagged_hash {
+            blobs.tag_delete(tag.name).await.expect("tag_delete");
+        }
+    }
+    assert!(
+        blobs
+            .blob_has(untagged_hash.clone())
+            .await
+            .expect("blob_has (pre-gc)"),
+        "untagged blob should exist before GC"
+    );
+
+    // Deterministic sweep.
+    blobs.gc_run_once().await.expect("gc_run_once");
+
+    // Docs content survived: the backing blob is still present …
+    assert!(
+        blobs
+            .blob_has(content_hash.clone())
+            .await
+            .expect("blob_has docs content"),
+        "docs content blob {content_hash} was collected by GC"
+    );
+    // … and is still readable through the docs API.
+    let got = doc
+        .get_exact(author, key)
+        .await
+        .expect("get_exact after gc")
+        .expect("doc entry should survive blob GC");
+    assert_eq!(got, value, "doc entry content changed across GC");
+
+    // And the namespace is still readable after reopening it fresh.
+    let reopened = docs
+        .open(namespace_id)
+        .await
+        .expect("open namespace after gc")
+        .expect("namespace should survive blob GC");
+    drop(reopened);
+
+    // Control: the untagged, unprotected blob was actually reclaimed — proving
+    // GC ran and only the docs-protected content was spared.
+    assert!(
+        !blobs
+            .blob_has(untagged_hash)
+            .await
+            .expect("blob_has (post-gc)"),
+        "untagged blob should be collected by GC"
+    );
 
     node.close().await;
 }

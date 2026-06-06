@@ -5,6 +5,46 @@ Date: 2026-06-06
 Requested by: portal-sync (`~/dev/emrul/portal-sync`), see
 `docs/phase5-gc-lifecycle.md` there for the consumer-side design.
 
+> ## ✅ RESOLVED (2026-06-06) — iroh-docs content is now GC-protected
+>
+> **Landed in `core/src/lib.rs`** (the GC constructors + `finalize` +
+> `CoreBlobsClient::gc_run_once`); regression test
+> `core/tests/blob_persistence_contract.rs::docs_entry_content_survives_blob_gc`.
+> The "Agreed fix" below is implemented exactly as written — portal can now enable
+> GC.
+>
+> The original ship used `add_protected: None`, which was **unsafe on any node
+> that uses iroh-docs** — which is every Aster node, since `finalize` always spawns
+> a docs engine on the shared blob store. **iroh-docs stores its entry content as
+> *untagged* content-addressed blobs in the shared iroh-blobs store** (root policy
+> records, grant envelopes, Tree manifests, node-status) and protects them via the
+> docs engine's GC protect callback, **not** via tags — so portal cannot tag them.
+> With GC enabled and no callback, the first sweep collected the synced docs
+> content and reads failed with `NotFound` ("reading root policy record: encode
+> error: Io(Kind(NotFound))"). The portal agent's diagnosis was correct (validated
+> by reproducing the exact `Io(Kind(NotFound))` failure in a unit test before
+> wiring the fix).
+>
+> ### Agreed fix (Aster's chosen design — preferred over an FFI callback)
+>
+> Do **not** expose an arbitrary `ProtectCb` over FFI (awkward, easy to misuse).
+> Instead, **internally** wire iroh-docs' built-in protect callback whenever a
+> node is constructed with docs enabled:
+>
+> 1. `ProtectCallbackHandler::new()`, pass its `ProtectCb` into `GcConfig`, and
+>    pass the handler into `Docs::…().protect_handler(…)`.
+> 2. **`Blobs::gc_run_once` must apply the same callback** before calling
+>    iroh-blobs' `gc_run_once`, so manual sweeps (portal's deterministic test
+>    path) are protected identically to the periodic loop.
+> 3. Regression test: create a doc, `set_bytes`, run blob GC (periodic **and**
+>    `gc_run_once`), then `read_entry_content` / `get_exact` must still succeed.
+>
+> This is sufficient for portal: portal's retention is exactly (portal's own
+> `portal/<tree>/*` tags) ∪ (iroh-docs content). The docs protect handler covers
+> the latter — **including content a daemon *downloaded* via docs sync** (the
+> replica is open while the daemon reads policy, so the handler protects it),
+> which is the exact case that broke. No portal-supplied callback is needed.
+
 ## Summary
 
 Aster exposes no way to enable iroh-blobs garbage collection. `CoreNode::
@@ -60,18 +100,18 @@ This is the standard iroh-blobs `gc_mark` behavior — we just need it actually
 running. No change to the tag API (`tag_set` / `tag_delete` / `tag_delete_prefix`
 / `add_path_with_named_tag`); portal-sync drives retention entirely through tags.
 
-### 3. Fail-safe protected-set guard (abort, never over-collect)
+### 3. Protect iroh-docs content internally (REQUIRED — see CRITICAL UPDATE)
 
-GC is destructive and the blob store is shared across all of a node's trees **and
-the NFS surface**, so a buggy/incomplete protected set must never delete live
-data. Use the iroh-blobs `add_protected: Option<ProtectCb>` hook with
-**abort-on-error semantics**: if computing the protected set fails, return
-`ProtectOutcome::Abort` so the sweep is **skipped**, not run with a partial set.
-
-Minimum: Aster may pass `add_protected: None` (tags alone protect) — acceptable,
-since portal-sync's retention is 100% tag-driven. **Preferred:** expose a way for
-the embedder to supply a `ProtectCb` (or at least guarantee that an internal mark
-error aborts the run). Document whichever is provided.
+GC is destructive and the blob store is shared across all of a node's trees,
+**the NFS surface, and iroh-docs**. `add_protected: None` is unsafe: it collects
+iroh-docs content. **Resolved design (no FFI callback):** Aster internally wires
+iroh-docs' built-in protect handler into `GcConfig.add_protected` **and** into
+`Blobs::gc_run_once`, whenever a node is built with docs enabled. Abort-on-error
+semantics (`ProtectOutcome::Abort`) so a failure to enumerate the protected set
+skips the sweep rather than over-collecting. Portal supplies **no** callback —
+its retention is `portal/<tree>/*` tags plus the docs handler's content set,
+which together are complete. (Full design + the regression test: the CRITICAL
+UPDATE at the top of this doc.)
 
 ### 4. Manual, deterministic sweep — `gc_run_once`
 
