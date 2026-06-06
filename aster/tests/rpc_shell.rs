@@ -161,3 +161,51 @@ async fn shell_bidi_data_resize_and_exit() {
     client_node.shutdown().await;
     server.shutdown().await;
 }
+
+/// The interactive path: `open_streaming()` hands back a `BidiCall` sender so the
+/// client can send a frame, observe its echo, then send the next frame *based on
+/// what it saw* — the ping-pong that the prebuilt-`Vec` bidi stub cannot express.
+/// This is the capability a live terminal (the `shell` example) is built on.
+#[tokio::test]
+async fn shell_streaming_is_incremental() {
+    let server = Node::start_with_alpns(cfg(), vec![RPC_ALPN.to_vec()])
+        .await
+        .unwrap();
+    let client_node = Node::start(cfg()).await.unwrap();
+    wait_for_addr(&server).await;
+    wait_for_addr(&client_node).await;
+    client_node.add_peer(&server).unwrap();
+    server.add_peer(&client_node).unwrap();
+
+    let _h = Server::new(&server)
+        .register(ShellServer::new(EchoShell))
+        .serve();
+
+    let conn: RpcConnection = within(client_node.rpc_connect(&server.id())).await.unwrap();
+    let client = ShellClient::new(conn);
+
+    // Incremental sender + response stream, both live at once.
+    let (sink, mut out) = within(client.open_streaming()).await.unwrap();
+
+    // Ping-pong: each send's echo must arrive before the next send is decided.
+    within(sink.send(&ShellIn::data("ping"))).await.unwrap();
+    let echo = within(out.recv()).await.unwrap().unwrap();
+    assert_eq!(echo.data, b"ping");
+
+    within(sink.send(&ShellIn::data("pong"))).await.unwrap();
+    let echo = within(out.recv()).await.unwrap().unwrap();
+    assert_eq!(echo.data, b"pong");
+
+    // A resize mid-stream, then close the send side. EchoShell reports the last
+    // resize rows as the exit code in its terminating eof frame.
+    within(sink.send(&ShellIn::resize(24, 80))).await.unwrap();
+    within(sink.finish()).await.unwrap();
+
+    let last = within(out.recv()).await.unwrap().unwrap();
+    assert!(last.eof);
+    assert_eq!(last.exit_code, 24);
+    assert!(within(out.recv()).await.is_none()); // OK trailer → stream end
+
+    client_node.shutdown().await;
+    server.shutdown().await;
+}

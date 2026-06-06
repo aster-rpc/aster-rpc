@@ -164,7 +164,9 @@ impl RpcConnection {
 
     /// Bidirectional call: send many requests (≥1) while reading responses. The
     /// requests are written by a background task so the caller can read the
-    /// returned [`ResponseStream`] concurrently.
+    /// returned [`ResponseStream`] concurrently. For *interactive* streams where
+    /// requests are produced over time (e.g. a remote shell), use
+    /// [`bidi_open`](RpcConnection::bidi_open) instead.
     pub async fn bidi(
         &self,
         header: &StreamHeader,
@@ -175,14 +177,60 @@ impl RpcConnection {
                 "bidi streaming requires at least one request".into(),
             ));
         }
+        let (sink, resp) = self.bidi_open(header).await?;
+        tokio::spawn(async move {
+            for req in requests {
+                if sink.send(req).await.is_err() {
+                    return;
+                }
+            }
+            let _ = sink.finish().await;
+        });
+        Ok(resp)
+    }
+
+    /// Open a bidirectional call for **incremental** sending: returns a
+    /// [`BidiSink`] whose [`send`](BidiSink::send) flushes each request frame
+    /// immediately (no buffering), plus the [`ResponseStream`] to read
+    /// concurrently. This is the handle an interactive client needs — a remote
+    /// shell pumps keystrokes through `send` as they're typed while draining the
+    /// response stream to its terminal.
+    ///
+    /// The server does not dispatch the call until the first request frame
+    /// arrives, so send an initial frame promptly (an interactive client
+    /// typically opens by sending its starting window size). Call
+    /// [`BidiSink::finish`] when there are no more requests.
+    pub async fn bidi_open(&self, header: &StreamHeader) -> Result<(BidiSink, ResponseStream)> {
         let (send, recv) = self.inner.open_streaming_substream().await?;
         write_header(&send, header).await?;
-        tokio::spawn(async move {
-            if write_requests(&send, requests).await.is_ok() {
-                let _ = send.finish().await;
-            }
-        });
-        Ok(ResponseStream::new(recv))
+        Ok((BidiSink { send }, ResponseStream::new(recv)))
+    }
+}
+
+/// The send half of an interactive bidi call (see
+/// [`RpcConnection::bidi_open`]). Each [`send`](BidiSink::send) writes one
+/// request frame immediately — no buffering — so keystroke-latency streams flush
+/// at once. Methods take `&self`, so wrap it in an `Arc` to send from several
+/// tasks (e.g. one for stdin, one for window-resize events).
+pub struct BidiSink {
+    send: CoreSendStream,
+}
+
+impl BidiSink {
+    /// Send one already-serialized request payload as a data frame, flushed
+    /// immediately. (Typed callers go through [`BidiCall`](super::streaming::BidiCall).)
+    pub async fn send(&self, payload: Vec<u8>) -> Result<()> {
+        self.send.write_all(encode_frame(&payload, 0)?).await?;
+        Ok(())
+    }
+
+    /// Signal end-of-requests by half-closing the send side (QUIC `finish`). The
+    /// reactor reads this as stream EOF and closes the server's request stream, so
+    /// its `recv_request`/`RequestStream` ends. The response half stays open for
+    /// reading. Safe to call once.
+    pub async fn finish(&self) -> Result<()> {
+        self.send.finish().await?;
+        Ok(())
     }
 }
 

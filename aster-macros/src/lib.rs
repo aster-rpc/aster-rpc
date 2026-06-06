@@ -876,17 +876,37 @@ fn client_method(s: &MethodSpec, svc_name: &str, svc_version: i32) -> TokenStrea
                 self.fory.deserialize::<#resp>(&__resp_bytes).map_err(#decode_err)
             }
         },
-        Pattern::BidiStream => quote! {
-            pub async fn #ident(&self, reqs: ::std::vec::Vec<#req>)
-                -> ::aster::Result<::aster::rpc::MessageStream<#resp>>
-            {
-                let mut __encoded = ::std::vec::Vec::with_capacity(reqs.len());
-                for __r in &reqs {
-                    __encoded.push(self.fory.serialize(__r).map_err(#encode_err)?);
+        Pattern::BidiStream => {
+            let stream_ident = format_ident!("{}_streaming", ident);
+            quote! {
+                pub async fn #ident(&self, reqs: ::std::vec::Vec<#req>)
+                    -> ::aster::Result<::aster::rpc::MessageStream<#resp>>
+                {
+                    let mut __encoded = ::std::vec::Vec::with_capacity(reqs.len());
+                    for __r in &reqs {
+                        __encoded.push(self.fory.serialize(__r).map_err(#encode_err)?);
+                    }
+                    let __raw = self.conn.bidi(&#header, __encoded).await?;
+                    ::core::result::Result::Ok(::aster::rpc::MessageStream::new(__raw, self.fory.clone()))
                 }
-                let __raw = self.conn.bidi(&#header, __encoded).await?;
-                ::core::result::Result::Ok(::aster::rpc::MessageStream::new(__raw, self.fory.clone()))
+
+                /// Open this bidi call for **incremental** sending: returns a typed
+                /// [`BidiCall`](::aster::rpc::BidiCall) sender plus the response
+                /// stream, for interactive use (e.g. a remote shell) where requests
+                /// are produced over time rather than known up front.
+                pub async fn #stream_ident(&self)
+                    -> ::aster::Result<(
+                        ::aster::rpc::BidiCall<#req>,
+                        ::aster::rpc::MessageStream<#resp>,
+                    )>
+                {
+                    let (__sink, __raw) = self.conn.bidi_open(&#header).await?;
+                    ::core::result::Result::Ok((
+                        ::aster::rpc::BidiCall::new(__sink, self.fory.clone()),
+                        ::aster::rpc::MessageStream::new(__raw, self.fory.clone()),
+                    ))
+                }
             }
-        },
+        }
     }
 }

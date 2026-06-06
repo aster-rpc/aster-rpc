@@ -110,6 +110,14 @@ impl Server {
         self
     }
 
+    /// Register an already-boxed dispatcher. Used by [`AsterServer`](crate::rpc::AsterServer)
+    /// to collect heterogeneous services into one registry.
+    pub(crate) fn register_arc(mut self, svc: Arc<dyn ServiceDispatch>) -> Self {
+        self.services
+            .insert((svc.name().to_string(), svc.version()), svc);
+        self
+    }
+
     /// Use a shared [`AttributeStore`] for Gate-3 capability checks. Keep a clone
     /// of the same store and populate it from your admission logic (e.g. after
     /// verifying a peer's attestation chain) so per-call `requires` checks see
@@ -151,6 +159,12 @@ impl ServerHandle {
     /// Stop the accept+dispatch loop.
     pub fn abort(&self) {
         self.join.abort();
+    }
+
+    /// Await the accept+dispatch loop. Resolves when the loop ends (the node
+    /// closed, or [`abort`](ServerHandle::abort) was called).
+    pub async fn joined(self) {
+        let _ = self.join.await;
     }
 }
 

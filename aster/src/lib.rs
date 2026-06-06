@@ -103,4 +103,4 @@ pub use gossip::{Gossip, GossipEvent, GossipTopic};
 // Convenience: `#[aster::service]` and `#[derive(aster::AsterType)]` at the crate
 // root (both also available under `aster::rpc`).
 #[cfg(feature = "rpc")]
-pub use rpc::{service, AsterType};
+pub use rpc::{service, AsterServer, AsterType};

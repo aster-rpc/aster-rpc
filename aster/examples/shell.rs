@@ -1,32 +1,28 @@
-//! A remote shell over Aster RPC — the "SSH replacement" shape in ~140 lines.
+//! A *live, interactive* remote shell over Aster RPC — the "SSH replacement"
+//! shape. Run it and you get a real shell prompt you can type at; `tmux`, `vim`,
+//! and `htop` work, and resizing your terminal resizes the remote PTY.
 //!
 //! The service is a single **bidirectional** stream: keystrokes flow up as
 //! `ShellIn` frames, terminal output flows down as `ShellOut` frames, both at
-//! once. The server backs each call with a *real PTY*, so the session is
-//! indistinguishable from a local terminal — `tmux`, `vim`, and `htop` all work,
-//! and window resize is a genuine `TIOCSWINSZ` ioctl.
+//! once. The server backs each call with a *real PTY* running your `$SHELL`.
 //!
 //! Two frame kinds travel up the same stream:
-//! - `Data` — raw bytes typed at the terminal (Ctrl-C rides here as 0x03; the
-//!   tty line discipline turns it into SIGINT for you).
+//! - `Data` — raw bytes typed at the terminal (Ctrl-C rides here as 0x03,
+//!   Ctrl-D as 0x04; the tty line discipline turns them into SIGINT / EOF).
 //! - `Resize` — a new (rows, cols); the server resizes the PTY in place.
 //!
-//! To stay deterministic the server runs a controlled shell (`/bin/sh` on Unix,
-//! `cmd.exe` on Windows) with a cleaned environment, not the user's `$SHELL` with
-//! its prompt/rc-file noise. This `main` drives it with a *scripted* program
-//! (resize, run a command, exit) so the example is self-contained and runnable.
-//!
-//! NOTE on interactivity: the generated bidi client buffers a prebuilt
-//! `Vec<ShellIn>` and closes the input stream once it has been sent (see
-//! `RpcConnection::bidi`). That is exactly right for a scripted session, but a
-//! *live* interactive client must interleave sends with reads — an incremental
-//! streaming-send handle the generated stub does not yet expose. Wiring that up
-//! (raw-mode stdin → frames) is the natural follow-up; the server side here is
-//! already fully interactive.
+//! The client uses the incremental bidi API: `open_streaming()` returns a
+//! `BidiCall` sender whose `send` flushes each frame immediately (so keystrokes
+//! aren't buffered), plus a response stream it drains to stdout — exactly what an
+//! interactive session needs, where requests are produced over time rather than
+//! known up front. The whole thing is one process: it starts an in-memory server
+//! node and connects a client node to it over loopback QUIC.
 //!
 //! Run with: `cargo run -p aster --example shell --features rpc`
+//! (run it from a real terminal; type `exit` to quit.)
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -120,20 +116,21 @@ impl Drop for ChildGuard {
     }
 }
 
-/// A controlled shell with a cleaned environment, for a deterministic demo.
+/// The shell to run on the server side: the user's `$SHELL` (so the session
+/// feels native), falling back to `/bin/sh`, or `cmd.exe` on Windows.
 fn shell_command() -> CommandBuilder {
     #[cfg(unix)]
     {
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.env_clear();
-        cmd.env("PATH", "/usr/bin:/bin");
-        cmd.env("TERM", "xterm");
-        cmd.env("PS1", "$ "); // quiet, deterministic prompt
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.env(
+            "TERM",
+            std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
+        );
         cmd
     }
     #[cfg(windows)]
     {
-        // Don't clear the env on Windows: cmd.exe needs SystemRoot et al.
         CommandBuilder::new("cmd.exe")
     }
 }
@@ -226,7 +223,106 @@ impl Shell for PtyShell {
     }
 }
 
-// ── Driver: two in-process nodes, a scripted session ────────────────────────
+// ── Client: raw-mode terminal driving the bidi stream ────────────────────────
+
+/// Puts the local terminal in raw mode and restores it on drop, so a panic or
+/// early return never leaves the user's terminal wedged.
+struct RawModeGuard(bool);
+
+impl RawModeGuard {
+    fn enter() -> Self {
+        Self(crossterm::terminal::enable_raw_mode().is_ok())
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
+fn term_size() -> (i32, i32) {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    (rows as i32, cols as i32)
+}
+
+async fn run_client(client: &ShellClient) -> Result<i32> {
+    let (sink, mut responses) = client.open_streaming().await?;
+    let sink = Arc::new(sink);
+
+    // Raw mode so keystrokes (and Ctrl-C / Ctrl-D) reach the remote PTY directly.
+    let _raw = RawModeGuard::enter();
+
+    // The server doesn't spawn the shell until the first frame arrives — open by
+    // sending our current window size (also what a real terminal client does).
+    let (rows, cols) = term_size();
+    sink.send(&ShellIn::resize(rows, cols)).await?;
+
+    // stdin → Data frames. Local stdin reads are blocking, so use a thread that
+    // hands chunks to an async task which forwards them through the sink.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = stdin.read(&mut buf) {
+            if n == 0 || stdin_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let stdin_sink = sink.clone();
+    let stdin_task = tokio::spawn(async move {
+        while let Some(bytes) = stdin_rx.recv().await {
+            if stdin_sink.send(&ShellIn::data(bytes)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // SIGWINCH → Resize frames, so the remote PTY tracks the local window.
+    #[cfg(unix)]
+    let winch_task = {
+        let winch_sink = sink.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sig = match signal(SignalKind::window_change()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            while sig.recv().await.is_some() {
+                let (rows, cols) = term_size();
+                if winch_sink.send(&ShellIn::resize(rows, cols)).await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
+
+    // responses → stdout, until the remote shell exits.
+    let mut stdout = std::io::stdout();
+    let mut exit = 0;
+    while let Some(frame) = responses.recv().await {
+        let f = frame?;
+        if !f.data.is_empty() {
+            stdout.write_all(&f.data).ok();
+            stdout.flush().ok();
+        }
+        if f.eof {
+            exit = f.exit_code;
+            break;
+        }
+    }
+
+    stdin_task.abort();
+    #[cfg(unix)]
+    winch_task.abort();
+    let _ = sink.finish().await;
+    Ok(exit)
+}
+
+// ── Driver: two in-process nodes ─────────────────────────────────────────────
 
 fn cfg() -> AsterConfig {
     AsterConfig::builder()
@@ -260,37 +356,11 @@ async fn main() -> Result<()> {
     let conn: RpcConnection = client_node.rpc_connect(&server.id()).await?;
     let client = ShellClient::new(conn);
 
-    // Resize to 40×100, then exit. On Unix we ask the tty its size first; because
-    // we drove a real PTY, `stty size` reports the dimensions our Resize applied.
-    #[cfg(unix)]
-    let program = vec![
-        ShellIn::resize(40, 100),
-        ShellIn::data("stty size\n"),
-        ShellIn::data("exit\n"),
-    ];
-    #[cfg(windows)]
-    let program = vec![ShellIn::resize(40, 100), ShellIn::data("exit\r\n")];
-
-    let frames = client.open(program).await?.collect().await?;
-
-    let mut screen = Vec::new();
-    let mut exit = 0;
-    for f in &frames {
-        screen.extend_from_slice(&f.data);
-        if f.eof {
-            exit = f.exit_code;
-        }
-    }
-    let text = String::from_utf8_lossy(&screen);
-    println!("--- remote shell output ---\n{text}\n--- exited with code {exit} ---");
-
-    #[cfg(unix)]
-    assert!(
-        text.contains("40 100"),
-        "the Resize frame should change the tty size"
-    );
+    let exit = run_client(&client).await;
 
     client_node.shutdown().await;
     server.shutdown().await;
+    // Raw mode is already restored (RawModeGuard dropped); print on a fresh line.
+    println!("\r\nremote shell exited with code {}", exit?);
     Ok(())
 }
