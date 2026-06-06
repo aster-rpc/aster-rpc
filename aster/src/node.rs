@@ -37,14 +37,22 @@ impl Node {
     pub async fn start_with_alpns(config: AsterConfig, alpns: Vec<Vec<u8>>) -> Result<Node> {
         let core = match &config.data_dir {
             Some(dir) => {
-                CoreNode::persistent_with_alpns(
+                CoreNode::persistent_with_alpns_and_gc(
                     dir.to_string_lossy().into_owned(),
                     alpns,
                     Some(config.inner.clone()),
+                    config.gc_interval,
                 )
                 .await?
             }
-            None => CoreNode::memory_with_alpns(alpns, Some(config.inner.clone())).await?,
+            None => {
+                CoreNode::memory_with_alpns_and_gc(
+                    alpns,
+                    Some(config.inner.clone()),
+                    config.gc_interval,
+                )
+                .await?
+            }
         };
         Ok(Node { inner: core })
     }

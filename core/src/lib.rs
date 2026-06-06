@@ -34,6 +34,7 @@ use iroh_blobs::api::Store as BlobStore;
 use iroh_blobs::format::collection::Collection;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::store::{gc_run_once as blobs_gc_run_once, GcConfig};
 use iroh_blobs::ticket::BlobTicket;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat, ALPN as BLOBS_ALPN};
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
@@ -1249,8 +1250,35 @@ impl CoreNode {
         aster_alpns: Vec<Vec<u8>>,
         endpoint_config: Option<CoreEndpointConfig>,
     ) -> Result<Self> {
+        Self::memory_with_alpns_and_gc(aster_alpns, endpoint_config, None).await
+    }
+
+    /// Like [`Self::memory_with_alpns`], but opts the in-memory blob store into
+    /// periodic garbage collection at `gc_interval`.
+    ///
+    /// `None` (the default taken by [`Self::memory_with_alpns`]) leaves the
+    /// store grow-only: tags control retention but untagged blobs are never
+    /// reclaimed. `Some(interval)` spawns the iroh-blobs GC loop, which sweeps
+    /// every `interval`, collecting any blob no tag (or temp-tag) protects.
+    /// Tags remain the sole retention root either way; see
+    /// [`CoreBlobsClient::gc_run_once`] for a deterministic manual sweep.
+    pub async fn memory_with_alpns_and_gc(
+        aster_alpns: Vec<Vec<u8>>,
+        endpoint_config: Option<CoreEndpointConfig>,
+        gc_interval: Option<Duration>,
+    ) -> Result<Self> {
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
-        let mem_store = MemStore::new();
+        let mem_store = match gc_interval {
+            Some(interval) => MemStore::new_with_opts(iroh_blobs::store::mem::Options {
+                gc_config: Some(GcConfig {
+                    interval,
+                    // Tags alone protect; an embedder-supplied ProtectCb is a
+                    // future addition (see docs/KNOWN_ISSUES.md).
+                    add_protected: None,
+                }),
+            }),
+            None => MemStore::new(),
+        };
         let store: BlobStore = (*mem_store).clone();
         Self::finalize(endpoint, store, None, aster_alpns, monitor, hook_receiver).await
     }
@@ -1266,13 +1294,37 @@ impl CoreNode {
         aster_alpns: Vec<Vec<u8>>,
         endpoint_config: Option<CoreEndpointConfig>,
     ) -> Result<Self> {
+        Self::persistent_with_alpns_and_gc(path, aster_alpns, endpoint_config, None).await
+    }
+
+    /// Like [`Self::persistent_with_alpns`], but opts the FsStore into periodic
+    /// garbage collection at `gc_interval`. See
+    /// [`Self::memory_with_alpns_and_gc`] for the semantics; `None` preserves
+    /// the grow-only default of [`Self::persistent_with_alpns`].
+    pub async fn persistent_with_alpns_and_gc(
+        path: String,
+        aster_alpns: Vec<Vec<u8>>,
+        endpoint_config: Option<CoreEndpointConfig>,
+        gc_interval: Option<Duration>,
+    ) -> Result<Self> {
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         let root = std::path::PathBuf::from(&path);
         // Create the data directory privately *before* the stores write secret
         // material (notably the node secret in `docs.redb`) into it.
         std::fs::create_dir_all(&root)?;
         harden_dir_private(&root)?;
-        let fs_store = FsStore::load(&root).await?;
+        let fs_store = match gc_interval {
+            Some(interval) => {
+                // Mirror `FsStore::load`'s db path, then overlay the GC option.
+                let mut options = iroh_blobs::store::fs::options::Options::new(&root);
+                options.gc = Some(GcConfig {
+                    interval,
+                    add_protected: None,
+                });
+                FsStore::load_with_opts(root.join("blobs.db"), options).await?
+            }
+            None => FsStore::load(&root).await?,
+        };
         let store: BlobStore = fs_store.into();
         Self::finalize(
             endpoint,
@@ -2597,6 +2649,21 @@ pub struct CoreBlobsClient {
 impl CoreBlobsClient {
     pub async fn add_bytes(&self, data: Vec<u8>) -> Result<String> {
         Ok(self.store.add_slice(&data).await?.hash.to_string())
+    }
+
+    /// Run exactly one GC mark+sweep pass now and return when it completes.
+    ///
+    /// Reclaims every blob not protected by a persistent tag, a live temp-tag,
+    /// or the store's protect callback. Unlike the periodic GC loop (enabled
+    /// via the `gc_interval` constructors), this is synchronous and
+    /// deterministic, so test harnesses can assert reclamation without waiting
+    /// on the timed interval. Safe to call whether or not periodic GC is
+    /// configured. GC is **node-wide** over the one shared blob store: it
+    /// collects any untagged blob regardless of which tree added it.
+    pub async fn gc_run_once(&self) -> Result<()> {
+        let mut live = std::collections::HashSet::new();
+        blobs_gc_run_once(&self.store, &mut live).await?;
+        Ok(())
     }
 
     /// Import a file from `path` into the blob store and return its hash (hex).
