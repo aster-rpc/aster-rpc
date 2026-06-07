@@ -361,6 +361,24 @@ impl Doc {
             .await?)
     }
 
+    /// Read multiple content blobs that are already complete locally.
+    ///
+    /// Missing or partial values return `None` at their original index.
+    pub async fn read_entry_contents_if_complete(
+        &self,
+        content_hashes: &[Hash],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        Ok(self
+            .inner
+            .read_entry_contents_if_complete(
+                content_hashes
+                    .iter()
+                    .map(|hash| hash.as_str().to_string())
+                    .collect(),
+            )
+            .await?)
+    }
+
     /// Return the local storage status for a document entry value blob.
     pub async fn entry_content_status(&self, content_hash: &Hash) -> Result<BlobStatus> {
         Ok(self

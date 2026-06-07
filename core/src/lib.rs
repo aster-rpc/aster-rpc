@@ -3551,6 +3551,32 @@ impl CoreDoc {
         Ok(self.store.get_bytes(hash).await?.to_vec())
     }
 
+    /// Read multiple document entry value blobs that are complete locally.
+    ///
+    /// Missing or partial values return `None` at their original index. Complete
+    /// values use the blob store's batched inline fast path when possible and
+    /// fall back to the existing validated export path for larger blobs.
+    pub async fn read_entry_contents_if_complete(
+        &self,
+        content_hash_hexes: Vec<String>,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut hashes = Vec::with_capacity(content_hash_hexes.len());
+        for hash_hex in content_hash_hexes {
+            hashes.push(hash_hex.parse::<Hash>()?);
+        }
+
+        let results = self
+            .store
+            .blobs()
+            .get_bytes_many_if_complete(hashes)
+            .await?;
+        let mut out = Vec::with_capacity(results.len());
+        for result in results {
+            out.push(result?.map(|bytes| bytes.to_vec()));
+        }
+        Ok(out)
+    }
+
     /// Return the local storage status for a document entry value blob.
     pub async fn entry_content_status(&self, content_hash_hex: String) -> Result<CoreBlobStatus> {
         let hash: Hash = content_hash_hex.parse()?;
