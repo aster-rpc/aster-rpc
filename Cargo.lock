@@ -2298,7 +2298,7 @@ dependencies = [
 [[package]]
 name = "iroh-docs"
 version = "0.100.0"
-source = "git+https://github.com/aster-rpc/iroh-docs?rev=14107686520394f1df0ffe08cb45c9ec7a229221#14107686520394f1df0ffe08cb45c9ec7a229221"
+source = "git+https://github.com/aster-rpc/iroh-docs?rev=027467daa2e29cf18b68e074ab07289b9f45ee22#027467daa2e29cf18b68e074ab07289b9f45ee22"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3227,7 +3227,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 3.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -4824,7 +4824,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
