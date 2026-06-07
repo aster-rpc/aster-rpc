@@ -1,5 +1,6 @@
 //! Document sync client.
 
+use crate::blobs::BlobStatus;
 use crate::error::Result;
 use crate::id::{AuthorId, Hash, NamespaceId, NamespaceSecret, NodeId, SecretKey};
 use aster_transport_core::{
@@ -358,6 +359,15 @@ impl Doc {
             .inner
             .read_entry_content(content_hash.as_str().to_string())
             .await?)
+    }
+
+    /// Return the local storage status for a document entry value blob.
+    pub async fn entry_content_status(&self, content_hash: &Hash) -> Result<BlobStatus> {
+        Ok(self
+            .inner
+            .entry_content_status(content_hash.as_str().to_string())
+            .await?
+            .into())
     }
 
     /// Share this document as a ticket (id-only addressing).

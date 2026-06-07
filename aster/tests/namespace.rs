@@ -4,7 +4,7 @@
 
 use aster::{
     hpke_generate_keypair, hpke_open, hpke_public_key_from_private, hpke_seal, AsterConfig,
-    NamespaceCapability, NamespaceSecret, Node, RelayMode, HPKE_ENVELOPE_ALG,
+    BlobStatus, NamespaceCapability, NamespaceSecret, Node, RelayMode, HPKE_ENVELOPE_ALG,
 };
 
 async fn mem_node() -> Node {
@@ -88,6 +88,10 @@ async fn read_import_then_write_import_upgrades_to_writable() {
         .await
         .expect("write must succeed after upgrade");
 
+    assert_eq!(
+        rw.entry_content_status(&hash).await.unwrap(),
+        BlobStatus::Complete { size: 1 }
+    );
     let val = rw.read_entry_content(&hash).await.unwrap();
     assert_eq!(val, b"v");
 
