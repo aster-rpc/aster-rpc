@@ -3435,19 +3435,19 @@ impl CoreDoc {
             builder = builder.limit(limit);
         }
         let query = builder.build();
-        let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
-        let mut results = Vec::new();
-        while let Some(entry) = entries_stream.next().await {
-            let entry = entry?;
-            results.push(CoreDocEntry {
+        Ok(self
+            .doc
+            .get_many_vec(query)
+            .await?
+            .into_iter()
+            .map(|entry| CoreDocEntry {
                 author_id: entry.author().to_string(),
                 key: entry.key().to_vec(),
                 content_hash: entry.content_hash().to_hex().to_string(),
                 content_len: entry.content_len(),
                 timestamp: entry.timestamp(),
-            });
-        }
-        Ok(results)
+            })
+            .collect())
     }
 
     /// Read the single latest entry for an exact key, across all authors.
@@ -3460,20 +3460,19 @@ impl CoreDoc {
     /// value of a key; [`CoreDoc::query_key_exact`] is for enumerating all authors.
     pub async fn query_latest_exact(&self, key: Vec<u8>) -> Result<Option<CoreDocEntry>> {
         let query = Query::single_latest_per_key().key_exact(key).build();
-        let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
-        match entries_stream.next().await {
-            Some(entry) => {
-                let entry = entry?;
-                Ok(Some(CoreDocEntry {
-                    author_id: entry.author().to_string(),
-                    key: entry.key().to_vec(),
-                    content_hash: entry.content_hash().to_hex().to_string(),
-                    content_len: entry.content_len(),
-                    timestamp: entry.timestamp(),
-                }))
-            }
-            None => Ok(None),
-        }
+        Ok(self
+            .doc
+            .get_many_vec(query)
+            .await?
+            .into_iter()
+            .next()
+            .map(|entry| CoreDocEntry {
+                author_id: entry.author().to_string(),
+                key: entry.key().to_vec(),
+                content_hash: entry.content_hash().to_hex().to_string(),
+                content_len: entry.content_len(),
+                timestamp: entry.timestamp(),
+            }))
     }
 
     /// Query all entries matching a key prefix, across all authors.
@@ -3492,19 +3491,19 @@ impl CoreDoc {
             builder = builder.limit(limit);
         }
         let query = builder.build();
-        let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
-        let mut results = Vec::new();
-        while let Some(entry) = entries_stream.next().await {
-            let entry = entry?;
-            results.push(CoreDocEntry {
+        Ok(self
+            .doc
+            .get_many_vec(query)
+            .await?
+            .into_iter()
+            .map(|entry| CoreDocEntry {
                 author_id: entry.author().to_string(),
                 key: entry.key().to_vec(),
                 content_hash: entry.content_hash().to_hex().to_string(),
                 content_len: entry.content_len(),
                 timestamp: entry.timestamp(),
-            });
-        }
-        Ok(results)
+            })
+            .collect())
     }
 
     /// List the latest entry for each distinct key under a prefix, across all authors.
@@ -3530,19 +3529,19 @@ impl CoreDoc {
             builder = builder.limit(limit);
         }
         let query = builder.build();
-        let mut entries_stream = Box::pin(self.doc.get_many(query).await?);
-        let mut results = Vec::new();
-        while let Some(entry) = entries_stream.next().await {
-            let entry = entry?;
-            results.push(CoreDocEntry {
+        Ok(self
+            .doc
+            .get_many_vec(query)
+            .await?
+            .into_iter()
+            .map(|entry| CoreDocEntry {
                 author_id: entry.author().to_string(),
                 key: entry.key().to_vec(),
                 content_hash: entry.content_hash().to_hex().to_string(),
                 content_len: entry.content_len(),
                 timestamp: entry.timestamp(),
-            });
-        }
-        Ok(results)
+            })
+            .collect())
     }
 
     /// Read the content bytes for a given content hash.
@@ -3550,6 +3549,21 @@ impl CoreDoc {
     pub async fn read_entry_content(&self, content_hash_hex: String) -> Result<Vec<u8>> {
         let hash: Hash = content_hash_hex.parse()?;
         Ok(self.store.get_bytes(hash).await?.to_vec())
+    }
+
+    /// Return the local storage status for a document entry value blob.
+    pub async fn entry_content_status(&self, content_hash_hex: String) -> Result<CoreBlobStatus> {
+        let hash: Hash = content_hash_hex.parse()?;
+        let status = self.store.blobs().status(hash).await?;
+        Ok(match status {
+            iroh_blobs::api::proto::BlobStatus::NotFound => CoreBlobStatus::NotFound,
+            iroh_blobs::api::proto::BlobStatus::Partial { size } => CoreBlobStatus::Partial {
+                size: size.unwrap_or(0),
+            },
+            iroh_blobs::api::proto::BlobStatus::Complete { size } => {
+                CoreBlobStatus::Complete { size }
+            }
+        })
     }
 
     pub async fn get_exact(&self, author_hex: String, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
