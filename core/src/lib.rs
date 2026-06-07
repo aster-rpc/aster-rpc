@@ -1099,6 +1099,7 @@ struct CoreNodeInner {
     docs: Docs,
     gossip: Gossip,
     store: BlobStore,
+    downloader: Downloader,
     /// GC protection callback bridging the docs engine to the blob store: when
     /// invoked it inserts every hash referenced by an open replica into the GC
     /// `live` set (aborting the sweep on any enumeration error). Wired into the
@@ -1386,6 +1387,7 @@ impl CoreNode {
         gc_protect: (ProtectCallbackHandler, ProtectCb),
     ) -> Result<Self> {
         let (protect_handler, protect_cb) = gc_protect;
+        let downloader = Downloader::new(&store, &endpoint);
         let blobs = BlobsProtocol::new(&store, None);
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let docs_builder = match &docs_root {
@@ -1449,6 +1451,7 @@ impl CoreNode {
                 docs,
                 gossip,
                 store,
+                downloader,
                 protect_cb,
                 secret_key_bytes,
                 aster_rx: Mutex::new(aster_rx),
@@ -1537,6 +1540,7 @@ impl CoreNode {
         CoreBlobsClient {
             store: self.inner.store.clone(),
             endpoint: self.inner.endpoint.clone(),
+            downloader: self.inner.downloader.clone(),
             protect_cb: self.inner.protect_cb.clone(),
         }
     }
@@ -2682,6 +2686,7 @@ pub enum CoreBlobStatus {
 pub struct CoreBlobsClient {
     pub store: BlobStore,
     pub endpoint: Endpoint,
+    downloader: Downloader,
     /// Docs GC protection callback (see [`CoreNodeInner::protect_cb`]). Replayed
     /// by [`Self::gc_run_once`] to seed the `live` set before a manual sweep, so
     /// a deterministic sweep protects docs content exactly as the periodic loop
@@ -3025,9 +3030,7 @@ impl CoreBlobsClient {
             mem.add_endpoint_info(addr.clone());
             lookup.add(mem);
         }
-        Downloader::new(&self.store, &self.endpoint)
-            .download(hash, vec![addr.id])
-            .await?;
+        self.downloader.download(hash, vec![addr.id]).await?;
 
         // If it's a HashSeq (Collection), extract the file contents
         if format == BlobFormat::HashSeq {
@@ -3063,9 +3066,7 @@ impl CoreBlobsClient {
             hash,
             format: blob_format,
         };
-        Downloader::new(&self.store, &self.endpoint)
-            .download(haf, vec![node_id])
-            .await?;
+        self.downloader.download(haf, vec![node_id]).await?;
 
         if blob_format == BlobFormat::HashSeq {
             let collection = Collection::load(hash, &self.store).await?;
@@ -3106,9 +3107,7 @@ impl CoreBlobsClient {
             hash,
             format: blob_format,
         };
-        Downloader::new(&self.store, &self.endpoint)
-            .download(haf, vec![node_id])
-            .await?;
+        self.downloader.download(haf, vec![node_id]).await?;
         Ok(())
     }
 
@@ -3124,9 +3123,7 @@ impl CoreBlobsClient {
             hash,
             format: BlobFormat::HashSeq,
         };
-        Downloader::new(&self.store, &self.endpoint)
-            .download(haf, vec![node_id])
-            .await?;
+        self.downloader.download(haf, vec![node_id]).await?;
 
         let collection = Collection::load(hash, &self.store).await?;
         let mut files = Vec::new();
@@ -3147,9 +3144,7 @@ impl CoreBlobsClient {
             mem.add_endpoint_info(addr.clone());
             lookup.add(mem);
         }
-        Downloader::new(&self.store, &self.endpoint)
-            .download(hash, vec![addr.id])
-            .await?;
+        self.downloader.download(hash, vec![addr.id]).await?;
 
         let collection = Collection::load(hash, &self.store).await?;
         let mut files = Vec::new();
