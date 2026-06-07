@@ -2235,7 +2235,7 @@ dependencies = [
 [[package]]
 name = "iroh-blobs"
 version = "0.102.0"
-source = "git+https://github.com/aster-rpc/iroh-blobs?rev=a0cbdd151e4471cd5ea48a50641402a9bcb50048#a0cbdd151e4471cd5ea48a50641402a9bcb50048"
+source = "git+https://github.com/aster-rpc/iroh-blobs?rev=e20ff0292da15d6dd42df37395f59264c7b48676#e20ff0292da15d6dd42df37395f59264c7b48676"
 dependencies = [
  "arrayvec",
  "bao-tree",
@@ -2298,7 +2298,7 @@ dependencies = [
 [[package]]
 name = "iroh-docs"
 version = "0.100.0"
-source = "git+https://github.com/aster-rpc/iroh-docs?rev=027467daa2e29cf18b68e074ab07289b9f45ee22#027467daa2e29cf18b68e074ab07289b9f45ee22"
+source = "git+https://github.com/aster-rpc/iroh-docs?rev=de983790c850a4406416697d29d948f78b6210fa#de983790c850a4406416697d29d948f78b6210fa"
 dependencies = [
  "anyhow",
  "async-channel",
