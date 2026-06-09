@@ -1,5 +1,18 @@
 # Ownership Attestations — Provable Root ↔ Node Linkage
 
+> **2026-06-10 update.** Design *direction* simplified by
+> [trust-directory.md](trust-directory.md) (informed by the portal-sync
+> control plane): in-deployment, delegation hierarchy becomes **directory
+> rows** (designations with scopes), not bundled chains — so multi-tier
+> minting (Step 0.5), epoch replay enforcement, and gossip-topic revocation
+> are no longer planned, and chains cap at **depth ≤ 2** (anchor↔root,
+> root↔node export). What survives unchanged: the implemented single-edge
+> reciprocal attestation, the wire/validation discipline, multi-anchor trust
+> sets, and the Day-1 JWS trust publication — all scoped to the deployment
+> *boundaries* (above the root; outside the deployment). See the per-mechanism
+> disposition table in trust-directory.md before implementing anything from
+> this doc.
+
 **Status:** Design locked for MVP; **v1 core partially implemented in Rust as of 2026-05-30** (single-edge mint + an N-tier verifier — see "Implementation status" below). Wire format is Fory-serialized, schema-versioned, opaque-body-signed with Ed25519 v1. The primary artifact is a **bundled `AttestationChain`** carrying all edges from leaf to anchor — verification is local, no walking. BLS deferred indefinitely (would be a `v2` schema bump if it ever lands). Concepts borrowed from OpenID Federation 1.0; wire format is not.
 **Date:** 2026-04-29 (last revised: 2026-05-30)
 **Related:**

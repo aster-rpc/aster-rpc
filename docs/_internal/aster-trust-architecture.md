@@ -1,7 +1,17 @@
-ase# Aster Trust Architecture — Identity, Enrollment, and Transparency
+# Aster Trust Architecture — Identity, Enrollment, and Transparency
 
-**Status:** Design draft  
-**Date:** 2026-04-07  
+> **2026-06-10 update.** Severed in two by
+> [trust-directory.md](trust-directory.md): the FROST quorum, epochal
+> ephemeral keys, transparency log, and credential-TTL machinery are
+> **aster.site platform** infrastructure (public-marketplace credential
+> issuance) — not enterprise-P2P core. For enterprise deployments, "Mode 1:
+> self-issued" becomes *run a trust directory*: authority is a live lookup in
+> the root-owned replicated namespace, with no credentials minted at all. The
+> three-gate model and the handle-binds-to-anchor decision stand, with gates
+> made data-driven from the directory.
+
+**Status:** Design draft
+**Date:** 2026-04-07
 **Companion docs:** [aster-security-hardening.md](aster-security-hardening.md), [aster-site-marketplace.md](aster-site-marketplace.md)  
 **Spec references:** [Aster-trust-spec.md](../../ffi_spec/Aster-trust-spec.md), [Aster-ContractIdentity.md](../../ffi_spec/Aster-ContractIdentity.md)
 

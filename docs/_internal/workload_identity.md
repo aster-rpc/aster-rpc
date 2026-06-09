@@ -1,5 +1,13 @@
 # Workload Identity — How Kubernetes (and Friends) Attest a Caller
 
+> **2026-06-10 update.** The OIDC verifier described here survives unchanged
+> under [trust-directory.md](trust-directory.md), but its **output changes**:
+> instead of minting an admission rcan bound to `sdk_pk` (with the
+> refresh-before-expiry loop), the verifier gates a **directory write** — a
+> designated *enroller* validates the JWT and writes the node's `Admission`
+> row into its designated namespace. The JWT's job ends at enrollment;
+> ongoing authority is the row; the credential-refresh lifecycle disappears.
+
 **Status:** Reference notes
 **Date:** 2026-05-05
 **Companion docs:**
