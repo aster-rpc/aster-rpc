@@ -172,6 +172,53 @@ rollout = epoch over Workload records (old-or-new, never half)
 rollback = restore the previous epoch
 ```
 
+## Scaling posture
+
+The honest answer to "does it scale?" — projected, not yet measured (validated
+mesh testing is 2–5 nodes; treat the numbers below as a reasoned bet a soak
+test must confirm, not a fact).
+
+**No scaling wall below a few hundred nodes**, because the structure removes the
+three things that usually break orchestrators:
+
+1. **No central control plane to bottleneck.** k8s tops out on etcd
+   write-throughput and apiserver watch fan-out under churn — not on compute.
+   Here authority is a *local* directory lookup, so the per-decision authz
+   round-trip that hammers the apiserver does not exist. This is the big one.
+2. **Content distribution scales *with* node count.** The multi-provider
+   downloader + have-map swarms images BitTorrent-style — more nodes are more
+   seeders. The centralized-registry bottleneck (what spegel/dragonfly bolt
+   onto k8s) inverts into an advantage.
+3. **Leases are O(1) in fleet size.** The CP quorum for singletons is a fixed
+   3–5 nodes whether the fleet is 5 or 500; consensus cost is per-lease, never
+   per-node. Gossip is bounded-degree epidemic, not full-mesh, so liveness is
+   squarely within its design range.
+
+**Two soft spots that need modest design (not redesign):**
+
+- **Observability fan-in.** N node-owned status namespaces make the console an
+  N-way aggregator, and fleet-wide views (unhealthy-node rollup, *rollout
+  progress across the fleet*) need an aggregation layer that is deferred today
+  (metrics is this-node-view only). Felt first, because progressive rollouts
+  (canary, "wait for N healthy") depend on reading fleet status back. Likely
+  shape: a designated-aggregator role or hierarchical rollup.
+- **Claim churn under correlated failure.** Steady state is fine (most directory
+  changes are irrelevant to most nodes). The stress case is a *correlated*
+  event — a node dies and its workloads reschedule, or a rollout touches many
+  records — where many nodes wake and race to claim. Occupancy/tiebreak
+  converges (LWW + deterministic claim, the P5T-007 seed), but the convergence
+  window wants backoff/jitter validation at fleet scale.
+
+**The stated ceiling: the directory is unsharded.** Every node sees every
+record. At a few hundred nodes × a few thousand records this is small and fine;
+past ~1000 nodes or ~10k workloads it needs partitioning (per-zone namespaces,
+or nodes subscribing only to relevant slices). 200 nodes is a deliberate
+comfortable zone *below* that threshold, not an accident — naming the ceiling
+keeps it a design choice rather than a surprise.
+
+The real gap at 200 nodes is **validation, not architecture**: the deferred
+soak/scale test (portal L1 / LPS-4) is what converts this posture into a fact.
+
 ## Prior art (survey required before any public claim)
 
 As of knowledge cutoff (Jan 2026): **Uncloud** (P2P Docker orchestration over
