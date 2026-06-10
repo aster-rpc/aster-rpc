@@ -5,7 +5,7 @@
 **Companion docs:**
 - [observability-in-core.md](observability-in-core.md) — OTel SDK, metrics, traces, logger trace-context hooks. This doc extends the logs section's boundary.
 - [aster-tunneld-linux.md](aster-tunneld-linux.md) — sibling pattern (Aster as the substrate replacing a category of infra)
-- [identity-worked-example.md](retired.identity-worked-example.md) — tenant model that frames per-tenant log isolation
+- identity-worked-example.md (deleted 2026-06-10, in git history; superseded by [../trust-directory.md](../trust-directory.md)) — tenant model that frames per-tenant log isolation
 
 ---
 

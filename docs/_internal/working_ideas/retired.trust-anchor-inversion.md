@@ -21,7 +21,7 @@
 
 **Status:** Working idea — not normative
 **Date:** 2026-04-15
-**Companion doc:** [trust-discovery-thinking-session.md](retired.trust-discovery-thinking-session.md) — the muddled session this clarifies
+**Companion doc:** trust-discovery-thinking-session.md (deleted 2026-06-10, in git history) — the muddled session this clarified; its direction concluded in [../trust-directory.md](../trust-directory.md)
 **Related:** [../../../ffi_spec/Aster-trust-spec.md](../../../ffi_spec/Aster-trust-spec.md) (current implemented spec)
 
 ---

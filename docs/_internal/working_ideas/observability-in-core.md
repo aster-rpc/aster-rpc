@@ -3,7 +3,7 @@
 **Status:** Working idea
 **Date:** 2026-05-05
 **Companion docs:**
-- [identity-worked-example.md](retired.identity-worked-example.md) — Portal use case; the `tenant_id` propagation question motivates the multi-tenancy section here
+- identity-worked-example.md (deleted 2026-06-10, in git history; superseded by [../trust-directory.md](../trust-directory.md)) — Portal use case; the `tenant_id` propagation question motivates the multi-tenancy section here
 - `bindings/python/aster/interceptors/metrics.py`, `bindings/typescript/.../metrics.ts`, `bindings/java/.../MetricsInterceptor.java` — current per-binding implementations this design supersedes
 
 ---

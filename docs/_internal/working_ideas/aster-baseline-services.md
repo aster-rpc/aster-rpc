@@ -6,8 +6,8 @@
 **Companion docs:**
 - [decentralized-log-distribution.md](decentralized-log-distribution.md) — the publisher/subscriber substrate; this doc adds the on-demand pull side
 - [observability-in-core.md](observability-in-core.md) — OTel SDK, metrics, traces, hooks
-- [identity-worked-example.md](retired.identity-worked-example.md) — tenant model + rcan scopes that gate access to the baseline services
-- [trust-discovery-thinking-session.md](retired.trust-discovery-thinking-session.md) — handle registry / discovery primitives the baseline `discovery.*` services would expose
+- identity-worked-example.md (deleted 2026-06-10, in git history) — tenant/rcan model; superseded by directory roles per [../trust-directory.md](../trust-directory.md)
+- trust-discovery-thinking-session.md (deleted 2026-06-10, in git history) — handle registry / discovery primitives the baseline `discovery.*` services would expose; concluded in [../trust-directory.md](../trust-directory.md)
 
 ---
 
@@ -56,7 +56,7 @@ aster.ops.NodeInfo          # version, build, capabilities, public endpoint id, 
 aster.ops.Manifest          # which contracts this node serves (reflection)
 aster.discovery.Resolve     # handle → anchor pubkey → endpoint list
                             # (the registry side of §"Control-plane HA"
-                            # in retired.identity-worked-example.md)
+                            # in the deleted identity-worked-example.md; see trust-directory.md)
 ```
 
 ### Health & lifecycle
@@ -99,7 +99,7 @@ aster.ops.Debug             # controlled introspection — feature flags, stack 
 aster.trust.Tokens          # admission token verification (called by other peers)
 aster.trust.Anchor          # anchor delegation lookup
 aster.trust.Enrollment      # the EnrollmentProof verifier surface
-                            # (see retired.identity-worked-example.md §"Pluggable
+                            # (see workload_identity.md §"Pluggable
                             # enrollment-proof pattern")
 ```
 
