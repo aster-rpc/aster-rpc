@@ -1,0 +1,169 @@
+# Aster Orchestrator — Flat Workload Orchestration On The Mesh
+
+**Status:** Working idea / product thesis
+**Date:** 2026-06-10
+**Related:**
+- [../trust-directory.md](../trust-directory.md) — the directory (apiserver-equivalent) and delegation model
+- [aster-tunneld-linux.md](aster-tunneld-linux.md) — the network plane (DNS intercept, TUN, broker contract)
+- portal-sync repo: `docs/substrate-thesis.md` (the substrate), `docs/roaming-workspace.md` (the lease primitive), `docs/design/control-plane-auth-rpc.md` (the proven control loop)
+
+---
+
+## Thesis
+
+Kubernetes is a database with controllers around it — and both halves are the
+operational burden: the database (etcd + apiserver) must be provisioned,
+upgraded, and babysat, and the hard subsystems (networking, storage, identity,
+registry) are not in the orchestrator at all but in a bolt-on ecosystem (CNI,
+CSI, OIDC config, Helm sprawl) where most of the complexity actually lives.
+Nomad proved a simpler core was possible and then died of "batteries sold
+separately" — its value was gated on adopting Consul and Vault as separate
+conscious choices.
+
+The Aster/portal substrate inverts both failure modes:
+
+> **A flat, P2P workload orchestrator where the replicated directory is the
+> apiserver, the QUIC mesh is the cluster network, the CAS is the registry and
+> the volume store, and there is no control plane to operate at all.**
+
+Every machine that enrolls — a VPS, an office server, a homelab box behind
+CGNAT — is "in the cluster," because NAT traversal is the substrate, not an
+add-on.
+
+## The kernel already exists: portal-syncd is an orchestrator
+
+This is not "we could build an orchestrator on our stack." portal-syncd
+**already is one, for a single workload type** (sync sessions), in production
+through portal-sync Phase 5:
+
+| Orchestrator concern | Already proven in portal-syncd |
+| --- | --- |
+| Desired state | Operator-authored records in the replicated directory (`SyncSessionDesired`) |
+| Control loop | Watchers → `SyncSupervisor` reconcile → workload execution with health states |
+| Status / observability | Debounced status to node-owned namespaces; console/CLI reads by node id |
+| Interactive ops | Aster RPC plane (`start/stop/flush/status`), role-gated |
+| Placement exclusivity | Single-owner occupancy per (node, resource) with eviction (P5T-007) |
+| AuthZ / enrollment | Trust directory: admissions, roles, designations; OIDC enroller for workload identity |
+| Revocation | Tombstones, re-validated during reconcile — running work stops on revoke |
+
+The orchestrator product is: **generalize the workload type from "sync
+session" to "OCI container / service unit."** The control loop, status plane,
+RPC plane, and authority model carry over unchanged.
+
+And every hard subsystem k8s outsources is a native primitive here:
+
+| K8s bolt-on | Native primitive |
+| --- | --- |
+| etcd + apiserver | Trust directory — replicated, watchable, no quorum to operate, no upgrade treadmill |
+| RBAC + OIDC wiring | Directory roles/designations + the workload-identity enroller |
+| CNI / Ingress / mesh sidecars | aster-tunneld + broker contract — QUIC, NAT-traversing, per-service authorization at `open` |
+| CSI / PV / stateful operators | Portal Trees (replicated volumes) + roaming lease (fenced migration) + snapshots (history) |
+| Registry + image distribution | The CAS — OCI layers are content-addressed already; the multi-provider downloader is P2P image distribution (what spegel/dragonfly bolt onto k8s) |
+| Rollout machinery | Epochs — a release is a ChangeSet; rollback is a restore |
+| kubectl + dashboard | The console-as-peer (portal `product-vision-ux.md`) |
+
+## Four design stances (where complexity will try to creep back)
+
+1. **No scheduler.** V1 placement is **constraint matching + replica count**
+   ("run 3 of this on nodes labeled `gpu`; never two on one node"), claimed
+   via directory records with a deterministic tiebreak. No bin-packing, no
+   preemption, no autoscaler. Fleets under ~50 nodes — the entire wedge
+   market — need "keep this running on machines matching X," not a scheduler.
+   This is a product stance, the same discipline as portal's "no fat per-node
+   GUI."
+2. **The node OS is the kubelet.** Do not re-implement runtime supervision —
+   that is where k8s's controller-years of edge cases live (crash loops,
+   backoff, image GC, disk pressure). The node agent writes **podman Quadlet
+   units and lets systemd supervise**: restarts, cgroups, journald. The agent
+   does reconcile-and-report, not process babysitting.
+3. **CP for leases, AP for everything else.** The directory is
+   eventually-consistent LWW — correct for desired state, status, and roles;
+   *wrong* for "at most one instance" (singleton jobs, primary databases).
+   That needs the **exclusive migrating lease with monotonic fencing tokens**
+   already designed in portal's `roaming-workspace.md` (designated-primary or
+   small-majority authority). Promote it to a first-class lease service.
+   K8s puts *everything* in CP and pays etcd's price for all of it; here
+   consensus cost is paid only where the semantics demand it.
+4. **Batteries invisible.** The Nomad trap is a mirror: "an Aster-based
+   orchestrator" must never require the customer to know Aster exists. One
+   binary, identity + network + storage + registry inside it. The stack being
+   ours is an implementation advantage, never a sales proposition.
+
+## Differentiators (rank-ordered)
+
+1. **Stateful workloads.** Every lightweight orchestrator punts on state
+   ("use a managed database"). This one uniquely has: replicated volumes
+   (Trees), exclusive-writer migration with fencing (roaming lease),
+   crash-consistent activation floors, and point-in-time history in the
+   customer's bucket (snapshots). *"Your Postgres moves between nodes with
+   its volume, fenced, and yesterday is in your bucket."* Nobody in the
+   lightweight tier can say that sentence.
+2. **NAT-spanning clusters with zero network config.** K8s assumes a flat
+   pod network; multi-site is Submariner-class pain. Here the cluster is
+   whatever enrolls, across sites, clouds, and CGNAT. Edge / multi-site /
+   hybrid is where k8s structurally cannot follow.
+3. **No control plane to operate.** Not "HA control plane" — none. The
+   CLI/console is a peer of the mesh; if it is offline, workloads do not
+   notice.
+4. **Client-aware load balancing for free.** Service consumers resolve
+   endpoints from directory records and rank by liveness, connection type
+   (direct > relay), and RTT — the `ContentDiscovery` ranking pattern pointed
+   at service endpoints instead of blob holders. tunneld's DNS intercept
+   makes it transparent to applications.
+
+## Architecture sketch
+
+```text
+operator / console (a peer)
+      │  writes Workload records (image, constraints, replicas, volumes,
+      │  service exposure, secrets as sealed records)
+      ▼
+trust directory  ── watched by every node agent
+      │
+node agent (per node, one binary)
+      ├─ claim: constraint match + occupancy/lease rules → claim record
+      ├─ fetch: image layers from CAS (multi-provider downloader)
+      ├─ run:   write podman Quadlet unit → systemd supervises
+      ├─ wire:  register service endpoint with local tunneld broker
+      ├─ state: mount Trees as volumes; singleton state under a fenced lease
+      └─ report: status → node-owned namespace (console/CLI read live)
+
+rollout = epoch over Workload records (old-or-new, never half)
+rollback = restore the previous epoch
+```
+
+## Prior art (survey required before any public claim)
+
+As of knowledge cutoff (Jan 2026): **Uncloud** (P2P Docker orchestration over
+a WireGuard mesh, no control plane) is the closest existing thing; also Kamal
+(37signals), Skate, Docker Swarm's remnants, and k3s/k0s as "smaller k8s."
+None have the storage/lease/identity story — that is the moat — but this
+needs an OI-012-style prior-art pass (and a fresh search; the space is moving)
+before "nobody does this" appears in any positioning.
+
+## Sequencing
+
+This is a **third product** and the substrate thesis's third leg — files
+(portal-sync), git (the worktree mesh), **workloads (this)** — all built from
+the same five primitives: directory + CAS + epochs + leases + tunnels.
+
+portal-sync ships first; the orchestrator is the substrate's second act, not
+a fork of current attention. The cheap moves **now** are design-level
+(each costs a paragraph today and saves a rewrite later):
+
+- Keep the **lease primitive generic** when roaming-workspace lands (it is a
+  lease service with fencing, not a file-sync feature).
+- Keep tunneld's **service registry as directory records** (its doc §5.2
+  already points at "subscribe-to-data-model" — that model is the trust
+  directory).
+- Keep portal's **status-record schema workload-agnostic** where free.
+- Keep the **occupancy/claim pattern** (P5T-007) documented as a generic
+  single-owner primitive, not a tree-specific rule.
+
+## The one-line version
+
+> Kubernetes is a database with controllers around it. We have a
+> better-shaped database (replicated, NAT-traversing, nothing to operate),
+> the controllers are proven in portal-syncd, and the three subsystems k8s
+> outsources to its ecosystem — network, storage, identity — are native
+> primitives. The cluster is wherever the mesh reaches.
