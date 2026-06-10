@@ -82,11 +82,13 @@ And every hard subsystem k8s outsources is a native primitive here:
 3. **CP for leases, AP for everything else.** The directory is
    eventually-consistent LWW — correct for desired state, status, and roles;
    *wrong* for "at most one instance" (singleton jobs, primary databases).
-   That needs the **exclusive migrating lease with monotonic fencing tokens**
-   already designed in portal's `roaming-workspace.md` (designated-primary or
-   small-majority authority). Promote it to a first-class lease service.
-   K8s puts *everything* in CP and pays etcd's price for all of it; here
-   consensus cost is paid only where the semantics demand it.
+   The shared primitive is **[aster-leases.md](aster-leases.md)**: advisory
+   grant in the directory + a monotonic fencing token enforced at the resource,
+   with the resource's own CAS as the per-resource serialization point (the
+   volume is a portal Tree, so `portal-store` serializes). K8s puts *everything*
+   in CP and pays etcd's price for all of it; here consensus cost is paid only
+   at the specific resources that would corrupt, and even there the resource
+   serializes itself — never a standing lock service.
 4. **Batteries invisible.** The Nomad trap is a mirror: "an Aster-based
    orchestrator" must never require the customer to know Aster exists. One
    binary, identity + network + storage + registry inside it. The stack being
@@ -244,8 +246,9 @@ portal-sync ships first; the orchestrator is the substrate's second act, not
 a fork of current attention. The cheap moves **now** are design-level
 (each costs a paragraph today and saves a rewrite later):
 
-- Keep the **lease primitive generic** when roaming-workspace lands (it is a
-  lease service with fencing, not a file-sync feature).
+- Keep the **lease primitive generic** when roaming-workspace lands — it is
+  [aster-leases.md](aster-leases.md) (grant/enforce split + resource-CAS
+  fencing), not a file-sync feature.
 - Keep tunneld's **service registry as directory records** (its doc §5.2
   already points at "subscribe-to-data-model" — that model is the trust
   directory).
