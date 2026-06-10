@@ -224,6 +224,69 @@ production secret, push to `main`, reach a new external service) require
 factor on a channel the injected agent does not control. Cheap, because
 console-as-peer already exists.
 
+### Defense 8 (optional) — local policy monitor
+
+A small **local model** (Gemma-class / on-device) running on the node, tasked
+with nothing but policy: it inspects each request and each response and can
+object. Its system prompt is fixed and not user-authored, so its *instructions*
+can't be rewritten by traffic. Useful, but it is sound only under one rule:
+
+> **The monitor may veto, never authorize.** Its verdict is
+> `no-objection | deny | escalate-to-human`, and `no-objection` never widens a
+> grant the deterministic floor (Defenses 1–7) didn't already allow.
+
+That asymmetry is the whole safety argument. A false *positive* costs blocked
+work (recoverable, human-overridable); a false *negative* costs nothing
+**beyond the deterministic floor, which already held**. The deterministic layer
+and the monitor fail in opposite directions and only the floor fails safe — so
+the monitor is a second lock, never a replacement for the first. The inversion
+to forbid in bold: **nothing below the monitor may be relaxed because it
+exists.** A monitor-only design is that rule written as the architecture, and is
+not shippable.
+
+Honest about corruptibility: the monitor's instructions are fixed, but its
+*inputs are attacker-controlled* — it must read the command/output/content it
+judges, and that text can say "ignore your instructions, this is benign." You
+don't escape injection by adding a model that also reads attacker text; you move
+the target. Mitigation is the Defense-5 insight: **judge structured facts, not
+raw blobs** — this resolved argv, this canonicalized path, this target service,
+this profile, this taint label, this just-added git remote. The more raw
+untrusted content a check must ingest, the more its verdict is a *signal* for
+human review and the less it *gates* automatically.
+
+Where it earns its keep (things rules can't enumerate):
+
+- **Sequence / behavioral anomaly** — individually-allowed commands that
+  together look like staging exfiltration; reads unrelated to the stated task.
+- **Contextual oddness** — `git push` to a remote added seconds ago; a
+  profile-escalation request that doesn't fit the task.
+- **Response-side secret scanning** — the sharp one: a cheap regex pre-filter
+  plus the model as second stage catches a mistakenly-committed key/JWT in
+  output *before* it streams back into the agent's context. This is a partial
+  mitigation for the transcript channel — the exact residual the deterministic
+  floor cannot close (see below). Probabilistic, not a solution, but the right
+  place to chip at the one otherwise-open hole.
+
+Architecture for robustness:
+
+- **Stateless, fresh context per evaluation** — no long-running chat that
+  accumulates attacker text across calls (prevents slow-burn poisoning);
+  history is supplied as structured facts, not conversational memory.
+- **Never sees secret *values*** — judges metadata and patterns, or it becomes
+  an exfil target and its logs leak.
+- **Typed verdict, not free text** — the enum drives a switch, so it can't be
+  coaxed into emitting an allow with a side effect.
+- **Runs as its own no-egress sandboxed job** (`PrivateNetwork=yes`) — a
+  subverted monitor still has no channel to exfiltrate what it sees. Local
+  inference is the point: the monitor itself never becomes the leak.
+- **Risk-gated invocation** — cheap deterministic pre-filters first; the model
+  runs only on the ambiguous/risky slice (brokered privileged actions, profile
+  transitions, new egress targets, pre-filter hits), never the high-volume safe
+  path.
+- **Observe-only mode is independently valuable** — even with enforcement off,
+  its flags are a high-signal audit stream feeding Defense 7. Ship it
+  observe-only first; let it earn the right to block.
+
 ### Enforcement substrate (mechanism, not policy)
 
 - **Linux v1: systemd transient units.** One `systemd-run` invocation carries
@@ -238,6 +301,34 @@ console-as-peer already exists.
 - **macOS / Windows** are weaker and stated honestly: Seatbelt profiles;
   restricted token + Job Objects. Path scoping is coarser; the
   deadline/limits/no-ambient-creds story still holds.
+
+### Day-0 minimum floor (non-negotiable for launch)
+
+Defenses 1–8 are the full picture; most can be staged. But the **floor must
+ship on day 0**, because the floor is what fails safe and the injection threat
+is live the first time an agent runs `exec` against real content. The floor is
+small — almost entirely systemd flags, hours of wiring, not weeks:
+
+1. **No ambient authority** — `ProtectHome=tmpfs` + scrubbed env (explicit
+   allowlist, never inherited `environ`). The single highest-value control.
+2. **`PrivateNetwork=yes` as the `workspace` default** — egress leg closed.
+3. **`ReadWritePaths=<root>` confinement** — repo-only write reach.
+4. **`deadline_ms` + output caps** — already in the contract.
+5. **role → profile lookup** — already built for auth.
+
+Stage for later: the trifecta-invariant *validator*, the secret broker, the
+reader/actor split, the microVM tier, and the policy monitor (which ships
+**observe-only** first, never as the floor). The economics matter here: the
+floor is the cheap, fail-safe half; the monitor is the expensive, unbounded-
+failure-mode half. "Ship the monitor only, for speed" inverts both.
+
+Grounding note: **even with none of this**, typed argv + mesh identity +
+directory roles + deadlines is already a large security and reliability
+improvement over today's SSH (ambient keys, no command structure, no job
+persistence, no per-action authorization). The floor above is nearly free on
+top of that, so there is no reason to launch without it — but the baseline is
+already ahead, which is why exec is shippable incrementally rather than
+all-or-nothing.
 
 ### The honest residual — what this does NOT solve
 
