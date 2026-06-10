@@ -256,6 +256,7 @@ docs/python/
 **/_internal/*/
 !**/_internal/day0/
 !**/_internal/java/
+!**/_internal/working_ideas/
 
 .aster/
 .aster-identity
