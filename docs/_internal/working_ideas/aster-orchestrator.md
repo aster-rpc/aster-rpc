@@ -75,7 +75,10 @@ And every hard subsystem k8s outsources is a native primitive here:
    that is where k8s's controller-years of edge cases live (crash loops,
    backoff, image GC, disk pressure). The node agent writes **podman Quadlet
    units and lets systemd supervise**: restarts, cgroups, journald. The agent
-   does reconcile-and-report, not process babysitting.
+   does reconcile-and-report, not process babysitting. Because systemd
+   supervises a VMM process exactly like a container, this generalizes across
+   an isolation spectrum (container ↔ microVM) with one loop — see *Workload
+   runtime spectrum*.
 3. **CP for leases, AP for everything else.** The directory is
    eventually-consistent LWW — correct for desired state, status, and roles;
    *wrong* for "at most one instance" (singleton jobs, primary databases).
@@ -88,6 +91,43 @@ And every hard subsystem k8s outsources is a native primitive here:
    orchestrator" must never require the customer to know Aster exists. One
    binary, identity + network + storage + registry inside it. The stack being
    ours is an implementation advantage, never a sales proposition.
+
+## Workload runtime spectrum
+
+Isolation is a **property of the workload record**, not an architecture choice.
+The agent maps the property to a backend; **systemd supervises all of them
+identically** (the same `Restart=`, cgroup accounting, journald capture), so
+the reconcile-and-report loop is unchanged across the spectrum.
+
+| Isolation class | Backend | Status |
+| --- | --- | --- |
+| `container` | podman Quadlet `.container` → systemd | **v1** |
+| `microvm` | **Kata** runtime (OCI-compatible; same Quadlet unit, `--runtime kata`) over Firecracker / Cloud Hypervisor → systemd | **v1** |
+| `vm` (full VM) | systemd-vmspawn / QEMU-KVM unit | **future, subject to need — see below** |
+
+Two classes ship in v1: `container` for trusted/dense workloads, `microvm` for
+isolation. The win is that `microvm` is the *same record shape and the same
+unit*, just a runtime-class field — Kata makes a microVM look like a container
+to the OCI runtime, so there is no second code path.
+
+**The microVM tier is shared with exec, not new.** `aster-exec`'s sandbox
+already specified a microVM backend as its untrusted-code isolation tier
+([aster-exec.md](aster-exec.md) — "running genuinely untrusted code needs a
+microVM backend behind the same profile schema"). Exec jobs and orchestrator
+workloads are the *same thing at different lifetimes* — run-once vs
+long-running — on *one* isolation spectrum. Building `microvm` once pays for
+both: isolation-as-a-dial makes multi-tenant / untrusted-code a toggle, not a
+re-architecture.
+
+**Full VMs are deliberately deferred — and may stay deferred.** Full-VM
+hosting is well-served by Proxmox/Incus already, and it carries the genuinely
+hard parts (tap-device-to-mesh bridging, guest-aware health, the temptation of
+live migration) without obvious differentiation over incumbents. The substrate
+*could* host VMs — the disk image is exactly the big-file/CDC/snapshot/
+roaming-lease case portal already serves, so cold crash-consistent failover
+would come nearly free — but that is an expansion gated on real demand (edge /
+legacy consolidation), not a v1 goal. If it lands, it is the same record with a
+`vm` isolation field and a QEMU/vmspawn backend; nothing above changes.
 
 ## Differentiators (rank-ordered)
 
@@ -123,7 +163,7 @@ trust directory  ── watched by every node agent
 node agent (per node, one binary)
       ├─ claim: constraint match + occupancy/lease rules → claim record
       ├─ fetch: image layers from CAS (multi-provider downloader)
-      ├─ run:   write podman Quadlet unit → systemd supervises
+      ├─ run:   write Quadlet unit (container | microvm via Kata) → systemd supervises
       ├─ wire:  register service endpoint with local tunneld broker
       ├─ state: mount Trees as volumes; singleton state under a fenced lease
       └─ report: status → node-owned namespace (console/CLI read live)
@@ -136,10 +176,16 @@ rollback = restore the previous epoch
 
 As of knowledge cutoff (Jan 2026): **Uncloud** (P2P Docker orchestration over
 a WireGuard mesh, no control plane) is the closest existing thing; also Kamal
-(37signals), Skate, Docker Swarm's remnants, and k3s/k0s as "smaller k8s."
-None have the storage/lease/identity story — that is the moat — but this
-needs an OI-012-style prior-art pass (and a fresh search; the space is moving)
-before "nobody does this" appears in any positioning.
+(37signals), Skate, Docker Swarm's remnants, and k3s/k0s as "smaller k8s." On
+the container+VM-unification axis (relevant even though full VMs are deferred):
+**Incus/LXD** (one tool, system containers + VMs, but database-clustered, not
+mesh), **Harvester** (SUSE HCI on k8s+KubeVirt+Longhorn — the close vision, but
+heavy), and **Fly.io** (Firecracker microVMs over a mesh — the philosophical
+cousin, but proprietary and not self-hostable). None have the
+flat-mesh + no-control-plane + NAT-spanning + isolation-spectrum +
+mesh-native-replicated-storage combination — that is the moat — but this needs
+an OI-012-style prior-art pass (and a fresh search; the space is moving) before
+"nobody does this" appears in any positioning.
 
 ## Sequencing
 

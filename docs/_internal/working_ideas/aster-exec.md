@@ -345,8 +345,12 @@ Stated plainly, because pretending otherwise is the actual security failure:
 - **Sandbox escape.** systemd units + Landlock bound the blast radius of a
   confused agent; they are not a hostile-*code* boundary (userns/kernel escapes
   exist). Running genuinely untrusted code needs a microVM backend
-  (Firecracker / gVisor) behind the *same profile schema* — a later tier,
-  named, not pretended.
+  (Firecracker / Cloud Hypervisor / gVisor) behind the *same profile schema* —
+  a later tier, named, not pretended. This is the **same microVM isolation
+  tier the orchestrator ships** ([aster-orchestrator.md](aster-orchestrator.md)
+  §Workload runtime spectrum): exec jobs and orchestrator workloads are one
+  isolation spectrum at different lifetimes, so the microVM backend is built
+  once and serves both.
 - **Covert / timing channels** between a job and a colluding authorized service
   are out of scope for this tier; declared, not defended.
 
