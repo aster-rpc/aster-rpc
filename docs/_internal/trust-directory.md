@@ -7,6 +7,7 @@
 - [aster-trust-architecture.md](aster-trust-architecture.md) — FROST/log/epochs; severed to the aster.site platform product
 - [workload_identity.md](workload_identity.md) — OIDC verifier; survives, output changes from credential to directory write
 - portal-sync (the incubator): `portal-sync/docs/design/control-plane-auth-rpc.md`, `portal-sync/docs/product-vision-ux.md` §Console Authority
+- [working_ideas/aster-orchestrator.md](working_ideas/aster-orchestrator.md) — the directory as the apiserver-equivalent of a flat workload orchestrator (the capability's second consumer after portal-sync)
 
 ---
 

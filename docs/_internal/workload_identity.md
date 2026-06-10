@@ -11,7 +11,7 @@
 **Status:** Reference notes
 **Date:** 2026-05-05
 **Companion docs:**
-- [working_ideas/identity-worked-example.md](working_ideas/identity-worked-example.md) — Portal use case, where `KubernetesProjectedToken` appears as one variant of the pluggable `EnrollmentProof`
+- [working_ideas/retired.identity-worked-example.md](working_ideas/retired.identity-worked-example.md) — Portal use case, where `KubernetesProjectedToken` appears as one variant of the pluggable `EnrollmentProof`
 - [ownership-attestations.md](ownership-attestations.md) — anchor → deployment-root → node delegation chain (supersedes the retired `trust-anchor-inversion.md`)
 
 ---
