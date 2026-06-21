@@ -23,7 +23,7 @@ serde_json = "1"
 unicode-normalization = "0.1"
 hex = "0.4"
 bs58 = "0.5"
-ed25519-dalek = { version = "=3.0.0-pre.7", features = ["rand_core"] }
+ed25519-dalek = { version = "=3.0.0-rc.0", features = ["rand_core"] }
 crossbeam-utils = { workspace = true }
 getrandom = "0.2"
 fory-core = "1.1.0-rc.1"
