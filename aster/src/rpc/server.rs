@@ -128,25 +128,75 @@ impl Server {
         self
     }
 
-    /// Spawn the reactor accept+dispatch loop. The returned [`ServerHandle`]
+    /// Snapshot the registered services + the Gate-3 attribute store as a
+    /// shareable, transport-agnostic [`Dispatcher`]. Each transport (the Iroh
+    /// reactor loop, an HTTP listener, …) holds a clone and feeds it
+    /// [`IncomingCall`]s. Grab this **before** [`serve`](Server::serve) when you
+    /// want to serve the same services over more than one transport:
+    ///
+    /// ```ignore
+    /// let server = Server::new(&node).register(svc).attributes(attrs);
+    /// let dispatcher = server.dispatcher(); // hand to a second transport (HTTP)
+    /// let handle = server.serve();          // Iroh accept loop
+    /// ```
+    pub fn dispatcher(&self) -> Dispatcher {
+        Dispatcher {
+            services: Arc::new(self.services.clone()),
+            attributes: self.attributes.clone(),
+        }
+    }
+
+    /// Spawn the Iroh reactor accept+dispatch loop. The returned [`ServerHandle`]
     /// keeps the loop alive; dropping it detaches (the loop runs until the node
-    /// closes), `abort()` stops it.
+    /// closes), `abort()` stops it. For a multi-transport process, call
+    /// [`dispatcher`](Server::dispatcher) first, then `serve`.
     pub fn serve(self) -> ServerHandle {
-        let services = Arc::new(self.services);
-        let attributes = self.attributes;
+        let dispatcher = self.dispatcher();
         let mut handle = reactor::start_reactor(self.core, 256);
         let join = tokio::spawn(async move {
             while let Some(ev) = handle.next_event().await {
                 if let ReactorEvent::Call(call) = ev {
-                    let services = services.clone();
-                    let attributes = attributes.clone();
-                    tokio::spawn(async move { handle_call(services, attributes, call).await });
+                    let dispatcher = dispatcher.clone();
+                    tokio::spawn(async move { dispatcher.dispatch_call(call).await });
                 }
                 // ConnectionClosed: per-connection session / attribute reaping
                 // lands with session-scoped services (a later step).
             }
         });
         ServerHandle { join }
+    }
+}
+
+/// The transport-agnostic RPC dispatcher: the registered services plus the
+/// Gate-3 [`AttributeStore`], shareable across transports. Produced by
+/// [`Server::dispatcher`]. The Iroh reactor loop uses one internally; a second
+/// transport (e.g. HTTP) holds a clone and calls
+/// [`dispatch_call`](Dispatcher::dispatch_call) per decoded inbound call.
+///
+/// Cloning is cheap — the service registry is `Arc`-shared and the attribute
+/// store is `Arc`-backed — so all clones see the same services and the same
+/// (live, mutable) attributes.
+#[derive(Clone)]
+pub struct Dispatcher {
+    services: Arc<Registry>,
+    attributes: AttributeStore,
+}
+
+impl Dispatcher {
+    /// Dispatch one already-decoded inbound [`IncomingCall`]: run the
+    /// pre-dispatch gates (service / method / serialization mode / Gate-3
+    /// capability) and, if they pass, hand a [`Call`] to the matched service.
+    /// Any transport that can produce an `IncomingCall` (peer id, header +
+    /// request payload, a response-frame channel) can drive RPC through this.
+    pub async fn dispatch_call(&self, call: IncomingCall) {
+        handle_call(self.services.clone(), self.attributes.clone(), call).await;
+    }
+
+    /// The Gate-3 [`AttributeStore`] this dispatcher checks. A transport's auth
+    /// stage writes resolved caller attributes here (keyed by the call's peer
+    /// id) before dispatching, so the capability gate sees them.
+    pub fn attributes(&self) -> &AttributeStore {
+        &self.attributes
     }
 }
 
