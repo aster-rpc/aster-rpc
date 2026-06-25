@@ -92,7 +92,7 @@ async fn mission_control_over_http() {
             agent_id: "agent-1".into(),
         })
         .unwrap();
-    let (data, status) = call_http(&service, "get_status", vec![req]).await;
+    let (data, status) = call_http(&service, "getStatus", vec![req]).await;
     assert_eq!(status.code, 0);
     let resp: StatusResponse = fory.deserialize(&data[0]).unwrap();
     assert_eq!(resp.agent_id, "agent-1");
@@ -106,7 +106,7 @@ async fn mission_control_over_http() {
             level: "info".into(),
         })
         .unwrap();
-    let (data, status) = call_http(&service, "tail_logs", vec![req]).await;
+    let (data, status) = call_http(&service, "tailLogs", vec![req]).await;
     assert_eq!(status.code, 0);
     assert_eq!(data.len(), 3);
     let first: LogEntry = fory.deserialize(&data[0]).unwrap();
@@ -124,7 +124,7 @@ async fn mission_control_over_http() {
             .unwrap()
         })
         .collect();
-    let (data, status) = call_http(&service, "ingest_metrics", pts).await;
+    let (data, status) = call_http(&service, "ingestMetrics", pts).await;
     assert_eq!(status.code, 0);
     let res: IngestResult = fory.deserialize(&data[0]).unwrap();
     assert_eq!(res.accepted, 3);
@@ -140,7 +140,7 @@ async fn mission_control_over_http() {
             .unwrap()
         })
         .collect();
-    let (data, status) = call_http(&service, "run_command", cmds).await;
+    let (data, status) = call_http(&service, "runCommand", cmds).await;
     assert_eq!(status.code, 0);
     assert_eq!(data.len(), 2);
     let r0: CommandResult = fory.deserialize(&data[0]).unwrap();

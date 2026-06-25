@@ -38,9 +38,10 @@ cargo test -p mission-control
 - Those split per-agent state into a **session-scoped** `AgentSession`
   service; the Rust crate doesn't support session scope yet, so the bidi
   `run_command` lives on the shared service here.
-- Method names are snake_case (the macro uses the Rust fn name), so the
-  wire `contract_id` differs from the camelCase Python/TS services — fine
-  for a Rust-only example, not yet cross-binding-identical.
 - `run_command` echoes the command; it does **not** run a shell (the
   Python example does).
+
+Wire method names match the Python/TS peers (`getStatus`, `tailLogs`,
+`ingestMetrics`, `runCommand`) via `#[rpc(name = "...")]`, so the service
+is cross-binding-identical.
 - HTTP is plain H1/H2 on TCP (no TLS yet).

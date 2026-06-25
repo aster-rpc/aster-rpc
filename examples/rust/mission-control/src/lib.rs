@@ -12,11 +12,12 @@
 //! | `ingest_metrics` | client-stream  |
 //! | `run_command`    | bidi-stream    |
 //!
+//! Wire method names match the Python/TS peers (`getStatus`, `tailLogs`, …) via
+//! `#[rpc(name = "...")]`, so the service is cross-binding-identical.
+//!
 //! Differences from the Python/TS example: those split per-agent state into a
 //! session-scoped `AgentSession` service, which the Rust crate doesn't support
-//! yet, so the bidi `run_command` lives on the shared service here. Method names
-//! are snake_case (the macro uses the Rust fn name), so the wire `contract_id`
-//! differs from the camelCase Python/TS services — fine for a Rust-only example.
+//! yet, so the bidi `run_command` lives on the shared service here.
 //! `run_command` echoes the command rather than executing a shell (the Python
 //! example runs arbitrary shell; we don't).
 
@@ -95,22 +96,24 @@ pub struct CommandResult {
 #[aster::service(name = "MissionControl", version = 1)]
 pub trait MissionControl {
     /// Unary: fleet status for an agent.
+    #[rpc(name = "getStatus")]
     async fn get_status(&self, req: StatusRequest) -> aster::Result<StatusResponse>;
 
     /// Unary: an agent pushes one log entry.
+    #[rpc(name = "submitLog")]
     async fn submit_log(&self, entry: LogEntry) -> aster::Result<SubmitLogResult>;
 
     /// Server-stream: emit log entries (synthetic, finite, for the example).
-    #[rpc(server_stream)]
+    #[rpc(server_stream, name = "tailLogs")]
     async fn tail_logs(&self, req: TailRequest, out: ResponseSink<LogEntry>) -> aster::Result<()>;
 
     /// Client-stream: an agent streams metric points; we count them.
-    #[rpc(client_stream)]
+    #[rpc(client_stream, name = "ingestMetrics")]
     async fn ingest_metrics(&self, reqs: RequestStream<MetricPoint>)
         -> aster::Result<IngestResult>;
 
     /// Bidi: run commands and stream a result per command (echoes, no shell).
-    #[rpc(bidi_stream)]
+    #[rpc(bidi_stream, name = "runCommand")]
     async fn run_command(
         &self,
         reqs: RequestStream<Command>,
