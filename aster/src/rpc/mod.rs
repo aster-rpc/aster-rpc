@@ -58,7 +58,9 @@ pub use publish::{
     fetch_and_verify_contract, publish_contract, FetchedContract, PublishedContract,
 };
 pub use runtime::{AsterServer, AsterServerBuilder};
-pub use server::{Call, CallParts, Dispatcher, Server, ServerHandle, ServiceDispatch, RPC_ALPN};
+pub use server::{
+    Call, CallParts, Dispatcher, HttpTransport, Server, ServerHandle, ServiceDispatch, RPC_ALPN,
+};
 
 /// Reactor frame types, re-exported so a non-Iroh transport can build
 /// [`CallParts`] (wire request frames into `request_receiver`, drain

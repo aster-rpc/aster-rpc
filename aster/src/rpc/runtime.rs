@@ -44,7 +44,7 @@ use crate::node::Node;
 use crate::ticket::{Credential, Ticket};
 
 use super::auth::{AttributeStore, Authenticator};
-use super::server::{Server, ServerHandle, ServiceDispatch, RPC_ALPN};
+use super::server::{Dispatcher, HttpTransport, Server, ServerHandle, ServiceDispatch, RPC_ALPN};
 
 /// Builder for an [`AsterServer`]. Start one with [`AsterServer::builder`].
 #[derive(Default)]
@@ -58,6 +58,7 @@ pub struct AsterServerBuilder {
     hooks: Option<bool>,
     attributes: Option<AttributeStore>,
     authenticator: Option<Arc<dyn Authenticator>>,
+    http: Option<Box<dyn HttpTransport>>,
     extra_alpns: Vec<Vec<u8>>,
 }
 
@@ -128,6 +129,15 @@ impl AsterServerBuilder {
         self
     }
 
+    /// Also serve over an additional transport (e.g. the HTTP/Salvo transport)
+    /// on the *same* dispatcher. Off by default — Iroh-only. The transport crate
+    /// provides the config type (`aster_transport_salvo::HttpConfig`); it's
+    /// spawned at [`start`](Self::start) and aborted on shutdown.
+    pub fn with_http(mut self, transport: impl HttpTransport) -> Self {
+        self.http = Some(Box::new(transport));
+        self
+    }
+
     /// Register an additional inbound ALPN beyond `aster/1` and the built-in
     /// blobs / docs / gossip protocols (e.g. an admission ALPN).
     pub fn alpn(mut self, alpn: impl Into<Vec<u8>>) -> Self {
@@ -191,12 +201,18 @@ impl AsterServerBuilder {
         for svc in self.services {
             server = server.register_arc(svc);
         }
+        // Grab the shareable dispatcher before `serve()` consumes the server, so
+        // an HTTP transport can drive the same services.
+        let dispatcher = server.dispatcher();
         let handle = server.serve();
+        let http = self.http.map(|t| t.serve(dispatcher.clone()));
 
         Ok(AsterServer {
             node,
             handle,
             attributes,
+            dispatcher,
+            http,
         })
     }
 }
@@ -211,6 +227,9 @@ pub struct AsterServer {
     node: Node,
     handle: ServerHandle,
     attributes: AttributeStore,
+    dispatcher: Dispatcher,
+    /// Optional additional transport (HTTP) task, aborted on shutdown.
+    http: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AsterServer {
@@ -239,6 +258,12 @@ impl AsterServer {
     /// admission logic to grant per-peer roles.
     pub fn attributes(&self) -> &AttributeStore {
         &self.attributes
+    }
+
+    /// The shared, transport-agnostic [`Dispatcher`]. Hand a clone to an
+    /// additional transport (or compose your own) to serve the same services.
+    pub fn dispatcher(&self) -> Dispatcher {
+        self.dispatcher.clone()
     }
 
     /// Take the admission handle (one-shot) for Gate-0 connection gating.
@@ -273,6 +298,9 @@ impl AsterServer {
 
     /// Stop serving and cleanly shut the node down, flushing persistent state.
     pub async fn shutdown(self) {
+        if let Some(http) = &self.http {
+            http.abort();
+        }
         self.handle.abort();
         self.node.shutdown().await;
     }
