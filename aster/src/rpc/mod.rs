@@ -54,7 +54,7 @@ pub use publish::{
     fetch_and_verify_contract, publish_contract, FetchedContract, PublishedContract,
 };
 pub use runtime::{AsterServer, AsterServerBuilder};
-pub use server::{Call, Server, ServerHandle, ServiceDispatch, RPC_ALPN};
+pub use server::{Call, Dispatcher, Server, ServerHandle, ServiceDispatch, RPC_ALPN};
 pub use status::{status_from_error, StatusCode};
 pub use streaming::{BidiCall, MessageStream, RequestStream, ResponseSink};
 
