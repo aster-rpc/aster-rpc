@@ -235,6 +235,10 @@ whole-service lockdown the Gate-0 allowlist above is the surer choice.
 
 ## 4. RPC
 
+> To serve these same services over **HTTPS / HTTP3 / WebTransport** (browsers,
+> JSON, TLS, sessions, static files), see
+> [Serving Aster over HTTP](./aster-http-getstarted.md).
+
 Enable the `rpc` feature. The public surface lives under `aster::rpc::*`, with
 `#[aster::service]` and `#[derive(aster::AsterType)]` also re-exported at the
 crate root.
