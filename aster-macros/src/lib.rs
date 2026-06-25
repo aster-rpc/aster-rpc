@@ -572,7 +572,6 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
 /// - `#[rpc(bidi_stream)]`: `async fn(&self, RequestStream<Req>, ResponseSink<Resp>) -> Result<()>`
 fn parse_method(m: &mut syn::TraitItemFn) -> syn::Result<MethodSpec> {
     let ident = m.sig.ident.clone();
-    let name = ident.to_string();
 
     if m.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
@@ -585,6 +584,7 @@ fn parse_method(m: &mut syn::TraitItemFn) -> syn::Result<MethodSpec> {
     let mut requires: Option<Expr> = None;
     let mut idempotent = false;
     let mut pattern = Pattern::Unary;
+    let mut name_override: Option<String> = None;
     for attr in &m.attrs {
         if !attr.path().is_ident("rpc") {
             continue;
@@ -592,6 +592,11 @@ fn parse_method(m: &mut syn::TraitItemFn) -> syn::Result<MethodSpec> {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("requires") {
                 requires = Some(meta.value()?.parse()?);
+            } else if meta.path.is_ident("name") {
+                // Wire method name override (for cross-binding parity with
+                // camelCase peers, e.g. `#[rpc(name = "getStatus")]`). Defaults
+                // to the Rust fn name.
+                name_override = Some(meta.value()?.parse::<syn::LitStr>()?.value());
             } else if meta.path.is_ident("idempotent") {
                 idempotent = true;
             } else if meta.path.is_ident("server_stream") {
@@ -607,6 +612,7 @@ fn parse_method(m: &mut syn::TraitItemFn) -> syn::Result<MethodSpec> {
         })?;
     }
     m.attrs.retain(|a| !a.path().is_ident("rpc"));
+    let name = name_override.unwrap_or_else(|| ident.to_string());
 
     // Receiver + the typed (non-self) arguments.
     let mut inputs = m.sig.inputs.iter();
