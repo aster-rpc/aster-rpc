@@ -48,6 +48,9 @@ use aster::rpc::{
 };
 use aster_transport_core::framing::{decode_frame, FLAG_END_STREAM, FLAG_TRAILER};
 
+pub mod tls;
+pub use tls::{generate_self_signed, rustls_config, serve_https, GeneratedCert, TlsMaterial};
+
 /// Canonical Aster-over-HTTP media type (Fory frames).
 pub const ASTER_FRAMES: &str = "application/aster-frames";
 const JSON: &str = "application/json";
