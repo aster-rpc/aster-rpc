@@ -1,6 +1,6 @@
 # Aster over HTTP — Transport Sketch (HTTP/1, /2, /3)
 
-**Status:** Design sketch (2026-05-02, revised). Not implemented.
+**Status:** Design sketch (2026-05-02; revised 2026-06-25). Not implemented.
 **Scope:** A second transport for Aster, alongside the existing Iroh
 (QUIC + NAT traversal + Ed25519 peer identity) transport. Serves
 HTTP/1.1, HTTP/2 and HTTP/3 from a single server (Salvo), with each
@@ -186,6 +186,72 @@ internal/mesh deployments. Same shape as Iroh's "endpoint id is a
 pubkey, optionally pinned" — different primitive (X.509 vs. raw
 Ed25519), same trust model.
 
+### TLS / certificate provisioning
+
+*Where the cert comes from* is config, expressed as a small data-only
+enum (`TlsMaterial`) so it crosses FFI without closures. Three modes for
+ordinary HTTP traffic, plus a WebTransport-specific path that ties the
+cert to the node identity.
+
+**Mode 1 — bring-your-own PEM (baseline).**
+
+```
+TlsMaterial::pem(cert_pem, key_pem)   // bytes or file paths
+```
+
+Operator-managed: an existing cert, a corporate CA, k8s cert-manager.
+Always works; no provisioning logic in Aster.
+
+**Mode 2 — ACME / Let's Encrypt, built-in (public-deployment default).**
+Salvo ships native ACME (`salvo::conn::acme`, TLS-ALPN-01 / HTTP-01) with
+automatic provisioning *and* renewal. Config is pure data:
+
+```
+TlsMaterial::acme(domains, contact_email, cache_dir)
+```
+
+The happy path for "I have a public domain and want HTTPS to just work."
+FFI-friendly (no callbacks). `cache_dir` persists the account + issued
+certs across restarts so renewals don't re-issue from scratch.
+
+**Mode 3 — self-signed / generated (dev + internal/mesh).** An
+`rcgen`-generated cert for inner-loop dev and pinned-cert mesh
+deployments:
+
+```
+TlsMaterial::self_signed(SelfSignedOpts { sans, validity, .. })
+```
+
+For dev, the client trusts it out-of-band (or the cert is installed).
+For mesh, the cert hash is pinned — see below.
+
+#### WebTransport: `serverCertificateHashes` bound to the node identity
+
+WebTransport lets a browser connect to a server presenting a
+**non-WebPKI self-signed cert** if it is given the cert's SHA-256 hash up
+front (`serverCertificateHashes`). Constraints: ECDSA, validity ≤ ~14
+days. This is exactly Aster's pinned-identity model — no CA; publish the
+hash, the client pins it — so we wire it to the node identity:
+
+1. Generate a short-lived self-signed cert **bound to / derived from the
+   node's Ed25519 identity**, so the HTTP server identity *is* the node
+   pubkey (same `EndpointId` as the Iroh transport — preserves the
+   "every caller is a peer" symmetry on the server side too).
+2. Publish the cert's SHA-256 hash in the Aster ticket / `address()`,
+   alongside the node id.
+3. The browser opens the WebTransport session with
+   `serverCertificateHashes: [{ algorithm: "sha-256", value: <hash> }]`
+   — no Let's Encrypt, no CA, mesh-native.
+4. Aster handles rotation: regenerate before the ≤14-day expiry and
+   re-publish the hash in the ticket/registry doc (same swap mechanism
+   the static-mount `ArcSwap` uses).
+
+**Caveat to honour:** `serverCertificateHashes` is **WebTransport-only**
+— it does *not* cover Fetch / H2 / H3 general traffic, and it forces
+short rotation. Public Fetch clients still need Mode 1 or 2. A
+deployment can run both: an ACME (or PEM) cert for Fetch/H2/H3 and the
+node-bound self-signed cert for WebTransport, selected per listener.
+
 ### Client identity — the "every caller is a peer" principle
 
 Aster's identity model is symmetric: every node has an Ed25519 keypair;
@@ -195,9 +261,131 @@ the pubkey IS the `EndpointId`. HTTP makes the *protocol* asymmetric
 `Authorization` header, in a way that proves possession of the privkey
 without ever putting the privkey on the wire.
 
-For v1, **one mode**: Bearer JWT. A second signature-based mode
-(Aster-Sig) is a v2 follow-up — sketched below so v1 doesn't paint
-into a corner, but explicitly out of scope for the first cut.
+Caller identity over HTTP is **pluggable**. The transport's only
+built-in job is to turn an HTTP request into the same `(principal,
+attributes, metadata)` shape the Iroh transport already produces (see
+"EndpointId mapping" below); *how* that shape is derived from the request
+is a delegate the operator can replace. Aster ships **Bearer JWT** as the
+bundled default delegate; a signature-based mode (Aster-Sig) and a
+WebAuthn exchange are further delegates sketched later. None of them are
+privileged — a user can drop in their own.
+
+### Step 0 (prerequisite): make call-context attributes writable
+
+This is the **first thing to build**, before any HTTP auth mode.
+
+Authorization in Aster is two separable jobs:
+
+- **Credential extraction** — turn a request into `(principal,
+  attributes, metadata)`. The only genuinely HTTP-specific part.
+- **Authorization policy** — capability / rcan checks. Already
+  transport-agnostic; already runs above the transport as an interceptor
+  (`interceptors/capability.py`, Gate 3 in the trust spec).
+
+The existing interceptor pipeline is the delegate seam. An interceptor's
+`on_request(ctx, request)` runs **pre-dispatch, before the body is
+decoded**, on every call pattern (see the pre-dispatch authz in
+`server.py`). It receives the full `CallContext`: `metadata` (the HTTP
+headers), `peer`, `session_id`, `peer_addr`, `relay_url`, `tunnel`.
+
+The gap: today an interceptor can mutate `ctx.metadata` but **cannot
+write `ctx.attributes`** — attributes are populated only from Iroh
+enrollment credentials at context-construction time, and the capability
+interceptor reads `ctx.attributes["aster.role"]` to make its decision.
+Over HTTP there is no Iroh enrollment, so the auth delegate *is* the
+source of attributes. Until attributes are writable by the auth stage, a
+custom HTTP auth delegate cannot feed the capability system at all.
+
+Change required (transport-agnostic, lands first):
+
+1. Add a setter / mutable channel for `CallContext.attributes` that the
+   auth stage may populate (e.g. `set_attributes(map)`, or a dedicated
+   `principal_attributes` dict merged into the credential-derived ones).
+2. Have capability evaluation read the **union** of enrollment-derived
+   and auth-delegate-supplied attributes, but make the delegate
+   *additive only*: **on a key collision the enrollment-derived value
+   wins**. Enrollment attributes are vouched cryptographically at
+   admission (Gate 1); a per-request/per-session delegate is a
+   lower-assurance source and must never rewrite or downgrade what was
+   vouched — a fail-safe default (worst case is a debuggable
+   `PERMISSION_DENIED`, never a silent escalation). In practice the two
+   sets are disjoint per transport (HTTP requests have no Iroh
+   enrollment; Iroh peers have no HTTP delegate), so this only bites in
+   hybrid deployments — where fail-safe is exactly the default you want.
+   Tag each attribute with its provenance (enrollment vs delegate) for
+   capability eval and audit. An operator who genuinely wants a delegate
+   to be authoritative can opt in explicitly, per delegate
+   (`override_enrollment = true`) — eyes open; it is never the default.
+   Note this does not stop a delegate from *granting* roles when
+   enrollment is silent (the pure-HTTP case, where the delegate is the
+   authorizer by design); the invariant is only that it cannot overwrite
+   an attribute enrollment already asserted.
+3. Confine the write to the pre-dispatch auth phase, so later
+   interceptors and the handler see a stable attribute set.
+
+This generalises beyond HTTP: it is really "a principal resolver may
+populate attributes, regardless of transport." Iroh's enrollment is just
+the default resolver; HTTP's auth delegate is another.
+
+### The delegate is a binding-language interceptor, not a Rust trait
+
+Custom auth lives where the user already writes code — the binding
+language (Python/TS/…), as an `Interceptor`, exactly as it does for the
+Iroh transport today. The HTTP transport does **not** define a new Rust
+`AuthDelegate` trait that users must implement in Rust. Concretely, the
+Salvo handler:
+
+1. Copies the relevant HTTP request parts (headers, `:authority`, TLS
+   peer info, connection id) into the pre-dispatch `CallContext` —
+   headers into `metadata`, connection/TLS info into dedicated fields.
+2. Runs the **existing** interceptor chain.
+3. The bundled Bearer-JWT verifier is itself just an interceptor — so it
+   is reusable over Iroh, and a user replaces or augments it the same way
+   they add any interceptor.
+
+This keeps `aster-transport-salvo` thin (it marshals bytes and headers;
+it makes no policy decisions) and keeps all auth policy in one place
+across both transports.
+
+### Per-call vs session-scoped auth
+
+Both are supported. The delegate declares which it wants.
+
+**What "session" means here.** HTTP is request-stateless; "session" is
+the Aster-level anchor from the "Session-scoped services" section below
+(`aster-session-id` header by default; QUIC-connection or bidi-stream
+anchors as alternatives). It is **not** an HTTP cookie session and not
+the TLS session. A session is "this caller, this lifetime" as Aster
+defines it — the same anchor session-scoped *services* use.
+
+- **Per-call auth (default).** The delegate runs on every request.
+  Correct for self-contained credentials like Bearer JWT, where
+  verification is a cheap local Ed25519 check and each request carries
+  its own proof. Stateless, proxy-friendly, survives reconnects with no
+  server memory.
+- **Session-scoped auth.** The delegate runs **once at session open**
+  (`OpenSession`, or the first request on a new anchor) and its result —
+  principal + attributes — is cached on the session and reused for every
+  subsequent request bound to that `aster-session-id`. Correct when
+  authentication is expensive or external: OIDC token introspection, a
+  database session lookup, a WebAuthn ceremony. The cost is paid once per
+  session, not once per call.
+
+Caching rules to document precisely:
+
+- Cached principal/attributes are invalidated when the session ends
+  (explicit close, anchor-connection death per Option 1, or TTL).
+- A session-scoped delegate must still bound its cache lifetime (a TTL ≤
+  the credential's own expiry) so revocation isn't shadowed — same
+  constraint as the JWT verifier cache in "Open questions".
+- Per-call and session-scoped delegates compose: a session may be opened
+  under an expensive delegate while individual calls still carry a cheap
+  per-call proof, if a service wants both.
+
+The Bearer-JWT default and the Aster-Sig / WebAuthn modes below are all
+just instances of this delegate model — the first signature-based mode
+(Aster-Sig) is a v2 follow-up, sketched so v1 doesn't paint into a
+corner but out of scope for the first cut.
 
 #### v1 — `Authorization: Bearer <jwt>`
 
@@ -396,6 +584,98 @@ calls through Aster framing on it. Effectively the WebTransport flavour
   sessions when their owning connection dies, even if the client
   identifies the session by header).
 
+## Stream priority
+
+Aster streams carry an optional **priority** so that, when several
+streams share one connection, the transport sends the urgent ones first.
+The motivating case is media: a session running parallel server-streams —
+video, chroma, audio — wants audio and keyframes to preempt video deltas
+under congestion. Aster has no such concept today; this section defines
+it.
+
+### Model — RFC 9218 urgency
+
+Priority is a single integer **urgency**, `0`–`7`, lower value = more
+urgent (RFC 9218, "Extensible Prioritization Scheme for HTTP": `0` is
+most urgent, `3` is the default, `7` is background). Plus an optional
+boolean **incremental** flag (RFC 9218 semantics: whether the stream is
+useful as progressive/partial data, or should be delivered ahead of its
+equal-urgency peers).
+
+We expose the raw `0`–`7` int, not a fixed enum. Whether to map it onto
+named classes (`CONTROL`, `AUDIO`, `VIDEO_KEY`, `VIDEO_DELTA`, …) is a
+**consumer decision** — it depends entirely on the workload, so Aster
+declines to bake one taxonomy in. A media app defines its own lattice; a
+generic RPC service may never touch priority at all (everything stays at
+the default `3`).
+
+Why RFC 9218: it is the *single* model that maps natively to every
+transport Aster targets, instead of an Aster-specific scheme each
+transport then has to reinterpret.
+
+### Static and dynamic forms
+
+Both forms exist; dynamic overrides static.
+
+- **Static (manifest).** A streaming method declares a default urgency in
+  its contract, e.g. `@priority(urgency = 1)` (optionally
+  `incremental = true`). Codegen applies it whenever a stream for that
+  method opens. This is the "audio service always outranks video service"
+  case — fixed by design, no per-call thought required.
+- **Dynamic (per-call option).** The caller passes an urgency as a call
+  option at invocation; it overrides the method's static default for that
+  one stream. For callers that rank streams at runtime (e.g. boost the
+  stream the user is actively watching).
+
+Because one streaming RPC = one QUIC/WebTransport stream (see "Wire
+mapping"), priority is naturally per-stream = per-call. For a
+session-scoped service running several parallel streams, group them so
+they rank against each other — see the WebTransport `sendGroup` note
+below.
+
+### Transport mapping — both Salvo and Iroh must honour it
+
+Priority is **not** an HTTP-only feature. It must be respected by the
+Salvo HTTP transport *and* the Iroh/noq transport — both run over QUIC,
+both can prioritise streams, and a service should behave the same way on
+either.
+
+| Transport | How urgency is applied |
+|-----------|------------------------|
+| **Iroh / noq (quinn)** | `quinn::SendStream::set_priority(i32)`. noq is a quinn fork, so this is already available — map urgency `0`–`7` to the i32 priority (higher i32 = more urgent, so invert via a lookup table). |
+| **HTTP/3 (Salvo, quinn)** | Same quinn `set_priority` underneath, plus the RFC 9218 `priority` request/response header so intermediaries can honour it. Native fit. |
+| **HTTP/3 WebTransport** | `sendOrder` integer per stream (higher `sendOrder` = sent first → derive from urgency, inverted), and `sendGroup` to bind a session's streams into one ranked group. |
+| **HTTP/2 (Salvo, TCP)** | RFC 9218 `priority` header (urgency + incremental). Best-effort — many intermediaries ignore or rewrite H/2 priority; advisory only, same caveat as H/2 bidi. |
+| **HTTP/1.1** | No stream multiplexing; priority is a no-op. Document, don't error. |
+
+The urgency→backend translation is a small lookup table in each transport
+adapter, kept out of user code (users only ever say "urgency N"). Keep
+the mapping in one shared helper so Salvo and Iroh can't drift.
+
+### Priority is not supersession
+
+Keep two concerns separate (they are conflated in portal-desktop's
+planned `wt_scheduler`):
+
+- **Priority** (this section) — a transport knob: which stream's bytes go
+  first. `set_priority` / `sendOrder`.
+- **Supersession / drop-stale** — a send-buffer policy: "a newer keyframe
+  makes a queued older delta pointless, drop it." Lives in the
+  application / codegen layer and works identically regardless of QUIC
+  priority. If we want it, it is a separate knob (e.g.
+  `@stream_policy(drop_stale)`), specified on its own. Do not fold it into
+  the priority field.
+
+### Acceptance test — the portal media shape
+
+The design is correct only if a session-scoped service exposing parallel
+server-streams — `video.stream()` at urgency 5, `audio.stream()` at
+urgency 1, a control bidi at urgency 0 — lets a media app like
+portal-desktop replace its hand-rolled per-track stream management with
+Aster streaming methods and get the same prioritisation declaratively, on
+both the WebTransport and the Iroh path. If portal can't be rewritten
+onto it, the abstraction is wrong.
+
 ## Static files
 
 RPC frameworks usually punt on static-file serving ("put nginx in
@@ -572,6 +852,185 @@ reachable.
 - **CSP and other security headers.** Per-mount config, applied by
   handler. Spec the knob shape when someone has a concrete need.
 
+## Enabling HTTP — the `withHttp` surface
+
+`Node::start` is the elegant entry point today, and it reads the same way
+across Rust and every FFI binding. Enabling HTTP must not break that
+feel: HTTP is **off by default** and turns on with one composable step
+that mirrors whatever shape `start` configuration takes today.
+
+```rust
+// Rust — HTTP is one more step on the AsterServer producer builder
+let srv = AsterServer::builder()
+    .service(EchoServer::new(EchoImpl))      // services are transport-agnostic
+    .relay(RelayMode::Default)
+    .with_http(HttpConfig {
+        bind: "[::]:443".parse()?,
+        tls: TlsMaterial::from_pem(cert, key),
+        versions: HttpVersions::all(),       // H1 + H2 + H3
+        auth: BearerJwt::default().into(),   // a delegate; see Identity
+        ..Default::default()
+    })
+    .start()
+    .await?;
+// The same services are now reachable over Iroh AND HTTP.
+srv.run().await;
+```
+
+```python
+# Python — same shape over FFI
+node = await (Node.builder()
+    .with_http(HttpConfig(
+        bind="[::]:443",
+        tls=TlsMaterial.from_pem(cert, key),
+        static_mounts=[StaticMount("/", fs="./dist", spa_fallback=True)],
+        auth=my_auth_interceptor,            # binding-language delegate
+    ))
+    .start())
+```
+
+Without `with_http(...)` the node is exactly what it is today — Iroh
+only, no HTTP framework in the running config. `with_http` is additive
+and FFI-expressible: a config struct, not Rust closures.
+
+### Two tiers of extensibility
+
+Consumers will want the HTTP server to host things that are *not* Aster
+RPC — a static site, a `/healthz`, a webhook receiver, a plain JSON
+endpoint. The namespacing invariant keeps this clean: **Aster owns
+`/aster/*` (and `/aster/_auth/*`); every other path is the consumer's.**
+Custom routes and Aster routes never collide.
+
+**Tier 1 — Rust consumers: compose Salvo directly.** The most elegant
+Rust story is "Aster is just a `Router` you nest." Expose the Aster
+routes — built from the registered dispatcher, not the raw node — as a
+Salvo `Router`:
+
+```rust
+let aster_routes: salvo::Router = aster_salvo::router(dispatcher.clone(), &http_config);
+
+let app = salvo::Router::new()
+    .push(aster_routes)                       // /aster/*
+    .push(salvo::Router::with_path("healthz").get(health))
+    .push(salvo::Router::with_path("hooks/stripe").post(stripe))
+    .push(serve_static("./dist"));            // their own static stack
+
+salvo::Server::new(listener).serve(app).await;
+```
+
+Power users get the full Salvo surface — their own middleware, listeners,
+routers — with Aster as one nested `Router`. The batteries-included
+`with_http(...)` is sugar over exactly this. (`dispatcher` is the
+transport-agnostic `Dispatcher` from `Server::dispatcher()` — see
+§"Low-level" below — the same handle the Iroh transport serves.)
+
+**Tier 2 — FFI / binding consumers: declarative config + callbacks.**
+Bindings can't hand a Salvo `Handler` across the FFI boundary, so they
+get two FFI-expressible extension points, both already defined elsewhere
+in this design:
+
+- **Static mounts** — first-class via "Static files". Adding a static
+  HTML site is `StaticMount(prefix, fs=… | fileseq=…)` in the config; no
+  Salvo knowledge required. This is the "consumer wants to add some
+  static html" case, handled directly.
+- **Custom route handlers** — register `(path_prefix, handler_fn)` where
+  `handler_fn` is a binding-language callback. The FFI analogue of a
+  Salvo handler: a non-Aster endpoint written in Python/TS/Java, no Rust.
+
+  The handler signature supports **full bidi streaming**, not just
+  request/response. The callback receives `(method, path, headers,
+  request_body_stream)` and returns `(status, headers,
+  response_body_stream)`, where each body is an async stream of chunks
+  the binding iterates: it may begin emitting response chunks before the
+  request body is fully consumed, so request-stream, server-stream, and
+  true bidi all fall out of one signature. Unary is the degenerate case —
+  a one-chunk request and a one-chunk response. This matches what Aster's
+  own four call patterns need from the transport, so custom handlers and
+  Aster RPC share the same streaming machinery rather than custom
+  handlers being a lesser tier.
+
+  Bidi custom handlers obey the **same version-guard rules** as Aster's
+  own bidi (see the server support matrix): true bidi requires H/2 or
+  H/3, is best-effort behind H/2 proxies, and is rejected on H/1.1 with
+  `426 Upgrade Required`. The guard is transport-level and applies
+  regardless of whether the body behind the route is Aster framing or a
+  consumer's own protocol.
+
+The callback path reuses the same FFI bridge the auth delegate uses
+(binding-language function ← Rust call), so there is one mechanism for
+"run my code on an HTTP request," not two.
+
+### Low-level: HTTP in a hand-wired process (alongside your own servers)
+
+The getstarted guide's "building a `Server` by hand" path (§4.3) is for
+consumers who own the node and run **other servers in the same process** —
+e.g. portal-sync stands up an NFS server next to Aster. HTTP must be
+reachable from that path too, not only from the `AsterServer` builder.
+
+The seam is the **transport-agnostic dispatcher**. Services register once
+on `Server::new(&node)`; each transport is an independent handle that
+serves that *same* dispatcher. HTTP is just a second listener you spawn —
+peer to the Iroh accept loop and to your own NFS server, none of them
+bolted to each other.
+
+```rust
+use aster::rpc::{AttributeStore, Server, RPC_ALPN};
+
+let node = Node::start_with_alpns(cfg, vec![RPC_ALPN.to_vec()]).await?;
+let attrs = AttributeStore::new();
+
+// Register services once.
+let server = Server::new(&node)
+    .register(EchoServer::new(EchoImpl))
+    .attributes(attrs.clone());
+
+// Snapshot the shareable, transport-agnostic dispatcher BEFORE serving.
+let dispatcher = server.dispatcher();            // aster::rpc::Dispatcher (cheap clone)
+
+// Transport 1: Iroh RPC (consumes `server`; we already hold `dispatcher`).
+let iroh = server.serve();                       // ServerHandle (accept+dispatch on RPC_ALPN)
+
+// Transport 2: HTTP, same dispatcher, its own socket.
+let app = salvo::Router::new()
+    .push(aster_salvo::router(dispatcher.clone(), &http_config)) // /aster/*
+    .push(salvo::Router::with_path("healthz").get(health));      // your non-Aster routes
+let http = tokio::spawn(salvo::Server::new(tcp_listener).serve(app));
+
+// Transport 3: your own server, unrelated to Aster.
+let nfs = tokio::spawn(run_nfs_server(/* … */));
+
+// You own the lifecycle: await whichever handle(s) gate shutdown.
+iroh.joined().await; // or select! across iroh / http / nfs
+```
+
+The point: `aster_salvo::router(&server, &cfg)` takes the **dispatcher**,
+not the raw node, so the hand-wired path serves the identical service set
+over HTTP that it serves over Iroh — and HTTP composes with the
+consumer's own listeners exactly like any other spawned task.
+`AsterServer::builder().with_http(…)` is sugar over precisely this.
+
+**Concrete API change this requires — DONE (`feat/web`).** Previously
+`Server::new(&node)…serve()` *consumed* the registry + attribute store
+into the Iroh accept loop, so a second transport couldn't reach the same
+services. Implemented: `Server::dispatcher()` snapshots a shareable,
+`Clone`-able `Dispatcher { services: Arc<Registry>, attributes:
+AttributeStore }`; `serve()` now routes through that same handle
+internally, and `Dispatcher::dispatch_call(IncomingCall)` is the
+transport-agnostic entry point any non-Iroh transport calls. Grab the
+dispatcher before `serve()` to drive two transports at once. This is the
+low-level peer of the high-level `with_http`, and the prerequisite for
+the NFS-alongside-Aster process to expose HTTP at all. (Existing
+Iroh-path RPC tests stay green — behaviour-preserving.)
+
+### What stays out of config
+
+Auth *policy* is a delegate (see Identity), not a `with_http` knob beyond
+naming which delegate runs. Static-mount *updates* are the
+`StaticControl` RPC service (see Static files), not config — config only
+declares the initial mounts. `HttpConfig` describes "what to stand up";
+behaviour lives in the same interceptor / service machinery the Iroh
+transport already uses.
+
 ## Layering inside aster-rpc-internal
 
 Today's layout is already transport-clean; the HTTP transport is
@@ -664,9 +1123,21 @@ for the operational tidy-up only. Defer until there is a concrete pain
 point — e.g. a non-browser HTTP/3 client that wants to join the iroh swarm
 on the same UDP socket.
 
-**Implication for this design:** the HTTP transport uses stock Salvo
-with its default `QuinnListener`. No salvo fork changes needed. The
-`noq-h3-listener` crate sketched below is shelved.
+**Implication for this design:** the HTTP transport uses Salvo with its
+quinn-based `QuinnListener` — and specifically **the Aster Salvo fork**
+at `/Users/emrul/dev/aster/salvo` (v0.93.x), *not* stock Salvo. The fork
+carries the patches the WebTransport + stream-priority features need:
+raw `quinn::Connection` exposure and Quinn keep-alive (already on the
+fork's `main`), plus WebTransport stream control on the
+`wt-webtransport-stream-control` branch. Still two QUIC stacks (quinn via
+the fork for HTTP, noq for Iroh); the `noq-h3-listener` crate sketched
+below stays shelved. The fork also ships an `acme` crate, which backs TLS
+provisioning Mode 2 above.
+
+> **Correction (2026-06-25):** an earlier revision of this note said
+> "stock Salvo, no fork changes needed." That is superseded — we build
+> against the Aster Salvo fork because stream priority (`sendOrder` /
+> per-stream control) and WebTransport need its patches.
 
 ---
 
