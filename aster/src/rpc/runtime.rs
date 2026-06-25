@@ -43,7 +43,7 @@ use crate::id::{NodeId, SecretKey};
 use crate::node::Node;
 use crate::ticket::{Credential, Ticket};
 
-use super::auth::AttributeStore;
+use super::auth::{AttributeStore, Authenticator};
 use super::server::{Server, ServerHandle, ServiceDispatch, RPC_ALPN};
 
 /// Builder for an [`AsterServer`]. Start one with [`AsterServer::builder`].
@@ -57,6 +57,7 @@ pub struct AsterServerBuilder {
     discovery: Option<bool>,
     hooks: Option<bool>,
     attributes: Option<AttributeStore>,
+    authenticator: Option<Arc<dyn Authenticator>>,
     extra_alpns: Vec<Vec<u8>>,
 }
 
@@ -119,6 +120,14 @@ impl AsterServerBuilder {
         self
     }
 
+    /// Attach a pre-dispatch [`Authenticator`] (runs before Gate-3 on every
+    /// call; can reject and resolve principal + attributes). See
+    /// [`Server::authenticator`](super::server::Server::authenticator).
+    pub fn authenticator(mut self, auth: impl Authenticator) -> Self {
+        self.authenticator = Some(Arc::new(auth));
+        self
+    }
+
     /// Register an additional inbound ALPN beyond `aster/1` and the built-in
     /// blobs / docs / gossip protocols (e.g. an admission ALPN).
     pub fn alpn(mut self, alpn: impl Into<Vec<u8>>) -> Self {
@@ -176,6 +185,9 @@ impl AsterServerBuilder {
 
         let attributes = self.attributes.unwrap_or_default();
         let mut server = Server::new(&node).attributes(attributes.clone());
+        if let Some(auth) = self.authenticator {
+            server = server.authenticator_arc(auth);
+        }
         for svc in self.services {
             server = server.register_arc(svc);
         }

@@ -28,7 +28,7 @@ use aster_transport_core::reactor::{
 };
 use aster_transport_core::CoreNode;
 
-use super::auth::{AttributeStore, CapabilityRequirement};
+use super::auth::{AttributeStore, AuthContext, Authenticator, CapabilityRequirement};
 use super::codec::{
     decode_stream_header, encode_rpc_status, RpcStatus, SerializationMode, StreamHeader,
 };
@@ -90,6 +90,7 @@ pub struct Server {
     core: CoreNode,
     services: Registry,
     attributes: AttributeStore,
+    authenticator: Option<Arc<dyn Authenticator>>,
 }
 
 impl Server {
@@ -100,7 +101,24 @@ impl Server {
             core: node.core(),
             services: HashMap::new(),
             attributes: AttributeStore::new(),
+            authenticator: None,
         }
+    }
+
+    /// Attach a pre-dispatch [`Authenticator`] (builder-style). It runs on every
+    /// call before the Gate-3 capability check, can reject, and can resolve a
+    /// principal + attributes (merged with the [`AttributeStore`], enrollment
+    /// winning on collision). This is where HTTP Bearer/JWT or any custom auth
+    /// lives — it applies to whichever transport drives the dispatcher.
+    pub fn authenticator(mut self, auth: impl Authenticator) -> Self {
+        self.authenticator = Some(Arc::new(auth));
+        self
+    }
+
+    /// Set an already-boxed authenticator (used by [`AsterServer`](crate::rpc::AsterServer)).
+    pub(crate) fn authenticator_arc(mut self, auth: Arc<dyn Authenticator>) -> Self {
+        self.authenticator = Some(auth);
+        self
     }
 
     /// Register a service dispatcher (builder-style; chainable).
@@ -143,6 +161,7 @@ impl Server {
         Dispatcher {
             services: Arc::new(self.services.clone()),
             attributes: self.attributes.clone(),
+            authenticator: self.authenticator.clone(),
         }
     }
 
@@ -180,6 +199,7 @@ impl Server {
 pub struct Dispatcher {
     services: Arc<Registry>,
     attributes: AttributeStore,
+    authenticator: Option<Arc<dyn Authenticator>>,
 }
 
 impl Dispatcher {
@@ -198,7 +218,13 @@ impl Dispatcher {
     /// channel) and calls this. Same gating and handler invocation as
     /// [`dispatch_call`](Dispatcher::dispatch_call).
     pub async fn dispatch_parts(&self, parts: CallParts) {
-        handle_call(self.services.clone(), self.attributes.clone(), parts).await;
+        handle_call(
+            self.services.clone(),
+            self.attributes.clone(),
+            self.authenticator.clone(),
+            parts,
+        )
+        .await;
     }
 
     /// The Gate-3 [`AttributeStore`] this dispatcher checks. A transport's auth
@@ -264,7 +290,12 @@ impl ServerHandle {
     }
 }
 
-async fn handle_call(services: Arc<Registry>, attributes: AttributeStore, call: CallParts) {
+async fn handle_call(
+    services: Arc<Registry>,
+    attributes: AttributeStore,
+    authenticator: Option<Arc<dyn Authenticator>>,
+    mut call: CallParts,
+) {
     // Pre-dispatch gating, mirroring `bindings/python/aster/server.py`:
     // missing service → INVALID_ARGUMENT, unknown (service, version) → NOT_FOUND,
     // unknown method → UNIMPLEMENTED, unsupported serialization mode →
@@ -328,10 +359,37 @@ async fn handle_call(services: Arc<Registry>, attributes: AttributeStore, call: 
         return;
     }
 
-    // Gate 3: per-call capability check against the peer's attributes (injected
-    // by the application). Service-level requirement first, then method-level —
-    // both must pass.
-    let attrs = attributes.get(&call.peer_id);
+    // Enrollment-derived attributes for this peer (from the application's store).
+    let mut attrs = attributes.get(&call.peer_id);
+
+    // Pre-dispatch auth hook: may reject, override the principal, and contribute
+    // attributes — merged additively, **enrollment wins on key collision**.
+    if let Some(auth) = authenticator.as_ref() {
+        let ctx = AuthContext {
+            peer_id: call.peer_id.clone(),
+            service: header.service.clone(),
+            method: header.method.clone(),
+            session_id: header.session_id,
+            metadata: metadata_map(&header),
+        };
+        match auth.authenticate(&ctx).await {
+            Ok(outcome) => {
+                if let Some(principal) = outcome.principal {
+                    call.peer_id = principal;
+                }
+                for (k, v) in outcome.attributes {
+                    attrs.entry(k).or_insert(v);
+                }
+            }
+            Err(status) => {
+                emit_rpc_status(&call.response_sender, &status);
+                return;
+            }
+        }
+    }
+
+    // Gate 3: per-call capability check against the resolved attributes.
+    // Service-level requirement first, then method-level — both must pass.
     for req in [svc.service_requires(), svc.method_requires(&header.method)]
         .into_iter()
         .flatten()
@@ -355,12 +413,26 @@ async fn handle_call(services: Arc<Registry>, attributes: AttributeStore, call: 
 
 /// Send a trailer-only error response (no data frame) before a [`Call`] exists.
 fn emit_trailer(sender: &UnboundedSender<OutgoingFrame>, code: StatusCode, message: &str) {
-    let status = RpcStatus::error(code, message);
-    if let Ok(bytes) = encode_rpc_status(&status) {
+    emit_rpc_status(sender, &RpcStatus::error(code, message));
+}
+
+/// Send an already-built [`RpcStatus`] as a trailer-only response. Used by the
+/// auth hook to surface its own status (code + message + details).
+fn emit_rpc_status(sender: &UnboundedSender<OutgoingFrame>, status: &RpcStatus) {
+    if let Ok(bytes) = encode_rpc_status(status) {
         if let Ok(frame) = encode_frame(&bytes, FLAG_TRAILER) {
             let _ = sender.send(OutgoingFrame::Trailer(frame));
         }
     }
+}
+
+/// Build a metadata map from a header's parallel key/value vectors.
+fn metadata_map(h: &StreamHeader) -> HashMap<String, String> {
+    h.metadata_keys
+        .iter()
+        .cloned()
+        .zip(h.metadata_values.iter().cloned())
+        .collect()
 }
 
 /// Per-call server context: request input, response output, and the decoded

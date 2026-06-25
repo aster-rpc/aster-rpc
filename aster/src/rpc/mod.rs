@@ -36,8 +36,8 @@ pub mod streaming;
 pub mod publish;
 
 pub use auth::{
-    require_all_of, require_any_of, require_role, AttributeStore, CapabilityKind,
-    CapabilityRequirement, ROLE_ATTRIBUTE,
+    require_all_of, require_any_of, require_role, AttributeStore, AuthContext, AuthOutcome,
+    Authenticator, CapabilityKind, CapabilityRequirement, ROLE_ATTRIBUTE,
 };
 pub use client::{BidiSink, ResponseStream, RpcConnection};
 pub use codec::{
