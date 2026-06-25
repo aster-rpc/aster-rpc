@@ -177,6 +177,80 @@ HTTP/3 supports trailers natively. (Browsers historically expose trailers
 poorly via Fetch; for browser clients, fall back to encoding status as
 the final frame in the body. gRPC-Web does this and it works.)
 
+## Content negotiation (codecs & compression)
+
+Aster RPC payloads are Fory. That's right for SDK-to-SDK, but a web
+frontend often wants JSON (debuggable in DevTools, no codegen) or
+MessagePack, and some deployments want to bring their own serializer.
+The HTTP transport should negotiate this with standard headers. Two
+**orthogonal** axes — don't conflate them:
+
+| Axis | Request header | Response header | Selects |
+|------|----------------|-----------------|---------|
+| **Codec** | `Content-Type` | `Accept` | payload serializer + body shape (Fory frames / JSON / msgpack / custom) |
+| **Compression** | `Content-Encoding` | `Accept-Encoding` | gzip / br / zstd — orthogonal, **not** Aster's concern |
+
+**Compression is free and separate.** `Content-Encoding` / `Accept-Encoding`
+are handled by a stock Salvo compression middleware (the fork ships a
+`compression` crate). It wraps the body bytes regardless of codec; Aster
+does nothing special. Mentioned only to keep it distinct from codec
+negotiation — the user question pairs them, but they live at different
+layers.
+
+### The architectural constraint
+
+The generic HTTP edge **cannot transcode** between codecs: turning bytes
+into a typed payload (and back) needs the payload *type*, which only the
+service's generated dispatcher knows. So codec selection cannot be a pure
+edge concern — it must reach the dispatcher, and a payload type can only
+be served in codec X if it derives what codec X needs (Fory needs
+`ForyStruct`; JSON/msgpack need `serde::{Serialize, Deserialize}`).
+
+That yields a two-layer model, both keyed by the negotiated codec id:
+
+1. **Body shape (edge, generic).** How the HTTP body is framed for this
+   content-type. `application/aster-frames` = length-prefixed Aster frames
+   (today). `application/json` = idiomatic JSON: a bare JSON object for
+   unary, NDJSON (newline-delimited) for streaming, status via HTTP
+   status + a final status object (browsers swallow trailers). The codec
+   owns this — a web dev posting JSON must not have to length-prefix it.
+2. **Payload (de)serialization (dispatcher, type-aware).** The generated
+   dispatcher encodes/decodes each payload in the negotiated codec.
+
+### Design
+
+- **Negotiation.** The Salvo handler reads `Content-Type` (request) and
+  `Accept` (response), resolves each to a codec id, and carries it into
+  dispatch via `StreamHeader.serialization_mode` (the field already
+  exists: XLANG / NATIVE / ROW / JSON). Unknown/absent → default
+  `application/aster-frames` (Fory). An `Accept` the service can't satisfy
+  → `406 Not Acceptable`.
+- **Opt-in per service.** `#[aster::service(codecs = ["fory", "json"])]`
+  (default `["fory"]`). Enabling `json` makes the macro require the
+  payload types to derive `serde` (a clear compile error otherwise) and
+  generate the JSON encode/decode arms. This keeps Fory-only services
+  free of any serde dependency.
+- **Custom codecs (registry).** A `CodecRegistry` maps a content-type
+  string to a codec providing (body-shape, payload encode/decode for the
+  trait it requires). Users register their own (e.g. msgpack). Because
+  payload (de)serialization is type-aware, a custom codec is usable only
+  by services whose payload types derive that codec's trait — same
+  constraint as JSON. Phase this in after JSON proves the seam.
+- **Relax the XLANG-only guard.** `core/src/lib.rs` rejects non-XLANG
+  today; that check becomes "is the negotiated codec one this service
+  supports."
+
+### Scope note
+
+This is a **core RPC** change (macro + codec layer + dispatch + payload
+type bounds), larger than the HTTP transport itself, and it touches every
+binding's codegen if cross-binding JSON is wanted. Recommended phasing:
+ship the transport's Fory path first (done/in progress), then add **JSON**
+as the first alternate codec end-to-end (macro opt-in + Salvo
+negotiation + the browser-friendly body shapes), then the custom-codec
+registry. Until then the transport is Fory-only and a JSON `Accept`
+returns `406`.
+
 ## Identity & authentication
 
 ### Server identity
