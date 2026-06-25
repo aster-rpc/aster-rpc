@@ -142,13 +142,13 @@ fn fory() -> &'static Fory {
     FORY.get_or_init(|| {
         let mut f = Fory::builder().xlang(true).compatible(true).build();
         // Register leaf-to-root: Statement is nested inside AttestationBody.
-        f.register_by_name::<Statement>("aster.attestation.statement", "v1")
+        f.register_by_name::<Statement>("aster.attestation.statement.v1")
             .expect("register Statement");
-        f.register_by_name::<AttestationBody>("aster.attestation.body", "v1")
+        f.register_by_name::<AttestationBody>("aster.attestation.body.v1")
             .expect("register AttestationBody");
-        f.register_by_name::<AttestationEdge>("aster.attestation.edge", "v1")
+        f.register_by_name::<AttestationEdge>("aster.attestation.edge.v1")
             .expect("register AttestationEdge");
-        f.register_by_name::<AttestationChain>("aster.attestation.chain", "v1")
+        f.register_by_name::<AttestationChain>("aster.attestation.chain.v1")
             .expect("register AttestationChain");
         f
     })

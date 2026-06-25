@@ -17,7 +17,8 @@ macro_rules! register {
     ($f:expr, $($t:ty),* $(,)?) => {
         $({
             let td = <$t as AsterType>::aster_type_def();
-            $f.register_by_name::<$t>(&td.package, &td.name).unwrap();
+            $f.register_by_name::<$t>(&format!("{}.{}", td.package, td.name))
+                .unwrap();
         })*
     };
 }

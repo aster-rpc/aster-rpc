@@ -57,7 +57,7 @@ static FORY: OnceLock<Fory> = OnceLock::new();
 fn fory() -> &'static Fory {
     FORY.get_or_init(|| {
         let mut f = Fory::builder().xlang(true).compatible(true).build();
-        f.register_by_name::<HpkeEnvelopeRecord>("aster.hpke", "Envelope")
+        f.register_by_name::<HpkeEnvelopeRecord>("aster.hpke.Envelope")
             .expect("register HpkeEnvelopeRecord");
         f
     })

@@ -8,8 +8,8 @@ description = "Mission Control example — typed Aster services served over Iroh
 [dependencies]
 aster = { path = "../../../aster", default-features = false, features = ["rpc"] }
 aster-transport-salvo = { path = "../../../aster-transport-salvo" }
-fory-core = "1.1.0-rc.1"
-fory-derive = "1.1.0-rc.1"
+fory-core = "1.3"
+fory-derive = "1.3"
 tokio = { workspace = true }
 salvo = { version = "0.93" }
 # Required by the generated JSON projection (codecs = ["json"]): serde on the

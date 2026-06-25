@@ -97,11 +97,11 @@ static ENVELOPE_FORY: OnceLock<Fory> = OnceLock::new();
 fn envelope_fory() -> &'static Fory {
     ENVELOPE_FORY.get_or_init(|| {
         let mut f = Fory::builder().xlang(true).compatible(true).build();
-        f.register_by_name::<StreamHeader>("_aster", "StreamHeader")
+        f.register_by_name::<StreamHeader>("_aster.StreamHeader")
             .expect("register StreamHeader");
-        f.register_by_name::<CallHeader>("_aster", "CallHeader")
+        f.register_by_name::<CallHeader>("_aster.CallHeader")
             .expect("register CallHeader");
-        f.register_by_name::<RpcStatus>("_aster", "RpcStatus")
+        f.register_by_name::<RpcStatus>("_aster.RpcStatus")
             .expect("register RpcStatus");
         f
     })
@@ -296,7 +296,7 @@ mod tests {
         }
 
         let mut f = new_payload_fory();
-        f.register_by_name::<TaskAssignment>("test", "TaskAssignment")
+        f.register_by_name::<TaskAssignment>("test.TaskAssignment")
             .unwrap();
         let t = TaskAssignment {
             task_id: "t1".into(),
