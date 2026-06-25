@@ -1,0 +1,19 @@
+[package]
+name = "mission-control"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Mission Control example — typed Aster services served over Iroh and HTTP."
+
+[dependencies]
+aster = { path = "../../../aster", default-features = false, features = ["rpc"] }
+aster-transport-salvo = { path = "../../../aster-transport-salvo" }
+fory-core = "1.1.0-rc.1"
+fory-derive = "1.1.0-rc.1"
+tokio = { workspace = true }
+salvo = { version = "0.93" }
+
+[dev-dependencies]
+# In-process HTTP client for the typed round-trip test.
+salvo = { version = "0.93", features = ["test"] }
+aster_transport_core = { path = "../../../core" }

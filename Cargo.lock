@@ -228,9 +228,11 @@ dependencies = [
  "aster",
  "aster_transport_core",
  "bytes",
+ "futures-util",
  "quinn",
  "salvo",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -3232,6 +3234,19 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mission-control"
+version = "0.1.0"
+dependencies = [
+ "aster",
+ "aster-transport-salvo",
+ "aster_transport_core",
+ "fory-core",
+ "fory-derive",
+ "salvo",
+ "tokio",
 ]
 
 [[package]]
