@@ -6,15 +6,21 @@
 //! with [`Server::dispatcher`](aster::rpc::Server::dispatcher) and hand a clone
 //! here.
 //!
-//! ## Scope (v0)
+//! ## Scope
 //!
-//! **Unary only.** `POST /aster/{service}/{method}` with an Aster-framed body
-//! (`[u32 len][u8 flags][payload]`) in, an Aster-framed body (response frame +
-//! trailer) out — the same wire framing the Iroh transport uses, so clients
-//! decode identically. Streaming (server/client/bidi), TLS modes, auth
-//! delegate, sessions, static files, and stream priority land in later
-//! increments. Auth is **not** wired yet: `peer_id` is the remote address, not
-//! an Aster identity, so only no-capability methods are reachable.
+//! **All four call patterns** under `POST /aster/{service}/{method}`, one
+//! handler. Bodies are Aster frames (`[u32 len][u8 flags][payload]`) — the same
+//! wire framing the Iroh transport uses, so any Aster client decodes them
+//! identically. The request body is read in full and its frames fed to the
+//! dispatcher (the Rust client is eager for client-stream / bidi inputs, so
+//! buffering requests matches its behaviour); the **response** is streamed frame
+//! by frame as the handler emits it, so server-stream / bidi don't wait for the
+//! handler to finish.
+//!
+//! Not yet: TLS modes, the auth delegate, sessions, static files, stream
+//! priority, true incremental request streaming. Auth is **not** wired — the
+//! `peer_id` is the remote address, not an Aster identity, so Gate-3 sees empty
+//! attributes (only no-capability methods reachable).
 //!
 //! Aster owns `/aster/*`; nest [`router`] into your own Salvo app and keep every
 //! other path for yourself.
@@ -23,9 +29,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures_util::StreamExt;
 use salvo::http::{ResBody, StatusCode as HttpStatus};
 use salvo::prelude::*;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use aster::rpc::codec::{encode_stream_header, SerializationMode, StreamHeader};
 use aster::rpc::{CallParts, Dispatcher, OutgoingFrame, RequestFrame};
@@ -43,15 +51,15 @@ pub const ASTER_FRAMES: &str = "application/aster-frames";
 ///     .push(salvo::Router::with_path("healthz").get(health));
 /// ```
 pub fn router(dispatcher: Dispatcher) -> Router {
-    Router::with_path("aster/{service}/{method}").post(UnaryHandler { dispatcher })
+    Router::with_path("aster/{service}/{method}").post(AsterHandler { dispatcher })
 }
 
-struct UnaryHandler {
+struct AsterHandler {
     dispatcher: Dispatcher,
 }
 
 #[async_trait]
-impl Handler for UnaryHandler {
+impl Handler for AsterHandler {
     async fn handle(
         &self,
         req: &mut Request,
@@ -66,18 +74,19 @@ impl Handler for UnaryHandler {
             return fail(res, HttpStatus::BAD_REQUEST, "missing method");
         };
 
-        // Request body = one length-prefixed Aster frame (unary).
+        // Request body = a sequence of Aster frames. Read in full (the Rust
+        // client is eager for client-stream / bidi inputs), then parse frames.
         let body = match req.payload().await {
             Ok(b) => b.to_vec(),
             Err(_) => return fail(res, HttpStatus::BAD_REQUEST, "missing request body"),
         };
-        let request_payload = match decode_frame(&body) {
-            Ok((payload, _flags, _consumed)) => payload,
+        let frames = match parse_frames(&body) {
+            Ok(f) => f,
             Err(_) => return fail(res, HttpStatus::BAD_REQUEST, "malformed request frame"),
         };
 
-        // Construct the StreamHeader from the URL. Metadata / session / auth
-        // land in later increments.
+        // Construct the StreamHeader from the URL. Metadata / session / auth land
+        // in later increments.
         let header = StreamHeader {
             service,
             method,
@@ -100,48 +109,72 @@ impl Handler for UnaryHandler {
             }
         };
 
-        // Response channel: the handler emits OutgoingFrames here.
-        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<OutgoingFrame>();
-        // Unary: no additional request frames — hand the dispatcher a closed
-        // receiver (the lone request rides inline via request_payload).
+        // Request channel: the first frame rides inline; the rest are forwarded,
+        // then the channel is closed so `Call::recv_request` terminates.
         let (req_tx, req_rx) = mpsc::unbounded_channel::<RequestFrame>();
+        let mut iter = frames.into_iter();
+        let (request_payload, request_flags) = iter.next().unwrap_or((Vec::new(), FLAG_END_STREAM));
+        for (payload, flags) in iter {
+            let _ = req_tx.send(RequestFrame { payload, flags });
+        }
         drop(req_tx);
 
+        // Response channel → streamed HTTP body (frames flow as the handler emits
+        // them; server-stream / bidi don't wait for completion).
+        let (resp_tx, resp_rx) = mpsc::unbounded_channel::<OutgoingFrame>();
+
         // TODO(auth): once the auth delegate lands, peer_id is the authenticated
-        // principal. For now it's the remote address — NOT an Aster identity —
-        // so Gate-3 sees empty attributes (only no-capability methods reachable).
+        // principal. For now it's the remote address — NOT an Aster identity.
         let peer_id = req.remote_addr().to_string();
 
         let parts = CallParts {
             peer_id,
             header_payload,
             request_payload,
-            request_flags: FLAG_END_STREAM,
+            request_flags,
             response_sender: resp_tx,
             request_receiver: req_rx,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        // Unary: the dispatcher runs the handler to completion (it sends its
-        // frames on the unbounded channel and returns), then we drain the
-        // buffered frames into the HTTP body — already-framed bytes, mirroring
-        // the Iroh wire so any Aster client decodes them identically. (Streaming
-        // will interleave send + drain instead of await-then-drain.)
-        self.dispatcher.dispatch_parts(parts).await;
-
-        let mut out = Vec::new();
-        while let Ok(frame) = resp_rx.try_recv() {
-            match frame {
-                OutgoingFrame::Frame(b)
-                | OutgoingFrame::Trailer(b)
-                | OutgoingFrame::CompleteUnary(b) => out.extend_from_slice(&b),
-            }
-        }
+        // Run dispatch concurrently with the response stream. Detached: it owns
+        // everything it needs and ends when the handler returns (dropping
+        // resp_tx, which terminates the body stream).
+        let dispatcher = self.dispatcher.clone();
+        tokio::spawn(async move {
+            dispatcher.dispatch_parts(parts).await;
+        });
 
         res.status_code(HttpStatus::OK);
         let _ = res.add_header("content-type", ASTER_FRAMES, true);
-        res.body(ResBody::Once(Bytes::from(out)));
+        let stream = UnboundedReceiverStream::new(resp_rx)
+            .map(|frame| Ok::<Bytes, std::io::Error>(frame_bytes(frame)));
+        res.body(ResBody::stream(stream));
     }
+}
+
+/// Already-framed bytes from an outgoing frame (all variants carry framed bytes).
+fn frame_bytes(f: OutgoingFrame) -> Bytes {
+    match f {
+        OutgoingFrame::Frame(b) | OutgoingFrame::Trailer(b) | OutgoingFrame::CompleteUnary(b) => {
+            Bytes::from(b)
+        }
+    }
+}
+
+/// Split a body of concatenated length-prefixed Aster frames into
+/// `(payload, flags)` pairs.
+fn parse_frames(mut buf: &[u8]) -> Result<Vec<(Vec<u8>, u8)>, ()> {
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        let (payload, flags, consumed) = decode_frame(buf).map_err(|_| ())?;
+        if consumed == 0 {
+            return Err(());
+        }
+        out.push((payload, flags));
+        buf = &buf[consumed..];
+    }
+    Ok(out)
 }
 
 fn fail(res: &mut Response, code: HttpStatus, msg: &str) {
