@@ -10,7 +10,7 @@ aster = { path = "../aster", default-features = false, features = ["rpc"] }
 aster_transport_core = { path = "../core" }
 
 # Aster Salvo fork (pinned in the workspace-root [patch.crates-io]).
-salvo = { version = "0.93", features = ["quinn", "rustls", "acme"] }
+salvo = { version = "0.93", features = ["quinn", "rustls", "acme", "serve-static"] }
 # TLS: self-signed cert generation + the WebTransport serverCertificateHashes hash.
 rcgen = "0.13"
 sha2 = "0.10"
