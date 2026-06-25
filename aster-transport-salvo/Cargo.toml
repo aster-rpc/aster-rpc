@@ -25,3 +25,8 @@ bytes = { workspace = true }
 # `test` feature pulls salvo's in-process TestClient (unions with the normal
 # salvo features above).
 salvo = { version = "0.93", features = ["test"] }
+# Typed payloads for the projection test (Fory + serde, both ends).
+fory-core = "1.1.0-rc.1"
+fory-derive = "1.1.0-rc.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

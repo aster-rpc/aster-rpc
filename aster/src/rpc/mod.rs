@@ -26,6 +26,7 @@ pub mod client;
 pub mod codec;
 pub mod contract;
 pub mod interceptor;
+pub mod projection;
 pub mod runtime;
 pub mod server;
 pub mod status;
@@ -49,6 +50,7 @@ pub use contract::{
     TypeDef, WireField,
 };
 pub use interceptor::{CallContext, CircuitBreaker, Interceptor, Pipeline, RetryPolicy};
+pub use projection::{Projection, ProjectionRegistry};
 #[cfg(all(feature = "docs", feature = "blobs"))]
 pub use publish::{
     fetch_and_verify_contract, publish_contract, FetchedContract, PublishedContract,
