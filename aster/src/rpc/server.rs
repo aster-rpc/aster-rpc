@@ -235,6 +235,17 @@ impl Dispatcher {
     }
 }
 
+/// A pluggable additional transport for [`AsterServer`] — e.g. the HTTP/Salvo
+/// transport. Defined here (in `aster`) so `aster` needn't depend on the
+/// transport crate; the transport crate implements it for its config type and
+/// `AsterServer::builder().with_http(cfg)` spawns it on the shared
+/// [`Dispatcher`]. Off by default — Iroh-only unless one is attached.
+pub trait HttpTransport: Send + 'static {
+    /// Spawn the transport serving `dispatcher`; the returned handle is held by
+    /// the [`AsterServer`] and aborted on shutdown.
+    fn serve(self: Box<Self>, dispatcher: Dispatcher) -> tokio::task::JoinHandle<()>;
+}
+
 /// The connection-agnostic inputs the dispatcher needs for one call. The Iroh
 /// reactor path builds this from an [`IncomingCall`] via
 /// [`from_incoming`](CallParts::from_incoming); other transports (HTTP)

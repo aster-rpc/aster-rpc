@@ -53,6 +53,60 @@ pub mod webtransport;
 pub use tls::{generate_self_signed, rustls_config, serve_https, GeneratedCert, TlsMaterial};
 pub use webtransport::wt_router;
 
+/// HTTP transport config for `AsterServer::builder().with_http(...)`. Serves the
+/// node's services over HTTPS (H1/H2/H3) — and WebTransport when enabled — on
+/// the shared dispatcher. Implements [`aster::rpc::HttpTransport`].
+pub struct HttpConfig {
+    /// Bind address, e.g. `"[::]:443"`.
+    pub addr: String,
+    /// TLS material (PEM / ACME / self-signed).
+    pub tls: TlsMaterial,
+    /// Browser JSON/NDJSON projections (empty = canonical Fory only).
+    pub projections: ProjectionRegistry,
+    /// Also mount the WebTransport endpoint at `/aster/wt`.
+    pub webtransport: bool,
+}
+
+impl HttpConfig {
+    /// Minimal config: address + TLS, canonical Fory only, no WebTransport.
+    pub fn new(addr: impl Into<String>, tls: TlsMaterial) -> Self {
+        Self {
+            addr: addr.into(),
+            tls,
+            projections: ProjectionRegistry::new(),
+            webtransport: false,
+        }
+    }
+
+    /// Enable browser JSON/NDJSON projections.
+    pub fn projections(mut self, projections: ProjectionRegistry) -> Self {
+        self.projections = projections;
+        self
+    }
+
+    /// Mount the WebTransport endpoint (`/aster/wt`).
+    pub fn webtransport(mut self, on: bool) -> Self {
+        self.webtransport = on;
+        self
+    }
+}
+
+impl aster::rpc::HttpTransport for HttpConfig {
+    fn serve(self: Box<Self>, dispatcher: aster::rpc::Dispatcher) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut app =
+                salvo::Router::new().push(router_with(dispatcher.clone(), self.projections));
+            if self.webtransport {
+                app = app.push(wt_router(dispatcher));
+            }
+            let service = salvo::Service::new(app);
+            if let Err(e) = serve_https(&self.addr, self.tls, service).await {
+                eprintln!("aster-transport-salvo: HTTP serve error: {e}");
+            }
+        })
+    }
+}
+
 /// Canonical Aster-over-HTTP media type (Fory frames).
 pub const ASTER_FRAMES: &str = "application/aster-frames";
 const JSON: &str = "application/json";
