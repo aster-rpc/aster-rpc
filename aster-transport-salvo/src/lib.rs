@@ -85,8 +85,18 @@ impl Handler for AsterHandler {
             Err(_) => return fail(res, HttpStatus::BAD_REQUEST, "malformed request frame"),
         };
 
-        // Construct the StreamHeader from the URL. Metadata / session / auth land
-        // in later increments.
+        // HTTP request headers → Aster metadata (lowercased names), so a
+        // server-side Authenticator sees `authorization` etc.
+        let mut metadata_keys = Vec::new();
+        let mut metadata_values = Vec::new();
+        for (name, value) in req.headers().iter() {
+            if let Ok(v) = value.to_str() {
+                metadata_keys.push(name.as_str().to_string());
+                metadata_values.push(v.to_string());
+            }
+        }
+
+        // Construct the StreamHeader from the URL + headers. Session land later.
         let header = StreamHeader {
             service,
             method,
@@ -94,8 +104,8 @@ impl Handler for AsterHandler {
             call_id: 0,
             deadline: 0,
             serialization_mode: SerializationMode::Xlang.as_i8(),
-            metadata_keys: Vec::new(),
-            metadata_values: Vec::new(),
+            metadata_keys,
+            metadata_values,
             session_id: 0,
         };
         let header_payload = match encode_stream_header(&header) {

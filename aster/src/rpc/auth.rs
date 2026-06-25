@@ -87,3 +87,49 @@ where
         roles: roles.into_iter().map(Into::into).collect(),
     }
 }
+
+// ── Pre-dispatch authentication hook ────────────────────────────────────────
+
+/// Context handed to an [`Authenticator`] before dispatch.
+pub struct AuthContext {
+    /// The transport-provided caller id (Iroh: peer node id; HTTP: remote addr
+    /// until the authenticator resolves a real principal).
+    pub peer_id: String,
+    pub service: String,
+    pub method: String,
+    /// `0` for stateless calls; the session anchor otherwise.
+    pub session_id: i32,
+    /// Request metadata — transport headers (e.g. `authorization`). Over HTTP
+    /// these are the request's HTTP headers (lowercased names).
+    pub metadata: HashMap<String, String>,
+}
+
+/// What an [`Authenticator`] resolved for a call.
+#[derive(Default)]
+pub struct AuthOutcome {
+    /// Replace the principal used for the rest of dispatch (e.g. the
+    /// authenticated pubkey). `None` keeps the transport-provided `peer_id`.
+    pub principal: Option<String>,
+    /// Attributes resolved for this call (e.g. `aster.role`). Merged with the
+    /// enrollment-derived attributes from the [`AttributeStore`] — **enrollment
+    /// wins on key collision** (a per-call delegate is lower-assurance than an
+    /// admission-vouched attribute and must not overwrite it).
+    pub attributes: HashMap<String, String>,
+}
+
+/// A server-side pre-dispatch authentication / authorization hook. Runs before
+/// the Gate-3 capability check on every call, with the request metadata
+/// (transport headers) plus peer / service / method / session. Reject by
+/// returning `Err(RpcStatus)` (e.g. `UNAUTHENTICATED`); otherwise return the
+/// resolved principal + attributes the capability gate then sees.
+///
+/// This is the Rust form of Aster's pluggable auth delegate: custom auth is an
+/// `Authenticator` impl — exactly where Rust users already write code, no
+/// separate plugin system. Bearer-JWT and friends are just impls of this trait.
+/// Attach one with [`Server::authenticator`](super::server::Server::authenticator)
+/// or [`AsterServerBuilder::authenticator`](super::runtime::AsterServerBuilder::authenticator).
+#[async_trait::async_trait]
+pub trait Authenticator: Send + Sync + 'static {
+    async fn authenticate(&self, ctx: &AuthContext)
+        -> Result<AuthOutcome, super::codec::RpcStatus>;
+}
