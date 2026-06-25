@@ -1,0 +1,25 @@
+[package]
+name = "aster-transport-salvo"
+version = "0.1.0"
+edition = "2021"
+description = "Aster RPC over HTTP (H1/H2/H3 + WebTransport) via the Aster Salvo fork."
+
+[dependencies]
+# Transport-agnostic dispatcher + codec/framing live in the aster crate (rpc).
+aster = { path = "../aster", default-features = false, features = ["rpc"] }
+aster_transport_core = { path = "../core" }
+
+# Aster Salvo fork (pinned in the workspace-root [patch.crates-io]).
+salvo = { version = "0.93", features = ["quinn", "rustls"] }
+# Direct quinn pin to unify with the transitive 0.11.x (h3-quinn -> salvo-http3)
+# so the quinn::Connection the fork stashes in request.extensions() resolves by
+# TypeId. Used for WT stats / stream control in a later increment.
+quinn = { version = "0.11", default-features = false }
+
+tokio = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+# `test` feature pulls salvo's in-process TestClient (unions with the normal
+# salvo features above).
+salvo = { version = "0.93", features = ["test"] }
