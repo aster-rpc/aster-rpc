@@ -593,6 +593,26 @@ video, chroma, audio — wants audio and keyframes to preempt video deltas
 under congestion. Aster has no such concept today; this section defines
 it.
 
+### Native priority is an accelerator, not the correctness layer
+
+The hard-won lesson from portal-agent's
+`design/WebTransportScheduling.md` (the production WebTransport scheduler
+this section aligns with): **native QUIC / WebTransport priority cannot be
+relied on for correctness.** Browsers, proxies, and the congestion
+controller may ignore or reorder it. The *correctness* layer there is an
+**app-level scheduler** — a queue that classifies each unit, enforces
+class ordering, supersedes stale work by key, drops past a max-age, and
+respects decode/dependency order, with a separate non-droppable pump for
+critical units. `set_priority` is an *opportunistic accelerator* on top.
+
+So Aster's job here is deliberately narrow: provide the **primitives** — a
+per-stream priority knob (below) plus stream reset/abort — and stay out of
+scheduling policy. The app (portal) owns the scheduler; Aster does **not**
+reimplement queues, supersession, max-age, or dependency tracking, so it
+can't ship a second, divergent scheduler beside portal-agent's. A generic
+RPC service that just wants "audio ahead of video" uses the priority knob
+directly and never needs a scheduler at all.
+
 ### Model — RFC 9218 urgency
 
 Priority is a single integer **urgency**, `0`–`7`, lower value = more
@@ -603,11 +623,19 @@ useful as progressive/partial data, or should be delivered ahead of its
 equal-urgency peers).
 
 We expose the raw `0`–`7` int, not a fixed enum. Whether to map it onto
-named classes (`CONTROL`, `AUDIO`, `VIDEO_KEY`, `VIDEO_DELTA`, …) is a
-**consumer decision** — it depends entirely on the workload, so Aster
-declines to bake one taxonomy in. A media app defines its own lattice; a
-generic RPC service may never touch priority at all (everything stays at
-the default `3`).
+named classes is a **consumer decision** — it depends entirely on the
+workload, so Aster declines to bake one taxonomy in. The canonical worked
+example is portal-agent, which maps four classes onto disjoint priority
+bands:
+
+```
+Critical    > Interactive > Repair      > Background
+(most urgent)                            (least urgent)
+```
+
+— i.e. portal's `Critical` ≈ Aster urgency `0`, `Background` ≈ urgency
+`7`. A media app defines its own such lattice; a generic RPC service may
+never touch priority at all (everything stays at the default `3`).
 
 Why RFC 9218: it is the *single* model that maps natively to every
 transport Aster targets, instead of an Aster-specific scheme each
@@ -640,41 +668,65 @@ Salvo HTTP transport *and* the Iroh/noq transport — both run over QUIC,
 both can prioritise streams, and a service should behave the same way on
 either.
 
-| Transport | How urgency is applied |
-|-----------|------------------------|
-| **Iroh / noq (quinn)** | `quinn::SendStream::set_priority(i32)`. noq is a quinn fork, so this is already available — map urgency `0`–`7` to the i32 priority (higher i32 = more urgent, so invert via a lookup table). |
-| **HTTP/3 (Salvo, quinn)** | Same quinn `set_priority` underneath, plus the RFC 9218 `priority` request/response header so intermediaries can honour it. Native fit. |
-| **HTTP/3 WebTransport** | `sendOrder` integer per stream (higher `sendOrder` = sent first → derive from urgency, inverted), and `sendGroup` to bind a session's streams into one ranked group. |
+Server-side, every QUIC-based path collapses to the **same primitive**:
+`quinn::SendStream::set_priority(i32)`, plus `reset_with_error_code` /
+`abort` for age-drop and supersession. The Aster Salvo fork (rev
+`cdfdc90f`, the `wt-webtransport-stream-control` merge) exposes exactly
+these on the WebTransport send stream returned by `open_uni` — this is the
+same surface portal-agent's S4 uses. `sendOrder` is the **browser-client**
+JS API (Fetch / WebTransport), not the server's knob; it's relevant only
+in the TypeScript binding when the *browser* opens streams.
+
+| Transport (server side) | How urgency is applied |
+|-------------------------|------------------------|
+| **Iroh / noq (quinn)** | `quinn::SendStream::set_priority(i32)`. noq is a quinn fork, so it's already available. |
+| **HTTP/3 (Salvo, quinn)** | Same quinn `set_priority` underneath (via the Aster Salvo fork), plus the RFC 9218 `priority` response header so intermediaries can honour it. |
+| **HTTP/3 WebTransport** | `set_priority(i32)` on the `open_uni` send stream (fork surface); `reset_with_error_code` / `abort` for age-drop. (`sendGroup` is a browser-client grouping concept, not server-applied.) |
 | **HTTP/2 (Salvo, TCP)** | RFC 9218 `priority` header (urgency + incremental). Best-effort — many intermediaries ignore or rewrite H/2 priority; advisory only, same caveat as H/2 bidi. |
 | **HTTP/1.1** | No stream multiplexing; priority is a no-op. Document, don't error. |
 
-The urgency→backend translation is a small lookup table in each transport
-adapter, kept out of user code (users only ever say "urgency N"). Keep
-the mapping in one shared helper so Salvo and Iroh can't drift.
+The urgency→`i32` translation is a small lookup table in each transport
+adapter — **higher i32 = more urgent, so invert** (urgency `0` → high
+i32, urgency `7` → low/negative i32). portal-agent's reference mapping
+uses disjoint i32 bands (Critical `[2.0e9,2.5e9)`, Interactive
+`[1.0e9,1.5e9)`, Repair `[0,0.5e9)`, Background `[-1.0e9,-0.5e9)`) so the
+quinn packet scheduler never reorders a Critical write behind a lower
+class at the congestion-window level — Aster's lookup table should
+likewise produce well-separated bands. Keep the mapping in one shared
+helper so Salvo and Iroh can't drift.
 
-### Priority is not supersession
+### Priority is not supersession (and Aster owns neither scheduler)
 
-Keep two concerns separate (they are conflated in portal-desktop's
-planned `wt_scheduler`):
+Keep two concerns separate — portal-agent's model proves this in
+production:
 
 - **Priority** (this section) — a transport knob: which stream's bytes go
-  first. `set_priority` / `sendOrder`.
-- **Supersession / drop-stale** — a send-buffer policy: "a newer keyframe
-  makes a queued older delta pointless, drop it." Lives in the
-  application / codegen layer and works identically regardless of QUIC
-  priority. If we want it, it is a separate knob (e.g.
-  `@stream_policy(drop_stale)`), specified on its own. Do not fold it into
-  the priority field.
+  first. `set_priority`. Aster owns this primitive.
+- **Scheduling** — the app-level correctness layer: supersession ("a newer
+  keyframe makes a queued older delta pointless, drop it"), max-age drop,
+  dependency / decode-order, a separate non-droppable critical pump. This
+  is *not* a transport knob and **Aster does not provide it** — it lives
+  in the application (portal's `wt_scheduler.rs`), built on Aster's
+  priority + reset/abort primitives. Conflating the two is the mistake
+  portal-agent's doc explicitly warns against.
+
+If a simple "drop stale" policy is ever wanted at the Aster layer it would
+be a *separate, opt-in* knob (e.g. `@stream_policy(drop_stale)`) backed by
+`reset_with_error_code`, never folded into the priority field — and even
+then the full scheduler stays in the app.
 
 ### Acceptance test — the portal media shape
 
-The design is correct only if a session-scoped service exposing parallel
-server-streams — `video.stream()` at urgency 5, `audio.stream()` at
-urgency 1, a control bidi at urgency 0 — lets a media app like
-portal-desktop replace its hand-rolled per-track stream management with
-Aster streaming methods and get the same prioritisation declaratively, on
-both the WebTransport and the Iroh path. If portal can't be rewritten
-onto it, the abstraction is wrong.
+The design is correct if a session-scoped service exposing parallel
+server-streams — `video.stream()` at a low urgency, `audio.stream()` at a
+high one, a control bidi highest — lets portal-agent **map its existing
+classes onto Aster stream priorities** and use Aster's `reset`/`abort` for
+age-drop, on **both** the WebTransport and the Iroh path, while keeping
+its app-level scheduler as the correctness layer. Aster replaces the
+low-level `open_uni → set_priority → write framing` plumbing and gives a
+typed streaming API with a priority knob; it does **not** replace the
+scheduler. If portal can't sit its scheduler on top of these primitives,
+the abstraction is wrong.
 
 ## Static files
 
@@ -1124,20 +1176,51 @@ point — e.g. a non-browser HTTP/3 client that wants to join the iroh swarm
 on the same UDP socket.
 
 **Implication for this design:** the HTTP transport uses Salvo with its
-quinn-based `QuinnListener` — and specifically **the Aster Salvo fork**
-at `/Users/emrul/dev/aster/salvo` (v0.93.x), *not* stock Salvo. The fork
-carries the patches the WebTransport + stream-priority features need:
-raw `quinn::Connection` exposure and Quinn keep-alive (already on the
-fork's `main`), plus WebTransport stream control on the
-`wt-webtransport-stream-control` branch. Still two QUIC stacks (quinn via
-the fork for HTTP, noq for Iroh); the `noq-h3-listener` crate sketched
-below stays shelved. The fork also ships an `acme` crate, which backs TLS
-provisioning Mode 2 above.
+quinn-based listener — and specifically **the Aster Salvo fork**
+(`github.com/aster-rpc/salvo`), *not* stock Salvo. The fork carries the
+patches the WebTransport + stream-priority features need: raw
+`quinn::Connection` exposure, Quinn keep-alive, and WebTransport stream
+control (`SendStream::set_priority` / `reset_with_error_code` / `abort`).
+Still two QUIC stacks (quinn via the fork for HTTP, noq for Iroh); the
+`noq-h3-listener` crate sketched below stays shelved. The fork also ships
+an `acme` crate, which backs TLS provisioning Mode 2 above.
 
-> **Correction (2026-06-25):** an earlier revision of this note said
-> "stock Salvo, no fork changes needed." That is superseded — we build
-> against the Aster Salvo fork because stream priority (`sendOrder` /
-> per-stream control) and WebTransport need its patches.
+**Pin (mirror portal-agent exactly).** portal-agent already consumes this
+fork; we pin the **same rev** so the whole product family builds one
+identical Salvo (and shares the runner cache). In the workspace-root
+`[patch.crates-io]`:
+
+```toml
+[patch.crates-io]
+salvo       = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo_core  = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo_macros = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo_extra = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+# Propagation gotcha: the fork patches these internally, but
+# [patch.crates-io] does NOT cross workspaces — re-declare them here.
+salvo-http3 = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+h3          = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+h3-quinn    = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+```
+
+Plus a direct `quinn = { version = "0.11", default-features = false }` dep
+so it unifies with the transitive `0.11.9` (via `h3-quinn → salvo-http3`),
+otherwise the `quinn::Connection` clone the fork stashes in
+`request.extensions()` won't resolve back by `TypeId`. Rev `cdfdc90f` =
+"Merge WebTransport stream control support"; the fork's `main` has since
+drifted ahead (an upstream merge), so we pin the rev, not the branch.
+Wire this block in the same change that adds the `aster-transport-salvo`
+crate (an unused patch warns otherwise).
+
+> **Follow-up (do after the transport lands):** cut a **versioned tag**
+> of `aster-rpc/salvo` (e.g. `v0.93.0-aster.1`) and migrate every
+> consumer — portal-agent, portal-desktop, this repo — off the raw rev
+> onto the tag, so the pin is legible and bumped deliberately. portal
+> also eventually owns this fork alongside noq.
+
+> **Correction (2026-06-25):** an earlier revision said "stock Salvo, no
+> fork changes needed." Superseded — stream priority and WebTransport
+> need the fork's patches; portal-agent already depends on them.
 
 ---
 
