@@ -68,6 +68,8 @@ pub struct HttpConfig {
     pub projections: ProjectionRegistry,
     /// Also mount the WebTransport endpoint at `/aster/wt`.
     pub webtransport: bool,
+    /// Static-file mounts: `(path_prefix, directory)`. Filesystem only.
+    pub static_mounts: Vec<(String, std::path::PathBuf)>,
 }
 
 impl HttpConfig {
@@ -78,6 +80,7 @@ impl HttpConfig {
             tls,
             projections: ProjectionRegistry::new(),
             webtransport: false,
+            static_mounts: Vec::new(),
         }
     }
 
@@ -92,6 +95,16 @@ impl HttpConfig {
         self.webtransport = on;
         self
     }
+
+    /// Serve files from `dir` under `path_prefix` (filesystem static serving).
+    pub fn static_mount(
+        mut self,
+        path_prefix: impl Into<String>,
+        dir: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.static_mounts.push((path_prefix.into(), dir.into()));
+        self
+    }
 }
 
 impl aster::rpc::HttpTransport for HttpConfig {
@@ -101,6 +114,11 @@ impl aster::rpc::HttpTransport for HttpConfig {
                 salvo::Router::new().push(router_with(dispatcher.clone(), self.projections));
             if self.webtransport {
                 app = app.push(wt_router(dispatcher));
+            }
+            // Static mounts last so /aster/* and specific routes win over a
+            // catch-all directory mount.
+            for (prefix, dir) in self.static_mounts {
+                app = app.push(static_router(&prefix, dir));
             }
             let service = salvo::Service::new(app);
             if let Err(e) = serve_https(&self.addr, self.tls, service).await {
@@ -112,6 +130,30 @@ impl aster::rpc::HttpTransport for HttpConfig {
 
 /// Canonical Aster-over-HTTP media type (Fory frames).
 pub const ASTER_FRAMES: &str = "application/aster-frames";
+
+/// A Salvo [`Router`] serving files from a filesystem directory under
+/// `path_prefix`. Directories fall back to `index.html`. Plain static serving —
+/// no iroh-blobs. Nest it into your app (or use [`HttpConfig::static_mount`]);
+/// keep `/aster/*` for RPC.
+///
+/// ```ignore
+/// let app = salvo::Router::new()
+///     .push(aster_transport_salvo::router(dispatcher))
+///     .push(aster_transport_salvo::static_router("/app", "./dist"));
+/// ```
+pub fn static_router(path_prefix: &str, dir: impl Into<std::path::PathBuf>) -> Router {
+    let dir = dir.into();
+    let p = path_prefix.trim_matches('/');
+    let pattern = if p.is_empty() {
+        "{*path}".to_string()
+    } else {
+        format!("{p}/{{*path}}")
+    };
+    Router::with_path(pattern).get(
+        salvo::serve_static::StaticDir::new([dir.to_string_lossy().into_owned()])
+            .defaults(["index.html"]),
+    )
+}
 const JSON: &str = "application/json";
 const NDJSON: &str = "application/x-ndjson";
 
