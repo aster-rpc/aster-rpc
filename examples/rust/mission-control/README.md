@@ -21,8 +21,9 @@ One shared `MissionControl` service:
 cargo run -p mission-control
 ```
 
-Serves Iroh RPC (`aster/1`) and HTTP on `127.0.0.1:8080`. Over HTTP, POST
-Aster-framed bodies to `/aster/MissionControl/<method>`.
+Serves Iroh RPC (`aster/1`) plus **HTTPS (H1/H2/H3) + WebTransport** on
+`127.0.0.1:8443` (dev self-signed cert). Canonical Aster RPC, browser
+JSON, and WebTransport all live under `/aster/...`.
 
 ## Test (HTTP, typed, all four patterns)
 
@@ -43,12 +44,12 @@ browser can POST plain JSON:
 
 ```bash
 # unary → JSON
-curl -X POST http://127.0.0.1:8080/aster/MissionControl/getStatus \
+curl --insecure -X POST https://127.0.0.1:8443/aster/MissionControl/getStatus \
   -H 'content-type: application/json' -H 'accept: application/json' \
   -d '{"agent_id":"agent-1"}'
 
 # server-stream → NDJSON
-curl -X POST http://127.0.0.1:8080/aster/MissionControl/tailLogs \
+curl --insecure -X POST https://127.0.0.1:8443/aster/MissionControl/tailLogs \
   -H 'content-type: application/json' -H 'accept: application/x-ndjson' \
   -d '{"agent_id":"agent-1","level":"info"}'
 ```
