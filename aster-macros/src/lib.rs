@@ -426,6 +426,8 @@ struct MethodSpec {
     resp_ty: Type,
     requires: Option<Expr>,
     idempotent: bool,
+    /// Unary method with no request arg — the request is the implicit `Empty`.
+    no_request: bool,
 }
 
 fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<TokenStream2> {
@@ -759,15 +761,23 @@ fn parse_method(m: &mut syn::TraitItemFn) -> syn::Result<MethodSpec> {
     };
     let arg_err = |msg: &str| syn::Error::new_spanned(&m.sig, msg.to_string());
 
+    // A unary method may take no request arg (`async fn foo(&self) -> Result<T>`):
+    // the request is the implicit `Empty` (Aster's call protocol always carries
+    // one request frame; the server ignores it).
+    let mut no_request = false;
     let (req_ty, resp_ty) = match pattern {
-        Pattern::Unary => {
-            if args.len() != 1 {
-                return Err(arg_err(
-                    "unary: `async fn(&self, req: Req) -> Result<Resp>`",
-                ));
+        Pattern::Unary => match args.len() {
+            0 => {
+                no_request = true;
+                (syn::parse_quote!(::aster::rpc::Empty), result_ok(&m.sig)?)
             }
-            (args[0].clone(), result_ok(&m.sig)?)
-        }
+            1 => (args[0].clone(), result_ok(&m.sig)?),
+            _ => {
+                return Err(arg_err(
+                    "unary: `async fn(&self, req: Req) -> Result<Resp>` or `async fn(&self) -> Result<Resp>`",
+                ))
+            }
+        },
         Pattern::ServerStream => {
             if args.len() != 2 {
                 return Err(arg_err(
@@ -810,6 +820,7 @@ fn parse_method(m: &mut syn::TraitItemFn) -> syn::Result<MethodSpec> {
         resp_ty,
         requires,
         idempotent,
+        no_request,
     })
 }
 
@@ -886,12 +897,21 @@ fn dispatch_arm(s: &MethodSpec) -> TokenStream2 {
     let resp = &s.resp_ty;
     match s.pattern {
         Pattern::Unary => {
-            let decode = decode_one_request(req);
             let respond = respond_one();
+            // No-request unary: consume the (ignored) request frame and call the
+            // handler with no argument; otherwise decode the request normally.
+            let (decode, invoke) = if s.no_request {
+                (
+                    quote! { let _ = call.recv_request().await; },
+                    quote! { self.inner.#ident() },
+                )
+            } else {
+                (decode_one_request(req), quote! { self.inner.#ident(__req) })
+            };
             quote! {
                 #name => {
                     #decode
-                    match self.inner.#ident(__req).await {
+                    match #invoke.await {
                         ::core::result::Result::Ok(__resp) => { #respond }
                         ::core::result::Result::Err(__e) => {
                             let _ = call.finish(&::aster::rpc::status_from_error(&__e));
@@ -974,6 +994,14 @@ fn client_method(s: &MethodSpec, svc_name: &str, svc_version: i32) -> TokenStrea
         |e| ::aster::Error::InvalidArgument(::std::format!("response decode: {e}"))
     };
     match s.pattern {
+        // No-request unary → no `req` parameter; send an implicit `Empty`.
+        Pattern::Unary if s.no_request => quote! {
+            pub async fn #ident(&self) -> ::aster::Result<#resp> {
+                let __bytes = self.fory.serialize(&<#req>::default()).map_err(#encode_err)?;
+                let __resp_bytes = self.conn.unary(&#header, __bytes).await?;
+                self.fory.deserialize::<#resp>(&__resp_bytes).map_err(#decode_err)
+            }
+        },
         Pattern::Unary => quote! {
             pub async fn #ident(&self, req: #req) -> ::aster::Result<#resp> {
                 let __bytes = self.fory.serialize(&req).map_err(#encode_err)?;
