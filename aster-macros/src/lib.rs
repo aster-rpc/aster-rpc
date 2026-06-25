@@ -456,7 +456,7 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
                 register_stmts.push(quote! {
                     {
                         let __td = <#ty as ::aster::rpc::AsterType>::aster_type_def();
-                        __f.register_by_name::<#ty>(&__td.package, &__td.name)
+                        __f.register_by_name::<#ty>(&::std::format!("{}.{}", __td.package, __td.name))
                             .expect("register payload type");
                     }
                 });

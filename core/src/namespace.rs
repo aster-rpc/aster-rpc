@@ -43,7 +43,7 @@ static FORY: OnceLock<Fory> = OnceLock::new();
 fn fory() -> &'static Fory {
     FORY.get_or_init(|| {
         let mut f = Fory::builder().xlang(true).compatible(true).build();
-        f.register_by_name::<NamespaceCapabilityRecord>("aster.namespace", "NamespaceCapability")
+        f.register_by_name::<NamespaceCapabilityRecord>("aster.namespace.NamespaceCapability")
             .expect("register NamespaceCapabilityRecord");
         f
     })
