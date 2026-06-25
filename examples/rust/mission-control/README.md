@@ -31,7 +31,31 @@ cargo test -p mission-control
 ```
 
 `tests/http.rs` drives the service over HTTP with Fory-encoded payloads
-(what an HTTP client binding does), asserting each pattern round-trips.
+(the canonical `application/aster-frames` path), asserting each pattern
+round-trips.
+
+## Browser JSON (no Fory, no framing)
+
+The service opts into a generated JSON gateway with
+`#[aster::service(..., codecs = ["json"])]`, which emits
+`MissionControlProjection`. Register it and serve via `router_with`, and a
+browser can POST plain JSON:
+
+```bash
+# unary → JSON
+curl -X POST http://127.0.0.1:8080/aster/MissionControl/getStatus \
+  -H 'content-type: application/json' -H 'accept: application/json' \
+  -d '{"agent_id":"agent-1"}'
+
+# server-stream → NDJSON
+curl -X POST http://127.0.0.1:8080/aster/MissionControl/tailLogs \
+  -H 'content-type: application/json' -H 'accept: application/x-ndjson' \
+  -d '{"agent_id":"agent-1","level":"info"}'
+```
+
+`tests/json.rs` covers unary JSON, server-stream NDJSON, and bidi → `406`
+(bidi isn't projected over plain HTTP JSON). The dispatcher still runs Fory
+throughout; JSON is transcoded at the edge.
 
 ## Differences from the Python/TS example
 

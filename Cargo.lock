@@ -3250,6 +3250,8 @@ dependencies = [
  "fory-core",
  "fory-derive",
  "salvo",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

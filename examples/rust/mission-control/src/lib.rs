@@ -23,16 +23,21 @@
 
 use aster::rpc::{RequestStream, ResponseSink};
 use fory_derive::ForyStruct;
+use serde::{Deserialize, Serialize};
 
 // ── Wire types ──────────────────────────────────────────────────────────────
 
-#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[derive(
+    ForyStruct, aster::AsterType, Serialize, Deserialize, Debug, Default, Clone, PartialEq,
+)]
 #[aster(wire = "mission/StatusRequest")]
 pub struct StatusRequest {
     pub agent_id: String,
 }
 
-#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[derive(
+    ForyStruct, aster::AsterType, Serialize, Deserialize, Debug, Default, Clone, PartialEq,
+)]
 #[aster(wire = "mission/StatusResponse")]
 pub struct StatusResponse {
     pub agent_id: String,
@@ -40,7 +45,9 @@ pub struct StatusResponse {
     pub uptime_secs: i64,
 }
 
-#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[derive(
+    ForyStruct, aster::AsterType, Serialize, Deserialize, Debug, Default, Clone, PartialEq,
+)]
 #[aster(wire = "mission/LogEntry")]
 pub struct LogEntry {
     pub timestamp: f64,
@@ -49,20 +56,26 @@ pub struct LogEntry {
     pub agent_id: String,
 }
 
-#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[derive(
+    ForyStruct, aster::AsterType, Serialize, Deserialize, Debug, Default, Clone, PartialEq,
+)]
 #[aster(wire = "mission/SubmitLogResult")]
 pub struct SubmitLogResult {
     pub accepted: bool,
 }
 
-#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[derive(
+    ForyStruct, aster::AsterType, Serialize, Deserialize, Debug, Default, Clone, PartialEq,
+)]
 #[aster(wire = "mission/TailRequest")]
 pub struct TailRequest {
     pub agent_id: String,
     pub level: String,
 }
 
-#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[derive(
+    ForyStruct, aster::AsterType, Serialize, Deserialize, Debug, Default, Clone, PartialEq,
+)]
 #[aster(wire = "mission/MetricPoint")]
 pub struct MetricPoint {
     pub name: String,
@@ -70,20 +83,26 @@ pub struct MetricPoint {
     pub timestamp: f64,
 }
 
-#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[derive(
+    ForyStruct, aster::AsterType, Serialize, Deserialize, Debug, Default, Clone, PartialEq,
+)]
 #[aster(wire = "mission/IngestResult")]
 pub struct IngestResult {
     pub accepted: i32,
     pub dropped: i32,
 }
 
-#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[derive(
+    ForyStruct, aster::AsterType, Serialize, Deserialize, Debug, Default, Clone, PartialEq,
+)]
 #[aster(wire = "mission/Command")]
 pub struct Command {
     pub command: String,
 }
 
-#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[derive(
+    ForyStruct, aster::AsterType, Serialize, Deserialize, Debug, Default, Clone, PartialEq,
+)]
 #[aster(wire = "mission/CommandResult")]
 pub struct CommandResult {
     pub stdout: String,
@@ -93,7 +112,7 @@ pub struct CommandResult {
 
 // ── Service ─────────────────────────────────────────────────────────────────
 
-#[aster::service(name = "MissionControl", version = 1)]
+#[aster::service(name = "MissionControl", version = 1, codecs = ["json"])]
 pub trait MissionControl {
     /// Unary: fleet status for an agent.
     #[rpc(name = "getStatus")]

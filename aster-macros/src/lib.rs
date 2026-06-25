@@ -345,12 +345,16 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 struct ServiceArgs {
     name: String,
     version: i32,
+    /// Browser projection codecs, e.g. `codecs = ["json"]`. Each emits a
+    /// generated `<Svc>Projection` (gateway transcoder). Default: none (Fory).
+    codecs: Vec<String>,
 }
 
 impl Parse for ServiceArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut name: Option<String> = None;
         let mut version: i32 = 1;
+        let mut codecs: Vec<String> = Vec::new();
         let metas = Punctuated::<MetaNameValue, Token![,]>::parse_terminated(input)?;
         for m in metas {
             if m.path.is_ident("name") {
@@ -367,6 +371,28 @@ impl Parse for ServiceArgs {
                 {
                     version = i.base10_parse()?;
                 }
+            } else if m.path.is_ident("codecs") {
+                // codecs = ["json", ...] — an array of string literals.
+                if let Expr::Array(arr) = &m.value {
+                    for elem in &arr.elems {
+                        if let Expr::Lit(ExprLit {
+                            lit: Lit::Str(s), ..
+                        }) = elem
+                        {
+                            codecs.push(s.value());
+                        } else {
+                            return Err(syn::Error::new_spanned(
+                                elem,
+                                "codecs entries must be string literals, e.g. \"json\"",
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(syn::Error::new_spanned(
+                        &m.value,
+                        "codecs must be an array, e.g. codecs = [\"json\"]",
+                    ));
+                }
             }
         }
         Ok(ServiceArgs {
@@ -377,6 +403,7 @@ impl Parse for ServiceArgs {
                 )
             })?,
             version,
+            codecs,
         })
     }
 }
@@ -497,6 +524,95 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
         .map(|s| client_method(s, &svc_name, svc_version))
         .collect();
 
+    // Optional browser JSON projection (gateway). Generated only when the
+    // service opts in via `codecs = ["json"]`; references `::serde_json` and
+    // requires the payload types to derive `serde::{Serialize, Deserialize}`.
+    let projection_code = if args.codecs.iter().any(|c| c == "json") {
+        let projection_ident = format_ident!("{}Projection", svc_ident);
+        let pattern_arms: Vec<TokenStream2> = specs
+            .iter()
+            .map(|s| {
+                let name = &s.name;
+                let pat = pattern_token(s.pattern);
+                quote!(#name => ::core::option::Option::Some(#pat),)
+            })
+            .collect();
+        let req_arms: Vec<TokenStream2> = specs
+            .iter()
+            .map(|s| {
+                let name = &s.name;
+                let req = &s.req_ty;
+                quote!(#name => {
+                    let __v: #req = ::serde_json::from_slice(body)
+                        .map_err(|e| ::std::string::ToString::to_string(&e))?;
+                    self.fory.serialize(&__v).map_err(|e| ::std::string::ToString::to_string(&e))
+                })
+            })
+            .collect();
+        let resp_arms: Vec<TokenStream2> = specs
+            .iter()
+            .map(|s| {
+                let name = &s.name;
+                let resp = &s.resp_ty;
+                quote!(#name => {
+                    let __v: #resp = self.fory.deserialize(fory)
+                        .map_err(|e| ::std::string::ToString::to_string(&e))?;
+                    ::serde_json::to_vec(&__v).map_err(|e| ::std::string::ToString::to_string(&e))
+                })
+            })
+            .collect();
+        let projection_ident_str = projection_ident.to_string();
+        quote! {
+            #[doc = "Generated browser JSON projection (gateway) for this service."]
+            #[doc = ""]
+            #[doc = "Register with `aster::rpc::ProjectionRegistry::register` and pass to"]
+            #[doc = "`aster_transport_salvo::router_with`. Transcodes JSON⇄Fory at the HTTP"]
+            #[doc = "edge; the dispatcher still runs ordinary Fory."]
+            pub struct #projection_ident {
+                fory: ::std::sync::Arc<::aster::rpc::Fory>,
+            }
+            impl #projection_ident {
+                pub fn new() -> Self {
+                    Self { fory: ::std::sync::Arc::new(#build_fory) }
+                }
+            }
+            impl ::core::default::Default for #projection_ident {
+                fn default() -> Self { Self::new() }
+            }
+            impl ::aster::rpc::Projection for #projection_ident {
+                fn service(&self) -> &str { #svc_name }
+                fn pattern(&self, method: &str)
+                    -> ::core::option::Option<::aster::rpc::MethodPattern>
+                {
+                    match method {
+                        #(#pattern_arms)*
+                        _ => ::core::option::Option::None,
+                    }
+                }
+                fn request_to_fory(&self, method: &str, _media: &str, body: &[u8])
+                    -> ::core::result::Result<::std::vec::Vec<u8>, ::std::string::String>
+                {
+                    match method {
+                        #(#req_arms)*
+                        _ => ::core::result::Result::Err(
+                            ::std::format!("{}: unknown method '{}'", #projection_ident_str, method)),
+                    }
+                }
+                fn response_from_fory(&self, method: &str, _media: &str, fory: &[u8])
+                    -> ::core::result::Result<::std::vec::Vec<u8>, ::std::string::String>
+                {
+                    match method {
+                        #(#resp_arms)*
+                        _ => ::core::result::Result::Err(
+                            ::std::format!("{}: unknown method '{}'", #projection_ident_str, method)),
+                    }
+                }
+            }
+        }
+    } else {
+        quote!()
+    };
+
     Ok(quote! {
         #[::aster::rpc::async_trait]
         #trait_def
@@ -560,6 +676,8 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
             }
             #(#client_methods)*
         }
+
+        #projection_code
     })
 }
 
