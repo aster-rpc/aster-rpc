@@ -228,9 +228,13 @@ dependencies = [
  "aster",
  "aster_transport_core",
  "bytes",
+ "fory-core",
+ "fory-derive",
  "futures-util",
  "quinn",
  "salvo",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
 ]
