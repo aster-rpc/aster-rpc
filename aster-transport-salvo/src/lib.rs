@@ -50,7 +50,10 @@ use aster_transport_core::framing::{decode_frame, FLAG_END_STREAM, FLAG_TRAILER}
 
 pub mod tls;
 pub mod webtransport;
-pub use tls::{generate_self_signed, rustls_config, serve_https, GeneratedCert, TlsMaterial};
+pub use tls::{
+    generate_self_signed, generate_webtransport_cert, rustls_config, serve_https, GeneratedCert,
+    TlsMaterial,
+};
 pub use webtransport::wt_router;
 
 /// HTTP transport config for `AsterServer::builder().with_http(...)`. Serves the

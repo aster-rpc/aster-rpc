@@ -80,6 +80,40 @@ pub fn generate_self_signed(sans: &[String]) -> Result<GeneratedCert, String> {
     })
 }
 
+/// Generate a **WebTransport-suitable** self-signed cert: ECDSA P-256 and
+/// validity ≤ 14 days (both required for a browser to accept it via
+/// `serverCertificateHashes`). `subject` becomes the certificate Common Name —
+/// pass the **node id** to bind the cert to the node identity. Returns the PEM
+/// plus the SHA-256 a client pins.
+///
+/// The hash needs no Aster ticket change: publish it however you already share
+/// connection info (config, an endpoint, the address you hand out).
+pub fn generate_webtransport_cert(subject: &str, sans: &[String]) -> Result<GeneratedCert, String> {
+    let mut all_sans = vec!["localhost".to_string()];
+    all_sans.extend(sans.iter().cloned());
+
+    // ECDSA P-256 is `KeyPair::generate`'s default — the algorithm WebTransport
+    // requires for serverCertificateHashes.
+    let key = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
+    let mut params = rcgen::CertificateParams::new(all_sans).map_err(|e| e.to_string())?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, format!("aster-node/{subject}"));
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::hours(1);
+    params.not_after = now + time::Duration::days(13); // < the 14-day WT cap
+
+    let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(cert.der().as_ref());
+    Ok(GeneratedCert {
+        cert_pem: cert.pem().into_bytes(),
+        key_pem: key.serialize_pem().into_bytes(),
+        sha256: hasher.finalize().into(),
+    })
+}
+
 /// Build a Salvo [`RustlsConfig`] from PEM or a freshly generated self-signed
 /// cert. (ACME isn't a static config — use [`serve_https`].)
 pub fn rustls_config(tls: &TlsMaterial) -> Result<RustlsConfig, String> {
