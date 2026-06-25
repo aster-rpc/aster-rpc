@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use salvo::conn::rustls::{Keycert, RustlsConfig};
-use salvo::conn::TcpListener;
+use salvo::conn::{QuinnListener, TcpListener};
 use salvo::prelude::*;
 use sha2::{Digest, Sha256};
 
@@ -98,8 +98,12 @@ pub fn rustls_config(tls: &TlsMaterial) -> Result<RustlsConfig, String> {
     ))
 }
 
-/// Bind `service` over HTTPS on `addr` (H1/H2 over TLS; H3/WebTransport land
-/// later) and serve until the process ends.
+/// Bind `service` over HTTPS on `addr` and serve until the process ends.
+///
+/// For PEM / self-signed, this serves **H1/H2 over TCP *and* H3 over QUIC** on
+/// the same address (one `QuinnListener` joined with the TCP listener) — so the
+/// existing handlers, and WebTransport, work over HTTP/3. ACME currently serves
+/// H1/H2 only.
 ///
 /// ```ignore
 /// let app = aster_transport_salvo::router(dispatcher);
@@ -132,8 +136,11 @@ pub async fn serve_https(addr: &str, tls: TlsMaterial, service: Service) -> Resu
         }
         other => {
             let config = rustls_config(&other)?;
-            let acceptor = TcpListener::new(addr.to_string())
-                .rustls(config)
+            // H1/H2 over TCP + H3 over QUIC on the same address.
+            let tcp = TcpListener::new(addr.to_string()).rustls(config.clone());
+            let quinn_config = config.build_quinn_config().map_err(|e| e.to_string())?;
+            let acceptor = QuinnListener::new(quinn_config, addr.to_string())
+                .join(tcp)
                 .bind()
                 .await;
             Server::new(acceptor).serve(service).await;
