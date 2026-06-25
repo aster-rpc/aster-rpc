@@ -35,6 +35,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Real TLS client for the HTTPS handshake test (rustls, accept self-signed).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-# Install a process-level crypto provider in the test (two rustls stacks present
-# — salvo + reqwest — so it can't auto-select). Not needed in production.
+# Install a process-level crypto provider in the test (multiple rustls stacks
+# present — salvo + reqwest + wtransport — so it can't auto-select). Prod doesn't
+# need this.
 rustls = "0.23"
+# Real WebTransport client for the H3/WT handshake test (same crate portal uses).
+wtransport = { version = "0.6", features = ["quinn", "dangerous-configuration"] }
