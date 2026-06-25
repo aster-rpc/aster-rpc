@@ -197,59 +197,79 @@ does nothing special. Mentioned only to keep it distinct from codec
 negotiation — the user question pairs them, but they live at different
 layers.
 
-### The architectural constraint
+### Principle: Aster RPC stays Fory; web codecs are an edge adapter
 
-The generic HTTP edge **cannot transcode** between codecs: turning bytes
-into a typed payload (and back) needs the payload *type*, which only the
-service's generated dispatcher knows. So codec selection cannot be a pure
-edge concern — it must reach the dispatcher, and a payload type can only
-be served in codec X if it derives what codec X needs (Fory needs
-`ForyStruct`; JSON/msgpack need `serde::{Serialize, Deserialize}`).
+Aster RPC is Fory, full stop — over Iroh **and** over
+`application/aster-frames` HTTP. `StreamHeader.serialization_mode` is an
+**Aster-protocol** field signalling an Aster *RPC client's* mode (a closed
+enum: XLANG / NATIVE / ROW / JSON). It is **not** a web content-negotiation
+knob: we do **not** overload it, and we do **not** extend it for
+MessagePack or arbitrary codecs. Loosening it would weaken the contract
+guarantee every binding relies on.
 
-That yields a two-layer model, both keyed by the negotiated codec id:
+Web serializer choice is therefore a **separate edge-transcoding layer** in
+the HTTP transport — not a change to the RPC protocol, the dispatcher, or
+`serialization_mode`:
 
-1. **Body shape (edge, generic).** How the HTTP body is framed for this
-   content-type. `application/aster-frames` = length-prefixed Aster frames
-   (today). `application/json` = idiomatic JSON: a bare JSON object for
-   unary, NDJSON (newline-delimited) for streaming, status via HTTP
-   status + a final status object (browsers swallow trailers). The codec
-   owns this — a web dev posting JSON must not have to length-prefix it.
-2. **Payload (de)serialization (dispatcher, type-aware).** The generated
-   dispatcher encodes/decodes each payload in the negotiated codec.
+- A request arriving as `application/aster-frames` is normal Aster RPC:
+  Fory frames straight to the dispatcher, untouched (today's path).
+- A request arriving as `application/json` (or a registered custom type) is
+  **transcoded to Fory at the edge**, dispatched as ordinary Fory, and the
+  Fory response is **transcoded back** to the negotiated `Accept` type. The
+  dispatcher only ever sees Fory; `serialization_mode` stays XLANG.
 
-### Design
+### Why transcoding needs generated help
+
+The edge can't transcode generically: turning JSON bytes into Fory bytes
+needs the payload *type* (field names, types, order), which the generic
+handler doesn't have. Two ways to supply it:
+
+- **Generated per-service adapter (the path).** `#[aster::service(codecs =
+  ["json"])]` makes the macro emit a JSON⇄Fory transcoder for that
+  service's methods, using `serde` on the payload types + the same Fory
+  runtime. The HTTP transport registers it per `(service, method)` and
+  calls it at the edge. Requires the payload types to also derive `serde`
+  (a clear compile error otherwise); Fory-only services pull no serde.
+- **Schema-driven generic transcoder (deferred).** The contract `TypeDef`s
+  fully describe every type, so in principle one transcoder could drive
+  JSON↔Fory from the schema with no per-type codegen. This needs Fory
+  *dynamic / untyped* encode, currently blocked upstream (the
+  DynamicTypeFactory investigation). Revisit when that lands — it would
+  make custom codecs nearly free.
+
+### Mechanism
 
 - **Negotiation.** The Salvo handler reads `Content-Type` (request) and
-  `Accept` (response), resolves each to a codec id, and carries it into
-  dispatch via `StreamHeader.serialization_mode` (the field already
-  exists: XLANG / NATIVE / ROW / JSON). Unknown/absent → default
-  `application/aster-frames` (Fory). An `Accept` the service can't satisfy
-  → `406 Not Acceptable`.
-- **Opt-in per service.** `#[aster::service(codecs = ["fory", "json"])]`
-  (default `["fory"]`). Enabling `json` makes the macro require the
-  payload types to derive `serde` (a clear compile error otherwise) and
-  generate the JSON encode/decode arms. This keeps Fory-only services
-  free of any serde dependency.
-- **Custom codecs (registry).** A `CodecRegistry` maps a content-type
-  string to a codec providing (body-shape, payload encode/decode for the
-  trait it requires). Users register their own (e.g. msgpack). Because
-  payload (de)serialization is type-aware, a custom codec is usable only
-  by services whose payload types derive that codec's trait — same
-  constraint as JSON. Phase this in after JSON proves the seam.
-- **Relax the XLANG-only guard.** `core/src/lib.rs` rejects non-XLANG
-  today; that check becomes "is the negotiated codec one this service
-  supports."
+  `Accept` (response) and resolves an edge transcoder. Default / absent /
+  `application/aster-frames` → no transcode (pure Fory, today's path). An
+  `Accept` with no registered transcoder for the service → `406 Not
+  Acceptable`.
+- **Body shape.** Each transcoder owns the HTTP body shape for its type:
+  `application/json` is a bare JSON object for unary and NDJSON for
+  streaming (browsers needn't length-prefix), status via HTTP status + a
+  final status object; `aster-frames` stays length-prefixed Fory frames.
+- **Custom serializers (registry).** A `TranscoderRegistry` maps a
+  content-type to an edge transcoder; msgpack etc. plug in here. Each still
+  needs the per-type bridge (generated serde adapter, or the schema-driven
+  transcoder once available), so a custom codec is usable by services whose
+  types derive its trait — same constraint as JSON.
+
+The Aster wire protocol, the dispatcher, `serialization_mode`, and the
+Fory-only contract are all **unchanged**. Web codecs are purely additive at
+the HTTP edge.
 
 ### Scope note
 
-This is a **core RPC** change (macro + codec layer + dispatch + payload
-type bounds), larger than the HTTP transport itself, and it touches every
-binding's codegen if cross-binding JSON is wanted. Recommended phasing:
-ship the transport's Fory path first (done/in progress), then add **JSON**
-as the first alternate codec end-to-end (macro opt-in + Salvo
-negotiation + the browser-friendly body shapes), then the custom-codec
-registry. Until then the transport is Fory-only and a JSON `Accept`
-returns `406`.
+This does **not** touch the RPC wire protocol, the dispatcher, or
+`serialization_mode` — only (a) the `#[aster::service]` macro (an opt-in
+generated transcoder) and (b) the HTTP transport edge. So the Fory-only
+Aster RPC standard is preserved; web codecs are an additive convenience.
+Recommended phasing: ship the transport's Fory path first (done / in
+progress), then **JSON** as the first edge transcoder (macro `codecs`
+opt-in + Salvo negotiation + browser-friendly body shapes), then the
+custom-transcoder registry. Until then the transport is Fory-only and a
+non-`aster-frames` `Accept` returns `406`. The schema-driven generic
+transcoder stays deferred behind Fory dynamic-encode.
 
 ## Identity & authentication
 
