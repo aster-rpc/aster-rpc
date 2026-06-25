@@ -73,6 +73,20 @@ impl Leaf {
 /// scalars below and for user payload types via `#[derive(AsterType)]`.
 pub trait WireField {
     fn leaf() -> Leaf;
+
+    /// Register this type and its **transitive** payload dependencies into a
+    /// Fory runtime, deduplicating via `seen` (so diamonds and self-referential
+    /// types terminate). Scalars are a no-op (default); `#[derive(AsterType)]`
+    /// structs override this to register themselves by wire name and recurse
+    /// into every field's element/value/key type. This is how nested structs and
+    /// `Vec<UserStruct>` get registered — the `#[aster::service]` macro only
+    /// names each method's top-level request/response type, and this walk pulls
+    /// in the rest. (Override callers require `Self: ForyStruct`.)
+    fn register_payload(
+        _fory: &mut fory_core::Fory,
+        _seen: &mut std::collections::HashSet<std::any::TypeId>,
+    ) {
+    }
 }
 
 macro_rules! prim_wire {

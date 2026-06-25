@@ -14,15 +14,16 @@
 //! separately in `default_lowers_into_contract`.
 
 use aster::rpc::{contract_id, AsterType, MethodDef, MethodPattern, ScopeKind, ServiceContract};
+use fory_derive::ForyStruct;
 
-#[derive(AsterType)]
+#[derive(ForyStruct, AsterType)]
 #[aster(wire = "echo/EchoRequest")]
 struct EchoRequest {
     #[allow(dead_code)]
     message: String,
 }
 
-#[derive(AsterType)]
+#[derive(ForyStruct, AsterType)]
 #[aster(wire = "echo/EchoResponse")]
 struct EchoResponse {
     #[allow(dead_code)]
@@ -71,7 +72,7 @@ fn echo_service_contract_id_matches_python_golden() {
 
 // ── Field-mapping coverage (Rust-internal) ───────────────────────────────────
 
-#[derive(AsterType)]
+#[derive(ForyStruct, AsterType)]
 #[aster(wire = "t/Shapes")]
 #[allow(dead_code)]
 struct Shapes {
@@ -107,7 +108,7 @@ fn container_optional_binary_and_ref_mapping() {
 
 // ── Spec-default lowering (§11.3.2.3) ─────────────────────────────────────────
 
-#[derive(AsterType)]
+#[derive(ForyStruct, AsterType)]
 #[aster(wire = "t/WithDefaults")]
 #[allow(dead_code)]
 struct WithDefaults {

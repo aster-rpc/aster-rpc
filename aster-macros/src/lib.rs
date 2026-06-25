@@ -57,6 +57,10 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     };
 
     let mut field_exprs: Vec<TokenStream2> = Vec::new();
+    // Transitive Fory registration: recurse into each field's element/value/key
+    // type. Scalars resolve to the `WireField` no-op default; nested structs
+    // register themselves and recurse further.
+    let mut register_children: Vec<TokenStream2> = Vec::new();
     for f in fields {
         let fname = f.ident.as_ref().unwrap().to_string();
         let info = analyze_type(&f.ty)?;
@@ -71,6 +75,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         field_exprs.push(quote! {
             ::aster::rpc::make_field(#fname, #leaf, #optional, #container, #key, #default_expr)
         });
+        for child in child_types(&f.ty) {
+            register_children.push(quote! {
+                <#child as ::aster::rpc::WireField>::register_payload(__fory, __seen);
+            });
+        }
     }
 
     Ok(quote! {
@@ -87,6 +96,20 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         impl ::aster::rpc::WireField for #ident {
             fn leaf() -> ::aster::rpc::Leaf {
                 ::aster::rpc::Leaf::reference(<Self as ::aster::rpc::AsterType>::aster_type_hash())
+            }
+
+            fn register_payload(
+                __fory: &mut ::aster::rpc::Fory,
+                __seen: &mut ::std::collections::HashSet<::core::any::TypeId>,
+            ) {
+                if !__seen.insert(::core::any::TypeId::of::<Self>()) {
+                    return;
+                }
+                let __td = <Self as ::aster::rpc::AsterType>::aster_type_def();
+                __fory
+                    .register_by_name::<Self>(&::std::format!("{}.{}", __td.package, __td.name))
+                    .expect("register payload type");
+                #(#register_children)*
             }
         }
     })
@@ -219,6 +242,32 @@ fn analyze_inner(ty: &Type) -> syn::Result<FieldInfo> {
 
 fn leaf_of(ty: &Type) -> TokenStream2 {
     quote!(<#ty as ::aster::rpc::WireField>::leaf())
+}
+
+/// The types a field contributes to transitive Fory registration — i.e. the
+/// types we recurse into via `WireField::register_payload`. Mirrors
+/// `analyze_type`'s container unwrapping: `Option<T>` unwraps to `T`'s children;
+/// `Vec<u8>` is binary (none); `Vec`/`VecDeque`/sets yield the element; maps
+/// yield key + value; everything else is the field type itself. Scalars resolve
+/// to the `WireField` no-op, so listing them is harmless.
+fn child_types(ty: &Type) -> Vec<Type> {
+    if let Some((ident, args)) = path_segment(ty) {
+        match ident.as_str() {
+            "Option" => return args.first().map(child_types).unwrap_or_default(),
+            "Vec" | "VecDeque" | "HashSet" | "BTreeSet" => {
+                return match args.first() {
+                    Some(elem) if is_u8(elem) => Vec::new(),
+                    Some(elem) => vec![elem.clone()],
+                    None => Vec::new(),
+                };
+            }
+            "HashMap" | "BTreeMap" => {
+                return args.into_iter().take(2).collect();
+            }
+            _ => {}
+        }
+    }
+    vec![ty.clone()]
 }
 
 /// Parse `#[aster(default ...)]` on a field → an expression of type
@@ -446,6 +495,9 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
     let client_ident = format_ident!("{}Client", svc_ident);
 
     // Unique payload types (for Fory registration; avoid double-registering).
+    // Each call registers the type *and its transitive dependencies* (nested
+    // structs, `Vec<UserStruct>`, map values, …) via `WireField::register_payload`,
+    // deduped at runtime by the shared `__seen` set below.
     let mut seen: Vec<String> = Vec::new();
     let mut register_stmts: Vec<TokenStream2> = Vec::new();
     for s in &specs {
@@ -454,17 +506,14 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
             if !seen.contains(&key) {
                 seen.push(key);
                 register_stmts.push(quote! {
-                    {
-                        let __td = <#ty as ::aster::rpc::AsterType>::aster_type_def();
-                        __f.register_by_name::<#ty>(&::std::format!("{}.{}", __td.package, __td.name))
-                            .expect("register payload type");
-                    }
+                    <#ty as ::aster::rpc::WireField>::register_payload(&mut __f, &mut __seen);
                 });
             }
         }
     }
     let build_fory = quote! {{
         let mut __f = ::aster::rpc::new_payload_fory();
+        let mut __seen = ::std::collections::HashSet::new();
         #(#register_stmts)*
         __f
     }};
