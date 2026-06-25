@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "ffi", "aster", "aster-macros", "bindings/python/rust", "bindings/typescript/native"]
+members = ["core", "ffi", "aster", "aster-macros", "aster-transport-salvo", "bindings/python/rust", "bindings/typescript/native"]
 exclude = ["core/fuzz", "ffi/fuzz"]
 resolver = "2"
 
@@ -49,3 +49,23 @@ iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "76492e4
 noq         = { git = "https://github.com/aster-rpc/noq",         rev = "ddb8829dbc1cd401f8643ba9b93c542ffee43577" }
 noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "ddb8829dbc1cd401f8643ba9b93c542ffee43577" }
 noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "ddb8829dbc1cd401f8643ba9b93c542ffee43577" }
+
+# ──────────────────────────────────────────────────────────────────────────
+# Aster Salvo fork (HTTP transport — see docs/_internal/working_ideas/aster-http3-transport.md)
+# ──────────────────────────────────────────────────────────────────────────
+# Pinned to the SAME rev portal-agent uses so the product family builds one
+# identical Salvo. cdfdc90f = "Merge WebTransport stream control support"
+# (SendStream::set_priority / reset_with_error_code / abort). The fork's main
+# has since drifted (upstream merge), so pin the rev, not the branch.
+# Propagation gotcha: the fork patches h3 / h3-quinn / salvo-http3 internally,
+# but [patch.crates-io] does NOT cross workspaces — re-declare them here.
+# Follow-up: cut a versioned tag (v0.93.0-aster.1) and move all consumers off
+# the raw rev.
+salvo        = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo_core   = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo_macros = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+# (salvo_extra is patched by portal-agent but not yet pulled here — re-add the
+#  line when a feature brings it into the graph, else cargo warns "patch unused".)
+salvo-http3  = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+h3           = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+h3-quinn     = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
