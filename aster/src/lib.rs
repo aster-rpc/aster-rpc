@@ -47,6 +47,10 @@
 //! this crate via git **must** copy the `[patch.crates-io]` block from the repo
 //! root `Cargo.toml` into its own — see the crate README.
 
+// Lets `#[derive(aster::AsterType)]` (which emits `::aster::…` paths) be used on
+// types defined inside this crate itself, e.g. `rpc::Empty`.
+extern crate self as aster;
+
 mod admission;
 mod config;
 pub mod crypto;

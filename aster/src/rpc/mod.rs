@@ -25,6 +25,7 @@ pub mod auth;
 pub mod client;
 pub mod codec;
 pub mod contract;
+pub mod empty;
 pub mod interceptor;
 pub mod projection;
 pub mod runtime;
@@ -49,6 +50,7 @@ pub use contract::{
     Leaf, ManifestMethod, MethodDef, MethodPattern, ScalarDefault, ScopeKind, ServiceContract,
     TypeDef, WireField,
 };
+pub use empty::Empty;
 pub use interceptor::{CallContext, CircuitBreaker, Interceptor, Pipeline, RetryPolicy};
 pub use projection::{Projection, ProjectionRegistry};
 #[cfg(all(feature = "docs", feature = "blobs"))]
