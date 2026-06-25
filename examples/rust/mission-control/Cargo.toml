@@ -12,6 +12,10 @@ fory-core = "1.1.0-rc.1"
 fory-derive = "1.1.0-rc.1"
 tokio = { workspace = true }
 salvo = { version = "0.93" }
+# Required by the generated JSON projection (codecs = ["json"]): serde on the
+# payload types, serde_json in the generated transcoder.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 # In-process HTTP client for the typed round-trip test.

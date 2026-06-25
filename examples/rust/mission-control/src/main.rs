@@ -8,9 +8,9 @@
 //! #   http://127.0.0.1:8080/aster/MissionControl/get_status
 //! ```
 
-use aster::rpc::Server;
+use aster::rpc::{ProjectionRegistry, Server};
 use aster::{AsterConfig, Node, RelayMode};
-use mission_control::{MissionControlImpl, MissionControlServer};
+use mission_control::{MissionControlImpl, MissionControlProjection, MissionControlServer};
 use salvo::conn::TcpListener;
 use salvo::prelude::*;
 
@@ -25,9 +25,12 @@ async fn main() -> aster::Result<()> {
     let _iroh = server.serve();
     println!("Iroh node id: {}", node.id());
 
-    let service = Service::new(aster_transport_salvo::router(dispatcher));
+    // Canonical Aster RPC + the generated browser JSON projection.
+    let projections = ProjectionRegistry::new().register(MissionControlProjection::new());
+    let service = Service::new(aster_transport_salvo::router_with(dispatcher, projections));
     let acceptor = TcpListener::new("127.0.0.1:8080").bind().await;
     println!("HTTP: POST http://127.0.0.1:8080/aster/MissionControl/<method>");
+    println!("      (application/aster-frames, or application/json for browsers)");
     salvo::Server::new(acceptor).serve(service).await;
     Ok(())
 }
