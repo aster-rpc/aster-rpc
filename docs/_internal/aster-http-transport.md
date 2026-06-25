@@ -1,6 +1,10 @@
-# Aster over HTTP — Transport Sketch (HTTP/1, /2, /3)
+# Aster over HTTP (HTTP/1, /2, /3 + WebTransport)
 
-**Status:** Design sketch (2026-05-02; revised 2026-06-25). Not implemented.
+**Status:** Implemented and merged to `main` (`feat/web`, 2026-06-25).
+Originated as a design sketch (2026-05-02); this doc is now the
+architecture record for the shipped transport. For *how to use it*, see the
+user guide [Serving Aster over HTTP, HTTP/3 & WebTransport](../aster-http-getstarted.md);
+the runnable reference is [`examples/rust/mission-control`](../../examples/rust/mission-control).
 **Scope:** A second transport for Aster, alongside the existing Iroh
 (QUIC + NAT traversal + Ed25519 peer identity) transport. Serves
 HTTP/1.1, HTTP/2 and HTTP/3 from a single server (Salvo), with each
@@ -8,8 +12,66 @@ version gated to only the call patterns it can correctly support.
 **Target:** Browsers and HTTP-addressable servers, without giving up the
 Aster RPC model (4 call patterns, contract identity, capabilities,
 session-scoped services).
-**Server framework:** Salvo, with a custom `NoqListener` so the HTTP
-transport and the Iroh transport share one QUIC implementation (`noq`).
+**Server framework:** the **Aster Salvo fork** (`github.com/aster-rpc/salvo`,
+rev `cdfdc90f`) on its own quinn QUIC stack — Iroh keeps `noq`. Two QUIC
+stacks; the once-planned shared-`noq` `NoqListener` was shelved (see
+[Server-side stack](#server-side-stack)).
+
+## Implementation status (as built)
+
+The transport lives in the **`aster-transport-salvo`** crate, bridging HTTP
+to the transport-agnostic `aster::rpc::Dispatcher`. The dispatcher seam in
+`aster` (`Server::dispatcher()` → `Dispatcher::dispatch_parts`) lets the same
+registered services serve over both Iroh and HTTP. What shipped, and where:
+
+| Capability | Status | Where |
+|------------|--------|-------|
+| Canonical Aster-over-HTTP (`application/aster-frames`), all 4 patterns | ✅ | `aster-transport-salvo/src/lib.rs` (`router`, `AsterHandler::serve_frames`) |
+| Browser JSON / NDJSON projection (`codecs = ["json"]` → `<Svc>Projection`) | ✅ | `aster/src/rpc/projection.rs`, macro in `aster-macros`, `router_with` |
+| TLS — PEM / ACME / self-signed; H1/H2 (TCP) + H3 (QUIC) | ✅ (ACME H1/H2 only) | `aster-transport-salvo/src/tls.rs` (`TlsMaterial`, `serve_https`) |
+| WebTransport (`/aster/wt`), bidi stream-per-call, all 4 patterns | ✅ | `aster-transport-salvo/src/webtransport.rs` (`wt_router`) |
+| WebTransport `serverCertificateHashes` bound to node identity | ✅ | `generate_webtransport_cert` (ECDSA, ≤14d, CN = node id) |
+| Stream priority (RFC 9218 urgency via `aster-priority` header) | ✅ (per-call, WT) | `webtransport.rs` (`urgency_to_priority`) |
+| Pluggable auth (`Authenticator` + writable call attributes) | ✅ | `aster/src/rpc/auth.rs`, `aster/src/rpc/server.rs` |
+| Session-scoped services (`register_session`, `aster-session-id`) | ✅ | `aster/src/rpc/server.rs`, `runtime.rs` |
+| Filesystem static files (`static_mount` / `static_router`) | ✅ | `aster-transport-salvo/src/lib.rs` (`static_router`) |
+| No-request unary methods (implicit `aster::rpc::Empty`) | ✅ | `aster/src/rpc/empty.rs`, macro |
+| `#[rpc(name = "...")]` wire-name override (cross-binding parity) | ✅ | `aster-macros` |
+| `AsterServer::builder().with_http(...)` one-step enable | ✅ | `aster/src/rpc/runtime.rs`, `HttpConfig: HttpTransport` |
+
+**Key design choices that landed as written:** the binding-language auth
+delegate is an `Authenticator` run above the transport (one place for both
+transports); attributes are writable by the auth stage with **enrollment
+winning on collision**; the Fory-only RPC standard is preserved (JSON is an
+edge projection, `serialization_mode` stays XLANG); `/aster/*` is Aster's,
+every other path is the consumer's.
+
+**Deferred (designed here, not built):**
+
+- **TypeScript Fetch / WebTransport client binding** — server-side only so
+  far; browsers use stock `fetch()` / `WebTransport` against the frame/JSON
+  wire described here.
+- **`serverCertificateHashes` publication in the Aster ticket** — no ticket
+  change was made; the hash travels via whatever already distributes the
+  address.
+- **iroh-blobs / `FileSeq` static serving + `StaticControl` RPC** — only
+  filesystem mounts shipped. The content-addressed mount design below is
+  unbuilt.
+- **`Aster-Sig` per-request signatures and the WebAuthn exchange** — v2,
+  sketched only. A bundled Bearer-JWT `Authenticator` is *not* shipped; the
+  `Authenticator` trait is the seam and consumers write their own (the
+  getting-started guide shows a Bearer example).
+- **`#[aster::service(scoped = "session")]` macro sugar**, session
+  idle-TTL / connection-close reaping, true incremental HTTP request-body
+  streaming (bodies are buffered), HTTP `Content-Encoding` rules, ACME over
+  H3 — all noted inline.
+- **`NoqListener` / shared-QUIC stack** — overruled 2026-05-22; two stacks.
+- **Salvo fork versioned tag** — still pinned to raw rev `cdfdc90f`; the
+  tag-and-migrate cleanup is outstanding.
+
+The forward-looking language and "to build" / "lands first" framing kept in
+the sections below is the original design intent, preserved for the *why*;
+the table above is the source of truth for *what is real*.
 
 ## Why a second transport
 
@@ -298,14 +360,14 @@ Both are legal but stacking them blindly is wrong. Rules:
 
 ### Scope note
 
-The canonical tier is the transport we're building (Fory, done / in
-progress). The projection tier is **additive at the HTTP edge + a macro
-codegen opt-in** — it does **not** touch the RPC wire protocol, the
-dispatcher, or `serialization_mode`, so the Fory-only Aster RPC standard is
-preserved. Phasing: canonical first; then the JSON projection (macro
-`codecs` opt-in + `ProjectionRegistry` + `router_with` + per-pattern body
-shapes); then custom projections. Until then, non-`aster-frames` requests
-return `415`/`406` as above.
+The canonical tier is the shipped transport (Fory). The projection tier is
+**additive at the HTTP edge + a macro codegen opt-in** — it does **not** touch
+the RPC wire protocol, the dispatcher, or `serialization_mode`, so the
+Fory-only Aster RPC standard is preserved. Both the canonical path and the
+JSON projection (macro `codecs` opt-in + `ProjectionRegistry` + `router_with`
++ per-pattern body shapes) are **built**; custom (non-JSON) projections remain
+future work. Non-`aster-frames`, non-`json` requests return `415`/`406` as
+above.
 
 ## Identity & authentication
 
@@ -859,6 +921,12 @@ scheduler. If portal can't sit its scheduler on top of these primitives,
 the abstraction is wrong.
 
 ## Static files
+
+> **As built:** only **filesystem** mounts shipped — `HttpConfig::static_mount`
+> / `static_router(prefix, dir)` over Salvo's `StaticDir` (ETag + `index.html`
+> fallback). The content-addressed `FileSeq` / iroh-blobs design, the
+> `StaticControl` RPC service, hot-swap, and per-mount auth gating below are
+> **unbuilt** — design intent for a later slice.
 
 RPC frameworks usually punt on static-file serving ("put nginx in
 front"). That works until you remember the browser also needs the
@@ -1470,31 +1538,34 @@ binary. Estimated effort: 400–800 LoC, structured as:
 - **Server-streaming over HTTP/2 fallback in Safari.** SSE works
   everywhere; revisit if HTTP/2 fallback ships.
 
-## Suggested rollout phases
+## Rollout — as executed
 
-1. **Phase 1 — `noq-h3-listener` crate.** Implement `h3::quic::Connection`
-   for `noq::Connection` and `salvo::conn::Acceptor` over a `noq::Endpoint`.
-   Stand-alone smoke test: a minimal Salvo H3 server backed by `noq`
-   serving `/hello` to `curl --http3`. No Aster code involved yet.
-2. **Phase 2 — `aster-transport-salvo` core handlers.** Wire `noq-h3-listener`
-   plus Salvo's stock TCP listener (H1/H2) into one server. Implement
-   the four handlers (unary, server-stream, client-stream, bidi) with
-   the version-guard middleware. Test all four from Rust HTTP/3 clients
-   (curl-h3, reqwest with h3 feature) and from a Node.js HTTP/2 client.
-   Get unary + server-stream + client-stream + bidi all green from
-   non-browser clients across H2 and H3, and unary + SSE-server-stream
-   green on H1.
-3. **Phase 3 — TypeScript Fetch binding.** Unary + server-stream +
-   client-stream from browsers via Fetch streaming. gRPC-Web-shape
-   error trailing in the body for browsers that swallow trailers.
-4. **Phase 4 — TypeScript WebTransport binding.** Bidi + session-scoped
-   reactor-style services on H3. Document Safari gap; plan its arrival.
-   This phase exercises the WebTransport extension on top of
-   `noq-h3-listener`.
-5. **Phase 5 — observability & proxying.** Standard HTTP middlewares
-   (auth, rate-limit, tracing) wired to the same Aster interceptors
-   the Iroh transport uses today. Validate operation behind nginx /
-   Envoy / a CDN.
+The original five-phase plan assumed a `noq-h3-listener` foundation; that was
+overruled (two QUIC stacks, see [Server-side stack](#server-side-stack)), so
+what actually shipped diverges from the phasing below. For the record:
+
+- **Server transport (done).** `aster-transport-salvo` on the Aster Salvo
+  fork (its own quinn stack) serves H1/H2 over TCP + H3 over QUIC + WebTransport
+  from one address. All four canonical patterns are exercised end-to-end by
+  `examples/rust/mission-control/tests/http.rs` and the crate's own
+  `tests/{unary,streaming,auth,projection,tls,webtransport,sessions,static_files,with_http}.rs`.
+- **Browser projection (done).** JSON/NDJSON gateway via the `codecs = ["json"]`
+  macro opt-in + `ProjectionRegistry`; covered by `tests/json.rs`.
+- **Auth / sessions / static / priority / TLS (done).** As tabled in
+  [Implementation status](#implementation-status-as-built).
+- **TypeScript Fetch + WebTransport binding (not yet).** Browsers consume the
+  wire described here directly; a typed TS binding is future work.
+
+The historical phase list (kept for context):
+
+1. ~~Phase 1 — `noq-h3-listener` crate.~~ **Dropped** (two QUIC stacks).
+2. **Phase 2 — `aster-transport-salvo` core handlers.** Done, on the Salvo
+   fork's quinn listener rather than `noq-h3-listener`.
+3. **Phase 3 — TypeScript Fetch binding.** Deferred.
+4. **Phase 4 — TypeScript WebTransport binding.** Server side done; TS client
+   deferred.
+5. **Phase 5 — observability & proxying.** Auth runs through the shared Aster
+   `Authenticator`; behind-proxy validation remains to be exercised in anger.
 
 ## What this does *not* change
 

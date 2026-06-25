@@ -288,7 +288,7 @@ This is the Day-0 zero-server case. No listening port, no firewall change, no TL
 Some operators run Prometheus and want the classic `GET /metrics` exposition endpoint. That requires an HTTP listener in-process, which converges with two existing threads on the roadmap:
 
 1. **HealthServer HTTP migration into core** (rust-core-migration plan, 2026-04-20) — `/healthz`, `/readyz`.
-2. **HTTP/3 transport on Salvo** (`working_ideas/aster-http3-transport.md`) — Salvo is already chosen as the framework, sharing the `noq` QUIC stack with the Iroh transport via `noq-h3-listener`.
+2. **HTTP/3 transport on Salvo** (`aster-http-transport.md`, shipped) — Salvo (Aster fork) on its own quinn stack; the shared-`noq` `NoqListener` was shelved (two QUIC stacks).
 
 The convergence: one Salvo-based **ops-endpoints surface in core**, feature-gated, mounting whichever endpoints the operator opts into.
 
@@ -813,7 +813,7 @@ Backwards compat stance: existing services that only used `MetricsInterceptor()`
 - **Java minimum runtime:** Java 25+ (locked in). Lets the Java binding rely on stable Panama / FFM and stable `ScopedValue` directly, no compatibility shims. Documented as a hard requirement in the binding's POM and CI matrix.
 - **Java FFI mechanism:** Project Panama (already what `IrohLibrary.java` uses). JNI / JNA explicitly out — perf and virtual-thread compatibility both benefit.
 - **Virtual-thread compatibility:** validated in §"Java performance and virtual threads" — `ScopedValue` for context, `Linker.Option.critical(true)` on hot-path FFI, `Tracing.withSpanAsync` for `CompletionStage` chains.
-- **Prometheus scrape / health endpoints:** feature-gated `aster-ops-endpoints` crate built on Salvo. Shared with the HealthServer-migration plan (`project_rust_core_migration`) and the HTTP/3 transport's Salvo `Server` (`working_ideas/aster-http3-transport.md`) when configured. OTLP push remains the Day-0 default with no in-process HTTP listener.
+- **Prometheus scrape / health endpoints:** feature-gated `aster-ops-endpoints` crate built on Salvo. Shared with the HealthServer-migration plan (`project_rust_core_migration`) and the HTTP/3 transport's Salvo `Server` (`aster-http-transport.md`) when configured. OTLP push remains the Day-0 default with no in-process HTTP listener.
 - **Logs:** explicit non-goal to ship a logs pipeline. Aster exposes four primitives + per-framework wrappers; the application's logger framework owns log emission, the node agent owns transport. Optional `aster-otel-logs` feature for OTLP consolidation when the operator wants it. Caveat documented: baggage values land in log lines, so do not put secrets in baggage.
 
 ---
