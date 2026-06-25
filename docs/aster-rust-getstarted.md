@@ -268,6 +268,13 @@ Field-type mapping: `String`→string, `bool`, `i8/i16/i32/i64`, `u16/u32/u64`,
 `f32/f64`, `Vec<u8>`→binary, `Vec<T>`/`HashSet<T>`→list/set, `HashMap<K,V>`→map,
 `Option<T>`→nullable, and a nested `AsterType` struct → a typed reference.
 
+Nested payload types — a struct field of another payload type, `Vec<Segment>`,
+`Option<Foo>`, `HashMap<String, Bar>`, and so on at any depth — are registered
+automatically: the macro names each method's top-level request/response type and
+the derive walks every field's element/value/key type into the Fory runtime.
+Every nested type just needs to derive `#[derive(ForyStruct, aster::AsterType)]`
+like any other payload (it must anyway to serialize).
+
 You can lower a scalar default into the contract with
 `#[aster(default = <expr>)]` (supported for `String` / `bool` / `i32` / `i64` /
 `f64`); a changed default changes the `contract_id`. See the cross-binding

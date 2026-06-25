@@ -14,18 +14,19 @@ use aster::rpc::{
     MethodPattern, ScopeKind, ServiceContract, TypeDef,
 };
 use aster::{AsterConfig, Node, RelayMode};
+use fory_derive::ForyStruct;
 use tokio::time::timeout;
 
 const GOLDEN_CID: &str = "12d2f2990f4dd71dfd59f5db470d186f1fcc7dbafdac0ea7fdf838ab263c0578";
 
-#[derive(AsterType)]
+#[derive(ForyStruct, AsterType)]
 #[aster(wire = "echo/EchoRequest")]
 struct EchoRequest {
     #[allow(dead_code)]
     message: String,
 }
 
-#[derive(AsterType)]
+#[derive(ForyStruct, AsterType)]
 #[aster(wire = "echo/EchoResponse")]
 struct EchoResponse {
     #[allow(dead_code)]
