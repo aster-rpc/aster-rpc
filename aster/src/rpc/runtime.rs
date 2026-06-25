@@ -59,6 +59,9 @@ pub struct AsterServerBuilder {
     attributes: Option<AttributeStore>,
     authenticator: Option<Arc<dyn Authenticator>>,
     http: Option<Box<dyn HttpTransport>>,
+    // Deferred `Server::register_session` calls (each captures a factory).
+    #[allow(clippy::type_complexity)]
+    session_appliers: Vec<Box<dyn FnOnce(Server) -> Server + Send>>,
     extra_alpns: Vec<Vec<u8>>,
 }
 
@@ -126,6 +129,18 @@ impl AsterServerBuilder {
     /// [`Server::authenticator`](super::server::Server::authenticator).
     pub fn authenticator(mut self, auth: impl Authenticator) -> Self {
         self.authenticator = Some(Arc::new(auth));
+        self
+    }
+
+    /// Register a **session-scoped** service: `factory` builds a fresh instance
+    /// per session id. See [`Server::register_session`](super::server::Server::register_session).
+    pub fn register_session<S, F>(mut self, factory: F) -> Self
+    where
+        S: ServiceDispatch,
+        F: Fn() -> S + Send + Sync + 'static,
+    {
+        self.session_appliers
+            .push(Box::new(move |s| s.register_session(factory)));
         self
     }
 
@@ -200,6 +215,9 @@ impl AsterServerBuilder {
         }
         for svc in self.services {
             server = server.register_arc(svc);
+        }
+        for apply in self.session_appliers {
+            server = apply(server);
         }
         // Grab the shareable dispatcher before `serve()` consumes the server, so
         // an HTTP transport can drive the same services.

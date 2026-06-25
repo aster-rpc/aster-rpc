@@ -21,11 +21,13 @@
 //! `Accept` (response) → unsatisfiable = `406`. Responses set
 //! `Vary: Accept, Accept-Encoding`.
 //!
-//! Not yet: TLS modes, sessions, static files, stream priority, generated
-//! projection adapters (today a projection is hand-written or via the macro
-//! once it lands), true incremental request streaming, HTTP compression rules.
-//! Auth is via [`Server::authenticator`](aster::rpc::Server::authenticator);
-//! the transport copies HTTP headers into Aster metadata.
+//! Supported: HTTPS (H1/H2/H3) + WebTransport, TLS (PEM/ACME/self-signed +
+//! WebTransport `serverCertificateHashes`), per-call stream priority (WT),
+//! session-scoped services (`aster-session-id`), filesystem static files, and
+//! pluggable auth via [`Server::authenticator`](aster::rpc::Server::authenticator)
+//! (the transport copies HTTP headers into Aster metadata). Not yet: true
+//! incremental request streaming (request bodies are buffered), HTTP
+//! compression rules.
 //!
 //! Aster owns `/aster/*`; nest [`router`] into your own Salvo app.
 

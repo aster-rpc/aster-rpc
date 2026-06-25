@@ -85,10 +85,18 @@ pub trait ServiceDispatch: Send + Sync + 'static {
 
 type Registry = HashMap<(String, i32), Arc<dyn ServiceDispatch>>;
 
+/// Builds a fresh per-session instance of a session-scoped service.
+type SessionFactory = Arc<dyn Fn() -> Arc<dyn ServiceDispatch> + Send + Sync>;
+
+type SessionFactories = HashMap<(String, i32), SessionFactory>;
+/// Per-session instances, keyed by `(service, version, session-id)`.
+type SessionTable = std::sync::RwLock<HashMap<(String, i32, String), Arc<dyn ServiceDispatch>>>;
+
 /// An RPC server bound to a node. Register services, then [`serve`](Server::serve).
 pub struct Server {
     core: CoreNode,
     services: Registry,
+    session_factories: SessionFactories,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
 }
@@ -100,6 +108,7 @@ impl Server {
         Self {
             core: node.core(),
             services: HashMap::new(),
+            session_factories: HashMap::new(),
             attributes: AttributeStore::new(),
             authenticator: None,
         }
@@ -136,6 +145,30 @@ impl Server {
         self
     }
 
+    /// Register a **session-scoped** service: `factory` builds a fresh instance
+    /// per session, keyed by the caller's session id (the `aster-session-id`
+    /// header, or `StreamHeader.session_id`). State on the instance is private to
+    /// that session — the analogue of Python's `scoped="session"` services. A
+    /// call with no session id is rejected with `INVALID_ARGUMENT`.
+    ///
+    /// (Reaping today: instances are dropped when [`end_session`] is called or,
+    /// on Iroh, when the owning connection closes; an idle TTL is a follow-up.)
+    ///
+    /// [`end_session`]: Dispatcher::end_session
+    pub fn register_session<S, F>(mut self, factory: F) -> Self
+    where
+        S: ServiceDispatch,
+        F: Fn() -> S + Send + Sync + 'static,
+    {
+        let factory: SessionFactory =
+            Arc::new(move || Arc::new(factory()) as Arc<dyn ServiceDispatch>);
+        // One throwaway instance just to read the (constant) name + version key.
+        let probe = factory();
+        self.session_factories
+            .insert((probe.name().to_string(), probe.version()), factory);
+        self
+    }
+
     /// Use a shared [`AttributeStore`] for Gate-3 capability checks. Keep a clone
     /// of the same store and populate it from your admission logic (e.g. after
     /// verifying a peer's attestation chain) so per-call `requires` checks see
@@ -160,6 +193,8 @@ impl Server {
     pub fn dispatcher(&self) -> Dispatcher {
         Dispatcher {
             services: Arc::new(self.services.clone()),
+            session_factories: Arc::new(self.session_factories.clone()),
+            sessions: Arc::new(SessionTable::default()),
             attributes: self.attributes.clone(),
             authenticator: self.authenticator.clone(),
         }
@@ -198,6 +233,9 @@ impl Server {
 #[derive(Clone)]
 pub struct Dispatcher {
     services: Arc<Registry>,
+    session_factories: Arc<SessionFactories>,
+    /// Live per-session instances, shared across clones of this dispatcher.
+    sessions: Arc<SessionTable>,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
 }
@@ -220,6 +258,8 @@ impl Dispatcher {
     pub async fn dispatch_parts(&self, parts: CallParts) {
         handle_call(
             self.services.clone(),
+            self.session_factories.clone(),
+            self.sessions.clone(),
             self.attributes.clone(),
             self.authenticator.clone(),
             parts,
@@ -232,6 +272,15 @@ impl Dispatcher {
     /// id) before dispatching, so the capability gate sees them.
     pub fn attributes(&self) -> &AttributeStore {
         &self.attributes
+    }
+
+    /// Drop all session-scoped instances for `session_id` (e.g. on session
+    /// close). Subsequent calls with that id create fresh instances.
+    pub fn end_session(&self, session_id: &str) {
+        self.sessions
+            .write()
+            .unwrap()
+            .retain(|(_, _, sid), _| sid != session_id);
     }
 }
 
@@ -301,8 +350,11 @@ impl ServerHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_call(
     services: Arc<Registry>,
+    session_factories: Arc<SessionFactories>,
+    sessions: Arc<SessionTable>,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
     mut call: CallParts,
@@ -332,16 +384,32 @@ async fn handle_call(
         return;
     }
 
-    let svc = match services.get(&(header.service.clone(), header.version)) {
-        Some(s) => s.clone(),
-        None => {
+    let key = (header.service.clone(), header.version);
+    let svc = if let Some(s) = services.get(&key) {
+        // SHARED service: one instance for everyone.
+        s.clone()
+    } else if let Some(factory) = session_factories.get(&key) {
+        // SESSION-scoped service: an instance per session id.
+        let sid = session_key(&header);
+        if sid.is_empty() {
             emit_trailer(
                 &call.response_sender,
-                StatusCode::NotFound,
-                &format!("service '{}' v{} not found", header.service, header.version),
+                StatusCode::InvalidArgument,
+                &format!(
+                    "service '{}' v{} is session-scoped; an aster-session-id is required",
+                    header.service, header.version
+                ),
             );
             return;
         }
+        get_or_create_session(&sessions, &key, &sid, factory)
+    } else {
+        emit_trailer(
+            &call.response_sender,
+            StatusCode::NotFound,
+            &format!("service '{}' v{} not found", header.service, header.version),
+        );
+        return;
     };
 
     let methods = svc.methods();
@@ -444,6 +512,36 @@ fn metadata_map(h: &StreamHeader) -> HashMap<String, String> {
         .cloned()
         .zip(h.metadata_values.iter().cloned())
         .collect()
+}
+
+/// The session id for a call: the `aster-session-id` metadata header (HTTP), or
+/// the numeric `StreamHeader.session_id` (Iroh) when non-zero. Empty = none.
+fn session_key(h: &StreamHeader) -> String {
+    for (k, v) in h.metadata_keys.iter().zip(h.metadata_values.iter()) {
+        if k == "aster-session-id" && !v.is_empty() {
+            return v.clone();
+        }
+    }
+    if h.session_id != 0 {
+        return h.session_id.to_string();
+    }
+    String::new()
+}
+
+/// Get (or lazily create) the per-session instance for `(service, session-id)`.
+fn get_or_create_session(
+    sessions: &SessionTable,
+    key: &(String, i32),
+    sid: &str,
+    factory: &SessionFactory,
+) -> Arc<dyn ServiceDispatch> {
+    let full = (key.0.clone(), key.1, sid.to_string());
+    if let Some(inst) = sessions.read().unwrap().get(&full) {
+        return inst.clone();
+    }
+    let mut guard = sessions.write().unwrap();
+    // Re-check under the write lock (another call may have created it).
+    guard.entry(full).or_insert_with(|| factory()).clone()
 }
 
 /// Per-call server context: request input, response output, and the decoded
