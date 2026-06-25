@@ -189,7 +189,16 @@ impl Dispatcher {
     /// Any transport that can produce an `IncomingCall` (peer id, header +
     /// request payload, a response-frame channel) can drive RPC through this.
     pub async fn dispatch_call(&self, call: IncomingCall) {
-        handle_call(self.services.clone(), self.attributes.clone(), call).await;
+        self.dispatch_parts(CallParts::from_incoming(call)).await;
+    }
+
+    /// Dispatch from connection-agnostic [`CallParts`] — the entry point for a
+    /// non-Iroh transport (e.g. HTTP) that has no `CoreConnection`. Builds the
+    /// parts itself (peer id, header + request payloads, a response-frame
+    /// channel) and calls this. Same gating and handler invocation as
+    /// [`dispatch_call`](Dispatcher::dispatch_call).
+    pub async fn dispatch_parts(&self, parts: CallParts) {
+        handle_call(self.services.clone(), self.attributes.clone(), parts).await;
     }
 
     /// The Gate-3 [`AttributeStore`] this dispatcher checks. A transport's auth
@@ -197,6 +206,43 @@ impl Dispatcher {
     /// id) before dispatching, so the capability gate sees them.
     pub fn attributes(&self) -> &AttributeStore {
         &self.attributes
+    }
+}
+
+/// The connection-agnostic inputs the dispatcher needs for one call. The Iroh
+/// reactor path builds this from an [`IncomingCall`] via
+/// [`from_incoming`](CallParts::from_incoming); other transports (HTTP)
+/// construct it directly — no `CoreConnection` required, because the dispatch
+/// path never touches the connection (only the FFI bindings do).
+///
+/// A transport wires the two channels: it sends request frames into
+/// `request_receiver` (the first inline as `request_payload` / `request_flags`)
+/// and drains `response_sender` to write the response. For a unary call:
+/// `request_payload` is the lone request frame, `request_flags` has
+/// `FLAG_END_STREAM`, and `request_receiver` is an already-closed channel.
+pub struct CallParts {
+    pub peer_id: String,
+    pub header_payload: Vec<u8>,
+    pub request_payload: Vec<u8>,
+    pub request_flags: u8,
+    pub response_sender: UnboundedSender<OutgoingFrame>,
+    pub request_receiver: UnboundedReceiver<RequestFrame>,
+    pub cancelled: Arc<AtomicBool>,
+}
+
+impl CallParts {
+    /// Extract the dispatch-relevant parts from a reactor [`IncomingCall`],
+    /// dropping the `CoreConnection` and the ids the dispatcher doesn't use.
+    pub fn from_incoming(call: IncomingCall) -> Self {
+        Self {
+            peer_id: call.peer_id,
+            header_payload: call.header_payload,
+            request_payload: call.request_payload,
+            request_flags: call.request_flags,
+            response_sender: call.response_sender,
+            request_receiver: call.request_receiver,
+            cancelled: call.cancelled,
+        }
     }
 }
 
@@ -218,7 +264,7 @@ impl ServerHandle {
     }
 }
 
-async fn handle_call(services: Arc<Registry>, attributes: AttributeStore, call: IncomingCall) {
+async fn handle_call(services: Arc<Registry>, attributes: AttributeStore, call: CallParts) {
     // Pre-dispatch gating, mirroring `bindings/python/aster/server.py`:
     // missing service → INVALID_ARGUMENT, unknown (service, version) → NOT_FOUND,
     // unknown method → UNIMPLEMENTED, unsupported serialization mode →
@@ -340,8 +386,8 @@ pub struct Call {
 }
 
 impl Call {
-    fn new(inner: IncomingCall, header: StreamHeader, attributes: HashMap<String, String>) -> Self {
-        let IncomingCall {
+    fn new(inner: CallParts, header: StreamHeader, attributes: HashMap<String, String>) -> Self {
+        let CallParts {
             peer_id,
             cancelled,
             response_sender,
