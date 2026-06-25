@@ -14,6 +14,8 @@ salvo = { version = "0.93", features = ["quinn", "rustls", "acme"] }
 # TLS: self-signed cert generation + the WebTransport serverCertificateHashes hash.
 rcgen = "0.13"
 sha2 = "0.10"
+# Cert validity window (WebTransport serverCertificateHashes requires <= 14 days).
+time = { version = "0.3", default-features = false, features = ["std"] }
 # Direct quinn pin to unify with the transitive 0.11.x (h3-quinn -> salvo-http3)
 # so the quinn::Connection the fork stashes in request.extensions() resolves by
 # TypeId. Used for WT stats / stream control in a later increment.

@@ -13,13 +13,16 @@
 
 use aster::rpc::{AsterServer, ProjectionRegistry};
 use aster::{Error, RelayMode};
-use aster_transport_salvo::{generate_self_signed, HttpConfig, TlsMaterial};
+use aster_transport_salvo::{generate_webtransport_cert, HttpConfig, TlsMaterial};
 use mission_control::{MissionControlImpl, MissionControlProjection, MissionControlServer};
 
 #[tokio::main]
 async fn main() -> aster::Result<()> {
-    // Generate the dev cert once so the printed hash matches the served cert.
-    let cert = generate_self_signed(&["localhost".into()]).map_err(Error::Connection)?;
+    // Generate a WebTransport-valid dev cert (ECDSA, <=14 days) once so the
+    // printed hash matches the served cert and browsers accept it via
+    // serverCertificateHashes.
+    let cert = generate_webtransport_cert("mission-control", &["localhost".into()])
+        .map_err(Error::Connection)?;
     let cert_hash: String = cert.sha256.iter().map(|b| format!("{b:02x}")).collect();
 
     let projections = ProjectionRegistry::new().register(MissionControlProjection::new());
