@@ -199,6 +199,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-expose"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aster_transport_core",
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "salvo 0.93.0",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "aster-macros"
 version = "0.2.0"
 dependencies = [
@@ -235,7 +253,7 @@ dependencies = [
  "rcgen 0.13.2",
  "reqwest 0.12.28",
  "rustls",
- "salvo",
+ "salvo 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e)",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1999,7 +2017,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/aster-rpc/salvo?rev=cdfdc90f604aa83ee13fba0b55e849d9fbc34915#cdfdc90f604aa83ee13fba0b55e849d9fbc34915"
+source = "git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e#61a572eac5a85129231265e3bc4f04c5457b828e"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2023,7 +2041,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/aster-rpc/salvo?rev=cdfdc90f604aa83ee13fba0b55e849d9fbc34915#cdfdc90f604aa83ee13fba0b55e849d9fbc34915"
+source = "git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e#61a572eac5a85129231265e3bc4f04c5457b828e"
 dependencies = [
  "bytes",
  "futures",
@@ -3264,7 +3282,7 @@ dependencies = [
  "aster_transport_core",
  "fory-core",
  "fory-derive",
- "salvo",
+ "salvo 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e)",
  "serde",
  "serde_json",
  "tokio",
@@ -5113,23 +5131,45 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "salvo"
 version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=cdfdc90f604aa83ee13fba0b55e849d9fbc34915#cdfdc90f604aa83ee13fba0b55e849d9fbc34915"
 dependencies = [
- "salvo-acme",
- "salvo-proxy",
+ "salvo-acme 0.93.0",
+ "salvo-proxy 0.93.0",
+ "salvo_core 0.93.0",
+]
+
+[[package]]
+name = "salvo"
+version = "0.93.0"
+source = "git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e#61a572eac5a85129231265e3bc4f04c5457b828e"
+dependencies = [
+ "salvo-acme 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e)",
+ "salvo-proxy 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e)",
  "salvo-serve-static",
- "salvo_core",
+ "salvo_core 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e)",
 ]
 
 [[package]]
 name = "salvo-acme"
 version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=cdfdc90f604aa83ee13fba0b55e849d9fbc34915#cdfdc90f604aa83ee13fba0b55e849d9fbc34915"
 dependencies = [
  "certon",
  "futures-util",
  "quinn",
- "salvo_core",
+ "salvo_core 0.93.0",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
+name = "salvo-acme"
+version = "0.93.0"
+source = "git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e#61a572eac5a85129231265e3bc4f04c5457b828e"
+dependencies = [
+ "certon",
+ "futures-util",
+ "quinn",
+ "salvo_core 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e)",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -5138,7 +5178,7 @@ dependencies = [
 [[package]]
 name = "salvo-http3"
 version = "0.7.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=cdfdc90f604aa83ee13fba0b55e849d9fbc34915#cdfdc90f604aa83ee13fba0b55e849d9fbc34915"
+source = "git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e#61a572eac5a85129231265e3bc4f04c5457b828e"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5154,7 +5194,6 @@ dependencies = [
 [[package]]
 name = "salvo-proxy"
 version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=cdfdc90f604aa83ee13fba0b55e849d9fbc34915#cdfdc90f604aa83ee13fba0b55e849d9fbc34915"
 dependencies = [
  "fastrand",
  "futures-util",
@@ -5163,7 +5202,24 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "reqwest 0.13.3",
- "salvo_core",
+ "salvo_core 0.93.0",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "salvo-proxy"
+version = "0.93.0"
+source = "git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e#61a572eac5a85129231265e3bc4f04c5457b828e"
+dependencies = [
+ "fastrand",
+ "futures-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "percent-encoding",
+ "reqwest 0.13.3",
+ "salvo_core 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e)",
  "tokio",
  "tracing",
 ]
@@ -5171,7 +5227,16 @@ dependencies = [
 [[package]]
 name = "salvo-serde-util"
 version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=cdfdc90f604aa83ee13fba0b55e849d9fbc34915#cdfdc90f604aa83ee13fba0b55e849d9fbc34915"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "salvo-serde-util"
+version = "0.93.0"
+source = "git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e#61a572eac5a85129231265e3bc4f04c5457b828e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5181,7 +5246,7 @@ dependencies = [
 [[package]]
 name = "salvo-serve-static"
 version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=cdfdc90f604aa83ee13fba0b55e849d9fbc34915#cdfdc90f604aa83ee13fba0b55e849d9fbc34915"
+source = "git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e#61a572eac5a85129231265e3bc4f04c5457b828e"
 dependencies = [
  "hex",
  "mime",
@@ -5189,7 +5254,7 @@ dependencies = [
  "path-slash",
  "percent-encoding",
  "rust-embed",
- "salvo_core",
+ "salvo_core 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e)",
  "serde",
  "serde_json",
  "time",
@@ -5200,7 +5265,6 @@ dependencies = [
 [[package]]
 name = "salvo_core"
 version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=cdfdc90f604aa83ee13fba0b55e849d9fbc34915#cdfdc90f604aa83ee13fba0b55e849d9fbc34915"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -5234,7 +5298,60 @@ dependencies = [
  "rand 0.10.1",
  "regex",
  "salvo-http3",
- "salvo_macros",
+ "salvo_macros 0.93.0",
+ "serde",
+ "serde-xml-rs",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "url",
+ "zstd",
+]
+
+[[package]]
+name = "salvo_core"
+version = "0.93.0"
+source = "git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e#61a572eac5a85129231265e3bc4f04c5457b828e"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "base64",
+ "brotli",
+ "bytes",
+ "chardetng",
+ "content_inspector",
+ "cookie",
+ "encoding_rs",
+ "enumflags2",
+ "flate2",
+ "form_urlencoded",
+ "futures-channel",
+ "futures-util",
+ "h3-datagram",
+ "headers",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "indexmap",
+ "mime",
+ "mime-infer",
+ "multimap",
+ "multra",
+ "parking_lot",
+ "percent-encoding",
+ "pin-project",
+ "quinn",
+ "rand 0.10.1",
+ "regex",
+ "salvo-http3",
+ "salvo_macros 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e)",
  "serde",
  "serde-xml-rs",
  "serde_json",
@@ -5253,13 +5370,23 @@ dependencies = [
 [[package]]
 name = "salvo_macros"
 version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=cdfdc90f604aa83ee13fba0b55e849d9fbc34915#cdfdc90f604aa83ee13fba0b55e849d9fbc34915"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
  "quote",
- "regex",
- "salvo-serde-util",
+ "salvo-serde-util 0.93.0",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "salvo_macros"
+version = "0.93.0"
+source = "git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e#61a572eac5a85129231265e3bc4f04c5457b828e"
+dependencies = [
+ "proc-macro-crate 3.5.0",
+ "proc-macro2",
+ "quote",
+ "salvo-serde-util 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=61a572eac5a85129231265e3bc4f04c5457b828e)",
  "syn 2.0.117",
 ]
 

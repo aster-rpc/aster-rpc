@@ -3,6 +3,8 @@
 //! end (the in-process TestClient can't exercise the transport). Also unit-tests
 //! self-signed cert generation.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aster::rpc::codec::decode_rpc_status;
@@ -112,4 +114,57 @@ async fn https_self_signed_roundtrip() {
     assert_eq!(decode_rpc_status(&trailer).unwrap().code, 0);
 
     node.shutdown().await;
+}
+
+/// `serve_https_with` threads the tuner down to the H3 `QuinnListener`, which
+/// runs it (against the real re-exported `TransportConfig`) when it binds.
+#[tokio::test]
+async fn serve_https_with_invokes_transport_tuner() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let cfg = AsterConfig::builder()
+        .relay(RelayMode::Disabled)
+        .bind_addr("127.0.0.1:0")
+        .build();
+    let node = Node::start(cfg).await.unwrap();
+    let dispatcher = Server::new(&node).register(Echo).dispatcher();
+    let service = Service::new(aster_transport_salvo::router(dispatcher));
+
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+
+    let tuned = Arc::new(AtomicBool::new(false));
+    let tuned_in = tuned.clone();
+    let server = tokio::spawn(async move {
+        let _ = aster_transport_salvo::serve_https_with(
+            &format!("127.0.0.1:{port}"),
+            TlsMaterial::self_signed(["localhost".into()]),
+            service,
+            move |t: &mut aster_transport_salvo::TransportConfig| {
+                // Names the re-exported type and mutates it like Portal will.
+                t.send_window(256 * 1024);
+                tuned_in.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+    });
+
+    // The tuner fires when the QuinnListener builds its initial config (at bind),
+    // before the serve loop — poll the flag while the spawned server comes up.
+    let mut invoked = false;
+    for _ in 0..40 {
+        if tuned.load(Ordering::SeqCst) {
+            invoked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    server.abort();
+    node.shutdown().await;
+    assert!(
+        invoked,
+        "serve_https_with did not invoke the transport tuner"
+    );
 }

@@ -11,10 +11,17 @@
 
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
 use salvo::conn::rustls::{Keycert, RustlsConfig};
 use salvo::conn::{QuinnListener, TcpListener};
 use salvo::prelude::*;
 use sha2::{Digest, Sha256};
+
+/// The `quinn::TransportConfig` the H3/WebTransport listener applies, re-exported
+/// so consumers name the *same* type the listener uses (the graph-unification
+/// concern as `h3-quinn`). Pass a tuner over it to [`serve_https_with`].
+pub use salvo::proto::quinn::TransportConfig;
 
 /// Where the server's TLS certificate comes from. Data only — no closures — so
 /// it crosses the FFI boundary.
@@ -148,6 +155,46 @@ pub fn rustls_config(tls: &TlsMaterial) -> Result<RustlsConfig, String> {
 /// ).await?;
 /// ```
 pub async fn serve_https(addr: &str, tls: TlsMaterial, service: Service) -> Result<(), String> {
+    serve_https_inner(addr, tls, service, None).await
+}
+
+/// Like [`serve_https`] but tunes the `quinn::TransportConfig` applied to every
+/// H3/WebTransport connection. The closure runs *after* salvo's default 5s
+/// keep-alive / 30s idle config, so those are preserved and you only override
+/// scheduling knobs (pacing, send/stream windows, congestion control) — for
+/// real-time media that wants frames emitted promptly rather than paced.
+///
+/// ```ignore
+/// aster_transport_salvo::serve_https_with(
+///     "[::]:443",
+///     TlsMaterial::self_signed(["localhost".into()]),
+///     Service::new(app),
+///     |t: &mut aster_transport_salvo::TransportConfig| {
+///         t.send_window(256 * 1024);
+///     },
+/// ).await?;
+/// ```
+///
+/// Only affects the QUIC path (PEM / self-signed). The ACME path is H1/H2-only,
+/// so the tuner is ignored there.
+pub async fn serve_https_with(
+    addr: &str,
+    tls: TlsMaterial,
+    service: Service,
+    tuner: impl Fn(&mut TransportConfig) + Send + Sync + 'static,
+) -> Result<(), String> {
+    let tuner: TransportTuner = Arc::new(tuner);
+    serve_https_inner(addr, tls, service, Some(tuner)).await
+}
+
+type TransportTuner = Arc<dyn Fn(&mut TransportConfig) + Send + Sync>;
+
+async fn serve_https_inner(
+    addr: &str,
+    tls: TlsMaterial,
+    service: Service,
+    tuner: Option<TransportTuner>,
+) -> Result<(), String> {
     match tls {
         TlsMaterial::Acme {
             domains,
@@ -173,10 +220,11 @@ pub async fn serve_https(addr: &str, tls: TlsMaterial, service: Service) -> Resu
             // H1/H2 over TCP + H3 over QUIC on the same address.
             let tcp = TcpListener::new(addr.to_string()).rustls(config.clone());
             let quinn_config = config.build_quinn_config().map_err(|e| e.to_string())?;
-            let acceptor = QuinnListener::new(quinn_config, addr.to_string())
-                .join(tcp)
-                .bind()
-                .await;
+            let mut quinn = QuinnListener::new(quinn_config, addr.to_string());
+            if let Some(tuner) = tuner {
+                quinn = quinn.transport_config_tuner(move |t| tuner(t));
+            }
+            let acceptor = quinn.join(tcp).bind().await;
             Server::new(acceptor).serve(service).await;
             Ok(())
         }
