@@ -2498,6 +2498,21 @@ impl CoreSendStream {
         let s = &mut *self.inner.lock().await;
         Ok(s.stopped().await?.map(|v| v.into_inner()))
     }
+
+    /// Set this stream's send priority. Quinn/iroh semantics: a higher value is
+    /// scheduled first when several send streams on the same connection compete
+    /// for the wire; default is `0`. Errors only if the stream is already closed.
+    pub async fn set_priority(&self, priority: i32) -> Result<()> {
+        let s = self.inner.lock().await;
+        s.set_priority(priority)?;
+        Ok(())
+    }
+
+    /// This stream's current send priority.
+    pub async fn priority(&self) -> Result<i32> {
+        let s = self.inner.lock().await;
+        Ok(s.priority()?)
+    }
 }
 
 // ============================================================================
