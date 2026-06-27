@@ -41,6 +41,37 @@ async fn persistent_node_identity_is_restart_stable() {
     );
 }
 
+/// `SecretKey::generate()` yields a random, round-trippable identity that a node
+/// honors when pinned — the keypair-creation path the get-started doc shows.
+#[tokio::test]
+async fn generated_secret_key_pins_node_identity() {
+    let a = SecretKey::generate();
+    let b = SecretKey::generate();
+    assert_ne!(a.to_bytes(), b.to_bytes(), "generate() must be random");
+    assert_eq!(
+        SecretKey::from_bytes(a.to_bytes()).to_bytes(),
+        a.to_bytes(),
+        "round-trips through from_bytes/to_bytes"
+    );
+
+    let node = Node::start(
+        AsterConfig::builder()
+            .relay(RelayMode::Disabled)
+            .secret_key(SecretKey::from_bytes(a.to_bytes()))
+            .build(),
+    )
+    .await
+    .unwrap();
+    // The node accepted the generated key as its identity, and the offline
+    // public-key helper derives the matching identity.
+    assert_eq!(node.export_secret_key().unwrap().to_bytes(), a.to_bytes());
+    assert_eq!(
+        node.id().to_string(),
+        aster::attestation::public_key(&a).to_hex()
+    );
+    node.shutdown().await;
+}
+
 /// The default docs author IS the node identity (`AuthorId == NodeId`): a doc
 /// entry's author is exactly the node that wrote it, so attribution is direct.
 #[tokio::test]
