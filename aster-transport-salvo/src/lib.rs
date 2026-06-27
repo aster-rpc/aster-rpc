@@ -54,7 +54,7 @@ pub mod tls;
 pub mod webtransport;
 pub use tls::{
     generate_self_signed, generate_webtransport_cert, rustls_config, serve_https, serve_https_with,
-    GeneratedCert, TlsMaterial, TransportConfig,
+    verify_cert_binding, GeneratedCert, NodeBinding, TlsMaterial, TransportConfig,
 };
 pub use webtransport::wt_router;
 

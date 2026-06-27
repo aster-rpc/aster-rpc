@@ -52,8 +52,15 @@ async fn webtransport_server_certificate_hashes() {
     let dispatcher = Server::new(&node).register(Echo).dispatcher();
     let service = Service::new(wt_router(dispatcher));
 
-    // Node-bound WT cert; the client will pin its hash.
-    let cert = generate_webtransport_cert(&node.id().to_string(), &["localhost".into()]).unwrap();
+    // Node-bound WT cert; the client will pin its hash. Pass the node id as both
+    // the CN subject and the `aster://` URI SAN binding.
+    let node_id = node.id().to_string();
+    let cert = generate_webtransport_cert(
+        &node_id,
+        Some(aster_transport_salvo::NodeBinding::Claim(&node_id)),
+        &["localhost".into()],
+    )
+    .unwrap();
     let cert_hash = cert.sha256;
     let tls = TlsMaterial::pem(cert.cert_pem, cert.key_pem);
 

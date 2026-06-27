@@ -21,7 +21,7 @@ async fn main() -> aster::Result<()> {
     // Generate a WebTransport-valid dev cert (ECDSA, <=14 days) once so the
     // printed hash matches the served cert and browsers accept it via
     // serverCertificateHashes.
-    let cert = generate_webtransport_cert("mission-control", &["localhost".into()])
+    let cert = generate_webtransport_cert("mission-control", None, &["localhost".into()])
         .map_err(Error::Connection)?;
     let cert_hash: String = cert.sha256.iter().map(|b| format!("{b:02x}")).collect();
 

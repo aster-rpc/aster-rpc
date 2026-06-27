@@ -67,7 +67,9 @@ use aster_transport_salvo::{generate_webtransport_cert, HttpConfig, TlsMaterial}
 
 # async fn run<S: aster::rpc::ServiceDispatch>(svc: S) -> aster::Result<()> {
 // A dev TLS cert (ECDSA, <=14 days — valid for WebTransport serverCertificateHashes).
-let cert = generate_webtransport_cert("my-node", &["localhost".into()])
+// `None` = no identity binding; pass `Some(NodeBinding::Signed(&secret))` to bind
+// it to your node key so peers can verify it (see §6).
+let cert = generate_webtransport_cert("my-node", None, &["localhost".into()])
     .map_err(aster::Error::Connection)?;
 
 let http = HttpConfig::new("[::]:443", TlsMaterial::pem(cert.cert_pem, cert.key_pem))
@@ -129,7 +131,15 @@ TlsMaterial::Acme {
 
 // 3. Generated self-signed (dev + pinned mesh).
 TlsMaterial::self_signed(["localhost".into()]);
+// 3b. ...bound to your Aster identity (stamps an aster://<node_id> SAN — see §6).
+TlsMaterial::self_signed_for_node(node.id().to_string(), ["localhost".into()]);
 ```
+
+> **ACME can't carry Aster identity.** A public CA issues only the SANs you prove
+> control of and ignores custom fields — you cannot put a node key in a
+> Let's-Encrypt cert. Bind identity only on the self-signed / WebTransport certs
+> we mint ourselves (§6); for ACME, carry the node id in a domain you control
+> (`<id>.nodes.example.com`) or publish a node-signed assertion out of band.
 
 `serve_https` serves **H1/H2 over TCP + H3 over QUIC** on one address for PEM /
 self-signed (ACME is H1/H2 today). For PEM/self-signed you can also build a
@@ -245,7 +255,7 @@ pinning the cert's SHA-256 — perfect for mesh/dev. `generate_webtransport_cert
 produces a WT-valid cert (ECDSA, ≤14 days, CN bound to your node id) and its hash:
 
 ```rust
-let cert = generate_webtransport_cert(&node.id().to_string(), &["localhost".into()])?;
+let cert = generate_webtransport_cert(&node.id().to_string(), None, &["localhost".into()])?;
 // serve with TlsMaterial::pem(cert.cert_pem, cert.key_pem)
 // publish cert.sha256 however you share connection info (config, an endpoint, …)
 ```
@@ -258,6 +268,49 @@ new WebTransport("https://host/aster/wt", {
 
 No Aster ticket change is needed — the hash travels however you already
 distribute the address.
+
+### Binding the cert to your Aster identity
+
+The cert's keypair is a fresh ECDSA key — **not** your Ed25519 node key (they
+can't be: WebTransport requires ECDSA). So a cert is only as trustworthy as how
+its hash reached the client. Two binding strengths:
+
+**Claim (an identifier, not a proof).** `NodeBinding::Claim(node_id)` stamps an
+`aster://<node_id>` URI SAN. Convenient for routing/identification, but
+**unauthenticated** — a MITM can mint a cert with the same SAN. A claim is only
+meaningful if you *also* pin the cert hash, delivered over a trusted channel
+(e.g. the Ed25519-authenticated Aster connection — dialing a `NodeId` is itself
+MITM-resistant, so a hash you receive over it is trustworthy).
+
+**Signed (a verifiable proof).** `NodeBinding::Signed(&node_secret)` has your
+node key sign the cert's public key and embeds the signature as an `aster-sig`
+SAN. The cert becomes **self-attesting** — a verifier proves it without any
+pinned hash or TOFU window:
+
+```rust
+use aster_transport_salvo::{generate_webtransport_cert, verify_cert_binding, NodeBinding};
+
+// Server: bind the cert to the node identity (node_secret is the 32-byte key).
+let cert = generate_webtransport_cert(
+    &node.id().to_string(),
+    Some(NodeBinding::Signed(&node_secret)),
+    &["localhost".into()],
+)?;
+
+// Client/relay: after learning the peer's node id over a trusted Aster channel,
+// verify the served cert really belongs to it — a substituted (MITM) cert fails.
+verify_cert_binding(&served_cert_pem, &expected_node_id)?; // Ok ⇒ node key signed this exact cert
+```
+
+`verify_cert_binding` requires the node id you expect (from the ticket /
+authenticated connection) — verifying against the id the cert merely *claims*
+would accept an attacker's self-consistent cert. With it, an attacker can't serve
+a substitute cert: they can't produce your Ed25519 signature over their TLS key.
+Browsers don't check this extension (they ignore unknown SANs); it's for
+**Aster-side** verifiers (a relay, a native peer, the edge proxy).
+
+> ⚠️ ACME certs can't carry this — see the note in §3. Identity binding applies to
+> the self-signed / WebTransport certs only.
 
 ---
 

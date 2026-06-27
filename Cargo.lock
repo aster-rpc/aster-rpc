@@ -187,6 +187,7 @@ dependencies = [
  "crossterm",
  "fory-core",
  "fory-derive",
+ "getrandom 0.2.17",
  "hex",
  "iroh-docs",
  "portable-pty",
@@ -246,9 +247,12 @@ dependencies = [
  "aster",
  "aster_transport_core",
  "bytes",
+ "ed25519-dalek 2.2.0",
  "fory-core",
  "fory-derive",
  "futures-util",
+ "hex",
+ "pem",
  "quinn",
  "rcgen 0.13.2",
  "reqwest 0.12.28",
@@ -261,6 +265,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "wtransport",
+ "x509-parser 0.17.0",
 ]
 
 [[package]]
