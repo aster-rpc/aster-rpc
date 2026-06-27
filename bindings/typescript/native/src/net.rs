@@ -350,6 +350,24 @@ impl IrohSendStream {
     pub async fn finish(&self) -> Result<()> {
         self.inner.clone().finish().await.map_err(to_napi_err)
     }
+
+    /// Set this stream's send priority (higher = scheduled first; default 0).
+    /// Lets a custom-ALPN app keep a control/audio lane ahead of bulk/video on a
+    /// shared connection. Errors only if the stream is already closed.
+    #[napi]
+    pub async fn set_priority(&self, priority: i32) -> Result<()> {
+        self.inner
+            .clone()
+            .set_priority(priority)
+            .await
+            .map_err(to_napi_err)
+    }
+
+    /// This stream's current send priority.
+    #[napi]
+    pub async fn priority(&self) -> Result<i32> {
+        self.inner.clone().priority().await.map_err(to_napi_err)
+    }
 }
 
 // ============================================================================
