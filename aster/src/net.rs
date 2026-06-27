@@ -98,6 +98,22 @@ impl SendStream {
     pub async fn finish(&self) -> Result<()> {
         Ok(self.inner.finish().await?)
     }
+
+    /// Set this stream's send priority (higher = scheduled first; default `0`).
+    ///
+    /// When several send streams share one connection — e.g. a control or audio
+    /// lane alongside bulk/video on your own ALPN — the transport sends
+    /// higher-priority streams' bytes first. This is the native-stream peer of
+    /// the per-call priority the WebTransport transport applies. Errors only if
+    /// the stream is already closed.
+    pub async fn set_priority(&self, priority: i32) -> Result<()> {
+        Ok(self.inner.set_priority(priority).await?)
+    }
+
+    /// This stream's current send priority.
+    pub async fn priority(&self) -> Result<i32> {
+        Ok(self.inner.priority().await?)
+    }
 }
 
 /// The receive half of a bidirectional stream.

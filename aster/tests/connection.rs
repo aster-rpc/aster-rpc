@@ -277,3 +277,50 @@ async fn bootstrap_alpn_admission_gates_normal_alpn() {
     client.shutdown().await;
     server.shutdown().await;
 }
+
+/// Native send streams expose quinn-style send priority, so a custom-ALPN app
+/// that multiplexes its own lanes (control/audio ahead of bulk/video) can keep
+/// the urgent lane first — the native peer of the WebTransport per-call priority.
+#[tokio::test]
+async fn send_stream_priority_round_trips() {
+    let server = Node::start_with_alpns(cfg(false), vec![RPC_ALPN.to_vec()])
+        .await
+        .unwrap();
+    let client = Node::start(cfg(false)).await.unwrap();
+    wait_for_addr(&server).await;
+    wait_for_addr(&client).await;
+    client.add_peer(&server).unwrap();
+    server.add_peer(&client).unwrap();
+
+    let srv = server.clone();
+    tokio::spawn(async move {
+        if let Ok((_alpn, conn)) = srv.accept().await {
+            if let Ok((send, recv)) = conn.accept_bi().await {
+                let echo = recv.read_to_end(1024).await.unwrap_or_default();
+                let _ = send.write_all(echo).await;
+                let _ = send.finish().await;
+            }
+            conn.closed().await;
+        }
+    });
+
+    let conn = client.connect(&server.id(), RPC_ALPN).await.unwrap();
+    let (send, recv) = conn.open_bi().await.unwrap();
+
+    // Default priority is 0; set it and read it back on the live send half.
+    assert_eq!(send.priority().await.unwrap(), 0);
+    send.set_priority(7).await.unwrap();
+    assert_eq!(send.priority().await.unwrap(), 7);
+
+    // Writing still works after the priority change.
+    send.write_all(b"frame".to_vec()).await.unwrap();
+    send.finish().await.unwrap();
+    let echo = timeout(Duration::from_secs(10), recv.read_to_end(1024))
+        .await
+        .expect("echo timed out")
+        .unwrap();
+    assert_eq!(echo, b"frame");
+
+    client.shutdown().await;
+    server.shutdown().await;
+}
