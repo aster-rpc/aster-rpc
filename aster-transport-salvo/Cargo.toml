@@ -14,6 +14,12 @@ salvo = { version = "0.93", features = ["quinn", "rustls", "acme", "serve-static
 # TLS: self-signed cert generation + the WebTransport serverCertificateHashes hash.
 rcgen = "0.13"
 sha2 = "0.10"
+# Ed25519 cert↔identity binding: the node key signs the cert's public key
+# (generate) and a verifier checks it (verify_cert_binding). x509-parser reads
+# the SPKI + SANs back out of the DER.
+ed25519-dalek = "2"
+x509-parser = "0.17"
+hex = "0.4"
 # Cert validity window (WebTransport serverCertificateHashes requires <= 14 days).
 time = { version = "0.3", default-features = false, features = ["std"] }
 # Direct quinn pin to unify with the transitive 0.11.x (h3-quinn -> salvo-http3)
@@ -43,3 +49,5 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rustls = "0.23"
 # Real WebTransport client for the H3/WT handshake test (same crate portal uses).
 wtransport = { version = "0.6", features = ["quinn", "dangerous-configuration"] }
+# Decode PEM to DER in cert tests (x509-parser is a normal dep above).
+pem = "3"

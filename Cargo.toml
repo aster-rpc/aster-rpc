@@ -54,18 +54,24 @@ noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "ddb8829
 # Aster Salvo fork (HTTP transport — see docs/_internal/working_ideas/aster-http3-transport.md)
 # ──────────────────────────────────────────────────────────────────────────
 # Pinned to the SAME rev portal-agent uses so the product family builds one
-# identical Salvo. cdfdc90f = "Merge WebTransport stream control support"
-# (SendStream::set_priority / reset_with_error_code / abort). The fork's main
-# has since drifted (upstream merge), so pin the rev, not the branch.
+# identical Salvo — bump portal + any other consumer to match. 61a572ea = tag
+# `aster-salvo-2026-06-27`: upstream merge (through #1621) carrying our active
+# patches (default keepalive, WT stream control, `Request::web_transport_owned()`,
+# `QuinnListener::transport_config_tuner()`). In this absorption the raw-quinn
+# patch GRADUATED upstream (PR #1528 — `Request::quinn_connection()`), so it was
+# dropped, not re-applied; no Aster consumer used it. The fork keeps each
+# remaining Aster patch on its own branch and re-cherry-picks onto main after
+# each upstream merge — pin the rev/tag, not the branch. Maintenance workflow:
+# ~/dev/aster/salvo_fork.md.
 # Propagation gotcha: the fork patches h3 / h3-quinn / salvo-http3 internally,
 # but [patch.crates-io] does NOT cross workspaces — re-declare them here.
 # Follow-up: cut a versioned tag (v0.93.0-aster.1) and move all consumers off
 # the raw rev.
-salvo        = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-salvo_core   = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-salvo_macros = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo        = { git = "https://github.com/aster-rpc/salvo", rev = "61a572eac5a85129231265e3bc4f04c5457b828e" }
+salvo_core   = { git = "https://github.com/aster-rpc/salvo", rev = "61a572eac5a85129231265e3bc4f04c5457b828e" }
+salvo_macros = { git = "https://github.com/aster-rpc/salvo", rev = "61a572eac5a85129231265e3bc4f04c5457b828e" }
 # (salvo_extra is patched by portal-agent but not yet pulled here — re-add the
 #  line when a feature brings it into the graph, else cargo warns "patch unused".)
-salvo-http3  = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-h3           = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-h3-quinn     = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo-http3  = { git = "https://github.com/aster-rpc/salvo", rev = "61a572eac5a85129231265e3bc4f04c5457b828e" }
+h3           = { git = "https://github.com/aster-rpc/salvo", rev = "61a572eac5a85129231265e3bc4f04c5457b828e" }
+h3-quinn     = { git = "https://github.com/aster-rpc/salvo", rev = "61a572eac5a85129231265e3bc4f04c5457b828e" }

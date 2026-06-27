@@ -270,6 +270,19 @@ impl fmt::Debug for PublicKey {
 pub struct SecretKey(pub(crate) [u8; 32]);
 
 impl SecretKey {
+    /// Generate a fresh random identity from the OS CSPRNG.
+    ///
+    /// An Aster identity is a 32-byte Ed25519 seed; this fills it from
+    /// `getrandom` — the same construction the C FFI (`iroh_secret_key_generate`)
+    /// and the Python binding (`ed25519_generate_keypair`) use. Derive the public
+    /// half (the value peers see as the [`NodeId`]) with
+    /// [`attestation::public_key`](crate::attestation::public_key), or pin a node
+    /// to it via [`AsterConfigBuilder::secret_key`](crate::AsterConfigBuilder::secret_key).
+    pub fn generate() -> Self {
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
+        Self(bytes)
+    }
     /// Construct from raw 32 bytes.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)

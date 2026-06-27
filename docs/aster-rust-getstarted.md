@@ -90,6 +90,45 @@ let topic = node.gossip().subscribe(topic_id).await?;
 > services from one builder. Drop to `Node` directly only for non-RPC use or
 > custom wiring.
 
+### 2.1 Identities and keypairs
+
+An Aster identity is a **32-byte Ed25519 secret key**; its public key *is* the
+`NodeId` peers see. If you don't supply one, `Node::start` generates a fresh key
+each boot (a new identity every restart). To control identity yourself — a
+restart-stable node, or an offline **root/vendor** key that signs attestations —
+mint a key with `SecretKey::generate()`:
+
+```rust
+use aster::{AsterConfig, Node, SecretKey};
+use aster::attestation::public_key;
+
+# fn demo() -> aster::Result<()> {
+// Fresh random identity (OS CSPRNG). Persist `to_bytes()` to keep it — losing
+// the secret loses the identity; the public key is what others verify against.
+let secret = SecretKey::generate();
+let public = public_key(&secret);        // the NodeId form of this identity
+println!("identity: {}", public.to_hex());
+
+// Restore later from the 32 bytes you stored.
+let restored = SecretKey::from_bytes(secret.to_bytes());
+
+// Pin a node to it (otherwise the node makes its own key).
+let cfg = AsterConfig::builder().secret_key(restored).build();
+let _node_fut = Node::start(cfg);
+# Ok(())
+# }
+```
+
+`SecretKey::generate()` is the same construction as the C FFI
+(`iroh_secret_key_generate`) and the Python binding (`ed25519_generate_keypair`)
+— 32 CSPRNG bytes — so a key minted in any binding is usable from the others.
+`AsterServer`'s `.identity(path)` does this load-or-create for you on disk (§4.3).
+
+The same secret key can also **bind a TLS certificate** to this identity: when
+serving over HTTP/WebTransport, the node key signs the cert so peers can verify
+it (and reject a MITM) without trusting a CA — see [Binding the cert to your
+Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identity).
+
 ---
 
 ## 3. Admission (Gate 0) and ownership attestations
@@ -150,7 +189,13 @@ tokio::spawn(async move {
 Minting a chain (vendor/root side):
 
 ```rust
+use aster::SecretKey;
 use aster::attestation::{attest_root_node, public_key, AttestOptions};
+
+// Mint identities if you don't already have them (§2.1). The root key is your
+// trust anchor — generate it once, keep it offline, persist `to_bytes()`.
+let root_secret = SecretKey::generate();
+let node_secret = SecretKey::generate();
 
 let chain = attest_root_node(&root_secret, &node_secret, &AttestOptions::default())?;
 let text = chain.to_text();                  // "aster.attestation.chain.v1:<base64url>"
