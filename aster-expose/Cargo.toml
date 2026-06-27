@@ -1,0 +1,37 @@
+[package]
+name = "aster-expose"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Expose local HTTP services over Aster — L7 terminate-and-relay. See docs/_internal/working_ideas/aster-expose-http.md"
+
+[features]
+# The public reverse-proxy edge (Case 2 data plane). Pulls in the Salvo fork
+# for browser-facing HTTP termination; origin-only consumers leave it off.
+edge = ["dep:salvo"]
+
+[dependencies]
+aster_transport_core = { path = "../core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+# Edge-only: the Salvo fork (hyper-based; same stack that carries H3/WT for V2).
+# `rustls`/`acme` add the static-cert and Let's Encrypt listeners.
+salvo = { path = "../../salvo/crates/salvo", optional = true, features = [
+    "rustls",
+    "acme",
+] }
+
+[dev-dependencies]
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+[[example]]
+name = "reverse_proxy"
+required-features = ["edge"]
