@@ -615,6 +615,26 @@ impl IrohSendStream {
             Ok(code)
         })
     }
+
+    /// Set this stream's send priority (higher = scheduled first; default 0).
+    /// Lets a custom-ALPN app keep a control/audio lane ahead of bulk/video on a
+    /// shared connection. Errors only if the stream is already closed.
+    fn set_priority<'py>(&self, py: Python<'py>, priority: i32) -> PyResult<Bound<'py, PyAny>> {
+        let stream = self.inner.clone();
+        future_into_py(py, async move {
+            stream.set_priority(priority).await.map_err(err_to_py)?;
+            Ok(())
+        })
+    }
+
+    /// This stream's current send priority.
+    fn priority<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let stream = self.inner.clone();
+        future_into_py(py, async move {
+            let p = stream.priority().await.map_err(err_to_py)?;
+            Ok(p)
+        })
+    }
 }
 
 // ============================================================================
