@@ -8,6 +8,7 @@ use aster::{
     alpns, AsterConfig, Credential, Gate0, Node, NodeId, PublicKey, RelayMode, SecretKey, Ticket,
 };
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 const ADMISSION_ALPN: &[u8] = alpns::PRODUCER_ADMISSION;
@@ -320,6 +321,103 @@ async fn send_stream_priority_round_trips() {
         .expect("echo timed out")
         .unwrap();
     assert_eq!(echo, b"frame");
+
+    client.shutdown().await;
+    server.shutdown().await;
+}
+
+/// Gap 1 (uni-stream facade) + Gap 2 (`AsyncWrite`/`AsyncRead` on the stream
+/// types): a uni-stream lane carries bytes via the tokio IO traits, echoed back
+/// on a second uni-stream. This is the shape Portal's `IrohCarrier` uses for the
+/// video/audio lanes.
+#[tokio::test]
+async fn uni_stream_async_io_round_trip() {
+    let server = Node::start_with_alpns(cfg(false), vec![RPC_ALPN.to_vec()])
+        .await
+        .unwrap();
+    let client = Node::start(cfg(false)).await.unwrap();
+    wait_for_addr(&server).await;
+    wait_for_addr(&client).await;
+    client.add_peer(&server).unwrap();
+    server.add_peer(&client).unwrap();
+
+    // Server: copy the inbound uni-stream onto an outbound one — pure
+    // AsyncRead + AsyncWrite via `tokio::io::copy` (no inherent-method calls).
+    let srv = server.clone();
+    tokio::spawn(async move {
+        if let Ok((_alpn, conn)) = srv.accept().await {
+            let mut recv = conn.accept_uni().await.unwrap(); // Gap 1 (AsyncRead)
+            let mut send = conn.open_uni().await.unwrap(); // Gap 1 (AsyncWrite)
+            tokio::io::copy(&mut recv, &mut send).await.unwrap(); // Gap 2
+            send.shutdown().await.unwrap();
+            conn.closed().await;
+        }
+    });
+
+    let conn = client.connect(&server.id(), RPC_ALPN).await.unwrap();
+    let mut send = conn.open_uni().await.unwrap();
+    // UFCS to reach the `AsyncWrite` trait method (the inherent `write_all`
+    // shadows it on the concrete type — generic/poll consumers see the trait).
+    AsyncWriteExt::write_all(&mut send, b"media-frame")
+        .await
+        .unwrap();
+    send.shutdown().await.unwrap();
+
+    let mut recv = timeout(Duration::from_secs(10), conn.accept_uni())
+        .await
+        .expect("accept_uni timed out")
+        .unwrap();
+    let mut echoed = Vec::new();
+    timeout(
+        Duration::from_secs(10),
+        AsyncReadExt::read_to_end(&mut recv, &mut echoed),
+    )
+    .await
+    .expect("read timed out")
+    .unwrap();
+    assert_eq!(echoed, b"media-frame");
+
+    client.shutdown().await;
+    server.shutdown().await;
+}
+
+/// Gap 1 (datagram facade): an unreliable datagram round-trips. Datagrams can be
+/// dropped, so retry a few times against a loopback connection.
+#[tokio::test]
+async fn datagram_round_trip() {
+    let server = Node::start_with_alpns(cfg(false), vec![RPC_ALPN.to_vec()])
+        .await
+        .unwrap();
+    let client = Node::start(cfg(false)).await.unwrap();
+    wait_for_addr(&server).await;
+    wait_for_addr(&client).await;
+    client.add_peer(&server).unwrap();
+    server.add_peer(&client).unwrap();
+
+    let srv = server.clone();
+    tokio::spawn(async move {
+        if let Ok((_alpn, conn)) = srv.accept().await {
+            while let Ok(dg) = conn.read_datagram().await {
+                let _ = conn.send_datagram(dg); // echo
+            }
+        }
+    });
+
+    let conn = client.connect(&server.id(), RPC_ALPN).await.unwrap();
+    assert!(
+        conn.max_datagram_size().is_some(),
+        "datagrams should be supported on this path"
+    );
+
+    let mut got = None;
+    for _ in 0..20 {
+        conn.send_datagram(b"timing-ping".to_vec()).unwrap();
+        if let Ok(Ok(dg)) = timeout(Duration::from_millis(300), conn.read_datagram()).await {
+            got = Some(dg);
+            break;
+        }
+    }
+    assert_eq!(got.expect("no datagram echoed"), b"timing-ping");
 
     client.shutdown().await;
     server.shutdown().await;

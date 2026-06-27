@@ -2,6 +2,7 @@
 pub mod attestation;
 pub mod canonical;
 pub mod contract;
+pub mod datagram;
 pub mod framing;
 pub mod hpke_envelope;
 pub mod namespace;
@@ -10,6 +11,7 @@ pub mod reactor;
 pub mod registry;
 pub mod ring;
 pub mod signing;
+pub mod stream_io;
 pub mod ticket;
 pub mod trust;
 pub mod tunnel;
@@ -57,7 +59,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::framing::{encode_frame, FLAG_TUNNEL};
 use crate::pool::{AcquireError, PoolConfig, PoolKey, StreamFactory, StreamHandle, StreamPool};
 use crate::tunnel::{
-    AuthorizeTunnelError, TunnelConfig, TunnelRegistry, TunnelTarget, TunnelTicket,
+    handle_http_relay, AdmissionState, AuthorizeTunnelError, LocalTargetRegistry,
+    LocalTunnelAcceptor, TunnelConfig, TunnelRegistry, TunnelTarget, TunnelTicket,
+    DEFAULT_MAX_STREAMS_PER_SERVICE, TUNNEL_SUBTYPE_HTTP_RELAY, TUNNEL_SUBTYPE_TICKET,
 };
 use tokio_stream::StreamExt;
 use tracing::debug;
@@ -1873,6 +1877,14 @@ pub struct CoreConnection {
     /// `ffi_spec/Aster-tunneling.md`. Dropped with the connection,
     /// which mass-revokes any unredeemed tickets.
     tunnels: Arc<TunnelRegistry>,
+    /// Node-shared map of `service_id -> L7 HTTP-object acceptor`
+    /// (design doc §5.2). Shared into every connection so a single
+    /// `register_local_target` exposes a service on all of them.
+    local_targets: Arc<LocalTargetRegistry>,
+    /// Per-connection L7 admission state: which services this connection
+    /// is admitted for + the per-service concurrent-stream cap. Dropped
+    /// with the connection (mass-revoke), like `tunnels`.
+    admissions: Arc<AdmissionState>,
 }
 
 impl CoreConnection {
@@ -1895,7 +1907,29 @@ impl CoreConnection {
             inner,
             pool,
             tunnels: Arc::new(TunnelRegistry::new(TunnelConfig::default())),
+            // Per-connection by default. A node that exposes services shares
+            // one registry across its connections via `set_local_targets`
+            // (wired by the `aster-expose` facade); the admission state stays
+            // per-connection regardless.
+            local_targets: Arc::new(LocalTargetRegistry::new()),
+            admissions: Arc::new(AdmissionState::new(DEFAULT_MAX_STREAMS_PER_SERVICE)),
         }
+    }
+
+    /// Replace this connection's L7 acceptor map with a node-shared one, so a
+    /// single `register_local_target` exposes a service across every
+    /// connection the node accepts. Called by the exposing facade right after
+    /// the connection is created, before any stream is accepted.
+    pub fn set_local_targets(&mut self, registry: Arc<LocalTargetRegistry>) {
+        self.local_targets = registry;
+    }
+
+    /// Register an L7 HTTP-object acceptor for `service_id` on this
+    /// connection's acceptor map (design doc §5.2). If the map is shared
+    /// (`set_local_targets`), the registration is visible to every connection
+    /// sharing it.
+    pub fn register_local_target(&self, service_id: &str, acceptor: Arc<dyn LocalTunnelAcceptor>) {
+        self.local_targets.register(service_id, acceptor);
     }
 
     /// Borrow the per-connection multiplexed-stream pool. Callers can
@@ -1977,14 +2011,40 @@ impl CoreConnection {
             };
 
             if flags & FLAG_TUNNEL != 0 {
-                let registry = self.tunnels.clone();
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::tunnel::handle_tunnel_redeem(send, recv, payload, registry).await
-                    {
-                        debug!("tunnel redeem error: {e}");
+                // First payload byte is the subtype discriminator (§5.2).
+                match payload.first().copied() {
+                    Some(TUNNEL_SUBTYPE_TICKET) => {
+                        let ticket = payload[1..].to_vec();
+                        let registry = self.tunnels.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                crate::tunnel::handle_tunnel_redeem(send, recv, ticket, registry)
+                                    .await
+                            {
+                                debug!("tunnel redeem error: {e}");
+                            }
+                        });
                     }
-                });
+                    Some(TUNNEL_SUBTYPE_HTTP_RELAY) => {
+                        let rest = payload[1..].to_vec();
+                        let peer = self.remote_id();
+                        let conn = self.clone();
+                        let registry = self.local_targets.clone();
+                        let admissions = self.admissions.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_http_relay(
+                                conn, send, recv, rest, peer, registry, admissions,
+                            )
+                            .await
+                            {
+                                debug!("http-relay error: {e}");
+                            }
+                        });
+                    }
+                    other => {
+                        debug!("unknown FLAG_TUNNEL subtype {other:?}, dropping stream");
+                    }
+                }
                 continue;
             }
 
@@ -2012,10 +2072,10 @@ impl CoreConnection {
     }
 
     /// Open a tunnel by redeeming a ticket received from the peer.
-    /// Sends the `[FLAG_TUNNEL][ticket]` handshake frame internally,
-    /// then returns the bidi stream pair. Bytes after the handshake
-    /// are raw — the caller speaks the backend protocol directly
-    /// (e.g. RFB for VNC).
+    /// Sends the `[FLAG_TUNNEL][subtype 0][ticket]` handshake frame
+    /// internally, then returns the bidi stream pair. Bytes after the
+    /// handshake are raw — the caller speaks the backend protocol
+    /// directly (e.g. RFB for VNC).
     pub async fn open_tunnel(
         &self,
         ticket: TunnelTicket,
@@ -2023,7 +2083,42 @@ impl CoreConnection {
         let (send, recv) = self.inner.open_bi().await?;
         let send = CoreSendStream::new(send);
         let recv = CoreRecvStream::new(recv);
-        let frame = encode_frame(ticket.as_bytes(), FLAG_TUNNEL)?;
+        // Subtype 0 = ticket-redeem (§5.2). Flag-day wire change.
+        let mut payload = Vec::with_capacity(33);
+        payload.push(TUNNEL_SUBTYPE_TICKET);
+        payload.extend_from_slice(ticket.as_bytes());
+        let frame = encode_frame(&payload, FLAG_TUNNEL)?;
+        send.write_all(frame).await?;
+        Ok((send, recv))
+    }
+
+    /// Open an L7 HTTP-object relay stream for `service_id` (design doc
+    /// §5.2). Writes the `[FLAG_TUNNEL][subtype 1][u16 len][service_id][u16
+    /// mlen][metadata]` first frame, then returns the bidi stream pair.
+    /// `metadata` is an opaque blob the remote's admission policy inspects
+    /// (token / capability / app identity / …); pass `&[]` for none. The caller
+    /// then writes the H3-object request and reads the response (the
+    /// `aster-expose` companion crate owns that codec). One stream per request.
+    pub async fn open_http_relay(
+        &self,
+        service_id: &str,
+        metadata: &[u8],
+    ) -> Result<(CoreSendStream, CoreRecvStream)> {
+        let (send, recv) = self.inner.open_bi().await?;
+        let send = CoreSendStream::new(send);
+        let recv = CoreRecvStream::new(recv);
+        let id = service_id.as_bytes();
+        let len = u16::try_from(id.len())
+            .map_err(|_| anyhow!("service_id too long ({} bytes, max 65535)", id.len()))?;
+        let mlen = u16::try_from(metadata.len())
+            .map_err(|_| anyhow!("metadata too long ({} bytes, max 65535)", metadata.len()))?;
+        let mut payload = Vec::with_capacity(5 + id.len() + metadata.len());
+        payload.push(TUNNEL_SUBTYPE_HTTP_RELAY);
+        payload.extend_from_slice(&len.to_le_bytes());
+        payload.extend_from_slice(id);
+        payload.extend_from_slice(&mlen.to_le_bytes());
+        payload.extend_from_slice(metadata);
+        let frame = encode_frame(&payload, FLAG_TUNNEL)?;
         send.write_all(frame).await?;
         Ok((send, recv))
     }

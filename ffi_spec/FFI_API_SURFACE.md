@@ -246,6 +246,7 @@ Tracks which FFI functions each language binding exposes.
 ### Legend
 - **Y** = Implemented and wired to real FFI
 - **P** = Partial (struct exists but not all methods)
+- **Pl** = Planned (spec'd, not yet implemented — must be applied to this binding)
 - **—** = Not implemented
 
 ### Transport (Tier 1-2)
@@ -341,6 +342,20 @@ Note: Python uses PyO3 direct Rust bindings, not the C FFI reactor.
 | `iroh_tags_get` | Y | P | Y | Y |
 | `iroh_tags_delete` | Y | P | Y | Y |
 | `iroh_tags_list_prefix` | Y | P | Y | — |
+
+### Expose-HTTP (planned)
+
+Spec: [`docs/_internal/working_ideas/aster-expose-http.md`](../docs/_internal/working_ideas/aster-expose-http.md). Verified Rust-first (spec §9), then **must be applied to every foreign-language interface** (Python, TypeScript, Java, Kotlin) — none are exempt. Function names below are provisional; finalize against the Rust facade before landing.
+
+| Function | Python | Java | Go | .NET |
+|----------|--------|------|----|------|
+| `aster_expose_local_http` (Socket + Service targets) | Pl | Pl | Pl | Pl |
+| `aster_dial_http` (pooled, reused keep-alive streams) | Pl | Pl | Pl | Pl |
+| `authorize` upcall (**async** — per-runtime async↔FFI bridge) | Pl | Pl | Pl | Pl |
+| `aster_register_with_edge` (Case 2 control plane) | Pl | Pl | Pl | Pl |
+| pool/cap config (`shared_pool_size`, per-service stream cap) | Pl | Pl | Pl | Pl |
+
+Note: the wire subtype byte, single-flight admission, per-service cap, and HTTP framing live in `core`, so bindings inherit those properties — the binding-surface work is the callbacks (`authorize`, target, hostname registration) re-expressed idiomatically per language.
 
 ---
 
