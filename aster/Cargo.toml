@@ -41,6 +41,9 @@ anyhow = { workspace = true }
 thiserror = "2"
 hex = "0.4"
 base64 = "0.22"
+# OS CSPRNG for SecretKey::generate (32-byte Ed25519 seed) — same source the
+# C FFI and Python binding use. Pinned to core's getrandom major.
+getrandom = "0.2"
 # Parse a peer's relay URL to extract its IP:port for the compact ticket
 # (the wire format stores relay as a socket address — see Ticket::from_node_addr).
 url = "2"
