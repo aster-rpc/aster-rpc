@@ -34,6 +34,20 @@ impl Connection {
         Self { inner }
     }
 
+    /// Clone of the underlying core connection — used by the `expose` module to
+    /// attach a shared target registry and feed the connection to its reactor.
+    #[cfg(feature = "expose")]
+    pub(crate) fn core_clone(&self) -> CoreConnection {
+        self.inner.clone()
+    }
+
+    /// Borrow the underlying core connection — used by the `expose` module's
+    /// consumer side (open relay / route-control streams).
+    #[cfg(feature = "expose")]
+    pub(crate) fn core_ref(&self) -> &CoreConnection {
+        &self.inner
+    }
+
     /// The remote peer's id.
     pub fn peer(&self) -> NodeId {
         NodeId::from_hex(self.inner.remote_id())
