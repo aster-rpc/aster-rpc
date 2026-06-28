@@ -192,6 +192,43 @@ impl Node {
         self.inner.clone()
     }
 
+    /// Create an [`Expose`](crate::expose::Expose) handle for publishing local
+    /// HTTP services over this node's connections (the `aster-expose` L7 relay).
+    /// Register services on it, then either let the node own the accept loop via
+    /// [`serve_expose`](Node::serve_expose) or route connections into it with
+    /// [`Expose::handle`](crate::expose::Expose::handle). See
+    /// `docs/aster-expose-getstarted.md`.
+    #[cfg(feature = "expose")]
+    pub fn expose(&self) -> crate::expose::Expose {
+        crate::expose::Expose::new()
+    }
+
+    /// Own the accept loop for a node whose endpoint serves **only** expose:
+    /// accept inbound connections, and feed each whose ALPN is in `alpns` to
+    /// `expose` (others are dropped). Runs until the node closes. The node must
+    /// have been started with those ALPNs registered via
+    /// [`start_with_alpns`](Node::start_with_alpns).
+    ///
+    /// Don't combine this with a manual [`accept`](Node::accept) loop or an
+    /// `rpc::Server` on the same node — they drain the
+    /// same inbound queue. For that case, run your own accept loop and call
+    /// [`Expose::handle`](crate::expose::Expose::handle) per expose connection.
+    #[cfg(feature = "expose")]
+    pub async fn serve_expose(
+        &self,
+        expose: &crate::expose::Expose,
+        alpns: &[&[u8]],
+    ) -> Result<()> {
+        loop {
+            let (alpn, conn) = self.accept().await?;
+            if alpns.is_empty() || alpns.contains(&alpn.as_slice()) {
+                expose.handle(&conn);
+            }
+            // Non-expose ALPN: drop `conn` (closes it). The node should be
+            // started only with expose ALPNs when using this loop.
+        }
+    }
+
     /// Blob store client.
     #[cfg(feature = "blobs")]
     pub fn blobs(&self) -> Blobs {
