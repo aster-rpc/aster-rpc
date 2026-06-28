@@ -90,6 +90,71 @@ tokio::spawn(async move {
 });
 ```
 
+### From a high-level `aster::Node`
+
+The snippet above is the core layer (`CoreConnection` + a hand-rolled reactor).
+If you already run an `aster::Node`, the `expose` feature folds all of it onto
+the node — mirroring how `AsterServer::with_http` folds RPC on:
+
+```toml
+aster = { git = "...", features = ["expose"] }   # add "expose-edge" for the edge
+```
+
+```rust
+const ALPN: &[u8] = b"aster-expose/demo";
+
+let node = Node::start_with_alpns(cfg, vec![ALPN.to_vec()]).await?;
+let expose = node.expose();
+expose.expose_http("signaling", authorize(), my_handler());
+
+// Dedicated host: let the node own the accept loop (attach + feed per conn).
+node.serve_expose(&expose, &[ALPN]).await?;
+```
+
+A node has **one** inbound accept loop (it drains a single connection queue), so
+don't run `serve_expose` *and* RPC *and* a manual `accept()` on the same node —
+they'd compete and connections would land in the wrong consumer. Instead, give
+the one accept owner an ALPN fan-out.
+
+**RPC + expose on one node** — the common case (e.g. a host serving an RPC
+consent gate plus a signaling relay) — is a one-call on `AsterServer`:
+
+```rust
+use aster::expose::Expose;
+use aster::rpc::AsterServer;
+
+let expose = Expose::new();
+expose.expose_http("signaling", authorize(), my_handler());
+
+let srv = AsterServer::builder()
+    .service(my_rpc_service)
+    .with_expose(b"portal/signaling/1".to_vec(), expose.clone())   // expose on its ALPN
+    .route_alpn(b"portal/media/1".to_vec(), |conn| { /* spawn your handler */ })  // any other protocol
+    .start()
+    .await?;
+```
+
+The RPC reactor is the single accept owner: it routes `aster/1` to RPC and hands
+every other ALPN to the handler you registered (`with_expose` attaches + feeds;
+`route_alpn` gives you the raw `Connection`). The ALPNs are registered on the
+node for you.
+
+If you run your **own** accept loop instead (no `AsterServer`), route connections
+into the expose handle yourself:
+
+```rust
+let (alpn, conn) = node.accept().await?;
+if alpn == ALPN {
+    expose.handle(&conn);   // attach + feed this connection
+}
+```
+
+The consumer side needs no `Expose` handle — `aster::expose::relay_request`,
+`relay_request_streaming`, and `request_route` take an `aster::Connection`
+directly. All the types below (`AuthorizeFn`, `HttpHandler`, `RouteSpec`, …) are
+re-exported from `aster::expose`, so an Aster consumer never adds `aster-expose`
+or `http` itself.
+
 ### Reaching an exposed service from a peer
 
 The other side dials and relays a request over one stream:

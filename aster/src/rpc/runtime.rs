@@ -44,7 +44,10 @@ use crate::node::Node;
 use crate::ticket::{Credential, Ticket};
 
 use super::auth::{AttributeStore, Authenticator};
-use super::server::{Dispatcher, HttpTransport, Server, ServerHandle, ServiceDispatch, RPC_ALPN};
+use super::server::{
+    AlpnHandler, Dispatcher, HttpTransport, Server, ServerHandle, ServiceDispatch, RPC_ALPN,
+};
+use crate::net::Connection;
 
 /// Builder for an [`AsterServer`]. Start one with [`AsterServer::builder`].
 #[derive(Default)]
@@ -63,6 +66,8 @@ pub struct AsterServerBuilder {
     #[allow(clippy::type_complexity)]
     session_appliers: Vec<Box<dyn FnOnce(Server) -> Server + Send>>,
     extra_alpns: Vec<Vec<u8>>,
+    // Non-RPC ALPN handlers; the ALPN is also registered on the node.
+    routes: Vec<(Vec<u8>, AlpnHandler)>,
 }
 
 impl AsterServerBuilder {
@@ -160,6 +165,53 @@ impl AsterServerBuilder {
         self
     }
 
+    /// Serve another protocol on `alpn` alongside RPC, on the **same** node and
+    /// accept loop. The reactor routes `aster/1` to RPC and hands every
+    /// connection on `alpn` to `handler` — no second acceptor (which would split
+    /// inbound connections arbitrarily). The ALPN is registered for you.
+    /// `handler` must not block — see [`AlpnHandler`](crate::rpc::AlpnHandler).
+    ///
+    /// This is how one identity hosts RPC plus, say, a media lane and a
+    /// signaling relay: chain `route_alpn` (or [`with_expose`](Self::with_expose))
+    /// once per protocol.
+    pub fn route_alpn(
+        mut self,
+        alpn: impl Into<Vec<u8>>,
+        handler: impl Fn(Connection) + Send + Sync + 'static,
+    ) -> Self {
+        let alpn = alpn.into();
+        self.extra_alpns.push(alpn.clone());
+        self.routes.push((alpn, std::sync::Arc::new(handler)));
+        self
+    }
+
+    /// Serve an [`Expose`](crate::expose::Expose) registry on `alpn` alongside
+    /// RPC — the one-call "RPC + expose on one node" path. Equivalent to
+    /// [`route_alpn`](Self::route_alpn) with a handler that attaches + feeds each
+    /// connection to `expose`.
+    ///
+    /// Build the handle with [`Expose::new`](crate::expose::Expose::new) (it's
+    /// node-independent), register your services on it, then pass a clone here;
+    /// keep the original to register / unexpose services later.
+    ///
+    /// ```no_run
+    /// # use aster::{rpc::AsterServer, expose::Expose};
+    /// # async fn run<S: aster::rpc::ServiceDispatch>(svc: S, a: aster::expose::AuthorizeFn, h: aster::expose::HttpHandler) -> aster::Result<()> {
+    /// let expose = Expose::new();
+    /// expose.expose_http("signaling", a, h);
+    /// let srv = AsterServer::builder()
+    ///     .service(svc)
+    ///     .with_expose(b"portal/signaling/1".to_vec(), expose.clone())
+    ///     .start()
+    ///     .await?;
+    /// # let _ = srv; Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "expose")]
+    pub fn with_expose(self, alpn: impl Into<Vec<u8>>, expose: crate::expose::Expose) -> Self {
+        self.route_alpn(alpn, move |conn| expose.handle(&conn))
+    }
+
     /// Build the node (RPC + built-in protocol ALPNs registered), start serving
     /// the registered services, and return the running [`AsterServer`].
     pub async fn start(self) -> Result<AsterServer> {
@@ -195,8 +247,14 @@ impl AsterServerBuilder {
         let config = builder.build();
 
         // `aster/1` always; blobs/docs/gossip ALPNs are registered by core.
+        // `route_alpn`/`with_expose` also push their ALPN into `extra_alpns`, so
+        // dedup before registering (a user may also have called `.alpn(...)`).
         let mut alpns = vec![RPC_ALPN.to_vec()];
-        alpns.extend(self.extra_alpns);
+        for alpn in self.extra_alpns {
+            if !alpns.contains(&alpn) {
+                alpns.push(alpn);
+            }
+        }
 
         let node = Node::start_with_alpns(config, alpns).await?;
 
@@ -218,6 +276,9 @@ impl AsterServerBuilder {
         }
         for apply in self.session_appliers {
             server = apply(server);
+        }
+        for (alpn, handler) in self.routes {
+            server = server.route_alpn_arc(alpn, handler);
         }
         // Grab the shareable dispatcher before `serve()` consumes the server, so
         // an HTTP transport can drive the same services.
