@@ -35,6 +35,7 @@ use super::codec::{
 use super::status::StatusCode;
 use super::streaming::{RequestStream, ResponseSink};
 use crate::error::{Error, Result};
+use crate::net::Connection;
 use crate::Node;
 
 /// The Aster RPC ALPN (`b"aster/1"`). A node must be started with this ALPN
@@ -92,6 +93,16 @@ type SessionFactories = HashMap<(String, i32), SessionFactory>;
 /// Per-session instances, keyed by `(service, version, session-id)`.
 type SessionTable = std::sync::RwLock<HashMap<(String, i32, String), Arc<dyn ServiceDispatch>>>;
 
+/// Handler for an inbound connection on a non-`aster/1` ALPN. Invoked once per
+/// accepted connection from the reactor's single accept loop, so it **must not
+/// block** — hand the connection to a task or channel and return (e.g.
+/// [`Expose::handle`](crate::expose::Expose::handle) feeds it to a reactor and
+/// returns immediately; a custom protocol should `tokio::spawn` its own loop).
+pub type AlpnHandler = Arc<dyn Fn(Connection) + Send + Sync>;
+
+/// ALPN → handler routing table for the non-RPC fan-out.
+type AlpnRoutes = HashMap<Vec<u8>, AlpnHandler>;
+
 /// An RPC server bound to a node. Register services, then [`serve`](Server::serve).
 pub struct Server {
     core: CoreNode,
@@ -99,6 +110,7 @@ pub struct Server {
     session_factories: SessionFactories,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
+    routes: AlpnRoutes,
 }
 
 impl Server {
@@ -111,6 +123,7 @@ impl Server {
             session_factories: HashMap::new(),
             attributes: AttributeStore::new(),
             authenticator: None,
+            routes: HashMap::new(),
         }
     }
 
@@ -179,6 +192,43 @@ impl Server {
         self
     }
 
+    /// Route inbound connections on a non-`aster/1` `alpn` to `handler`,
+    /// instead of dropping them. This is the fan-out that lets one node serve
+    /// RPC **and** other protocols on a single accept loop: the reactor owns
+    /// `accept()`, sends `aster/1` to the RPC pipeline, and hands every other
+    /// ALPN to its registered handler (so a second acceptor — which would split
+    /// connections arbitrarily — is never needed).
+    ///
+    /// The node must also be started with `alpn` registered
+    /// ([`start_with_alpns`](crate::Node::start_with_alpns), or
+    /// [`AsterServerBuilder::route_alpn`](crate::rpc::AsterServerBuilder::route_alpn)
+    /// which registers it for you). `handler` must not block — see
+    /// [`AlpnHandler`].
+    pub fn route_alpn(
+        mut self,
+        alpn: impl Into<Vec<u8>>,
+        handler: impl Fn(Connection) + Send + Sync + 'static,
+    ) -> Self {
+        self.routes.insert(alpn.into(), Arc::new(handler));
+        self
+    }
+
+    /// Register an already-boxed ALPN handler. Used by
+    /// [`AsterServer`](crate::rpc::AsterServer) to forward its collected routes.
+    pub(crate) fn route_alpn_arc(mut self, alpn: Vec<u8>, handler: AlpnHandler) -> Self {
+        self.routes.insert(alpn, handler);
+        self
+    }
+
+    /// Route inbound connections on `alpn` to an [`Expose`](crate::expose::Expose)
+    /// registry: each is attached + fed so its relay streams reach the exposed
+    /// services. The convenience over [`route_alpn`](Self::route_alpn) for the
+    /// common "RPC + expose on one node" case.
+    #[cfg(feature = "expose")]
+    pub fn expose_alpn(self, alpn: impl Into<Vec<u8>>, expose: crate::expose::Expose) -> Self {
+        self.route_alpn(alpn, move |conn| expose.handle(&conn))
+    }
+
     /// Snapshot the registered services + the Gate-3 attribute store as a
     /// shareable, transport-agnostic [`Dispatcher`]. Each transport (the Iroh
     /// reactor loop, an HTTP listener, …) holds a clone and feeds it
@@ -206,9 +256,12 @@ impl Server {
     /// [`dispatcher`](Server::dispatcher) first, then `serve`.
     pub fn serve(self) -> ServerHandle {
         let dispatcher = self.dispatcher();
-        let mut handle = reactor::start_reactor(self.core, 256);
-        let join = tokio::spawn(async move {
-            while let Some(ev) = handle.next_event().await {
+        let handle = reactor::start_reactor(self.core, 256);
+        let (mut event_rx, mut non_rpc_rx) = handle.into_parts();
+
+        // RPC pipeline: dispatch each `aster/1` call.
+        let rpc_join = tokio::spawn(async move {
+            while let Some(ev) = event_rx.recv().await {
                 if let ReactorEvent::Call(call) = ev {
                     let dispatcher = dispatcher.clone();
                     tokio::spawn(async move { dispatcher.dispatch_call(call).await });
@@ -217,7 +270,26 @@ impl Server {
                 // lands with session-scoped services (a later step).
             }
         });
-        ServerHandle { join }
+
+        // Non-RPC fan-out: route every other ALPN to its handler. Always
+        // drained (even with no routes) so the accept loop never stalls on a
+        // full non-rpc channel.
+        let routes = Arc::new(self.routes);
+        let route_join = tokio::spawn(async move {
+            while let Some((alpn, core)) = non_rpc_rx.recv().await {
+                match routes.get(&alpn) {
+                    Some(handler) => handler(Connection::new(core)),
+                    // No handler for this ALPN: drop `core`, which closes the
+                    // connection. The peer observes a closed connection.
+                    None => drop(core),
+                }
+            }
+        });
+
+        ServerHandle {
+            rpc_join,
+            route_join,
+        }
     }
 }
 
@@ -332,21 +404,26 @@ impl CallParts {
     }
 }
 
-/// Handle to a running [`Server`] loop.
+/// Handle to a running [`Server`] loop: the RPC dispatch task plus the non-RPC
+/// ALPN fan-out task (see [`Server::route_alpn`]).
 pub struct ServerHandle {
-    join: tokio::task::JoinHandle<()>,
+    rpc_join: tokio::task::JoinHandle<()>,
+    route_join: tokio::task::JoinHandle<()>,
 }
 
 impl ServerHandle {
-    /// Stop the accept+dispatch loop.
+    /// Stop both the RPC dispatch and ALPN fan-out loops.
     pub fn abort(&self) {
-        self.join.abort();
+        self.rpc_join.abort();
+        self.route_join.abort();
     }
 
-    /// Await the accept+dispatch loop. Resolves when the loop ends (the node
-    /// closed, or [`abort`](ServerHandle::abort) was called).
+    /// Await the loops. Resolves when they end (the node closed, or
+    /// [`abort`](ServerHandle::abort) was called).
     pub async fn joined(self) {
-        let _ = self.join.await;
+        let _ = self.rpc_join.await;
+        self.route_join.abort();
+        let _ = self.route_join.await;
     }
 }
 

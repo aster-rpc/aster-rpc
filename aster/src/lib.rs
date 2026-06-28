@@ -66,6 +66,8 @@ pub mod attestation;
 mod blobs;
 #[cfg(feature = "docs")]
 mod docs;
+#[cfg(feature = "expose")]
+pub mod expose;
 #[cfg(feature = "gossip")]
 mod gossip;
 #[cfg(feature = "rpc")]
@@ -101,6 +103,8 @@ pub use blobs::{BlobFormat, BlobStatus, Blobs};
 pub use docs::{
     default_author_id, Doc, DocEntry, DocEvent, DocEvents, Docs, DownloadPolicy, ShareMode,
 };
+#[cfg(feature = "expose")]
+pub use expose::Expose;
 #[cfg(feature = "gossip")]
 pub use gossip::{Gossip, GossipEvent, GossipTopic};
 
