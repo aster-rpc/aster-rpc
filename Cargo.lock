@@ -2624,7 +2624,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=3c329f0c350b98a772bccdf697bfcc519fcdf25a#3c329f0c350b98a772bccdf697bfcc519fcdf25a"
+source = "git+https://github.com/aster-rpc/iroh?rev=f0d154aca90a8816490c0443facec2518d05d7b7#f0d154aca90a8816490c0443facec2518d05d7b7"
 dependencies = [
  "backon",
  "blake3",
@@ -2674,7 +2674,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.0.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=3c329f0c350b98a772bccdf697bfcc519fcdf25a#3c329f0c350b98a772bccdf697bfcc519fcdf25a"
+source = "git+https://github.com/aster-rpc/iroh?rev=f0d154aca90a8816490c0443facec2518d05d7b7#f0d154aca90a8816490c0443facec2518d05d7b7"
 dependencies = [
  "curve25519-dalek 5.0.0-rc.0",
  "data-encoding",
@@ -2732,7 +2732,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.0.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=3c329f0c350b98a772bccdf697bfcc519fcdf25a#3c329f0c350b98a772bccdf697bfcc519fcdf25a"
+source = "git+https://github.com/aster-rpc/iroh?rev=f0d154aca90a8816490c0443facec2518d05d7b7#f0d154aca90a8816490c0443facec2518d05d7b7"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -2880,7 +2880,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=3c329f0c350b98a772bccdf697bfcc519fcdf25a#3c329f0c350b98a772bccdf697bfcc519fcdf25a"
+source = "git+https://github.com/aster-rpc/iroh?rev=f0d154aca90a8816490c0443facec2518d05d7b7#f0d154aca90a8816490c0443facec2518d05d7b7"
 dependencies = [
  "blake3",
  "bytes",
@@ -3620,7 +3620,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.0.0"
-source = "git+https://github.com/aster-rpc/noq?rev=ddb8829dbc1cd401f8643ba9b93c542ffee43577#ddb8829dbc1cd401f8643ba9b93c542ffee43577"
+source = "git+https://github.com/aster-rpc/noq?rev=d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6#d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3630,7 +3630,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3641,7 +3641,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.0.0"
-source = "git+https://github.com/aster-rpc/noq?rev=ddb8829dbc1cd401f8643ba9b93c542ffee43577#ddb8829dbc1cd401f8643ba9b93c542ffee43577"
+source = "git+https://github.com/aster-rpc/noq?rev=d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6#d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -3669,11 +3669,11 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.0.0"
-source = "git+https://github.com/aster-rpc/noq?rev=ddb8829dbc1cd401f8643ba9b93c542ffee43577#ddb8829dbc1cd401f8643ba9b93c542ffee43577"
+source = "git+https://github.com/aster-rpc/noq?rev=d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6#d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]

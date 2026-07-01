@@ -5,7 +5,8 @@
 #
 # Purpose: tell consumers exactly what to pin for the current release wave.
 # Consumers pin by git `rev` (authoritative); the `tag` is a human label on the
-# same commit. For this wave, pin == tag == validated code (no -pN retags).
+# same commit. Pin == tag == validated code. The -p1 noq/iroh tags carry the
+# 2026-07-01 Windows UDP busy-loop fix on top of the 1.0.0 wave.
 #
 # Regenerate every upgrade cycle. See docs/iroh-patches.md for the patch ledger
 # and the full upgrade procedure.
@@ -13,7 +14,7 @@
 
 schema = 1
 wave = "iroh-1.0.0"
-released = "2026-06-21"
+released = "2026-07-01"
 
 # -----------------------------------------------------------------------------
 # Forks (pin these by rev in [patch.crates-io])
@@ -22,8 +23,8 @@ released = "2026-06-21"
 [forks.noq]
 repo = "https://github.com/aster-rpc/noq"
 upstream_base = "noq-v1.0.0"
-tag = "aster-noq-v1.0.0"
-commit = "ddb8829dbc1cd401f8643ba9b93c542ffee43577"
+tag = "aster-noq-v1.0.0-p1"
+commit = "d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6"
 branch = "upgrade/noq-v1.0.0"
 crates = ["noq", "noq-udp", "noq-proto"]
 crate_version = "1.0.0"
@@ -31,8 +32,8 @@ crate_version = "1.0.0"
 [forks.iroh]
 repo = "https://github.com/aster-rpc/iroh"
 upstream_base = "v1.0.0"
-tag = "aster-iroh-v1.0.0"
-commit = "3c329f0c350b98a772bccdf697bfcc519fcdf25a"
+tag = "aster-iroh-v1.0.0-p1"
+commit = "f0d154aca90a8816490c0443facec2518d05d7b7"
 branch = "upgrade/iroh-v1.0.0"
 crates = ["iroh", "iroh-base", "iroh-relay"]
 crate_version = "1.0.0"
@@ -94,13 +95,13 @@ iroh-mdns-address-lookup = "0.4"
 # Pin block ([patch.crates-io]):
 patch_crates_io = """
 [patch.crates-io]
-iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "3c329f0c350b98a772bccdf697bfcc519fcdf25a" }
-iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "3c329f0c350b98a772bccdf697bfcc519fcdf25a" }
-iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "3c329f0c350b98a772bccdf697bfcc519fcdf25a" }
+iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "f0d154aca90a8816490c0443facec2518d05d7b7" }
+iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "f0d154aca90a8816490c0443facec2518d05d7b7" }
+iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "f0d154aca90a8816490c0443facec2518d05d7b7" }
 iroh-blobs  = { git = "https://github.com/aster-rpc/iroh-blobs",  rev = "60d098c99d6a759b5b1bf0df635b149b50c74775" }
 iroh-docs   = { git = "https://github.com/aster-rpc/iroh-docs",   rev = "2f3f3df834dfe6ce83f052c9c94ef80db2f5627c" }
 iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "76492e4cf8a745cae27ea57fb8a30d42ab675498" }
-noq         = { git = "https://github.com/aster-rpc/noq",         rev = "ddb8829dbc1cd401f8643ba9b93c542ffee43577" }
-noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "ddb8829dbc1cd401f8643ba9b93c542ffee43577" }
-noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "ddb8829dbc1cd401f8643ba9b93c542ffee43577" }
+noq         = { git = "https://github.com/aster-rpc/noq",         rev = "d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6" }
+noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6" }
+noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6" }
 """
