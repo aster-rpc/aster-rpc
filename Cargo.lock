@@ -2623,8 +2623,8 @@ dependencies = [
 
 [[package]]
 name = "iroh"
-version = "1.0.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=f0d154aca90a8816490c0443facec2518d05d7b7#f0d154aca90a8816490c0443facec2518d05d7b7"
+version = "1.0.1"
+source = "git+https://github.com/aster-rpc/iroh?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
 dependencies = [
  "backon",
  "blake3",
@@ -2673,8 +2673,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-base"
-version = "1.0.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=f0d154aca90a8816490c0443facec2518d05d7b7#f0d154aca90a8816490c0443facec2518d05d7b7"
+version = "1.0.1"
+source = "git+https://github.com/aster-rpc/iroh?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
 dependencies = [
  "curve25519-dalek 5.0.0-rc.0",
  "data-encoding",
@@ -2731,8 +2731,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.0.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=f0d154aca90a8816490c0443facec2518d05d7b7#f0d154aca90a8816490c0443facec2518d05d7b7"
+version = "1.0.1"
+source = "git+https://github.com/aster-rpc/iroh?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -2879,8 +2879,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.0.0"
-source = "git+https://github.com/aster-rpc/iroh?rev=f0d154aca90a8816490c0443facec2518d05d7b7#f0d154aca90a8816490c0443facec2518d05d7b7"
+version = "1.0.1"
+source = "git+https://github.com/aster-rpc/iroh?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
 dependencies = [
  "blake3",
  "bytes",
@@ -3471,9 +3471,9 @@ dependencies = [
 
 [[package]]
 name = "netdev"
-version = "0.44.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d31e7286c21ceaf0ddb1d881964011214555ea0b317cc2eb1a1d68d861386fc"
+checksum = "569dfbdd2efd771b24ec9bb57f956e04d4fbfc72f62b2f11961723f9b3f4b020"
 dependencies = [
  "block2",
  "dispatch2",
@@ -3484,7 +3484,7 @@ dependencies = [
  "mac-addr",
  "ndk-context",
  "netlink-packet-core",
- "netlink-packet-route 0.29.0",
+ "netlink-packet-route",
  "netlink-sys",
  "objc2",
  "objc2-core-foundation",
@@ -3503,18 +3503,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3463cbb78394cb0141e2c926b93fc2197e473394b761986eca3b9da2c63ae0f4"
 dependencies = [
  "paste",
-]
-
-[[package]]
-name = "netlink-packet-route"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df9854ea6ad14e3f4698a7f03b65bce0833dd2d81d594a0e4a984170537146b6"
-dependencies = [
- "bitflags 2.11.1",
- "libc",
- "log",
- "netlink-packet-core",
 ]
 
 [[package]]
@@ -3558,9 +3546,9 @@ dependencies = [
 
 [[package]]
 name = "netwatch"
-version = "0.19.0"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8487d26d691cd98d5c17b2adb4b1fd4b31cccc820da1eac827d483295d7bb94a"
+checksum = "4d9cbe01741347ef750d743d6690603f5eed8341e679fb51c8e629337aa11976"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3574,7 +3562,7 @@ dependencies = [
  "n0-watcher",
  "netdev",
  "netlink-packet-core",
- "netlink-packet-route 0.31.0",
+ "netlink-packet-route",
  "netlink-proto",
  "netlink-sys",
  "noq-udp",
@@ -3619,8 +3607,8 @@ dependencies = [
 
 [[package]]
 name = "noq"
-version = "1.0.0"
-source = "git+https://github.com/aster-rpc/noq?rev=d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6#d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6"
+version = "1.0.1"
+source = "git+https://github.com/aster-rpc/noq?rev=c84091f4c1d62f3c9025e40014fc2db59f239ffc#c84091f4c1d62f3c9025e40014fc2db59f239ffc"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3630,7 +3618,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3640,8 +3628,8 @@ dependencies = [
 
 [[package]]
 name = "noq-proto"
-version = "1.0.0"
-source = "git+https://github.com/aster-rpc/noq?rev=d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6#d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6"
+version = "1.0.1"
+source = "git+https://github.com/aster-rpc/noq?rev=c84091f4c1d62f3c9025e40014fc2db59f239ffc#c84091f4c1d62f3c9025e40014fc2db59f239ffc"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -3668,12 +3656,12 @@ dependencies = [
 
 [[package]]
 name = "noq-udp"
-version = "1.0.0"
-source = "git+https://github.com/aster-rpc/noq?rev=d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6#d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6"
+version = "1.0.1"
+source = "git+https://github.com/aster-rpc/noq?rev=c84091f4c1d62f3c9025e40014fc2db59f239ffc#c84091f4c1d62f3c9025e40014fc2db59f239ffc"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4220,9 +4208,9 @@ dependencies = [
 
 [[package]]
 name = "portmapper"
-version = "0.19.0"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccc716c56a0a50f7e4e25f41446419599d47c6197cc5c9858174220e97c272e6"
+checksum = "eb3713e4977408279158444a18c1a01ac9bf2e7eaf1fbfd1a19ac9cd18d90721"
 dependencies = [
  "base64",
  "bytes",

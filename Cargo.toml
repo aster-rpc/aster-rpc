@@ -7,7 +7,7 @@ resolver = "2"
 # Core Iroh
 # Declared as crates.io versions; [patch.crates-io] below rewrites them
 # to the aster-rpc forks (read_into, poll_driver — see UPGRADE_1.0.0-rc.0.md).
-iroh        = "=1.0.0"
+iroh        = "=1.0.1"
 iroh-blobs  = "0.103.0"
 iroh-docs   = "0.101.0"
 iroh-gossip = "0.101.0"
@@ -40,15 +40,15 @@ crossbeam-utils = "0.8"
 # iroh from crates.io) must also resolve to the fork. A regular dep override
 # only affects the top-level use; [patch] rewires every resolution.
 [patch.crates-io]
-iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "f0d154aca90a8816490c0443facec2518d05d7b7" }
-iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "f0d154aca90a8816490c0443facec2518d05d7b7" }
-iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "f0d154aca90a8816490c0443facec2518d05d7b7" }
+iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "5228d64d91b10ef5f5bc9fcf8855b7774102cfc9" }
+iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "5228d64d91b10ef5f5bc9fcf8855b7774102cfc9" }
+iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "5228d64d91b10ef5f5bc9fcf8855b7774102cfc9" }
 iroh-blobs  = { git = "https://github.com/aster-rpc/iroh-blobs",  rev = "60d098c99d6a759b5b1bf0df635b149b50c74775" }
 iroh-docs   = { git = "https://github.com/aster-rpc/iroh-docs",   rev = "2f3f3df834dfe6ce83f052c9c94ef80db2f5627c" }
 iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "76492e4cf8a745cae27ea57fb8a30d42ab675498" }
-noq         = { git = "https://github.com/aster-rpc/noq",         rev = "d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6" }
-noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6" }
-noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "d8daa2b18afe26d8b8c812c1cc2be19f4b6ec2a6" }
+noq         = { git = "https://github.com/aster-rpc/noq",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
+noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
+noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
 
 # ──────────────────────────────────────────────────────────────────────────
 # Aster Salvo fork (HTTP transport — see docs/_internal/working_ideas/aster-http3-transport.md)
