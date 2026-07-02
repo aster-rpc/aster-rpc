@@ -43,7 +43,10 @@ use crate::id::{NodeId, SecretKey};
 use crate::node::Node;
 use crate::ticket::{Credential, Ticket};
 
-use super::auth::{AttributeStore, Authenticator};
+use super::auth::{AttributeStore, Authenticator, CapabilityRequirement};
+use super::baseline::{
+    LiveNodeInfo, NodeIdentity, NodeIdentityHandle, NodeInfoServer, RequireGuard,
+};
 use super::server::{
     AlpnHandler, Dispatcher, HttpTransport, Server, ServerHandle, ServiceDispatch, RPC_ALPN,
 };
@@ -68,11 +71,17 @@ pub struct AsterServerBuilder {
     extra_alpns: Vec<Vec<u8>>,
     // Non-RPC ALPN handlers; the ALPN is also registered on the node.
     routes: Vec<(Vec<u8>, AlpnHandler)>,
+    // Baseline `aster.ops.NodeInfo` (default ON; inverted so Default works).
+    disable_node_info: bool,
+    node_identity: Option<NodeIdentity>,
+    node_info_requires: Option<CapabilityRequirement>,
 }
 
 impl AsterServerBuilder {
-    /// Add a service to serve (chainable; call once per service). At least one
-    /// is required before [`start`](Self::start).
+    /// Add a service to serve (chainable; call once per service). Optional as
+    /// long as the baseline `aster.ops.NodeInfo` service is enabled (the
+    /// default); with [`builtin_node_info(false)`](Self::builtin_node_info),
+    /// at least one service is required before [`start`](Self::start).
     pub fn service(mut self, svc: impl ServiceDispatch) -> Self {
         self.services.push(Arc::new(svc));
         self
@@ -212,12 +221,37 @@ impl AsterServerBuilder {
         self.route_alpn(alpn, move |conn| expose.handle(&conn))
     }
 
+    /// Enable/disable the baseline `aster.ops.NodeInfo` service (default:
+    /// **enabled**). With it enabled, a server with no application services is
+    /// still startable — a bare node that can describe itself.
+    pub fn builtin_node_info(mut self, enabled: bool) -> Self {
+        self.disable_node_info = !enabled;
+        self
+    }
+
+    /// The [`NodeIdentity`] the baseline `aster.ops.NodeInfo` service serves
+    /// (name, tags, roles, attributes). `node_id` is stamped from the node's
+    /// key at start — any value set here is overwritten. Without this, an
+    /// empty identity (id only) is served.
+    pub fn node_identity(mut self, identity: NodeIdentity) -> Self {
+        self.node_identity = Some(identity);
+        self
+    }
+
+    /// Gate every method of the baseline `aster.ops.NodeInfo` service behind a
+    /// capability requirement (Gate 3). Default: no requirement (any dialer
+    /// admitted to the transport can call `describe`).
+    pub fn node_info_requires(mut self, requires: CapabilityRequirement) -> Self {
+        self.node_info_requires = Some(requires);
+        self
+    }
+
     /// Build the node (RPC + built-in protocol ALPNs registered), start serving
     /// the registered services, and return the running [`AsterServer`].
     pub async fn start(self) -> Result<AsterServer> {
-        if self.services.is_empty() {
+        if self.services.is_empty() && self.disable_node_info {
             return Err(Error::InvalidArgument(
-                "AsterServer requires at least one service".into(),
+                "AsterServer requires at least one service (or an enabled baseline service)".into(),
             ));
         }
 
@@ -274,6 +308,22 @@ impl AsterServerBuilder {
         for svc in self.services {
             server = server.register_arc(svc);
         }
+        // Baseline `aster.ops.NodeInfo` — registered unless disabled, with the
+        // node_id stamped from the just-started node's key. The handle stays
+        // on the AsterServer so the served identity can be updated live.
+        let mut identity_handle = None;
+        if !self.disable_node_info {
+            let mut identity = self.node_identity.unwrap_or_default();
+            identity.node_id = node.id().to_string();
+            let handle = NodeIdentityHandle::new(identity);
+            server = server.register_arc(Arc::new(RequireGuard {
+                inner: NodeInfoServer::new(LiveNodeInfo {
+                    handle: handle.clone(),
+                }),
+                requires: self.node_info_requires,
+            }));
+            identity_handle = Some(handle);
+        }
         for apply in self.session_appliers {
             server = apply(server);
         }
@@ -292,6 +342,7 @@ impl AsterServerBuilder {
             attributes,
             dispatcher,
             http,
+            identity_handle,
         })
     }
 }
@@ -309,12 +360,34 @@ pub struct AsterServer {
     dispatcher: Dispatcher,
     /// Optional additional transport (HTTP) task, aborted on shutdown.
     http: Option<tokio::task::JoinHandle<()>>,
+    /// Live identity served by the baseline `aster.ops.NodeInfo` service
+    /// (`None` when the baseline service was disabled).
+    identity_handle: Option<NodeIdentityHandle>,
 }
 
 impl AsterServer {
     /// Start configuring a server.
     pub fn builder() -> AsterServerBuilder {
         AsterServerBuilder::default()
+    }
+
+    /// The live [`NodeIdentityHandle`] behind the baseline `aster.ops.NodeInfo`
+    /// service — keep a clone and update the served identity while the server
+    /// runs (`node_id` stays pinned). `None` when the baseline service was
+    /// disabled with [`builtin_node_info(false)`](AsterServerBuilder::builtin_node_info).
+    ///
+    /// ```no_run
+    /// # fn f(srv: &aster::rpc::AsterServer) {
+    /// if let Some(identity) = srv.node_identity() {
+    ///     identity.update(|id| {
+    ///         id.attributes
+    ///             .push(aster::rpc::baseline::Attr::new("draining", true));
+    ///     });
+    /// }
+    /// # }
+    /// ```
+    pub fn node_identity(&self) -> Option<NodeIdentityHandle> {
+        self.identity_handle.clone()
     }
 
     /// This server's connectable address as an `aster1…` ticket. Hand it to a

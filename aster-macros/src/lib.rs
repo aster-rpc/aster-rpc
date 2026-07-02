@@ -48,10 +48,12 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ))
             }
         },
+        Data::Enum(e) => return expand_union(ident, &package, &type_name, e),
         _ => {
             return Err(syn::Error::new_spanned(
                 ident,
-                "#[derive(AsterType)] can only be applied to structs",
+                "#[derive(AsterType)] can only be applied to structs (messages) or \
+                 data-carrying enums (unions)",
             ))
         }
     };
@@ -77,7 +79,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         });
         for child in child_types(&f.ty) {
             register_children.push(quote! {
-                <#child as ::aster::rpc::WireField>::register_payload(__fory, __seen);
+                <#child as ::aster::rpc::WireField>::register_payload(__reg);
             });
         }
     }
@@ -98,27 +100,166 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::aster::rpc::Leaf::reference(<Self as ::aster::rpc::AsterType>::aster_type_hash())
             }
 
-            fn register_payload(
-                __fory: &mut ::aster::rpc::Fory,
-                __seen: &mut ::std::collections::HashSet<::core::any::TypeId>,
-            ) {
-                if !__seen.insert(::core::any::TypeId::of::<Self>()) {
+            fn register_payload(__reg: &mut ::aster::rpc::PayloadRegistry) {
+                if !__reg.mark_seen::<Self>() {
                     return;
                 }
                 let __td = <Self as ::aster::rpc::AsterType>::aster_type_def();
-                __fory
-                    .register_by_name::<Self>(&::std::format!("{}.{}", __td.package, __td.name))
-                    .expect("register payload type");
+                __reg.register::<Self>(&::std::format!("{}.{}", __td.package, __td.name));
                 #(#register_children)*
             }
         }
     })
 }
 
+/// Expand `#[derive(AsterType)]` on a data-carrying enum → a `TypeDefKind::Union`
+/// contract type (§11.3.3 v1 scope):
+///
+/// - Every variant must have exactly one unnamed field whose type is itself an
+///   `AsterType` **message** (primitive variants like `Int(i64)` are outside
+///   the v1 cross-binding contract scope — wrap the primitive in a one-field
+///   message).
+/// - `T | nothing` is not a union variant — model nullability as
+///   `Option<TheUnion>` at the *field* using the union (§11.3.3 rule 2), so
+///   unit variants are rejected.
+/// - Variant case ids follow the `ForyUnion` scheme (explicit `#[fory(id = N)]`,
+///   else 0-based declaration index over the known variants) so contract
+///   identity and Fory wire discriminators agree. Pair with
+///   `#[derive(ForyUnion)]` for serialization — which also requires a trailing
+///   `#[fory(unknown)] Unknown(UnknownCase)` forward-compat variant; that
+///   variant is a runtime artifact and is **excluded** from the contract.
+fn expand_union(
+    ident: &Ident,
+    package: &str,
+    type_name: &str,
+    data: &syn::DataEnum,
+) -> syn::Result<TokenStream2> {
+    let mut variant_exprs: Vec<TokenStream2> = Vec::new();
+    let mut register_children: Vec<TokenStream2> = Vec::new();
+    let mut implicit_id: i32 = 0;
+    for variant in data.variants.iter() {
+        // `#[fory(unknown)] Unknown(UnknownCase)` — ForyUnion's runtime
+        // forward-compat carrier. Not a wire variant; skip it in the contract
+        // (and in implicit-id assignment, mirroring ForyUnion).
+        if has_fory_unknown_attr(variant) {
+            continue;
+        }
+        let vname = variant.ident.to_string();
+        let payload = match &variant.fields {
+            Fields::Unnamed(u) if u.unnamed.len() == 1 => &u.unnamed.first().unwrap().ty,
+            Fields::Unit => {
+                return Err(syn::Error::new_spanned(
+                    variant,
+                    "AsterType unions cannot carry unit variants: `nothing` is not a \
+                     cross-binding variant type. Model absence as Option<TheUnion> on the \
+                     field that uses this union, or wrap an empty message",
+                ))
+            }
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    variant,
+                    "AsterType union variants must have exactly one unnamed field whose type \
+                     is an AsterType message, e.g. `Int(IntValue)` — primitive payloads like \
+                     `Int(i64)` are outside the v1 contract scope (§11.3.3)",
+                ))
+            }
+        };
+        let id = fory_variant_id(variant)?.unwrap_or(implicit_id);
+        implicit_id += 1;
+        variant_exprs.push(quote! {
+            ::aster::rpc::make_union_variant(
+                #vname,
+                #id,
+                <#payload as ::aster::rpc::AsterType>::aster_type_hash(),
+            )
+        });
+        register_children.push(quote! {
+            <#payload as ::aster::rpc::WireField>::register_payload(__reg);
+        });
+    }
+
+    Ok(quote! {
+        impl ::aster::rpc::AsterType for #ident {
+            fn aster_type_def() -> ::aster::rpc::TypeDef {
+                ::aster::rpc::union_type_def(
+                    #package,
+                    #type_name,
+                    ::std::vec![ #(#variant_exprs),* ],
+                )
+            }
+        }
+
+        impl ::aster::rpc::WireField for #ident {
+            fn leaf() -> ::aster::rpc::Leaf {
+                ::aster::rpc::Leaf::reference(<Self as ::aster::rpc::AsterType>::aster_type_hash())
+            }
+
+            fn register_payload(__reg: &mut ::aster::rpc::PayloadRegistry) {
+                if !__reg.mark_seen::<Self>() {
+                    return;
+                }
+                let __td = <Self as ::aster::rpc::AsterType>::aster_type_def();
+                __reg.register::<Self>(&::std::format!("{}.{}", __td.package, __td.name));
+                #(#register_children)*
+            }
+        }
+    })
+}
+
+/// Whether a union variant carries `#[fory(unknown)]` — ForyUnion's runtime
+/// forward-compat marker. (ForyUnion itself validates the full shape; here the
+/// attribute alone decides contract exclusion.)
+fn has_fory_unknown_attr(variant: &syn::Variant) -> bool {
+    variant.attrs.iter().any(|attr| {
+        if !attr.path().is_ident("fory") {
+            return false;
+        }
+        let mut found = false;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("unknown") {
+                found = true;
+            } else if meta.input.peek(syn::Token![=]) {
+                let _: Expr = meta.value()?.parse()?;
+            }
+            Ok(())
+        });
+        found
+    })
+}
+
+/// Read an explicit `#[fory(id = N)]` case id off a union variant (the same
+/// attribute `ForyUnion` reads), so the contract mirrors the wire discriminator.
+fn fory_variant_id(variant: &syn::Variant) -> syn::Result<Option<i32>> {
+    for attr in &variant.attrs {
+        if !attr.path().is_ident("fory") {
+            continue;
+        }
+        let mut id: Option<i32> = None;
+        // Tolerate other #[fory(...)] keys (skip, default, …) — only `id`
+        // matters for contract identity.
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("id") {
+                if let Ok(value) = meta.value() {
+                    if let Ok(lit) = value.parse::<syn::LitInt>() {
+                        id = Some(lit.base10_parse::<i32>()?);
+                    }
+                }
+            } else if meta.input.peek(syn::Token![=]) {
+                let _: Expr = meta.value()?.parse()?;
+            }
+            Ok(())
+        });
+        if id.is_some() {
+            return Ok(id);
+        }
+    }
+    Ok(None)
+}
+
 /// Parse `#[aster(wire = "ns/Name")]` → `(package, name)`. Splits on the last
 /// `/`. Defaults to `("", <struct ident>)` when absent.
 fn parse_wire_tag(attrs: &[syn::Attribute], ident: &str) -> syn::Result<(String, String)> {
-    let mut wire: Option<String> = None;
+    let mut wire: Option<(String, proc_macro2::Span)> = None;
     for attr in attrs {
         if !attr.path().is_ident("aster") {
             continue;
@@ -127,7 +268,7 @@ fn parse_wire_tag(attrs: &[syn::Attribute], ident: &str) -> syn::Result<(String,
             if meta.path.is_ident("wire") {
                 let value = meta.value()?;
                 let lit: syn::LitStr = value.parse()?;
-                wire = Some(lit.value());
+                wire = Some((lit.value(), lit.span()));
                 Ok(())
             } else {
                 // Ignore unknown struct-level keys here; field-level keys are
@@ -137,12 +278,40 @@ fn parse_wire_tag(attrs: &[syn::Attribute], ident: &str) -> syn::Result<(String,
         })?;
     }
     match wire {
-        Some(tag) => match tag.rsplit_once('/') {
-            Some((ns, name)) => Ok((ns.to_string(), name.to_string())),
-            None => Ok((String::new(), tag)),
-        },
+        Some((tag, span)) => {
+            let (package, name) = match tag.rsplit_once('/') {
+                Some((ns, name)) => (ns.to_string(), name.to_string()),
+                None => (String::new(), tag),
+            };
+            if is_reserved_namespace(&package) && !expanding_inside_aster() {
+                return Err(syn::Error::new(
+                    span,
+                    format!(
+                        "wire package `{package}` is reserved: the `aster` namespace is for \
+                         baseline types shipped with the framework. Use your own package, \
+                         e.g. `#[aster(wire = \"myapp/{name}\")]`",
+                    ),
+                ));
+            }
+            Ok((package, name))
+        }
         None => Ok((String::new(), ident.to_string())),
     }
+}
+
+/// Whether `value` falls in the reserved `aster` namespace: the bare package
+/// `aster`, or anything under `aster.` / `aster/`. Deliberately does NOT match
+/// `aster-foo` / `asterix` — only the exact namespace is reserved.
+fn is_reserved_namespace(value: &str) -> bool {
+    value == "aster" || value.starts_with("aster.") || value.starts_with("aster/")
+}
+
+/// Escape hatch for the framework itself: baseline services/types defined in
+/// the `aster` crate are allowed to use the reserved namespace. Checked at
+/// macro-expansion time via the expanding crate's package name (covers the
+/// crate's own tests/examples too, which share `CARGO_PKG_NAME=aster`).
+fn expanding_inside_aster() -> bool {
+    std::env::var("CARGO_PKG_NAME").is_ok_and(|p| p == "aster")
 }
 
 struct FieldInfo {
@@ -411,7 +580,18 @@ impl Parse for ServiceArgs {
                     lit: Lit::Str(s), ..
                 }) = &m.value
                 {
-                    name = Some(s.value());
+                    let value = s.value();
+                    if is_reserved_namespace(&value) && !expanding_inside_aster() {
+                        return Err(syn::Error::new(
+                            s.span(),
+                            format!(
+                                "service name `{value}` is reserved: the `aster.*` namespace is \
+                                 for baseline services shipped with the framework. Choose a name \
+                                 in your own namespace, e.g. `name = \"myapp.MyService\"`",
+                            ),
+                        ));
+                    }
+                    name = Some(value);
                 }
             } else if m.path.is_ident("version") {
                 if let Expr::Lit(ExprLit {
@@ -494,29 +674,44 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
     let server_ident = format_ident!("{}Server", svc_ident);
     let client_ident = format_ident!("{}Client", svc_ident);
 
-    // Unique payload types (for Fory registration; avoid double-registering).
-    // Each call registers the type *and its transitive dependencies* (nested
-    // structs, `Vec<UserStruct>`, map values, …) via `WireField::register_payload`,
-    // deduped at runtime by the shared `__seen` set below.
-    let mut seen: Vec<String> = Vec::new();
-    let mut register_stmts: Vec<TokenStream2> = Vec::new();
+    // Unique payload root types (each method's request/response). Every root
+    // gets its OWN Fory runtime holding the root plus its transitive field
+    // tree (nested structs, `Vec<UserStruct>`, map values, …) via
+    // `WireField::register_payload`. One runtime per root is what keeps Fory's
+    // per-crate `fory_type_index()` scheme collision-safe: two roots whose
+    // types come from different crates (e.g. a user payload and the implicit
+    // aster `Empty`) may share an index and so must not share a runtime.
+    // Serialization is unaffected — every payload frame is a standalone Fory
+    // document, so which runtime encodes it only depends on what's registered.
+    let mut roots: Vec<String> = Vec::new();
+    let mut fory_exprs: Vec<TokenStream2> = Vec::new();
     for s in &specs {
         for ty in [&s.req_ty, &s.resp_ty] {
             let key = quote!(#ty).to_string();
-            if !seen.contains(&key) {
-                seen.push(key);
-                register_stmts.push(quote! {
-                    <#ty as ::aster::rpc::WireField>::register_payload(&mut __f, &mut __seen);
+            if !roots.contains(&key) {
+                roots.push(key);
+                fory_exprs.push(quote! {
+                    ::std::sync::Arc::new({
+                        let mut __reg = ::aster::rpc::PayloadRegistry::new();
+                        <#ty as ::aster::rpc::WireField>::register_payload(&mut __reg);
+                        __reg.into_fory()
+                    })
                 });
             }
         }
     }
-    let build_fory = quote! {{
-        let mut __f = ::aster::rpc::new_payload_fory();
-        let mut __seen = ::std::collections::HashSet::new();
-        #(#register_stmts)*
-        __f
-    }};
+    let build_fory = quote! {
+        ::std::vec![ #(#fory_exprs),* ]
+    };
+    // Compile-time root-type → runtime index lookup for the generated call
+    // sites (`self.fory[idx]`).
+    let root_idx = |ty: &Type| -> usize {
+        let key = quote!(#ty).to_string();
+        roots
+            .iter()
+            .position(|k| *k == key)
+            .expect("payload root type not in registration list")
+    };
 
     // ServiceContract expression.
     let method_defs: Vec<TokenStream2> = specs
@@ -567,12 +762,23 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
             })
         })
         .collect();
-    let dispatch_arms: Vec<TokenStream2> = specs.iter().map(dispatch_arm).collect();
+    let dispatch_arms: Vec<TokenStream2> = specs
+        .iter()
+        .map(|s| dispatch_arm(s, root_idx(&s.req_ty), root_idx(&s.resp_ty)))
+        .collect();
 
     // Client methods.
     let client_methods: Vec<TokenStream2> = specs
         .iter()
-        .map(|s| client_method(s, &svc_name, svc_version))
+        .map(|s| {
+            client_method(
+                s,
+                &svc_name,
+                svc_version,
+                root_idx(&s.req_ty),
+                root_idx(&s.resp_ty),
+            )
+        })
         .collect();
 
     // Optional browser JSON projection (gateway). Generated only when the
@@ -593,10 +799,11 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
             .map(|s| {
                 let name = &s.name;
                 let req = &s.req_ty;
+                let idx = root_idx(&s.req_ty);
                 quote!(#name => {
                     let __v: #req = ::serde_json::from_slice(body)
                         .map_err(|e| ::std::string::ToString::to_string(&e))?;
-                    self.fory.serialize(&__v).map_err(|e| ::std::string::ToString::to_string(&e))
+                    self.fory[#idx].serialize(&__v).map_err(|e| ::std::string::ToString::to_string(&e))
                 })
             })
             .collect();
@@ -605,8 +812,9 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
             .map(|s| {
                 let name = &s.name;
                 let resp = &s.resp_ty;
+                let idx = root_idx(&s.resp_ty);
                 quote!(#name => {
-                    let __v: #resp = self.fory.deserialize(fory)
+                    let __v: #resp = self.fory[#idx].deserialize(fory)
                         .map_err(|e| ::std::string::ToString::to_string(&e))?;
                     ::serde_json::to_vec(&__v).map_err(|e| ::std::string::ToString::to_string(&e))
                 })
@@ -620,11 +828,11 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
             #[doc = "`aster_transport_salvo::router_with`. Transcodes JSON⇄Fory at the HTTP"]
             #[doc = "edge; the dispatcher still runs ordinary Fory."]
             pub struct #projection_ident {
-                fory: ::std::sync::Arc<::aster::rpc::Fory>,
+                fory: ::std::vec::Vec<::std::sync::Arc<::aster::rpc::Fory>>,
             }
             impl #projection_ident {
                 pub fn new() -> Self {
-                    Self { fory: ::std::sync::Arc::new(#build_fory) }
+                    Self { fory: #build_fory }
                 }
             }
             impl ::core::default::Default for #projection_ident {
@@ -671,12 +879,12 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
         /// Server adapter: wrap a trait impl and register it with an `rpc::Server`.
         pub struct #server_ident<T> {
             inner: T,
-            fory: ::std::sync::Arc<::aster::rpc::Fory>,
+            fory: ::std::vec::Vec<::std::sync::Arc<::aster::rpc::Fory>>,
         }
 
         impl<T: #svc_ident + ::core::marker::Send + ::core::marker::Sync + 'static> #server_ident<T> {
             pub fn new(inner: T) -> Self {
-                Self { inner, fory: ::std::sync::Arc::new(#build_fory) }
+                Self { inner, fory: #build_fory }
             }
             /// The cross-binding `ServiceContract` for this service.
             pub fn contract() -> ::aster::rpc::ServiceContract {
@@ -714,12 +922,12 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
         /// Client stub over an `RpcConnection`.
         pub struct #client_ident {
             conn: ::aster::rpc::RpcConnection,
-            fory: ::std::sync::Arc<::aster::rpc::Fory>,
+            fory: ::std::vec::Vec<::std::sync::Arc<::aster::rpc::Fory>>,
         }
 
         impl #client_ident {
             pub fn new(conn: ::aster::rpc::RpcConnection) -> Self {
-                Self { conn, fory: ::std::sync::Arc::new(#build_fory) }
+                Self { conn, fory: #build_fory }
             }
             /// The cross-binding `ServiceContract` for this service.
             pub fn contract() -> ::aster::rpc::ServiceContract {
@@ -904,10 +1112,10 @@ fn pattern_token(p: Pattern) -> TokenStream2 {
 }
 
 /// Decode the (single) request payload, bailing with INVALID_ARGUMENT on failure.
-fn decode_one_request(req: &Type) -> TokenStream2 {
+fn decode_one_request(req: &Type, req_idx: usize) -> TokenStream2 {
     quote! {
         let __raw = call.recv_request().await.unwrap_or_default();
-        let __req: #req = match self.fory.deserialize(&__raw) {
+        let __req: #req = match self.fory[#req_idx].deserialize(&__raw) {
             ::core::result::Result::Ok(r) => r,
             ::core::result::Result::Err(e) => {
                 let _ = call.finish(&::aster::rpc::RpcStatus::error(
@@ -922,9 +1130,9 @@ fn decode_one_request(req: &Type) -> TokenStream2 {
 
 /// Encode `__resp` and complete the unary/client-stream call, or finish with an
 /// INTERNAL error if encoding fails.
-fn respond_one() -> TokenStream2 {
+fn respond_one(resp_idx: usize) -> TokenStream2 {
     quote! {
-        match self.fory.serialize(&__resp) {
+        match self.fory[#resp_idx].serialize(&__resp) {
             ::core::result::Result::Ok(__bytes) => {
                 let _ = call.respond(__bytes, &::aster::rpc::RpcStatus::ok());
             }
@@ -939,14 +1147,14 @@ fn respond_one() -> TokenStream2 {
 }
 
 /// The `match` arm in the generated `ServiceDispatch::dispatch` for one method.
-fn dispatch_arm(s: &MethodSpec) -> TokenStream2 {
+fn dispatch_arm(s: &MethodSpec, req_idx: usize, resp_idx: usize) -> TokenStream2 {
     let name = &s.name;
     let ident = &s.ident;
     let req = &s.req_ty;
     let resp = &s.resp_ty;
     match s.pattern {
         Pattern::Unary => {
-            let respond = respond_one();
+            let respond = respond_one(resp_idx);
             // No-request unary: consume the (ignored) request frame and call the
             // handler with no argument; otherwise decode the request normally.
             let (decode, invoke) = if s.no_request {
@@ -955,7 +1163,10 @@ fn dispatch_arm(s: &MethodSpec) -> TokenStream2 {
                     quote! { self.inner.#ident() },
                 )
             } else {
-                (decode_one_request(req), quote! { self.inner.#ident(__req) })
+                (
+                    decode_one_request(req, req_idx),
+                    quote! { self.inner.#ident(__req) },
+                )
             };
             quote! {
                 #name => {
@@ -970,11 +1181,11 @@ fn dispatch_arm(s: &MethodSpec) -> TokenStream2 {
             }
         }
         Pattern::ServerStream => {
-            let decode = decode_one_request(req);
+            let decode = decode_one_request(req, req_idx);
             quote! {
                 #name => {
                     #decode
-                    let __sink = call.response_sink::<#resp>(self.fory.clone());
+                    let __sink = call.response_sink::<#resp>(self.fory[#resp_idx].clone());
                     match self.inner.#ident(__req, __sink).await {
                         ::core::result::Result::Ok(()) => {
                             let _ = call.finish(&::aster::rpc::RpcStatus::ok());
@@ -987,10 +1198,10 @@ fn dispatch_arm(s: &MethodSpec) -> TokenStream2 {
             }
         }
         Pattern::ClientStream => {
-            let respond = respond_one();
+            let respond = respond_one(resp_idx);
             quote! {
                 #name => {
-                    let __reqs = call.take_requests::<#req>(self.fory.clone());
+                    let __reqs = call.take_requests::<#req>(self.fory[#req_idx].clone());
                     match self.inner.#ident(__reqs).await {
                         ::core::result::Result::Ok(__resp) => { #respond }
                         ::core::result::Result::Err(__e) => {
@@ -1002,8 +1213,8 @@ fn dispatch_arm(s: &MethodSpec) -> TokenStream2 {
         }
         Pattern::BidiStream => quote! {
             #name => {
-                let __reqs = call.take_requests::<#req>(self.fory.clone());
-                let __sink = call.response_sink::<#resp>(self.fory.clone());
+                let __reqs = call.take_requests::<#req>(self.fory[#req_idx].clone());
+                let __sink = call.response_sink::<#resp>(self.fory[#resp_idx].clone());
                 match self.inner.#ident(__reqs, __sink).await {
                     ::core::result::Result::Ok(()) => {
                         let _ = call.finish(&::aster::rpc::RpcStatus::ok());
@@ -1018,7 +1229,13 @@ fn dispatch_arm(s: &MethodSpec) -> TokenStream2 {
 }
 
 /// One client-stub method.
-fn client_method(s: &MethodSpec, svc_name: &str, svc_version: i32) -> TokenStream2 {
+fn client_method(
+    s: &MethodSpec,
+    svc_name: &str,
+    svc_version: i32,
+    req_idx: usize,
+    resp_idx: usize,
+) -> TokenStream2 {
     let ident = &s.ident;
     let name = &s.name;
     let req = &s.req_ty;
@@ -1046,35 +1263,35 @@ fn client_method(s: &MethodSpec, svc_name: &str, svc_version: i32) -> TokenStrea
         // No-request unary → no `req` parameter; send an implicit `Empty`.
         Pattern::Unary if s.no_request => quote! {
             pub async fn #ident(&self) -> ::aster::Result<#resp> {
-                let __bytes = self.fory.serialize(&<#req>::default()).map_err(#encode_err)?;
+                let __bytes = self.fory[#req_idx].serialize(&<#req>::default()).map_err(#encode_err)?;
                 let __resp_bytes = self.conn.unary(&#header, __bytes).await?;
-                self.fory.deserialize::<#resp>(&__resp_bytes).map_err(#decode_err)
+                self.fory[#resp_idx].deserialize::<#resp>(&__resp_bytes).map_err(#decode_err)
             }
         },
         Pattern::Unary => quote! {
             pub async fn #ident(&self, req: #req) -> ::aster::Result<#resp> {
-                let __bytes = self.fory.serialize(&req).map_err(#encode_err)?;
+                let __bytes = self.fory[#req_idx].serialize(&req).map_err(#encode_err)?;
                 let __resp_bytes = self.conn.unary(&#header, __bytes).await?;
-                self.fory.deserialize::<#resp>(&__resp_bytes).map_err(#decode_err)
+                self.fory[#resp_idx].deserialize::<#resp>(&__resp_bytes).map_err(#decode_err)
             }
         },
         Pattern::ServerStream => quote! {
             pub async fn #ident(&self, req: #req)
                 -> ::aster::Result<::aster::rpc::MessageStream<#resp>>
             {
-                let __bytes = self.fory.serialize(&req).map_err(#encode_err)?;
+                let __bytes = self.fory[#req_idx].serialize(&req).map_err(#encode_err)?;
                 let __raw = self.conn.server_stream(&#header, __bytes).await?;
-                ::core::result::Result::Ok(::aster::rpc::MessageStream::new(__raw, self.fory.clone()))
+                ::core::result::Result::Ok(::aster::rpc::MessageStream::new(__raw, self.fory[#resp_idx].clone()))
             }
         },
         Pattern::ClientStream => quote! {
             pub async fn #ident(&self, reqs: ::std::vec::Vec<#req>) -> ::aster::Result<#resp> {
                 let mut __encoded = ::std::vec::Vec::with_capacity(reqs.len());
                 for __r in &reqs {
-                    __encoded.push(self.fory.serialize(__r).map_err(#encode_err)?);
+                    __encoded.push(self.fory[#req_idx].serialize(__r).map_err(#encode_err)?);
                 }
                 let __resp_bytes = self.conn.client_stream(&#header, __encoded).await?;
-                self.fory.deserialize::<#resp>(&__resp_bytes).map_err(#decode_err)
+                self.fory[#resp_idx].deserialize::<#resp>(&__resp_bytes).map_err(#decode_err)
             }
         },
         Pattern::BidiStream => {
@@ -1085,10 +1302,10 @@ fn client_method(s: &MethodSpec, svc_name: &str, svc_version: i32) -> TokenStrea
                 {
                     let mut __encoded = ::std::vec::Vec::with_capacity(reqs.len());
                     for __r in &reqs {
-                        __encoded.push(self.fory.serialize(__r).map_err(#encode_err)?);
+                        __encoded.push(self.fory[#req_idx].serialize(__r).map_err(#encode_err)?);
                     }
                     let __raw = self.conn.bidi(&#header, __encoded).await?;
-                    ::core::result::Result::Ok(::aster::rpc::MessageStream::new(__raw, self.fory.clone()))
+                    ::core::result::Result::Ok(::aster::rpc::MessageStream::new(__raw, self.fory[#resp_idx].clone()))
                 }
 
                 /// Open this bidi call for **incremental** sending: returns a typed
@@ -1103,11 +1320,34 @@ fn client_method(s: &MethodSpec, svc_name: &str, svc_version: i32) -> TokenStrea
                 {
                     let (__sink, __raw) = self.conn.bidi_open(&#header).await?;
                     ::core::result::Result::Ok((
-                        ::aster::rpc::BidiCall::new(__sink, self.fory.clone()),
-                        ::aster::rpc::MessageStream::new(__raw, self.fory.clone()),
+                        ::aster::rpc::BidiCall::new(__sink, self.fory[#req_idx].clone()),
+                        ::aster::rpc::MessageStream::new(__raw, self.fory[#resp_idx].clone()),
                     ))
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_reserved_namespace;
+
+    #[test]
+    fn reserved_namespace_matches_exact_and_prefixed() {
+        assert!(is_reserved_namespace("aster"));
+        assert!(is_reserved_namespace("aster.ops.NodeInfo"));
+        assert!(is_reserved_namespace("aster.trust"));
+        assert!(is_reserved_namespace("aster/ops"));
+    }
+
+    #[test]
+    fn reserved_namespace_ignores_lookalikes() {
+        assert!(!is_reserved_namespace(""));
+        assert!(!is_reserved_namespace("asterix"));
+        assert!(!is_reserved_namespace("aster-foo"));
+        assert!(!is_reserved_namespace("portalsync"));
+        assert!(!is_reserved_namespace("myapp.aster"));
+        assert!(!is_reserved_namespace("Aster")); // reservation is case-exact
     }
 }

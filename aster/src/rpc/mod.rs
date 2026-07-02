@@ -22,6 +22,7 @@
 //!   finish with an [`RpcStatus`].
 
 pub mod auth;
+pub mod baseline;
 pub mod client;
 pub mod codec;
 pub mod contract;
@@ -46,9 +47,10 @@ pub use codec::{
     new_payload_fory, CallHeader, CodecError, RpcStatus, SerializationMode, StreamHeader,
 };
 pub use contract::{
-    contract_id, encode_scalar_default, make_field, message_type_def, AsterType, ContractManifest,
-    Leaf, ManifestMethod, MethodDef, MethodPattern, ScalarDefault, ScopeKind, ServiceContract,
-    TypeDef, WireField,
+    contract_id, encode_scalar_default, make_field, make_union_variant, message_type_def,
+    union_type_def, AsterType, ContractManifest, Leaf, ManifestMethod, MethodDef, MethodPattern,
+    PayloadRegistry, ScalarDefault, ScopeKind, ServiceContract, TypeDef, UnionVariantDef,
+    WireField,
 };
 pub use empty::Empty;
 pub use interceptor::{CallContext, CircuitBreaker, Interceptor, Pipeline, RetryPolicy};
@@ -72,6 +74,12 @@ pub use streaming::{BidiCall, MessageStream, RequestStream, ResponseSink};
 
 /// The Apache Fory runtime, re-exported for `#[aster::service]`-generated code
 /// (payload ser/de). Build one with [`new_payload_fory`].
+///
+/// Note: `#[derive(ForyUnion)]` payload enums must declare their mandatory
+/// forward-compat variant as `#[fory(unknown)] Unknown(fory_core::UnknownCase)`
+/// — the ForyUnion derive only accepts that exact path spelling, so it cannot
+/// be re-exported here. That variant is a runtime artifact; the `AsterType`
+/// derive excludes it from the cross-binding contract.
 pub use fory_core::Fory;
 
 /// `#[async_trait]`, re-exported so service traits + impls don't need a direct

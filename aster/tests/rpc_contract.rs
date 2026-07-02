@@ -143,3 +143,118 @@ fn default_lowers_into_contract() {
     assert_eq!(plain.default_value, "");
     assert_eq!(plain.type_primitive, "varint64");
 }
+
+// ── Unions (§11.3.3 v1: all-message variants) ─────────────────────────────────
+
+use fory_derive::ForyUnion;
+
+#[derive(ForyStruct, AsterType, Debug, Default, PartialEq)]
+#[aster(wire = "echo/IntBox")]
+struct IntBox {
+    value: i64,
+}
+
+#[derive(ForyStruct, AsterType, Debug, Default, PartialEq)]
+#[aster(wire = "echo/TextBox")]
+struct TextBox {
+    value: String,
+}
+
+#[derive(ForyUnion, AsterType, Debug, PartialEq)]
+#[aster(wire = "echo/Scalar")]
+enum Scalar {
+    #[fory(default)]
+    Int(IntBox),
+    Text(TextBox),
+    /// ForyUnion's mandatory forward-compat carrier — excluded from the contract.
+    #[fory(unknown)]
+    Unknown(fory_core::UnknownCase),
+}
+
+#[test]
+fn union_typedef_shape() {
+    let td = Scalar::aster_type_def();
+    assert_eq!(format!("{:?}", td.kind), "Union");
+    assert_eq!(td.package, "echo");
+    assert_eq!(td.name, "Scalar");
+    assert!(td.fields.is_empty());
+    assert!(td.enum_values.is_empty());
+    assert_eq!(td.union_variants.len(), 2);
+
+    let int_v = &td.union_variants[0];
+    assert_eq!(int_v.name, "Int");
+    assert_eq!(int_v.id, 0, "implicit case id = declaration index");
+    assert_eq!(int_v.type_ref, IntBox::aster_type_hash_hex());
+
+    let text_v = &td.union_variants[1];
+    assert_eq!(text_v.name, "Text");
+    assert_eq!(text_v.id, 1);
+    assert_eq!(text_v.type_ref, TextBox::aster_type_hash_hex());
+}
+
+#[derive(ForyUnion, AsterType, Debug, PartialEq)]
+#[aster(wire = "echo/ScalarOrdered")]
+enum ScalarDeclared {
+    #[fory(default, id = 0)]
+    Int(IntBox),
+    #[fory(id = 1)]
+    Text(TextBox),
+    #[fory(unknown)]
+    Unknown(fory_core::UnknownCase),
+}
+
+#[derive(ForyUnion, AsterType, Debug, PartialEq)]
+#[aster(wire = "echo/ScalarOrdered")]
+enum ScalarReversed {
+    #[fory(id = 1)]
+    Text(TextBox),
+    #[fory(default, id = 0)]
+    Int(IntBox),
+    #[fory(unknown)]
+    Unknown(fory_core::UnknownCase),
+}
+
+#[test]
+fn union_hash_is_declaration_order_independent() {
+    // Same wire name + same {name, id, type_ref} variant set, declared in
+    // opposite order → identical canonical bytes (encoder sorts by id).
+    assert_eq!(
+        ScalarDeclared::aster_type_hash_hex(),
+        ScalarReversed::aster_type_hash_hex()
+    );
+    // And an explicit-id declaration matches the implicit-index one when the
+    // ids coincide — modulo the differing wire name.
+    let td = ScalarDeclared::aster_type_def();
+    assert_eq!(td.union_variants[0].id, 0);
+    assert_eq!(td.union_variants[1].id, 1);
+}
+
+#[test]
+fn union_value_roundtrips_through_payload_fory() {
+    let mut reg = aster::rpc::PayloadRegistry::new();
+    <Scalar as aster::rpc::WireField>::register_payload(&mut reg);
+    let fory = reg.into_fory();
+
+    for value in [
+        Scalar::Int(IntBox { value: -42 }),
+        Scalar::Text(TextBox {
+            value: "hello".into(),
+        }),
+    ] {
+        let bytes = fory.serialize(&value).expect("serialize union");
+        let back: Scalar = fory.deserialize(&bytes).expect("deserialize union");
+        assert_eq!(back, value);
+    }
+}
+
+#[test]
+fn union_hash_golden_pin() {
+    // Stability pin for the union canonical form (encoder: core, §11.3.3).
+    // Cross-check against the Java/TS canonical encoders when their union
+    // codegen lands (they already model UnionVariantDef identically).
+    assert_eq!(
+        Scalar::aster_type_hash_hex(),
+        "bf7cf4699db6dcfd4e9d9246fd39d3f55c1cc77f6080a87572c64b3293346891",
+        "union canonical bytes changed — this breaks cross-binding contract identity"
+    );
+}

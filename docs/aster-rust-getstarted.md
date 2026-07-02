@@ -617,3 +617,18 @@ with `AsterConfigBuilder::hooks(true)`.
 - `Admission` exposes separate `next_handshake()` (inbound) and `next_connect()`
   (outbound) streams; with hooks enabled, unhandled outbound connect hooks wait
   for the hook timeout before a default accept.
+
+---
+
+## 7. See also
+
+- [aster-baseline-services-getstarted.md](aster-baseline-services-getstarted.md) —
+  the default-on `aster.ops.NodeInfo` service, the `aster/Value` typed
+  name/value primitive, the reserved `aster.*` namespace, and defining your own
+  union payloads with `#[derive(ForyUnion, AsterType)]`.
+- [aster-sealed-grants-getstarted.md](aster-sealed-grants-getstarted.md) —
+  `aster::grants`: hand a secret (e.g. a docs-namespace capability) to one node
+  through a publicly-replicated policy doc.
+- [aster-expose-getstarted.md](aster-expose-getstarted.md) /
+  [aster-http-getstarted.md](aster-http-getstarted.md) — additional transports
+  on the same node.
