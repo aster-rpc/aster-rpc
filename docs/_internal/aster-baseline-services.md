@@ -1,13 +1,14 @@
 # `aster.*` Baseline Services — A Standard Ops Surface on Every Node
 
-> **Status: working idea, not a spec.** Everything below is exploratory — the catalog, the names, the auth model, the RPC shapes. Expect refinement and scope reduction before any of this becomes normative. Don't take a single name or method signature here as committed; we will likely ship a smaller, sharper subset than what's enumerated.
+> **Status: first slice SHIPPED (2026-07-02), rest is proposal.** Shipped in Rust: the compile-time `aster.*` namespace guard, union support in `#[derive(AsterType)]`, the `aster/Value`+`aster/Attr`+`aster/NodeIdentity` payload types, and `aster.ops.NodeInfo` served **by default** on every `AsterServer` (`aster/src/rpc/baseline.rs`; end-user doc [../aster-baseline-services-getstarted.md](../aster-baseline-services-getstarted.md)). Everything else below — Health, Manifest, Logs, the auth-scope model, the wider catalog — remains exploratory; expect refinement and scope reduction before it becomes normative.
 
-**Date:** 2026-05-06
 **Companion docs:**
-- [decentralized-log-distribution.md](decentralized-log-distribution.md) — the publisher/subscriber substrate; this doc adds the on-demand pull side
-- [observability-in-core.md](observability-in-core.md) — OTel SDK, metrics, traces, hooks
-- identity-worked-example.md (deleted 2026-06-10, in git history) — tenant/rcan model; superseded by directory roles per [../trust-directory.md](../trust-directory.md)
-- trust-discovery-thinking-session.md (deleted 2026-06-10, in git history) — handle registry / discovery primitives the baseline `discovery.*` services would expose; concluded in [../trust-directory.md](../trust-directory.md)
+- [working_ideas/decentralized-log-distribution.md](working_ideas/decentralized-log-distribution.md) — the publisher/subscriber substrate; this doc adds the on-demand pull side
+- [working_ideas/observability-in-core.md](working_ideas/observability-in-core.md) — OTel SDK, metrics, traces, hooks
+- [working_ideas/aster-network-topology.md](working_ideas/aster-network-topology.md) — locality self-mapping; would surface as `aster.net.Topology` alongside `aster.ops.Connections`
+- [aster-sealed-grants.md](aster-sealed-grants.md) — per-recipient capability distribution (from portal-sync); shipped as `aster::grants`; any runtime surface would land in `aster.trust.*`
+- identity-worked-example.md (deleted 2026-06-10, in git history) — tenant/rcan model; superseded by directory roles per [trust-directory.md](trust-directory.md)
+- trust-discovery-thinking-session.md (deleted 2026-06-10, in git history) — handle registry / discovery primitives the baseline `discovery.*` services would expose; concluded in [trust-directory.md](trust-directory.md)
 
 ---
 
@@ -41,6 +42,10 @@ Common threads: **uniform, discoverable, scope-gated, shipped with the runtime.*
 
 Strict rule: `aster.*` is reserved for baseline services defined in core. Bindings cannot define `aster.*` services themselves. A downstream product that wants its own ops surface lives in its own namespace (`portal.ops.*`, etc.).
 
+**ENFORCED (shipped 2026-07-02).** Both macros reject the reserved namespace at compile time — `#[aster::service(name = …)]` for service names and `#[aster(wire = "ns/Name")]` for payload packages (`aster-macros/src/lib.rs`, `is_reserved_namespace`). The check covers `aster` exact plus `aster.`/`aster/` prefixes, is deliberately case-exact, and does **not** match lookalikes (`asterix`, `aster-foo`). Escape hatch for the framework itself: expansion inside the `aster` crate (`CARGO_PKG_NAME == "aster"`) is exempt, which is where `rpc::baseline` defines the real baseline types. Note this is a foot-gun guard, not a security boundary — a determined consumer can hand-implement `AsterType` — but it prevents accidental squatting.
+
+Note the two naming forms in play: service *names* are arbitrary strings (`aster.ops.NodeInfo`), while payload types carry a `#[aster(wire = "…")]` tag that splits on the **last** `/` into `(package, name)` — so a baseline payload is `aster/NodeIdentity`, package `aster`. The reservation applies to both.
+
 Versioning: probably `aster.ops.v1.Logs` style in the contract path, with the contract-identity hash giving the more granular guarantee. Cosmetic question — defer.
 
 ---
@@ -52,12 +57,50 @@ A first-cut list, grouped by concern. Treat this as the **maximum** surface; eve
 ### Identity & discovery
 
 ```
-aster.ops.NodeInfo          # version, build, capabilities, public endpoint id, uptime
+aster.ops.NodeInfo          # version, build, capabilities, public endpoint id, uptime → NodeIdentity
 aster.ops.Manifest          # which contracts this node serves (reflection)
 aster.discovery.Resolve     # handle → anchor pubkey → endpoint list
                             # (the registry side of §"Control-plane HA"
                             # in the deleted identity-worked-example.md; see trust-directory.md)
 ```
+
+**Origin.** This entry was concretised by portal-sync hand-rolling its own `NodeService` / `NodeInfo` (a node describing itself). The generic half of that — "a node can describe itself" — is baseline. The rest of portal-sync's record (admission `state: active|revoked|retired`, expiry, policy attributes) is **domain policy** and stays in portal-sync's namespace. The rule that falls out: **Aster ships the introspection mechanism + a generic identity record; it does not absorb any one consumer's policy schema.** Consumers layer their own service on top (ideally embedding `NodeIdentity` rather than re-declaring `node_id`).
+
+**`NodeIdentity` (SHIPPED — wire `aster/NodeIdentity`, `aster/src/rpc/baseline.rs`).** Mirrors the node's real substrate — Aster's `AttributeStore` is `HashMap<String, HashMap<String, String>>` (`aster/src/rpc/auth.rs:22`), i.e. single-valued name→value:
+
+```
+node_id: String        # hex public key (NodeId) — stamped by the server at start; unforgeable by config
+node_name: String
+tags: Vec<String>
+roles: Vec<String>     # hoisted out of attributes — Gate-3 load-bearing (aster.role)
+attributes: Vec<Attr>  # everything else; Attr { name: String, value: Option<Value> }
+```
+
+Rejected the portal-sync `attr_keys` / `attr_kinds` / `attr_values` parallel-array shape: three index-aligned `Vec<String>` encode a desync bug the type can't prevent, and double-stringly-type the value. A `Vec<Attr>` of a self-contained pair fixes both.
+
+**`aster.ops.NodeInfo` (SHIPPED).** One idempotent method, `describe() → NodeIdentity`. Served **by default** on every `AsterServer` (which also makes a service-less server startable — a bare node is still describable); `builtin_node_info(false)` disables, `node_info_requires(…)` gates it (Gate 3, via a `RequireGuard` service-requirement wrapper), `node_identity(…)` supplies the initial record. The served record is **live**: `AsterServer::node_identity()` returns a clone-shared `NodeIdentityHandle` (AttributeStore pattern) with `get`/`set`/`update` for runtime changes (drain flags, capacity, retagging); `node_id` stays pinned through every mutation. Tests: `aster/tests/rpc_baseline.rs`.
+
+### Shared value type — `aster/Value` (SHIPPED)
+
+`Value` is referenced across the surface (e.g. `map<string, Value>` in `LogRecord` below, and `Attr` above): one typed primitive union, `Int(i64) | Float(f64) | Bool(bool) | Text(String)` (Int/Float deliberately distinct: JS/TS `number` makes i64-vs-f64 a real cross-binding distinction).
+
+Two shape decisions were forced by the normative spec during implementation:
+
+- **Variants are one-field wrapper messages** (`aster/IntValue` etc.), not bare primitives. ContractIdentity **§11.3.3 v1 admits only message-typed union variants** — `UnionVariantDef` carries only `{name, id, type_ref-of-message}`, with no slot for a primitive; primitive variants "MUST raise in v1". Allowing them is a canonical-bytes change that must land in **all four** bindings' encoders simultaneously (they already model unions identically), so it's a flagged spec-revision follow-up, not something to slip in Rust-side. Ergonomics are recovered with `From` impls + `as_*` accessors — callers never touch the wrappers.
+- **No `Null` variant.** §11.3.3 rule 2: `T | nothing` is nullability, not a union — absence is `Option<Value>` at the field (see `Attr.value`). ForyUnion's mandatory `#[fory(default)]` sits on `Text` instead, and its mandatory `#[fory(unknown)] Unknown(fory_core::UnknownCase)` forward-compat variant is a runtime artifact excluded from the contract.
+
+**Two-layer state of the world (updated 2026-07-02, post-ship):**
+
+- **Contract-identity layer models unions cross-binding** — and Rust now *emits* it: `#[derive(AsterType)]` accepts data-carrying enums → `TypeDefKind::Union` + `union_variants`, ids per the ForyUnion case-id scheme (explicit `#[fory(id = N)]`, else 0-based declaration index, `Unknown` excluded). Canonical hash is declaration-order-independent (encoder sorts by id) and pinned by a golden in `aster/tests/rpc_contract.rs`. Java/Python/TS already model `UnionVariantDef` identically; cross-check their encoders against the golden when their union codegen lands.
+- **Value codec:** Rust round-trips unions through the payload Fory (`ForyUnion`, fory-core 1.3). Python/TS/Java/Kotlin still have no union value codec (Python peels `Optional` only; TS hard-codes `union_variants: []`; Fory version skew: rest of the matrix is on 0.17.0). Rides the existing cross-binding-payload track — exactly as sequenced.
+
+**Build order — where it stands:**
+0. ✅ Namespace guard in the macros (see *Namespace reservation*).
+1. ✅ `#[derive(AsterType)]` union support (`aster-macros/src/lib.rs::expand_union`), tested incl. golden hash pin.
+2. ✅ `aster/Value` + Rust↔Rust Fory round-trip (`aster/tests/rpc_contract.rs::union_value_roundtrips_through_payload_fory`).
+3. ✅ `aster/Attr` + `aster/NodeIdentity` + `aster.ops.NodeInfo` default-on in `AsterServerBuilder` (end-to-end tests in `aster/tests/rpc_baseline.rs`).
+4. ⏳ Per-binding union **value** codec + codegen (Python/TS/Java/Kotlin) + Fory 0.17→1.x reconciliation — tracked under the cross-binding-payload effort. Also carries the FFI surfaces for `NodeInfo` in each binding.
+5. ⏳ (Flagged spec revision, optional) Direct primitive union variants — §11.3.3 change to `UnionVariantDef` canonical form, all four encoders at once; would let `Value` drop the wrapper messages in a v2.
 
 ### Health & lifecycle
 
@@ -276,7 +319,7 @@ The full catalog above is what the surface *could* look like at maturity. What's
 **Genuine Day-1 candidates** (small, high-value, mostly core-side):
 
 ```
-aster.ops.NodeInfo          # trivial; one method
+aster.ops.NodeInfo          # ✅ SHIPPED (Rust, default-on; aster/src/rpc/baseline.rs)
 aster.ops.Health            # the HealthServer migration is already happening anyway
 aster.ops.Manifest          # already implicit in contract identity
 aster.ops.Logs              # the killer demo; reads core-owned buffer
@@ -317,7 +360,7 @@ If the goal is "smallest surface that delivers the Day-0 control-panel-tail demo
 
 ## Mental model
 
-> Every Aster node exposes the same baseline surface. A control panel, a CLI, a monitor knows it can dial any node and call the same ops RPCs and get a predictable response. The application can never disable or override these — they're shipped with the runtime, gated by rcan scopes, and namespace-reserved in `aster.*`.
+> Every Aster node exposes the same baseline surface. A control panel, a CLI, a monitor knows it can dial any node and call the same ops RPCs and get a predictable response. They ship with the runtime, on by default, namespace-reserved in `aster.*`, and gated by scopes. (As shipped: the application *can* disable or auth-gate a baseline service via the builder — default-on with explicit opt-out replaced the original "never disable" stance; what stays non-negotiable is the reserved namespace and the uniform shape when the service is present. Whether some services become truly mandatory is part of the scope-model session.)
 >
 > The "connect and see" surface (Logs, Metrics, Traces) takes a filter parameter so the operator can drill down without dragging back the whole stream. The pull RPCs and the gossip-based push substrate share a single in-process buffer in core, so an operator gets immediacy when they want it and durability when they want that.
 >

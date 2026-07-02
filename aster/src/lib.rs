@@ -55,6 +55,7 @@ mod admission;
 mod config;
 pub mod crypto;
 mod error;
+pub mod grants;
 mod id;
 mod net;
 mod node;

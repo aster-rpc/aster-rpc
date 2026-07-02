@@ -18,7 +18,8 @@ use aster_transport_core::contract::{canonical_xlang_bytes_type_def, compute_typ
 
 // Re-exports the generated code + callers reference through `aster::rpc`.
 pub use aster_transport_core::contract::{
-    ContractManifest, ManifestMethod, MethodDef, MethodPattern, ScopeKind, ServiceContract, TypeDef,
+    ContractManifest, ManifestMethod, MethodDef, MethodPattern, ScopeKind, ServiceContract,
+    TypeDef, UnionVariantDef,
 };
 
 /// A type that can appear as an RPC payload: it has a contract `TypeDef` and a
@@ -75,17 +76,85 @@ pub trait WireField {
     fn leaf() -> Leaf;
 
     /// Register this type and its **transitive** payload dependencies into a
-    /// Fory runtime, deduplicating via `seen` (so diamonds and self-referential
-    /// types terminate). Scalars are a no-op (default); `#[derive(AsterType)]`
-    /// structs override this to register themselves by wire name and recurse
-    /// into every field's element/value/key type. This is how nested structs and
-    /// `Vec<UserStruct>` get registered — the `#[aster::service]` macro only
-    /// names each method's top-level request/response type, and this walk pulls
-    /// in the rest. (Override callers require `Self: ForyStruct`.)
-    fn register_payload(
-        _fory: &mut fory_core::Fory,
-        _seen: &mut std::collections::HashSet<std::any::TypeId>,
-    ) {
+    /// [`PayloadRegistry`], deduplicating by `TypeId` (so diamonds and
+    /// self-referential types terminate). Scalars are a no-op (default);
+    /// `#[derive(AsterType)]` structs override this to register themselves by
+    /// wire name and recurse into every field's element/value/key type. This is
+    /// how nested structs and `Vec<UserStruct>` get registered — the
+    /// `#[aster::service]` macro only names each method's top-level
+    /// request/response type, and this walk pulls in the rest. (Override
+    /// callers require `Self: ForyStruct`.)
+    fn register_payload(_reg: &mut PayloadRegistry) {}
+}
+
+/// A Fory runtime under construction for **one payload root type** (a method's
+/// request or response) and its transitive field tree.
+///
+/// Apache Fory's `#[derive(ForyStruct)]` allocates each type a
+/// `fory_type_index()` from a **per-crate** counter that restarts at 0 in
+/// every crate, and registration claims `type_id_index[fory_type_index()]`
+/// unconditionally — even for name-based registration. Two types from
+/// different crates can therefore collide inside one runtime ("Type index N
+/// already registered"). The `#[aster::service]` macro avoids cross-root
+/// collisions by building one runtime per payload root; this registry tracks
+/// occupied indices so the irreducible case — a collision *within* one root's
+/// field tree — fails with a diagnostic naming both wire types instead of
+/// Fory's bare index number.
+pub struct PayloadRegistry {
+    fory: fory_core::Fory,
+    seen: std::collections::HashSet<std::any::TypeId>,
+    wire_name_by_index: std::collections::HashMap<u32, String>,
+}
+
+impl PayloadRegistry {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        PayloadRegistry {
+            fory: super::codec::new_payload_fory(),
+            seen: std::collections::HashSet::new(),
+            wire_name_by_index: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record `T` as visited. Returns `false` when `T` was already walked (the
+    /// caller must then skip registration and recursion).
+    pub fn mark_seen<T: 'static>(&mut self) -> bool {
+        self.seen.insert(std::any::TypeId::of::<T>())
+    }
+
+    /// Register `T` under `wire_name`, panicking with an actionable diagnostic
+    /// on a Fory type-index collision.
+    ///
+    /// # Panics
+    ///
+    /// When another type in this registry already occupies
+    /// `T::fory_type_index()`, or when Fory rejects the registration.
+    pub fn register<T>(&mut self, wire_name: &str)
+    where
+        T: fory_core::StructSerializer + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    {
+        let index = T::fory_type_index();
+        if let Some(prev) = self.wire_name_by_index.get(&index) {
+            panic!(
+                "aster: Fory type-index collision: payload types `{prev}` and `{wire_name}` \
+                 both have per-crate Fory type index {index}, so they cannot share one payload \
+                 runtime. Fory allocates `fory_type_index()` per crate (restarting at 0), so \
+                 this happens when one payload type's field tree spans types defined in two \
+                 crates. Workarounds: move both types into the same crate, or reorder the \
+                 `#[derive(ForyStruct)]` items in one crate so their indices no longer clash."
+            );
+        }
+        self.fory
+            .register_by_name::<T>(wire_name)
+            .unwrap_or_else(|e| {
+                panic!("aster: failed to register payload type `{wire_name}`: {e}")
+            });
+        self.wire_name_by_index.insert(index, wire_name.to_string());
+    }
+
+    /// Finish registration and yield the configured Fory runtime.
+    pub fn into_fory(self) -> fory_core::Fory {
+        self.fory
     }
 }
 
@@ -124,6 +193,32 @@ pub fn message_type_def(package: &str, name: &str, fields: Vec<FieldDef>) -> Typ
         fields,
         enum_values: Vec::new(),
         union_variants: Vec::new(),
+    }
+}
+
+/// Build a `TypeDef` for a union (data-carrying enum). Used by the derive.
+/// Per §11.3.3 v1 scope, every variant's payload must itself be a message
+/// (`#[derive(AsterType)]` struct) — the variant's `type_ref` is that
+/// message's 32-byte type hash.
+pub fn union_type_def(package: &str, name: &str, variants: Vec<UnionVariantDef>) -> TypeDef {
+    TypeDef {
+        kind: TypeDefKind::Union,
+        package: package.to_string(),
+        name: name.to_string(),
+        fields: Vec::new(),
+        enum_values: Vec::new(),
+        union_variants: variants,
+    }
+}
+
+/// Build a `UnionVariantDef` from the derive's per-variant inputs. `id` follows
+/// the `ForyUnion` case-id scheme (explicit `#[fory(id = N)]`, else 0-based
+/// declaration index), so contract identity and Fory wire discriminators agree.
+pub fn make_union_variant(name: &str, id: i32, type_ref: [u8; 32]) -> UnionVariantDef {
+    UnionVariantDef {
+        name: name.to_string(),
+        id,
+        type_ref: hex::encode(type_ref),
     }
 }
 
