@@ -1,0 +1,13 @@
+# Patterns are relative to the build context (the REPO ROOT). Keep all crate
+# sources + workspace manifests; drop the heavy gitignored build outputs so the
+# Docker context stays small (target/ alone is ~154 GB).
+target/
+**/target/
+**/node_modules/
+**/.venv/
+**/dist/
+.git/
+wheels/
+dist-cli/
+share/python-wheels/
+**/*.pcap
