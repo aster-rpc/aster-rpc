@@ -1,0 +1,25 @@
+# Fly.io config for the `probe_edge` connectivity spike.
+# Outbound-only worker (no inbound services) — it dials the home `probe_local`
+# node and logs Direct-vs-Relay + RTT. Read results with `fly logs`.
+#
+# Deploy from the REPO ROOT:
+#   fly launch --no-deploy --config spikes/connectivity/fly.toml   # first time, to create the app
+#   fly secrets set PROBE_TICKET=<the token probe_local printed> --config spikes/connectivity/fly.toml
+#   fly deploy --config spikes/connectivity/fly.toml .
+#   fly logs --config spikes/connectivity/fly.toml
+
+app = "aster-probe-edge"          # rename if taken
+primary_region = "lhr"            # London — pick the region NEAREST the home node for best-case direct RTT
+
+[build]
+  # Resolved relative to THIS config file's directory (spikes/connectivity/).
+  dockerfile = "Dockerfile"
+
+[env]
+  PROBE_INTERVAL_MS = "1000"
+  PROBE_PINGS = "0"               # run forever; rolling summary every 20 pings
+
+# No [http_service]/[[services]]: nothing listens. It's a pure outbound prober.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
