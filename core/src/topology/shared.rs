@@ -90,7 +90,6 @@ pub struct CoreTopoSwarm {
     view_cache: Mutex<Option<(Instant, Arc<SharedView>)>>,
     /// Peers we've already offered to the doc sync set.
     synced_peers: Mutex<HashSet<String>>,
-    _publisher: Mutex<Option<crate::AbortOnDrop>>,
 }
 
 impl fmt::Debug for CoreTopoSwarm {
@@ -104,6 +103,14 @@ impl fmt::Debug for CoreTopoSwarm {
 
 impl CoreTopoSwarm {
     /// Import the namespace, start sync, and spawn the publisher.
+    ///
+    /// Returns the swarm handle **plus the publisher's abort guard**. The
+    /// guard — not the `Arc` — owns the publisher's lifetime: the node
+    /// keeps it in its swarm registration slot, so `CoreNode::close()` (or
+    /// re-joining) stops the publisher even while external `Arc`s to the
+    /// swarm are still held. Those external handles keep only the query
+    /// surface alive. The task additionally holds a mere `Weak`, so it
+    /// also exits if every handle is gone.
     pub(crate) async fn start(
         doc: CoreDoc,
         namespace_id: [u8; 32],
@@ -111,7 +118,7 @@ impl CoreTopoSwarm {
         monitor: CoreMonitor,
         endpoint: Endpoint,
         config: CoreTopoSwarmConfig,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<(Arc<Self>, crate::AbortOnDrop)> {
         let swarm = Arc::new(Self {
             doc,
             namespace_id,
@@ -121,7 +128,6 @@ impl CoreTopoSwarm {
             config,
             view_cache: Mutex::new(None),
             synced_peers: Mutex::new(HashSet::new()),
-            _publisher: Mutex::new(None),
         });
 
         // First publish + sync immediately so joiners appear without
@@ -136,16 +142,13 @@ impl CoreTopoSwarm {
             ticker.tick().await; // immediate first tick already published
             loop {
                 ticker.tick().await;
-                // Holding only a Weak: the publisher dies with the swarm
-                // handle instead of keeping doc/endpoint alive.
                 let Some(swarm) = weak.upgrade() else { break };
                 swarm.publish_once().await;
             }
         });
-        *swarm._publisher.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(crate::AbortOnDrop(task.abort_handle()));
+        let guard = crate::AbortOnDrop(task.abort_handle());
 
-        Ok(swarm)
+        Ok((swarm, guard))
     }
 
     /// The topology namespace id (doubles as the swarm id for bridge

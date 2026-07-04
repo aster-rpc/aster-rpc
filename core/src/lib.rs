@@ -1290,8 +1290,10 @@ struct CoreNodeInner {
     /// [`CoreNode::take_hook_receiver`].
     hook_receiver: Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
     /// Joined topology swarm (v2), set via
-    /// [`CoreNode::topology_join_swarm`].
-    topo_swarm: RwLock<Option<Arc<CoreTopoSwarm>>>,
+    /// [`CoreNode::topology_join_swarm`]. The paired guard owns the
+    /// publisher task: dropping this slot (close, re-join) aborts the
+    /// publisher even while external `Arc`s to the swarm survive.
+    topo_swarm: RwLock<Option<(Arc<CoreTopoSwarm>, AbortOnDrop)>>,
 }
 
 /// Build the iroh `Endpoint` for a `CoreNode`, optionally applying a
@@ -1792,7 +1794,7 @@ impl CoreNode {
             .docs_client()
             .import_write_namespace(secret.to_vec())
             .await?;
-        let swarm = CoreTopoSwarm::start(
+        let (swarm, publisher_guard) = CoreTopoSwarm::start(
             doc,
             namespace_id,
             self.node_id(),
@@ -1805,18 +1807,21 @@ impl CoreNode {
             .inner
             .topo_swarm
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = Some(swarm.clone());
+            .unwrap_or_else(|e| e.into_inner()) = Some((swarm.clone(), publisher_guard));
         Ok(swarm)
     }
 
     /// The joined topology swarm, if [`Self::topology_join_swarm`] was
-    /// called.
+    /// called. The returned handle is query-only in lifetime terms: the
+    /// publisher task belongs to the node's registration and stops on
+    /// [`close`](Self::close) or re-join regardless of outstanding clones.
     pub fn topology_swarm(&self) -> Option<Arc<CoreTopoSwarm>> {
         self.inner
             .topo_swarm
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .as_ref()
+            .map(|(swarm, _)| swarm.clone())
     }
 
     /// Export all transport-level metrics in Prometheus text exposition format.
