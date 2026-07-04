@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
         if pings != 0 && i >= pings {
             break;
         }
-        if pings == 0 && i % 20 == 0 {
+        if pings == 0 && i.is_multiple_of(20) {
             print_summary(&stats);
         }
         tokio::time::sleep(interval).await;
