@@ -229,6 +229,14 @@ impl Node {
         }
     }
 
+    /// Local topology view (locality ladder + path quality per peer).
+    /// Populates only when the node was started with
+    /// [`AsterConfigBuilder::monitoring(true)`](crate::AsterConfigBuilder::monitoring);
+    /// check [`Topology::has_monitoring`](crate::topology::Topology::has_monitoring).
+    pub fn topology(&self) -> crate::topology::Topology {
+        crate::topology::Topology::new(self.inner.clone())
+    }
+
     /// Blob store client.
     #[cfg(feature = "blobs")]
     pub fn blobs(&self) -> Blobs {

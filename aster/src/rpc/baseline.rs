@@ -265,6 +265,133 @@ impl NodeInfo for LiveNodeInfo {
     }
 }
 
+// ── aster.net.Topology ────────────────────────────────────────────────────────
+
+/// One peer in the node's local proximity view (wire `aster/PeerView`) — the
+/// RPC projection of [`topology::PeerView`](crate::topology::PeerView).
+/// Deliberately address-free: the in-process view carries the peer's socket
+/// address, the wire view does not leak network layout beyond node ids.
+///
+/// All-integer fields per the cross-binding convention (no floats):
+/// rates/confidence are parts-per-million, RTT/jitter microseconds.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster/PeerView")]
+pub struct PeerView {
+    /// Hex public key of the peer.
+    pub node_id: String,
+    /// Locality ladder level: 0 same-host, 1 same-lan, 2 same-site,
+    /// 3 same-region, 4 far.
+    pub level: i32,
+    /// The signal that justified the level (e.g. "verified private path").
+    pub level_reason: String,
+    /// Smoothed RTT, microseconds. 0 = not yet measured.
+    pub rtt_us: i64,
+    /// EWMA of |ΔRTT|, microseconds. 0 = not yet derivable.
+    pub jitter_us: i64,
+    /// Smoothed loss rate, parts per million of sent datagrams.
+    pub loss_ppm: i32,
+    /// Passively observed goodput (both directions), bits/sec.
+    pub throughput_bps: i64,
+    /// cwnd/RTT throughput ceiling estimate, bits/sec.
+    pub cwnd_ceiling_bps: i64,
+    /// Selected path is direct (vs relayed).
+    pub direct: bool,
+    /// Relay URL when the selected path is relayed; "" when direct.
+    pub relay_url: String,
+    /// Congestion events observed on sampled paths.
+    pub congestion_events: i64,
+    /// Number of sampler ticks folded into this entry.
+    pub samples: i64,
+    /// Confidence 0..990_000 ppm; grows with samples, decays with staleness.
+    pub confidence_ppm: i32,
+    pub last_measured_unix_ms: i64,
+    pub is_connected: bool,
+}
+
+impl From<&aster_transport_core::CorePeerView> for PeerView {
+    fn from(v: &aster_transport_core::CorePeerView) -> Self {
+        PeerView {
+            node_id: v.node_id.clone(),
+            level: v.level.as_i32(),
+            level_reason: v.level_reason.clone(),
+            rtt_us: v.rtt_us.unwrap_or(0) as i64,
+            jitter_us: v.jitter_us.unwrap_or(0) as i64,
+            loss_ppm: v.loss_ppm as i32,
+            throughput_bps: v.throughput_bps as i64,
+            cwnd_ceiling_bps: v.cwnd_ceiling_bps as i64,
+            direct: v.direct,
+            relay_url: v.relay_url.clone().unwrap_or_default(),
+            congestion_events: v.congestion_events as i64,
+            samples: v.samples as i64,
+            confidence_ppm: v.confidence_ppm as i32,
+            last_measured_unix_ms: v.last_measured_unix_ms as i64,
+            is_connected: v.is_connected,
+        }
+    }
+}
+
+/// Request for `aster.net.Topology.peer` (wire `aster/PeerQuery`).
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster/PeerQuery")]
+pub struct PeerQuery {
+    /// Hex public key of the peer to look up.
+    pub node_id: String,
+}
+
+/// Response of the `aster.net.Topology` methods (wire `aster/PeerList`).
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster/PeerList")]
+pub struct PeerList {
+    pub peers: Vec<PeerView>,
+}
+
+/// Baseline topology service: query the node's local proximity view
+/// (topology v1 — ladder levels + path quality; clusters arrive with v2).
+///
+/// **Opt-in**, unlike `aster.ops.NodeInfo`: the view discloses inferred
+/// network layout and topology is a producer-node feature, so operators
+/// enable it deliberately via
+/// [`builtin_topology(true)`](super::runtime::AsterServerBuilder::builtin_topology)
+/// (and usually gate it with
+/// [`topology_requires`](super::runtime::AsterServerBuilder::topology_requires)).
+/// Requires the node to be started with monitoring enabled.
+#[aster_macros::service(name = "aster.net.Topology", version = 1)]
+pub trait Topology {
+    /// Every known peer's view entry.
+    #[rpc(idempotent)]
+    async fn peers(&self) -> aster::Result<PeerList>;
+
+    /// One peer's view entry (0-or-1 element list).
+    #[rpc(idempotent)]
+    async fn peer(&self, query: PeerQuery) -> aster::Result<PeerList>;
+}
+
+/// The stock implementation served by `AsterServerBuilder`: reads the core
+/// node's live topology view.
+pub(crate) struct LiveTopology {
+    pub(crate) core: aster_transport_core::CoreNode,
+}
+
+#[async_trait::async_trait]
+impl Topology for LiveTopology {
+    async fn peers(&self) -> aster::Result<PeerList> {
+        Ok(PeerList {
+            peers: self.core.peer_views().iter().map(PeerView::from).collect(),
+        })
+    }
+
+    async fn peer(&self, query: PeerQuery) -> aster::Result<PeerList> {
+        Ok(PeerList {
+            peers: self
+                .core
+                .peer_view(&query.node_id)
+                .iter()
+                .map(PeerView::from)
+                .collect(),
+        })
+    }
+}
+
 // ── Service-wide requirement override ─────────────────────────────────────────
 
 /// Wraps a [`ServiceDispatch`] and imposes a service-wide capability

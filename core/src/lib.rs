@@ -13,8 +13,11 @@ pub mod ring;
 pub mod signing;
 pub mod stream_io;
 pub mod ticket;
+pub mod topology;
 pub mod trust;
 pub mod tunnel;
+
+pub use topology::{CoreLadderLevel, CorePeerView};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -472,6 +475,15 @@ impl CoreRemoteAggregate {
 struct RemoteInfoEntry {
     aggregate: CoreRemoteAggregate,
     connections: HashMap<u64, WeakConnectionHandle>,
+    /// Derived topology-v1 state (ladder level, path quality, confidence),
+    /// updated by the sampler spawned via [`CoreMonitor::spawn_sampler`].
+    topo: topology::PeerTopoState,
+}
+
+impl RemoteInfoEntry {
+    fn has_live_connection(&self) -> bool {
+        self.connections.values().any(|h| h.upgrade().is_some())
+    }
 }
 
 impl RemoteInfoEntry {
@@ -542,6 +554,16 @@ struct TrackedConnection {
     handle: WeakConnectionHandle,
 }
 
+/// Aborts the wrapped task when dropped.
+#[derive(Debug)]
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Connection monitor that tracks remote endpoint information.
 ///
 /// Implements `EndpointHooks` to capture a `WeakConnectionHandle` from
@@ -553,6 +575,10 @@ pub struct CoreMonitor {
     #[allow(dead_code)]
     tx: mpsc::Sender<TrackedConnection>,
     _task: Arc<tokio::task::AbortHandle>,
+    /// Sampler abort guard: the sampler task holds a strong `Endpoint`
+    /// clone, so it must die with the last monitor handle or it would keep
+    /// the endpoint alive after a plain drop (no explicit close()).
+    sampler_guard: Arc<std::sync::Mutex<Option<AbortOnDrop>>>,
 }
 
 /// Hook portion of the monitor — installed on the endpoint builder.
@@ -587,6 +613,7 @@ impl CoreMonitor {
             map,
             tx,
             _task: Arc::new(abort_handle),
+            sampler_guard: Arc::new(std::sync::Mutex::new(None)),
         };
         (hook, monitor)
     }
@@ -714,6 +741,139 @@ impl CoreMonitor {
             .iter()
             .map(|(id, entry)| entry.to_core_remote_info(id))
             .collect()
+    }
+
+    /// Topology-v1 snapshot for one peer. `None` when the peer is unknown
+    /// or has never been sampled.
+    pub fn peer_view(&self, node_id: &str) -> Option<CorePeerView> {
+        let inner = self.map.read().unwrap_or_else(|e| e.into_inner());
+        let entry = inner.get(node_id)?;
+        entry.topo.to_view(node_id, entry.has_live_connection())
+    }
+
+    /// Topology-v1 snapshots for every known peer (sampled at least once).
+    pub fn peer_views(&self) -> Vec<CorePeerView> {
+        let inner = self.map.read().unwrap_or_else(|e| e.into_inner());
+        inner
+            .iter()
+            .filter_map(|(id, entry)| entry.topo.to_view(id, entry.has_live_connection()))
+            .collect()
+    }
+
+    /// Start the topology sampler: every [`topology::SAMPLE_INTERVAL`] it
+    /// folds live-connection stats into per-peer derived state. Called once
+    /// per endpoint right after bind; the task exits when the endpoint
+    /// closes, and is aborted when the last monitor handle drops (it holds
+    /// a strong `Endpoint` clone, which must not outlive its owners).
+    /// Purely passive — reads counters off connections the application
+    /// already holds, never dials.
+    pub(crate) fn spawn_sampler(&self, endpoint: Endpoint) {
+        let map = self.map.clone();
+        let task = tokio::spawn(async move {
+            let closed_ep = endpoint.clone();
+            let closed = closed_ep.closed();
+            tokio::pin!(closed);
+            let mut ticker = tokio::time::interval(topology::SAMPLE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let local_public: Vec<std::net::IpAddr> = endpoint
+                            .addr()
+                            .ip_addrs()
+                            .map(|sa| sa.ip())
+                            .filter(|ip| {
+                                topology::classify_ip(*ip) == topology::AddrClass::Public
+                            })
+                            .collect();
+                        Self::sample_all(&map, &local_public);
+                    }
+                    _ = &mut closed => break,
+                }
+            }
+        });
+        let guard = AbortOnDrop(task.abort_handle());
+        *self.sampler_guard.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+    }
+
+    /// One sampler tick: for every known peer, sum monotonic counters
+    /// across *all* live connections (a peer often holds several — RPC,
+    /// docs, gossip — and the busy one is what path quality should
+    /// reflect), take the path shape from the best selected path (direct
+    /// preferred, then lowest measured RTT), and fold the result into the
+    /// peer's topology state.
+    fn sample_all(map: &RemoteMapInner, local_public_ips: &[std::net::IpAddr]) {
+        let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
+        for (_id, entry) in inner.iter_mut() {
+            // Fingerprint of the live connection set: counter sums are only
+            // comparable while the same set is alive.
+            let mut conn_key = 0u64;
+            let mut lost_packets = 0u64;
+            let mut congestion_events = 0u64;
+            let mut tx_datagrams = 0u64;
+            let mut tx_bytes = 0u64;
+            let mut rx_bytes = 0u64;
+            // Representative selected path: direct beats relay, then lowest
+            // measured RTT.
+            let mut best: Option<(TransportAddr, Duration, u64)> = None;
+            let mut any_live = false;
+
+            for (conn_id, handle) in entry.connections.iter() {
+                let Some(conn) = handle.upgrade() else {
+                    continue;
+                };
+                any_live = true;
+                conn_key ^= conn_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+                let conn_stats = conn.stats();
+                lost_packets += conn_stats.lost_packets;
+                tx_datagrams += conn_stats.udp_tx.datagrams;
+                tx_bytes += conn_stats.udp_tx.bytes;
+                rx_bytes += conn_stats.udp_rx.bytes;
+
+                let paths = conn.paths();
+                let Some(path) = paths.iter().find(|p| p.is_selected()) else {
+                    continue;
+                };
+                let stats = path.stats();
+                congestion_events += stats.congestion_events;
+
+                let better = match &best {
+                    None => true,
+                    Some((cur_remote, cur_rtt, _)) => {
+                        let cand_direct = path.remote_addr().is_ip();
+                        let cur_direct = cur_remote.is_ip();
+                        if cand_direct != cur_direct {
+                            cand_direct
+                        } else {
+                            !stats.rtt.is_zero() && (cur_rtt.is_zero() || stats.rtt < *cur_rtt)
+                        }
+                    }
+                };
+                if better {
+                    best = Some((path.remote_addr().clone(), stats.rtt, stats.cwnd));
+                }
+            }
+
+            if !any_live {
+                continue;
+            }
+            let Some((remote, rtt, cwnd)) = best else {
+                continue;
+            };
+            entry.topo.apply_sample(topology::PeerSample {
+                conn_key,
+                remote,
+                rtt,
+                lost_packets,
+                congestion_events,
+                cwnd,
+                tx_datagrams,
+                tx_bytes,
+                rx_bytes,
+                local_public_ips: local_public_ips.to_vec(),
+            });
+        }
     }
 }
 
@@ -1120,7 +1280,6 @@ struct CoreNodeInner {
     aster_rx: Mutex<mpsc::Receiver<(Vec<u8>, Connection)>>,
     /// Connection monitor (populated if enable_monitoring=true on the
     /// endpoint config passed to a `_with_alpns` constructor).
-    #[allow(dead_code)]
     monitor: Option<CoreMonitor>,
     /// Hooks receiver — present iff enable_hooks=true. Same shape as
     /// [`CoreNetClient::hook_receiver`]; takeable once via
@@ -1171,6 +1330,10 @@ async fn build_node_endpoint(
             }
 
             let endpoint = builder.bind().await?;
+
+            if let Some(mon) = &monitor {
+                mon.spawn_sampler(endpoint.clone());
+            }
 
             if config.enable_discovery {
                 let mdns = MdnsAddressLookup::builder()
@@ -1564,9 +1727,31 @@ impl CoreNode {
         CoreNetClient {
             endpoint: self.inner.endpoint.clone(),
             secret_key_bytes: self.inner.secret_key_bytes.clone(),
-            monitor: None,
+            monitor: self.inner.monitor.clone(),
             hook_receiver: None,
         }
+    }
+
+    /// Whether this node was built with `enable_monitoring=true` (the
+    /// prerequisite for the topology view).
+    pub fn has_monitoring(&self) -> bool {
+        self.inner.monitor.is_some()
+    }
+
+    /// Topology-v1 snapshot for one peer. `None` when monitoring is
+    /// disabled, the peer is unknown, or it has never been sampled.
+    pub fn peer_view(&self, node_id: &str) -> Option<CorePeerView> {
+        self.inner.monitor.as_ref()?.peer_view(node_id)
+    }
+
+    /// Topology-v1 snapshots for every known peer. Empty when monitoring
+    /// is disabled.
+    pub fn peer_views(&self) -> Vec<CorePeerView> {
+        self.inner
+            .monitor
+            .as_ref()
+            .map(|m| m.peer_views())
+            .unwrap_or_default()
     }
 
     /// Export all transport-level metrics in Prometheus text exposition format.
@@ -1705,6 +1890,10 @@ impl CoreNetClient {
 
         let endpoint = builder.bind().await?;
 
+        if let Some(mon) = &monitor {
+            mon.spawn_sampler(endpoint.clone());
+        }
+
         if config.enable_discovery {
             let mdns = MdnsAddressLookup::builder()
                 .build(endpoint.id())
@@ -1797,6 +1986,21 @@ impl CoreNetClient {
     /// Returns whether monitoring is enabled for this endpoint.
     pub fn has_monitoring(&self) -> bool {
         self.monitor.is_some()
+    }
+
+    /// Topology-v1 snapshot for one peer. `None` when monitoring is
+    /// disabled, the peer is unknown, or it has never been sampled.
+    pub fn peer_view(&self, node_id: &str) -> Option<CorePeerView> {
+        self.monitor.as_ref()?.peer_view(node_id)
+    }
+
+    /// Topology-v1 snapshots for every known peer. Empty when monitoring
+    /// is disabled.
+    pub fn peer_views(&self) -> Vec<CorePeerView> {
+        self.monitor
+            .as_ref()
+            .map(|m| m.peer_views())
+            .unwrap_or_default()
     }
 
     // ============================================================================

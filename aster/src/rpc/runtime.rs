@@ -45,7 +45,8 @@ use crate::ticket::{Credential, Ticket};
 
 use super::auth::{AttributeStore, Authenticator, CapabilityRequirement};
 use super::baseline::{
-    LiveNodeInfo, NodeIdentity, NodeIdentityHandle, NodeInfoServer, RequireGuard,
+    LiveNodeInfo, LiveTopology, NodeIdentity, NodeIdentityHandle, NodeInfoServer, RequireGuard,
+    TopologyServer,
 };
 use super::server::{
     AlpnHandler, Dispatcher, HttpTransport, Server, ServerHandle, ServiceDispatch, RPC_ALPN,
@@ -75,6 +76,9 @@ pub struct AsterServerBuilder {
     disable_node_info: bool,
     node_identity: Option<NodeIdentity>,
     node_info_requires: Option<CapabilityRequirement>,
+    // Baseline `aster.net.Topology` (default OFF — discloses network layout).
+    enable_topology: bool,
+    topology_requires: Option<CapabilityRequirement>,
 }
 
 impl AsterServerBuilder {
@@ -246,10 +250,29 @@ impl AsterServerBuilder {
         self
     }
 
+    /// Enable the baseline `aster.net.Topology` service (default: **disabled**,
+    /// unlike NodeInfo — the view discloses inferred network layout, and
+    /// topology is a producer-node feature). Requires the node to be started
+    /// with monitoring enabled
+    /// ([`AsterConfigBuilder::monitoring(true)`](crate::AsterConfigBuilder::monitoring));
+    /// [`start`](Self::start) refuses otherwise.
+    pub fn builtin_topology(mut self, enabled: bool) -> Self {
+        self.enable_topology = enabled;
+        self
+    }
+
+    /// Gate every method of the baseline `aster.net.Topology` service behind a
+    /// capability requirement (Gate 3). Only meaningful together with
+    /// [`builtin_topology(true)`](Self::builtin_topology).
+    pub fn topology_requires(mut self, requires: CapabilityRequirement) -> Self {
+        self.topology_requires = Some(requires);
+        self
+    }
+
     /// Build the node (RPC + built-in protocol ALPNs registered), start serving
     /// the registered services, and return the running [`AsterServer`].
     pub async fn start(self) -> Result<AsterServer> {
-        if self.services.is_empty() && self.disable_node_info {
+        if self.services.is_empty() && self.disable_node_info && !self.enable_topology {
             return Err(Error::InvalidArgument(
                 "AsterServer requires at least one service (or an enabled baseline service)".into(),
             ));
@@ -279,6 +302,16 @@ impl AsterServerBuilder {
             }
         }
         let config = builder.build();
+
+        // Topology reads the connection monitor; refuse a config that can
+        // never populate it rather than serving permanently-empty views.
+        if self.enable_topology && !config.enable_monitoring {
+            return Err(Error::InvalidArgument(
+                "builtin_topology(true) requires monitoring — enable it with \
+                 AsterConfigBuilder::monitoring(true)"
+                    .into(),
+            ));
+        }
 
         // `aster/1` always; blobs/docs/gossip ALPNs are registered by core.
         // `route_alpn`/`with_expose` also push their ALPN into `extra_alpns`, so
@@ -323,6 +356,13 @@ impl AsterServerBuilder {
                 requires: self.node_info_requires,
             }));
             identity_handle = Some(handle);
+        }
+        // Baseline `aster.net.Topology` — opt-in; reads the node's live view.
+        if self.enable_topology {
+            server = server.register_arc(Arc::new(RequireGuard {
+                inner: TopologyServer::new(LiveTopology { core: node.core() }),
+                requires: self.topology_requires,
+            }));
         }
         for apply in self.session_appliers {
             server = apply(server);
@@ -440,6 +480,13 @@ impl AsterServer {
     #[cfg(feature = "gossip")]
     pub fn gossip(&self) -> crate::gossip::Gossip {
         self.node.gossip()
+    }
+
+    /// Local topology view backed by this server's node (see
+    /// [`Node::topology`]). Independent of the baseline `aster.net.Topology`
+    /// RPC service — this is the in-process view.
+    pub fn topology(&self) -> crate::topology::Topology {
+        self.node.topology()
     }
 
     /// Serve until the node closes (or the loop is otherwise stopped). Mirrors

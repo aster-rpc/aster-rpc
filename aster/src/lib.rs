@@ -60,6 +60,7 @@ mod id;
 mod net;
 mod node;
 mod ticket;
+pub mod topology;
 
 #[cfg(feature = "attestation")]
 pub mod attestation;
