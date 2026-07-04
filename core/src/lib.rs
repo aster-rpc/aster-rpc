@@ -1646,6 +1646,15 @@ impl CoreNode {
         format!("{:?}", self.inner.endpoint.addr())
     }
     pub async fn close(&self) {
+        // Drop the topology swarm first: its publisher task ticks for as
+        // long as a swarm handle exists, and a caller that keeps this
+        // CoreNode around after close() would otherwise leave it writing
+        // against a shut-down docs engine.
+        *self
+            .inner
+            .topo_swarm
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         // Flush blob-store metadata to disk while the store actor is still
         // alive. `router.shutdown()` below shuts the store down (via
         // `BlobsProtocol::shutdown()` -> `store.shutdown()`), so a `sync_db()`

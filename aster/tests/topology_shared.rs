@@ -195,6 +195,17 @@ async fn swarm_converges_with_sealed_grant_distribution() {
     .await
     .unwrap();
 
+    // Resource poisoning: an oversized value under the forger's *own*
+    // key path (valid attribution) must be rejected by the size caps
+    // before readers ever fetch it — bounded damage from a hostile writer.
+    doc.set_bytes(
+        &author,
+        records::rtt_key(servers[1].id().as_str(), fake.as_str()),
+        vec![0u8; 512 * 1024],
+    )
+    .await
+    .unwrap();
+
     // Give the forged record time to replicate + a few view refreshes: the
     // fake vertex must never appear, and the real cluster must be intact.
     tokio::time::sleep(Duration::from_secs(3)).await;
