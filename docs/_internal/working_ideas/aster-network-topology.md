@@ -153,6 +153,8 @@ Deterministic derivation gives **eventual** agreement. During churn (a node join
 | `full_mesh_cutoff` | 8 members | at or below: full-mesh maintained edges |
 | `separation_coverage` | 2 | distinct far pairs required for `separated` |
 | `max_clock_skew` | 30 s | records timestamped beyond now + skew are dropped |
+| `max_position_len` | 4096 B | position records above this are dropped unfetched |
+| `max_edge_len` | 256 B | rtt/lan records above this are dropped unfetched |
 
 **Reader time rules** (one rule set, reader's clock throughout):
 
@@ -237,6 +239,8 @@ LanEdge {
 ```
 
 **Decode/drop rules**: an entry is dropped (and counted in metrics, never fatal) if the value fails Fory decode, if any timestamp is future-dated beyond `max_clock_skew`, or if attribution fails validation (below). Unknown Fory fields are tolerated (compatible mode) — additive evolution doesn't need a version bump; semantic changes do.
+
+**Record size caps (normative) and bounded reader cost.** Readers validate *before fetching content*: key shape, attribution, admission, and a size cap checked against the entry's declared length — `NetworkPosition` ≤ `max_position_len` (headroom for prefix hashes), `RttEdge`/`LanEdge` ≤ `max_edge_len`. Oversized records are dropped unfetched. Reads are two-pass: positions first, then only the RTT edges whose two endpoints are live admitted vertices. Together these bound what a single admitted-but-hostile writer can cost every reader per refresh — the poisoning-bounds story holds operationally, not just logically. Writers must keep records under the caps; growing one is a schema change (new key version).
 
 **Edge rules.** An edge enters the cluster graph only when **both endpoints have published their half and both halves pass the reader time rules (fresh, held ≥ `min_hold`, `rtt_us` ≤ `hyst_exit`); the graph uses the max of the two sides.** A one-sided record is a candidate, not an edge — a liar cannot manufacture the other endpoint's half. (Two *colluding* nodes can fake an edge between themselves; see poisoning bounds.)
 
