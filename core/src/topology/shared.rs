@@ -30,6 +30,11 @@ use crate::{CoreDoc, CoreMonitor};
 
 /// How long a derived [`SharedView`] snapshot is served before recomputing.
 const VIEW_CACHE_TTL: Duration = Duration::from_secs(1);
+/// Size caps enforced *before* fetching record contents — a hostile
+/// writer's oversized values are never read. Positions get headroom for
+/// future prefix hashes; edges are a handful of integers.
+const MAX_POSITION_LEN: u64 = 4096;
+const MAX_EDGE_LEN: u64 = 256;
 
 /// Pluggable admission check: is this author (hex node id) currently an
 /// admitted producer?
@@ -154,7 +159,10 @@ impl CoreTopoSwarm {
         let now_ms = unix_now_ms();
 
         // Offer doc sync to bootstrap + monitor-known peers we haven't
-        // offered yet (start_sync is additive).
+        // *successfully* offered yet (start_sync is additive). Peers are
+        // marked synced only after the offer succeeds, so a failed batch is
+        // retried next beat; unparseable ids are dropped permanently so one
+        // bad bootstrap entry can't poison every batch forever.
         let mut new_peers = Vec::new();
         {
             let mut synced = self.synced_peers.lock().unwrap_or_else(|e| e.into_inner());
@@ -165,14 +173,24 @@ impl CoreTopoSwarm {
                 .cloned()
                 .chain(self.monitor.peer_views().into_iter().map(|v| v.node_id))
             {
-                if peer != self.self_hex && synced.insert(peer.clone()) {
-                    new_peers.push(peer);
+                if peer == self.self_hex || synced.contains(&peer) || new_peers.contains(&peer) {
+                    continue;
                 }
+                if peer.parse::<iroh::EndpointId>().is_err() {
+                    tracing::debug!("topology: dropping unparseable sync peer {peer}");
+                    synced.insert(peer); // never retry garbage
+                    continue;
+                }
+                new_peers.push(peer);
             }
         }
         if !new_peers.is_empty() {
-            if let Err(e) = self.doc.start_sync(new_peers).await {
-                tracing::debug!("topology: start_sync failed: {e}");
+            match self.doc.start_sync(new_peers.clone()).await {
+                Ok(()) => {
+                    let mut synced = self.synced_peers.lock().unwrap_or_else(|e| e.into_inner());
+                    synced.extend(new_peers);
+                }
+                Err(e) => tracing::debug!("topology: start_sync failed (will retry): {e}"),
             }
         }
 
@@ -244,15 +262,63 @@ impl CoreTopoSwarm {
         }
 
         let now_ms = unix_now_ms();
+        let admitted = self.config.admitted.clone();
+        let admitted_check = move |n: &str| admitted.as_ref().is_none_or(|f| f(n));
+
+        // A single admitted-but-hostile writer must have *bounded* reader
+        // cost, so validation happens before any content is fetched:
+        // key-shape + attribution + admission + size caps prefilter the
+        // entry list, and the read is two-pass — positions first, then
+        // only the RTT edges whose endpoints are live admitted vertices.
         let entries = self
             .doc
             .query_key_prefix(TOPO_KEY_PREFIX.as_bytes().to_vec(), None)
             .await?;
-        let hashes: Vec<String> = entries.iter().map(|e| e.content_hash.clone()).collect();
-        let contents = self.doc.read_entry_contents_if_complete(hashes).await?;
 
+        let mut dropped = 0u64;
+        let mut pos_entries = Vec::new();
+        let mut edge_entries = Vec::new();
+        for entry in &entries {
+            let Some(key) = records::parse_key(&entry.key) else {
+                continue; // unknown key shape/version — forward compat
+            };
+            if key.node() != entry.author_id {
+                dropped += 1; // forged path — never fetched
+                continue;
+            }
+            if !admitted_check(&entry.author_id) {
+                continue; // unadmitted producer — filtered, not anomalous
+            }
+            match key {
+                records::TopoKey::Position { .. } => {
+                    if entry.content_len > MAX_POSITION_LEN {
+                        dropped += 1;
+                        continue;
+                    }
+                    pos_entries.push(entry);
+                }
+                records::TopoKey::Rtt { peer, .. } => {
+                    if entry.content_len > MAX_EDGE_LEN {
+                        dropped += 1;
+                        continue;
+                    }
+                    edge_entries.push((entry, peer));
+                }
+                // LAN attestations don't participate in derivation yet —
+                // don't pay to fetch them.
+                records::TopoKey::Lan { .. } => {}
+            }
+        }
+
+        // Pass 1: positions → the live-admitted vertex set.
         let mut recs = TopoRecords::default();
-        for (entry, content) in entries.iter().zip(contents) {
+        let contents = self
+            .doc
+            .read_entry_contents_if_complete(
+                pos_entries.iter().map(|e| e.content_hash.clone()).collect(),
+            )
+            .await?;
+        for (entry, content) in pos_entries.iter().zip(contents) {
             let Some(bytes) = content else { continue }; // value not local yet
             recs.insert_entry(
                 &entry.author_id,
@@ -262,15 +328,42 @@ impl CoreTopoSwarm {
                 self.config.topo.max_skew,
             );
         }
+        let liveness_ms = self.config.topo.liveness_ttl.as_millis() as i64;
+        let live: std::collections::HashSet<String> = recs
+            .positions
+            .iter()
+            .filter(|(_, p)| now_ms as i64 - p.updated_unix_ms <= liveness_ms)
+            .map(|(node, _)| node.clone())
+            .collect();
 
-        let admitted = self.config.admitted.clone();
-        let admitted_ref: &dyn Fn(&str) -> bool = match &admitted {
-            Some(f) => f.as_ref(),
-            None => &|_| true,
-        };
+        // Pass 2: only edges between live vertices — bogus peer ids in a
+        // writer's own rtt/* keys are skipped without a read.
+        let wanted: Vec<_> = edge_entries
+            .into_iter()
+            .filter(|(entry, peer)| live.contains(&entry.author_id) && live.contains(peer))
+            .map(|(entry, _)| entry)
+            .collect();
+        let contents = self
+            .doc
+            .read_entry_contents_if_complete(
+                wanted.iter().map(|e| e.content_hash.clone()).collect(),
+            )
+            .await?;
+        for (entry, content) in wanted.iter().zip(contents) {
+            let Some(bytes) = content else { continue };
+            recs.insert_entry(
+                &entry.author_id,
+                &entry.key,
+                &bytes,
+                now_ms,
+                self.config.topo.max_skew,
+            );
+        }
+        recs.dropped += dropped;
+
         let view = Arc::new(cluster::derive(
             &recs,
-            admitted_ref,
+            &admitted_check,
             &self.namespace_id,
             now_ms,
             &self.config.topo,
