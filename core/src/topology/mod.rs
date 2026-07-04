@@ -6,6 +6,14 @@
 //! map via a periodic sampler; no probe traffic, no shared state — this is
 //! the v1 "read what iroh already knows" phase of
 //! `docs/_internal/working_ideas/aster-network-topology.md`.
+//!
+//! v2 (shared doc + clusters) lives in the submodules: [`records`] (wire
+//! records + key layout), [`cluster`] (pure derivation), [`shared`] (the
+//! swarm engine).
+
+pub mod cluster;
+pub mod records;
+pub mod shared;
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime};
@@ -145,6 +153,10 @@ pub(crate) struct PeerTopoState {
     samples: u64,
     last_sample: Option<SystemTime>,
     counter_base: Option<CounterBase>,
+    /// Publisher-side cluster-edge hysteresis (topology v2): set when
+    /// smoothed RTT first drops below the enter threshold, cleared only
+    /// above the exit threshold.
+    cluster_held_since: Option<SystemTime>,
 }
 
 impl PeerTopoState {
@@ -188,6 +200,14 @@ impl PeerTopoState {
             if s.cwnd > 0 {
                 let rtt_secs = rtt_us / 1_000_000.0;
                 self.cwnd_ceiling_bps = ((s.cwnd as f64 * 8.0) / rtt_secs) as u64;
+            }
+
+            // v2 publisher-owned hold band: start holding only below the
+            // enter threshold, stop only above the exit threshold.
+            if self.rtt_us_smooth < REGION_RTT_ENTER_US {
+                self.cluster_held_since.get_or_insert_with(SystemTime::now);
+            } else if self.rtt_us_smooth > REGION_RTT_EXIT_US {
+                self.cluster_held_since = None;
             }
         }
 
@@ -290,14 +310,18 @@ impl PeerTopoState {
             congestion_events: self.congestion_events,
             samples: self.samples,
             confidence_ppm: (confidence * 1_000_000.0) as u32,
-            last_measured_unix_ms: last_sample
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .min(u64::MAX as u128) as u64,
+            last_measured_unix_ms: unix_ms(last_sample),
+            cluster_held_since_unix_ms: self.cluster_held_since.map(unix_ms).unwrap_or(0),
             is_connected,
         })
     }
+}
+
+fn unix_ms(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 /// Pure ladder derivation: highest level the current signals justify.
@@ -380,6 +404,9 @@ pub struct CorePeerView {
     /// with staleness.
     pub confidence_ppm: u32,
     pub last_measured_unix_ms: u64,
+    /// Since when smoothed RTT has continuously held under the cluster
+    /// enter threshold (v2 publisher hysteresis); 0 = not currently held.
+    pub cluster_held_since_unix_ms: u64,
     pub is_connected: bool,
 }
 
@@ -522,6 +549,32 @@ mod tests {
         st.apply_sample(s3);
         let loss = st.to_view("p", true).unwrap().loss_ppm;
         assert!(loss > 0, "loss should register after a same-set window");
+    }
+
+    #[test]
+    fn cluster_hold_band_sets_below_enter_and_clears_above_exit() {
+        let mut st = PeerTopoState::default();
+        // 5ms < enter (12ms): hold starts.
+        st.apply_sample(sample(direct("8.8.8.8:4433"), 5, 1));
+        let held = st.to_view("p", true).unwrap().cluster_held_since_unix_ms;
+        assert!(held > 0);
+
+        // Drift into the 12–18ms band: hold must persist (and keep its
+        // original start stamp).
+        for _ in 0..20 {
+            st.apply_sample(sample(direct("8.8.8.8:4433"), 15, 1));
+        }
+        assert_eq!(
+            st.to_view("p", true).unwrap().cluster_held_since_unix_ms,
+            held,
+            "hold persists through the band without re-stamping"
+        );
+
+        // Rise above exit (18ms): hold clears.
+        for _ in 0..30 {
+            st.apply_sample(sample(direct("8.8.8.8:4433"), 60, 1));
+        }
+        assert_eq!(st.to_view("p", true).unwrap().cluster_held_since_unix_ms, 0);
     }
 
     #[test]

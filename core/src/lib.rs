@@ -17,6 +17,10 @@ pub mod topology;
 pub mod trust;
 pub mod tunnel;
 
+pub use topology::cluster::{
+    CoreClusterView, CoreSeparationVerdict, SharedView as CoreTopoSharedView, TopoConfig,
+};
+pub use topology::shared::{AdmittedFn, CoreTopoSwarm, CoreTopoSwarmConfig};
 pub use topology::{CoreLadderLevel, CorePeerView};
 
 use std::collections::HashMap;
@@ -1285,6 +1289,9 @@ struct CoreNodeInner {
     /// [`CoreNetClient::hook_receiver`]; takeable once via
     /// [`CoreNode::take_hook_receiver`].
     hook_receiver: Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
+    /// Joined topology swarm (v2), set via
+    /// [`CoreNode::topology_join_swarm`].
+    topo_swarm: RwLock<Option<Arc<CoreTopoSwarm>>>,
 }
 
 /// Build the iroh `Endpoint` for a `CoreNode`, optionally applying a
@@ -1624,6 +1631,7 @@ impl CoreNode {
                 aster_rx: Mutex::new(aster_rx),
                 monitor,
                 hook_receiver,
+                topo_swarm: RwLock::new(None),
             }),
         })
     }
@@ -1752,6 +1760,54 @@ impl CoreNode {
             .as_ref()
             .map(|m| m.peer_views())
             .unwrap_or_default()
+    }
+
+    /// Join a topology swarm (topology v2): import the shared namespace
+    /// from its 32-byte secret, start publishing this node's measurements,
+    /// and derive the swarm-wide cluster view. Requires monitoring
+    /// (`enable_monitoring=true`) — the published edges come from the v1
+    /// sampler. Idempotent-ish: joining again replaces the previous swarm
+    /// handle.
+    pub async fn topology_join_swarm(
+        &self,
+        secret: &[u8],
+        config: CoreTopoSwarmConfig,
+    ) -> Result<Arc<CoreTopoSwarm>> {
+        let monitor = self
+            .inner
+            .monitor
+            .clone()
+            .ok_or_else(|| anyhow!("topology swarm requires monitoring (enable_monitoring)"))?;
+        let namespace_id = topology::shared::namespace_id_for_secret(secret)?;
+        let doc = self
+            .docs_client()
+            .import_write_namespace(secret.to_vec())
+            .await?;
+        let swarm = CoreTopoSwarm::start(
+            doc,
+            namespace_id,
+            self.node_id(),
+            monitor,
+            self.inner.endpoint.clone(),
+            config,
+        )
+        .await?;
+        *self
+            .inner
+            .topo_swarm
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(swarm.clone());
+        Ok(swarm)
+    }
+
+    /// The joined topology swarm, if [`Self::topology_join_swarm`] was
+    /// called.
+    pub fn topology_swarm(&self) -> Option<Arc<CoreTopoSwarm>> {
+        self.inner
+            .topo_swarm
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Export all transport-level metrics in Prometheus text exposition format.
