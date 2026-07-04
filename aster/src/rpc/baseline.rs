@@ -345,6 +345,60 @@ pub struct PeerList {
     pub peers: Vec<PeerView>,
 }
 
+/// One derived cluster (wire `aster/ClusterView`): mutually-close admitted
+/// live producers, with the deterministically elected bridge and witness
+/// set. Node ids are hex strings, consistent with [`PeerView::node_id`].
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster/ClusterView")]
+pub struct ClusterView {
+    /// Sorted hex node ids (admitted ∧ live members only).
+    pub members: Vec<String>,
+    pub bridge: String,
+    /// Top-ranked members by bridge score; includes the bridge.
+    pub witnesses: Vec<String>,
+}
+
+impl From<&aster_transport_core::CoreClusterView> for ClusterView {
+    fn from(c: &aster_transport_core::CoreClusterView) -> Self {
+        ClusterView {
+            members: c.members.clone(),
+            bridge: c.bridge.clone(),
+            witnesses: c.witnesses.clone(),
+        }
+    }
+}
+
+/// Response of `aster.net.Topology.clusters` (wire `aster/ClusterList`).
+/// Empty when the node has not joined a topology swarm.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster/ClusterList")]
+pub struct ClusterList {
+    pub clusters: Vec<ClusterView>,
+}
+
+/// Request for `aster.net.Topology.separated` (wire `aster/SeparatedQuery`).
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster/SeparatedQuery")]
+pub struct SeparatedQuery {
+    pub node_a: String,
+    pub node_b: String,
+}
+
+/// `separated` verdict codes for [`SeparatedVerdict::verdict`].
+pub const SEPARATED_UNKNOWN: i32 = 0;
+pub const SEPARATED_CONNECTED: i32 = 1;
+pub const SEPARATED_SEPARATED: i32 = 2;
+
+/// Response of `aster.net.Topology.separated` (wire `aster/SeparatedVerdict`).
+/// `Unknown` (0) is a real answer: absence of measurement is never treated
+/// as evidence of distance.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster/SeparatedVerdict")]
+pub struct SeparatedVerdict {
+    /// 0 unknown, 1 connected, 2 separated.
+    pub verdict: i32,
+}
+
 /// Baseline topology service: query the node's local proximity view
 /// (topology v1 — ladder levels + path quality; clusters arrive with v2).
 ///
@@ -364,6 +418,16 @@ pub trait Topology {
     /// One peer's view entry (0-or-1 element list).
     #[rpc(idempotent)]
     async fn peer(&self, query: PeerQuery) -> aster::Result<PeerList>;
+
+    /// The derived clusters of the joined topology swarm (v2). Empty when
+    /// this node has not joined a swarm.
+    #[rpc(idempotent)]
+    async fn clusters(&self) -> aster::Result<ClusterList>;
+
+    /// Separation verdict for two nodes per the coverage rule (v2).
+    /// `Unknown` when no swarm is joined or evidence is insufficient.
+    #[rpc(idempotent)]
+    async fn separated(&self, query: SeparatedQuery) -> aster::Result<SeparatedVerdict>;
 }
 
 /// The stock implementation served by `AsterServerBuilder`: reads the core
@@ -389,6 +453,32 @@ impl Topology for LiveTopology {
                 .map(PeerView::from)
                 .collect(),
         })
+    }
+
+    async fn clusters(&self) -> aster::Result<ClusterList> {
+        let Some(swarm) = self.core.topology_swarm() else {
+            return Ok(ClusterList::default());
+        };
+        let view = swarm.view().await.map_err(crate::Error::from)?;
+        Ok(ClusterList {
+            clusters: view.clusters.iter().map(ClusterView::from).collect(),
+        })
+    }
+
+    async fn separated(&self, query: SeparatedQuery) -> aster::Result<SeparatedVerdict> {
+        use aster_transport_core::CoreSeparationVerdict as V;
+        let Some(swarm) = self.core.topology_swarm() else {
+            return Ok(SeparatedVerdict {
+                verdict: SEPARATED_UNKNOWN,
+            });
+        };
+        let view = swarm.view().await.map_err(crate::Error::from)?;
+        let verdict = match view.separated(&query.node_a, &query.node_b) {
+            V::Unknown => SEPARATED_UNKNOWN,
+            V::Connected => SEPARATED_CONNECTED,
+            V::Separated => SEPARATED_SEPARATED,
+        };
+        Ok(SeparatedVerdict { verdict })
     }
 }
 

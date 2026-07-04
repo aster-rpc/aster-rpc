@@ -78,6 +78,9 @@ required-features = ["rpc"]
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
+# Topology integration tests forge raw `topo/v1/…` records to prove readers
+# drop them (attribution rules) — the record encoders live in core.
+aster_transport_core = { path = "../core" }
 # Real PTY for the `shell` example (allocate a tty, spawn $SHELL, resize ioctl).
 portable-pty = "0.8"
 # Local terminal raw mode + size for the interactive `shell` client.

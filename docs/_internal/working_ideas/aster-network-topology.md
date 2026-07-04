@@ -329,6 +329,8 @@ ClusterView {
 
 **v2 (feature-flagged) — the shared doc + clusters.** Topology namespace, `NetworkPosition` + `RttEdge` records per the normative schema, corroborated edge rules, threshold-component clustering, witness sets + maintenance probing, bridge election, coverage rule, join flow, prefix-hash candidate matching. Gossip levers that need no fork changes: locality-aware bootstrap/`JoinPeers`.
 
+> **v2 core shipped 2026-07-04 (Rust).** `core/src/topology/{records,cluster,shared}.rs`: normative record schema + key layout, reader validation (attribution, admission filter, future-timestamp drop, TTLs), publisher with owned `held_since` hysteresis, pure cluster derivation (corroborated edges, components, blake3 bridge/witness ranking, `separated()` coverage rule with singleton clamp). Surface: `Topology::enable_shared/clusters/my_cluster/separated` + RPC `clusters()`/`separated()` on `aster.net.Topology`; namespace secret rides sealed grants (exercised in `aster/tests/topology_shared.rs`). **Deferred to v2.x:** prefix hashes + L1 candidate matching (needs NIC enumeration), witness join-probing + maintenance probes (current swarm measures organically-connected peers only), ASN DB, gossip `PeerData`, namespace rotation.
+
 **v3 — consumers.** Cluster-scoped replication policies, fork-level gossip biasing (weighted promotion + reserved random slots), blob-fetch strategies, leader-per-LAN.
 
 ## Open questions (v3 / scale-out only)

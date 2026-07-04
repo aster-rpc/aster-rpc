@@ -6,12 +6,14 @@ nearby nodes** with an elected **bridge** per cluster for cross-cluster work.
 No coordinator, no config file describing your network: nodes measure,
 share measurements, and every node independently derives the *same* answer.
 
-> **Status: v1 shipped (Rust), v2 conceptual.** The local per-peer view
-> (§3) is implemented in the Rust `aster` crate as of 2026-07-04; other
-> bindings follow the FFI wave. Clusters and bridges (§4) are designed but
-> not yet built ([design doc](_internal/working_ideas/aster-network-topology.md))
-> — that section's API shapes are illustrative and will be finalised when
-> v2 lands.
+> **Status: v1 + v2 core shipped (Rust, 2026-07-04).** The local per-peer
+> view (§3) and the shared swarm — clusters, bridges, `separated()` (§4) —
+> are implemented in the Rust `aster` crate; other bindings follow the FFI
+> wave. Still to come as v2.x
+> ([design doc](_internal/working_ideas/aster-network-topology.md)):
+> prefix-hash L1 candidates, witness join-probing and maintenance probes
+> (today's swarm measures organically-connected peers only), and the ASN
+> hint.
 
 ---
 
@@ -142,62 +144,96 @@ addresses (those stay in-process only).
 In v1 the view covers **peers you've actually connected to**. Ranking
 never-contacted peers arrives with v2's shared measurements.
 
-## 4. Clusters and bridges (v2)
+## 4. Clusters and bridges (v2 — shipped in Rust)
 
 v2 adds a shared **topology document** (an iroh-docs namespace) where every
-node publishes its measurements. Enable it on the root node and admit
-members the same way you distribute any Aster capability — via
-[sealed grants](aster-sealed-grants-getstarted.md):
+producer publishes its measurements, and from which every producer
+independently derives the *same* clusters and bridges. The namespace secret
+is distributed like any Aster capability — inside a
+[sealed grant](aster-sealed-grants-getstarted.md):
 
 ```rust
-// Root: provision the topology namespace for the swarm.
-let srv = AsterServer::builder()
-    .topology(TopologyConfig::default())   // feature-flagged in v2
-    .start()
-    .await?;
+use aster::grants::{open_namespace_grant, seal_namespace_grant, GrantContext};
+use aster::topology::TopologySwarmOptions;
+use aster::{NamespaceCapability, NamespaceSecret, SecretKey};
 
-// Admit a node: the namespace secret travels inside the sealed grant,
-// alongside whatever else you grant it. Nothing topology-specific to do.
+// Root: mint the swarm's topology namespace secret once, then seal it
+// per admitted node.
+let topo_secret = NamespaceSecret::from_bytes(SecretKey::generate().to_bytes());
+let ctx = GrantContext {
+    app: "myapp/topo/v1",
+    granter: &root_id,
+    recipient: &member_id,
+    resource: &topo_secret.id().to_bytes(),
+    path: "/topo/v1/grants",
+    role: "write",
+};
+let sealed = seal_namespace_grant(&ctx, &NamespaceCapability::write(topo_secret.clone()))?;
+
+// Member: open the grant with its identity key and join the swarm.
+let NamespaceCapability::Write(secret) =
+    open_namespace_grant(&identity_secret, &ctx, &sealed)?
+else { unreachable!() };
+node.topology()
+    .enable_shared(&secret, TopologySwarmOptions::default())
+    .await?;
 ```
 
-A joining node syncs the doc, sees the whole swarm's layout *before probing
-anything*, confirms where it belongs with a handful of dials, and publishes
-its own measurements. From then on:
+From then on the node heartbeats its `position` record and one RTT-edge
+half per measured peer into the doc, and derives the swarm view locally:
 
 ```rust
-let cluster = topo.my_cluster();
-println!("cluster of {} nodes, bridge = {}", cluster.members.len(), cluster.bridge);
-
-// The replication pattern from the use case above:
-for peer in &cluster.members {
-    replicate_with(peer);                       // dense, intra-cluster
-}
-if cluster.bridge == node.id() {
-    for other in topo.clusters() {
-        if other != cluster {
-            replicate_with(other.bridge);       // bridge ↔ bridge, cross-region
+let topo = node.topology();
+if let Some(cluster) = topo.my_cluster().await? {
+    // The replication pattern from the use case above:
+    for peer in &cluster.members {
+        replicate_with(peer); // dense, intra-cluster
+    }
+    if cluster.bridge == node.id().to_string() {
+        for other in topo.clusters().await? {
+            if other != cluster {
+                replicate_with(&other.bridge); // bridge ↔ bridge, cross-region
+            }
         }
     }
 }
 ```
 
-The bridge check is just a comparison — election is a deterministic
-function of the shared data, so every member evaluates it identically. If
-the bridge dies, its records stop refreshing and within minutes every node
+The bridge check is just a string comparison — election is a deterministic
+function of the shared records (a blake3 ranking salted by the namespace
+id), so every member evaluates it identically. If the bridge dies, its
+records stop refreshing and, within the liveness TTL, every node
 independently promotes the same successor.
 
 You can also ask for separation evidence:
 
 ```rust
-match topo.separated(node_a, node_b)? {
-    Verdict::Separated => { /* measured far apart — real diversity */ }
-    Verdict::Connected => { /* same cluster */ }
-    Verdict::Unknown   => { /* not enough measurements — treat as unknown, not far */ }
+use aster::topology::SeparationVerdict;
+
+match topo.separated(&node_a, &node_b).await? {
+    SeparationVerdict::Separated => { /* measured far apart — real diversity */ }
+    SeparationVerdict::Connected => { /* same cluster */ }
+    SeparationVerdict::Unknown   => { /* not enough measurements — treat as unknown, not far */ }
 }
 ```
 
 `Unknown` is a real answer: absence of a measurement is never treated as
-evidence of distance.
+evidence of distance — `Separated` requires corroborated far measurements
+under a coverage rule.
+
+The opt-in `aster.net.Topology` RPC service gains `clusters()` and
+`separated(node_a, node_b)` alongside the v1 `peers()`/`peer()` methods,
+so operators can inspect a producer's derived view remotely.
+
+Two practical notes:
+
+- **Timing knobs**: production defaults (60s heartbeat, 2min edge hold,
+  5min liveness) come from the design doc; `TopologySwarmOptions.timing`
+  overrides them (tests run with sub-second refresh).
+- **Custom admission**: `TopologySwarmOptions.admitted` installs a
+  read-time filter over record authors. Without it, every holder of the
+  namespace secret counts — which is already admission-gated by how you
+  distributed the grants.
 
 ## 5. What to rely on — and what not to
 
@@ -257,9 +293,11 @@ rule) lives in the
 - **v1 — local view. Shipped (Rust).** Ladder + path quality + confidence
   over live connections; `Node::topology()` + opt-in `aster.net.Topology`.
   No shared state. Python/TS/Java surfaces follow the FFI wave.
-- **v2 — clusters (feature-flagged).** Shared topology doc, cluster
-  derivation, bridges, witnesses, `separated()`. This guide gets finalised
-  (real API signatures, per-binding examples) when this lands.
+- **v2 — clusters. Core shipped (Rust).** Shared topology doc, corroborated
+  edge rules, cluster derivation, bridges/witnesses, `separated()`,
+  sealed-grant secret distribution, read-time admission filter. Remaining
+  v2.x: prefix-hash L1 candidates, witness join-probing + maintenance
+  probes, ASN hint.
 - **v3 — consumers.** Locality-aware gossip biasing, blob-fetch
   strategies, leader-per-LAN aggregation, replica-placement policies built
   on the view.
