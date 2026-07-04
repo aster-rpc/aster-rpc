@@ -3,7 +3,7 @@
 > **Status: core mechanism SHIPPED (2026-07-02)** as `aster::grants` — `GrantContext` + AAD discipline, `seal_grant`/`open_grant` (identity-derived + standalone-key variants), typed namespace-capability helpers with role consistency, `PolicyDoc` pinned-author reads, and the `grant_key` convention. See `aster/src/grants.rs`, tests in `aster/tests/grants.rs`, end-user doc [../aster-sealed-grants-getstarted.md](../aster-sealed-grants-getstarted.md). Still open: the reconcile-loop helper + local cap cache (piece 3), portal-sync's migration onto this API, and namespace rotation.
 
 **Companion docs:**
-- [working_ideas/aster-network-topology.md](working_ideas/aster-network-topology.md) — first internal consumer: the topology namespace secret distributes via this mechanism
+- [aster-network-topology.md](aster-network-topology.md) — first internal consumer: the topology namespace secret distributes via this mechanism
 - [aster-baseline-services.md](aster-baseline-services.md) — the trust-side surface (`aster.trust.*`) is the natural home if any of this becomes an RPC
 - Origin: portal-sync (`/Users/emrul/dev/emrul/portal-sync`), `crates/portal-cas/src/policy/` — the hand-rolled implementation this generalizes
 
@@ -64,7 +64,7 @@ The AAD is length-prefixed (u32 BE) over a versioned domain label (`aster/sealed
 
 ### 2. Pinned-author policy reads → `PolicyDoc`
 
-HPKE Base has no sender authenticity. portal-sync gets authenticity from *where the record sits*: reads go through `get_exact(root_author, key)` in a namespace where only the root author's records are trusted. That "root-authored policy doc, pinned author, read-only import" wrapper is now wanted by at least three consumers — portal-sync policy, the topology namespace ([working_ideas/aster-network-topology.md](working_ideas/aster-network-topology.md) §Shared topology doc), and admission-record distribution. Shipped:
+HPKE Base has no sender authenticity. portal-sync gets authenticity from *where the record sits*: reads go through `get_exact(root_author, key)` in a namespace where only the root author's records are trusted. That "root-authored policy doc, pinned author, read-only import" wrapper is now wanted by at least three consumers — portal-sync policy, the topology namespace ([aster-network-topology.md](aster-network-topology.md) §Shared topology doc), and admission-record distribution. Shipped:
 
 ```rust
 let policy = PolicyDoc::import_read_only(&docs, namespace_id, root_author).await?;

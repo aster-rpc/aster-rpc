@@ -5,7 +5,7 @@
 **Companion docs:**
 - [working_ideas/decentralized-log-distribution.md](working_ideas/decentralized-log-distribution.md) — the publisher/subscriber substrate; this doc adds the on-demand pull side
 - [working_ideas/observability-in-core.md](working_ideas/observability-in-core.md) — OTel SDK, metrics, traces, hooks
-- [working_ideas/aster-network-topology.md](working_ideas/aster-network-topology.md) — locality self-mapping; would surface as `aster.net.Topology` alongside `aster.ops.Connections`
+- [aster-network-topology.md](aster-network-topology.md) — locality self-mapping; would surface as `aster.net.Topology` alongside `aster.ops.Connections`
 - [aster-sealed-grants.md](aster-sealed-grants.md) — per-recipient capability distribution (from portal-sync); shipped as `aster::grants`; any runtime surface would land in `aster.trust.*`
 - identity-worked-example.md (deleted 2026-06-10, in git history) — tenant/rcan model; superseded by directory roles per [trust-directory.md](trust-directory.md)
 - trust-discovery-thinking-session.md (deleted 2026-06-10, in git history) — handle registry / discovery primitives the baseline `discovery.*` services would expose; concluded in [trust-directory.md](trust-directory.md)

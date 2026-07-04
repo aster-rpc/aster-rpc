@@ -1,9 +1,9 @@
 # Network Topology Self-Mapping — Locality-Aware Aster Swarms
 
-> **Status: implementation-ready draft (2026-07-04) for v1 and a feature-flagged v2.** The signal trust rules, edge rules, cluster derivation, witness/coverage policy, bridge election, record schema, and defaults table are **normative** for v2. Numeric defaults are chosen-and-tunable (config, not folklore left open). Open questions now cover only v3 and scale-out.
+> **Status: normative spec; v1 + v2 core shipped in Rust (2026-07-04).** The signal trust rules, edge rules, cluster derivation, witness/coverage policy, bridge election, record schema, size caps, and defaults table are **normative** — other bindings implementing topology must match them. Numeric defaults are chosen-and-tunable (config, not folklore left open). Shipped/deferred detail lives in the Phasing section; open questions cover only v3 and scale-out. User guide: `docs/aster-topology-getstarted.md`.
 
 **Companion docs:**
-- [../aster-baseline-services.md](../aster-baseline-services.md) — the topology surface lives in the `aster.*` baseline catalog (`aster.net.Topology`, adjacent to `aster.ops.Connections`)
+- [aster-baseline-services.md](aster-baseline-services.md) — the topology surface lives in the `aster.*` baseline catalog (`aster.net.Topology`, adjacent to `aster.ops.Connections`)
 - Local discovery plan (mDNS + `AddrFilter`) — mDNS sightings are a Tier-1 feeder for this design, not a standalone feature
 
 ---
@@ -202,7 +202,7 @@ Own continuous measurement saturates confidence toward 1; corroborated edges pub
 
 ## Shared topology doc — the replication substrate
 
-Topology knowledge replicates through a dedicated **iroh-docs namespace**. The root node provisions the namespace and propagates the namespace secret to admitted nodes via **sealed grants** — the per-recipient HPKE capability-distribution mechanism generalized from portal-sync, now implemented in `aster::grants` (see [../aster-sealed-grants.md](../aster-sealed-grants.md)). Nodes write their own observations; the CRDT store replicates them swarm-wide with no coordinator and no requirement that nodes be online simultaneously.
+Topology knowledge replicates through a dedicated **iroh-docs namespace**. The root node provisions the namespace and propagates the namespace secret to admitted nodes via **sealed grants** — the per-recipient HPKE capability-distribution mechanism generalized from portal-sync, now implemented in `aster::grants` (see [aster-sealed-grants.md](aster-sealed-grants.md)). Nodes write their own observations; the CRDT store replicates them swarm-wide with no coordinator and no requirement that nodes be online simultaneously.
 
 **Attribution survives the shared secret.** iroh-docs entries are signed by both the namespace key *and* the per-node author key — a shared write secret does not mean anonymous writes. Every record stays attributable to the node that wrote it, which is what keeps the trust tiers enforceable: each RTT edge is attributable to its measurer; each claim to its claimant.
 
@@ -304,7 +304,7 @@ iroh-gossip *is* HyParView (membership: bounded `active_view`, default cap 5, ov
 
 ## Surface
 
-Core (Rust) computes the view — it owns iroh path info, quinn stats, and the docs client. mDNS local discovery feeds L1 sightings into the same view. Exposed via the baseline catalog, adjacent to `aster.ops.Connections` in [../aster-baseline-services.md](../aster-baseline-services.md):
+Core (Rust) computes the view — it owns iroh path info, quinn stats, and the docs client. mDNS local discovery feeds L1 sightings into the same view. Exposed via the baseline catalog, adjacent to `aster.ops.Connections` in [aster-baseline-services.md](aster-baseline-services.md):
 
 ```
 aster.net.Topology
@@ -342,7 +342,7 @@ ClusterView {
 1. **Default tuning.** The Defaults table is normative but chosen from rules of thumb; run an empirical pass against real deployments (relay fleet geography, office LANs) before declaring the numbers final.
 2. **Chaining in practice.** Components are pinned; if real topologies chain-merge regions (or colluders exploit it), switch the linkage rule to complete-linkage — the escape hatch is documented, the trigger is evidence.
 3. **Doc growth at scale.** O(N) positions + intra-cluster edges is fine to thousands of nodes; beyond that, shard the namespace by cluster/region.
-4. **Namespace rotation mechanics.** How the root re-keys and redistributes after revocation — shared open question with [../aster-sealed-grants.md](../aster-sealed-grants.md) (its Q4); one rotation design should serve both.
+4. **Namespace rotation mechanics.** How the root re-keys and redistributes after revocation — shared open question with [aster-sealed-grants.md](aster-sealed-grants.md) (its Q4); one rotation design should serve both.
 5. **Active-view slot split.** How many of the (default 5) HyParView active slots get locality-biased vs left uniformly random? Too greedy partitions the overlay into locality islands; too conservative wastes the bias. Needs simulation (iroh-gossip ships a `sim` harness we can extend) before the fork change lands.
 6. **`PeerData` size budget — and whether the piggyback survives at all.** Membership messages carry `PeerData` on every Join/ForwardJoin/Shuffle; without a coordinate to carry, the remaining hint (egress + ASN, claim-only) may not justify taxing the whole overlay. Prefix hashes stay doc-only regardless.
 7. **Bridge exclusivity.** The deterministic bridge is eventually-agreed, not exclusive. Which consumers are fine with transient double-bridging (replication: yes) and which need a real coordination primitive on top?

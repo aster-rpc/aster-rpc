@@ -1,7 +1,7 @@
 //! Topology v2 wire records — the `topo/v1/…` entries of the shared
 //! topology namespace.
 //!
-//! Schema is normative per `docs/_internal/working_ideas/aster-network-topology.md`
+//! Schema is normative per `docs/_internal/aster-network-topology.md`
 //! §"Record schema": Fory XLANG encoding (payload root `aster.topo`),
 //! all-integer fields, version in the key path (`topo/v1/…`; unknown
 //! `topo/v<N>` prefixes are ignored by readers for forward compatibility).
