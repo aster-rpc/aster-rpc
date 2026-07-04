@@ -5,7 +5,7 @@
 //! recently held) live connections to. Fed by [`crate::CoreMonitor`]'s remote
 //! map via a periodic sampler; no probe traffic, no shared state — this is
 //! the v1 "read what iroh already knows" phase of
-//! `docs/_internal/working_ideas/aster-network-topology.md`.
+//! `docs/_internal/aster-network-topology.md`.
 //!
 //! v2 (shared doc + clusters) lives in the submodules: [`records`] (wire
 //! records + key layout), [`cluster`] (pure derivation), [`shared`] (the

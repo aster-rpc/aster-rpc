@@ -10,7 +10,7 @@ share measurements, and every node independently derives the *same* answer.
 > view (§3) and the shared swarm — clusters, bridges, `separated()` (§4) —
 > are implemented in the Rust `aster` crate; other bindings follow the FFI
 > wave. Still to come as v2.x
-> ([design doc](_internal/working_ideas/aster-network-topology.md)):
+> ([design doc](_internal/aster-network-topology.md)):
 > prefix-hash L1 candidates, witness join-probing and maintenance probes
 > (today's swarm measures organically-connected peers only), and the ASN
 > hint.
@@ -286,7 +286,7 @@ just work. The knobs you're most likely to touch:
 
 The full normative table (hysteresis bands, hold times, TTLs, coverage
 rule) lives in the
-[design doc](_internal/working_ideas/aster-network-topology.md#defaults-normative-config-tunable).
+[design doc](_internal/aster-network-topology.md#defaults-normative-config-tunable).
 
 ## 7. Roadmap
 
@@ -303,4 +303,4 @@ rule) lives in the
   on the view.
 
 Design rationale, trust model, and the normative wire schema:
-[`docs/_internal/working_ideas/aster-network-topology.md`](_internal/working_ideas/aster-network-topology.md).
+[`docs/_internal/aster-network-topology.md`](_internal/aster-network-topology.md).
