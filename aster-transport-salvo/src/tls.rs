@@ -373,7 +373,16 @@ async fn serve_https_inner(
                 quinn = quinn.transport_config_tuner(move |t| tuner(t));
             }
             let acceptor = quinn.join(tcp).bind().await;
-            Server::new(acceptor).serve(service).await;
+            // No `Alt-Svc: h3`: the QUIC side of this listener exists for
+            // WebTransport (which dials it directly); page/API fetches must
+            // stay on TCP. Safari (Network.framework) otherwise migrates plain
+            // fetches onto H3 mid-page and can wedge them without settling the
+            // request (observed: /wt-ticket hanging forever → viewer stuck on
+            // "Connecting…" with an empty console).
+            let builder = salvo::conn::HttpBuilder::new().auto_alt_svc_header(false);
+            Server::with_http_builder(acceptor, builder)
+                .serve(service)
+                .await;
             Ok(())
         }
     }
