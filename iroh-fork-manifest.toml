@@ -67,6 +67,16 @@ branch = "upgrade/iroh-gossip-v0.101"
 crates = ["iroh-gossip"]
 crate_version = "0.101.0"
 
+
+[forks.salvo]
+repo = "https://github.com/aster-rpc/salvo"
+upstream_base = "upstream/main through #1621 (2026-06-27 merge)"
+tag = "aster-salvo-2026-07-05"
+commit = "0e8477c10760b7f66fa5667e2755c938d07393c0"
+branch = "main"
+crates = ["salvo", "salvo_core", "salvo_macros", "salvo-http3", "h3", "h3-quinn"]
+crate_version = "0.93.0"
+
 # -----------------------------------------------------------------------------
 # Transitive crates.io pins forced by upstream's 1.0 dependency update.
 # These are NOT forks — pin them in your own Cargo.toml at these versions to
@@ -106,4 +116,16 @@ iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "76492e4
 noq         = { git = "https://github.com/aster-rpc/noq",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
 noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
 noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
+"""
+
+# Salvo fork pin block ([patch.crates-io]) — the fork patches h3 / h3-quinn /
+# salvo-http3 internally and [patch.crates-io] does not cross workspaces, so
+# every consumer re-declares the whole family at the same rev:
+salvo_patch_crates_io = """
+salvo        = { git = "https://github.com/aster-rpc/salvo", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
+salvo_core   = { git = "https://github.com/aster-rpc/salvo", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
+salvo_macros = { git = "https://github.com/aster-rpc/salvo", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
+salvo-http3  = { git = "https://github.com/aster-rpc/salvo", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
+h3           = { git = "https://github.com/aster-rpc/salvo", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
+h3-quinn     = { git = "https://github.com/aster-rpc/salvo", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
 """
