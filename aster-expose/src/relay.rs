@@ -50,6 +50,31 @@ pub type HttpHandler = Arc<
 /// policy is often a network call.
 pub type AuthorizeFn = Arc<dyn Fn(PeerContext) -> BoxFut<Result<()>> + Send + Sync>;
 
+/// The transport-authenticated identity of the peer that opened a request stream — the verified
+/// remote node id (`conn.remote_id()`). The relay inserts it into each request's [`http::Extensions`]
+/// AFTER decoding the head and BEFORE dispatch, so a handler can attribute the request to its
+/// authenticated origin (e.g. a per-peer quota) with a provenance the peer cannot forge.
+///
+/// The inner value is PRIVATE and there is no public constructor — HTTP input can neither populate
+/// nor override this extension; only the relay's [`accept`](ServiceAcceptor::accept) can mint it. A
+/// handler reads it via `req.extensions().get::<AuthenticatedPeer>()` and must fail closed if absent.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedPeer {
+    peer_id: String,
+}
+
+impl AuthenticatedPeer {
+    /// Crate-private: constructed ONLY from a verified transport connection (never from a request).
+    pub(crate) fn new(peer_id: String) -> Self {
+        Self { peer_id }
+    }
+
+    /// The verified remote node id.
+    pub fn as_str(&self) -> &str {
+        &self.peer_id
+    }
+}
+
 /// Bound on the request/response head (the body is unbounded — it streams).
 const MAX_HEAD: usize = 1 << 20; // 1 MiB
 
@@ -133,14 +158,22 @@ where
 /// response head, pump the streaming response body back, then finish the send
 /// side. Generic over the byte transport so it is testable without a live
 /// Aster connection.
-pub async fn serve_request<R, W>(mut read: R, mut write: W, handler: &HttpHandler) -> Result<()>
+pub async fn serve_request<R, W>(
+    mut read: R,
+    mut write: W,
+    handler: &HttpHandler,
+    peer: AuthenticatedPeer,
+) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
     let head = read_length_prefixed(&mut read, MAX_HEAD, "request head").await?;
     let parts = codec::decode_request_head(&head)?;
-    let request = http::Request::from_parts(parts, RelayBody::new(Box::pin(read)));
+    let mut request = http::Request::from_parts(parts, RelayBody::new(Box::pin(read)));
+    // Attribute the request to its transport-authenticated origin. Inserted AFTER decoding the head,
+    // so it overwrites (never merges with) anything a peer might have tried to smuggle in the head.
+    request.extensions_mut().insert(peer);
 
     let response = handler(request).await?;
     let (parts, body) = response.into_parts();
@@ -228,15 +261,18 @@ impl LocalTunnelAcceptor for ServiceAcceptor {
 
     fn accept(
         &self,
-        _conn: CoreConnection,
+        conn: CoreConnection,
         send: CoreSendStream,
         recv: CoreRecvStream,
     ) -> BoxFut<()> {
         let handler = self.handler.clone();
+        // The transport-authenticated peer identity — derived here from the verified connection, the
+        // only place it can come from, and handed to the handler as a request extension.
+        let peer = AuthenticatedPeer::new(conn.remote_id());
         Box::pin(async move {
             let io = AsterStreamIo::new(recv, send);
             let (r, w) = tokio::io::split(io);
-            if let Err(e) = serve_request(r, w, &handler).await {
+            if let Err(e) = serve_request(r, w, &handler, peer).await {
                 tracing::debug!("http-relay serve error: {e}");
             }
         })
@@ -391,7 +427,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (sr, sw) = tokio::io::split(server);
         let handler = echo_handler();
-        let srv = tokio::spawn(async move { serve_request(sr, sw, &handler).await });
+        let srv = tokio::spawn(async move {
+            serve_request(sr, sw, &handler, AuthenticatedPeer::new("test-peer".into())).await
+        });
 
         let (cr, mut cw) = tokio::io::split(client);
         let parts = http::Request::builder()
@@ -416,7 +454,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (sr, sw) = tokio::io::split(server);
         let handler = echo_handler();
-        let srv = tokio::spawn(async move { serve_request(sr, sw, &handler).await });
+        let srv = tokio::spawn(async move {
+            serve_request(sr, sw, &handler, AuthenticatedPeer::new("test-peer".into())).await
+        });
 
         let (cr, mut cw) = tokio::io::split(client);
         let parts = http::Request::builder()
@@ -438,7 +478,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (sr, sw) = tokio::io::split(server);
         let handler = echo_handler();
-        let srv = tokio::spawn(async move { serve_request(sr, sw, &handler).await });
+        let srv = tokio::spawn(async move {
+            serve_request(sr, sw, &handler, AuthenticatedPeer::new("test-peer".into())).await
+        });
 
         let (cr, mut cw) = tokio::io::split(client);
         let parts = http::Request::builder()
