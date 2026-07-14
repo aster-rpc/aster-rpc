@@ -76,6 +76,29 @@ node.expose_http("web", authorize(), my_handler());      // in-process handler
 closure. Wrap any `tower::Service` with [`relay::tower_handler`], or write the
 closure directly (see the example).
 
+### Attributing a request to its authenticated peer
+
+The `AuthorizeFn` above sees the peer once, at admission. A **handler** that needs
+the peer identity per request — for a per-peer quota, an audit record, or
+routing — reads it from the request's extensions:
+
+```rust
+use aster_expose::relay::AuthenticatedPeer;
+
+// inside your HttpHandler:
+let peer = req.extensions().get::<AuthenticatedPeer>();
+match peer {
+    Some(p) => { /* attribute to p.as_str() — the verified remote node id */ }
+    None    => { /* fail closed: no relay-inserted identity → reject */ }
+}
+```
+
+`AuthenticatedPeer` is inserted by the relay **after** decoding the request head
+and **before** dispatch, straight from the verified connection
+(`conn.remote_id()`). Its constructor is private to `aster-expose` and HTTP input
+cannot populate or override extensions, so the value is unforgeable — a handler
+can trust it for attribution and should treat its absence as a hard failure.
+
 Then run the node's accept loop, attaching the registry to each connection:
 
 ```rust
