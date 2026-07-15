@@ -21,8 +21,8 @@ use http_body_util::BodyExt;
 
 use aster_expose::body::{RelayBody, RelayError, ResponseBody};
 use aster_expose::relay::{
-    expose_http_on_connection, expose_local_http, relay_request, AuthorizeFn, HttpHandler,
-    LocalHttpTarget,
+    expose_http_on_connection, expose_local_http, relay_request, AuthenticatedPeer, AuthorizeFn,
+    HttpHandler, LocalHttpTarget,
 };
 
 const TEST_ALPN: &[u8] = b"aster-test/expose";
@@ -194,6 +194,74 @@ async fn denied_authorize_drops_stream() -> Result<()> {
     )
     .await?;
     assert!(r.is_err(), "denied authorize must not yield a response");
+    Ok(())
+}
+
+/// Reflects the transport-authenticated peer (from the request extension) into `x-authed-peer`, and any
+/// forged `x-authenticated-peer` REQUEST header into `x-hdr-peer` — so a test can prove the extension
+/// (not the header) is the authoritative identity.
+fn peer_reflect_handler() -> HttpHandler {
+    Arc::new(|req: http::Request<RelayBody>| {
+        Box::pin(async move {
+            let authed = req
+                .extensions()
+                .get::<AuthenticatedPeer>()
+                .map(|p| p.as_str().to_owned())
+                .unwrap_or_else(|| "<none>".to_owned());
+            let hdr = req
+                .headers()
+                .get("x-authenticated-peer")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_owned();
+            let resp = http::Response::builder()
+                .status(200)
+                .header("x-authed-peer", authed)
+                .header("x-hdr-peer", hdr)
+                .body(
+                    http_body_util::Full::new(bytes::Bytes::new())
+                        .map_err(|e: std::convert::Infallible| -> RelayError { match e {} })
+                        .boxed_unsync(),
+                )
+                .unwrap();
+            Ok(resp)
+        }) as BoxFut<Result<http::Response<ResponseBody>>>
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_peer_is_the_connection_remote_id() -> Result<()> {
+    // End-to-end over a REAL authenticated QUIC connection: the relay derives AuthenticatedPeer from
+    // `conn.remote_id()`, so the handler's extension must equal the id the server authenticated the
+    // client as — the identity the host turns into an `EdgeId`. A forged identity-looking REQUEST
+    // header must NOT change it (it rides along inert), proving the transport peer — not HTTP input —
+    // determines attribution. This is the remaining end-to-end link for the host's fail-closed
+    // `EdgeId::from_authenticated_peer` derivation.
+    let h = harness().await?;
+    let expected_peer = h.server_conn.remote_id(); // what the server authenticated the client as
+    expose_http_on_connection(&h.server_conn, "peer", allow_all(), peer_reflect_handler());
+
+    let mut req = post("/x", b"");
+    req.headers_mut()
+        .insert("x-authenticated-peer", "attacker-peer".parse().unwrap());
+    let resp = timeout(STEP_TIMEOUT, relay_request(&h.client_conn, "peer", req)).await??;
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-authed-peer")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        expected_peer,
+        "the authenticated peer must be the connection's remote id, not a header"
+    );
+    assert_eq!(
+        resp.headers().get("x-hdr-peer").unwrap(),
+        "attacker-peer",
+        "the forged identity header rides along inert — the extension is authoritative"
+    );
+    assert_ne!(expected_peer, "attacker-peer");
     Ok(())
 }
 
