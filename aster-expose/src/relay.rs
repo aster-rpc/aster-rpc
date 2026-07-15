@@ -449,6 +449,94 @@ mod tests {
         srv.await.unwrap().unwrap();
     }
 
+    /// Reflects the transport-attributed peer back to the caller: `x-authed-peer` carries the
+    /// value read from `req.extensions().get::<AuthenticatedPeer>()` (or `<none>` if the handler
+    /// received no extension — a fail-closed handler would reject that), and `x-hdr-peer` echoes
+    /// whatever an `x-authenticated-peer` HTTP header claimed, so a test can prove the header does
+    /// not influence the extension.
+    fn peer_reflect_handler() -> HttpHandler {
+        Arc::new(|req: http::Request<RelayBody>| {
+            Box::pin(async move {
+                let authed = req
+                    .extensions()
+                    .get::<AuthenticatedPeer>()
+                    .map(|p| p.as_str().to_owned())
+                    .unwrap_or_else(|| "<none>".to_owned());
+                let hdr = req
+                    .headers()
+                    .get("x-authenticated-peer")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("<none>")
+                    .to_owned();
+                let resp = http::Response::builder()
+                    .status(200)
+                    .header("x-authed-peer", authed)
+                    .header("x-hdr-peer", hdr)
+                    .body(
+                        Full::new(Bytes::new())
+                            .map_err(|e: std::convert::Infallible| -> RelayError { match e {} })
+                            .boxed_unsync(),
+                    )
+                    .unwrap();
+                Ok(resp)
+            }) as BoxFut<Result<http::Response<ResponseBody>>>
+        })
+    }
+
+    #[tokio::test]
+    async fn handler_receives_the_exact_authenticated_peer_extension() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server);
+        let handler = peer_reflect_handler();
+        let srv = tokio::spawn(async move {
+            serve_request(sr, sw, &handler, AuthenticatedPeer::new("test-peer".into())).await
+        });
+
+        let (cr, mut cw) = tokio::io::split(client);
+        let parts = http::Request::builder()
+            .uri("/whoami")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        write_request(&mut cw, &parts, b"").await;
+
+        let resp = read_response(cr).await;
+        assert_eq!(resp.status(), 200);
+        // The handler saw exactly the peer that serve_request was given.
+        assert_eq!(resp.headers().get("x-authed-peer").unwrap(), "test-peer");
+        srv.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_forged_identity_header_does_not_alter_attribution() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server);
+        let handler = peer_reflect_handler();
+        // The transport attributes this connection to "real-peer".
+        let srv = tokio::spawn(async move {
+            serve_request(sr, sw, &handler, AuthenticatedPeer::new("real-peer".into())).await
+        });
+
+        let (cr, mut cw) = tokio::io::split(client);
+        // The caller tries to spoof a different identity via an HTTP header.
+        let parts = http::Request::builder()
+            .uri("/whoami")
+            .header("x-authenticated-peer", "attacker-peer")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        write_request(&mut cw, &parts, b"").await;
+
+        let resp = read_response(cr).await;
+        // The extension is still the transport-derived identity, untouched by the header...
+        assert_eq!(resp.headers().get("x-authed-peer").unwrap(), "real-peer");
+        // ...even though the forged header did ride along in the request untouched.
+        assert_eq!(resp.headers().get("x-hdr-peer").unwrap(), "attacker-peer");
+        srv.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn empty_body_request() {
         let (client, server) = tokio::io::duplex(64 * 1024);
