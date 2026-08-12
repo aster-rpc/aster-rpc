@@ -16,10 +16,31 @@ STUB="bindings/python/aster/_aster.pyi"
 
 WHEEL_DIR="bindings/python/target/wheels"
 
-# Wheels need the exact derived version in both package metadata and the native
-# binary. Preserve the caller's working tree while temporarily stamping it.
+# Pin aster-rpc fork transitive deps (hickory-proto / hickory-net → beta.1)
+# before preserving the versioned files. If the pins need a legitimate lockfile
+# refresh, that refresh should survive the temporary build-version stamping.
+./scripts/pin-fork-deps.sh
+
+# Wheels need the exact derived version in Python metadata, Cargo package
+# metadata, and the native binary. Preserve the caller's working tree while
+# temporarily stamping all tracked version files.
 BUILD_STATE="$(mktemp -d)"
-cp pyproject.toml "$BUILD_STATE/pyproject.toml"
+VERSIONED_BUILD_FILES=(
+  pyproject.toml
+  Cargo.lock
+  core/Cargo.toml
+  ffi/Cargo.toml
+  aster/Cargo.toml
+  aster-expose/Cargo.toml
+  aster-macros/Cargo.toml
+  aster-transport-salvo/Cargo.toml
+  bindings/python/rust/Cargo.toml
+  bindings/typescript/native/Cargo.toml
+)
+for relative in "${VERSIONED_BUILD_FILES[@]}"; do
+  mkdir -p "$BUILD_STATE/$(dirname "$relative")"
+  cp "$relative" "$BUILD_STATE/$relative"
+done
 if [[ -f BUILD_NUMBER ]]; then
   cp BUILD_NUMBER "$BUILD_STATE/BUILD_NUMBER"
   HAD_BUILD_NUMBER=true
@@ -27,7 +48,9 @@ else
   HAD_BUILD_NUMBER=false
 fi
 restore_build_state() {
-  cp "$BUILD_STATE/pyproject.toml" pyproject.toml
+  for relative in "${VERSIONED_BUILD_FILES[@]}"; do
+    cp "$BUILD_STATE/$relative" "$relative"
+  done
   if [[ "$HAD_BUILD_NUMBER" == true ]]; then
     cp "$BUILD_STATE/BUILD_NUMBER" BUILD_NUMBER
   else
@@ -39,12 +62,8 @@ trap restore_build_state EXIT
 
 ASTER_BUILD_VERSION="$(./scripts/release/version.sh)"
 export ASTER_BUILD_VERSION
-./scripts/release/prepare-python-build.sh "$ASTER_BUILD_VERSION" >/dev/null
+./scripts/release/prepare-build-tree.sh "$ASTER_BUILD_VERSION" >/dev/null
 echo "Building Aster $ASTER_BUILD_VERSION"
-
-# Pin aster-rpc fork transitive deps (hickory-proto / hickory-net → beta.1)
-# before invoking cargo. No-op if already pinned.
-./scripts/pin-fork-deps.sh
 
 # Build wheel, then install it — single cargo compilation
 uv run --frozen --no-sync maturin build -m "$MANIFEST" --out "$WHEEL_DIR" "$@"
