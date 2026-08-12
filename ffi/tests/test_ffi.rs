@@ -2,6 +2,7 @@
 //!
 //! These tests validate the FFI layer by testing through the C-compatible API.
 
+use std::ffi::CStr;
 use std::ptr;
 use std::time::Duration;
 
@@ -14,6 +15,12 @@ fn test_abi_version() {
     assert_eq!(iroh_abi_version_major(), 1);
     assert_eq!(iroh_abi_version_minor(), 0);
     assert_eq!(iroh_abi_version_patch(), 0);
+}
+
+#[test]
+fn test_aster_build_version() {
+    let version = unsafe { CStr::from_ptr(aster_version()) };
+    assert_eq!(version.to_str().unwrap(), aster_transport_core::VERSION);
 }
 
 #[test]

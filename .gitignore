@@ -155,6 +155,7 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
+/BUILD_NUMBER
 
 # Jupyter Notebook
 .ipynb_checkpoints

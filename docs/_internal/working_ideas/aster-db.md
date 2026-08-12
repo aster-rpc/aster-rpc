@@ -1,164 +1,198 @@
-There is a credible Aster database product here. My recommendation is:
+# aster-sqlite — Local-First SQLite Replication Over Aster
 
-  1. Build aster-sqlite first, using Fly.io’s maintained cr-sqlite fork and Corrosion as the correctness reference.
-  2. Use Iroh as the replication plane, not as SQLite’s physical backing store.
-  3. Explore FoundationDB separately as an Aster-authenticated gateway/layer—not by embedding or modifying fdbserver.
+Status: working idea / product boundary accepted
 
-                         aster-sqlite                                     aster-foundationdb
-  ━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   Consistency           Eventual CRDT convergence                        Strict serializability
-  ────────────────────  ───────────────────────────────────────────────  ─────────────────────────────────────────────────
-   Offline writes        Yes                                              No
-  ────────────────────  ───────────────────────────────────────────────  ─────────────────────────────────────────────────
-   Data model            Full local SQLite, with CRR restrictions         Ordered key/value; no SQL
-  ────────────────────  ───────────────────────────────────────────────  ─────────────────────────────────────────────────
-   Aster advantage       Very high: P2P, NAT traversal, identity, sync    Moderate: secure gateway and cross-language API
-  ────────────────────  ───────────────────────────────────────────────  ─────────────────────────────────────────────────
-   Initial complexity    Medium                                           Medium as gateway; extreme if bundling servers
-  ────────────────────  ───────────────────────────────────────────────  ─────────────────────────────────────────────────
-   Best use              Local-first and edge state                       Authoritative online service state
+## Decision
 
-  ## The SQLite direction
+Build `aster-sqlite` as Aster's offline-capable SQLite replication product,
+using Fly.io's maintained `cr-sqlite` fork and Corrosion as the primary
+correctness reference.
 
-  The important distinction is “replicated over Iroh,” not “stored in Iroh.”
+Use Iroh as the replication plane, not as SQLite's physical backing store.
+Synchronize logical changes and snapshots; never synchronize SQLite database or
+WAL files.
 
-  iroh-docs is a CRDT key/value replica in which (namespace, author, key) points to content stored in iroh-blobs; it already uses gossip for
-  live notification and range-based reconciliation for recovery. Automerge is separate: Iroh currently demonstrates synchronizing a
-  JSON-like Automerge document over a bidirectional stream. Neither understands SQLite pages, WAL files, transactions, indexes, or
-  constraints. Iroh documents (https://docs.iroh.computer/protocols/documents), Iroh Automerge example
-  (https://docs.iroh.computer/protocols/automerge).
+`aster-sqlite` is deliberately an AP/local-first system. It is not the backing
+store for lease epochs, exclusive ownership, singleton selection, or other
+state that cannot tolerate two concurrent truths. Those use the separate
+[`aster-coordination`](aster-coordination.md) CP state machine.
 
-  Therefore:
+| Property | `aster-sqlite` contract |
+| --- | --- |
+| Local transactions | SQLite ACID on each replica |
+| Cross-node consistency | Eventual CRDT convergence |
+| Offline writes | Supported |
+| Query model | Full local SQLite, subject to CRR restrictions |
+| Replication unit | Logical committed change batch |
+| Best fit | Local-first and edge application state |
+| Not suitable for | Fencing, exclusive ownership, or authoritative mutable pointers |
 
-  - Never synchronize the .sqlite or WAL file through blobs/docs.
-  - Synchronize logical cr-sqlite changesets.
-  - Keep SQLite authoritative for local queries and persistence.
-  - Use Iroh for identity, discovery, delivery, anti-entropy, and snapshots.
+## The important distinction
 
-  A production shape would be:
+The product is **replicated over Iroh**, not **stored in Iroh**.
 
-  Application
-      │ local SQL
-      ▼
-  SQLite + cr-sqlite
-      │ committed ChangeBatch
-      ▼
-  aster-sqlite replicator
-      ├── gossip: small “new head” hints
-      ├── Aster bidi RPC: vector/gap reconciliation and change streaming
-      ├── iroh-blobs: large batches and logical snapshots
-      └── iroh-docs: database catalog, schema and snapshot manifests
+`iroh-docs` is a CRDT key/value replica in which `(namespace, author, key)`
+points to content in `iroh-blobs`. It provides signed metadata reconciliation,
+blob delivery, and live notifications. Automerge is a separate JSON-like CRDT
+example. Neither layer understands SQLite pages, WAL files, transactions,
+indexes, or constraints.
 
-  Gossip must only be a hint: Aster explicitly surfaces a receiver-lagged event in aster/src/gossip.rs:7. Recovery must come from durable
-  state or anti-entropy.
+Therefore:
 
-  ### A very attractive first spike
+- never copy a `.sqlite`, `-wal`, or `-shm` file through blobs or docs;
+- capture and replicate logical `cr-sqlite` changesets;
+- keep SQLite authoritative for local query execution and persistence;
+- apply each complete remote batch inside one local SQLite transaction;
+- use Aster/Iroh for identity, admission, discovery, delivery, anti-entropy,
+  and snapshot transfer;
+- treat gossip only as a freshness hint and recover gaps from durable state.
 
-  For the prototype, iroh-docs can temporarily replace the custom anti-entropy protocol:
+Relevant Iroh material:
 
-  tx/<schema-epoch>/<replica-id>/<db-version> -> zstd(ChangeBatch)
-  snapshot/<schema-epoch>/<snapshot-hash>     -> SnapshotManifest
-  head/<replica-id>                           -> ReplicaHead
-  schema/<schema-epoch>                       -> SchemaManifest
+- <https://docs.iroh.computer/protocols/documents>
+- <https://docs.iroh.computer/protocols/automerge>
 
-  Each transaction becomes one immutable docs entry. Once ContentReady arrives, the receiver applies the entire batch inside one SQLite
-  transaction. Docs supplies signed metadata reconciliation and blob delivery almost for free.
+## Proposed architecture
 
-  That is excellent for proving convergence, but I would not assume it is the final implementation. A permanent transaction-per-entry log
-  creates retention, compaction, dormant-writer, and capability-revocation problems. Production likely wants Corrosion-style vector/gap
-  reconciliation with blobs for snapshots, leaving docs as the control plane.
+```text
+Application
+    | local SQL transaction
+    v
+SQLite + cr-sqlite
+    | committed ChangeBatch
+    v
+aster-sqlite replicator
+    |-- gossip: small new-head hints
+    |-- Aster bidi RPC: vector/gap reconciliation and change streaming
+    |-- iroh-blobs: large batches and logical snapshots
+    `-- iroh-docs: database catalog, schema, and snapshot manifests
+```
 
-  ### Start from the Fly.io fork
+Gossip cannot be load-bearing: Aster explicitly surfaces receiver lag in
+`aster/src/gossip.rs`. A missed hint must only delay convergence; durable
+anti-entropy must still find and transfer the missing changes.
 
-  The original vlcn upstream is quiet: its latest release is 0.16.3 from January 2024. Fly.io now maintains a materially divergent 0.17 fork
-  specifically for Corrosion. It adds per-site database versions and makes gap detection, sequence tracking, and buffering explicit. vlcn
-  release (https://github.com/vlcn-io/cr-sqlite/releases/tag/v0.16.3), Fly.io cr-sqlite fork (https://github.com/superfly/cr-sqlite).
+## First spike: docs-backed immutable transactions
 
-  Corrosion (https://github.com/superfly/corrosion) is almost the direct precedent:
+For a bounded prototype, `iroh-docs` can temporarily provide the durable
+catalog and anti-entropy index:
 
-  - SQLite on every node
-  - cr-sqlite conflict resolution
-  - gossip for fresh changes
-  - periodic peer synchronization
-  - QUIC transport
+```text
+tx/<schema-epoch>/<replica-id>/<db-version> -> zstd(ChangeBatch)
+snapshot/<schema-epoch>/<snapshot-hash>     -> SnapshotManifest
+head/<replica-id>                           -> ReplicaHead
+schema/<schema-epoch>                       -> SchemaManifest
+```
 
-  Aster can replace its IP-address bootstrapping, TLS setup, and SWIM membership with endpoint identities, relays/NAT traversal, admission,
-  topology, and service contracts. I would borrow Corrosion’s bookkeeping model rather than designing another one.
+Each local transaction publishes one immutable entry. Once its content is
+ready, a receiver validates the schema and batch envelope, then applies the
+whole batch atomically.
 
-  ### Non-negotiable correctness rules
+This is a good convergence spike, not a commitment to keep one docs entry per
+transaction forever. An unbounded transaction log creates retention,
+compaction, dormant-writer, bootstrap, and capability-revocation problems.
+Production likely wants Corrosion-style vector/gap reconciliation with blobs
+for snapshots, leaving docs as the catalog/control plane.
 
-  - A replica_id is not a NodeId. Multiple database replicas can exist on one node; persist a random replica identity and bind it to the
-    Aster identity.
+## Start from the Fly.io fork and Corrosion
 
-  - Batch by cr-sqlite db_version and include the final seq; receivers buffer until complete, then apply atomically.
-  - Serialize local writes through an owned SQLite writer actor. Otherwise a crash or later overwrite can occur before a changeset is
-    captured.
+Fly.io maintains a materially divergent `cr-sqlite` fork for Corrosion. It
+adds per-site database versions and makes gap detection, sequence tracking, and
+buffering explicit:
 
-  - Treat duplicates and reordering as normal.
-  - Require an exact schema epoch/hash before applying a batch.
-  - Use bound SQL parameters when inserting into crsql_changes.
-  - Begin with whole-database replication only—one database/namespace per sharing group.
-  - Validate that the docs author is an admitted NodeId. The current working tree already binds the default docs author to the node identity
-    in aster/src/docs.rs:188.
+- <https://github.com/superfly/cr-sqlite>
+- <https://github.com/superfly/corrosion>
 
-  cr-sqlite is history-free: later writes can replace metadata from earlier database versions, so preserving replicated transaction
-  boundaries requires networking-layer work. It also cannot enforce foreign keys, non-primary-key uniqueness, or some checks on CRR tables.
-  Transaction behavior (https://portal.vlcn.io/blog/how-crsqlite-transactions-work-today), constraint limitations
-  (https://www.vlcn.io/docs/cr-sqlite/constraints).
+Corrosion is the closest operating precedent:
 
-  ## The FoundationDB direction
+- SQLite on every node;
+- `cr-sqlite` conflict resolution;
+- gossip for fresh changes;
+- periodic peer synchronization; and
+- QUIC transport.
 
-  FoundationDB solves a different problem: it provides an always-online, distributed ordered key/value store with strict serializable
-  transactions. It deliberately does not supply SQL or disconnected operation. Consistency model
-  (https://apple.github.io/foundationdb/consistency.html), anti-features (https://apple.github.io/foundationdb/anti-features.html).
+Aster can replace IP-address bootstrapping, TLS setup, and SWIM membership with
+endpoint identities, relays/NAT traversal, admission, topology, and generated
+service contracts. Reuse Corrosion's replication bookkeeping and failure
+lessons rather than inventing a second model.
 
-  There are three possible interpretations:
+## Non-negotiable correctness rules
 
-  1. An Aster gateway to an externally managed FDB cluster — recommended.
-  2. Bundle fdbserver, supervise a cluster, and distribute configuration — much larger.
-  3. Replace FoundationDB’s internal network with Iroh — effectively a major FoundationDB fork and not worthwhile initially.
+- A `replica_id` is not a `NodeId`. One Aster node may host multiple database
+  replicas. Persist a random replica identity and bind it to the authenticated
+  Aster identity.
+- Batch by `cr-sqlite` `db_version` and include the final sequence. A receiver
+  buffers until the batch is complete and applies it atomically.
+- Serialize local writes through an owned SQLite writer actor so a committed
+  change cannot be overwritten or lost before capture.
+- Treat duplication, reordering, retries, and reconnects as normal.
+- Require an exact schema epoch and hash before applying a batch.
+- Use bound SQL parameters when inserting into `crsql_changes`.
+- Begin with whole-database replication: one database/namespace per sharing
+  group.
+- Authenticate and authorize the publisher NodeId. The Aster docs facade binds
+  the default docs author to node identity in `aster/src/docs.rs`.
+- Persist receive progress and batch application in the same transaction so a
+  crash cannot acknowledge unapplied work.
+- Bootstrap from a verified logical snapshot plus a precise per-replica
+  frontier, then reconcile every gap after that frontier.
+- Compact only when retention policy accounts for every supported dormant
+  replica, or force an old replica to rebootstrap explicitly.
 
-  The gateway could expose:
+## Constraint and transaction caveats
 
-  Get
-  GetRange          -> server stream
-  Transact(program) -> atomic result
-  Watch             -> server stream
+`cr-sqlite` is history-free: later writes can replace metadata from earlier
+database versions. Preserving replicated transaction boundaries therefore
+requires networking-layer batch and sequence bookkeeping.
 
-  A declarative transaction program is preferable to interactive v1 transactions because the gateway can safely perform FoundationDB retry
-  loops. An interactive transaction could later use Aster’s existing incremental bidi support in aster/src/rpc/client.rs:192, but must
-  expose conflict/restart and “possibly committed” semantics honestly.
+CRR tables also cannot safely enforce every ordinary SQLite invariant across
+concurrent offline writers. Foreign keys, non-primary-key uniqueness, and some
+checks need application-level convergence rules or a data model that avoids
+those invariants.
 
-  This gateway has real Aster-specific value:
+References:
 
-  - Clients need neither libfdb_c nor fdb.cluster.
-  - Aster identity can enforce key-prefix/subspace permissions.
-  - Remote clients do not need direct connectivity to every FDB process.
-  - It addresses FoundationDB’s explicit lack of user-level access control. FDB limitations
-    (https://apple.github.io/foundationdb/known-limitations.html).
+- <https://portal.vlcn.io/blog/how-crsqlite-transactions-work-today>
+- <https://www.vlcn.io/docs/cr-sqlite/constraints>
 
-  It should run as a Linux-sidecar/service near the FDB cluster. The Rust binding still requires the native FoundationDB client, has
-  process-global one-time network initialization, and has weaker macOS/Windows support. foundationdb-rs
-  (https://docs.rs/foundationdb/latest/foundationdb/), FDB client requirements (https://apple.github.io/foundationdb/api-general.html).
+## Relationship to aster-coordination
 
-  I would not put it behind an aster core feature. Make it a sibling aster-foundationdb crate or aster-fdb-gateway binary so the native
-  dependency does not contaminate Aster’s Windows/mobile/binding matrix. Database logic also belongs above the transport core, matching the
-  existing separation in aster/Cargo.toml:8.
+The two products intentionally make different promises:
 
-  ## Suggested sequence
+| Question | `aster-sqlite` | `aster-coordination` |
+| --- | --- | --- |
+| Can a disconnected node write? | Yes | No |
+| Can two partitions accept writes? | Yes, then converge | Only the quorum side |
+| Is arbitrary local SQL exposed? | Yes, with CRR constraints | No; bounded commands only |
+| Is a mutable value linearizable? | No | Yes |
+| Typical payload | Application rows | Lease metadata and a small opaque value/pointer |
 
-  1. Create a three-replica aster-sqlite spike using Fly’s cr-sqlite fork and the docs-backed immutable transaction log.
-  2. Test partitions, duplicates, reordering, concurrent edits, restart during publication/application, schema mismatch, and a peer offline
-     beyond retention.
+An application may use both. For example, it may replicate ordinary user state
+through `aster-sqlite`, store immutable large objects in `iroh-blobs`, and use
+`aster-coordination` only for the one active-version pointer that must not
+split-brain. The planes remain separate; there is no cross-plane atomic
+transaction.
 
-  3. Measure docs metadata growth and snapshot/bootstrap time.
-  4. If the model holds, replace the permanent docs log with Corrosion-style Aster anti-entropy; retain docs for membership/schema/snapshot
-     manifests.
+## Suggested delivery sequence
 
-  5. Separately spike an external-cluster FDB gateway with Get, streamed ranges, declarative transactions, watches, and prefix
-     authorization.
+- [ ] Create a three-replica spike using the Fly.io fork and the docs-backed
+  immutable transaction log.
+- [ ] Test partitions, duplicate and reordered delivery, concurrent edits,
+  restart during publication/application, schema mismatch, and a replica
+  offline beyond retention.
+- [ ] Add deterministic batch-completeness and idempotent-apply tests.
+- [ ] Measure docs metadata growth, steady-state reconciliation traffic, and
+  snapshot/bootstrap time.
+- [ ] Prove logical snapshot restore plus gap catch-up after process and machine
+  loss.
+- [ ] Replace the permanent docs transaction log with Corrosion-style Aster
+  anti-entropy if measurements show it is required; retain docs for compact
+  membership/schema/snapshot manifests.
+- [ ] Document which SQLite constraints are unsupported or require application
+  conflict semantics before calling the product production-ready.
 
-  If funding only one now, I would choose aster-sqlite: it exercises Aster’s distinctive P2P strengths and has a much shorter path to
-  something compelling. FoundationDB is the stronger later server-side offering, but only after narrowing it to a gateway/layer rather than
-  “FoundationDB packaged inside Aster.”
+## One-line version
 
+> `aster-sqlite` gives every peer a real local SQLite database and converges
+> logical writes over Aster; it embraces offline/AP behavior and delegates the
+> few values that require one global truth to `aster-coordination`.

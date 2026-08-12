@@ -55,7 +55,7 @@ jobs:
       - name: Compute version + ffi source
         id: ver
         run: |
-          BASE="0.2.0"
+          BASE="0.3.0"
           if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
             REF="${{ github.event.workflow_run.head_branch }}"
             SHA="${{ github.event.workflow_run.head_sha }}"

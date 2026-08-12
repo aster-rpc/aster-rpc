@@ -51,6 +51,9 @@
 // types defined inside this crate itself, e.g. `rpc::Empty`.
 extern crate self as aster;
 
+/// Exact Aster build version (`major.minor.commit-offset`) embedded at compile time.
+pub const VERSION: &str = aster_transport_core::VERSION;
+
 mod admission;
 mod config;
 pub mod crypto;

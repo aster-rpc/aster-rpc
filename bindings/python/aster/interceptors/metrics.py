@@ -78,8 +78,10 @@ class MetricsInterceptor(Interceptor):
 
         if _otel_trace is not None and _otel_metrics is not None:
             try:
-                self._tracer = _otel_trace.get_tracer("aster.rpc", "0.2.0")
-                self._meter = _otel_metrics.get_meter("aster.rpc", "0.2.0")
+                from .._aster import VERSION
+
+                self._tracer = _otel_trace.get_tracer("aster.rpc", VERSION)
+                self._meter = _otel_metrics.get_meter("aster.rpc", VERSION)
 
                 self._started_counter = self._meter.create_counter(
                     "aster.rpc.started",

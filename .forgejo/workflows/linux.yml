@@ -3,6 +3,7 @@ name: Linux and Windows CI and artifacts
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - "core/**"
       - "aster/**"
@@ -14,6 +15,10 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "pyproject.toml"
+      - "VERSION"
+      - "scripts/build.sh"
+      - "scripts/release.sh"
+      - "scripts/release/**"
       - ".forgejo/**"
       - ".github/runner/Dockerfile"
   pull_request:
@@ -28,6 +33,10 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "pyproject.toml"
+      - "VERSION"
+      - "scripts/build.sh"
+      - "scripts/release.sh"
+      - "scripts/release/**"
       - ".forgejo/**"
       - ".github/runner/Dockerfile"
   workflow_dispatch:
@@ -58,7 +67,13 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Resolve Aster build version
+        run: |
+          version="$(scripts/release/version.sh)"
+          scripts/release/prepare-python-build.sh "$version"
+          echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -93,7 +108,13 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Resolve Aster build version
+        run: |
+          version="$(scripts/release/version.sh)"
+          scripts/release/prepare-python-build.sh "$version"
+          echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -130,7 +151,13 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Resolve Aster build version
+        run: |
+          version="$(scripts/release/version.sh)"
+          scripts/release/prepare-python-build.sh "$version"
+          echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -183,7 +210,13 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Resolve Aster build version
+        run: |
+          version="$(scripts/release/version.sh)"
+          scripts/release/prepare-python-build.sh "$version"
+          echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -224,3 +257,31 @@ jobs:
         if: always()
         continue-on-error: true
         run: sccache --show-stats
+
+  release:
+    if: forgejo.event_name == 'push' && startsWith(forgejo.ref, 'refs/tags/v')
+    needs: [build-linux-wheel, build-windows-wheel]
+    runs-on: aster-forge-linux-x64
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve Aster build version
+        run: |
+          version="$(scripts/release/version.sh)"
+          echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Download Linux release artifacts
+        uses: https://data.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: aster-python-linux-${{ forgejo.run_number }}
+          path: dist
+      - name: Download Windows release artifacts
+        uses: https://data.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: aster-python-windows-x64-${{ forgejo.run_number }}
+          path: dist
+      - name: Publish permanent Forgejo release
+        env:
+          ASTER_RELEASE_TOKEN: ${{ secrets.ASTER_RELEASE_TOKEN }}
+        run: scripts/release/publish-forgejo.sh dist

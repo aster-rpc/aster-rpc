@@ -36,27 +36,27 @@
     },
     "native": {
       "name": "@aster-rpc/transport",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "devDependencies": {
         "@napi-rs/cli": "^3.6.0",
       },
       "optionalDependencies": {
-        "@aster-rpc/transport-darwin-arm64": "0.2.0",
-        "@aster-rpc/transport-darwin-x64": "0.2.0",
-        "@aster-rpc/transport-linux-arm64-gnu": "0.2.0",
-        "@aster-rpc/transport-linux-x64-gnu": "0.2.0",
-        "@aster-rpc/transport-win32-x64-msvc": "0.2.0",
+        "@aster-rpc/transport-darwin-arm64": "0.3.0",
+        "@aster-rpc/transport-darwin-x64": "0.3.0",
+        "@aster-rpc/transport-linux-arm64-gnu": "0.3.0",
+        "@aster-rpc/transport-linux-x64-gnu": "0.3.0",
+        "@aster-rpc/transport-win32-x64-msvc": "0.3.0",
       },
     },
     "packages/aster": {
       "name": "@aster-rpc/aster",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "bin": {
         "aster-gen": "./dist/cli/gen.js",
       },
       "dependencies": {
         "@apache-fory/core": "0.17.0",
-        "@aster-rpc/transport": "0.2.0",
+        "@aster-rpc/transport": "0.3.0",
       },
       "devDependencies": {
         "@types/node": "^25.5.2",

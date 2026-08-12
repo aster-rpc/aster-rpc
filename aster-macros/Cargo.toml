@@ -1,6 +1,6 @@
 [package]
 name = "aster-macros"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Proc-macros for the Aster RPC framework (#[derive(AsterType)], #[aster::service])."
 license = "MIT OR Apache-2.0"

@@ -356,6 +356,12 @@ uint32_t iroh_abi_version_minor(void);
 
 uint32_t iroh_abi_version_patch(void);
 
+/**
+ * Exact Aster build version (`major.minor.commit-offset`).
+ * The returned UTF-8 string is process-lifetime storage and must not be freed.
+ */
+const char *aster_version(void);
+
 int32_t iroh_runtime_new(const struct iroh_runtime_config_t *config, iroh_runtime_t *out_runtime);
 
 int32_t iroh_runtime_close(iroh_runtime_t runtime);

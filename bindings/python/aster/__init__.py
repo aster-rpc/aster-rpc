@@ -53,6 +53,7 @@ _install_uvloop_if_available()
 
 try:
     from ._aster import (
+        VERSION,
         # Exception
         IrohError,
         BlobNotFound,
@@ -196,13 +197,13 @@ from .interceptors import (
     MetricsInterceptor,
 )
 
-try:
-    from importlib.metadata import version as _pkg_version
-    __version__ = _pkg_version("aster-rpc")
-except Exception:
-    __version__ = "0.0.0-dev"
+# The compiled constant remains correct even when the wheel was unpacked or
+# vendored without its .dist-info metadata.
+__version__ = VERSION
 
 __all__ = [
+    "VERSION",
+    "__version__",
     # ── Iroh native bindings ──
     "IrohError",
     "BlobNotFound",

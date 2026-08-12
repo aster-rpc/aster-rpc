@@ -1,5 +1,5 @@
 """
-Multiple Services on One Endpoint — Aster RPC Example.
+Multiple Services on One Endpoint -- Aster RPC Example.
 
 Demonstrates registering multiple independent services on a single
 ``AsterServer``.  All services share one QUIC endpoint and one node ID,
@@ -15,10 +15,10 @@ Key concepts:
 
 Usage (two terminals):
 
-  # Terminal 1 — producer
+  # Terminal 1 -- producer
   python multi_service.py producer
 
-  # Terminal 2 — consumer
+  # Terminal 2 -- consumer
   ASTER_ENDPOINT_ADDR=<printed by producer> python multi_service.py consumer
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass
 from typing import AsyncIterator
 
-from aster import AsterServer, AsterClient
+from aster import AsterServer, AsterClient, VERSION
 from aster.codec import wire_type
 from aster.decorators import service, rpc, server_stream
 
@@ -249,7 +249,7 @@ async def run_consumer() -> None:
         kv = await c.client(KeyValueStoreService)
 
         # Put some values
-        for key, val in [("name", "Aster"), ("version", "0.2.0"), ("lang", "Python")]:
+        for key, val in [("name", "Aster"), ("version", VERSION), ("lang", "Python")]:
             resp = await kv.put(PutRequest(key=key, value=val))
             print(f"  put({key!r}, {val!r}) -> was_update={resp.was_update}")
 
@@ -264,15 +264,15 @@ async def run_consumer() -> None:
     print("\n[consumer] Done.")
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+# -- Entry point --------------------------------------------------------------
 
 
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] not in ("producer", "consumer"):
         print("Usage: python multi_service.py <producer|consumer>")
         print()
-        print("  producer  — start all three services on one endpoint")
-        print("  consumer  — connect and call all services")
+        print("  producer  -- start all three services on one endpoint")
+        print("  consumer  -- connect and call all services")
         sys.exit(1)
 
     role = sys.argv[1]

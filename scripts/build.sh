@@ -8,17 +8,46 @@
 
 set -euo pipefail
 
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO"
+
 MANIFEST="bindings/python/rust/Cargo.toml"
 STUB="bindings/python/aster/_aster.pyi"
 
 WHEEL_DIR="bindings/python/target/wheels"
+
+# Wheels need the exact derived version in both package metadata and the native
+# binary. Preserve the caller's working tree while temporarily stamping it.
+BUILD_STATE="$(mktemp -d)"
+cp pyproject.toml "$BUILD_STATE/pyproject.toml"
+if [[ -f BUILD_NUMBER ]]; then
+  cp BUILD_NUMBER "$BUILD_STATE/BUILD_NUMBER"
+  HAD_BUILD_NUMBER=true
+else
+  HAD_BUILD_NUMBER=false
+fi
+restore_build_state() {
+  cp "$BUILD_STATE/pyproject.toml" pyproject.toml
+  if [[ "$HAD_BUILD_NUMBER" == true ]]; then
+    cp "$BUILD_STATE/BUILD_NUMBER" BUILD_NUMBER
+  else
+    rm -f BUILD_NUMBER
+  fi
+  rm -rf "$BUILD_STATE"
+}
+trap restore_build_state EXIT
+
+ASTER_BUILD_VERSION="$(./scripts/release/version.sh)"
+export ASTER_BUILD_VERSION
+./scripts/release/prepare-python-build.sh "$ASTER_BUILD_VERSION" >/dev/null
+echo "Building Aster $ASTER_BUILD_VERSION"
 
 # Pin aster-rpc fork transitive deps (hickory-proto / hickory-net → beta.1)
 # before invoking cargo. No-op if already pinned.
 ./scripts/pin-fork-deps.sh
 
 # Build wheel, then install it — single cargo compilation
-uv run maturin build -m "$MANIFEST" --out "$WHEEL_DIR" "$@"
+uv run --frozen --no-sync maturin build -m "$MANIFEST" --out "$WHEEL_DIR" "$@"
 WHEEL="$(ls -t "$WHEEL_DIR"/aster_rpc-*.whl | head -n 1)"
 uv pip install --offline "$WHEEL" --force-reinstall --no-deps
 
@@ -27,7 +56,7 @@ echo "✓ Wheel(s) in $WHEEL_DIR"
 # The repo's Python tests import the source-tree package. `maturin build` only
 # writes the extension into the wheel, so refresh the in-tree extension before
 # importing `aster._aster` for stub generation.
-uv run python - "$WHEEL" <<'PY'
+uv run --frozen --no-sync python - "$WHEEL" <<'PY'
 import pathlib
 import sys
 import zipfile
@@ -50,7 +79,7 @@ with zipfile.ZipFile(wheel) as zf:
 PY
 
 # Regenerate native-module type stub from the live compiled module.
-uv run python -c "
+uv run --frozen --no-sync python -c "
 import aster._aster as m
 lines = [
     '\"\"\"Auto-generated type stubs for the native _aster extension module.\"\"\"',

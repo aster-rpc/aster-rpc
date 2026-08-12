@@ -47,8 +47,8 @@ function hex(data: Uint8Array | Buffer): string {
 }
 
 describe('native contract identity (Rust core via NAPI)', () => {
-  it.skipIf(!available)('version() returns crate version', () => {
-    expect(native.version()).toBe('0.2.0');
+  it.skipIf(!available)('version() returns the embedded build version', () => {
+    expect(native.version()).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
   it.skipIf(!available)('golden vector 1: Echo — canonical bytes', () => {

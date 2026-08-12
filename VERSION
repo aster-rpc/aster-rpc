@@ -1,0 +1,4 @@
+# Version base for the derived Aster version: <major.minor>.<commit-count - offset>.
+# Bump major/minor with scripts/release/bump-version.sh; never edit by hand.
+# The offset is the commit count of the bump commit, so that commit is patch 0.
+0.3 570

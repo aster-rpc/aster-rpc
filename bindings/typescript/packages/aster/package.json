@@ -1,6 +1,6 @@
 {
   "name": "@aster-rpc/aster",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Aster RPC framework for TypeScript — P2P services with type safety, streaming, and trust",
   "type": "module",
   "main": "./dist/index.js",
@@ -40,7 +40,7 @@
   },
   "dependencies": {
     "@apache-fory/core": "0.17.0",
-    "@aster-rpc/transport": "0.2.0"
+    "@aster-rpc/transport": "0.3.0"
   },
   "peerDependencies": {
     "typescript": "^5.0.0"

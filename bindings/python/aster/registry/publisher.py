@@ -17,6 +17,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
+from .._aster import VERSION
 from .keys import contract_key, lease_key, version_key, channel_key
 from .models import (
     ArtifactRef,
@@ -219,7 +220,7 @@ class RegistryPublisher:
         policy_realm: str | None = None,
         health_status: str = STARTING,
         language_runtime: str | None = None,
-        aster_version: str = "0.2.0",
+        aster_version: str = VERSION,
     ) -> None:
         """Write initial EndpointLease (health=STARTING) and start refresh.
 
