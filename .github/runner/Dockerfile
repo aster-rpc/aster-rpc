@@ -233,3 +233,7 @@ RUN rustup target add x86_64-pc-windows-msvc \
   && RUSTC_WRAPPER= cargo install --locked \
        --version "${CARGO_XWIN_VERSION}" cargo-xwin \
   && RUSTC_WRAPPER= cargo xwin cache xwin
+
+# Match the `ci` stage's runtime user. Forgejo's persistent cache volumes and
+# workspace parent are currently initialized by the native jobs as root.
+USER root
