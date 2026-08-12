@@ -1,7 +1,8 @@
-# Self-hosted GitHub Actions runner for aster-python CI.
+# Aster Linux CI image plus the legacy GitHub Actions runner wrapper.
 #
-# Multi-arch: builds on both x86_64 and aarch64.
-# Host-mounted cache volumes keep Cargo/sccache/uv state across restarts.
+# The `ci` stage is the Forgejo job image. The final `github-runner` stage
+# retains the existing ephemeral GitHub runner for hosts that still use it.
+# Both stages are multi-arch; mounted cache volumes keep Cargo/sccache/uv state.
 #
 # Build + run via compose (preferred — see docker-compose.yml):
 #   docker compose -f .github/runner/docker-compose.yml up -d --build linux-x64
@@ -16,7 +17,7 @@
 #     -v aster-cache-uv:/cache/uv \
 #     aster-runner
 
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS ci
 
 ARG RUNNER_VERSION=2.334.0
 # Rust pin — keep in sync with the dev machines. Mac is on 1.96.0 (2026-05-25);
@@ -34,7 +35,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Note: setup-java@v4 installs the JDK but NOT Maven, so we provide
 # `maven` here for the Java binding workflow. Without it, build-java.yml
 # fails with `mvn: command not found`.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99force-ipv4 \
+  && apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     cmake \
@@ -80,14 +82,14 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
   && mv /root/.local/bin/uv /usr/local/bin/uv \
   && mv /root/.local/bin/uvx /usr/local/bin/uvx
 
-# ── Node.js (LTS 20 + 22) ────────────────────────────────────────────
+# ── Node.js (20 + 22 + 24) ───────────────────────────────────────────
 # Seeded into the GitHub Actions hosted-tool-cache so `actions/setup-node`
 # resolves from cache (no per-job download). The newest seeded major is also
 # symlinked onto PATH as the default `node`. AGENT_TOOLSDIRECTORY is the env
 # the runner reads to locate that cache.
 ENV AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 RUN NODEARCH=$(case "$(uname -m)" in x86_64) echo x64;; aarch64) echo arm64;; *) echo x64;; esac) \
-  && for major in 20 22; do \
+  && for major in 20 22 24; do \
        ver=$(curl -fsSL https://nodejs.org/dist/index.json \
              | jq -r --arg m "v${major}." '[.[] | select(.version | startswith($m))][0].version' \
              | sed 's/^v//'); \
@@ -189,6 +191,12 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
   && gh --version
 
 # ── GitHub Actions runner ────────────────────────────────────────────
+FROM ci AS github-runner
+
+ARG RUNNER_VERSION=2.334.0
+ARG TARGETARCH
+
+USER root
 RUN ARCH=$(case ${TARGETARCH} in amd64) echo x64;; arm64) echo arm64;; *) echo x64;; esac) \
   && mkdir -p /opt/actions-runner \
   && cd /opt/actions-runner \
