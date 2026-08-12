@@ -1,4 +1,4 @@
-name: Linux and Windows CI and artifacts
+name: Aster CI and native artifacts
 
 on:
   push:
@@ -203,9 +203,9 @@ jobs:
         continue-on-error: true
         run: sccache --show-stats
 
-  # Build the Windows wheel on the Forge host with cargo-xwin. The resulting
-  # abi3 wheel is import-tested by the existing native Windows GitHub matrix;
-  # macOS remains unchanged.
+  # Build the Windows wheel on the Forge host with cargo-xwin. A native Windows
+  # import smoke test can be added later without restoring the retired GitHub
+  # runner fleet.
   build-windows-wheel:
     needs: test
     runs-on: aster-forge-cross-x64
