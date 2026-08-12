@@ -69,7 +69,7 @@ tag, version, commit = sys.argv[1:4]
 print(json.dumps({
     "tag_name": tag,
     "name": f"Aster {version}",
-    "body": f"Aster {version}, built from `{commit}`.\n\nAssets include Linux and Windows Python abi3 wheels plus the source distribution.",
+    "body": f"Aster {version}, built from `{commit}`.\n\nAssets include Linux, Windows, and Apple Silicon macOS Python abi3 wheels plus the source distribution.",
     "draft": False,
     "prerelease": False,
 }))

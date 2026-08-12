@@ -258,9 +258,92 @@ jobs:
         continue-on-error: true
         run: sccache --show-stats
 
+  # Native Apple Silicon wheels run on the dedicated repository-scoped Mac
+  # runner. Never execute pull-request code on this non-isolated host.
+  build-macos-wheel:
+    if: forgejo.event_name != 'pull_request'
+    needs: test
+    runs-on: aster-forge-macos-arm64
+    env:
+      CARGO_HOME: /Users/emrul/dev/aster/local_mac_forgejo_runner/cache/cargo
+      SCCACHE_DIR: /Users/emrul/dev/aster/local_mac_forgejo_runner/cache/sccache
+      UV_CACHE_DIR: /Users/emrul/dev/aster/local_mac_forgejo_runner/cache/uv
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve Aster build version
+        run: |
+          version="$(scripts/release/version.sh)"
+          scripts/release/prepare-python-build.sh "$version"
+          echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/aster-target" >> "$GITHUB_ENV"
+      - name: Checkout pinned Salvo fork
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          repository: Aster/salvo
+          ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
+          path: _deps/salvo
+          token: ${{ secrets.ASTER_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Link sibling path dependency
+        run: |
+          salvo_link="$GITHUB_WORKSPACE/../salvo"
+          if [[ -e "$salvo_link" && ! -L "$salvo_link" ]]; then
+            echo "error: refusing to replace non-symlink $salvo_link" >&2
+            exit 1
+          fi
+          ln -sfn "$GITHUB_WORKSPACE/_deps/salvo" "$salvo_link"
+      - name: Build and import-test macOS arm64 wheel
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python maturin
+          .venv/bin/maturin build --release --locked \
+            --out dist -m bindings/python/rust/Cargo.toml
+          uv venv .wheel-test
+          uv pip install --python .wheel-test/bin/python dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/.wheel-test/bin/python" -c \
+            'import aster, os; assert aster.VERSION == os.environ["ASTER_BUILD_VERSION"]; print(aster.VERSION)'
+      - name: Store workflow artifact on Forgejo
+        uses: https://data.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: aster-python-macos-arm64-${{ forgejo.run_number }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish dev artifact to Forgejo packages
+        if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main'
+        env:
+          ASTER_PACKAGE_TOKEN: ${{ secrets.ASTER_PACKAGE_TOKEN }}
+        run: |
+          package_version="dev-${FORGEJO_RUN_NUMBER}"
+          for artifact in dist/*.whl; do
+            artifact_name=$(basename "$artifact")
+            curl --fail-with-body --silent --show-error \
+              --user "agents:${ASTER_PACKAGE_TOKEN}" \
+              --upload-file "$artifact" \
+              "${FORGEJO_SERVER_URL}/api/packages/Aster/generic/aster-python/${package_version}/${artifact_name}"
+          done
+      - name: Compiler-cache statistics
+        if: always()
+        continue-on-error: true
+        run: sccache --show-stats
+      - name: Remove disposable Mac build state
+        if: always()
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/.venv" "$GITHUB_WORKSPACE/.wheel-test" \
+            "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/_deps" \
+            "$RUNNER_TEMP/aster-target"
+          if [[ -L "$GITHUB_WORKSPACE/../salvo" ]]; then
+            rm "$GITHUB_WORKSPACE/../salvo"
+          fi
+          uv cache prune --ci || true
+
   release:
     if: forgejo.event_name == 'push' && startsWith(forgejo.ref, 'refs/tags/v')
-    needs: [build-linux-wheel, build-windows-wheel]
+    needs: [build-linux-wheel, build-windows-wheel, build-macos-wheel]
     runs-on: aster-forge-linux-x64
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
@@ -280,6 +363,11 @@ jobs:
         uses: https://data.forgejo.org/forgejo/download-artifact@v4
         with:
           name: aster-python-windows-x64-${{ forgejo.run_number }}
+          path: dist
+      - name: Download macOS release artifacts
+        uses: https://data.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: aster-python-macos-arm64-${{ forgejo.run_number }}
           path: dist
       - name: Publish permanent Forgejo release
         env:
