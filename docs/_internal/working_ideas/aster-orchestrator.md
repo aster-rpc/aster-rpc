@@ -82,7 +82,7 @@ And every hard subsystem k8s outsources is a native primitive here:
 3. **CP for leases, AP for everything else.** The directory is
    eventually-consistent LWW — correct for desired state, status, and roles;
    *wrong* for "at most one instance" (singleton jobs, primary databases).
-   The shared primitive is **[aster-leases.md](aster-leases.md)**: advisory
+   The shared primitive is **[aster-leases.md](../aster-leases.md)**: advisory
    grant in the directory + a monotonic fencing token enforced at the resource,
    with the resource's own CAS as the per-resource serialization point (the
    volume is a portal Tree, so `portal-store` serializes). K8s puts *everything*
@@ -247,7 +247,7 @@ a fork of current attention. The cheap moves **now** are design-level
 (each costs a paragraph today and saves a rewrite later):
 
 - Keep the **lease primitive generic** when roaming-workspace lands — it is
-  [aster-leases.md](aster-leases.md) (grant/enforce split + resource-CAS
+  [aster-leases.md](../aster-leases.md) (grant/enforce split + resource-CAS
   fencing), not a file-sync feature.
 - Keep tunneld's **service registry as directory records** (its doc §5.2
   already points at "subscribe-to-data-model" — that model is the trust
