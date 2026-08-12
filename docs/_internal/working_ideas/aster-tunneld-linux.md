@@ -262,3 +262,41 @@ Each step is independently shippable and testable. Step 4 is the natural MVP —
 A user runs `aster-tunneld` on their laptop pointed at a connector node inside their employer's VPC. They `ssh ws-1.internal.dev`, `psql db.internal.dev`, browse `wiki.internal.dev` — all without a VPN, without opening any inbound ports on the connector, with per-service authorisation handled by the connector's RPC handler. The connector node is the only thing that touches the corporate network; the user's laptop just speaks Aster QUIC to one connector, and bytes flow.
 
 That's the OpenZiti Edge-Tunneler value proposition, built on Aster's identity + RPC + tunneling primitives instead of Ziti's edge protocol.
+
+---
+
+## 9. Addendum: rayfish comparison (2026-07-06)
+
+[rayfish](https://github.com/rayfish) is a mesh VPN built on iroh — the nearest prior art on the same transport. Reviewed from a local checkout (`~/dev/github/rayfish/rayfish`). It sits at a different layer than this design, and the differences are instructive.
+
+### 9.1 Their mechanism
+
+WireGuard/Tailscale-shaped L3 mesh, not a proxy:
+
+- Root daemon owns a TUN (MTU 1280, IPv6 minimum) and one shared iroh `Endpoint`; one QUIC connection per peer.
+- **Each raw IP packet rides one unreliable QUIC datagram** (`send_datagram`). No streams for data. The end-hosts' kernel TCP stacks do loss recovery, so the tunnel never retransmits payload — no TCP-over-TCP meltdown, at the cost of per-packet (not per-flow) processing.
+- Per-network ALPN embeds a wire-protocol version (`rayfish/net/<version>/<netkey-prefix>`): incompatible peers fail at the TLS handshake, no in-band version negotiation at all.
+- Peer addressing is coordinator-free: stable IPs in `100.64.0.0/10` / `200::/7` derived from each peer's Ed25519 identity.
+- Data plane is three tasks: single TUN-read loop (parse → userspace firewall → peer lookup → `send_datagram`), one `read_datagram` reader per peer (anti-spoof: source IP must equal the peer's derived mesh IP), single TUN-writer task.
+
+### 9.2 Their efficiency work (worth stealing)
+
+The code is measurement-driven — Criterion per-packet microbenches keep the *pre-optimization copy paths as fixtures* so the zero-copy delta is regression-guarded, plus an iperf3 e2e harness that scores the direct-vs-tunnel *ratio*, not absolute Mbit/s.
+
+- **Zero-copy handoff both directions**: TX slices packets from a pooled 64 KiB `BytesMut` via `split_to(n).freeze()` (one alloc per ~50 packets; the `Bytes` handed to quinn keeps the chunk alive); RX passes the datagram `Bytes` through by refcount.
+- **Transport config tuned to shape**: `send_fairness(false)` (no competing data streams), GSO pinned on explicitly so it can't silently regress, Cubic kept with a documented BBR3 deferral.
+- **Drop-newest backpressure**: check `datagram_send_buffer_space()` before sending; drop the *new* packet rather than let quinn evict the oldest queued one. Keeps the single TUN read loop non-blocking — no cross-peer head-of-line blocking.
+- RFC 1624 incremental checksum updates for their in-path port NAT instead of full recompute.
+
+### 9.3 Their ceiling
+
+One syscall per ≤1280-byte packet on the TUN side, both directions (plain `read_buf` / `write_all` per packet). No `IFF_VNET_HDR`/GRO/GSO coalescing on the TUN fd — the technique that gave Tailscale its userspace throughput jump by moving ~64 KiB per syscall. Every 1280 bytes pays: TUN syscall → parse → firewall eval → AEAD seal → UDP send (GSO helps only that last hop). Their own bench notes concede single-stream TCP is CPU-bound with "userspace TUN + QUIC datagram encryption" as the bottleneck. Userspace-Tailscale-class; nowhere near kernel WireGuard.
+
+### 9.4 Implications for this design
+
+- **Layer choice validated, in our favour for our use case.** Rayfish's L3/datagram model buys transparency (ICMP, UDP, any protocol, "same LAN" semantics) that we explicitly don't target. Our smoltcp-terminate + splice-over-reliable-stream model should be *more* CPU-efficient for bulk flows: bytes move in large chunks with QUIC doing loss recovery, instead of parse+firewall+seal per ≤1280 B packet; and the app's TCP handshake terminates at the local daemon (zero-RTT connect from the app's perspective).
+- **Adopt the ALPN-embedded protocol version** for Aster tunnel ALPNs — transport-enforced version gating, zero in-band cost.
+- **Adopt drop-newest via `datagram_send_buffer_space()`** wherever we do datagram relay (aster-expose Stage B / future `TunnelTarget::Udp` §5.1) — same problem shape.
+- **Adopt the pooled `split_to/freeze` handoff** on any per-packet path, and their bench discipline (copy-path fixtures pinned in Criterion; ratio-based e2e numbers).
+- **The unclaimed lever**: TUN vnet_hdr GRO/GSO offloads. Neither rayfish nor this spec uses them. For us they'd only matter on the TUN↔smoltcp boundary; revisit after profiling (consistent with §6's "eBPF later" stance).
+- Their fixed-UDP-listen-port trick (stable manually-forwardable port across daemon restarts) is cheap and worth considering for connector nodes.
