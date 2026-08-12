@@ -16,7 +16,7 @@ iroh-tickets = "=1.0.0"
 iroh-mdns-address-lookup = "0.4"
 
 # Python FFI
-pyo3        = { version = "0.28.2", features = ["extension-module", "abi3-py39"] }
+pyo3        = { version = "0.28.2", features = ["extension-module", "abi3-py39", "generate-import-lib"] }
 pyo3-async-runtimes = { version = "0.28.0", features = ["tokio-runtime"] }
 
 # Common dependencies

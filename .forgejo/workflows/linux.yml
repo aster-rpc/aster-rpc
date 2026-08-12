@@ -11,7 +11,6 @@ on:
       - "cli/**"
       - "tests/python/**"
       - "tests/chaos/**"
-      - "scripts/ci/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "pyproject.toml"
@@ -26,7 +25,6 @@ on:
       - "cli/**"
       - "tests/python/**"
       - "tests/chaos/**"
-      - "scripts/ci/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "pyproject.toml"
@@ -48,8 +46,9 @@ env:
   UV_CACHE_DIR: /cache/uv
 
 jobs:
+  # Linux compilation and tests stay on the container-isolated Forge host.
   lint:
-    runs-on: aster-linux-x64
+    runs-on: aster-forge-linux-x64
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -80,7 +79,7 @@ jobs:
 
   test:
     needs: lint
-    runs-on: aster-linux-x64
+    runs-on: aster-forge-linux-x64
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -113,7 +112,7 @@ jobs:
 
   build-linux-wheel:
     needs: test
-    runs-on: aster-linux-x64
+    runs-on: aster-forge-linux-x64
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -157,13 +156,12 @@ jobs:
               "${FORGEJO_SERVER_URL}/api/packages/Aster/generic/aster-python/${package_version}/${artifact_name}"
           done
 
-  # Forgejo Runner is Linux-only, so this job is orchestrated by the WSL
-  # runner and invokes the native Windows toolchain through WSL interop.
-  # Host jobs have no isolation: only trusted main pushes/manual runs may use it.
+  # Build the Windows wheel on the Forge host with cargo-xwin. The resulting
+  # abi3 wheel is import-tested by the existing native Windows GitHub matrix;
+  # macOS remains unchanged.
   build-windows-wheel:
-    if: forgejo.event_name != 'pull_request' && (forgejo.ref == 'refs/heads/main' || forgejo.event_name == 'workflow_dispatch')
     needs: test
-    runs-on: aster-windows-x64
+    runs-on: aster-forge-cross-x64
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -176,17 +174,14 @@ jobs:
           path: _deps/salvo
           token: ${{ secrets.ASTER_REPO_TOKEN }}
           persist-credentials: false
-      - name: Build and smoke-test native Windows wheel
+      - name: Build Windows wheel with cargo-xwin
         run: |
-          # A systemd-started WSL runner has no per-shell WSL_INTEROP value.
-          # PID 1's interop socket is the stable bridge to Windows processes.
-          export WSL_INTEROP=/run/WSL/1_interop
-          repository_root=$(wslpath -w "$GITHUB_WORKSPACE")
-          build_script=$(wslpath -w "$GITHUB_WORKSPACE/scripts/ci/build-windows-wheel.ps1")
-          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass \
-            -File "$build_script" \
-            -RepositoryRoot "$repository_root" \
-            -CacheRoot 'D:\forgejo-runner\cache'
+          ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
+          uv venv .venv
+          uv pip install --python .venv/bin/python maturin
+          uv run --python .venv/bin/python maturin build --release \
+            --target x86_64-pc-windows-msvc \
+            --out dist -m bindings/python/rust/Cargo.toml
       - name: Store workflow artifact on Forgejo
         uses: https://data.forgejo.org/forgejo/upload-artifact@v4
         with:

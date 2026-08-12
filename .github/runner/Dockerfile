@@ -213,3 +213,23 @@ USER runner
 WORKDIR /opt/actions-runner
 
 ENTRYPOINT ["/opt/actions-runner/entrypoint.sh"]
+
+# Forgejo-only image for Linux-to-Windows MSVC cross compilation. Keeping this
+# in a separate stage leaves normal Linux jobs on the smaller `ci` image.
+FROM ci AS cross-ci
+
+ARG CARGO_XWIN_VERSION=0.23.0
+
+USER root
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    clang \
+    ninja-build \
+  && rm -rf /var/lib/apt/lists/*
+
+USER runner
+RUN rustup target add x86_64-pc-windows-msvc \
+  && rustup component add llvm-tools \
+  && RUSTC_WRAPPER= cargo install --locked \
+       --version "${CARGO_XWIN_VERSION}" cargo-xwin \
+  && RUSTC_WRAPPER= cargo xwin cache xwin
