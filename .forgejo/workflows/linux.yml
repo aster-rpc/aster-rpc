@@ -47,6 +47,15 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
+      - name: Checkout pinned Salvo fork
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          repository: Aster/salvo
+          ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
+          path: _deps/salvo
+          token: ${{ secrets.ASTER_REPO_TOKEN }}
+      - name: Link sibling path dependency
+        run: ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
       - name: Toolchain versions
         run: |
           rustc --version
@@ -66,6 +75,15 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
+      - name: Checkout pinned Salvo fork
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          repository: Aster/salvo
+          ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
+          path: _deps/salvo
+          token: ${{ secrets.ASTER_REPO_TOKEN }}
+      - name: Link sibling path dependency
+        run: ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
       - name: Rust core and FFI tests
         run: |
           cargo test -p aster_transport_core
@@ -87,6 +105,15 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
+      - name: Checkout pinned Salvo fork
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          repository: Aster/salvo
+          ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
+          path: _deps/salvo
+          token: ${{ secrets.ASTER_REPO_TOKEN }}
+      - name: Link sibling path dependency
+        run: ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
       - name: Build Linux wheel and source distribution
         run: |
           uv venv .venv
