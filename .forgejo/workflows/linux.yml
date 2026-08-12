@@ -36,6 +36,9 @@ concurrency:
   group: forgejo-linux-${{ forgejo.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   SCCACHE_DIR: /cache/sccache
@@ -47,6 +50,8 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -54,6 +59,7 @@ jobs:
           ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
           path: _deps/salvo
           token: ${{ secrets.ASTER_REPO_TOKEN }}
+          persist-credentials: false
       - name: Link sibling path dependency
         run: ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
       - name: Toolchain versions
@@ -75,6 +81,8 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -82,6 +90,7 @@ jobs:
           ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
           path: _deps/salvo
           token: ${{ secrets.ASTER_REPO_TOKEN }}
+          persist-credentials: false
       - name: Link sibling path dependency
         run: ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
       - name: Rust core and FFI tests
@@ -105,6 +114,8 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -112,6 +123,7 @@ jobs:
           ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
           path: _deps/salvo
           token: ${{ secrets.ASTER_REPO_TOKEN }}
+          persist-credentials: false
       - name: Link sibling path dependency
         run: ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
       - name: Build Linux wheel and source distribution
