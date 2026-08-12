@@ -234,6 +234,10 @@ RUN rustup target add x86_64-pc-windows-msvc \
        --version "${CARGO_XWIN_VERSION}" cargo-xwin \
   && RUSTC_WRAPPER= cargo xwin cache xwin
 
+# The toolchain is installed as `runner`, while Forgejo executes this image as
+# root. Keep both users on the SDK/CRT copy baked into the image.
+ENV XWIN_CACHE_DIR=/home/runner/.cache/cargo-xwin
+
 # Match the `ci` stage's runtime user. Forgejo's persistent cache volumes and
 # workspace parent are currently initialized by the native jobs as root.
 USER root
