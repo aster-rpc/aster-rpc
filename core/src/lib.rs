@@ -42,7 +42,9 @@ use iroh::endpoint::{
 };
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{EndpointAddr, EndpointId, RelayMap, RelayUrl, SecretKey, TransportAddr};
-use iroh_blobs::api::downloader::Downloader;
+use iroh_blobs::api::downloader::{
+    DownloadOptions, DownloadProgressItem, Downloader, SplitStrategy,
+};
 use iroh_blobs::api::Store as BlobStore;
 use iroh_blobs::format::collection::Collection;
 use iroh_blobs::store::fs::FsStore;
@@ -280,6 +282,132 @@ pub struct CoreBlobLocalInfo {
     pub is_complete: bool,
     /// Number of bytes we have locally for this blob.
     pub local_bytes: u64,
+}
+
+/// How a multi-provider fetch should decompose a HashSeq.
+///
+/// This is *not* about how many providers are used — ordered failover across
+/// the provider list happens either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoreFetchStrategy {
+    /// Fetch the HashSeq as a single request.
+    #[default]
+    Whole,
+    /// Fetch the root, then each child as its own concurrent request.
+    SplitChildren,
+}
+
+/// What one provider did during a fetch.
+#[derive(Clone, Debug)]
+pub struct CoreProviderOutcome {
+    /// The provider's endpoint id, hex-encoded.
+    pub node_id: String,
+    /// How many requests were attempted against this provider.
+    pub attempts: u32,
+    /// How many of those attempts failed to connect or transfer.
+    pub failures: u32,
+    /// How many requests this provider carried to completion.
+    pub completed_requests: u32,
+}
+
+/// The outcome of a multi-provider fetch, for callers that rank providers.
+#[derive(Clone, Debug, Default)]
+pub struct CoreFetchReport {
+    /// Providers in the order they were first attempted; repeated uses of one
+    /// id are aggregated into a single entry.
+    pub providers: Vec<CoreProviderOutcome>,
+    /// Payload bytes read from providers during this fetch. Excludes protocol
+    /// overhead and data that was already resident locally; includes bytes
+    /// received before an attempt failed.
+    pub bytes_transferred: u64,
+}
+
+/// Folds a download's progress stream into a [`CoreFetchReport`].
+///
+/// Provider attribution is by request: `PartComplete` carries no provider id,
+/// so it is credited to whichever provider that request last announced with
+/// `TryProvider`. Requests are keyed by value (`GetRequest` is `Eq + Hash`),
+/// not by allocation identity.
+#[derive(Default)]
+struct FetchAccumulator {
+    order: Vec<EndpointId>,
+    outcomes: HashMap<EndpointId, (u32, u32, u32)>,
+    active: HashMap<Arc<iroh_blobs::protocol::GetRequest>, EndpointId>,
+    bytes: u64,
+    errors: Vec<String>,
+    part_failed: bool,
+}
+
+impl FetchAccumulator {
+    fn entry(&mut self, id: EndpointId) -> &mut (u32, u32, u32) {
+        self.outcomes.entry(id).or_insert_with(|| {
+            self.order.push(id);
+            (0, 0, 0)
+        })
+    }
+
+    fn observe(&mut self, item: DownloadProgressItem) {
+        match item {
+            DownloadProgressItem::TryProvider { id, request } => {
+                self.entry(id).0 += 1;
+                self.active.insert(request, id);
+            }
+            DownloadProgressItem::ProviderFailed { id, request } => {
+                self.entry(id).1 += 1;
+                self.active.remove(&request);
+            }
+            DownloadProgressItem::PartComplete { request } => {
+                if let Some(id) = self.active.remove(&request) {
+                    self.entry(id).2 += 1;
+                }
+            }
+            DownloadProgressItem::BytesTransferred(n) => self.bytes += n,
+            DownloadProgressItem::Error(err) => self.errors.push(err.to_string()),
+            DownloadProgressItem::DownloadError => self.part_failed = true,
+            DownloadProgressItem::Progress(_) => {}
+        }
+    }
+
+    fn finish(self, hash: Hash) -> Result<CoreFetchReport> {
+        let providers: Vec<CoreProviderOutcome> = self
+            .order
+            .iter()
+            .map(|id| {
+                let (attempts, failures, completed_requests) = self.outcomes[id];
+                CoreProviderOutcome {
+                    node_id: id.to_string(),
+                    attempts,
+                    failures,
+                    completed_requests,
+                }
+            })
+            .collect();
+        if !self.errors.is_empty() || self.part_failed {
+            let tried = providers
+                .iter()
+                .map(|p| p.node_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let failed = providers
+                .iter()
+                .filter(|p| p.failures > 0)
+                .map(|p| p.node_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = if self.errors.is_empty() {
+                "one or more parts of the request could not be fetched".to_string()
+            } else {
+                self.errors.join("; ")
+            };
+            return Err(anyhow!(
+                "download of {hash} failed: {detail} (tried: [{tried}], failed: [{failed}])"
+            ));
+        }
+        Ok(CoreFetchReport {
+            providers,
+            bytes_transferred: self.bytes,
+        })
+    }
 }
 
 // ============================================================================
@@ -3435,28 +3563,26 @@ impl CoreBlobsClient {
         }
     }
 
-    /// Download a blob by hash from a specific node, bypassing ticket parsing.
-    /// `format` should be "raw" or "hash_seq".
-    pub async fn download_hash(
-        &self,
-        hash_hex: String,
-        node_id_hex: String,
-        format: String,
-    ) -> Result<Vec<u8>> {
-        let hash: Hash = hash_hex.parse()?;
-        let node_id: EndpointId = node_id_hex.parse()?;
-        let blob_format = if format == "hash_seq" {
+    /// Parse the legacy `format` string used across the bindings. Only the
+    /// literal `"hash_seq"` selects HashSeq; anything else stays Raw.
+    fn parse_blob_format(format: &str) -> BlobFormat {
+        if format == "hash_seq" {
             BlobFormat::HashSeq
         } else {
             BlobFormat::Raw
-        };
-        let haf = HashAndFormat {
-            hash,
-            format: blob_format,
-        };
-        self.downloader.download(haf, vec![node_id]).await?;
+        }
+    }
 
-        if blob_format == BlobFormat::HashSeq {
+    fn parse_providers(node_ids_hex: &[String]) -> Result<Vec<EndpointId>> {
+        node_ids_hex
+            .iter()
+            .map(|id| id.parse::<EndpointId>().map_err(Into::into))
+            .collect()
+    }
+
+    /// Read a blob back out of the store once it is resident.
+    async fn read_resident(&self, hash: Hash, format: BlobFormat) -> Result<Vec<u8>> {
+        if format == BlobFormat::HashSeq {
             let collection = Collection::load(hash, &self.store).await?;
             let mut result = Vec::new();
             for (_name, blob_hash) in collection.iter() {
@@ -3467,6 +3593,141 @@ impl CoreBlobsClient {
         } else {
             Ok(self.store.get_bytes(hash).await?.to_vec())
         }
+    }
+
+    /// Fetch `haf` from `providers` **in the given order**, reporting what each
+    /// provider did.
+    ///
+    /// Ordered failover, resumption (each attempt asks only for what is still
+    /// missing) and child splitting are the downloader's own behaviour; this
+    /// consumes its progress stream to build the report rather than awaiting
+    /// the future and discarding it.
+    async fn run_download(
+        &self,
+        haf: HashAndFormat,
+        providers: Vec<EndpointId>,
+        strategy: CoreFetchStrategy,
+    ) -> Result<CoreFetchReport> {
+        if providers.is_empty() {
+            return Err(anyhow!(
+                "no providers supplied for download of {}",
+                haf.hash
+            ));
+        }
+        if strategy == CoreFetchStrategy::SplitChildren && haf.format != BlobFormat::HashSeq {
+            return Err(anyhow!(
+                "split-children fetch needs a hash_seq blob, got raw for {}",
+                haf.hash
+            ));
+        }
+        let split = match strategy {
+            CoreFetchStrategy::Whole => SplitStrategy::None,
+            CoreFetchStrategy::SplitChildren => SplitStrategy::Split,
+        };
+        let mut stream = self
+            .downloader
+            .download_with_opts(DownloadOptions::new(haf, providers, split))
+            .stream()
+            .await?;
+        let mut acc = FetchAccumulator::default();
+        while let Some(item) = futures_lite::StreamExt::next(&mut stream).await {
+            acc.observe(item);
+        }
+        acc.finish(haf.hash)
+    }
+
+    /// Download a blob by hash from an **ordered** list of providers, returning
+    /// the bytes and a report of what each provider did. Providers are tried in
+    /// order; each attempt asks only for the ranges still missing.
+    pub async fn download_hash_multi(
+        &self,
+        hash_hex: String,
+        node_ids_hex: Vec<String>,
+        format: String,
+        strategy: CoreFetchStrategy,
+    ) -> Result<(Vec<u8>, CoreFetchReport)> {
+        let hash: Hash = hash_hex.parse()?;
+        let blob_format = Self::parse_blob_format(&format);
+        let providers = Self::parse_providers(&node_ids_hex)?;
+        let report = self
+            .run_download(
+                HashAndFormat {
+                    hash,
+                    format: blob_format,
+                },
+                providers,
+                strategy,
+            )
+            .await?;
+        Ok((self.read_resident(hash, blob_format).await?, report))
+    }
+
+    /// As [`Self::download_hash_multi`], but leaves the blob in the store
+    /// without reading it back — see [`Self::download_hash_to_store`] for why
+    /// that matters.
+    pub async fn download_hash_to_store_multi(
+        &self,
+        hash_hex: String,
+        node_ids_hex: Vec<String>,
+        format: String,
+        strategy: CoreFetchStrategy,
+    ) -> Result<CoreFetchReport> {
+        let hash: Hash = hash_hex.parse()?;
+        let providers = Self::parse_providers(&node_ids_hex)?;
+        self.run_download(
+            HashAndFormat {
+                hash,
+                format: Self::parse_blob_format(&format),
+            },
+            providers,
+            strategy,
+        )
+        .await
+    }
+
+    /// As [`Self::download_hash_multi`], for a collection: returns the
+    /// (name, data) pairs plus the fetch report.
+    pub async fn download_collection_hash_multi(
+        &self,
+        hash_hex: String,
+        node_ids_hex: Vec<String>,
+        strategy: CoreFetchStrategy,
+    ) -> Result<(Vec<(String, Vec<u8>)>, CoreFetchReport)> {
+        let hash: Hash = hash_hex.parse()?;
+        let providers = Self::parse_providers(&node_ids_hex)?;
+        let report = self
+            .run_download(HashAndFormat::hash_seq(hash), providers, strategy)
+            .await?;
+        Ok((self.load_collection(hash).await?, report))
+    }
+
+    async fn load_collection(&self, hash: Hash) -> Result<Vec<(String, Vec<u8>)>> {
+        let collection = Collection::load(hash, &self.store).await?;
+        let mut files = Vec::new();
+        for (name, blob_hash) in collection.iter() {
+            let bytes = self.store.get_bytes(*blob_hash).await?;
+            files.push((name.clone(), bytes.to_vec()));
+        }
+        Ok(files)
+    }
+
+    /// Download a blob by hash from a specific node, bypassing ticket parsing.
+    /// `format` should be "raw" or "hash_seq".
+    pub async fn download_hash(
+        &self,
+        hash_hex: String,
+        node_id_hex: String,
+        format: String,
+    ) -> Result<Vec<u8>> {
+        let (bytes, _report) = self
+            .download_hash_multi(
+                hash_hex,
+                vec![node_id_hex],
+                format,
+                CoreFetchStrategy::Whole,
+            )
+            .await?;
+        Ok(bytes)
     }
 
     /// Download a blob by hash from a specific node **into the local store
@@ -3484,18 +3745,13 @@ impl CoreBlobsClient {
         node_id_hex: String,
         format: String,
     ) -> Result<()> {
-        let hash: Hash = hash_hex.parse()?;
-        let node_id: EndpointId = node_id_hex.parse()?;
-        let blob_format = if format == "hash_seq" {
-            BlobFormat::HashSeq
-        } else {
-            BlobFormat::Raw
-        };
-        let haf = HashAndFormat {
-            hash,
-            format: blob_format,
-        };
-        self.downloader.download(haf, vec![node_id]).await?;
+        self.download_hash_to_store_multi(
+            hash_hex,
+            vec![node_id_hex],
+            format,
+            CoreFetchStrategy::Whole,
+        )
+        .await?;
         Ok(())
     }
 
@@ -3505,20 +3761,9 @@ impl CoreBlobsClient {
         hash_hex: String,
         node_id_hex: String,
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        let hash: Hash = hash_hex.parse()?;
-        let node_id: EndpointId = node_id_hex.parse()?;
-        let haf = HashAndFormat {
-            hash,
-            format: BlobFormat::HashSeq,
-        };
-        self.downloader.download(haf, vec![node_id]).await?;
-
-        let collection = Collection::load(hash, &self.store).await?;
-        let mut files = Vec::new();
-        for (name, blob_hash) in collection.iter() {
-            let bytes = self.store.get_bytes(*blob_hash).await?;
-            files.push((name.clone(), bytes.to_vec()));
-        }
+        let (files, _report) = self
+            .download_collection_hash_multi(hash_hex, vec![node_id_hex], CoreFetchStrategy::Whole)
+            .await?;
         Ok(files)
     }
 
