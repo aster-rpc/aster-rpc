@@ -135,7 +135,7 @@ jobs:
           uv run --python .venv/bin/python maturin sdist \
             --out dist -m bindings/python/rust/Cargo.toml
       - name: Store workflow artifact on Forgejo
-        uses: https://data.forgejo.org/actions/upload-artifact@v3
+        uses: https://data.forgejo.org/forgejo/upload-artifact@v4
         with:
           name: aster-python-linux-${{ forgejo.run_number }}
           path: dist/*
