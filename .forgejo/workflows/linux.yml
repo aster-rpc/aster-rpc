@@ -41,7 +41,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep downloads and Cargo's cross-run usage database together. The runner
+  # mounts this path but leaves workspace target/ directories disposable.
+  CARGO_HOME: /cache/cargo
+  CARGO_INCREMENTAL: "0"
+  CARGO_CACHE_AUTO_CLEAN_FREQUENCY: "1 day"
   SCCACHE_DIR: /cache/sccache
+  SCCACHE_CACHE_SIZE: "10G"
   RUSTC_WRAPPER: sccache
   UV_CACHE_DIR: /cache/uv
 
@@ -75,7 +81,11 @@ jobs:
       - name: Rust formatting
         run: cargo fmt --all -- --check
       - name: Rust lint
-        run: cargo clippy --workspace --all-targets --exclude aster-transport-napi -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --exclude aster-transport-napi -- -D warnings
+      - name: Compiler-cache statistics
+        if: always()
+        continue-on-error: true
+        run: sccache --show-stats
 
   test:
     needs: lint
@@ -96,19 +106,23 @@ jobs:
         run: ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
       - name: Rust core and FFI tests
         run: |
-          cargo test -p aster_transport_core
-          cargo test -p aster_transport_ffi
+          cargo test --locked -p aster_transport_core
+          cargo test --locked -p aster_transport_ffi
       - name: Python framework tests
         run: |
           uv venv .venv
           uv pip install --python .venv/bin/python \
             pytest pytest-asyncio pytest-timeout maturin \
             "pyfory==0.16.0" "zstandard>=0.25.0"
-          .venv/bin/maturin develop --release \
+          .venv/bin/maturin develop --release --locked \
             -m bindings/python/rust/Cargo.toml
           uv pip install --python .venv/bin/python -e cli/
           .venv/bin/pytest tests/python/ tests/chaos/ \
             -v --timeout=30 -m "not network and not iroh_primitives"
+      - name: Compiler-cache statistics
+        if: always()
+        continue-on-error: true
+        run: sccache --show-stats
 
   build-linux-wheel:
     needs: test
@@ -131,7 +145,7 @@ jobs:
         run: |
           uv venv .venv
           uv pip install --python .venv/bin/python maturin
-          .venv/bin/maturin build --release \
+          .venv/bin/maturin build --release --locked \
             --out dist -m bindings/python/rust/Cargo.toml
           .venv/bin/maturin sdist \
             --out dist -m bindings/python/rust/Cargo.toml
@@ -141,7 +155,7 @@ jobs:
           name: aster-python-linux-${{ forgejo.run_number }}
           path: dist/*
           if-no-files-found: error
-          retention-days: 30
+          retention-days: ${{ forgejo.event_name == 'pull_request' && 7 || 30 }}
       - name: Publish dev artifacts to Forgejo packages
         if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main'
         env:
@@ -155,6 +169,10 @@ jobs:
               --upload-file "$artifact" \
               "${FORGEJO_SERVER_URL}/api/packages/Aster/generic/aster-python/${package_version}/${artifact_name}"
           done
+      - name: Compiler-cache statistics
+        if: always()
+        continue-on-error: true
+        run: sccache --show-stats
 
   # Build the Windows wheel on the Forge host with cargo-xwin. The resulting
   # abi3 wheel is import-tested by the existing native Windows GitHub matrix;
@@ -179,7 +197,7 @@ jobs:
           ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
           uv venv .venv
           uv pip install --python .venv/bin/python maturin
-          .venv/bin/maturin build --release \
+          .venv/bin/maturin build --release --locked \
             --target x86_64-pc-windows-msvc \
             --out dist -m bindings/python/rust/Cargo.toml
       - name: Store workflow artifact on Forgejo
@@ -188,7 +206,7 @@ jobs:
           name: aster-python-windows-x64-${{ forgejo.run_number }}
           path: dist/*.whl
           if-no-files-found: error
-          retention-days: 30
+          retention-days: ${{ forgejo.event_name == 'pull_request' && 7 || 30 }}
       - name: Publish dev artifact to Forgejo packages
         if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main'
         env:
@@ -202,3 +220,7 @@ jobs:
               --upload-file "$artifact" \
               "${FORGEJO_SERVER_URL}/api/packages/Aster/generic/aster-python/${package_version}/${artifact_name}"
           done
+      - name: Compiler-cache statistics
+        if: always()
+        continue-on-error: true
+        run: sccache --show-stats
