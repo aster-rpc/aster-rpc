@@ -310,7 +310,7 @@ def test_fetch_manifests_from_directory_ref(monkeypatch):
         return FakeRuntime()
 
     monkeypatch.setattr(contract.importlib, "import_module", lambda name: FakeTypesModule)
-    monkeypatch.setattr("aster_cli.aster_service.open_aster_service", fake_open_aster_service)
+    monkeypatch.setattr(aster_service, "open_aster_service", fake_open_aster_service)
 
     manifests = asyncio.run(
         contract._fetch_manifests_from_directory_ref("@alice/ShellTestService", "aster1test")
