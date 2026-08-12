@@ -2693,7 +2693,7 @@ dependencies = [
 [[package]]
 name = "iroh-blobs"
 version = "0.103.0"
-source = "git+https://github.com/aster-rpc/iroh-blobs?rev=60d098c99d6a759b5b1bf0df635b149b50c74775#60d098c99d6a759b5b1bf0df635b149b50c74775"
+source = "git+https://github.com/aster-rpc/iroh-blobs?rev=a2e15663c4015dc37118845d160100ebdbdb4aeb#a2e15663c4015dc37118845d160100ebdbdb4aeb"
 dependencies = [
  "arrayvec",
  "bao-tree",

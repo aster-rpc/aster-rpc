@@ -43,8 +43,8 @@ crate_version = "1.0.1"
 [forks.iroh-blobs]
 repo = "https://github.com/aster-rpc/iroh-blobs"
 upstream_base = "v0.103.0"
-tag = "aster-iroh-blobs-v0.103.0"
-commit = "60d098c99d6a759b5b1bf0df635b149b50c74775"
+tag = "aster-iroh-blobs-v0.103.0-p1"
+commit = "a2e15663c4015dc37118845d160100ebdbdb4aeb"
 branch = "upgrade/iroh-blobs-v0.103"
 crates = ["iroh-blobs"]
 crate_version = "0.103.0"
@@ -110,7 +110,7 @@ patch_crates_io = """
 iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "5228d64d91b10ef5f5bc9fcf8855b7774102cfc9" }
 iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "5228d64d91b10ef5f5bc9fcf8855b7774102cfc9" }
 iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "5228d64d91b10ef5f5bc9fcf8855b7774102cfc9" }
-iroh-blobs  = { git = "https://github.com/aster-rpc/iroh-blobs",  rev = "60d098c99d6a759b5b1bf0df635b149b50c74775" }
+iroh-blobs  = { git = "https://github.com/aster-rpc/iroh-blobs",  rev = "a2e15663c4015dc37118845d160100ebdbdb4aeb" }
 iroh-docs   = { git = "https://github.com/aster-rpc/iroh-docs",   rev = "2f3f3df834dfe6ce83f052c9c94ef80db2f5627c" }
 iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "76492e4cf8a745cae27ea57fb8a30d42ab675498" }
 noq         = { git = "https://github.com/aster-rpc/noq",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }

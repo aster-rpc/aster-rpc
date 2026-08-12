@@ -104,7 +104,7 @@ pub use node::Node;
 pub use ticket::{Credential, Ticket};
 
 #[cfg(feature = "blobs")]
-pub use blobs::{BlobFormat, BlobStatus, Blobs};
+pub use blobs::{BlobFormat, BlobStatus, Blobs, FetchReport, FetchStrategy, ProviderOutcome};
 #[cfg(feature = "docs")]
 pub use docs::{
     default_author_id, Doc, DocEntry, DocEvent, DocEvents, Docs, DownloadPolicy, ShareMode,
