@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Verify that aster-cli's aster-rpc lower bound is >= the current framework version.
+"""Verify that aster-cli follows the current aster-rpc compatibility series.
 
-Guards against this footgun: you bump aster-rpc to 0.2.0 (breaking change),
-publish it, but leave aster-cli's dependency as `aster-rpc>=0.1.0`. An old
+Guards against this footgun: you bump aster-rpc to 0.4.0 (breaking change),
+publish it, but leave aster-cli's dependency as `aster-rpc>=0.3.0`. An old
 copy of aster-cli on PyPI will then pull the new aster-rpc on install and
 crash at import time.
 
 Rule enforced:
-  cli/pyproject.toml must declare `aster-rpc>=X.Y.Z` where X.Y.Z >= the
-  `version` in the repo-root pyproject.toml (the aster-rpc version).
+  cli/pyproject.toml must declare `aster-rpc>=X.Y.Z` in the same major/minor
+  series as the repo-root project. Patch versions are commit counts and are
+  backwards compatible within that series, so the lower patch may stay at 0.
 
 Exits 0 on pass, 1 on fail with a fix-it hint.
 
@@ -16,6 +17,7 @@ Run manually: python3 scripts/check-cli-compat.py
 Invoked from:
   - .githooks/pre-push
   - .github/workflows/ci.yml (lint job)
+  - .forgejo/workflows/linux.yml (lint job)
 """
 
 from __future__ import annotations
@@ -74,28 +76,27 @@ def main() -> int:
         )
         return 1
 
-    if parse_version(cli_lower) < parse_version(framework_version):
+    framework = parse_version(framework_version)
+    cli = parse_version(cli_lower)
+    if len(framework) < 3 or len(cli) < 3:
+        print("error: framework and CLI versions must be X.Y.Z", file=sys.stderr)
+        return 2
+
+    if cli[:2] != framework[:2] or cli > framework:
         print(
             f"error: aster-cli's aster-rpc lower bound ({cli_lower}) is "
-            f"older than the framework version ({framework_version}).",
+            f"incompatible with the framework series ({framework_version}).",
             file=sys.stderr,
         )
         print(
-            "  Why this matters: once aster-rpc {fw} ships to PyPI, old aster-cli\n"
-            "  installs will pull the new aster-rpc and break at import time if\n"
-            "  there are breaking changes.".format(fw=framework_version),
+            "  Major/minor bumps define compatibility boundaries; commit-count\n"
+            "  patch releases remain compatible within one series.",
             file=sys.stderr,
         )
+        expected = f"{framework[0]}.{framework[1]}.0"
         print(
             f'  Fix: in cli/pyproject.toml, change "aster-rpc>={cli_lower}" '
-            f'to "aster-rpc>={framework_version}".',
-            file=sys.stderr,
-        )
-        print(
-            "  If this framework bump is fully backwards compatible and you want\n"
-            "  to keep the older lower bound on purpose, raise the lower bound\n"
-            "  to the framework version anyway -- the CLI is tested against the\n"
-            "  current framework, not against arbitrarily old ones.",
+            f'to "aster-rpc>={expected}".',
             file=sys.stderr,
         )
         return 1
