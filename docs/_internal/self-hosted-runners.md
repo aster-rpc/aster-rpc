@@ -1,16 +1,26 @@
 # Self-Hosted GitHub Actions Runners
 
-**Last updated:** 2026-04-06
+**Last updated:** 2026-08-12
+
+> **Retired:** The repository-scoped GitHub registrations and services for
+> `aster-linux-x64`, `aster-macos-arm64`, and `aster-windows-x64` were removed
+> on 2026-08-12 after Aster builds and release publishing moved to Forgejo.
+> GitHub currently has no self-hosted runners registered for this repository.
+> The inventory below is retained only as historical recovery information; do
+> not restart these services without deliberately re-registering them.
 
 ## Overview
 
-CI tests run on self-hosted runners in Emrul's home lab + OCI. Wheel builds for PyPI remain on GitHub-hosted runners (manylinux reproducibility).
+This page documents the retired GitHub runner topology. Current Aster CI,
+native wheels, development packages, and tagged release assets run on
+`forge.emrul.dev`; the public GitHub mirror alone uses a GitHub-hosted runner.
 
-Runners are registered at: **Settings > Actions > Runners** on `github.com/emrul/iroh-python`
+The runners were registered at **Settings > Actions > Runners** on the private
+GitHub repository (historically `github.com/emrul/iroh-python`).
 
 ---
 
-## Runners
+## Historical runner inventory
 
 ### aster-linux-x64
 
@@ -84,7 +94,7 @@ Runners are registered at: **Settings > Actions > Runners** on `github.com/emrul
 
 ---
 
-## Common Operations
+## Historical recovery operations
 
 ### Check runner status
 ```bash
@@ -130,7 +140,7 @@ rustup component add rustfmt clippy
 
 ---
 
-## Architecture
+## Historical architecture
 
 ```
 ci.yml (tests)          → self-hosted runners (all 4 machines)
@@ -138,10 +148,12 @@ build.yml (wheels)      → GitHub-hosted runners (manylinux/macOS/Windows)
 mobile.yml (iOS/Android)→ self-hosted Mac (iOS) + self-hosted Linux ARM64 (Android)
 ```
 
-Wheel builds stay on GitHub-hosted for manylinux container reproducibility and PyPI trusted publishing. Tests run on self-hosted for speed, cost savings, and reliable networking.
+Wheel builds previously stayed on GitHub-hosted runners for manylinux container
+reproducibility and PyPI trusted publishing. Tests used the self-hosted fleet for
+speed, cost savings, and reliable networking.
 
 ---
 
-## Docker Runner Image
+## Historical Docker runner image
 
 A Docker-based runner setup exists at `.github/runner/` (Dockerfile, docker-compose.yml, entrypoint.sh) but is not currently in use. The runners were set up as native installs for simplicity. The Docker image is available if containerization is needed later.
