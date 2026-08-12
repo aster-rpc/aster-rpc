@@ -104,10 +104,10 @@ jobs:
           uv pip install --python .venv/bin/python \
             pytest pytest-asyncio pytest-timeout maturin \
             "pyfory==0.16.0" "zstandard>=0.25.0"
-          uv run --python .venv/bin/python maturin develop --release \
+          .venv/bin/maturin develop --release \
             -m bindings/python/rust/Cargo.toml
           uv pip install --python .venv/bin/python -e cli/
-          uv run --python .venv/bin/python pytest tests/python/ tests/chaos/ \
+          .venv/bin/pytest tests/python/ tests/chaos/ \
             -v --timeout=30 -m "not network and not iroh_primitives"
 
   build-linux-wheel:
@@ -131,9 +131,9 @@ jobs:
         run: |
           uv venv .venv
           uv pip install --python .venv/bin/python maturin
-          uv run --python .venv/bin/python maturin build --release \
+          .venv/bin/maturin build --release \
             --out dist -m bindings/python/rust/Cargo.toml
-          uv run --python .venv/bin/python maturin sdist \
+          .venv/bin/maturin sdist \
             --out dist -m bindings/python/rust/Cargo.toml
       - name: Store workflow artifact on Forgejo
         uses: https://data.forgejo.org/forgejo/upload-artifact@v4
@@ -179,7 +179,7 @@ jobs:
           ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
           uv venv .venv
           uv pip install --python .venv/bin/python maturin
-          uv run --python .venv/bin/python maturin build --release \
+          .venv/bin/maturin build --release \
             --target x86_64-pc-windows-msvc \
             --out dist -m bindings/python/rust/Cargo.toml
       - name: Store workflow artifact on Forgejo
