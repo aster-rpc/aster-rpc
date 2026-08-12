@@ -281,6 +281,10 @@ jobs:
           scripts/release/prepare-build-tree.sh "$version"
           echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/aster-target" >> "$GITHUB_ENV"
+          # Forgejo gives each host job a different absolute checkout/temp
+          # root. Normalize both roots or identical Rust inputs hash to new
+          # sccache keys on every run.
+          echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE:$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
         with:
