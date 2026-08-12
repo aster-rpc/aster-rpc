@@ -28,6 +28,7 @@ pub mod codec;
 pub mod contract;
 pub mod empty;
 pub mod interceptor;
+pub mod lease;
 pub mod projection;
 pub mod runtime;
 pub mod server;
