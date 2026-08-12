@@ -285,6 +285,11 @@ jobs:
           # root. Normalize both roots or identical Rust inputs hash to new
           # sccache keys on every run.
           echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE:$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Remove targets abandoned by cancelled Mac jobs
+        run: |
+          runner_work=/Users/emrul/dev/aster/local_mac_forgejo_runner/_work
+          find "$runner_work" -mindepth 3 -maxdepth 3 -type d \
+            -path '*/tmp/aster-target' -exec rm -rf {} +
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
         with:
