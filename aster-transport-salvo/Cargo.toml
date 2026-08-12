@@ -1,6 +1,6 @@
 [package]
 name = "aster-transport-salvo"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Aster RPC over HTTP (H1/H2/H3 + WebTransport) via the Aster Salvo fork."
 

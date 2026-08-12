@@ -1,6 +1,6 @@
 [package]
 name = "aster-expose"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Expose local HTTP services over Aster — L7 terminate-and-relay. See docs/_internal/working_ideas/aster-expose-http.md"

@@ -805,6 +805,19 @@ pub extern "C" fn iroh_abi_version_patch() -> u32 {
     IROH_ABI_VERSION_PATCH
 }
 
+/// Exact Aster build version as a process-lifetime, NUL-terminated UTF-8 string.
+/// The returned pointer is borrowed and must not be freed.
+#[no_mangle]
+pub extern "C" fn aster_version() -> *const c_char {
+    static VERSION: std::sync::OnceLock<CString> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            CString::new(aster_transport_core::VERSION)
+                .expect("ASTER_BUILD_VERSION cannot contain a NUL byte")
+        })
+        .as_ptr()
+}
+
 // ============================================================================
 // C FFI Functions - Runtime
 // ============================================================================

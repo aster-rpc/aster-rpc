@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name    = "aster-rpc"
-version = "0.2.0"
+version = "0.3.0"
 description = "Aster RPC framework with Iroh P2P transport (Python bindings)"
 requires-python = ">=3.9,<3.14"
 dependencies = [
@@ -31,7 +31,7 @@ python-source  = "bindings/python"
 # at the project root. PyPI's PEP 639 check rejects sdists where the
 # declared license-file is not actually in the tarball, so we have to
 # explicitly include LICENSE in both wheel and sdist artifacts.
-include        = ["LICENSE"]
+include        = ["LICENSE", "VERSION", "BUILD_NUMBER"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

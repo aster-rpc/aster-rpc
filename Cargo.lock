@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "aster"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aster-expose",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "aster-expose"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aster_transport_core",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "aster-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "aster-transport-napi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aster_transport_core",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "aster-transport-salvo"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aster",
  "aster_transport_core",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "aster_rs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aster_transport_core",
  "blake3",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "aster_transport_core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "aster_transport_ffi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aster_transport_core",

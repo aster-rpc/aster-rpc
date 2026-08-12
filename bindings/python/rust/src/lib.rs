@@ -59,6 +59,10 @@ pub(crate) fn ensure_tokio_runtime() {
 fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
 
+    // This comes from core/build.rs and therefore describes the source commit,
+    // not merely the static Cargo package fallback.
+    m.add("VERSION", aster_transport_core::VERSION)?;
+
     // Register error types first (needed by other modules)
     error::register(py, m)?;
 

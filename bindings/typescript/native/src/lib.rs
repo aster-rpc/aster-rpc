@@ -21,8 +21,8 @@ mod node;
 mod reactor;
 mod ticket;
 
-/// Module version (matches package.json).
+/// Exact version embedded by the shared Rust core build.
 #[napi]
 pub fn version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    aster_transport_core::VERSION.to_string()
 }

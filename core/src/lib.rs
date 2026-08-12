@@ -18,6 +18,9 @@ pub mod topology;
 pub mod trust;
 pub mod tunnel;
 
+/// Exact Aster build version (`major.minor.commit-offset`) embedded at compile time.
+pub const VERSION: &str = env!("ASTER_BUILD_VERSION");
+
 pub use topology::cluster::{
     CoreClusterView, CoreSeparationVerdict, SharedView as CoreTopoSharedView, TopoConfig,
 };
