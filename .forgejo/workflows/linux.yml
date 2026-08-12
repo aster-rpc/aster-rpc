@@ -74,7 +74,7 @@ jobs:
       - name: Resolve Aster build version
         run: |
           version="$(scripts/release/version.sh)"
-          scripts/release/prepare-python-build.sh "$version"
+          scripts/release/prepare-build-tree.sh "$version"
           echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
@@ -115,7 +115,7 @@ jobs:
       - name: Resolve Aster build version
         run: |
           version="$(scripts/release/version.sh)"
-          scripts/release/prepare-python-build.sh "$version"
+          scripts/release/prepare-build-tree.sh "$version"
           echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
@@ -158,7 +158,7 @@ jobs:
       - name: Resolve Aster build version
         run: |
           version="$(scripts/release/version.sh)"
-          scripts/release/prepare-python-build.sh "$version"
+          scripts/release/prepare-build-tree.sh "$version"
           echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
@@ -217,7 +217,7 @@ jobs:
       - name: Resolve Aster build version
         run: |
           version="$(scripts/release/version.sh)"
-          scripts/release/prepare-python-build.sh "$version"
+          scripts/release/prepare-build-tree.sh "$version"
           echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
       - name: Checkout pinned Salvo fork
         uses: https://data.forgejo.org/actions/checkout@v6
@@ -278,7 +278,7 @@ jobs:
       - name: Resolve Aster build version
         run: |
           version="$(scripts/release/version.sh)"
-          scripts/release/prepare-python-build.sh "$version"
+          scripts/release/prepare-build-tree.sh "$version"
           echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/aster-target" >> "$GITHUB_ENV"
       - name: Checkout pinned Salvo fork
