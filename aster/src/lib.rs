@@ -57,6 +57,7 @@ pub mod crypto;
 mod error;
 pub mod grants;
 mod id;
+pub mod lease;
 mod net;
 mod node;
 mod ticket;

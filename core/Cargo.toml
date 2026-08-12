@@ -12,6 +12,7 @@ iroh-tickets = { workspace = true }
 iroh-mdns-address-lookup = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
+async-trait = "0.1"
 bytes = { workspace = true }
 anyhow = { workspace = true }
 futures-lite = { workspace = true }
