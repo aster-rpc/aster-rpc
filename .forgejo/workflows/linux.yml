@@ -1,4 +1,4 @@
-name: Linux CI and artifacts
+name: Linux and Windows CI and artifacts
 
 on:
   push:
@@ -11,6 +11,7 @@ on:
       - "cli/**"
       - "tests/python/**"
       - "tests/chaos/**"
+      - "scripts/ci/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "pyproject.toml"
@@ -25,6 +26,7 @@ on:
       - "cli/**"
       - "tests/python/**"
       - "tests/chaos/**"
+      - "scripts/ci/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "pyproject.toml"
@@ -33,7 +35,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: forgejo-linux-${{ forgejo.ref }}
+  group: forgejo-aster-build-${{ forgejo.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -47,7 +49,7 @@ env:
 
 jobs:
   lint:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: aster-linux-x64
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -78,7 +80,7 @@ jobs:
 
   test:
     needs: lint
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: aster-linux-x64
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -111,7 +113,7 @@ jobs:
 
   build-linux-wheel:
     needs: test
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: aster-linux-x64
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
         with:
@@ -148,6 +150,57 @@ jobs:
         run: |
           package_version="dev-${FORGEJO_RUN_NUMBER}"
           for artifact in dist/*; do
+            artifact_name=$(basename "$artifact")
+            curl --fail-with-body --silent --show-error \
+              --user "agents:${ASTER_PACKAGE_TOKEN}" \
+              --upload-file "$artifact" \
+              "${FORGEJO_SERVER_URL}/api/packages/Aster/generic/aster-python/${package_version}/${artifact_name}"
+          done
+
+  # Forgejo Runner is Linux-only, so this job is orchestrated by the WSL
+  # runner and invokes the native Windows toolchain through WSL interop.
+  # Host jobs have no isolation: only trusted main pushes/manual runs may use it.
+  build-windows-wheel:
+    if: forgejo.event_name != 'pull_request' && (forgejo.ref == 'refs/heads/main' || forgejo.event_name == 'workflow_dispatch')
+    needs: test
+    runs-on: aster-windows-x64
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Checkout pinned Salvo fork
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          repository: Aster/salvo
+          ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
+          path: _deps/salvo
+          token: ${{ secrets.ASTER_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Build and smoke-test native Windows wheel
+        run: |
+          # A systemd-started WSL runner has no per-shell WSL_INTEROP value.
+          # PID 1's interop socket is the stable bridge to Windows processes.
+          export WSL_INTEROP=/run/WSL/1_interop
+          repository_root=$(wslpath -w "$GITHUB_WORKSPACE")
+          build_script=$(wslpath -w "$GITHUB_WORKSPACE/scripts/ci/build-windows-wheel.ps1")
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass \
+            -File "$build_script" \
+            -RepositoryRoot "$repository_root" \
+            -CacheRoot 'D:\forgejo-runner\cache'
+      - name: Store workflow artifact on Forgejo
+        uses: https://data.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: aster-python-windows-x64-${{ forgejo.run_number }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish dev artifact to Forgejo packages
+        if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main'
+        env:
+          ASTER_PACKAGE_TOKEN: ${{ secrets.ASTER_PACKAGE_TOKEN }}
+        run: |
+          package_version="dev-${FORGEJO_RUN_NUMBER}"
+          for artifact in dist/*.whl; do
             artifact_name=$(basename "$artifact")
             curl --fail-with-body --silent --show-error \
               --user "agents:${ASTER_PACKAGE_TOKEN}" \
