@@ -3981,6 +3981,16 @@ impl CoreDoc {
         }
     }
 
+    /// Whether an entry exists for an exact `(author, key)`, INCLUDING a deletion tombstone
+    /// (an empty entry left by [`del`](Self::del)). Unlike [`get_exact`](Self::get_exact) — which
+    /// passes `include_empty = false` and so reports a tombstone as absent — this reads with
+    /// `include_empty = true` and never fetches content. It exists for insert-if-absent callers
+    /// that must treat a revoked key as permanently taken, so a tombstoned id is never resurrected.
+    pub async fn entry_exists(&self, author_hex: String, key: Vec<u8>) -> Result<bool> {
+        let author_id: AuthorId = author_hex.parse()?;
+        Ok(self.doc.get_exact(author_id, key, true).await?.is_some())
+    }
+
     pub async fn share(&self, mode: String) -> Result<String> {
         let share_mode = match mode.as_str() {
             "read" | "Read" => ShareMode::Read,
