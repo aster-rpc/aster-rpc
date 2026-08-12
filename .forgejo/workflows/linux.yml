@@ -1,0 +1,117 @@
+name: Linux CI and artifacts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "core/**"
+      - "aster/**"
+      - "ffi/**"
+      - "bindings/python/**"
+      - "cli/**"
+      - "tests/python/**"
+      - "tests/chaos/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pyproject.toml"
+      - ".forgejo/**"
+      - ".github/runner/Dockerfile"
+  pull_request:
+    paths:
+      - "core/**"
+      - "aster/**"
+      - "ffi/**"
+      - "bindings/python/**"
+      - "cli/**"
+      - "tests/python/**"
+      - "tests/chaos/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pyproject.toml"
+      - ".forgejo/**"
+      - ".github/runner/Dockerfile"
+  workflow_dispatch:
+
+concurrency:
+  group: forgejo-linux-${{ forgejo.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_DIR: /cache/sccache
+  RUSTC_WRAPPER: sccache
+  UV_CACHE_DIR: /cache/uv
+
+jobs:
+  lint:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          python3 --version
+          uv --version
+          node --version
+      - name: aster-cli compatibility
+        run: python3 scripts/check-cli-compat.py
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Rust lint
+        run: cargo clippy --workspace --all-targets --exclude aster-transport-napi -- -D warnings
+
+  test:
+    needs: lint
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - name: Rust core and FFI tests
+        run: |
+          cargo test -p aster_transport_core
+          cargo test -p aster_transport_ffi
+      - name: Python framework tests
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python \
+            pytest pytest-asyncio pytest-timeout maturin \
+            "pyfory==0.16.0" "zstandard>=0.25.0"
+          uv run --python .venv/bin/python maturin develop --release \
+            -m bindings/python/rust/Cargo.toml
+          uv pip install --python .venv/bin/python -e cli/
+          uv run --python .venv/bin/python pytest tests/python/ tests/chaos/ \
+            -v --timeout=30 -m "not network and not iroh_primitives"
+
+  build-linux-wheel:
+    needs: test
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - name: Build Linux wheel and source distribution
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python maturin
+          uv run --python .venv/bin/python maturin build --release \
+            --out dist -m bindings/python/rust/Cargo.toml
+          uv run --python .venv/bin/python maturin sdist \
+            --out dist -m bindings/python/rust/Cargo.toml
+      - name: Store workflow artifact on Forgejo
+        uses: https://data.forgejo.org/actions/upload-artifact@v4
+        with:
+          name: aster-python-linux-${{ forgejo.run_number }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish dev artifacts to Forgejo packages
+        if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main'
+        env:
+          ASTER_PACKAGE_TOKEN: ${{ secrets.ASTER_PACKAGE_TOKEN }}
+        run: |
+          package_version="dev-${FORGEJO_RUN_NUMBER}"
+          for artifact in dist/*; do
+            artifact_name=$(basename "$artifact")
+            curl --fail-with-body --silent --show-error \
+              --user "agents:${ASTER_PACKAGE_TOKEN}" \
+              --upload-file "$artifact" \
+              "${FORGEJO_SERVER_URL}/api/packages/Aster/generic/aster-python/${package_version}/${artifact_name}"
+          done
