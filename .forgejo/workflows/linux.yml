@@ -301,6 +301,14 @@ jobs:
             exit 1
           fi
           ln -sfn "$GITHUB_WORKSPACE/_deps/salvo" "$salvo_link"
+      - name: Start compiler cache with normalized job paths
+        run: |
+          # sccache reads SCCACHE_BASEDIRS when its daemon starts. The
+          # runner-specific daemon can outlive one host job, so restart the
+          # daemon (not the on-disk cache) after this job's paths are known.
+          sccache --stop-server || true
+          sccache --start-server
+          sccache --zero-stats
       - name: Build and import-test macOS arm64 wheel
         run: |
           uv venv .venv
