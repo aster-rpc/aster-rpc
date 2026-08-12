@@ -299,6 +299,17 @@ impl Doc {
             .await?)
     }
 
+    /// Whether an entry exists for an exact `(author, key)`, INCLUDING a deletion tombstone left
+    /// by [`del`](Self::del). [`get_exact`](Self::get_exact) reports a tombstone as absent; this
+    /// reports it as present (and fetches no content). For insert-if-absent callers that must
+    /// treat a revoked key as permanently taken.
+    pub async fn entry_exists(&self, author: &AuthorId, key: impl Into<Vec<u8>>) -> Result<bool> {
+        Ok(self
+            .inner
+            .entry_exists(author.as_str().to_string(), key.into())
+            .await?)
+    }
+
     /// All entries for an exact key, across authors (`limit` optional).
     pub async fn query_key_exact(
         &self,
