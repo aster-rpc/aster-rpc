@@ -20,9 +20,10 @@ root (granter)                            recipient node
 ──────────────                            ──────────────
 GrantContext { … }                        GrantContext { … }   (identical!)
 seal_namespace_grant(ctx, capability)     PolicyDoc::import_read_only(…)
-doc.set_bytes(author, grant_key(…), •)    policy.fetch_grant(prefix, my_id)
-        │                                 open_namespace_grant(my_secret, ctx, •)
-        └── policy doc replicates ──────────────┘
+GrantRecord::active(role, ver, •)         policy.fetch_grant(prefix, my_id)
+doc.set_bytes(author, grant_key(…), •)    reconcile_namespace_grant(secret, ctx, •)
+        │                                          │
+        └── policy doc replicates ────────────────┘
 ```
 
 - **`GrantContext`** binds the grant to *app label, granter, recipient,
@@ -30,6 +31,12 @@ doc.set_bytes(author, grant_key(…), •)    policy.fetch_grant(prefix, my_id)
   open must use an identical context — a grant record moved to another
   node, resource, role, or path simply fails to open. You never build the
   AAD yourself.
+- **`GrantRecord`** is the plaintext framing the envelope is published in.
+  It carries the two things a recipient needs *before* it can decrypt:
+  whether the grant is active or **explicitly revoked**, and which context
+  version sealed it. `reconcile_*` turns a record (or its absence) into a
+  [`GrantOutcome`](#6-revocation--write-a-state-dont-delete-the-key) you
+  must match on.
 - **`PolicyDoc`** reads a replicated doc through a **pinned author**. HPKE
   gives confidentiality, not sender authenticity; authenticity comes from
   only trusting records the root wrote. Aster's docs author *is* the node
@@ -54,7 +61,7 @@ someone, never read their mail.
 ## 2. Root side: seal and publish
 
 ```rust
-use aster::grants::{grant_key, seal_namespace_grant, GrantContext};
+use aster::grants::{grant_key, seal_namespace_grant, GrantContext, GrantRecord};
 use aster::{NamespaceCapability, NamespaceSecret};
 
 // The namespace being shared (e.g. a data doc the fleet should write to).
@@ -73,20 +80,31 @@ let ctx = GrantContext {
 };
 let sealed = seal_namespace_grant(&ctx, &NamespaceCapability::write(shared))?;
 
+// Publish the envelope inside a record: `1` is *your* context version — the
+// generation of `app`/AAD layout this was sealed under (see §6).
+let record = GrantRecord::active("write", 1, sealed);
+
 let docs = root_node.docs();
 let policy_doc = docs.create().await?;               // or reopen the existing one
 let author = docs.default_author().await?;           // == the root's node id
-policy_doc.set_bytes(&author, record_key.into_bytes(), sealed).await?;
+policy_doc.set_bytes(&author, record_key.into_bytes(), record.encode_fory()).await?;
 // share the policy doc read-only: policy_doc.share(ShareMode::Read)
 ```
 
 Role/capability consistency is checked at seal and open: a `Write`
-capability under `role: "read"` (or vice versa) is rejected up front.
+capability under `role: "read"` (or vice versa) is rejected up front. This
+check is on `role` alone — `resource` stays whatever you pass, including in
+the typed helpers, so bind your app's *stable* identity for the granted
+thing. Here that's the namespace id; if your namespace can rotate under a
+longer-lived object, bind that object's id and keep the context stable
+across rotations.
 
 ## 3. Recipient side: fetch and open
 
 ```rust
-use aster::grants::{grant_key, open_namespace_grant, GrantContext, PolicyDoc};
+use aster::grants::{
+    grant_key, reconcile_namespace_grant, GrantContext, GrantOutcome, PolicyDoc,
+};
 
 let docs = my_node.docs();
 let policy = PolicyDoc::import_read_only(&docs, policy_namespace_id, root_author).await?;
@@ -102,17 +120,32 @@ let ctx = GrantContext {
     role: "write",
 };
 
-if let Some(record) = policy.fetch_grant("/myapp/v1", &my_node.id()).await? {
-    let capability = open_namespace_grant(&my_identity_secret, &ctx, &record)?;
-    // Import and use the granted namespace:
-    let data_doc = match capability {
-        aster::NamespaceCapability::Write(secret) =>
-            docs.open_or_import_write_namespace(secret).await?,
-        aster::NamespaceCapability::Read(id) =>
-            docs.open_or_import_read_namespace(id).await?,
-    };
+let record = policy.fetch_grant("/myapp/v1", &my_node.id()).await?;
+match reconcile_namespace_grant(&my_identity_secret, &ctx, record.as_deref()) {
+    GrantOutcome::Active(capability) => {
+        // Import and use the granted namespace:
+        let data_doc = match capability {
+            aster::NamespaceCapability::Write(secret) =>
+                docs.open_or_import_write_namespace(secret).await?,
+            aster::NamespaceCapability::Read(id) =>
+                docs.open_or_import_read_namespace(id).await?,
+        };
+    }
+    GrantOutcome::Revoked { reason, .. } => {
+        // Drop the cached capability and tear down sessions using it.
+    }
+    GrantOutcome::Unopenable(e) => {
+        // Same action as revoked — fail closed — but alert: this is a fault.
+    }
+    GrantOutcome::Absent => {
+        // No decision yet. Keep waiting; keep whatever you already hold.
+    }
 }
 ```
+
+`open_namespace_grant` / `open_grant` are still there if you only want the
+crypto step — but `reconcile_*` is the one that can't be got wrong by
+omission, because the four cases don't collapse.
 
 Watch for changes with `policy.subscribe()`, filtering events with
 `policy.is_policy_write(&event)` — only the pinned author's inserts count as
@@ -169,15 +202,62 @@ attribution, and a compromised member exposes every group grant. Use
 individual grants where audit or differing capability sets matter; groups
 for uniform fleet-wide capabilities.
 
-## 6. Revocation — know the limit
+## 6. Revocation — write a state, don't delete the key
 
-Tombstoning a grant record (write an empty/revoked marker; recipients drop
-the capability on their next reconcile) stops an **honest** node. A
-malicious node that already learned a namespace secret still has it. True
-revocation of a leaked capability = rotate the underlying namespace and
-re-grant to the remaining nodes. Design your app's reconcile loop
-accordingly: treat "grant absent/unopenable" as "drop local capability and
-tear down sessions".
+Revoke by **overwriting the grant key** with a revoked record. Don't delete
+the key: under eventual replication an absent key is ambiguous with "hasn't
+synced yet", so a reconcile loop that treats absence as revocation tears the
+node down during its first sync, and a delete additionally relies on
+tombstone propagation to beat any replica still serving the old entry. An
+explicit state arrives unambiguously, carries a reason, and is auditable.
+
+```rust
+policy_doc.set_bytes(
+    &author,
+    grant_key("/myapp/v1", &node).into_bytes(),   // the SAME key
+    GrantRecord::revoked("write", "node decommissioned").encode_fory(),
+).await?;
+```
+
+A revoked record must carry an empty envelope — `decode_fory` rejects one
+that doesn't, so revocation can never ship openable material by accident.
+
+`reconcile_*` returns the resulting rule as four cases you have to match:
+
+| Outcome | Meaning | Do |
+|---|---|---|
+| `Active(cap)` | grant in force | apply / refresh the capability |
+| `Revoked { reason, role }` | granter withdrew it | drop the capability, tear down sessions |
+| `Unopenable(err)` | present but unusable | same drop — fail closed — **and alert**; this is a fault, not a decision |
+| `Absent` | no record at the key | nothing yet; keep waiting, keep what you hold |
+
+`outcome.drops_capability()` is the two-case shorthand if you don't need to
+distinguish revocation from fault.
+
+### Migrating the AAD layout
+
+`GrantRecord.context_version` is plaintext, so a recipient picks the
+`GrantContext` to open with *before* decrypting. Without it the app label
+lives only inside the AAD and the only way to span two generations is trial
+decryption — guessing on a security boundary. Decode first, select, then
+open:
+
+```rust
+let record = GrantRecord::decode_fory(&bytes)?;
+let ctx = match record.context_version { 1 => &v1_ctx, 2 => &v2_ctx, _ => bail!(…) };
+reconcile_namespace_grant(&my_identity_secret, ctx, Some(&bytes))
+```
+
+Roll forward rather than dual-reading indefinitely: teach recipients to open
+both versions, re-seal every active grant to the new one, then drop the old.
+Grants are derived state — the granter still holds the namespace secrets and
+can re-seal the fleet on command — and an open-ended window leaves a
+downgrade surface.
+
+Know the limit either way: this stops an **honest** node. A malicious node
+that already learned a namespace secret still has it. True revocation of a
+leaked capability = rotate the underlying namespace and re-grant to the
+remaining nodes.
 
 Design background and roadmap (reconcile-loop helper, standalone-key policy
 records, namespace rotation): `docs/_internal/aster-sealed-grants.md`.

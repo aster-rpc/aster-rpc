@@ -179,6 +179,10 @@ node.topology()
     .await?;
 ```
 
+(Sealing and opening are shown back to back here. When you actually publish
+the grant into a policy doc, wrap `sealed` in a `GrantRecord` and read it
+back with `reconcile_namespace_grant` — see the sealed-grants guide.)
+
 From then on the node heartbeats its `position` record and one RTT-edge
 half per measured peer into the doc, and derives the swarm view locally:
 

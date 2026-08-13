@@ -4,6 +4,7 @@ pub mod canonical;
 pub mod contract;
 pub mod datagram;
 pub mod framing;
+pub mod grant_record;
 pub mod hpke_envelope;
 pub mod lease;
 pub mod namespace;

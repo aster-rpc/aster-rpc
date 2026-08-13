@@ -3,8 +3,8 @@
 //! role consistency, and pinned-author PolicyDoc reads.
 
 use aster::grants::{
-    grant_key, open_grant, open_namespace_grant, seal_grant, seal_namespace_grant, GrantContext,
-    PolicyDoc,
+    grant_key, open_grant, open_namespace_grant, reconcile_grant, reconcile_namespace_grant,
+    seal_grant, seal_namespace_grant, GrantContext, GrantOutcome, GrantRecord, PolicyDoc,
 };
 use aster::{AsterConfig, NamespaceCapability, NamespaceSecret, Node, RelayMode, SecretKey};
 
@@ -203,6 +203,194 @@ async fn grant_flow_over_policy_doc() {
     let capability = open_namespace_grant(&recipient_secret, &ctx, &fetched).unwrap();
     assert!(capability.can_write());
     assert_eq!(capability.namespace_id(), namespace_id);
+
+    root.shutdown().await;
+}
+
+#[test]
+fn reconcile_distinguishes_absent_from_revoked() {
+    // The rule this API exists to make unmissable: absence is not revocation.
+    let (_, root_id) = node_identity();
+    let (recipient_secret, recipient_id) = node_identity();
+
+    let namespace = fresh_namespace();
+    let namespace_id = namespace.id();
+    let key = grant_key("/app/v1", &recipient_id);
+    let ctx = GrantContext {
+        app: "app/data-grant/v1",
+        granter: &root_id,
+        recipient: &recipient_id,
+        resource: &namespace_id.to_bytes(),
+        path: &key,
+        role: "write",
+    };
+
+    // Nothing published yet — a node in this state must keep waiting, not tear
+    // itself down. This is the initial-sync case a delete-based scheme breaks.
+    let absent = reconcile_namespace_grant(&recipient_secret, &ctx, None);
+    assert!(matches!(absent, GrantOutcome::Absent));
+    assert!(!absent.drops_capability());
+
+    // Active.
+    let sealed = seal_namespace_grant(&ctx, &NamespaceCapability::write(namespace)).unwrap();
+    let active_record = GrantRecord::active("write", 1, sealed).encode_fory();
+    let active = reconcile_namespace_grant(&recipient_secret, &ctx, Some(&active_record));
+    assert!(!active.drops_capability());
+    let capability = active.active().expect("active grant opens");
+    assert!(capability.can_write());
+    assert_eq!(capability.namespace_id(), namespace_id);
+
+    // Revoked — an explicit value written at the same key, carrying a reason.
+    let revoked_record = GrantRecord::revoked("write", "node decommissioned").encode_fory();
+    let revoked = reconcile_namespace_grant(&recipient_secret, &ctx, Some(&revoked_record));
+    assert!(revoked.drops_capability());
+    match revoked {
+        GrantOutcome::Revoked { reason, role } => {
+            assert_eq!(reason, "node decommissioned");
+            assert_eq!(role, "write");
+        }
+        other => panic!("expected Revoked, got {other:?}"),
+    }
+}
+
+#[test]
+fn reconcile_fails_closed_on_unopenable_records() {
+    let (_, root_id) = node_identity();
+    let (recipient_secret, recipient_id) = node_identity();
+    let key = grant_key("/app/v1", &recipient_id);
+    let ctx = GrantContext {
+        app: "app/data-grant/v1",
+        granter: &root_id,
+        recipient: &recipient_id,
+        resource: b"resource",
+        path: &key,
+        role: "write",
+    };
+
+    // Garbage framing.
+    let garbage = reconcile_grant(&recipient_secret, &ctx, Some(b"not a grant record"));
+    assert!(garbage.drops_capability());
+    assert!(matches!(garbage, GrantOutcome::Unopenable(_)));
+
+    // Well-framed, but sealed to somebody else — the AAD binding fails.
+    let (_, other_id) = node_identity();
+    let other_ctx = GrantContext {
+        recipient: &other_id,
+        ..ctx.clone()
+    };
+    let sealed_elsewhere = seal_grant(&other_ctx, b"secret").unwrap();
+    let record = GrantRecord::active("write", 1, sealed_elsewhere).encode_fory();
+    let wrong = reconcile_grant(&recipient_secret, &ctx, Some(&record));
+    assert!(wrong.drops_capability());
+    assert!(matches!(wrong, GrantOutcome::Unopenable(_)));
+
+    // A role the context doesn't expect is reported as a role mismatch rather
+    // than an opaque decrypt failure.
+    let sealed = seal_grant(&ctx, b"secret").unwrap();
+    let mislabelled = GrantRecord::active("read", 1, sealed).encode_fory();
+    match reconcile_grant(&recipient_secret, &ctx, Some(&mislabelled)) {
+        GrantOutcome::Unopenable(e) => {
+            assert!(e.to_string().contains("role"), "got: {e}");
+        }
+        other => panic!("expected Unopenable, got {other:?}"),
+    }
+}
+
+#[test]
+fn context_version_selects_the_aad_without_trial_decryption() {
+    // Two AAD generations coexist during a migration window. The plaintext
+    // context_version picks the right one; nothing is trial-decrypted.
+    let (_, root_id) = node_identity();
+    let (recipient_secret, recipient_id) = node_identity();
+    let key = grant_key("/app/v1", &recipient_id);
+
+    let ctx_for = |app| GrantContext {
+        app,
+        granter: &root_id,
+        recipient: &recipient_id,
+        resource: b"resource",
+        path: &key,
+        role: "write",
+    };
+    let v1 = ctx_for("app/data-grant/v1");
+    let v2 = ctx_for("app/data-grant/v2");
+
+    let record = GrantRecord::active("write", 2, seal_grant(&v2, b"secret").unwrap()).encode_fory();
+
+    // A reader that never inspects the version and guesses v1 fails closed.
+    assert!(reconcile_grant(&recipient_secret, &v1, Some(&record)).drops_capability());
+
+    // Reading the version first selects the context that works.
+    let decoded = GrantRecord::decode_fory(&record).unwrap();
+    let ctx = match decoded.context_version {
+        1 => &v1,
+        2 => &v2,
+        other => panic!("unknown context version {other}"),
+    };
+    let opened = reconcile_grant(&recipient_secret, ctx, Some(&record))
+        .active()
+        .expect("versioned context opens");
+    assert_eq!(opened.expose_secret(), b"secret");
+}
+
+#[tokio::test]
+async fn revocation_over_policy_doc_overwrites_the_key() {
+    // End-to-end: the root revokes by overwriting the grant key with a revoked
+    // record — the key stays present, so the recipient's next reconcile reads a
+    // decision rather than an absence it would have to guess about.
+    let root = Node::start(cfg()).await.unwrap();
+    let docs = root.docs();
+    let doc = docs.create().await.unwrap();
+    let root_author = docs.default_author().await.unwrap();
+
+    let (recipient_secret, recipient_id) = node_identity();
+    let shared_namespace = fresh_namespace();
+    let namespace_id = shared_namespace.id();
+    let prefix = "/app/v1";
+    let key = grant_key(prefix, &recipient_id);
+    let ctx = GrantContext {
+        app: "app/grant/v1",
+        granter: &root.id(),
+        recipient: &recipient_id,
+        resource: &namespace_id.to_bytes(),
+        path: &key,
+        role: "write",
+    };
+
+    let sealed = seal_namespace_grant(&ctx, &NamespaceCapability::write(shared_namespace)).unwrap();
+    doc.set_bytes(
+        &root_author,
+        key.clone().into_bytes(),
+        GrantRecord::active("write", 1, sealed).encode_fory(),
+    )
+    .await
+    .unwrap();
+
+    let policy = PolicyDoc::wrap(doc.clone(), root_author.clone());
+    let fetched = policy.fetch_grant(prefix, &recipient_id).await.unwrap();
+    assert!(
+        reconcile_namespace_grant(&recipient_secret, &ctx, fetched.as_deref())
+            .active()
+            .is_some()
+    );
+
+    // Revoke in place.
+    doc.set_bytes(
+        &root_author,
+        key.clone().into_bytes(),
+        GrantRecord::revoked("write", "rotated").encode_fory(),
+    )
+    .await
+    .unwrap();
+
+    let fetched = policy
+        .fetch_grant(prefix, &recipient_id)
+        .await
+        .unwrap()
+        .expect("revocation is a record, so the key is still present");
+    let outcome = reconcile_namespace_grant(&recipient_secret, &ctx, Some(&fetched));
+    assert!(outcome.drops_capability());
+    assert!(matches!(outcome, GrantOutcome::Revoked { .. }));
 
     root.shutdown().await;
 }

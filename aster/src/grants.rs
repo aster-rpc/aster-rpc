@@ -9,7 +9,7 @@
 //! identity secret — no pairwise RPC, no requirement that granter and
 //! recipient are online together.
 //!
-//! Three composable pieces:
+//! Four composable pieces:
 //!
 //! - [`GrantContext`] + [`seal_grant`] / [`open_grant`] — the crypto with the
 //!   AAD discipline built in. The context binds *app label, granter,
@@ -19,6 +19,9 @@
 //! - [`seal_namespace_grant`] / [`open_namespace_grant`] — the typed
 //!   convenience for the common payload, with role/capability consistency
 //!   checked at both ends.
+//! - [`GrantRecord`] + [`reconcile_grant`] / [`reconcile_namespace_grant`] —
+//!   the record framing an envelope is published in (explicit state, plaintext
+//!   context version) and the reconcile decision over it. See *Revocation*.
 //! - [`PolicyDoc`] — pinned-author reads over a replicated doc. HPKE Base
 //!   gives confidentiality only, **not sender authenticity**; authenticity
 //!   comes from reading records via `get_exact(<root author>, key)` and
@@ -36,18 +39,30 @@
 //! [`open_grant_with_key`] — and keep the two schemes explicit; a grant
 //! sealed to a key the recipient doesn't use fails only at open time.
 //!
-//! ## Revocation honesty limit
+//! ## Revocation
 //!
-//! Deleting/tombstoning a grant record only stops an **honest** recipient — a
-//! malicious node that already learned a namespace secret keeps it. True
-//! revocation of a leaked capability requires rotating the underlying
-//! namespace and re-granting.
+//! Revoke by writing [`GrantRecord::revoked`] at the grant key, not by
+//! deleting the key. Under eventual replication an absent key is ambiguous —
+//! it reads the same as "not synced yet", so a recipient that treats absence
+//! as revocation tears itself down during initial sync, and a delete relies
+//! on tombstone propagation to beat any replica still holding the old entry.
+//! An explicit state is unambiguous on arrival, carries a reason, and is
+//! auditable.
+//!
+//! [`reconcile_grant`] returns that rule as a [`GrantOutcome`] you have to
+//! match on, so it can't be got wrong by omission: *revoked* and *unopenable*
+//! both drop the capability, *absent* is not a decision.
+//!
+//! Either way this only stops an **honest** recipient — a malicious node that
+//! already learned a namespace secret keeps it. True revocation of a leaked
+//! capability requires rotating the underlying namespace and re-granting.
 
 use crate::crypto::{hpke_x25519_public_from_node_id, hpke_x25519_secret_from_identity};
 use crate::error::{Error, Result};
 use crate::id::{NamespaceCapability, NodeId, SecretKey};
 use crate::{hpke_open, hpke_seal, HpkeEnvelope};
 
+pub use aster_transport_core::grant_record::{GrantRecord, GrantState, GRANT_RECORD_VERSION};
 pub use aster_transport_core::namespace::DecryptedCapabilityPayload;
 
 /// Domain-separation label baked into every grant AAD. Versioned: changing
@@ -66,7 +81,12 @@ pub struct GrantContext<'a> {
     pub granter: &'a NodeId,
     /// The one node this grant is addressed to.
     pub recipient: &'a NodeId,
-    /// What the sealed capability unlocks (e.g. the namespace id bytes).
+    /// What the sealed capability unlocks — **caller-chosen opaque bytes**,
+    /// not interpreted by Aster and not tied to the payload type. The
+    /// namespace id is the obvious choice when the namespace *is* the durable
+    /// thing; when it can rotate under a longer-lived object, bind that
+    /// object's stable id instead, so re-sealing after a rotation keeps the
+    /// same context. The typed helpers below impose no constraint here.
     pub resource: &'a [u8],
     /// The exact doc key the grant record is written at.
     pub path: &'a str,
@@ -184,6 +204,114 @@ pub fn open_namespace_grant(
     let capability = NamespaceCapability::decode_fory(payload.expose_secret())?;
     check_role(ctx, &capability)?;
     Ok(capability)
+}
+
+// ── Reconcile: the revocation rule as a type ──────────────────────────────────
+
+/// What a reconcile loop should do with the record (or absence of one) at a
+/// grant key. Returned instead of a `Result` because every failure mode is a
+/// decision: there is no case where ignoring the outcome is correct.
+#[derive(Debug)]
+pub enum GrantOutcome<T> {
+    /// Active and opened — apply or refresh the capability.
+    Active(T),
+    /// Explicitly revoked by the granter. Drop the cached capability and tear
+    /// down sessions using it.
+    Revoked {
+        /// The granter's stated reason (may be empty).
+        reason: String,
+        /// The role the revoked grant carried, for display.
+        role: String,
+    },
+    /// A record is present but could not be turned into a capability — bad
+    /// framing, a context mismatch, or a failed decrypt. Fail closed: drop the
+    /// capability exactly as for [`GrantOutcome::Revoked`], and surface the
+    /// error, because unlike revocation this is a fault worth alerting on.
+    Unopenable(Error),
+    /// No record at the key. **Not** revocation — under eventual replication
+    /// this is indistinguishable from "hasn't synced yet". Keep waiting, and
+    /// keep any capability already held.
+    Absent,
+}
+
+impl<T> GrantOutcome<T> {
+    /// Whether this outcome means "stop using the capability now" — true for
+    /// [`Revoked`](GrantOutcome::Revoked) and [`Unopenable`](GrantOutcome::Unopenable),
+    /// false for [`Active`](GrantOutcome::Active) and [`Absent`](GrantOutcome::Absent).
+    pub fn drops_capability(&self) -> bool {
+        matches!(
+            self,
+            GrantOutcome::Revoked { .. } | GrantOutcome::Unopenable(_)
+        )
+    }
+
+    /// The opened capability, if the grant is active.
+    pub fn active(self) -> Option<T> {
+        match self {
+            GrantOutcome::Active(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// Decide what to do with the record at `ctx.path`, opening the raw payload if
+/// the grant is active. Pass `None` when the key has no record.
+///
+/// Apps with more than one AAD version should decode the record first
+/// ([`GrantRecord::decode_fory`]), read `context_version`, build the matching
+/// `ctx`, then pass the same bytes here — never trial-decrypt across contexts.
+pub fn reconcile_grant(
+    identity_secret: &SecretKey,
+    ctx: &GrantContext<'_>,
+    record: Option<&[u8]>,
+) -> GrantOutcome<DecryptedCapabilityPayload> {
+    reconcile(record, ctx, |envelope| {
+        open_grant(identity_secret, ctx, envelope)
+    })
+}
+
+/// [`reconcile_grant`] for the typed namespace payload, re-checking
+/// role/capability consistency as [`open_namespace_grant`] does.
+pub fn reconcile_namespace_grant(
+    identity_secret: &SecretKey,
+    ctx: &GrantContext<'_>,
+    record: Option<&[u8]>,
+) -> GrantOutcome<NamespaceCapability> {
+    reconcile(record, ctx, |envelope| {
+        open_namespace_grant(identity_secret, ctx, envelope)
+    })
+}
+
+fn reconcile<T>(
+    record: Option<&[u8]>,
+    ctx: &GrantContext<'_>,
+    open: impl FnOnce(&[u8]) -> Result<T>,
+) -> GrantOutcome<T> {
+    let Some(bytes) = record else {
+        return GrantOutcome::Absent;
+    };
+    let record = match GrantRecord::decode_fory(bytes) {
+        Ok(record) => record,
+        Err(e) => return GrantOutcome::Unopenable(Error::Transport(e)),
+    };
+    if !record.is_active() {
+        return GrantOutcome::Revoked {
+            reason: record.reason,
+            role: record.role,
+        };
+    }
+    // The role is also in the AAD, so a mismatch would fail the decrypt — but
+    // as a plaintext field it can say so precisely instead of "decrypt failed".
+    if record.role != ctx.role {
+        return GrantOutcome::Unopenable(Error::InvalidArgument(format!(
+            "grant record role '{}' does not match the context role '{}'",
+            record.role, ctx.role,
+        )));
+    }
+    match open(&record.envelope) {
+        Ok(value) => GrantOutcome::Active(value),
+        Err(e) => GrantOutcome::Unopenable(e),
+    }
 }
 
 /// The conventional **doc entry key** for a grant record:
