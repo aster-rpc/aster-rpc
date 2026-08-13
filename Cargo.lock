@@ -2629,7 +2629,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b15ae8071384f2643b46600ccfebbc2f4d36b6e9#b15ae8071384f2643b46600ccfebbc2f4d36b6e9"
 dependencies = [
  "backon",
  "blake3",
@@ -2679,7 +2679,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b15ae8071384f2643b46600ccfebbc2f4d36b6e9#b15ae8071384f2643b46600ccfebbc2f4d36b6e9"
 dependencies = [
  "curve25519-dalek 5.0.0-rc.0",
  "data-encoding",
@@ -2697,7 +2697,7 @@ dependencies = [
 [[package]]
 name = "iroh-blobs"
 version = "0.103.1"
-source = "git+https://forge.emrul.dev/Aster/iroh-blobs.git?rev=7e0da6f72729a78cd01d4f7ebed776cc524a2ff5#7e0da6f72729a78cd01d4f7ebed776cc524a2ff5"
+source = "git+https://forge.emrul.dev/Aster/iroh-blobs.git?rev=dfac111c61946c970c5a98e79112957f94291bc3#dfac111c61946c970c5a98e79112957f94291bc3"
 dependencies = [
  "arrayvec",
  "bao-tree",
@@ -2737,7 +2737,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b15ae8071384f2643b46600ccfebbc2f4d36b6e9#b15ae8071384f2643b46600ccfebbc2f4d36b6e9"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -2760,7 +2760,7 @@ dependencies = [
 [[package]]
 name = "iroh-docs"
 version = "0.101.0"
-source = "git+https://forge.emrul.dev/Aster/iroh-docs.git?rev=2f3f3df834dfe6ce83f052c9c94ef80db2f5627c#2f3f3df834dfe6ce83f052c9c94ef80db2f5627c"
+source = "git+https://forge.emrul.dev/Aster/iroh-docs.git?rev=d9c091511de89a3e1310b23072804118822cebb6#d9c091511de89a3e1310b23072804118822cebb6"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2799,7 +2799,7 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.101.0"
-source = "git+https://forge.emrul.dev/Aster/iroh-gossip.git?rev=76492e4cf8a745cae27ea57fb8a30d42ab675498#76492e4cf8a745cae27ea57fb8a30d42ab675498"
+source = "git+https://forge.emrul.dev/Aster/iroh-gossip.git?rev=5c021f998a172b81a69669e71786e14a339fa963#5c021f998a172b81a69669e71786e14a339fa963"
 dependencies = [
  "blake3",
  "bytes",
@@ -2884,7 +2884,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b15ae8071384f2643b46600ccfebbc2f4d36b6e9#b15ae8071384f2643b46600ccfebbc2f4d36b6e9"
 dependencies = [
  "blake3",
  "bytes",
