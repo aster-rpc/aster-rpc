@@ -15,35 +15,35 @@ interceptors, and cross-binding contract publication).
 
 ## 1. Add the dependency
 
-`aster` is distributed as a git dependency and pins patched `iroh`/`noq` forks.
-Both the dependency **and** the `[patch.crates-io]` block are required — patches
-do not propagate across crates.
+Released Rust crates are distributed from Aster's public Forgejo Cargo registry.
+Configure the registry in `.cargo/config.toml` and select one released Aster
+version:
 
 ```toml
-[dependencies]
-aster = { git = "https://github.com/aster-rpc/aster-rpc-internal", branch = "main", features = ["rpc"] }
-
-[patch.crates-io]
-# Copy this block verbatim from this repo's root Cargo.toml (the fork revs change
-# over time). Without it, iroh/noq won't resolve to the Aster forks.
-iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "…" }
-iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "…" }
-iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "…" }
-iroh-blobs  = { git = "https://github.com/aster-rpc/iroh-blobs",  rev = "…" }
-iroh-docs   = { git = "https://github.com/aster-rpc/iroh-docs",   rev = "…" }
-iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "…" }
-noq         = { git = "https://github.com/aster-rpc/noq",         rev = "…" }
-noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "…" }
-noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "…" }
+# .cargo/config.toml
+[registries.aster]
+index = "sparse+https://forge.emrul.dev/api/packages/Aster/cargo/"
 ```
+
+```toml
+# Cargo.toml
+[dependencies]
+aster = { version = "0.3", registry = "aster", features = ["rpc"] }
+```
+
+Commit `Cargo.lock` in applications so the resolved patch is reproducible.
+Consumers do not copy Aster's fork pins. See
+[Consuming the Aster Rust SDK](rust-sdk-consumer-guide.md)
+for registry bootstrap status, native Iroh/Fory/Salvo interop, version policy,
+and the maintainer-only private-Git fallback.
 
 To define **typed RPC payloads** you also need the Apache Fory derive in scope
 (the `#[derive(ForyStruct)]` macro expands to `::fory_core::` paths, so both
 crates must be direct dependencies):
 
 ```toml
-fory-core   = "1.3"
-fory-derive = "1.3"
+fory-core   = "=1.3.0"
+fory-derive = "=1.3.0"
 ```
 
 ---

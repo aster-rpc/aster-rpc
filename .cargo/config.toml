@@ -1,0 +1,5 @@
+# Public Aster source-crate registry. Reading packages must remain anonymous;
+# only maintainers publishing releases configure a token.
+[registries.aster]
+index = "sparse+https://forge.emrul.dev/api/packages/Aster/cargo/"
+credential-provider = "cargo:token"

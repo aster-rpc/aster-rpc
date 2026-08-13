@@ -175,6 +175,25 @@ impl Docs {
         Self { inner }
     }
 
+    /// Clone the live Iroh Docs protocol handle behind this facade.
+    ///
+    /// It shares the replica, blob store and router owned by the Aster node.
+    /// Do not call its `shutdown`; [`crate::Node`] owns its lifecycle.
+    pub fn native_docs(&self) -> crate::native::iroh_docs::protocol::Docs {
+        self.inner.inner.clone()
+    }
+
+    /// Clone the Iroh Blobs store shared by Docs and [`crate::Blobs`]. Do not
+    /// call the native store's `shutdown`; [`crate::Node`] owns its lifecycle.
+    pub fn native_store(&self) -> crate::native::iroh_blobs::api::Store {
+        self.inner.store.clone()
+    }
+
+    /// Clone the Iroh endpoint used by Docs synchronization.
+    pub fn native_endpoint(&self) -> crate::native::iroh::Endpoint {
+        self.inner.endpoint.clone()
+    }
+
     /// Create a new document with a fresh random namespace.
     pub async fn create(&self) -> Result<Doc> {
         Ok(Doc::new(self.inner.create().await?))

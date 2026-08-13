@@ -41,11 +41,11 @@
 //! ([`Node::take_admission`]) additionally requires the node to be started with
 //! [`AsterConfigBuilder::hooks(true)`].
 //!
-//! ## Dependency note
+//! ## Native interop
 //!
-//! Aster pins iroh / noq to patched forks. An external Rust project depending on
-//! this crate via git **must** copy the `[patch.crates-io]` block from the repo
-//! root `Cargo.toml` into its own — see the crate README.
+//! The facade is the stable entry point. Advanced Rust consumers can use
+//! [`native`] for the exact Iroh, Fory and (when enabled) Salvo crates carried
+//! by this release, plus clone-cheap handles to the running node.
 
 // Lets `#[derive(aster::AsterType)]` (which emits `::aster::…` paths) be used on
 // types defined inside this crate itself, e.g. `rpc::Empty`.
@@ -61,6 +61,7 @@ mod error;
 pub mod grants;
 mod id;
 pub mod lease;
+pub mod native;
 mod net;
 mod node;
 mod ticket;

@@ -22,3 +22,8 @@ pub mod control;
 pub mod edge;
 pub mod node;
 pub mod relay;
+
+/// The exact Salvo crate used by the public edge, for composing Aster routes
+/// into a larger Salvo application without resolving a second Salvo source.
+#[cfg(feature = "edge")]
+pub use salvo;

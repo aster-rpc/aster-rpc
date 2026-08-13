@@ -2,6 +2,7 @@
 name = "aster_transport_ffi"
 version = "0.3.0"
 edition = "2021"
+publish = false
 
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -11,7 +12,7 @@ name = "soak_test_runner"
 path = "src/bin/soak_test_runner/main.rs"
 
 [dependencies]
-aster_transport_core = { path = "../core" }
+aster_transport_core = { path = "../core", version = "=0.3.0" }
 iroh = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

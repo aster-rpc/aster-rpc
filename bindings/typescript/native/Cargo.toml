@@ -4,12 +4,13 @@ version = "0.3.0"
 edition = "2021"
 description = "NAPI-RS bindings for Aster transport (Iroh P2P)"
 license = "Apache-2.0"
+publish = false
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-aster_transport_core = { path = "../../../core" }
+aster_transport_core = { path = "../../../core", version = "=0.3.0" }
 napi = { version = "2", default-features = false, features = ["async", "napi9"] }
 napi-derive = { version = "2", features = ["type-def"] }
 tokio = { workspace = true }

@@ -31,6 +31,11 @@
 //!
 //! Aster owns `/aster/*`; nest [`router`] into your own Salvo app.
 
+/// The exact Salvo crate used by this transport. Prefer this re-export for
+/// composing routers and services; add the same registry crate directly only
+/// when a Salvo proc macro requires an extern-prelude `salvo` name.
+pub use salvo;
+
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 

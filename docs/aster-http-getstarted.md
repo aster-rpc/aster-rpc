@@ -18,35 +18,23 @@ is transport-agnostic.
 
 ```toml
 [dependencies]
-aster = { git = "https://github.com/aster-rpc/aster-rpc-internal", branch = "main", features = ["rpc"] }
-aster-transport-salvo = { git = "https://github.com/aster-rpc/aster-rpc-internal", branch = "main" }
+aster = { version = "0.3", registry = "aster", features = ["rpc"] }
+aster-transport-salvo = { version = "0.3", registry = "aster" }
 
 # Typed payloads (as in the core guide):
-fory-core   = "1.3"
-fory-derive = "1.3"
+fory-core   = "=1.3.0"
+fory-derive = "=1.3.0"
 
 # Only if you serve the browser JSON projection (see §5):
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
-The HTTP transport uses the **Aster Salvo fork** (it carries the WebTransport
-stream-control surface and a raw-quinn accessor). Copy this into your
-`[patch.crates-io]` **in addition to** the iroh/noq block from the core guide —
-pin the same rev across your whole workspace:
-
-```toml
-[patch.crates-io]
-# ... the iroh / noq block from the core guide ...
-salvo        = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-salvo_core   = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-salvo_macros = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-# Propagation gotcha: [patch.crates-io] doesn't cross workspaces, so re-declare
-# the vendored h3 stack the fork patches internally:
-salvo-http3  = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-h3           = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-h3-quinn     = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-```
+Configure the `aster` registry as shown in the
+[Rust SDK consumer guide](rust-sdk-consumer-guide.md). The transport reexports
+its exact fork as `aster_transport_salvo::salvo`; add `salvo` directly from the
+Aster registry only when a Salvo proc macro or extra supported feature requires
+an extern-prelude dependency.
 
 > A crypto provider: with only one TLS stack in your binary, rustls auto-selects
 > it. If you also link another (e.g. `reqwest`, `wtransport`), install one once

@@ -51,6 +51,18 @@ packages = {
     "bindings/typescript/native/Cargo.toml": "aster-transport-napi",
 }
 
+# Every local dependency that survives packaging needs a version. Keep these
+# in lockstep with the package versions stamped above; Cargo uses the path in a
+# checkout and the version from the target registry in a published `.crate`.
+versioned_path_dependencies = {
+    "ffi/Cargo.toml": ["aster_transport_core"],
+    "aster/Cargo.toml": ["aster_transport_core", "aster-expose", "aster-macros"],
+    "aster-expose/Cargo.toml": ["aster_transport_core"],
+    "aster-transport-salvo/Cargo.toml": ["aster", "aster_transport_core"],
+    "bindings/python/rust/Cargo.toml": ["aster_transport_core"],
+    "bindings/typescript/native/Cargo.toml": ["aster_transport_core"],
+}
+
 package_block_re = re.compile(
     r"(?ms)^\[package\]\s*$.*?(?=^\[|\Z)"
 )
@@ -85,26 +97,24 @@ for relative, expected_name in packages.items():
     updated_block = version_line_re.sub(rf"\g<1>{version}\g<3>", block, count=1)
     text = text[: block_match.start()] + updated_block + text[block_match.end() :]
 
-    # Versioned path dependencies must agree with the package versions. Most
-    # internal paths omit a version; these two intentionally declare one.
-    if relative == "aster/Cargo.toml":
-        for dependency in ("aster-expose", "aster-macros"):
-            dependency_re = re.compile(
-                rf'(?m)^(\s*{re.escape(dependency)}\s*=\s*\{{[^\n]*'
-                rf'\bversion\s*=\s*")([^"]+)("[^\n]*\}}\s*)$'
+    for dependency in versioned_path_dependencies.get(relative, []):
+        dependency_re = re.compile(
+            rf'(?m)^(\s*{re.escape(dependency)}\s*=\s*\{{[^\n]*'
+            rf'\bversion\s*=\s*")([^"]+)("[^\n]*\}}\s*)$'
+        )
+        matches = list(dependency_re.finditer(text))
+        if not matches:
+            raise SystemExit(
+                f"expected a versioned {dependency} path dependency in {relative}"
             )
-            matches = list(dependency_re.finditer(text))
-            if len(matches) != 1:
+        for match in matches:
+            current = match.group(2)
+            if current not in {f"={baseline}", f"={version}"}:
                 raise SystemExit(
-                    f"expected one versioned {dependency} path dependency in {relative}"
+                    f"expected {dependency} dependency version ={baseline} "
+                    f"(or ={version}), found {current}"
                 )
-            current = matches[0].group(2)
-            if current not in {baseline, version}:
-                raise SystemExit(
-                    f"expected {dependency} dependency version {baseline} "
-                    f"(or {version}), found {current}"
-                )
-            text = dependency_re.sub(rf"\g<1>{version}\g<3>", text, count=1)
+        text = dependency_re.sub(rf"\g<1>={version}\g<3>", text)
 
     path.write_text(text)
 
