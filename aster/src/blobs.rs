@@ -155,12 +155,15 @@ impl FetchReport {
             .map(|p| &p.node_id)
     }
 
-    /// Payload bytes successfully decoded from providers during this fetch.
+    /// Payload bytes pulled off the wire during this fetch: the sum of what
+    /// each provider attempt successfully decoded.
     ///
     /// Excludes protocol overhead and anything that was already resident
     /// locally. A provider that transferred part of a blob before failing is
-    /// counted up to its last valid chunk, so each byte is counted once even
-    /// when the fetch failed over between providers.
+    /// counted up to its last valid chunk, and the next provider resumes from
+    /// what is already stored, so ordinary failover counts each byte once —
+    /// but this is a transfer metric, not a content size: a range that was
+    /// decoded and then failed to be stored is re-fetched and counted again.
     pub fn bytes_transferred(&self) -> u64 {
         self.bytes_transferred
     }

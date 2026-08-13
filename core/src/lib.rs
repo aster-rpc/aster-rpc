@@ -316,10 +316,14 @@ pub struct CoreFetchReport {
     /// Providers in the order they were first attempted; repeated uses of one
     /// id are aggregated into a single entry.
     pub providers: Vec<CoreProviderOutcome>,
-    /// Payload bytes successfully decoded from providers during this fetch.
-    /// Excludes protocol overhead and data that was already resident locally.
-    /// A provider that transferred part of a blob before failing is counted up
-    /// to its last valid chunk, so each byte is counted once across failover.
+    /// Payload bytes pulled off the wire during this fetch: the sum of what
+    /// each provider attempt successfully decoded. Excludes protocol overhead
+    /// and data that was already resident locally. A provider that transferred
+    /// part of a blob before failing is counted up to its last valid chunk and
+    /// the next resumes from what is stored, so ordinary failover counts each
+    /// byte once — but this is a transfer metric, not a content size: a range
+    /// that was decoded and then failed to be stored is counted again when it
+    /// is re-fetched.
     pub bytes_transferred: u64,
 }
 

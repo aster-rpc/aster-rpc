@@ -56,8 +56,8 @@ registry_bridge_crates = [
 [forks.iroh-blobs]
 repo = "https://forge.emrul.dev/Aster/iroh-blobs.git"
 upstream_base = "v0.103.0"
-tag = "aster-iroh-blobs-v0.103.0-p2"
-commit = "1f01a0878384b4c0fab343319e88fb1acb7bb27b"
+tag = "aster-iroh-blobs-v0.103.0-p3"
+commit = "a892b9e3192dd9d450f38eeae6498e14acc0cde3"
 branch = "upgrade/iroh-blobs-v0.103"
 crates = ["iroh-blobs"]
 registry_crates = ["iroh-blobs"]
@@ -189,7 +189,7 @@ patch_crates_io = """
 iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "5228d64d91b10ef5f5bc9fcf8855b7774102cfc9" }
 iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "5228d64d91b10ef5f5bc9fcf8855b7774102cfc9" }
 iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "5228d64d91b10ef5f5bc9fcf8855b7774102cfc9" }
-iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "1f01a0878384b4c0fab343319e88fb1acb7bb27b" }
+iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "a892b9e3192dd9d450f38eeae6498e14acc0cde3" }
 iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "2f3f3df834dfe6ce83f052c9c94ef80db2f5627c" }
 iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "76492e4cf8a745cae27ea57fb8a30d42ab675498" }
 noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
