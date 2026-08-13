@@ -10,22 +10,34 @@ to hand Aster an ordered list. Ranking stays Portal's; ordered *consumption*
 plus a truthful report is what Aster gained.
 
 Pins: `iroh-blobs` moved from `60d098c9` to `7e0da6f7`
-(`aster-iroh-blobs-v0.103.1`), and its **crate version moved 0.103.0 →
-0.103.1**. That bump is load-bearing, not cosmetic: the Aster registry holds an
-immutable `iroh-blobs 0.103.0` built from the pre-multifetch source, and
-`publish-native-stack.py` skips an already-published version, so shipping this
-under 0.103.0 would publish an `aster` that resolves a registry `iroh-blobs`
-without `DownloadProgressItem::BytesTransferred` and fails to compile for
-consumers — while our own source tree kept building through the root
-`[patch.crates-io]`.
+(`aster-iroh-blobs-v0.103.1`).
 
-**Delivery is blocked on publishing.** portal-sync consumes
+**This is already released.** The registry wave was published mid-development:
+`iroh-blobs 0.103.0` in the Aster registry is byte-identical to fork rev
+`1f01a087` (verified by extracting the `.crate` and diffing its whole `src/`
+tree — 0 differing lines; `60d098c9` differs by 462 and the current tip by 31),
+and `aster 0.3.12` already exports `download_hash_from`,
+`download_hash_to_store_from`, `download_collection_from`, `FetchStrategy` and
+`bytes_transferred`. portal-sync consumes
 `aster = { version = "0.3", registry = "aster" }` with no patch block and no
-path override, so it currently resolves `aster 0.3.12` + `iroh-blobs 0.103.0`
-and cannot see any of this. The order is: publish `iroh-blobs 0.103.1` via
-`scripts/release/publish-native-stack.py publish` (needs `ASTER_CARGO_TOKEN`),
-then tag Aster so CI's `publish-cargo.sh --publish` ships the facade, then
-`cargo update -p aster` in portal-sync.
+path override, so it is already building and testing against this feature.
+
+The crate-version move to **0.103.1** is hygiene, not a fix: the delta between
+the immutable 0.103.0 archive and the fork tip is one softened doc comment on
+`BytesTransferred` plus one added assertion inside `mod tests` — no behavioural
+code. It restores "one version, one source state" so the BOM rev and the
+published archive agree again. Do **not** yank 0.103.0; nothing consuming it is
+broken. It ships with the next wave
+(`scripts/release/publish-native-stack.py publish`, then a tagged Aster), after
+which portal-sync picks it up with `cargo update -p aster`.
+
+Provenance is checkable and worth re-checking rather than inferring from pin
+history — the mistake that produced the earlier "delivery is blocked" claim was
+assuming the published archive matched the pin that preceded this work. See
+`docs/_internal/rust-sdk-maintainer-guide.md`; note that
+`publish-native-stack.py check` validates the *fork at the BOM rev*, so on its
+own it cannot detect divergence between the BOM and what the registry actually
+serves.
 
 ## What was already upstream — not reimplemented
 

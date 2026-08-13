@@ -135,6 +135,51 @@ def is_published(name: str, version: str) -> bool:
     return any(json.loads(line).get("vers") == version for line in lines if line)
 
 
+def source_tree_digests(package_root: Path) -> dict[str, str]:
+    """Hash every file under `package_root/src`, keyed by relative path."""
+    source_root = package_root / "src"
+    digests: dict[str, str] = {}
+    if not source_root.is_dir():
+        return digests
+    for path in sorted(source_root.rglob("*")):
+        if path.is_file():
+            relative = path.relative_to(package_root).as_posix()
+            digests[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digests
+
+
+def published_source_drift(
+    package: Package, package_root: Path, destination: Path
+) -> list[str]:
+    """Compare a staged package's `src` tree with the archive the registry serves.
+
+    Registry versions are immutable, so a BOM revision that no longer matches an
+    already-published version of the same crate is a release hazard: `publish`
+    skips the version as present and the registry keeps serving older code,
+    while our own builds resolve the BOM revision through `[patch.crates-io]`
+    and look correct. Only `src` is compared -- dependency-source metadata in
+    `Cargo.toml` is rewritten by design during packaging.
+    """
+    url = f"{REGISTRY_HTTP}/api/v1/crates/{quote(package.name)}/{quote(package.version)}/download"
+    request = Request(url, headers={"User-Agent": USER_AGENT})
+    archive = destination / f"published-{package.name}-{package.version}.crate"
+    with urlopen(request, timeout=60) as response, archive.open("wb") as output:
+        shutil.copyfileobj(response, output)
+    extract_root = destination / f"published-extract-{package.name}"
+    if extract_root.exists():
+        shutil.rmtree(extract_root)
+    extract_root.mkdir()
+    safe_extract(archive, extract_root)
+    published_root = extract_root / f"{package.name}-{package.version}"
+    published = source_tree_digests(published_root)
+    staged = source_tree_digests(package_root)
+    return sorted(set(published) ^ set(staged)) + sorted(
+        name
+        for name in set(published) & set(staged)
+        if published[name] != staged[name]
+    )
+
+
 def wait_until_published(name: str, version: str) -> None:
     for _ in range(30):
         if is_published(name, version):
@@ -449,8 +494,10 @@ def main() -> int:
         bridge_manifests: dict[str, Path] = {}
         vendor_manifests: dict[str, Path] = {}
 
+        drifted: list[str] = []
         for package in PACKAGES:
-            if args.mode == "publish" and is_published(package.name, package.version):
+            already_published = is_published(package.name, package.version)
+            if args.mode == "publish" and already_published and package.kind == "bridge":
                 print(f"= {package.name} {package.version} already published; skipping")
                 continue
             if package.kind == "bridge":
@@ -479,10 +526,37 @@ def main() -> int:
                 else:
                     manifest_path = source_manifest
             validate_package(package, manifest_path)
+            if already_published and package.kind != "bridge":
+                changed = published_source_drift(
+                    package, manifest_path.parent, staging
+                )
+                if changed:
+                    drifted.append(package.name)
+                    print(
+                        f"✗ {package.name} {package.version} is published but its "
+                        f"source differs from the BOM revision: "
+                        f"{', '.join(changed[:5])}"
+                        f"{' …' if len(changed) > 5 else ''}"
+                    )
+                    continue
+                if args.mode == "publish":
+                    print(
+                        f"= {package.name} {package.version} already published "
+                        "and identical; skipping"
+                    )
+                    continue
+                print(f"✓ {package.name} {package.version} (matches registry)")
+                continue
             if args.mode == "publish":
                 publish_package(package, manifest_path)
             else:
                 print(f"✓ {package.name} {package.version}")
+        if drifted:
+            raise RuntimeError(
+                "published source differs from the BOM revision for: "
+                f"{', '.join(drifted)}. Registry versions are immutable -- bump the "
+                "crate version in the fork, the publisher table, and the BOM."
+            )
     return 0
 
 

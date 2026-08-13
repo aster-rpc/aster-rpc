@@ -87,7 +87,7 @@ registry** at the exact supported version so Cargo unifies it with Aster:
 
 ```toml
 iroh = { version = "=1.0.1", registry = "aster", features = ["metrics"] }
-iroh-blobs = { version = "=0.103.1", registry = "aster" }
+iroh-blobs = { version = "=0.103.0", registry = "aster" }
 ```
 
 Do not combine Aster-registry Iroh crates with same-named crates from crates.io
