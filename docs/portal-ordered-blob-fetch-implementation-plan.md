@@ -9,8 +9,8 @@ Consumer: portal-sync Phase 6 item D. Portal ranks fetch candidates itself
 to hand Aster an ordered list. Ranking stays Portal's; ordered *consumption*
 plus a truthful report is what Aster gained.
 
-Pins: `iroh-blobs` moved from `60d098c9` to `1f01a087`
-(`aster-iroh-blobs-v0.103.0-p2`).
+Pins: `iroh-blobs` moved from `60d098c9` to `a892b9e3`
+(`aster-iroh-blobs-v0.103.0-p3`).
 
 ## What was already upstream — not reimplemented
 
@@ -84,13 +84,16 @@ Definitions, as documented on the types:
 - **served** — at least one `PartComplete`, attributed to the provider that
   request last announced with `TryProvider`. Requests are keyed by `GetRequest`
   value (`Eq + Hash`), never by `Arc` identity.
-- **bytes_transferred** — payload bytes successfully decoded from providers;
-  excludes protocol overhead and resident data. A provider that transferred part
-  of a blob before failing is counted up to its last valid chunk, so each byte
-  is counted once across failover
-  (`downloader_counts_bytes_from_a_partial_provider` asserts the sum equals the
-  blob size exactly). A chunk that fails verification is not counted, since the
-  decode error propagates before its progress update is sent.
+- **bytes_transferred** — payload pulled off the wire: the sum of what each
+  attempt successfully decoded. Excludes protocol overhead and resident data. A
+  provider that transferred part of a blob before failing is counted up to its
+  last valid chunk and the next resumes from what is stored, so ordinary
+  failover counts each byte once — `downloader_counts_bytes_from_a_partial_provider`
+  asserts the sum equals the blob size exactly across a failed attempt and the
+  one that completes it. It is a transfer metric rather than a content size,
+  though: a chunk that fails verification is not counted (the decode error
+  propagates before its progress update is sent), and a range that was decoded
+  but failed to be stored is counted again when re-fetched.
 
 A provider can legitimately appear in both `failed()` and `served()`: it may
 complete one split child and fail another.
@@ -132,7 +135,7 @@ stays additive, and there is no consumer.
 ## Verification
 
 - Fork: `cargo fmt --all --check`, `cargo clippy --all-features --tests -D warnings`,
-  `cargo test --all-features` (125 tests) before the pin moved.
+  `cargo test --all-features` (125 passed, 2 ignored) before the pin moved.
 - Aster: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -D warnings`,
   `cargo test -p aster --features rpc,expose --test blob_fetch_multi`
   (**10 tests**, non-zero count checked on the raw `running N tests` line),
