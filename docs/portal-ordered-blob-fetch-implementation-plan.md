@@ -9,8 +9,23 @@ Consumer: portal-sync Phase 6 item D. Portal ranks fetch candidates itself
 to hand Aster an ordered list. Ranking stays Portal's; ordered *consumption*
 plus a truthful report is what Aster gained.
 
-Pins: `iroh-blobs` moved from `60d098c9` to `a892b9e3`
-(`aster-iroh-blobs-v0.103.0-p3`).
+Pins: `iroh-blobs` moved from `60d098c9` to `7e0da6f7`
+(`aster-iroh-blobs-v0.103.1`), and its **crate version moved 0.103.0 →
+0.103.1**. That bump is load-bearing, not cosmetic: the Aster registry holds an
+immutable `iroh-blobs 0.103.0` built from the pre-multifetch source, and
+`publish-native-stack.py` skips an already-published version, so shipping this
+under 0.103.0 would publish an `aster` that resolves a registry `iroh-blobs`
+without `DownloadProgressItem::BytesTransferred` and fails to compile for
+consumers — while our own source tree kept building through the root
+`[patch.crates-io]`.
+
+**Delivery is blocked on publishing.** portal-sync consumes
+`aster = { version = "0.3", registry = "aster" }` with no patch block and no
+path override, so it currently resolves `aster 0.3.12` + `iroh-blobs 0.103.0`
+and cannot see any of this. The order is: publish `iroh-blobs 0.103.1` via
+`scripts/release/publish-native-stack.py publish` (needs `ASTER_CARGO_TOKEN`),
+then tag Aster so CI's `publish-cargo.sh --publish` ships the facade, then
+`cargo update -p aster` in portal-sync.
 
 ## What was already upstream — not reimplemented
 
