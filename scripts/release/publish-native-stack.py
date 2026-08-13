@@ -68,7 +68,7 @@ PACKAGES = [
     Package("iroh-tickets", "1.0.0", "bridge", "iroh-tickets"),
     Package("iroh-util", "0.6.0", "bridge", "iroh-util"),
     Package("iroh-gossip", "0.101.0", "fork", "iroh-gossip", "Cargo.toml"),
-    Package("iroh-blobs", "0.103.0", "fork", "iroh-blobs", "Cargo.toml"),
+    Package("iroh-blobs", "0.103.1", "fork", "iroh-blobs", "Cargo.toml"),
     Package("iroh-docs", "0.101.0", "fork", "iroh-docs", "Cargo.toml"),
     Package("h3", "0.0.8", "vendor", "salvo", "vendor/h3/Cargo.toml"),
     Package("h3-datagram", "0.0.2", "bridge", "h3-datagram"),
