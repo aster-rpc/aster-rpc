@@ -30,11 +30,15 @@ cargo run -p aster-expose --example reverse_proxy --features edge
 
 ```toml
 [dependencies]
-aster-expose = { git = "https://github.com/aster-rpc/aster-rpc-internal", branch = "main" }
+aster-expose = { version = "0.3", registry = "aster" }
 # The public edge (Salvo + TLS/ACME) is behind a feature; origin-only
 # consumers leave it off and don't pull in Salvo:
 # aster-expose = { ..., features = ["edge"] }
 ```
+
+Configure the public registry and select versions as described in the
+[Rust SDK consumer guide](rust-sdk-consumer-guide.md). With `edge`, the exact
+Salvo fork is available as `aster_expose::salvo`.
 
 | You want to… | Need `edge` feature? |
 |---|---|

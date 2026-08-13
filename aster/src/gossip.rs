@@ -28,6 +28,12 @@ impl Gossip {
         Self { inner }
     }
 
+    /// Clone the live Iroh Gossip protocol handle behind this facade. Do not
+    /// call its `shutdown`; [`crate::Node`] owns its lifecycle.
+    pub fn native_gossip(&self) -> crate::native::iroh_gossip::net::Gossip {
+        self.inner.inner.clone()
+    }
+
     /// Subscribe to a 32-byte topic, bootstrapping from `peers`.
     pub async fn subscribe(&self, topic: [u8; 32], peers: &[NodeId]) -> Result<GossipTopic> {
         let peers = peers.iter().map(|p| p.as_str().to_string()).collect();

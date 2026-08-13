@@ -1,5 +1,11 @@
 # Aster over HTTP (HTTP/1, /2, /3 + WebTransport)
 
+> Distribution note: this architecture record preserves the Git pin used when
+> the transport was implemented. It is not current installation guidance. Use
+> [`docs/rust-sdk-consumer-guide.md`](../rust-sdk-consumer-guide.md) and
+> [`docs/_internal/rust-sdk-maintainer-guide.md`](rust-sdk-maintainer-guide.md)
+> for the public Forgejo source-crate workflow and Salvo reexport policy.
+
 **Status:** Implemented and merged to `main` (`feat/web`, 2026-06-25).
 Originated as a design sketch (2026-05-02); this doc is now the
 architecture record for the shipped transport. For *how to use it*, see the
@@ -12,7 +18,7 @@ version gated to only the call patterns it can correctly support.
 **Target:** Browsers and HTTP-addressable servers, without giving up the
 Aster RPC model (4 call patterns, contract identity, capabilities,
 session-scoped services).
-**Server framework:** the **Aster Salvo fork** (`github.com/aster-rpc/salvo`,
+**Server framework:** the **Aster Salvo fork** (`forge.emrul.dev/Aster/salvo`,
 rev `cdfdc90f`) on its own quinn QUIC stack — Iroh keeps `noq`. Two QUIC
 stacks; the once-planned shared-`noq` `NoqListener` was shelved (see
 [Server-side stack](#server-side-stack)).
@@ -1375,7 +1381,7 @@ on the same UDP socket.
 
 **Implication for this design:** the HTTP transport uses Salvo with its
 quinn-based listener — and specifically **the Aster Salvo fork**
-(`github.com/aster-rpc/salvo`), *not* stock Salvo. The fork carries the
+(`forge.emrul.dev/Aster/salvo`), *not* stock Salvo. The fork carries the
 patches the WebTransport + stream-priority features need: raw
 `quinn::Connection` exposure, Quinn keep-alive, and WebTransport stream
 control (`SendStream::set_priority` / `reset_with_error_code` / `abort`).
@@ -1390,15 +1396,15 @@ identical Salvo (and shares the runner cache). In the workspace-root
 
 ```toml
 [patch.crates-io]
-salvo       = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-salvo_core  = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-salvo_macros = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-salvo_extra = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo       = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo_core  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo_extra = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
 # Propagation gotcha: the fork patches these internally, but
 # [patch.crates-io] does NOT cross workspaces — re-declare them here.
-salvo-http3 = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-h3          = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
-h3-quinn    = { git = "https://github.com/aster-rpc/salvo", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+salvo-http3 = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+h3          = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
+h3-quinn    = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "cdfdc90f604aa83ee13fba0b55e849d9fbc34915" }
 ```
 
 Plus a direct `quinn = { version = "0.11", default-features = false }` dep

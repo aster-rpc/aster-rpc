@@ -2,6 +2,10 @@
 name = "aster_transport_core"
 version = "0.3.0"
 edition = "2021"
+description = "Shared Rust transport engine for the Aster SDK."
+license = "MIT OR Apache-2.0"
+repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"
+publish = ["aster"]
 
 [dependencies]
 iroh = { workspace = true }
@@ -27,8 +31,8 @@ bs58 = "0.5"
 ed25519-dalek = { version = "=3.0.0-rc.0", features = ["rand_core"] }
 crossbeam-utils = { workspace = true }
 getrandom = "0.2"
-fory-core = "1.3"
-fory-derive = "1.3"
+fory-core = "=1.3.0"
+fory-derive = "=1.3.0"
 thiserror = { version = "2", optional = true }
 base64 = { version = "0.22", optional = true }
 hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }

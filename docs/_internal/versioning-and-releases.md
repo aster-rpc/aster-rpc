@@ -1,5 +1,9 @@
 # Aster — Versioning, Releases, and Package Distribution
 
+> Superseded for current Rust/Forgejo distribution by
+> `docs/_internal/rust-sdk-maintainer-guide.md`. This document describes an
+> older independent-track/GitHub Packages design and is retained as history.
+
 **Status:** Active  
 **Date:** 2026-04-07  
 **Audience:** Engineering team

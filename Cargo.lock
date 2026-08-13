@@ -193,7 +193,11 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "iroh",
+ "iroh-blobs",
  "iroh-docs",
+ "iroh-gossip",
+ "iroh-tickets",
  "portable-pty",
  "serde_json",
  "tempfile",
@@ -215,7 +219,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "salvo 0.93.0",
+ "salvo",
  "tokio",
  "tower",
  "tracing",
@@ -261,7 +265,7 @@ dependencies = [
  "rcgen 0.13.2",
  "reqwest 0.12.28",
  "rustls",
- "salvo 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0)",
+ "salvo",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2027,7 +2031,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2051,7 +2055,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
 dependencies = [
  "bytes",
  "futures",
@@ -2625,7 +2629,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.1"
-source = "git+https://github.com/aster-rpc/iroh?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
 dependencies = [
  "backon",
  "blake3",
@@ -2675,7 +2679,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.0.1"
-source = "git+https://github.com/aster-rpc/iroh?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
 dependencies = [
  "curve25519-dalek 5.0.0-rc.0",
  "data-encoding",
@@ -2693,7 +2697,7 @@ dependencies = [
 [[package]]
 name = "iroh-blobs"
 version = "0.103.0"
-source = "git+https://github.com/aster-rpc/iroh-blobs?rev=1f01a0878384b4c0fab343319e88fb1acb7bb27b#1f01a0878384b4c0fab343319e88fb1acb7bb27b"
+source = "git+https://forge.emrul.dev/Aster/iroh-blobs.git?rev=1f01a0878384b4c0fab343319e88fb1acb7bb27b#1f01a0878384b4c0fab343319e88fb1acb7bb27b"
 dependencies = [
  "arrayvec",
  "bao-tree",
@@ -2733,7 +2737,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.0.1"
-source = "git+https://github.com/aster-rpc/iroh?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -2756,7 +2760,7 @@ dependencies = [
 [[package]]
 name = "iroh-docs"
 version = "0.101.0"
-source = "git+https://github.com/aster-rpc/iroh-docs?rev=2f3f3df834dfe6ce83f052c9c94ef80db2f5627c#2f3f3df834dfe6ce83f052c9c94ef80db2f5627c"
+source = "git+https://forge.emrul.dev/Aster/iroh-docs.git?rev=2f3f3df834dfe6ce83f052c9c94ef80db2f5627c#2f3f3df834dfe6ce83f052c9c94ef80db2f5627c"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2795,7 +2799,7 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.101.0"
-source = "git+https://github.com/aster-rpc/iroh-gossip?rev=76492e4cf8a745cae27ea57fb8a30d42ab675498#76492e4cf8a745cae27ea57fb8a30d42ab675498"
+source = "git+https://forge.emrul.dev/Aster/iroh-gossip.git?rev=76492e4cf8a745cae27ea57fb8a30d42ab675498#76492e4cf8a745cae27ea57fb8a30d42ab675498"
 dependencies = [
  "blake3",
  "bytes",
@@ -2834,8 +2838,7 @@ dependencies = [
 [[package]]
 name = "iroh-mdns-address-lookup"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c1f941695731bc3999d8c13d7e94d50e229427da81ac957eec3818264f17559"
+source = "git+https://github.com/n0-computer/iroh-address-lookups?rev=87fdd7ea1a902845695f8f685c1905f096b3d02d#87fdd7ea1a902845695f8f685c1905f096b3d02d"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -2881,7 +2884,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.1"
-source = "git+https://github.com/aster-rpc/iroh?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=5228d64d91b10ef5f5bc9fcf8855b7774102cfc9#5228d64d91b10ef5f5bc9fcf8855b7774102cfc9"
 dependencies = [
  "blake3",
  "bytes",
@@ -2926,8 +2929,7 @@ dependencies = [
 [[package]]
 name = "iroh-tickets"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da53233419ca36bf521ed45683b7748366f9b233032891eefc2d70567a84ac54"
+source = "git+https://github.com/n0-computer/iroh-tickets?rev=4899684e1209dea29ed28aa2314450927557b037#4899684e1209dea29ed28aa2314450927557b037"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -2940,8 +2942,7 @@ dependencies = [
 [[package]]
 name = "iroh-util"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20e41eb982f15230c55f0a70a74a514360e1f565b07861924fd0e8db172b3d00"
+source = "git+https://github.com/n0-computer/iroh-util?rev=2b5447abf79bc0d7c02c202f2cc21f44f42d39fa#2b5447abf79bc0d7c02c202f2cc21f44f42d39fa"
 dependencies = [
  "derive_more",
  "iroh",
@@ -2954,8 +2955,7 @@ dependencies = [
 [[package]]
 name = "irpc"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3623d6ff582b415904b29bbe6ebcb4a4f9a262ccdee05a45fdd003ef0950c386"
+source = "git+https://github.com/n0-computer/irpc?rev=0ed2b235d5c797b54d8263ecb3b0247272d055f9#0ed2b235d5c797b54d8263ecb3b0247272d055f9"
 dependencies = [
  "futures-buffered",
  "futures-util",
@@ -2976,8 +2976,7 @@ dependencies = [
 [[package]]
 name = "irpc-derive"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35c254013736de16472140d26904e6ac98e8f3887284dcf4af40f88c77411b56"
+source = "git+https://github.com/n0-computer/irpc?rev=0ed2b235d5c797b54d8263ecb3b0247272d055f9#0ed2b235d5c797b54d8263ecb3b0247272d055f9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3292,7 +3291,7 @@ dependencies = [
  "aster_transport_core",
  "fory-core",
  "fory-derive",
- "salvo 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0)",
+ "salvo",
  "serde",
  "serde_json",
  "tokio",
@@ -3548,8 +3547,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d9cbe01741347ef750d743d6690603f5eed8341e679fb51c8e629337aa11976"
+source = "git+https://github.com/n0-computer/net-tools?rev=051ab8761006d7f2155e34a49f6bb881b582d5ab#051ab8761006d7f2155e34a49f6bb881b582d5ab"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3609,7 +3607,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.0.1"
-source = "git+https://github.com/aster-rpc/noq?rev=c84091f4c1d62f3c9025e40014fc2db59f239ffc#c84091f4c1d62f3c9025e40014fc2db59f239ffc"
+source = "git+https://forge.emrul.dev/Aster/noq.git?rev=c84091f4c1d62f3c9025e40014fc2db59f239ffc#c84091f4c1d62f3c9025e40014fc2db59f239ffc"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3630,7 +3628,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.0.1"
-source = "git+https://github.com/aster-rpc/noq?rev=c84091f4c1d62f3c9025e40014fc2db59f239ffc#c84091f4c1d62f3c9025e40014fc2db59f239ffc"
+source = "git+https://forge.emrul.dev/Aster/noq.git?rev=c84091f4c1d62f3c9025e40014fc2db59f239ffc#c84091f4c1d62f3c9025e40014fc2db59f239ffc"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -3658,7 +3656,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.0.1"
-source = "git+https://github.com/aster-rpc/noq?rev=c84091f4c1d62f3c9025e40014fc2db59f239ffc#c84091f4c1d62f3c9025e40014fc2db59f239ffc"
+source = "git+https://forge.emrul.dev/Aster/noq.git?rev=c84091f4c1d62f3c9025e40014fc2db59f239ffc#c84091f4c1d62f3c9025e40014fc2db59f239ffc"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -3775,7 +3773,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -4210,8 +4208,7 @@ dependencies = [
 [[package]]
 name = "portmapper"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb3713e4977408279158444a18c1a01ac9bf2e7eaf1fbfd1a19ac9cd18d90721"
+source = "git+https://github.com/n0-computer/net-tools?rev=051ab8761006d7f2155e34a49f6bb881b582d5ab#051ab8761006d7f2155e34a49f6bb881b582d5ab"
 dependencies = [
  "base64",
  "bytes",
@@ -5139,45 +5136,23 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "salvo"
 version = "0.93.0"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
 dependencies = [
- "salvo-acme 0.93.0",
- "salvo-proxy 0.93.0",
- "salvo_core 0.93.0",
-]
-
-[[package]]
-name = "salvo"
-version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
-dependencies = [
- "salvo-acme 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0)",
- "salvo-proxy 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0)",
+ "salvo-acme",
+ "salvo-proxy",
  "salvo-serve-static",
- "salvo_core 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0)",
+ "salvo_core",
 ]
 
 [[package]]
 name = "salvo-acme"
 version = "0.93.0"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
 dependencies = [
  "certon",
  "futures-util",
  "quinn",
- "salvo_core 0.93.0",
- "tokio",
- "tokio-rustls",
- "tracing",
-]
-
-[[package]]
-name = "salvo-acme"
-version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
-dependencies = [
- "certon",
- "futures-util",
- "quinn",
- "salvo_core 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0)",
+ "salvo_core",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -5186,7 +5161,7 @@ dependencies = [
 [[package]]
 name = "salvo-http3"
 version = "0.7.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5202,6 +5177,7 @@ dependencies = [
 [[package]]
 name = "salvo-proxy"
 version = "0.93.0"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
 dependencies = [
  "fastrand",
  "futures-util",
@@ -5210,24 +5186,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "reqwest 0.13.3",
- "salvo_core 0.93.0",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "salvo-proxy"
-version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
-dependencies = [
- "fastrand",
- "futures-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "percent-encoding",
- "reqwest 0.13.3",
- "salvo_core 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0)",
+ "salvo_core",
  "tokio",
  "tracing",
 ]
@@ -5235,16 +5194,7 @@ dependencies = [
 [[package]]
 name = "salvo-serde-util"
 version = "0.93.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "salvo-serde-util"
-version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5254,7 +5204,7 @@ dependencies = [
 [[package]]
 name = "salvo-serve-static"
 version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
 dependencies = [
  "hex",
  "mime",
@@ -5262,7 +5212,7 @@ dependencies = [
  "path-slash",
  "percent-encoding",
  "rust-embed",
- "salvo_core 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0)",
+ "salvo_core",
  "serde",
  "serde_json",
  "time",
@@ -5273,6 +5223,7 @@ dependencies = [
 [[package]]
 name = "salvo_core"
 version = "0.93.0"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -5306,60 +5257,7 @@ dependencies = [
  "rand 0.10.1",
  "regex",
  "salvo-http3",
- "salvo_macros 0.93.0",
- "serde",
- "serde-xml-rs",
- "serde_json",
- "serde_urlencoded",
- "sync_wrapper",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "url",
- "zstd",
-]
-
-[[package]]
-name = "salvo_core"
-version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
-dependencies = [
- "arc-swap",
- "async-trait",
- "base64",
- "brotli",
- "bytes",
- "chardetng",
- "content_inspector",
- "cookie",
- "encoding_rs",
- "enumflags2",
- "flate2",
- "form_urlencoded",
- "futures-channel",
- "futures-util",
- "h3-datagram",
- "headers",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "indexmap",
- "mime",
- "mime-infer",
- "multimap",
- "multra",
- "parking_lot",
- "percent-encoding",
- "pin-project",
- "quinn",
- "rand 0.10.1",
- "regex",
- "salvo-http3",
- "salvo_macros 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0)",
+ "salvo_macros",
  "serde",
  "serde-xml-rs",
  "serde_json",
@@ -5378,23 +5276,12 @@ dependencies = [
 [[package]]
 name = "salvo_macros"
 version = "0.93.0"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
  "quote",
- "salvo-serde-util 0.93.0",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "salvo_macros"
-version = "0.93.0"
-source = "git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0#0e8477c10760b7f66fa5667e2755c938d07393c0"
-dependencies = [
- "proc-macro-crate 3.5.0",
- "proc-macro2",
- "quote",
- "salvo-serde-util 0.93.0 (git+https://github.com/aster-rpc/salvo?rev=0e8477c10760b7f66fa5667e2755c938d07393c0)",
+ "salvo-serde-util",
  "syn 2.0.117",
 ]
 

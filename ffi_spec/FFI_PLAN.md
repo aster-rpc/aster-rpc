@@ -3975,7 +3975,7 @@ The aster-rpc/iroh fork also includes security hardening from a code audit:
 
 ```toml
 [dependencies]
-iroh = { git = "https://github.com/aster-rpc/iroh", branch = "main" }
+iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", branch = "main" }
 ```
 
 This transitively pulls `aster-rpc/noq` (which has `read_into` and `PollDriver`).

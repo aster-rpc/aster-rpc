@@ -50,30 +50,28 @@ See `examples/quickstart.rs` for an end-to-end persistence round-trip.
 Admission (`Node::take_admission()`) additionally requires the node to be
 started with `AsterConfig::builder().hooks(true)`.
 
-## ⚠️ Depending on this crate (required patch block)
+## Depending on this crate
 
-Aster pins `iroh` / `noq` to patched forks via `[patch.crates-io]`. Cargo patches
-**do not propagate across repositories**, so an external project depending on
-`aster` via git **must** copy the patch block below into its own root
-`Cargo.toml` (keep it in sync with this repo's root `Cargo.toml`):
+Released crates come from Aster's public Forgejo Cargo registry. Configure it
+once per project:
 
 ```toml
-[dependencies]
-aster = { git = "https://github.com/aster-rpc/aster-rpc-internal", branch = "main" }
-
-[patch.crates-io]
-iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "77a68a5477c15db261c66e7740a77ef752d9685f" }
-iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "77a68a5477c15db261c66e7740a77ef752d9685f" }
-iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "77a68a5477c15db261c66e7740a77ef752d9685f" }
-iroh-blobs  = { git = "https://github.com/aster-rpc/iroh-blobs",  rev = "ede454c774b24e1e4674aa713a37573b4144517d" }
-iroh-docs   = { git = "https://github.com/aster-rpc/iroh-docs",   rev = "be04181e05e566adb033af786e09c4d20ac9390f" }
-iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "d7d13582ba81d1b266cce758daccacad3ab5357c" }
-noq         = { git = "https://github.com/aster-rpc/noq",         rev = "617899fe7e983f794e0162d15d8558258fa8c375" }
-noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "617899fe7e983f794e0162d15d8558258fa8c375" }
-noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "617899fe7e983f794e0162d15d8558258fa8c375" }
+# .cargo/config.toml
+[registries.aster]
+index = "sparse+https://forge.emrul.dev/api/packages/Aster/cargo/"
 ```
 
-Without this block the build fails to resolve the forked iroh/noq revisions.
+```toml
+# Cargo.toml
+[dependencies]
+aster = { version = "0.3", registry = "aster" }
+```
+
+Use the selected release version rather than copying Aster's private fork
+graph. Advanced Rust consumers can access the exact Iroh/Fory/Salvo stack via
+`aster::native`. See `docs/rust-sdk-consumer-guide.md` in the repository for
+the registry rollout state, direct-dependency exceptions for proc macros, and
+the maintainer-only private-Git fallback.
 
 ## Status
 

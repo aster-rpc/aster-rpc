@@ -92,7 +92,7 @@ Two shape decisions were forced by the normative spec during implementation:
 **Two-layer state of the world (updated 2026-07-02, post-ship):**
 
 - **Contract-identity layer models unions cross-binding** — and Rust now *emits* it: `#[derive(AsterType)]` accepts data-carrying enums → `TypeDefKind::Union` + `union_variants`, ids per the ForyUnion case-id scheme (explicit `#[fory(id = N)]`, else 0-based declaration index, `Unknown` excluded). Canonical hash is declaration-order-independent (encoder sorts by id) and pinned by a golden in `aster/tests/rpc_contract.rs`. Java/Python/TS already model `UnionVariantDef` identically; cross-check their encoders against the golden when their union codegen lands.
-- **Value codec:** Rust round-trips unions through the payload Fory (`ForyUnion`, fory-core 1.3). Python/TS/Java/Kotlin still have no union value codec (Python peels `Optional` only; TS hard-codes `union_variants: []`; Fory version skew: rest of the matrix is on 0.17.0). Rides the existing cross-binding-payload track — exactly as sequenced.
+- **Value codec:** Rust round-trips unions through the payload Fory (`ForyUnion`, fory-core 1.3.0). Python/TS/Java/Kotlin still have no union value codec (Python peels `Optional` only; TS hard-codes `union_variants: []`; Fory version skew: rest of the matrix is on 0.17.0). Rides the existing cross-binding-payload track — exactly as sequenced.
 
 **Build order — where it stands:**
 0. ✅ Namespace guard in the macros (see *Namespace reservation*).

@@ -186,8 +186,8 @@ You only need this if you're contributing to Aster itself. Most users should `pi
 ### Python binding
 
 ```bash
-git clone https://github.com/aster-rpc/aster-rpc.git
-cd aster-rpc
+git clone https://forge.emrul.dev/Aster/aster-rpc-internal.git
+cd aster-rpc-internal
 
 uv venv
 uv pip install maturin pytest pytest-asyncio pytest-timeout pytest-rerunfailures
@@ -204,11 +204,11 @@ Or use the build script which also regenerates type stubs and pins fork deps:
 
 ### aster-rpc fork deps
 
-This repo depends on the `aster-rpc/*` GitHub forks of `iroh`, `noq`,
-`iroh-blobs`, `iroh-docs`, and `iroh-gossip` (pinned to commit SHAs via
-`[patch.crates-io]` in the root `Cargo.toml`). The forks contain security
-fixes, zero-copy `read_into` on `RecvStream`, and dependency alignment
-that hasn't landed upstream yet.
+Repository development uses Aster's public Forgejo forks of Iroh/Noq and Salvo,
+pinned to commit SHAs via `[patch.crates-io]` in the root `Cargo.toml`. This is
+a maintainer mechanism; released Rust consumers use the public Cargo registry
+and do not copy the patches. See `docs/rust-sdk-consumer-guide.md` and
+`docs/_internal/rust-sdk-maintainer-guide.md`.
 
 One wart: cargo's resolver picks the latest `hickory-proto` / `hickory-net`
 beta by default, but the iroh fork pins `hickory-resolver = "=0.26.0-beta.1"`

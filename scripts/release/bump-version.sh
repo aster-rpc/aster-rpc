@@ -52,6 +52,7 @@ for relative in cargo_files:
     if changed != 1:
         raise SystemExit(f"expected package version {old} in {relative}")
     text = text.replace(f'version = "{old}"', f'version = "{new}"')
+    text = text.replace(f'version = "={old}"', f'version = "={new}"')
     path.write_text(text)
 
 for relative in ["pyproject.toml", "cli/pyproject.toml"]:

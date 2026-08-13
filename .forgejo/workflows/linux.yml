@@ -7,6 +7,9 @@ on:
     paths:
       - "core/**"
       - "aster/**"
+      - "aster-expose/**"
+      - "aster-macros/**"
+      - "aster-transport-salvo/**"
       - "ffi/**"
       - "bindings/python/**"
       - "cli/**"
@@ -14,6 +17,7 @@ on:
       - "tests/chaos/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".cargo/**"
       - "pyproject.toml"
       - "VERSION"
       - "scripts/build.sh"
@@ -26,6 +30,9 @@ on:
     paths:
       - "core/**"
       - "aster/**"
+      - "aster-expose/**"
+      - "aster-macros/**"
+      - "aster-transport-salvo/**"
       - "ffi/**"
       - "bindings/python/**"
       - "cli/**"
@@ -33,6 +40,7 @@ on:
       - "tests/chaos/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".cargo/**"
       - "pyproject.toml"
       - "VERSION"
       - "scripts/build.sh"
@@ -76,16 +84,6 @@ jobs:
           version="$(scripts/release/version.sh)"
           scripts/release/prepare-build-tree.sh "$version"
           echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
-      - name: Checkout pinned Salvo fork
-        uses: https://data.forgejo.org/actions/checkout@v6
-        with:
-          repository: Aster/salvo
-          ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
-          path: _deps/salvo
-          token: ${{ secrets.ASTER_REPO_TOKEN }}
-          persist-credentials: false
-      - name: Link sibling path dependency
-        run: ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
       - name: Toolchain versions
         run: |
           rustc --version
@@ -99,6 +97,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Rust lint
         run: cargo clippy --locked --workspace --all-targets --exclude aster-transport-napi -- -D warnings
+      - name: Rust SDK package manifests
+        run: scripts/release/publish-cargo.sh --check
       - name: Compiler-cache statistics
         if: always()
         continue-on-error: true
@@ -117,16 +117,6 @@ jobs:
           version="$(scripts/release/version.sh)"
           scripts/release/prepare-build-tree.sh "$version"
           echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
-      - name: Checkout pinned Salvo fork
-        uses: https://data.forgejo.org/actions/checkout@v6
-        with:
-          repository: Aster/salvo
-          ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
-          path: _deps/salvo
-          token: ${{ secrets.ASTER_REPO_TOKEN }}
-          persist-credentials: false
-      - name: Link sibling path dependency
-        run: ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
       - name: Rust core and FFI tests
         run: |
           cargo test --locked -p aster_transport_core
@@ -160,16 +150,6 @@ jobs:
           version="$(scripts/release/version.sh)"
           scripts/release/prepare-build-tree.sh "$version"
           echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
-      - name: Checkout pinned Salvo fork
-        uses: https://data.forgejo.org/actions/checkout@v6
-        with:
-          repository: Aster/salvo
-          ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
-          path: _deps/salvo
-          token: ${{ secrets.ASTER_REPO_TOKEN }}
-          persist-credentials: false
-      - name: Link sibling path dependency
-        run: ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
       - name: Build Linux wheel and source distribution
         run: |
           uv venv .venv
@@ -219,17 +199,8 @@ jobs:
           version="$(scripts/release/version.sh)"
           scripts/release/prepare-build-tree.sh "$version"
           echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
-      - name: Checkout pinned Salvo fork
-        uses: https://data.forgejo.org/actions/checkout@v6
-        with:
-          repository: Aster/salvo
-          ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
-          path: _deps/salvo
-          token: ${{ secrets.ASTER_REPO_TOKEN }}
-          persist-credentials: false
       - name: Build Windows wheel with cargo-xwin
         run: |
-          ln -s "$GITHUB_WORKSPACE/_deps/salvo" "$GITHUB_WORKSPACE/../salvo"
           uv venv .venv
           uv pip install --python .venv/bin/python maturin
           .venv/bin/maturin build --release --locked \
@@ -290,22 +261,6 @@ jobs:
           runner_work=/Users/emrul/dev/aster/local_mac_forgejo_runner/_work
           find "$runner_work" -mindepth 3 -maxdepth 3 -type d \
             -path '*/tmp/aster-target' -exec rm -rf {} +
-      - name: Checkout pinned Salvo fork
-        uses: https://data.forgejo.org/actions/checkout@v6
-        with:
-          repository: Aster/salvo
-          ref: 0e8477c10760b7f66fa5667e2755c938d07393c0
-          path: _deps/salvo
-          token: ${{ secrets.ASTER_REPO_TOKEN }}
-          persist-credentials: false
-      - name: Link sibling path dependency
-        run: |
-          salvo_link="$GITHUB_WORKSPACE/../salvo"
-          if [[ -e "$salvo_link" && ! -L "$salvo_link" ]]; then
-            echo "error: refusing to replace non-symlink $salvo_link" >&2
-            exit 1
-          fi
-          ln -sfn "$GITHUB_WORKSPACE/_deps/salvo" "$salvo_link"
       - name: Start compiler cache with normalized job paths
         run: |
           # sccache reads SCCACHE_BASEDIRS when its daemon starts. The
@@ -353,11 +308,8 @@ jobs:
         if: always()
         run: |
           rm -rf "$GITHUB_WORKSPACE/.venv" "$GITHUB_WORKSPACE/.wheel-test" \
-            "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/_deps" \
+            "$GITHUB_WORKSPACE/dist" \
             "$RUNNER_TEMP/aster-target"
-          if [[ -L "$GITHUB_WORKSPACE/../salvo" ]]; then
-            rm "$GITHUB_WORKSPACE/../salvo"
-          fi
           uv cache prune --ci || true
 
   release:
@@ -372,6 +324,7 @@ jobs:
       - name: Resolve Aster build version
         run: |
           version="$(scripts/release/version.sh)"
+          scripts/release/prepare-build-tree.sh "$version"
           echo "ASTER_BUILD_VERSION=$version" >> "$GITHUB_ENV"
       - name: Download Linux release artifacts
         uses: https://data.forgejo.org/forgejo/download-artifact@v4
@@ -388,6 +341,14 @@ jobs:
         with:
           name: aster-python-macos-arm64-${{ forgejo.run_number }}
           path: dist
+      - name: Publish Rust SDK source crates
+        env:
+          ASTER_CARGO_TOKEN: ${{ secrets.ASTER_CARGO_TOKEN }}
+        run: scripts/release/publish-cargo.sh --publish
+      - name: Publish public native artifacts
+        env:
+          ASTER_PACKAGE_TOKEN: ${{ secrets.ASTER_PACKAGE_TOKEN }}
+        run: scripts/release/publish-generic-release.sh dist
       - name: Publish permanent Forgejo release
         env:
           ASTER_RELEASE_TOKEN: ${{ secrets.ASTER_RELEASE_TOKEN }}

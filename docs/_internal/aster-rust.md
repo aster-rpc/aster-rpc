@@ -1,5 +1,11 @@
 # Aster: native Rust crate
 
+> Distribution note: this implementation-era document preserves the old Git
+> dependency + copied-patch workflow for historical context. It is not the
+> consumer contract. Use `docs/rust-sdk-consumer-guide.md` and
+> `docs/_internal/rust-sdk-maintainer-guide.md` for the Forgejo Cargo registry,
+> native reexports, and release process.
+
 > Status: **Step 1 implemented** (`aster/` crate — node + blobs/docs/gossip + admission + deterministic namespaces). Step 2 (Rust RPC, `rpc` feature) **in progress** (2026-06-01): codec (envelope + payload), status/errors, server dispatch + client stub for **all four call patterns** (steps 1–3), **identity + manifest publication (step 4)**, and **Gate-3 auth (step 5)** are implemented and tested. Contract identity is **cross-binding-verified** — `#[derive(AsterType)]` reproduces the Python reference producer's golden contract-ids byte-for-byte (`scripts/cross_lang_echo_contract_id.py`); `publish_contract`/`fetch_and_verify_contract` round-trip a contract collection + manifest through a registry doc with `blake3(contract.bin)==contract_id` verification. Gate 3: `ServiceDispatch::{service,method}_requires` + an `AttributeStore` the app populates → the server rejects calls lacking the required capability with `PERMISSION_DENIED` before dispatch (Gate 1 enrollment + Gate 2 session-authorize remain deferred — see "Outstanding"). **Step 6 (`#[aster::service]` macro)** generates, for **all four call patterns**, a `…Server<T>` dispatcher, a `…Client` stub, and a cross-binding `ServiceContract` (verified: the generated contract's request type matches the golden, and each method's `pattern` is recorded). Streaming methods are declared with `#[rpc(server_stream|client_stream|bidi_stream)]` and typed stream handles — server handlers take a `RequestStream<Req>` and/or `ResponseSink<Resp>`; clients return a `MessageStream<Resp>`. `#[rpc(requires = …)]` wires Gate-3. **Step 7 (interceptors)** is implemented: an `RpcConnection` carries a `Pipeline` (`with_interceptor`/`with_retry`/`with_circuit_breaker`/`with_deadline`) that wraps unary calls — an `Interceptor` chain (`on_request`/`on_response`/`on_error`), a `RetryPolicy` (retryable status codes + exponential backoff), per-attempt deadline → `DEADLINE_EXCEEDED`, and a `CircuitBreaker` that fails fast when open; no-op by default. **2A (Rust-native RPC) is complete** and green against the iroh/noq rc1 forks (45 aster + 35 core-contract tests). Remaining: the deferred **2B** cross-binding payload work (Fory version gap) and **Gate 1/2 auth** (see "Outstanding"). Cross-binding RPC *payloads* remain deferred on the Fory version gap (2B); manifests/contract-ids are cross-binding now. Step 1 details are under "Implementation status & portal-sync migration" at the end.
 
 ## Context
@@ -16,7 +22,7 @@ This document specifies a clean, stable public Rust crate:
 | Decision | Choice |
 |----------|--------|
 | Scope of first delivery | Step 1 now; Step 2 designed, deferred |
-| Distribution | Git dependency on this repo; consumer copies the `[patch.crates-io]` block |
+| Distribution | **Superseded:** public Forgejo source crates; see the maintainer guide |
 | API shape | Idiomatic facade; `core` stays the FFI-shaped backend |
 | RPC envelope + payload codec | **Static Fory registration** (Apache Fory Rust crate, `#[derive(ForyObject)]`) |
 
@@ -199,15 +205,15 @@ An external consumer must, in its own `Cargo.toml`:
 aster = { git = "https://github.com/aster-rpc/aster-rpc-internal", branch = "main" }
 
 [patch.crates-io]   # copy verbatim from this repo's root Cargo.toml
-iroh        = { git = "https://github.com/aster-rpc/iroh",        rev = "77a68a5…" }
-iroh-base   = { git = "https://github.com/aster-rpc/iroh",        rev = "77a68a5…" }
-iroh-relay  = { git = "https://github.com/aster-rpc/iroh",        rev = "77a68a5…" }
-iroh-blobs  = { git = "https://github.com/aster-rpc/iroh-blobs",  rev = "ede454c…" }
-iroh-docs   = { git = "https://github.com/aster-rpc/iroh-docs",   rev = "be04181…" }
-iroh-gossip = { git = "https://github.com/aster-rpc/iroh-gossip", rev = "d7d1358…" }
-noq         = { git = "https://github.com/aster-rpc/noq",         rev = "617899f…" }
-noq-udp     = { git = "https://github.com/aster-rpc/noq",         rev = "617899f…" }
-noq-proto   = { git = "https://github.com/aster-rpc/noq",         rev = "617899f…" }
+iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "77a68a5…" }
+iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "77a68a5…" }
+iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "77a68a5…" }
+iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "ede454c…" }
+iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "be04181…" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "d7d1358…" }
+noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "617899f…" }
+noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "617899f…" }
+noq-proto   = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "617899f…" }
 ```
 
 The `[patch.crates-io]` block is **mandatory** for any external consumer — patches don't propagate across repos. The `aster/README.md` carries this block as the single source consumers copy; keep it in sync with the root `Cargo.toml`.

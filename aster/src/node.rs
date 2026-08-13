@@ -62,6 +62,16 @@ impl Node {
         NodeId::from_hex(self.inner.node_id())
     }
 
+    /// Clone the live Iroh endpoint owned by this node.
+    ///
+    /// Use this only for Iroh operations not represented by the Aster facade.
+    /// The returned handle shares the node's router and lifetime: do not close
+    /// it, replace its ALPN set, or install a competing accept loop. Its type is
+    /// re-exported as [`crate::native::iroh::Endpoint`].
+    pub fn native_endpoint(&self) -> crate::native::iroh::Endpoint {
+        self.inner.net_client().endpoint
+    }
+
     /// This node's address (id + relay + direct addresses).
     pub fn addr(&self) -> NodeAddr {
         let core = self.inner.node_addr_info();

@@ -186,6 +186,22 @@ impl Blobs {
         Self { inner }
     }
 
+    /// Clone the live Iroh Blobs store behind this facade.
+    ///
+    /// Raw store operations share data and GC state with Aster. Callers that
+    /// add long-lived content through this handle must protect it with a tag;
+    /// untagged content remains eligible for Aster's node-wide garbage
+    /// collection. Do not call the native store's `shutdown`; [`crate::Node`]
+    /// owns its lifecycle.
+    pub fn native_store(&self) -> crate::native::iroh_blobs::api::Store {
+        self.inner.store.clone()
+    }
+
+    /// Clone the Iroh endpoint used by the blob downloader.
+    pub fn native_endpoint(&self) -> crate::native::iroh::Endpoint {
+        self.inner.endpoint.clone()
+    }
+
     /// Store raw bytes; returns the blob hash.
     pub async fn add_bytes(&self, data: impl Into<Vec<u8>>) -> Result<Hash> {
         Ok(Hash::from_hex(self.inner.add_bytes(data.into()).await?))

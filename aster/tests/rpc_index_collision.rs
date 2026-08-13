@@ -1,7 +1,7 @@
 #![cfg(feature = "rpc")]
 //! Regression test for cross-crate Fory type-index collisions (TradeStorm).
 //!
-//! Fory 1.3 gives every `#[derive(ForyStruct)]` type a `fory_type_index()`
+//! Fory 1.3.0 gives every `#[derive(ForyStruct)]` type a `fory_type_index()`
 //! allocated from a **per-crate** counter that restarts at 0 in each crate.
 //! Registration claims `type_id_index[fory_type_index()]` and errors when the
 //! slot is taken — so two types from *different* crates (e.g. a user payload
