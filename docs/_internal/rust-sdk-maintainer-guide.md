@@ -115,6 +115,21 @@ use `path`, exact `version`, and `registry = "aster"`. Without the `registry`
 key Cargo normalizes the fallback to crates.io even when the parent is published
 with `--registry aster`. The Git/path location is not embedded in the `.crate`.
 
+Changing the code of a crate whose current version is already published means
+bumping that crate's version. Registry versions are immutable and
+`publish-native-stack.py` treats a present version as done, so leaving the
+version alone republishes nothing and the registry keeps serving the older
+source while our own builds resolve the new revision through
+`[patch.crates-io]` and look correct. Aster-owned crates track upstream release
+numbers, so an Aster-local change on top of an upstream release takes the next
+patch number (`0.103.0` -> `0.103.1`) while `upstream_base` stays at the
+upstream tag. The version lives in four places and `check` fails if they
+disagree: the fork's own `Cargo.toml`, the `PACKAGES` table in
+`scripts/release/publish-native-stack.py`, the BOM's `crate_version` and
+`version_specs`, and the root `[workspace.dependencies]` entry. Consumer-facing
+version examples in `docs/rust-sdk-consumer-guide.md` name what is *published*,
+so they move when the wave publishes, not when the BOM does.
+
 ### 2. Update Aster
 
 - Update the workspace dependency and every root patch entry to the same fork
@@ -149,7 +164,13 @@ cargo test --workspace --all-features
 
 The native-stack check clones every fork at the BOM revision, checksum-verifies
 every unmodified crates.io bridge archive, applies only temporary dependency
-source metadata rewrites, and verifies the complete publisher set. The Aster
+source metadata rewrites, and verifies the complete publisher set. For any
+fork or vendor package whose version is already in the registry it also
+downloads that published `.crate` and diffs its `src` tree against the staged
+source, reporting `(matches registry)` or failing with the differing paths.
+Only `src` is compared, because dependency-source metadata is rewritten during
+packaging by design. Without that step the check proves the BOM is internally
+consistent and nothing about what consumers actually receive. The Aster
 package check validates file selection, normalized dependency identities, and
 the resolved reverse closure against the bridge-crate BOM without requiring a
 live registry. The publish command performs Cargo's real
@@ -188,7 +209,9 @@ scripts/release/publish-native-stack.py publish
 The script stages exact fork revisions and verified bridge archives under a
 temporary directory, dry-runs each crate immediately before upload, waits for
 the sparse index between dependents, and skips versions already present after
-a partial retry. It never changes a fork checkout or crates.io archive in
+a partial retry — but only when the published source matches the staged source.
+A version that is present with *different* code is a release error, not a
+retry, and fails the run. It never changes a fork checkout or crates.io archive in
 place. Run it only when the BOM or supported native dependency closure changes;
 ordinary Aster-only releases reuse the immutable published dependency wave.
 
@@ -244,6 +267,41 @@ remains the signed-off maintainer record. `scripts/download-release.sh` reads
 the public package, verifies Forgejo's digest and `SHA256SUMS`, and requires no
 token.
 
+## What the registry actually serves
+
+Never infer the contents of a published version from pin history, from the
+current `iroh-fork-manifest.toml`, or from what this repository builds. Root
+`[patch.crates-io]` entries make our source tree resolve the BOM revision no
+matter what the registry holds, so a source-tree build tells you nothing about
+consumers. The published archive is the only evidence, and reading it takes
+about a minute:
+
+```bash
+# What versions exist (sparse index; two-letter/two-letter path for names >3):
+curl -s https://forge.emrul.dev/api/packages/Aster/cargo/ir/oh/iroh-blobs |
+  python3 -c 'import sys,json; [print(json.loads(l)["vers"]) for l in sys.stdin if l.strip()]'
+
+# What one of them contains:
+curl -sL -o pkg.crate \
+  https://forge.emrul.dev/api/packages/Aster/cargo/api/v1/crates/iroh-blobs/0.103.0/download
+tar xzf pkg.crate
+git -C /Users/emrul/dev/aster/iroh-blobs archive <rev> src | tar x -C /tmp/rev
+diff -r /tmp/rev/src iroh-blobs-0.103.0/src
+```
+
+`publish-native-stack.py check` performs this comparison for the whole closure
+and prints `(matches registry)` per crate; use it in preference to the manual
+form, and use the manual form when investigating a specific claim.
+
+This is not hypothetical. On 2026-08-13 an agent assumed the published
+`iroh-blobs 0.103.0` came from the revision pinned before its work began,
+concluded consumers were missing a feature and that a release would fail to
+compile, and bumped a crate version to "fix" it. The archive was in fact
+byte-identical to a revision two commits later: the wave had been published
+mid-development, the feature was already live in `aster 0.3.12`, and the
+consumer was already testing against it. The version bump was reasonable
+hygiene; the diagnosis was invented. When a claim is checkable, check it.
+
 ## Public surface policy
 
 The facade owns Aster's source-compatibility promise. Native reexports exist so
@@ -267,6 +325,9 @@ endpoint closure, ALPN mutation, competing accept loops, and blob GC.
 
 - [ ] Fork tags and commits match `iroh-fork-manifest.toml`.
 - [ ] Resolved all-feature fork closure matches the registry BOM.
+- [ ] Every already-published crate's archive matches its BOM revision
+      (`publish-native-stack.py check` reports `(matches registry)`); any crate
+      whose source moved carries a new version.
 - [ ] Bridge crates have been repackaged with same-registry dependency metadata;
       their source matches the recorded crates.io archive byte-for-byte after
       excluding the manifest rewrite and Cargo-generated packaging metadata.
