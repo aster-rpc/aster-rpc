@@ -155,10 +155,12 @@ impl FetchReport {
             .map(|p| &p.node_id)
     }
 
-    /// Payload bytes read from providers during this fetch.
+    /// Payload bytes successfully decoded from providers during this fetch.
     ///
     /// Excludes protocol overhead and anything that was already resident
-    /// locally; includes bytes received before an attempt failed.
+    /// locally. A provider that transferred part of a blob before failing is
+    /// counted up to its last valid chunk, so each byte is counted once even
+    /// when the fetch failed over between providers.
     pub fn bytes_transferred(&self) -> u64 {
         self.bytes_transferred
     }
