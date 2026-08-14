@@ -2759,8 +2759,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-docs"
-version = "0.101.0"
-source = "git+https://forge.emrul.dev/Aster/iroh-docs.git?rev=d9c091511de89a3e1310b23072804118822cebb6#d9c091511de89a3e1310b23072804118822cebb6"
+version = "0.101.1"
+source = "git+https://forge.emrul.dev/Aster/iroh-docs.git?rev=6c011608b3781bc8738103dcfb5f56f9f6f4efb8#6c011608b3781bc8738103dcfb5f56f9f6f4efb8"
 dependencies = [
  "anyhow",
  "async-channel",
