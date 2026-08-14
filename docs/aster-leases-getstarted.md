@@ -14,9 +14,11 @@ never corruption.
 > state machine, fence rule, holder engine (§3–§4), and the
 > `aster.lease.Grantor` service (§5) are implemented in the Rust `aster`
 > crate; other bindings follow the FFI wave. Still to come
-> ([design doc](_internal/aster-leases.md)): portal-store and S3-catalog
-> serializer backends, the advisory directory row (lease visibility in the
-> shared doc), and `aster.ops` metrics for fencing rejections.
+> ([design doc](_internal/aster-leases.md)): the quorum-backed coordination
+> serializer for resources whose owner moves between nodes, the single-node
+> portal-store and S3-catalog serializer backends, the advisory directory row
+> (lease visibility in the shared doc), and `aster.ops` metrics for fencing
+> rejections.
 
 ---
 
@@ -272,10 +274,12 @@ different tempos against the same grantor.
   `LeaseHandle` engine, `aster.lease.Grantor` + `GrantorSerializer` with
   transport-bound identity. Design-doc test matrix rows 1–6, 8, 10 plus
   wire tests pass.
-- **Next:** portal-store (SQLite row) and S3-catalog serializer backends,
-  the advisory directory row + serializer-authored audit trail, fencing-
-  rejection metrics in `aster.ops`. Python/TS/Java surfaces follow the FFI
-  wave.
+- **Next:** the quorum-backed coordination serializer (the one to use when the
+  holder moves between nodes — a single node's store cannot serialize a handoff
+  between two nodes that each have their own), single-node portal-store (SQLite
+  row) and S3-catalog serializer backends, the advisory directory row +
+  serializer-authored audit trail, fencing-rejection metrics in `aster.ops`.
+  Python/TS/Java surfaces follow the FFI wave.
 
 Design rationale, the full state machine, timing rules, and the test
 matrix: [`docs/_internal/aster-leases.md`](_internal/aster-leases.md).
