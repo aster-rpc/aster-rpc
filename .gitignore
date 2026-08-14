@@ -268,7 +268,6 @@ AGENTS.md
 /bindings/python/aster/lib_aster.dylib.dSYM/
 aster-docs
 aster-website
-scripts/check-ascii.py
 
 # TypeScript NAPI build artifacts -- the .node binary and per-platform
 # npm/<platform>/ dirs are produced by `napi build` / `napi create-npm-dirs`
