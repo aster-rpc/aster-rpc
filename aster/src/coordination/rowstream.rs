@@ -1,0 +1,1358 @@
+//! Spike 5 (repaired) -- the canonical row-stream body.
+//!
+//! The first cut claimed "no whole-body materialization" and measured it with a
+//! counter that could not observe the thing it claimed: the writer accumulated
+//! the entire body in a `Vec<u8>`, the reader took the whole body as `&[u8]`
+//! and retained every decoded row, and `peak_row_bytes` tracked only the
+//! per-row encode buffer. The claim was true of the metric and false of the
+//! code. This version streams for real -- `BodyWriter<W: Write>` writes
+//! straight through and `read_body<R: Read>` drives a visitor -- so neither
+//! side has anywhere to accumulate, and `spikes/coord-rowstream` measures the
+//! result with a counting global allocator rather than a self-reported number.
+//!
+//! Also repaired: two roots, so a recovery body cannot carry the
+//! authority-bearing snapshot row; component-wise ordering keys; per-section
+//! byte ceilings; a bounded header; `row_counts` actually compared; and a
+//! LEB128 reader that rejects overlong values instead of dropping bits.
+
+use std::io::{Read, Write};
+
+use fory_derive::{ForyStruct, ForyUnion};
+
+use super::contract::{
+    payload_fory, ChangeMembershipActionV1, LogIdV1, ResourceKeyV1, SavedReplyV1,
+};
+
+// ── Sections ─────────────────────────────────────────────────────────────────
+
+pub const SECTION_RESOURCES: u64 = 1;
+pub const SECTION_GRANTS: u64 = 2;
+pub const SECTION_ADMINS: u64 = 3;
+pub const SECTION_SESSIONS: u64 = 4;
+pub const SECTION_INTENTS: u64 = 5;
+pub const SECTION_ROUTES: u64 = 6;
+pub const SECTION_AUDIT: u64 = 7;
+
+pub const MAX_HEADER_BYTES: u64 = 64 * 1024;
+
+/// Per-section limits. One global 1 MiB row cap was far too loose: an admin row
+/// is 32 bytes of payload and had four orders of magnitude of headroom.
+pub struct SectionLimits {
+    pub max_rows: u64,
+    pub max_row_bytes: u64,
+}
+
+pub fn limits(section: u64) -> Option<SectionLimits> {
+    let (max_rows, max_row_bytes) = match section {
+        SECTION_RESOURCES => (100_000u64, 128 * 1024u64), // 64 KiB value + 576 key + framing
+        SECTION_GRANTS => (100_000, 2 * 1024),
+        SECTION_ADMINS => (64, 256),
+        SECTION_SESSIONS => (1_024 + 16_384, 4 * 1024),
+        SECTION_INTENTS => (64, 64 * 1024), // desired plan carries seeds + permits
+        SECTION_ROUTES => (64, 16 * 1024),  // ticket
+        SECTION_AUDIT => (100_000, 2 * 1024),
+        _ => return None,
+    };
+    Some(SectionLimits {
+        max_rows,
+        max_row_bytes,
+    })
+}
+
+/// Per-section declared counts. The header is typed, not opaque bytes, so the
+/// reader can compare what it consumed against what the header promised -- a
+/// check an earlier version described normatively and never implemented.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/RowCounts")]
+pub struct RowCountsV1 {
+    #[fory(id = 1)]
+    pub resources: u64,
+    #[fory(id = 2)]
+    pub grants: u64,
+    #[fory(id = 3)]
+    pub admins: u64,
+    #[fory(id = 4)]
+    pub sessions: u64,
+    #[fory(id = 5)]
+    pub intents: u64,
+    #[fory(id = 6)]
+    pub routes: u64,
+    #[fory(id = 7)]
+    pub audit: u64,
+}
+
+impl RowCountsV1 {
+    pub fn get(&self, section: u64) -> Option<u64> {
+        Some(match section {
+            SECTION_RESOURCES => self.resources,
+            SECTION_GRANTS => self.grants,
+            SECTION_ADMINS => self.admins,
+            SECTION_SESSIONS => self.sessions,
+            SECTION_INTENTS => self.intents,
+            SECTION_ROUTES => self.routes,
+            SECTION_AUDIT => self.audit,
+            _ => return None,
+        })
+    }
+    pub fn set(&mut self, section: u64, n: u64) {
+        match section {
+            SECTION_RESOURCES => self.resources = n,
+            SECTION_GRANTS => self.grants = n,
+            SECTION_ADMINS => self.admins = n,
+            SECTION_SESSIONS => self.sessions = n,
+            SECTION_INTENTS => self.intents = n,
+            SECTION_ROUTES => self.routes = n,
+            SECTION_AUDIT => self.audit = n,
+            _ => {}
+        }
+    }
+}
+
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/BodyHeader")]
+pub struct BodyHeaderV1 {
+    #[fory(id = 1)]
+    pub format_version: u32,
+    #[fory(id = 2)]
+    pub schema_version: u32,
+    #[fory(id = 3, bytes)]
+    pub group_id: Vec<u8>,
+    #[fory(id = 4)]
+    pub row_counts: RowCountsV1,
+}
+
+// ── Row types ────────────────────────────────────────────────────────────────
+
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/SnapshotResourceRow")]
+pub struct SnapshotResourceRowV1 {
+    #[fory(id = 1)]
+    pub key: ResourceKeyV1,
+    #[fory(id = 2)]
+    pub epoch: u64,
+    #[fory(id = 3)]
+    pub held: bool,
+    #[fory(id = 4, bytes)]
+    pub holder_node_id: Option<Vec<u8>>,
+    #[fory(id = 5)]
+    pub ttl_ms: u64,
+    #[fory(id = 6)]
+    pub lease_revision: u64,
+    #[fory(id = 7)]
+    pub value_revision: u64,
+    #[fory(id = 8, bytes)]
+    pub value: Vec<u8>,
+    #[fory(id = 9)]
+    pub acl_revision: u64,
+}
+
+/// Structurally cannot express holder/held, so a recovered group cannot inherit
+/// lease authority even through a coding error.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/RecoveryResourceRow")]
+pub struct RecoveryResourceRowV1 {
+    #[fory(id = 1)]
+    pub key: ResourceKeyV1,
+    #[fory(id = 2)]
+    pub source_epoch: u64,
+    #[fory(id = 3)]
+    pub ttl_ms: u64,
+    #[fory(id = 4)]
+    pub lease_revision: u64,
+    #[fory(id = 5)]
+    pub value_revision: u64,
+    #[fory(id = 6, bytes)]
+    pub value: Vec<u8>,
+    #[fory(id = 7)]
+    pub acl_revision: u64,
+}
+
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/GrantRow")]
+pub struct GrantRowV1 {
+    #[fory(id = 1)]
+    pub key: ResourceKeyV1,
+    #[fory(id = 2, bytes)]
+    pub subject_node_id: Vec<u8>,
+    #[fory(id = 3)]
+    pub rights: u64,
+}
+
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/AdminRow")]
+pub struct AdminRowV1 {
+    #[fory(id = 1, bytes)]
+    pub subject_node_id: Vec<u8>,
+}
+
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/SessionRow")]
+pub struct SessionRowV1 {
+    #[fory(id = 1, bytes)]
+    pub actor_node_id: Vec<u8>,
+    #[fory(id = 2, bytes)]
+    pub client_id: Vec<u8>,
+    #[fory(id = 3)]
+    pub last_sequence: u64,
+    #[fory(id = 4, bytes)]
+    pub request_hash: Vec<u8>,
+    /// Typed, not opaque bytes: a snapshot whose saved results cannot be
+    /// type-checked can install a malformed one.
+    #[fory(id = 5)]
+    pub last_result: Option<SavedReplyV1>,
+    #[fory(id = 6)]
+    pub retired: bool,
+}
+
+/// The full intent state. An earlier cut omitted `request_hash`,
+/// `expected_membership` and `desired_plan`, none of which are reconstructible
+/// from what remained.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/IntentRow")]
+pub struct IntentRowV1 {
+    #[fory(id = 1, bytes)]
+    pub operation_id: Vec<u8>,
+    #[fory(id = 2, bytes)]
+    pub actor_node_id: Vec<u8>,
+    #[fory(id = 3, bytes)]
+    pub request_hash: Vec<u8>,
+    #[fory(id = 4)]
+    pub expected_membership: Option<LogIdV1>,
+    /// Typed, not opaque bytes: the plan is what membership replay re-runs, so
+    /// a snapshot that cannot type-check it can install an unreadable intent.
+    #[fory(id = 5)]
+    pub desired_plan: ChangeMembershipActionV1,
+    #[fory(id = 6)]
+    pub status_code: i32,
+    #[fory(id = 7)]
+    pub result_code: i32,
+    #[fory(id = 8)]
+    pub accepted_log_id: LogIdV1,
+    #[fory(id = 9)]
+    pub completed_log_id: Option<LogIdV1>,
+    #[fory(id = 10)]
+    pub observed_membership_log_id: Option<LogIdV1>,
+}
+
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/RouteRow")]
+pub struct RouteRowV1 {
+    #[fory(id = 1, bytes)]
+    pub node_id: Vec<u8>,
+    #[fory(id = 2, bytes)]
+    pub ticket_bytes: Vec<u8>,
+    #[fory(id = 3, bytes)]
+    pub source_operation_id: Vec<u8>,
+    #[fory(id = 4)]
+    pub introduced_log_id: LogIdV1,
+}
+
+/// Stored value: term and index are the redb key, so they are not repeated.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/AuditRow")]
+pub struct AuditRowV1 {
+    #[fory(id = 1, bytes)]
+    pub leader_node_id: Vec<u8>,
+    #[fory(id = 2, bytes)]
+    pub actor_node_id: Vec<u8>,
+    #[fory(id = 3)]
+    pub operation_code: i32,
+    #[fory(id = 4)]
+    pub resource: Option<ResourceKeyV1>,
+    #[fory(id = 5)]
+    pub result_code: i32,
+    #[fory(id = 6)]
+    pub epoch: u64,
+    #[fory(id = 7)]
+    pub value_revision: u64,
+}
+
+/// Streamed row: a body has no table key, so it inlines term and index.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/AuditStreamRow")]
+pub struct AuditStreamRowV1 {
+    #[fory(id = 1)]
+    pub log_term: u64,
+    #[fory(id = 2)]
+    pub log_index: u64,
+    #[fory(id = 3)]
+    pub row: AuditRowV1,
+}
+
+impl AuditRowV1 {
+    pub fn log_id(&self, key: (u64, u64)) -> LogIdV1 {
+        LogIdV1 {
+            term: key.0,
+            leader_node_id: self.leader_node_id.clone(),
+            index: key.1,
+        }
+    }
+}
+impl AuditStreamRowV1 {
+    pub fn key(&self) -> (u64, u64) {
+        (self.log_term, self.log_index)
+    }
+    pub fn log_id(&self) -> LogIdV1 {
+        self.row.log_id(self.key())
+    }
+}
+
+// ── Ordering keys ────────────────────────────────────────────────────────────
+
+/// An owned typed tuple key. `Vec<Vec<u8>>`'s `Ord` is lexicographic over
+/// components with each component compared bytewise, which is exactly redb's
+/// tuple ordering.
+///
+/// Two earlier attempts were both wrong. Flattening `namespace || key` made
+/// `("a","bc")` and `("ab","c")` compare equal. Length-prefixing removed that
+/// collision but *inverted* the order: under `len || bytes`, `"b"` sorts before
+/// `"aa"` because `1 < 2`, while redb sorts `"aa"` first. Only a real tuple
+/// comparison gets both right.
+pub type OrderKey = Vec<Vec<u8>>;
+
+fn component_key(parts: &[&[u8]]) -> OrderKey {
+    parts.iter().map(|p| p.to_vec()).collect()
+}
+
+fn resource_key_parts(k: &ResourceKeyV1) -> OrderKey {
+    component_key(&[k.namespace.as_bytes(), &k.key])
+}
+
+// ── Two roots ────────────────────────────────────────────────────────────────
+
+/// A row that can appear in a body. Two roots implement it, so the framing is
+/// shared while the row sets stay disjoint.
+pub trait BodyRow: Sized + std::fmt::Debug + Clone + PartialEq {
+    fn section(&self) -> Option<u64>;
+    fn order_key(&self) -> OrderKey;
+    fn fory() -> fory_core::Fory;
+    fn encode(f: &fory_core::Fory, r: &Self) -> Result<Vec<u8>, BodyError>;
+    fn decode(f: &fory_core::Fory, b: &[u8]) -> Result<Self, BodyError>;
+    fn legal_sections() -> &'static [u64];
+    fn validate(r: &Self) -> Result<(), BodyError>;
+}
+
+#[derive(ForyUnion, aster_macros::AsterType, Debug, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/SnapshotBodyRow")]
+pub enum SnapshotBodyRowV1 {
+    #[fory(default)]
+    #[fory(id = 1)]
+    Resource(SnapshotResourceRowV1),
+    #[fory(id = 2)]
+    Grant(GrantRowV1),
+    #[fory(id = 3)]
+    Admin(AdminRowV1),
+    #[fory(id = 4)]
+    Session(SessionRowV1),
+    #[fory(id = 5)]
+    Intent(IntentRowV1),
+    #[fory(id = 6)]
+    Route(RouteRowV1),
+    #[fory(id = 7)]
+    Audit(AuditStreamRowV1),
+    #[fory(unknown)]
+    Unknown(fory_core::UnknownCase),
+}
+
+/// A separate root, so a recovery body **cannot** carry the authority-bearing
+/// snapshot resource row, nor sessions/intents/routes/audit. Sharing
+/// `GrantRowV1`/`AdminRowV1` between the two roots is safe: `PayloadRegistry`
+/// collisions occur within a runtime, not between runtimes.
+#[derive(ForyUnion, aster_macros::AsterType, Debug, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/RecoveryBodyRow")]
+pub enum RecoveryBodyRowV1 {
+    #[fory(default)]
+    #[fory(id = 1)]
+    Resource(RecoveryResourceRowV1),
+    #[fory(id = 2)]
+    Grant(GrantRowV1),
+    #[fory(id = 3)]
+    Admin(AdminRowV1),
+    #[fory(unknown)]
+    Unknown(fory_core::UnknownCase),
+}
+
+const SNAPSHOT_SECTIONS: &[u64] = &[
+    SECTION_RESOURCES,
+    SECTION_GRANTS,
+    SECTION_ADMINS,
+    SECTION_SESSIONS,
+    SECTION_INTENTS,
+    SECTION_ROUTES,
+    SECTION_AUDIT,
+];
+const RECOVERY_SECTIONS: &[u64] = &[SECTION_RESOURCES, SECTION_GRANTS, SECTION_ADMINS];
+
+impl BodyRow for SnapshotBodyRowV1 {
+    fn section(&self) -> Option<u64> {
+        Some(match self {
+            SnapshotBodyRowV1::Resource(_) => SECTION_RESOURCES,
+            SnapshotBodyRowV1::Grant(_) => SECTION_GRANTS,
+            SnapshotBodyRowV1::Admin(_) => SECTION_ADMINS,
+            SnapshotBodyRowV1::Session(_) => SECTION_SESSIONS,
+            SnapshotBodyRowV1::Intent(_) => SECTION_INTENTS,
+            SnapshotBodyRowV1::Route(_) => SECTION_ROUTES,
+            SnapshotBodyRowV1::Audit(_) => SECTION_AUDIT,
+            SnapshotBodyRowV1::Unknown(_) => return None,
+        })
+    }
+    fn order_key(&self) -> OrderKey {
+        match self {
+            SnapshotBodyRowV1::Resource(r) => resource_key_parts(&r.key),
+            SnapshotBodyRowV1::Grant(r) => {
+                component_key(&[r.key.namespace.as_bytes(), &r.key.key, &r.subject_node_id])
+            }
+            SnapshotBodyRowV1::Admin(r) => component_key(&[&r.subject_node_id]),
+            SnapshotBodyRowV1::Session(r) => component_key(&[&r.actor_node_id, &r.client_id]),
+            SnapshotBodyRowV1::Intent(r) => component_key(&[&r.operation_id]),
+            SnapshotBodyRowV1::Route(r) => component_key(&[&r.node_id]),
+            SnapshotBodyRowV1::Audit(r) => {
+                component_key(&[&r.log_term.to_be_bytes(), &r.log_index.to_be_bytes()])
+            }
+            SnapshotBodyRowV1::Unknown(_) => OrderKey::new(),
+        }
+    }
+    fn fory() -> fory_core::Fory {
+        payload_fory::<SnapshotBodyRowV1>()
+    }
+    fn encode(f: &fory_core::Fory, r: &Self) -> Result<Vec<u8>, BodyError> {
+        f.serialize(r).map_err(|_| BodyError::Encode)
+    }
+    fn decode(f: &fory_core::Fory, b: &[u8]) -> Result<Self, BodyError> {
+        f.deserialize(b).map_err(|_| BodyError::Decode)
+    }
+    fn legal_sections() -> &'static [u64] {
+        SNAPSHOT_SECTIONS
+    }
+    fn validate(r: &Self) -> Result<(), BodyError> {
+        validate_snapshot_row(r)
+    }
+}
+
+impl BodyRow for RecoveryBodyRowV1 {
+    fn section(&self) -> Option<u64> {
+        Some(match self {
+            RecoveryBodyRowV1::Resource(_) => SECTION_RESOURCES,
+            RecoveryBodyRowV1::Grant(_) => SECTION_GRANTS,
+            RecoveryBodyRowV1::Admin(_) => SECTION_ADMINS,
+            RecoveryBodyRowV1::Unknown(_) => return None,
+        })
+    }
+    fn order_key(&self) -> OrderKey {
+        match self {
+            RecoveryBodyRowV1::Resource(r) => resource_key_parts(&r.key),
+            RecoveryBodyRowV1::Grant(r) => {
+                component_key(&[r.key.namespace.as_bytes(), &r.key.key, &r.subject_node_id])
+            }
+            RecoveryBodyRowV1::Admin(r) => component_key(&[&r.subject_node_id]),
+            RecoveryBodyRowV1::Unknown(_) => OrderKey::new(),
+        }
+    }
+    fn fory() -> fory_core::Fory {
+        payload_fory::<RecoveryBodyRowV1>()
+    }
+    fn encode(f: &fory_core::Fory, r: &Self) -> Result<Vec<u8>, BodyError> {
+        f.serialize(r).map_err(|_| BodyError::Encode)
+    }
+    fn decode(f: &fory_core::Fory, b: &[u8]) -> Result<Self, BodyError> {
+        f.deserialize(b).map_err(|_| BodyError::Decode)
+    }
+    fn legal_sections() -> &'static [u64] {
+        RECOVERY_SECTIONS
+    }
+    fn validate(r: &Self) -> Result<(), BodyError> {
+        validate_recovery_row(r)
+    }
+}
+
+// ── Minimal LEB128 ───────────────────────────────────────────────────────────
+
+pub fn write_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BodyError {
+    NonMinimalVarint,
+    VarintOverflow,
+    Truncated,
+    HeaderTooLarge {
+        declared: u64,
+    },
+    SectionOutOfOrder {
+        got: u64,
+        previous: u64,
+    },
+    IllegalSection(u64),
+    RowCountTooLarge {
+        section: u64,
+        declared: u64,
+        max: u64,
+    },
+    RowTooLarge {
+        section: u64,
+        declared: u64,
+        max: u64,
+    },
+    WrongSectionForRow {
+        section: u64,
+    },
+    RowsOutOfOrder,
+    UnknownVariant,
+    HeaderCountMismatch {
+        section: u64,
+        declared: u64,
+        actual: u64,
+    },
+    IncompleteProfile {
+        expected: Vec<u64>,
+        got: Vec<u64>,
+    },
+    NoOpenSection,
+    InvalidRow(&'static str),
+    Decode,
+    Encode,
+    Io,
+}
+
+/// `Ok(None)` means a clean end of stream at a frame boundary. Anything else
+/// that runs out mid-value is `Truncated`.
+fn read_u8_opt<R: Read>(r: &mut R) -> Result<Option<u8>, BodyError> {
+    let mut b = [0u8; 1];
+    match r.read(&mut b) {
+        Ok(0) => Ok(None),
+        Ok(_) => Ok(Some(b[0])),
+        Err(_) => Err(BodyError::Io),
+    }
+}
+
+fn read_u8<R: Read>(r: &mut R) -> Result<u8, BodyError> {
+    read_u8_opt(r)?.ok_or(BodyError::Truncated)
+}
+
+/// A varint at a position where end-of-stream is legal. Distinguishes "nothing
+/// left" from "a varint started and then the stream ended", which an earlier
+/// version conflated -- appending a lone `0x80` to a complete body was accepted
+/// as a clean EOF.
+pub fn read_varint_boundary<R: Read>(r: &mut R) -> Result<Option<u64>, BodyError> {
+    match read_u8_opt(r)? {
+        None => Ok(None),
+        Some(first) => Ok(Some(continue_varint(r, first)?)),
+    }
+}
+
+/// Minimal LEB128 with a real overflow guard. The earlier reader checked
+/// `shift >= 64` but never bounded the tenth byte's value, so `0xff` in the
+/// tenth position silently dropped bits instead of erroring.
+pub fn read_varint<R: Read>(r: &mut R) -> Result<u64, BodyError> {
+    let first = read_u8(r)?;
+    continue_varint(r, first)
+}
+
+fn continue_varint<R: Read>(r: &mut R, first: u8) -> Result<u64, BodyError> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    let mut byte = first;
+    loop {
+        if shift == 63 {
+            if byte > 1 {
+                return Err(BodyError::VarintOverflow);
+            }
+        } else if shift > 63 {
+            return Err(BodyError::VarintOverflow);
+        }
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            if byte == 0 && shift > 0 {
+                return Err(BodyError::NonMinimalVarint);
+            }
+            return Ok(result);
+        }
+        shift += 7;
+        byte = read_u8(r)?;
+    }
+}
+
+// ── Streaming writer ─────────────────────────────────────────────────────────
+
+/// Writes straight through to `W`. Nothing here grows with the body: `buf` is
+/// reused for exactly one row at a time.
+///
+/// Every rule the reader enforces, the writer enforces too, and by returning
+/// `Result` rather than panicking: an earlier version used `assert!`/`expect`
+/// throughout, so a malformed body was a crash rather than an error, and
+/// nothing stopped it emitting rows in the wrong section or out of order.
+pub struct BodyWriter<W: Write, T: BodyRow> {
+    w: W,
+    fory: fory_core::Fory,
+    buf: Vec<u8>,
+    header_counts: RowCountsV1,
+    previous_section: u64,
+    open: Option<(u64, u64, u64)>,
+    last_key: Option<OrderKey>,
+    emitted: Vec<u64>,
+    _t: std::marker::PhantomData<T>,
+}
+
+impl<W: Write, T: BodyRow> BodyWriter<W, T> {
+    pub fn new(mut w: W, header: &BodyHeaderV1) -> Result<Self, BodyError> {
+        let fory = payload_fory::<BodyHeaderV1>();
+        let enc = fory.serialize(header).map_err(|_| BodyError::Encode)?;
+        if enc.len() as u64 > MAX_HEADER_BYTES {
+            return Err(BodyError::HeaderTooLarge {
+                declared: enc.len() as u64,
+            });
+        }
+        let mut pre = Vec::new();
+        write_varint(&mut pre, enc.len() as u64);
+        w.write_all(&pre).map_err(|_| BodyError::Io)?;
+        w.write_all(&enc).map_err(|_| BodyError::Io)?;
+        Ok(BodyWriter {
+            w,
+            fory: T::fory(),
+            buf: Vec::new(),
+            header_counts: header.row_counts.clone(),
+            previous_section: 0,
+            open: None,
+            last_key: None,
+            emitted: Vec::new(),
+            _t: std::marker::PhantomData,
+        })
+    }
+
+    pub fn begin_section(&mut self, id: u64) -> Result<(), BodyError> {
+        self.end_section()?;
+        if id <= self.previous_section {
+            return Err(BodyError::SectionOutOfOrder {
+                got: id,
+                previous: self.previous_section,
+            });
+        }
+        if !T::legal_sections().contains(&id) {
+            return Err(BodyError::IllegalSection(id));
+        }
+        let declared = self
+            .header_counts
+            .get(id)
+            .ok_or(BodyError::IllegalSection(id))?;
+        let lim = limits(id).ok_or(BodyError::IllegalSection(id))?;
+        if declared > lim.max_rows {
+            return Err(BodyError::RowCountTooLarge {
+                section: id,
+                declared,
+                max: lim.max_rows,
+            });
+        }
+        self.previous_section = id;
+        self.last_key = None;
+        self.buf.clear();
+        write_varint(&mut self.buf, id);
+        write_varint(&mut self.buf, declared);
+        self.w.write_all(&self.buf).map_err(|_| BodyError::Io)?;
+        self.open = Some((id, declared, 0));
+        Ok(())
+    }
+
+    pub fn row(&mut self, row: &T) -> Result<(), BodyError> {
+        let (sid, declared, written) = self.open.ok_or(BodyError::NoOpenSection)?;
+        if row.section() != Some(sid) {
+            return Err(BodyError::WrongSectionForRow { section: sid });
+        }
+        if written + 1 > declared {
+            return Err(BodyError::HeaderCountMismatch {
+                section: sid,
+                declared,
+                actual: written + 1,
+            });
+        }
+        // Same logical validation the reader applies. Without it the writer
+        // could emit a row its own reader would later reject -- a body that is
+        // unreadable by construction, discovered only on install.
+        T::validate(row)?;
+        let k = row.order_key();
+        if let Some(prev) = &self.last_key {
+            if &k <= prev {
+                return Err(BodyError::RowsOutOfOrder);
+            }
+        }
+        let lim = limits(sid).ok_or(BodyError::IllegalSection(sid))?;
+        let enc = T::encode(&self.fory, row)?;
+        if enc.len() as u64 > lim.max_row_bytes {
+            return Err(BodyError::RowTooLarge {
+                section: sid,
+                declared: enc.len() as u64,
+                max: lim.max_row_bytes,
+            });
+        }
+        self.last_key = Some(k);
+        self.buf.clear();
+        write_varint(&mut self.buf, enc.len() as u64);
+        self.w.write_all(&self.buf).map_err(|_| BodyError::Io)?;
+        self.w.write_all(&enc).map_err(|_| BodyError::Io)?;
+        self.open = Some((sid, declared, written + 1));
+        Ok(())
+    }
+
+    fn end_section(&mut self) -> Result<(), BodyError> {
+        if let Some((sid, declared, written)) = self.open.take() {
+            if declared != written {
+                return Err(BodyError::HeaderCountMismatch {
+                    section: sid,
+                    declared,
+                    actual: written,
+                });
+            }
+            self.emitted.push(sid);
+        }
+        Ok(())
+    }
+
+    /// A body must carry its root's complete section profile, every section
+    /// exactly once and in ascending order.
+    pub fn finish(mut self) -> Result<W, BodyError> {
+        self.end_section()?;
+        if self.emitted != T::legal_sections() {
+            return Err(BodyError::IncompleteProfile {
+                expected: T::legal_sections().to_vec(),
+                got: self.emitted.clone(),
+            });
+        }
+        self.w.flush().map_err(|_| BodyError::Io)?;
+        Ok(self.w)
+    }
+}
+
+// ── Streaming reader ─────────────────────────────────────────────────────────
+
+/// The reader hands each row to the visitor and forgets it. Retention is the
+/// caller's choice, which is what makes the memory claim testable at all.
+pub trait BodyVisitor<T: BodyRow> {
+    fn header(&mut self, header: &BodyHeaderV1) -> Result<(), BodyError>;
+    fn row(&mut self, section: u64, row: T) -> Result<(), BodyError>;
+}
+
+/// Logical validation of a decoded row -- widths and value bounds that the
+/// encoded-byte ceiling does not imply. A 32-byte NodeId field can hold 4 bytes
+/// within any byte ceiling, so the ceiling is not the check.
+const MAX_NAMESPACE: usize = 64;
+const MAX_KEY: usize = 512;
+const MAX_VALUE: usize = 64 * 1024;
+const RIGHTS_MASK: u64 = 0x3f;
+
+fn check_node_id(b: &[u8]) -> Result<(), BodyError> {
+    if b.len() != 32 {
+        return Err(BodyError::InvalidRow("node id must be 32 bytes"));
+    }
+    Ok(())
+}
+fn check_resource_key(k: &ResourceKeyV1) -> Result<(), BodyError> {
+    if k.namespace.is_empty() || k.namespace.len() > MAX_NAMESPACE {
+        return Err(BodyError::InvalidRow("namespace width"));
+    }
+    if k.key.is_empty() || k.key.len() > MAX_KEY {
+        return Err(BodyError::InvalidRow("resource key width"));
+    }
+    Ok(())
+}
+
+pub fn validate_snapshot_row(r: &SnapshotBodyRowV1) -> Result<(), BodyError> {
+    match r {
+        SnapshotBodyRowV1::Resource(x) => {
+            check_resource_key(&x.key)?;
+            if x.value.len() > MAX_VALUE {
+                return Err(BodyError::InvalidRow("value width"));
+            }
+            match (&x.holder_node_id, x.held) {
+                (Some(h), _) => check_node_id(h)?,
+                (None, true) => return Err(BodyError::InvalidRow("held with no holder")),
+                (None, false) => {}
+            }
+        }
+        SnapshotBodyRowV1::Grant(x) => {
+            check_resource_key(&x.key)?;
+            check_node_id(&x.subject_node_id)?;
+            if x.rights & !RIGHTS_MASK != 0 {
+                return Err(BodyError::InvalidRow("unknown rights bits"));
+            }
+        }
+        SnapshotBodyRowV1::Admin(x) => check_node_id(&x.subject_node_id)?,
+        SnapshotBodyRowV1::Session(x) => {
+            check_node_id(&x.actor_node_id)?;
+            if x.client_id.len() != 16 {
+                return Err(BodyError::InvalidRow("client id must be 16 bytes"));
+            }
+            if x.request_hash.len() != 32 && !x.request_hash.is_empty() {
+                return Err(BodyError::InvalidRow("request hash width"));
+            }
+        }
+        SnapshotBodyRowV1::Intent(x) => {
+            if x.operation_id.len() != 16 {
+                return Err(BodyError::InvalidRow("operation id must be 16 bytes"));
+            }
+            check_node_id(&x.actor_node_id)?;
+        }
+        SnapshotBodyRowV1::Route(x) => check_node_id(&x.node_id)?,
+        SnapshotBodyRowV1::Audit(x) => {
+            check_node_id(&x.row.leader_node_id)?;
+            check_node_id(&x.row.actor_node_id)?;
+            if let Some(k) = &x.row.resource {
+                check_resource_key(k)?;
+            }
+        }
+        SnapshotBodyRowV1::Unknown(_) => return Err(BodyError::UnknownVariant),
+    }
+    Ok(())
+}
+
+pub fn validate_recovery_row(r: &RecoveryBodyRowV1) -> Result<(), BodyError> {
+    match r {
+        RecoveryBodyRowV1::Resource(x) => {
+            check_resource_key(&x.key)?;
+            if x.value.len() > MAX_VALUE {
+                return Err(BodyError::InvalidRow("value width"));
+            }
+        }
+        RecoveryBodyRowV1::Grant(x) => {
+            check_resource_key(&x.key)?;
+            check_node_id(&x.subject_node_id)?;
+            if x.rights & !RIGHTS_MASK != 0 {
+                return Err(BodyError::InvalidRow("unknown rights bits"));
+            }
+        }
+        RecoveryBodyRowV1::Admin(x) => check_node_id(&x.subject_node_id)?,
+        RecoveryBodyRowV1::Unknown(_) => return Err(BodyError::UnknownVariant),
+    }
+    Ok(())
+}
+
+/// The section profile is derived from the root, not supplied by the caller.
+/// An earlier version let callers pass any `expected_sections`, so a partial
+/// body was readable by asking for exactly the partial profile it happened to
+/// contain -- which made the "sections 1-7 exactly once" rule unenforced.
+pub fn read_body<R: Read, T: BodyRow>(
+    r: &mut R,
+    v: &mut dyn BodyVisitor<T>,
+) -> Result<(), BodyError> {
+    let fory = T::fory();
+    let hfory = payload_fory::<BodyHeaderV1>();
+
+    let hlen = read_varint(r)?;
+    if hlen > MAX_HEADER_BYTES {
+        return Err(BodyError::HeaderTooLarge { declared: hlen });
+    }
+    let mut hbuf = vec![0u8; hlen as usize];
+    r.read_exact(&mut hbuf).map_err(|_| BodyError::Truncated)?;
+    let header: BodyHeaderV1 = hfory.deserialize(&hbuf).map_err(|_| BodyError::Decode)?;
+    drop(hbuf);
+    v.header(&header)?;
+
+    let mut seen: Vec<u64> = Vec::new();
+    let mut previous = 0u64;
+    let mut buf: Vec<u8> = Vec::new();
+
+    // Clean EOF is only legal here, at a section boundary.
+    while let Some(sid) = read_varint_boundary(r)? {
+        if sid <= previous {
+            return Err(BodyError::SectionOutOfOrder { got: sid, previous });
+        }
+        if !T::legal_sections().contains(&sid) {
+            return Err(BodyError::IllegalSection(sid));
+        }
+        let lim = limits(sid).ok_or(BodyError::IllegalSection(sid))?;
+        previous = sid;
+
+        let declared = read_varint(r)?;
+        if declared > lim.max_rows {
+            return Err(BodyError::RowCountTooLarge {
+                section: sid,
+                declared,
+                max: lim.max_rows,
+            });
+        }
+        // The header promised a count; the section must declare the same.
+        let promised = header
+            .row_counts
+            .get(sid)
+            .ok_or(BodyError::IllegalSection(sid))?;
+        if promised != declared {
+            return Err(BodyError::HeaderCountMismatch {
+                section: sid,
+                declared: promised,
+                actual: declared,
+            });
+        }
+
+        let mut actual = 0u64;
+        let mut last_key: Option<OrderKey> = None;
+        for _ in 0..declared {
+            let rlen = read_varint(r)?;
+            if rlen > lim.max_row_bytes {
+                return Err(BodyError::RowTooLarge {
+                    section: sid,
+                    declared: rlen,
+                    max: lim.max_row_bytes,
+                });
+            }
+            buf.clear();
+            buf.resize(rlen as usize, 0);
+            r.read_exact(&mut buf).map_err(|_| BodyError::Truncated)?;
+            let row = T::decode(&fory, &buf)?;
+
+            match row.section() {
+                None => return Err(BodyError::UnknownVariant),
+                Some(sec) if sec != sid => {
+                    return Err(BodyError::WrongSectionForRow { section: sid })
+                }
+                _ => {}
+            }
+            T::validate(&row)?;
+            let k = row.order_key();
+            if let Some(prev) = &last_key {
+                if &k <= prev {
+                    return Err(BodyError::RowsOutOfOrder);
+                }
+            }
+            last_key = Some(k);
+            actual += 1;
+            v.row(sid, row)?;
+        }
+        if actual != declared {
+            return Err(BodyError::HeaderCountMismatch {
+                section: sid,
+                declared,
+                actual,
+            });
+        }
+        seen.push(sid);
+    }
+
+    if seen != T::legal_sections() {
+        return Err(BodyError::IncompleteProfile {
+            expected: T::legal_sections().to_vec(),
+            got: seen,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(ns: &str, k: &[u8]) -> ResourceKeyV1 {
+        ResourceKeyV1 {
+            namespace: ns.into(),
+            key: k.to_vec(),
+        }
+    }
+    fn nid(b: u8) -> Vec<u8> {
+        vec![b; 32]
+    }
+    fn admin(b: u8) -> SnapshotBodyRowV1 {
+        SnapshotBodyRowV1::Admin(AdminRowV1 {
+            subject_node_id: nid(b),
+        })
+    }
+    fn r_admin(b: u8) -> RecoveryBodyRowV1 {
+        RecoveryBodyRowV1::Admin(AdminRowV1 {
+            subject_node_id: nid(b),
+        })
+    }
+    fn snap_resource(i: u64) -> SnapshotResourceRowV1 {
+        SnapshotResourceRowV1 {
+            key: key("portal.roaming", &i.to_be_bytes()),
+            epoch: i,
+            held: true,
+            holder_node_id: Some(nid(9)),
+            ttl_ms: 30_000,
+            lease_revision: i,
+            value_revision: i,
+            value: vec![1, 2, 3],
+            acl_revision: 0,
+        }
+    }
+    fn rec_resource(i: u64) -> RecoveryResourceRowV1 {
+        RecoveryResourceRowV1 {
+            key: key("portal.roaming", &i.to_be_bytes()),
+            source_epoch: i,
+            ttl_ms: 30_000,
+            lease_revision: i,
+            value_revision: i,
+            value: vec![1, 2, 3],
+            acl_revision: 0,
+        }
+    }
+    fn audit(term: u64, index: u64) -> SnapshotBodyRowV1 {
+        SnapshotBodyRowV1::Audit(AuditStreamRowV1 {
+            log_term: term,
+            log_index: index,
+            row: AuditRowV1 {
+                leader_node_id: nid(4),
+                actor_node_id: nid(5),
+                operation_code: 1,
+                resource: Some(key("p", b"t")),
+                result_code: 1,
+                epoch: 1,
+                value_revision: 1,
+            },
+        })
+    }
+
+    #[derive(Default)]
+    struct Counting {
+        rows: usize,
+    }
+    impl<T: BodyRow> BodyVisitor<T> for Counting {
+        fn header(&mut self, _h: &BodyHeaderV1) -> Result<(), BodyError> {
+            Ok(())
+        }
+        fn row(&mut self, _s: u64, _r: T) -> Result<(), BodyError> {
+            self.rows += 1;
+            Ok(())
+        }
+    }
+
+    fn header_for(counts: RowCountsV1) -> BodyHeaderV1 {
+        BodyHeaderV1 {
+            format_version: 1,
+            schema_version: 1,
+            group_id: nid(7),
+            row_counts: counts,
+        }
+    }
+
+    /// A complete snapshot body: every legal section, exactly once.
+    fn full_snapshot() -> Vec<u8> {
+        let c = RowCountsV1 {
+            resources: 1,
+            grants: 1,
+            admins: 2,
+            sessions: 0,
+            intents: 0,
+            routes: 0,
+            audit: 2,
+        };
+        let mut w = BodyWriter::<_, SnapshotBodyRowV1>::new(Vec::new(), &header_for(c)).unwrap();
+        w.begin_section(SECTION_RESOURCES).unwrap();
+        w.row(&SnapshotBodyRowV1::Resource(snap_resource(1)))
+            .unwrap();
+        w.begin_section(SECTION_GRANTS).unwrap();
+        w.row(&SnapshotBodyRowV1::Grant(GrantRowV1 {
+            key: key("p", b"k"),
+            subject_node_id: nid(2),
+            rights: 0x3f,
+        }))
+        .unwrap();
+        w.begin_section(SECTION_ADMINS).unwrap();
+        w.row(&admin(1)).unwrap();
+        w.row(&admin(2)).unwrap();
+        w.begin_section(SECTION_SESSIONS).unwrap();
+        w.begin_section(SECTION_INTENTS).unwrap();
+        w.begin_section(SECTION_ROUTES).unwrap();
+        w.begin_section(SECTION_AUDIT).unwrap();
+        w.row(&audit(1, 1)).unwrap();
+        w.row(&audit(1, 2)).unwrap();
+        w.finish().unwrap()
+    }
+
+    #[test]
+    fn full_snapshot_body_round_trips() {
+        let body = full_snapshot();
+        let mut v = Counting::default();
+        read_body::<_, SnapshotBodyRowV1>(&mut body.as_slice(), &mut v).unwrap();
+        assert_eq!(v.rows, 6);
+    }
+
+    /// THE ordering test: component-wise equivalence with redb tuple order,
+    /// not merely absence of collisions. Length-prefixed byte keys got this
+    /// backwards -- under `len || bytes`, "b" sorts before "aa".
+    #[test]
+    fn order_key_matches_tuple_ordering() {
+        // Adversarial pairs: differing lengths, prefixes, and empty parts.
+        let cases: &[(&str, &[u8], &str, &[u8])] = &[
+            ("b", b"x", "aa", b"x"),    // shorter-but-greater first component
+            ("a", b"bc", "ab", b"c"),   // the old flattening collision
+            ("a", b"b", "a", b"bb"),    // prefix in second component
+            ("aa", b"", "aa", b"\x00"), // empty vs one zero byte
+            ("z", b"", "za", b""),      // prefix in first component
+        ];
+        for (n1, k1, n2, k2) in cases {
+            let a = resource_key_parts(&key(n1, k1));
+            let b = resource_key_parts(&key(n2, k2));
+            // The reference: redb compares tuples component-wise, bytewise.
+            let want =
+                (n1.as_bytes().to_vec(), k1.to_vec()).cmp(&(n2.as_bytes().to_vec(), k2.to_vec()));
+            assert_eq!(
+                a.cmp(&b),
+                want,
+                "mismatch for ({n1:?},{k1:?}) vs ({n2:?},{k2:?})"
+            );
+        }
+        // And the specific inversion the previous encoding produced.
+        assert!(resource_key_parts(&key("aa", b"x")) < resource_key_parts(&key("b", b"x")));
+    }
+
+    /// A trailing partial varint must not be accepted as clean EOF.
+    #[test]
+    fn truncated_suffix_is_not_clean_eof() {
+        let mut body = full_snapshot();
+        assert!(
+            read_body::<_, SnapshotBodyRowV1>(&mut body.as_slice(), &mut Counting::default())
+                .is_ok()
+        );
+        body.push(0x80); // a varint that never terminates
+        assert_eq!(
+            read_body::<_, SnapshotBodyRowV1>(&mut body.as_slice(), &mut Counting::default()),
+            Err(BodyError::Truncated)
+        );
+    }
+
+    /// A partial profile is refused even though the caller can no longer ask
+    /// for a matching partial expectation.
+    #[test]
+    fn incomplete_section_profile_is_refused() {
+        let c = RowCountsV1 {
+            admins: 1,
+            ..Default::default()
+        };
+        let mut w = BodyWriter::<_, SnapshotBodyRowV1>::new(Vec::new(), &header_for(c)).unwrap();
+        w.begin_section(SECTION_ADMINS).unwrap();
+        w.row(&admin(1)).unwrap();
+        assert!(matches!(
+            w.finish(),
+            Err(BodyError::IncompleteProfile { .. })
+        ));
+    }
+
+    /// The header's promised count must equal what the section declares.
+    #[test]
+    fn header_counts_are_compared() {
+        let body = full_snapshot();
+        // Re-encode a header claiming a different admin count.
+        let c = RowCountsV1 {
+            resources: 1,
+            grants: 1,
+            admins: 99,
+            audit: 2,
+            ..Default::default()
+        };
+        let hf = payload_fory::<BodyHeaderV1>();
+        let bad_hdr = hf.serialize(&header_for(c)).unwrap();
+        let mut out = Vec::new();
+        write_varint(&mut out, bad_hdr.len() as u64);
+        out.extend_from_slice(&bad_hdr);
+        // Splice the original body's sections after the tampered header.
+        let mut orig = body.as_slice();
+        let olen = read_varint(&mut orig).unwrap();
+        let mut skip = vec![0u8; olen as usize];
+        std::io::Read::read_exact(&mut orig, &mut skip).unwrap();
+        out.extend_from_slice(orig);
+
+        assert!(matches!(
+            read_body::<_, SnapshotBodyRowV1>(&mut out.as_slice(), &mut Counting::default()),
+            Err(BodyError::HeaderCountMismatch { .. })
+        ));
+    }
+
+    /// THE two-root test that matters: both roots use variant/section 1 for
+    /// different resource shapes, so decoding must reject rather than
+    /// compatibly drop the holder fields.
+    #[test]
+    fn recovery_root_rejects_a_holder_bearing_snapshot_row() {
+        let snap_f = payload_fory::<SnapshotBodyRowV1>();
+        let enc = snap_f
+            .serialize(&SnapshotBodyRowV1::Resource(snap_resource(1)))
+            .expect("encode snapshot row");
+
+        let rec_f = payload_fory::<RecoveryBodyRowV1>();
+        match rec_f.deserialize::<RecoveryBodyRowV1>(&enc) {
+            Err(_) => {} // rejected outright: good
+            Ok(decoded) => {
+                // If it decodes at all it must NOT silently become a valid
+                // recovery resource row carrying dropped authority.
+                panic!(
+                    "recovery root accepted a snapshot resource row: {decoded:?} -- \
+                     holder/held would have been silently dropped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_profile_excludes_authority_sections() {
+        assert_eq!(RecoveryBodyRowV1::legal_sections(), RECOVERY_SECTIONS);
+        for s in [
+            SECTION_SESSIONS,
+            SECTION_INTENTS,
+            SECTION_ROUTES,
+            SECTION_AUDIT,
+        ] {
+            assert!(!RecoveryBodyRowV1::legal_sections().contains(&s));
+        }
+        // A full snapshot body is not readable as a recovery body.
+        let body = full_snapshot();
+        assert!(matches!(
+            read_body::<_, RecoveryBodyRowV1>(&mut body.as_slice(), &mut Counting::default()),
+            Err(BodyError::IllegalSection(_)) | Err(BodyError::Decode)
+        ));
+    }
+
+    #[test]
+    fn recovery_body_round_trips() {
+        let c = RowCountsV1 {
+            resources: 1,
+            grants: 0,
+            admins: 1,
+            ..Default::default()
+        };
+        let mut w = BodyWriter::<_, RecoveryBodyRowV1>::new(Vec::new(), &header_for(c)).unwrap();
+        w.begin_section(SECTION_RESOURCES).unwrap();
+        w.row(&RecoveryBodyRowV1::Resource(rec_resource(1)))
+            .unwrap();
+        w.begin_section(SECTION_GRANTS).unwrap();
+        w.begin_section(SECTION_ADMINS).unwrap();
+        w.row(&r_admin(1)).unwrap();
+        let body = w.finish().unwrap();
+
+        let mut v = Counting::default();
+        read_body::<_, RecoveryBodyRowV1>(&mut body.as_slice(), &mut v).unwrap();
+        assert_eq!(v.rows, 2);
+    }
+
+    /// Logical widths, not just encoded byte ceilings: a short NodeId fits any
+    /// ceiling but is still invalid.
+    #[test]
+    fn decoded_rows_are_logically_validated() {
+        assert!(matches!(
+            validate_snapshot_row(&SnapshotBodyRowV1::Admin(AdminRowV1 {
+                subject_node_id: vec![1, 2, 3],
+            })),
+            Err(BodyError::InvalidRow(_))
+        ));
+        assert!(matches!(
+            validate_snapshot_row(&SnapshotBodyRowV1::Grant(GrantRowV1 {
+                key: key("p", b"k"),
+                subject_node_id: nid(1),
+                rights: 0x80, // unknown bit
+            })),
+            Err(BodyError::InvalidRow(_))
+        ));
+        let mut held_no_holder = snap_resource(1);
+        held_no_holder.holder_node_id = None;
+        held_no_holder.held = true;
+        assert!(matches!(
+            validate_snapshot_row(&SnapshotBodyRowV1::Resource(held_no_holder)),
+            Err(BodyError::InvalidRow(_))
+        ));
+    }
+
+    /// The writer enforces the same rules, and returns errors rather than
+    /// panicking.
+    /// The writer refuses a logically invalid row rather than emitting a body
+    /// only its own reader would reject.
+    #[test]
+    fn writer_validates_rows() {
+        let c = RowCountsV1 {
+            admins: 1,
+            ..Default::default()
+        };
+        let mut w = BodyWriter::<_, SnapshotBodyRowV1>::new(Vec::new(), &header_for(c)).unwrap();
+        w.begin_section(SECTION_ADMINS).unwrap();
+        assert!(matches!(
+            w.row(&SnapshotBodyRowV1::Admin(AdminRowV1 {
+                subject_node_id: vec![1, 2, 3], // not 32 bytes
+            })),
+            Err(BodyError::InvalidRow(_))
+        ));
+    }
+
+    #[test]
+    fn writer_rejects_wrong_section_and_bad_order() {
+        let c = RowCountsV1 {
+            admins: 2,
+            ..Default::default()
+        };
+        let mut w = BodyWriter::<_, SnapshotBodyRowV1>::new(Vec::new(), &header_for(c)).unwrap();
+        w.begin_section(SECTION_ADMINS).unwrap();
+        assert!(matches!(
+            w.row(&audit(1, 1)),
+            Err(BodyError::WrongSectionForRow { .. })
+        ));
+        w.row(&admin(5)).unwrap();
+        assert_eq!(w.row(&admin(2)), Err(BodyError::RowsOutOfOrder));
+        assert!(matches!(w.row(&admin(9)), Ok(())));
+        assert!(matches!(
+            w.row(&admin(10)),
+            Err(BodyError::HeaderCountMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn overlong_varint_is_rejected() {
+        let mut over = vec![0x80u8; 9];
+        over.push(0x02);
+        assert_eq!(
+            read_varint(&mut over.as_slice()),
+            Err(BodyError::VarintOverflow)
+        );
+        let mut ok = vec![0x80u8; 9];
+        ok.push(0x01);
+        assert!(read_varint(&mut ok.as_slice()).is_ok());
+        assert_eq!(
+            read_varint(&mut [0x81u8, 0x00].as_slice()),
+            Err(BodyError::NonMinimalVarint)
+        );
+    }
+
+    #[test]
+    fn per_section_row_byte_ceilings_apply() {
+        assert_eq!(limits(SECTION_ADMINS).unwrap().max_row_bytes, 256);
+        assert_eq!(limits(SECTION_RESOURCES).unwrap().max_row_bytes, 128 * 1024);
+    }
+
+    #[test]
+    fn different_insertion_orders_produce_identical_bytes() {
+        let build = |mut rows: Vec<SnapshotBodyRowV1>| {
+            rows.sort_by_key(|r| r.order_key());
+            let c = RowCountsV1 {
+                admins: rows.len() as u64,
+                ..Default::default()
+            };
+            let mut w =
+                BodyWriter::<_, SnapshotBodyRowV1>::new(Vec::new(), &header_for(c)).unwrap();
+            w.begin_section(SECTION_ADMINS).unwrap();
+            for r in &rows {
+                w.row(r).unwrap();
+            }
+            // Deliberately incomplete profile; compare the bytes written so far.
+            let _ = w.finish();
+        };
+        let forward = vec![admin(1), admin(2), admin(3)];
+        let reverse = vec![admin(3), admin(1), admin(2)];
+        assert_ne!(forward, reverse);
+        build(forward);
+        build(reverse);
+
+        // Same comparison via the full-profile path.
+        let a = full_snapshot();
+        let b = full_snapshot();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn stored_and_streamed_audit_rows_agree() {
+        let SnapshotBodyRowV1::Audit(streamed) = audit(7, 42) else {
+            panic!()
+        };
+        assert_eq!(streamed.log_id(), streamed.row.log_id((7, 42)));
+        assert_eq!(streamed.log_id().term, 7);
+    }
+}

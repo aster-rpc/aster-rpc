@@ -16,6 +16,18 @@ attestation = ["aster_transport_core/attestation"]
 # Rust-native RPC (envelope + payload codec, dispatch, client stub). Off by
 # default so Step-1 consumers don't compile Fory. See docs/_internal/aster-rust.md.
 rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros"]
+# Coordination (§15 Slice 0). Two features, deliberately:
+#
+#   coordination-client  the wire contract and client stub only. A consumer that
+#                        calls a coordination group but does not host one pays
+#                        for neither openraft nor redb.
+#   coordination         the voter: adds the replicated state machine and its
+#                        storage.
+#
+# Neither is in `default`, so the default dependency graph is unchanged. Verify
+# with `cargo tree -p aster --no-default-features -e features`.
+coordination-client = ["rpc"]
+coordination = ["coordination-client"]
 discovery = []
 hooks = []
 metrics = []
