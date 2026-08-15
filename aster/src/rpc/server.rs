@@ -86,6 +86,18 @@ pub trait ServiceDispatch: Send + Sync + 'static {
     fn max_frame_size(&self, _method: &str) -> Option<u32> {
         None
     }
+    /// Refuse calls whose peer identity was not authenticated by the iroh
+    /// handshake (§3.3).
+    ///
+    /// Default `false`, so no existing service changes behaviour. Coordination
+    /// services set it: a voter's identity *is* its authority, so admitting the
+    /// same apparent NodeId over an HTTP or WebTransport front end — where the
+    /// peer id may be a client-supplied header — would let anyone impersonate a
+    /// voter. Enforced by dispatch before the handler runs, so a service cannot
+    /// forget the check.
+    fn iroh_only(&self) -> bool {
+        false
+    }
     /// Handle one call. `method` is `StreamHeader.method` (guaranteed to be in
     /// [`methods`](ServiceDispatch::methods) when that table is non-empty). The
     /// handler MUST terminate the call by consuming `call` via [`Call::respond`]
@@ -430,8 +442,48 @@ pub trait HttpTransport: Send + 'static {
 /// and drains `response_sender` to write the response. For a unary call:
 /// `request_payload` is the lone request frame, `request_flags` has
 /// `FLAG_END_STREAM`, and `request_receiver` is an already-closed channel.
+/// How the transport learned the peer identity on a call.
+///
+/// This is the difference between "the peer proved possession of the key" and
+/// "something told us this string". A `peer_id` from an iroh QUIC connection is
+/// the remote's authenticated node id; a `peer_id` from an HTTP or WebTransport
+/// front end is whatever that front end decided to put there, which may be a
+/// header a client supplied.
+///
+/// Coordination cares because a voter's identity IS its authority: a service
+/// that admits the same apparent NodeId over an unauthenticated transport would
+/// let anyone impersonate a voter. Hence [`ServiceDispatch::iroh_only`].
+///
+/// Deliberately not `Default`: a transport must state what it knows. The whole
+/// point is that "unspecified" cannot silently become "authenticated".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PeerProvenance {
+    /// The peer id is an iroh QUIC remote node id, authenticated by the
+    /// transport's handshake.
+    IrohAuthenticated,
+    /// Any other transport. The peer id may be unauthenticated or supplied by
+    /// the client; treat it as a hint, never as an authority.
+    Other,
+}
+
+impl PeerProvenance {
+    /// Whether this provenance carries transport-level proof of the identity.
+    pub fn is_authenticated(self) -> bool {
+        matches!(self, PeerProvenance::IrohAuthenticated)
+    }
+}
+
+/// The dispatch-relevant parts of one call.
+///
+/// `#[non_exhaustive]` so a future transport cannot construct this with a
+/// struct literal and get a defaulted `provenance`. New transports must go
+/// through [`CallParts::new`] and say what they know about the peer — the
+/// forgeable-by-omission failure this type exists to prevent.
+#[non_exhaustive]
 pub struct CallParts {
     pub peer_id: String,
+    pub provenance: PeerProvenance,
     pub header_payload: Vec<u8>,
     pub request_payload: Vec<u8>,
     pub request_flags: u8,
@@ -441,11 +493,41 @@ pub struct CallParts {
 }
 
 impl CallParts {
+    /// Construct from a transport that is not the iroh reactor. `provenance` is
+    /// required rather than defaulted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        peer_id: String,
+        provenance: PeerProvenance,
+        header_payload: Vec<u8>,
+        request_payload: Vec<u8>,
+        request_flags: u8,
+        response_sender: UnboundedSender<OutgoingFrame>,
+        request_receiver: Receiver<RequestFrame>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            peer_id,
+            provenance,
+            header_payload,
+            request_payload,
+            request_flags,
+            response_sender,
+            request_receiver,
+            cancelled,
+        }
+    }
+
     /// Extract the dispatch-relevant parts from a reactor [`IncomingCall`],
     /// dropping the `CoreConnection` and the ids the dispatcher doesn't use.
+    ///
+    /// This is the one path that may claim [`PeerProvenance::IrohAuthenticated`],
+    /// because it is the one path whose peer id came from a completed iroh
+    /// handshake.
     pub fn from_incoming(call: IncomingCall) -> Self {
         Self {
             peer_id: call.peer_id,
+            provenance: PeerProvenance::IrohAuthenticated,
             header_payload: call.header_payload,
             request_payload: call.request_payload,
             request_flags: call.request_flags,
@@ -544,6 +626,20 @@ async fn handle_call(
         .await;
         return;
     };
+
+    // Provenance BEFORE method routing and before any handler runs. A service
+    // that declares `iroh_only` must never see a call whose peer id the
+    // transport could not vouch for, and it must not have to remember to check.
+    // `NotFound` rather than `PermissionDenied`: over an unauthenticated
+    // transport the service's existence is itself not something to confirm.
+    if svc.iroh_only() && !call.provenance.is_authenticated() {
+        emit_trailer(
+            &call.response_sender,
+            StatusCode::NotFound,
+            &format!("service '{}' v{} not found", header.service, header.version),
+        );
+        return;
+    }
 
     let methods = svc.methods();
     if !methods.is_empty() && !methods.iter().any(|m| *m == header.method) {
@@ -692,6 +788,7 @@ pub struct Call {
     header: StreamHeader,
     attributes: HashMap<String, String>,
     peer_id: String,
+    provenance: PeerProvenance,
     cancelled: Arc<AtomicBool>,
     response_sender: ResponseSender,
     /// The first request payload, delivered inline by the reactor (taken once).
@@ -710,6 +807,7 @@ impl Call {
     fn new(inner: CallParts, header: StreamHeader, attributes: HashMap<String, String>) -> Self {
         let CallParts {
             peer_id,
+            provenance,
             cancelled,
             response_sender,
             request_payload,
@@ -722,6 +820,7 @@ impl Call {
             header,
             attributes,
             peer_id,
+            provenance,
             cancelled,
             response_sender,
             first_request: Some(request_payload),
@@ -743,6 +842,16 @@ impl Call {
     /// The remote peer's id (hex).
     pub fn peer(&self) -> &str {
         &self.peer_id
+    }
+
+    /// How the transport learned [`peer`](Call::peer).
+    ///
+    /// A handler that treats the peer id as an authorization input should check
+    /// this, or declare its service
+    /// [`iroh_only`](ServiceDispatch::iroh_only) and let dispatch reject the
+    /// call before the handler runs.
+    pub fn provenance(&self) -> PeerProvenance {
+        self.provenance
     }
 
     /// The peer's authorization attributes (from the server's

@@ -26,7 +26,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use aster::rpc::codec::{decode_stream_header, StreamHeader};
-use aster::rpc::{CallParts, Dispatcher, OutgoingFrame, RequestFrame};
+use aster::rpc::{CallParts, Dispatcher, OutgoingFrame, PeerProvenance, RequestFrame};
 use aster_transport_core::framing::FLAG_END_STREAM;
 use aster_transport_core::reactor::{response_channel, FRAME_CHANNEL_DEPTH};
 
@@ -128,15 +128,19 @@ async fn serve_call<Snd, Rcv>(
     }
 
     let (resp_tx, mut resp_rx) = response_channel();
-    let parts = CallParts {
+    // `Other`: this peer id came from the WebTransport session, not an iroh
+    // handshake, so it is a hint rather than a proof. A service that treats the
+    // peer id as authority declares `iroh_only` and dispatch refuses the call.
+    let parts = CallParts::new(
         peer_id,
+        PeerProvenance::Other,
         header_payload,
-        request_payload: first_payload,
-        request_flags: first_flags,
-        response_sender: resp_tx,
-        request_receiver: req_rx,
-        cancelled: Arc::new(AtomicBool::new(false)),
-    };
+        first_payload,
+        first_flags,
+        resp_tx,
+        req_rx,
+        Arc::new(AtomicBool::new(false)),
+    );
     tokio::spawn(async move { dispatcher.dispatch_parts(parts).await });
 
     // Stream response frames out as the handler emits them.

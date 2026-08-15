@@ -49,8 +49,8 @@ use aster::rpc::codec::{
     decode_rpc_status, encode_stream_header, RpcStatus, SerializationMode, StreamHeader,
 };
 use aster::rpc::{
-    CallParts, Dispatcher, MethodPattern, OutgoingFrame, Projection, ProjectionRegistry,
-    RequestFrame,
+    CallParts, Dispatcher, MethodPattern, OutgoingFrame, PeerProvenance, Projection,
+    ProjectionRegistry, RequestFrame,
 };
 use aster_transport_core::framing::{decode_frame, FLAG_END_STREAM, FLAG_TRAILER};
 use aster_transport_core::reactor::{
@@ -437,15 +437,18 @@ impl AsterHandler {
         drop(req_tx);
 
         let (resp_tx, resp_rx) = response_channel();
-        let parts = CallParts {
+        // `Other`: an HTTP front end's peer id may be a client-supplied
+        // header. See the WebTransport site for the same reasoning.
+        let parts = CallParts::new(
             peer_id,
+            PeerProvenance::Other,
             header_payload,
             request_payload,
             request_flags,
-            response_sender: resp_tx,
-            request_receiver: req_rx,
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
+            resp_tx,
+            req_rx,
+            Arc::new(AtomicBool::new(false)),
+        );
         let dispatcher = self.dispatcher.clone();
         tokio::spawn(async move {
             dispatcher.dispatch_parts(parts).await;

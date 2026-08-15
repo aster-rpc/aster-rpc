@@ -63,8 +63,8 @@ pub use publish::{
 };
 pub use runtime::{AsterServer, AsterServerBuilder};
 pub use server::{
-    AlpnHandler, Call, CallParts, Dispatcher, HttpTransport, Server, ServerHandle, ServiceDispatch,
-    RPC_ALPN,
+    AlpnHandler, Call, CallParts, Dispatcher, HttpTransport, PeerProvenance, Server, ServerHandle,
+    ServiceDispatch, RPC_ALPN,
 };
 
 /// Reactor frame types, re-exported so a non-Iroh transport can build
