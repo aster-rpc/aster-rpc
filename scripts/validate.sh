@@ -24,15 +24,34 @@ pass() { echo -e "${GREEN}✓ $1${RESET}"; }
 fail() { echo -e "${RED}✗ $1${RESET}"; exit 1; }
 step() { echo -e "\n${BOLD}── $1 ──${RESET}"; }
 
-# ── Optional local compiler cache (sccache) ─────────────────────────
-if command -v sccache &>/dev/null; then
-    export RUSTC_WRAPPER=sccache
-    pass "Using sccache (RUSTC_WRAPPER=sccache)"
-    # Reset stats for this run so end-of-run output is easier to read.
-    sccache --zero-stats >/dev/null 2>&1 || true
+# ── Local compiler cache (Kache) ────────────────────────────────────
+# Report the wrapper in effect; do not set one. A bare run picks up the
+# global wrapper from ~/.cargo/config.toml, and running this script under
+# scripts/with-kache pins the shared config via RUSTC_WRAPPER — overriding
+# either here would defeat the launcher.
+#
+# This previously exported RUSTC_WRAPPER=sccache and, failing that, told you
+# to `brew install sccache`. sccache was removed from this machine on
+# 2026-08-15 and must not be reinstalled.
+#
+# Note the wrapper is a pinned absolute path, not a binary on PATH, so
+# `command -v kache` is not a valid check for it.
+KACHE_BIN=""
+if [[ -n "${RUSTC_WRAPPER:-}" ]]; then
+    KACHE_BIN="${RUSTC_WRAPPER}"
+    pass "Compiler cache: RUSTC_WRAPPER=${RUSTC_WRAPPER}"
 else
-    echo "  ⚠ sccache not found — running without compiler artifact cache."
-    echo "  Install with: brew install sccache"
+    cargo_cfg="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+    if [[ -r "$cargo_cfg" ]]; then
+        KACHE_BIN=$(sed -n 's/^ *rustc-wrapper *= *"\(.*\)"/\1/p' "$cargo_cfg" | head -1)
+    fi
+    if [[ -n "$KACHE_BIN" && -x "$KACHE_BIN" ]]; then
+        pass "Compiler cache: $(basename "$KACHE_BIN") via ${cargo_cfg/#$HOME/\~}"
+    else
+        KACHE_BIN=""
+        echo "  ⚠ No compiler cache configured — expected kache. See the rust-dev"
+        echo "    skill; do not install sccache."
+    fi
 fi
 
 # ── 0. Pin fork transitive deps (hickory-proto / hickory-net) ─────
@@ -152,9 +171,11 @@ else
     echo "  ⚠ pyright not installed -- skipping type check"
 fi
 
-if command -v sccache &>/dev/null; then
-    step "sccache stats"
-    sccache --show-stats || true
+if [[ -n "$KACHE_BIN" ]]; then
+    step "kache stats"
+    # Scoped to roughly this run rather than all time, so the numbers describe
+    # the validation that just ran.
+    "$KACHE_BIN" stats --since 1h || true
 fi
 
 echo -e "\n${GREEN}${BOLD}All checks passed!${RESET}"
