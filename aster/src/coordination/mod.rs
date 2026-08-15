@@ -7,3 +7,8 @@
 pub mod contract;
 pub mod ids;
 pub mod rowstream;
+
+/// The OpenRaft type configuration. Voter-only, so it needs `coordination`
+/// rather than `coordination-client`.
+#[cfg(feature = "coordination")]
+pub mod typeconfig;
