@@ -21,7 +21,7 @@
 
 use fory_derive::{ForyStruct, ForyUnion};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "coordination"))]
 use super::contract::MAX_WIRE_STRING;
 use super::contract::{ChangeMembershipActionV1, CommandV1, LogIdV1, SavedReplyV1};
 
@@ -534,7 +534,9 @@ pub struct ClientSessionV1 {
     pub retired: bool,
 }
 
-#[cfg(test)]
+// The tests exercise the mirrors against real OpenRaft values, so they need the
+// voter feature even though the declarations above do not.
+#[cfg(all(test, feature = "coordination"))]
 mod tests {
     use super::*;
     use crate::coordination::contract::payload_fory;

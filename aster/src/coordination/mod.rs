@@ -5,7 +5,6 @@
 //! replicated state machine and its redb storage.
 
 pub mod contract;
-pub mod convert;
 pub mod hash;
 pub mod ids;
 pub mod reason;
@@ -25,10 +24,19 @@ pub mod model;
 
 /// The OpenRaft type configuration. Voter-only, so it needs `coordination`
 /// rather than `coordination-client`.
-/// §5.3.1 OpenRaft mirrors and §11 storage roots. Voter-only: they mirror
-/// types a client never sees.
-#[cfg(feature = "coordination")]
+/// §5.3.1 OpenRaft mirrors, the §5.3 wire messages, and the §11 storage roots.
+///
+/// Compiled by `coordination-client` as well as `coordination`: these are plain
+/// Fory declarations with no `openraft` dependency, and `rowstream`'s snapshot
+/// and recovery bodies nest the storage roots. Only the conversions to and from
+/// real OpenRaft values need the voter feature, and they live in
+/// [`super::convert`].
 pub mod raft;
+
+/// Conversions between OpenRaft values and the §5.3.1 mirrors. Voter-only: it
+/// is the one place `openraft` types appear outside the type config.
+#[cfg(feature = "coordination")]
+pub mod convert;
 
 #[cfg(feature = "coordination")]
 pub mod typeconfig;
