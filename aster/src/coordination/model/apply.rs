@@ -418,9 +418,58 @@ pub enum Command {
         client: ClientRef,
         action: Action,
     },
+    /// §10.1's forced apply: a committed client command whose **mutation
+    /// prefix** is well-formed but whose action violates a logical
+    /// request-shape limit -- an oversized encoding, an ill-formed field, or a
+    /// request hash that does not match its action.
+    ///
+    /// This is a command, not an early reply. An earlier revision answered it
+    /// at the wire boundary before `apply_command` ran, so a committed entry
+    /// consumed no sequence, saved no result, wrote no audit row, charged no
+    /// reserve, passed no delivery guard, and did not advance `last_applied` --
+    /// which is precisely the set of things §10.1 requires it to do
+    /// atomically. The sequence is real and the client will retry it; without a
+    /// saved result that retry would be classified as a first attempt forever.
+    ///
+    /// `operation_code` comes from the wire action's variant, which is known
+    /// even when its fields are not, so the audit row still says what was
+    /// attempted.
+    RejectedClient {
+        client: ClientRef,
+        operation_code: i32,
+    },
+    /// A committed command whose **mutation prefix** is ill-formed: an actor id
+    /// or client id of the wrong width, or a malformed request hash.
+    ///
+    /// Deliberately its own rule rather than a case of [`Command::RejectedClient`].
+    /// Such an entry names no session -- there is no validated `(actor,
+    /// client_id)` to key one by -- so it cannot consume a sequence, save a
+    /// result, or be replayed, and it cannot be audited either: an audit row
+    /// attributes an operation to an actor, and inventing a zero NodeId for one
+    /// would record an action by a node that does not exist. It advances
+    /// `last_applied` and nothing else, identically on every voter.
+    Shapeless(ShapelessCommand),
     Expire(ExpireCommand),
     MembershipProgress(MembershipProgressCommand),
     RetireClient(RetireCommand),
+}
+
+/// A committed command with no usable identity (§10.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShapelessCommand {
+    /// The §5.2 method the wire variant named, if it named one.
+    pub operation_code: i32,
+    /// Which reply the caller is waiting for. OpenRaft's `R` is one union, and
+    /// a client waiting on a mutation cannot be answered with a system reply.
+    pub reply_shape: ReplyShape,
+}
+
+/// Which arm of `CommandReply` a shapeless command must still produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyShape {
+    Client,
+    Retirement,
+    System,
 }
 
 /// The reply for a committed command: OpenRaft's `R` (§5.3).
@@ -476,6 +525,16 @@ pub fn apply_command(
         Command::Client { client, action } => {
             CommandReply::Client(Box::new(apply_client(state, log_id, client, action)))
         }
+        Command::RejectedClient {
+            client,
+            operation_code,
+        } => CommandReply::Client(Box::new(apply_rejected_client(
+            state,
+            log_id,
+            client,
+            *operation_code,
+        ))),
+        Command::Shapeless(shapeless) => shapeless_reply(state, shapeless),
         Command::Expire(expire) => CommandReply::System(apply_expire(state, log_id, expire)),
         Command::MembershipProgress(progress) => {
             CommandReply::System(apply_membership_progress(state, log_id, progress))
@@ -487,6 +546,101 @@ pub fn apply_command(
 
     state.last_applied = Some(log_id);
     Ok(reply)
+}
+
+/// §10.1's forced apply for a client command whose action is shapeless.
+///
+/// The classifier runs first and unchanged, so this differs from an ordinary
+/// command only in what it decides:
+///
+/// * a **replay** returns the saved reply verbatim -- a sequence already
+///   answered is answered the same way whatever the new request looks like;
+/// * a **classifier refusal** keeps its own reason code, because §5.2 has one
+///   for that condition and `(100, 0)` is reserved for requests that are
+///   shapeless to the protocol;
+/// * an **unresolved** sequence is where the forced apply happens: `Consumed`,
+///   `(100 Rejected, 0 None)`, no business-state mutation, and the reply saved
+///   so the client's retry replays it rather than being reclassified.
+fn apply_rejected_client(
+    state: &mut State,
+    log_id: LogId,
+    client: &ClientRef,
+    operation_code: i32,
+) -> ClientResult {
+    let session = state.sessions.get(&(client.actor, client.client_id));
+    let capacity = state.capacity_for(&client.actor);
+    let classification = classify(session, client.sequence, &client.request_hash, capacity);
+
+    let (result, writes_session) = match classification {
+        Classification::Replay { saved, .. } => (
+            ClientResult {
+                disposition: Disposition::Consumed,
+                reply: *saved,
+                replayed: true,
+            },
+            false,
+        ),
+        Classification::Refuse { reason, .. } => (
+            ClientResult {
+                disposition: Disposition::NotConsumed,
+                // No resource: the request that named one was not well enough
+                // formed to have validated it.
+                reply: rejection(state, None, reason),
+                replayed: false,
+            },
+            false,
+        ),
+        Classification::Unresolved { .. } => (
+            ClientResult {
+                disposition: Disposition::Consumed,
+                reply: rejection(state, None, Reason::None),
+                replayed: false,
+            },
+            true,
+        ),
+    };
+
+    if writes_session {
+        write_session(state, client, Some(result.reply.clone()));
+    }
+    write_audit_row(
+        state,
+        log_id,
+        AuditRow {
+            leader_node_id: log_id.leader_node_id,
+            actor: client.actor,
+            operation_code,
+            // Never the malformed key: an unvalidated resource in bounded
+            // metadata is what the §12.1 charge is computed from.
+            resource: None,
+            result: AuditResult::Client(result.reply.outcome),
+            epoch: 0,
+            value_revision: 0,
+        },
+    );
+    result
+}
+
+/// The reply for a command with no usable identity. Writes nothing; the caller
+/// still advances `last_applied`.
+fn shapeless_reply(state: &State, command: &ShapelessCommand) -> CommandReply {
+    match command.reply_shape {
+        ReplyShape::Client => CommandReply::Client(Box::new(ClientResult {
+            // Nothing was consumed, because there is no session to consume a
+            // sequence in.
+            disposition: Disposition::NotConsumed,
+            reply: rejection(state, None, Reason::None),
+            replayed: false,
+        })),
+        ReplyShape::Retirement => CommandReply::Retirement(RetirementResult {
+            outcome: Outcome::Rejected,
+            reason: Reason::None,
+        }),
+        ReplyShape::System => CommandReply::System(SystemResult {
+            system_result_code: crate::coordination::contract::SYS_MEMBERSHIP_PHASE_MISMATCH,
+            lease_revision: 0,
+        }),
+    }
 }
 
 /// Apply a committed `retire_client` (§10).

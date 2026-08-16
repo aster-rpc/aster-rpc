@@ -26,7 +26,10 @@ use crate::coordination::contract::{
 use crate::coordination::reason::Disposition;
 
 use super::admin::AdminAction;
-use super::apply::{apply_command, Action, ClientRef, ClientResult, Command, CommandReply, Fault};
+use super::apply::{
+    apply_command, Action, ClientRef, ClientResult, Command, CommandReply, Fault, ReplyShape,
+    ShapelessCommand, OPERATION_EXPIRE, OPERATION_MEMBERSHIP_PROGRESS, OPERATION_RETIRE_CLIENT,
+};
 use super::expire::ExpireCommand;
 use super::grant::GrantAction;
 use super::limits::RIGHT_READ;
@@ -264,35 +267,120 @@ pub fn apply_wire_command(
     group_id: &[u8],
     command: &CommandV1,
 ) -> Result<CommandReplyV1, Fault> {
-    // §12.1's `max_encoded_command`, enforced where it is decidable. The bound
-    // is on the **encoded** form, so it cannot be reconstructed from field
-    // limits: an action whose fields are each in range can still encode past the
-    // cap once framing is counted. Re-encoding here is deterministic, so every
-    // voter reaches the same verdict on the same entry -- which is what makes
-    // this a committed rejection rather than a host-local ingress check that
-    // some voters applied and others did not. An earlier revision exposed the
-    // check with no caller at all, so the declared limit bounded nothing.
-    if oversized(command) {
-        return Ok(malformed_reply(command));
-    }
-
-    let model = match command_from_wire(command) {
-        Ok(model) => model,
-        // §5.3.1: a variant this version does not know is fatal.
-        Err(NarrowError::UnknownVariant) => return Err(Fault::UnknownCommand),
-        // §10.1: a **known** command with an ill-formed field is a
-        // deterministic rejection, not a halt. Every voter knows what it was
-        // meant to be and refuses it identically; halting would let a malformed
-        // field become an availability kill switch.
-        Err(NarrowError::MalformedField(_)) => {
-            return Ok(malformed_reply(command));
-        }
-    };
+    // §5.3.1: a variant this version does not know is fatal. Everything else --
+    // including a request the protocol cannot make sense of -- is a command that
+    // goes through apply.
+    let model = command_for_apply(command).map_err(|_| Fault::UnknownCommand)?;
 
     // A first attempt reports the value it wrote; the value lives in state, not
     // in the saved reply, so it is read here and only here.
     let reply = apply_command(state, log_id, &model)?;
     Ok(to_wire(state, group_id, &model, reply))
+}
+
+/// Narrow a committed command for apply, turning a request-shape violation into
+/// the command §10.1 forces **through the log** rather than into an early reply.
+///
+/// The distinction that matters is where the violation is:
+///
+/// * a well-formed mutation prefix with a shapeless action becomes
+///   [`Command::RejectedClient`], which consumes the sequence, saves its reply,
+///   audits, charges reserve and advances `last_applied` in one transaction;
+/// * an ill-formed prefix becomes [`Command::Shapeless`], which names no session
+///   and therefore can do none of that;
+/// * an unknown variant stays fatal.
+///
+/// An earlier revision short-circuited both shape cases to a reply built at this
+/// boundary, so a committed entry left no trace in replicated state at all.
+pub fn command_for_apply(command: &CommandV1) -> Result<Command, NarrowError> {
+    // §12.1's `max_encoded_command`, checked on the **encoded** form. The bound
+    // is not reconstructible from field limits: an action whose fields are each
+    // in range can still encode past the cap once framing is counted.
+    // Re-encoding is deterministic, so every voter reaches the same verdict on
+    // the same entry -- which is what makes this a committed rejection rather
+    // than a host-local ingress check some voters applied and others did not.
+    if oversized(command) {
+        return Ok(shape_rejection(command));
+    }
+
+    match command_from_wire(command) {
+        Ok(model) => Ok(model),
+        Err(NarrowError::UnknownVariant) => Err(NarrowError::UnknownVariant),
+        // §10.1: a **known** command with an ill-formed field is a deterministic
+        // rejection, not a halt. Every voter knows what it was meant to be and
+        // refuses it identically; halting would let a malformed field become an
+        // availability kill switch.
+        Err(NarrowError::MalformedField(_)) => Ok(shape_rejection(command)),
+    }
+}
+
+/// Which forced-apply command a shape violation becomes.
+fn shape_rejection(command: &CommandV1) -> Command {
+    match command {
+        CommandV1::Client(c) => {
+            // The prefix is what decides. A validated `(actor, client_id,
+            // sequence, request_hash)` is a session identity even when the
+            // action attached to it is nonsense.
+            match (
+                node_id(&c.actor_node_id),
+                client_id(&c.client_id),
+                hash(&c.request_hash),
+            ) {
+                (Ok(actor), Ok(cid), Ok(request_hash)) => Command::RejectedClient {
+                    client: ClientRef {
+                        actor,
+                        client_id: cid,
+                        sequence: c.sequence,
+                        request_hash,
+                    },
+                    operation_code: wire_operation_code(&c.action),
+                },
+                _ => Command::Shapeless(ShapelessCommand {
+                    operation_code: wire_operation_code(&c.action),
+                    reply_shape: ReplyShape::Client,
+                }),
+            }
+        }
+        CommandV1::RetireClient(_) => Command::Shapeless(ShapelessCommand {
+            operation_code: OPERATION_RETIRE_CLIENT,
+            reply_shape: ReplyShape::Retirement,
+        }),
+        CommandV1::Expire(_) => Command::Shapeless(ShapelessCommand {
+            operation_code: OPERATION_EXPIRE,
+            reply_shape: ReplyShape::System,
+        }),
+        CommandV1::MembershipProgress(_) => Command::Shapeless(ShapelessCommand {
+            operation_code: OPERATION_MEMBERSHIP_PROGRESS,
+            reply_shape: ReplyShape::System,
+        }),
+        // Unreachable: `command_for_apply` returns `UnknownVariant` first, and
+        // `oversized` cannot be the reason an unknown variant is rejected.
+        CommandV1::Unknown(_) => Command::Unknown,
+    }
+}
+
+/// The §5.2 method a wire action names.
+///
+/// Read from the **variant**, which is known even when the fields inside it are
+/// not, so a rejected command still audits what was attempted rather than an
+/// anonymous failure.
+fn wire_operation_code(action: &ActionV1) -> i32 {
+    match action {
+        ActionV1::Acquire(_) => 1,
+        ActionV1::Renew(_) => 2,
+        ActionV1::CompareAndSet(_) => 3,
+        ActionV1::Release(_) => 4,
+        ActionV1::ReleaseWithValue(_) => 5,
+        ActionV1::Revoke(_) => 6,
+        ActionV1::SetGrant(_) => 7,
+        ActionV1::SetAdmin(_) => 8,
+        ActionV1::ChangeMembership(_) => 9,
+        // §5.2 skips 10; cancel is 11.
+        ActionV1::CancelMembership(_) => 11,
+        // Not reachable through `shape_rejection`, which runs only after
+        // `command_for_apply` has ruled the variant known.
+        ActionV1::Unknown(_) => 0,
+    }
 }
 
 /// Does this command exceed §12.1's encoded-size cap?
@@ -305,37 +393,6 @@ fn oversized(command: &CommandV1) -> bool {
         .serialize(command)
         .map_or(usize::MAX, |bytes| bytes.len());
     check_encoded_command(encoded_len).is_some()
-}
-
-/// The reply for a known command whose fields will not narrow.
-///
-/// `Consumed + 100 Rejected + 0 None` for a client command, exactly as §10.1
-/// specifies for a request-shape violation. A system command has no client to
-/// answer, so it reports its own phase code.
-fn malformed_reply(command: &CommandV1) -> CommandReplyV1 {
-    match command {
-        CommandV1::Client(_) => {
-            CommandReplyV1::Client(crate::coordination::contract::ClientReplyV1 {
-                disposition_code: 1,
-                outcome_code: 100,
-                reason_code: 0,
-                snapshot: None,
-                acl_revision: 0,
-                admin_revision: 0,
-                operation_id: None,
-                membership_log_id: None,
-            })
-        }
-        CommandV1::RetireClient(_) => CommandReplyV1::Retirement(retirement_reply(
-            crate::coordination::reason::Outcome::Rejected,
-            crate::coordination::reason::Reason::None,
-        )),
-        _ => CommandReplyV1::System(system_reply(
-            crate::coordination::contract::SYS_MEMBERSHIP_PHASE_MISMATCH,
-            0,
-            None,
-        )),
-    }
 }
 
 fn to_wire(
@@ -435,6 +492,7 @@ mod tests {
     use crate::coordination::hash::request_hash;
     use crate::coordination::model::limits::ALL_RIGHTS;
     use crate::coordination::model::state::ResourceKey;
+    use crate::coordination::reason::{Outcome, Reason};
 
     const ACTOR: [u8; 32] = [2u8; 32];
     const ADMIN: [u8; 32] = [1u8; 32];
@@ -484,15 +542,21 @@ mod tests {
         })
     }
 
-    /// §12.1's encoded-command cap is enforced by the production apply path, not
-    /// merely declared. An earlier revision exposed `check_encoded_command` with
-    /// no caller, so a command of any size applied.
+    /// §12.1's encoded-command cap is enforced by the production apply path, and
+    /// the rejection goes **through** apply rather than around it. An earlier
+    /// revision answered at the wire boundary, so a committed entry consumed no
+    /// sequence, saved no result, wrote no audit row, charged no reserve and did
+    /// not advance `last_applied` -- every one of the things §10.1 requires it
+    /// to do atomically.
     #[test]
-    fn an_oversized_command_is_rejected_by_the_apply_path() {
+    fn an_oversized_command_is_rejected_through_the_apply_path() {
         use crate::coordination::contract::CompareAndSetActionV1;
         use crate::coordination::model::limits::MAX_ENCODED_COMMAND;
 
         let mut s = genesis();
+        s.last_applied = Some(log(0));
+        let reserve_before = s.reserve_bytes;
+
         let oversized = client_command(
             ACTOR,
             1,
@@ -508,19 +572,285 @@ mod tests {
         );
 
         let reply = apply_wire_command(&mut s, log(1), &GROUP, &oversized).expect("no fault");
-        match reply {
+        let first = match &reply {
+            CommandReplyV1::Client(r) => r.clone(),
+            other => panic!("expected a client reply, got {other:?}"),
+        };
+        // §10.1: a committed request-shape violation, the one condition that
+        // carries no reason code.
+        assert_eq!(first.disposition_code, 1, "Consumed");
+        assert_eq!(first.outcome_code, 100, "Rejected");
+        assert_eq!(first.reason_code, 0, "shapeless to the protocol");
+        assert!(
+            s.resources.is_empty(),
+            "a rejected command mutates no business state"
+        );
+
+        // The four things the early reply skipped.
+        assert_eq!(
+            s.last_applied,
+            Some(log(1)),
+            "the entry was applied, so last_applied moves"
+        );
+        let session = s
+            .sessions
+            .get(&(ACTOR, [9u8; 16]))
+            .expect("the sequence was consumed, so a session row exists");
+        assert_eq!(session.last_sequence, 1);
+        let saved = session
+            .last_result
+            .as_ref()
+            .expect("the reply was saved for replay");
+        assert_eq!(saved.outcome, Outcome::Rejected);
+        assert_eq!(saved.reason, Reason::None);
+        assert!(
+            saved.snapshot.is_none(),
+            "no resource: the request naming one was not well enough formed to validate it"
+        );
+
+        let audited = s.audit.get(&(1, 1)).expect("an audit row for the entry");
+        assert_eq!(audited.actor, ACTOR);
+        assert_eq!(
+            audited.operation_code, 3,
+            "compare_and_set, from the variant"
+        );
+        assert_eq!(audited.resource, None, "never the unvalidated key");
+        assert!(
+            matches!(
+                audited.result,
+                crate::coordination::model::state::AuditResult::Client(Outcome::Rejected)
+            ),
+            "a client rejection, not a system code"
+        );
+        assert!(
+            s.reserve_bytes > reserve_before,
+            "the audit row is charged against the reserve like any other"
+        );
+
+        // Exact replay: the client retries the same sequence and gets the same
+        // typed reply back, not a reclassification.
+        let replay = apply_wire_command(&mut s, log(2), &GROUP, &oversized).expect("no fault");
+        match &replay {
+            CommandReplyV1::Client(r) => assert_eq!(
+                r, &first,
+                "a replay returns the saved reply verbatim, field for field"
+            ),
+            other => panic!("expected a client reply, got {other:?}"),
+        }
+        assert_eq!(
+            s.last_applied,
+            Some(log(2)),
+            "the replay is an applied entry"
+        );
+        assert_eq!(
+            s.sessions.get(&(ACTOR, [9u8; 16])).unwrap().last_sequence,
+            1,
+            "a replay consumes nothing new"
+        );
+    }
+
+    /// The delivery guard runs on a shape rejection like any other command: it
+    /// is applied, so redelivering it is a fatal storage invariant rather than a
+    /// second rejection.
+    #[test]
+    fn a_shape_rejection_is_guarded_against_redelivery() {
+        use crate::coordination::contract::CompareAndSetActionV1;
+        use crate::coordination::model::limits::MAX_ENCODED_COMMAND;
+
+        let mut s = genesis();
+        s.last_applied = Some(log(0));
+        let oversized = client_command(
+            ACTOR,
+            1,
+            ActionV1::CompareAndSet(CompareAndSetActionV1 {
+                fence: fence_wire(),
+                expected_value_revision: 0,
+                new_value: vec![0xA5u8; MAX_ENCODED_COMMAND + 1],
+            }),
+        );
+        apply_wire_command(&mut s, log(5), &GROUP, &oversized).expect("no fault");
+        let before = s.clone();
+
+        assert!(
+            apply_wire_command(&mut s, log(5), &GROUP, &oversized).is_err(),
+            "delivery at or below last_applied faults"
+        );
+        assert_eq!(before, s, "and faults before anything is written");
+    }
+
+    /// A malformed **action** on a well-formed prefix takes the same path as an
+    /// oversized one: the sequence is real, so it is consumed and answered.
+    #[test]
+    fn a_malformed_action_consumes_its_sequence_and_saves_a_reply() {
+        use crate::coordination::contract::AcquireActionV1;
+
+        let mut s = genesis();
+        s.last_applied = Some(log(0));
+
+        // An over-long namespace: a known variant whose field will not validate.
+        let bad = client_command(
+            ACTOR,
+            1,
+            ActionV1::Acquire(AcquireActionV1 {
+                resource: ResourceKeyV1 {
+                    namespace: "n".repeat(4096),
+                    key: b"k".to_vec(),
+                },
+                ttl_ms: 30_000,
+            }),
+        );
+        assert!(
+            !super::oversized(&bad),
+            "this is a field violation, not a size one"
+        );
+
+        let reply = apply_wire_command(&mut s, log(1), &GROUP, &bad).expect("no fault");
+        match &reply {
             CommandReplyV1::Client(r) => {
-                // §10.1: a committed request-shape violation, which is the one
-                // condition that carries no reason code.
-                assert_eq!(r.disposition_code, 1, "Consumed");
-                assert_eq!(r.outcome_code, 100, "Rejected");
-                assert_eq!(r.reason_code, 0, "shapeless to the protocol");
+                assert_eq!(
+                    (r.disposition_code, r.outcome_code, r.reason_code),
+                    (1, 100, 0)
+                );
+            }
+            other => panic!("expected a client reply, got {other:?}"),
+        }
+        assert_eq!(s.last_applied, Some(log(1)));
+        assert_eq!(
+            s.sessions.get(&(ACTOR, [9u8; 16])).unwrap().last_sequence,
+            1
+        );
+        assert_eq!(
+            s.audit.get(&(1, 1)).expect("audited").operation_code,
+            1,
+            "acquire, read from the variant that would not validate"
+        );
+    }
+
+    /// A malformed **prefix** cannot create a session identity, so it takes the
+    /// separate rule: `last_applied` advances and nothing else is written. An
+    /// audit row would have to name an actor, and there is no validated one --
+    /// a zeroed NodeId would record an action by a node that does not exist.
+    #[test]
+    fn a_malformed_prefix_advances_last_applied_and_writes_nothing_else() {
+        let mut s = genesis();
+        s.last_applied = Some(log(0));
+        let before = s.clone();
+
+        let mut bad = match client_command(ACTOR, 1, acquire()) {
+            CommandV1::Client(c) => c,
+            other => panic!("expected a client command, got {other:?}"),
+        };
+        bad.actor_node_id = vec![0u8; 31];
+        let bad = CommandV1::Client(bad);
+
+        assert!(matches!(
+            super::command_for_apply(&bad),
+            Ok(Command::Shapeless(_))
+        ));
+
+        let reply = apply_wire_command(&mut s, log(1), &GROUP, &bad).expect("no fault");
+        match &reply {
+            CommandReplyV1::Client(r) => {
+                // NotConsumed: there is no session for a sequence to be
+                // consumed in.
+                assert_eq!(
+                    (r.disposition_code, r.outcome_code, r.reason_code),
+                    (2, 100, 0)
+                );
+            }
+            other => panic!("expected a client reply, got {other:?}"),
+        }
+        assert_eq!(s.last_applied, Some(log(1)), "the entry was applied");
+        assert_eq!(s.sessions, before.sessions, "no session row: no identity");
+        assert_eq!(
+            s.audit, before.audit,
+            "no audit row: no actor to attribute it to"
+        );
+        assert_eq!(
+            s.reserve_bytes, before.reserve_bytes,
+            "and no reserve charge"
+        );
+        assert_eq!(s.resources, before.resources);
+    }
+
+    /// A hash that does not match its action is a request-shape violation, so it
+    /// commits and consumes like one -- it does not halt, and it does not slip
+    /// through as a valid request.
+    #[test]
+    fn a_mismatched_request_hash_commits_as_a_shape_violation() {
+        let mut s = genesis();
+        s.last_applied = Some(log(0));
+
+        let mut bad = match client_command(ACTOR, 1, acquire()) {
+            CommandV1::Client(c) => c,
+            other => panic!("expected a client command, got {other:?}"),
+        };
+        bad.request_hash = vec![0xEEu8; 32];
+        let bad = CommandV1::Client(bad);
+
+        let reply = apply_wire_command(&mut s, log(1), &GROUP, &bad).expect("no fault");
+        match &reply {
+            CommandReplyV1::Client(r) => {
+                assert_eq!(
+                    (r.disposition_code, r.outcome_code, r.reason_code),
+                    (1, 100, 0)
+                );
             }
             other => panic!("expected a client reply, got {other:?}"),
         }
         assert!(
             s.resources.is_empty(),
-            "a rejected command mutates no business state"
+            "the acquire it claimed to be did not happen"
+        );
+        assert_eq!(
+            s.sessions.get(&(ACTOR, [9u8; 16])).unwrap().last_sequence,
+            1,
+            "the sequence was really sent, so it is really consumed"
+        );
+    }
+
+    /// The classifier still comes first. A sequence conflict on a shapeless
+    /// action keeps its own §5.2 reason: `(100, 0)` is reserved for requests the
+    /// protocol cannot make sense of, and a stale sequence is not one.
+    #[test]
+    fn a_classifier_refusal_outranks_the_shape_rejection() {
+        use crate::coordination::contract::CompareAndSetActionV1;
+        use crate::coordination::model::limits::MAX_ENCODED_COMMAND;
+
+        let mut s = genesis();
+        s.last_applied = Some(log(0));
+
+        // Consume sequence 1 with an ordinary command.
+        apply_wire_command(&mut s, log(1), &GROUP, &client_command(ACTOR, 1, acquire()))
+            .expect("no fault");
+
+        // Now an oversized command at the **same** sequence with a different
+        // request: a sequence conflict, which §5.2 has a reason code for.
+        let stale = client_command(
+            ACTOR,
+            1,
+            ActionV1::CompareAndSet(CompareAndSetActionV1 {
+                fence: fence_wire(),
+                expected_value_revision: 0,
+                new_value: vec![0xA5u8; MAX_ENCODED_COMMAND + 1],
+            }),
+        );
+        let reply = apply_wire_command(&mut s, log(2), &GROUP, &stale).expect("no fault");
+        match &reply {
+            CommandReplyV1::Client(r) => {
+                assert_eq!(r.disposition_code, 2, "NotConsumed");
+                assert_eq!(r.outcome_code, 100);
+                assert_ne!(
+                    r.reason_code, 0,
+                    "a sequence conflict has a reason code and must keep it"
+                );
+            }
+            other => panic!("expected a client reply, got {other:?}"),
+        }
+        assert_eq!(
+            s.sessions.get(&(ACTOR, [9u8; 16])).unwrap().last_sequence,
+            1,
+            "a refusal consumes nothing"
         );
     }
 
@@ -1045,7 +1375,16 @@ mod tests {
                     },
                 ],
                 retained_learners: Vec::new(),
-                member_seeds: Vec::new(),
+                // §9: every new node is seeded, and a new node's seed carries a
+                // join permit. All three are new against an empty committed
+                // membership.
+                member_seeds: (1u8..=3)
+                    .map(|b| MemberSeedV1 {
+                        node_id: vec![b; 32],
+                        ticket: "aster1ticket".into(),
+                        signed_join_permit: Some(vec![0xEEu8; 64]),
+                    })
+                    .collect(),
             }),
         );
         apply_wire_command(&mut s, log(1), &GROUP, &accept).expect("no fault");

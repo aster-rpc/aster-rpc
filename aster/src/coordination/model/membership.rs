@@ -32,6 +32,8 @@
 //! expected phase, so a controller report could drive an intent from `Pending`
 //! straight to `Cancelled`, or out of a terminal phase entirely.
 
+use std::collections::BTreeSet;
+
 use super::limits::{charge_intent, charge_route, MAX_RETAINED_INTENTS, MAX_RETAINED_ROUTES};
 use super::shape::{self, ShapeLimit};
 use super::state::{Intent, LogId, MembershipPlan, NodeId, OperationId, Route, State};
@@ -119,20 +121,74 @@ pub enum Decision {
     RefuseShapeless(ShapeLimit),
 }
 
-/// Every §12.1 shape bound a membership plan can violate.
+/// Every §9/§12.1 shape bound a membership plan can violate.
 ///
 /// Ordered so a plan violating two reports the same one on every voter.
-fn plan_shape(plan: &MembershipPlan) -> Option<ShapeLimit> {
+///
+/// `current_members` is the committed membership, which decides what "new node"
+/// means -- and therefore which seeds must carry a join permit. Passing it in
+/// rather than reading state here keeps the function a pure predicate over the
+/// two things it compares.
+fn plan_shape(plan: &MembershipPlan, current_members: &BTreeSet<NodeId>) -> Option<ShapeLimit> {
     if let Some(limit) =
         shape::check_membership_plan(plan.desired_voters.len(), plan.retained_learners.len())
     {
         return Some(limit);
     }
+
+    // §9: both vectors are **sorted unique**. Without this a plan may name the
+    // same voter five times and satisfy a count check while describing a
+    // one-voter group.
+    if !shape::sorted_unique(&plan.desired_voters) || !shape::sorted_unique(&plan.retained_learners)
+    {
+        return Some(ShapeLimit::MembershipPlanOrder);
+    }
+    let seed_ids: Vec<NodeId> = plan.member_seeds.iter().map(|s| s.node_id).collect();
+    if !shape::sorted_unique(&seed_ids) {
+        return Some(ShapeLimit::MembershipPlanOrder);
+    }
+    // A voter that is also a learner is two different roles for one node.
+    if plan
+        .desired_voters
+        .iter()
+        .any(|v| plan.retained_learners.contains(v))
+    {
+        return Some(ShapeLimit::MembershipPlanOrder);
+    }
+
+    let in_plan =
+        |node: &NodeId| plan.desired_voters.contains(node) || plan.retained_learners.contains(node);
     for seed in &plan.member_seeds {
         if let Some(limit) =
             shape::check_member_seed(seed.ticket.len(), seed.join_permit.as_ref().map(Vec::len))
         {
             return Some(limit);
+        }
+        // §9: seeds carry route material for the plan's own members. Without
+        // this rule the seed vector is unbounded independently of the plan, so a
+        // legal three-voter plan could carry sixty-five seeds and insert
+        // sixty-five routes past §12.1's cap of 64 -- which is exactly how the
+        // cap was bypassed. Bounding seeds by plan membership makes the route
+        // count per intent at most `MAX_VOTERS + MAX_RETAINED_LEARNERS`.
+        if !in_plan(&seed.node_id) {
+            return Some(ShapeLimit::MemberSeedUnknownNode);
+        }
+        // §9: a valid signed join permit is mandatory exactly for a new node and
+        // absent for an existing member. (Verifying the signature is §7.1's
+        // job -- it needs the authority key, which the state machine does not
+        // hold. What apply can decide deterministically is presence.)
+        let is_new = !current_members.contains(&seed.node_id);
+        if is_new != seed.join_permit.is_some() {
+            return Some(ShapeLimit::MemberSeedPermit);
+        }
+    }
+
+    // §9: every **new** node must be seeded, or the group commits a membership
+    // containing a node it has no route to.
+    let seeded = |node: &NodeId| plan.member_seeds.iter().any(|s| &s.node_id == node);
+    for node in plan.desired_voters.iter().chain(&plan.retained_learners) {
+        if !current_members.contains(node) && !seeded(node) {
+            return Some(ShapeLimit::MemberSeedUnknownNode);
         }
     }
     None
@@ -180,7 +236,7 @@ pub fn decide_change(
     // §12.1 request-shape bounds, checked before anything is decided against
     // replicated state: a plan outside the v1 shape was never a well-posed
     // request. These were declared and had no caller.
-    if let Some(limit) = plan_shape(&action.plan) {
+    if let Some(limit) = plan_shape(&action.plan, &state.members) {
         return Decision::RefuseShapeless(limit);
     }
 
@@ -483,30 +539,47 @@ mod tests {
         s
     }
 
-    /// A §9-legal plan: exactly three voters. `voters` seeds their ids, and is
-    /// padded so a fixture cannot accidentally build a shape the contract
-    /// forbids.
+    /// A §9-legal plan: exactly three voters, sorted and unique, each seeded.
+    ///
+    /// Every voter is seeded because §9 requires a seed for every **new** node,
+    /// and these fixtures start from an empty committed membership -- so all
+    /// three are new, and each seed carries the join permit a new node must
+    /// have. `voters` seeds their ids and is padded and sorted, so a fixture
+    /// cannot accidentally build a shape the contract forbids.
     fn plan(voters: &[u8]) -> MembershipPlan {
+        plan_against(voters, &BTreeSet::new())
+    }
+
+    /// The same, against a stated committed membership: a node already in it is
+    /// not new, so its seed must **not** carry a permit.
+    fn plan_against(voters: &[u8], members: &BTreeSet<NodeId>) -> MembershipPlan {
         let mut ids: Vec<u8> = voters.to_vec();
         while ids.len() < 3 {
             ids.push(100 + ids.len() as u8);
         }
         ids.truncate(3);
+        let mut nodes: Vec<NodeId> = ids
+            .iter()
+            .map(|b| {
+                let mut id = [0u8; 32];
+                id[0] = *b;
+                id
+            })
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+
         MembershipPlan {
-            desired_voters: ids
+            desired_voters: nodes.clone(),
+            retained_learners: Vec::new(),
+            member_seeds: nodes
                 .iter()
-                .map(|b| {
-                    let mut id = [0u8; 32];
-                    id[0] = *b;
-                    id
+                .map(|node| MemberSeed {
+                    node_id: *node,
+                    ticket: b"aster1ticket".to_vec(),
+                    join_permit: (!members.contains(node)).then(|| vec![0xEEu8; 64]),
                 })
                 .collect(),
-            retained_learners: Vec::new(),
-            member_seeds: vec![MemberSeed {
-                node_id: [9u8; 32],
-                ticket: b"aster1ticket".to_vec(),
-                join_permit: None,
-            }],
         }
     }
 
@@ -564,6 +637,234 @@ mod tests {
         s.growth_bytes = s.recompute_growth();
     }
 
+    // ── §9 plan shape ───────────────────────────────────────────────────────
+
+    fn shapeless(d: Decision) -> ShapeLimit {
+        match d {
+            Decision::RefuseShapeless(limit) => limit,
+            other => panic!("expected a shape refusal, got {other:?}"),
+        }
+    }
+
+    /// **The route-cap bypass.** A legal three-voter plan carrying sixty-five
+    /// tiny seeds passed every earlier check: the voter count was right, each
+    /// seed was individually small, and an empty route table offered no
+    /// eviction candidates -- so apply inserted sixty-five routes and the cap of
+    /// 64 was simply not reached by the code that enforces it. Bounding seeds by
+    /// plan membership closes it at the source: a plan holds at most
+    /// `MAX_VOTERS + MAX_RETAINED_LEARNERS` nodes, so it can introduce at most
+    /// that many routes.
+    #[test]
+    fn a_plan_cannot_carry_seeds_for_nodes_it_does_not_contain() {
+        let s = base();
+        let mut p = plan(&[1, 2, 3]);
+        for i in 0..65u8 {
+            let mut node = [0u8; 32];
+            node[0] = 200;
+            node[1] = i;
+            p.member_seeds.push(MemberSeed {
+                node_id: node,
+                ticket: b"t".to_vec(),
+                join_permit: Some(vec![0xEEu8; 64]),
+            });
+        }
+        p.member_seeds.sort_by_key(|s| s.node_id);
+
+        assert_eq!(
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: p,
+                }
+            )),
+            ShapeLimit::MemberSeedUnknownNode,
+        );
+    }
+
+    /// The bound that makes the cap safe, stated as the property rather than the
+    /// mechanism: no accepted plan can introduce more routes than a plan can
+    /// hold nodes.
+    #[test]
+    fn an_accepted_plan_introduces_at_most_one_route_per_plan_node() {
+        let s = base();
+        let e = effect(decide_change(
+            &s,
+            &ADMIN,
+            &[7u8; 32],
+            &change(op(1), &[1, 2, 3], None),
+        ));
+        assert!(
+            e.routes.len() <= super::shape::MAX_VOTERS + super::shape::MAX_RETAINED_LEARNERS,
+            "an intent cannot introduce more routes than its plan has nodes"
+        );
+    }
+
+    /// §9: the node vectors are **sorted unique**. An unsorted plan is a
+    /// different request from its sorted spelling -- they hash differently --
+    /// so it is refused rather than normalised.
+    #[test]
+    fn an_unsorted_or_duplicated_plan_is_refused() {
+        let s = base();
+        let sorted = plan(&[1, 2, 3]);
+
+        let mut reversed = sorted.clone();
+        reversed.desired_voters.reverse();
+        assert_eq!(
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: reversed,
+                }
+            )),
+            ShapeLimit::MembershipPlanOrder,
+        );
+
+        // Three entries naming one node: a count check alone would call this a
+        // legal three-voter group.
+        let mut duplicated = sorted.clone();
+        duplicated.desired_voters = vec![[1u8; 32], [1u8; 32], [1u8; 32]];
+        assert_eq!(
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: duplicated,
+                }
+            )),
+            ShapeLimit::MembershipPlanOrder,
+        );
+
+        // Unsorted seeds, same rule.
+        let mut unsorted_seeds = sorted.clone();
+        unsorted_seeds.member_seeds.reverse();
+        assert_eq!(
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: unsorted_seeds,
+                }
+            )),
+            ShapeLimit::MembershipPlanOrder,
+        );
+    }
+
+    /// A node cannot be both a voter and a learner: that is two roles for one
+    /// node, and the joint-config arithmetic has no answer for it.
+    #[test]
+    fn a_node_cannot_be_both_a_voter_and_a_learner() {
+        let s = base();
+        let mut p = plan(&[1, 2, 3]);
+        p.retained_learners = vec![p.desired_voters[0]];
+        assert_eq!(
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: p,
+                }
+            )),
+            ShapeLimit::MembershipPlanOrder,
+        );
+    }
+
+    /// §9: a join permit is mandatory exactly for a new node and absent for an
+    /// existing member. Both directions, because either one alone would let the
+    /// other through.
+    #[test]
+    fn a_join_permit_is_required_exactly_for_a_new_node() {
+        let mut s = base();
+
+        // New node, no permit.
+        let mut p = plan(&[1, 2, 3]);
+        p.member_seeds[0].join_permit = None;
+        assert_eq!(
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: p,
+                }
+            )),
+            ShapeLimit::MemberSeedPermit,
+        );
+
+        // Existing member, permit present.
+        let committed = plan(&[1, 2, 3]);
+        s.members = committed.desired_voters.iter().copied().collect();
+        assert_eq!(
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: committed,
+                }
+            )),
+            ShapeLimit::MemberSeedPermit,
+        );
+
+        // The same plan with permits dropped is accepted, so the rule is a
+        // correspondence and not a blanket refusal.
+        assert!(matches!(
+            decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: plan_against(&[1, 2, 3], &s.members),
+                }
+            ),
+            Decision::Apply(_)
+        ));
+    }
+
+    /// §9: every new node must be seeded, or the group commits a membership
+    /// containing a node it has no route to.
+    #[test]
+    fn a_new_node_without_a_seed_is_refused() {
+        let s = base();
+        let mut p = plan(&[1, 2, 3]);
+        p.member_seeds.remove(0);
+        assert_eq!(
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: p,
+                }
+            )),
+            ShapeLimit::MemberSeedUnknownNode,
+        );
+    }
+
     // ── Route retention ─────────────────────────────────────────────────────
 
     #[test]
@@ -577,18 +878,25 @@ mod tests {
             &change(op(1), &[1, 2, 3], None),
         ));
 
-        // One seed arrives, so exactly one incumbent leaves -- the one with the
-        // lowest introducing log id.
-        assert_eq!(e.routes.len(), 1);
-        let mut oldest = [0u8; 32];
-        oldest[31] = 0xAA;
-        assert_eq!(e.evict_routes, vec![oldest]);
+        // Three seeds arrive, so exactly three incumbents leave -- the three
+        // with the lowest introducing log ids.
+        assert_eq!(e.routes.len(), 3);
+        let oldest: Vec<NodeId> = (0..3u64)
+            .map(|i| {
+                let mut n = [0u8; 32];
+                n[0..8].copy_from_slice(&i.to_be_bytes());
+                n[31] = 0xAA;
+                n
+            })
+            .collect();
+        assert_eq!(e.evict_routes, oldest);
     }
 
     #[test]
     fn an_unfilled_route_table_evicts_nothing() {
         let mut s = base();
-        with_routes(&mut s, MAX_RETAINED_ROUTES - 1);
+        // Three seeds arrive, so leave room for exactly three.
+        with_routes(&mut s, MAX_RETAINED_ROUTES - 3);
         let e = effect(decide_change(
             &s,
             &ADMIN,
@@ -602,20 +910,24 @@ mod tests {
     fn re_seeding_a_known_node_needs_no_eviction() {
         let mut s = base();
         with_routes(&mut s, MAX_RETAINED_ROUTES);
-        // The plan's only seed is already routed, so the table does not grow.
-        s.routes.insert(
-            [9u8; 32],
-            Route {
-                ticket: b"aster1stale".to_vec(),
-                introduced_log_id: log(500),
-                source_operation_id: op(0),
-            },
-        );
-        s.routes.remove(&{
+        // Every seed in the plan is already routed, so the table does not grow;
+        // three incumbents are dropped to keep the count at the cap.
+        for node in plan(&[1, 2, 3]).desired_voters {
+            s.routes.insert(
+                node,
+                Route {
+                    ticket: b"aster1stale".to_vec(),
+                    introduced_log_id: log(500),
+                    source_operation_id: op(0),
+                },
+            );
+        }
+        for i in 0..3u64 {
             let mut n = [0u8; 32];
+            n[0..8].copy_from_slice(&i.to_be_bytes());
             n[31] = 0xAA;
-            n
-        });
+            s.routes.remove(&n);
+        }
         s.growth_bytes = s.recompute_growth();
 
         let e = effect(decide_change(
@@ -645,11 +957,16 @@ mod tests {
             &change(op(1), &[1, 2, 3], None),
         ));
         assert!(!e.evict_routes.contains(&oldest));
-        assert_eq!(e.evict_routes.len(), 1, "the next-oldest goes instead");
-        let mut second = [0u8; 32];
-        second[0..8].copy_from_slice(&1u64.to_be_bytes());
-        second[31] = 0xAA;
-        assert_eq!(e.evict_routes, vec![second]);
+        assert_eq!(e.evict_routes.len(), 3, "the next-oldest go instead");
+        let next: Vec<NodeId> = (1..4u64)
+            .map(|i| {
+                let mut n = [0u8; 32];
+                n[0..8].copy_from_slice(&i.to_be_bytes());
+                n[31] = 0xAA;
+                n
+            })
+            .collect();
+        assert_eq!(e.evict_routes, next);
     }
 
     #[test]
@@ -732,7 +1049,11 @@ mod tests {
 
         assert_eq!(e.intent.status_code, PHASE_PENDING);
         assert_eq!(e.intent.plan.desired_voters.len(), 3);
-        assert_eq!(e.intent.plan.member_seeds.len(), 1);
+        assert_eq!(
+            e.intent.plan.member_seeds.len(),
+            3,
+            "every new node is seeded, which is what §9 requires"
+        );
         assert_eq!(e.intent.plan.member_seeds[0].ticket, b"aster1ticket");
         assert_eq!(e.intent.actor, ADMIN);
         assert_eq!(e.intent.request_hash, [7u8; 32]);
@@ -750,9 +1071,11 @@ mod tests {
             &[7u8; 32],
             &change(op(1), &[1, 2, 3], None),
         ));
-        assert_eq!(e.routes.len(), 1);
+        assert_eq!(e.routes.len(), 3, "one route per seeded new node");
         let (node, route) = &e.routes[0];
-        assert_eq!(*node, [9u8; 32]);
+        let mut first = [0u8; 32];
+        first[0] = 1;
+        assert_eq!(*node, first);
         assert_eq!(route.ticket, b"aster1ticket");
         assert_eq!(route.source_operation_id, op(1));
     }

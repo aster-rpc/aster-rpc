@@ -168,11 +168,16 @@ fn step(state: &State, n: u64) -> Step {
             plan: MembershipPlan {
                 desired_voters: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
                 retained_learners: Vec::new(),
-                member_seeds: vec![MemberSeed {
-                    node_id: [(n % 9) as u8; 32],
-                    ticket: vec![n as u8; 16],
-                    join_permit: None,
-                }],
+                // §9: every new node is seeded, sorted by node id, and a new
+                // node's seed carries a join permit. The generator's plan never
+                // matches the committed membership, so all three are new.
+                member_seeds: (1u8..=3)
+                    .map(|b| MemberSeed {
+                        node_id: [b; 32],
+                        ticket: vec![n as u8; 16],
+                        join_permit: Some(vec![0xEEu8; 64]),
+                    })
+                    .collect(),
             },
         }),
         9 => Action::CancelMembership(CancelMembershipAction {
@@ -762,6 +767,7 @@ fn membership_intents_transition_and_stay_within_their_cap() {
         let sequence = u64::from(round) + 1;
         let op = [round; 16];
         let expected = state.membership_log_id;
+        let members = state.members.clone();
 
         // Accept.
         index += 1;
@@ -781,7 +787,20 @@ fn membership_intents_transition_and_stay_within_their_cap() {
                     plan: MembershipPlan {
                         desired_voters: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
                         retained_learners: Vec::new(),
-                        member_seeds: Vec::new(),
+                        // §9: a join permit is mandatory for a **new** node and
+                        // absent for an existing member. After the first round
+                        // completes, these three are the committed membership,
+                        // so their seeds stop carrying permits -- derived from
+                        // state rather than hard-coded, because the rule is
+                        // exactly that it depends on state.
+                        member_seeds: (1u8..=3)
+                            .map(|b| MemberSeed {
+                                node_id: [b; 32],
+                                ticket: b"aster1ticket".to_vec(),
+                                join_permit: (!members.contains(&[b; 32]))
+                                    .then(|| vec![0xEEu8; 64]),
+                            })
+                            .collect(),
                     },
                 }),
             },

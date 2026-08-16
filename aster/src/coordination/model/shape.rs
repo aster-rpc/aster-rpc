@@ -112,6 +112,9 @@ shape_limits! {
     /// A membership plan outside §9's shape: not 3 or 5 desired voters, more
     /// than two new voter identities, or more than two retained learners.
     MembershipPlanSize => "the membership plan is outside the v1 shape",
+    MembershipPlanOrder => "a membership plan node vector is not sorted and unique",
+    MemberSeedUnknownNode => "a member seed names a node the plan does not contain",
+    MemberSeedPermit => "a member seed's join permit does not match its node's status",
 }
 
 /// Validate a raw `(namespace, key)` into the durable key type.
@@ -167,6 +170,17 @@ pub fn check_membership_plan(voters: usize, retained_learners: usize) -> Option<
     (!sized || retained_learners > MAX_RETAINED_LEARNERS).then_some(ShapeLimit::MembershipPlanSize)
 }
 
+/// Is a node-id vector sorted and free of duplicates?
+///
+/// Both properties at once, and deliberately not "sort it and compare lengths":
+/// §9 declares these vectors **sorted unique**, so an unsorted one is a
+/// different request from its sorted spelling and must be refused rather than
+/// normalised. Two spellings of one plan would hash differently while meaning
+/// the same thing, which is exactly what the request hash exists to prevent.
+pub fn sorted_unique(ids: &[[u8; 32]]) -> bool {
+    ids.windows(2).all(|w| w[0] < w[1])
+}
+
 /// Check a member seed's ticket and join permit.
 pub fn check_member_seed(ticket_len: usize, join_permit_len: Option<usize>) -> Option<ShapeLimit> {
     if ticket_len > MAX_TICKET {
@@ -189,7 +203,7 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ShapeLimit::ALL.len());
-        assert_eq!(ShapeLimit::ALL.len(), 13, "update this count with the enum");
+        assert_eq!(ShapeLimit::ALL.len(), 16, "update this count with the enum");
         // Every variant has its own description; a shared one would make two
         // different failures read identically in a status message.
         let mut descriptions: Vec<_> = ShapeLimit::ALL.iter().map(|l| l.describe()).collect();
