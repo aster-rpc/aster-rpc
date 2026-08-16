@@ -68,7 +68,7 @@ impl ServiceDispatch for EchoService {
     async fn dispatch(&self, _method: &str, mut call: Call) {
         let req = call.recv_request().await.unwrap_or_default();
         let resp: Vec<u8> = req.into_iter().rev().collect();
-        let _ = call.respond(resp, &RpcStatus::ok());
+        let _ = call.respond(resp, &RpcStatus::ok()).await;
     }
 }
 

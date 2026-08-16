@@ -165,7 +165,8 @@ impl MissionControl for MissionControlImpl {
                 level: "info".into(),
                 message: format!("log {i}"),
                 agent_id: req.agent_id.clone(),
-            })?;
+            })
+            .await?;
         }
         Ok(())
     }
@@ -194,7 +195,8 @@ impl MissionControl for MissionControlImpl {
                 stdout: format!("ran: {}", cmd.command),
                 stderr: String::new(),
                 exit_code: 0,
-            })?;
+            })
+            .await?;
         }
         Ok(())
     }

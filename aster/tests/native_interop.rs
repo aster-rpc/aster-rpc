@@ -1,4 +1,12 @@
 //! Compile and lifetime smoke test for the supported native escape hatch.
+//!
+//! The handles this exercises come from the `blobs`, `docs` and `gossip`
+//! features, so the whole target is gated on them. Without the gate the target
+//! fails to compile under any smaller feature set — including the
+//! `--no-default-features --features rpc` build that the coordination work
+//! must keep green — even though nothing here is being tested in that
+//! configuration.
+#![cfg(all(feature = "blobs", feature = "docs", feature = "gossip"))]
 
 use aster::{AsterConfig, Node, RelayMode};
 

@@ -392,14 +392,16 @@ impl ServiceDispatch for LeaseGrantor {
         match self.run(method, caller, raw).await {
             Ok(decision) => match self.fory.decision.serialize(&decision) {
                 Ok(bytes) => {
-                    let _ = call.respond(bytes, &RpcStatus::ok());
+                    let _ = call.respond(bytes, &RpcStatus::ok()).await;
                 }
                 Err(e) => {
-                    let _ = call.finish(&RpcStatus::error(StatusCode::Internal, e.to_string()));
+                    let _ = call
+                        .finish(&RpcStatus::error(StatusCode::Internal, e.to_string()))
+                        .await;
                 }
             },
             Err(status) => {
-                let _ = call.finish(&status);
+                let _ = call.finish(&status).await;
             }
         }
     }

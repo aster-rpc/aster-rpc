@@ -31,8 +31,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
-use tokio::sync::mpsc;
+use anyhow::{anyhow, Context, Result};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::framing::{FLAG_CANCEL, FLAG_END_STREAM, FLAG_HEADER};
 use crate::{CoreClosedInfo, CoreConnection, CoreNode, CoreRecvStream, CoreSendStream};
@@ -74,13 +74,13 @@ pub struct IncomingCall {
     pub request_payload: Vec<u8>,
     pub request_flags: u8,
     pub peer_id: String,
-    pub response_sender: mpsc::UnboundedSender<OutgoingFrame>,
+    pub response_sender: ResponseSender,
     /// Receiver for ADDITIONAL request frames after the first one (which
     /// is delivered inline via `request_payload` / `request_flags`). Unary
     /// and server-streaming calls will see this channel close almost
     /// immediately; client-streaming and bidi-streaming calls pull frames
     /// until `FLAG_END_STREAM` or QUIC EOF closes the channel.
-    pub request_receiver: mpsc::UnboundedReceiver<RequestFrame>,
+    pub request_receiver: mpsc::Receiver<RequestFrame>,
     /// Set to `true` by the reactor when a `FLAG_CANCEL` frame arrives on
     /// the wire OR when the QUIC stream errors mid-call. The binding can
     /// poll this from a long-running streaming dispatcher (typically via
@@ -113,6 +113,288 @@ pub enum OutgoingFrame {
     /// `aster_call_unary` pattern that writes header+request as one buffer.
     /// Terminal: the reactor returns `CallOutcome::Complete` after writing.
     CompleteUnary(Vec<u8>),
+}
+
+impl OutgoingFrame {
+    /// Number of caller-owned bytes this item pins until the transport write
+    /// completes. The FFI reserves this exact charge before it copies bytes.
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            Self::Frame(bytes) | Self::Trailer(bytes) | Self::CompleteUnary(bytes) => bytes.len(),
+        }
+    }
+}
+
+/// Response items allowed to exist per call, including the item currently
+/// blocked in the transport writer.
+///
+/// This is deliberately independent of the byte budget. A high item ceiling
+/// amortizes tiny-frame producer handoffs; the byte budget keeps large frames
+/// inside the former `8 * MAX_FRAME_SIZE` envelope.
+pub const RESPONSE_ITEM_LIMIT: usize = 256;
+
+/// Maximum response bytes pinned per call, including the transport writer's
+/// in-flight item. This is exactly the envelope previously attributed to an
+/// eight-slot channel, but unlike an mpsc slot count it is an actual byte
+/// invariant.
+pub const RESPONSE_BYTE_LIMIT: usize =
+    FRAME_CHANNEL_DEPTH * crate::framing::MAX_FRAME_SIZE as usize;
+
+struct ResponseBudget {
+    items: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+}
+
+/// Response producer for one call. Capacity is two-dimensional: every item
+/// owns one item permit plus its exact encoded byte charge before it may enter
+/// the queue.
+#[derive(Clone)]
+pub struct ResponseSender {
+    tx: mpsc::Sender<BudgetedResponse>,
+    budget: Arc<ResponseBudget>,
+    item_limit: usize,
+    byte_limit: usize,
+}
+
+/// Response consumer for one call.
+pub struct ResponseReceiver {
+    rx: mpsc::Receiver<BudgetedResponse>,
+}
+
+/// Capacity acquired before a producer constructs or copies response bytes.
+pub struct ResponsePermit {
+    queue: mpsc::OwnedPermit<BudgetedResponse>,
+    item: OwnedSemaphorePermit,
+    bytes: OwnedSemaphorePermit,
+    encoded_len: usize,
+}
+
+/// The item returned to a transport writer. Its private lease must remain live
+/// until the write completes, so both the queued and in-flight bytes count
+/// against the same per-call envelope.
+pub struct ResponseItem {
+    frame: OutgoingFrame,
+    lease: ResponseLease,
+}
+
+/// Capacity lease separated from the frame so a transport can move the bytes
+/// into its write call while retaining the permits until that future resolves.
+pub struct ResponseLease {
+    _item: OwnedSemaphorePermit,
+    _bytes: OwnedSemaphorePermit,
+}
+
+struct BudgetedResponse {
+    frame: OutgoingFrame,
+    item: OwnedSemaphorePermit,
+    bytes: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseReserveError {
+    Full,
+    Closed,
+    TooLarge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResponseSendError;
+
+impl ResponseSender {
+    /// Acquire both dimensions without waiting. A `Full` result owns no
+    /// capacity and callers have not yet copied any bytes.
+    pub fn try_reserve(&self, encoded_len: usize) -> Result<ResponsePermit, ResponseReserveError> {
+        if encoded_len > self.byte_limit || encoded_len > u32::MAX as usize {
+            return Err(ResponseReserveError::TooLarge);
+        }
+
+        let item = self
+            .budget
+            .items
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ResponseReserveError::Full)?;
+        let bytes = self
+            .budget
+            .bytes
+            .clone()
+            .try_acquire_many_owned(encoded_len as u32)
+            .map_err(|_| ResponseReserveError::Full)?;
+        let queue = self
+            .tx
+            .clone()
+            .try_reserve_owned()
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ResponseReserveError::Full,
+                mpsc::error::TrySendError::Closed(_) => ResponseReserveError::Closed,
+            })?;
+
+        Ok(ResponsePermit {
+            queue,
+            item,
+            bytes,
+            encoded_len,
+        })
+    }
+
+    /// Acquire both capacity dimensions asynchronously. No response bytes need
+    /// to exist while this future waits.
+    pub async fn reserve(
+        &self,
+        encoded_len: usize,
+    ) -> Result<ResponsePermit, ResponseReserveError> {
+        if encoded_len > self.byte_limit || encoded_len > u32::MAX as usize {
+            return Err(ResponseReserveError::TooLarge);
+        }
+
+        let item = self
+            .budget
+            .items
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ResponseReserveError::Closed)?;
+        let bytes = self
+            .budget
+            .bytes
+            .clone()
+            .acquire_many_owned(encoded_len as u32)
+            .await
+            .map_err(|_| ResponseReserveError::Closed)?;
+        let queue = self
+            .tx
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| ResponseReserveError::Closed)?;
+
+        Ok(ResponsePermit {
+            queue,
+            item,
+            bytes,
+            encoded_len,
+        })
+    }
+
+    pub async fn send(&self, frame: OutgoingFrame) -> Result<(), ResponseSendError> {
+        let permit = self
+            .reserve(frame.encoded_len())
+            .await
+            .map_err(|_| ResponseSendError)?;
+        permit.send(frame)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    pub async fn closed(&self) {
+        self.tx.closed().await;
+    }
+
+    pub fn item_limit(&self) -> usize {
+        self.item_limit
+    }
+
+    pub fn byte_limit(&self) -> usize {
+        self.byte_limit
+    }
+}
+
+impl ResponsePermit {
+    pub fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+
+    pub fn send(self, frame: OutgoingFrame) -> Result<(), ResponseSendError> {
+        if frame.encoded_len() != self.encoded_len {
+            return Err(ResponseSendError);
+        }
+        self.queue.send(BudgetedResponse {
+            frame,
+            item: self.item,
+            bytes: self.bytes,
+        });
+        Ok(())
+    }
+}
+
+impl ResponseReceiver {
+    pub async fn recv(&mut self) -> Option<ResponseItem> {
+        self.rx.recv().await.map(|response| ResponseItem {
+            frame: response.frame,
+            lease: ResponseLease {
+                _item: response.item,
+                _bytes: response.bytes,
+            },
+        })
+    }
+
+    pub fn try_recv(&mut self) -> Result<ResponseItem, mpsc::error::TryRecvError> {
+        self.rx.try_recv().map(|response| ResponseItem {
+            frame: response.frame,
+            lease: ResponseLease {
+                _item: response.item,
+                _bytes: response.bytes,
+            },
+        })
+    }
+}
+
+impl tokio_stream::Stream for ResponseReceiver {
+    type Item = ResponseItem;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx).map(|response| {
+            response.map(|response| ResponseItem {
+                frame: response.frame,
+                lease: ResponseLease {
+                    _item: response.item,
+                    _bytes: response.bytes,
+                },
+            })
+        })
+    }
+}
+
+impl ResponseItem {
+    pub fn into_parts(self) -> (OutgoingFrame, ResponseLease) {
+        (self.frame, self.lease)
+    }
+}
+
+/// Construct the production response queue.
+pub fn response_channel() -> (ResponseSender, ResponseReceiver) {
+    response_channel_with_limits(RESPONSE_ITEM_LIMIT, RESPONSE_BYTE_LIMIT)
+}
+
+/// Construct a queue with explicit limits for invariant tests and transport
+/// adapters. Both values must be positive; the production path uses the
+/// constants above.
+pub fn response_channel_with_limits(
+    item_limit: usize,
+    byte_limit: usize,
+) -> (ResponseSender, ResponseReceiver) {
+    assert!(item_limit > 0);
+    assert!(byte_limit > 0);
+    assert!(byte_limit <= Semaphore::MAX_PERMITS);
+    let (tx, rx) = mpsc::channel(item_limit);
+    let budget = Arc::new(ResponseBudget {
+        items: Arc::new(Semaphore::new(item_limit)),
+        bytes: Arc::new(Semaphore::new(byte_limit)),
+    });
+    (
+        ResponseSender {
+            tx,
+            budget,
+            item_limit,
+            byte_limit,
+        },
+        ResponseReceiver { rx },
+    )
 }
 
 /// An event dispatched from the reactor to its consumer. In addition to
@@ -212,12 +494,21 @@ impl ReactorHandle {
 pub struct ReactorFeeder {
     event_tx: mpsc::Sender<ReactorEvent>,
     rt_handle: tokio::runtime::Handle,
+    resolve: Option<FrameLimitResolver>,
 }
 
 impl ReactorFeeder {
     pub fn feed(&self, conn: CoreConnection) {
         let tx = self.event_tx.clone();
-        self.rt_handle.spawn(connection_loop(conn, tx));
+        self.rt_handle
+            .spawn(connection_loop(conn, tx, self.resolve.clone()));
+    }
+
+    /// Install the per-method body-frame cap resolver. Without one every
+    /// service keeps the pre-existing global limit, so this is additive.
+    pub fn with_frame_limits(mut self, resolve: FrameLimitResolver) -> Self {
+        self.resolve = Some(resolve);
+        self
     }
 }
 
@@ -240,15 +531,30 @@ pub fn create_reactor(
         ReactorFeeder {
             event_tx,
             rt_handle: handle.clone(),
+            resolve: None,
         },
     )
 }
 
 /// Start a reactor that owns the accept loop.
 pub fn start_reactor(node: CoreNode, channel_capacity: usize) -> ReactorHandle {
+    start_reactor_with_limits(node, channel_capacity, None)
+}
+
+/// As [`start_reactor`], with a per-method body-frame cap resolver.
+///
+/// This is the production accept path -- `Server::serve` goes through it -- so
+/// without this entry point a service could declare method limits that nothing
+/// ever installed. `None` keeps the pre-existing global limit for every
+/// service.
+pub fn start_reactor_with_limits(
+    node: CoreNode,
+    channel_capacity: usize,
+    resolve: Option<FrameLimitResolver>,
+) -> ReactorHandle {
     let (event_tx, event_rx) = mpsc::channel(channel_capacity);
     let (non_rpc_tx, non_rpc_rx) = mpsc::channel(channel_capacity);
-    tokio::spawn(accept_loop(node, event_tx, non_rpc_tx));
+    tokio::spawn(accept_loop(node, event_tx, non_rpc_tx, resolve));
     ReactorHandle {
         event_rx,
         non_rpc_rx,
@@ -261,19 +567,31 @@ pub fn start_reactor_on(
     node: CoreNode,
     channel_capacity: usize,
 ) -> ReactorHandle {
+    start_reactor_on_with_limits(handle, node, channel_capacity, None)
+}
+
+/// As [`start_reactor_on`], with a per-method body-frame cap resolver.
+pub fn start_reactor_on_with_limits(
+    handle: &tokio::runtime::Handle,
+    node: CoreNode,
+    channel_capacity: usize,
+    resolve: Option<FrameLimitResolver>,
+) -> ReactorHandle {
     let (event_tx, event_rx) = mpsc::channel(channel_capacity);
     let (non_rpc_tx, non_rpc_rx) = mpsc::channel(channel_capacity);
-    handle.spawn(accept_loop(node, event_tx, non_rpc_tx));
+    handle.spawn(accept_loop(node, event_tx, non_rpc_tx, resolve));
     ReactorHandle {
         event_rx,
         non_rpc_rx,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     node: CoreNode,
     event_tx: mpsc::Sender<ReactorEvent>,
     non_rpc_tx: mpsc::Sender<(Vec<u8>, CoreConnection)>,
+    resolve: Option<FrameLimitResolver>,
 ) {
     loop {
         match node.accept_aster().await {
@@ -285,7 +603,7 @@ async fn accept_loop(
                 // silently dropped the handshake. See task #31.
                 if alpn == RPC_ALPN {
                     let tx = event_tx.clone();
-                    tokio::spawn(connection_loop(conn, tx));
+                    tokio::spawn(connection_loop(conn, tx, resolve.clone()));
                 } else if non_rpc_tx.send((alpn, conn)).await.is_err() {
                     // Binding dropped the non-rpc receiver. That means nothing
                     // is listening — drop the connection. The peer will see a
@@ -303,7 +621,11 @@ async fn accept_loop(
     }
 }
 
-async fn connection_loop(conn: CoreConnection, event_tx: mpsc::Sender<ReactorEvent>) {
+async fn connection_loop(
+    conn: CoreConnection,
+    event_tx: mpsc::Sender<ReactorEvent>,
+    resolve: Option<FrameLimitResolver>,
+) {
     let peer_id = conn.remote_id();
     let connection_id = next_connection_id();
 
@@ -314,9 +636,10 @@ async fn connection_loop(conn: CoreConnection, event_tx: mpsc::Sender<ReactorEve
         let tx = event_tx.clone();
         let peer = peer_id.clone();
         let conn_clone = conn.clone();
+        let res = resolve.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_stream_inner(send, recv, peer, connection_id, conn_clone, tx).await
+                handle_stream_inner(send, recv, peer, connection_id, conn_clone, tx, res).await
             {
                 tracing::debug!("reactor stream error: {e}");
             }
@@ -346,20 +669,154 @@ struct WireFrame {
     flags: u8,
 }
 
-/// Per-stream frame reader task. Owns `recv` for the lifetime of the QUIC
-/// bi-stream and pushes every frame it reads into a shared mpsc that the
-/// dispatch loop consumes from. Exits on the first read error (typically
-/// EOF when the peer closes its send side), which closes the channel and
-/// signals the dispatch loop that no more frames are coming.
-async fn read_all_frames(recv: CoreRecvStream, frame_tx: mpsc::UnboundedSender<WireFrame>) {
+/// Resolves the body-frame cap for a call from its raw header bytes.
+///
+/// Core never decodes the header: it hands the bytes to a closure the `aster`
+/// crate installs and gets a decision back. That keeps the payload format out
+/// of the transport while still letting the cap be per-method.
+pub enum FrameLimit {
+    /// Header did not decode. Reset the stream; read no body.
+    Reject,
+    /// Decoded, but the service/method is unknown here. Use the global cap.
+    Default,
+    /// This method's body-frame cap.
+    Limit(u32),
+}
+
+pub type FrameLimitResolver = std::sync::Arc<dyn Fn(&[u8]) -> FrameLimit + Send + Sync>;
+
+/// How many frames may sit between the reader and the dispatch loop.
+pub const FRAME_CHANNEL_DEPTH: usize = 8;
+
+/// Physical response queue depth. The strict item and byte semaphores include
+/// the writer's in-flight item; this mpsc capacity is only the transport for
+/// those already-accounted items.
+pub const RESPONSE_CHANNEL_DEPTH: usize = RESPONSE_ITEM_LIMIT;
+
+/// Test-only counters so a test can assert on what the reader actually did --
+/// how many resolver calls it made and how many body bytes it materialized --
+/// rather than on the much weaker signal of whether a call was delivered.
+#[cfg(feature = "ingress-metrics")]
+pub mod ingress_metrics {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static RESOLVER_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static BODY_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+    pub static HEADER_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+    /// Incremented inside `read_one_frame_capped` at the point the payload
+    /// buffer is allocated -- so it covers `accept_aster_bi`'s peek as well as
+    /// the reactor's reads. The per-path counters above are downstream of a
+    /// successful read and cannot see an allocation that then blocked.
+    pub static FRAME_BYTES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        RESOLVER_CALLS.store(0, Ordering::Relaxed);
+        BODY_BYTES_READ.store(0, Ordering::Relaxed);
+        HEADER_BYTES_READ.store(0, Ordering::Relaxed);
+        FRAME_BYTES_ALLOCATED.store(0, Ordering::Relaxed);
+    }
+    pub fn snapshot() -> (u64, u64, u64) {
+        (
+            RESOLVER_CALLS.load(Ordering::Relaxed),
+            HEADER_BYTES_READ.load(Ordering::Relaxed),
+            BODY_BYTES_READ.load(Ordering::Relaxed),
+        )
+    }
+    /// Total bytes any frame read has allocated since `reset`.
+    pub fn allocated() -> u64 {
+        FRAME_BYTES_ALLOCATED.load(Ordering::Relaxed)
+    }
+}
+
+/// Per-stream frame reader. Unlike a free-running reader, this **handshakes**
+/// with dispatch: it reads a call header under the global header cap, waits for
+/// the body cap that header implies, reads that call's body frames under it,
+/// and resets to the header cap at the next call.
+///
+/// Free-running was wrong in two ways. It read call *n+1*'s frames under call
+/// *n*'s limit, and with an unbounded channel it read them as fast as the peer
+/// could send regardless of whether dispatch was keeping up. A bounded channel
+/// alone fixes only the second.
+async fn read_all_frames(
+    recv: CoreRecvStream,
+    frame_tx: mpsc::Sender<WireFrame>,
+    resolve: Option<FrameLimitResolver>,
+) {
     loop {
-        match recv.read_one_frame().await {
-            Ok((payload, flags)) => {
-                if frame_tx.send(WireFrame { payload, flags }).is_err() {
-                    return;
-                }
-            }
+        // ── call header: always the global header cap ──
+        let (payload, flags) = match recv
+            .read_one_frame_capped(crate::framing::MAX_CALL_HEADER_SIZE)
+            .await
+        {
+            Ok(f) => f,
             Err(_) => return,
+        };
+
+        // Transport validity first. A frame without FLAG_HEADER is not a call
+        // header whatever its bytes say, so resolving it -- and then reading a
+        // body under whatever cap that produced -- would be acting on an
+        // attacker-chosen limit before the frame was known to be a header at
+        // all. Dispatch rejects it too, but only after the reader has already
+        // gone on to the next frame.
+        #[cfg(feature = "ingress-metrics")]
+        ingress_metrics::HEADER_BYTES_READ
+            .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+        if flags & crate::framing::FLAG_HEADER == 0 {
+            // A cancellation for the call that just ended its request stream.
+            // The reader is back in header state, so without this it would
+            // silently `return` and the cancel would never reach dispatch --
+            // which is exactly what made a server-streaming cancel a no-op,
+            // since such a call ends its request stream on the FIRST frame.
+            //
+            // Forward it and stop reading: FLAG_CANCEL poisons this stream
+            // (§6), so there is no next call on it to read a header for.
+            if flags & FLAG_CANCEL != 0 {
+                let _ = frame_tx.send(WireFrame { payload, flags }).await;
+            }
+            return;
+        }
+
+        #[cfg(feature = "ingress-metrics")]
+        ingress_metrics::RESOLVER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let body_cap = match &resolve {
+            None => crate::framing::MAX_FRAME_SIZE,
+            Some(f) => match f(&payload) {
+                FrameLimit::Reject => return,
+                FrameLimit::Default => crate::framing::MAX_FRAME_SIZE,
+                FrameLimit::Limit(n) => n,
+            },
+        };
+
+        if frame_tx.send(WireFrame { payload, flags }).await.is_err() {
+            return;
+        }
+
+        // ── body frames: this call's cap, until the next header ──
+        loop {
+            match recv.read_one_frame_capped(body_cap).await {
+                Ok((payload, flags)) => {
+                    #[cfg(feature = "ingress-metrics")]
+                    ingress_metrics::BODY_BYTES_READ
+                        .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let is_header = flags & crate::framing::FLAG_HEADER != 0;
+                    if frame_tx.send(WireFrame { payload, flags }).await.is_err() {
+                        return;
+                    }
+                    if is_header {
+                        // Shouldn't happen: a header arriving under a body cap
+                        // means the peer framed a new call without the reader
+                        // resetting. Bail rather than continue under the wrong
+                        // limit.
+                        return;
+                    }
+                    if flags & FLAG_END_STREAM != 0 {
+                        break; // next iteration reads a header again
+                    }
+                }
+                Err(_) => return,
+            }
         }
     }
 }
@@ -371,13 +828,14 @@ async fn handle_stream_inner(
     connection_id: u64,
     connection: CoreConnection,
     call_tx: mpsc::Sender<ReactorEvent>,
+    resolve: Option<FrameLimitResolver>,
 ) -> Result<()> {
     let stream_id = next_stream_id();
 
     // Spawn the per-stream reader task. Everything below pulls from
     // `frame_rx`; nothing else touches `recv`.
-    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
-    let reader_handle = tokio::spawn(read_all_frames(recv, frame_tx));
+    let (frame_tx, mut frame_rx) = mpsc::channel(FRAME_CHANNEL_DEPTH);
+    let reader_handle = tokio::spawn(read_all_frames(recv, frame_tx, resolve));
 
     let result = dispatch_stream(
         &mut frame_rx,
@@ -398,13 +856,31 @@ async fn handle_stream_inner(
 
 /// Outcome of dispatching one call through `dispatch_one_call`.
 enum CallOutcome {
-    /// The call completed (trailer sent to the peer). The caller
-    /// loops to read the next `StreamHeader` on the same stream
-    /// (multiplexed-stream model — every stream is multiplexed, spec §6).
-    Complete,
+    /// The call completed (trailer sent to the peer). The caller loops to read
+    /// the next `StreamHeader` on the same stream (multiplexed-stream model --
+    /// every stream is multiplexed, spec §6).
+    ///
+    /// Carries that header when it had already arrived. The reader starts on
+    /// call N+1 as soon as N's request stream ends, so with a `biased` select
+    /// putting the wire first, N+1's header and N's writer completion can both
+    /// be ready — and whoever polls first used to decide whether a perfectly
+    /// legal reused stream was accepted or rejected as "mid-call". Holding the
+    /// header until the current call's output is finished makes completed
+    /// output win without dropping it.
+    Complete(Option<WireFrame>),
     /// The peer closed the stream before the call finished. The caller
     /// should return `Ok(())` from the dispatch function.
     StreamEof,
+    /// The peer sent `FLAG_CANCEL`. The writer task has been aborted so the
+    /// response receiver is dropped and every producer woken with a closed
+    /// channel, and the send direction has been **reset**.
+    ///
+    /// The stream is poisoned, not reusable: a response frame may have been
+    /// partially written when flow control blocked, so the byte stream is no
+    /// longer at a frame boundary and anything written after it would silently
+    /// extend a half-frame. The connection and any connection-scoped session
+    /// survive; the client acquires a fresh stream.
+    Cancelled,
 }
 
 /// Unified multiplexed-call reader (spec §6 — every stream is multiplexed).
@@ -424,7 +900,7 @@ enum CallOutcome {
 /// payload-opaque and treats every stream identically.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_stream(
-    frame_rx: &mut mpsc::UnboundedReceiver<WireFrame>,
+    frame_rx: &mut mpsc::Receiver<WireFrame>,
     send: CoreSendStream,
     peer_id: String,
     connection_id: u64,
@@ -432,13 +908,20 @@ async fn dispatch_stream(
     stream_id: u64,
     call_tx: mpsc::Sender<ReactorEvent>,
 ) -> Result<()> {
+    // Call N+1's header, when the previous call had already read it off the
+    // wire while finishing its output.
+    let mut next_header: Option<WireFrame> = None;
+
     loop {
-        let header = match frame_rx.recv().await {
+        let header = match next_header.take() {
             Some(f) => f,
-            // Clean EOF between calls — peer closed the multiplexed
-            // stream. Don't `finish()` here; just exit so the
-            // per-stream task can drop the send half naturally.
-            None => return Ok(()),
+            None => match frame_rx.recv().await {
+                Some(f) => f,
+                // Clean EOF between calls — peer closed the multiplexed
+                // stream. Don't `finish()` here; just exit so the
+                // per-stream task can drop the send half naturally.
+                None => return Ok(()),
+            },
         };
         if header.flags & FLAG_HEADER == 0 {
             return Err(anyhow!(
@@ -467,8 +950,12 @@ async fn dispatch_stream(
         )
         .await?;
 
-        if matches!(outcome, CallOutcome::StreamEof) {
-            return Ok(());
+        match outcome {
+            CallOutcome::StreamEof => return Ok(()),
+            // A cancelled stream is poisoned (§6): end the stream task rather
+            // than looping for a next call that must not be served on it.
+            CallOutcome::Cancelled => return Ok(()),
+            CallOutcome::Complete(prefetched) => next_header = prefetched,
         }
         // Otherwise loop: read the next call's StreamHeader on this
         // multiplexed stream.
@@ -482,7 +969,7 @@ async fn dispatch_stream(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one_call(
     send: &CoreSendStream,
-    frame_rx: &mut mpsc::UnboundedReceiver<WireFrame>,
+    frame_rx: &mut mpsc::Receiver<WireFrame>,
     peer_id: &str,
     connection_id: u64,
     connection: &CoreConnection,
@@ -493,12 +980,29 @@ async fn dispatch_one_call(
     first_request_payload: Vec<u8>,
     first_request_flags: u8,
 ) -> Result<CallOutcome> {
-    let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
-    let (req_tx, req_rx) = mpsc::unbounded_channel();
+    // Both queues are bounded, but on different invariants. Requests retain
+    // §12.4's eight-item depth. Responses use an aggregate byte budget equal
+    // to eight maximum frames plus a separate item ceiling for tiny frames.
+    //
+    // The request queue is fed by the reader from remote bytes, so an unbounded
+    // one let a slow handler turn the bounded wire channel into an unbounded
+    // remote-driven buffer -- the cap moved rather than bound anything.
+    //
+    // The response queue is equally remote-driven in practice: a peer can start
+    // a server-streaming call and stop reading, so what accumulates is memory
+    // the peer controls. It is written from a sync `extern "C"` function that
+    // cannot `.await`, which is why the FFI reserves capacity with `try_reserve`
+    // and returns `QUEUE_FULL` rather than blocking -- blocking there would pin
+    // Java virtual-thread carriers.
+    let (resp_tx, mut resp_rx) = response_channel();
+    let (req_tx, req_rx) = mpsc::channel(FRAME_CHANNEL_DEPTH);
     let cancelled = Arc::new(AtomicBool::new(false));
 
-    let mut request_done = first_request_flags & FLAG_END_STREAM != 0;
-    let mut req_tx_opt = if request_done { None } else { Some(req_tx) };
+    // No `request_done` flag any more: the wire branch is unconditionally
+    // enabled, so there is nothing to gate. Whether the request stream has
+    // ended is expressed by `req_tx_opt` being `None`.
+    let request_ended = first_request_flags & FLAG_END_STREAM != 0;
+    let mut req_tx_opt = if request_ended { None } else { Some(req_tx) };
 
     call_tx
         .send(ReactorEvent::Call(IncomingCall {
@@ -518,34 +1022,158 @@ async fn dispatch_one_call(
         .await
         .map_err(|_| anyhow!("reactor channel closed"))?;
 
+    // The response writer runs in its OWN task, owning `resp_rx` and a clone of
+    // the send half.
+    //
+    // This is what makes cancellation observable. Writing inline in a `select!`
+    // arm meant that when the peer stopped reading, flow control blocked the
+    // dispatch loop inside `write_all` — so it was not in the `select!` and
+    // could not poll the wire for a `FLAG_CANCEL` at all. Racing `write_all`
+    // against the read would not fix it either, because a cancelled partial
+    // write leaves the byte stream off a frame boundary.
+    //
+    // With a separate task the dispatch loop is always able to read the wire,
+    // and cancelling is `abort()` + `reset()` rather than an attempt to resume
+    // a stream that is no longer framed.
+    let send_writer = send.clone();
+    let mut writer = tokio::spawn(async move {
+        while let Some(resp) = resp_rx.recv().await {
+            let (resp, _capacity_lease) = resp.into_parts();
+            let (bytes, terminal) = match resp {
+                OutgoingFrame::Frame(b) => (b, false),
+                OutgoingFrame::Trailer(b) | OutgoingFrame::CompleteUnary(b) => (b, true),
+            };
+            if !bytes.is_empty() && send_writer.write_all(bytes).await.is_err() {
+                return false;
+            }
+            if terminal {
+                return true;
+            }
+        }
+        // Channel closed with no trailer: the binding dropped the sender, or a
+        // cancellation dropped the receiver.
+        false
+    });
+
+    // Set once call N+1's header has arrived while this call's output is still
+    // being written. Gates the wire branch off, because everything after it on
+    // the wire belongs to N+1.
+    let mut pending_header: Option<WireFrame> = None;
+
     loop {
         tokio::select! {
             biased;
 
-            // Forward additional request frames from the peer.
-            wire = frame_rx.recv(), if !request_done => {
+            // Read the peer's frames. This branch stays enabled AFTER
+            // `request_done`, which it did not used to: a server-streaming call
+            // ends its request stream with the first frame, so gating on
+            // `!request_done` meant a later FLAG_CANCEL was never read at all
+            // and the producer streamed on to a peer that had cancelled.
+            //
+            // A completed call's next header is retained as `pending_header`
+            // and handed back to `dispatch_stream`; it is never discarded.
+            wire = frame_rx.recv(), if pending_header.is_none() => {
                 match wire {
                     Some(frame) => {
                         if frame.flags & FLAG_CANCEL != 0 {
-                            // Peer signalled cancellation: surface to
-                            // the binding, close the request channel,
-                            // and stop forwarding. The binding's
-                            // eventual trailer closes the response side.
+                            // A real cancellation. Setting the flag is not
+                            // enough on its own: a producer blocked on a
+                            // bounded `send` -- or an FFI caller spinning on
+                            // QUEUE_FULL -- is waiting on CAPACITY, and an
+                            // atomic nobody is polling never wakes it.
+                            //
+                            // Dropping the receiver is what wakes them. Every
+                            // producer, in every binding, then observes a
+                            // closed channel: `SendError` in Rust, NOT_FOUND
+                            // from the C ABI. One mechanism, no per-binding
+                            // cancellation plumbing.
                             cancelled.store(true, Ordering::Release);
-                            request_done = true;
-                            req_tx_opt = None;
-                            continue;
+                            // Close the handler's input.
+                            drop(req_tx_opt.take());
+                            // Abort the writer and AWAIT it, so `resp_rx` is
+                            // dropped before we return. That drop is the wake:
+                            // every producer, in every binding, then observes a
+                            // closed channel -- `SendError` in Rust, NOT_FOUND
+                            // from the C ABI. One mechanism, no per-binding
+                            // cancellation plumbing, and no reliance on anyone
+                            // polling the atomic flag.
+                            writer.abort();
+                            let _ = (&mut writer).await;
+                            // Poison the send direction: a response frame may
+                            // have been partially written when flow control
+                            // blocked, so the stream is no longer at a frame
+                            // boundary and must never be written to again.
+                            // Named code so the peer can tell a
+                            // deliberate cancellation from a fault.
+                            // Propagate: a reset that could not be issued
+                            // means the stream was NOT poisoned, and silently
+                            // reporting a clean cancellation would invite the
+                            // reuse the poison exists to prevent.
+                            send.reset(crate::framing::RESET_CODE_CANCELLED)
+                                .await
+                                .context("poisoning a cancelled stream")?;
+                            return Ok(CallOutcome::Cancelled);
                         }
                         if frame.flags & FLAG_HEADER != 0 {
-                            // A fresh StreamHeader mid-call means the
-                            // peer started the next call before ending
-                            // the previous request stream. Protocol
-                            // violation — every multi-frame call MUST
-                            // terminate its request stream with
-                            // FLAG_END_STREAM before opening the next.
-                            return Err(anyhow!(
-                                "got StreamHeader before previous call's END_STREAM"
-                            ));
+                            if req_tx_opt.is_some() {
+                                // The request stream has NOT ended, so this is
+                                // the peer starting the next call before
+                                // finishing this one's requests. Protocol
+                                // violation -- every multi-frame call MUST
+                                // terminate its request stream with
+                                // FLAG_END_STREAM before opening the next.
+                                writer.abort();
+                                let _ = (&mut writer).await;
+                                // A violation, NOT a cancellation: a client
+                                // must not read its own cancel as honoured
+                                // when the server rejected what it sent.
+                                send.reset(crate::framing::RESET_CODE_PROTOCOL_VIOLATION)
+                                    .await
+                                    .context("resetting a stream after a framing violation")?;
+                                return Err(anyhow!(
+                                    "got StreamHeader before previous call's END_STREAM"
+                                ));
+                            }
+                            // Calls are strictly sequential (§ session-scoped
+                            // services): N+1 may not begin until N's RESPONSE
+                            // has finished, not merely its request.
+                            //
+                            // So a header here is only the benign
+                            // already-finished race -- writer completion and
+                            // N+1's header both ready, biased select happening
+                            // to poll the wire first. Anything else is the peer
+                            // running ahead.
+                            if !writer.is_finished() {
+                                // Accepting this would stop wire reads while
+                                // the writer is still blocked, so a FLAG_CANCEL
+                                // arriving next would never be read and the
+                                // producer would never wake:
+                                //   N END_STREAM -> early N+1 header -> CANCEL
+                                //
+                                // Tear the writer down before returning.
+                                // Dropping its JoinHandle does NOT abort the
+                                // task -- it would keep holding `resp_rx` and
+                                // the producer would stay blocked on a stream
+                                // nobody is reading, which is the very hang
+                                // this rejection exists to prevent.
+                                writer.abort();
+                                let _ = (&mut writer).await;
+                                // A violation, NOT a cancellation: a client
+                                // must not read its own cancel as honoured
+                                // when the server rejected what it sent.
+                                send.reset(crate::framing::RESET_CODE_PROTOCOL_VIOLATION)
+                                    .await
+                                    .context("resetting a stream after a framing violation")?;
+                                return Err(anyhow!(
+                                    "got StreamHeader before previous call's \
+                                     response completed"
+                                ));
+                            }
+                            // Writer already done: hold the header and stop
+                            // reading, since every frame after it belongs to
+                            // N+1 and consuming more here would steal them.
+                            pending_header = Some(frame);
+                            continue;
                         }
                         let end = frame.flags & FLAG_END_STREAM != 0;
                         // An empty FLAG_END_STREAM frame is the
@@ -558,14 +1186,20 @@ async fn dispatch_one_call(
                         let forward = !(end && frame.payload.is_empty());
                         if forward {
                             if let Some(tx) = req_tx_opt.as_ref() {
-                                let _ = tx.send(RequestFrame {
-                                    payload: frame.payload,
-                                    flags: frame.flags,
-                                });
+                                // Awaited, not dropped. On a bounded channel
+                                // `send` is a future: `let _ =` would discard
+                                // it and silently lose the frame -- and would
+                                // also discard the backpressure this bound
+                                // exists to apply.
+                                let _ = tx
+                                    .send(RequestFrame {
+                                        payload: frame.payload,
+                                        flags: frame.flags,
+                                    })
+                                    .await;
                             }
                         }
                         if end {
-                            request_done = true;
                             req_tx_opt = None;
                         }
                     }
@@ -577,66 +1211,29 @@ async fn dispatch_one_call(
                         // returning StreamEof so the trailer (if any)
                         // still flushes to the wire.
                         drop(req_tx_opt.take());
-                        // Drain any remaining response frames (the
-                        // binding may already have queued the trailer).
-                        while let Some(resp) = resp_rx.recv().await {
-                            match resp {
-                                OutgoingFrame::Frame(bytes) => {
-                                    if !bytes.is_empty() {
-                                        let _ = send.write_all(bytes).await;
-                                    }
-                                }
-                                OutgoingFrame::Trailer(bytes) => {
-                                    if !bytes.is_empty() {
-                                        let _ = send.write_all(bytes).await;
-                                    }
-                                    break;
-                                }
-                                OutgoingFrame::CompleteUnary(bytes) => {
-                                    if !bytes.is_empty() {
-                                        let _ = send.write_all(bytes).await;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
+                        // Let the writer flush whatever the binding already
+                        // queued (often the trailer) before we report EOF.
+                        let _ = (&mut writer).await;
                         return Ok(CallOutcome::StreamEof);
                     }
                 }
             }
 
-            // Drain response frames from the binding.
-            resp = resp_rx.recv() => {
-                match resp {
-                    Some(OutgoingFrame::Frame(bytes)) => {
-                        if !bytes.is_empty() {
-                            send.write_all(bytes).await?;
-                        }
-                    }
-                    Some(OutgoingFrame::Trailer(bytes)) => {
-                        if !bytes.is_empty() {
-                            send.write_all(bytes).await?;
-                        }
-                        // Don't `finish()` the send side — every stream
-                        // is multiplexed, so the next call (if any) on
-                        // this stream still needs to write its frames.
-                        // The send half is dropped naturally when the
-                        // peer EOFs and we return cleanly from
-                        // dispatch_stream.
-                        return Ok(CallOutcome::Complete);
-                    }
-                    Some(OutgoingFrame::CompleteUnary(bytes)) => {
-                        if !bytes.is_empty() {
-                            send.write_all(bytes).await?;
-                        }
-                        return Ok(CallOutcome::Complete);
-                    }
-                    None => {
-                        return Err(anyhow!(
-                            "binding dropped response channel without trailer"
-                        ));
-                    }
-                }
+            // The writer finished: it wrote a terminal frame, or the binding
+            // dropped the response sender.
+            //
+            // Don't `finish()` the send side — every stream is multiplexed, so
+            // the next call (if any) on this stream still needs to write its
+            // frames. The send half is dropped naturally when the peer EOFs and
+            // we return cleanly from dispatch_stream.
+            written = &mut writer => {
+                return match written {
+                    Ok(true) => Ok(CallOutcome::Complete(pending_header.take())),
+                    Ok(false) => Err(anyhow!(
+                        "binding dropped response channel without trailer"
+                    )),
+                    Err(e) => Err(anyhow!("response writer task failed: {e}")),
+                };
             }
         }
     }

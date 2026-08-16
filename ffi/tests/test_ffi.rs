@@ -12,7 +12,9 @@ mod common;
 
 #[test]
 fn test_abi_version() {
-    assert_eq!(iroh_abi_version_major(), 1);
+    // 2.0.0: the submit family can now return QUEUE_FULL, which a 1.0 caller
+    // does not retry. Behavioural incompatibility, so a major bump.
+    assert_eq!(iroh_abi_version_major(), 2);
     assert_eq!(iroh_abi_version_minor(), 0);
     assert_eq!(iroh_abi_version_patch(), 0);
 }

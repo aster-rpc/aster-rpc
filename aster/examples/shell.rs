@@ -205,7 +205,7 @@ impl Shell for PtyShell {
                     None => input_open = false, // client done sending; keep draining output
                 },
                 chunk = rx.recv() => match chunk {
-                    Some(bytes) => out.send(&ShellOut::out(bytes))?,
+                    Some(bytes) => out.send(&ShellOut::out(bytes)).await?,
                     None => break,           // PTY closed → child has exited
                 },
             }
@@ -218,7 +218,7 @@ impl Shell for PtyShell {
             tokio::task::spawn_blocking(move || child.wait().map(|s| s.exit_code()).unwrap_or(0))
                 .await
                 .unwrap_or(0) as i32;
-        out.send(&ShellOut::eof(code))?;
+        out.send(&ShellOut::eof(code)).await?;
         Ok(())
     }
 }

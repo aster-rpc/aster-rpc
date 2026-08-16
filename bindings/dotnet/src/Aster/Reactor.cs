@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Aster;
 
@@ -120,9 +121,33 @@ public sealed class Reactor : IDisposable
                 trailerLen = (uint)response.TrailerFrame.Length;
             }
 
-            int r = Native.aster_reactor_submit(_runtimeHandle, _handle, callId, respPtr, respLen, trailerPtr, trailerLen);
-            if (r != 0)
-                throw IrohException.FromStatus(r, "aster_reactor_submit");
+            // ABI 2.0: the per-call response channel is bounded, so a peer
+            // that stops reading makes this return QUEUE_FULL. That is
+            // backpressure, not an error -- nothing was copied and no call
+            // state changed, so the pinned buffers above are still valid and
+            // the retry is free. Treating it as fatal (as this did) would abort
+            // live calls under load.
+            //
+            // Native code never blocks, so the wait happens here. Bounded
+            // backoff from 50us to 2ms: short enough that a brief burst costs
+            // almost nothing, capped so a reader that resumes is noticed
+            // promptly.
+            const int QueueFull = 4; // IROH_STATUS_QUEUE_FULL
+            var backoff = TimeSpan.FromTicks(500); // 50us
+            var maxBackoff = TimeSpan.FromMilliseconds(2);
+            while (true)
+            {
+                int r = Native.aster_reactor_submit(_runtimeHandle, _handle, callId, respPtr, respLen, trailerPtr, trailerLen);
+                if (r != QueueFull)
+                {
+                    if (r != 0)
+                        throw IrohException.FromStatus(r, "aster_reactor_submit");
+                    break;
+                }
+                Thread.Sleep(backoff);
+                var doubled = TimeSpan.FromTicks(backoff.Ticks * 2);
+                backoff = doubled > maxBackoff ? maxBackoff : doubled;
+            }
         }
         finally
         {

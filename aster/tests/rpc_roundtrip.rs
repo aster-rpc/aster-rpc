@@ -81,16 +81,16 @@ impl ServiceDispatch for EchoService {
             "unary" => {
                 let req = call.recv_request().await.unwrap_or_default();
                 let resp: Vec<u8> = req.into_iter().rev().collect();
-                let _ = call.respond(resp, &RpcStatus::ok());
+                let _ = call.respond(resp, &RpcStatus::ok()).await;
             }
             // server-stream: request is a single byte N; emit frames [0]..=[N-1].
             "server_stream" => {
                 let req = call.recv_request().await.unwrap_or_default();
                 let n = req.first().copied().unwrap_or(0);
                 for i in 0..n {
-                    let _ = call.send(vec![i]);
+                    let _ = call.send(vec![i]).await;
                 }
-                let _ = call.finish(&RpcStatus::ok());
+                let _ = call.finish(&RpcStatus::ok()).await;
             }
             // client-stream: sum the first byte of every request; respond [sum].
             "client_stream" => {
@@ -98,20 +98,22 @@ impl ServiceDispatch for EchoService {
                 while let Some(req) = call.recv_request().await {
                     sum += req.first().copied().unwrap_or(0) as u32;
                 }
-                let _ = call.respond(vec![sum as u8], &RpcStatus::ok());
+                let _ = call.respond(vec![sum as u8], &RpcStatus::ok()).await;
             }
             // bidi: echo each request back (reversed) as it arrives.
             "bidi" => {
                 while let Some(req) = call.recv_request().await {
                     let echoed: Vec<u8> = req.into_iter().rev().collect();
-                    let _ = call.send(echoed);
+                    let _ = call.send(echoed).await;
                 }
-                let _ = call.finish(&RpcStatus::ok());
+                let _ = call.finish(&RpcStatus::ok()).await;
             }
             // always fails with NOT_FOUND, to exercise error propagation.
             "fails" => {
                 let _ = call.recv_request().await;
-                let _ = call.finish(&RpcStatus::error(StatusCode::NotFound, "nope"));
+                let _ = call
+                    .finish(&RpcStatus::error(StatusCode::NotFound, "nope"))
+                    .await;
             }
             // drops the Call without sending a trailer — the client must observe
             // an error, not a clean/empty success.
@@ -123,19 +125,21 @@ impl ServiceDispatch for EchoService {
             // the client must reject the (synthesized empty) trailer, not return Ok.
             "half_unary" => {
                 let _ = call.recv_request().await;
-                let _ = call.send(vec![9]);
+                let _ = call.send(vec![9]).await;
                 drop(call);
             }
             // client-stream handler that finishes OK with no response data frame:
             // the client must error (a client-stream owes exactly one response).
             "client_no_resp" => {
                 while call.recv_request().await.is_some() {}
-                let _ = call.finish(&RpcStatus::ok());
+                let _ = call.finish(&RpcStatus::ok()).await;
             }
             // Defensive: the server rejects unlisted methods (see `methods`)
             // before dispatch, so this is unreachable in practice.
             other => {
-                let _ = call.finish(&RpcStatus::error(StatusCode::Unimplemented, other));
+                let _ = call
+                    .finish(&RpcStatus::error(StatusCode::Unimplemented, other))
+                    .await;
             }
         }
     }

@@ -21,8 +21,38 @@ pub const FLAG_END_STREAM: u8 = 0x40;
 /// acceptor splices bytes to the backend socket. See `Aster-tunneling.md`.
 pub const FLAG_TUNNEL: u8 = 0x80;
 
+/// QUIC application error code used to poison a stream after `FLAG_CANCEL`
+/// (§6).
+///
+/// A named constant rather than a bare `0`, because the peer is expected to
+/// *recognise* it: a client that sees this code knows its cancel was honoured
+/// and the stream was retired deliberately, as distinct from a transport fault
+/// or a server crash. Stable across versions -- changing it is a wire-visible
+/// change.
+pub const RESET_CODE_CANCELLED: u32 = 0x41_53_00_01; // "AS" 00 01
+
+/// QUIC application error code for a stream torn down because the **peer broke
+/// the framing contract** -- e.g. starting call N+1 before call N's response
+/// finished (§6).
+///
+/// Distinct from [`RESET_CODE_CANCELLED`] on purpose. That code normatively
+/// means "your cancellation was honoured"; using it here would tell a client
+/// its own cancel succeeded when in fact the server rejected what it sent, so a
+/// client could log a clean cancellation for a bug it needs to fix. Same
+/// stability rule: changing it is a wire-visible change.
+pub const RESET_CODE_PROTOCOL_VIOLATION: u32 = 0x41_53_00_02; // "AS" 00 02
+
 /// Maximum frame body size: 16 MiB.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+
+/// Maximum size of a **call header** frame, for every service without
+/// exception: 64 KiB.
+///
+/// A header is small and its size does not depend on the service, so this can
+/// be applied before the service is known -- which is the point, since the
+/// header is what names the service. Body frames are bounded separately, per
+/// method, once the header has been decoded.
+pub const MAX_CALL_HEADER_SIZE: u32 = 64 * 1024;
 
 /// Encode a frame: returns `[4-byte LE length][1-byte flags][payload]`.
 ///

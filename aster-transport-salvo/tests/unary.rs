@@ -32,10 +32,12 @@ impl ServiceDispatch for EchoService {
             "unary" => {
                 let req = call.recv_request().await.unwrap_or_default();
                 let resp: Vec<u8> = req.into_iter().rev().collect();
-                let _ = call.respond(resp, &RpcStatus::ok());
+                let _ = call.respond(resp, &RpcStatus::ok()).await;
             }
             other => {
-                let _ = call.finish(&RpcStatus::error(StatusCode::Unimplemented, other));
+                let _ = call
+                    .finish(&RpcStatus::error(StatusCode::Unimplemented, other))
+                    .await;
             }
         }
     }

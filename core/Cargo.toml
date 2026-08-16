@@ -39,6 +39,9 @@ hpke = { version = "0.13", default-features = false, features = ["alloc", "x2551
 rand_core = { version = "0.9", features = ["os_rng"] }
 
 [features]
+# Test-only ingress counters (see reactor::ingress_metrics). Never on in a
+# shipping build; the tests that need them enable them explicitly.
+ingress-metrics = []
 # Ownership-attestation chain. Apache Fory is now a core dependency because
 # simple trust-config primitives also use Fory XLANG.
 attestation = ["dep:thiserror", "dep:base64"]

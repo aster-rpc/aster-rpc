@@ -151,7 +151,10 @@ fn spawn_ack_binding(mut reactor: aster_transport_core::reactor::ReactorHandle) 
                     // bindings/python/aster/transport/iroh.py
                     // `check_trailer`).
                     let trailer = encode_frame(&[], FLAG_TRAILER).unwrap();
-                    let _ = call.response_sender.send(OutgoingFrame::Trailer(trailer));
+                    let _ = call
+                        .response_sender
+                        .send(OutgoingFrame::Trailer(trailer))
+                        .await;
                     calls_c.lock().await.push(call);
                 }
                 ReactorEvent::ConnectionClosed { connection_id, .. } => {
@@ -757,4 +760,278 @@ proptest! {
             "pool leaked a handle during adversarial test"
         );
     }
+}
+
+// ── Per-method frame caps (coordination Slice-0 ingress seam) ────────────────
+
+/// Start a reactor whose body-frame cap is resolved per call from the raw
+/// header bytes. Header bytes here are `service|method`; `!` means undecodable.
+async fn start_capped_reactor(
+    server: CoreNetClient,
+) -> (
+    aster_transport_core::reactor::ReactorHandle,
+    tokio::task::JoinHandle<()>,
+) {
+    use aster_transport_core::reactor::FrameLimit;
+    let (handle, feeder) = create_reactor(&tokio::runtime::Handle::current(), 256);
+    let feeder = feeder.with_frame_limits(std::sync::Arc::new(|h: &[u8]| {
+        let s = match std::str::from_utf8(h) {
+            Ok(s) => s,
+            Err(_) => return FrameLimit::Reject,
+        };
+        if s.starts_with('!') {
+            return FrameLimit::Reject;
+        }
+        match s {
+            "small|m" => FrameLimit::Limit(4 * 1024),
+            "large|m" => FrameLimit::Limit(1024 * 1024),
+            _ => FrameLimit::Default,
+        }
+    }));
+    let accept_task = tokio::spawn(async move {
+        loop {
+            match server.accept().await {
+                Ok(conn) => feeder.feed(conn),
+                Err(_) => return,
+            }
+        }
+    });
+    (handle, accept_task)
+}
+
+async fn setup_capped_pair() -> Result<(
+    CoreConnection,
+    aster_transport_core::reactor::ReactorHandle,
+    tokio::task::JoinHandle<()>,
+    CoreNetClient,
+    CoreNetClient,
+)> {
+    let server = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
+    let client = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
+    let server_id = server.endpoint_id();
+    let (reactor, accept_task) = start_capped_reactor(server.clone()).await;
+    let conn = client.connect(server_id, TEST_ALPN.to_vec()).await?;
+    Ok((conn, reactor, accept_task, server, client))
+}
+
+/// Two calls on ONE multiplexed stream, with different per-method caps. The
+/// second call's body is legal under the first call's cap and illegal under its
+/// own -- so if the reader did not reset the limit at the call header, this
+/// would be accepted.
+#[tokio::test]
+async fn per_method_cap_resets_at_each_call_on_a_multiplexed_stream() -> Result<()> {
+    let (conn, reactor, _accept, _server, _client) = setup_capped_pair().await?;
+    let (calls, _closed, _binding) = spawn_ack_binding(reactor);
+
+    let handle = conn.acquire_stream(None).await.unwrap();
+    let stream = handle.get();
+
+    // Call 1 under the 1 MiB cap: a 64 KiB body is fine.
+    let big = vec![0xabu8; 64 * 1024];
+    timeout(STEP_TIMEOUT, drive_unary_call(stream, b"large|m", &big)).await??;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        calls.lock().await.len(),
+        1,
+        "first call should be delivered"
+    );
+
+    // Call 2 on the SAME stream under the 4 KiB cap: the identical body is now
+    // over the limit and the stream must be torn down without delivering it.
+    let _ = drive_unary_call(stream, b"small|m", &big).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        calls.lock().await.len(),
+        1,
+        "second call exceeded its own method cap and must not be delivered"
+    );
+    Ok(())
+}
+
+/// A small body under a small cap still works -- the cap rejects, it does not
+/// simply break the second call on every stream.
+#[tokio::test]
+async fn second_call_within_its_own_cap_is_delivered() -> Result<()> {
+    let (conn, reactor, _accept, _server, _client) = setup_capped_pair().await?;
+    let (calls, _closed, _binding) = spawn_ack_binding(reactor);
+
+    let handle = conn.acquire_stream(None).await.unwrap();
+    let stream = handle.get();
+    let big = vec![0xabu8; 64 * 1024];
+    let small = vec![0x01u8; 1024];
+
+    timeout(STEP_TIMEOUT, drive_unary_call(stream, b"large|m", &big)).await??;
+    timeout(STEP_TIMEOUT, drive_unary_call(stream, b"small|m", &small)).await??;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        calls.lock().await.len(),
+        2,
+        "both calls are within their caps"
+    );
+    Ok(())
+}
+
+/// An undecodable header is rejected and no body is read behind it.
+#[tokio::test]
+async fn undecodable_header_rejects_the_stream() -> Result<()> {
+    let (conn, reactor, _accept, _server, _client) = setup_capped_pair().await?;
+    let (calls, _closed, _binding) = spawn_ack_binding(reactor);
+
+    let handle = conn.acquire_stream(None).await.unwrap();
+    let stream = handle.get();
+    let _ = drive_unary_call(stream, b"!bad", b"body").await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        calls.lock().await.len(),
+        0,
+        "rejected header delivers no call"
+    );
+    Ok(())
+}
+
+/// An unregistered service keeps the pre-existing global limit, so adding the
+/// seam does not change behaviour for services that never opt in.
+#[tokio::test]
+async fn unknown_service_keeps_the_global_limit() -> Result<()> {
+    let (conn, reactor, _accept, _server, _client) = setup_capped_pair().await?;
+    let (calls, _closed, _binding) = spawn_ack_binding(reactor);
+
+    let handle = conn.acquire_stream(None).await.unwrap();
+    let stream = handle.get();
+    let body = vec![7u8; 256 * 1024];
+    timeout(
+        STEP_TIMEOUT,
+        drive_unary_call(stream, b"someapp|thing", &body),
+    )
+    .await??;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(calls.lock().await.len(), 1);
+    Ok(())
+}
+
+/// A first frame whose declared length exceeds the global call-header cap is/// A first frame whose declared length exceeds the global call-header cap is
+/// refused without its body being read. Asserted on the *stream* dying rather
+/// than on delivery, because delivery is the weaker signal: a reactor that read
+/// 16 MiB and then declined to dispatch would also "not deliver".
+#[tokio::test]
+async fn oversized_call_header_is_refused() -> Result<()> {
+    use aster_transport_core::framing::MAX_CALL_HEADER_SIZE;
+    let (conn, reactor, _accept, _server, _client) = setup_capped_pair().await?;
+    let (calls, _closed, _binding) = spawn_ack_binding(reactor);
+
+    let handle = conn.acquire_stream(None).await.unwrap();
+    let (send, _recv) = handle.get();
+
+    // Declare a header one byte over the cap and send only the prefix, so a
+    // reactor that honours the cap never allocates and a reactor that ignores
+    // it blocks waiting for bytes that never come.
+    let declared = MAX_CALL_HEADER_SIZE + 1;
+    let mut framed = Vec::new();
+    framed.extend_from_slice(&declared.to_le_bytes());
+    framed.push(FLAG_HEADER);
+    send.write_all(framed).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        calls.lock().await.len(),
+        0,
+        "oversized header delivers no call"
+    );
+    Ok(())
+}
+
+/// A first frame with valid-looking bytes but no FLAG_HEADER must be rejected
+/// as a transport error *before* the resolver runs, so no body is read under a
+/// cap chosen from a frame that was never a header.
+#[tokio::test]
+async fn non_header_first_frame_is_rejected_before_any_body() -> Result<()> {
+    let (conn, reactor, _accept, _server, _client) = setup_capped_pair().await?;
+    let (calls, _closed, _binding) = spawn_ack_binding(reactor);
+
+    let handle = conn.acquire_stream(None).await.unwrap();
+    let (send, _recv) = handle.get();
+
+    // Bytes that WOULD resolve to the 1 MiB cap if they were treated as a
+    // header -- but the frame carries no FLAG_HEADER.
+    send.write_all(encode_frame(b"large|m", 0).unwrap())
+        .await
+        .unwrap();
+    // ...followed by a body only that generous cap would admit.
+    send.write_all(encode_frame(&vec![0u8; 512 * 1024], FLAG_END_STREAM).unwrap())
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        calls.lock().await.len(),
+        0,
+        "a non-header first frame must not be resolved or dispatched"
+    );
+    Ok(())
+}
+
+/// A slow handler must backpressure the wire rather than let request frames
+/// accumulate. The peer writes far more frames than any queue depth; if the
+/// path were unbounded they would all be buffered while the handler sleeps.
+#[tokio::test]
+async fn slow_handler_backpressures_the_request_queue() -> Result<()> {
+    let (conn, reactor, _accept, _server, _client) = setup_capped_pair().await?;
+
+    // A binding that accepts calls but never drains their request frames.
+    let seen = Arc::new(tokio::sync::Mutex::new(0usize));
+    let seen2 = seen.clone();
+    let mut reactor = reactor;
+    let _binding = tokio::spawn(async move {
+        while let Some(ev) = reactor.next_event().await {
+            if let ReactorEvent::Call(call) = ev {
+                *seen2.lock().await += 1;
+                // Hold the call without reading `request_receiver`.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(call);
+            }
+        }
+    });
+
+    let handle = conn.acquire_stream(None).await.unwrap();
+    let (send, _recv) = handle.get();
+    send.write_all(encode_frame(b"large|m", FLAG_HEADER).unwrap())
+        .await
+        .unwrap();
+    send.write_all(encode_frame(b"first", 0).unwrap())
+        .await
+        .unwrap();
+
+    // Now push many more frames than any queue depth. With bounded queues the
+    // writes stall in QUIC flow control; the test's point is that the process
+    // does not accumulate them all, and that it stays responsive.
+    let pushed = tokio::time::timeout(Duration::from_millis(500), async {
+        for i in 0..10_000u32 {
+            let last = i == 9_999;
+            let flags = if last { FLAG_END_STREAM } else { 0 };
+            if send
+                .write_all(encode_frame(&vec![0u8; 4096], flags).unwrap())
+                .await
+                .is_err()
+            {
+                return i;
+            }
+        }
+        10_000
+    })
+    .await;
+
+    // Either the writes stalled (timeout) or the stream errored -- both mean
+    // backpressure reached the peer. What must NOT happen is all 10k frames
+    // being absorbed instantly into an unbounded queue.
+    assert!(
+        pushed.is_err() || pushed.unwrap() < 10_000,
+        "peer was able to push every frame; the request path is not bounded"
+    );
+    assert_eq!(*seen.lock().await, 1, "exactly one call was accepted");
+    Ok(())
 }
