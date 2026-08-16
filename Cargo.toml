@@ -10,7 +10,7 @@ resolver = "2"
 # Cargo registry. [patch.crates-io] below still unifies transitive references.
 iroh        = { version = "=1.0.1", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh.git", rev = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9" }
 iroh-blobs  = { version = "0.103.1", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "dfac111c61946c970c5a98e79112957f94291bc3" }
-iroh-docs   = { version = "0.101.1", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "6c011608b3781bc8738103dcfb5f56f9f6f4efb8" }
+iroh-docs   = { version = "0.101.1", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "597675189f3fa75c38ac802f50982c07a0b0f925" }
 iroh-gossip = { version = "0.101.0", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "5c021f998a172b81a69669e71786e14a339fa963" }
 iroh-tickets = { version = "=1.0.0", registry = "aster", git = "https://github.com/n0-computer/iroh-tickets", rev = "4899684e1209dea29ed28aa2314450927557b037" }
 # mDNS lookup moved to a separate crate in iroh 1.0.0-rc.0.
@@ -49,7 +49,7 @@ iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b1
 iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9" }
 iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9" }
 iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "dfac111c61946c970c5a98e79112957f94291bc3" }
-iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "6c011608b3781bc8738103dcfb5f56f9f6f4efb8" }
+iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "597675189f3fa75c38ac802f50982c07a0b0f925" }
 iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "5c021f998a172b81a69669e71786e14a339fa963" }
 noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
 noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
