@@ -270,20 +270,6 @@ pub fn decide_change(
         return Decision::Refuse(RefusalReason::MembershipIntentActive);
     }
 
-    // §12.1: intent and route rows are growth-funded, so an accepted plan must
-    // fit the budget like any other write. An earlier revision checked the byte
-    // budget for resource values only, so these two tables wrote past a
-    // saturated budget.
-    let routes = routes_from(action);
-    let added = charge_intent(action.plan.encoded_len())
-        + routes
-            .iter()
-            .map(|(_, r)| charge_route(r.ticket.len()))
-            .sum::<u64>();
-    if !state.growth_fits(added) {
-        return Decision::Refuse(RefusalReason::StateBudgetExhausted);
-    }
-
     let intent = Intent {
         actor: *actor,
         request_hash: *request_hash,
@@ -297,7 +283,8 @@ pub fn decide_change(
         observed_membership_log_id: None,
     };
 
-    Decision::Apply(Box::new(IntentEffect {
+    let routes = routes_from(action);
+    let effect = IntentEffect {
         operation_id: action.operation_id,
         intent,
         outcome: Outcome::MembershipAccepted,
@@ -308,7 +295,55 @@ pub fn decide_change(
         routes,
         membership_log_id: None,
         intent_members: Vec::new(),
-    }))
+    };
+
+    // §12.1: intent and route rows are growth-funded, so an accepted plan must
+    // fit the budget like any other write. The charge is the **net** delta of
+    // the effect that would be written, computed from that effect rather than
+    // from the request -- an earlier revision charged the full incoming route
+    // set without crediting the rows those routes replace or the ones the same
+    // command evicts, so a command that fits was refused as though it did not.
+    if !state.growth_fits(growth_delta(state, &effect)) {
+        return Decision::Refuse(RefusalReason::StateBudgetExhausted);
+    }
+
+    Decision::Apply(Box::new(effect))
+}
+
+/// The exact §12.1 growth an effect adds, in bytes, floored at zero.
+///
+/// Admission and apply must agree about what a command costs, so this is
+/// derived from the same [`IntentEffect`] apply writes. It credits three things
+/// the request alone cannot see: the intent row this one replaces at the same
+/// operation id, the route rows these seeds replace at the same nodes, and the
+/// rows the effect itself evicts.
+///
+/// Saturating rather than signed: a net-freeing effect costs nothing, and there
+/// is no budget question to ask about it.
+pub fn growth_delta(state: &State, effect: &IntentEffect) -> u64 {
+    let mut added = charge_intent(effect.intent.charge_len(&effect.operation_id));
+    let mut freed = state
+        .intents
+        .get(&effect.operation_id)
+        .map_or(0, |i| charge_intent(i.charge_len(&effect.operation_id)));
+
+    for id in &effect.evict {
+        if let Some(old) = state.intents.get(id) {
+            freed += charge_intent(old.charge_len(id));
+        }
+    }
+    for (node, route) in &effect.routes {
+        added += charge_route(route.ticket.len());
+        if let Some(old) = state.routes.get(node) {
+            freed += charge_route(old.ticket.len());
+        }
+    }
+    for node in &effect.evict_routes {
+        if let Some(old) = state.routes.get(node) {
+            freed += charge_route(old.ticket.len());
+        }
+    }
+    added.saturating_sub(freed)
 }
 
 /// Which routes to evict so the retained set fits §12.1's cap of 64.
@@ -862,6 +897,134 @@ mod tests {
                 }
             )),
             ShapeLimit::MemberSeedUnknownNode,
+        );
+    }
+
+    // ── The §12.1 budget delta ──────────────────────────────────────────────
+
+    /// The admission charge is the **exact** net delta apply writes, tested at
+    /// the boundary: one byte of headroom accepts, one byte short refuses. An
+    /// over-charge is a false refusal, and a discrepancy at the boundary is
+    /// exactly where it shows.
+    #[test]
+    fn admission_charges_the_exact_net_delta() {
+        let s = base();
+        let action = change(op(1), &[1, 2, 3], None);
+
+        // What the effect actually costs.
+        let e = effect(decide_change(&s, &ADMIN, &[7u8; 32], &action));
+        let cost = growth_delta(&s, &e);
+        assert!(cost > 0, "an intent and three routes are not free");
+
+        // Apply it and compare against a full recomputation: the incremental
+        // accounting and the delta must describe the same write.
+        let mut applied = s.clone();
+        let before = applied.growth_bytes;
+        crate::coordination::model::apply::apply_client_command(
+            &mut applied,
+            log(1),
+            &crate::coordination::model::apply::ClientRef {
+                actor: ADMIN,
+                client_id: [1u8; 16],
+                sequence: 1,
+                request_hash: [7u8; 32],
+            },
+            &crate::coordination::model::apply::Action::ChangeMembership(action.clone()),
+        )
+        .expect("no fault");
+        assert_eq!(
+            applied.growth_bytes - before,
+            cost,
+            "the charge admission checked is the growth apply wrote"
+        );
+        assert!(applied.counters_match_recomputation());
+
+        // Exactly enough headroom: accepted.
+        let mut tight = s.clone();
+        tight.growth_bytes = super::super::limits::GROWTH_BUDGET - cost;
+        assert!(matches!(
+            decide_change(&tight, &ADMIN, &[7u8; 32], &action),
+            Decision::Apply(_)
+        ));
+
+        // One byte less: refused.
+        let mut short = s.clone();
+        short.growth_bytes = super::super::limits::GROWTH_BUDGET - cost + 1;
+        assert_eq!(
+            reason(decide_change(&short, &ADMIN, &[7u8; 32], &action)),
+            Reason::StateBudgetExhausted,
+        );
+    }
+
+    /// Replacing a route costs the difference, not the whole row. Re-seeding a
+    /// node the group already routes is close to free, and charging it in full
+    /// would refuse a refresh that frees as much as it adds.
+    #[test]
+    fn replacing_a_route_is_charged_as_a_difference() {
+        let mut s = base();
+        let action = change(op(1), &[1, 2, 3], None);
+        let fresh = growth_delta(&s, &effect(decide_change(&s, &ADMIN, &[7u8; 32], &action)));
+
+        // Now route all three nodes already, with tickets of the same length.
+        for node in plan(&[1, 2, 3]).desired_voters {
+            s.routes.insert(
+                node,
+                Route {
+                    ticket: b"aster1ticket".to_vec(),
+                    introduced_log_id: log(1),
+                    source_operation_id: op(0),
+                },
+            );
+        }
+        s.growth_bytes = s.recompute_growth();
+
+        let replacing = growth_delta(&s, &effect(decide_change(&s, &ADMIN, &[7u8; 32], &action)));
+        assert!(
+            replacing < fresh,
+            "replacing three routes must cost less than introducing three"
+        );
+        assert_eq!(
+            replacing,
+            charge_intent(plan(&[1, 2, 3]).encoded_len(&op(1), None)),
+            "only the intent row is new"
+        );
+    }
+
+    /// The charge measures the **stored** value. Two plans differing only in
+    /// their operation id or expected membership are different rows, and a
+    /// charge computed from a synthetic action with those fields blanked would
+    /// report them as identical.
+    #[test]
+    fn the_intent_charge_measures_what_is_stored() {
+        let p = plan(&[1, 2, 3]);
+        let base_len = p.encoded_len(&op(1), None);
+
+        assert_ne!(
+            base_len,
+            p.encoded_len(&op(1), Some(log(7))),
+            "an expected membership log id is part of the stored row"
+        );
+        assert_eq!(
+            base_len,
+            p.encoded_len(&op(2), None),
+            "two 16-byte operation ids encode to the same length"
+        );
+
+        // And the intent charges itself with its own key.
+        let intent = Intent {
+            actor: ADMIN,
+            request_hash: [7u8; 32],
+            expected_membership: Some(log(7)),
+            plan: p.clone(),
+            status_code: PHASE_PENDING,
+            result_code: 0,
+            accepted_log_id: log(1),
+            completed_log_id: None,
+            observed_membership_log_id: None,
+        };
+        assert_eq!(
+            intent.charge_len(&op(1)),
+            p.encoded_len(&op(1), Some(log(7)))
         );
     }
 

@@ -208,21 +208,31 @@ impl MembershipPlan {
     /// counter, so an approximation over field lengths is not merely imprecise:
     /// it undercounts Fory's per-field and per-wrapper framing, which means two
     /// voters agree on the number while the store holds more than the counter
-    /// says. The charge is derived from the plan's own contents rather than
-    /// carried alongside it, so it cannot disagree with what is stored.
+    /// says.
     ///
-    /// Encoding is fallible; a plan that will not encode is charged its
-    /// declared maximum rather than zero, because charging zero for something
+    /// It measures the **stored** value, so it takes the operation id and
+    /// expected membership that go into the row alongside the plan. An earlier
+    /// revision encoded a synthetic action with a zeroed operation id and
+    /// `expected_membership_log_id: None`, which is not what §11's
+    /// `MembershipIntentV1.desired_plan` holds -- so the charge described a
+    /// value that is never written.
+    ///
+    /// Encoding is fallible; a plan that will not encode is charged its declared
+    /// maximum rather than zero, because charging zero for something
     /// unmeasurable is the one answer guaranteed to be wrong in the unsafe
     /// direction.
-    pub fn encoded_len(&self) -> usize {
+    pub fn encoded_len(
+        &self,
+        operation_id: &OperationId,
+        expected_membership: Option<LogId>,
+    ) -> usize {
         use crate::coordination::contract::{
-            payload_fory, ChangeMembershipActionV1, MemberSeedV1, NodeIdV1,
+            payload_fory, ChangeMembershipActionV1, LogIdV1, MemberSeedV1, NodeIdV1,
         };
 
         let wire = ChangeMembershipActionV1 {
-            operation_id: vec![0u8; 16],
-            expected_membership_log_id: None,
+            operation_id: operation_id.to_vec(),
+            expected_membership_log_id: expected_membership.map(|id| LogIdV1::from(&id)),
             desired_voters: self
                 .desired_voters
                 .iter()
@@ -291,6 +301,17 @@ pub struct Intent {
     pub completed_log_id: Option<LogId>,
     /// The committed membership the controller observed.
     pub observed_membership_log_id: Option<LogId>,
+}
+
+impl Intent {
+    /// The encoded length this intent is charged for under §12.1.
+    ///
+    /// Takes the operation id because the row is keyed by it and stores it, so
+    /// the charge and the stored value are measured from the same thing.
+    pub fn charge_len(&self, operation_id: &OperationId) -> usize {
+        self.plan
+            .encoded_len(operation_id, self.expected_membership)
+    }
 }
 
 /// A retained node route (§11.3 `RouteRowV1`), an advisory dialling hint.
@@ -444,8 +465,8 @@ impl State {
         let admins = self.admins.len() as u64 * limits::charge_admin();
         let intents: u64 = self
             .intents
-            .values()
-            .map(|i| limits::charge_intent(i.plan.encoded_len()))
+            .iter()
+            .map(|(id, i)| limits::charge_intent(i.charge_len(id)))
             .sum();
         let routes: u64 = self
             .routes

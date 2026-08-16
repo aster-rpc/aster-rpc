@@ -850,7 +850,7 @@ fn apply_membership_progress(
 fn write_intent(state: &mut State, log_id: LogId, mut effect: membership::IntentEffect) {
     for id in &effect.evict {
         if let Some(old) = state.intents.remove(id) {
-            state.growth_bytes -= limits::charge_intent(old.plan.encoded_len());
+            state.growth_bytes -= limits::charge_intent(old.charge_len(id));
         }
     }
     if effect.intent.accepted_log_id.index == 0 {
@@ -867,9 +867,9 @@ fn write_intent(state: &mut State, log_id: LogId, mut effect: membership::Intent
     let previous = state
         .intents
         .get(&effect.operation_id)
-        .map(|i| limits::charge_intent(i.plan.encoded_len()));
+        .map(|i| limits::charge_intent(i.charge_len(&effect.operation_id)));
     state.growth_bytes = state.growth_bytes
-        + limits::charge_intent(effect.intent.plan.encoded_len())
+        + limits::charge_intent(effect.intent.charge_len(&effect.operation_id))
         - previous.unwrap_or(0);
     state.intents.insert(effect.operation_id, effect.intent);
 

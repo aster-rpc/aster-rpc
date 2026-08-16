@@ -317,18 +317,40 @@ pub struct UnsignedCountersV1 {
 /// One `Fory` per payload root, built through `PayloadRegistry` exactly as
 /// `rpc/lease.rs` does — the derive walks the field tree, so registration order
 /// is not hand-maintained.
-/// The largest `String` field this codec can carry, in bytes.
+/// The largest `String` field this codec is known to carry, in bytes.
 ///
 /// **A measured limit, not a policy one.** Under the `xlang(true)` +
-/// `compatible(true)` runtime every Aster payload uses, Apache Fory 1.3 encodes
-/// a `String` field of 4096 bytes or more and then fails to decode it, with
-/// `TypeError("Type inconsistent, target collection element type is not
-/// polymorphic")`. `Vec<u8>` under `#[fory(bytes)]` is unaffected at any size,
-/// so this is specific to the string path.
+/// `compatible(true)` runtime every Aster payload uses, a `String` field of
+/// 4096 bytes encodes and then fails to decode, with `TypeError("Type
+/// inconsistent, target collection element type is not polymorphic")`. 4095
+/// round-trips. `Vec<u8>` under `#[fory(bytes)]` is unaffected at 64 KiB, so
+/// the defect is specific to the string path.
 ///
-/// Anything declared "up to 4 KiB" in a `String` field is therefore capped one
-/// byte lower until the codec is fixed. Refusing a 4096-byte value is strictly
-/// better than accepting one no peer can read back.
+/// The cause is upstream, in `fory-core`'s `Buffer::write_var_u36_small`: the
+/// three-byte branch (`value < 0x200000`) writes a whole four-byte word, and the
+/// five-byte branch writes eight, while the reader consumes only the varint's
+/// actual length. A string's header packs its byte length, so 4095 encodes a
+/// header below `0x4000` and 4096 crosses into the over-writing branch --
+/// which is why the boundary is exactly here and not at a round number of the
+/// string itself. The branches are still present on Apache Fory `main`, and the
+/// latest release is 1.5.0, so this is not merely a property of the 1.3.0 pin.
+///
+/// 4096 is the **first failing length** that has been measured. Larger lengths
+/// were sampled and also fail, but the cap is set from the first failure, not
+/// from a claim about every length above it.
+///
+/// A `String` field declared "up to 4 KiB" is therefore capped one byte lower.
+/// Refusing a 4096-byte value is strictly better than accepting one no peer can
+/// read back.
+///
+/// **Raising this is not automatic when the codec is fixed.** It is a shipped
+/// v1 bound: a voter on a patched build and a voter on an unpatched one would
+/// still be in the same group, and the one that cannot decode 4096 bytes is the
+/// one that decides whether the group makes progress. Lifting the cap is a
+/// protocol-version decision, not a dependency bump. The alternative, if
+/// product-wide long strings are needed before an upstream release, is to carry
+/// the minimal patch in Aster's Fory fork under the existing fork-patch ledger
+/// policy.
 pub const MAX_WIRE_STRING: usize = 4095;
 
 pub fn payload_fory<T: WireField>() -> fory_core::Fory {
@@ -357,11 +379,14 @@ mod tests {
         }
     }
 
-    /// The measured boundary behind [`MAX_WIRE_STRING`]. Pinned as a test so the
-    /// day the codec is fixed, this fails and the cap can be lifted deliberately
-    /// rather than discovered by a peer that cannot read a ticket.
+    /// The measured boundary behind [`MAX_WIRE_STRING`]: 4095 round-trips and
+    /// 4096 does not. Pinned as a test so that if the codec changes under us,
+    /// this fails and the change is noticed rather than discovered by a peer
+    /// that cannot read a ticket. A failure here is **not** an instruction to
+    /// raise the cap -- see [`MAX_WIRE_STRING`] for why that is a
+    /// protocol-version decision.
     #[test]
-    fn a_string_field_of_4096_bytes_does_not_decode() {
+    fn the_first_failing_string_length_is_4096_bytes() {
         #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
         #[aster(wire = "aster.coordination.v1/StringBoundProbe")]
         struct Probe {
@@ -389,7 +414,7 @@ mod tests {
         };
         assert!(
             !encodes_and_decodes(&over_limit),
-            "if this now passes, Fory has been fixed -- raise MAX_WIRE_STRING"
+            "4096 is the first failing length; if it now passes, the codec changed"
         );
 
         // The same byte count as bytes, which is why byte fields keep their
