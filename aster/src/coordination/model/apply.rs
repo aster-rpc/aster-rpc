@@ -344,7 +344,8 @@ fn project(decision: ActionDecision) -> Admission {
         | ActionDecision::Admin(admin::Decision::Refuse(r))
         | ActionDecision::Membership(membership::Decision::Refuse(r)) => (Some(r), None),
         ActionDecision::Resource(Decision::RefuseShapeless(l))
-        | ActionDecision::Grant(grant::Decision::RefuseShapeless(l)) => (None, Some(l)),
+        | ActionDecision::Grant(grant::Decision::RefuseShapeless(l))
+        | ActionDecision::Membership(membership::Decision::RefuseShapeless(l)) => (None, Some(l)),
     };
     project_refusal(refusal, shapeless)
 }
@@ -739,6 +740,13 @@ fn write_intent(state: &mut State, log_id: LogId, mut effect: membership::Intent
 
     if let Some(id) = effect.membership_log_id {
         state.membership_log_id = Some(id);
+        // A completed change makes its plan the committed membership, which is
+        // what protects those nodes' routes from eviction.
+        state.members = effect
+            .intent_members
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
     }
 }
 
@@ -897,7 +905,8 @@ fn apply_decided(
         // use. Only a **malformed identity** yields `None`, because there is no
         // validated key to store.
         ActionDecision::Resource(Decision::RefuseShapeless(_))
-        | ActionDecision::Grant(grant::Decision::RefuseShapeless(_)) => ClientResult {
+        | ActionDecision::Grant(grant::Decision::RefuseShapeless(_))
+        | ActionDecision::Membership(membership::Decision::RefuseShapeless(_)) => ClientResult {
             disposition: Disposition::Consumed,
             reply: rejection(state, action.validated_resource(), Reason::None),
             replayed: false,
@@ -1074,9 +1083,18 @@ fn prune_audit(state: &mut State) {
             break;
         };
         let charge = limits::charge_audit(row.resource.as_ref().map(key_parts));
+        let leader = row.leader_node_id;
         state.audit.remove(&key);
         state.reserve_bytes -= charge;
-        state.audit_floor = key.1 + 1;
+        // The **whole** log id of the oldest row still retained. The pruned
+        // row's leader comes from the row itself, since the table key carries
+        // only term and index -- which is exactly why the row stores it.
+        state.audit_floor = state
+            .audit
+            .iter()
+            .next()
+            .map(|((term, index), oldest)| LogId::new(*term, oldest.leader_node_id, *index))
+            .or(Some(LogId::new(key.0, leader, key.1)));
     }
 }
 

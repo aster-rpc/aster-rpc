@@ -204,16 +204,52 @@ pub struct MembershipPlan {
 impl MembershipPlan {
     /// The encoded length used for the §12.1 intent charge.
     ///
-    /// Derived from the plan's own contents rather than carried alongside it,
-    /// so it cannot disagree with what is stored.
+    /// **Measured, not estimated.** This value feeds the replicated growth
+    /// counter, so an approximation over field lengths is not merely imprecise:
+    /// it undercounts Fory's per-field and per-wrapper framing, which means two
+    /// voters agree on the number while the store holds more than the counter
+    /// says. The charge is derived from the plan's own contents rather than
+    /// carried alongside it, so it cannot disagree with what is stored.
+    ///
+    /// Encoding is fallible; a plan that will not encode is charged its
+    /// declared maximum rather than zero, because charging zero for something
+    /// unmeasurable is the one answer guaranteed to be wrong in the unsafe
+    /// direction.
     pub fn encoded_len(&self) -> usize {
-        let ids = (self.desired_voters.len() + self.retained_learners.len()) * 32;
-        let seeds: usize = self
-            .member_seeds
-            .iter()
-            .map(|s| 32 + s.ticket.len() + s.join_permit.as_ref().map_or(0, Vec::len))
-            .sum();
-        ids + seeds
+        use crate::coordination::contract::{
+            payload_fory, ChangeMembershipActionV1, MemberSeedV1, NodeIdV1,
+        };
+
+        let wire = ChangeMembershipActionV1 {
+            operation_id: vec![0u8; 16],
+            expected_membership_log_id: None,
+            desired_voters: self
+                .desired_voters
+                .iter()
+                .map(|n| NodeIdV1 {
+                    node_id: n.to_vec(),
+                })
+                .collect(),
+            retained_learners: self
+                .retained_learners
+                .iter()
+                .map(|n| NodeIdV1 {
+                    node_id: n.to_vec(),
+                })
+                .collect(),
+            member_seeds: self
+                .member_seeds
+                .iter()
+                .map(|s| MemberSeedV1 {
+                    node_id: s.node_id.to_vec(),
+                    ticket: String::from_utf8_lossy(&s.ticket).into_owned(),
+                    signed_join_permit: s.join_permit.clone(),
+                })
+                .collect(),
+        };
+        payload_fory::<ChangeMembershipActionV1>()
+            .serialize(&wire)
+            .map_or(limits::MAX_ENCODED_COMMAND, |bytes| bytes.len())
     }
 }
 
@@ -345,6 +381,13 @@ pub struct State {
     /// Maintained incrementally. MUST equal [`State::recompute_reserve`].
     pub reserve_bytes: u64,
     pub admin_revision: u64,
+    /// The current committed voter and learner set.
+    ///
+    /// Kept beside the log id because §9 protects a route for a node **in the
+    /// current committed membership** from eviction, and a log id alone cannot
+    /// answer "is this node a member?". Storing only the id made that rule
+    /// unimplementable.
+    pub members: BTreeSet<NodeId>,
     /// The committed membership's log id, or `None` before the first change.
     ///
     /// `change_membership` carries an `expected_membership_log_id`, not a
@@ -352,12 +395,14 @@ pub struct State {
     /// synthetic `u64`, which cannot express "no membership committed yet" and
     /// does not match what the contract compares.
     pub membership_log_id: Option<LogId>,
-    /// The lowest log index still present in `audit`.
+    /// The complete [`LogId`] of the oldest audit row still retained, or
+    /// `None` while nothing has been pruned.
     ///
-    /// Advances as retention prunes, and `audit_stream` returns `OUT_OF_RANGE`
-    /// plus this floor for a request below it (§5.2) rather than silently
-    /// returning a partial range.
-    pub audit_floor: u64,
+    /// The frozen type is `Option<LogIdV1>`, so an index alone loses the term
+    /// and leader — and `audit_stream` compares a caller's `after_log_id`
+    /// against this floor, which means a floor that cannot express a full log
+    /// id cannot answer the comparison the contract specifies.
+    pub audit_floor: Option<LogId>,
     /// The complete [`LogId`] of the last applied entry, or `None` before the
     /// first.
     ///
@@ -370,6 +415,15 @@ pub struct State {
 }
 
 impl State {
+    /// Would `added` growth bytes fit the §12.1 budget?
+    ///
+    /// One place, so every growth-funded table is checked the same way. An
+    /// earlier revision checked only resource values, so `set_admin`,
+    /// membership intents and routes wrote past a full budget.
+    pub fn growth_fits(&self, added: u64) -> bool {
+        self.growth_bytes.saturating_add(added) <= limits::GROWTH_BUDGET
+    }
+
     /// `Σ charge` over the growth-funded tables: resources, ACL, admins,
     /// intents, routes.
     ///

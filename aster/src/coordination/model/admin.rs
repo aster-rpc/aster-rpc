@@ -93,6 +93,12 @@ pub fn decide(state: &State, actor: &NodeId, action: &AdminAction) -> Decision {
         if state.admins.len() <= 1 {
             return Decision::Refuse(RefusalReason::LastAdministrator);
         }
+    } else if !state.growth_fits(super::limits::charge_admin()) {
+        // §12.1: an admin row is growth-funded like any other, and adding one
+        // must be refused when the budget is full. An earlier revision checked
+        // the byte budget for resource values only, so this table wrote past a
+        // saturated budget.
+        return Decision::Refuse(RefusalReason::StateBudgetExhausted);
     } else if state.admins.len() as u64 >= MAX_ADMINS_PER_GROUP {
         // §12.1's 64-administrator cap, reported as `23 AclSlotsExhausted`:
         // §8.1 groups ACL and admin state together, and the terminality matches

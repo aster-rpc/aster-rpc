@@ -29,49 +29,73 @@ use super::admin::AdminAction;
 use super::apply::{apply_command, Action, ClientRef, ClientResult, Command, CommandReply, Fault};
 use super::expire::ExpireCommand;
 use super::grant::GrantAction;
+use super::limits::RIGHT_READ;
 use super::membership::{
     CancelMembershipAction, ChangeMembershipAction, MembershipProgressCommand,
 };
 use super::project::{client_reply, retirement_reply, system_reply, Provenance};
-use super::resource::{Fence, RawResourceKey, ResourceAction};
+use super::resource::{self, Fence, RawResourceKey, ResourceAction};
 use super::retire::RetireCommand;
+use super::shape::{self, ShapeLimit};
 use super::state::{LogId, MemberSeed, MembershipPlan, NodeId, State};
 
 /// Narrow a wire `Vec<u8>` to a 32-byte node id.
-fn node_id(bytes: &[u8]) -> Option<NodeId> {
-    bytes.try_into().ok()
+fn node_id(bytes: &[u8]) -> Result<NodeId, NarrowError> {
+    bytes
+        .try_into()
+        .map_err(|_| NarrowError::MalformedField(ShapeLimit::NodeIdWidth))
 }
 
-fn client_id(bytes: &[u8]) -> Option<[u8; 16]> {
-    bytes.try_into().ok()
+fn client_id(bytes: &[u8]) -> Result<[u8; 16], NarrowError> {
+    bytes
+        .try_into()
+        .map_err(|_| NarrowError::MalformedField(ShapeLimit::ClientIdWidth))
 }
 
-fn hash(bytes: &[u8]) -> Option<[u8; 32]> {
-    bytes.try_into().ok()
+fn hash(bytes: &[u8]) -> Result<[u8; 32], NarrowError> {
+    bytes
+        .try_into()
+        .map_err(|_| NarrowError::MalformedField(ShapeLimit::RequestHashWidth))
 }
 
 fn raw_key(k: &crate::coordination::contract::ResourceKeyV1) -> RawResourceKey {
     RawResourceKey::new(k.namespace.clone(), k.key.clone())
 }
 
-fn fence(f: &crate::coordination::contract::FenceV1) -> Option<Fence> {
-    Some(Fence {
+fn fence(f: &crate::coordination::contract::FenceV1) -> Result<Fence, NarrowError> {
+    Ok(Fence {
         resource: raw_key(&f.resource),
         epoch: f.epoch,
         holder: node_id(&f.holder)?,
     })
 }
 
-fn log_id(id: &crate::coordination::contract::LogIdV1) -> Option<LogId> {
-    LogId::try_from(id).ok()
+fn log_id(id: &crate::coordination::contract::LogIdV1) -> Result<LogId, NarrowError> {
+    LogId::try_from(id).map_err(|_| NarrowError::MalformedField(ShapeLimit::NodeIdWidth))
+}
+
+/// Why a wire action could not be narrowed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NarrowError {
+    /// The forward-compatibility carrier. This voter does not know what the
+    /// action *is*, so §5.3.1 makes it fatal.
+    UnknownVariant,
+    /// A **known** action whose fields are ill-formed -- a node id that is not
+    /// 32 bytes, a malformed log id.
+    ///
+    /// Deliberately not fatal. §10.1 makes a known bounds violation a
+    /// deterministic rejection, and this is the same kind: every voter knows
+    /// exactly what the command was meant to be and can refuse it identically.
+    /// Halting instead would hand a faulty leader an availability kill switch
+    /// through a malformed field, which is precisely the outcome §10.1 rejects.
+    MalformedField(ShapeLimit),
 }
 
 /// Narrow a wire action to a model action.
-///
-/// `None` means this voter cannot interpret it -- an ill-formed identity, or the
-/// `Unknown` carrier, which §5.2.1 says is never proposable or appliable.
-pub fn action_from_wire(action: &ActionV1) -> Option<Action> {
-    Some(match action {
+pub fn action_from_wire(action: &ActionV1) -> Result<Action, NarrowError> {
+    let field = |o: Option<NodeId>| o.ok_or(NarrowError::MalformedField(ShapeLimit::NodeIdWidth));
+    let _ = &field;
+    Ok(match action {
         ActionV1::Acquire(a) => Action::Resource(ResourceAction::Acquire {
             resource: raw_key(&a.resource),
             ttl_ms: a.ttl_ms,
@@ -118,23 +142,23 @@ pub fn action_from_wire(action: &ActionV1) -> Option<Action> {
                     .desired_voters
                     .iter()
                     .map(|n| node_id(&n.node_id))
-                    .collect::<Option<Vec<_>>>()?,
+                    .collect::<Result<Vec<_>, _>>()?,
                 retained_learners: a
                     .retained_learners
                     .iter()
                     .map(|n| node_id(&n.node_id))
-                    .collect::<Option<Vec<_>>>()?,
+                    .collect::<Result<Vec<_>, _>>()?,
                 member_seeds: a
                     .member_seeds
                     .iter()
                     .map(|s| {
-                        Some(MemberSeed {
+                        Ok(MemberSeed {
                             node_id: node_id(&s.node_id)?,
                             ticket: s.ticket.clone().into_bytes(),
                             join_permit: s.signed_join_permit.clone(),
                         })
                     })
-                    .collect::<Option<Vec<_>>>()?,
+                    .collect::<Result<Vec<_>, _>>()?,
             },
         }),
         ActionV1::CancelMembership(a) => Action::CancelMembership(CancelMembershipAction {
@@ -142,13 +166,20 @@ pub fn action_from_wire(action: &ActionV1) -> Option<Action> {
             expected_phase_code: a.expected_phase_code,
         }),
         // §5.2.1: never hashable, never proposable, never appliable.
-        ActionV1::Unknown(_) => return None,
+        ActionV1::Unknown(_) => return Err(NarrowError::UnknownVariant),
     })
 }
 
 /// Narrow a wire command to a model command.
-pub fn command_from_wire(command: &CommandV1) -> Option<Command> {
-    Some(match command {
+///
+/// The `Client` arm additionally **verifies the request hash**: `request_hash`
+/// is what the session table compares a retry against, so a hash that is not the
+/// canonical digest of its own action would let a client present one action
+/// under another's identity -- replaying a benign hash to smuggle a different
+/// mutation past the classifier. §5.2.1 defines the hash over the action, and
+/// the only way that binding holds is if apply checks it.
+pub fn command_from_wire(command: &CommandV1) -> Result<Command, NarrowError> {
+    Ok(match command {
         CommandV1::Client(ClientCommandV1 {
             actor_node_id,
             client_id: cid,
@@ -162,14 +193,24 @@ pub fn command_from_wire(command: &CommandV1) -> Option<Command> {
                 sequence: *sequence,
                 request_hash: hash(request_hash)?,
             },
-            action: action_from_wire(action)?,
+            action: {
+                let narrowed = action_from_wire(action)?;
+                let expected = crate::coordination::hash::request_hash(action)
+                    .map_err(|_| NarrowError::MalformedField(ShapeLimit::RequestHashMismatch))?;
+                if hash(request_hash)? != expected {
+                    return Err(NarrowError::MalformedField(ShapeLimit::RequestHashMismatch));
+                }
+                narrowed
+            },
         },
         CommandV1::Expire(ExpireCommandV1 {
             resource,
             epoch,
             lease_revision,
         }) => Command::Expire(ExpireCommand {
-            resource: raw_key(resource).validate().ok()?,
+            resource: raw_key(resource)
+                .validate()
+                .map_err(NarrowError::MalformedField)?,
             epoch: *epoch,
             lease_revision: *lease_revision,
         }),
@@ -202,6 +243,15 @@ pub fn command_from_wire(command: &CommandV1) -> Option<Command> {
     })
 }
 
+/// The §12.1 `max_encoded_command` bound, checked on the **encoded** form.
+///
+/// Not reconstructible from field limits, which is why it takes the bytes: an
+/// action whose individual fields are each in range can still encode past the
+/// cap once framing is counted.
+pub fn check_encoded_command(encoded_len: usize) -> Option<ShapeLimit> {
+    shape::check_encoded_command(encoded_len)
+}
+
 /// Apply one production `CommandV1` and produce its `CommandReplyV1`.
 ///
 /// Total: an input this voter cannot narrow is a [`Fault::UnknownCommand`],
@@ -214,14 +264,54 @@ pub fn apply_wire_command(
     group_id: &[u8],
     command: &CommandV1,
 ) -> Result<CommandReplyV1, Fault> {
-    let Some(model) = command_from_wire(command) else {
-        return Err(Fault::UnknownCommand);
+    let model = match command_from_wire(command) {
+        Ok(model) => model,
+        // §5.3.1: a variant this version does not know is fatal.
+        Err(NarrowError::UnknownVariant) => return Err(Fault::UnknownCommand),
+        // §10.1: a **known** command with an ill-formed field is a
+        // deterministic rejection, not a halt. Every voter knows what it was
+        // meant to be and refuses it identically; halting would let a malformed
+        // field become an availability kill switch.
+        Err(NarrowError::MalformedField(_)) => {
+            return Ok(malformed_reply(command));
+        }
     };
 
     // A first attempt reports the value it wrote; the value lives in state, not
     // in the saved reply, so it is read here and only here.
     let reply = apply_command(state, log_id, &model)?;
     Ok(to_wire(state, group_id, &model, reply))
+}
+
+/// The reply for a known command whose fields will not narrow.
+///
+/// `Consumed + 100 Rejected + 0 None` for a client command, exactly as §10.1
+/// specifies for a request-shape violation. A system command has no client to
+/// answer, so it reports its own phase code.
+fn malformed_reply(command: &CommandV1) -> CommandReplyV1 {
+    match command {
+        CommandV1::Client(_) => {
+            CommandReplyV1::Client(crate::coordination::contract::ClientReplyV1 {
+                disposition_code: 1,
+                outcome_code: 100,
+                reason_code: 0,
+                snapshot: None,
+                acl_revision: 0,
+                admin_revision: 0,
+                operation_id: None,
+                membership_log_id: None,
+            })
+        }
+        CommandV1::RetireClient(_) => CommandReplyV1::Retirement(retirement_reply(
+            crate::coordination::reason::Outcome::Rejected,
+            crate::coordination::reason::Reason::None,
+        )),
+        _ => CommandReplyV1::System(system_reply(
+            crate::coordination::contract::SYS_MEMBERSHIP_PHASE_MISMATCH,
+            0,
+            None,
+        )),
+    }
 }
 
 fn to_wire(
@@ -245,29 +335,55 @@ fn to_wire(
     }
 }
 
-/// Project a client result, supplying the live value only for a first attempt.
+/// Project a client result, supplying the live value only when the actor may
+/// read it.
+///
+/// **Two independent conditions, both required.**
+///
+/// A *replay* never carries a value: the bytes were never saved, and
+/// substituting the current ones would hand back something the original command
+/// did not produce.
+///
+/// A first attempt carries one only if the actor holds `READ` on that resource.
+/// §8.1 grants bind one exact `(group, resource, subject)` and imply nothing
+/// else, so `ACQUIRE` is permission to take a lease — not to read what the lease
+/// guards. Returning the value on every successful command let an actor with
+/// `ACQUIRE` alone acquire a resource and receive its existing secret, which is
+/// a confidentiality break rather than an inconvenience: the actor never had to
+/// call `read_linearizable`, so the ACL check that exists for reads was simply
+/// bypassed.
+///
+/// Without `READ` the reply is `(None, false)` — absent, and **not** flagged
+/// redacted. `value_redacted` means "this was a replay and the bytes were never
+/// stored"; using it for an authorization outcome would tell the client to retry
+/// for a value it is not entitled to.
 fn client_reply_for(
     state: &State,
     group_id: &[u8],
     command: &Command,
     result: &ClientResult,
 ) -> crate::coordination::contract::ClientReplyV1 {
-    // A replay is answered from the session table; its value was never saved.
     let provenance = if result.replayed {
         Provenance::Replay
     } else {
         Provenance::FirstAttempt
     };
 
+    let actor = match command {
+        Command::Client { client, .. } => Some(client.actor),
+        _ => None,
+    };
+
     let value = match provenance {
         Provenance::Replay => None,
-        Provenance::FirstAttempt => result
-            .reply
-            .resource()
-            .and_then(|key| state.resources.get(key))
-            .map(|row| row.value.clone()),
+        Provenance::FirstAttempt => result.reply.resource().and_then(|key| {
+            let actor = actor?;
+            let may_read = resource::granted_rights(state, key, &actor) & RIGHT_READ != 0;
+            may_read
+                .then(|| state.resources.get(key).map(|row| row.value.clone()))
+                .flatten()
+        }),
     };
-    let _ = command;
 
     client_reply(
         group_id,
@@ -470,7 +586,7 @@ mod tests {
         assert_eq!(actions.len(), 10, "§5.2 declares ten actions");
         for action in &actions {
             assert!(
-                action_from_wire(action).is_some(),
+                action_from_wire(action).is_ok(),
                 "{action:?} does not narrow"
             );
         }
@@ -514,7 +630,7 @@ mod tests {
                 }],
             });
 
-        let Some(Action::ChangeMembership(narrowed)) = action_from_wire(&action) else {
+        let Ok(Action::ChangeMembership(narrowed)) = action_from_wire(&action) else {
             panic!("expected a change-membership action");
         };
         assert_eq!(narrowed.plan.desired_voters.len(), 3);
@@ -528,24 +644,124 @@ mod tests {
         );
     }
 
-    /// A command this voter cannot narrow is fatal, not skipped -- §5.3.1.
+    /// A **variant** this version does not know is fatal -- §5.3.1. The voter
+    /// cannot know what the command *is*, so no deterministic rejection exists.
     #[test]
-    fn an_uninterpretable_command_is_fatal() {
+    fn an_unknown_command_variant_is_fatal() {
+        let mut s = genesis();
+        assert_eq!(
+            apply_wire_command(&mut s, log(1), &GROUP, &CommandV1::Unknown(unknown_case())),
+            Err(Fault::UnknownCommand)
+        );
+        assert!(s.audit.is_empty(), "nothing was written");
+        assert_eq!(s.last_applied, None);
+    }
+
+    /// A **known** command with an ill-formed field is a deterministic
+    /// rejection, not a halt (§10.1). Every voter knows exactly what it was
+    /// meant to be and refuses it identically; halting would let a malformed
+    /// field become an availability kill switch.
+    #[test]
+    fn a_known_command_with_a_malformed_field_is_rejected_not_fatal() {
         let mut s = genesis();
 
-        // An ill-formed node id: a real `CommandV1`, but not one this voter can
-        // apply.
         let malformed = CommandV1::RetireClient(RetireClientCommandV1 {
             actor_node_id: vec![1u8; 8],
             target_node_id: ACTOR.to_vec(),
             target_client_id: vec![9u8; 16],
         });
-        assert_eq!(
-            apply_wire_command(&mut s, log(1), &GROUP, &malformed),
-            Err(Fault::UnknownCommand)
+        let reply = apply_wire_command(&mut s, log(1), &GROUP, &malformed)
+            .expect("a known command is never fatal");
+        match reply {
+            CommandReplyV1::Retirement(r) => assert_eq!(r.outcome_code, 100),
+            other => panic!("expected a retirement reply, got {other:?}"),
+        }
+    }
+
+    /// A client command whose `request_hash` is not the canonical hash of its
+    /// own action is refused. Without this the hash binds nothing: a client
+    /// could present one action under another's identity and slip a different
+    /// mutation past the classifier.
+    #[test]
+    fn a_request_hash_that_does_not_match_its_action_is_refused() {
+        let mut s = genesis();
+        let mut command = client_command(ACTOR, 1, acquire());
+        let CommandV1::Client(ref mut c) = command else {
+            panic!("a client command")
+        };
+        c.request_hash = vec![0xFF; 32];
+
+        let reply = apply_wire_command(&mut s, log(1), &GROUP, &command)
+            .expect("a known command is never fatal");
+        match reply {
+            CommandReplyV1::Client(r) => {
+                assert_eq!(r.outcome_code, 100);
+                assert_eq!(r.disposition_code, 1, "it committed, so it is consumed");
+            }
+            other => panic!("expected a client reply, got {other:?}"),
+        }
+        assert!(
+            s.resources.is_empty(),
+            "a mismatched hash must not apply its action"
         );
-        assert!(s.audit.is_empty(), "nothing was written");
-        assert_eq!(s.last_applied, None);
+    }
+
+    /// And the matching hash is accepted, so the check is on the binding rather
+    /// than on the field being present.
+    #[test]
+    fn a_matching_request_hash_is_accepted() {
+        let mut s = genesis();
+        let reply =
+            apply_wire_command(&mut s, log(1), &GROUP, &client_command(ACTOR, 1, acquire()))
+                .expect("no fault");
+        match reply {
+            CommandReplyV1::Client(r) => assert_eq!(r.outcome_code, 1),
+            other => panic!("expected a client reply, got {other:?}"),
+        }
+    }
+
+    /// The forward-compat carrier, reached by decoding a newer peer's command.
+    fn unknown_case() -> fory_core::UnknownCase {
+        use crate::coordination::contract::payload_fory;
+        use fory_derive::{ForyStruct, ForyUnion};
+
+        #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+        #[aster(wire = "aster.coordination.v1/ExpireCommand")]
+        struct Stand {
+            #[fory(id = 1)]
+            resource: ResourceKeyV1,
+            #[fory(id = 2)]
+            epoch: u64,
+            #[fory(id = 3)]
+            lease_revision: u64,
+        }
+
+        #[derive(ForyUnion, aster_macros::AsterType, Debug, Clone, PartialEq)]
+        #[aster(wire = "aster.coordination.v1/Command")]
+        enum CommandV2 {
+            #[fory(default)]
+            #[fory(id = 2)]
+            Expire(Stand),
+            #[fory(id = 9)]
+            Future(Stand),
+            #[fory(unknown)]
+            Unknown(fory_core::UnknownCase),
+        }
+
+        let encoded = payload_fory::<CommandV2>()
+            .serialize(&CommandV2::Future(Stand {
+                resource: wire_key(),
+                epoch: 1,
+                lease_revision: 1,
+            }))
+            .expect("encode");
+        let decoded: CommandV1 = payload_fory::<CommandV1>()
+            .deserialize(&encoded)
+            .expect("decode");
+        match decoded {
+            CommandV1::Unknown(u) => u,
+            other => panic!("expected the carrier, got {other:?}"),
+        }
     }
 
     /// A replay through the boundary redacts the value while reproducing every
@@ -588,6 +804,125 @@ mod tests {
         assert!(!a.value_redacted);
     }
 
+    // ── Value confidentiality ───────────────────────────────────────────────
+
+    /// **An actor without `READ` never receives the value**, even on a command
+    /// it is fully authorized to run.
+    ///
+    /// §8.1 grants bind one exact `(group, resource, subject)` and imply nothing
+    /// else, so `ACQUIRE` is permission to take a lease -- not to read what the
+    /// lease guards. Returning the value on every success let an actor with
+    /// `ACQUIRE` alone acquire and receive the existing secret without ever
+    /// calling `read_linearizable`, bypassing the ACL check reads exist for.
+    #[test]
+    fn an_actor_without_read_never_receives_the_value() {
+        use crate::coordination::model::limits::{RIGHT_ACQUIRE, RIGHT_READ, RIGHT_RELEASE};
+
+        let mut s = State::default();
+        s.admins.insert(ADMIN);
+        s.admin_revision = 1;
+        // Everything except READ.
+        s.acl.insert((key(), ACTOR), RIGHT_ACQUIRE | RIGHT_RELEASE);
+        // A resource that already holds a secret.
+        s.resources.insert(
+            key(),
+            crate::coordination::model::state::ResourceRow {
+                value: b"the-existing-secret".to_vec(),
+                ..Default::default()
+            },
+        );
+        s.growth_bytes = s.recompute_growth();
+        s.reserve_bytes = s.recompute_reserve();
+
+        let CommandReplyV1::Client(reply) =
+            apply_wire_command(&mut s, log(1), &GROUP, &client_command(ACTOR, 1, acquire()))
+                .expect("no fault")
+        else {
+            panic!("expected a client reply");
+        };
+
+        assert_eq!(reply.outcome_code, 1, "the acquire itself is authorized");
+        let snap = reply.snapshot.expect("a snapshot");
+        assert_eq!(
+            snap.value, None,
+            "an actor without READ must not receive the value"
+        );
+        assert!(
+            !snap.value_redacted,
+            "absent for authorization is not the same as redacted for a replay: \
+             `value_redacted` would tell the client to retry for something it is \
+             not entitled to"
+        );
+        // The value is still there -- it was withheld, not erased.
+        assert_eq!(
+            s.resources.get(&key()).unwrap().value,
+            b"the-existing-secret"
+        );
+        let _ = RIGHT_READ;
+    }
+
+    /// The same command, with `READ`, does return it -- so the check is on the
+    /// right, not on the command.
+    #[test]
+    fn an_actor_with_read_receives_the_value() {
+        use crate::coordination::model::limits::{RIGHT_ACQUIRE, RIGHT_READ};
+
+        let mut s = State::default();
+        s.acl.insert((key(), ACTOR), RIGHT_ACQUIRE | RIGHT_READ);
+        s.resources.insert(
+            key(),
+            crate::coordination::model::state::ResourceRow {
+                value: b"visible".to_vec(),
+                ..Default::default()
+            },
+        );
+        s.growth_bytes = s.recompute_growth();
+
+        let CommandReplyV1::Client(reply) =
+            apply_wire_command(&mut s, log(1), &GROUP, &client_command(ACTOR, 1, acquire()))
+                .expect("no fault")
+        else {
+            panic!("expected a client reply");
+        };
+        let snap = reply.snapshot.expect("a snapshot");
+        assert_eq!(snap.value, Some(b"visible".to_vec()));
+        assert!(!snap.value_redacted);
+    }
+
+    /// Losing `READ` between the first attempt and a replay changes nothing:
+    /// a replay carries no value either way, so the two paths cannot be played
+    /// against each other.
+    #[test]
+    fn a_replay_carries_no_value_whatever_the_actors_rights() {
+        use crate::coordination::model::limits::ALL_RIGHTS;
+
+        let mut s = State::default();
+        s.acl.insert((key(), ACTOR), ALL_RIGHTS);
+        s.resources.insert(
+            key(),
+            crate::coordination::model::state::ResourceRow {
+                value: b"secret".to_vec(),
+                ..Default::default()
+            },
+        );
+        s.growth_bytes = s.recompute_growth();
+
+        let command = client_command(ACTOR, 1, acquire());
+        apply_wire_command(&mut s, log(1), &GROUP, &command).expect("no fault");
+
+        let CommandReplyV1::Client(replayed) =
+            apply_wire_command(&mut s, log(2), &GROUP, &command).expect("no fault")
+        else {
+            panic!("expected a client reply");
+        };
+        let snap = replayed.snapshot.expect("a snapshot");
+        assert_eq!(snap.value, None);
+        assert!(
+            snap.value_redacted,
+            "a replay is redacted, not unauthorized"
+        );
+    }
+
     /// A cancellation reports `10 MembershipCancelled` through the boundary.
     #[test]
     fn a_cancellation_reports_membership_cancelled_on_the_wire() {
@@ -599,9 +934,18 @@ mod tests {
             ActionV1::ChangeMembership(crate::coordination::contract::ChangeMembershipActionV1 {
                 operation_id: vec![6u8; 16],
                 expected_membership_log_id: None,
-                desired_voters: vec![NodeIdV1 {
-                    node_id: vec![1u8; 32],
-                }],
+                // §9: exactly three or five voters.
+                desired_voters: vec![
+                    NodeIdV1 {
+                        node_id: vec![1u8; 32],
+                    },
+                    NodeIdV1 {
+                        node_id: vec![2u8; 32],
+                    },
+                    NodeIdV1 {
+                        node_id: vec![3u8; 32],
+                    },
+                ],
                 retained_learners: Vec::new(),
                 member_seeds: Vec::new(),
             }),

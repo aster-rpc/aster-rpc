@@ -32,7 +32,8 @@
 //! expected phase, so a controller report could drive an intent from `Pending`
 //! straight to `Cancelled`, or out of a terminal phase entirely.
 
-use super::limits::MAX_RETAINED_INTENTS;
+use super::limits::{charge_intent, charge_route, MAX_RETAINED_INTENTS, MAX_RETAINED_ROUTES};
+use super::shape::{self, ShapeLimit};
 use super::state::{Intent, LogId, MembershipPlan, NodeId, OperationId, Route, State};
 use crate::coordination::contract::{SYS_MEMBERSHIP_ADVANCED, SYS_MEMBERSHIP_PHASE_MISMATCH};
 use crate::coordination::reason::{Outcome, RefusalReason};
@@ -114,6 +115,27 @@ pub enum Decision {
         phase: i32,
     },
     Refuse(RefusalReason),
+    /// Refused by a §12.1 request-shape bound, which has no §5.2 reason code.
+    RefuseShapeless(ShapeLimit),
+}
+
+/// Every §12.1 shape bound a membership plan can violate.
+///
+/// Ordered so a plan violating two reports the same one on every voter.
+fn plan_shape(plan: &MembershipPlan) -> Option<ShapeLimit> {
+    if let Some(limit) =
+        shape::check_membership_plan(plan.desired_voters.len(), plan.retained_learners.len())
+    {
+        return Some(limit);
+    }
+    for seed in &plan.member_seeds {
+        if let Some(limit) =
+            shape::check_member_seed(seed.ticket.len(), seed.join_permit.as_ref().map(Vec::len))
+        {
+            return Some(limit);
+        }
+    }
+    None
 }
 
 /// The intent an accepted command writes.
@@ -131,6 +153,11 @@ pub struct IntentEffect {
     pub evict_routes: Vec<NodeId>,
     /// The committed membership this command observed, if it advanced it.
     pub membership_log_id: Option<LogId>,
+    /// The voters and learners this plan makes current, when it completes.
+    ///
+    /// Carried on the effect rather than re-read, so the member set and the
+    /// membership log id are established by the same value.
+    pub intent_members: Vec<NodeId>,
 }
 
 impl Decision {
@@ -138,7 +165,7 @@ impl Decision {
         match self {
             Decision::Apply(e) => Some(e.outcome),
             Decision::Existing { .. } => Some(Outcome::MembershipAccepted),
-            Decision::Refuse(_) => None,
+            Decision::Refuse(_) | Decision::RefuseShapeless(_) => None,
         }
     }
 }
@@ -150,6 +177,13 @@ pub fn decide_change(
     request_hash: &[u8; 32],
     action: &ChangeMembershipAction,
 ) -> Decision {
+    // §12.1 request-shape bounds, checked before anything is decided against
+    // replicated state: a plan outside the v1 shape was never a well-posed
+    // request. These were declared and had no caller.
+    if let Some(limit) = plan_shape(&action.plan) {
+        return Decision::RefuseShapeless(limit);
+    }
+
     if !state.admins.contains(actor) {
         return Decision::Refuse(RefusalReason::PermissionChanged);
     }
@@ -180,6 +214,20 @@ pub fn decide_change(
         return Decision::Refuse(RefusalReason::MembershipIntentActive);
     }
 
+    // §12.1: intent and route rows are growth-funded, so an accepted plan must
+    // fit the budget like any other write. An earlier revision checked the byte
+    // budget for resource values only, so these two tables wrote past a
+    // saturated budget.
+    let routes = routes_from(action);
+    let added = charge_intent(action.plan.encoded_len())
+        + routes
+            .iter()
+            .map(|(_, r)| charge_route(r.ticket.len()))
+            .sum::<u64>();
+    if !state.growth_fits(added) {
+        return Decision::Refuse(RefusalReason::StateBudgetExhausted);
+    }
+
     let intent = Intent {
         actor: *actor,
         request_hash: *request_hash,
@@ -200,10 +248,52 @@ pub fn decide_change(
         // `Pending` is not terminal, so it displaces nothing: the cap bounds
         // terminal history only.
         evict: Vec::new(),
-        routes: routes_from(action),
-        evict_routes: Vec::new(),
+        evict_routes: route_evictions(state, &routes),
+        routes,
         membership_log_id: None,
+        intent_members: Vec::new(),
     }))
+}
+
+/// Which routes to evict so the retained set fits §12.1's cap of 64.
+///
+/// Oldest-first by introducing log id, and a route for a node in the **current
+/// committed membership** is never a candidate: routes are advisory dialling
+/// hints, so losing one costs a discovery round trip -- except for a current
+/// member, where losing it can cost the ability to reach a voter.
+///
+/// An earlier revision returned an empty list unconditionally, so successive
+/// valid intents grew the table without bound and the cap enforced nothing.
+fn route_evictions(state: &State, incoming: &[(NodeId, Route)]) -> Vec<NodeId> {
+    let new_nodes = incoming
+        .iter()
+        .filter(|(node, _)| !state.routes.contains_key(node))
+        .count() as u64;
+    if new_nodes == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<((u64, u64), NodeId)> = state
+        .routes
+        .iter()
+        .filter(|(node, _)| !state.members.contains(*node))
+        .filter(|(node, _)| !incoming.iter().any(|(n, _)| n == *node))
+        .map(|(node, route)| {
+            (
+                (route.introduced_log_id.term, route.introduced_log_id.index),
+                *node,
+            )
+        })
+        .collect();
+    candidates.sort_unstable();
+
+    let retained = state.routes.len() as u64;
+    let over = (retained + new_nodes).saturating_sub(MAX_RETAINED_ROUTES);
+    candidates
+        .into_iter()
+        .take(over as usize)
+        .map(|(_, node)| node)
+        .collect()
 }
 
 /// The routes a plan's member seeds introduce.
@@ -272,6 +362,7 @@ pub fn decide_cancel(state: &State, actor: &NodeId, action: &CancelMembershipAct
         routes: Vec::new(),
         evict_routes: Vec::new(),
         membership_log_id: None,
+        intent_members: Vec::new(),
     }))
 }
 
@@ -315,6 +406,17 @@ pub fn decide_progress(state: &State, command: &MembershipProgressCommand) -> Op
         membership_log_id: (command.new_phase == PHASE_COMPLETED)
             .then_some(command.observed_membership_log_id)
             .flatten(),
+        intent_members: if command.new_phase == PHASE_COMPLETED {
+            existing
+                .plan
+                .desired_voters
+                .iter()
+                .chain(&existing.plan.retained_learners)
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -381,9 +483,17 @@ mod tests {
         s
     }
 
+    /// A §9-legal plan: exactly three voters. `voters` seeds their ids, and is
+    /// padded so a fixture cannot accidentally build a shape the contract
+    /// forbids.
     fn plan(voters: &[u8]) -> MembershipPlan {
+        let mut ids: Vec<u8> = voters.to_vec();
+        while ids.len() < 3 {
+            ids.push(100 + ids.len() as u8);
+        }
+        ids.truncate(3);
         MembershipPlan {
-            desired_voters: voters
+            desired_voters: ids
                 .iter()
                 .map(|b| {
                     let mut id = [0u8; 32];
@@ -434,6 +544,161 @@ mod tests {
             Decision::Apply(e) => *e,
             other => panic!("expected an applied intent, got {other:?}"),
         }
+    }
+
+    /// Fill the route table to `count` entries, oldest first by index.
+    fn with_routes(s: &mut State, count: u64) {
+        for i in 0..count {
+            let mut node = [0u8; 32];
+            node[0..8].copy_from_slice(&i.to_be_bytes());
+            node[31] = 0xAA;
+            s.routes.insert(
+                node,
+                Route {
+                    ticket: b"aster1old".to_vec(),
+                    introduced_log_id: log(i + 1),
+                    source_operation_id: op(0),
+                },
+            );
+        }
+        s.growth_bytes = s.recompute_growth();
+    }
+
+    // ── Route retention ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_full_route_table_evicts_the_oldest_to_make_room() {
+        let mut s = base();
+        with_routes(&mut s, MAX_RETAINED_ROUTES);
+        let e = effect(decide_change(
+            &s,
+            &ADMIN,
+            &[7u8; 32],
+            &change(op(1), &[1, 2, 3], None),
+        ));
+
+        // One seed arrives, so exactly one incumbent leaves -- the one with the
+        // lowest introducing log id.
+        assert_eq!(e.routes.len(), 1);
+        let mut oldest = [0u8; 32];
+        oldest[31] = 0xAA;
+        assert_eq!(e.evict_routes, vec![oldest]);
+    }
+
+    #[test]
+    fn an_unfilled_route_table_evicts_nothing() {
+        let mut s = base();
+        with_routes(&mut s, MAX_RETAINED_ROUTES - 1);
+        let e = effect(decide_change(
+            &s,
+            &ADMIN,
+            &[7u8; 32],
+            &change(op(1), &[1, 2, 3], None),
+        ));
+        assert!(e.evict_routes.is_empty());
+    }
+
+    #[test]
+    fn re_seeding_a_known_node_needs_no_eviction() {
+        let mut s = base();
+        with_routes(&mut s, MAX_RETAINED_ROUTES);
+        // The plan's only seed is already routed, so the table does not grow.
+        s.routes.insert(
+            [9u8; 32],
+            Route {
+                ticket: b"aster1stale".to_vec(),
+                introduced_log_id: log(500),
+                source_operation_id: op(0),
+            },
+        );
+        s.routes.remove(&{
+            let mut n = [0u8; 32];
+            n[31] = 0xAA;
+            n
+        });
+        s.growth_bytes = s.recompute_growth();
+
+        let e = effect(decide_change(
+            &s,
+            &ADMIN,
+            &[7u8; 32],
+            &change(op(1), &[1, 2, 3], None),
+        ));
+        assert!(e.evict_routes.is_empty(), "replacing a route is not growth");
+    }
+
+    #[test]
+    fn a_current_members_route_is_never_evicted() {
+        let mut s = base();
+        with_routes(&mut s, MAX_RETAINED_ROUTES);
+        // Make the oldest route belong to a committed voter. Losing an
+        // arbitrary peer's dialling hint costs a discovery round trip; losing a
+        // voter's can cost quorum.
+        let mut oldest = [0u8; 32];
+        oldest[31] = 0xAA;
+        s.members.insert(oldest);
+
+        let e = effect(decide_change(
+            &s,
+            &ADMIN,
+            &[7u8; 32],
+            &change(op(1), &[1, 2, 3], None),
+        ));
+        assert!(!e.evict_routes.contains(&oldest));
+        assert_eq!(e.evict_routes.len(), 1, "the next-oldest goes instead");
+        let mut second = [0u8; 32];
+        second[0..8].copy_from_slice(&1u64.to_be_bytes());
+        second[31] = 0xAA;
+        assert_eq!(e.evict_routes, vec![second]);
+    }
+
+    #[test]
+    fn completing_a_change_makes_its_plan_the_protected_member_set() {
+        let mut s = base();
+        let e = effect(decide_change(
+            &s,
+            &ADMIN,
+            &[7u8; 32],
+            &change(op(1), &[1, 2, 3], None),
+        ));
+        let mut pending = e.intent.clone();
+        // Only the last hop of the phase walk commits a new membership.
+        pending.status_code = PHASE_CHANGING_VOTERS;
+        s.intents.insert(op(1), pending);
+
+        let done = (decide_progress(
+            &s,
+            &MembershipProgressCommand {
+                operation_id: op(1),
+                expected_phase: PHASE_CHANGING_VOTERS,
+                new_phase: PHASE_COMPLETED,
+                result_code: 0,
+                observed_membership_log_id: Some(log(9)),
+            },
+        ))
+        .expect("a pending intent advances")
+        .intent_members;
+        assert_eq!(done.len(), 3, "three voters, no learners");
+        let mut first = [0u8; 32];
+        first[0] = 1;
+        assert!(done.contains(&first));
+    }
+
+    #[test]
+    fn an_exhausted_budget_refuses_the_intent() {
+        let mut s = base();
+        // Saturate growth so the intent and route rows cannot be funded.
+        s.growth_bytes = crate::coordination::model::limits::GROWTH_BUDGET;
+        assert_eq!(
+            reason(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &change(op(1), &[1, 2, 3], None)
+            )),
+            Reason::StateBudgetExhausted,
+            "intent and route rows are growth-funded like any other write",
+        );
     }
 
     // ── Acceptance ──────────────────────────────────────────────────────────

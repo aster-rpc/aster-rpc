@@ -100,8 +100,18 @@ shape_limits! {
     MemberSeedTicket => "a member seed ticket exceeds its limit",
     /// A member seed's signed join permit longer than `MAX_JOIN_PERMIT`.
     MemberSeedJoinPermit => "a signed join permit exceeds its limit",
-    /// More voters in a membership plan than v1 permits.
-    MembershipPlanSize => "the membership plan names too many voters",
+    /// A `Vec<u8>` node id that is not exactly 32 bytes.
+    NodeIdWidth => "a node id is not 32 bytes",
+    /// A `Vec<u8>` client or operation id that is not exactly 16 bytes.
+    ClientIdWidth => "a client or operation id is not 16 bytes",
+    /// A `request_hash` that is not exactly 32 bytes.
+    RequestHashWidth => "the request hash is not 32 bytes",
+    /// The `request_hash` is well-formed but is **not** the canonical hash of
+    /// the action it accompanies (§5.2.1).
+    RequestHashMismatch => "the request hash does not match its action",
+    /// A membership plan outside §9's shape: not 3 or 5 desired voters, more
+    /// than two new voter identities, or more than two retained learners.
+    MembershipPlanSize => "the membership plan is outside the v1 shape",
 }
 
 /// Validate a raw `(namespace, key)` into the durable key type.
@@ -142,6 +152,21 @@ pub fn check_encoded_command(len: usize) -> Option<ShapeLimit> {
     (len > super::limits::MAX_ENCODED_COMMAND).then_some(ShapeLimit::EncodedCommand)
 }
 
+/// §12.1 voter-count bounds for a membership plan (§9).
+pub const MIN_VOTERS: usize = 3;
+pub const MAX_VOTERS: usize = 5;
+pub const MAX_RETAINED_LEARNERS: usize = 2;
+
+/// Check a membership plan's shape.
+///
+/// A production plan targets exactly 3 or 5 voters -- never an even set, which
+/// has no majority advantage and a worse failure mode -- and retains at most two
+/// learners. Larger replacements use successive committed plans.
+pub fn check_membership_plan(voters: usize, retained_learners: usize) -> Option<ShapeLimit> {
+    let sized = voters == MIN_VOTERS || voters == MAX_VOTERS;
+    (!sized || retained_learners > MAX_RETAINED_LEARNERS).then_some(ShapeLimit::MembershipPlanSize)
+}
+
 /// Check a member seed's ticket and join permit.
 pub fn check_member_seed(ticket_len: usize, join_permit_len: Option<usize>) -> Option<ShapeLimit> {
     if ticket_len > MAX_TICKET {
@@ -164,11 +189,7 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ShapeLimit::ALL.len());
-        assert_eq!(
-            ShapeLimit::ALL.len(),
-            9,
-            "§12.1 declares nine request-shape limits; update this count with the enum"
-        );
+        assert_eq!(ShapeLimit::ALL.len(), 13, "update this count with the enum");
         // Every variant has its own description; a shared one would make two
         // different failures read identically in a status message.
         let mut descriptions: Vec<_> = ShapeLimit::ALL.iter().map(|l| l.describe()).collect();

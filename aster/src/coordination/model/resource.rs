@@ -213,7 +213,11 @@ fn required_rights(action: &ResourceAction) -> u64 {
 }
 
 /// The rights `actor` holds on `resource`, or 0.
-fn granted_rights(state: &State, resource: &ResourceKey, actor: &NodeId) -> u64 {
+///
+/// Public because value confidentiality depends on it: a reply may only carry a
+/// register value to an actor holding `READ`, and that check belongs at the
+/// projection boundary as much as at the transition.
+pub fn granted_rights(state: &State, resource: &ResourceKey, actor: &NodeId) -> u64 {
     state
         .acl
         .get(&(resource.clone(), *actor))
