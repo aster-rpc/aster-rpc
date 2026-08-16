@@ -143,6 +143,10 @@ pub struct State {
     /// Maintained incrementally. MUST equal [`State::recompute_reserve`].
     pub reserve_bytes: u64,
     pub admin_revision: u64,
+    /// The highest applied log index. Advances on **every** applied entry,
+    /// including a rejection: a committed entry that left no trace would be
+    /// indistinguishable from one that was skipped.
+    pub last_applied: u64,
 }
 
 impl State {

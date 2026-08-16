@@ -34,9 +34,10 @@
 //! and the compiled constants.
 
 use super::limits::{
-    self, MAX_COUNTER, MAX_RESOURCES_PER_GROUP, MAX_TTL_MS, MAX_VALUE, MIN_TTL_MS, RIGHT_ACQUIRE,
-    RIGHT_MUTATE, RIGHT_RELEASE, RIGHT_RENEW, RIGHT_REVOKE,
+    self, MAX_COUNTER, MAX_RESOURCES_PER_GROUP, RIGHT_ACQUIRE, RIGHT_MUTATE, RIGHT_RELEASE,
+    RIGHT_RENEW, RIGHT_REVOKE,
 };
+use super::shape::{self, ShapeLimit};
 use super::state::{NodeId, ResourceKey, ResourceRow, State};
 use crate::coordination::reason::{Outcome, Reason};
 
@@ -128,10 +129,6 @@ pub struct ResourceEffect {
     pub creates_resource: bool,
 }
 
-/// A refusal with no §5.2 reason code.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShapeViolation(pub &'static str);
-
 /// The outcome of deciding one resource action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -148,7 +145,7 @@ pub enum Decision {
     /// shapeless to the protocol, so there is no coordination reason to report.
     /// Being `Consumed` it is terminal, which is also correct: the client cannot
     /// fix the bound without changing a request it may no longer change.
-    RefuseShapeless(ShapeViolation),
+    RefuseShapeless(ShapeLimit),
 }
 
 impl Decision {
@@ -280,26 +277,30 @@ pub fn decide(state: &State, actor: &NodeId, action: &ResourceAction) -> Decisio
     }
 }
 
-/// §12.1 request-shape bounds. These have no §5.2 reason code.
-fn check_shape(action: &ResourceAction) -> Option<ShapeViolation> {
+/// Every §12.1 request-shape bound a resource action can violate.
+///
+/// The order is fixed so that a request violating two limits reports the same
+/// one on every voter: apply must be deterministic, and "whichever check ran
+/// first" is not determinism unless the order is part of the code.
+fn check_shape(action: &ResourceAction) -> Option<ShapeLimit> {
     let key = action.resource();
-    if key.namespace.len() > limits::MAX_NAMESPACE {
-        return Some(ShapeViolation("namespace exceeds its limit"));
-    }
-    if key.key.len() > limits::MAX_KEY {
-        return Some(ShapeViolation("resource key exceeds its limit"));
+    if let Some(limit) = shape::check_resource_key(&key.namespace, &key.key) {
+        return Some(limit);
     }
     let value = match action {
         ResourceAction::CompareAndSet { new_value, .. } => Some(new_value),
         ResourceAction::ReleaseWithValue { final_value, .. } => Some(final_value),
-        _ => None,
+        ResourceAction::Acquire { .. }
+        | ResourceAction::Renew { .. }
+        | ResourceAction::Release { .. }
+        | ResourceAction::Revoke { .. } => None,
     };
-    if value.is_some_and(|v| v.len() > MAX_VALUE) {
-        return Some(ShapeViolation("resource value exceeds its limit"));
+    if let Some(limit) = value.and_then(|v| shape::check_value(v)) {
+        return Some(limit);
     }
     if let ResourceAction::Acquire { ttl_ms, .. } = action {
-        if !(MIN_TTL_MS..=MAX_TTL_MS).contains(ttl_ms) {
-            return Some(ShapeViolation("ttl_ms is outside the v1 bounds"));
+        if let Some(limit) = shape::check_ttl(*ttl_ms) {
+            return Some(limit);
         }
     }
     None
@@ -336,10 +337,14 @@ fn decide_acquire(
 
     // "Acquire never takes a held row, even if a leader timer believes it is
     // old." A leader must commit the exact `Expire` first; log order then
-    // decides an expiry-versus-renew race. This is also why a holder
-    // re-acquiring its own lease is refused rather than treated as a renew --
-    // the two have different effects on the epoch, and silently substituting one
-    // for the other would move a fence the client still believes in.
+    // decides an expiry-versus-renew race.
+    //
+    // **For `acquire`, `1 HeldByOther` means "already held, including by this
+    // caller."** The name reads as though it excluded the current holder; it
+    // does not. A holder re-acquiring is refused rather than silently treated
+    // as a renew, because the two have different effects on the epoch and
+    // substituting one for the other would move a fence the client still
+    // believes in. The refusal changes nothing at all.
     if row.held {
         return Decision::refuse(Reason::HeldByOther);
     }
@@ -499,9 +504,14 @@ fn decide_revoke(existing: Option<&ResourceRow>, expected_epoch: Option<u64>) ->
         return Decision::refuse(Reason::CounterExhausted);
     }
 
-    // No `held` precondition (§9.1): revoke is a fencing operation, and
-    // advancing the epoch on an already-free row is harmless and idempotent in
-    // effect. The value is preserved, as with a plain release.
+    // No `held` precondition (§9.1): revoke is an **unconditional** fencing
+    // operation, so it advances the epoch and lease revision whether or not
+    // anyone holds the lease.
+    //
+    // The transition itself is *not* idempotent -- two separate revoke commands
+    // advance the counters twice. Only a replay of the same sequenced command
+    // is idempotent, and that is the session table's doing, not this
+    // transition's. The value is preserved, as with a plain release.
     let mut next = row.clone();
     next.held = false;
     next.holder = None;
@@ -513,7 +523,7 @@ fn decide_revoke(existing: Option<&ResourceRow>, expected_epoch: Option<u64>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordination::model::limits::{ALL_RIGHTS, GROWTH_BUDGET};
+    use crate::coordination::model::limits::{ALL_RIGHTS, GROWTH_BUDGET, MAX_TTL_MS, MIN_TTL_MS};
 
     const HOLDER: NodeId = [1u8; 32];
     const OTHER: NodeId = [2u8; 32];
@@ -603,20 +613,35 @@ mod tests {
     }
 
     /// "Acquire never takes a held row, even if a leader timer believes it is
-    /// old." Including from the current holder: re-acquiring is not a renew,
-    /// and silently treating it as one would move a fence the client still
-    /// believes in.
+    /// old." For `acquire`, `1 HeldByOther` means **already held, including by
+    /// this caller** -- the name reads as though it excluded the current
+    /// holder, and it does not.
     #[test]
-    fn acquire_never_takes_a_held_row_not_even_the_holders_own() {
-        let s = with_row(state_with_rights(HOLDER, ALL_RIGHTS), held_row(HOLDER, 5));
+    fn acquire_refuses_a_held_row_including_the_callers_own_and_changes_nothing() {
+        let before = held_row(HOLDER, 5);
         let acquire = ResourceAction::Acquire {
             resource: key(),
-            ttl_ms: 30_000,
+            ttl_ms: 60_000,
         };
-        assert_eq!(reason(decide(&s, &HOLDER, &acquire)), Reason::HeldByOther);
 
-        let s2 = with_row(state_with_rights(OTHER, ALL_RIGHTS), held_row(HOLDER, 5));
-        assert_eq!(reason(decide(&s2, &OTHER, &acquire)), Reason::HeldByOther);
+        // The current holder re-acquiring: refused, not silently renewed.
+        let mine = with_row(state_with_rights(HOLDER, ALL_RIGHTS), before.clone());
+        assert_eq!(
+            reason(decide(&mine, &HOLDER, &acquire)),
+            Reason::HeldByOther
+        );
+
+        // Another node: the same reason, which is what the name suggests.
+        let theirs = with_row(state_with_rights(OTHER, ALL_RIGHTS), before.clone());
+        assert_eq!(
+            reason(decide(&theirs, &OTHER, &acquire)),
+            Reason::HeldByOther
+        );
+
+        // And the refusal changes nothing -- in particular it does not extend
+        // the lease, move the TTL, or advance any counter.
+        assert_eq!(mine.resources.get(&key()), Some(&before));
+        assert_eq!(theirs.resources.get(&key()), Some(&before));
     }
 
     #[test]
@@ -1002,8 +1027,12 @@ mod tests {
         assert_eq!(reason(d), Reason::ValueRevisionMismatch);
     }
 
-    /// Revoke has no `held` precondition (§9.1): it is a fencing operation, so
-    /// it advances the epoch whether or not anyone holds the lease.
+    /// Revoke has no `held` precondition (§9.1): it is an unconditional fencing
+    /// operation, so it advances the epoch and lease revision whether or not
+    /// anyone holds the lease.
+    ///
+    /// See [`repeated_revoke_commands_advance_the_counters_each_time`] for why
+    /// this is not the same as calling the transition idempotent.
     #[test]
     fn revoke_fences_a_held_row_and_advances_a_free_one() {
         let held = held_row(OTHER, 5);
@@ -1065,6 +1094,34 @@ mod tests {
             ),
             Decision::Apply(_)
         ));
+    }
+
+    /// The revoke *transition* is not idempotent: two separate revoke commands
+    /// advance the counters twice. Only a replay of the same sequenced command
+    /// returns the first answer without re-applying, and that is the session
+    /// table's doing rather than this transition's.
+    #[test]
+    fn repeated_revoke_commands_advance_the_counters_each_time() {
+        let mut row = held_row(OTHER, 5);
+        row.lease_revision = 2;
+        let mut s = with_row(state_with_rights(HOLDER, ALL_RIGHTS), row);
+
+        let revoke = ResourceAction::Revoke {
+            resource: key(),
+            expected_epoch: None,
+        };
+
+        let first = effect(decide(&s, &HOLDER, &revoke));
+        assert_eq!((first.row.epoch, first.row.lease_revision), (6, 3));
+
+        // Commit it, then revoke again: the counters move a second time.
+        s.resources.insert(key(), first.row.clone());
+        let second = effect(decide(&s, &HOLDER, &revoke));
+        assert_eq!(
+            (second.row.epoch, second.row.lease_revision),
+            (7, 4),
+            "a second revoke command is a second fencing event, not a no-op"
+        );
     }
 
     // ── Counters ────────────────────────────────────────────────────────────

@@ -76,7 +76,16 @@ macro_rules! reasons {
 }
 
 reasons! {
-    /// No reason applies. Carried by every successful outcome.
+    /// No reason applies.
+    ///
+    /// Carried by every successful outcome -- and, by one narrow exception, by
+    /// a rejection. A committed command that violates a **logical
+    /// request-shape limit** (§12.1) rejects as `(100 Rejected, 0 None)`,
+    /// because §5.2 has no reason for that failure and inventing one would
+    /// change the frozen contract. That pairing is legal **only** there; every
+    /// other rejection carries a defined, nonzero reason. See
+    /// [`Outcome::Rejected`] and the forced-apply rule in
+    /// `coordination::model::apply`.
     None = 0,
     HeldByOther = 1,
     NotHeld = 2,
@@ -292,6 +301,14 @@ outcomes! {
     /// Every rejection shares this outcome; the reason carries the cause. A
     /// test that compares only `outcome_code` therefore asserts almost nothing
     /// about a rejection -- the spike had exactly that bug.
+    ///
+    /// A rejection normally carries a **nonzero** reason. The single exception
+    /// is a committed logical request-shape violation, which is
+    /// `(100, 0 None)`: §5.2 has no reason code for a request that is shapeless
+    /// to the protocol. Apply must still be total -- skipping a committed entry
+    /// diverges the voters, and halting would hand a faulty leader an
+    /// availability kill switch -- so it commits that pairing, saves it, and
+    /// replays it exactly. See [`Reason::None`].
     Rejected = 100,
 }
 
@@ -512,6 +529,42 @@ mod tests {
         }
         assert_eq!(Outcome::from_code(101), None);
         assert_eq!(Outcome::from_code(0), None, "0 is not an outcome");
+    }
+
+    /// `(100 Rejected, 0 None)` is reserved for exactly one condition: a
+    /// committed logical request-shape violation. Pinned here, over the whole
+    /// code space, so no future reason can quietly claim the pairing.
+    ///
+    /// The rule is stated as an exhaustive property rather than a comment: a
+    /// rejection carrying `None` means "shape violation" and nothing else, so
+    /// a client can rely on a nonzero reason identifying a coordination cause.
+    #[test]
+    fn a_rejection_with_no_reason_is_reserved_for_the_shape_violation_case() {
+        // Every reason except `None` is a defined coordination cause, so
+        // pairing it with `Rejected` is unambiguous.
+        let coordination_causes: Vec<_> =
+            Reason::ALL.iter().filter(|r| **r != Reason::None).collect();
+        assert_eq!(
+            coordination_causes.len(),
+            Reason::ALL.len() - 1,
+            "exactly one reason -- `None` -- is not a coordination cause"
+        );
+
+        // And `None` is the only one that can accompany a rejection without
+        // naming a cause, which is what makes the pairing a reliable marker.
+        assert_eq!(Reason::None.code(), 0);
+        assert!(
+            !Reason::None.is_admission_denial(),
+            "the forced case is not an admission denial: it committed"
+        );
+        assert!(
+            !Reason::None.is_terminal_when_not_consumed(),
+            "the forced case is terminal through Consumed, not through the reason"
+        );
+        // Terminality comes from the disposition, and Consumed is always
+        // terminal -- so a forced rejection is terminal without `None` needing
+        // to be classified terminal itself.
+        assert!(Disposition::Consumed.is_terminal(Reason::None));
     }
 
     #[test]
