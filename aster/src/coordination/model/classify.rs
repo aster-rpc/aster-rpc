@@ -87,10 +87,14 @@ pub enum Classification {
     /// Row 2: answered from the saved result. Always `Consumed`, always
     /// terminal.
     ///
+    /// Boxed: `SavedReply` now carries a whole snapshot, so this variant is
+    /// much larger than the other two and an unboxed enum would pay for it at
+    /// every classification.
+    ///
     /// The saved row is returned **verbatim**. Reconstructing a reply field by
     /// field is how the spike lost a committed `19 StateBudgetExhausted`, which
     /// replayed as reason `0` -- telling the client its rejection had no cause.
-    Replay { row: Row, saved: SavedReply },
+    Replay { row: Row, saved: Box<SavedReply> },
 
     /// Every refusing row. All are `NotConsumed`: the classifier answers before
     /// anything is written.
@@ -162,7 +166,7 @@ pub fn classify(
         if let Some(saved) = &session.last_result {
             return Classification::Replay {
                 row: Row::Replay,
-                saved: saved.clone(),
+                saved: Box::new(saved.clone()),
             };
         }
     }
@@ -291,7 +295,7 @@ mod tests {
         MAX_ACTIVE_CLIENTS_PER_ACTOR, MAX_ACTIVE_CLIENTS_PER_GROUP,
         MAX_RETAINED_SESSIONS_PER_ACTOR, MAX_RETAINED_SESSIONS_PER_GROUP,
     };
-    use crate::coordination::model::state::ResourceKey;
+    use crate::coordination::model::state::{ResourceKey, SavedSnapshot};
     use crate::coordination::reason::Outcome;
 
     const HASH_A: [u8; 32] = [0xAA; 32];
@@ -314,11 +318,20 @@ mod tests {
                 Outcome::Rejected
             },
             reason,
-            resource: Some(ResourceKey::new("ns", b"k".to_vec()).expect("valid")),
-            epoch: 7,
-            value_revision: 3,
+            snapshot: Some(SavedSnapshot {
+                resource: ResourceKey::new("ns", b"k".to_vec()).expect("valid"),
+                epoch: 7,
+                holder: Some([5u8; 32]),
+                held: true,
+                ttl_ms: 30_000,
+                lease_revision: 1,
+                value_revision: 3,
+                acl_revision: 2,
+            }),
             acl_revision: 2,
             admin_revision: 0,
+            operation_id: None,
+            membership_log_id: None,
         }
     }
 
@@ -364,7 +377,7 @@ mod tests {
         match c {
             Classification::Replay { saved, .. } => {
                 assert_eq!(saved.outcome, Outcome::Granted);
-                assert_eq!(saved.epoch, 7);
+                assert_eq!(saved.snapshot.as_ref().unwrap().epoch, 7);
             }
             other => panic!("expected a replay, got {other:?}"),
         }
@@ -382,7 +395,8 @@ mod tests {
                 assert_eq!(saved.reason, Reason::StateBudgetExhausted);
                 assert_eq!(saved.outcome, Outcome::Rejected);
                 // The revisions a client resyncs from after losing its response.
-                assert_eq!((saved.epoch, saved.value_revision), (7, 3));
+                let snap = saved.snapshot.as_ref().unwrap();
+                assert_eq!((snap.epoch, snap.value_revision), (7, 3));
                 assert_eq!(saved.acl_revision, 2);
             }
             other => panic!("expected a replay, got {other:?}"),

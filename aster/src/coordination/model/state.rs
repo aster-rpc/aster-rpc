@@ -41,34 +41,74 @@ pub struct ResourceRow {
     pub acl_revision: u64,
 }
 
-/// The result saved for a consumed sequence (§5.2.1 `SavedSnapshotV1`).
+/// The lease/value snapshot saved with a consumed sequence, mirroring
+/// §5.2.1's `SavedSnapshotV1` field for field.
 ///
-/// There is deliberately **no value field**. A replay carries
-/// `value_redacted = true` and the revisions, never the bytes: saving values
-/// here would duplicate every resource value into the reserve-funded session
-/// table, and the reserve is sized on the assumption that it does not.
+/// **No `value`**, deliberately: saving values here would duplicate every
+/// resource value into the reserve-funded session table, and the reserve is
+/// sized at `256 + KEY` a row on the assumption that it does not.
+///
+/// Everything *else* the reply reports is here, and that is the point. An
+/// earlier revision stored only the revisions and rebuilt `holder`, `held`,
+/// `ttl_ms` and `lease_revision` from **current** state at projection time, so
+/// a replay after a later mutation returned the saved revisions stapled to a
+/// different holder -- a reply that never existed at any point in the log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedSnapshot {
+    pub resource: ResourceKey,
+    pub epoch: u64,
+    pub holder: Option<NodeId>,
+    pub held: bool,
+    pub ttl_ms: u64,
+    pub lease_revision: u64,
+    pub value_revision: u64,
+    pub acl_revision: u64,
+}
+
+impl SavedSnapshot {
+    /// The snapshot a row produces at the moment it is written.
+    pub fn of(resource: ResourceKey, row: &ResourceRow) -> Self {
+        Self {
+            resource,
+            epoch: row.epoch,
+            holder: row.holder,
+            held: row.held,
+            ttl_ms: row.ttl_ms,
+            lease_revision: row.lease_revision,
+            value_revision: row.value_revision,
+            acl_revision: row.acl_revision,
+        }
+    }
+}
+
+/// The result saved for a consumed sequence (§5.2.1 `SavedReplyV1`).
+///
+/// Structurally sufficient for an **exact** replay: every field the public
+/// reply reports is either here or is the redacted value. Projection reads no
+/// business state at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SavedReply {
     pub outcome: Outcome,
     pub reason: Reason,
-    /// The resource the command named, if any. This is what makes the session
-    /// charge include `KEY`.
-    pub resource: Option<ResourceKey>,
-    pub epoch: u64,
-    pub value_revision: u64,
-    /// The ACL revision a `set_grant` produced, so a client that lost its
-    /// response can resync `expected_acl_revision` rather than guess. Without
-    /// it every subsequent grant from that client would mismatch.
+    /// The resource snapshot, when the command named one.
+    pub snapshot: Option<SavedSnapshot>,
     pub acl_revision: u64,
-    /// The administrator revision a `set_admin` produced, for the same reason.
-    /// `0` when the command did not touch it (§5.2.1).
     pub admin_revision: u64,
+    /// The membership operation this reply concerns, if any.
+    pub operation_id: Option<OperationId>,
+    /// The membership log id this reply observed, if any.
+    pub membership_log_id: Option<LogId>,
 }
 
 impl SavedReply {
+    /// The resource this reply names, if any.
+    pub fn resource(&self) -> Option<&ResourceKey> {
+        self.snapshot.as_ref().map(|s| &s.resource)
+    }
+
     /// The charge parts of the embedded resource key, if any.
     fn key_parts(&self) -> Option<(&str, &[u8])> {
-        self.resource.as_ref().map(key_parts)
+        self.resource().map(key_parts)
     }
 }
 
@@ -85,6 +125,37 @@ pub struct Session {
     pub request_hash: [u8; 32],
     pub last_result: Option<SavedReply>,
     pub retired: bool,
+}
+
+/// What an applied entry produced, as the audit table records it.
+///
+/// §5.2: "the result code is the public outcome code for client commands and a
+/// separately declared system phase code for system commands." Those are two
+/// disjoint code spaces -- `1 Expired` is not `1 Granted` -- so storing them in
+/// one `i32` field without a tag makes an audit row ambiguous about which space
+/// it is in. An earlier revision coerced every system result to
+/// `Outcome::Rejected`, which recorded a successful expiry as a rejection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditResult {
+    /// A client command's §5.2 outcome code.
+    Client(Outcome),
+    /// A system command's phase code (`SYS_*` in `contract`).
+    System(i32),
+}
+
+impl AuditResult {
+    /// The stored `result_code`.
+    pub fn code(self) -> i32 {
+        match self {
+            AuditResult::Client(outcome) => outcome.code(),
+            AuditResult::System(code) => code,
+        }
+    }
+
+    /// Was this a client command?
+    pub fn is_client(self) -> bool {
+        matches!(self, AuditResult::Client(_))
+    }
 }
 
 /// One authoritative audit row, mirroring
@@ -107,7 +178,7 @@ pub struct AuditRow {
     pub actor: NodeId,
     pub operation_code: i32,
     pub resource: Option<ResourceKey>,
-    pub result: Outcome,
+    pub result: AuditResult,
     /// The resulting epoch, copied from the saved reply.
     pub epoch: u64,
     /// The resulting value revision, copied from the saved reply.
@@ -117,26 +188,83 @@ pub struct AuditRow {
 /// A 16-byte membership operation identity (§4.1).
 pub type OperationId = [u8; 16];
 
-/// A membership intent. Terminal intents are evicted deterministically when a
-/// 65th is produced, which is why reason `20` is reserved and never emitted.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Intent {
-    pub encoded_plan_len: usize,
-    /// A canonical digest of the desired plan. Comparison is by digest rather
-    /// than by decoded fields, because §9's "identical plan" has to mean
-    /// identical canonical bytes.
-    pub plan_hash: [u8; 32],
-    /// One of the §5.2 phase codes; see `membership::is_terminal_phase`.
-    pub phase: i32,
-    /// The log index that introduced this intent. Eviction is oldest-first by
-    /// this value, so every voter evicts the same rows.
-    pub introduced_index: u64,
+/// A membership plan: the normative `ChangeMembershipActionV1` payload.
+///
+/// Stored **typed**, not as a hash and a length. A failover controller has to
+/// re-run the plan after a restart, and it cannot reconstruct desired voters,
+/// retained learners or member seeds from a digest -- which is what an earlier
+/// revision stored.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct MembershipPlan {
+    pub desired_voters: Vec<NodeId>,
+    pub retained_learners: Vec<NodeId>,
+    pub member_seeds: Vec<MemberSeed>,
 }
 
-/// A retained node route.
+impl MembershipPlan {
+    /// The encoded length used for the §12.1 intent charge.
+    ///
+    /// Derived from the plan's own contents rather than carried alongside it,
+    /// so it cannot disagree with what is stored.
+    pub fn encoded_len(&self) -> usize {
+        let ids = (self.desired_voters.len() + self.retained_learners.len()) * 32;
+        let seeds: usize = self
+            .member_seeds
+            .iter()
+            .map(|s| 32 + s.ticket.len() + s.join_permit.as_ref().map_or(0, Vec::len))
+            .sum();
+        ids + seeds
+    }
+}
+
+/// One member seed inside a plan (§5.2.1 `MemberSeedV1`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberSeed {
+    pub node_id: NodeId,
+    pub ticket: Vec<u8>,
+    pub join_permit: Option<Vec<u8>>,
+}
+
+/// A membership intent, mirroring §11.3's `IntentRowV1` field for field.
+///
+/// Terminal intents are evicted deterministically when a 65th is produced,
+/// which is why reason `20` is reserved and never emitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Intent {
+    /// The administrator that submitted it.
+    pub actor: NodeId,
+    /// The canonical request hash of the submitting command, which is what
+    /// §9's "identical plan" comparison is against.
+    pub request_hash: [u8; 32],
+    /// The membership log id the plan expected. `None` means "no membership
+    /// has been committed yet", which is distinct from any particular id.
+    pub expected_membership: Option<LogId>,
+    pub plan: MembershipPlan,
+    /// One of the §5.2 phase codes; see `membership::is_terminal_phase`.
+    pub status_code: i32,
+    /// The system result code recorded when the intent reached a terminal
+    /// phase; `0` while it is still active.
+    pub result_code: i32,
+    /// The log id at which the intent was accepted.
+    pub accepted_log_id: LogId,
+    /// The log id at which it reached a terminal phase.
+    ///
+    /// **Eviction orders by this**, not by acceptance: §9 says terminal intents
+    /// are retained newest-first *by their completion log id*, and two intents
+    /// accepted in one order can complete in the other.
+    pub completed_log_id: Option<LogId>,
+    /// The committed membership the controller observed.
+    pub observed_membership_log_id: Option<LogId>,
+}
+
+/// A retained node route (§11.3 `RouteRowV1`), an advisory dialling hint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Route {
-    pub ticket_len: usize,
+    pub ticket: Vec<u8>,
+    /// The intent that introduced this route.
+    pub source_operation_id: OperationId,
+    /// Eviction orders oldest-first by this.
+    pub introduced_log_id: LogId,
 }
 
 /// A grant: the rights one subject holds on one resource.
@@ -217,8 +345,19 @@ pub struct State {
     /// Maintained incrementally. MUST equal [`State::recompute_reserve`].
     pub reserve_bytes: u64,
     pub admin_revision: u64,
-    /// Advances with every accepted membership intent (§9).
-    pub membership_revision: u64,
+    /// The committed membership's log id, or `None` before the first change.
+    ///
+    /// `change_membership` carries an `expected_membership_log_id`, not a
+    /// revision counter -- an earlier revision of this model substituted a
+    /// synthetic `u64`, which cannot express "no membership committed yet" and
+    /// does not match what the contract compares.
+    pub membership_log_id: Option<LogId>,
+    /// The lowest log index still present in `audit`.
+    ///
+    /// Advances as retention prunes, and `audit_stream` returns `OUT_OF_RANGE`
+    /// plus this floor for a request below it (§5.2) rather than silently
+    /// returning a partial range.
+    pub audit_floor: u64,
     /// The complete [`LogId`] of the last applied entry, or `None` before the
     /// first.
     ///
@@ -252,12 +391,12 @@ impl State {
         let intents: u64 = self
             .intents
             .values()
-            .map(|i| limits::charge_intent(i.encoded_plan_len))
+            .map(|i| limits::charge_intent(i.plan.encoded_len()))
             .sum();
         let routes: u64 = self
             .routes
             .values()
-            .map(|r| limits::charge_route(r.ticket_len))
+            .map(|r| limits::charge_route(r.ticket.len()))
             .sum();
         resources + acl + admins + intents + routes
     }
@@ -430,15 +569,31 @@ mod tests {
                 s.intents.insert(
                     [3u8; 16],
                     Intent {
-                        encoded_plan_len: 10,
-                        plan_hash: [0u8; 32],
-                        phase: 1,
-                        introduced_index: 1,
+                        actor: [1u8; 32],
+                        request_hash: [0u8; 32],
+                        expected_membership: None,
+                        plan: MembershipPlan {
+                            desired_voters: vec![[1u8; 32]],
+                            retained_learners: Vec::new(),
+                            member_seeds: Vec::new(),
+                        },
+                        status_code: 1,
+                        result_code: 0,
+                        accepted_log_id: LogId::new(1, [0u8; 32], 1),
+                        completed_log_id: None,
+                        observed_membership_log_id: None,
                     },
                 );
             }),
             ("routes", |s| {
-                s.routes.insert([4u8; 32], Route { ticket_len: 20 });
+                s.routes.insert(
+                    [4u8; 32],
+                    Route {
+                        ticket: vec![0u8; 20],
+                        source_operation_id: [0u8; 16],
+                        introduced_log_id: LogId::new(1, [0u8; 32], 1),
+                    },
+                );
             }),
         ];
 
@@ -473,7 +628,7 @@ mod tests {
                         actor: [7u8; 32],
                         operation_code: 1,
                         resource: None,
-                        result: Outcome::Granted,
+                        result: AuditResult::Client(Outcome::Granted),
                         epoch: 1,
                         value_revision: 0,
                     },
@@ -516,11 +671,14 @@ mod tests {
                 last_result: Some(SavedReply {
                     outcome: Outcome::Granted,
                     reason: Reason::None,
-                    resource: Some(key("namespace", b"a-longer-key")),
-                    epoch: 1,
-                    value_revision: 0,
+                    snapshot: Some(SavedSnapshot::of(
+                        key("namespace", b"a-longer-key"),
+                        &ResourceRow::default(),
+                    )),
                     acl_revision: 0,
                     admin_revision: 0,
+                    operation_id: None,
+                    membership_log_id: None,
                 }),
                 retired: false,
             },

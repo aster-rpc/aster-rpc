@@ -25,7 +25,7 @@ use crate::coordination::ids::{CoordinationNodeId, ResourceKey};
 use crate::coordination::reason::Outcome;
 use crate::coordination::rowstream::AuditRowV1;
 
-use super::state::{AuditRow, LogId, NodeId};
+use super::state::{AuditResult, AuditRow, LogId, NodeId};
 
 /// The OpenRaft log id for this type config.
 ///
@@ -135,7 +135,15 @@ impl TryFrom<&AuditRowV1> for AuditRow {
             actor: node_id(&row.actor_node_id)?,
             operation_code: row.operation_code,
             resource,
-            result: Outcome::from_code(row.result_code).ok_or(WireError::OutcomeCode)?,
+            // A stored row does not say which code space it is in, so the
+            // operation code decides: 100/101 are the system commands.
+            result: if row.operation_code == 100 || row.operation_code == 101 {
+                AuditResult::System(row.result_code)
+            } else {
+                AuditResult::Client(
+                    Outcome::from_code(row.result_code).ok_or(WireError::OutcomeCode)?,
+                )
+            },
             epoch: row.epoch,
             value_revision: row.value_revision,
         })
@@ -156,7 +164,7 @@ mod tests {
             actor: [0x22u8; 32],
             operation_code: 3,
             resource: Some(ResourceKey::new("ns.sub", b"\x00\xffkey".to_vec()).expect("valid")),
-            result: Outcome::Mutated,
+            result: AuditResult::Client(Outcome::Mutated),
             epoch: 9,
             value_revision: 4,
         }
@@ -281,6 +289,30 @@ mod tests {
 
     /// Each fallible field refuses independently, so a malformed row cannot be
     /// partially accepted.
+    /// A system row round-trips as a system result, not as a client outcome.
+    /// The operation code is what decides, since the stored row does not say
+    /// which of the two disjoint code spaces its result belongs to.
+    #[test]
+    fn a_system_audit_row_round_trips_as_a_system_result() {
+        let mut row = audit_row();
+        row.operation_code = 100; // system Expire
+        row.result = AuditResult::System(crate::coordination::contract::SYS_EXPIRED);
+        row.resource = None;
+
+        let wire: AuditRowV1 = (&row).into();
+        assert_eq!(wire.result_code, crate::coordination::contract::SYS_EXPIRED);
+        assert_eq!(AuditRow::try_from(&wire), Ok(row));
+
+        // And the same numeric code under a *client* operation decodes as a
+        // client outcome, which is what makes the tag load-bearing.
+        let mut client = audit_row();
+        client.operation_code = 1;
+        client.result = AuditResult::Client(Outcome::Granted);
+        let wire: AuditRowV1 = (&client).into();
+        assert_eq!(wire.result_code, 1);
+        assert_eq!(AuditRow::try_from(&wire), Ok(client));
+    }
+
     #[test]
     fn each_malformed_wire_field_is_refused_on_its_own() {
         let good: AuditRowV1 = (&audit_row()).into();

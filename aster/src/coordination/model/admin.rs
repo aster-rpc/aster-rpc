@@ -204,19 +204,22 @@ mod tests {
         );
     }
 
-    /// §8.1: the final administrator cannot be removed, and the refusal is
-    /// terminal -- adding another administrator requires an administrator, so
-    /// the removal as sent can never apply.
+    /// §8.1: the final administrator cannot be removed -- and the refusal is
+    /// **retryable**, because a v1 command clears it.
+    ///
+    /// The last administrator can add a second one and then re-send the
+    /// unchanged removal. That is exactly §10's test for retryable, and an
+    /// earlier revision of this model had it backwards.
     #[test]
-    fn the_final_administrator_cannot_be_removed_and_the_refusal_is_terminal() {
+    fn the_final_administrator_cannot_be_removed_but_the_refusal_is_retryable() {
         let s = genesis(&[A]);
         let d = decide(&s, &A, &action(A, false, 1));
         assert_eq!(reason(d.clone()), Reason::LastAdministrator);
         match d {
             Decision::Refuse(r) => {
                 assert!(
-                    r.is_terminal_when_not_consumed(),
-                    "a client must stop rather than retry"
+                    !r.is_terminal_when_not_consumed(),
+                    "adding a second administrator lets the same removal succeed"
                 );
                 assert!(r.is_admission_denial(), "denied pre-proposal at stage 3");
             }
@@ -298,9 +301,9 @@ mod tests {
         );
     }
 
-    /// The last-administrator rule outranks the counter ceiling: both are
-    /// terminal, and naming the ceiling would send the client to fix the wrong
-    /// thing.
+    /// The last-administrator rule outranks the counter ceiling. Naming the
+    /// ceiling would send the client to fix something it cannot, when adding a
+    /// second administrator is what actually unblocks it.
     #[test]
     fn the_last_administrator_rule_outranks_the_counter_ceiling() {
         let mut s = genesis(&[A]);

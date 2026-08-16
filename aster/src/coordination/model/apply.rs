@@ -86,7 +86,8 @@ use super::resource::{self, Decision, ResourceAction};
 use super::retire::{self, RetireCommand};
 use super::shape::ShapeLimit;
 use super::state::{
-    key_parts, AuditRow, ClientId, LogId, NodeId, ResourceKey, SavedReply, Session, State,
+    key_parts, AuditResult, AuditRow, ClientId, LogId, NodeId, OperationId, ResourceKey,
+    ResourceRow, SavedReply, SavedSnapshot, Session, State,
 };
 
 /// The `(actor, client_id, sequence, request_hash)` mutation prefix every
@@ -154,6 +155,15 @@ impl Action {
     /// rather than a copy of the malformed one. An oversized key stored in a
     /// session row would blow the 832-byte reserve charge the whole budget
     /// proof rests on, and would produce a row later validation rejects.
+    /// The membership operation this action names, if any.
+    fn operation_id(&self) -> Option<OperationId> {
+        match self {
+            Action::ChangeMembership(m) => Some(m.operation_id),
+            Action::CancelMembership(m) => Some(m.operation_id),
+            _ => None,
+        }
+    }
+
     fn validated_resource(&self) -> Option<ResourceKey> {
         match self {
             Action::Resource(r) => r.raw_resource().validate().ok(),
@@ -165,13 +175,13 @@ impl Action {
         }
     }
 
-    fn decide(&self, state: &State, actor: &NodeId) -> ActionDecision {
+    fn decide(&self, state: &State, actor: &NodeId, request_hash: &[u8; 32]) -> ActionDecision {
         match self {
             Action::Resource(r) => ActionDecision::Resource(resource::decide(state, actor, r)),
             Action::Grant(g) => ActionDecision::Grant(grant::decide(state, actor, g)),
             Action::Admin(a) => ActionDecision::Admin(admin::decide(state, actor, a)),
             Action::ChangeMembership(m) => {
-                ActionDecision::Membership(membership::decide_change(state, actor, m))
+                ActionDecision::Membership(membership::decide_change(state, actor, request_hash, m))
             }
             Action::CancelMembership(m) => {
                 ActionDecision::Membership(membership::decide_cancel(state, actor, m))
@@ -258,6 +268,13 @@ pub enum Fault {
 pub struct ClientResult {
     pub disposition: Disposition,
     pub reply: SavedReply,
+    /// Whether this answer came from the session table rather than from
+    /// applying now.
+    ///
+    /// Carried on the result rather than re-derived at projection time: only
+    /// apply knows, and a projection that guessed would have to read state --
+    /// which is exactly what makes a replay inexact.
+    pub replayed: bool,
 }
 
 impl ClientResult {
@@ -290,13 +307,17 @@ pub fn preflight(state: &State, client: &ClientRef, action: &Action) -> Admissio
         // Stage 2. Every resolved row, terminal or not.
         Classification::Replay { saved, .. } => Admission::Resolved(Box::new(ClientResult {
             disposition: Disposition::Consumed,
-            reply: saved,
+            reply: *saved,
+            replayed: true,
         })),
         Classification::Refuse { reason, .. } => Admission::Resolved(Box::new(ClientResult {
             disposition: Disposition::NotConsumed,
-            reply: rejection(action.validated_resource(), reason),
+            reply: rejection(state, action.validated_resource(), reason),
+            replayed: false,
         })),
-        Classification::Unresolved { .. } => project(action.decide(state, &client.actor)),
+        Classification::Unresolved { .. } => {
+            project(action.decide(state, &client.actor, &client.request_hash))
+        }
     }
 }
 
@@ -354,15 +375,29 @@ fn project_refusal(refusal: Option<RefusalReason>, shapeless: Option<ShapeLimit>
 /// reaches here. That applies to classifier refusals too -- they name a
 /// sequence, not a resource, and copying an unvalidated key into one would put
 /// it in the reserve-funded session table by a different door.
-fn rejection(resource: Option<ResourceKey>, reason: Reason) -> SavedReply {
+/// Build a rejection reply.
+///
+/// The snapshot is the resource's state **as the rejection observed it**, not
+/// zeros: a client that lost its response and replays a conflict must be able to
+/// read the revision it actually conflicted with, or it cannot resync and will
+/// send the same stale expectation again. `None` when the identity was not
+/// well-formed or the command names no resource.
+fn rejection(state: &State, resource: Option<ResourceKey>, reason: Reason) -> SavedReply {
+    let snapshot = resource.map(|key| {
+        state.resources.get(&key).map_or_else(
+            || SavedSnapshot::of(key.clone(), &ResourceRow::default()),
+            |row| SavedSnapshot::of(key.clone(), row),
+        )
+    });
+    let acl_revision = snapshot.as_ref().map_or(0, |s| s.acl_revision);
     SavedReply {
         outcome: Outcome::Rejected,
         reason,
-        resource,
-        epoch: 0,
-        value_revision: 0,
-        acl_revision: 0,
-        admin_revision: 0,
+        snapshot,
+        acl_revision,
+        admin_revision: state.admin_revision,
+        operation_id: None,
+        membership_log_id: None,
     }
 }
 
@@ -487,7 +522,7 @@ fn apply_retire(state: &mut State, log_id: LogId, command: &RetireCommand) -> Re
             actor: command.actor,
             operation_code: OPERATION_RETIRE_CLIENT,
             resource: None,
-            result: result.outcome,
+            result: AuditResult::Client(result.outcome),
             epoch: 0,
             value_revision: 0,
         },
@@ -495,10 +530,13 @@ fn apply_retire(state: &mut State, log_id: LogId, command: &RetireCommand) -> Re
     result
 }
 
-/// §5.2: audit operation code `100` is system `Expire`, `101` is
-/// `MembershipProgress`. `retire_client` is absent from the method table, so it
-/// takes the next free code above the ten mutation methods.
-pub const OPERATION_RETIRE_CLIENT: i32 = 12;
+/// §5.2: "audit operation codes 1-11 are the mutation method codes".
+///
+/// The method table assigns 1-9 and 11, leaving **10** unused -- and
+/// `retire_client` is the one mutation deliberately absent from that table
+/// (§5.2), so 10 is the code the contract retains for it. An earlier revision
+/// invented 12, which is outside the 1-11 range the contract declares.
+pub const OPERATION_RETIRE_CLIENT: i32 = 10;
 /// System `Expire` (§5.2).
 pub const OPERATION_EXPIRE: i32 = 100;
 /// `MembershipProgress` (§5.2).
@@ -549,7 +587,8 @@ fn apply_client(
         Classification::Replay { saved, .. } => (
             ClientResult {
                 disposition: Disposition::Consumed,
-                reply: saved,
+                reply: *saved,
+                replayed: true,
             },
             false,
         ),
@@ -560,7 +599,8 @@ fn apply_client(
         Classification::Refuse { reason, .. } => (
             ClientResult {
                 disposition: Disposition::NotConsumed,
-                reply: rejection(action.validated_resource(), reason),
+                reply: rejection(state, action.validated_resource(), reason),
+                replayed: false,
             },
             false,
         ),
@@ -601,10 +641,11 @@ fn apply_expire(state: &mut State, log_id: LogId, command: &ExpireCommand) -> Sy
             actor: log_id.leader_node_id,
             operation_code: OPERATION_EXPIRE,
             resource: Some(command.resource.clone()),
-            // §5.2: a system command's audit result is its phase code, not a
-            // client outcome. `Rejected` is the outcome enum's only non-client
-            // member; the system code travels in the reply.
-            result: Outcome::Rejected,
+            // §5.2: a system command's audit result is its **phase code**, not
+            // a client outcome. Coercing it to `Rejected` recorded a successful
+            // expiry as a rejection and put two disjoint code spaces in one
+            // untagged field.
+            result: AuditResult::System(decision.system_result_code()),
             epoch,
             value_revision: 0,
         },
@@ -638,7 +679,7 @@ fn apply_membership_progress(
             actor: log_id.leader_node_id,
             operation_code: OPERATION_MEMBERSHIP_PROGRESS,
             resource: None,
-            result: Outcome::Rejected,
+            result: AuditResult::System(code),
             epoch: 0,
             value_revision: 0,
         },
@@ -654,20 +695,51 @@ fn apply_membership_progress(
 fn write_intent(state: &mut State, log_id: LogId, mut effect: membership::IntentEffect) {
     for id in &effect.evict {
         if let Some(old) = state.intents.remove(id) {
-            state.growth_bytes -= limits::charge_intent(old.encoded_plan_len);
+            state.growth_bytes -= limits::charge_intent(old.plan.encoded_len());
         }
     }
-    if effect.intent.introduced_index == 0 {
-        effect.intent.introduced_index = log_id.index;
+    if effect.intent.accepted_log_id.index == 0 {
+        effect.intent.accepted_log_id = log_id;
     }
+    // Eviction orders by completion, so the terminal phase is where the
+    // completion id is stamped.
+    if membership::is_terminal_phase(effect.intent.status_code)
+        && effect.intent.completed_log_id.is_none()
+    {
+        effect.intent.completed_log_id = Some(log_id);
+    }
+
     let previous = state
         .intents
         .get(&effect.operation_id)
-        .map(|i| limits::charge_intent(i.encoded_plan_len));
-    state.growth_bytes = state.growth_bytes + limits::charge_intent(effect.intent.encoded_plan_len)
+        .map(|i| limits::charge_intent(i.plan.encoded_len()));
+    state.growth_bytes = state.growth_bytes
+        + limits::charge_intent(effect.intent.plan.encoded_len())
         - previous.unwrap_or(0);
     state.intents.insert(effect.operation_id, effect.intent);
-    state.membership_revision = effect.membership_revision;
+
+    for node in &effect.evict_routes {
+        if let Some(old) = state.routes.remove(node) {
+            state.growth_bytes -= limits::charge_route(old.ticket.len());
+        }
+    }
+    for (node, route) in effect.routes {
+        let mut route = route;
+        if route.introduced_log_id.index == 0 {
+            route.introduced_log_id = log_id;
+        }
+        let previous = state
+            .routes
+            .get(&node)
+            .map(|r| limits::charge_route(r.ticket.len()));
+        state.growth_bytes =
+            state.growth_bytes + limits::charge_route(route.ticket.len()) - previous.unwrap_or(0);
+        state.routes.insert(node, route);
+    }
+
+    if let Some(id) = effect.membership_log_id {
+        state.membership_log_id = Some(id);
+    }
 }
 
 /// Reject a delivery that cannot belong to a committed history, before any
@@ -723,19 +795,13 @@ fn apply_decided(
     client: &ClientRef,
     action: &Action,
 ) -> ClientResult {
-    match action.decide(state, &client.actor) {
+    match action.decide(state, &client.actor, &client.request_hash) {
         ActionDecision::Resource(Decision::Apply(effect)) => {
             charge_resource_row(state, &effect.key, effect.row.value.len());
             state
                 .resources
                 .insert(effect.key.clone(), effect.row.clone());
-            consumed_success(
-                effect.outcome,
-                effect.key,
-                effect.row.epoch,
-                effect.row.value_revision,
-                effect.row.acl_revision,
-            )
+            consumed_success(effect.outcome, effect.key, &effect.row)
         }
 
         ActionDecision::Grant(grant::Decision::Apply(effect)) => {
@@ -763,13 +829,7 @@ fn apply_decided(
                 }
             }
 
-            consumed_success(
-                Outcome::GrantUpdated,
-                effect.key,
-                effect.row.epoch,
-                effect.row.value_revision,
-                effect.row.acl_revision,
-            )
+            consumed_success(Outcome::GrantUpdated, effect.key, &effect.row)
         }
 
         ActionDecision::Admin(admin::Decision::Apply(effect)) => {
@@ -783,57 +843,38 @@ fn apply_decided(
             state.admin_revision = effect.admin_revision;
             ClientResult {
                 disposition: Disposition::Consumed,
-                reply: SavedReply {
-                    outcome: Outcome::AdminUpdated,
-                    reason: Reason::None,
-                    resource: None,
-                    epoch: 0,
-                    value_revision: 0,
-                    acl_revision: 0,
-                    admin_revision: effect.admin_revision,
-                },
+                reply: admin_reply(effect.admin_revision),
+                replayed: false,
             }
         }
 
         ActionDecision::Admin(admin::Decision::NoOp { admin_revision }) => ClientResult {
             disposition: Disposition::Consumed,
-            reply: SavedReply {
-                outcome: Outcome::AdminUpdated,
-                reason: Reason::None,
-                resource: None,
-                epoch: 0,
-                value_revision: 0,
-                acl_revision: 0,
-                admin_revision,
-            },
+            reply: admin_reply(admin_revision),
+            replayed: false,
         },
 
         ActionDecision::Membership(membership::Decision::Apply(effect)) => {
-            let revision = effect.membership_revision;
+            let (outcome, operation_id) = (effect.outcome, effect.operation_id);
             write_intent(state, log_id, *effect);
-            membership_reply(revision)
+            membership_reply(outcome, operation_id, state.membership_log_id)
         }
 
-        // The identical plan under an id already accepted: the existing intent
-        // is the answer, and nothing is written a second time.
-        ActionDecision::Membership(membership::Decision::Existing { .. }) => {
-            membership_reply(state.membership_revision)
-        }
+        // The identical request under an id already accepted: the existing
+        // intent is the answer, and nothing is written a second time.
+        ActionDecision::Membership(membership::Decision::Existing { .. }) => membership_reply(
+            Outcome::MembershipAccepted,
+            action.operation_id().expect("a membership action"),
+            state.membership_log_id,
+        ),
 
         // A legal command that changes nothing still commits a saved reply --
         // that is what consumes the sequence and lets a retry be answered
         // without re-deciding.
         ActionDecision::Grant(grant::Decision::NoOp { acl_revision }) => ClientResult {
             disposition: Disposition::Consumed,
-            reply: SavedReply {
-                outcome: Outcome::GrantUpdated,
-                reason: Reason::None,
-                resource: action.validated_resource(),
-                epoch: 0,
-                value_revision: 0,
-                acl_revision,
-                admin_revision: 0,
-            },
+            reply: no_op_grant_reply(state, action.validated_resource(), acl_revision),
+            replayed: false,
         },
 
         // A reason-coded refusal that reached the log. Consumed, saved, and
@@ -844,7 +885,8 @@ fn apply_decided(
         | ActionDecision::Admin(admin::Decision::Refuse(reason))
         | ActionDecision::Membership(membership::Decision::Refuse(reason)) => ClientResult {
             disposition: Disposition::Consumed,
-            reply: rejection(action.validated_resource(), reason.get()),
+            reply: rejection(state, action.validated_resource(), reason.get()),
+            replayed: false,
         },
 
         // The forced-apply case (§10.1). Business state is untouched.
@@ -857,26 +899,66 @@ fn apply_decided(
         ActionDecision::Resource(Decision::RefuseShapeless(_))
         | ActionDecision::Grant(grant::Decision::RefuseShapeless(_)) => ClientResult {
             disposition: Disposition::Consumed,
-            reply: rejection(action.validated_resource(), Reason::None),
+            reply: rejection(state, action.validated_resource(), Reason::None),
+            replayed: false,
         },
     }
 }
 
-fn membership_reply(membership_revision: u64) -> ClientResult {
+fn admin_reply(admin_revision: u64) -> SavedReply {
+    SavedReply {
+        outcome: Outcome::AdminUpdated,
+        reason: Reason::None,
+        snapshot: None,
+        acl_revision: 0,
+        admin_revision,
+        operation_id: None,
+        membership_log_id: None,
+    }
+}
+
+/// A `set_grant` no-op still reports the resource's state, so a replay is exact.
+fn no_op_grant_reply(
+    state: &State,
+    resource: Option<ResourceKey>,
+    acl_revision: u64,
+) -> SavedReply {
+    let snapshot = resource.and_then(|key| {
+        state
+            .resources
+            .get(&key)
+            .map(|row| SavedSnapshot::of(key.clone(), row))
+    });
+    SavedReply {
+        outcome: Outcome::GrantUpdated,
+        reason: Reason::None,
+        snapshot,
+        acl_revision,
+        admin_revision: 0,
+        operation_id: None,
+        membership_log_id: None,
+    }
+}
+
+/// A membership reply carries the operation id and the membership log id --
+/// both of which §5.2.1 gives dedicated fields, and both of which an earlier
+/// revision discarded into an unrelated `admin_revision` slot.
+fn membership_reply(
+    outcome: Outcome,
+    operation_id: OperationId,
+    membership_log_id: Option<LogId>,
+) -> ClientResult {
     ClientResult {
+        replayed: false,
         disposition: Disposition::Consumed,
         reply: SavedReply {
-            outcome: Outcome::MembershipAccepted,
+            outcome,
             reason: Reason::None,
-            resource: None,
-            epoch: 0,
-            value_revision: 0,
+            snapshot: None,
             acl_revision: 0,
-            // A membership command reports the membership revision through the
-            // admin-revision slot's sibling; §5.2.1 gives the client reply a
-            // dedicated `membership_log_id`, which Slice 3 fills once the
-            // controller observes it.
-            admin_revision: membership_revision,
+            admin_revision: 0,
+            operation_id: Some(operation_id),
+            membership_log_id,
         },
     }
 }
@@ -893,23 +975,23 @@ fn charge_resource_row(state: &mut State, key: &ResourceKey, new_value_len: usiz
     state.growth_bytes = state.growth_bytes + new - old;
 }
 
-fn consumed_success(
-    outcome: Outcome,
-    key: ResourceKey,
-    epoch: u64,
-    value_revision: u64,
-    acl_revision: u64,
-) -> ClientResult {
+/// A successful client result, snapshotting the row **as written**.
+///
+/// The snapshot is taken from the effect's row rather than from state at
+/// projection time, so a replay after a later mutation still reports what this
+/// command produced.
+fn consumed_success(outcome: Outcome, key: ResourceKey, row: &ResourceRow) -> ClientResult {
     ClientResult {
+        replayed: false,
         disposition: Disposition::Consumed,
         reply: SavedReply {
             outcome,
             reason: Reason::None,
-            resource: Some(key),
-            epoch,
-            value_revision,
-            acl_revision,
+            snapshot: Some(SavedSnapshot::of(key, row)),
+            acl_revision: row.acl_revision,
             admin_revision: 0,
+            operation_id: None,
+            membership_log_id: None,
         },
     }
 }
@@ -933,7 +1015,7 @@ fn session_charge(session: &Session) -> u64 {
         session
             .last_result
             .as_ref()
-            .and_then(|r| r.resource.as_ref())
+            .and_then(|r| r.resource())
             .map(key_parts),
     )
 }
@@ -950,7 +1032,7 @@ fn write_audit(
     reply: &SavedReply,
     action: &Action,
 ) {
-    let resource = reply.resource.clone();
+    let resource = reply.resource().cloned();
     let row = AuditRow {
         // Stored even though term and index are the table key: together they
         // reconstruct this entry's full log id once the log has been purged.
@@ -958,26 +1040,50 @@ fn write_audit(
         actor: client.actor,
         operation_code: action.operation_code(),
         resource: resource.clone(),
-        result: reply.outcome,
+        result: AuditResult::Client(reply.outcome),
         // Copied from the saved reply rather than re-read from state, so the
         // audit row and the client's answer cannot disagree about what the
         // entry produced.
-        epoch: reply.epoch,
-        value_revision: reply.value_revision,
+        epoch: reply.snapshot.as_ref().map_or(0, |s| s.epoch),
+        value_revision: reply.snapshot.as_ref().map_or(0, |s| s.value_revision),
     };
     write_audit_row(state, log_id, row);
 }
 
-/// Insert a prebuilt audit row and advance the tip.
+/// Insert a prebuilt audit row, advance the tip, and prune to the retention
+/// limit.
 fn write_audit_row(state: &mut State, log_id: LogId, row: AuditRow) {
     state.reserve_bytes += limits::charge_audit(row.resource.as_ref().map(key_parts));
     state.audit.insert((log_id.term, log_id.index), row);
     state.audit_tip = Some(log_id);
+    prune_audit(state);
+}
+
+/// Prune the oldest audit rows down to §12.1's retention limit.
+///
+/// Without this the audit table grows without bound and the 128 MiB reserve
+/// proof -- which is `100,000 x 832` audit bytes plus `16,384 x 832` session
+/// bytes -- is not a bound on anything. Pruning is deterministic: the table is
+/// keyed `(term, index)`, so every voter drops the same rows in the same order.
+///
+/// `audit_floor` advances with it, so `audit_stream` can answer `OUT_OF_RANGE`
+/// with the floor rather than silently returning a partial range (§5.2).
+fn prune_audit(state: &mut State) {
+    while state.audit.len() as u64 > limits::MAX_AUDIT_ROWS {
+        let Some((&key, row)) = state.audit.iter().next() else {
+            break;
+        };
+        let charge = limits::charge_audit(row.resource.as_ref().map(key_parts));
+        state.audit.remove(&key);
+        state.reserve_bytes -= charge;
+        state.audit_floor = key.1 + 1;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::model::admin::AdminAction;
     use crate::coordination::model::grant::GrantAction;
     use crate::coordination::model::limits::{ALL_RIGHTS, MAX_VALUE, RIGHT_ACQUIRE};
     use crate::coordination::model::resource::{Fence, RawResourceKey};
@@ -1069,6 +1175,24 @@ mod tests {
         action: &Action,
     ) -> ClientResult {
         apply_client_command(state, log_id, client, action).expect("no fault")
+    }
+
+    /// Assert a replay reproduced the original answer exactly.
+    ///
+    /// Compares the saved reply and the disposition -- everything the client
+    /// sees. The `replayed` flag is deliberately excluded: it is *supposed* to
+    /// differ, since it is what tells projection to redact the value.
+    fn assert_replays(first: &ClientResult, again: &ClientResult) {
+        assert_eq!(
+            again.reply, first.reply,
+            "the saved reply must be identical"
+        );
+        assert_eq!(again.disposition, first.disposition);
+        assert!(
+            again.replayed,
+            "the second answer came from the session table"
+        );
+        assert!(!first.replayed, "the first did not");
     }
 
     /// Assert that a faulting delivery changed **nothing**, over every table
@@ -1224,12 +1348,13 @@ mod tests {
 
         assert!(result.is_forced_shape_rejection());
         assert_eq!(
-            result.reply.resource, None,
+            result.reply.resource(),
+            None,
             "a shapeless identity has no place in a saved reply"
         );
 
         let session = s.sessions.get(&(ACTOR, CLIENT)).expect("session row");
-        assert_eq!(session.last_result.as_ref().unwrap().resource, None);
+        assert_eq!(session.last_result.as_ref().unwrap().resource(), None);
 
         let audit = s.audit.values().next().expect("audit row");
         assert_eq!(audit.resource, None, "nor in an audit row");
@@ -1249,7 +1374,7 @@ mod tests {
 
         assert!(result.is_forced_shape_rejection());
         assert_eq!(
-            result.reply.resource,
+            result.reply.resource().cloned(),
             Some(key()),
             "the identity was valid; only the value was not"
         );
@@ -1264,7 +1389,7 @@ mod tests {
         // any decision runs.
         let result = apply_ok(&mut s, log(1, 4), &client(5), &malformed_identity());
         assert_eq!(result.reply.reason, Reason::SequenceGap);
-        assert_eq!(result.reply.resource, None);
+        assert_eq!(result.reply.resource(), None);
         assert_eq!(s.audit.values().next().unwrap().resource, None);
     }
 
@@ -1278,7 +1403,7 @@ mod tests {
         let audit_before = s.audit.len();
 
         match preflight(&s, &client(1), &oversized_value()) {
-            Admission::Resolved(replayed) => assert_eq!(*replayed, first),
+            Admission::Resolved(replayed) => assert_replays(&first, &replayed),
             other => panic!("a consumed sequence must resolve, got {other:?}"),
         }
         assert_eq!(s.audit.len(), audit_before, "preflight commits nothing");
@@ -1300,7 +1425,7 @@ mod tests {
 
         let second = apply_ok(&mut s, log(1, 8), &client(1), &acquire());
 
-        assert_eq!(second, first, "the saved result is returned verbatim");
+        assert_replays(&first, &second);
         assert_eq!(
             s.resources.get(&key()).cloned(),
             row_after_first,
@@ -1450,10 +1575,20 @@ mod tests {
         );
 
         let row = s.audit.get(&(1, 5)).expect("audit row");
-        assert_eq!(row.epoch, result.reply.epoch);
-        assert_eq!(row.value_revision, result.reply.value_revision);
+        assert_eq!(
+            row.epoch,
+            result.reply.snapshot.as_ref().map_or(0, |s| s.epoch)
+        );
+        assert_eq!(
+            row.value_revision,
+            result
+                .reply
+                .snapshot
+                .as_ref()
+                .map_or(0, |s| s.value_revision)
+        );
         assert_eq!(row.value_revision, 1, "the mutation advanced it");
-        assert_eq!(row.result, result.reply.outcome);
+        assert_eq!(row.result, AuditResult::Client(result.reply.outcome));
     }
 
     /// The case audit-equality could never catch: two **different**
@@ -1584,12 +1719,12 @@ mod tests {
         let first = apply_ok(&mut s, log(1, 7), &client(1), &oversized_value());
 
         match preflight(&s, &client(1), &oversized_value()) {
-            Admission::Resolved(replayed) => assert_eq!(*replayed, first),
+            Admission::Resolved(replayed) => assert_replays(&first, &replayed),
             other => panic!("a consumed sequence must resolve, got {other:?}"),
         }
 
         let second = apply_ok(&mut s, log(1, 8), &client(1), &oversized_value());
-        assert_eq!(second, first, "byte-identical, and never an RpcStatus");
+        assert_replays(&first, &second);
     }
 
     // ── (100, 0) uniqueness ─────────────────────────────────────────────────
@@ -1729,7 +1864,7 @@ mod tests {
         s.acl.remove(&(key(), ACTOR));
 
         match preflight(&s, &client(1), &acquire()) {
-            Admission::Resolved(replayed) => assert_eq!(*replayed, first),
+            Admission::Resolved(replayed) => assert_replays(&first, &replayed),
             other => panic!("the committed result must still be reachable, got {other:?}"),
         }
     }
@@ -1743,7 +1878,7 @@ mod tests {
 
         assert_eq!(result.disposition, Disposition::Consumed);
         assert_eq!(result.reply.outcome, Outcome::Granted);
-        assert_eq!(result.reply.epoch, 1);
+        assert_eq!(result.reply.snapshot.as_ref().map_or(0, |s| s.epoch), 1);
 
         let row = s.resources.get(&key()).expect("the row was created");
         assert!(row.held);
@@ -1886,7 +2021,7 @@ mod tests {
         .expect("no fault");
 
         let replayed = apply_ok(&mut s, log(1, 3), &client(1), &acquire());
-        assert_eq!(replayed, first, "the saved result survives retirement");
+        assert_replays(&first, &replayed);
     }
 
     /// An `Expire` is a committed entry with no client and no sequence: it
@@ -1924,6 +2059,56 @@ mod tests {
         assert_eq!(after.epoch, row.epoch + 1);
         assert_eq!(s.audit.len(), 2);
         assert!(s.counters_match_recomputation());
+    }
+
+    /// The audit operation codes, pinned against §5.2's literal declaration
+    /// rather than against the constants themselves.
+    ///
+    /// The history coverage test walks `OPERATION_*`, which moves with any
+    /// change to them -- a self-referential oracle. These are the numbers the
+    /// contract fixes: "audit operation codes 1-11 are the mutation method
+    /// codes", `100` system `Expire`, `101` `MembershipProgress`.
+    #[test]
+    fn the_audit_operation_codes_match_the_spec_literals() {
+        assert_eq!(OPERATION_EXPIRE, 100);
+        assert_eq!(OPERATION_MEMBERSHIP_PROGRESS, 101);
+        assert_eq!(
+            OPERATION_RETIRE_CLIENT, 10,
+            "the method table assigns 1-9 and 11, so 10 is what the contract \
+             retains for the one mutation deliberately absent from it"
+        );
+        assert!(
+            (1..=11).contains(&OPERATION_RETIRE_CLIENT),
+            "codes outside 1-11 are not mutation method codes at all"
+        );
+    }
+
+    /// And it collides with none of the ten declared methods.
+    #[test]
+    fn the_retire_code_collides_with_no_declared_method() {
+        // §5.2's method table.
+        let methods = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11];
+        assert!(
+            !methods.contains(&OPERATION_RETIRE_CLIENT),
+            "retire_client must not reuse a method's code"
+        );
+
+        // Every action's operation code is one of those methods.
+        let mut seen: Vec<i32> = Vec::new();
+        for action in [
+            acquire(),
+            grant(ALL_RIGHTS, 0),
+            Action::Admin(AdminAction {
+                target: ACTOR,
+                enabled: true,
+                expected_admin_revision: 1,
+            }),
+        ] {
+            seen.push(action.operation_code());
+        }
+        for code in seen {
+            assert!(methods.contains(&code), "{code} is not a declared method");
+        }
     }
 
     // ── set_grant through the full apply path ───────────────────────────────
@@ -1994,7 +2179,7 @@ mod tests {
         );
         // But the sequence is consumed and replays.
         let replayed = apply_ok(&mut s, log(1, 3), &client(2), &grant(ALL_RIGHTS, 1));
-        assert_eq!(replayed, result);
+        assert_replays(&result, &replayed);
     }
 
     /// The §8.3 fence lands through the full apply path, not merely in the

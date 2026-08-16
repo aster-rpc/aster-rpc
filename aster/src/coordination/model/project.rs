@@ -26,17 +26,22 @@
 //! `Some([])` and `None` encode differently in Fory, which is what makes rows 2
 //! and 3 distinguishable on the wire rather than collapsing into one.
 
-use crate::coordination::contract::{ClientReplyV1, ResourceKeyV1, ResourceSnapshotV1};
-use crate::coordination::reason::Disposition;
+use crate::coordination::contract::{
+    ClientReplyV1, ResourceKeyV1, ResourceSnapshotV1, RetirementReplyV1, SystemReplyV1,
+};
+use crate::coordination::reason::{Disposition, Outcome, Reason};
 
-use super::state::{ResourceRow, SavedReply, State};
+use super::state::{LogId, SavedReply};
 
 /// Whether this reply is a first attempt or an answer replayed from the session
 /// table.
+///
+/// The distinction reaches the wire in exactly one field, `value_redacted`.
+/// Everything else is identical, because everything else comes from the saved
+/// snapshot either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provenance {
-    /// The command applied now: the live row is available, so the value is
-    /// returned.
+    /// The command applied now, so the value it wrote is available.
     FirstAttempt,
     /// Answered from a saved result: the value was never stored, so it is
     /// reported as redacted rather than as absent.
@@ -45,36 +50,40 @@ pub enum Provenance {
 
 /// Project a model reply onto the public `ClientReplyV1`.
 ///
-/// `state` supplies the live resource row for a first attempt. On a replay it
-/// is not consulted for the value at all -- reading the *current* value and
-/// returning it as though it were the one the command produced would be worse
-/// than redacting, because the client could not tell the two apart.
+/// **Reads no business state.** Every field but the value comes from the saved
+/// snapshot, which was taken when the command applied. An earlier revision
+/// rebuilt `holder`, `held`, `ttl_ms` and `lease_revision` from *current* state,
+/// so a replay after a later mutation returned the saved revisions stapled to a
+/// different holder -- a reply that never existed at any point in the log, and
+/// one a client would act on as though it had.
+///
+/// `value` is the only argument the caller supplies, and only a first attempt
+/// has one to give.
 pub fn client_reply(
-    state: &State,
     group_id: &[u8],
     reply: &SavedReply,
     disposition: Disposition,
     provenance: Provenance,
+    value: Option<&[u8]>,
 ) -> ClientReplyV1 {
-    let snapshot = reply.resource.as_ref().map(|key| {
-        let live = state.resources.get(key);
+    let snapshot = reply.snapshot.as_ref().map(|saved| {
         let (value, value_redacted) = match provenance {
-            Provenance::FirstAttempt => (live.map(|row| row.value.clone()), false),
+            Provenance::FirstAttempt => (value.map(<[u8]>::to_vec), false),
             Provenance::Replay => (None, true),
         };
         ResourceSnapshotV1 {
             group_id: group_id.to_vec(),
             resource: ResourceKeyV1 {
-                namespace: key.namespace().to_string(),
-                key: key.key().to_vec(),
+                namespace: saved.resource.namespace().to_string(),
+                key: saved.resource.key().to_vec(),
             },
-            epoch: reply.epoch,
-            holder: live.and_then(|row| row.holder.map(|h| h.to_vec())),
-            held: live.is_some_and(|row| row.held),
-            ttl_ms: live.map_or(0, |row| row.ttl_ms),
-            lease_revision: live.map_or(0, |row| row.lease_revision),
-            value_revision: reply.value_revision,
-            acl_revision: reply.acl_revision,
+            epoch: saved.epoch,
+            holder: saved.holder.map(|h| h.to_vec()),
+            held: saved.held,
+            ttl_ms: saved.ttl_ms,
+            lease_revision: saved.lease_revision,
+            value_revision: saved.value_revision,
+            acl_revision: saved.acl_revision,
             value,
             value_redacted,
         }
@@ -90,131 +99,169 @@ pub fn client_reply(
         snapshot,
         acl_revision: reply.acl_revision,
         admin_revision: reply.admin_revision,
-        operation_id: None,
-        membership_log_id: None,
+        operation_id: reply.operation_id.map(|id| id.to_vec()),
+        membership_log_id: reply.membership_log_id.as_ref().map(Into::into),
     }
 }
 
-/// The live row for a resource, if any -- exposed so a caller can tell "the
-/// resource has no value" from "the value is redacted" without reaching into
-/// `State`.
-pub fn live_row<'a>(state: &'a State, reply: &SavedReply) -> Option<&'a ResourceRow> {
-    reply.resource.as_ref().and_then(|k| state.resources.get(k))
+/// Project a system command's result (§5.3).
+pub fn system_reply(
+    system_result_code: i32,
+    lease_revision: u64,
+    membership_log_id: Option<&LogId>,
+) -> SystemReplyV1 {
+    SystemReplyV1 {
+        system_result_code,
+        lease_revision,
+        membership_log_id: membership_log_id.map(Into::into),
+    }
 }
 
+/// Project a retirement result (§5.3). No disposition: a sessionless command
+/// consumes no sequence.
+pub fn retirement_reply(outcome: Outcome, reason: Reason) -> RetirementReplyV1 {
+    RetirementReplyV1 {
+        outcome_code: outcome.code(),
+        reason_code: reason.code(),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordination::model::state::ResourceKey;
-    use crate::coordination::reason::{Outcome, Reason};
+    use crate::coordination::model::state::{ResourceKey, ResourceRow, SavedSnapshot};
 
     const GROUP: [u8; 16] = [0xAB; 16];
+    const HOLDER: [u8; 32] = [1u8; 32];
 
     fn key() -> ResourceKey {
         ResourceKey::new("ns", b"k".to_vec()).expect("valid")
     }
 
-    fn state_with_value(value: &[u8]) -> State {
-        let mut s = State::default();
-        s.resources.insert(
-            key(),
-            ResourceRow {
-                epoch: 4,
-                held: true,
-                holder: Some([1u8; 32]),
-                ttl_ms: 30_000,
-                lease_revision: 2,
-                value_revision: 3,
-                value: value.to_vec(),
-                acl_revision: 1,
-            },
-        );
-        s.growth_bytes = s.recompute_growth();
-        s
+    fn row() -> ResourceRow {
+        ResourceRow {
+            epoch: 4,
+            held: true,
+            holder: Some(HOLDER),
+            ttl_ms: 30_000,
+            lease_revision: 2,
+            value_revision: 3,
+            value: b"payload".to_vec(),
+            acl_revision: 1,
+        }
     }
 
     fn reply() -> SavedReply {
         SavedReply {
             outcome: Outcome::Mutated,
             reason: Reason::None,
-            resource: Some(key()),
-            epoch: 4,
-            value_revision: 3,
+            snapshot: Some(SavedSnapshot::of(key(), &row())),
             acl_revision: 1,
             admin_revision: 0,
+            operation_id: None,
+            membership_log_id: None,
         }
     }
 
     /// Row 1: a first attempt returns the value, unredacted.
     #[test]
     fn a_first_attempt_returns_the_value() {
-        let s = state_with_value(b"payload");
         let out = client_reply(
-            &s,
             &GROUP,
             &reply(),
             Disposition::Consumed,
             Provenance::FirstAttempt,
+            Some(b"payload"),
         );
         let snap = out.snapshot.expect("a snapshot");
         assert_eq!(snap.value, Some(b"payload".to_vec()));
         assert!(!snap.value_redacted);
     }
 
-    /// Row 2: an empty value is `Some([])`, not `None` -- distinguishable from
-    /// a redacted one because Fory encodes the two differently.
+    /// Row 2: an empty value is `Some([])`, not `None` -- Fory encodes the two
+    /// differently, which is what keeps them distinguishable.
     #[test]
     fn an_empty_value_is_present_and_not_redacted() {
-        let s = state_with_value(b"");
         let out = client_reply(
-            &s,
             &GROUP,
             &reply(),
             Disposition::Consumed,
             Provenance::FirstAttempt,
+            Some(b""),
         );
         let snap = out.snapshot.expect("a snapshot");
         assert_eq!(snap.value, Some(Vec::new()));
         assert!(!snap.value_redacted);
     }
 
-    /// Row 3: a replay carries `value = None, value_redacted = true`. The bytes
-    /// were never saved, so there is nothing to return -- and returning the
-    /// *current* value instead would be worse, because the client could not
-    /// tell it from the one its command produced.
+    /// Row 3: a replay carries `value = None, value_redacted = true`.
     #[test]
-    fn a_replay_is_redacted_and_never_returns_the_live_value() {
-        let s = state_with_value(b"a-different-value-since");
+    fn a_replay_is_redacted() {
         let out = client_reply(
-            &s,
             &GROUP,
             &reply(),
             Disposition::Consumed,
             Provenance::Replay,
+            Some(b"whatever the caller passes"),
         );
         let snap = out.snapshot.expect("a snapshot");
-        assert_eq!(snap.value, None);
+        assert_eq!(snap.value, None, "a replay ignores any supplied value");
         assert!(snap.value_redacted);
     }
 
-    /// A replay preserves the outcome and the revisions -- everything except
-    /// the value. That is what lets a client resync after losing a response.
+    /// **The exact-replay property.** Every field but the value comes from the
+    /// saved snapshot, so a replay after arbitrary later mutations is identical
+    /// to the first answer. An earlier revision rebuilt holder, held, TTL and
+    /// lease revision from current state, so a replay returned the saved
+    /// revisions stapled to a different holder -- a reply that never existed at
+    /// any point in the log.
     #[test]
-    fn a_replay_preserves_the_outcome_and_revisions() {
-        let s = state_with_value(b"x");
+    fn a_replay_is_unaffected_by_later_mutations() {
+        let saved = reply();
+
+        // Whatever happens afterwards -- a new holder, a longer TTL, a bumped
+        // lease revision -- projection has no access to it.
         let first = client_reply(
-            &s,
             &GROUP,
-            &reply(),
-            Disposition::Consumed,
-            Provenance::FirstAttempt,
-        );
-        let replayed = client_reply(
-            &s,
-            &GROUP,
-            &reply(),
+            &saved,
             Disposition::Consumed,
             Provenance::Replay,
+            None,
+        );
+        let later = client_reply(
+            &GROUP,
+            &saved,
+            Disposition::Consumed,
+            Provenance::Replay,
+            None,
+        );
+        assert_eq!(first, later);
+
+        let snap = first.snapshot.expect("a snapshot");
+        assert_eq!(snap.holder, Some(HOLDER.to_vec()));
+        assert!(snap.held);
+        assert_eq!(snap.ttl_ms, 30_000);
+        assert_eq!(snap.lease_revision, 2);
+        assert_eq!(snap.epoch, 4);
+        assert_eq!(snap.value_revision, 3);
+    }
+
+    /// A first attempt and its replay differ in exactly one field.
+    #[test]
+    fn a_replay_differs_from_the_first_attempt_only_in_the_value() {
+        let saved = reply();
+        let first = client_reply(
+            &GROUP,
+            &saved,
+            Disposition::Consumed,
+            Provenance::FirstAttempt,
+            Some(b"payload"),
+        );
+        let replayed = client_reply(
+            &GROUP,
+            &saved,
+            Disposition::Consumed,
+            Provenance::Replay,
+            None,
         );
 
         assert_eq!(replayed.outcome_code, first.outcome_code);
@@ -224,32 +271,61 @@ mod tests {
             first.snapshot.expect("first"),
             replayed.snapshot.expect("replay"),
         );
-        assert_eq!(b.epoch, a.epoch);
-        assert_eq!(b.value_revision, a.value_revision);
-        assert_eq!(b.acl_revision, a.acl_revision);
-        // And only the value differs.
-        assert_ne!(b.value, a.value);
-        assert_ne!(b.value_redacted, a.value_redacted);
+        assert_eq!(
+            ResourceSnapshotV1 {
+                value: None,
+                value_redacted: true,
+                ..a.clone()
+            },
+            b,
+            "only the value and its flag may differ"
+        );
     }
 
-    /// Row 4: a reply naming no resource -- a `set_admin`, a membership
-    /// command, or a shapeless rejection -- has no snapshot, and
-    /// `value_redacted` does not apply.
+    /// Row 4: a reply naming no resource -- `set_admin`, a membership command --
+    /// has no snapshot.
     #[test]
     fn a_reply_with_no_resource_has_no_snapshot() {
-        let s = State::default();
         let mut r = reply();
-        r.resource = None;
-        let out = client_reply(&s, &GROUP, &r, Disposition::Consumed, Provenance::Replay);
+        r.snapshot = None;
+        let out = client_reply(&GROUP, &r, Disposition::Consumed, Provenance::Replay, None);
         assert!(out.snapshot.is_none());
     }
 
-    /// The disposition codes are §5.2's: `1 Consumed`, `2 NotConsumed`.
+    /// A membership reply carries its operation id and membership log id, both
+    /// of which §5.2.1 gives dedicated fields.
+    #[test]
+    fn a_membership_reply_carries_its_operation_and_log_ids() {
+        let mut r = reply();
+        r.snapshot = None;
+        r.outcome = Outcome::MembershipCancelled;
+        r.operation_id = Some([7u8; 16]);
+        r.membership_log_id = Some(LogId::new(2, [9u8; 32], 11));
+
+        let out = client_reply(
+            &GROUP,
+            &r,
+            Disposition::Consumed,
+            Provenance::FirstAttempt,
+            None,
+        );
+        assert_eq!(out.operation_id, Some(vec![7u8; 16]));
+        let id = out.membership_log_id.expect("a membership log id");
+        assert_eq!((id.term, id.index), (2, 11));
+        assert_eq!(id.leader_node_id, vec![9u8; 32]);
+        assert_eq!(out.outcome_code, Outcome::MembershipCancelled.code());
+    }
+
     #[test]
     fn the_disposition_codes_match_the_spec() {
-        let s = state_with_value(b"x");
         for (disposition, code) in [(Disposition::Consumed, 1), (Disposition::NotConsumed, 2)] {
-            let out = client_reply(&s, &GROUP, &reply(), disposition, Provenance::FirstAttempt);
+            let out = client_reply(
+                &GROUP,
+                &reply(),
+                disposition,
+                Provenance::FirstAttempt,
+                None,
+            );
             assert_eq!(out.disposition_code, code);
         }
     }
@@ -257,29 +333,46 @@ mod tests {
     /// An unheld resource reports no holder rather than a zero-byte sentinel.
     #[test]
     fn an_unheld_resource_reports_no_holder() {
-        let mut s = state_with_value(b"x");
-        let row = s.resources.get_mut(&key()).unwrap();
-        row.held = false;
-        row.holder = None;
+        let mut free = row();
+        free.held = false;
+        free.holder = None;
+        let mut r = reply();
+        r.snapshot = Some(SavedSnapshot::of(key(), &free));
 
         let out = client_reply(
-            &s,
             &GROUP,
-            &reply(),
+            &r,
             Disposition::Consumed,
             Provenance::FirstAttempt,
+            None,
         );
         let snap = out.snapshot.expect("a snapshot");
         assert_eq!(snap.holder, None);
         assert!(!snap.held);
     }
 
+    /// A system reply carries the phase code, not a client outcome.
     #[test]
-    fn live_row_resolves_only_a_named_resource() {
-        let s = state_with_value(b"x");
-        assert!(live_row(&s, &reply()).is_some());
-        let mut r = reply();
-        r.resource = None;
-        assert!(live_row(&s, &r).is_none());
+    fn a_system_reply_carries_its_phase_code() {
+        let out = system_reply(
+            crate::coordination::contract::SYS_EXPIRED,
+            7,
+            Some(&LogId::new(1, [3u8; 32], 4)),
+        );
+        assert_eq!(
+            out.system_result_code,
+            crate::coordination::contract::SYS_EXPIRED
+        );
+        assert_eq!(out.lease_revision, 7);
+        assert!(out.membership_log_id.is_some());
+    }
+
+    /// A retirement reply has an outcome and a reason, and no disposition --
+    /// a sessionless command consumes no sequence.
+    #[test]
+    fn a_retirement_reply_has_no_disposition() {
+        let out = retirement_reply(Outcome::ClientRetired, Reason::None);
+        assert_eq!(out.outcome_code, Outcome::ClientRetired.code());
+        assert_eq!(out.reason_code, 0);
     }
 }

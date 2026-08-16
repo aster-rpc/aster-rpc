@@ -159,7 +159,7 @@ mod tests {
     use crate::coordination::model::limits::{
         MAX_ACTIVE_CLIENTS_PER_ACTOR, MAX_RETAINED_SESSIONS_PER_GROUP,
     };
-    use crate::coordination::model::state::{ResourceKey, SavedReply};
+    use crate::coordination::model::state::{ResourceKey, SavedReply, SavedSnapshot};
     use crate::coordination::reason::Reason;
 
     const ACTOR: NodeId = [1u8; 32];
@@ -171,11 +171,20 @@ mod tests {
         SavedReply {
             outcome: Outcome::Granted,
             reason: Reason::None,
-            resource: Some(ResourceKey::new("ns", b"k".to_vec()).expect("valid")),
-            epoch: 3,
-            value_revision: 1,
+            snapshot: Some(SavedSnapshot {
+                resource: ResourceKey::new("ns", b"k".to_vec()).expect("valid"),
+                epoch: 3,
+                holder: Some([1u8; 32]),
+                held: true,
+                ttl_ms: 30_000,
+                lease_revision: 1,
+                value_revision: 1,
+                acl_revision: 2,
+            }),
             acl_revision: 2,
             admin_revision: 0,
+            operation_id: None,
+            membership_log_id: None,
         }
     }
 

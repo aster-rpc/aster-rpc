@@ -40,12 +40,12 @@ use super::expire::ExpireCommand;
 use super::grant::GrantAction;
 use super::limits::{ALL_RIGHTS, RIGHT_ACQUIRE, RIGHT_MUTATE, RIGHT_READ, RIGHT_RELEASE};
 use super::membership::{
-    CancelMembershipAction, ChangeMembershipAction, MembershipProgressCommand, PHASE_COMPLETED,
-    PHASE_PENDING,
+    CancelMembershipAction, ChangeMembershipAction, MembershipProgressCommand,
+    PHASE_ADDING_LEARNERS, PHASE_CHANGING_VOTERS, PHASE_COMPLETED, PHASE_PENDING,
 };
 use super::resource::{Fence, RawResourceKey, ResourceAction};
 use super::retire::RetireCommand;
-use super::state::{LogId, NodeId, ResourceKey, State};
+use super::state::{AuditResult, LogId, MemberSeed, MembershipPlan, NodeId, ResourceKey, State};
 
 const ADMIN: NodeId = [1u8; 32];
 const ALICE: NodeId = [2u8; 32];
@@ -164,13 +164,26 @@ fn step(state: &State, n: u64) -> Step {
         }),
         8 => Action::ChangeMembership(ChangeMembershipAction {
             operation_id: [(n % 7) as u8; 16],
-            expected_membership_revision: state.membership_revision,
-            plan_hash: [(n % 5) as u8; 32],
-            encoded_plan_len: 400 + (n % 100) as usize,
+            expected_membership_log_id: state.membership_log_id,
+            plan: MembershipPlan {
+                desired_voters: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
+                retained_learners: Vec::new(),
+                member_seeds: vec![MemberSeed {
+                    node_id: [(n % 9) as u8; 32],
+                    ticket: vec![n as u8; 16],
+                    join_permit: None,
+                }],
+            },
         }),
         9 => Action::CancelMembership(CancelMembershipAction {
             operation_id: [(n % 7) as u8; 16],
-            expected_phase: PHASE_PENDING,
+            // Cycles through the phases an intent can be in, so both the
+            // immediate-cancel and the refuse-mid-flight paths are reached.
+            expected_phase_code: match n % 3 {
+                0 => PHASE_PENDING,
+                1 => PHASE_ADDING_LEARNERS,
+                _ => PHASE_CHANGING_VOTERS,
+            },
         }),
         10 => {
             return Step {
@@ -187,8 +200,9 @@ fn step(state: &State, n: u64) -> Step {
                 command: Command::MembershipProgress(MembershipProgressCommand {
                     operation_id: [(n % 7) as u8; 16],
                     expected_phase: PHASE_PENDING,
-                    new_phase: PHASE_COMPLETED,
-                    observed_membership_log_id: None,
+                    new_phase: PHASE_ADDING_LEARNERS,
+                    observed_membership_log_id: Some(LogId::new(1, LEADER, n + 1)),
+                    result_code: crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED,
                 }),
                 sequencer: None,
             }
@@ -288,8 +302,8 @@ fn render(reply: &CommandReply) -> String {
             r.disposition,
             r.reply.outcome,
             r.reply.reason,
-            r.reply.epoch,
-            r.reply.value_revision,
+            r.reply.snapshot.as_ref().map_or(0, |s| s.epoch),
+            r.reply.snapshot.as_ref().map_or(0, |s| s.value_revision),
             r.reply.acl_revision,
             r.reply.admin_revision
         ),
@@ -363,14 +377,20 @@ fn the_generated_history_reaches_every_command_shape_and_both_dispositions() {
     }
 
     // Both dispositions, and both successes and refusals.
-    let outcomes: Vec<Outcome> = state.audit.values().map(|r| r.result).collect();
+    let outcomes: Vec<AuditResult> = state.audit.values().map(|r| r.result).collect();
     assert!(
-        outcomes.iter().any(|o| *o != Outcome::Rejected),
-        "no command ever succeeded"
+        outcomes
+            .iter()
+            .any(|o| matches!(o, AuditResult::Client(c) if *c != Outcome::Rejected)),
+        "no client command ever succeeded"
     );
     assert!(
-        outcomes.contains(&Outcome::Rejected),
-        "no command was ever rejected"
+        outcomes.contains(&AuditResult::Client(Outcome::Rejected)),
+        "no client command was ever rejected"
+    );
+    assert!(
+        outcomes.iter().any(|o| matches!(o, AuditResult::System(_))),
+        "no system command was ever audited"
     );
 }
 
@@ -443,7 +463,12 @@ fn every_consumed_sequence_replays_identically() {
                 .expect("no fault");
                 match again {
                     CommandReply::Client(second) => {
-                        assert_eq!(second, *first, "a replay differed at step {n}")
+                        // The saved reply is what a replay must reproduce; the
+                        // `replayed` flag is expected to differ, since it is
+                        // what tells projection to redact the value.
+                        assert_eq!(second.reply, first.reply, "a replay differed at step {n}");
+                        assert_eq!(second.disposition, first.disposition);
+                        assert!(second.replayed && !first.replayed);
                     }
                     other => panic!("expected a client reply, got {other:?}"),
                 }
@@ -724,17 +749,22 @@ fn an_admin_race_is_resolved_by_revision() {
     assert!(!state.admins.contains(&BOB));
 }
 
-/// Every membership-intent transition the model defines is reachable, and the
-/// terminal-history cap never grows past 64.
+/// Every membership-intent transition the model defines is reachable, the
+/// terminal-history cap never grows past 64, and eviction is by completion.
 #[test]
 fn membership_intents_transition_and_stay_within_their_cap() {
     let mut state = genesis();
     let mut index = 0u64;
 
     for round in 0..80u8 {
-        index += 1;
+        // The client's next sequence: one per accepted change, since the
+        // interleaved progress reports are system commands and consume none.
+        let sequence = u64::from(round) + 1;
         let op = [round; 16];
-        let membership_revision = state.membership_revision;
+        let expected = state.membership_log_id;
+
+        // Accept.
+        index += 1;
         apply_command(
             &mut state,
             LogId::new(1, LEADER, index),
@@ -742,33 +772,42 @@ fn membership_intents_transition_and_stay_within_their_cap() {
                 client: ClientRef {
                     actor: ADMIN,
                     client_id: [1u8; 16],
-                    // Consecutive: only the client command consumes a
-                    // sequence, and `MembershipProgress` is a system command.
-                    sequence: u64::from(round) + 1,
+                    sequence,
                     request_hash: [round; 32],
                 },
                 action: Action::ChangeMembership(ChangeMembershipAction {
                     operation_id: op,
-                    expected_membership_revision: membership_revision,
-                    plan_hash: [round; 32],
-                    encoded_plan_len: 400,
+                    expected_membership_log_id: expected,
+                    plan: MembershipPlan {
+                        desired_voters: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
+                        retained_learners: Vec::new(),
+                        member_seeds: Vec::new(),
+                    },
                 }),
             },
         )
         .expect("no fault");
 
-        index += 1;
-        apply_command(
-            &mut state,
-            LogId::new(1, LEADER, index),
-            &Command::MembershipProgress(MembershipProgressCommand {
-                operation_id: op,
-                expected_phase: PHASE_PENDING,
-                new_phase: PHASE_COMPLETED,
-                observed_membership_log_id: None,
-            }),
-        )
-        .expect("no fault");
+        // Walk the legal phase chain to completion, one report per step.
+        for (from, to) in [
+            (PHASE_PENDING, PHASE_ADDING_LEARNERS),
+            (PHASE_ADDING_LEARNERS, PHASE_CHANGING_VOTERS),
+            (PHASE_CHANGING_VOTERS, PHASE_COMPLETED),
+        ] {
+            index += 1;
+            apply_command(
+                &mut state,
+                LogId::new(1, LEADER, index),
+                &Command::MembershipProgress(MembershipProgressCommand {
+                    operation_id: op,
+                    expected_phase: from,
+                    new_phase: to,
+                    observed_membership_log_id: Some(LogId::new(1, LEADER, index)),
+                    result_code: crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED,
+                }),
+            )
+            .expect("no fault");
+        }
 
         assert!(
             state.intents.len() as u64 <= super::limits::MAX_RETAINED_INTENTS,
@@ -781,6 +820,22 @@ fn membership_intents_transition_and_stay_within_their_cap() {
         state.intents.len() as u64,
         super::limits::MAX_RETAINED_INTENTS,
         "80 completed intents must leave exactly the retained 64"
+    );
+    // Every retained intent completed, and the oldest completions were the ones
+    // evicted -- so the survivors are the most recent 64.
+    let mut completions: Vec<u64> = state
+        .intents
+        .values()
+        .map(|i| i.completed_log_id.expect("terminal").index)
+        .collect();
+    completions.sort_unstable();
+    assert_eq!(
+        completions.len() as u64,
+        super::limits::MAX_RETAINED_INTENTS
+    );
+    assert!(
+        completions[0] > 4,
+        "the earliest completions must have been evicted"
     );
 }
 
