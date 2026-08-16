@@ -6,6 +6,7 @@
 
 pub mod contract;
 pub mod ids;
+pub mod reason;
 pub mod rowstream;
 pub mod service;
 
