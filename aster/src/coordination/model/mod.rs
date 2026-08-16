@@ -12,4 +12,5 @@
 
 pub mod classify;
 pub mod limits;
+pub mod resource;
 pub mod state;
