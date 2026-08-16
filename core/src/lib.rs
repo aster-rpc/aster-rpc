@@ -3872,7 +3872,10 @@ async fn release_both_references(
 
     let left = match tokio::time::timeout_at(deadline, leave).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(anyhow!("leave failed: {e}")),
+        // `context` rather than a formatted string: the original error keeps
+        // its `source()` chain, so a caller can still walk to the root cause
+        // instead of receiving a flattened top line.
+        Ok(Err(e)) => Err(e.context("leave failed")),
         Err(_) => Err(anyhow!("leave timed out")),
     };
     // Deliberately not short-circuited on `left`. A failed leave is precisely
@@ -3880,16 +3883,21 @@ async fn release_both_references(
     // leave the reference the whole operation exists to drop.
     let closed = match tokio::time::timeout_at(deadline, close).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(anyhow!("close failed: {e}")),
+        Ok(Err(e)) => Err(e.context("close failed")),
         Err(_) => Err(anyhow!("close timed out")),
     };
 
     match (left, closed) {
         (Ok(()), Ok(())) => Ok(()),
+        // One failure: returned as-is, so its `source()` chain survives intact.
         (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
-        // Both preserved: a cleanup failure is a different and worse fault than
-        // the one that preceded it, and diagnosing the result needs both.
-        (Err(l), Err(c)) => Err(anyhow!("{l}; and {c}")),
+        // Both: `anyhow::Error` carries one chain, and dropping either failure
+        // would hide a fault — a cleanup failure is a different and worse one
+        // than what preceded it. So the close failure keeps its structural
+        // chain and the leave failure is rendered with `{:#}`, which prints its
+        // full chain rather than only the top line. Both causes are readable;
+        // only one is walkable.
+        (Err(l), Err(c)) => Err(c.context(format!("after leave failed: {l:#}"))),
     }
 }
 
@@ -4156,6 +4164,10 @@ pub enum CoreLocalAccess {
 }
 
 /// The result of retiring local write authority.
+///
+/// `#[must_use]` because `Busy` is an `Ok` value: `retire(..).await?;` would
+/// otherwise discard a fail-closed outcome and read as success.
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreRetireOutcome {
     /// Retired; this is the access now **stored**, not the access requested.
@@ -4467,9 +4479,9 @@ impl CoreDoc {
     /// budgets would silently double it.
     ///
     /// Close is attempted even when `leave` fails, because a failed leave is
-    /// precisely when the handle most needs releasing; both errors are
-    /// preserved if both fail, since a cleanup failure is a different and worse
-    /// fault than the one that preceded it.
+    /// precisely when the handle most needs releasing. If both fail, both are
+    /// reported: the close failure keeps its structural `source()` chain and
+    /// the leave failure is rendered with its full chain into the message.
     pub async fn shutdown_for_role_swap(self, budget: Duration) -> Result<()> {
         release_both_references(budget, self.doc.leave(), self.doc.close()).await
     }
@@ -4678,12 +4690,90 @@ mod role_swap_shutdown_tests {
     )]
 
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::release_both_references;
 
     const BUDGET: Duration = Duration::from_millis(500);
+
+    /// Leave must **complete** before close is even polled.
+    ///
+    /// Load-bearing, not stylistic: close invalidates the handle, and a leave
+    /// issued against an already-closed handle is rejected. Reversing the order
+    /// would leave the live-sync reference held while reporting success, and
+    /// retirement would then report `Busy` with nothing left able to fix it.
+    ///
+    /// Recorded rather than timed: the close future's body cannot run until it
+    /// is polled, so the log order *is* the poll order.
+    #[tokio::test]
+    async fn leave_completes_before_close_is_polled() {
+        let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let leave_log = Arc::clone(&log);
+        let close_log = Arc::clone(&log);
+
+        release_both_references(
+            BUDGET,
+            async move {
+                leave_log.lock().unwrap().push("leave:start");
+                // Several yields: if close were polled concurrently or first,
+                // its entry would land inside this gap.
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                leave_log.lock().unwrap().push("leave:done");
+                Ok(())
+            },
+            async move {
+                close_log.lock().unwrap().push("close:polled");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["leave:start", "leave:done", "close:polled"],
+            "close must not be polled until leave has finished",
+        );
+    }
+
+    /// Nested causes survive on both paths.
+    #[tokio::test]
+    async fn error_chains_are_preserved() {
+        let root = || anyhow::anyhow!("socket closed").context("transport lost");
+
+        // Single failure: the chain is walkable through `source()`.
+        let err = release_both_references(BUDGET, async { Err(root()) }, async { Ok(()) })
+            .await
+            .expect_err("leave failed");
+        let chain: Vec<String> = err.chain().map(|c| c.to_string()).collect();
+        assert_eq!(
+            chain,
+            vec!["leave failed", "transport lost", "socket closed"],
+            "a formatted top line would have lost the causes",
+        );
+
+        // Both failed: close keeps its walkable chain, leave's is rendered in
+        // full into the message.
+        let err = release_both_references(BUDGET, async { Err(root()) }, async {
+            Err(anyhow::anyhow!("disk gone").context("store unavailable"))
+        })
+        .await
+        .expect_err("both failed");
+        let chain: Vec<String> = err.chain().map(|c| c.to_string()).collect();
+        assert!(
+            chain.iter().any(|c| c == "store unavailable")
+                && chain.iter().any(|c| c == "disk gone"),
+            "the close chain must stay walkable: {chain:?}",
+        );
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("transport lost") && text.contains("socket closed"),
+            "the leave chain must be readable in full, not just its top line: {text}",
+        );
+    }
 
     /// Close runs even when leave fails promptly, and both failures survive.
     ///
@@ -4711,9 +4801,11 @@ mod role_swap_shutdown_tests {
             closed.load(Ordering::SeqCst),
             "close must be attempted regardless of how leave went",
         );
+        // `{:#}` walks the chain; the bare form prints only the top context,
+        // which is the whole point of keeping the cause attached.
         assert!(
-            format!("{err}").contains("no route to peer"),
-            "the leave failure must survive: {err}",
+            format!("{err:#}").contains("no route to peer"),
+            "the leave failure must survive: {err:#}",
         );
     }
 
@@ -4728,7 +4820,7 @@ mod role_swap_shutdown_tests {
         .await
         .expect_err("two failures must be reported");
 
-        let text = format!("{err}");
+        let text = format!("{err:#}");
         assert!(text.contains("leave broke"), "{text}");
         assert!(
             text.contains("close broke"),
@@ -4742,7 +4834,13 @@ mod role_swap_shutdown_tests {
     /// Per-step budgets look bounded and are not: a slow leave gets the whole
     /// budget and the close then gets a fresh one, doubling what the caller
     /// allowed for a transition it is holding a lock across.
-    #[tokio::test]
+    ///
+    /// Paused time, so the assertion is exact rather than a threshold. With
+    /// real time and two steps that hang, a loaded machine could push a
+    /// correct implementation over any margin — and two immediate steps would
+    /// satisfy any margin regardless of how many budgets were used, which is
+    /// the failure a wall-clock version of this test actually had.
+    #[tokio::test(start_paused = true)]
     async fn the_deadline_is_shared_across_both_steps() {
         let budget = Duration::from_millis(300);
         let started = tokio::time::Instant::now();
@@ -4762,12 +4860,12 @@ mod role_swap_shutdown_tests {
         .expect_err("both steps hang, so both must time out");
         let elapsed = started.elapsed();
 
-        assert!(
-            elapsed < budget + Duration::from_millis(150),
-            "one budget covers both steps; per-step budgets would take about \
-             twice as long ({elapsed:?} against {budget:?})",
+        assert_eq!(
+            elapsed, budget,
+            "one budget covers both steps; a budget each would take exactly \
+             twice as long",
         );
-        let text = format!("{err}");
+        let text = format!("{err:#}");
         assert!(text.contains("leave timed out"), "{text}");
         assert!(text.contains("close timed out"), "{text}");
     }

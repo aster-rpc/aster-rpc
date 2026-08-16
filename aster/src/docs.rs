@@ -181,6 +181,10 @@ pub enum LocalAccess {
 }
 
 /// The result of retiring local write authority over a namespace.
+///
+/// `#[must_use]` because `Busy` is an `Ok` value: `retire(..).await?;` would
+/// otherwise discard a fail-closed outcome and read as success.
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetireOutcome {
     /// Retired; this is the access now **stored**, not the access requested.
@@ -522,8 +526,7 @@ impl Doc {
     /// double the transition budget a caller allowed for.
     ///
     /// Close is attempted even when leaving fails — a failed leave is exactly
-    /// when the handle most needs releasing — and both errors are preserved if
-    /// both fail.
+    /// when the handle most needs releasing. If both fail, both are reported.
     pub async fn shutdown_for_role_swap(self, budget: Duration) -> Result<()> {
         Ok(self.inner.shutdown_for_role_swap(budget).await?)
     }
