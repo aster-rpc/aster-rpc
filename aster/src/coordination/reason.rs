@@ -227,11 +227,14 @@ reasons! {
         AclSlotsExhausted = 23,
         /// §8.1: `set_admin` MUST NOT remove the final administrator.
         ///
-        /// **Terminal.** No v1 command can make the refusal succeed while that
-        /// administrator is the last one -- adding another administrator is
-        /// itself a `set_admin`, which the surviving administrator must issue,
-        /// so the *removal* as sent can never apply. A client retrying it would
-        /// loop.
+        /// **Retryable**, and an earlier revision of this file had it wrong.
+        /// The reasoning that made it terminal -- "adding an administrator is
+        /// itself a `set_admin`, so the removal can never apply" -- does not
+        /// hold: the last administrator can add a second one (on a different
+        /// client id, since a pre-proposal `NotConsumed` consumed no sequence
+        /// and the original request may not be altered), and the original
+        /// removal then succeeds unchanged. A v1 command therefore clears the
+        /// condition, which is exactly §10's test for retryable.
         ///
         /// Added to §5.2 for this condition rather than reusing a code:
         /// `12 PermissionChanged` is wrong (the actor does have permission; the
@@ -310,10 +313,7 @@ impl Reason {
             // a resource's ACL, epoch or lease revision.
             | Reason::CounterExhausted
             // v1 has no delete-resource command (§9.1).
-            | Reason::ResourceSlotsExhausted
-            // The removal as sent can never apply while that administrator is
-            // the last one (§8.1).
-            | Reason::LastAdministrator => true,
+            | Reason::ResourceSlotsExhausted => true,
 
             // The instructive near misses: each has a v1 command that clears it.
             // Retiring frees an active slot; grant removal frees an ACL row; a
@@ -321,7 +321,10 @@ impl Reason {
             // removal, or an admin removal frees growth bytes.
             Reason::ActiveClientCap
             | Reason::AclSlotsExhausted
-            | Reason::StateBudgetExhausted => false,
+            | Reason::StateBudgetExhausted
+            // Adding a second administrator clears it, and that is an ordinary
+            // v1 command.
+            | Reason::LastAdministrator => false,
 
             Reason::None
             | Reason::HeldByOther
@@ -450,7 +453,7 @@ mod tests {
     const ADMISSION_DENIAL_CODES: [i32; 5] = [15, 19, 22, 23, 24];
 
     /// §10: `NotConsumed` refusals no v1 command can clear.
-    const TERMINAL_NOT_CONSUMED_CODES: [i32; 5] = [11, 15, 18, 22, 24];
+    const TERMINAL_NOT_CONSUMED_CODES: [i32; 4] = [11, 15, 18, 22];
 
     /// §5.2: defined so it cannot be reused, but never emitted.
     const RESERVED_CODES: [i32; 1] = [20];
@@ -575,6 +578,10 @@ mod tests {
                 Reason::StateBudgetExhausted,
                 "a value-shrinking compare_and_set frees growth bytes",
             ),
+            (
+                Reason::LastAdministrator,
+                "adding a second administrator lets the removal succeed",
+            ),
         ] {
             assert!(
                 !reason.is_terminal_when_not_consumed(),
@@ -596,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_six_terminal_cases_exist() {
+    fn exactly_five_terminal_cases_exist() {
         let consumed = Reason::ALL
             .iter()
             .filter(|r| Disposition::Consumed.is_terminal(**r))
@@ -609,8 +616,8 @@ mod tests {
         // NotConsumed ones -- "five cases" is 1 rule + 4 reasons, not 5 reasons.
         assert_eq!(consumed, Reason::ALL.len());
         assert_eq!(
-            not_consumed, 5,
-            "§10 names five terminal NotConsumed reasons"
+            not_consumed, 4,
+            "§10 names four terminal NotConsumed reasons"
         );
     }
 
