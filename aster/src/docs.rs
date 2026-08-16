@@ -3,8 +3,11 @@
 use crate::blobs::BlobStatus;
 use crate::error::Result;
 use crate::id::{AuthorId, Hash, NamespaceId, NamespaceSecret, NodeId, SecretKey};
+use std::time::Duration;
+
 use aster_transport_core::{
     CoreDoc, CoreDocEntry, CoreDocEvent, CoreDocEventReceiver, CoreDocsClient, CoreDownloadPolicy,
+    CoreLocalAccess, CoreRetireOutcome,
 };
 
 /// The default-docs [`AuthorId`] for a node with this secret — the same value
@@ -164,6 +167,49 @@ impl DocEvents {
     }
 }
 
+/// What access a namespace grants this node locally.
+///
+/// Aster's own type on purpose: the document layer has an equivalent, and
+/// re-exporting it would put a dependency's enum in Aster's public API, so
+/// callers would have to track that crate's versioning to match on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalAccess {
+    /// This node can write to the namespace.
+    Write,
+    /// This node can read it and nothing more.
+    Read,
+}
+
+/// The result of retiring local write authority over a namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetireOutcome {
+    /// Retired; this is the access now **stored**, not the access requested.
+    Retired(LocalAccess),
+    /// Refused: references to the document are still open.
+    ///
+    /// A live-sync reference and each caller handle both count. Unexpected
+    /// handles usually mean the caller does not own what it thought it owned,
+    /// so this is normally fail-closed rather than something to retry through.
+    Busy {
+        /// How many references remain.
+        handles: u64,
+    },
+}
+
+impl From<CoreRetireOutcome> for RetireOutcome {
+    fn from(outcome: CoreRetireOutcome) -> Self {
+        match outcome {
+            CoreRetireOutcome::Retired(CoreLocalAccess::Write) => {
+                RetireOutcome::Retired(LocalAccess::Write)
+            }
+            CoreRetireOutcome::Retired(CoreLocalAccess::Read) => {
+                RetireOutcome::Retired(LocalAccess::Read)
+            }
+            CoreRetireOutcome::Busy { handles } => RetireOutcome::Busy { handles },
+        }
+    }
+}
+
 /// A handle to a node's document store. Cheap to clone.
 #[derive(Clone)]
 pub struct Docs {
@@ -228,6 +274,30 @@ impl Docs {
                 .import_write_namespace(secret.to_bytes().to_vec())
                 .await?,
         ))
+    }
+
+    /// Retire this node's **local write authority** over a namespace, keeping
+    /// every entry.
+    ///
+    /// The only way to narrow access in place. Importing a read capability
+    /// cannot do it — capability merge upgrades only — and dropping the
+    /// document deletes the entries the node still has to serve.
+    ///
+    /// Local only: it revokes nothing cryptographically and reaches no other
+    /// node. A peer holding the namespace secret still writes.
+    ///
+    /// **Release every reference first**, which
+    /// [`Doc::shutdown_for_role_swap`] does. Until the count reaches zero this
+    /// reports [`RetireOutcome::Busy`] rather than proceeding.
+    ///
+    /// Returns the access now **stored**, so a caller verifies the outcome
+    /// rather than trusting its request was applied.
+    pub async fn retire_local_write_authority(&self, id: NamespaceId) -> Result<RetireOutcome> {
+        Ok(self
+            .inner
+            .retire_local_write_authority(id.to_bytes().to_vec())
+            .await?
+            .into())
     }
 
     /// Open-or-import a **read-only** namespace from its public id. Idempotent;
@@ -437,6 +507,25 @@ impl Doc {
     /// Stop syncing this document.
     pub async fn leave(&self) -> Result<()> {
         Ok(self.inner.leave().await?)
+    }
+
+    /// Release **both** of this document's references, so its namespace can
+    /// change role.
+    ///
+    /// Consuming, because it invalidates this handle and every clone of it —
+    /// returning `self` would hand back something permanently unusable, and a
+    /// caller still holding a clone will find that dead too. That is the point:
+    /// a role swap must not leave a live reference behind.
+    ///
+    /// Releases the live-sync reference and this handle's own, under **one
+    /// absolute deadline** covering both. A budget per step would silently
+    /// double the transition budget a caller allowed for.
+    ///
+    /// Close is attempted even when leaving fails — a failed leave is exactly
+    /// when the handle most needs releasing — and both errors are preserved if
+    /// both fail.
+    pub async fn shutdown_for_role_swap(self, budget: Duration) -> Result<()> {
+        Ok(self.inner.shutdown_for_role_swap(budget).await?)
     }
 
     /// Subscribe to live events for this document.

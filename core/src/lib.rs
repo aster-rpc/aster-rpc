@@ -59,7 +59,8 @@ use iroh_docs::engine::{LiveEvent, ProtectCallbackHandler};
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::{DownloadPolicy, FilterKind, Query};
 use iroh_docs::{
-    Author, AuthorId, Capability, DocTicket, NamespaceId, NamespaceSecret, ALPN as DOCS_ALPN,
+    Author, AuthorId, Capability, CapabilityKind, DocTicket, NamespaceId, NamespaceSecret,
+    RetireWriteAuthorityOutcome, ALPN as DOCS_ALPN,
 };
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::Gossip;
@@ -3852,6 +3853,46 @@ impl CoreBlobsClient {
 // CoreDocsClient - Document sync protocol
 // ============================================================================
 
+/// Release a document's two references under one absolute deadline.
+///
+/// Split out from [`CoreDoc::shutdown_for_role_swap`] so the sequencing can be
+/// tested with failures injected: `leave` cannot be made to fail through the
+/// public API — it is idempotent and succeeds even when nothing is syncing — so
+/// the "close runs anyway" property would otherwise be untestable, and an
+/// untested property in cleanup code is one that quietly stops holding.
+///
+/// One deadline, not one per step: a caller narrowing a role has a transition
+/// budget, and two sequential budgets would silently double it.
+async fn release_both_references(
+    budget: Duration,
+    leave: impl std::future::Future<Output = anyhow::Result<()>>,
+    close: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + budget;
+
+    let left = match tokio::time::timeout_at(deadline, leave).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(anyhow!("leave failed: {e}")),
+        Err(_) => Err(anyhow!("leave timed out")),
+    };
+    // Deliberately not short-circuited on `left`. A failed leave is precisely
+    // when the handle most needs releasing — abandoning the close there would
+    // leave the reference the whole operation exists to drop.
+    let closed = match tokio::time::timeout_at(deadline, close).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(anyhow!("close failed: {e}")),
+        Err(_) => Err(anyhow!("close timed out")),
+    };
+
+    match (left, closed) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        // Both preserved: a cleanup failure is a different and worse fault than
+        // the one that preceded it, and diagnosing the result needs both.
+        (Err(l), Err(c)) => Err(anyhow!("{l}; and {c}")),
+    }
+}
+
 #[derive(Clone)]
 pub struct CoreDocsClient {
     pub inner: Docs,
@@ -3916,6 +3957,39 @@ impl CoreDocsClient {
             doc: self.inner.api().import_namespace(capability).await?,
             store: self.store.clone(),
         })
+    }
+
+    /// Retire this node's **local write authority** over a namespace, keeping
+    /// every entry.
+    ///
+    /// Local only: it revokes nothing cryptographically and reaches no other
+    /// node — a peer holding the namespace secret still writes. What it retires
+    /// is this node's own ability to sign.
+    ///
+    /// **Release every reference first.** A live-sync reference and each caller
+    /// handle both count; until all are gone this reports
+    /// [`CoreRetireOutcome::Busy`] with the number remaining rather than
+    /// proceeding. [`CoreDoc::shutdown_for_role_swap`] releases both under one
+    /// deadline.
+    ///
+    /// Returns the access now **stored**, so a caller verifies the outcome
+    /// rather than trusting that its request was applied. Idempotent, and a
+    /// later [`Self::import_write_namespace`] widens again.
+    pub async fn retire_local_write_authority(
+        &self,
+        namespace_id_bytes: Vec<u8>,
+    ) -> Result<CoreRetireOutcome> {
+        if namespace_id_bytes.len() != 32 {
+            return Err(anyhow!("namespace id must be 32 bytes"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&namespace_id_bytes);
+        Ok(self
+            .inner
+            .api()
+            .retire_write_authority(NamespaceId::from(arr))
+            .await?
+            .into())
     }
 
     /// Open an existing local namespace by its ID (hex), without a ticket or a
@@ -4067,6 +4141,50 @@ impl CoreDocsClient {
 // ============================================================================
 // CoreDoc - Single document instance
 // ============================================================================
+
+/// What access a namespace grants this node locally.
+///
+/// Aster's own type. The underlying document layer has an equivalent, but
+/// leaking it would put a dependency's enum in Aster's public API — and callers
+/// would then have to track that crate's versioning to match on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreLocalAccess {
+    /// This node can write to the namespace.
+    Write,
+    /// This node can read it and nothing more.
+    Read,
+}
+
+/// The result of retiring local write authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreRetireOutcome {
+    /// Retired; this is the access now **stored**, not the access requested.
+    Retired(CoreLocalAccess),
+    /// Refused: references to the document are still open.
+    ///
+    /// Both a live-sync reference and each caller handle count. Unexpected
+    /// handles usually mean the caller does not own what it thought it owned,
+    /// so this is normally a fail-closed condition rather than one to retry
+    /// through.
+    Busy {
+        /// How many references remain.
+        handles: u64,
+    },
+}
+
+impl From<RetireWriteAuthorityOutcome> for CoreRetireOutcome {
+    fn from(outcome: RetireWriteAuthorityOutcome) -> Self {
+        match outcome {
+            RetireWriteAuthorityOutcome::Retired(CapabilityKind::Write) => {
+                CoreRetireOutcome::Retired(CoreLocalAccess::Write)
+            }
+            RetireWriteAuthorityOutcome::Retired(CapabilityKind::Read) => {
+                CoreRetireOutcome::Retired(CoreLocalAccess::Read)
+            }
+            RetireWriteAuthorityOutcome::Busy { handles } => CoreRetireOutcome::Busy { handles },
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct CoreDoc {
@@ -4331,6 +4449,31 @@ impl CoreDoc {
         Ok(())
     }
 
+    /// Release **both** of this document's references, so its namespace can
+    /// change role.
+    ///
+    /// Consuming, because it invalidates the handle and every clone of it: the
+    /// underlying close sets a shared flag, so returning `self` would hand back
+    /// something permanently unusable. A caller that still holds a clone will
+    /// find it dead too, which is the point — role swap must not leave a live
+    /// reference behind.
+    ///
+    /// `leave` releases the live-sync reference, `close` releases this handle's
+    /// own. Both are needed: retirement counts references, not intentions, and
+    /// releasing one leaves the other holding the namespace open.
+    ///
+    /// **One absolute deadline covers both steps**, not one budget each — a
+    /// caller narrowing a role has a transition budget, and two sequential
+    /// budgets would silently double it.
+    ///
+    /// Close is attempted even when `leave` fails, because a failed leave is
+    /// precisely when the handle most needs releasing; both errors are
+    /// preserved if both fail, since a cleanup failure is a different and worse
+    /// fault than the one that preceded it.
+    pub async fn shutdown_for_role_swap(self, budget: Duration) -> Result<()> {
+        release_both_references(budget, self.doc.leave(), self.doc.close()).await
+    }
+
     /// Subscribe to live document events.
     pub async fn subscribe(&self) -> Result<CoreDocEventReceiver> {
         let stream = self.doc.subscribe().await?;
@@ -4522,5 +4665,110 @@ impl CoreGossipTopic {
                 data: None,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod role_swap_shutdown_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test scaffolding: a failed unwrap/panic is the test failing"
+    )]
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::release_both_references;
+
+    const BUDGET: Duration = Duration::from_millis(500);
+
+    /// Close runs even when leave fails promptly, and both failures survive.
+    ///
+    /// A failed leave is exactly when the handle most needs releasing:
+    /// abandoning the close there would leave behind the reference the whole
+    /// operation exists to drop, and retirement would then report `Busy`
+    /// forever with no indication why.
+    #[tokio::test]
+    async fn close_runs_after_a_prompt_leave_failure() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&closed);
+
+        let err = release_both_references(
+            BUDGET,
+            async { Err(anyhow::anyhow!("no route to peer")) },
+            async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a failed leave must be reported");
+
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "close must be attempted regardless of how leave went",
+        );
+        assert!(
+            format!("{err}").contains("no route to peer"),
+            "the leave failure must survive: {err}",
+        );
+    }
+
+    /// Both failures are preserved, not just the first.
+    #[tokio::test]
+    async fn both_failures_are_preserved() {
+        let err = release_both_references(
+            BUDGET,
+            async { Err(anyhow::anyhow!("leave broke")) },
+            async { Err(anyhow::anyhow!("close broke")) },
+        )
+        .await
+        .expect_err("two failures must be reported");
+
+        let text = format!("{err}");
+        assert!(text.contains("leave broke"), "{text}");
+        assert!(
+            text.contains("close broke"),
+            "a cleanup failure is a different and worse fault than the one \
+             before it, and diagnosing needs both: {text}",
+        );
+    }
+
+    /// One absolute deadline covers both steps, not one budget each.
+    ///
+    /// Per-step budgets look bounded and are not: a slow leave gets the whole
+    /// budget and the close then gets a fresh one, doubling what the caller
+    /// allowed for a transition it is holding a lock across.
+    #[tokio::test]
+    async fn the_deadline_is_shared_across_both_steps() {
+        let budget = Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+
+        let err = release_both_references(
+            budget,
+            async {
+                std::future::pending::<()>().await;
+                Ok(())
+            },
+            async {
+                std::future::pending::<()>().await;
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("both steps hang, so both must time out");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < budget + Duration::from_millis(150),
+            "one budget covers both steps; per-step budgets would take about \
+             twice as long ({elapsed:?} against {budget:?})",
+        );
+        let text = format!("{err}");
+        assert!(text.contains("leave timed out"), "{text}");
+        assert!(text.contains("close timed out"), "{text}");
     }
 }
