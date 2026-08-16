@@ -13,6 +13,7 @@
 pub mod adapter;
 pub mod admin;
 pub mod apply;
+pub mod boundary;
 pub mod classify;
 pub mod expire;
 pub mod grant;
