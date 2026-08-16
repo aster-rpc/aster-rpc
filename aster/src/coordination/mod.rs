@@ -24,5 +24,10 @@ pub mod model;
 
 /// The OpenRaft type configuration. Voter-only, so it needs `coordination`
 /// rather than `coordination-client`.
+/// §5.3.1 OpenRaft mirrors and §11 storage roots. Voter-only: they mirror
+/// types a client never sees.
+#[cfg(feature = "coordination")]
+pub mod raft;
+
 #[cfg(feature = "coordination")]
 pub mod typeconfig;

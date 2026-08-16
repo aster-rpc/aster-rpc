@@ -24,8 +24,14 @@
 //! resource would be two leases over one row.
 
 use std::fmt;
+use std::sync::Arc;
 
-use crate::coordination::ids::{CoordinationGroupId, ResourceKey};
+use aster_transport_core::lease::{
+    DenyReason, Fence, LeaseOp, LeaseSerializer, LeaseSnapshot, TransitionOutcome,
+};
+
+use crate::coordination::ids::{CoordinationGroupId, CoordinationNodeId, ResourceKey};
+use crate::coordination::reason::{Outcome, Reason};
 
 /// The adapter-encoding prefix.
 const PREFIX: &str = "ac1";
@@ -159,6 +165,24 @@ fn decode_base64url_nopad(s: &str) -> Option<Vec<u8>> {
         for (i, c) in chunk.iter().enumerate() {
             n |= value(*c)? << (18 - 6 * i);
         }
+
+        // **Canonical tail bits.** A short final quantum encodes 8 or 16 bits
+        // in 12 or 18, and the spare low bits MUST be zero. Without this check
+        // several distinct strings decode to the same bytes -- `YQ`, `YR`, `Yf`
+        // and thirteen more all give `[0x61]` -- so one resource would have
+        // sixteen spellings and therefore sixteen lease identities over one
+        // row. Rejecting is the only safe answer: normalising would silently
+        // accept a peer's non-canonical form and hand back a different string
+        // than it sent.
+        let spare = match chunk.len() {
+            2 => n & 0xFFFF,
+            3 => n & 0xFF,
+            _ => 0,
+        };
+        if spare != 0 {
+            return None;
+        }
+
         out.push((n >> 16) as u8);
         if chunk.len() > 2 {
             out.push((n >> 8) as u8);
@@ -168,6 +192,127 @@ fn decode_base64url_nopad(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// The coordination backend behind one committed command.
+///
+/// Slice 1 owns the *shape*, not the network: a transport binds this to a live
+/// `CoordinationClient` in Slice 4. Keeping the trait boundary here is what lets
+/// the existing `LeaseHandle` -- its renew loop, self-limit and status watch --
+/// drive coordination without a second lease implementation being written.
+#[allow(async_fn_in_trait)]
+pub trait CoordinationBackend: Send + Sync {
+    /// Submit one committed mutation and return `(outcome, reason, fence)`.
+    fn submit(&self, resource: &ResourceKey, op: &LeaseOp) -> (Outcome, Reason, Option<Fence>);
+}
+
+/// `CoordinationSerializer` (§9.4): the coordination group behind the existing
+/// `LeaseSerializer` trait.
+///
+/// Binds **one** group and one local NodeId. Both bindings are enforced on every
+/// call rather than assumed:
+///
+/// * the adapter resource must name this group, so a handle held across a
+///   recovery cannot be renewed against the recovered one;
+/// * every `LeaseOp`'s actor string must equal this client's immutable local
+///   NodeId. The wire omits the actor -- it comes from transport identity -- so
+///   an actor string that disagrees means the caller believes it is someone
+///   else, and proceeding would attribute its writes to the wrong node.
+pub struct CoordinationSerializer<B: CoordinationBackend> {
+    group: CoordinationGroupId,
+    local_node: CoordinationNodeId,
+    backend: Arc<B>,
+}
+
+impl<B: CoordinationBackend> CoordinationSerializer<B> {
+    pub fn new(
+        group: CoordinationGroupId,
+        local_node: CoordinationNodeId,
+        backend: Arc<B>,
+    ) -> Self {
+        Self {
+            group,
+            local_node,
+            backend,
+        }
+    }
+
+    /// Resolve an adapter resource, enforcing the group binding.
+    pub fn resolve(&self, resource: &str) -> Result<ResourceKey, AdapterError> {
+        decode(resource, &self.group).map(|r| r.key)
+    }
+
+    /// Every `LeaseOp` actor must be this client's own NodeId.
+    fn actor_is_local(&self, op: &LeaseOp) -> bool {
+        op.actor() == self.local_node.to_hex()
+    }
+}
+
+/// Map a coordination refusal onto the lease engine's `DenyReason`.
+///
+/// The mapping is deliberately lossy in one direction only: `LeaseSerializer`
+/// predates coordination and has four reasons, so several coordination reasons
+/// share one. Authorization refusals map to `Unauthorized`, which is what §9.4
+/// specifies -- a client that needs the exact code uses `CoordinationLease`
+/// rather than the compatibility path.
+pub fn deny_reason_for(reason: Reason) -> DenyReason {
+    match reason {
+        Reason::HeldByOther => DenyReason::HeldByOther,
+        Reason::NotHeld => DenyReason::NotHeld,
+        Reason::NotHolder => DenyReason::NotHolder,
+        Reason::EpochMismatch => DenyReason::EpochMismatch,
+        _ => DenyReason::Unauthorized,
+    }
+}
+
+#[async_trait::async_trait]
+impl<B: CoordinationBackend + 'static> LeaseSerializer for CoordinationSerializer<B> {
+    async fn transition(&self, resource: &str, op: LeaseOp) -> anyhow::Result<TransitionOutcome> {
+        let key = self
+            .resolve(resource)
+            .map_err(|e| anyhow::anyhow!("adapter resource: {e}"))?;
+
+        if !self.actor_is_local(&op) {
+            // Not a refusal the group decided -- the caller is claiming an
+            // identity this client does not have, so it never reaches the log.
+            return Ok(TransitionOutcome::Denied(
+                DenyReason::Unauthorized,
+                advisory_snapshot(resource),
+            ));
+        }
+
+        let (outcome, reason, fence) = self.backend.submit(&key, &op);
+        Ok(match outcome {
+            Outcome::Granted => TransitionOutcome::Granted(
+                fence.ok_or_else(|| anyhow::anyhow!("a grant with no fence"))?,
+            ),
+            Outcome::Renewed => TransitionOutcome::Renewed,
+            Outcome::Released => TransitionOutcome::Released,
+            Outcome::Revoked => TransitionOutcome::Revoked,
+            _ => TransitionOutcome::Denied(deny_reason_for(reason), advisory_snapshot(resource)),
+        })
+    }
+
+    async fn snapshot(&self, resource: &str) -> anyhow::Result<LeaseSnapshot> {
+        self.resolve(resource)
+            .map_err(|e| anyhow::anyhow!("adapter resource: {e}"))?;
+        Ok(advisory_snapshot(resource))
+    }
+}
+
+/// §9.4: the advisory snapshot's `remaining` is `None`.
+///
+/// A coordination lease's remaining time is not a replicated fact -- it depends
+/// on a clock, and `apply` reads none -- so reporting a number would be
+/// inventing one.
+fn advisory_snapshot(resource: &str) -> LeaseSnapshot {
+    LeaseSnapshot {
+        resource: resource.to_string(),
+        epoch: 0,
+        holder: None,
+        held: false,
+        remaining: None,
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +429,206 @@ mod tests {
         for (name, input, expected) in cases {
             assert_eq!(decode(&input, &g), Err(expected), "{name}");
         }
+    }
+
+    /// Non-canonical **tail bits** are rejected. Without this, sixteen distinct
+    /// strings decode to `[0x61]`, so one row would have sixteen lease
+    /// identities -- and the lease engine compares resources as opaque strings.
+    #[test]
+    fn non_canonical_tail_bits_are_rejected() {
+        // In a two-character quantum the second symbol carries 4 spare bits, so
+        // exactly four of the 64 symbols are canonical -- the ones whose low
+        // nibble is zero, giving `A`, `Q`, `g`, `w` for bytes 0x60..=0x63.
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut canonical = 0;
+        for (index, symbol) in ALPHABET.iter().enumerate() {
+            let s = format!("Y{}", *symbol as char);
+            let decoded = decode_base64url_nopad(&s);
+            if index % 16 == 0 {
+                canonical += 1;
+                assert!(decoded.is_some(), "{s} is the canonical form of a byte");
+            } else {
+                assert_eq!(
+                    decoded, None,
+                    "{s} sets spare tail bits and is not canonical"
+                );
+            }
+        }
+        assert_eq!(
+            canonical, 4,
+            "sixty of the sixty-four spellings are refused"
+        );
+        assert_eq!(decode_base64url_nopad("YQ"), Some(vec![0x61]));
+
+        // The three-character quantum has 2 spare bits, same rule.
+        let canonical = base64url_nopad(&[0x61, 0x62]);
+        assert_eq!(decode_base64url_nopad(&canonical), Some(vec![0x61, 0x62]));
+        let mut bad = canonical.clone().into_bytes();
+        *bad.last_mut().unwrap() += 1;
+        assert_eq!(
+            decode_base64url_nopad(std::str::from_utf8(&bad).unwrap()),
+            None
+        );
+    }
+
+    /// The consequence, stated as the property that matters: no two distinct
+    /// adapter strings name the same resource.
+    #[test]
+    fn one_resource_has_exactly_one_adapter_spelling() {
+        let g = group(1);
+        for len in 1..=8usize {
+            let k = key("ns", &vec![0x61u8; len]);
+            let canonical = encode(&g, &k);
+            // Perturbing the last character either changes the key or is
+            // refused -- never silently decodes to the same row.
+            let mut bytes = canonical.clone().into_bytes();
+            let last = bytes.last_mut().unwrap();
+            *last = if *last == b'_' { b'-' } else { *last + 1 };
+            let perturbed = String::from_utf8(bytes).unwrap();
+            if let Ok(other) = decode(&perturbed, &g) {
+                assert_ne!(
+                    other.key, k,
+                    "{perturbed} decoded to the same resource as {canonical}"
+                );
+            }
+        }
+    }
+
+    // ── The LeaseSerializer implementation ──────────────────────────────────
+
+    struct StubBackend {
+        outcome: Outcome,
+        reason: Reason,
+    }
+
+    impl CoordinationBackend for StubBackend {
+        fn submit(
+            &self,
+            _resource: &ResourceKey,
+            op: &LeaseOp,
+        ) -> (Outcome, Reason, Option<Fence>) {
+            let fence = matches!(self.outcome, Outcome::Granted).then(|| Fence {
+                resource: "r".into(),
+                epoch: 1,
+                holder: op.actor().to_string(),
+            });
+            (self.outcome, self.reason, fence)
+        }
+    }
+
+    fn serializer(outcome: Outcome, reason: Reason) -> CoordinationSerializer<StubBackend> {
+        CoordinationSerializer::new(
+            group(1),
+            CoordinationNodeId::from_array([9u8; 32]),
+            Arc::new(StubBackend { outcome, reason }),
+        )
+    }
+
+    fn local_actor() -> String {
+        CoordinationNodeId::from_array([9u8; 32]).to_hex()
+    }
+
+    /// The adapter really implements the trait, so an existing `LeaseHandle`
+    /// drives coordination without a second lease implementation.
+    #[tokio::test]
+    async fn the_adapter_implements_lease_serializer() {
+        let s = serializer(Outcome::Granted, Reason::None);
+        let resource = encode(&group(1), &key("ns", b"primary"));
+
+        let outcome = s
+            .transition(
+                &resource,
+                LeaseOp::Acquire {
+                    candidate: local_actor(),
+                    ttl: std::time::Duration::from_secs(30),
+                },
+            )
+            .await
+            .expect("no backend error");
+        assert!(matches!(outcome, TransitionOutcome::Granted(_)));
+    }
+
+    /// A resource from another group is refused, so a handle held across a
+    /// recovery cannot be renewed against the recovered group -- the reason the
+    /// group is inside the string the renew loop carries.
+    #[tokio::test]
+    async fn a_resource_from_another_group_is_refused_by_the_serializer() {
+        let s = serializer(Outcome::Granted, Reason::None);
+        let theirs = encode(&group(2), &key("ns", b"primary"));
+        assert!(s
+            .transition(
+                &theirs,
+                LeaseOp::Revoke {
+                    authority: local_actor()
+                }
+            )
+            .await
+            .is_err());
+        assert!(s.snapshot(&theirs).await.is_err());
+    }
+
+    /// Every `LeaseOp` actor must equal this client's own NodeId. The wire omits
+    /// the actor -- it comes from transport identity -- so a disagreeing actor
+    /// string means the caller believes it is someone else.
+    #[tokio::test]
+    async fn an_op_from_another_actor_is_unauthorized() {
+        let s = serializer(Outcome::Granted, Reason::None);
+        let resource = encode(&group(1), &key("ns", b"primary"));
+
+        let outcome = s
+            .transition(
+                &resource,
+                LeaseOp::Renew {
+                    holder: "not-this-node".into(),
+                    epoch: 1,
+                },
+            )
+            .await
+            .expect("no backend error");
+        assert!(matches!(
+            outcome,
+            TransitionOutcome::Denied(DenyReason::Unauthorized, _)
+        ));
+    }
+
+    /// Coordination refusals map onto the lease engine's reasons, with
+    /// authorization becoming `Unauthorized` per §9.4.
+    #[test]
+    fn coordination_reasons_map_onto_deny_reasons() {
+        assert_eq!(
+            deny_reason_for(Reason::HeldByOther),
+            DenyReason::HeldByOther
+        );
+        assert_eq!(deny_reason_for(Reason::NotHeld), DenyReason::NotHeld);
+        assert_eq!(deny_reason_for(Reason::NotHolder), DenyReason::NotHolder);
+        assert_eq!(
+            deny_reason_for(Reason::EpochMismatch),
+            DenyReason::EpochMismatch
+        );
+        for reason in [
+            Reason::PermissionChanged,
+            Reason::StateBudgetExhausted,
+            Reason::ClientRetired,
+        ] {
+            assert_eq!(
+                deny_reason_for(reason),
+                DenyReason::Unauthorized,
+                "{reason:?} has no lease-engine equivalent"
+            );
+        }
+    }
+
+    /// §9.4: the advisory `remaining` is `None`, because a coordination lease's
+    /// remaining time is not a replicated fact -- `apply` reads no clock, so
+    /// reporting a number would be inventing one.
+    #[tokio::test]
+    async fn the_advisory_snapshot_reports_no_remaining_time() {
+        let s = serializer(Outcome::Granted, Reason::None);
+        let resource = encode(&group(1), &key("ns", b"primary"));
+        let snap = s.snapshot(&resource).await.expect("resolvable");
+        assert_eq!(snap.remaining, None);
+        assert_eq!(snap.resource, resource);
     }
 
     /// The encoding is stable: the same resource always produces the same
