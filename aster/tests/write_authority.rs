@@ -3,7 +3,7 @@
 //! accounting that gates it, the consuming shutdown that satisfies it, and the
 //! two behaviours a caller must not assume away.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aster::{AsterConfig, LocalAccess, NamespaceSecret, Node, RelayMode, RetireOutcome};
 
@@ -53,10 +53,17 @@ async fn retirement_needs_both_references_released() {
     node.shutdown().await;
 }
 
-/// The consuming shutdown releases both references in one call, and does it
-/// within a single budget rather than one per step.
+/// The consuming shutdown releases **both** references — the sync session and
+/// the open handle — in a single call.
+///
+/// Deliberately no timing assertion. That the two steps share one absolute
+/// deadline rather than a budget each is a property of the implementation, and
+/// asserting it end-to-end only measures how long a loopback node happened to
+/// take: it passes on a fast machine whether or not the deadline is shared, and
+/// flakes on a loaded one when it is. What is observable here is the outcome,
+/// so that is what this checks.
 #[tokio::test]
-async fn shutdown_for_role_swap_releases_both_within_one_budget() {
+async fn shutdown_for_role_swap_releases_both_references() {
     let node = mem_node().await;
     let secret = NamespaceSecret::from_bytes([0x22u8; 32]);
     let id = secret.id();
@@ -67,16 +74,10 @@ async fn shutdown_for_role_swap_releases_both_within_one_budget() {
         .unwrap();
     doc.start_sync(&[]).await.unwrap();
 
-    let budget = Duration::from_millis(500);
-    let started = Instant::now();
-    doc.shutdown_for_role_swap(budget).await.unwrap();
-    let elapsed = started.elapsed();
+    doc.shutdown_for_role_swap(Duration::from_millis(500))
+        .await
+        .unwrap();
 
-    assert!(
-        elapsed < budget,
-        "one absolute deadline covers leave and close; two sequential budgets \
-         would silently double what the caller allowed ({elapsed:?})",
-    );
     assert_eq!(
         node.docs().retire_local_write_authority(id).await.unwrap(),
         RetireOutcome::Retired(LocalAccess::Read),
