@@ -913,7 +913,7 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
                     other => {
                         let _ = call.finish(&::aster::rpc::RpcStatus::error(
                             ::aster::rpc::StatusCode::Unimplemented, other,
-                        ));
+                        )).await;
                     }
                 }
             }
@@ -1121,7 +1121,7 @@ fn decode_one_request(req: &Type, req_idx: usize) -> TokenStream2 {
                 let _ = call.finish(&::aster::rpc::RpcStatus::error(
                     ::aster::rpc::StatusCode::InvalidArgument,
                     ::std::format!("request decode: {e}"),
-                ));
+                )).await;
                 return;
             }
         };
@@ -1134,13 +1134,13 @@ fn respond_one(resp_idx: usize) -> TokenStream2 {
     quote! {
         match self.fory[#resp_idx].serialize(&__resp) {
             ::core::result::Result::Ok(__bytes) => {
-                let _ = call.respond(__bytes, &::aster::rpc::RpcStatus::ok());
+                let _ = call.respond(__bytes, &::aster::rpc::RpcStatus::ok()).await;
             }
             ::core::result::Result::Err(e) => {
                 let _ = call.finish(&::aster::rpc::RpcStatus::error(
                     ::aster::rpc::StatusCode::Internal,
                     ::std::format!("response encode: {e}"),
-                ));
+                )).await;
             }
         }
     }
@@ -1174,7 +1174,7 @@ fn dispatch_arm(s: &MethodSpec, req_idx: usize, resp_idx: usize) -> TokenStream2
                     match #invoke.await {
                         ::core::result::Result::Ok(__resp) => { #respond }
                         ::core::result::Result::Err(__e) => {
-                            let _ = call.finish(&::aster::rpc::status_from_error(&__e));
+                            let _ = call.finish(&::aster::rpc::status_from_error(&__e)).await;
                         }
                     }
                 }
@@ -1188,10 +1188,10 @@ fn dispatch_arm(s: &MethodSpec, req_idx: usize, resp_idx: usize) -> TokenStream2
                     let __sink = call.response_sink::<#resp>(self.fory[#resp_idx].clone());
                     match self.inner.#ident(__req, __sink).await {
                         ::core::result::Result::Ok(()) => {
-                            let _ = call.finish(&::aster::rpc::RpcStatus::ok());
+                            let _ = call.finish(&::aster::rpc::RpcStatus::ok()).await;
                         }
                         ::core::result::Result::Err(__e) => {
-                            let _ = call.finish(&::aster::rpc::status_from_error(&__e));
+                            let _ = call.finish(&::aster::rpc::status_from_error(&__e)).await;
                         }
                     }
                 }
@@ -1205,7 +1205,7 @@ fn dispatch_arm(s: &MethodSpec, req_idx: usize, resp_idx: usize) -> TokenStream2
                     match self.inner.#ident(__reqs).await {
                         ::core::result::Result::Ok(__resp) => { #respond }
                         ::core::result::Result::Err(__e) => {
-                            let _ = call.finish(&::aster::rpc::status_from_error(&__e));
+                            let _ = call.finish(&::aster::rpc::status_from_error(&__e)).await;
                         }
                     }
                 }
@@ -1217,10 +1217,10 @@ fn dispatch_arm(s: &MethodSpec, req_idx: usize, resp_idx: usize) -> TokenStream2
                 let __sink = call.response_sink::<#resp>(self.fory[#resp_idx].clone());
                 match self.inner.#ident(__reqs, __sink).await {
                     ::core::result::Result::Ok(()) => {
-                        let _ = call.finish(&::aster::rpc::RpcStatus::ok());
+                        let _ = call.finish(&::aster::rpc::RpcStatus::ok()).await;
                     }
                     ::core::result::Result::Err(__e) => {
-                        let _ = call.finish(&::aster::rpc::status_from_error(&__e));
+                        let _ = call.finish(&::aster::rpc::status_from_error(&__e)).await;
                     }
                 }
             }

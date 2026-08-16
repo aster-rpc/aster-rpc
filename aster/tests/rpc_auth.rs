@@ -77,7 +77,7 @@ impl ServiceDispatch for AdminService {
             .get("aster.role")
             .cloned()
             .unwrap_or_default();
-        let _ = call.respond(role.into_bytes(), &RpcStatus::ok());
+        let _ = call.respond(role.into_bytes(), &RpcStatus::ok()).await;
     }
 }
 

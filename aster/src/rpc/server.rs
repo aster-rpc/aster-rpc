@@ -19,12 +19,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use fory_core::Fory;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::Receiver;
 
 use aster_transport_core::contract::evaluate_capability;
 use aster_transport_core::framing::{encode_frame, FLAG_END_STREAM, FLAG_TRAILER};
 use aster_transport_core::reactor::{
-    self, IncomingCall, OutgoingFrame, ReactorEvent, RequestFrame,
+    self, IncomingCall, OutgoingFrame, ReactorEvent, RequestFrame, ResponseSender,
 };
 use aster_transport_core::CoreNode;
 
@@ -76,6 +76,16 @@ pub trait ServiceDispatch: Send + Sync + 'static {
     fn method_requires(&self, _method: &str) -> Option<CapabilityRequirement> {
         None
     }
+    /// Maximum **body** frame size for `method`, in bytes. `None` (default)
+    /// keeps the global `MAX_FRAME_SIZE`, so existing services are unaffected.
+    ///
+    /// This is a declaration, not an enforcement point: the transport applies
+    /// it before reading a body frame, because by the time dispatch runs the
+    /// allocation has already happened. Call headers are separately bounded by
+    /// `MAX_CALL_HEADER_SIZE` for every service.
+    fn max_frame_size(&self, _method: &str) -> Option<u32> {
+        None
+    }
     /// Handle one call. `method` is `StreamHeader.method` (guaranteed to be in
     /// [`methods`](ServiceDispatch::methods) when that table is non-empty). The
     /// handler MUST terminate the call by consuming `call` via [`Call::respond`]
@@ -108,6 +118,9 @@ pub struct Server {
     core: CoreNode,
     services: Registry,
     session_factories: SessionFactories,
+    /// Metadata-only instances of session-scoped services (name, version,
+    /// methods, frame caps). Never dispatched to.
+    session_probes: Registry,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
     routes: AlpnRoutes,
@@ -121,6 +134,7 @@ impl Server {
             core: node.core(),
             services: HashMap::new(),
             session_factories: HashMap::new(),
+            session_probes: HashMap::new(),
             attributes: AttributeStore::new(),
             authenticator: None,
             routes: HashMap::new(),
@@ -175,10 +189,15 @@ impl Server {
     {
         let factory: SessionFactory =
             Arc::new(move || Arc::new(factory()) as Arc<dyn ServiceDispatch>);
-        // One throwaway instance just to read the (constant) name + version key.
+        // One instance read for its constant metadata: name, version, and --
+        // since the frame-limit resolver runs before any session exists -- the
+        // declared per-method frame caps. Keeping it means session-scoped
+        // services get their limits installed like any other; without it they
+        // silently kept the 16 MiB default.
         let probe = factory();
-        self.session_factories
-            .insert((probe.name().to_string(), probe.version()), factory);
+        let key = (probe.name().to_string(), probe.version());
+        self.session_probes.insert(key.clone(), probe);
+        self.session_factories.insert(key, factory);
         self
     }
 
@@ -243,6 +262,7 @@ impl Server {
     pub fn dispatcher(&self) -> Dispatcher {
         Dispatcher {
             services: Arc::new(self.services.clone()),
+            session_probes: Arc::new(self.session_probes.clone()),
             session_factories: Arc::new(self.session_factories.clone()),
             sessions: Arc::new(SessionTable::default()),
             attributes: self.attributes.clone(),
@@ -256,7 +276,8 @@ impl Server {
     /// [`dispatcher`](Server::dispatcher) first, then `serve`.
     pub fn serve(self) -> ServerHandle {
         let dispatcher = self.dispatcher();
-        let handle = reactor::start_reactor(self.core, 256);
+        let resolver = dispatcher.frame_limit_resolver();
+        let handle = reactor::start_reactor_with_limits(self.core, 256, Some(resolver));
         let (mut event_rx, mut non_rpc_rx) = handle.into_parts();
 
         // RPC pipeline: dispatch each `aster/1` call.
@@ -305,6 +326,9 @@ impl Server {
 #[derive(Clone)]
 pub struct Dispatcher {
     services: Arc<Registry>,
+    /// Metadata-only probes for session-scoped services; see
+    /// [`frame_limit_resolver`](Dispatcher::frame_limit_resolver).
+    session_probes: Arc<Registry>,
     session_factories: Arc<SessionFactories>,
     /// Live per-session instances, shared across clones of this dispatcher.
     sessions: Arc<SessionTable>,
@@ -313,6 +337,34 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
+    /// Build the transport's per-method frame-limit resolver from the
+    /// registered services.
+    ///
+    /// The transport hands over raw header bytes and gets a decision back; it
+    /// never learns the payload format. Decoding `StreamHeader` -- and knowing
+    /// what a service or a method is -- stays here, on the `aster` side of the
+    /// boundary.
+    pub fn frame_limit_resolver(&self) -> reactor::FrameLimitResolver {
+        let services = self.services.clone();
+        // Session-scoped services are registered as factories, so the shared
+        // registry does not contain them. Consulting only that registry left
+        // every session-scoped service on the 16 MiB default.
+        let probes = self.session_probes.clone();
+        Arc::new(move |header: &[u8]| match decode_stream_header(header) {
+            // Undecodable header: reject the stream rather than fall back to a
+            // generous default and read a body behind it.
+            Err(_) => reactor::FrameLimit::Reject,
+            Ok(h) => {
+                let key = (h.service.clone(), h.version);
+                let svc = services.get(&key).or_else(|| probes.get(&key));
+                match svc.and_then(|s| s.max_frame_size(&h.method)) {
+                    None => reactor::FrameLimit::Default,
+                    Some(n) => reactor::FrameLimit::Limit(n),
+                }
+            }
+        })
+    }
+
     /// Dispatch one already-decoded inbound [`IncomingCall`]: run the
     /// pre-dispatch gates (service / method / serialization mode / Gate-3
     /// capability) and, if they pass, hand a [`Call`] to the matched service.
@@ -383,8 +435,8 @@ pub struct CallParts {
     pub header_payload: Vec<u8>,
     pub request_payload: Vec<u8>,
     pub request_flags: u8,
-    pub response_sender: UnboundedSender<OutgoingFrame>,
-    pub request_receiver: UnboundedReceiver<RequestFrame>,
+    pub response_sender: ResponseSender,
+    pub request_receiver: Receiver<RequestFrame>,
     pub cancelled: Arc<AtomicBool>,
 }
 
@@ -447,7 +499,8 @@ async fn handle_call(
                 &call.response_sender,
                 StatusCode::Internal,
                 "malformed stream header",
-            );
+            )
+            .await;
             return;
         }
     };
@@ -457,7 +510,8 @@ async fn handle_call(
             &call.response_sender,
             StatusCode::InvalidArgument,
             "missing service name",
-        );
+        )
+        .await;
         return;
     }
 
@@ -476,7 +530,8 @@ async fn handle_call(
                     "service '{}' v{} is session-scoped; an aster-session-id is required",
                     header.service, header.version
                 ),
-            );
+            )
+            .await;
             return;
         }
         get_or_create_session(&sessions, &key, &sid, factory)
@@ -485,7 +540,8 @@ async fn handle_call(
             &call.response_sender,
             StatusCode::NotFound,
             &format!("service '{}' v{} not found", header.service, header.version),
-        );
+        )
+        .await;
         return;
     };
 
@@ -498,7 +554,8 @@ async fn handle_call(
                 "method '{}.{}' not implemented",
                 header.service, header.method
             ),
-        );
+        )
+        .await;
         return;
     }
 
@@ -511,7 +568,8 @@ async fn handle_call(
                 "unsupported serialization mode: {}",
                 header.serialization_mode
             ),
-        );
+        )
+        .await;
         return;
     }
 
@@ -538,7 +596,7 @@ async fn handle_call(
                 }
             }
             Err(status) => {
-                emit_rpc_status(&call.response_sender, &status);
+                emit_rpc_status(&call.response_sender, &status).await;
                 return;
             }
         }
@@ -558,7 +616,8 @@ async fn handle_call(
                     "capability check failed for '{}.{}'",
                     header.service, header.method
                 ),
-            );
+            )
+            .await;
             return;
         }
     }
@@ -568,16 +627,20 @@ async fn handle_call(
 }
 
 /// Send a trailer-only error response (no data frame) before a [`Call`] exists.
-fn emit_trailer(sender: &UnboundedSender<OutgoingFrame>, code: StatusCode, message: &str) {
-    emit_rpc_status(sender, &RpcStatus::error(code, message));
+/// Async because the response channel is bounded (§12.4). Every caller is
+/// already in an async context; the alternative would be dropping a trailer
+/// when the channel is momentarily full, which leaves the peer waiting for a
+/// terminator that never comes.
+async fn emit_trailer(sender: &ResponseSender, code: StatusCode, message: &str) {
+    emit_rpc_status(sender, &RpcStatus::error(code, message)).await;
 }
 
 /// Send an already-built [`RpcStatus`] as a trailer-only response. Used by the
 /// auth hook to surface its own status (code + message + details).
-fn emit_rpc_status(sender: &UnboundedSender<OutgoingFrame>, status: &RpcStatus) {
+async fn emit_rpc_status(sender: &ResponseSender, status: &RpcStatus) {
     if let Ok(bytes) = encode_rpc_status(status) {
         if let Ok(frame) = encode_frame(&bytes, FLAG_TRAILER) {
-            let _ = sender.send(OutgoingFrame::Trailer(frame));
+            let _ = sender.send(OutgoingFrame::Trailer(frame)).await;
         }
     }
 }
@@ -630,12 +693,12 @@ pub struct Call {
     attributes: HashMap<String, String>,
     peer_id: String,
     cancelled: Arc<AtomicBool>,
-    response_sender: UnboundedSender<OutgoingFrame>,
+    response_sender: ResponseSender,
     /// The first request payload, delivered inline by the reactor (taken once).
     first_request: Option<Vec<u8>>,
     /// Additional request frames (client-stream / bidi). `None` once taken by
     /// [`take_requests`](Call::take_requests).
-    request_receiver: Option<UnboundedReceiver<RequestFrame>>,
+    request_receiver: Option<Receiver<RequestFrame>>,
     /// Whether the first request frame carried `FLAG_END_STREAM` (a single-frame
     /// request stream). The reactor only opens the per-call request channel when
     /// there are *additional* frames to forward; if the first frame already ended
@@ -715,10 +778,16 @@ impl Call {
     }
 
     /// Emit one streaming response data frame.
-    pub fn send(&self, payload: Vec<u8>) -> Result<()> {
+    ///
+    /// Async since §12.4 bounded the response channel: awaiting here is the
+    /// backpressure. A handler producing faster than the peer reads is slowed
+    /// down rather than queueing without limit — which is the whole point, as
+    /// the peer controls that memory.
+    pub async fn send(&self, payload: Vec<u8>) -> Result<()> {
         let frame = encode_frame(&payload, 0)?;
         self.response_sender
             .send(OutgoingFrame::Frame(frame))
+            .await
             .map_err(|_| channel_closed())
     }
 
@@ -726,7 +795,7 @@ impl Call {
     /// terminal trailer, in a single write. An empty `payload` sends the trailer
     /// only (a data frame can't carry an empty payload) — the client observes an
     /// empty response with the given status.
-    pub fn respond(self, payload: Vec<u8>, status: &RpcStatus) -> Result<()> {
+    pub async fn respond(self, payload: Vec<u8>, status: &RpcStatus) -> Result<()> {
         let trailer = encode_frame(&encode_rpc_status(status)?, FLAG_TRAILER)?;
         let buf = if payload.is_empty() {
             trailer
@@ -737,15 +806,17 @@ impl Call {
         };
         self.response_sender
             .send(OutgoingFrame::CompleteUnary(buf))
+            .await
             .map_err(|_| channel_closed())
     }
 
     /// Finish a streaming call with the terminal trailer (status). Use after the
     /// last [`send`](Call::send), or on its own to fail a call before any data.
-    pub fn finish(self, status: &RpcStatus) -> Result<()> {
+    pub async fn finish(self, status: &RpcStatus) -> Result<()> {
         let frame = encode_frame(&encode_rpc_status(status)?, FLAG_TRAILER)?;
         self.response_sender
             .send(OutgoingFrame::Trailer(frame))
+            .await
             .map_err(|_| channel_closed())
     }
 

@@ -49,7 +49,7 @@ impl Streams for StreamsImpl {
 
     async fn count_up(&self, req: Count, out: ResponseSink<Count>) -> Result<()> {
         for i in 0..req.n {
-            out.send(&Count { n: i })?;
+            out.send(&Count { n: i }).await?;
         }
         Ok(())
     }
@@ -64,7 +64,7 @@ impl Streams for StreamsImpl {
 
     async fn double(&self, mut reqs: RequestStream<Count>, out: ResponseSink<Count>) -> Result<()> {
         while let Some(c) = reqs.recv().await? {
-            out.send(&Count { n: c.n * 2 })?;
+            out.send(&Count { n: c.n * 2 }).await?;
         }
         Ok(())
     }

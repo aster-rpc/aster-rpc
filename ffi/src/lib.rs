@@ -28,7 +28,13 @@ pub mod reactor;
 // ABI Version
 // ============================================================================
 
-pub const IROH_ABI_VERSION_MAJOR: u32 = 1;
+// 2.0.0, not 1.1.0: `aster_reactor_submit`, `..._submit_frame` and
+// `..._submit_trailer` can now return `IROH_STATUS_QUEUE_FULL`, and a caller
+// that does not retry silently drops responses under backpressure. The
+// signatures are unchanged, so this is behavioural incompatibility rather than
+// an additive change -- exactly what a major bump is for. See the retry
+// contract in `iroh_ffi.h` and `docs/_internal/reactor-ffi-guide.md`.
+pub const IROH_ABI_VERSION_MAJOR: u32 = 2;
 pub const IROH_ABI_VERSION_MINOR: u32 = 0;
 pub const IROH_ABI_VERSION_PATCH: u32 = 0;
 

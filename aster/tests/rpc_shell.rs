@@ -78,11 +78,14 @@ impl Shell for EchoShell {
         let mut last_rows = 0;
         while let Some(m) = input.recv().await? {
             match m.kind {
-                KIND_DATA => out.send(&ShellOut {
-                    data: m.data,
-                    eof: false,
-                    exit_code: 0,
-                })?,
+                KIND_DATA => {
+                    out.send(&ShellOut {
+                        data: m.data,
+                        eof: false,
+                        exit_code: 0,
+                    })
+                    .await?
+                }
                 KIND_RESIZE => last_rows = m.rows,
                 _ => {}
             }
@@ -91,7 +94,8 @@ impl Shell for EchoShell {
             data: Vec::new(),
             eof: true,
             exit_code: last_rows,
-        })?;
+        })
+        .await?;
         Ok(())
     }
 }

@@ -27,7 +27,7 @@ use crate::node::IrohNode;
 /// to terminate.
 #[napi]
 pub struct ReactorResponseSender {
-    inner: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<core_reactor::OutgoingFrame>>>,
+    inner: StdMutex<Option<core_reactor::ResponseSender>>,
 }
 
 #[napi]
@@ -35,34 +35,50 @@ impl ReactorResponseSender {
     /// Unary fast-path: one Frame + one Trailer, atomically. After this
     /// call the sender is consumed and further submits fail.
     #[napi]
-    pub fn submit(&self, response_frame: Buffer, trailer_frame: Buffer) -> Result<()> {
-        let sender = self
-            .inner
-            .lock()
-            .map_err(|_| Error::from_reason("lock poisoned".to_string()))?
-            .take()
-            .ok_or_else(|| Error::from_reason("response already submitted".to_string()))?;
+    pub async fn submit(&self, response_frame: Buffer, trailer_frame: Buffer) -> Result<()> {
+        let sender = {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| Error::from_reason("lock poisoned".to_string()))?;
+            guard
+                .take()
+                .ok_or_else(|| Error::from_reason("response already submitted".to_string()))?
+        };
         let response = response_frame.to_vec();
+        let trailer = trailer_frame.to_vec();
         if !response.is_empty() {
-            let _ = sender.send(core_reactor::OutgoingFrame::Frame(response));
+            let _ = sender
+                .send(core_reactor::OutgoingFrame::Frame(response))
+                .await;
         }
-        let _ = sender.send(core_reactor::OutgoingFrame::Trailer(trailer_frame.to_vec()));
+        let _ = sender
+            .send(core_reactor::OutgoingFrame::Trailer(trailer))
+            .await;
         Ok(())
     }
 
     /// Streaming: send one response data frame. The sender stays open for
     /// further `sendFrame` / `sendTrailer` calls.
     #[napi]
-    pub fn send_frame(&self, frame: Buffer) -> Result<()> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| Error::from_reason("lock poisoned".to_string()))?;
-        let sender = guard
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("response stream already closed".to_string()))?;
+    pub async fn send_frame(&self, frame: Buffer) -> Result<()> {
+        // The guard lives in its own block so it is provably dropped before
+        // the await: the response channel is bounded (§12.4), so the send below
+        // can suspend, and a std::sync::MutexGuard held across an await is both
+        // unsound and not `Send` — which napi requires of the future.
+        let sender = {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| Error::from_reason("lock poisoned".to_string()))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("response stream already closed".to_string()))?
+                .clone()
+        };
         sender
             .send(core_reactor::OutgoingFrame::Frame(frame.to_vec()))
+            .await
             .map_err(|_| Error::from_reason("reactor dropped response channel".to_string()))?;
         Ok(())
     }
@@ -70,15 +86,19 @@ impl ReactorResponseSender {
     /// Streaming terminator: send the trailer frame and consume the sender.
     /// Further sends fail.
     #[napi]
-    pub fn send_trailer(&self, trailer_frame: Buffer) -> Result<()> {
-        let sender = self
-            .inner
-            .lock()
-            .map_err(|_| Error::from_reason("lock poisoned".to_string()))?
-            .take()
-            .ok_or_else(|| Error::from_reason("response stream already closed".to_string()))?;
+    pub async fn send_trailer(&self, trailer_frame: Buffer) -> Result<()> {
+        let sender = {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| Error::from_reason("lock poisoned".to_string()))?;
+            guard
+                .take()
+                .ok_or_else(|| Error::from_reason("response stream already closed".to_string()))?
+        };
         sender
             .send(core_reactor::OutgoingFrame::Trailer(trailer_frame.to_vec()))
+            .await
             .map_err(|_| Error::from_reason("reactor dropped response channel".to_string()))?;
         Ok(())
     }
@@ -94,11 +114,7 @@ impl ReactorResponseSender {
 /// arrives. Only client-streaming and bidi dispatchers need this.
 #[napi]
 pub struct ReactorRequestReceiver {
-    inner: Arc<
-        tokio::sync::Mutex<
-            Option<tokio::sync::mpsc::UnboundedReceiver<core_reactor::RequestFrame>>,
-        >,
-    >,
+    inner: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<core_reactor::RequestFrame>>>>,
 }
 
 /// Result of [`ReactorRequestReceiver::recv`]. `payload` is empty and

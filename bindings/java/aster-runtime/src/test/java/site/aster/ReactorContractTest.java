@@ -7,7 +7,9 @@ import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import site.aster.ffi.IrohEventKind;
 import site.aster.ffi.IrohLibrary;
 import site.aster.ffi.IrohStatus;
 import site.aster.ffi.Reactor;
@@ -115,6 +117,49 @@ public class ReactorContractTest {
     return layout.byteOffset(MemoryLayout.PathElement.groupElement(field));
   }
 
+  /**
+   * {@code checkCancelled} must treat an unknown call id as terminal.
+   *
+   * <p>The bug this guards against was silent: {@code return status == 1} read {@code NOT_FOUND} --
+   * positive code 2 -- as {@code false}, telling a long-running emit loop to keep streaming on a
+   * call that had already been cancelled and reaped. Since cancellation now reaps per-call state as
+   * soon as the response receiver drops, NOT_FOUND is the <em>common</em> answer after a cancel,
+   * not an edge case, so the wrong mapping meant producers routinely ran on.
+   *
+   * <p>An unknown id is exactly what a reaped call looks like from Java, and needs no peer, so this
+   * is deterministic.
+   */
+  @Test
+  public void testCheckCancelledTreatsUnknownCallAsTerminal() throws Throwable {
+    long runtime = createRuntime();
+    long node = createNode(runtime);
+    Reactor reactor = new Reactor(runtime, node, 64);
+    try {
+      long unknown = 0xDEAD_BEEF_CAFE_F00DL;
+      assertTrue(
+          reactor.checkCancelled(unknown),
+          "an unknown call id means the call is gone -- cancelled and reaped, or already "
+              + "completed. Reporting it live tells a producer to stream on forever.");
+      // Stable across polls: a reaped call must not flicker back to live.
+      for (int i = 0; i < 20; i++) {
+        assertTrue(reactor.checkCancelled(unknown), "flipped to live on poll " + i);
+      }
+    } finally {
+      // Release the node and runtime too. Leaking them keeps endpoints and a
+      // tokio runtime alive for the rest of the class, and this harness already
+      // fails intermittently on a one-second node-creation budget -- adding
+      // load to it makes an unrelated test the one that flakes.
+      reactor.close();
+      closeRuntime(runtime);
+    }
+  }
+
+  /** NOT_FOUND is positive; the old doc comment claimed error codes were negative. */
+  @Test
+  public void testNotFoundIsPositive() {
+    assertTrue(IrohStatus.NOT_FOUND.code > 0, "NOT_FOUND must be positive");
+  }
+
   /** Create a fresh runtime via {@code iroh_runtime_new}. */
   private static long createRuntime() throws Throwable {
     var lib = IrohLibrary.getInstance();
@@ -168,8 +213,11 @@ public class ReactorContractTest {
 
       int status = (int) nodeMemoryAlpns.invoke(runtime, alpnsArray, alpnLens, 1L, 0L, outOp);
       assertEquals(IrohStatus.OK.code, status, "iroh_node_memory_with_alpns failed");
+      long nodeOperation = outOp.get(ValueLayout.JAVA_LONG, 0);
 
-      // Drain events to wait for NODE_CREATED
+      // Correlate NODE_CREATED with the submitted operation. The former
+      // one-second sleep loop was load-sensitive, and returning hard-coded
+      // handle 1 made the test observe a handle it had not actually received.
       var pollEvents =
           lib.getHandle(
               "iroh_poll_events",
@@ -181,25 +229,26 @@ public class ReactorContractTest {
                   ValueLayout.JAVA_INT));
 
       MemorySegment events = arena.allocate(IrohLibrary.IROH_EVENT, 8);
-      // Wait up to 1s for node creation
-      for (int i = 0; i < 100; i++) {
-        long count = (long) pollEvents.invoke(runtime, events, 8L, 5);
-        if (count > 0) {
-          // Find a NODE_CREATED event (kind = 1)
-          for (long j = 0; j < count; j++) {
-            int kind =
-                events
-                    .asSlice(j * IrohLibrary.IROH_EVENT.byteSize(), IrohLibrary.IROH_EVENT)
-                    .get(ValueLayout.JAVA_INT, 4);
-            if (kind == 1) {
-              // First node created is always handle 1.
-              return 1L;
-            }
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+      while (System.nanoTime() < deadline) {
+        long count = (long) pollEvents.invoke(runtime, events, 8L, 250);
+        for (long j = 0; j < count; j++) {
+          MemorySegment event =
+              events.asSlice(j * IrohLibrary.IROH_EVENT.byteSize(), IrohLibrary.IROH_EVENT);
+          if (event.get(ValueLayout.JAVA_LONG, 16) != nodeOperation) {
+            continue;
           }
+          assertEquals(
+              IrohEventKind.NODE_CREATED.code,
+              event.get(ValueLayout.JAVA_INT, 4),
+              "node operation event kind");
+          assertEquals(
+              IrohStatus.OK.code, event.get(ValueLayout.JAVA_INT, 8), "node creation status");
+          return event.get(ValueLayout.JAVA_LONG, 24);
         }
-        Thread.sleep(10);
       }
-      throw new AssertionError("node creation event not received within 1s");
+      throw new AssertionError(
+          "node creation operation " + nodeOperation + " did not complete within 30s");
     }
   }
 }

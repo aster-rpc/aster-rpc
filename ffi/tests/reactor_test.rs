@@ -4,28 +4,13 @@
 //! the full pump task → SPSC ring → poll path with real connections.
 
 use std::ptr;
-use std::time::Duration;
 
 use aster_transport_ffi::reactor::*;
 use aster_transport_ffi::*;
 
-unsafe fn poll_for_event(
-    runtime: iroh_runtime_t,
-    event_kind: iroh_event_kind_t,
-    max_iters: u32,
-) -> bool {
-    for _ in 0..max_iters {
-        std::thread::sleep(Duration::from_millis(10));
-        let mut events = [std::mem::zeroed(); 8];
-        let count = iroh_poll_events(runtime, events.as_mut_ptr(), 8, 5);
-        for ev in events.iter().take(count) {
-            if ev.kind == event_kind as u32 {
-                return true;
-            }
-        }
-    }
-    false
-}
+mod common;
+
+use common::wait_for_successful_operation;
 
 unsafe fn create_runtime_and_node() -> (iroh_runtime_t, iroh_node_t) {
     let mut runtime: iroh_runtime_t = 0;
@@ -46,11 +31,10 @@ unsafe fn create_runtime_and_node() -> (iroh_runtime_t, iroh_node_t) {
     );
     assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
-    let created = poll_for_event(runtime, iroh_event_kind_t::IROH_EVENT_NODE_CREATED, 100);
-    assert!(created, "node should be created");
+    let created =
+        wait_for_successful_operation(runtime, node_op, iroh_event_kind_t::IROH_EVENT_NODE_CREATED);
 
-    // First node is always handle 1
-    (runtime, 1)
+    (runtime, created.handle)
 }
 
 #[test]

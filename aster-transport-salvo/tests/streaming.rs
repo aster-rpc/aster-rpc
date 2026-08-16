@@ -32,9 +32,9 @@ impl ServiceDispatch for StreamSvc {
                 let req = call.recv_request().await.unwrap_or_default();
                 let n = req.first().copied().unwrap_or(0);
                 for i in 0..n {
-                    let _ = call.send(vec![i]);
+                    let _ = call.send(vec![i]).await;
                 }
-                let _ = call.finish(&RpcStatus::ok());
+                let _ = call.finish(&RpcStatus::ok()).await;
             }
             // client-stream: sum the first byte of every request; respond [sum].
             "client_stream" => {
@@ -42,18 +42,20 @@ impl ServiceDispatch for StreamSvc {
                 while let Some(req) = call.recv_request().await {
                     sum += req.first().copied().unwrap_or(0) as u32;
                 }
-                let _ = call.respond(vec![sum as u8], &RpcStatus::ok());
+                let _ = call.respond(vec![sum as u8], &RpcStatus::ok()).await;
             }
             // bidi: echo each request back reversed as it arrives.
             "bidi" => {
                 while let Some(req) = call.recv_request().await {
                     let echoed: Vec<u8> = req.into_iter().rev().collect();
-                    let _ = call.send(echoed);
+                    let _ = call.send(echoed).await;
                 }
-                let _ = call.finish(&RpcStatus::ok());
+                let _ = call.finish(&RpcStatus::ok()).await;
             }
             other => {
-                let _ = call.finish(&RpcStatus::error(StatusCode::Unimplemented, other));
+                let _ = call
+                    .finish(&RpcStatus::error(StatusCode::Unimplemented, other))
+                    .await;
             }
         }
     }

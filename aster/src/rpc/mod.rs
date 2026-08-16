@@ -45,7 +45,8 @@ pub use auth::{
 };
 pub use client::{BidiSink, ResponseStream, RpcConnection};
 pub use codec::{
-    new_payload_fory, CallHeader, CodecError, RpcStatus, SerializationMode, StreamHeader,
+    encode_stream_header, new_payload_fory, CallHeader, CodecError, RpcStatus, SerializationMode,
+    StreamHeader,
 };
 pub use contract::{
     contract_id, encode_scalar_default, make_field, make_union_variant, message_type_def,
