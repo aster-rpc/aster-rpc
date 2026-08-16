@@ -75,6 +75,7 @@
 use crate::coordination::reason::{Disposition, Outcome, Reason, RefusalReason};
 
 use super::classify::{classify, Classification};
+use super::grant::{self, GrantAction};
 use super::limits;
 use super::resource::{self, Decision, ResourceAction};
 use super::shape::ShapeLimit;
@@ -97,11 +98,21 @@ pub struct ClientRef {
     pub request_hash: [u8; 32],
 }
 
-/// A client action. Resource actions today; grant and admin actions land with
-/// their own modules.
+/// A client action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Resource(ResourceAction),
+    Grant(GrantAction),
+}
+
+/// The decision for whichever action was given.
+///
+/// One value rather than two code paths: preflight projects it and apply writes
+/// it, so neither can drift from the other's idea of what the command means.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionDecision {
+    Resource(Decision),
+    Grant(grant::Decision),
 }
 
 impl Action {
@@ -116,6 +127,7 @@ impl Action {
                 ResourceAction::ReleaseWithValue { .. } => 5,
                 ResourceAction::Revoke { .. } => 6,
             },
+            Action::Grant(_) => 7,
         }
     }
 
@@ -130,12 +142,14 @@ impl Action {
     fn validated_resource(&self) -> Option<ResourceKey> {
         match self {
             Action::Resource(r) => r.raw_resource().validate().ok(),
+            Action::Grant(g) => g.resource.validate().ok(),
         }
     }
 
-    fn decide(&self, state: &State, actor: &NodeId) -> Decision {
+    fn decide(&self, state: &State, actor: &NodeId) -> ActionDecision {
         match self {
-            Action::Resource(r) => resource::decide(state, actor, r),
+            Action::Resource(r) => ActionDecision::Resource(resource::decide(state, actor, r)),
+            Action::Grant(g) => ActionDecision::Grant(grant::decide(state, actor, g)),
         }
     }
 }
@@ -248,23 +262,42 @@ pub fn preflight(state: &State, client: &ClientRef, action: &Action) -> Admissio
 }
 
 /// Project an unresolved decision onto §10's stages 3 and 4.
-fn project(decision: Decision) -> Admission {
-    match decision {
-        Decision::Apply(_) => Admission::Admit,
-        Decision::RefuseShapeless(limit) => Admission::Status(StatusDenial::Shape(limit)),
+///
+/// Keyed on the refusal reason, not on which command produced it: the stages
+/// are a property of the reason, and duplicating the mapping per command is how
+/// two of them would come to disagree.
+fn project(decision: ActionDecision) -> Admission {
+    let (refusal, shapeless) = match decision {
+        ActionDecision::Resource(Decision::Apply(_))
+        | ActionDecision::Grant(grant::Decision::Apply(_))
+        // A no-op still commits a saved reply, so it is admitted like any
+        // other successful command rather than answered pre-proposal.
+        | ActionDecision::Grant(grant::Decision::NoOp { .. }) => return Admission::Admit,
+        ActionDecision::Resource(Decision::Refuse(r))
+        | ActionDecision::Grant(grant::Decision::Refuse(r)) => (Some(r), None),
+        ActionDecision::Resource(Decision::RefuseShapeless(l))
+        | ActionDecision::Grant(grant::Decision::RefuseShapeless(l)) => (None, Some(l)),
+    };
+    project_refusal(refusal, shapeless)
+}
+
+fn project_refusal(refusal: Option<RefusalReason>, shapeless: Option<ShapeLimit>) -> Admission {
+    match (refusal, shapeless) {
+        (_, Some(limit)) => Admission::Status(StatusDenial::Shape(limit)),
         // Authorization has no §5.2 reason code pre-proposal (§10 stage 4),
         // even though apply saves it as `12 PermissionChanged`.
-        Decision::Refuse(RefusalReason::PermissionChanged) => {
+        (Some(RefusalReason::PermissionChanged), None) => {
             Admission::Status(StatusDenial::NotAuthorized)
         }
         // Stage 3: exactly the four reason-coded admission denials.
-        Decision::Refuse(reason) if reason.is_admission_denial() => Admission::Deny(reason),
+        (Some(reason), None) if reason.is_admission_denial() => Admission::Deny(reason),
         // Everything else is **admitted** precisely so it reaches the log and
         // commits a saved result. The clearest case is `6 AclRevisionMismatch`:
         // denied here it would be a non-terminal `NotConsumed`, and since a
         // client may never change the request at a sequence it has already
         // sent, it would retry the stale revision forever.
-        Decision::Refuse(_) => Admission::Admit,
+        (Some(_), None) => Admission::Admit,
+        (None, None) => Admission::Admit,
     }
 }
 
@@ -388,35 +421,74 @@ fn guard_delivery(state: &State, log_id: LogId) -> Result<(), Fault> {
 /// The unresolved path: decide, then write whatever the decision says.
 fn apply_decided(state: &mut State, client: &ClientRef, action: &Action) -> ClientResult {
     match action.decide(state, &client.actor) {
-        Decision::Apply(effect) => {
-            let (ns, k) = key_parts(&effect.key);
-            let old_charge = state
+        ActionDecision::Resource(Decision::Apply(effect)) => {
+            charge_resource_row(state, &effect.key, effect.row.value.len());
+            state
                 .resources
-                .get(&effect.key)
-                .map(|row| limits::charge_resource(ns, k, row.value.len()));
-            let new_charge = limits::charge_resource(ns, k, effect.row.value.len());
-            state.growth_bytes = state.growth_bytes + new_charge - old_charge.unwrap_or(0);
+                .insert(effect.key.clone(), effect.row.clone());
+            consumed_success(
+                effect.outcome,
+                effect.key,
+                effect.row.epoch,
+                effect.row.value_revision,
+                effect.row.acl_revision,
+            )
+        }
+
+        ActionDecision::Grant(grant::Decision::Apply(effect)) => {
+            // Both rows or neither: the resource row and the ACL row move in
+            // the same step, so there is no shape in which a grant points at a
+            // resource that does not exist.
+            charge_resource_row(state, &effect.key, effect.row.value.len());
             state
                 .resources
                 .insert(effect.key.clone(), effect.row.clone());
 
-            ClientResult {
-                disposition: Disposition::Consumed,
-                reply: SavedReply {
-                    outcome: effect.outcome,
-                    reason: Reason::None,
-                    resource: Some(effect.key),
-                    epoch: effect.row.epoch,
-                    value_revision: effect.row.value_revision,
-                    acl_revision: effect.row.acl_revision,
-                },
+            let acl_key = (effect.key.clone(), effect.subject);
+            let (ns, k) = key_parts(&effect.key);
+            match effect.rights {
+                Some(rights) => {
+                    if effect.creates_acl_row {
+                        state.growth_bytes += limits::charge_acl(ns, k);
+                    }
+                    state.acl.insert(acl_key, rights);
+                }
+                None => {
+                    if state.acl.remove(&acl_key).is_some() {
+                        state.growth_bytes -= limits::charge_acl(ns, k);
+                    }
+                }
             }
+
+            consumed_success(
+                Outcome::GrantUpdated,
+                effect.key,
+                effect.row.epoch,
+                effect.row.value_revision,
+                effect.row.acl_revision,
+            )
         }
+
+        // A legal command that changes nothing still commits a saved reply --
+        // that is what consumes the sequence and lets a retry be answered
+        // without re-deciding.
+        ActionDecision::Grant(grant::Decision::NoOp { acl_revision }) => ClientResult {
+            disposition: Disposition::Consumed,
+            reply: SavedReply {
+                outcome: Outcome::GrantUpdated,
+                reason: Reason::None,
+                resource: action.validated_resource(),
+                epoch: 0,
+                value_revision: 0,
+                acl_revision,
+            },
+        },
 
         // A reason-coded refusal that reached the log. Consumed, saved, and
         // terminal because it is saved -- even a `19` whose budget condition
         // later clears.
-        Decision::Refuse(reason) => ClientResult {
+        ActionDecision::Resource(Decision::Refuse(reason))
+        | ActionDecision::Grant(grant::Decision::Refuse(reason)) => ClientResult {
             disposition: Disposition::Consumed,
             reply: rejection(action.validated_resource(), reason.get()),
         },
@@ -428,9 +500,42 @@ fn apply_decided(state: &mut State, client: &ClientRef, action: &Action) -> Clie
         // good resource, and dropping it would lose information the client can
         // use. Only a **malformed identity** yields `None`, because there is no
         // validated key to store.
-        Decision::RefuseShapeless(_) => ClientResult {
+        ActionDecision::Resource(Decision::RefuseShapeless(_))
+        | ActionDecision::Grant(grant::Decision::RefuseShapeless(_)) => ClientResult {
             disposition: Disposition::Consumed,
             reply: rejection(action.validated_resource(), Reason::None),
+        },
+    }
+}
+
+/// Move the growth counter by a resource row's charge delta.
+fn charge_resource_row(state: &mut State, key: &ResourceKey, new_value_len: usize) {
+    let (ns, k) = key_parts(key);
+    let old = state
+        .resources
+        .get(key)
+        .map(|row| limits::charge_resource(ns, k, row.value.len()))
+        .unwrap_or(0);
+    let new = limits::charge_resource(ns, k, new_value_len);
+    state.growth_bytes = state.growth_bytes + new - old;
+}
+
+fn consumed_success(
+    outcome: Outcome,
+    key: ResourceKey,
+    epoch: u64,
+    value_revision: u64,
+    acl_revision: u64,
+) -> ClientResult {
+    ClientResult {
+        disposition: Disposition::Consumed,
+        reply: SavedReply {
+            outcome,
+            reason: Reason::None,
+            resource: Some(key),
+            epoch,
+            value_revision,
+            acl_revision,
         },
     }
 }
@@ -494,6 +599,7 @@ fn write_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::model::grant::GrantAction;
     use crate::coordination::model::limits::{ALL_RIGHTS, MAX_VALUE, RIGHT_ACQUIRE};
     use crate::coordination::model::resource::{Fence, RawResourceKey};
     use crate::coordination::model::state::ResourceRow;
@@ -1182,7 +1288,7 @@ mod tests {
             if *refusal == RefusalReason::PermissionChanged {
                 continue;
             }
-            let projected = project(Decision::Refuse(*refusal));
+            let projected = project(ActionDecision::Resource(Decision::Refuse(*refusal)));
             if refusal.is_admission_denial() {
                 assert_eq!(
                     projected,
@@ -1199,10 +1305,38 @@ mod tests {
         }
     }
 
+    /// The projection is keyed on the reason, not on the command, so both
+    /// command kinds answer identically for the same refusal. Duplicating the
+    /// mapping per command is how two of them would come to disagree.
+    #[test]
+    fn both_command_kinds_project_a_reason_identically() {
+        for refusal in RefusalReason::ALL {
+            assert_eq!(
+                project(ActionDecision::Resource(Decision::Refuse(*refusal))),
+                project(ActionDecision::Grant(grant::Decision::Refuse(*refusal))),
+                "{refusal:?} must project the same way whichever command produced it"
+            );
+        }
+    }
+
+    /// A `set_grant` no-op is admitted, not answered pre-proposal: it still
+    /// commits a saved reply, which is what consumes the sequence.
+    #[test]
+    fn a_grant_no_op_is_admitted() {
+        assert_eq!(
+            project(ActionDecision::Grant(grant::Decision::NoOp {
+                acl_revision: 3
+            })),
+            Admission::Admit
+        );
+    }
+
     #[test]
     fn a_stale_revision_is_admitted_rather_than_denied() {
         assert_eq!(
-            project(Decision::Refuse(RefusalReason::AclRevisionMismatch)),
+            project(ActionDecision::Resource(Decision::Refuse(
+                RefusalReason::AclRevisionMismatch
+            ))),
             Admission::Admit
         );
     }
@@ -1250,6 +1384,131 @@ mod tests {
         assert_eq!(s.audit.len(), 1, "the applied entry still leaves a trace");
         assert_eq!(s.last_applied, Some(log(1, 4)));
         assert!(s.counters_match_recomputation());
+    }
+
+    // ── set_grant through the full apply path ───────────────────────────────
+
+    fn grant(rights: u64, expected_acl_revision: u64) -> Action {
+        Action::Grant(GrantAction {
+            resource: raw(),
+            subject: ACTOR,
+            rights,
+            expected_acl_revision,
+        })
+    }
+
+    fn admin_state() -> State {
+        let mut s = State::default();
+        s.admins.insert(ACTOR);
+        s.admin_revision = 1;
+        s.growth_bytes = s.recompute_growth();
+        s.reserve_bytes = s.recompute_reserve();
+        s
+    }
+
+    /// A grant on a missing resource writes **both** rows in one applied entry,
+    /// and both counters stay honest.
+    #[test]
+    fn an_applied_grant_writes_both_rows_and_keeps_the_counters_honest() {
+        let mut s = admin_state();
+        let result = apply_ok(&mut s, log(1, 1), &client(1), &grant(ALL_RIGHTS, 0));
+
+        assert_eq!(result.reply.outcome, Outcome::GrantUpdated);
+        assert_eq!(result.reply.acl_revision, 1);
+        assert!(s.resources.contains_key(&key()), "the resource row");
+        assert_eq!(s.acl.get(&(key(), ACTOR)), Some(&ALL_RIGHTS), "the ACL row");
+        assert!(s.counters_match_recomputation());
+        assert_eq!(s.audit.get(&(1, 1)).unwrap().operation_code, 7);
+    }
+
+    /// Removing a grant frees its growth bytes.
+    #[test]
+    fn removing_a_grant_frees_its_growth_bytes() {
+        let mut s = admin_state();
+        apply_ok(&mut s, log(1, 1), &client(1), &grant(ALL_RIGHTS, 0));
+        let with_grant = s.growth_bytes;
+
+        apply_ok(&mut s, log(1, 2), &client(2), &grant(0, 1));
+        assert!(s.acl.is_empty(), "the grant row is gone");
+        assert!(s.resources.contains_key(&key()), "the resource survives");
+        assert!(s.growth_bytes < with_grant);
+        assert!(s.counters_match_recomputation());
+    }
+
+    /// A no-op commits its saved reply -- consuming the sequence -- while
+    /// writing no business row and leaving the revision where it was.
+    #[test]
+    fn an_applied_grant_no_op_consumes_its_sequence_without_changing_state() {
+        let mut s = admin_state();
+        apply_ok(&mut s, log(1, 1), &client(1), &grant(ALL_RIGHTS, 0));
+        let business = (s.resources.clone(), s.acl.clone(), s.growth_bytes);
+
+        let result = apply_ok(&mut s, log(1, 2), &client(2), &grant(ALL_RIGHTS, 1));
+        assert_eq!(result.disposition, Disposition::Consumed);
+        assert_eq!(result.reply.outcome, Outcome::GrantUpdated);
+        assert_eq!(result.reply.acl_revision, 1, "the revision does not move");
+        assert_eq!(
+            (s.resources.clone(), s.acl.clone(), s.growth_bytes),
+            business,
+            "a no-op writes no business row"
+        );
+        // But the sequence is consumed and replays.
+        let replayed = apply_ok(&mut s, log(1, 3), &client(2), &grant(ALL_RIGHTS, 1));
+        assert_eq!(replayed, result);
+    }
+
+    /// The §8.3 fence lands through the full apply path, not merely in the
+    /// decision: a holder stripped of a sustaining right loses its lease in the
+    /// same committed entry.
+    #[test]
+    fn an_applied_grant_fences_the_holder_in_the_same_entry() {
+        let mut s = admin_state();
+        apply_ok(&mut s, log(1, 1), &client(1), &grant(ALL_RIGHTS, 0));
+        apply_ok(&mut s, log(1, 2), &client(2), &acquire());
+
+        let held = s.resources.get(&key()).unwrap().clone();
+        assert!(held.held && held.holder == Some(ACTOR));
+
+        // Strip RENEW from the holder.
+        let stripped = ALL_RIGHTS & !crate::coordination::model::limits::RIGHT_RENEW;
+        apply_ok(&mut s, log(1, 3), &client(3), &grant(stripped, 1));
+
+        let after = s.resources.get(&key()).unwrap();
+        assert!(!after.held, "the holder is fenced");
+        assert_eq!(after.holder, None);
+        assert_eq!(after.epoch, held.epoch + 1);
+        assert_eq!(after.lease_revision, held.lease_revision + 1);
+        assert_eq!(after.acl_revision, 2);
+        assert!(s.counters_match_recomputation());
+    }
+
+    /// A non-administrator is a stage-4 status, exactly as for a resource
+    /// command -- the projection is shared.
+    #[test]
+    fn a_non_administrator_grant_is_a_stage_four_status() {
+        let s = State::default();
+        assert_eq!(
+            preflight(&s, &client(1), &grant(ALL_RIGHTS, 0)),
+            Admission::Status(StatusDenial::NotAuthorized)
+        );
+    }
+
+    /// A stale revision is admitted and commits a consumed conflict, rather
+    /// than being denied pre-proposal.
+    #[test]
+    fn a_stale_grant_revision_commits_a_consumed_conflict() {
+        let mut s = admin_state();
+        apply_ok(&mut s, log(1, 1), &client(1), &grant(ALL_RIGHTS, 0));
+
+        assert_eq!(
+            preflight(&s, &client(2), &grant(RIGHT_ACQUIRE, 0)),
+            Admission::Admit,
+            "a stale revision must reach the log"
+        );
+        let result = apply_ok(&mut s, log(1, 2), &client(2), &grant(RIGHT_ACQUIRE, 0));
+        assert_eq!(result.disposition, Disposition::Consumed);
+        assert_eq!(result.reply.reason, Reason::AclRevisionMismatch);
+        assert!(result.is_terminal(), "Consumed is terminal");
     }
 
     #[test]
