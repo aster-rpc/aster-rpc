@@ -424,3 +424,136 @@ async fn future_epoch_is_integrity_alarm() {
         Err(FenceRejection::FutureEpoch { .. })
     ));
 }
+
+// ── The additive `stop_renewing` seam (coordination §9.4) ────────────────────
+
+// It stops the renew loop and hands back the fence **without** releasing at the
+// serializer, so a caller can spend that fence on one final atomic operation.
+// `release` cannot serve this: it performs its own RELEASE, which advances the
+// fence and would reject the very write it is being paired with.
+#[tokio::test(start_paused = true)]
+async fn stop_renewing_returns_the_fence_without_releasing() {
+    let s = Arc::new(MemorySerializer::new());
+    let lease = match LeaseHandle::acquire(s.clone(), "r", "node-a", opts())
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Granted(l) => l,
+        _ => panic!("grant expected"),
+    };
+    let epoch = lease.epoch();
+
+    let fence = lease.stop_renewing().expect("the fence is still usable");
+    assert_eq!(fence.epoch, epoch, "the fence is unchanged");
+    assert_eq!(fence.holder, "node-a");
+
+    // The lease is still held at the serializer -- nothing was released -- so
+    // the returned fence is still the live one and another node cannot take it.
+    assert!(matches!(
+        acquire_raw(&s, "node-b").await,
+        TransitionOutcome::Denied(DenyReason::HeldByOther, _)
+    ));
+
+    // And the fence still passes the serializer's own check, which is what
+    // makes it spendable on that one final operation.
+    let outcome = s
+        .transition(
+            "r",
+            LeaseOp::Release {
+                holder: fence.holder.clone(),
+                epoch: fence.epoch,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, TransitionOutcome::Released));
+}
+
+// It really does stop renewing: without the loop the lease lapses by TTL at the
+// serializer, so a later candidate can take it.
+#[tokio::test(start_paused = true)]
+async fn stop_renewing_stops_the_renew_loop() {
+    let s = Arc::new(MemorySerializer::new());
+    let lease = match LeaseHandle::acquire(s.clone(), "r", "node-a", opts())
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Granted(l) => l,
+        _ => panic!("grant expected"),
+    };
+
+    let _fence = lease.stop_renewing().expect("usable");
+    tokio::time::sleep(3 * TTL).await;
+
+    // No renewal happened, so the lease expired and is acquirable again.
+    assert!(matches!(
+        acquire_raw(&s, "node-b").await,
+        TransitionOutcome::Granted(_)
+    ));
+}
+
+// It returns `None` when the fence is no longer usable, applying the same gate
+// `fence()` does -- a caller must not act on a fence this node can no longer
+// justify holding.
+#[tokio::test(start_paused = true)]
+async fn stop_renewing_returns_none_once_the_self_limit_has_passed() {
+    let s = Arc::new(MemorySerializer::new());
+    let lease = match LeaseHandle::acquire(s.clone(), "r", "node-a", opts())
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Granted(l) => l,
+        _ => panic!("grant expected"),
+    };
+
+    // Fence the holder at the serializer, so its renewals start failing and the
+    // handle flips out of `Held`.
+    revoke(s.as_ref(), "r", "admin").await.unwrap();
+    tokio::time::sleep(3 * TTL).await;
+    assert_ne!(lease.status(), LeaseStatus::Held);
+
+    assert!(
+        lease.stop_renewing().is_none(),
+        "a fenced holder must not be handed a fence to spend"
+    );
+}
+
+// The existing paths are untouched: `release` still performs its RELEASE, and a
+// dropped handle still stops renewing without releasing.
+#[tokio::test(start_paused = true)]
+async fn release_and_drop_keep_their_existing_behaviour() {
+    let s = Arc::new(MemorySerializer::new());
+
+    let lease = match LeaseHandle::acquire(s.clone(), "r", "node-a", opts())
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Granted(l) => l,
+        _ => panic!("grant expected"),
+    };
+    lease.release().await.unwrap();
+    assert!(
+        matches!(
+            acquire_raw(&s, "node-b").await,
+            TransitionOutcome::Granted(_)
+        ),
+        "release still hands the resource over immediately"
+    );
+
+    let lease = match LeaseHandle::acquire(s.clone(), "r2", "node-a", opts())
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Granted(l) => l,
+        _ => panic!("grant expected"),
+    };
+    drop(lease);
+    tokio::time::sleep(3 * TTL).await;
+    assert!(
+        matches!(
+            acquire_raw(&s, "node-b").await,
+            TransitionOutcome::Granted(_)
+        ),
+        "a dropped handle still lapses by TTL rather than releasing"
+    );
+}

@@ -664,6 +664,35 @@ impl LeaseHandle {
             .await?;
         Ok(())
     }
+
+    /// Stop renewing and hand back the fence, **without** releasing at the
+    /// serializer (coordination §9.4).
+    ///
+    /// The seam exists so a final value write and the lease's end can be one
+    /// atomic committed command rather than two. `release` performs its own
+    /// `Release` transition, which advances the fence -- so a caller wanting
+    /// "write this value, then give up the lease, atomically" cannot use it: the
+    /// release would fence the very write it is trying to pair with. This
+    /// consumes the handle, aborts the renew loop and marks the lease locally
+    /// released, then returns the fence for the caller to spend on exactly one
+    /// further operation.
+    ///
+    /// Returns `None` when the fence is no longer usable -- the lease was fenced
+    /// or lost, or the self-limit has expired. That is the same gate
+    /// [`fence`](Self::fence) applies: a caller must not act on a fence this
+    /// node can no longer justify holding, and the whole point of the
+    /// conservative self-limit is that it stops the holder before the server's
+    /// timer could transfer ownership.
+    ///
+    /// Everything else is unchanged. `release`, the designated-grantor path and
+    /// the renewal loop keep their existing behaviour; this adds a third way to
+    /// end a lease, it does not modify the other two.
+    pub fn stop_renewing(self) -> Option<Fence> {
+        let fence = self.fence();
+        self.renew_task.abort();
+        self.status_tx.send_replace(LeaseStatus::Released);
+        fence
+    }
 }
 
 impl Drop for LeaseHandle {

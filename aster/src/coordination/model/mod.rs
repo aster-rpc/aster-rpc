@@ -10,11 +10,13 @@
 //! Storage (Slice 2) and consensus (Slice 3) call into this module rather than
 //! reimplementing its transitions.
 
+pub mod adapter;
 pub mod admin;
 pub mod apply;
 pub mod classify;
 pub mod expire;
 pub mod grant;
+pub mod history;
 pub mod limits;
 pub mod membership;
 pub mod project;
