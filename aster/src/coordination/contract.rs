@@ -317,6 +317,20 @@ pub struct UnsignedCountersV1 {
 /// One `Fory` per payload root, built through `PayloadRegistry` exactly as
 /// `rpc/lease.rs` does — the derive walks the field tree, so registration order
 /// is not hand-maintained.
+/// The largest `String` field this codec can carry, in bytes.
+///
+/// **A measured limit, not a policy one.** Under the `xlang(true)` +
+/// `compatible(true)` runtime every Aster payload uses, Apache Fory 1.3 encodes
+/// a `String` field of 4096 bytes or more and then fails to decode it, with
+/// `TypeError("Type inconsistent, target collection element type is not
+/// polymorphic")`. `Vec<u8>` under `#[fory(bytes)]` is unaffected at any size,
+/// so this is specific to the string path.
+///
+/// Anything declared "up to 4 KiB" in a `String` field is therefore capped one
+/// byte lower until the codec is fixed. Refusing a 4096-byte value is strictly
+/// better than accepting one no peer can read back.
+pub const MAX_WIRE_STRING: usize = 4095;
+
 pub fn payload_fory<T: WireField>() -> fory_core::Fory {
     let mut reg = PayloadRegistry::new();
     T::register_payload(&mut reg);
@@ -341,6 +355,53 @@ mod tests {
             epoch: 42,
             holder: vec![9u8; 32],
         }
+    }
+
+    /// The measured boundary behind [`MAX_WIRE_STRING`]. Pinned as a test so the
+    /// day the codec is fixed, this fails and the cap can be lifted deliberately
+    /// rather than discovered by a peer that cannot read a ticket.
+    #[test]
+    fn a_string_field_of_4096_bytes_does_not_decode() {
+        #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+        #[aster(wire = "aster.coordination.v1/StringBoundProbe")]
+        struct Probe {
+            #[fory(id = 1)]
+            text: String,
+            #[fory(id = 2, bytes)]
+            blob: Vec<u8>,
+        }
+
+        let fory = payload_fory::<Probe>();
+        let encodes_and_decodes = |p: &Probe| {
+            let bytes = fory.serialize(p).expect("encode always succeeds");
+            fory.deserialize::<Probe>(&bytes).is_ok()
+        };
+
+        let at_limit = Probe {
+            text: "x".repeat(MAX_WIRE_STRING),
+            blob: Vec::new(),
+        };
+        assert!(encodes_and_decodes(&at_limit), "4095 bytes round-trips");
+
+        let over_limit = Probe {
+            text: "x".repeat(MAX_WIRE_STRING + 1),
+            blob: Vec::new(),
+        };
+        assert!(
+            !encodes_and_decodes(&over_limit),
+            "if this now passes, Fory has been fixed -- raise MAX_WIRE_STRING"
+        );
+
+        // The same byte count as bytes, which is why byte fields keep their
+        // full declared ceilings.
+        let as_bytes = Probe {
+            text: String::new(),
+            blob: vec![0x41u8; 64 * 1024],
+        };
+        assert!(
+            encodes_and_decodes(&as_bytes),
+            "the defect is specific to the string path"
+        );
     }
 
     /// Q: would a field silently drifting back to `i64` be caught?

@@ -34,7 +34,12 @@ pub const MAX_KEY: usize = 512;
 /// Maximum resource value length (§12.1).
 pub const MAX_VALUE: usize = 65_536;
 /// Maximum ticket length inside a member seed (§12.1).
-pub const MAX_TICKET: usize = 4 * 1024;
+///
+/// §12.1 says "up to 4 KiB"; the enforced value is one byte lower because a
+/// ticket travels in a Fory `String` field, and this codec cannot decode one of
+/// 4096 bytes or more. See [`crate::coordination::contract::MAX_WIRE_STRING`].
+/// Accepting a ticket no voter can read back would be worse than refusing it.
+pub const MAX_TICKET: usize = crate::coordination::contract::MAX_WIRE_STRING;
 /// Maximum signed join permit length (§12.1).
 pub const MAX_JOIN_PERMIT: usize = 8 * 1024;
 /// Maximum encoded `ActionV1` (§12.1). Checked on the encoded form, not
@@ -230,7 +235,10 @@ mod tests {
         assert_eq!(MAX_VALUE, 65_536);
         assert_eq!(MAX_KEY, 512);
         assert_eq!(MAX_NAMESPACE, 64);
-        assert_eq!(MAX_TICKET, 4_096);
+        assert_eq!(
+            MAX_TICKET, 4_095,
+            "one byte under §12.1's 4 KiB, pinned by the codec's string limit"
+        );
         assert_eq!(MAX_JOIN_PERMIT, 8_192);
         assert_eq!(MAX_ENCODED_COMMAND, 262_144);
         assert_eq!(GROWTH_BUDGET, 201_326_592);

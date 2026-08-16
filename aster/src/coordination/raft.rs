@@ -21,6 +21,8 @@
 
 use fory_derive::{ForyStruct, ForyUnion};
 
+#[cfg(test)]
+use super::contract::MAX_WIRE_STRING;
 use super::contract::{ChangeMembershipActionV1, CommandV1, LogIdV1, SavedReplyV1};
 
 /// `openraft::Vote { leader_id: LeaderId { term, node_id }, committed }`.
@@ -271,6 +273,158 @@ pub struct RaftResponseEnvelopeV1 {
     pub payload: Vec<u8>,
 }
 
+// ── §5.3's snapshot stream ──────────────────────────────────────────────────
+
+/// The first and only header frame of an `install_snapshot` stream.
+///
+/// `vote_payload` and `snapshot_meta_payload` are bounded canonical Fory bytes
+/// for the same reason [`RaftEnvelopeV1::payload`] is: the receiver checks
+/// group, sender and bounds before decoding anything it was sent.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/RaftSnapshotHeader")]
+pub struct RaftSnapshotHeaderWireV1 {
+    #[fory(id = 1)]
+    pub protocol_version: i32,
+    #[fory(id = 2)]
+    pub raft_codec_version: i32,
+    #[fory(id = 3, bytes)]
+    pub group_id: Vec<u8>,
+    #[fory(id = 4, bytes)]
+    pub sender_node_id: Vec<u8>,
+    /// A canonical `VoteV1`.
+    #[fory(id = 5, bytes)]
+    pub vote_payload: Vec<u8>,
+    /// A canonical `SnapshotMetaV1`.
+    #[fory(id = 6, bytes)]
+    pub snapshot_meta_payload: Vec<u8>,
+    #[fory(id = 7)]
+    pub total_len: u64,
+    /// Exactly 32 bytes.
+    #[fory(id = 8, bytes)]
+    pub blake3_checksum: Vec<u8>,
+}
+
+/// One body frame: strictly increasing `offset`, at most 1 MiB of `data`.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/RaftSnapshotChunk")]
+pub struct RaftSnapshotChunkWireV1 {
+    #[fory(id = 1)]
+    pub offset: u64,
+    #[fory(id = 2, bytes)]
+    pub data: Vec<u8>,
+    #[fory(id = 3)]
+    pub final_chunk: bool,
+}
+
+/// The snapshot request stream: exactly two variants, never renumbered.
+#[derive(ForyUnion, aster_macros::AsterType, Debug, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/RaftSnapshotFrame")]
+pub enum RaftSnapshotFrameV1 {
+    #[fory(default)]
+    #[fory(id = 1)]
+    Header(RaftSnapshotHeaderWireV1),
+    #[fory(id = 2)]
+    Chunk(RaftSnapshotChunkWireV1),
+    #[fory(unknown)]
+    Unknown(fory_core::UnknownCase),
+}
+
+// ── §7.1's signed documents ─────────────────────────────────────────────────
+
+/// One initial voter and the ticket it is reachable at.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/VoterSeed")]
+pub struct VoterSeedV1 {
+    #[fory(id = 1, bytes)]
+    pub node_id: Vec<u8>,
+    /// At most 4 KiB, and only in the Open profile.
+    #[fory(id = 2)]
+    pub ticket: String,
+}
+
+/// The signed genesis document (§7.1).
+///
+/// The genesis hash is BLAKE3 over the domain-separated **signed** document, and
+/// it is persisted in both databases: reusing a group id under a different
+/// genesis hash is a hard startup failure rather than a recoverable mismatch.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/Genesis")]
+pub struct GenesisV1 {
+    #[fory(id = 1)]
+    pub format_version: u32,
+    #[fory(id = 2, bytes)]
+    pub group_id: Vec<u8>,
+    /// 1..=128 ASCII. Present here, and in [`JoinPermitV1`], because §7.1
+    /// requires every signed document's domain to equal the configured
+    /// expectation -- a document without the field cannot satisfy that rule.
+    #[fory(id = 3)]
+    pub authority_domain: String,
+    #[fory(id = 4, bytes)]
+    pub genesis_nonce: Vec<u8>,
+    /// 1 Prod | 2 DevSingle | 3 DevEven.
+    #[fory(id = 5)]
+    pub deployment_profile_code: i32,
+    /// Sorted by node id.
+    #[fory(id = 6)]
+    pub initial_voters: Vec<VoterSeedV1>,
+    /// Sorted, 1..=64.
+    #[fory(id = 7)]
+    pub initial_admins: Vec<NodeIdV1>,
+    #[fory(id = 8, bytes)]
+    pub recovery_export_hash: Option<Vec<u8>>,
+}
+
+/// The signed join permit (§7.1).
+///
+/// Deliberately has **no** wall-clock expiry: time is not a portable bootstrap
+/// authority. A permit adds no member on its own -- an existing administrator
+/// must still commit a membership intent through the current quorum -- so it is
+/// revoked operationally by refusing that plan.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/JoinPermit")]
+pub struct JoinPermitV1 {
+    #[fory(id = 1)]
+    pub format_version: u32,
+    #[fory(id = 2, bytes)]
+    pub group_id: Vec<u8>,
+    #[fory(id = 3)]
+    pub authority_domain: String,
+    #[fory(id = 4, bytes)]
+    pub genesis_hash: Vec<u8>,
+    #[fory(id = 5, bytes)]
+    pub candidate_node_id: Vec<u8>,
+    /// At most 4 KiB, and only in the Open profile.
+    #[fory(id = 6)]
+    pub candidate_ticket: String,
+    /// Sorted and non-empty: until the candidate applies a membership containing
+    /// itself, these are the only senders it accepts Raft traffic from.
+    #[fory(id = 7)]
+    pub bootstrap_senders: Vec<NodeIdV1>,
+    #[fory(id = 8, bytes)]
+    pub join_nonce: Vec<u8>,
+}
+
+/// The signature envelope around a genesis or join document.
+///
+/// The inner document is carried as **opaque bytes**, not as a typed field.
+/// Verification has to sign and check the exact bytes received; a typed field
+/// would invite a decode/re-encode round trip whose output could differ from
+/// its input, and §7.1's re-encode check compares against these bytes.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/SignedDocument")]
+pub struct SignedCoordinationDocumentV1 {
+    #[fory(id = 1)]
+    pub format_version: u32,
+    #[fory(id = 2, bytes)]
+    pub document_bytes: Vec<u8>,
+    /// Exactly 32 bytes.
+    #[fory(id = 3, bytes)]
+    pub authority_public_key: Vec<u8>,
+    /// Exactly 64 bytes.
+    #[fory(id = 4, bytes)]
+    pub signature: Vec<u8>,
+}
+
 /// §13's recovery provenance, referenced by [`CoordinationMetaV1`].
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/RecoveredFrom")]
@@ -501,6 +655,187 @@ mod tests {
                 last_result: None,
                 retired: true,
             }
+        );
+    }
+
+    /// Every wire root round-trips at its **empty** and its **maximal** shape,
+    /// not only at a convenient middle one. Empty collections and absent
+    /// options are where a codec most often substitutes a default, and the
+    /// maximal shape is where a bound is either enforced or discovered late.
+    #[test]
+    fn wire_roots_round_trip_at_their_empty_and_maximal_shapes() {
+        macro_rules! round_trip {
+            ($ty:ty, $value:expr) => {{
+                let fory = payload_fory::<$ty>();
+                let value = $value;
+                let encoded = fory.serialize(&value).expect("encode");
+                let decoded: $ty = fory.deserialize(&encoded).expect("decode");
+                assert_eq!(decoded, value, concat!(stringify!($ty), " round trip"));
+            }};
+        }
+
+        // Empty shapes: no entries, no voters, no admins, every option absent.
+        round_trip!(
+            AppendRequestV1,
+            AppendRequestV1 {
+                vote: VoteV1::default(),
+                prev_log_id: None,
+                entries: Vec::new(),
+                leader_commit: None,
+            }
+        );
+        round_trip!(
+            AppendPartialSuccessV1,
+            AppendPartialSuccessV1 { matching: None }
+        );
+        round_trip!(AppendSuccessV1, AppendSuccessV1 {});
+        round_trip!(AppendConflictV1, AppendConflictV1 {});
+        round_trip!(
+            MembershipV1,
+            MembershipV1 {
+                configs: Vec::new(),
+                nodes: Vec::new(),
+            }
+        );
+        round_trip!(
+            RaftSnapshotChunkWireV1,
+            RaftSnapshotChunkWireV1 {
+                offset: 0,
+                data: Vec::new(),
+                final_chunk: false,
+            }
+        );
+
+        // Maximal shapes: the declared ceilings, so a bound that is only a
+        // comment fails here rather than in production.
+        // One byte under 4 KiB, deliberately: see
+        // `contract::tests::a_string_field_of_4096_bytes_does_not_decode`.
+        const MAX_TICKET: usize = MAX_WIRE_STRING;
+        const MAX_DOMAIN: usize = 128;
+        const MAX_CHUNK: usize = 1024 * 1024;
+
+        round_trip!(
+            GenesisV1,
+            GenesisV1 {
+                format_version: 1,
+                group_id: vec![0xFFu8; 32],
+                authority_domain: "d".repeat(MAX_DOMAIN),
+                genesis_nonce: vec![0xFFu8; 32],
+                deployment_profile_code: 3,
+                initial_voters: (0..5u8)
+                    .map(|i| VoterSeedV1 {
+                        node_id: vec![i; 32],
+                        ticket: "t".repeat(MAX_TICKET),
+                    })
+                    .collect(),
+                initial_admins: (0..64u8)
+                    .map(|i| NodeIdV1 {
+                        node_id: vec![i; 32],
+                    })
+                    .collect(),
+                recovery_export_hash: Some(vec![0xABu8; 32]),
+            }
+        );
+        round_trip!(
+            JoinPermitV1,
+            JoinPermitV1 {
+                format_version: 1,
+                group_id: vec![0xFFu8; 32],
+                authority_domain: "d".repeat(MAX_DOMAIN),
+                genesis_hash: vec![0x11u8; 32],
+                candidate_node_id: vec![0x22u8; 32],
+                candidate_ticket: "t".repeat(MAX_TICKET),
+                bootstrap_senders: (0..5u8)
+                    .map(|i| NodeIdV1 {
+                        node_id: vec![i; 32]
+                    })
+                    .collect(),
+                join_nonce: vec![0x33u8; 32],
+            }
+        );
+        round_trip!(
+            RaftSnapshotChunkWireV1,
+            RaftSnapshotChunkWireV1 {
+                offset: u64::MAX,
+                data: vec![0x5Au8; MAX_CHUNK],
+                final_chunk: true,
+            }
+        );
+        round_trip!(
+            RaftSnapshotHeaderWireV1,
+            RaftSnapshotHeaderWireV1 {
+                protocol_version: 1,
+                raft_codec_version: 1,
+                group_id: vec![0xAAu8; 32],
+                sender_node_id: vec![0xBBu8; 32],
+                vote_payload: vec![1u8; 64],
+                snapshot_meta_payload: vec![2u8; 256],
+                total_len: u64::MAX,
+                blake3_checksum: vec![0xCCu8; 32],
+            }
+        );
+        round_trip!(
+            SignedCoordinationDocumentV1,
+            SignedCoordinationDocumentV1 {
+                format_version: 1,
+                document_bytes: vec![0x7Fu8; 8192],
+                authority_public_key: vec![0xDDu8; 32],
+                signature: vec![0xEEu8; 64],
+            }
+        );
+        round_trip!(
+            RaftEnvelopeV1,
+            RaftEnvelopeV1 {
+                protocol_version: 1,
+                raft_codec_version: 1,
+                group_id: vec![0xAAu8; 32],
+                sender_node_id: vec![0xBBu8; 32],
+                payload: vec![0u8; 4096],
+            }
+        );
+        round_trip!(
+            RaftResponseEnvelopeV1,
+            RaftResponseEnvelopeV1 {
+                protocol_version: 1,
+                raft_codec_version: 1,
+                group_id: vec![0xAAu8; 32],
+                responder_node_id: vec![0xBBu8; 32],
+                payload: Vec::new(),
+            }
+        );
+    }
+
+    /// The snapshot stream's two frames are one union, and a header must not be
+    /// readable as a chunk. Variant ids are wire contract: renumbering them
+    /// would make an old sender's header decode as somebody's chunk data.
+    #[test]
+    fn snapshot_frames_stay_distinguishable() {
+        let header = RaftSnapshotFrameV1::Header(RaftSnapshotHeaderWireV1 {
+            protocol_version: 1,
+            raft_codec_version: 1,
+            group_id: vec![0xAAu8; 32],
+            sender_node_id: vec![0xBBu8; 32],
+            vote_payload: Vec::new(),
+            snapshot_meta_payload: Vec::new(),
+            total_len: 10,
+            blake3_checksum: vec![0u8; 32],
+        });
+        let chunk = RaftSnapshotFrameV1::Chunk(RaftSnapshotChunkWireV1 {
+            offset: 0,
+            data: b"0123456789".to_vec(),
+            final_chunk: true,
+        });
+
+        let fory = payload_fory::<RaftSnapshotFrameV1>();
+        for frame in [&header, &chunk] {
+            let decoded: RaftSnapshotFrameV1 = fory
+                .deserialize(&fory.serialize(frame).expect("encode"))
+                .expect("decode");
+            assert_eq!(&decoded, frame);
+        }
+        assert_ne!(
+            fory.serialize(&header).expect("encode"),
+            fory.serialize(&chunk).expect("encode")
         );
     }
 
