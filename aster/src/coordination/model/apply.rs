@@ -2059,6 +2059,73 @@ mod tests {
         assert_eq!(after.epoch, row.epoch + 1);
         assert_eq!(s.audit.len(), 2);
         assert!(s.counters_match_recomputation());
+
+        // The audit row records the **system phase code**, not a client
+        // outcome. Coercing it to `Rejected` -- as an earlier revision did --
+        // records a successful expiry as a rejection, and puts two disjoint
+        // code spaces in one untagged field.
+        let audited = s.audit.get(&(1, 2)).expect("the expiry's audit row");
+        assert_eq!(
+            audited.result,
+            AuditResult::System(crate::coordination::contract::SYS_EXPIRED),
+            "a system command audits its phase code"
+        );
+        assert!(!audited.result.is_client());
+        assert_eq!(audited.operation_code, OPERATION_EXPIRE);
+    }
+
+    /// A stale expiry audits `2 ExpiryStale`, so the two system results are
+    /// distinguishable in the audit trail rather than both reading as failures.
+    #[test]
+    fn a_stale_expire_audits_its_own_system_code() {
+        let mut s = granted();
+        apply_ok(&mut s, log(1, 1), &client(1), &acquire());
+
+        apply_command(
+            &mut s,
+            log(1, 2),
+            &Command::Expire(crate::coordination::model::expire::ExpireCommand {
+                resource: key(),
+                epoch: 99,
+                lease_revision: 99,
+            }),
+        )
+        .expect("no fault");
+
+        let audited = s.audit.get(&(1, 2)).expect("the expiry's audit row");
+        assert_eq!(
+            audited.result,
+            AuditResult::System(crate::coordination::contract::SYS_EXPIRY_STALE)
+        );
+    }
+
+    /// A membership progress report audits its system code too, and a phase
+    /// mismatch is distinguishable from an advance.
+    #[test]
+    fn membership_progress_audits_its_system_code() {
+        let mut s = admin_state();
+        apply_command(
+            &mut s,
+            log(1, 1),
+            &Command::MembershipProgress(
+                crate::coordination::model::membership::MembershipProgressCommand {
+                    operation_id: [1u8; 16],
+                    expected_phase: 1,
+                    new_phase: 2,
+                    observed_membership_log_id: None,
+                    result_code: crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED,
+                },
+            ),
+        )
+        .expect("no fault");
+
+        let audited = s.audit.get(&(1, 1)).expect("the progress audit row");
+        assert_eq!(
+            audited.result,
+            AuditResult::System(crate::coordination::contract::SYS_MEMBERSHIP_PHASE_MISMATCH),
+            "no such intent, so the report did not advance anything"
+        );
+        assert_eq!(audited.operation_code, OPERATION_MEMBERSHIP_PROGRESS);
     }
 
     /// The audit operation codes, pinned against §5.2's literal declaration
