@@ -115,6 +115,28 @@ pub struct Route {
 /// A grant: the rights one subject holds on one resource.
 pub type GrantKey = (ResourceKey, NodeId);
 
+/// A Raft log entry identity: term **and** index (§11.2).
+///
+/// `last_applied` is this whole value, not an index. An index alone cannot
+/// distinguish an entry from a different leader's entry at the same position,
+/// and OpenRaft requires the full log id of each applied entry to resume
+/// correctly -- it restarts delivery from `already_committed.next_index()`.
+///
+/// Deliberately **no** `Ord`. Log ordering is by index; deriving a lexicographic
+/// `(term, index)` comparison would silently order two entries by term first,
+/// which is not what any caller means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LogId {
+    pub term: u64,
+    pub index: u64,
+}
+
+impl LogId {
+    pub fn new(term: u64, index: u64) -> Self {
+        Self { term, index }
+    }
+}
+
 /// The complete replicated state.
 #[derive(Clone, Debug, Default)]
 pub struct State {
@@ -125,20 +147,28 @@ pub struct State {
     pub intents: BTreeMap<[u8; 16], Intent>,
     pub routes: BTreeMap<NodeId, Route>,
     /// Keyed by the normative entry identity `(log_term, log_index)` (§11.2),
-    /// which is what makes reapplying the same entry idempotent: the key
-    /// already exists, so no second row and no second charge.
+    /// which orders pruning deterministically.
     ///
-    /// Ordering by term then index also prunes the oldest deterministically.
+    /// **Not** an oracle for "has this entry been applied?". Audit rows are
+    /// prunable, are absent for non-command entries, and are a lossy projection
+    /// of the command -- two different `compare_and_set` commands produce
+    /// identical rows, because the row carries no value. `last_applied` is the
+    /// authority; see [`State::highest_audited_index`].
     pub audit: BTreeMap<(u64, u64), AuditRow>,
     /// Maintained incrementally. MUST equal [`State::recompute_growth`].
     pub growth_bytes: u64,
     /// Maintained incrementally. MUST equal [`State::recompute_reserve`].
     pub reserve_bytes: u64,
     pub admin_revision: u64,
-    /// The highest applied log index. Advances on **every** applied entry,
-    /// including a rejection: a committed entry that left no trace would be
-    /// indistinguishable from one that was skipped.
-    pub last_applied: u64,
+    /// The complete [`LogId`] of the last applied entry, or `None` before the
+    /// first.
+    ///
+    /// Advances on **every** applied entry, including a rejection: a committed
+    /// entry that left no trace would be indistinguishable from one that was
+    /// skipped. It is written in the same transaction as that entry's effects
+    /// and audit row (§11.3), which is what makes it the authoritative answer
+    /// to "has this entry been applied?".
+    pub last_applied: Option<LogId>,
 }
 
 impl State {
@@ -196,6 +226,16 @@ impl State {
     pub fn counters_match_recomputation(&self) -> bool {
         self.growth_bytes == self.recompute_growth()
             && self.reserve_bytes == self.recompute_reserve()
+    }
+
+    /// The highest log index any audit row records.
+    ///
+    /// Used only to detect corrupt state: §11.3 writes effects, audit and
+    /// `last_applied` in one transaction, so an audit row for an entry
+    /// `last_applied` says was never applied means that atomicity was violated.
+    /// Production storage keeps this as a stored maximum rather than a scan.
+    pub fn highest_audited_index(&self) -> Option<u64> {
+        self.audit.keys().map(|(_, index)| *index).max()
     }
 
     /// Session capacity for `actor`, at both scopes.

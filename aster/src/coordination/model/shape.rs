@@ -186,11 +186,20 @@ mod tests {
             ("empty key", "ns", b"", ShapeLimit::ResourceKey),
             ("uppercase namespace", "NS", b"k", ShapeLimit::Namespace),
             ("unicode namespace", "nsé", b"k", ShapeLimit::Namespace),
-            ("punctuation", "ns/sub", b"k", ShapeLimit::Namespace),
+            (
+                "byte outside the charset",
+                "ns/sub",
+                b"k",
+                ShapeLimit::Namespace,
+            ),
+            ("space", "ns ns", b"k", ShapeLimit::Namespace),
+            // `.`, `-` and `_` are legal *inside* a namespace but not as the
+            // first byte, which keeps a leading-dot name from looking like a
+            // hidden file wherever it is written to disk. One case per byte,
+            // and the legal-in-the-tail counterpart below.
             ("leading dot", ".hidden", b"k", ShapeLimit::Namespace),
             ("leading dash", "-ns", b"k", ShapeLimit::Namespace),
             ("leading underscore", "_ns", b"k", ShapeLimit::Namespace),
-            ("space", "ns ns", b"k", ShapeLimit::Namespace),
         ];
         for (name, ns, key, expected) in cases {
             assert_eq!(
@@ -199,6 +208,14 @@ mod tests {
                 "{name} must be refused"
             );
         }
+    }
+
+    /// The counterpart to the leading-byte cases: the same three bytes are
+    /// legal after the first, so the rule is about position rather than about
+    /// the characters.
+    #[test]
+    fn dot_dash_and_underscore_are_legal_after_the_first_byte() {
+        assert!(validate_resource_key("a.b-c_d", b"k").is_ok());
     }
 
     #[test]
