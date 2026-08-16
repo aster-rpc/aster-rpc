@@ -229,6 +229,19 @@ pub enum Fault {
         delivered: LogId,
         last_applied: LogId,
     },
+    /// A committed entry decoded to the forward-compatibility carrier.
+    ///
+    /// §5.3.1: an unknown command is **fatal on every voter**, not skipped. The
+    /// carrier exists so a newer peer's payload does not corrupt a decoder, not
+    /// so an unrecognised command can be applied -- and applying one is
+    /// impossible by definition, since this version does not know what it
+    /// means. Skipping it would diverge the voters that *do* know; halting
+    /// stops this one and lets the quorum continue without it.
+    ///
+    /// It cannot arise from a conforming leader, which rejects `Unknown` with
+    /// `INVALID_ARGUMENT` before the hash is computed and therefore before
+    /// proposal.
+    UnknownCommand,
     /// An audit row exists for an entry `last_applied` says was never applied.
     ///
     /// §11.3 writes both in one transaction, so this state is unreachable
@@ -361,7 +374,14 @@ fn rejection(resource: Option<ResourceKey>, reason: Reason) -> SavedReply {
 /// forbidding a client from retiring the session it was calling from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    Client { client: ClientRef, action: Action },
+    /// A committed entry this version cannot interpret (§5.3.1). Modelled so
+    /// the fatal path is reachable and testable, rather than being a comment
+    /// about what the decoder ought to do.
+    Unknown,
+    Client {
+        client: ClientRef,
+        action: Action,
+    },
     Expire(ExpireCommand),
     MembershipProgress(MembershipProgressCommand),
     RetireClient(RetireCommand),
@@ -413,6 +433,10 @@ pub fn apply_command(
     guard_delivery(state, log_id)?;
 
     let reply = match command {
+        // Fatal before anything is written, and before `last_applied` moves:
+        // a voter that cannot interpret an entry must not record having
+        // applied it.
+        Command::Unknown => return Err(Fault::UnknownCommand),
         Command::Client { client, action } => {
             CommandReply::Client(Box::new(apply_client(state, log_id, client, action)))
         }
@@ -1738,6 +1762,167 @@ mod tests {
         assert!(s.sessions.is_empty(), "no session row is created");
         assert_eq!(s.audit.len(), 1, "the applied entry still leaves a trace");
         assert_eq!(s.last_applied, Some(log(1, 4)));
+        assert!(s.counters_match_recomputation());
+    }
+
+    /// §5.3.1: a committed `Unknown` is fatal on every voter, not skipped --
+    /// and it must fault **before** `last_applied` moves, or this node would
+    /// record having applied an entry it cannot interpret.
+    #[test]
+    fn a_committed_unknown_command_is_fatal_and_records_nothing() {
+        let mut s = granted();
+        apply_ok(&mut s, log(1, 1), &client(1), &acquire());
+        let before = s.clone();
+
+        assert_eq!(
+            apply_command(&mut s, log(1, 2), &Command::Unknown),
+            Err(Fault::UnknownCommand)
+        );
+        assert_state_unchanged(&before, &s);
+        assert_eq!(
+            s.last_applied,
+            Some(log(1, 1)),
+            "a voter must not record applying what it cannot interpret"
+        );
+    }
+
+    /// The three command shapes each produce their own reply variant, so a
+    /// `disposition` never appears where it has no meaning.
+    #[test]
+    fn each_command_shape_produces_its_own_reply_variant() {
+        let mut s = admin_state();
+
+        assert!(matches!(
+            apply_command(
+                &mut s,
+                log(1, 1),
+                &Command::Client {
+                    client: client(1),
+                    action: grant(ALL_RIGHTS, 0),
+                }
+            ),
+            Ok(CommandReply::Client(_))
+        ));
+
+        assert!(matches!(
+            apply_command(
+                &mut s,
+                log(1, 2),
+                &Command::Expire(crate::coordination::model::expire::ExpireCommand {
+                    resource: key(),
+                    epoch: 1,
+                    lease_revision: 1,
+                })
+            ),
+            Ok(CommandReply::System(_))
+        ));
+
+        assert!(matches!(
+            apply_command(
+                &mut s,
+                log(1, 3),
+                &Command::RetireClient(RetireCommand {
+                    actor: ACTOR,
+                    target_actor: ACTOR,
+                    target_client_id: CLIENT,
+                })
+            ),
+            Ok(CommandReply::Retirement(_))
+        ));
+
+        assert!(s.counters_match_recomputation());
+    }
+
+    /// A retirement is a committed entry like any other: it audits and advances
+    /// `last_applied`, even when it changed nothing.
+    #[test]
+    fn a_retirement_audits_and_advances_last_applied() {
+        let mut s = granted();
+        let reply = apply_command(
+            &mut s,
+            log(1, 1),
+            &Command::RetireClient(RetireCommand {
+                actor: ACTOR,
+                target_actor: ACTOR,
+                target_client_id: CLIENT,
+            }),
+        )
+        .expect("no fault");
+
+        match reply {
+            CommandReply::Retirement(r) => {
+                assert_eq!(r.outcome, Outcome::ClientRetired);
+                assert!(r.is_terminal());
+            }
+            other => panic!("expected a retirement reply, got {other:?}"),
+        }
+        assert_eq!(s.audit.len(), 1);
+        assert_eq!(s.last_applied, Some(log(1, 1)));
+        assert!(s.counters_match_recomputation());
+
+        // The tombstone closes the id: the classifier now refuses every
+        // sequence for it.
+        let refused = apply_ok(&mut s, log(1, 2), &client(1), &acquire());
+        assert_eq!(refused.reply.reason, Reason::ClientRetired);
+    }
+
+    /// A committed retirement retains a saved result, so a retry of the
+    /// sequence that already applied still gets its answer -- the one lie the
+    /// journal cannot survive.
+    #[test]
+    fn retirement_preserves_a_committed_result() {
+        let mut s = granted();
+        let first = apply_ok(&mut s, log(1, 1), &client(1), &acquire());
+
+        apply_command(
+            &mut s,
+            log(1, 2),
+            &Command::RetireClient(RetireCommand {
+                actor: ACTOR,
+                target_actor: ACTOR,
+                target_client_id: CLIENT,
+            }),
+        )
+        .expect("no fault");
+
+        let replayed = apply_ok(&mut s, log(1, 3), &client(1), &acquire());
+        assert_eq!(replayed, first, "the saved result survives retirement");
+    }
+
+    /// An `Expire` is a committed entry with no client and no sequence: it
+    /// audits, advances `last_applied`, and reports a system code.
+    #[test]
+    fn an_expire_applies_as_a_system_command() {
+        let mut s = granted();
+        apply_ok(&mut s, log(1, 1), &client(1), &acquire());
+        let row = s.resources.get(&key()).unwrap().clone();
+
+        let reply = apply_command(
+            &mut s,
+            log(1, 2),
+            &Command::Expire(crate::coordination::model::expire::ExpireCommand {
+                resource: key(),
+                epoch: row.epoch,
+                lease_revision: row.lease_revision,
+            }),
+        )
+        .expect("no fault");
+
+        match reply {
+            CommandReply::System(r) => {
+                assert_eq!(
+                    r.system_result_code,
+                    crate::coordination::contract::SYS_EXPIRED
+                );
+                assert_eq!(r.lease_revision, row.lease_revision + 1);
+            }
+            other => panic!("expected a system reply, got {other:?}"),
+        }
+
+        let after = s.resources.get(&key()).unwrap();
+        assert!(!after.held);
+        assert_eq!(after.epoch, row.epoch + 1);
+        assert_eq!(s.audit.len(), 2);
         assert!(s.counters_match_recomputation());
     }
 

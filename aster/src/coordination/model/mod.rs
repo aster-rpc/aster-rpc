@@ -17,6 +17,7 @@ pub mod expire;
 pub mod grant;
 pub mod limits;
 pub mod membership;
+pub mod project;
 pub mod resource;
 pub mod retire;
 pub mod shape;

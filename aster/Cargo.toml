@@ -28,7 +28,7 @@ rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros"
 # Neither is in `default`, so voter-only dependencies are not enabled there.
 # Verify the direct edges with `cargo tree -p aster --no-default-features
 # --depth 1` and the full feature graph with `-e features`.
-coordination-client = ["rpc"]
+coordination-client = ["rpc", "dep:blake3"]
 coordination = ["coordination-client", "dep:openraft", "dep:redb"]
 discovery = []
 hooks = []
@@ -62,6 +62,12 @@ fory-derive = { version = "=1.3.0", optional = true }
 async-trait = { version = "0.1", optional = true }
 # Proc-macros: #[derive(AsterType)] (and later #[aster::service]). Gated by `rpc`.
 aster-macros = { path = "../aster-macros", version = "=0.3.0", registry = "aster", optional = true }
+# Canonical action hashing (§5.2.1): BLAKE3 over the domain-separated encoded
+# `ActionV1`. Gated by `coordination-client` because the client computes the
+# same hash the voter checks -- if only the voter had it, the two could not
+# agree. Already in the graph via `aster_transport_core`, so this adds no new
+# resolution.
+blake3 = { version = "1", optional = true }
 # Coordination voter (the `coordination` feature). Both are exact pins because
 # this subsystem's on-disk and on-wire formats are versioned against them.
 #
