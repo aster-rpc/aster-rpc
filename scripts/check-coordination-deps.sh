@@ -30,8 +30,9 @@ fail() { echo -e "${RED}FAIL${RESET} $1"; exit 1; }
 
 # `-e normal` keeps dev-dependencies out: a dev-only OpenRaft (for the storage
 # conformance suite) would be legitimate, and this gate is about the shipping
-# graph.
-tree() { cargo tree -p aster -e normal "$@"; }
+# graph. `--locked` matches the rest of CI and means a stale Cargo.lock fails
+# the gate rather than being quietly resolved into whatever it would become.
+tree() { cargo tree --locked -p aster -e normal "$@"; }
 
 # ── 1. OpenRaft is absent unless the voter feature is on ────────────────────
 

@@ -2,10 +2,14 @@
 # validate.sh — Run the same checks as CI locally to catch issues before pushing.
 # Usage: ./scripts/validate.sh
 #
-# Mirrors the jobs in .github/workflows/ci.yml + ci-typescript.yml:
+# Approximates the jobs in .forgejo/workflows/linux.yml — the active CI and
+# release workflow (AGENTS.md) — plus the TypeScript checks. It is not a full
+# mirror: notably it does not run the core/FFI Rust test suites, only the
+# feature-gated ingress proofs those suites silently skip.
 #   1. cargo fmt --all --check (workspace)
 #   2. cargo clippy --workspace --all-targets -- -D warnings (NAPI excluded)
 #   2b. scripts/check-coordination-deps.sh (coordination feature graph)
+#   2c. cargo test (core, ingress-metrics allocation proofs)
 #   3. uv run maturin develop (build the extension)
 #   4. uv run pytest tests/python/
 #   5. cargo clippy (NAPI, lib only)
@@ -91,6 +95,18 @@ if ./scripts/check-coordination-deps.sh; then
     pass "Coordination feature graph OK"
 else
     fail "Coordination dependency gate failed. See the output above."
+fi
+
+# ── 2c. §12.4 ingress allocation proofs ───────────────────────────
+# `core/tests/ingress_metrics.rs` is `#![cfg(feature = "ingress-metrics")]`.
+# Without the feature it compiles to an empty binary and reports "0 passed" —
+# green, and proving nothing. These are the only tests that assert over-cap
+# bytes were never *materialized*, rather than that the call was refused.
+step "cargo test (core, ingress allocation proofs)"
+if cargo test -p aster_transport_core --features ingress-metrics --test ingress_metrics; then
+    pass "Ingress allocation proofs OK"
+else
+    fail "Ingress allocation proofs failed. See the output above."
 fi
 
 # ── 3. Build the Python extension via uv ───────────────────────────
