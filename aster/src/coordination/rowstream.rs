@@ -19,9 +19,8 @@ use std::io::{Read, Write};
 
 use fory_derive::{ForyStruct, ForyUnion};
 
-use super::contract::{
-    payload_fory, ChangeMembershipActionV1, LogIdV1, ResourceKeyV1, SavedReplyV1,
-};
+use super::contract::{payload_fory, LogIdV1, ResourceKeyV1};
+use super::raft::{ClientSessionV1, CoordinationMetaV1, MembershipIntentV1, StoredMembershipV1};
 
 // ── Sections ─────────────────────────────────────────────────────────────────
 
@@ -108,17 +107,105 @@ impl RowCountsV1 {
     }
 }
 
+/// §11.4's snapshot header.
+///
+/// One of **two** frozen header roots, not a shared one. An earlier revision
+/// collapsed both into a single `BodyHeaderV1 { format_version, schema_version,
+/// group_id, row_counts }`, which is neither: a recovery header carries ten
+/// source-provenance fields that a snapshot header does not, and a snapshot
+/// header carries the full `CoordinationMetaV1`. The shared type could express
+/// neither, so a recovery export written through it silently dropped the
+/// provenance a replacement genesis binds.
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
-#[aster(wire = "aster.coordination.v1/BodyHeader")]
-pub struct BodyHeaderV1 {
+#[aster(wire = "aster.coordination.v1/SnapshotHeader")]
+pub struct SnapshotHeaderV1 {
+    #[fory(id = 1)]
+    pub format_version: u32,
+    #[fory(id = 2)]
+    pub schema_version: u32,
+    #[fory(id = 3)]
+    pub meta: CoordinationMetaV1,
+    #[fory(id = 4)]
+    pub row_counts: RowCountsV1,
+}
+
+/// §13's recovery-export header.
+///
+/// Every field is `source_*` because a recovery export describes the group it
+/// came **from**: the importing group is new, and binding these to it is what
+/// makes the export traceable to an authority rather than anonymous state.
+/// Sessions, intents, routes and audit are absent by construction -- the row
+/// profile cannot express them -- and their counts are therefore zero.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/RecoveryHeader")]
+pub struct RecoveryHeaderV1 {
     #[fory(id = 1)]
     pub format_version: u32,
     #[fory(id = 2)]
     pub schema_version: u32,
     #[fory(id = 3, bytes)]
-    pub group_id: Vec<u8>,
-    #[fory(id = 4)]
+    pub source_group_id: Vec<u8>,
+    #[fory(id = 4, bytes)]
+    pub source_genesis_hash: Vec<u8>,
+    #[fory(id = 5, bytes)]
+    pub source_authority_public_key: Vec<u8>,
+    #[fory(id = 6)]
+    pub source_authority_domain: String,
+    #[fory(id = 7)]
+    pub source_last_applied: Option<LogIdV1>,
+    #[fory(id = 8)]
+    pub source_membership: StoredMembershipV1,
+    #[fory(id = 9)]
+    pub source_audit_floor: Option<LogIdV1>,
+    #[fory(id = 10)]
+    pub source_audit_tip: Option<LogIdV1>,
+    #[fory(id = 11)]
+    pub source_admin_revision: u64,
+    #[fory(id = 12)]
     pub row_counts: RowCountsV1,
+}
+
+/// What the framing needs from a header, so the two roots share one writer and
+/// one reader without sharing a type.
+pub trait BodyHeader: Sized + std::fmt::Debug + Clone + PartialEq {
+    fn fory() -> fory_core::Fory;
+    fn encode(&self) -> Result<Vec<u8>, BodyError>;
+    fn decode(bytes: &[u8]) -> Result<Self, BodyError>;
+    fn row_counts(&self) -> &RowCountsV1;
+}
+
+impl BodyHeader for SnapshotHeaderV1 {
+    fn fory() -> fory_core::Fory {
+        payload_fory::<SnapshotHeaderV1>()
+    }
+    fn encode(&self) -> Result<Vec<u8>, BodyError> {
+        Self::fory().serialize(self).map_err(|_| BodyError::Encode)
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, BodyError> {
+        Self::fory()
+            .deserialize(bytes)
+            .map_err(|_| BodyError::Decode)
+    }
+    fn row_counts(&self) -> &RowCountsV1 {
+        &self.row_counts
+    }
+}
+
+impl BodyHeader for RecoveryHeaderV1 {
+    fn fory() -> fory_core::Fory {
+        payload_fory::<RecoveryHeaderV1>()
+    }
+    fn encode(&self) -> Result<Vec<u8>, BodyError> {
+        Self::fory().serialize(self).map_err(|_| BodyError::Encode)
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, BodyError> {
+        Self::fory()
+            .deserialize(bytes)
+            .map_err(|_| BodyError::Decode)
+    }
+    fn row_counts(&self) -> &RowCountsV1 {
+        &self.row_counts
+    }
 }
 
 // ── Row types ────────────────────────────────────────────────────────────────
@@ -192,46 +279,33 @@ pub struct SessionRowV1 {
     pub actor_node_id: Vec<u8>,
     #[fory(id = 2, bytes)]
     pub client_id: Vec<u8>,
+    /// The §11 storage root itself, nested rather than flattened.
+    ///
+    /// An earlier revision copied `ClientSessionV1`'s four fields into this row.
+    /// That left the declared storage root with no user anywhere, so its shape
+    /// was never exercised, and the row and the root could drift apart while
+    /// both round-tripped their own tests. A snapshot section and the table it
+    /// restores must be the same type or restoring is a translation.
     #[fory(id = 3)]
-    pub last_sequence: u64,
-    #[fory(id = 4, bytes)]
-    pub request_hash: Vec<u8>,
-    /// Typed, not opaque bytes: a snapshot whose saved results cannot be
-    /// type-checked can install a malformed one.
-    #[fory(id = 5)]
-    pub last_result: Option<SavedReplyV1>,
-    #[fory(id = 6)]
-    pub retired: bool,
+    pub session: ClientSessionV1,
 }
 
-/// The full intent state. An earlier cut omitted `request_hash`,
-/// `expected_membership` and `desired_plan`, none of which are reconstructible
-/// from what remained.
-#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+/// One retained membership intent, keyed by operation id.
+///
+/// The state is the §11 `MembershipIntentV1` storage root, nested for the same
+/// reason as [`SessionRowV1::session`]: a flattened copy leaves the declared
+/// root unused, and a root nothing constructs is a declaration rather than a
+/// format.
+// No `Default`: `MembershipIntentV1` has none deliberately, because a default
+// intent would carry an all-zero `accepted_log_id`, which names an entry no
+// leader ever wrote.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/IntentRow")]
 pub struct IntentRowV1 {
     #[fory(id = 1, bytes)]
     pub operation_id: Vec<u8>,
-    #[fory(id = 2, bytes)]
-    pub actor_node_id: Vec<u8>,
-    #[fory(id = 3, bytes)]
-    pub request_hash: Vec<u8>,
-    #[fory(id = 4)]
-    pub expected_membership: Option<LogIdV1>,
-    /// Typed, not opaque bytes: the plan is what membership replay re-runs, so
-    /// a snapshot that cannot type-check it can install an unreadable intent.
-    #[fory(id = 5)]
-    pub desired_plan: ChangeMembershipActionV1,
-    #[fory(id = 6)]
-    pub status_code: i32,
-    #[fory(id = 7)]
-    pub result_code: i32,
-    #[fory(id = 8)]
-    pub accepted_log_id: LogIdV1,
-    #[fory(id = 9)]
-    pub completed_log_id: Option<LogIdV1>,
-    #[fory(id = 10)]
-    pub observed_membership_log_id: Option<LogIdV1>,
+    #[fory(id = 2)]
+    pub intent: MembershipIntentV1,
 }
 
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
@@ -323,6 +397,11 @@ fn resource_key_parts(k: &ResourceKeyV1) -> OrderKey {
 /// A row that can appear in a body. Two roots implement it, so the framing is
 /// shared while the row sets stay disjoint.
 pub trait BodyRow: Sized + std::fmt::Debug + Clone + PartialEq {
+    /// The header root this profile's body begins with. Bound to the profile so
+    /// a recovery body cannot be written under a snapshot header, or the
+    /// reverse: the two are never alternatives within one stream.
+    type Header: BodyHeader;
+
     fn section(&self) -> Option<u64>;
     fn order_key(&self) -> OrderKey;
     fn fory() -> fory_core::Fory;
@@ -384,6 +463,8 @@ const SNAPSHOT_SECTIONS: &[u64] = &[
 const RECOVERY_SECTIONS: &[u64] = &[SECTION_RESOURCES, SECTION_GRANTS, SECTION_ADMINS];
 
 impl BodyRow for SnapshotBodyRowV1 {
+    type Header = SnapshotHeaderV1;
+
     fn section(&self) -> Option<u64> {
         Some(match self {
             SnapshotBodyRowV1::Resource(_) => SECTION_RESOURCES,
@@ -430,6 +511,8 @@ impl BodyRow for SnapshotBodyRowV1 {
 }
 
 impl BodyRow for RecoveryBodyRowV1 {
+    type Header = RecoveryHeaderV1;
+
     fn section(&self) -> Option<u64> {
         Some(match self {
             RecoveryBodyRowV1::Resource(_) => SECTION_RESOURCES,
@@ -603,9 +686,8 @@ pub struct BodyWriter<W: Write, T: BodyRow> {
 }
 
 impl<W: Write, T: BodyRow> BodyWriter<W, T> {
-    pub fn new(mut w: W, header: &BodyHeaderV1) -> Result<Self, BodyError> {
-        let fory = payload_fory::<BodyHeaderV1>();
-        let enc = fory.serialize(header).map_err(|_| BodyError::Encode)?;
+    pub fn new(mut w: W, header: &T::Header) -> Result<Self, BodyError> {
+        let enc = header.encode()?;
         if enc.len() as u64 > MAX_HEADER_BYTES {
             return Err(BodyError::HeaderTooLarge {
                 declared: enc.len() as u64,
@@ -619,7 +701,7 @@ impl<W: Write, T: BodyRow> BodyWriter<W, T> {
             w,
             fory: T::fory(),
             buf: Vec::new(),
-            header_counts: header.row_counts.clone(),
+            header_counts: header.row_counts().clone(),
             previous_section: 0,
             open: None,
             last_key: None,
@@ -735,7 +817,7 @@ impl<W: Write, T: BodyRow> BodyWriter<W, T> {
 /// The reader hands each row to the visitor and forgets it. Retention is the
 /// caller's choice, which is what makes the memory claim testable at all.
 pub trait BodyVisitor<T: BodyRow> {
-    fn header(&mut self, header: &BodyHeaderV1) -> Result<(), BodyError>;
+    fn header(&mut self, header: &T::Header) -> Result<(), BodyError>;
     fn row(&mut self, section: u64, row: T) -> Result<(), BodyError>;
 }
 
@@ -789,7 +871,7 @@ pub fn validate_snapshot_row(r: &SnapshotBodyRowV1) -> Result<(), BodyError> {
             if x.client_id.len() != 16 {
                 return Err(BodyError::InvalidRow("client id must be 16 bytes"));
             }
-            if x.request_hash.len() != 32 && !x.request_hash.is_empty() {
+            if x.session.request_hash.len() != 32 && !x.session.request_hash.is_empty() {
                 return Err(BodyError::InvalidRow("request hash width"));
             }
         }
@@ -797,7 +879,7 @@ pub fn validate_snapshot_row(r: &SnapshotBodyRowV1) -> Result<(), BodyError> {
             if x.operation_id.len() != 16 {
                 return Err(BodyError::InvalidRow("operation id must be 16 bytes"));
             }
-            check_node_id(&x.actor_node_id)?;
+            check_node_id(&x.intent.actor_node_id)?;
         }
         SnapshotBodyRowV1::Route(x) => check_node_id(&x.node_id)?,
         SnapshotBodyRowV1::Audit(x) => {
@@ -842,7 +924,6 @@ pub fn read_body<R: Read, T: BodyRow>(
     v: &mut dyn BodyVisitor<T>,
 ) -> Result<(), BodyError> {
     let fory = T::fory();
-    let hfory = payload_fory::<BodyHeaderV1>();
 
     let hlen = read_varint(r)?;
     if hlen > MAX_HEADER_BYTES {
@@ -850,7 +931,7 @@ pub fn read_body<R: Read, T: BodyRow>(
     }
     let mut hbuf = vec![0u8; hlen as usize];
     r.read_exact(&mut hbuf).map_err(|_| BodyError::Truncated)?;
-    let header: BodyHeaderV1 = hfory.deserialize(&hbuf).map_err(|_| BodyError::Decode)?;
+    let header = T::Header::decode(&hbuf)?;
     drop(hbuf);
     v.header(&header)?;
 
@@ -879,7 +960,7 @@ pub fn read_body<R: Read, T: BodyRow>(
         }
         // The header promised a count; the section must declare the same.
         let promised = header
-            .row_counts
+            .row_counts()
             .get(sid)
             .ok_or(BodyError::IllegalSection(sid))?;
         if promised != declared {
@@ -1011,7 +1092,7 @@ mod tests {
         rows: usize,
     }
     impl<T: BodyRow> BodyVisitor<T> for Counting {
-        fn header(&mut self, _h: &BodyHeaderV1) -> Result<(), BodyError> {
+        fn header(&mut self, _h: &T::Header) -> Result<(), BodyError> {
             Ok(())
         }
         fn row(&mut self, _s: u64, _r: T) -> Result<(), BodyError> {
@@ -1020,11 +1101,51 @@ mod tests {
         }
     }
 
-    fn header_for(counts: RowCountsV1) -> BodyHeaderV1 {
-        BodyHeaderV1 {
+    fn header_for(counts: RowCountsV1) -> SnapshotHeaderV1 {
+        SnapshotHeaderV1 {
             format_version: 1,
             schema_version: 1,
-            group_id: nid(7),
+            meta: meta(),
+            row_counts: counts,
+        }
+    }
+
+    fn meta() -> CoordinationMetaV1 {
+        CoordinationMetaV1 {
+            schema_version: 1,
+            group_id: vec![7u8; 16],
+            genesis_hash: vec![0x11u8; 32],
+            authority_public_key: nid(3),
+            authority_domain: "aster0.net".into(),
+            deployment_profile_code: 1,
+            last_applied: Some(LogIdV1 {
+                term: 1,
+                leader_node_id: nid(1),
+                index: 9,
+            }),
+            membership: StoredMembershipV1::default(),
+            admin_revision: 1,
+            recovery_export_hash: None,
+            recovered_from: None,
+            aggregate_growth_bytes: 0,
+            aggregate_reserve_bytes: 0,
+            audit_floor: None,
+        }
+    }
+
+    fn recovery_header_for(counts: RowCountsV1) -> RecoveryHeaderV1 {
+        RecoveryHeaderV1 {
+            format_version: 1,
+            schema_version: 1,
+            source_group_id: vec![7u8; 16],
+            source_genesis_hash: vec![0x11u8; 32],
+            source_authority_public_key: nid(3),
+            source_authority_domain: "aster0.net".into(),
+            source_last_applied: None,
+            source_membership: StoredMembershipV1::default(),
+            source_audit_floor: None,
+            source_audit_tip: None,
+            source_admin_revision: 1,
             row_counts: counts,
         }
     }
@@ -1061,6 +1182,128 @@ mod tests {
         w.row(&audit(1, 1)).unwrap();
         w.row(&audit(1, 2)).unwrap();
         w.finish().unwrap()
+    }
+
+    fn session_row(n: u8) -> SnapshotBodyRowV1 {
+        SnapshotBodyRowV1::Session(SessionRowV1 {
+            actor_node_id: nid(n),
+            client_id: vec![n; 16],
+            session: ClientSessionV1 {
+                last_sequence: 5,
+                request_hash: vec![0xAAu8; 32],
+                last_result: None,
+                retired: false,
+            },
+        })
+    }
+
+    fn intent_row(n: u8) -> SnapshotBodyRowV1 {
+        use crate::coordination::contract::ChangeMembershipActionV1;
+
+        SnapshotBodyRowV1::Intent(IntentRowV1 {
+            operation_id: vec![n; 16],
+            intent: MembershipIntentV1 {
+                actor_node_id: nid(n),
+                request_hash: vec![0xBBu8; 32],
+                expected_membership: None,
+                desired_plan: ChangeMembershipActionV1::default(),
+                status_code: 1,
+                result_code: 0,
+                accepted_log_id: LogIdV1 {
+                    term: 1,
+                    leader_node_id: nid(1),
+                    index: 3,
+                },
+                completed_log_id: None,
+                observed_membership_log_id: None,
+            },
+        })
+    }
+
+    /// Sessions and intents carry the §11 storage roots themselves, and both
+    /// survive the body whole. Nothing exercised these two sections before, so
+    /// the row types were declarations rather than a format.
+    #[test]
+    fn session_and_intent_rows_carry_their_storage_roots() {
+        let c = RowCountsV1 {
+            resources: 0,
+            grants: 0,
+            admins: 1,
+            sessions: 2,
+            intents: 1,
+            routes: 0,
+            audit: 0,
+        };
+        let mut w = BodyWriter::<_, SnapshotBodyRowV1>::new(Vec::new(), &header_for(c)).unwrap();
+        w.begin_section(SECTION_RESOURCES).unwrap();
+        w.begin_section(SECTION_GRANTS).unwrap();
+        w.begin_section(SECTION_ADMINS).unwrap();
+        w.row(&admin(1)).unwrap();
+        w.begin_section(SECTION_SESSIONS).unwrap();
+        w.row(&session_row(1)).unwrap();
+        w.row(&session_row(2)).unwrap();
+        w.begin_section(SECTION_INTENTS).unwrap();
+        w.row(&intent_row(4)).unwrap();
+        w.begin_section(SECTION_ROUTES).unwrap();
+        w.begin_section(SECTION_AUDIT).unwrap();
+        let body = w.finish().unwrap();
+
+        #[derive(Default)]
+        struct Keep {
+            rows: Vec<SnapshotBodyRowV1>,
+        }
+        impl BodyVisitor<SnapshotBodyRowV1> for Keep {
+            fn header(&mut self, _h: &SnapshotHeaderV1) -> Result<(), BodyError> {
+                Ok(())
+            }
+            fn row(&mut self, _s: u64, r: SnapshotBodyRowV1) -> Result<(), BodyError> {
+                self.rows.push(r);
+                Ok(())
+            }
+        }
+
+        let mut keep = Keep::default();
+        read_body::<_, SnapshotBodyRowV1>(&mut body.as_slice(), &mut keep).unwrap();
+        assert_eq!(keep.rows.len(), 4);
+        assert_eq!(keep.rows[1], session_row(1), "the session root survives");
+        assert_eq!(keep.rows[3], intent_row(4), "the intent root survives");
+    }
+
+    /// Both header roots round-trip through Fory with every field intact. The
+    /// recovery header's ten source fields are the ones a single shared header
+    /// type could not express at all.
+    #[test]
+    fn both_header_roots_round_trip() {
+        let snap = header_for(RowCountsV1::default());
+        assert_eq!(
+            SnapshotHeaderV1::decode(&snap.encode().unwrap()).unwrap(),
+            snap
+        );
+        assert_eq!(snap.meta.authority_domain, "aster0.net");
+
+        let rec = recovery_header_for(RowCountsV1::default());
+        let back = RecoveryHeaderV1::decode(&rec.encode().unwrap()).unwrap();
+        assert_eq!(back, rec);
+        assert_eq!(back.source_authority_public_key, nid(3));
+        assert_eq!(back.source_genesis_hash, vec![0x11u8; 32]);
+    }
+
+    /// The two headers are different roots, not two spellings of one. A
+    /// recovery body opened as a snapshot must fail rather than decode into a
+    /// header with empty provenance.
+    #[test]
+    fn a_recovery_header_is_not_readable_as_a_snapshot_header() {
+        let rec = recovery_header_for(RowCountsV1 {
+            resources: 0,
+            grants: 0,
+            admins: 0,
+            ..Default::default()
+        });
+        let encoded = rec.encode().unwrap();
+        assert!(
+            SnapshotHeaderV1::decode(&encoded).is_err(),
+            "distinct roots must not silently interchange"
+        );
     }
 
     #[test]
@@ -1144,7 +1387,7 @@ mod tests {
             audit: 2,
             ..Default::default()
         };
-        let hf = payload_fory::<BodyHeaderV1>();
+        let hf = payload_fory::<SnapshotHeaderV1>();
         let bad_hdr = hf.serialize(&header_for(c)).unwrap();
         let mut out = Vec::new();
         write_varint(&mut out, bad_hdr.len() as u64);
@@ -1213,7 +1456,8 @@ mod tests {
             admins: 1,
             ..Default::default()
         };
-        let mut w = BodyWriter::<_, RecoveryBodyRowV1>::new(Vec::new(), &header_for(c)).unwrap();
+        let mut w =
+            BodyWriter::<_, RecoveryBodyRowV1>::new(Vec::new(), &recovery_header_for(c)).unwrap();
         w.begin_section(SECTION_RESOURCES).unwrap();
         w.row(&RecoveryBodyRowV1::Resource(rec_resource(1)))
             .unwrap();
