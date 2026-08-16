@@ -127,6 +127,150 @@ pub struct RaftEntryV1 {
     pub payload: EntryPayloadV1,
 }
 
+// ── §5.3's RPC messages ─────────────────────────────────────────────────────
+
+/// `openraft::VoteRequest`.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/VoteRequest")]
+pub struct VoteRequestV1 {
+    #[fory(id = 1)]
+    pub vote: VoteV1,
+    #[fory(id = 2)]
+    pub last_log_id: Option<LogIdV1>,
+}
+
+/// `openraft::VoteResponse`.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/VoteResponse")]
+pub struct VoteResponseV1 {
+    #[fory(id = 1)]
+    pub vote: VoteV1,
+    #[fory(id = 2)]
+    pub vote_granted: bool,
+    #[fory(id = 3)]
+    pub last_log_id: Option<LogIdV1>,
+}
+
+/// `openraft::AppendEntriesRequest`.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/AppendRequest")]
+pub struct AppendRequestV1 {
+    #[fory(id = 1)]
+    pub vote: VoteV1,
+    #[fory(id = 2)]
+    pub prev_log_id: Option<LogIdV1>,
+    #[fory(id = 3)]
+    pub entries: Vec<RaftEntryV1>,
+    #[fory(id = 4)]
+    pub leader_commit: Option<LogIdV1>,
+}
+
+/// `AppendEntriesResponse::Success`. A unit variant still needs a message
+/// (§5.2.1), so adding a field later is a field addition rather than a shape
+/// change.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/AppendSuccess")]
+pub struct AppendSuccessV1 {}
+
+/// `AppendEntriesResponse::PartialSuccess(Option<LogId>)`.
+///
+/// The matching log id is what OpenRaft resumes replication from, and `None` is
+/// a distinct answer from `Some(..)` -- "nothing matched" rather than "matched
+/// up to here". A mirror that elided this type would have lost the difference.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/AppendPartialSuccess")]
+pub struct AppendPartialSuccessV1 {
+    #[fory(id = 1)]
+    pub matching: Option<LogIdV1>,
+}
+
+/// `AppendEntriesResponse::Conflict`.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/AppendConflict")]
+pub struct AppendConflictV1 {}
+
+/// `AppendEntriesResponse::HigherVote(Vote)`.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/AppendHigherVote")]
+pub struct AppendHigherVoteV1 {
+    #[fory(id = 1)]
+    pub vote: VoteV1,
+}
+
+/// `openraft::SnapshotResponse`.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/SnapshotResponse")]
+pub struct SnapshotResponseV1 {
+    #[fory(id = 1)]
+    pub vote: VoteV1,
+}
+
+/// Every Raft message that crosses the wire, as one union (§5.3).
+#[derive(ForyUnion, aster_macros::AsterType, Debug, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/RaftMessage")]
+pub enum RaftMessageV1 {
+    #[fory(default)]
+    #[fory(id = 1)]
+    VoteRequest(VoteRequestV1),
+    #[fory(id = 2)]
+    VoteResponse(VoteResponseV1),
+    #[fory(id = 3)]
+    AppendRequest(AppendRequestV1),
+    #[fory(id = 4)]
+    AppendSuccess(AppendSuccessV1),
+    #[fory(id = 5)]
+    AppendPartialSuccess(AppendPartialSuccessV1),
+    #[fory(id = 6)]
+    AppendConflict(AppendConflictV1),
+    #[fory(id = 7)]
+    AppendHigherVote(AppendHigherVoteV1),
+    #[fory(id = 8)]
+    SnapshotResponse(SnapshotResponseV1),
+    #[fory(unknown)]
+    Unknown(fory_core::UnknownCase),
+}
+
+/// §5.3's unary envelope.
+///
+/// `payload` is bounded canonical Fory bytes rather than a nested
+/// `RaftMessageV1`, because the receiver checks group, bootstrap state,
+/// producer admission and the sender allowlist **before** decoding it: a node
+/// that decoded first would be doing work on behalf of a sender it has not yet
+/// agreed to talk to.
+///
+/// `sender_node_id` MUST equal the immutable Iroh transport NodeId. A response
+/// uses the same field order with `responder_node_id` in place of the sender.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/RaftEnvelope")]
+pub struct RaftEnvelopeV1 {
+    #[fory(id = 1)]
+    pub protocol_version: i32,
+    #[fory(id = 2)]
+    pub raft_codec_version: i32,
+    #[fory(id = 3, bytes)]
+    pub group_id: Vec<u8>,
+    #[fory(id = 4, bytes)]
+    pub sender_node_id: Vec<u8>,
+    #[fory(id = 5, bytes)]
+    pub payload: Vec<u8>,
+}
+
+/// §5.3's unary response envelope.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/RaftResponseEnvelope")]
+pub struct RaftResponseEnvelopeV1 {
+    #[fory(id = 1)]
+    pub protocol_version: i32,
+    #[fory(id = 2)]
+    pub raft_codec_version: i32,
+    #[fory(id = 3, bytes)]
+    pub group_id: Vec<u8>,
+    #[fory(id = 4, bytes)]
+    pub responder_node_id: Vec<u8>,
+    #[fory(id = 5, bytes)]
+    pub payload: Vec<u8>,
+}
+
 /// §13's recovery provenance, referenced by [`CoordinationMetaV1`].
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/RecoveredFrom")]

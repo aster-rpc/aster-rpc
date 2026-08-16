@@ -17,8 +17,9 @@ use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Snapsh
 use super::contract::LogIdV1;
 use super::ids::CoordinationNodeId;
 use super::raft::{
+    AppendConflictV1, AppendHigherVoteV1, AppendPartialSuccessV1, AppendRequestV1, AppendSuccessV1,
     BlankPayloadV1, EntryPayloadV1, MembershipV1, NodeEntryV1, NodeIdSetV1, NodeIdV1, RaftEntryV1,
-    SnapshotMetaV1, StoredMembershipV1, VoteV1,
+    RaftMessageV1, SnapshotMetaV1, StoredMembershipV1, VoteRequestV1, VoteResponseV1, VoteV1,
 };
 use super::typeconfig::{CoordinationNode, CoordinationTypeConfig};
 
@@ -275,6 +276,142 @@ impl TryFrom<&RaftEntryV1> for Entry<CoordinationTypeConfig> {
     }
 }
 
+// ── RPC messages ────────────────────────────────────────────────────────────
+
+use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse};
+
+impl From<&VoteRequest<CoordinationNodeId>> for VoteRequestV1 {
+    fn from(req: &VoteRequest<CoordinationNodeId>) -> Self {
+        Self {
+            vote: VoteV1::from(&req.vote),
+            last_log_id: req.last_log_id.map(LogIdV1::from),
+        }
+    }
+}
+
+impl TryFrom<&VoteRequestV1> for VoteRequest<CoordinationNodeId> {
+    type Error = MirrorError;
+
+    fn try_from(wire: &VoteRequestV1) -> Result<Self, Self::Error> {
+        Ok(VoteRequest {
+            vote: Vote::try_from(&wire.vote)?,
+            last_log_id: wire
+                .last_log_id
+                .as_ref()
+                .map(LogId::<CoordinationNodeId>::try_from)
+                .transpose()?,
+        })
+    }
+}
+
+impl From<&VoteResponse<CoordinationNodeId>> for VoteResponseV1 {
+    fn from(resp: &VoteResponse<CoordinationNodeId>) -> Self {
+        Self {
+            vote: VoteV1::from(&resp.vote),
+            vote_granted: resp.vote_granted,
+            last_log_id: resp.last_log_id.map(LogIdV1::from),
+        }
+    }
+}
+
+impl TryFrom<&VoteResponseV1> for VoteResponse<CoordinationNodeId> {
+    type Error = MirrorError;
+
+    fn try_from(wire: &VoteResponseV1) -> Result<Self, Self::Error> {
+        Ok(VoteResponse {
+            vote: Vote::try_from(&wire.vote)?,
+            vote_granted: wire.vote_granted,
+            last_log_id: wire
+                .last_log_id
+                .as_ref()
+                .map(LogId::<CoordinationNodeId>::try_from)
+                .transpose()?,
+        })
+    }
+}
+
+impl From<&AppendEntriesRequest<CoordinationTypeConfig>> for AppendRequestV1 {
+    fn from(req: &AppendEntriesRequest<CoordinationTypeConfig>) -> Self {
+        Self {
+            vote: VoteV1::from(&req.vote),
+            prev_log_id: req.prev_log_id.map(LogIdV1::from),
+            entries: req.entries.iter().map(RaftEntryV1::from).collect(),
+            leader_commit: req.leader_commit.map(LogIdV1::from),
+        }
+    }
+}
+
+impl TryFrom<&AppendRequestV1> for AppendEntriesRequest<CoordinationTypeConfig> {
+    type Error = MirrorError;
+
+    fn try_from(wire: &AppendRequestV1) -> Result<Self, Self::Error> {
+        let mut entries = Vec::with_capacity(wire.entries.len());
+        for entry in &wire.entries {
+            entries.push(Entry::try_from(entry)?);
+        }
+        Ok(AppendEntriesRequest {
+            vote: Vote::try_from(&wire.vote)?,
+            prev_log_id: wire
+                .prev_log_id
+                .as_ref()
+                .map(LogId::<CoordinationNodeId>::try_from)
+                .transpose()?,
+            entries,
+            leader_commit: wire
+                .leader_commit
+                .as_ref()
+                .map(LogId::<CoordinationNodeId>::try_from)
+                .transpose()?,
+        })
+    }
+}
+
+/// An append response is a union on the wire, because its four OpenRaft
+/// variants carry different payloads.
+impl From<&AppendEntriesResponse<CoordinationNodeId>> for RaftMessageV1 {
+    fn from(resp: &AppendEntriesResponse<CoordinationNodeId>) -> Self {
+        match resp {
+            AppendEntriesResponse::Success => RaftMessageV1::AppendSuccess(AppendSuccessV1 {}),
+            // `None` and `Some(..)` are different answers, so the field is
+            // optional rather than defaulted to a zero log id.
+            AppendEntriesResponse::PartialSuccess(matching) => {
+                RaftMessageV1::AppendPartialSuccess(AppendPartialSuccessV1 {
+                    matching: matching.map(LogIdV1::from),
+                })
+            }
+            AppendEntriesResponse::Conflict => RaftMessageV1::AppendConflict(AppendConflictV1 {}),
+            AppendEntriesResponse::HigherVote(vote) => {
+                RaftMessageV1::AppendHigherVote(AppendHigherVoteV1 {
+                    vote: VoteV1::from(vote),
+                })
+            }
+        }
+    }
+}
+
+impl TryFrom<&RaftMessageV1> for AppendEntriesResponse<CoordinationNodeId> {
+    type Error = MirrorError;
+
+    fn try_from(wire: &RaftMessageV1) -> Result<Self, Self::Error> {
+        Ok(match wire {
+            RaftMessageV1::AppendSuccess(_) => AppendEntriesResponse::Success,
+            RaftMessageV1::AppendPartialSuccess(p) => AppendEntriesResponse::PartialSuccess(
+                p.matching
+                    .as_ref()
+                    .map(LogId::<CoordinationNodeId>::try_from)
+                    .transpose()?,
+            ),
+            RaftMessageV1::AppendConflict(_) => AppendEntriesResponse::Conflict,
+            RaftMessageV1::AppendHigherVote(h) => {
+                AppendEntriesResponse::HigherVote(Vote::try_from(&h.vote)?)
+            }
+            // Not an append response at all, or a variant this build does not
+            // know. Either way it is not something to guess at.
+            _ => return Err(MirrorError::UnknownPayloadVariant),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +541,137 @@ mod tests {
                 std::mem::discriminant(&entry.payload)
             );
         }
+    }
+
+    /// The three RPC shapes the plan names as most likely to be lossily mapped:
+    /// joint membership with two configs, a learner-only node set, and
+    /// `PartialSuccess(None)` against `PartialSuccess(Some(..))`.
+    #[test]
+    fn append_response_variants_round_trip_including_partial_success() {
+        let matching = LogId::new(CommittedLeaderId::new(3, node(4)), 17);
+        let cases: Vec<AppendEntriesResponse<CoordinationNodeId>> = vec![
+            AppendEntriesResponse::Success,
+            AppendEntriesResponse::PartialSuccess(None),
+            AppendEntriesResponse::PartialSuccess(Some(matching)),
+            AppendEntriesResponse::Conflict,
+            AppendEntriesResponse::HigherVote(Vote::new_committed(9, node(2))),
+        ];
+        for case in &cases {
+            let wire = RaftMessageV1::from(case);
+            let fory = payload_fory::<RaftMessageV1>();
+            let decoded: RaftMessageV1 = fory
+                .deserialize(&fory.serialize(&wire).expect("encode"))
+                .expect("decode");
+            assert_eq!(&decoded, &wire);
+            assert_eq!(
+                &AppendEntriesResponse::try_from(&decoded).expect("well formed"),
+                case
+            );
+        }
+
+        // The distinction the plan calls out: an elided type would have made
+        // these two the same message.
+        assert_ne!(
+            RaftMessageV1::from(&AppendEntriesResponse::<CoordinationNodeId>::PartialSuccess(None)),
+            RaftMessageV1::from(&AppendEntriesResponse::PartialSuccess(Some(matching)))
+        );
+    }
+
+    /// A message that is not an append response does not decode as one. Guessing
+    /// would turn a vote reply into a replication decision.
+    #[test]
+    fn a_non_append_message_is_not_read_as_an_append_response() {
+        let vote_reply = RaftMessageV1::VoteResponse(VoteResponseV1 {
+            vote: VoteV1::from(&Vote::new_committed(1, node(1))),
+            vote_granted: true,
+            last_log_id: None,
+        });
+        assert_eq!(
+            AppendEntriesResponse::try_from(&vote_reply).err(),
+            Some(MirrorError::UnknownPayloadVariant)
+        );
+    }
+
+    #[test]
+    fn vote_request_and_response_round_trip() {
+        let req = VoteRequest {
+            vote: Vote::new(7, node(1)),
+            last_log_id: Some(LogId::new(CommittedLeaderId::new(6, node(2)), 30)),
+        };
+        assert_eq!(
+            VoteRequest::try_from(&VoteRequestV1::from(&req)).expect("well formed"),
+            req
+        );
+
+        for last in [
+            None,
+            Some(LogId::new(CommittedLeaderId::new(6, node(2)), 30)),
+        ] {
+            for granted in [true, false] {
+                let resp = VoteResponse {
+                    vote: Vote::new_committed(7, node(1)),
+                    vote_granted: granted,
+                    last_log_id: last,
+                };
+                assert_eq!(
+                    VoteResponse::try_from(&VoteResponseV1::from(&resp)).expect("well formed"),
+                    resp
+                );
+            }
+        }
+    }
+
+    /// An append request carries whole entries, so the log a follower writes is
+    /// the log the leader sent -- including an empty heartbeat, which is the
+    /// shape most likely to be special-cased into something else.
+    #[test]
+    fn append_request_round_trips_with_entries_and_as_a_heartbeat() {
+        let entry = Entry::<CoordinationTypeConfig> {
+            log_id: LogId::new(CommittedLeaderId::new(1, node(1)), 2),
+            payload: EntryPayload::Membership(membership()),
+        };
+        let req = AppendEntriesRequest::<CoordinationTypeConfig> {
+            vote: Vote::new_committed(4, node(1)),
+            prev_log_id: Some(LogId::new(CommittedLeaderId::new(1, node(1)), 1)),
+            entries: vec![entry],
+            leader_commit: Some(LogId::new(CommittedLeaderId::new(1, node(1)), 1)),
+        };
+        let back =
+            AppendEntriesRequest::try_from(&AppendRequestV1::from(&req)).expect("well formed");
+        assert_eq!(back.vote, req.vote);
+        assert_eq!(back.prev_log_id, req.prev_log_id);
+        assert_eq!(back.leader_commit, req.leader_commit);
+        assert_eq!(back.entries.len(), 1);
+        assert_eq!(back.entries[0].log_id, req.entries[0].log_id);
+
+        let heartbeat = AppendEntriesRequest::<CoordinationTypeConfig> {
+            vote: Vote::new_committed(4, node(1)),
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        };
+        let back = AppendEntriesRequest::try_from(&AppendRequestV1::from(&heartbeat))
+            .expect("well formed");
+        assert!(back.entries.is_empty());
+        assert_eq!(back.prev_log_id, None);
+    }
+
+    /// A learner-only node set: nodes present, no voter in that config. The
+    /// membership mirror must not confuse "no voters" with "no configs".
+    #[test]
+    fn a_learner_only_membership_survives() {
+        let m: Membership<CoordinationNodeId, CoordinationNode> = Membership::new(
+            vec![[node(1)].into_iter().collect()],
+            Some([node(7), node(8)].into_iter().collect()),
+        );
+        let wire = MembershipV1::from(&m);
+        assert!(
+            wire.nodes.len() >= 3,
+            "learners appear in the node map, not in the config"
+        );
+        let back = Membership::try_from(&wire).expect("well formed");
+        assert_eq!(back.get_joint_config(), m.get_joint_config());
+        assert_eq!(back.nodes().count(), m.nodes().count());
     }
 
     /// A log id keeps its leader through every hop. Two entries at the same term
