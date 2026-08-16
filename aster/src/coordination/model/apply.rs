@@ -1673,6 +1673,102 @@ mod tests {
         );
     }
 
+    /// The retention limit is proved by exceeding it, not by asserting the
+    /// constant. An earlier revision tested pruning with two rows, which cannot
+    /// distinguish "prunes at 100,000" from "prunes at 2".
+    #[test]
+    fn the_audit_table_retains_exactly_the_declared_limit() {
+        let mut s = granted();
+        s.last_applied = Some(log(1, 0));
+
+        // One row past the cap, each under a different leader so the pruned
+        // floor can be checked for the whole identity rather than a term and an
+        // index.
+        let total = limits::MAX_AUDIT_ROWS + 1;
+        for i in 1..=total {
+            let mut leader = [0u8; 32];
+            leader[0..8].copy_from_slice(&i.to_be_bytes());
+            write_audit_row(
+                &mut s,
+                LogId::new(1, leader, i),
+                AuditRow {
+                    leader_node_id: leader,
+                    actor: ACTOR,
+                    operation_code: OPERATION_RETIRE_CLIENT,
+                    resource: None,
+                    result: AuditResult::System(0),
+                    epoch: 0,
+                    value_revision: 0,
+                },
+            );
+        }
+
+        assert_eq!(
+            s.audit.len() as u64,
+            limits::MAX_AUDIT_ROWS,
+            "retention holds exactly the declared limit, not one more"
+        );
+        assert!(
+            !s.audit.contains_key(&(1, 1)),
+            "the single oldest row is the one that went"
+        );
+        assert!(s.audit.contains_key(&(1, 2)), "the new oldest is retained");
+        assert!(s.audit.contains_key(&(1, total)), "the tip is never pruned");
+        assert_eq!(s.audit_tip, Some(LogId::new(1, tip_leader(total), total)));
+
+        // The floor is the whole log id of the oldest **retained** row. A floor
+        // that kept only the term and index would name a position that two
+        // leaders can both claim, so a client resuming from it cannot tell
+        // which history it is resuming.
+        assert_eq!(
+            s.audit_floor,
+            Some(LogId::new(1, tip_leader(2), 2)),
+            "the floor carries the retained row's leader, not a zero"
+        );
+        assert_ne!(
+            s.audit_floor.map(|f| f.leader_node_id),
+            Some([0u8; 32]),
+            "a zeroed leader would be a lost protocol identity, not a value"
+        );
+
+        // Reserve accounting unwinds with the rows: pruning that forgot the
+        // charge would leave the 128 MiB proof bounding nothing.
+        let expected: u64 = s
+            .audit
+            .values()
+            .map(|r| limits::charge_audit(r.resource.as_ref().map(key_parts)))
+            .sum();
+        assert_eq!(s.reserve_bytes, expected);
+    }
+
+    /// The leader stamped on row `i` by the retention fixture.
+    fn tip_leader(i: u64) -> NodeId {
+        let mut leader = [0u8; 32];
+        leader[0..8].copy_from_slice(&i.to_be_bytes());
+        leader
+    }
+
+    /// A floor observed by a client has to survive the wire unchanged: term,
+    /// leader and index. Round-tripping through the §11 mirror is the only
+    /// thing that proves the leader is carried rather than reconstructed.
+    #[test]
+    fn the_audit_floor_round_trips_with_its_full_identity() {
+        use crate::coordination::contract::LogIdV1;
+
+        let floor = LogId::new(7, [0x5Au8; 32], 4_294_967_296);
+        let wire = LogIdV1::from(&floor);
+        assert_eq!(wire.term, 7);
+        assert_eq!(wire.leader_node_id, vec![0x5Au8; 32]);
+        assert_eq!(wire.index, 4_294_967_296);
+        assert_eq!(LogId::try_from(&wire).expect("a well-formed floor"), floor);
+
+        // Same term and index, different leader: two distinct floors that a
+        // (term, index) pair alone would conflate.
+        let other = LogId::new(7, [0x5Bu8; 32], 4_294_967_296);
+        assert_ne!(floor, other);
+        assert_ne!(LogIdV1::from(&floor), LogIdV1::from(&other));
+    }
+
     /// Pruning audit rows must not make an old entry deliverable again: the
     /// guard is `last_applied` and the retained tip, neither of which pruning
     /// touches. Prunes the **oldest** row, as audit retention does -- the tip is

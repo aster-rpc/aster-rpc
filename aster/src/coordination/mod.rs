@@ -5,6 +5,7 @@
 //! replicated state machine and its redb storage.
 
 pub mod contract;
+pub mod convert;
 pub mod hash;
 pub mod ids;
 pub mod reason;

@@ -360,22 +360,22 @@ mod tests {
         );
     }
 
-    /// A mirror that only parses is not a mirror. These walk a **real**
-    /// OpenRaft value out to the wire type and back, so a field that quietly
-    /// meant something else would not survive.
+    /// A mirror that only parses is not a mirror. This walks **real** OpenRaft
+    /// values out to the wire type and back through
+    /// [`crate::coordination::convert`], which is the conversion storage will
+    /// use -- an earlier revision mapped the fields by hand inside the test, so
+    /// it proved the test author understood the shape rather than that the code
+    /// did.
     #[test]
     fn the_openraft_mirrors_round_trip_through_real_values() {
         use openraft::{CommittedLeaderId, Membership, StoredMembership, Vote};
 
         let vote: Vote<CoordinationNodeId> = Vote::new_committed(7, node(1));
-        let wire = VoteV1 {
-            term: vote.leader_id.term,
-            leader_node_id: vote.leader_id.node_id.as_bytes().to_vec(),
-            committed: vote.is_committed(),
-        };
+        let wire = VoteV1::from(&vote);
         assert_eq!(wire.term, 7);
         assert_eq!(wire.leader_node_id, vec![1u8; 32]);
         assert!(wire.committed);
+        assert_eq!(Vote::try_from(&wire).expect("well formed"), vote);
 
         // A joint membership: two configs, which is the shape §5.3.1 must
         // mirror and the one a single-config type would silently flatten.
@@ -386,29 +386,7 @@ mod tests {
             ],
             None,
         );
-        let mirrored = MembershipV1 {
-            configs: membership
-                .get_joint_config()
-                .iter()
-                .map(|set| {
-                    let mut ids: Vec<Vec<u8>> = set.iter().map(|n| n.as_bytes().to_vec()).collect();
-                    ids.sort_unstable();
-                    NodeIdSetV1 {
-                        ids: ids
-                            .into_iter()
-                            .map(|node_id| NodeIdV1 { node_id })
-                            .collect(),
-                    }
-                })
-                .collect(),
-            nodes: membership
-                .nodes()
-                .map(|(id, _)| NodeEntryV1 {
-                    node_id: id.as_bytes().to_vec(),
-                    format_version: 1,
-                })
-                .collect(),
-        };
+        let mirrored = MembershipV1::from(&membership);
         assert_eq!(mirrored.configs.len(), 2, "joint configs must both survive");
         assert_eq!(mirrored.configs[0].ids.len(), 3);
 
@@ -416,10 +394,20 @@ mod tests {
         let encoded = fory.serialize(&mirrored).expect("encode");
         let decoded: MembershipV1 = fory.deserialize(&encoded).expect("decode");
         assert_eq!(decoded, mirrored);
+        assert_eq!(
+            Membership::try_from(&decoded)
+                .expect("well formed")
+                .get_joint_config(),
+            membership.get_joint_config(),
+            "through the wire and back, unchanged"
+        );
 
         let stored: StoredMembership<CoordinationNodeId, CoordinationNode> =
             StoredMembership::new(None, membership);
-        assert_eq!(stored.membership().get_joint_config().len(), 2);
+        let back =
+            StoredMembership::try_from(&StoredMembershipV1::from(&stored)).expect("well formed");
+        assert_eq!(back.membership().get_joint_config().len(), 2);
+        assert_eq!(back.log_id(), stored.log_id());
 
         // The committed leader id retains its node under this feature set --
         // asserted here as well as in `model::wire`, because these mirrors
