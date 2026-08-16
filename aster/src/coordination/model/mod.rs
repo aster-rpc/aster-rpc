@@ -10,4 +10,6 @@
 //! Storage (Slice 2) and consensus (Slice 3) call into this module rather than
 //! reimplementing its transitions.
 
+pub mod classify;
 pub mod limits;
+pub mod state;
