@@ -74,10 +74,16 @@
 
 use crate::coordination::reason::{Disposition, Outcome, Reason, RefusalReason};
 
+use super::admin::{self, AdminAction};
 use super::classify::{classify, Classification};
+use super::expire::{self, ExpireCommand};
 use super::grant::{self, GrantAction};
 use super::limits;
+use super::membership::{
+    self, CancelMembershipAction, ChangeMembershipAction, MembershipProgressCommand,
+};
 use super::resource::{self, Decision, ResourceAction};
+use super::retire::{self, RetireCommand};
 use super::shape::ShapeLimit;
 use super::state::{
     key_parts, AuditRow, ClientId, LogId, NodeId, ResourceKey, SavedReply, Session, State,
@@ -103,6 +109,9 @@ pub struct ClientRef {
 pub enum Action {
     Resource(ResourceAction),
     Grant(GrantAction),
+    Admin(AdminAction),
+    ChangeMembership(ChangeMembershipAction),
+    CancelMembership(CancelMembershipAction),
 }
 
 /// The decision for whichever action was given.
@@ -113,6 +122,8 @@ pub enum Action {
 pub enum ActionDecision {
     Resource(Decision),
     Grant(grant::Decision),
+    Admin(admin::Decision),
+    Membership(membership::Decision),
 }
 
 impl Action {
@@ -128,6 +139,10 @@ impl Action {
                 ResourceAction::Revoke { .. } => 6,
             },
             Action::Grant(_) => 7,
+            Action::Admin(_) => 8,
+            Action::ChangeMembership(_) => 9,
+            // §5.2 skips 10; cancel is 11.
+            Action::CancelMembership(_) => 11,
         }
     }
 
@@ -143,6 +158,10 @@ impl Action {
         match self {
             Action::Resource(r) => r.raw_resource().validate().ok(),
             Action::Grant(g) => g.resource.validate().ok(),
+            // A `set_admin` names no resource: it changes group-level
+            // authority. Storing one would put an identity in the audit row
+            // that the command never touched.
+            Action::Admin(_) | Action::ChangeMembership(_) | Action::CancelMembership(_) => None,
         }
     }
 
@@ -150,6 +169,13 @@ impl Action {
         match self {
             Action::Resource(r) => ActionDecision::Resource(resource::decide(state, actor, r)),
             Action::Grant(g) => ActionDecision::Grant(grant::decide(state, actor, g)),
+            Action::Admin(a) => ActionDecision::Admin(admin::decide(state, actor, a)),
+            Action::ChangeMembership(m) => {
+                ActionDecision::Membership(membership::decide_change(state, actor, m))
+            }
+            Action::CancelMembership(m) => {
+                ActionDecision::Membership(membership::decide_cancel(state, actor, m))
+            }
         }
     }
 }
@@ -270,11 +296,19 @@ fn project(decision: ActionDecision) -> Admission {
     let (refusal, shapeless) = match decision {
         ActionDecision::Resource(Decision::Apply(_))
         | ActionDecision::Grant(grant::Decision::Apply(_))
+        | ActionDecision::Admin(admin::Decision::Apply(_))
         // A no-op still commits a saved reply, so it is admitted like any
         // other successful command rather than answered pre-proposal.
-        | ActionDecision::Grant(grant::Decision::NoOp { .. }) => return Admission::Admit,
+        | ActionDecision::Grant(grant::Decision::NoOp { .. })
+        | ActionDecision::Admin(admin::Decision::NoOp { .. })
+        | ActionDecision::Membership(membership::Decision::Apply(_))
+        | ActionDecision::Membership(membership::Decision::Existing { .. }) => {
+            return Admission::Admit
+        }
         ActionDecision::Resource(Decision::Refuse(r))
-        | ActionDecision::Grant(grant::Decision::Refuse(r)) => (Some(r), None),
+        | ActionDecision::Grant(grant::Decision::Refuse(r))
+        | ActionDecision::Admin(admin::Decision::Refuse(r))
+        | ActionDecision::Membership(membership::Decision::Refuse(r)) => (Some(r), None),
         ActionDecision::Resource(Decision::RefuseShapeless(l))
         | ActionDecision::Grant(grant::Decision::RefuseShapeless(l)) => (None, Some(l)),
     };
@@ -315,8 +349,136 @@ fn rejection(resource: Option<ResourceKey>, reason: Reason) -> SavedReply {
         epoch: 0,
         value_revision: 0,
         acl_revision: 0,
+        admin_revision: 0,
     }
 }
+
+/// A committed command: OpenRaft's `D`, in model terms (§5.3).
+///
+/// Four variants, and only one of them has a session. Modelling the other three
+/// as client actions would give them a sequence they do not have -- the mistake
+/// an earlier revision made with `retire_client`, which then needed a rule
+/// forbidding a client from retiring the session it was calling from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    Client { client: ClientRef, action: Action },
+    Expire(ExpireCommand),
+    MembershipProgress(MembershipProgressCommand),
+    RetireClient(RetireCommand),
+}
+
+/// The reply for a committed command: OpenRaft's `R` (§5.3).
+///
+/// One variant per command shape, because `disposition` is meaningful for
+/// exactly one of them. A struct carrying fields that do not apply would have to
+/// default them, and a defaulted disposition reads as a real answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandReply {
+    Client(Box<ClientResult>),
+    System(SystemResult),
+    Retirement(RetirementResult),
+}
+
+/// `Expire` and `MembershipProgress` results. No disposition and no outcome
+/// code: there is no client and no sequence, so nothing was consumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemResult {
+    pub system_result_code: i32,
+    pub lease_revision: u64,
+}
+
+/// A `retire_client` result. It has a caller but no sequence, so no
+/// disposition; terminality is a property of the reason alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetirementResult {
+    pub outcome: Outcome,
+    pub reason: Reason,
+}
+
+impl RetirementResult {
+    pub fn is_terminal(&self) -> bool {
+        self.outcome == Outcome::ClientRetired || self.reason.is_terminal_when_not_consumed()
+    }
+}
+
+/// Apply one committed command -- the single top-level entry point.
+///
+/// Every `CommandV1` variant lands here, so the delivery guard, the audit row
+/// and `last_applied` are enforced once rather than per command shape.
+pub fn apply_command(
+    state: &mut State,
+    log_id: LogId,
+    command: &Command,
+) -> Result<CommandReply, Fault> {
+    guard_delivery(state, log_id)?;
+
+    let reply = match command {
+        Command::Client { client, action } => {
+            CommandReply::Client(Box::new(apply_client(state, log_id, client, action)))
+        }
+        Command::Expire(expire) => CommandReply::System(apply_expire(state, log_id, expire)),
+        Command::MembershipProgress(progress) => {
+            CommandReply::System(apply_membership_progress(state, log_id, progress))
+        }
+        Command::RetireClient(retire) => {
+            CommandReply::Retirement(apply_retire(state, log_id, retire))
+        }
+    };
+
+    state.last_applied = Some(log_id);
+    Ok(reply)
+}
+
+/// Apply a committed `retire_client` (§10).
+fn apply_retire(state: &mut State, log_id: LogId, command: &RetireCommand) -> RetirementResult {
+    let decision = retire::decide(state, command);
+    let result = match &decision {
+        retire::Decision::Apply(effect) => {
+            if let Some(row) = retire::effect_row(state, command, effect) {
+                let key = (command.target_actor, command.target_client_id);
+                let previous = state.sessions.get(&key).map(session_charge);
+                state.reserve_bytes =
+                    state.reserve_bytes + session_charge(&row) - previous.unwrap_or(0);
+                state.sessions.insert(key, row);
+            }
+            RetirementResult {
+                outcome: Outcome::ClientRetired,
+                reason: Reason::None,
+            }
+        }
+        retire::Decision::Refuse(reason) => RetirementResult {
+            outcome: Outcome::Rejected,
+            reason: reason.get(),
+        },
+    };
+
+    // Sessionless, so there is no sequence to deduplicate on: a retry
+    // legitimately produces another audit row. The state transition is
+    // idempotent; the audit trail is not.
+    write_audit_row(
+        state,
+        log_id,
+        AuditRow {
+            leader_node_id: log_id.leader_node_id,
+            actor: command.actor,
+            operation_code: OPERATION_RETIRE_CLIENT,
+            resource: None,
+            result: result.outcome,
+            epoch: 0,
+            value_revision: 0,
+        },
+    );
+    result
+}
+
+/// §5.2: audit operation code `100` is system `Expire`, `101` is
+/// `MembershipProgress`. `retire_client` is absent from the method table, so it
+/// takes the next free code above the ten mutation methods.
+pub const OPERATION_RETIRE_CLIENT: i32 = 12;
+/// System `Expire` (§5.2).
+pub const OPERATION_EXPIRE: i32 = 100;
+/// `MembershipProgress` (§5.2).
+pub const OPERATION_MEMBERSHIP_PROGRESS: i32 = 101;
 
 /// Apply one committed client command.
 ///
@@ -330,8 +492,26 @@ pub fn apply_client_command(
     client: &ClientRef,
     action: &Action,
 ) -> Result<ClientResult, Fault> {
-    guard_delivery(state, log_id)?;
+    match apply_command(
+        state,
+        log_id,
+        &Command::Client {
+            client: client.clone(),
+            action: action.clone(),
+        },
+    )? {
+        CommandReply::Client(result) => Ok(*result),
+        other => unreachable!("a client command produces a client reply, got {other:?}"),
+    }
+}
 
+/// The client-command body, after [`guard_delivery`] has run.
+fn apply_client(
+    state: &mut State,
+    log_id: LogId,
+    client: &ClientRef,
+    action: &Action,
+) -> ClientResult {
     let session = state.sessions.get(&(client.actor, client.client_id));
     let capacity = state.capacity_for(&client.actor);
     let classification = classify(session, client.sequence, &client.request_hash, capacity);
@@ -361,15 +541,109 @@ pub fn apply_client_command(
             false,
         ),
 
-        Classification::Unresolved { .. } => (apply_decided(state, client, action), true),
+        Classification::Unresolved { .. } => (apply_decided(state, log_id, client, action), true),
     };
 
     if writes_session {
         write_session(state, client, Some(result.reply.clone()));
     }
     write_audit(state, log_id, client, &result.reply, action);
-    state.last_applied = Some(log_id);
-    Ok(result)
+    result
+}
+
+/// Apply a committed system `Expire` (§9.1).
+fn apply_expire(state: &mut State, log_id: LogId, command: &ExpireCommand) -> SystemResult {
+    let decision = expire::decide(state, command);
+    if let expire::Decision::Apply { row } = &decision {
+        // Safety-reducing and value-preserving, so the growth charge is
+        // unchanged -- expiry is neither refused for budget nor a way out of
+        // exhaustion.
+        state
+            .resources
+            .insert(command.resource.clone(), row.clone());
+    }
+    let row = state.resources.get(&command.resource);
+    let lease_revision = row.map_or(0, |r| r.lease_revision);
+    let epoch = row.map_or(0, |r| r.epoch);
+
+    write_audit_row(
+        state,
+        log_id,
+        AuditRow {
+            leader_node_id: log_id.leader_node_id,
+            // A system command has no caller. The proposing leader is already
+            // the entry's identity, so the actor carries the same id rather
+            // than a placeholder that would read as a real node.
+            actor: log_id.leader_node_id,
+            operation_code: OPERATION_EXPIRE,
+            resource: Some(command.resource.clone()),
+            // §5.2: a system command's audit result is its phase code, not a
+            // client outcome. `Rejected` is the outcome enum's only non-client
+            // member; the system code travels in the reply.
+            result: Outcome::Rejected,
+            epoch,
+            value_revision: 0,
+        },
+    );
+
+    SystemResult {
+        system_result_code: decision.system_result_code(),
+        lease_revision,
+    }
+}
+
+/// Apply a committed system `MembershipProgress` (§9).
+fn apply_membership_progress(
+    state: &mut State,
+    log_id: LogId,
+    command: &MembershipProgressCommand,
+) -> SystemResult {
+    let code = match membership::decide_progress(state, command) {
+        Some(effect) => {
+            write_intent(state, log_id, effect);
+            crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED
+        }
+        None => crate::coordination::contract::SYS_MEMBERSHIP_PHASE_MISMATCH,
+    };
+
+    write_audit_row(
+        state,
+        log_id,
+        AuditRow {
+            leader_node_id: log_id.leader_node_id,
+            actor: log_id.leader_node_id,
+            operation_code: OPERATION_MEMBERSHIP_PROGRESS,
+            resource: None,
+            result: Outcome::Rejected,
+            epoch: 0,
+            value_revision: 0,
+        },
+    );
+
+    SystemResult {
+        system_result_code: code,
+        lease_revision: 0,
+    }
+}
+
+/// Store an intent and evict whatever its acceptance displaced.
+fn write_intent(state: &mut State, log_id: LogId, mut effect: membership::IntentEffect) {
+    for id in &effect.evict {
+        if let Some(old) = state.intents.remove(id) {
+            state.growth_bytes -= limits::charge_intent(old.encoded_plan_len);
+        }
+    }
+    if effect.intent.introduced_index == 0 {
+        effect.intent.introduced_index = log_id.index;
+    }
+    let previous = state
+        .intents
+        .get(&effect.operation_id)
+        .map(|i| limits::charge_intent(i.encoded_plan_len));
+    state.growth_bytes = state.growth_bytes + limits::charge_intent(effect.intent.encoded_plan_len)
+        - previous.unwrap_or(0);
+    state.intents.insert(effect.operation_id, effect.intent);
+    state.membership_revision = effect.membership_revision;
 }
 
 /// Reject a delivery that cannot belong to a committed history, before any
@@ -419,7 +693,12 @@ fn guard_delivery(state: &State, log_id: LogId) -> Result<(), Fault> {
 }
 
 /// The unresolved path: decide, then write whatever the decision says.
-fn apply_decided(state: &mut State, client: &ClientRef, action: &Action) -> ClientResult {
+fn apply_decided(
+    state: &mut State,
+    log_id: LogId,
+    client: &ClientRef,
+    action: &Action,
+) -> ClientResult {
     match action.decide(state, &client.actor) {
         ActionDecision::Resource(Decision::Apply(effect)) => {
             charge_resource_row(state, &effect.key, effect.row.value.len());
@@ -469,6 +748,54 @@ fn apply_decided(state: &mut State, client: &ClientRef, action: &Action) -> Clie
             )
         }
 
+        ActionDecision::Admin(admin::Decision::Apply(effect)) => {
+            if effect.enabled {
+                if state.admins.insert(effect.target) {
+                    state.growth_bytes += limits::charge_admin();
+                }
+            } else if state.admins.remove(&effect.target) {
+                state.growth_bytes -= limits::charge_admin();
+            }
+            state.admin_revision = effect.admin_revision;
+            ClientResult {
+                disposition: Disposition::Consumed,
+                reply: SavedReply {
+                    outcome: Outcome::AdminUpdated,
+                    reason: Reason::None,
+                    resource: None,
+                    epoch: 0,
+                    value_revision: 0,
+                    acl_revision: 0,
+                    admin_revision: effect.admin_revision,
+                },
+            }
+        }
+
+        ActionDecision::Admin(admin::Decision::NoOp { admin_revision }) => ClientResult {
+            disposition: Disposition::Consumed,
+            reply: SavedReply {
+                outcome: Outcome::AdminUpdated,
+                reason: Reason::None,
+                resource: None,
+                epoch: 0,
+                value_revision: 0,
+                acl_revision: 0,
+                admin_revision,
+            },
+        },
+
+        ActionDecision::Membership(membership::Decision::Apply(effect)) => {
+            let revision = effect.membership_revision;
+            write_intent(state, log_id, *effect);
+            membership_reply(revision)
+        }
+
+        // The identical plan under an id already accepted: the existing intent
+        // is the answer, and nothing is written a second time.
+        ActionDecision::Membership(membership::Decision::Existing { .. }) => {
+            membership_reply(state.membership_revision)
+        }
+
         // A legal command that changes nothing still commits a saved reply --
         // that is what consumes the sequence and lets a retry be answered
         // without re-deciding.
@@ -481,6 +808,7 @@ fn apply_decided(state: &mut State, client: &ClientRef, action: &Action) -> Clie
                 epoch: 0,
                 value_revision: 0,
                 acl_revision,
+                admin_revision: 0,
             },
         },
 
@@ -488,7 +816,9 @@ fn apply_decided(state: &mut State, client: &ClientRef, action: &Action) -> Clie
         // terminal because it is saved -- even a `19` whose budget condition
         // later clears.
         ActionDecision::Resource(Decision::Refuse(reason))
-        | ActionDecision::Grant(grant::Decision::Refuse(reason)) => ClientResult {
+        | ActionDecision::Grant(grant::Decision::Refuse(reason))
+        | ActionDecision::Admin(admin::Decision::Refuse(reason))
+        | ActionDecision::Membership(membership::Decision::Refuse(reason)) => ClientResult {
             disposition: Disposition::Consumed,
             reply: rejection(action.validated_resource(), reason.get()),
         },
@@ -504,6 +834,25 @@ fn apply_decided(state: &mut State, client: &ClientRef, action: &Action) -> Clie
         | ActionDecision::Grant(grant::Decision::RefuseShapeless(_)) => ClientResult {
             disposition: Disposition::Consumed,
             reply: rejection(action.validated_resource(), Reason::None),
+        },
+    }
+}
+
+fn membership_reply(membership_revision: u64) -> ClientResult {
+    ClientResult {
+        disposition: Disposition::Consumed,
+        reply: SavedReply {
+            outcome: Outcome::MembershipAccepted,
+            reason: Reason::None,
+            resource: None,
+            epoch: 0,
+            value_revision: 0,
+            acl_revision: 0,
+            // A membership command reports the membership revision through the
+            // admin-revision slot's sibling; §5.2.1 gives the client reply a
+            // dedicated `membership_log_id`, which Slice 3 fills once the
+            // controller observes it.
+            admin_revision: membership_revision,
         },
     }
 }
@@ -536,6 +885,7 @@ fn consumed_success(
             epoch,
             value_revision,
             acl_revision,
+            admin_revision: 0,
         },
     }
 }
@@ -591,7 +941,12 @@ fn write_audit(
         epoch: reply.epoch,
         value_revision: reply.value_revision,
     };
-    state.reserve_bytes += limits::charge_audit(resource.as_ref().map(key_parts));
+    write_audit_row(state, log_id, row);
+}
+
+/// Insert a prebuilt audit row and advance the tip.
+fn write_audit_row(state: &mut State, log_id: LogId, row: AuditRow) {
+    state.reserve_bytes += limits::charge_audit(row.resource.as_ref().map(key_parts));
     state.audit.insert((log_id.term, log_id.index), row);
     state.audit_tip = Some(log_id);
 }

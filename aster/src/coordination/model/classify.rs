@@ -318,6 +318,7 @@ mod tests {
             epoch: 7,
             value_revision: 3,
             acl_revision: 2,
+            admin_revision: 0,
         }
     }
 

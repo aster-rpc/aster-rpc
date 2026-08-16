@@ -60,6 +60,9 @@ pub struct SavedReply {
     /// response can resync `expected_acl_revision` rather than guess. Without
     /// it every subsequent grant from that client would mismatch.
     pub acl_revision: u64,
+    /// The administrator revision a `set_admin` produced, for the same reason.
+    /// `0` when the command did not touch it (§5.2.1).
+    pub admin_revision: u64,
 }
 
 impl SavedReply {
@@ -111,12 +114,23 @@ pub struct AuditRow {
     pub value_revision: u64,
 }
 
+/// A 16-byte membership operation identity (§4.1).
+pub type OperationId = [u8; 16];
+
 /// A membership intent. Terminal intents are evicted deterministically when a
 /// 65th is produced, which is why reason `20` is reserved and never emitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intent {
     pub encoded_plan_len: usize,
-    pub terminal: bool,
+    /// A canonical digest of the desired plan. Comparison is by digest rather
+    /// than by decoded fields, because §9's "identical plan" has to mean
+    /// identical canonical bytes.
+    pub plan_hash: [u8; 32],
+    /// One of the §5.2 phase codes; see `membership::is_terminal_phase`.
+    pub phase: i32,
+    /// The log index that introduced this intent. Eviction is oldest-first by
+    /// this value, so every voter evicts the same rows.
+    pub introduced_index: u64,
 }
 
 /// A retained node route.
@@ -172,7 +186,7 @@ pub struct State {
     pub acl: BTreeMap<GrantKey, u64>,
     pub admins: BTreeSet<NodeId>,
     pub sessions: BTreeMap<(NodeId, ClientId), Session>,
-    pub intents: BTreeMap<[u8; 16], Intent>,
+    pub intents: BTreeMap<OperationId, Intent>,
     pub routes: BTreeMap<NodeId, Route>,
     /// The full [`LogId`] of the newest audit row, maintained on write.
     ///
@@ -203,6 +217,8 @@ pub struct State {
     /// Maintained incrementally. MUST equal [`State::recompute_reserve`].
     pub reserve_bytes: u64,
     pub admin_revision: u64,
+    /// Advances with every accepted membership intent (§9).
+    pub membership_revision: u64,
     /// The complete [`LogId`] of the last applied entry, or `None` before the
     /// first.
     ///
@@ -415,7 +431,9 @@ mod tests {
                     [3u8; 16],
                     Intent {
                         encoded_plan_len: 10,
-                        terminal: false,
+                        plan_hash: [0u8; 32],
+                        phase: 1,
+                        introduced_index: 1,
                     },
                 );
             }),
@@ -502,6 +520,7 @@ mod tests {
                     epoch: 1,
                     value_revision: 0,
                     acl_revision: 0,
+                    admin_revision: 0,
                 }),
                 retired: false,
             },

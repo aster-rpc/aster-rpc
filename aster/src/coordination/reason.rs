@@ -225,6 +225,20 @@ reasons! {
         ActiveClientCap = 21,
         ResourceSlotsExhausted = 22,
         AclSlotsExhausted = 23,
+        /// §8.1: `set_admin` MUST NOT remove the final administrator.
+        ///
+        /// **Terminal.** No v1 command can make the refusal succeed while that
+        /// administrator is the last one -- adding another administrator is
+        /// itself a `set_admin`, which the surviving administrator must issue,
+        /// so the *removal* as sent can never apply. A client retrying it would
+        /// loop.
+        ///
+        /// Added to §5.2 for this condition rather than reusing a code:
+        /// `12 PermissionChanged` is wrong (the actor does have permission; the
+        /// resulting state is what is forbidden) and non-terminal, and the
+        /// `(100, 0)` shapeless encoding is reserved by §10.1 for request-shape
+        /// violations, which this is not -- it is derived from replicated state.
+        LastAdministrator = 24,
     }
 }
 
@@ -240,7 +254,8 @@ impl Reason {
             Reason::CounterExhausted
             | Reason::StateBudgetExhausted
             | Reason::ResourceSlotsExhausted
-            | Reason::AclSlotsExhausted => true,
+            | Reason::AclSlotsExhausted
+            | Reason::LastAdministrator => true,
 
             // Consumed conflicts. These must reach the log and save a result:
             // denied pre-proposal, a client that may not alter the request at
@@ -295,7 +310,10 @@ impl Reason {
             // a resource's ACL, epoch or lease revision.
             | Reason::CounterExhausted
             // v1 has no delete-resource command (§9.1).
-            | Reason::ResourceSlotsExhausted => true,
+            | Reason::ResourceSlotsExhausted
+            // The removal as sent can never apply while that administrator is
+            // the last one (§8.1).
+            | Reason::LastAdministrator => true,
 
             // The instructive near misses: each has a v1 command that clears it.
             // Retiring frees an active slot; grant removal frees an ACL row; a
@@ -429,16 +447,16 @@ mod tests {
     // wrong arm left every case passing.
 
     /// §10 stage 3: the reason-coded admission denials.
-    const ADMISSION_DENIAL_CODES: [i32; 4] = [15, 19, 22, 23];
+    const ADMISSION_DENIAL_CODES: [i32; 5] = [15, 19, 22, 23, 24];
 
     /// §10: `NotConsumed` refusals no v1 command can clear.
-    const TERMINAL_NOT_CONSUMED_CODES: [i32; 4] = [11, 15, 18, 22];
+    const TERMINAL_NOT_CONSUMED_CODES: [i32; 5] = [11, 15, 18, 22, 24];
 
     /// §5.2: defined so it cannot be reused, but never emitted.
     const RESERVED_CODES: [i32; 1] = [20];
 
     /// §5.2 declares reasons 0 through 23 with no gaps.
-    const REASON_CODE_RANGE: std::ops::RangeInclusive<i32> = 0..=23;
+    const REASON_CODE_RANGE: std::ops::RangeInclusive<i32> = 0..=24;
 
     /// §5.2's outcome codes.
     const OUTCOME_CODES: [i32; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100];
@@ -475,7 +493,7 @@ mod tests {
         // Data, not a bug: an unrecognised code must be reportable rather than
         // fatal. -1 and 24 bracket the declared range; i32::MAX is the corrupt
         // case.
-        for code in [-1, 24, 99, i32::MAX, i32::MIN] {
+        for code in [-1, 25, 99, i32::MAX, i32::MIN] {
             assert_eq!(Reason::from_code(code), None, "code {code} must not map");
         }
     }
@@ -578,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_five_terminal_cases_exist() {
+    fn exactly_six_terminal_cases_exist() {
         let consumed = Reason::ALL
             .iter()
             .filter(|r| Disposition::Consumed.is_terminal(**r))
@@ -591,8 +609,8 @@ mod tests {
         // NotConsumed ones -- "five cases" is 1 rule + 4 reasons, not 5 reasons.
         assert_eq!(consumed, Reason::ALL.len());
         assert_eq!(
-            not_consumed, 4,
-            "§10 names four terminal NotConsumed reasons"
+            not_consumed, 5,
+            "§10 names five terminal NotConsumed reasons"
         );
     }
 
