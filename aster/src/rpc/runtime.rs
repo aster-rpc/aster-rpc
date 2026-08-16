@@ -79,6 +79,10 @@ pub struct AsterServerBuilder {
     // Baseline `aster.net.Topology` (default OFF — discloses network layout).
     enable_topology: bool,
     topology_requires: Option<CapabilityRequirement>,
+    // Coordination voter hosting (default OFF). `Some` registers the reserved
+    // `aster.coordination.*` services and requires a persistent identity.
+    #[cfg(feature = "coordination")]
+    coordination: Option<crate::coordination::host::CoordinationConfig>,
 }
 
 impl AsterServerBuilder {
@@ -269,10 +273,51 @@ impl AsterServerBuilder {
         self
     }
 
+    /// Host a coordination voter: register the reserved
+    /// `aster.coordination.Store` and `aster.coordination.Raft` v1 services
+    /// (§3.3, §5.2, §5.3).
+    ///
+    /// Off unless called, and there is no config-file or environment route to
+    /// it. That is the point of the "absent unless configured" rule: a node
+    /// that did not ask to be a voter answers `NOT_FOUND` for both names rather
+    /// than presenting a surface that merely refuses.
+    ///
+    /// [`start`](Self::start) **fails** unless the endpoint secret key is
+    /// persistently configured -- via [`identity(path)`](Self::identity) or an
+    /// explicit `secret_key` in [`config`](Self::config). Committed Raft
+    /// membership names exact NodeIds, so a voter that restarts under a fresh
+    /// key is not a recovered voter but a stranger, permanently unable to
+    /// rejoin the group it is a member of. `AsterServer` otherwise defaults to
+    /// an ephemeral in-memory identity, which is right for ordinary RPC and
+    /// wrong here.
+    ///
+    /// Slice 0 registers the reservations only: every method answers
+    /// `UNIMPLEMENTED`. What is live is the identity rule, the `iroh_only`
+    /// refusal, and the §12.3 frame caps.
+    #[cfg(feature = "coordination")]
+    pub fn builtin_coordination(
+        mut self,
+        config: crate::coordination::host::CoordinationConfig,
+    ) -> Self {
+        self.coordination = Some(config);
+        self
+    }
+
     /// Build the node (RPC + built-in protocol ALPNs registered), start serving
     /// the registered services, and return the running [`AsterServer`].
     pub async fn start(self) -> Result<AsterServer> {
-        if self.services.is_empty() && self.disable_node_info && !self.enable_topology {
+        // A voter is a served surface, so hosting coordination satisfies the
+        // "at least one service" rule on its own.
+        #[cfg(feature = "coordination")]
+        let hosts_coordination = self.coordination.is_some();
+        #[cfg(not(feature = "coordination"))]
+        let hosts_coordination = false;
+
+        if self.services.is_empty()
+            && self.disable_node_info
+            && !self.enable_topology
+            && !hosts_coordination
+        {
             return Err(Error::InvalidArgument(
                 "AsterServer requires at least one service (or an enabled baseline service)".into(),
             ));
@@ -302,6 +347,23 @@ impl AsterServerBuilder {
             }
         }
         let config = builder.build();
+
+        // §3.3: a voter's NodeId is named by committed Raft membership, so it
+        // MUST survive restart. Checked here -- after config resolution, before
+        // the node starts and long before any storage is opened -- so a
+        // misconfigured voter fails on its first start rather than on its first
+        // *re*start, when the group has already recorded an identity it can no
+        // longer produce. When storage lands, it opens after this point, not
+        // before.
+        #[cfg(feature = "coordination")]
+        if self.coordination.is_some() && self.identity.is_none() && config.secret_key.is_none() {
+            return Err(Error::InvalidArgument(
+                "builtin_coordination requires a persistent endpoint identity: set \
+                 AsterServerBuilder::identity(path) or an explicit secret_key in AsterConfig. \
+                 A voter that restarts under a new key cannot rejoin its own group."
+                    .into(),
+            ));
+        }
 
         // Topology reads the connection monitor; refuse a config that can
         // never populate it rather than serving permanently-empty views.
@@ -363,6 +425,15 @@ impl AsterServerBuilder {
                 inner: TopologyServer::new(LiveTopology { core: node.core() }),
                 requires: self.topology_requires,
             }));
+        }
+        // Reserved coordination services -- registered only when the host asked
+        // for them (§3.3). Both declare `iroh_only`, so they are refused over a
+        // transport that cannot authenticate the peer even here.
+        #[cfg(feature = "coordination")]
+        if self.coordination.is_some() {
+            use crate::coordination::service::{ReservedRaft, ReservedStore};
+            server = server.register_arc(Arc::new(ReservedStore));
+            server = server.register_arc(Arc::new(ReservedRaft));
         }
         for apply in self.session_appliers {
             server = apply(server);
