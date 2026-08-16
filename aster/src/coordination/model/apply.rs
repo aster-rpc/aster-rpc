@@ -195,7 +195,7 @@ pub enum Fault {
     /// unless that atomicity was violated -- a torn write, or a store that
     /// committed one table and not the other.
     AuditAheadOfLastApplied {
-        highest_audited_index: u64,
+        audit_tip: LogId,
         last_applied: Option<LogId>,
     },
 }
@@ -334,7 +334,7 @@ pub fn apply_client_command(
     if writes_session {
         write_session(state, client, Some(result.reply.clone()));
     }
-    write_audit(state, log_id, client, action, result.reply.outcome);
+    write_audit(state, log_id, client, &result.reply, action);
     state.last_applied = Some(log_id);
     Ok(result)
 }
@@ -365,11 +365,18 @@ fn guard_delivery(state: &State, log_id: LogId) -> Result<(), Fault> {
         }
     }
 
-    if let Some(audited) = state.highest_audited_index() {
-        let last_index = state.last_applied.map(|l| l.index);
-        if last_index.is_none_or(|last| audited > last) {
+    if let Some(tip) = state.audit_tip {
+        let consistent = match state.last_applied {
+            // An audit row with nothing applied at all.
+            None => false,
+            // Ahead of what was applied, or -- the case a maximum-index scan
+            // cannot see -- at the same index but from a different term or
+            // leader, which is a different entry.
+            Some(last) => tip.index < last.index || tip == last,
+        };
+        if !consistent {
             return Err(Fault::AuditAheadOfLastApplied {
-                highest_audited_index: audited,
+                audit_tip: tip,
                 last_applied: state.last_applied,
             });
         }
@@ -461,18 +468,27 @@ fn write_audit(
     state: &mut State,
     log_id: LogId,
     client: &ClientRef,
+    reply: &SavedReply,
     action: &Action,
-    outcome: Outcome,
 ) {
-    let resource = action.validated_resource();
+    let resource = reply.resource.clone();
     let row = AuditRow {
+        // Stored even though term and index are the table key: together they
+        // reconstruct this entry's full log id once the log has been purged.
+        leader_node_id: log_id.leader_node_id,
         actor: client.actor,
         operation_code: action.operation_code(),
         resource: resource.clone(),
-        result: outcome,
+        result: reply.outcome,
+        // Copied from the saved reply rather than re-read from state, so the
+        // audit row and the client's answer cannot disagree about what the
+        // entry produced.
+        epoch: reply.epoch,
+        value_revision: reply.value_revision,
     };
     state.reserve_bytes += limits::charge_audit(resource.as_ref().map(key_parts));
     state.audit.insert((log_id.term, log_id.index), row);
+    state.audit_tip = Some(log_id);
 }
 
 #[cfg(test)]
@@ -485,6 +501,12 @@ mod tests {
     const ACTOR: NodeId = [1u8; 32];
     const CLIENT: ClientId = [9u8; 16];
     const HASH: [u8; 32] = [0xAA; 32];
+    const LEADER: NodeId = [0x11; 32];
+    const OTHER_LEADER: NodeId = [0x22; 32];
+
+    fn log(term: u64, index: u64) -> LogId {
+        LogId::new(term, LEADER, index)
+    }
 
     fn raw() -> RawResourceKey {
         RawResourceKey::new("ns", b"k".to_vec())
@@ -660,7 +682,7 @@ mod tests {
     #[test]
     fn a_committed_shape_violation_commits_rejected_with_no_reason() {
         let mut s = held_state();
-        let result = apply_ok(&mut s, LogId::new(1, 7), &client(1), &oversized_value());
+        let result = apply_ok(&mut s, log(1, 7), &client(1), &oversized_value());
 
         assert_eq!(result.disposition, Disposition::Consumed);
         assert_eq!(result.reply.outcome, Outcome::Rejected);
@@ -681,7 +703,7 @@ mod tests {
             s.growth_bytes,
         );
 
-        apply_ok(&mut s, LogId::new(1, 7), &client(1), &oversized_value());
+        apply_ok(&mut s, log(1, 7), &client(1), &oversized_value());
 
         assert_eq!(
             (
@@ -701,7 +723,7 @@ mod tests {
         assert_eq!(session.request_hash, HASH);
         assert!(session.last_result.is_some(), "the rejection is saved");
         assert_eq!(s.audit.len(), 1, "an audit row is written");
-        assert_eq!(s.last_applied, Some(LogId::new(1, 7)));
+        assert_eq!(s.last_applied, Some(log(1, 7)));
         assert!(s.counters_match_recomputation());
     }
 
@@ -713,7 +735,7 @@ mod tests {
     #[test]
     fn a_malformed_identity_is_never_copied_into_durable_metadata() {
         let mut s = granted();
-        let result = apply_ok(&mut s, LogId::new(1, 4), &client(1), &malformed_identity());
+        let result = apply_ok(&mut s, log(1, 4), &client(1), &malformed_identity());
 
         assert!(result.is_forced_shape_rejection());
         assert_eq!(
@@ -738,7 +760,7 @@ mod tests {
     #[test]
     fn a_shape_violation_with_a_valid_identity_keeps_its_resource() {
         let mut s = held_state();
-        let result = apply_ok(&mut s, LogId::new(1, 4), &client(1), &oversized_value());
+        let result = apply_ok(&mut s, log(1, 4), &client(1), &oversized_value());
 
         assert!(result.is_forced_shape_rejection());
         assert_eq!(
@@ -755,7 +777,7 @@ mod tests {
         let mut s = granted();
         // Sequence 5 with no session: a gap, refused by the classifier before
         // any decision runs.
-        let result = apply_ok(&mut s, LogId::new(1, 4), &client(5), &malformed_identity());
+        let result = apply_ok(&mut s, log(1, 4), &client(5), &malformed_identity());
         assert_eq!(result.reply.reason, Reason::SequenceGap);
         assert_eq!(result.reply.resource, None);
         assert_eq!(s.audit.values().next().unwrap().resource, None);
@@ -767,7 +789,7 @@ mod tests {
     #[test]
     fn a_preflight_replay_writes_no_audit_row() {
         let mut s = held_state();
-        let first = apply_ok(&mut s, LogId::new(1, 7), &client(1), &oversized_value());
+        let first = apply_ok(&mut s, log(1, 7), &client(1), &oversized_value());
         let audit_before = s.audit.len();
 
         match preflight(&s, &client(1), &oversized_value()) {
@@ -775,7 +797,7 @@ mod tests {
             other => panic!("a consumed sequence must resolve, got {other:?}"),
         }
         assert_eq!(s.audit.len(), audit_before, "preflight commits nothing");
-        assert_eq!(s.last_applied, Some(LogId::new(1, 7)));
+        assert_eq!(s.last_applied, Some(log(1, 7)));
     }
 
     /// Case 2: a duplicate that was itself proposed and committed, at a new and
@@ -787,11 +809,11 @@ mod tests {
     #[test]
     fn a_committed_duplicate_at_a_higher_index_audits_and_advances_last_applied() {
         let mut s = granted();
-        let first = apply_ok(&mut s, LogId::new(1, 7), &client(1), &acquire());
+        let first = apply_ok(&mut s, log(1, 7), &client(1), &acquire());
         let session_after_first = s.sessions.get(&(ACTOR, CLIENT)).cloned();
         let row_after_first = s.resources.get(&key()).cloned();
 
-        let second = apply_ok(&mut s, LogId::new(1, 8), &client(1), &acquire());
+        let second = apply_ok(&mut s, log(1, 8), &client(1), &acquire());
 
         assert_eq!(second, first, "the saved result is returned verbatim");
         assert_eq!(
@@ -805,7 +827,7 @@ mod tests {
             "no session effect"
         );
         assert_eq!(s.audit.len(), 2, "an applied entry always leaves a trace");
-        assert_eq!(s.last_applied, Some(LogId::new(1, 8)));
+        assert_eq!(s.last_applied, Some(log(1, 8)));
         assert!(s.counters_match_recomputation());
     }
 
@@ -817,16 +839,16 @@ mod tests {
     #[test]
     fn a_lower_index_faults_with_the_entire_state_unchanged() {
         let mut s = granted();
-        apply_ok(&mut s, LogId::new(1, 9), &client(1), &acquire());
+        apply_ok(&mut s, log(1, 9), &client(1), &acquire());
         let before = s.clone();
 
-        let fault = apply_client_command(&mut s, LogId::new(1, 3), &client(2), &acquire())
+        let fault = apply_client_command(&mut s, log(1, 3), &client(2), &acquire())
             .expect_err("an older index cannot belong to a committed history");
         assert_eq!(
             fault,
             Fault::LogIdNotAdvancing {
-                delivered: LogId::new(1, 3),
-                last_applied: LogId::new(1, 9),
+                delivered: log(1, 3),
+                last_applied: log(1, 9),
             }
         );
         assert_state_unchanged(&before, &s);
@@ -838,10 +860,10 @@ mod tests {
     #[test]
     fn redelivering_the_last_applied_entry_faults_unchanged() {
         let mut s = granted();
-        apply_ok(&mut s, LogId::new(2, 7), &client(1), &acquire());
+        apply_ok(&mut s, log(2, 7), &client(1), &acquire());
         let before = s.clone();
 
-        assert!(apply_client_command(&mut s, LogId::new(2, 7), &client(1), &acquire()).is_err());
+        assert!(apply_client_command(&mut s, log(2, 7), &client(1), &acquire()).is_err());
         assert_state_unchanged(&before, &s);
     }
 
@@ -851,19 +873,102 @@ mod tests {
     #[test]
     fn the_same_index_under_another_term_faults_unchanged() {
         let mut s = granted();
-        apply_ok(&mut s, LogId::new(1, 7), &client(1), &acquire());
+        apply_ok(&mut s, log(1, 7), &client(1), &acquire());
         let before = s.clone();
 
-        let fault = apply_client_command(&mut s, LogId::new(2, 7), &client(1), &acquire())
+        let fault = apply_client_command(&mut s, log(2, 7), &client(1), &acquire())
             .expect_err("one index cannot hold two entries");
         assert_eq!(
             fault,
             Fault::LogIdNotAdvancing {
-                delivered: LogId::new(2, 7),
-                last_applied: LogId::new(1, 7),
+                delivered: log(2, 7),
+                last_applied: log(1, 7),
             }
         );
         assert_state_unchanged(&before, &s);
+    }
+
+    /// The same term **and** index under a different leader is still a
+    /// different entry. An index-only or `(term, index)` identity cannot
+    /// express this, which is why the model's `LogId` carries all three fields
+    /// the wire type declares.
+    #[test]
+    fn the_same_term_and_index_under_another_leader_faults_unchanged() {
+        let mut s = granted();
+        apply_ok(&mut s, LogId::new(1, LEADER, 7), &client(1), &acquire());
+        let before = s.clone();
+
+        let delivered = LogId::new(1, OTHER_LEADER, 7);
+        let fault = apply_client_command(&mut s, delivered, &client(1), &acquire())
+            .expect_err("a different leader's entry at an applied position");
+        assert_eq!(
+            fault,
+            Fault::LogIdNotAdvancing {
+                delivered,
+                last_applied: LogId::new(1, LEADER, 7),
+            }
+        );
+        assert_state_unchanged(&before, &s);
+    }
+
+    /// The corrupt-state check sees a tip at the *same* index as
+    /// `last_applied` but from a different leader -- which a maximum-index scan
+    /// cannot distinguish from the ordinary case.
+    #[test]
+    fn an_audit_tip_from_another_leader_at_the_applied_index_faults() {
+        let mut s = granted();
+        apply_ok(&mut s, LogId::new(1, LEADER, 7), &client(1), &acquire());
+        // Same term and index, different leader: a different entry.
+        s.audit_tip = Some(LogId::new(1, OTHER_LEADER, 7));
+
+        assert!(matches!(
+            apply_client_command(&mut s, log(1, 9), &client(2), &acquire()),
+            Err(Fault::AuditAheadOfLastApplied { .. })
+        ));
+    }
+
+    /// The stored audit row carries `leader_node_id`, so an entry's full log id
+    /// is still reconstructible once the log itself has been purged -- the only
+    /// place that information then survives.
+    #[test]
+    fn a_stored_audit_row_reconstructs_its_entrys_full_log_id() {
+        let mut s = granted();
+        let id = LogId::new(3, OTHER_LEADER, 11);
+        apply_ok(&mut s, id, &client(1), &acquire());
+
+        let ((term, index), row) = s.audit.iter().next().expect("audit row");
+        assert_eq!(
+            LogId::new(*term, row.leader_node_id, *index),
+            id,
+            "term and index are the key; the leader comes from the row"
+        );
+    }
+
+    /// The audit row records the revisions the entry produced, taken from the
+    /// saved reply so the two cannot disagree.
+    #[test]
+    fn the_audit_row_records_the_revisions_the_entry_produced() {
+        let mut s = held_state();
+        let result = apply_ok(
+            &mut s,
+            log(1, 5),
+            &client(1),
+            &Action::Resource(ResourceAction::CompareAndSet {
+                fence: Fence {
+                    resource: raw(),
+                    epoch: 1,
+                    holder: ACTOR,
+                },
+                expected_value_revision: 0,
+                new_value: b"v".to_vec(),
+            }),
+        );
+
+        let row = s.audit.get(&(1, 5)).expect("audit row");
+        assert_eq!(row.epoch, result.reply.epoch);
+        assert_eq!(row.value_revision, result.reply.value_revision);
+        assert_eq!(row.value_revision, 1, "the mutation advanced it");
+        assert_eq!(row.result, result.reply.outcome);
     }
 
     /// The case audit-equality could never catch: two **different**
@@ -894,14 +999,14 @@ mod tests {
             new_value: b"second".to_vec(),
         });
 
-        apply_ok(&mut s, LogId::new(1, 5), &client(1), &first_cas);
+        apply_ok(&mut s, log(1, 5), &client(1), &first_cas);
         let audited = s.audit.get(&(1, 5)).cloned().expect("audit row");
         let before = s.clone();
 
         // Redelivering the same log id with a different command: the audit
         // projections are identical, so equality would have called it a
         // duplicate.
-        assert!(apply_client_command(&mut s, LogId::new(1, 5), &client(1), &second_cas).is_err());
+        assert!(apply_client_command(&mut s, log(1, 5), &client(1), &second_cas).is_err());
         assert_state_unchanged(&before, &s);
         assert_eq!(
             s.resources.get(&key()).unwrap().value,
@@ -922,7 +1027,7 @@ mod tests {
             },
         );
         probe.growth_bytes = probe.recompute_growth();
-        apply_ok(&mut probe, LogId::new(1, 5), &client(1), &second_cas);
+        apply_ok(&mut probe, log(1, 5), &client(1), &second_cas);
         assert_eq!(
             probe.audit.get(&(1, 5)).unwrap(),
             &audited,
@@ -931,24 +1036,22 @@ mod tests {
     }
 
     /// Pruning audit rows must not make an old entry deliverable again: the
-    /// guard is `last_applied`, which pruning does not touch.
+    /// guard is `last_applied` and the retained tip, neither of which pruning
+    /// touches. Prunes the **oldest** row, as audit retention does -- the tip is
+    /// never the row that goes.
     #[test]
     fn pruning_audit_cannot_make_an_old_entry_reapplicable() {
         let mut s = granted();
-        apply_ok(&mut s, LogId::new(1, 7), &client(1), &acquire());
-        apply_ok(&mut s, LogId::new(1, 8), &client(2), &acquire());
+        apply_ok(&mut s, log(1, 7), &client(1), &acquire());
+        apply_ok(&mut s, log(1, 8), &client(2), &acquire());
 
-        // Prune everything, as audit retention eventually does.
-        let pruned: u64 = s
-            .audit
-            .values()
-            .map(|a| limits::charge_audit(a.resource.as_ref().map(key_parts)))
-            .sum();
-        s.audit.clear();
-        s.reserve_bytes -= pruned;
+        let oldest = *s.audit.keys().next().expect("an audit row");
+        let row = s.audit.remove(&oldest).expect("the oldest row");
+        s.reserve_bytes -= limits::charge_audit(row.resource.as_ref().map(key_parts));
+        assert_eq!(s.audit.len(), 1, "the tip survives pruning");
         let before = s.clone();
 
-        assert!(apply_client_command(&mut s, LogId::new(1, 7), &client(1), &acquire()).is_err());
+        assert!(apply_client_command(&mut s, log(1, 7), &client(1), &acquire()).is_err());
         assert_state_unchanged(&before, &s);
     }
 
@@ -957,20 +1060,20 @@ mod tests {
     #[test]
     fn audit_ahead_of_last_applied_faults_as_corrupt_state() {
         let mut s = granted();
-        apply_ok(&mut s, LogId::new(1, 7), &client(1), &acquire());
+        apply_ok(&mut s, log(1, 7), &client(1), &acquire());
 
         // Simulate a torn write: the audit table committed, `last_applied` did
         // not.
-        s.last_applied = Some(LogId::new(1, 5));
+        s.last_applied = Some(log(1, 5));
         let before = s.clone();
 
-        let fault = apply_client_command(&mut s, LogId::new(1, 9), &client(2), &acquire())
+        let fault = apply_client_command(&mut s, log(1, 9), &client(2), &acquire())
             .expect_err("audit ahead of last_applied is unreachable state");
         assert_eq!(
             fault,
             Fault::AuditAheadOfLastApplied {
-                highest_audited_index: 7,
-                last_applied: Some(LogId::new(1, 5)),
+                audit_tip: log(1, 7),
+                last_applied: Some(log(1, 5)),
             }
         );
         assert_state_unchanged(&before, &s);
@@ -981,11 +1084,11 @@ mod tests {
     #[test]
     fn audit_with_no_last_applied_faults_as_corrupt_state() {
         let mut s = granted();
-        apply_ok(&mut s, LogId::new(1, 7), &client(1), &acquire());
+        apply_ok(&mut s, log(1, 7), &client(1), &acquire());
         s.last_applied = None;
 
         assert!(matches!(
-            apply_client_command(&mut s, LogId::new(1, 9), &client(2), &acquire()),
+            apply_client_command(&mut s, log(1, 9), &client(2), &acquire()),
             Err(Fault::AuditAheadOfLastApplied { .. })
         ));
     }
@@ -993,14 +1096,14 @@ mod tests {
     #[test]
     fn a_forced_rejection_replays_exactly_as_a_typed_reply() {
         let mut s = held_state();
-        let first = apply_ok(&mut s, LogId::new(1, 7), &client(1), &oversized_value());
+        let first = apply_ok(&mut s, log(1, 7), &client(1), &oversized_value());
 
         match preflight(&s, &client(1), &oversized_value()) {
             Admission::Resolved(replayed) => assert_eq!(*replayed, first),
             other => panic!("a consumed sequence must resolve, got {other:?}"),
         }
 
-        let second = apply_ok(&mut s, LogId::new(1, 8), &client(1), &oversized_value());
+        let second = apply_ok(&mut s, log(1, 8), &client(1), &oversized_value());
         assert_eq!(second, first, "byte-identical, and never an RpcStatus");
     }
 
@@ -1051,7 +1154,7 @@ mod tests {
         ];
 
         for (name, mut s, action) in cases {
-            let result = apply_ok(&mut s, LogId::new(1, 1), &client(1), &action);
+            let result = apply_ok(&mut s, log(1, 1), &client(1), &action);
             assert_eq!(result.reply.outcome, Outcome::Rejected, "{name}");
             assert_ne!(
                 result.reply.reason,
@@ -1065,7 +1168,7 @@ mod tests {
     #[test]
     fn a_successful_outcome_carries_no_reason() {
         let mut s = granted();
-        let result = apply_ok(&mut s, LogId::new(1, 1), &client(1), &acquire());
+        let result = apply_ok(&mut s, log(1, 1), &client(1), &acquire());
         assert_eq!(result.reply.outcome, Outcome::Granted);
         assert_eq!(result.reply.reason, Reason::None);
         assert!(!result.is_forced_shape_rejection());
@@ -1107,7 +1210,7 @@ mod tests {
     #[test]
     fn a_committed_result_is_returned_even_after_the_grant_is_revoked() {
         let mut s = granted();
-        let first = apply_ok(&mut s, LogId::new(1, 1), &client(1), &acquire());
+        let first = apply_ok(&mut s, log(1, 1), &client(1), &acquire());
         assert_eq!(first.reply.outcome, Outcome::Granted);
 
         s.acl.remove(&(key(), ACTOR));
@@ -1123,7 +1226,7 @@ mod tests {
     #[test]
     fn a_successful_acquire_writes_the_row_and_keeps_the_counters_honest() {
         let mut s = granted();
-        let result = apply_ok(&mut s, LogId::new(1, 3), &client(1), &acquire());
+        let result = apply_ok(&mut s, log(1, 3), &client(1), &acquire());
 
         assert_eq!(result.disposition, Disposition::Consumed);
         assert_eq!(result.reply.outcome, Outcome::Granted);
@@ -1132,20 +1235,20 @@ mod tests {
         let row = s.resources.get(&key()).expect("the row was created");
         assert!(row.held);
         assert_eq!(row.holder, Some(ACTOR));
-        assert_eq!(s.last_applied, Some(LogId::new(1, 3)));
+        assert_eq!(s.last_applied, Some(log(1, 3)));
         assert!(s.counters_match_recomputation());
     }
 
     #[test]
     fn a_classifier_refusal_writes_audit_but_no_session_row() {
         let mut s = granted();
-        let result = apply_ok(&mut s, LogId::new(1, 4), &client(5), &acquire());
+        let result = apply_ok(&mut s, log(1, 4), &client(5), &acquire());
 
         assert_eq!(result.disposition, Disposition::NotConsumed);
         assert_eq!(result.reply.reason, Reason::SequenceGap);
         assert!(s.sessions.is_empty(), "no session row is created");
         assert_eq!(s.audit.len(), 1, "the applied entry still leaves a trace");
-        assert_eq!(s.last_applied, Some(LogId::new(1, 4)));
+        assert_eq!(s.last_applied, Some(log(1, 4)));
         assert!(s.counters_match_recomputation());
     }
 
@@ -1187,7 +1290,7 @@ mod tests {
             };
             let mut c = client(sequence);
             c.request_hash = [step as u8; 32];
-            let result = apply_ok(&mut s, LogId::new(1, index), &c, &action);
+            let result = apply_ok(&mut s, log(1, index), &c, &action);
             if result.disposition == Disposition::Consumed {
                 sequence += 1;
             }

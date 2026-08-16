@@ -26,6 +26,43 @@ pub type ClientId = [u8; 16];
 /// state holds only values that passed its constructor.
 pub use crate::coordination::ids::ResourceKey;
 
+/// Conversions between the model's [`LogId`] and the compiled wire type.
+///
+/// Both directions exist so a round-trip test can prove no field is dropped.
+/// The fallible direction is the one that matters: `LogIdV1.leader_node_id` is
+/// a `Vec<u8>` on the wire, and a value that is not exactly 32 bytes is not a
+/// NodeId.
+impl From<&LogId> for crate::coordination::contract::LogIdV1 {
+    fn from(id: &LogId) -> Self {
+        crate::coordination::contract::LogIdV1 {
+            term: id.term,
+            leader_node_id: id.leader_node_id.to_vec(),
+            index: id.index,
+        }
+    }
+}
+
+/// The wire log id carried a `leader_node_id` that is not 32 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BadLogId;
+
+impl TryFrom<&crate::coordination::contract::LogIdV1> for LogId {
+    type Error = BadLogId;
+
+    fn try_from(id: &crate::coordination::contract::LogIdV1) -> Result<Self, BadLogId> {
+        let leader_node_id: NodeId = id
+            .leader_node_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| BadLogId)?;
+        Ok(LogId {
+            term: id.term,
+            leader_node_id,
+            index: id.index,
+        })
+    }
+}
+
 /// A resource row: the lease and the value it guards.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResourceRow {
@@ -84,18 +121,28 @@ pub struct Session {
     pub retired: bool,
 }
 
-/// One authoritative audit row.
+/// One authoritative audit row, mirroring
+/// [`AuditRowV1`](crate::coordination::contract::AuditRowV1).
 ///
-/// Carries `result_code` -- the outcome -- and no reason code (§5.2). That is
-/// why a reserved reason number could not be disambiguated from audit even in
+/// Carries `result` -- the outcome -- and no reason code (§5.2). That is why a
+/// reserved reason number could not be disambiguated from audit even in
 /// principle, and why the reserved-code argument rests on saved replies and
 /// client journals instead.
+///
+/// `leader_node_id` is stored even though term and index are the table key:
+/// together they reconstruct the entry's full [`LogId`] after the log itself has
+/// been purged, which is the only place that information then survives.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditRow {
+    pub leader_node_id: NodeId,
     pub actor: NodeId,
     pub operation_code: i32,
     pub resource: Option<ResourceKey>,
     pub result: Outcome,
+    /// The resulting epoch, copied from the saved reply.
+    pub epoch: u64,
+    /// The resulting value revision, copied from the saved reply.
+    pub value_revision: u64,
 }
 
 /// A membership intent. Terminal intents are evicted deterministically when a
@@ -115,30 +162,45 @@ pub struct Route {
 /// A grant: the rights one subject holds on one resource.
 pub type GrantKey = (ResourceKey, NodeId);
 
-/// A Raft log entry identity: term **and** index (§11.2).
+/// A Raft log entry identity: `(term, leader_node_id, index)`.
 ///
-/// `last_applied` is this whole value, not an index. An index alone cannot
-/// distinguish an entry from a different leader's entry at the same position,
-/// and OpenRaft requires the full log id of each applied entry to resume
-/// correctly -- it restarts delivery from `already_committed.next_index()`.
+/// All three, because that is what the compiled contract declares
+/// ([`LogIdV1`](crate::coordination::contract::LogIdV1)) and what OpenRaft
+/// retains under this type config -- its `LogId` is
+/// `{ leader_id: { term, node_id }, index }`. An earlier revision of this model
+/// carried `(term, index)` only, which cannot round-trip the wire type and
+/// cannot reconstruct a full log id from a stored audit row after the log is
+/// purged.
 ///
-/// Deliberately **no** `Ord`. Log ordering is by index; deriving a lexicographic
-/// `(term, index)` comparison would silently order two entries by term first,
-/// which is not what any caller means.
+/// Deliberately **no** `Ord`. Log ordering is by index; deriving a
+/// lexicographic comparison over the fields would silently order two entries by
+/// term first, which is not what any caller means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LogId {
     pub term: u64,
+    /// The leader that created the entry. Part of the identity: two leaders can
+    /// each write an entry at the same term and index, and they are different
+    /// entries.
+    pub leader_node_id: NodeId,
     pub index: u64,
 }
 
 impl LogId {
-    pub fn new(term: u64, index: u64) -> Self {
-        Self { term, index }
+    pub fn new(term: u64, leader_node_id: NodeId, index: u64) -> Self {
+        Self {
+            term,
+            leader_node_id,
+            index,
+        }
     }
 }
 
 /// The complete replicated state.
-#[derive(Clone, Debug, Default)]
+///
+/// `PartialEq` is derived deliberately: tests that assert "nothing changed"
+/// compare the whole value, so a field added later is covered without anyone
+/// remembering to extend an assertion list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct State {
     pub resources: BTreeMap<ResourceKey, ResourceRow>,
     pub acl: BTreeMap<GrantKey, u64>,
@@ -146,6 +208,14 @@ pub struct State {
     pub sessions: BTreeMap<(NodeId, ClientId), Session>,
     pub intents: BTreeMap<[u8; 16], Intent>,
     pub routes: BTreeMap<NodeId, Route>,
+    /// The full [`LogId`] of the newest audit row, maintained on write.
+    ///
+    /// An O(1) tail rather than a scan: `apply` consults it on every entry, and
+    /// scanning up to 100,000 audit rows each time would make replaying a full
+    /// log quadratic. Carrying the whole log id also catches a row at the same
+    /// index as `last_applied` but from a different term or leader, which a
+    /// maximum-index scan cannot see.
+    pub audit_tip: Option<LogId>,
     /// Keyed by the normative entry identity `(log_term, log_index)` (§11.2),
     /// which orders pruning deterministically.
     ///
@@ -226,16 +296,6 @@ impl State {
     pub fn counters_match_recomputation(&self) -> bool {
         self.growth_bytes == self.recompute_growth()
             && self.reserve_bytes == self.recompute_reserve()
-    }
-
-    /// The highest log index any audit row records.
-    ///
-    /// Used only to detect corrupt state: §11.3 writes effects, audit and
-    /// `last_applied` in one transaction, so an audit row for an entry
-    /// `last_applied` says was never applied means that atomicity was violated.
-    /// Production storage keeps this as a stored maximum rather than a scan.
-    pub fn highest_audited_index(&self) -> Option<u64> {
-        self.audit.keys().map(|(_, index)| *index).max()
     }
 
     /// Session capacity for `actor`, at both scopes.
@@ -343,6 +403,55 @@ mod tests {
         );
     }
 
+    /// The model's `LogId` and the compiled wire type carry the same three
+    /// fields, and a round trip in either direction loses nothing. A model that
+    /// dropped `leader_node_id` would round-trip "successfully" while silently
+    /// substituting a different entry's identity.
+    #[test]
+    fn log_id_round_trips_through_the_wire_type_without_loss() {
+        use crate::coordination::contract::LogIdV1;
+
+        let id = LogId::new(7, [0xABu8; 32], 42);
+        let wire: LogIdV1 = (&id).into();
+
+        assert_eq!(wire.term, 7);
+        assert_eq!(wire.index, 42);
+        assert_eq!(wire.leader_node_id, vec![0xABu8; 32]);
+
+        let back = LogId::try_from(&wire).expect("a well-formed wire log id");
+        assert_eq!(back, id);
+    }
+
+    /// Every field is load-bearing: changing any one of the three changes the
+    /// identity, so none can be dropped from the model without losing entries.
+    #[test]
+    fn every_log_id_field_distinguishes_an_entry() {
+        let base = LogId::new(1, [1u8; 32], 1);
+        assert_ne!(base, LogId::new(2, [1u8; 32], 1), "term");
+        assert_ne!(base, LogId::new(1, [2u8; 32], 1), "leader");
+        assert_ne!(base, LogId::new(1, [1u8; 32], 2), "index");
+    }
+
+    /// A wire log id whose leader is not exactly 32 bytes is not a log id.
+    #[test]
+    fn a_wire_log_id_with_a_malformed_leader_is_rejected() {
+        use crate::coordination::contract::LogIdV1;
+
+        for leader in [vec![], vec![0u8; 31], vec![0u8; 33]] {
+            let wire = LogIdV1 {
+                term: 1,
+                leader_node_id: leader.clone(),
+                index: 1,
+            };
+            assert_eq!(
+                LogId::try_from(&wire),
+                Err(BadLogId),
+                "a {}-byte leader is not a NodeId",
+                leader.len()
+            );
+        }
+    }
+
     #[test]
     fn an_empty_state_has_zero_counters_and_they_match_recomputation() {
         let s = State::default();
@@ -408,10 +517,13 @@ mod tests {
                 s.audit.insert(
                     (1, 0),
                     AuditRow {
+                        leader_node_id: [8u8; 32],
                         actor: [7u8; 32],
                         operation_code: 1,
                         resource: None,
                         result: Outcome::Granted,
+                        epoch: 1,
+                        value_revision: 0,
                     },
                 );
             }),
