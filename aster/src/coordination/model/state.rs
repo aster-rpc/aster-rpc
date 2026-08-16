@@ -16,32 +16,15 @@ pub type NodeId = [u8; 32];
 /// A client session identity (16 bytes).
 pub type ClientId = [u8; 16];
 
-/// A `(namespace, key)` resource identity.
+/// The validated resource identity, re-exported so the model has one name for
+/// it.
 ///
-/// Ordering is `(namespace, key)` lexicographic, which is what redb's tuple
-/// comparator gives and what the canonical row stream's ordering key must
-/// match. Deriving `Ord` on the struct in field order produces exactly that;
-/// flattening the two into one buffer does **not** -- the spike's round-2 defect
-/// was a length-prefixed flattening under which `"b"` sorts before `"aa"`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct ResourceKey {
-    pub namespace: String,
-    pub key: Vec<u8>,
-}
-
-impl ResourceKey {
-    pub fn new(namespace: impl Into<String>, key: impl Into<Vec<u8>>) -> Self {
-        Self {
-            namespace: namespace.into(),
-            key: key.into(),
-        }
-    }
-
-    /// The `(namespace, key)` pair as the charge formulas take it.
-    pub fn as_charge_parts(&self) -> (&str, &[u8]) {
-        (&self.namespace, &self.key)
-    }
-}
+/// Deliberately **not** a model-local struct. An earlier revision had one with
+/// public fields and maxima-only validation, which let empty and malformed
+/// identities into state, saved replies and audit rows -- rows that
+/// `coordination::ids::ResourceKey` would then refuse to reconstruct. Durable
+/// state holds only values that passed its constructor.
+pub use crate::coordination::ids::ResourceKey;
 
 /// A resource row: the lease and the value it guards.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -82,8 +65,13 @@ pub struct SavedReply {
 impl SavedReply {
     /// The charge parts of the embedded resource key, if any.
     fn key_parts(&self) -> Option<(&str, &[u8])> {
-        self.resource.as_ref().map(ResourceKey::as_charge_parts)
+        self.resource.as_ref().map(key_parts)
     }
+}
+
+/// The `(namespace, key)` pair as the charge formulas take it.
+pub fn key_parts(key: &ResourceKey) -> (&str, &[u8]) {
+    (key.namespace(), key.key())
 }
 
 /// One client session row. Tombstones are session rows with `retired = true`;
@@ -136,7 +124,11 @@ pub struct State {
     pub sessions: BTreeMap<(NodeId, ClientId), Session>,
     pub intents: BTreeMap<[u8; 16], Intent>,
     pub routes: BTreeMap<NodeId, Route>,
-    /// Keyed `(log_index, ordinal)` so pruning the oldest is deterministic.
+    /// Keyed by the normative entry identity `(log_term, log_index)` (§11.2),
+    /// which is what makes reapplying the same entry idempotent: the key
+    /// already exists, so no second row and no second charge.
+    ///
+    /// Ordering by term then index also prunes the oldest deterministically.
     pub audit: BTreeMap<(u64, u64), AuditRow>,
     /// Maintained incrementally. MUST equal [`State::recompute_growth`].
     pub growth_bytes: u64,
@@ -160,12 +152,12 @@ impl State {
         let resources: u64 = self
             .resources
             .iter()
-            .map(|(k, r)| limits::charge_resource(&k.namespace, &k.key, r.value.len()))
+            .map(|(k, r)| limits::charge_resource(k.namespace(), k.key(), r.value.len()))
             .sum();
         let acl: u64 = self
             .acl
             .keys()
-            .map(|(k, _)| limits::charge_acl(&k.namespace, &k.key))
+            .map(|(k, _)| limits::charge_acl(k.namespace(), k.key()))
             .sum();
         let admins = self.admins.len() as u64 * limits::charge_admin();
         let intents: u64 = self
@@ -191,7 +183,7 @@ impl State {
         let audit: u64 = self
             .audit
             .values()
-            .map(|a| limits::charge_audit(a.resource.as_ref().map(ResourceKey::as_charge_parts)))
+            .map(|a| limits::charge_audit(a.resource.as_ref().map(key_parts)))
             .sum();
         sessions + audit
     }
@@ -262,7 +254,7 @@ mod tests {
     use super::*;
 
     fn key(ns: &str, k: &[u8]) -> ResourceKey {
-        ResourceKey::new(ns, k)
+        ResourceKey::new(ns, k).expect("a valid fixture identity")
     }
 
     /// A named mutation used to probe which counter a table charges to.
@@ -296,14 +288,19 @@ mod tests {
             "\"aa\" must sort before \"b\"; a length-prefixed key inverts this"
         );
         // And the namespace dominates, whatever the key lengths.
-        assert!(key("a", b"zzzzzzzz") < key("b", b""));
+        assert!(key("a", b"zzzzzzzz") < key("b", b"a"));
     }
 
-    /// Empty and one-zero-byte keys are distinct, and neither is a sentinel.
+    /// A one-zero-byte key is a real key, not a sentinel -- and an *empty* key
+    /// is not constructible at all, which is why no row can carry one.
     #[test]
-    fn an_empty_key_is_distinct_from_a_zero_byte_key() {
-        assert_ne!(key("ns", b""), key("ns", b"\0"));
-        assert!(key("ns", b"") < key("ns", b"\0"));
+    fn a_zero_byte_key_is_a_real_key_and_an_empty_one_is_unconstructible() {
+        assert_ne!(key("ns", b"\0"), key("ns", b"\0\0"));
+        assert!(key("ns", b"\0") < key("ns", b"\0\0"));
+        assert!(
+            ResourceKey::new("ns", Vec::new()).is_err(),
+            "an empty key must never reach a durable row"
+        );
     }
 
     #[test]

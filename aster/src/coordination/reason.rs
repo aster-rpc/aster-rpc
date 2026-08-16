@@ -35,21 +35,36 @@
 //! `is_admission_denial()` was testing that the code agreed with itself, and
 //! moving a reason into the wrong arm kept every case passing.
 
-/// Generates the `Reason` enum, its exhaustive `ALL` list, and `from_code` from
-/// one declaration.
+/// Generates the `Reason` enum, its exhaustive `ALL` list, `from_code`,
+/// `is_reserved`, and the [`RefusalReason`] constants -- all from **one**
+/// declaration, in three groups.
+///
+/// The grouping is what makes `RefusalReason` structural rather than checked.
+/// A reason lands in exactly one group, and only the `refusable` group gets a
+/// constant, so a refusal path has no way to name `None` or a reserved code.
 macro_rules! reasons {
-    ($($(#[$m:meta])* $name:ident = $code:expr),* $(,)?) => {
+    (
+        absent { $(#[$am:meta])* $absent:ident = $acode:expr }
+        reserved { $($(#[$rm:meta])* $reserved:ident = $rcode:expr),* $(,)? }
+        refusable { $($(#[$fm:meta])* $refusable:ident = $fcode:expr),* $(,)? }
+    ) => {
         /// A rejection reason (§5.2). `None` (0) means no reason applies.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
         #[repr(i32)]
         pub enum Reason {
-            $($(#[$m])* $name = $code),*
+            $(#[$am])* $absent = $acode,
+            $($(#[$rm])* $reserved = $rcode,)*
+            $($(#[$fm])* $refusable = $fcode,)*
         }
 
         impl Reason {
             /// Every reason in §5.2, derived from the declaration above so it
             /// cannot go stale.
-            pub const ALL: &'static [Reason] = &[$(Reason::$name),*];
+            pub const ALL: &'static [Reason] = &[
+                Reason::$absent,
+                $(Reason::$reserved,)*
+                $(Reason::$refusable,)*
+            ];
 
             /// Reconstruct a reason from a stored or received code.
             ///
@@ -62,7 +77,9 @@ macro_rules! reasons {
             /// directs for the reserved `20`.
             pub fn from_code(code: i32) -> Option<Reason> {
                 match code {
-                    $($code => Some(Reason::$name),)*
+                    $acode => Some(Reason::$absent),
+                    $($rcode => Some(Reason::$reserved),)*
+                    $($fcode => Some(Reason::$refusable),)*
                     _ => None,
                 }
             }
@@ -71,56 +88,144 @@ macro_rules! reasons {
             pub fn code(self) -> i32 {
                 self as i32
             }
+
+            /// Is this code reserved -- defined so it cannot be reused, but
+            /// never emitted by any transition (§5.2)?
+            ///
+            /// Derived from the declaration's `reserved` group rather than
+            /// hand-written, so a reserved code cannot be added without also
+            /// losing its `RefusalReason` constant.
+            pub fn is_reserved(self) -> bool {
+                matches!(self, $(Reason::$reserved)|*)
+            }
+
+            /// Can a refusal carry this reason?
+            ///
+            /// False for `None` -- the absence of a reason is not a reason --
+            /// and for every reserved code. See [`RefusalReason`].
+            pub fn is_refusable(self) -> bool {
+                matches!(self, $(Reason::$refusable)|*)
+            }
+        }
+
+        /// A reason a refusal may actually carry.
+        ///
+        /// This type exists to make one rule structural instead of checked:
+        /// **no reasoned refusal can produce `(100 Rejected, 0 None)`**. That
+        /// pairing is reserved for a committed request-shape violation (§10.1),
+        /// and a test that merely samples decision paths cannot prove another
+        /// path will not emit it -- `Refuse(Reason::None)` stayed constructible
+        /// and would have produced exactly the forbidden pairing.
+        ///
+        /// A refusal site names a constant (`RefusalReason::HeldByOther`), so
+        /// `None` and reserved codes are not in the vocabulary at all. The
+        /// fallible [`RefusalReason::new`] exists for reconstructing one from
+        /// stored data, where the value is not known at compile time.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct RefusalReason(Reason);
+
+        #[allow(non_upper_case_globals)]
+        impl RefusalReason {
+            $(
+                $(#[$fm])*
+                pub const $refusable: RefusalReason = RefusalReason(Reason::$refusable);
+            )*
+
+            /// Every reason a refusal may carry.
+            pub const ALL: &'static [RefusalReason] =
+                &[$(RefusalReason(Reason::$refusable)),*];
+
+            /// Reconstruct from a stored reason. `None` if the reason is
+            /// `Reason::None` or reserved -- neither of which any refusal may
+            /// carry.
+            pub const fn new(reason: Reason) -> Option<RefusalReason> {
+                match reason {
+                    $(Reason::$refusable => Some(RefusalReason(Reason::$refusable)),)*
+                    _ => None,
+                }
+            }
+
+            /// The underlying reason.
+            pub const fn get(self) -> Reason {
+                self.0
+            }
+
+            /// The wire code. Always nonzero.
+            pub fn code(self) -> i32 {
+                self.0.code()
+            }
+
+            /// See [`Reason::is_admission_denial`].
+            pub fn is_admission_denial(self) -> bool {
+                self.0.is_admission_denial()
+            }
+
+            /// See [`Reason::is_terminal_when_not_consumed`].
+            pub fn is_terminal_when_not_consumed(self) -> bool {
+                self.0.is_terminal_when_not_consumed()
+            }
+        }
+
+        impl From<RefusalReason> for Reason {
+            fn from(r: RefusalReason) -> Reason {
+                r.0
+            }
         }
     };
 }
 
 reasons! {
-    /// No reason applies.
-    ///
-    /// Carried by every successful outcome -- and, by one narrow exception, by
-    /// a rejection. A committed command that violates a **logical
-    /// request-shape limit** (§12.1) rejects as `(100 Rejected, 0 None)`,
-    /// because §5.2 has no reason for that failure and inventing one would
-    /// change the frozen contract. That pairing is legal **only** there; every
-    /// other rejection carries a defined, nonzero reason. See
-    /// [`Outcome::Rejected`] and the forced-apply rule in
-    /// `coordination::model::apply`.
-    None = 0,
-    HeldByOther = 1,
-    NotHeld = 2,
-    NotHolder = 3,
-    EpochMismatch = 4,
-    ValueRevisionMismatch = 5,
-    AclRevisionMismatch = 6,
-    AdminRevisionMismatch = 7,
-    SequenceTooOld = 8,
-    SequenceGap = 9,
-    SequenceConflict = 10,
-    ClientRetired = 11,
-    PermissionChanged = 12,
-    MembershipRevisionMismatch = 13,
-    MembershipIntentActive = 14,
-    CounterExhausted = 15,
-    MembershipCannotCancel = 16,
-    OperationIdConflict = 17,
-    RetainedSessionCapReached = 18,
-    StateBudgetExhausted = 19,
-    /// **Reserved, never emitted.** §9 retains 64 terminal intents and evicts
-    /// the oldest deterministically when a 65th is produced, so no transition
-    /// can exhaust an intent slot.
-    ///
-    /// Kept in the enum rather than deleted because reason codes outlive the
-    /// transition that produced them: `SavedReplyV1.reason_code` persists in the
-    /// session table and is returned to every future retry of that sequence.
-    /// Reusing `20` for a different condition would make an old saved reply mean
-    /// one thing to a v1 reader and another to a later one. Emission is blocked
-    /// by [`Reason::is_reserved`]; a client that receives it treats it as an
-    /// unknown reason.
-    IntentSlotsExhausted = 20,
-    ActiveClientCap = 21,
-    ResourceSlotsExhausted = 22,
-    AclSlotsExhausted = 23,
+    absent {
+        /// No reason applies.
+        ///
+        /// Carried by every successful outcome -- and, by one narrow exception,
+        /// by a rejection. A committed command that violates a **logical
+        /// request-shape limit** (§12.1) rejects as `(100 Rejected, 0 None)`,
+        /// because §5.2 has no reason for that failure and inventing one would
+        /// change the frozen contract. That pairing is legal **only** there;
+        /// every other rejection carries a defined, nonzero reason, which
+        /// [`RefusalReason`] enforces structurally. See [`Outcome::Rejected`]
+        /// and the forced-apply rule in `coordination::model::apply`.
+        None = 0
+    }
+    reserved {
+        /// **Reserved, never emitted.** §9 retains 64 terminal intents and
+        /// evicts the oldest deterministically when a 65th is produced, so no
+        /// transition can exhaust an intent slot.
+        ///
+        /// Kept in the enum rather than deleted because reason codes outlive the
+        /// transition that produced them: `SavedReplyV1.reason_code` persists in
+        /// the session table and is returned to every future retry of that
+        /// sequence. Reusing `20` for a different condition would make an old
+        /// saved reply mean one thing to a v1 reader and another to a later one.
+        /// Emission is impossible because it has no [`RefusalReason`] constant;
+        /// a client that receives it treats it as an unknown reason.
+        IntentSlotsExhausted = 20,
+    }
+    refusable {
+        HeldByOther = 1,
+        NotHeld = 2,
+        NotHolder = 3,
+        EpochMismatch = 4,
+        ValueRevisionMismatch = 5,
+        AclRevisionMismatch = 6,
+        AdminRevisionMismatch = 7,
+        SequenceTooOld = 8,
+        SequenceGap = 9,
+        SequenceConflict = 10,
+        ClientRetired = 11,
+        PermissionChanged = 12,
+        MembershipRevisionMismatch = 13,
+        MembershipIntentActive = 14,
+        CounterExhausted = 15,
+        MembershipCannotCancel = 16,
+        OperationIdConflict = 17,
+        RetainedSessionCapReached = 18,
+        StateBudgetExhausted = 19,
+        ActiveClientCap = 21,
+        ResourceSlotsExhausted = 22,
+        AclSlotsExhausted = 23,
+    }
 }
 
 impl Reason {
@@ -218,14 +323,6 @@ impl Reason {
             | Reason::OperationIdConflict
             | Reason::IntentSlotsExhausted => false,
         }
-    }
-
-    /// Is this code reserved -- defined so it cannot be reused, but never
-    /// emitted by any transition (§5.2)?
-    ///
-    /// Emission paths assert on this rather than trusting a comment.
-    pub fn is_reserved(self) -> bool {
-        matches!(self, Reason::IntentSlotsExhausted)
     }
 }
 
@@ -532,39 +629,69 @@ mod tests {
     }
 
     /// `(100 Rejected, 0 None)` is reserved for exactly one condition: a
-    /// committed logical request-shape violation. Pinned here, over the whole
-    /// code space, so no future reason can quietly claim the pairing.
+    /// committed logical request-shape violation (§10.1).
     ///
-    /// The rule is stated as an exhaustive property rather than a comment: a
-    /// rejection carrying `None` means "shape violation" and nothing else, so
-    /// a client can rely on a nonzero reason identifying a coordination cause.
+    /// This is enforced **structurally**, not sampled. A refusal carries a
+    /// [`RefusalReason`], whose only constants come from the declaration's
+    /// `refusable` group, so no refusal path can name `Reason::None` or a
+    /// reserved code. An earlier version of this test walked the enum and
+    /// proved arithmetic about it, which said nothing about what production
+    /// paths could emit -- `Decision::Refuse(Reason::None)` stayed constructible
+    /// and would have produced exactly the forbidden pairing.
     #[test]
-    fn a_rejection_with_no_reason_is_reserved_for_the_shape_violation_case() {
-        // Every reason except `None` is a defined coordination cause, so
-        // pairing it with `Rejected` is unambiguous.
-        let coordination_causes: Vec<_> =
-            Reason::ALL.iter().filter(|r| **r != Reason::None).collect();
+    fn no_refusal_can_carry_none_or_a_reserved_reason() {
+        // `new` is the only fallible way in, and it rejects both.
+        assert_eq!(RefusalReason::new(Reason::None), None);
+        assert_eq!(RefusalReason::new(Reason::IntentSlotsExhausted), None);
+
+        // Every constant carries a nonzero, non-reserved reason.
+        for refusal in RefusalReason::ALL {
+            assert_ne!(refusal.code(), 0, "{refusal:?} must be nonzero");
+            assert!(!refusal.get().is_reserved(), "{refusal:?} is reserved");
+        }
+    }
+
+    /// The refusable group must be exactly `ALL` minus `None` minus the
+    /// reserved codes.
+    ///
+    /// Derived from the two classifications rather than from a second list, so
+    /// moving a reason between groups cannot silently shrink the vocabulary a
+    /// refusal path can express.
+    #[test]
+    fn the_refusable_set_is_every_reason_that_is_neither_none_nor_reserved() {
+        let expected: Vec<Reason> = Reason::ALL
+            .iter()
+            .copied()
+            .filter(|r| *r != Reason::None && !r.is_reserved())
+            .collect();
+        let actual: Vec<Reason> = RefusalReason::ALL.iter().map(|r| r.get()).collect();
+
+        assert_eq!(actual, expected);
         assert_eq!(
-            coordination_causes.len(),
-            Reason::ALL.len() - 1,
-            "exactly one reason -- `None` -- is not a coordination cause"
+            actual.len(),
+            Reason::ALL.len() - 2,
+            "exactly two reasons -- `None` and the one reserved code -- are not refusable"
         );
 
-        // And `None` is the only one that can accompany a rejection without
-        // naming a cause, which is what makes the pairing a reliable marker.
-        assert_eq!(Reason::None.code(), 0);
-        assert!(
-            !Reason::None.is_admission_denial(),
-            "the forced case is not an admission denial: it committed"
-        );
-        assert!(
-            !Reason::None.is_terminal_when_not_consumed(),
-            "the forced case is terminal through Consumed, not through the reason"
-        );
-        // Terminality comes from the disposition, and Consumed is always
-        // terminal -- so a forced rejection is terminal without `None` needing
-        // to be classified terminal itself.
-        assert!(Disposition::Consumed.is_terminal(Reason::None));
+        // And `is_refusable` agrees with the group it was generated from.
+        for reason in Reason::ALL {
+            assert_eq!(
+                reason.is_refusable(),
+                RefusalReason::new(*reason).is_some(),
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// A refusal round-trips through its code, so a saved reason reconstructs
+    /// as a refusal rather than as a bare `Reason` that might be `None`.
+    #[test]
+    fn a_stored_refusal_reason_round_trips() {
+        for refusal in RefusalReason::ALL {
+            let code = refusal.code();
+            let reason = Reason::from_code(code).expect("a declared code");
+            assert_eq!(RefusalReason::new(reason), Some(*refusal));
+        }
     }
 
     #[test]

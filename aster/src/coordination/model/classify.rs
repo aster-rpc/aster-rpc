@@ -314,7 +314,7 @@ mod tests {
                 Outcome::Rejected
             },
             reason,
-            resource: Some(ResourceKey::new("ns", b"k".to_vec())),
+            resource: Some(ResourceKey::new("ns", b"k".to_vec()).expect("valid")),
             epoch: 7,
             value_revision: 3,
             acl_revision: 2,

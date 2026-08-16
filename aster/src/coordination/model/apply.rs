@@ -40,14 +40,34 @@
 //! 3. A replay returns the saved typed reply, never an `RpcStatus`.
 //! 4. Every logical request-shape limit is covered, not merely the obvious two.
 //!    See [`ShapeLimit`](super::shape::ShapeLimit).
+//!
+//! ## Three things called "a replay", which behave differently
+//!
+//! Conflating them loses audit rows or double-charges the reserve:
+//!
+//! 1. **A preflight replay.** No entry was committed, so there is no audit row
+//!    and `last_applied` does not move. [`preflight`] writes nothing at all.
+//! 2. **A duplicate that was itself proposed and committed.** This happens
+//!    normally -- two copies of a request preflight before either applies, so
+//!    both reach the log -- and needs no faulty leader. It has no business or
+//!    session effects, but it **is** an applied entry: it writes its audit row
+//!    and advances `last_applied`, or the entry would be indistinguishable from
+//!    one that was skipped.
+//! 3. **Reapplication of the same log entry**, after a crash before
+//!    `last_applied` was durable. Identified by `(log_term, log_index)`, the
+//!    normative entry identity: the audit row already exists, so nothing is
+//!    written and nothing is charged a second time. Content that differs at an
+//!    existing identity is a divergence signal, not a duplicate.
 
-use crate::coordination::reason::{Disposition, Outcome, Reason};
+use crate::coordination::reason::{Disposition, Outcome, Reason, RefusalReason};
 
 use super::classify::{classify, Classification};
 use super::limits;
 use super::resource::{self, Decision, ResourceAction};
 use super::shape::ShapeLimit;
-use super::state::{AuditRow, ClientId, NodeId, ResourceKey, SavedReply, Session, State};
+use super::state::{
+    key_parts, AuditRow, ClientId, NodeId, ResourceKey, SavedReply, Session, State,
+};
 
 /// The `(actor, client_id, sequence, request_hash)` mutation prefix every
 /// client command carries, mirroring the wire type rather than passing four
@@ -86,9 +106,17 @@ impl Action {
         }
     }
 
-    fn resource(&self) -> &ResourceKey {
+    /// The validated identity, or `None` when the request's identity is not
+    /// well-formed.
+    ///
+    /// `None` is what keeps an unvalidated key out of bounded metadata: a saved
+    /// reply and an audit row for a shapeless request carry no resource at all,
+    /// rather than a copy of the malformed one. An oversized key stored in a
+    /// session row would blow the 832-byte reserve charge the whole budget
+    /// proof rests on, and would produce a row later validation rejects.
+    fn validated_resource(&self) -> Option<ResourceKey> {
         match self {
-            Action::Resource(r) => r.resource(),
+            Action::Resource(r) => r.raw_resource().validate().ok(),
         }
     }
 
@@ -107,7 +135,10 @@ pub enum Admission {
     Resolved(Box<ClientResult>),
     /// Stage 3: a reason-coded admission denial. Typed reply, `NotConsumed`,
     /// nothing written.
-    Deny(Reason),
+    ///
+    /// A [`RefusalReason`], so a denial cannot be built carrying `None` or a
+    /// reserved code.
+    Deny(RefusalReason),
     /// Stage 4: a denial with no §5.2 reason code. An `RpcStatus`, never a
     /// typed reply -- there is no code to put in one.
     Status(StatusDenial),
@@ -123,6 +154,22 @@ pub enum StatusDenial {
     NotAuthorized,
     /// A request-shape bound.
     Shape(ShapeLimit),
+}
+
+/// A condition meaning the log or local state is inconsistent.
+///
+/// Not a rejection: there is no client answer for it. The runtime moves to
+/// fatal rather than continuing, because continuing would mean writing state
+/// that disagrees with a peer's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// An audit row already exists at this `(log_term, log_index)` carrying
+    /// different content.
+    ///
+    /// The entry identity is normative, so the same identity must describe the
+    /// same entry on every voter. Two different entries at one identity means
+    /// this node's log and its applied state have diverged.
+    AuditIdentityMismatch { log_term: u64, log_index: u64 },
 }
 
 /// The result of a committed client command.
@@ -166,7 +213,7 @@ pub fn preflight(state: &State, client: &ClientRef, action: &Action) -> Admissio
         })),
         Classification::Refuse { reason, .. } => Admission::Resolved(Box::new(ClientResult {
             disposition: Disposition::NotConsumed,
-            reply: rejection(action.resource(), reason),
+            reply: rejection(action.validated_resource(), reason),
         })),
         Classification::Unresolved { .. } => project(action.decide(state, &client.actor)),
     }
@@ -179,7 +226,7 @@ fn project(decision: Decision) -> Admission {
         Decision::RefuseShapeless(limit) => Admission::Status(StatusDenial::Shape(limit)),
         // Authorization has no §5.2 reason code pre-proposal (§10 stage 4),
         // even though apply saves it as `12 PermissionChanged`.
-        Decision::Refuse(Reason::PermissionChanged) => {
+        Decision::Refuse(RefusalReason::PermissionChanged) => {
             Admission::Status(StatusDenial::NotAuthorized)
         }
         // Stage 3: exactly the four reason-coded admission denials.
@@ -193,11 +240,17 @@ fn project(decision: Decision) -> Admission {
     }
 }
 
-fn rejection(resource: &ResourceKey, reason: Reason) -> SavedReply {
+/// Build a rejection reply.
+///
+/// `resource` is the **validated** identity or `None`; a raw action key never
+/// reaches here. That applies to classifier refusals too -- they name a
+/// sequence, not a resource, and copying an unvalidated key into one would put
+/// it in the reserve-funded session table by a different door.
+fn rejection(resource: Option<ResourceKey>, reason: Reason) -> SavedReply {
     SavedReply {
         outcome: Outcome::Rejected,
         reason,
-        resource: Some(resource.clone()),
+        resource,
         epoch: 0,
         value_revision: 0,
         acl_revision: 0,
@@ -206,39 +259,44 @@ fn rejection(resource: &ResourceKey, reason: Reason) -> SavedReply {
 
 /// Apply one committed client command.
 ///
-/// Total by construction: every input produces a result and advances
-/// `last_applied`. `log_index` and `ordinal` key the audit row so pruning the
-/// oldest is deterministic.
+/// `(log_term, log_index)` is the normative entry identity (§11.2). Reapplying
+/// the same identity is idempotent; a different entry at an existing identity
+/// is a [`Fault`].
+///
+/// Total by construction otherwise: every other input produces a result and
+/// advances `last_applied`.
 pub fn apply_client_command(
     state: &mut State,
+    log_term: u64,
     log_index: u64,
-    ordinal: u64,
     client: &ClientRef,
     action: &Action,
-) -> ClientResult {
+) -> Result<ClientResult, Fault> {
     let session = state.sessions.get(&(client.actor, client.client_id));
     let capacity = state.capacity_for(&client.actor);
     let classification = classify(session, client.sequence, &client.request_hash, capacity);
 
     let (result, writes_session) = match classification {
-        // A replay re-applies nothing and returns the saved row verbatim.
-        // Reconstructing it field by field is how the spike lost a committed
-        // `19`, which replayed as "rejected, no cause".
-        Classification::Replay { saved, .. } => {
-            return ClientResult {
+        // Case 2: a duplicate that was itself proposed and committed. It
+        // re-applies nothing and returns the saved row **verbatim** --
+        // reconstructing it field by field is how the spike lost a committed
+        // `19`, which replayed as "rejected, no cause" -- but it is an applied
+        // entry, so it still writes its audit row below.
+        Classification::Replay { saved, .. } => (
+            ClientResult {
                 disposition: Disposition::Consumed,
                 reply: saved,
-            }
-        }
+            },
+            false,
+        ),
 
         // A classifier refusal writes no session row -- "creating nothing" in
         // the capacity case means no session or business row. It still writes
-        // its audit row and advances `last_applied`, because a committed entry
-        // may never be silently skipped.
+        // its audit row and advances `last_applied`.
         Classification::Refuse { reason, .. } => (
             ClientResult {
                 disposition: Disposition::NotConsumed,
-                reply: rejection(action.resource(), reason),
+                reply: rejection(action.validated_resource(), reason),
             },
             false,
         ),
@@ -246,41 +304,52 @@ pub fn apply_client_command(
         Classification::Unresolved { .. } => (apply_decided(state, client, action), true),
     };
 
-    if writes_session {
-        write_session(state, client, Some(result.reply.clone()));
-    }
-    write_audit(
+    // Case 3: reapplication. The audit row is the idempotence point, so this
+    // must run before any counter moves -- and `apply_decided` above has
+    // already run, which is safe only because a reapplied entry reaches an
+    // identical decision from identical state. If it did not, the mismatch
+    // below is exactly what catches it.
+    let reapplied = write_audit(
         state,
+        log_term,
         log_index,
-        ordinal,
         client,
         action,
         result.reply.outcome,
-    );
-    state.last_applied = log_index;
-    result
+    )?;
+    if reapplied {
+        return Ok(result);
+    }
+
+    if writes_session {
+        write_session(state, client, Some(result.reply.clone()));
+    }
+    // Never backwards: an out-of-order entry must not un-apply the log.
+    state.last_applied = state.last_applied.max(log_index);
+    Ok(result)
 }
 
 /// The unresolved path: decide, then write whatever the decision says.
 fn apply_decided(state: &mut State, client: &ClientRef, action: &Action) -> ClientResult {
     match action.decide(state, &client.actor) {
         Decision::Apply(effect) => {
-            let key = action.resource().clone();
+            let (ns, k) = key_parts(&effect.key);
             let old_charge = state
                 .resources
-                .get(&key)
-                .map(|row| limits::charge_resource(&key.namespace, &key.key, row.value.len()));
-            let new_charge =
-                limits::charge_resource(&key.namespace, &key.key, effect.row.value.len());
+                .get(&effect.key)
+                .map(|row| limits::charge_resource(ns, k, row.value.len()));
+            let new_charge = limits::charge_resource(ns, k, effect.row.value.len());
             state.growth_bytes = state.growth_bytes + new_charge - old_charge.unwrap_or(0);
-            state.resources.insert(key.clone(), effect.row.clone());
+            state
+                .resources
+                .insert(effect.key.clone(), effect.row.clone());
 
             ClientResult {
                 disposition: Disposition::Consumed,
                 reply: SavedReply {
                     outcome: effect.outcome,
                     reason: Reason::None,
-                    resource: Some(key),
+                    resource: Some(effect.key),
                     epoch: effect.row.epoch,
                     value_revision: effect.row.value_revision,
                     acl_revision: effect.row.acl_revision,
@@ -293,14 +362,15 @@ fn apply_decided(state: &mut State, client: &ClientRef, action: &Action) -> Clie
         // later clears.
         Decision::Refuse(reason) => ClientResult {
             disposition: Disposition::Consumed,
-            reply: rejection(action.resource(), reason),
+            reply: rejection(action.validated_resource(), reason.into()),
         },
 
-        // The forced-apply case. Business state is untouched; the metadata
-        // below is what consumes the sequence.
+        // The forced-apply case (§10.1). Business state is untouched, and the
+        // saved reply carries **no resource**: the identity may be exactly what
+        // was malformed, and a shapeless key has no place in a bounded row.
         Decision::RefuseShapeless(_) => ClientResult {
             disposition: Disposition::Consumed,
-            reply: rejection(action.resource(), Reason::None),
+            reply: rejection(action.validated_resource(), Reason::None),
         },
     }
 }
@@ -325,45 +395,63 @@ fn session_charge(session: &Session) -> u64 {
             .last_result
             .as_ref()
             .and_then(|r| r.resource.as_ref())
-            .map(ResourceKey::as_charge_parts),
+            .map(key_parts),
     )
 }
 
-/// Append the audit row. Every applied entry writes one, whether it succeeded
-/// or was rejected.
+/// Append the audit row, and report whether this entry had already been
+/// applied.
+///
+/// Keyed by `(log_term, log_index)`, so a reapplied entry finds its own row
+/// present, writes nothing, and is charged nothing. A row already present with
+/// **different** content is a divergence signal rather than a duplicate.
 fn write_audit(
     state: &mut State,
+    log_term: u64,
     log_index: u64,
-    ordinal: u64,
     client: &ClientRef,
     action: &Action,
     outcome: Outcome,
-) {
-    let resource = Some(action.resource().clone());
+) -> Result<bool, Fault> {
+    let resource = action.validated_resource();
     let row = AuditRow {
         actor: client.actor,
         operation_code: action.operation_code(),
         resource: resource.clone(),
         result: outcome,
     };
-    state.reserve_bytes +=
-        limits::charge_audit(resource.as_ref().map(ResourceKey::as_charge_parts));
-    state.audit.insert((log_index, ordinal), row);
+
+    match state.audit.get(&(log_term, log_index)) {
+        Some(existing) if *existing == row => Ok(true),
+        Some(_) => Err(Fault::AuditIdentityMismatch {
+            log_term,
+            log_index,
+        }),
+        None => {
+            state.reserve_bytes += limits::charge_audit(resource.as_ref().map(key_parts));
+            state.audit.insert((log_term, log_index), row);
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::coordination::model::limits::{ALL_RIGHTS, MAX_VALUE, RIGHT_ACQUIRE};
-    use crate::coordination::model::resource::Fence;
+    use crate::coordination::model::resource::{Fence, RawResourceKey};
     use crate::coordination::model::state::ResourceRow;
 
     const ACTOR: NodeId = [1u8; 32];
     const CLIENT: ClientId = [9u8; 16];
     const HASH: [u8; 32] = [0xAA; 32];
 
+    fn raw() -> RawResourceKey {
+        RawResourceKey::new("ns", b"k".to_vec())
+    }
+
     fn key() -> ResourceKey {
-        ResourceKey::new("ns", b"k".to_vec())
+        raw().validate().expect("a valid fixture identity")
     }
 
     fn granted() -> State {
@@ -385,21 +473,28 @@ mod tests {
 
     fn acquire() -> Action {
         Action::Resource(ResourceAction::Acquire {
-            resource: key(),
+            resource: raw(),
             ttl_ms: 30_000,
         })
     }
 
-    /// An acquire whose value is irrelevant but whose namespace is over-long.
     fn oversized_value() -> Action {
         Action::Resource(ResourceAction::CompareAndSet {
             fence: Fence {
-                resource: key(),
+                resource: raw(),
                 epoch: 1,
                 holder: ACTOR,
             },
             expected_value_revision: 0,
             new_value: vec![0u8; MAX_VALUE + 1],
+        })
+    }
+
+    /// An action whose *identity* is malformed, so no validated key exists.
+    fn malformed_identity() -> Action {
+        Action::Resource(ResourceAction::Acquire {
+            resource: RawResourceKey::new("NOT a namespace", vec![0u8; 2000]),
+            ttl_ms: 30_000,
         })
     }
 
@@ -420,29 +515,42 @@ mod tests {
         s
     }
 
+    fn apply_ok(
+        state: &mut State,
+        term: u64,
+        index: u64,
+        client: &ClientRef,
+        action: &Action,
+    ) -> ClientResult {
+        apply_client_command(state, term, index, client, action).expect("no fault")
+    }
+
     // ── Stage 4: a conforming leader denies pre-proposal, status-only ───────
 
-    /// Every request-shape limit a resource action can violate is denied
-    /// pre-proposal as a status, never as a typed reply -- there is no reason
-    /// code to put in one.
+    /// Every request-shape limit a **resource action** can violate is denied
+    /// pre-proposal as a status, never a typed reply -- there is no reason code
+    /// to put in one.
+    ///
+    /// Scoped to resource actions deliberately: `EncodedCommand` is enforced at
+    /// the ingest boundary where an encoded length exists, and the member-seed
+    /// and membership-plan limits belong to `change_membership`, which is not
+    /// modelled yet. Naming the scope keeps the test from implying it covers
+    /// all nine.
     #[test]
-    fn preflight_denies_every_shape_limit_as_a_status_only() {
+    fn preflight_denies_every_resource_action_shape_limit_as_a_status_only() {
         let s = held_state();
         let cases: Vec<(ShapeLimit, Action)> = vec![
             (
                 ShapeLimit::Namespace,
                 Action::Resource(ResourceAction::Acquire {
-                    resource: ResourceKey::new(
-                        "n".repeat(limits::MAX_NAMESPACE + 1),
-                        b"k".to_vec(),
-                    ),
+                    resource: RawResourceKey::new("NOPE", b"k".to_vec()),
                     ttl_ms: 30_000,
                 }),
             ),
             (
                 ShapeLimit::ResourceKey,
                 Action::Resource(ResourceAction::Acquire {
-                    resource: ResourceKey::new("ns", vec![0u8; limits::MAX_KEY + 1]),
+                    resource: RawResourceKey::new("ns", Vec::new()),
                     ttl_ms: 30_000,
                 }),
             ),
@@ -450,7 +558,7 @@ mod tests {
             (
                 ShapeLimit::Ttl,
                 Action::Resource(ResourceAction::Acquire {
-                    resource: key(),
+                    resource: raw(),
                     ttl_ms: 1,
                 }),
             ),
@@ -465,20 +573,19 @@ mod tests {
         }
     }
 
-    /// A conforming leader writes nothing when it denies at stage 4.
     #[test]
     fn a_stage_four_denial_writes_nothing() {
         let s = held_state();
         let before = s.clone();
-        let answer = preflight(&s, &client(1), &oversized_value());
-        assert!(matches!(answer, Admission::Status(_)));
+        assert!(matches!(
+            preflight(&s, &client(1), &oversized_value()),
+            Admission::Status(_)
+        ));
         assert_eq!(s.sessions.len(), before.sessions.len());
         assert_eq!(s.audit.len(), before.audit.len());
         assert_eq!(s.resources, before.resources);
     }
 
-    /// Authorization is a stage-4 status pre-proposal, though apply saves it as
-    /// `12 PermissionChanged`.
     #[test]
     fn an_unauthorized_request_is_a_stage_four_status() {
         let mut s = State::default();
@@ -489,14 +596,12 @@ mod tests {
         );
     }
 
-    // ── Forced apply ────────────────────────────────────────────────────────
+    // ── Forced apply (§10.1) ────────────────────────────────────────────────
 
-    /// A non-conforming leader proposes a shape violation. Apply is total: it
-    /// commits `Consumed + 100 + 0` rather than skipping the entry or halting.
     #[test]
     fn a_committed_shape_violation_commits_rejected_with_no_reason() {
         let mut s = held_state();
-        let result = apply_client_command(&mut s, 7, 0, &client(1), &oversized_value());
+        let result = apply_ok(&mut s, 1, 7, &client(1), &oversized_value());
 
         assert_eq!(result.disposition, Disposition::Consumed);
         assert_eq!(result.reply.outcome, Outcome::Rejected);
@@ -505,8 +610,6 @@ mod tests {
         assert!(result.is_terminal(), "Consumed is always terminal");
     }
 
-    /// Forced apply mutates no business state -- but persists its metadata
-    /// atomically, which is what consumes the sequence.
     #[test]
     fn forced_apply_mutates_no_business_state_but_advances_its_metadata() {
         let mut s = held_state();
@@ -519,7 +622,7 @@ mod tests {
             s.growth_bytes,
         );
 
-        apply_client_command(&mut s, 7, 0, &client(1), &oversized_value());
+        apply_ok(&mut s, 1, 7, &client(1), &oversized_value());
 
         assert_eq!(
             (
@@ -534,53 +637,192 @@ mod tests {
             "no business row and no growth byte may move"
         );
 
-        // And the metadata that consumes the sequence.
         let session = s.sessions.get(&(ACTOR, CLIENT)).expect("session row");
         assert_eq!(session.last_sequence, 1);
         assert_eq!(session.request_hash, HASH);
         assert!(session.last_result.is_some(), "the rejection is saved");
         assert_eq!(s.audit.len(), 1, "an audit row is written");
         assert_eq!(s.last_applied, 7);
-        assert!(
-            s.counters_match_recomputation(),
-            "the reserve counter must track the rows it funded"
+        assert!(s.counters_match_recomputation());
+    }
+
+    /// A malformed **identity** saves no resource at all, in the reply and in
+    /// the audit row alike. Copying the raw key would put an unvalidated -- and
+    /// possibly oversized -- identity into reserve-funded metadata, blowing the
+    /// 832-byte charge the budget proof rests on.
+    #[test]
+    fn a_malformed_identity_is_never_copied_into_durable_metadata() {
+        let mut s = granted();
+        let result = apply_ok(&mut s, 1, 4, &client(1), &malformed_identity());
+
+        assert!(result.is_forced_shape_rejection());
+        assert_eq!(
+            result.reply.resource, None,
+            "a shapeless identity has no place in a saved reply"
+        );
+
+        let session = s.sessions.get(&(ACTOR, CLIENT)).expect("session row");
+        assert_eq!(session.last_result.as_ref().unwrap().resource, None);
+
+        let audit = s.audit.values().next().expect("audit row");
+        assert_eq!(audit.resource, None, "nor in an audit row");
+
+        // The charge is the bare row overhead, not the 2 KiB the request named.
+        assert!(s.counters_match_recomputation());
+        assert_eq!(s.reserve_bytes, 256 + 256, "one session row, one audit row");
+    }
+
+    /// A classifier refusal must not copy an unvalidated key either.
+    #[test]
+    fn a_classifier_refusal_carries_no_unvalidated_identity() {
+        let mut s = granted();
+        // Sequence 5 with no session: a gap, refused by the classifier before
+        // any decision runs.
+        let result = apply_ok(&mut s, 1, 4, &client(5), &malformed_identity());
+        assert_eq!(result.reply.reason, Reason::SequenceGap);
+        assert_eq!(result.reply.resource, None);
+        assert_eq!(s.audit.values().next().unwrap().resource, None);
+    }
+
+    // ── The three replay cases ──────────────────────────────────────────────
+
+    /// Case 1: a preflight replay commits nothing, so there is no audit row.
+    #[test]
+    fn a_preflight_replay_writes_no_audit_row() {
+        let mut s = held_state();
+        let first = apply_ok(&mut s, 1, 7, &client(1), &oversized_value());
+        let audit_before = s.audit.len();
+
+        match preflight(&s, &client(1), &oversized_value()) {
+            Admission::Resolved(replayed) => assert_eq!(*replayed, first),
+            other => panic!("a consumed sequence must resolve, got {other:?}"),
+        }
+        assert_eq!(s.audit.len(), audit_before, "preflight commits nothing");
+        assert_eq!(s.last_applied, 7);
+    }
+
+    /// Case 2: a duplicate that was itself proposed and committed. No business
+    /// or session effects -- but it **is** an applied entry, so it writes an
+    /// audit row and advances `last_applied`.
+    ///
+    /// This needs no faulty leader: two copies of one request can preflight
+    /// before either applies, so both reach the log.
+    #[test]
+    fn a_committed_duplicate_writes_its_own_audit_row_and_advances_last_applied() {
+        let mut s = granted();
+        let first = apply_ok(&mut s, 1, 7, &client(1), &acquire());
+        let session_after_first = s.sessions.get(&(ACTOR, CLIENT)).cloned();
+        let row_after_first = s.resources.get(&key()).cloned();
+
+        // The duplicate lands at its own log position.
+        let second = apply_ok(&mut s, 1, 8, &client(1), &acquire());
+
+        assert_eq!(second, first, "the saved result is returned verbatim");
+        assert_eq!(
+            s.resources.get(&key()).cloned(),
+            row_after_first,
+            "no business effect"
+        );
+        assert_eq!(
+            s.sessions.get(&(ACTOR, CLIENT)).cloned(),
+            session_after_first,
+            "no session effect"
+        );
+        assert_eq!(s.audit.len(), 2, "an applied entry always leaves a trace");
+        assert_eq!(s.last_applied, 8);
+        assert!(s.counters_match_recomputation());
+    }
+
+    /// Case 3: reapplying the **same** entry identity is idempotent -- no
+    /// second audit row, and no second charge.
+    #[test]
+    fn reapplying_the_same_entry_identity_charges_nothing_twice() {
+        let mut s = granted();
+        let first = apply_ok(&mut s, 2, 7, &client(1), &acquire());
+        let after = (
+            s.audit.len(),
+            s.reserve_bytes,
+            s.growth_bytes,
+            s.last_applied,
+        );
+
+        let again = apply_ok(&mut s, 2, 7, &client(1), &acquire());
+
+        assert_eq!(again, first);
+        assert_eq!(
+            (
+                s.audit.len(),
+                s.reserve_bytes,
+                s.growth_bytes,
+                s.last_applied
+            ),
+            after,
+            "reapplication must move no counter"
+        );
+        assert!(s.counters_match_recomputation());
+    }
+
+    /// The same index under a **different term** is a different entry, so it is
+    /// not a reapplication.
+    #[test]
+    fn the_same_index_in_a_different_term_is_a_different_entry() {
+        let mut s = granted();
+        apply_ok(&mut s, 1, 7, &client(1), &acquire());
+        apply_ok(&mut s, 2, 7, &client(1), &acquire());
+        assert_eq!(s.audit.len(), 2, "(term, index) is the entry identity");
+    }
+
+    /// Different content at an existing identity means this node's log and its
+    /// applied state disagree. That is a divergence signal, not a duplicate.
+    #[test]
+    fn different_content_at_an_existing_entry_identity_is_a_fault() {
+        let mut s = granted();
+        apply_ok(&mut s, 1, 7, &client(1), &acquire());
+
+        let other_actor = ClientRef {
+            actor: [7u8; 32],
+            ..client(1)
+        };
+        assert_eq!(
+            apply_client_command(&mut s, 1, 7, &other_actor, &acquire()),
+            Err(Fault::AuditIdentityMismatch {
+                log_term: 1,
+                log_index: 7
+            })
         );
     }
 
-    /// The saved rejection replays exactly, as a typed reply -- never as an
-    /// `RpcStatus`. The client that lost its response learns the same thing the
-    /// first attempt told it.
+    /// `last_applied` never goes backwards.
+    #[test]
+    fn last_applied_never_regresses() {
+        let mut s = granted();
+        apply_ok(&mut s, 1, 9, &client(1), &acquire());
+        assert_eq!(s.last_applied, 9);
+        apply_ok(&mut s, 1, 3, &client(2), &acquire());
+        assert_eq!(
+            s.last_applied, 9,
+            "an earlier index must not un-apply the log"
+        );
+    }
+
     #[test]
     fn a_forced_rejection_replays_exactly_as_a_typed_reply() {
         let mut s = held_state();
-        let first = apply_client_command(&mut s, 7, 0, &client(1), &oversized_value());
+        let first = apply_ok(&mut s, 1, 7, &client(1), &oversized_value());
 
-        // Preflight now resolves it from the session table.
         match preflight(&s, &client(1), &oversized_value()) {
-            Admission::Resolved(replayed) => {
-                assert_eq!(*replayed, first, "the replay must be byte-identical");
-            }
+            Admission::Resolved(replayed) => assert_eq!(*replayed, first),
             other => panic!("a consumed sequence must resolve, got {other:?}"),
         }
 
-        // And so does a second apply, without re-applying anything.
-        let audit_before = s.audit.len();
-        let second = apply_client_command(&mut s, 8, 0, &client(1), &oversized_value());
-        assert_eq!(second, first);
-        assert_eq!(
-            s.audit.len(),
-            audit_before,
-            "a replay re-applies nothing at all"
-        );
+        let second = apply_ok(&mut s, 1, 8, &client(1), &oversized_value());
+        assert_eq!(second, first, "byte-identical, and never an RpcStatus");
     }
 
     // ── (100, 0) uniqueness ─────────────────────────────────────────────────
 
-    /// `(Rejected, None)` is legal **only** for a committed shape violation.
-    /// Every other rejection carries a defined, nonzero coordination reason.
     #[test]
     fn only_a_shape_violation_rejects_with_no_reason() {
-        // A representative rejection from each reason-carrying path.
         let cases: Vec<(&str, State, Action)> = vec![
             (
                 "authorization",
@@ -613,7 +855,7 @@ mod tests {
                 held_state(),
                 Action::Resource(ResourceAction::CompareAndSet {
                     fence: Fence {
-                        resource: key(),
+                        resource: raw(),
                         epoch: 1,
                         holder: ACTOR,
                     },
@@ -624,7 +866,7 @@ mod tests {
         ];
 
         for (name, mut s, action) in cases {
-            let result = apply_client_command(&mut s, 1, 0, &client(1), &action);
+            let result = apply_ok(&mut s, 1, 1, &client(1), &action);
             assert_eq!(result.reply.outcome, Outcome::Rejected, "{name}");
             assert_ne!(
                 result.reply.reason,
@@ -635,66 +877,54 @@ mod tests {
         }
     }
 
-    /// A successful outcome never carries a reason, and a rejection is the only
-    /// outcome that may carry one.
     #[test]
     fn a_successful_outcome_carries_no_reason() {
         let mut s = granted();
-        let result = apply_client_command(&mut s, 1, 0, &client(1), &acquire());
+        let result = apply_ok(&mut s, 1, 1, &client(1), &acquire());
         assert_eq!(result.reply.outcome, Outcome::Granted);
         assert_eq!(result.reply.reason, Reason::None);
-        assert!(
-            !result.is_forced_shape_rejection(),
-            "success is not a rejection, whatever its reason field"
-        );
+        assert!(!result.is_forced_shape_rejection());
     }
 
     // ── Projection ──────────────────────────────────────────────────────────
 
-    /// Exactly the four §10 admission reasons are denied pre-proposal; every
-    /// other reason-coded refusal is admitted so it reaches the log.
     #[test]
     fn only_the_four_admission_reasons_are_denied_before_proposal() {
-        for reason in Reason::ALL {
-            if reason.is_reserved() || *reason == Reason::PermissionChanged {
+        for refusal in RefusalReason::ALL {
+            if *refusal == RefusalReason::PermissionChanged {
                 continue;
             }
-            let projected = project(Decision::Refuse(*reason));
-            if reason.is_admission_denial() {
+            let projected = project(Decision::Refuse(*refusal));
+            if refusal.is_admission_denial() {
                 assert_eq!(
                     projected,
-                    Admission::Deny(*reason),
-                    "{reason:?} is a stage-3 admission denial"
+                    Admission::Deny(*refusal),
+                    "{refusal:?} is a stage-3 admission denial"
                 );
             } else {
                 assert_eq!(
                     projected,
                     Admission::Admit,
-                    "{reason:?} must be proposed so it can commit a saved result"
+                    "{refusal:?} must be proposed so it can commit a saved result"
                 );
             }
         }
     }
 
-    /// The case the spike broke twice: a stale revision must be **admitted**,
-    /// not denied, or a client that may not change its request retries forever.
     #[test]
     fn a_stale_revision_is_admitted_rather_than_denied() {
         assert_eq!(
-            project(Decision::Refuse(Reason::AclRevisionMismatch)),
+            project(Decision::Refuse(RefusalReason::AclRevisionMismatch)),
             Admission::Admit
         );
     }
 
-    /// Session resolution runs before every denial, so a committed result is
-    /// never stranded behind a permanent authorization failure.
     #[test]
     fn a_committed_result_is_returned_even_after_the_grant_is_revoked() {
         let mut s = granted();
-        let first = apply_client_command(&mut s, 1, 0, &client(1), &acquire());
+        let first = apply_ok(&mut s, 1, 1, &client(1), &acquire());
         assert_eq!(first.reply.outcome, Outcome::Granted);
 
-        // The actor's grant is revoked, then it retries the lost response.
         s.acl.remove(&(key(), ACTOR));
 
         match preflight(&s, &client(1), &acquire()) {
@@ -708,7 +938,7 @@ mod tests {
     #[test]
     fn a_successful_acquire_writes_the_row_and_keeps_the_counters_honest() {
         let mut s = granted();
-        let result = apply_client_command(&mut s, 3, 0, &client(1), &acquire());
+        let result = apply_ok(&mut s, 1, 3, &client(1), &acquire());
 
         assert_eq!(result.disposition, Disposition::Consumed);
         assert_eq!(result.reply.outcome, Outcome::Granted);
@@ -721,14 +951,10 @@ mod tests {
         assert!(s.counters_match_recomputation());
     }
 
-    /// A classifier refusal writes no session row, but still writes its audit
-    /// row and advances `last_applied` -- a committed entry may never be
-    /// silently skipped.
     #[test]
     fn a_classifier_refusal_writes_audit_but_no_session_row() {
         let mut s = granted();
-        // Sequence 5 with no session: row 13, a gap.
-        let result = apply_client_command(&mut s, 4, 0, &client(5), &acquire());
+        let result = apply_ok(&mut s, 1, 4, &client(5), &acquire());
 
         assert_eq!(result.disposition, Disposition::NotConsumed);
         assert_eq!(result.reply.reason, Reason::SequenceGap);
@@ -738,8 +964,6 @@ mod tests {
         assert!(s.counters_match_recomputation());
     }
 
-    /// Counters stay honest across an arbitrary history -- the property snapshot
-    /// install and log replay depend on.
     #[test]
     fn counters_equal_recomputation_after_a_mixed_history() {
         let mut s = granted();
@@ -748,38 +972,37 @@ mod tests {
 
         for step in 0..40u64 {
             index += 1;
+            let epoch = s.resources.get(&key()).map_or(0, |r| r.epoch);
+            let value_revision = s.resources.get(&key()).map_or(0, |r| r.value_revision);
             let action = match step % 4 {
                 0 => acquire(),
                 1 => Action::Resource(ResourceAction::CompareAndSet {
                     fence: Fence {
-                        resource: key(),
-                        epoch: s.resources.get(&key()).map_or(0, |r| r.epoch),
+                        resource: raw(),
+                        epoch,
                         holder: ACTOR,
                     },
-                    expected_value_revision: s
-                        .resources
-                        .get(&key())
-                        .map_or(0, |r| r.value_revision),
+                    expected_value_revision: value_revision,
                     new_value: vec![step as u8; (step % 7) as usize],
                 }),
                 2 => Action::Resource(ResourceAction::Renew {
                     fence: Fence {
-                        resource: key(),
-                        epoch: s.resources.get(&key()).map_or(0, |r| r.epoch),
+                        resource: raw(),
+                        epoch,
                         holder: ACTOR,
                     },
                 }),
                 _ => Action::Resource(ResourceAction::Release {
                     fence: Fence {
-                        resource: key(),
-                        epoch: s.resources.get(&key()).map_or(0, |r| r.epoch),
+                        resource: raw(),
+                        epoch,
                         holder: ACTOR,
                     },
                 }),
             };
             let mut c = client(sequence);
             c.request_hash = [step as u8; 32];
-            let result = apply_client_command(&mut s, index, 0, &c, &action);
+            let result = apply_ok(&mut s, 1, index, &c, &action);
             if result.disposition == Disposition::Consumed {
                 sequence += 1;
             }

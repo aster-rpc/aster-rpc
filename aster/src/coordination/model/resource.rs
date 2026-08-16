@@ -38,13 +38,45 @@ use super::limits::{
     RIGHT_RENEW, RIGHT_REVOKE,
 };
 use super::shape::{self, ShapeLimit};
-use super::state::{NodeId, ResourceKey, ResourceRow, State};
-use crate::coordination::reason::{Outcome, Reason};
+use super::state::{key_parts, NodeId, ResourceKey, ResourceRow, State};
+use crate::coordination::reason::{Outcome, RefusalReason};
+
+/// A resource identity **exactly as it arrived**, before validation.
+///
+/// Kept separate from the durable [`ResourceKey`] so that an unvalidated
+/// identity has nowhere to be stored. A raw key reaches [`decide`], which either
+/// validates it into a `ResourceKey` or refuses the request; nothing downstream
+/// ever sees this type.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RawResourceKey {
+    pub namespace: String,
+    pub key: Vec<u8>,
+}
+
+impl RawResourceKey {
+    pub fn new(namespace: impl Into<String>, key: impl Into<Vec<u8>>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            key: key.into(),
+        }
+    }
+
+    /// Validate into the durable key type, or name the limit it violates.
+    pub fn validate(&self) -> Result<ResourceKey, ShapeLimit> {
+        shape::validate_resource_key(&self.namespace, &self.key)
+    }
+}
+
+impl From<&ResourceKey> for RawResourceKey {
+    fn from(k: &ResourceKey) -> Self {
+        RawResourceKey::new(k.namespace(), k.key())
+    }
+}
 
 /// A lease fence: the resource, the epoch it was granted at, and the holder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fence {
-    pub resource: ResourceKey,
+    pub resource: RawResourceKey,
     pub epoch: u64,
     pub holder: NodeId,
 }
@@ -58,7 +90,7 @@ pub struct Fence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResourceAction {
     Acquire {
-        resource: ResourceKey,
+        resource: RawResourceKey,
         ttl_ms: u64,
     },
     Renew {
@@ -78,14 +110,14 @@ pub enum ResourceAction {
         final_value: Vec<u8>,
     },
     Revoke {
-        resource: ResourceKey,
+        resource: RawResourceKey,
         expected_epoch: Option<u64>,
     },
 }
 
 impl ResourceAction {
-    /// The resource this action names.
-    pub fn resource(&self) -> &ResourceKey {
+    /// The raw, still-unvalidated resource this action names.
+    pub fn raw_resource(&self) -> &RawResourceKey {
         match self {
             ResourceAction::Acquire { resource, .. } | ResourceAction::Revoke { resource, .. } => {
                 resource
@@ -119,6 +151,9 @@ impl ResourceAction {
 /// What a successful transition writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceEffect {
+    /// The validated identity this transition writes to. Produced here so apply
+    /// cannot re-derive it, and so an unvalidated key has no path into state.
+    pub key: ResourceKey,
     /// The row after the transition. Apply writes this verbatim rather than
     /// recomputing it, so the two cannot drift.
     pub row: ResourceRow,
@@ -134,7 +169,7 @@ pub struct ResourceEffect {
 pub enum Decision {
     Apply(Box<ResourceEffect>),
     /// Refused with a §5.2 reason.
-    Refuse(Reason),
+    Refuse(RefusalReason),
     /// Refused by a request-shape bound, which §5.2 gives no reason code.
     ///
     /// §10 answers this with an `RpcStatus` at stage 4, so a correct leader
@@ -149,16 +184,14 @@ pub enum Decision {
 }
 
 impl Decision {
-    fn refuse(reason: Reason) -> Decision {
-        debug_assert!(
-            !reason.is_reserved(),
-            "{reason:?} is reserved and must never be emitted"
-        );
-        Decision::Refuse(reason)
-    }
-
-    fn apply(row: ResourceRow, outcome: Outcome, creates_resource: bool) -> Decision {
+    fn apply(
+        key: ResourceKey,
+        row: ResourceRow,
+        outcome: Outcome,
+        creates_resource: bool,
+    ) -> Decision {
         Decision::Apply(Box::new(ResourceEffect {
+            key,
             row,
             outcome,
             creates_resource,
@@ -204,10 +237,9 @@ fn counters_have_room(counters: &[u64]) -> bool {
 /// length, since `256 + KEY` is unchanged for an existing row and is the whole
 /// charge for a new one.
 fn growth_fits(state: &State, key: &ResourceKey, old_len: Option<usize>, new_len: usize) -> bool {
-    let old = old_len.map_or(0, |len| {
-        limits::charge_resource(&key.namespace, &key.key, len)
-    });
-    let new = limits::charge_resource(&key.namespace, &key.key, new_len);
+    let (ns, k) = key_parts(key);
+    let old = old_len.map_or(0, |len| limits::charge_resource(ns, k, len));
+    let new = limits::charge_resource(ns, k, new_len);
     if new <= old {
         return true;
     }
@@ -219,32 +251,36 @@ fn growth_fits(state: &State, key: &ResourceKey, old_len: Option<usize>, new_len
 /// The check order is normative where it changes the answer, and each ordering
 /// decision is commented at its site.
 pub fn decide(state: &State, actor: &NodeId, action: &ResourceAction) -> Decision {
-    // Request-shape bounds first: a request that is too big is shapeless to the
-    // protocol, and evaluating a shapeless request against replicated state
-    // would be answering a question that was never well posed. (This is stage 4
-    // in §10's matrix, but stage 2's session resolution has already run before
-    // any of this is called -- that ordering lives in the caller, not here.)
-    if let Some(violation) = check_shape(action) {
-        return Decision::RefuseShapeless(violation);
+    // Request-shape bounds first, identity included: a malformed request is
+    // shapeless to the protocol, and evaluating it against replicated state
+    // would be answering a question that was never well posed. Validating here
+    // also means every path below holds a `ResourceKey` that state, saved
+    // replies and audit rows can accept -- an unvalidated identity has nowhere
+    // to go.
+    let key = match action.raw_resource().validate() {
+        Ok(key) => key,
+        Err(limit) => return Decision::RefuseShapeless(limit),
+    };
+    if let Some(limit) = check_shape(action) {
+        return Decision::RefuseShapeless(limit);
     }
 
-    let key = action.resource();
-    let existing = state.resources.get(key);
+    let existing = state.resources.get(&key);
 
     // Authorization. At apply this is `12 PermissionChanged` and the name is
     // exact: a command unauthorized at proposal time should never have been
     // proposed, so reaching apply unauthorized means the ACL moved underneath
     // it.
     let needed = required_rights(action);
-    if granted_rights(state, key, actor) & needed != needed {
-        return Decision::refuse(Reason::PermissionChanged);
+    if granted_rights(state, &key, actor) & needed != needed {
+        return Decision::Refuse(RefusalReason::PermissionChanged);
     }
 
     match action {
         ResourceAction::Acquire { ttl_ms, .. } => {
             decide_acquire(state, actor, key, existing, *ttl_ms)
         }
-        ResourceAction::Renew { fence } => decide_renew(actor, existing, fence),
+        ResourceAction::Renew { fence } => decide_renew(actor, key, existing, fence),
         ResourceAction::CompareAndSet {
             fence,
             expected_value_revision,
@@ -258,7 +294,7 @@ pub fn decide(state: &State, actor: &NodeId, action: &ResourceAction) -> Decisio
             *expected_value_revision,
             new_value,
         ),
-        ResourceAction::Release { fence } => decide_release(actor, existing, fence),
+        ResourceAction::Release { fence } => decide_release(actor, key, existing, fence),
         ResourceAction::ReleaseWithValue {
             fence,
             expected_value_revision,
@@ -273,20 +309,19 @@ pub fn decide(state: &State, actor: &NodeId, action: &ResourceAction) -> Decisio
             final_value,
             action,
         ),
-        ResourceAction::Revoke { expected_epoch, .. } => decide_revoke(existing, *expected_epoch),
+        ResourceAction::Revoke { expected_epoch, .. } => {
+            decide_revoke(key, existing, *expected_epoch)
+        }
     }
 }
 
-/// Every §12.1 request-shape bound a resource action can violate.
+/// The §12.1 request-shape bounds beyond the resource identity, which
+/// [`decide`] has already validated.
 ///
 /// The order is fixed so that a request violating two limits reports the same
 /// one on every voter: apply must be deterministic, and "whichever check ran
 /// first" is not determinism unless the order is part of the code.
 fn check_shape(action: &ResourceAction) -> Option<ShapeLimit> {
-    let key = action.resource();
-    if let Some(limit) = shape::check_resource_key(&key.namespace, &key.key) {
-        return Some(limit);
-    }
     let value = match action {
         ResourceAction::CompareAndSet { new_value, .. } => Some(new_value),
         ResourceAction::ReleaseWithValue { final_value, .. } => Some(final_value),
@@ -313,15 +348,15 @@ fn check_shape(action: &ResourceAction) -> Option<ShapeLimit> {
 /// wrong node is `NotHolder` before its epoch is compared -- reporting
 /// `EpochMismatch` to a node that was never the holder would send it to refresh
 /// a fence it can never hold.
-fn check_fence(actor: &NodeId, row: &ResourceRow, fence: &Fence) -> Option<Reason> {
+fn check_fence(actor: &NodeId, row: &ResourceRow, fence: &Fence) -> Option<RefusalReason> {
     if !row.held {
-        return Some(Reason::NotHeld);
+        return Some(RefusalReason::NotHeld);
     }
     if fence.holder != *actor || row.holder != Some(*actor) {
-        return Some(Reason::NotHolder);
+        return Some(RefusalReason::NotHolder);
     }
     if row.epoch != fence.epoch {
-        return Some(Reason::EpochMismatch);
+        return Some(RefusalReason::EpochMismatch);
     }
     None
 }
@@ -329,7 +364,7 @@ fn check_fence(actor: &NodeId, row: &ResourceRow, fence: &Fence) -> Option<Reaso
 fn decide_acquire(
     state: &State,
     actor: &NodeId,
-    key: &ResourceKey,
+    key: ResourceKey,
     existing: Option<&ResourceRow>,
     ttl_ms: u64,
 ) -> Decision {
@@ -346,22 +381,22 @@ fn decide_acquire(
     // substituting one for the other would move a fence the client still
     // believes in. The refusal changes nothing at all.
     if row.held {
-        return Decision::refuse(Reason::HeldByOther);
+        return Decision::Refuse(RefusalReason::HeldByOther);
     }
 
     if existing.is_none() {
         // Creating a row: the slot cap applies, and it is terminal, so it is
         // checked before the retryable budget.
         if state.resources.len() as u64 >= MAX_RESOURCES_PER_GROUP {
-            return Decision::refuse(Reason::ResourceSlotsExhausted);
+            return Decision::Refuse(RefusalReason::ResourceSlotsExhausted);
         }
-        if !growth_fits(state, key, None, 0) {
-            return Decision::refuse(Reason::StateBudgetExhausted);
+        if !growth_fits(state, &key, None, 0) {
+            return Decision::Refuse(RefusalReason::StateBudgetExhausted);
         }
     }
 
     if !counters_have_room(&[row.epoch, row.lease_revision]) {
-        return Decision::refuse(Reason::CounterExhausted);
+        return Decision::Refuse(RefusalReason::CounterExhausted);
     }
 
     let mut next = row;
@@ -370,51 +405,56 @@ fn decide_acquire(
     next.held = true;
     next.holder = Some(*actor);
     next.ttl_ms = ttl_ms;
-    Decision::apply(next, Outcome::Granted, existing.is_none())
+    Decision::apply(key, next, Outcome::Granted, existing.is_none())
 }
 
-fn decide_renew(actor: &NodeId, existing: Option<&ResourceRow>, fence: &Fence) -> Decision {
+fn decide_renew(
+    actor: &NodeId,
+    key: ResourceKey,
+    existing: Option<&ResourceRow>,
+    fence: &Fence,
+) -> Decision {
     let Some(row) = existing else {
-        return Decision::refuse(Reason::NotHeld);
+        return Decision::Refuse(RefusalReason::NotHeld);
     };
     if let Some(reason) = check_fence(actor, row, fence) {
-        return Decision::refuse(reason);
+        return Decision::Refuse(reason);
     }
     if !counters_have_room(&[row.lease_revision]) {
-        return Decision::refuse(Reason::CounterExhausted);
+        return Decision::Refuse(RefusalReason::CounterExhausted);
     }
 
     // Lease revision only: the epoch and the value are unchanged, so a renew
     // never invalidates a fence the holder is still using.
     let mut next = row.clone();
     next.lease_revision += 1;
-    Decision::apply(next, Outcome::Renewed, false)
+    Decision::apply(key, next, Outcome::Renewed, false)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn decide_compare_and_set(
     state: &State,
     actor: &NodeId,
-    key: &ResourceKey,
+    key: ResourceKey,
     existing: Option<&ResourceRow>,
     fence: &Fence,
     expected_value_revision: u64,
     new_value: &[u8],
 ) -> Decision {
     let Some(row) = existing else {
-        return Decision::refuse(Reason::NotHeld);
+        return Decision::Refuse(RefusalReason::NotHeld);
     };
     if let Some(reason) = check_fence(actor, row, fence) {
-        return Decision::refuse(reason);
+        return Decision::Refuse(reason);
     }
     if row.value_revision != expected_value_revision {
-        return Decision::refuse(Reason::ValueRevisionMismatch);
+        return Decision::Refuse(RefusalReason::ValueRevisionMismatch);
     }
-    if !growth_fits(state, key, Some(row.value.len()), new_value.len()) {
-        return Decision::refuse(Reason::StateBudgetExhausted);
+    if !growth_fits(state, &key, Some(row.value.len()), new_value.len()) {
+        return Decision::Refuse(RefusalReason::StateBudgetExhausted);
     }
     if !counters_have_room(&[row.value_revision]) {
-        return Decision::refuse(Reason::CounterExhausted);
+        return Decision::Refuse(RefusalReason::CounterExhausted);
     }
 
     // "compare_and_set does not renew": the lease revision is untouched, so a
@@ -422,18 +462,23 @@ fn decide_compare_and_set(
     let mut next = row.clone();
     next.value = new_value.to_vec();
     next.value_revision += 1;
-    Decision::apply(next, Outcome::Mutated, false)
+    Decision::apply(key, next, Outcome::Mutated, false)
 }
 
-fn decide_release(actor: &NodeId, existing: Option<&ResourceRow>, fence: &Fence) -> Decision {
+fn decide_release(
+    actor: &NodeId,
+    key: ResourceKey,
+    existing: Option<&ResourceRow>,
+    fence: &Fence,
+) -> Decision {
     let Some(row) = existing else {
-        return Decision::refuse(Reason::NotHeld);
+        return Decision::Refuse(RefusalReason::NotHeld);
     };
     if let Some(reason) = check_fence(actor, row, fence) {
-        return Decision::refuse(reason);
+        return Decision::Refuse(reason);
     }
     if !counters_have_room(&[row.epoch, row.lease_revision]) {
-        return Decision::refuse(Reason::CounterExhausted);
+        return Decision::Refuse(RefusalReason::CounterExhausted);
     }
 
     // The value is **preserved**. A plain release is safety-reducing but it is
@@ -443,14 +488,14 @@ fn decide_release(actor: &NodeId, existing: Option<&ResourceRow>, fence: &Fence)
     next.holder = None;
     next.epoch += 1;
     next.lease_revision += 1;
-    Decision::apply(next, Outcome::Released, false)
+    Decision::apply(key, next, Outcome::Released, false)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn decide_release_with_value(
     state: &State,
     actor: &NodeId,
-    key: &ResourceKey,
+    key: ResourceKey,
     existing: Option<&ResourceRow>,
     fence: &Fence,
     expected_value_revision: u64,
@@ -458,23 +503,23 @@ fn decide_release_with_value(
     action: &ResourceAction,
 ) -> Decision {
     let Some(row) = existing else {
-        return Decision::refuse(Reason::NotHeld);
+        return Decision::Refuse(RefusalReason::NotHeld);
     };
     if let Some(reason) = check_fence(actor, row, fence) {
-        return Decision::refuse(reason);
+        return Decision::Refuse(reason);
     }
     if row.value_revision != expected_value_revision {
-        return Decision::refuse(Reason::ValueRevisionMismatch);
+        return Decision::Refuse(RefusalReason::ValueRevisionMismatch);
     }
     // Safety-reducing only when the value does not grow, which is why this is
     // decided against the row rather than by the variant.
     if !action.is_safety_reducing(row.value.len())
-        && !growth_fits(state, key, Some(row.value.len()), final_value.len())
+        && !growth_fits(state, &key, Some(row.value.len()), final_value.len())
     {
-        return Decision::refuse(Reason::StateBudgetExhausted);
+        return Decision::Refuse(RefusalReason::StateBudgetExhausted);
     }
     if !counters_have_room(&[row.epoch, row.lease_revision, row.value_revision]) {
-        return Decision::refuse(Reason::CounterExhausted);
+        return Decision::Refuse(RefusalReason::CounterExhausted);
     }
 
     // All five effects or none: "a failed release_with_value leaves both the
@@ -486,22 +531,26 @@ fn decide_release_with_value(
     next.holder = None;
     next.epoch += 1;
     next.lease_revision += 1;
-    Decision::apply(next, Outcome::Released, false)
+    Decision::apply(key, next, Outcome::Released, false)
 }
 
-fn decide_revoke(existing: Option<&ResourceRow>, expected_epoch: Option<u64>) -> Decision {
+fn decide_revoke(
+    key: ResourceKey,
+    existing: Option<&ResourceRow>,
+    expected_epoch: Option<u64>,
+) -> Decision {
     // Revoke is not one of §9.1's lazily-creating commands, so there is nothing
     // to fence on a resource that does not exist.
     let Some(row) = existing else {
-        return Decision::refuse(Reason::NotHeld);
+        return Decision::Refuse(RefusalReason::NotHeld);
     };
     if let Some(expected) = expected_epoch {
         if row.epoch != expected {
-            return Decision::refuse(Reason::EpochMismatch);
+            return Decision::Refuse(RefusalReason::EpochMismatch);
         }
     }
     if !counters_have_room(&[row.epoch, row.lease_revision]) {
-        return Decision::refuse(Reason::CounterExhausted);
+        return Decision::Refuse(RefusalReason::CounterExhausted);
     }
 
     // No `held` precondition (§9.1): revoke is an **unconditional** fencing
@@ -517,19 +566,24 @@ fn decide_revoke(existing: Option<&ResourceRow>, expected_epoch: Option<u64>) ->
     next.holder = None;
     next.epoch += 1;
     next.lease_revision += 1;
-    Decision::apply(next, Outcome::Revoked, false)
+    Decision::apply(key, next, Outcome::Revoked, false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::coordination::model::limits::{ALL_RIGHTS, GROWTH_BUDGET, MAX_TTL_MS, MIN_TTL_MS};
+    use crate::coordination::reason::Reason;
 
     const HOLDER: NodeId = [1u8; 32];
     const OTHER: NodeId = [2u8; 32];
 
+    fn raw() -> RawResourceKey {
+        RawResourceKey::new("ns", b"k".to_vec())
+    }
+
     fn key() -> ResourceKey {
-        ResourceKey::new("ns", b"k".to_vec())
+        raw().validate().expect("a valid fixture identity")
     }
 
     /// A state where `actor` holds every right on `key()`.
@@ -561,7 +615,7 @@ mod tests {
 
     fn fence(epoch: u64, holder: NodeId) -> Fence {
         Fence {
-            resource: key(),
+            resource: raw(),
             epoch,
             holder,
         }
@@ -576,7 +630,7 @@ mod tests {
 
     fn reason(d: Decision) -> Reason {
         match d {
-            Decision::Refuse(r) => r,
+            Decision::Refuse(r) => r.get(),
             other => panic!("expected a reason-coded refusal, got {other:?}"),
         }
     }
@@ -593,7 +647,7 @@ mod tests {
             &s,
             &HOLDER,
             &ResourceAction::Acquire {
-                resource: key(),
+                resource: raw(),
                 ttl_ms: 30_000,
             },
         ));
@@ -620,7 +674,7 @@ mod tests {
     fn acquire_refuses_a_held_row_including_the_callers_own_and_changes_nothing() {
         let before = held_row(HOLDER, 5);
         let acquire = ResourceAction::Acquire {
-            resource: key(),
+            resource: raw(),
             ttl_ms: 60_000,
         };
 
@@ -652,7 +706,7 @@ mod tests {
                 &s,
                 &HOLDER,
                 &ResourceAction::Acquire {
-                    resource: key(),
+                    resource: raw(),
                     ttl_ms: ttl,
                 },
             );
@@ -667,7 +721,7 @@ mod tests {
                 &s,
                 &HOLDER,
                 &ResourceAction::Acquire {
-                    resource: key(),
+                    resource: raw(),
                     ttl_ms: ttl,
                 },
             );
@@ -685,7 +739,7 @@ mod tests {
             &s,
             &HOLDER,
             &ResourceAction::Acquire {
-                resource: ResourceKey::new("n".repeat(limits::MAX_NAMESPACE + 1), b"k".to_vec()),
+                resource: RawResourceKey::new("n".repeat(limits::MAX_NAMESPACE + 1), b"k".to_vec()),
                 ttl_ms: 30_000,
             },
         );
@@ -700,7 +754,7 @@ mod tests {
         let cases: Vec<(ResourceAction, u64)> = vec![
             (
                 ResourceAction::Acquire {
-                    resource: key(),
+                    resource: raw(),
                     ttl_ms: 30_000,
                 },
                 RIGHT_ACQUIRE,
@@ -735,7 +789,7 @@ mod tests {
             ),
             (
                 ResourceAction::Revoke {
-                    resource: key(),
+                    resource: raw(),
                     expected_epoch: None,
                 },
                 RIGHT_REVOKE,
@@ -758,7 +812,7 @@ mod tests {
             let with = with_row(state_with_rights(HOLDER, needed), held_row(HOLDER, 5));
             let d = decide(&with, &HOLDER, &action);
             assert!(
-                !matches!(d, Decision::Refuse(Reason::PermissionChanged)),
+                !matches!(d, Decision::Refuse(RefusalReason::PermissionChanged)),
                 "{action:?} must be satisfied by exactly its declared right"
             );
         }
@@ -878,7 +932,7 @@ mod tests {
                 new_value: b"v".to_vec(),
             },
             ResourceAction::Revoke {
-                resource: key(),
+                resource: raw(),
                 expected_epoch: None,
             },
         ] {
@@ -1041,7 +1095,7 @@ mod tests {
             &s,
             &HOLDER,
             &ResourceAction::Revoke {
-                resource: key(),
+                resource: raw(),
                 expected_epoch: None,
             },
         ));
@@ -1061,7 +1115,7 @@ mod tests {
             &s2,
             &HOLDER,
             &ResourceAction::Revoke {
-                resource: key(),
+                resource: raw(),
                 expected_epoch: None,
             },
         ));
@@ -1077,7 +1131,7 @@ mod tests {
                 &s,
                 &HOLDER,
                 &ResourceAction::Revoke {
-                    resource: key(),
+                    resource: raw(),
                     expected_epoch: Some(4),
                 }
             )),
@@ -1088,7 +1142,7 @@ mod tests {
                 &s,
                 &HOLDER,
                 &ResourceAction::Revoke {
-                    resource: key(),
+                    resource: raw(),
                     expected_epoch: Some(5),
                 }
             ),
@@ -1107,7 +1161,7 @@ mod tests {
         let mut s = with_row(state_with_rights(HOLDER, ALL_RIGHTS), row);
 
         let revoke = ResourceAction::Revoke {
-            resource: key(),
+            resource: raw(),
             expected_epoch: None,
         };
 
@@ -1259,7 +1313,7 @@ mod tests {
                 fence: fence(5, HOLDER),
             },
             ResourceAction::Revoke {
-                resource: key(),
+                resource: raw(),
                 expected_epoch: None,
             },
         ] {
@@ -1280,7 +1334,7 @@ mod tests {
         let mut s = state_with_rights(HOLDER, ALL_RIGHTS);
         for i in 0..MAX_RESOURCES_PER_GROUP {
             s.resources.insert(
-                ResourceKey::new("f", i.to_be_bytes().to_vec()),
+                ResourceKey::new("f", i.to_be_bytes().to_vec()).expect("valid"),
                 ResourceRow::default(),
             );
         }
@@ -1292,7 +1346,7 @@ mod tests {
                 &s,
                 &HOLDER,
                 &ResourceAction::Acquire {
-                    resource: key(),
+                    resource: raw(),
                     ttl_ms: 30_000,
                 }
             )),
@@ -1311,7 +1365,7 @@ mod tests {
         );
         for i in 0..MAX_RESOURCES_PER_GROUP {
             s.resources.insert(
-                ResourceKey::new("f", i.to_be_bytes().to_vec()),
+                ResourceKey::new("f", i.to_be_bytes().to_vec()).expect("valid"),
                 ResourceRow::default(),
             );
         }
@@ -1323,7 +1377,7 @@ mod tests {
                     &s,
                     &HOLDER,
                     &ResourceAction::Acquire {
-                        resource: key(),
+                        resource: raw(),
                         ttl_ms: 30_000,
                     }
                 ),
@@ -1335,13 +1389,16 @@ mod tests {
 
     // ── Cross-cutting ───────────────────────────────────────────────────────
 
-    /// No decision may emit a reserved reason.
+    /// No decision can emit a reserved reason -- and this is now structural
+    /// rather than checked: [`RefusalReason`] has no constant for a reserved
+    /// code, so a refusal path cannot name one. The test asserts the property
+    /// still holds end to end.
     #[test]
     fn no_transition_emits_a_reserved_reason() {
         let s = with_row(state_with_rights(HOLDER, ALL_RIGHTS), held_row(OTHER, 5));
         let actions = [
             ResourceAction::Acquire {
-                resource: key(),
+                resource: raw(),
                 ttl_ms: 30_000,
             },
             ResourceAction::Renew {
@@ -1351,13 +1408,17 @@ mod tests {
                 fence: fence(5, HOLDER),
             },
             ResourceAction::Revoke {
-                resource: key(),
+                resource: raw(),
                 expected_epoch: Some(1),
             },
         ];
         for action in actions {
             if let Decision::Refuse(r) = decide(&s, &HOLDER, &action) {
-                assert!(!r.is_reserved(), "{action:?} emitted the reserved {r:?}");
+                assert!(
+                    !r.get().is_reserved(),
+                    "{action:?} emitted the reserved {r:?}"
+                );
+                assert_ne!(r.get(), Reason::None, "a refusal must name a cause");
             }
         }
     }

@@ -8,13 +8,23 @@
 //! * **State** limits -- resources per group, ACL rows per group, grants per
 //!   resource -- describe how full the group is. A violation is a coordination
 //!   outcome and has a §5.2 reason code (`22`, `23`).
-//! * **Request-shape** limits -- an oversized value, an over-long namespace, a
-//!   TTL outside the v1 range -- describe the request itself. §5.2 has **no**
-//!   reason code for any of them, because a request that is too big is shapeless
-//!   to the protocol rather than a coordination result.
+//! * **Request-shape** limits -- an invalid resource identity, an oversized
+//!   value, a TTL outside the v1 range -- describe the request itself. §5.2 has
+//!   **no** reason code for any of them, because a malformed request is
+//!   shapeless to the protocol rather than a coordination result.
 //!
 //! The split is not which section declares the limit; it is whether a violation
 //! has a reason code to report.
+//!
+//! ## Shape is validity, not merely size
+//!
+//! An earlier version of this module checked maxima only, which accepted empty
+//! keys, empty namespaces, uppercase and non-ASCII namespaces, and punctuation
+//! §4.2 forbids. That was not a smaller check than the contract's -- it was a
+//! different one, and it let identities into bounded metadata that
+//! [`coordination::ids::ResourceKey`](crate::coordination::ids::ResourceKey)
+//! would later reject. [`validate_resource_key`] delegates to that type, which
+//! is the only constructor for a durable key.
 //!
 //! ## Where they are enforced
 //!
@@ -23,99 +33,93 @@
 //! * A conforming leader refuses one **pre-proposal** at §10 stage 4, with an
 //!   `RpcStatus`. Nothing is written and no sequence is consumed.
 //! * `apply` enforces them again, because a **non-conforming** leader can
-//!   propose anything and apply may not skip a committed entry. See
-//!   [`crate::coordination::model::apply`] for the forced-apply rule that
-//!   governs what that commits.
-//!
-//! [`ShapeLimit`] is an enum rather than a message string so the set is
-//! enumerable: a test can assert that every request-shape limit §12.1 declares
-//! has a variant, and adding a limit without classifying it is a compile error
-//! at every exhaustive match.
+//!   propose anything and apply may not skip a committed entry. See §10.1 and
+//!   [`crate::coordination::model::apply`] for the forced-apply rule.
 
-use super::limits::{
-    MAX_JOIN_PERMIT, MAX_KEY, MAX_NAMESPACE, MAX_TICKET, MAX_TTL_MS, MAX_VALUE, MIN_TTL_MS,
-};
+use crate::coordination::ids::{IdError, ResourceKey};
 
-/// A §12.1 logical limit that bounds the shape of a request.
+use super::limits::{MAX_JOIN_PERMIT, MAX_TICKET, MAX_TTL_MS, MAX_VALUE, MIN_TTL_MS};
+
+/// Generates the [`ShapeLimit`] enum, its `ALL` list, and its descriptions from
+/// one declaration -- the same reason `reasons!` exists.
 ///
-/// Every variant is a condition with **no** §5.2 reason code. Adding one here
-/// is a deliberate statement that the protocol has no coordination reason for
-/// it; if a condition does have a reason code it belongs in
-/// [`Reason`](crate::coordination::reason::Reason) instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ShapeLimit {
-    /// `namespace` longer than [`MAX_NAMESPACE`].
-    Namespace,
-    /// `key` longer than [`MAX_KEY`].
-    ResourceKey,
-    /// A resource value longer than [`MAX_VALUE`].
-    Value,
+/// An earlier version kept `ALL` as a literal beside the enum with a comment
+/// claiming it was derived. It was not: adding a variant left the list stale
+/// and every "every limit" test silently narrower.
+macro_rules! shape_limits {
+    ($($(#[$m:meta])* $name:ident => $describe:expr),* $(,)?) => {
+        /// A §12.1 logical limit that bounds the shape of a request.
+        ///
+        /// Every variant is a condition with **no** §5.2 reason code. Adding one
+        /// here is a deliberate statement that the protocol has no coordination
+        /// reason for it; a condition that does have a reason code belongs in
+        /// [`Reason`](crate::coordination::reason::Reason) instead.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum ShapeLimit {
+            $($(#[$m])* $name),*
+        }
+
+        impl ShapeLimit {
+            /// Every request-shape limit §12.1 declares.
+            pub const ALL: &'static [ShapeLimit] = &[$(ShapeLimit::$name),*];
+
+            /// A short description, for an `RpcStatus` message at §10 stage 4.
+            ///
+            /// Diagnostic text, not protocol surface: a client branches on the
+            /// status code, never on this string.
+            pub fn describe(self) -> &'static str {
+                match self {
+                    $(ShapeLimit::$name => $describe),*
+                }
+            }
+        }
+    };
+}
+
+shape_limits! {
+    /// The namespace is not a valid §4.2 namespace: empty, over 64 bytes, or
+    /// carrying a byte outside `[a-z0-9._-]` (or a leading `.`/`-`/`_`).
+    Namespace => "namespace is not a valid coordination namespace",
+    /// The key is not a valid §4.2 key: empty or over 512 bytes.
+    ResourceKey => "resource key is not a valid coordination key",
+    /// A resource value longer than `MAX_VALUE`.
+    Value => "resource value exceeds its limit",
     /// `ttl_ms` outside `MIN_TTL_MS..=MAX_TTL_MS`.
-    Ttl,
+    Ttl => "ttl_ms is outside the v1 bounds",
     /// A `rights` mask carrying a bit v1 does not define (§8.1).
     ///
     /// Unknown bits are rejected rather than ignored: a grant this voter cannot
     /// evaluate is not forward compatibility.
-    RightsBits,
+    RightsBits => "rights carry a bit v1 does not define",
     /// An encoded `ActionV1` larger than `MAX_ENCODED_COMMAND`.
     ///
     /// Checked on the encoded form at the ingest boundary, where the encoded
     /// length exists -- not reconstructed from field limits.
-    EncodedCommand,
-    /// A member seed's ticket longer than [`MAX_TICKET`].
-    MemberSeedTicket,
-    /// A member seed's signed join permit longer than [`MAX_JOIN_PERMIT`].
-    MemberSeedJoinPermit,
+    EncodedCommand => "the encoded command exceeds its limit",
+    /// A member seed's ticket longer than `MAX_TICKET`.
+    MemberSeedTicket => "a member seed ticket exceeds its limit",
+    /// A member seed's signed join permit longer than `MAX_JOIN_PERMIT`.
+    MemberSeedJoinPermit => "a signed join permit exceeds its limit",
     /// More voters in a membership plan than v1 permits.
-    MembershipPlanSize,
+    MembershipPlanSize => "the membership plan names too many voters",
 }
 
-impl ShapeLimit {
-    /// Every request-shape limit §12.1 declares.
-    ///
-    /// Derived by an exhaustive match rather than written as a literal beside
-    /// the enum: a list maintained alongside its enum goes stale, which is the
-    /// same defect `reasons!` exists to prevent.
-    pub const ALL: &'static [ShapeLimit] = &[
-        ShapeLimit::Namespace,
-        ShapeLimit::ResourceKey,
-        ShapeLimit::Value,
-        ShapeLimit::Ttl,
-        ShapeLimit::RightsBits,
-        ShapeLimit::EncodedCommand,
-        ShapeLimit::MemberSeedTicket,
-        ShapeLimit::MemberSeedJoinPermit,
-        ShapeLimit::MembershipPlanSize,
-    ];
-
-    /// A short description, for an `RpcStatus` message at §10 stage 4.
-    ///
-    /// This is diagnostic text, not protocol surface: a client branches on the
-    /// status code, never on this string.
-    pub fn describe(self) -> &'static str {
-        match self {
-            ShapeLimit::Namespace => "namespace exceeds its limit",
-            ShapeLimit::ResourceKey => "resource key exceeds its limit",
-            ShapeLimit::Value => "resource value exceeds its limit",
-            ShapeLimit::Ttl => "ttl_ms is outside the v1 bounds",
-            ShapeLimit::RightsBits => "rights carry a bit v1 does not define",
-            ShapeLimit::EncodedCommand => "the encoded command exceeds its limit",
-            ShapeLimit::MemberSeedTicket => "a member seed ticket exceeds its limit",
-            ShapeLimit::MemberSeedJoinPermit => "a signed join permit exceeds its limit",
-            ShapeLimit::MembershipPlanSize => "the membership plan names too many voters",
+/// Validate a raw `(namespace, key)` into the durable key type.
+///
+/// This is the **only** way a resource identity enters state, a saved reply, or
+/// an audit row. Returning the validated value rather than a boolean is what
+/// stops a caller from validating and then storing the raw input anyway.
+pub fn validate_resource_key(namespace: &str, key: &[u8]) -> Result<ResourceKey, ShapeLimit> {
+    ResourceKey::new(namespace, key).map_err(|e| match e {
+        IdError::NamespaceLength { .. } | IdError::NamespaceCharset => ShapeLimit::Namespace,
+        IdError::KeyLength { .. } => ShapeLimit::ResourceKey,
+        // The fixed-width and hex errors cannot arise from `ResourceKey::new`;
+        // mapping them to the key limit keeps this total without inventing a
+        // variant for an unreachable case.
+        IdError::Length { .. } | IdError::HexLength { .. } | IdError::HexDigit => {
+            ShapeLimit::ResourceKey
         }
-    }
-}
-
-/// Check a `(namespace, key)` pair.
-pub fn check_resource_key(namespace: &str, key: &[u8]) -> Option<ShapeLimit> {
-    if namespace.len() > MAX_NAMESPACE {
-        return Some(ShapeLimit::Namespace);
-    }
-    if key.len() > MAX_KEY {
-        return Some(ShapeLimit::ResourceKey);
-    }
-    None
+    })
 }
 
 /// Check a resource value.
@@ -152,51 +156,71 @@ pub fn check_member_seed(ticket_len: usize, join_permit_len: Option<usize>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::model::limits::{MAX_ENCODED_COMMAND, MAX_KEY, MAX_NAMESPACE};
 
-    /// `ALL` must be exhaustive. A wildcard-free match fails to compile when a
-    /// variant is added, forcing both the list and a classification decision.
     #[test]
-    fn the_all_list_covers_every_variant() {
-        for limit in ShapeLimit::ALL {
-            // Exhaustive by construction: adding a variant without extending
-            // this match is a compile error.
-            let _: &'static str = match limit {
-                ShapeLimit::Namespace
-                | ShapeLimit::ResourceKey
-                | ShapeLimit::Value
-                | ShapeLimit::Ttl
-                | ShapeLimit::RightsBits
-                | ShapeLimit::EncodedCommand
-                | ShapeLimit::MemberSeedTicket
-                | ShapeLimit::MemberSeedJoinPermit
-                | ShapeLimit::MembershipPlanSize => limit.describe(),
-            };
-        }
-
+    fn the_all_list_is_generated_and_has_no_duplicates() {
         let mut seen = ShapeLimit::ALL.to_vec();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), ShapeLimit::ALL.len(), "ALL has a duplicate");
+        assert_eq!(seen.len(), ShapeLimit::ALL.len());
         assert_eq!(
             ShapeLimit::ALL.len(),
             9,
             "§12.1 declares nine request-shape limits; update this count with the enum"
         );
+        // Every variant has its own description; a shared one would make two
+        // different failures read identically in a status message.
+        let mut descriptions: Vec<_> = ShapeLimit::ALL.iter().map(|l| l.describe()).collect();
+        descriptions.sort_unstable();
+        descriptions.dedup();
+        assert_eq!(descriptions.len(), ShapeLimit::ALL.len());
+    }
+
+    /// The findings this module previously accepted: a maxima-only check let
+    /// every one of these through into bounded durable metadata.
+    #[test]
+    fn an_invalid_identity_is_rejected_even_when_it_is_within_the_maxima() {
+        let cases: Vec<(&str, &str, &[u8], ShapeLimit)> = vec![
+            ("empty namespace", "", b"k", ShapeLimit::Namespace),
+            ("empty key", "ns", b"", ShapeLimit::ResourceKey),
+            ("uppercase namespace", "NS", b"k", ShapeLimit::Namespace),
+            ("unicode namespace", "nsé", b"k", ShapeLimit::Namespace),
+            ("punctuation", "ns/sub", b"k", ShapeLimit::Namespace),
+            ("leading dot", ".hidden", b"k", ShapeLimit::Namespace),
+            ("leading dash", "-ns", b"k", ShapeLimit::Namespace),
+            ("leading underscore", "_ns", b"k", ShapeLimit::Namespace),
+            ("space", "ns ns", b"k", ShapeLimit::Namespace),
+        ];
+        for (name, ns, key, expected) in cases {
+            assert_eq!(
+                validate_resource_key(ns, key),
+                Err(expected),
+                "{name} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_identity_validates_and_preserves_its_bytes() {
+        let k = validate_resource_key("ns.sub-1_a", b"\x00\xff any bytes").expect("valid");
+        assert_eq!(k.namespace(), "ns.sub-1_a");
+        assert_eq!(k.key(), b"\x00\xff any bytes");
     }
 
     /// Every limit is checked at its exact boundary, so none is off by one.
     #[test]
     fn each_limit_admits_its_maximum_and_refuses_one_more() {
-        assert_eq!(check_resource_key(&"n".repeat(MAX_NAMESPACE), b""), None);
+        assert!(validate_resource_key(&"n".repeat(MAX_NAMESPACE), b"k").is_ok());
         assert_eq!(
-            check_resource_key(&"n".repeat(MAX_NAMESPACE + 1), b""),
-            Some(ShapeLimit::Namespace)
+            validate_resource_key(&"n".repeat(MAX_NAMESPACE + 1), b"k"),
+            Err(ShapeLimit::Namespace)
         );
 
-        assert_eq!(check_resource_key("ns", &vec![0u8; MAX_KEY]), None);
+        assert!(validate_resource_key("ns", &vec![0u8; MAX_KEY]).is_ok());
         assert_eq!(
-            check_resource_key("ns", &vec![0u8; MAX_KEY + 1]),
-            Some(ShapeLimit::ResourceKey)
+            validate_resource_key("ns", &vec![0u8; MAX_KEY + 1]),
+            Err(ShapeLimit::ResourceKey)
         );
 
         assert_eq!(check_value(&vec![0u8; MAX_VALUE]), None);
@@ -215,12 +239,9 @@ mod tests {
         assert_eq!(check_rights(0), None, "removing every right is legal");
         assert_eq!(check_rights(0x40), Some(ShapeLimit::RightsBits));
 
+        assert_eq!(check_encoded_command(MAX_ENCODED_COMMAND), None);
         assert_eq!(
-            check_encoded_command(super::super::limits::MAX_ENCODED_COMMAND),
-            None
-        );
-        assert_eq!(
-            check_encoded_command(super::super::limits::MAX_ENCODED_COMMAND + 1),
+            check_encoded_command(MAX_ENCODED_COMMAND + 1),
             Some(ShapeLimit::EncodedCommand)
         );
 
@@ -236,15 +257,13 @@ mod tests {
         assert_eq!(check_member_seed(0, None), None, "a permit is optional");
     }
 
-    /// The namespace is checked before the key, so a request violating both is
-    /// reported deterministically -- every voter must reach the same answer.
+    /// The namespace is reported before the key, so a request violating both is
+    /// answered deterministically -- every voter must reach the same answer.
     #[test]
     fn a_request_violating_two_limits_reports_deterministically() {
-        let long_ns = "n".repeat(MAX_NAMESPACE + 1);
-        let long_key = vec![0u8; MAX_KEY + 1];
         assert_eq!(
-            check_resource_key(&long_ns, &long_key),
-            Some(ShapeLimit::Namespace)
+            validate_resource_key(&"n".repeat(MAX_NAMESPACE + 1), &vec![0u8; MAX_KEY + 1]),
+            Err(ShapeLimit::Namespace)
         );
     }
 }
