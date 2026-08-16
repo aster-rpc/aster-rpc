@@ -26,43 +26,6 @@ pub type ClientId = [u8; 16];
 /// state holds only values that passed its constructor.
 pub use crate::coordination::ids::ResourceKey;
 
-/// Conversions between the model's [`LogId`] and the compiled wire type.
-///
-/// Both directions exist so a round-trip test can prove no field is dropped.
-/// The fallible direction is the one that matters: `LogIdV1.leader_node_id` is
-/// a `Vec<u8>` on the wire, and a value that is not exactly 32 bytes is not a
-/// NodeId.
-impl From<&LogId> for crate::coordination::contract::LogIdV1 {
-    fn from(id: &LogId) -> Self {
-        crate::coordination::contract::LogIdV1 {
-            term: id.term,
-            leader_node_id: id.leader_node_id.to_vec(),
-            index: id.index,
-        }
-    }
-}
-
-/// The wire log id carried a `leader_node_id` that is not 32 bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BadLogId;
-
-impl TryFrom<&crate::coordination::contract::LogIdV1> for LogId {
-    type Error = BadLogId;
-
-    fn try_from(id: &crate::coordination::contract::LogIdV1) -> Result<Self, BadLogId> {
-        let leader_node_id: NodeId = id
-            .leader_node_id
-            .as_slice()
-            .try_into()
-            .map_err(|_| BadLogId)?;
-        Ok(LogId {
-            term: id.term,
-            leader_node_id,
-            index: id.index,
-        })
-    }
-}
-
 /// A resource row: the lease and the value it guards.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResourceRow {
@@ -122,7 +85,10 @@ pub struct Session {
 }
 
 /// One authoritative audit row, mirroring
-/// [`AuditRowV1`](crate::coordination::contract::AuditRowV1).
+/// [`AuditRowV1`](crate::coordination::rowstream::AuditRowV1).
+///
+/// The conversions in [`super::wire`] are typed both ways, so a field added to
+/// either side is a compile error rather than a silent divergence.
 ///
 /// Carries `result` -- the outcome -- and no reason code (§5.2). That is why a
 /// reserved reason number could not be disambiguated from audit even in
@@ -215,6 +181,13 @@ pub struct State {
     /// log quadratic. Carrying the whole log id also catches a row at the same
     /// index as `last_applied` but from a different term or leader, which a
     /// maximum-index scan cannot see.
+    ///
+    /// **Rebuilt and validated from the retained audit rows at database open
+    /// and at snapshot install**, not trusted from whatever was last persisted.
+    /// That is where a full cross-table consistency check belongs -- it is paid
+    /// once per open rather than once per entry -- and it is what makes the
+    /// cheap per-apply check above sound: the tip it reads was verified against
+    /// the rows it summarises.
     pub audit_tip: Option<LogId>,
     /// Keyed by the normative entry identity `(log_term, log_index)` (§11.2),
     /// which orders pruning deterministically.
@@ -403,25 +376,6 @@ mod tests {
         );
     }
 
-    /// The model's `LogId` and the compiled wire type carry the same three
-    /// fields, and a round trip in either direction loses nothing. A model that
-    /// dropped `leader_node_id` would round-trip "successfully" while silently
-    /// substituting a different entry's identity.
-    #[test]
-    fn log_id_round_trips_through_the_wire_type_without_loss() {
-        use crate::coordination::contract::LogIdV1;
-
-        let id = LogId::new(7, [0xABu8; 32], 42);
-        let wire: LogIdV1 = (&id).into();
-
-        assert_eq!(wire.term, 7);
-        assert_eq!(wire.index, 42);
-        assert_eq!(wire.leader_node_id, vec![0xABu8; 32]);
-
-        let back = LogId::try_from(&wire).expect("a well-formed wire log id");
-        assert_eq!(back, id);
-    }
-
     /// Every field is load-bearing: changing any one of the three changes the
     /// identity, so none can be dropped from the model without losing entries.
     #[test]
@@ -430,26 +384,6 @@ mod tests {
         assert_ne!(base, LogId::new(2, [1u8; 32], 1), "term");
         assert_ne!(base, LogId::new(1, [2u8; 32], 1), "leader");
         assert_ne!(base, LogId::new(1, [1u8; 32], 2), "index");
-    }
-
-    /// A wire log id whose leader is not exactly 32 bytes is not a log id.
-    #[test]
-    fn a_wire_log_id_with_a_malformed_leader_is_rejected() {
-        use crate::coordination::contract::LogIdV1;
-
-        for leader in [vec![], vec![0u8; 31], vec![0u8; 33]] {
-            let wire = LogIdV1 {
-                term: 1,
-                leader_node_id: leader.clone(),
-                index: 1,
-            };
-            assert_eq!(
-                LogId::try_from(&wire),
-                Err(BadLogId),
-                "a {}-byte leader is not a NodeId",
-                leader.len()
-            );
-        }
     }
 
     #[test]
