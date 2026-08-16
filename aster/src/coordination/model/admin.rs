@@ -6,10 +6,14 @@
 //! here rather than left to callers.
 //!
 //! **The final administrator cannot be removed.** A group with zero
-//! administrators can never grant again, and nothing can rescue it: adding an
-//! administrator is itself a `set_admin`, which requires an administrator to
-//! issue. The refusal is therefore `24 LastAdministrator` and **terminal** --
-//! the removal as sent can never apply while that node is the last one.
+//! administrators can never grant again, and no later command can rescue it:
+//! adding an administrator is itself a `set_admin`, which requires an
+//! administrator to issue. The refusal is `24 LastAdministrator`, and it is
+//! **retryable** rather than terminal: the last administrator can add a second
+//! one and then reissue the removal unchanged, so a v1 command clears the
+//! condition -- which is §10's test. (The removal must be reissued on a
+//! different client id, because a pre-proposal `NotConsumed` consumed no
+//! sequence and the original request may not be altered at that sequence.)
 //!
 //! **The revision advances exactly when the set changes.** Enabling an existing
 //! administrator, or disabling one that is not there, is a no-op returning

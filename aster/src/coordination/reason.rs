@@ -458,7 +458,7 @@ mod tests {
     /// §5.2: defined so it cannot be reused, but never emitted.
     const RESERVED_CODES: [i32; 1] = [20];
 
-    /// §5.2 declares reasons 0 through 23 with no gaps.
+    /// §5.2 declares reasons 0 through 24 with no gaps.
     const REASON_CODE_RANGE: std::ops::RangeInclusive<i32> = 0..=24;
 
     /// §5.2's outcome codes.

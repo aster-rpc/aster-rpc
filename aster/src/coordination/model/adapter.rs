@@ -194,16 +194,51 @@ fn decode_base64url_nopad(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// What the group says about one resource right now (§9.1's row, read).
+///
+/// This is a *read*, not a guess. `LeaseSnapshot` is advisory -- nothing may
+/// gate a write on it -- but advisory does not mean fabricated: an observer that
+/// reports `held: false` for a resource this node itself holds is not stale, it
+/// is wrong, and the lease engine's status watch surfaces it to callers as fact.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResourceObservation {
+    pub epoch: u64,
+    pub held: bool,
+    pub holder: Option<CoordinationNodeId>,
+}
+
+/// One committed mutation's result, with the row it left behind.
+///
+/// The observation travels with the reply rather than being fetched afterwards:
+/// a second round trip would report a row that a concurrent command may already
+/// have moved, so a denial would carry a snapshot that never explained it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendReply {
+    pub outcome: Outcome,
+    pub reason: Reason,
+    pub fence: Option<Fence>,
+    pub observed: ResourceObservation,
+}
+
 /// The coordination backend behind one committed command.
 ///
 /// Slice 1 owns the *shape*, not the network: a transport binds this to a live
 /// `CoordinationClient` in Slice 4. Keeping the trait boundary here is what lets
 /// the existing `LeaseHandle` -- its renew loop, self-limit and status watch --
 /// drive coordination without a second lease implementation being written.
-#[allow(async_fn_in_trait)]
+///
+/// Both methods are async and fallible, because both are round trips to a
+/// quorum. A sync signature would have forced the Slice 4 implementation to
+/// block a runtime thread inside the lease engine's renew loop, and an
+/// infallible one would have had to render a transport failure as a coordination
+/// refusal -- two different things that callers retry differently.
+#[async_trait::async_trait]
 pub trait CoordinationBackend: Send + Sync {
-    /// Submit one committed mutation and return `(outcome, reason, fence)`.
-    fn submit(&self, resource: &ResourceKey, op: &LeaseOp) -> (Outcome, Reason, Option<Fence>);
+    /// Submit one committed mutation.
+    async fn submit(&self, resource: &ResourceKey, op: &LeaseOp) -> anyhow::Result<BackendReply>;
+
+    /// Read one resource row without mutating it (§5.2 `get`).
+    async fn observe(&self, resource: &ResourceKey) -> anyhow::Result<ResourceObservation>;
 }
 
 /// `CoordinationSerializer` (§9.4): the coordination group behind the existing
@@ -275,42 +310,55 @@ impl<B: CoordinationBackend + 'static> LeaseSerializer for CoordinationSerialize
         if !self.actor_is_local(&op) {
             // Not a refusal the group decided -- the caller is claiming an
             // identity this client does not have, so it never reaches the log.
+            // The row is still read, because a denial's snapshot has to describe
+            // the resource rather than an empty one.
+            let observed = self.backend.observe(&key).await?;
             return Ok(TransitionOutcome::Denied(
                 DenyReason::Unauthorized,
-                advisory_snapshot(resource),
+                snapshot_from(resource, &observed),
             ));
         }
 
-        let (outcome, reason, fence) = self.backend.submit(&key, &op);
-        Ok(match outcome {
+        let reply = self.backend.submit(&key, &op).await?;
+        Ok(match reply.outcome {
             Outcome::Granted => TransitionOutcome::Granted(
-                fence.ok_or_else(|| anyhow::anyhow!("a grant with no fence"))?,
+                reply
+                    .fence
+                    .ok_or_else(|| anyhow::anyhow!("a grant with no fence"))?,
             ),
             Outcome::Renewed => TransitionOutcome::Renewed,
             Outcome::Released => TransitionOutcome::Released,
             Outcome::Revoked => TransitionOutcome::Revoked,
-            _ => TransitionOutcome::Denied(deny_reason_for(reason), advisory_snapshot(resource)),
+            _ => TransitionOutcome::Denied(
+                deny_reason_for(reply.reason),
+                snapshot_from(resource, &reply.observed),
+            ),
         })
     }
 
     async fn snapshot(&self, resource: &str) -> anyhow::Result<LeaseSnapshot> {
-        self.resolve(resource)
+        let key = self
+            .resolve(resource)
             .map_err(|e| anyhow::anyhow!("adapter resource: {e}"))?;
-        Ok(advisory_snapshot(resource))
+        let observed = self.backend.observe(&key).await?;
+        Ok(snapshot_from(resource, &observed))
     }
 }
 
-/// §9.4: the advisory snapshot's `remaining` is `None`.
+/// Render an observed row as the lease engine's snapshot.
 ///
-/// A coordination lease's remaining time is not a replicated fact -- it depends
-/// on a clock, and `apply` reads none -- so reporting a number would be
-/// inventing one.
-fn advisory_snapshot(resource: &str) -> LeaseSnapshot {
+/// `remaining` is `None` per §9.4: a coordination lease's remaining time is not
+/// a replicated fact -- `apply` reads no clock -- so reporting a number would be
+/// inventing one. Everything else is copied from the row, not defaulted. An
+/// earlier revision returned `epoch: 0, held: false, holder: None` for every
+/// resource, which made a held lease indistinguishable from a free one to the
+/// status watch that surfaces it.
+fn snapshot_from(resource: &str, observed: &ResourceObservation) -> LeaseSnapshot {
     LeaseSnapshot {
         resource: resource.to_string(),
-        epoch: 0,
-        holder: None,
-        held: false,
+        epoch: observed.epoch,
+        holder: observed.holder.as_ref().map(|h| h.to_hex()),
+        held: observed.held,
         remaining: None,
     }
 }
@@ -497,32 +545,72 @@ mod tests {
 
     // ── The LeaseSerializer implementation ──────────────────────────────────
 
+    /// A backend with a real row behind it, so the adapter's snapshot has
+    /// something true to report. Recording the calls lets a test prove the
+    /// adapter read the row rather than inventing one.
     struct StubBackend {
         outcome: Outcome,
         reason: Reason,
+        row: ResourceObservation,
+        observes: std::sync::atomic::AtomicUsize,
     }
 
+    #[async_trait::async_trait]
     impl CoordinationBackend for StubBackend {
-        fn submit(
+        async fn submit(
             &self,
             _resource: &ResourceKey,
             op: &LeaseOp,
-        ) -> (Outcome, Reason, Option<Fence>) {
+        ) -> anyhow::Result<BackendReply> {
             let fence = matches!(self.outcome, Outcome::Granted).then(|| Fence {
                 resource: "r".into(),
                 epoch: 1,
                 holder: op.actor().to_string(),
             });
-            (self.outcome, self.reason, fence)
+            Ok(BackendReply {
+                outcome: self.outcome,
+                reason: self.reason,
+                fence,
+                observed: self.row.clone(),
+            })
+        }
+
+        async fn observe(&self, _resource: &ResourceKey) -> anyhow::Result<ResourceObservation> {
+            self.observes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.row.clone())
         }
     }
 
-    fn serializer(outcome: Outcome, reason: Reason) -> CoordinationSerializer<StubBackend> {
+    const HOLDER: [u8; 32] = [0xC3u8; 32];
+
+    fn held_row() -> ResourceObservation {
+        ResourceObservation {
+            epoch: 12,
+            held: true,
+            holder: Some(CoordinationNodeId::from_array(HOLDER)),
+        }
+    }
+
+    fn serializer_with(
+        outcome: Outcome,
+        reason: Reason,
+        row: ResourceObservation,
+    ) -> CoordinationSerializer<StubBackend> {
         CoordinationSerializer::new(
             group(1),
             CoordinationNodeId::from_array([9u8; 32]),
-            Arc::new(StubBackend { outcome, reason }),
+            Arc::new(StubBackend {
+                outcome,
+                reason,
+                row,
+                observes: std::sync::atomic::AtomicUsize::new(0),
+            }),
         )
+    }
+
+    fn serializer(outcome: Outcome, reason: Reason) -> CoordinationSerializer<StubBackend> {
+        serializer_with(outcome, reason, ResourceObservation::default())
     }
 
     fn local_actor() -> String {
@@ -621,14 +709,158 @@ mod tests {
 
     /// §9.4: the advisory `remaining` is `None`, because a coordination lease's
     /// remaining time is not a replicated fact -- `apply` reads no clock, so
-    /// reporting a number would be inventing one.
+    /// reporting a number would be inventing one. Everything else comes from the
+    /// row.
     #[tokio::test]
-    async fn the_advisory_snapshot_reports_no_remaining_time() {
-        let s = serializer(Outcome::Granted, Reason::None);
+    async fn the_snapshot_reports_the_observed_row_not_a_default() {
+        let s = serializer_with(Outcome::Granted, Reason::None, held_row());
         let resource = encode(&group(1), &key("ns", b"primary"));
+
         let snap = s.snapshot(&resource).await.expect("resolvable");
-        assert_eq!(snap.remaining, None);
+        assert_eq!(snap.remaining, None, "no clock, so no remaining time");
         assert_eq!(snap.resource, resource);
+        assert!(snap.held, "the row is held, and the snapshot must say so");
+        assert_eq!(snap.epoch, 12, "the row's epoch, not zero");
+        assert_eq!(
+            snap.holder,
+            Some(CoordinationNodeId::from_array(HOLDER).to_hex()),
+            "the holder is named, not dropped"
+        );
+        assert_eq!(
+            s.backend
+                .observes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the row was read, not fabricated"
+        );
+    }
+
+    /// A free row and a held row must produce different snapshots. This is the
+    /// property an epoch-0/unheld default silently destroyed: the lease engine's
+    /// status watch reported every resource as free.
+    #[tokio::test]
+    async fn a_free_row_and_a_held_row_do_not_look_alike() {
+        let resource = encode(&group(1), &key("ns", b"primary"));
+        let free = serializer_with(
+            Outcome::Granted,
+            Reason::None,
+            ResourceObservation::default(),
+        )
+        .snapshot(&resource)
+        .await
+        .expect("resolvable");
+        let held = serializer_with(Outcome::Granted, Reason::None, held_row())
+            .snapshot(&resource)
+            .await
+            .expect("resolvable");
+
+        assert_ne!(free, held);
+        assert!(!free.held);
+        assert_eq!(free.holder, None);
+        assert_eq!(free.epoch, 0, "a free row genuinely has epoch zero");
+    }
+
+    /// A denial carries the row that explains it. `HeldByOther` with an empty
+    /// snapshot tells a caller its lease was refused by nobody.
+    #[tokio::test]
+    async fn a_denial_carries_the_row_that_explains_it() {
+        let s = serializer_with(Outcome::Rejected, Reason::HeldByOther, held_row());
+        let resource = encode(&group(1), &key("ns", b"primary"));
+
+        let outcome = s
+            .transition(
+                &resource,
+                LeaseOp::Acquire {
+                    candidate: local_actor(),
+                    ttl: std::time::Duration::from_secs(30),
+                },
+            )
+            .await
+            .expect("no backend error");
+        let TransitionOutcome::Denied(reason, snap) = outcome else {
+            panic!("expected a denial");
+        };
+        assert_eq!(reason, DenyReason::HeldByOther);
+        assert!(snap.held);
+        assert_eq!(
+            snap.holder,
+            Some(CoordinationNodeId::from_array(HOLDER).to_hex()),
+            "the holder that refused the acquire is named"
+        );
+        assert_eq!(snap.epoch, 12);
+        assert_eq!(
+            s.backend
+                .observes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the row travels with the reply; a second read could have moved"
+        );
+    }
+
+    /// An unauthorized actor is refused without reaching the log, but the
+    /// snapshot still describes the resource.
+    #[tokio::test]
+    async fn an_unauthorized_denial_still_describes_the_resource() {
+        let s = serializer_with(Outcome::Granted, Reason::None, held_row());
+        let resource = encode(&group(1), &key("ns", b"primary"));
+
+        let outcome = s
+            .transition(
+                &resource,
+                LeaseOp::Renew {
+                    holder: "not-this-node".into(),
+                    epoch: 1,
+                },
+            )
+            .await
+            .expect("no backend error");
+        let TransitionOutcome::Denied(reason, snap) = outcome else {
+            panic!("expected a denial");
+        };
+        assert_eq!(reason, DenyReason::Unauthorized);
+        assert!(snap.held);
+        assert_eq!(snap.epoch, 12);
+    }
+
+    /// A backend failure is an error, not a refusal. A transport fault rendered
+    /// as `Denied` would tell a caller the group decided something it never saw.
+    #[tokio::test]
+    async fn a_backend_failure_is_not_a_refusal() {
+        struct Broken;
+
+        #[async_trait::async_trait]
+        impl CoordinationBackend for Broken {
+            async fn submit(
+                &self,
+                _resource: &ResourceKey,
+                _op: &LeaseOp,
+            ) -> anyhow::Result<BackendReply> {
+                Err(anyhow::anyhow!("no quorum"))
+            }
+            async fn observe(
+                &self,
+                _resource: &ResourceKey,
+            ) -> anyhow::Result<ResourceObservation> {
+                Err(anyhow::anyhow!("no quorum"))
+            }
+        }
+
+        let s = CoordinationSerializer::new(
+            group(1),
+            CoordinationNodeId::from_array([9u8; 32]),
+            Arc::new(Broken),
+        );
+        let resource = encode(&group(1), &key("ns", b"primary"));
+        assert!(s.snapshot(&resource).await.is_err());
+        assert!(s
+            .transition(
+                &resource,
+                LeaseOp::Revoke {
+                    authority: local_actor()
+                }
+            )
+            .await
+            .is_err());
     }
 
     /// The encoding is stable: the same resource always produces the same

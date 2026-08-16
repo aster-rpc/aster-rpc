@@ -264,6 +264,18 @@ pub fn apply_wire_command(
     group_id: &[u8],
     command: &CommandV1,
 ) -> Result<CommandReplyV1, Fault> {
+    // §12.1's `max_encoded_command`, enforced where it is decidable. The bound
+    // is on the **encoded** form, so it cannot be reconstructed from field
+    // limits: an action whose fields are each in range can still encode past the
+    // cap once framing is counted. Re-encoding here is deterministic, so every
+    // voter reaches the same verdict on the same entry -- which is what makes
+    // this a committed rejection rather than a host-local ingress check that
+    // some voters applied and others did not. An earlier revision exposed the
+    // check with no caller at all, so the declared limit bounded nothing.
+    if oversized(command) {
+        return Ok(malformed_reply(command));
+    }
+
     let model = match command_from_wire(command) {
         Ok(model) => model,
         // §5.3.1: a variant this version does not know is fatal.
@@ -281,6 +293,18 @@ pub fn apply_wire_command(
     // in the saved reply, so it is read here and only here.
     let reply = apply_command(state, log_id, &model)?;
     Ok(to_wire(state, group_id, &model, reply))
+}
+
+/// Does this command exceed §12.1's encoded-size cap?
+///
+/// A command that will not re-encode is treated as oversized rather than as
+/// zero bytes: an unmeasurable request is not a small one, and the only safe
+/// direction to guess in is refusal.
+fn oversized(command: &CommandV1) -> bool {
+    let encoded_len = crate::coordination::contract::payload_fory::<CommandV1>()
+        .serialize(command)
+        .map_or(usize::MAX, |bytes| bytes.len());
+    check_encoded_command(encoded_len).is_some()
 }
 
 /// The reply for a known command whose fields will not narrow.
@@ -458,6 +482,80 @@ mod tests {
             resource: wire_key(),
             ttl_ms: 30_000,
         })
+    }
+
+    /// §12.1's encoded-command cap is enforced by the production apply path, not
+    /// merely declared. An earlier revision exposed `check_encoded_command` with
+    /// no caller, so a command of any size applied.
+    #[test]
+    fn an_oversized_command_is_rejected_by_the_apply_path() {
+        use crate::coordination::contract::CompareAndSetActionV1;
+        use crate::coordination::model::limits::MAX_ENCODED_COMMAND;
+
+        let mut s = genesis();
+        let oversized = client_command(
+            ACTOR,
+            1,
+            ActionV1::CompareAndSet(CompareAndSetActionV1 {
+                fence: fence_wire(),
+                expected_value_revision: 0,
+                new_value: vec![0xA5u8; MAX_ENCODED_COMMAND + 1],
+            }),
+        );
+        assert!(
+            super::oversized(&oversized),
+            "the fixture must actually exceed the cap it is testing"
+        );
+
+        let reply = apply_wire_command(&mut s, log(1), &GROUP, &oversized).expect("no fault");
+        match reply {
+            CommandReplyV1::Client(r) => {
+                // §10.1: a committed request-shape violation, which is the one
+                // condition that carries no reason code.
+                assert_eq!(r.disposition_code, 1, "Consumed");
+                assert_eq!(r.outcome_code, 100, "Rejected");
+                assert_eq!(r.reason_code, 0, "shapeless to the protocol");
+            }
+            other => panic!("expected a client reply, got {other:?}"),
+        }
+        assert!(
+            s.resources.is_empty(),
+            "a rejected command mutates no business state"
+        );
+    }
+
+    /// A command at the cap still applies. Without this the previous test would
+    /// pass on a check that rejected everything.
+    #[test]
+    fn a_command_within_the_cap_still_applies() {
+        use crate::coordination::contract::CompareAndSetActionV1;
+
+        let mut s = genesis();
+        // Acquire first, since a compare-and-set needs a fence from a real hold.
+        apply_wire_command(&mut s, log(1), &GROUP, &client_command(ACTOR, 1, acquire()))
+            .expect("no fault");
+        let epoch = s.resources.get(&key()).expect("a row").epoch;
+
+        let mut fence = fence_wire();
+        fence.epoch = epoch;
+        let sized = client_command(
+            ACTOR,
+            2,
+            ActionV1::CompareAndSet(CompareAndSetActionV1 {
+                fence,
+                expected_value_revision: 0,
+                new_value: vec![0xA5u8; 1024],
+            }),
+        );
+        assert!(!super::oversized(&sized));
+        let reply = apply_wire_command(&mut s, log(2), &GROUP, &sized).expect("no fault");
+        match reply {
+            CommandReplyV1::Client(r) => assert_ne!(
+                r.outcome_code, 100,
+                "an in-range command is not a shape violation"
+            ),
+            other => panic!("expected a client reply, got {other:?}"),
+        }
     }
 
     /// The boundary the whole system runs through: a production `CommandV1`
