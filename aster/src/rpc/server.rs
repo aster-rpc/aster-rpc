@@ -502,7 +502,7 @@ impl CallParts {
         header_payload: Vec<u8>,
         request_payload: Vec<u8>,
         request_flags: u8,
-        response_sender: UnboundedSender<OutgoingFrame>,
+        response_sender: ResponseSender,
         request_receiver: Receiver<RequestFrame>,
         cancelled: Arc<AtomicBool>,
     ) -> Self {
@@ -637,7 +637,8 @@ async fn handle_call(
             &call.response_sender,
             StatusCode::NotFound,
             &format!("service '{}' v{} not found", header.service, header.version),
-        );
+        )
+        .await;
         return;
     }
 

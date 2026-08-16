@@ -21,6 +21,7 @@ use aster::rpc::{
 };
 use aster::{AsterConfig, Node, RelayMode};
 use aster_transport_core::framing::FLAG_END_STREAM;
+use aster_transport_core::reactor::response_channel;
 use tokio::sync::mpsc;
 
 struct Guarded;
@@ -42,7 +43,9 @@ impl ServiceDispatch for Guarded {
         // Reaching here at all is what the guarded test asserts cannot happen
         // over an unauthenticated transport. The marker payload is how we tell
         // "the handler ran" from "dispatch refused".
-        let _ = call.respond(b"handler-ran".to_vec(), &RpcStatus::ok());
+        let _ = call
+            .respond(b"handler-ran".to_vec(), &RpcStatus::ok())
+            .await;
     }
 }
 
@@ -59,7 +62,9 @@ impl ServiceDispatch for Ordinary {
         &["ping"]
     }
     async fn dispatch(&self, _method: &str, call: Call) {
-        let _ = call.respond(b"handler-ran".to_vec(), &RpcStatus::ok());
+        let _ = call
+            .respond(b"handler-ran".to_vec(), &RpcStatus::ok())
+            .await;
     }
 }
 
@@ -87,7 +92,7 @@ async fn dispatch(service: &str, provenance: PeerProvenance) -> Vec<u8> {
     })
     .expect("encode header");
 
-    let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
+    let (resp_tx, mut resp_rx) = response_channel();
     let (_req_tx, req_rx) = mpsc::channel::<RequestFrame>(1);
     let parts = CallParts::new(
         // The SAME apparent peer id in both cases: the calls differ only in
@@ -104,7 +109,8 @@ async fn dispatch(service: &str, provenance: PeerProvenance) -> Vec<u8> {
     dispatcher.dispatch_parts(parts).await;
 
     let mut out = Vec::new();
-    while let Ok(frame) = resp_rx.try_recv() {
+    while let Ok(item) = resp_rx.try_recv() {
+        let (frame, _lease) = item.into_parts();
         let bytes = match frame {
             OutgoingFrame::Frame(b)
             | OutgoingFrame::Trailer(b)

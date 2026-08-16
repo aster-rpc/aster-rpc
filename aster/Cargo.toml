@@ -18,14 +18,16 @@ attestation = ["aster_transport_core/attestation"]
 rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros"]
 # Coordination (§15 Slice 0). Two features, deliberately:
 #
-#   coordination-client  the wire contract and client stub only. A consumer that
-#                        calls a coordination group but does not host one pays
-#                        for neither openraft nor redb.
+#   coordination-client  the wire contract and client stub only. Enabling it
+#                        adds neither openraft nor a direct redb dependency.
+#                        The base Iroh stack already carries transitive redb
+#                        versions through iroh-blobs and iroh-docs.
 #   coordination         the voter: adds the replicated state machine and its
 #                        storage.
 #
-# Neither is in `default`, so the default dependency graph is unchanged. Verify
-# with `cargo tree -p aster --no-default-features -e features`.
+# Neither is in `default`, so voter-only dependencies are not enabled there.
+# Verify the direct edges with `cargo tree -p aster --no-default-features
+# --depth 1` and the full feature graph with `-e features`.
 coordination-client = ["rpc"]
 coordination = ["coordination-client", "dep:openraft", "dep:redb"]
 discovery = []
