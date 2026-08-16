@@ -16,6 +16,11 @@ pub mod service;
 #[cfg(feature = "coordination")]
 pub mod host;
 
+/// The replicated state machine. Voter-only: a client evaluates no transition,
+/// so `coordination-client` compiles none of it.
+#[cfg(feature = "coordination")]
+pub mod model;
+
 /// The OpenRaft type configuration. Voter-only, so it needs `coordination`
 /// rather than `coordination-client`.
 #[cfg(feature = "coordination")]
