@@ -5,6 +5,7 @@
 # Mirrors the jobs in .github/workflows/ci.yml + ci-typescript.yml:
 #   1. cargo fmt --all --check (workspace)
 #   2. cargo clippy --workspace --all-targets -- -D warnings (NAPI excluded)
+#   2b. scripts/check-coordination-deps.sh (coordination feature graph)
 #   3. uv run maturin develop (build the extension)
 #   4. uv run pytest tests/python/
 #   5. cargo clippy (NAPI, lib only)
@@ -79,6 +80,17 @@ if cargo clippy --workspace --all-targets --exclude aster-transport-napi -- -D w
     pass "Clippy OK"
 else
     fail "Clippy found errors. Fix the issues above."
+fi
+
+# ── 2b. Coordination feature graph ────────────────────────────────
+# A Cargo.toml edit can pull OpenRaft into the default graph, or give `aster` a
+# direct redb edge, without breaking a single build. See the script for why the
+# redb half is about the *direct* edge and not about redb being absent.
+step "coordination dependency gate"
+if ./scripts/check-coordination-deps.sh; then
+    pass "Coordination feature graph OK"
+else
+    fail "Coordination dependency gate failed. See the output above."
 fi
 
 # ── 3. Build the Python extension via uv ───────────────────────────
