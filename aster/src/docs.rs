@@ -6,8 +6,8 @@ use crate::id::{AuthorId, Hash, NamespaceId, NamespaceSecret, NodeId, SecretKey}
 use std::time::Duration;
 
 use aster_transport_core::{
-    CoreDoc, CoreDocEntry, CoreDocEvent, CoreDocEventReceiver, CoreDocsClient, CoreDownloadPolicy,
-    CoreLocalAccess, CoreRetireOutcome,
+    CoreAuthorityFingerprint, CoreAuthorityReport, CoreDoc, CoreDocEntry, CoreDocEvent,
+    CoreDocEventReceiver, CoreDocsClient, CoreDownloadPolicy, CoreLocalAccess, CoreRetireOutcome,
 };
 
 /// The default-docs [`AuthorId`] for a node with this secret — the same value
@@ -200,15 +200,99 @@ pub enum RetireOutcome {
     },
 }
 
+/// A stable, opaque correlation value over `(namespace, stored access)`.
+///
+/// **Correlation, not evidence.** A namespace id is the namespace public key,
+/// and a write capability is the one secret behind it — so `(namespace,
+/// access)` already identifies every capability this node can hold for that
+/// namespace, and this hash tells a caller nothing that comparing those two
+/// fields would not. It exists so a caller holding a grant record can compare
+/// one value instead of two, and so a future capability type carrying material
+/// that pair does not determine has a versioned slot to grow into.
+///
+/// It does **not** cover secret material — Aster cannot read the stored secret
+/// back — and it cannot detect authority material changing at the same role,
+/// because the current capability model cannot represent that.
+///
+/// The algorithm is BLAKE3 over a domain separator, the 32-byte namespace id,
+/// and one access byte (`Write` = 1, `Read` = 2). The domain string carries the
+/// version, so a later definition can never collide with this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorityFingerprint(CoreAuthorityFingerprint);
+
+impl AuthorityFingerprint {
+    /// Fingerprint a namespace and access pair.
+    ///
+    /// Public so a caller can derive the same value from its own grant record
+    /// and compare it against a report without reimplementing the algorithm.
+    pub fn of(namespace: NamespaceId, access: LocalAccess) -> Self {
+        Self(CoreAuthorityFingerprint::of(
+            namespace.to_bytes(),
+            access.into(),
+        ))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+
+    pub fn to_hex(&self) -> String {
+        self.0.to_hex()
+    }
+}
+
+/// What this node actually holds over a namespace, read back from the store.
+///
+/// Obtained from [`Docs::authority_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityReport(CoreAuthorityReport);
+
+impl AuthorityReport {
+    /// The namespace actually opened.
+    pub fn namespace(&self) -> NamespaceId {
+        NamespaceId::from_bytes(self.0.namespace())
+    }
+
+    /// The access **stored** for it — never the access that was requested.
+    pub fn access(&self) -> LocalAccess {
+        self.0.access().into()
+    }
+
+    /// This report's correlation fingerprint. See [`AuthorityFingerprint`] for
+    /// what it does and does not prove.
+    pub fn fingerprint(&self) -> AuthorityFingerprint {
+        AuthorityFingerprint(self.0.fingerprint())
+    }
+}
+
+impl From<CoreAuthorityReport> for AuthorityReport {
+    fn from(report: CoreAuthorityReport) -> Self {
+        Self(report)
+    }
+}
+
+impl From<CoreLocalAccess> for LocalAccess {
+    fn from(access: CoreLocalAccess) -> Self {
+        match access {
+            CoreLocalAccess::Write => LocalAccess::Write,
+            CoreLocalAccess::Read => LocalAccess::Read,
+        }
+    }
+}
+
+impl From<LocalAccess> for CoreLocalAccess {
+    fn from(access: LocalAccess) -> Self {
+        match access {
+            LocalAccess::Write => CoreLocalAccess::Write,
+            LocalAccess::Read => CoreLocalAccess::Read,
+        }
+    }
+}
+
 impl From<CoreRetireOutcome> for RetireOutcome {
     fn from(outcome: CoreRetireOutcome) -> Self {
         match outcome {
-            CoreRetireOutcome::Retired(CoreLocalAccess::Write) => {
-                RetireOutcome::Retired(LocalAccess::Write)
-            }
-            CoreRetireOutcome::Retired(CoreLocalAccess::Read) => {
-                RetireOutcome::Retired(LocalAccess::Read)
-            }
+            CoreRetireOutcome::Retired(access) => RetireOutcome::Retired(access.into()),
             CoreRetireOutcome::Busy { handles } => RetireOutcome::Busy { handles },
         }
     }
@@ -300,6 +384,25 @@ impl Docs {
         Ok(self
             .inner
             .retire_local_write_authority(id.to_bytes().to_vec())
+            .await?
+            .into())
+    }
+
+    /// Report the authority this node actually holds over `id`.
+    ///
+    /// Read back from the local store *after* any import or merge, so it
+    /// answers "what may this node do" rather than "what did this node ask
+    /// for". Because [`Self::open_or_import_read_namespace`] never narrows an
+    /// existing write capability, a read request over a locally writable
+    /// namespace correctly reports [`LocalAccess::Write`].
+    ///
+    /// Errors if the namespace is not in the local store. That is deliberate:
+    /// a caller uses this to decide whether it may serve a namespace, and
+    /// "cannot prove" must not arrive in the same shape as "proved read-only".
+    pub async fn authority_report(&self, id: NamespaceId) -> Result<AuthorityReport> {
+        Ok(self
+            .inner
+            .authority_report(id.to_bytes().to_vec())
             .await?
             .into())
     }

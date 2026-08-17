@@ -108,8 +108,8 @@ pub use ticket::{Credential, Ticket};
 pub use blobs::{BlobFormat, BlobStatus, Blobs, FetchReport, FetchStrategy, ProviderOutcome};
 #[cfg(feature = "docs")]
 pub use docs::{
-    default_author_id, Doc, DocEntry, DocEvent, DocEvents, Docs, DownloadPolicy, LocalAccess,
-    RetireOutcome, ShareMode,
+    default_author_id, AuthorityFingerprint, AuthorityReport, Doc, DocEntry, DocEvent, DocEvents,
+    Docs, DownloadPolicy, LocalAccess, RetireOutcome, ShareMode,
 };
 #[cfg(feature = "expose")]
 pub use expose::Expose;

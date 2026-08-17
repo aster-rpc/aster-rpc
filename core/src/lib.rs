@@ -3986,13 +3986,58 @@ impl CoreDocsClient {
     /// Whether `ns_id` is present in the local replica store. Used to
     /// disambiguate a "not found" open from a real error (see [`Self::open`]).
     async fn namespace_exists(&self, ns_id: NamespaceId) -> Result<bool> {
+        Ok(self.stored_access(ns_id).await?.is_some())
+    }
+
+    /// The access **stored** for `ns_id`, or `None` if the namespace is not in
+    /// the local replica store.
+    ///
+    /// This is the one place that reads authority back out of the store, and it
+    /// is deliberately not parameterised by what the caller asked for: the whole
+    /// point is to report what the store holds after any import/merge, not to
+    /// restate a request. `list()` is the only read-only capability
+    /// introspection the document layer exposes, so it costs one pass over the
+    /// local namespaces; a targeted lookup would need a change in that
+    /// dependency and is not worth one until measurement says so.
+    async fn stored_access(&self, ns_id: NamespaceId) -> Result<Option<CoreLocalAccess>> {
         let mut stream = self.inner.api().list().await?;
         while let Some(item) = stream.next().await {
-            if item?.0 == ns_id {
-                return Ok(true);
+            let (id, kind) = item?;
+            if id == ns_id {
+                return Ok(Some(kind.into()));
             }
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    /// Report the authority this node actually holds over `namespace_id_bytes`.
+    ///
+    /// Fallible on purpose, and absent-means-error rather than
+    /// `Ok(None)`: a caller asks this to decide whether it may serve a
+    /// namespace, so "cannot prove" and "proved read-only" must not arrive in
+    /// the same shape. Returning the requested mode, or an echo of the caller's
+    /// own capability bytes, would answer a different question than the one
+    /// being asked.
+    pub async fn authority_report(
+        &self,
+        namespace_id_bytes: Vec<u8>,
+    ) -> Result<CoreAuthorityReport> {
+        if namespace_id_bytes.len() != 32 {
+            return Err(anyhow!("namespace id must be 32 bytes"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&namespace_id_bytes);
+        let ns_id = NamespaceId::from(arr);
+        match self.stored_access(ns_id).await? {
+            Some(access) => Ok(CoreAuthorityReport {
+                namespace: arr,
+                access,
+            }),
+            None => Err(anyhow!(
+                "namespace {ns_id} is not in the local replica store, so its \
+                 authority cannot be reported"
+            )),
+        }
     }
 
     pub async fn join(&self, ticket_str: String) -> Result<CoreDoc> {
@@ -4110,6 +4155,103 @@ pub enum CoreLocalAccess {
     Read,
 }
 
+impl From<CapabilityKind> for CoreLocalAccess {
+    fn from(kind: CapabilityKind) -> Self {
+        match kind {
+            CapabilityKind::Write => CoreLocalAccess::Write,
+            CapabilityKind::Read => CoreLocalAccess::Read,
+        }
+    }
+}
+
+impl CoreLocalAccess {
+    /// The byte this access contributes to a fingerprint.
+    ///
+    /// Declared here rather than reusing the document layer's discriminants, so
+    /// a renumbering upstream cannot silently change a value Aster has already
+    /// published as stable.
+    const fn fingerprint_byte(self) -> u8 {
+        match self {
+            CoreLocalAccess::Write => 1,
+            CoreLocalAccess::Read => 2,
+        }
+    }
+}
+
+/// The domain separator for [`CoreAuthorityFingerprint`].
+///
+/// Versioned in the string itself: a future capability model that makes the
+/// fingerprint carry more than `(namespace, access)` gets `/v2`, and an old
+/// value can never collide with a new one.
+const AUTHORITY_FINGERPRINT_DOMAIN: &[u8] = b"aster-docs/authority-fingerprint/v1\0";
+
+/// A stable, opaque correlation value over `(namespace, stored access)`.
+///
+/// **This is a correlation token, not evidence.** Under the current capability
+/// model a namespace ID *is* the namespace public key, and a write capability
+/// is the single secret behind it — so `(namespace, access)` already identifies
+/// every capability a node can hold for that namespace, and this hash adds no
+/// information to comparing those two fields directly. It exists because a
+/// caller comparing a grant record with an opened runtime wants one value to
+/// compare rather than two, and because a future capability type could carry
+/// material that this pair does not determine. It is emphatically not a proof
+/// over secret material: Aster cannot read the stored secret back, and a
+/// fingerprint that claimed to cover it would be a lie a caller might rely on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CoreAuthorityFingerprint([u8; 32]);
+
+impl CoreAuthorityFingerprint {
+    /// Fingerprint a namespace and access pair.
+    ///
+    /// Takes raw namespace bytes rather than the document layer's id type, so
+    /// no caller has to name that dependency to derive the same value from its
+    /// own grant record.
+    pub fn of(namespace: [u8; 32], access: CoreLocalAccess) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(AUTHORITY_FINGERPRINT_DOMAIN);
+        hasher.update(&namespace);
+        hasher.update(&[access.fingerprint_byte()]);
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// What a node actually holds over a namespace, read back from the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreAuthorityReport {
+    namespace: [u8; 32],
+    access: CoreLocalAccess,
+}
+
+impl CoreAuthorityReport {
+    /// The namespace actually opened, as raw bytes — the document layer's id
+    /// type stays out of this crate's public surface.
+    pub fn namespace(&self) -> [u8; 32] {
+        self.namespace
+    }
+
+    /// The access **stored** for it — never the access that was requested.
+    ///
+    /// Importing a read capability over an existing write one does not narrow
+    /// it, so a read request can legitimately report [`CoreLocalAccess::Write`].
+    pub fn access(&self) -> CoreLocalAccess {
+        self.access
+    }
+
+    /// This report's correlation fingerprint. See [`CoreAuthorityFingerprint`]
+    /// for what it does and does not prove.
+    pub fn fingerprint(&self) -> CoreAuthorityFingerprint {
+        CoreAuthorityFingerprint::of(self.namespace, self.access)
+    }
+}
+
 /// The result of retiring local write authority.
 ///
 /// `#[must_use]` because `Busy` is an `Ok` value: `retire(..).await?;` would
@@ -4134,12 +4276,7 @@ pub enum CoreRetireOutcome {
 impl From<RetireWriteAuthorityOutcome> for CoreRetireOutcome {
     fn from(outcome: RetireWriteAuthorityOutcome) -> Self {
         match outcome {
-            RetireWriteAuthorityOutcome::Retired(CapabilityKind::Write) => {
-                CoreRetireOutcome::Retired(CoreLocalAccess::Write)
-            }
-            RetireWriteAuthorityOutcome::Retired(CapabilityKind::Read) => {
-                CoreRetireOutcome::Retired(CoreLocalAccess::Read)
-            }
+            RetireWriteAuthorityOutcome::Retired(kind) => CoreRetireOutcome::Retired(kind.into()),
             RetireWriteAuthorityOutcome::Busy { handles } => CoreRetireOutcome::Busy { handles },
         }
     }
