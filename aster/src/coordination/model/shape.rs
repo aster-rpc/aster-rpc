@@ -119,6 +119,7 @@ shape_limits! {
     MemberSeedTicketInvalid => "a member seed ticket is not a canonical Aster ticket",
     MemberSeedTicketCredential => "a member seed ticket carries a credential",
     MemberSeedTicketNode => "a member seed ticket is for another node",
+    MemberSeedTicketNonCanonical => "a member seed ticket is not its own canonical encoding",
     MembershipNewVoters => "a membership plan adds more than two new voters at once",
 }
 
@@ -253,7 +254,7 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ShapeLimit::ALL.len());
-        assert_eq!(ShapeLimit::ALL.len(), 21, "update this count with the enum");
+        assert_eq!(ShapeLimit::ALL.len(), 22, "update this count with the enum");
         // Every variant has its own description; a shared one would make two
         // different failures read identically in a status message.
         let mut descriptions: Vec<_> = ShapeLimit::ALL.iter().map(|l| l.describe()).collect();

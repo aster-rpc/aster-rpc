@@ -927,11 +927,13 @@ mod tests {
     }
 
     /// A malformed **prefix** cannot create a session identity, so it takes the
-    /// separate rule: `last_applied` advances and nothing else is written. An
-    /// audit row would have to name an actor, and there is no validated one --
-    /// a zeroed NodeId would record an action by a node that does not exist.
+    /// separate rule: `last_applied` advances and one audit row is written, and
+    /// nothing else. Attribution is marked absent rather than invented -- a
+    /// zeroed NodeId would record an action by a node that does not exist -- but
+    /// a separately valid resource identity survives, because a malformed
+    /// client id says nothing about the resource the request named.
     #[test]
-    fn a_malformed_prefix_advances_last_applied_and_writes_nothing_else() {
+    fn a_malformed_prefix_writes_only_its_audit_row_and_last_applied() {
         let mut s = genesis();
         s.last_applied = Some(log(0));
         let before = s.clone();

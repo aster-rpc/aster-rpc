@@ -134,6 +134,10 @@ portable-pty = "0.8"
 crossterm = "0.27"
 # For implementing the RPC ServiceDispatch trait in tests (mirrors the macro).
 async-trait = "0.1"
+# Coordination ticket tests forge a non-canonical ticket -- a reserved header bit
+# set -- to prove apply refuses bytes no encoder produces. The same version core
+# encodes tickets with, so the test and the production encoder agree.
+bs58 = "0.5"
 # For deriving ForyStruct on payload types in rpc tests (the `#[derive(ForyStruct)]`
 # macro emits `::fory_core::` paths, so both are needed in the test crate).
 fory-core = "=1.3.0"

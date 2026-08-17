@@ -454,10 +454,17 @@ pub enum Command {
     /// Deliberately its own rule rather than a case of [`Command::RejectedClient`].
     /// Such an entry names no session -- there is no validated `(actor,
     /// client_id)` to key one by -- so it cannot consume a sequence, save a
-    /// result, or be replayed, and it cannot be audited either: an audit row
-    /// attributes an operation to an actor, and inventing a zero NodeId for one
-    /// would record an action by a node that does not exist. It advances
-    /// `last_applied` and nothing else, identically on every voter.
+    /// result, or be replayed.
+    ///
+    /// It **is** audited. §11.3 requires exactly one audit row for every
+    /// committed user or system command, and a hostile malformed entry is
+    /// precisely the one that must not vanish from the record. Attribution is
+    /// optional rather than invented: an actor id that narrowed is recorded even
+    /// when the client id or request hash did not, a system command records the
+    /// proposing log leader, and only an actor id that will not narrow is stored
+    /// as `None`. So the entry writes its audit row, the matching reserve
+    /// charge, and `last_applied` -- and nothing else -- identically on every
+    /// voter.
     Shapeless(ShapelessCommand),
     Expire(ExpireCommand),
     MembershipProgress(MembershipProgressCommand),

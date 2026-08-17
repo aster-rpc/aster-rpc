@@ -282,8 +282,21 @@ pub fn decide_change(
     request_hash: &[u8; 32],
     action: &ChangeMembershipAction,
 ) -> Decision {
-    // **A retained operation resolves first**, before authorization and before
-    // every check whose answer depends on current replicated state.
+    // §5.2: `change_membership` is administrator-only, and that is a property of
+    // the **method**, not of the plan. It therefore comes before everything
+    // else, including the retained-operation lookup: an earlier revision
+    // resolved a retained id first, so a caller who was never an administrator
+    // -- or whose authority had been revoked -- could read any operation's
+    // status by guessing its id.
+    //
+    // This costs nothing in lost-response handling. A client re-sending a
+    // sequence it already sent is answered by the session classifier from the
+    // saved reply, before any of this runs.
+    if !state.admins.contains(actor) {
+        return Decision::Refuse(RefusalReason::PermissionChanged);
+    }
+
+    // **A retained operation then resolves before state-relative validation.**
     //
     // The order is load-bearing, not stylistic. §9 promises that resubmitting a
     // group-global `operation_id` returns its stored status; an earlier revision
@@ -294,9 +307,7 @@ pub fn decide_change(
     // controller most needs to ask "did my operation finish?".
     //
     // Neither branch mutates membership, and neither grants the caller
-    // authority to start a new operation: this answers about an operation the
-    // group already accepted, which it accepted from an administrator at the
-    // time.
+    // authority to start a new operation.
     if let Some(existing) = state.intents.get(&action.operation_id) {
         if &existing.request_hash == request_hash {
             return Decision::Existing {
@@ -316,10 +327,6 @@ pub fn decide_change(
         state.deployment_profile_code,
     ) {
         return Decision::RefuseShapeless(limit);
-    }
-
-    if !state.admins.contains(actor) {
-        return Decision::Refuse(RefusalReason::PermissionChanged);
     }
 
     // Compared against the committed membership log id, not a synthetic
@@ -442,6 +449,24 @@ fn check_seed_ticket(ticket: &[u8], node: &NodeId) -> Result<(), ShapeLimit> {
     let text = std::str::from_utf8(ticket).map_err(|_| ShapeLimit::MemberSeedTicketInvalid)?;
     let parsed = aster_transport_core::ticket::AsterTicket::from_base58_str(text)
         .map_err(|_| ShapeLimit::MemberSeedTicketInvalid)?;
+
+    // **Parsing is not canonicity.** The core decoder ignores the header's
+    // unused low bits and other reserved space, so a ticket with a reserved bit
+    // set decodes cleanly to the same value -- which would give one route two
+    // spellings, and put bytes into replicated state that no encoder produces.
+    // Re-encoding and comparing is the check: the writer emits exactly one
+    // encoding of a given value, so equality proves the input was that one.
+    //
+    // Done here rather than by tightening the core decoder: that decoder is
+    // shared with every existing ticket consumer, and changing what it accepts
+    // is a far wider change than this rule needs. A stricter rule at the point
+    // where bytes enter replicated state is both narrower and stronger.
+    let canonical = parsed
+        .to_base58_string()
+        .map_err(|_| ShapeLimit::MemberSeedTicketInvalid)?;
+    if canonical != text {
+        return Err(ShapeLimit::MemberSeedTicketNonCanonical);
+    }
 
     // Open only: a route row is replicated group state that every voter and
     // every future snapshot reader holds, so a credential in it is a secret
@@ -1270,6 +1295,69 @@ mod tests {
         );
     }
 
+    // ── Authorization ───────────────────────────────────────────────────────
+
+    /// §5.2 makes `change_membership` administrator-only, and that is a property
+    /// of the **method**, not of the plan. A retained operation is no exception:
+    /// resolving one before the authorization check let a caller who was never
+    /// an administrator -- or whose authority had been revoked -- read any
+    /// operation's status by guessing its id.
+    #[test]
+    fn a_non_administrator_cannot_read_a_retained_operation() {
+        let mut s = base();
+        s.intents
+            .insert(op(1), intent(PHASE_COMPLETED, Some(log(3))));
+
+        // The identical request, which for an administrator returns `Existing`.
+        let action = ChangeMembershipAction {
+            operation_id: op(1),
+            expected_membership_log_id: None,
+            plan: plan(&[1, 2, 3]),
+        };
+        assert_eq!(
+            decide_change(&s, &ADMIN, &[7u8; 32], &action),
+            Decision::Existing {
+                phase: PHASE_COMPLETED
+            },
+            "the fixture must be one an administrator can resolve"
+        );
+        assert_eq!(
+            reason(decide_change(&s, &OTHER, &[7u8; 32], &action)),
+            Reason::PermissionChanged,
+            "a non-administrator learns nothing, not even that the id exists"
+        );
+
+        // The conflict branch is equally closed: a wrong hash under a retained
+        // id must not distinguish "exists" from "does not exist" either.
+        assert_eq!(
+            reason(decide_change(
+                &s,
+                &OTHER,
+                &[9u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: plan(&[1, 2, 3]),
+                }
+            )),
+            Reason::PermissionChanged,
+        );
+        assert_eq!(
+            reason(decide_change(
+                &s,
+                &OTHER,
+                &[9u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(2),
+                    expected_membership_log_id: None,
+                    plan: plan(&[1, 2, 3]),
+                }
+            )),
+            Reason::PermissionChanged,
+            "an unknown id answers identically, so the reply leaks no existence"
+        );
+    }
+
     // ── Retained-operation replay ───────────────────────────────────────────
 
     /// **The replay that stopped working after completion.** §9 promises that
@@ -1422,6 +1510,46 @@ mod tests {
         .expect("encodes")
         .into_bytes();
         assert_eq!(refuse(credentialed), ShapeLimit::MemberSeedTicketCredential);
+
+        // A ticket that decodes to the right value but is **not** its own
+        // canonical encoding. The wire layout is `endpoint_id[32] ||
+        // header(version:4 | relay_type:2 | reserved:2) || ... ||
+        // count(count:4 | reserved:4)`, and the decoder reads neither reserved
+        // field -- so setting a bit in either leaves a ticket that parses to an
+        // identical value. Accepting one would give a single route two
+        // spellings and store bytes no encoder produces.
+        let canonical = test_ticket(&node9);
+        let canonical_text = std::str::from_utf8(&canonical).expect("ascii").to_string();
+        let wire = bs58::decode(canonical_text.strip_prefix("aster1").expect("prefixed"))
+            .into_vec()
+            .expect("base58");
+
+        // Byte 32 is the header (2 reserved bits); byte 33 is the count byte
+        // (4 reserved bits) for a ticket with no relay.
+        for (index, bit, field) in [
+            (32usize, 0b0000_0001u8, "header"),
+            (33, 0b0000_0001, "count"),
+        ] {
+            let mut forged = wire.clone();
+            forged[index] |= bit;
+            let text = format!("aster1{}", bs58::encode(&forged).into_string());
+
+            let reparsed = aster_transport_core::ticket::AsterTicket::from_base58_str(&text)
+                .unwrap_or_else(|e| panic!("{field}: the forgery must still parse: {e}"));
+            assert_eq!(
+                reparsed,
+                aster_transport_core::ticket::AsterTicket::from_base58_str(&canonical_text)
+                    .expect("canonical parses"),
+                "{field}: the forgery must decode to the identical value, or it tests the wrong thing"
+            );
+            assert_ne!(text, canonical_text, "{field}: and differ on the wire");
+
+            assert_eq!(
+                refuse(text.into_bytes()),
+                ShapeLimit::MemberSeedTicketNonCanonical,
+                "{field}: a reserved bit is not a spelling choice"
+            );
+        }
 
         // And the canonical one is accepted, so this is validation rather than
         // a blanket refusal.
