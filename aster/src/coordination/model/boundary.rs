@@ -1017,6 +1017,72 @@ mod tests {
         );
     }
 
+    /// Each mutation-prefix field on its own. The boundary must not be able to
+    /// erase the action's resource merely by taking the shapeless path, so all
+    /// three malformed-prefix cases are checked independently.
+    #[test]
+    fn each_malformed_prefix_field_keeps_the_action_resource() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut ClientCommandV1)>, Option<[u8; 32]>)> = vec![
+            (
+                "actor id",
+                Box::new(|c: &mut ClientCommandV1| c.actor_node_id = vec![0u8; 31]),
+                None,
+            ),
+            (
+                "client id",
+                Box::new(|c: &mut ClientCommandV1| c.client_id = vec![9u8; 8]),
+                Some(ACTOR),
+            ),
+            (
+                "request hash",
+                Box::new(|c: &mut ClientCommandV1| c.request_hash = vec![0u8; 16]),
+                Some(ACTOR),
+            ),
+        ];
+
+        for (index, (name, break_it, expected_actor)) in cases.into_iter().enumerate() {
+            let mut s = genesis();
+            s.last_applied = Some(log(0));
+
+            let mut bad = match client_command(ACTOR, 1, acquire()) {
+                CommandV1::Client(c) => c,
+                other => panic!("expected a client command, got {other:?}"),
+            };
+            break_it(&mut bad);
+            let bad = CommandV1::Client(bad);
+            assert!(
+                matches!(super::command_for_apply(&bad), Ok(Command::Shapeless(_))),
+                "{name}: the fixture must take the shapeless path"
+            );
+
+            let index = index as u64 + 1;
+            let reply = apply_wire_command(&mut s, log(index), &GROUP, &bad).expect("no fault");
+            match &reply {
+                CommandReplyV1::Client(r) => {
+                    assert_eq!(
+                        (r.disposition_code, r.outcome_code, r.reason_code),
+                        (2, 100, 0)
+                    );
+                    let snapshot = r
+                        .snapshot
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{name}: the reply keeps the valid resource"));
+                    assert_eq!(snapshot.resource, wire_key(), "{name}");
+                }
+                other => panic!("expected a client reply, got {other:?}"),
+            }
+
+            let audited = s.audit.get(&(1, index)).expect("audited");
+            assert_eq!(
+                audited.resource,
+                Some(key()),
+                "{name}: a malformed prefix field says nothing about the resource"
+            );
+            assert_eq!(audited.actor, expected_actor, "{name}: attribution");
+            assert!(s.sessions.is_empty(), "{name}: no session identity");
+        }
+    }
+
     /// Every malformed system command reports **its own** code. Sharing one
     /// generic reply told an operator a malformed expiry was a membership phase
     /// problem.
