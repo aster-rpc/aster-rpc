@@ -29,7 +29,7 @@ rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros"
 # Verify the direct edges with `cargo tree -p aster --no-default-features
 # --depth 1` and the full feature graph with `-e features`.
 coordination-client = ["rpc", "dep:blake3"]
-coordination = ["coordination-client", "dep:openraft", "dep:redb"]
+coordination = ["coordination-client", "dep:openraft", "dep:redb", "dep:ed25519-dalek"]
 discovery = []
 hooks = []
 metrics = []
@@ -85,6 +85,10 @@ openraft = { version = "=0.9.25", default-features = false, features = [
 # subsystem uses redb rather than rusqlite, where `links = "sqlite3"` makes two
 # versions a hard build failure.)
 redb = { version = "=4.1.0", optional = true }
+# §7.1 signed genesis/join verification. Exact pin, and the same version the
+# transport core already uses, so one Ed25519 implementation verifies every
+# Aster signature rather than two that could disagree.
+ed25519-dalek = { version = "=3.0.0-rc.0", optional = true }
 # JSON for root public-key files and, with `rpc`, registry manifests.
 serde_json = "1"
 toml = "0.8"

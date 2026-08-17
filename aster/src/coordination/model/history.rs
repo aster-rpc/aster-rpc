@@ -67,6 +67,11 @@ fn genesis() -> State {
     let mut s = State::default();
     s.admins.insert(ADMIN);
     s.admin_revision = 1;
+    // A group that is already running: §12.1 allows at most two new voters per
+    // change, so a history starting from an empty membership could not accept
+    // the three-voter plans it generates.
+    s.authority = crate::coordination::model::authority::testing::authority();
+    s.members = (1u8..=3).map(|b| [b; 32]).collect();
     for n in 0..3u8 {
         for actor in [ALICE, BOB] {
             s.acl.insert((key(n), actor), ALL_RIGHTS);
@@ -171,11 +176,13 @@ fn step(state: &State, n: u64) -> Step {
                 // §9: every new node is seeded, sorted by node id, and a new
                 // node's seed carries a join permit. The generator's plan never
                 // matches the committed membership, so all three are new.
+                // The generator's plan is always the committed membership, so
+                // no seed is a join and none carries a permit.
                 member_seeds: (1u8..=3)
                     .map(|b| MemberSeed {
                         node_id: [b; 32],
                         ticket: vec![n as u8; 16],
-                        join_permit: Some(vec![0xEEu8; 64]),
+                        join_permit: None,
                     })
                     .collect(),
             },
@@ -797,8 +804,12 @@ fn membership_intents_transition_and_stay_within_their_cap() {
                             .map(|b| MemberSeed {
                                 node_id: [b; 32],
                                 ticket: b"aster1ticket".to_vec(),
-                                join_permit: (!members.contains(&[b; 32]))
-                                    .then(|| vec![0xEEu8; 64]),
+                                join_permit: (!members.contains(&[b; 32])).then(|| {
+                                    crate::coordination::model::authority::testing::valid(
+                                        &[b; 32],
+                                        b"aster1ticket",
+                                    )
+                                }),
                             })
                             .collect(),
                     },

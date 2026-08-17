@@ -251,6 +251,7 @@ dependencies = [
  "base64",
  "blake3",
  "crossterm",
+ "ed25519-dalek 3.0.0-rc.0",
  "fory-core",
  "fory-derive",
  "getrandom 0.2.17",

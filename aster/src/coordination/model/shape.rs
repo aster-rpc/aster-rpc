@@ -115,6 +115,8 @@ shape_limits! {
     MembershipPlanOrder => "a membership plan node vector is not sorted and unique",
     MemberSeedUnknownNode => "a member seed names a node the plan does not contain",
     MemberSeedPermit => "a member seed's join permit does not match its node's status",
+    MemberSeedTicketEmpty => "a member seed carries no ticket",
+    MembershipNewVoters => "a membership plan adds more than two new voters at once",
 }
 
 /// Validate a raw `(namespace, key)` into the durable key type.
@@ -160,6 +162,14 @@ pub const MIN_VOTERS: usize = 3;
 pub const MAX_VOTERS: usize = 5;
 pub const MAX_RETAINED_LEARNERS: usize = 2;
 
+/// §12.1: at most two **new** voter identities per change.
+///
+/// The bound §12.1's `max_encoded_command` arithmetic assumes, and the reason a
+/// `ChangeMembership` is bounded at all: each new voter carries a ticket and a
+/// signed join permit. It also keeps a single change from replacing a quorum
+/// outright, which is a membership change no surviving voter voted for.
+pub const MAX_NEW_VOTERS: usize = 2;
+
 /// Check a membership plan's shape.
 ///
 /// A production plan targets exactly 3 or 5 voters -- never an even set, which
@@ -168,6 +178,11 @@ pub const MAX_RETAINED_LEARNERS: usize = 2;
 pub fn check_membership_plan(voters: usize, retained_learners: usize) -> Option<ShapeLimit> {
     let sized = voters == MIN_VOTERS || voters == MAX_VOTERS;
     (!sized || retained_learners > MAX_RETAINED_LEARNERS).then_some(ShapeLimit::MembershipPlanSize)
+}
+
+/// How many voters in `desired` are not already committed members?
+pub fn new_voters(desired: &[[u8; 32]], current: &std::collections::BTreeSet<[u8; 32]>) -> usize {
+    desired.iter().filter(|v| !current.contains(*v)).count()
 }
 
 /// Is a node-id vector sorted and free of duplicates?
@@ -203,7 +218,7 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ShapeLimit::ALL.len());
-        assert_eq!(ShapeLimit::ALL.len(), 16, "update this count with the enum");
+        assert_eq!(ShapeLimit::ALL.len(), 18, "update this count with the enum");
         // Every variant has its own description; a shared one would make two
         // different failures read identically in a status message.
         let mut descriptions: Vec<_> = ShapeLimit::ALL.iter().map(|l| l.describe()).collect();

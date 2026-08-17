@@ -581,6 +581,10 @@ mod tests {
         let mut s = State::default();
         s.admins.insert(ADMIN);
         s.admin_revision = 1;
+        // A running group: §12.1 allows at most two new voters per change, so a
+        // membership fixture cannot start from an empty committed set.
+        s.authority = crate::coordination::model::authority::testing::authority();
+        s.members = (1u8..=3).map(|b| [b; 32]).collect();
         s.acl.insert((key(), ACTOR), ALL_RIGHTS);
         s.growth_bytes = s.recompute_growth();
         s.reserve_bytes = s.recompute_reserve();
@@ -1654,14 +1658,14 @@ mod tests {
                     },
                 ],
                 retained_learners: Vec::new(),
-                // §9: every new node is seeded, and a new node's seed carries a
-                // join permit. All three are new against an empty committed
-                // membership.
+                // §9: every node in the plan is seeded. These three are the
+                // committed membership -- see `genesis()` -- so their seeds
+                // refresh route material and carry no join permit.
                 member_seeds: (1u8..=3)
                     .map(|b| MemberSeedV1 {
                         node_id: vec![b; 32],
                         ticket: "aster1ticket".into(),
-                        signed_join_permit: Some(vec![0xEEu8; 64]),
+                        signed_join_permit: None,
                     })
                     .collect(),
             }),

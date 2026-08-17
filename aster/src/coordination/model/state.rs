@@ -368,6 +368,21 @@ impl LogId {
     }
 }
 
+/// The group's §7.1 verification inputs, from §11's `CoordinationMetaV1`.
+///
+/// Replicated rather than configured at each voter: apply must reach the same
+/// verdict on every node, and a per-node configuration value would let two
+/// voters disagree about whether a permit is valid. The **key** is still pinned
+/// by configuration at startup (§3.3); this is the copy the state machine
+/// decides against, and startup refuses to proceed if the two disagree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupAuthority {
+    pub public_key: [u8; 32],
+    pub domain: String,
+    pub group_id: [u8; 32],
+    pub genesis_hash: [u8; 32],
+}
+
 /// The complete replicated state.
 ///
 /// `PartialEq` is derived deliberately: tests that assert "nothing changed"
@@ -410,6 +425,8 @@ pub struct State {
     /// Maintained incrementally. MUST equal [`State::recompute_reserve`].
     pub reserve_bytes: u64,
     pub admin_revision: u64,
+    /// The §7.1 material every signed document is verified against.
+    pub authority: GroupAuthority,
     /// The current committed voter and learner set.
     ///
     /// Kept beside the log id because §9 protects a route for a node **in the

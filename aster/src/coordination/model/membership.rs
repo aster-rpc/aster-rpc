@@ -34,9 +34,12 @@
 
 use std::collections::BTreeSet;
 
+use super::authority;
 use super::limits::{charge_intent, charge_route, MAX_RETAINED_INTENTS, MAX_RETAINED_ROUTES};
 use super::shape::{self, ShapeLimit};
-use super::state::{Intent, LogId, MembershipPlan, NodeId, OperationId, Route, State};
+use super::state::{
+    GroupAuthority, Intent, LogId, MembershipPlan, NodeId, OperationId, Route, State,
+};
 use crate::coordination::contract::{SYS_MEMBERSHIP_ADVANCED, SYS_MEMBERSHIP_PHASE_MISMATCH};
 use crate::coordination::reason::{Outcome, RefusalReason};
 
@@ -129,7 +132,11 @@ pub enum Decision {
 /// means -- and therefore which seeds must carry a join permit. Passing it in
 /// rather than reading state here keeps the function a pure predicate over the
 /// two things it compares.
-fn plan_shape(plan: &MembershipPlan, current_members: &BTreeSet<NodeId>) -> Option<ShapeLimit> {
+fn plan_shape(
+    plan: &MembershipPlan,
+    current_members: &BTreeSet<NodeId>,
+    authority_material: &GroupAuthority,
+) -> Option<ShapeLimit> {
     if let Some(limit) =
         shape::check_membership_plan(plan.desired_voters.len(), plan.retained_learners.len())
     {
@@ -156,6 +163,14 @@ fn plan_shape(plan: &MembershipPlan, current_members: &BTreeSet<NodeId>) -> Opti
         return Some(ShapeLimit::MembershipPlanOrder);
     }
 
+    // §12.1: at most two new voter identities per change. Without it a single
+    // command replaces an entire quorum -- a membership no surviving voter voted
+    // for -- and `max_encoded_command`'s sizing, which assumes two new seeds,
+    // stops describing the worst case.
+    if shape::new_voters(&plan.desired_voters, current_members) > shape::MAX_NEW_VOTERS {
+        return Some(ShapeLimit::MembershipNewVoters);
+    }
+
     let in_plan =
         |node: &NodeId| plan.desired_voters.contains(node) || plan.retained_learners.contains(node);
     for seed in &plan.member_seeds {
@@ -173,13 +188,32 @@ fn plan_shape(plan: &MembershipPlan, current_members: &BTreeSet<NodeId>) -> Opti
         if !in_plan(&seed.node_id) {
             return Some(ShapeLimit::MemberSeedUnknownNode);
         }
+        // A seed with no ticket is route material that routes nowhere; §12.1
+        // charges a route row for it either way.
+        if seed.ticket.is_empty() {
+            return Some(ShapeLimit::MemberSeedTicketEmpty);
+        }
         // §9: a valid signed join permit is mandatory exactly for a new node and
-        // absent for an existing member. (Verifying the signature is §7.1's
-        // job -- it needs the authority key, which the state machine does not
-        // hold. What apply can decide deterministically is presence.)
+        // absent for an existing member -- and **valid** means verified, not
+        // present. An earlier revision checked presence and length only, so
+        // `Some(vec![])` was a permit, as was one minted for another node,
+        // group, genesis or deployment.
         let is_new = !current_members.contains(&seed.node_id);
-        if is_new != seed.join_permit.is_some() {
-            return Some(ShapeLimit::MemberSeedPermit);
+        match (is_new, &seed.join_permit) {
+            (true, Some(permit)) => {
+                if authority::verify_join_permit(
+                    authority_material,
+                    permit,
+                    &seed.node_id,
+                    &seed.ticket,
+                )
+                .is_err()
+                {
+                    return Some(ShapeLimit::MemberSeedPermit);
+                }
+            }
+            (false, None) => {}
+            _ => return Some(ShapeLimit::MemberSeedPermit),
         }
     }
 
@@ -236,7 +270,7 @@ pub fn decide_change(
     // §12.1 request-shape bounds, checked before anything is decided against
     // replicated state: a plan outside the v1 shape was never a well-posed
     // request. These were declared and had no caller.
-    if let Some(limit) = plan_shape(&action.plan, &state.members) {
+    if let Some(limit) = plan_shape(&action.plan, &state.members, &state.authority) {
         return Decision::RefuseShapeless(limit);
     }
 
@@ -566,12 +600,35 @@ mod tests {
         LogId::new(1, LEADER, index)
     }
 
+    /// A group that is already running: three committed voters and an installed
+    /// authority.
+    ///
+    /// Not an empty membership, because §12.1 allows at most two **new** voters
+    /// per change -- a group's first three come from signed genesis at
+    /// `initialize`, never from a `change_membership` command, so a fixture
+    /// starting empty would be modelling a change the contract forbids.
     fn base() -> State {
         let mut s = State::default();
         s.admins.insert(ADMIN);
         s.admin_revision = 1;
+        s.authority = authority::testing::authority();
+        s.members = nodes(&[1, 2, 3]).into_iter().collect();
         s.growth_bytes = s.recompute_growth();
         s
+    }
+
+    fn nodes(ids: &[u8]) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = ids
+            .iter()
+            .map(|b| {
+                let mut id = [0u8; 32];
+                id[0] = *b;
+                id
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// A §9-legal plan: exactly three voters, sorted and unique, each seeded.
@@ -581,8 +638,14 @@ mod tests {
     /// three are new, and each seed carries the join permit a new node must
     /// have. `voters` seeds their ids and is padded and sorted, so a fixture
     /// cannot accidentally build a shape the contract forbids.
+    /// A plan that replaces voter 3 with a genuinely new node, seeded with a
+    /// real signed permit.
+    fn plan_adding(new: u8) -> MembershipPlan {
+        plan_against(&[1, 2, new], &nodes(&[1, 2, 3]).into_iter().collect())
+    }
+
     fn plan(voters: &[u8]) -> MembershipPlan {
-        plan_against(voters, &BTreeSet::new())
+        plan_against(voters, &nodes(&[1, 2, 3]).into_iter().collect())
     }
 
     /// The same, against a stated committed membership: a node already in it is
@@ -612,7 +675,11 @@ mod tests {
                 .map(|node| MemberSeed {
                     node_id: *node,
                     ticket: b"aster1ticket".to_vec(),
-                    join_permit: (!members.contains(node)).then(|| vec![0xEEu8; 64]),
+                    // A **real** signed permit for a new node, so a negative
+                    // test differs from this one by exactly the field under
+                    // test rather than by being unsigned.
+                    join_permit: (!members.contains(node))
+                        .then(|| authority::testing::valid(node, b"aster1ticket")),
                 })
                 .collect(),
         }
@@ -825,11 +892,101 @@ mod tests {
     /// other through.
     #[test]
     fn a_join_permit_is_required_exactly_for_a_new_node() {
-        let mut s = base();
+        let s = base();
+        let refuse = |p: MembershipPlan| {
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: p,
+                },
+            ))
+        };
 
-        // New node, no permit.
+        // A new node with no permit at all.
+        let mut p = plan_adding(9);
+        p.member_seeds
+            .iter_mut()
+            .find(|s| s.node_id[0] == 9)
+            .expect("the new node is seeded")
+            .join_permit = None;
+        assert_eq!(refuse(p), ShapeLimit::MemberSeedPermit);
+
+        // A new node with an **empty** permit -- the case the old presence
+        // check accepted outright.
+        let mut p = plan_adding(9);
+        p.member_seeds
+            .iter_mut()
+            .find(|s| s.node_id[0] == 9)
+            .expect("the new node is seeded")
+            .join_permit = Some(Vec::new());
+        assert_eq!(refuse(p), ShapeLimit::MemberSeedPermit);
+
+        // A new node carrying a **valid permit for another node**: correctly
+        // signed by this group's authority, and still not this node's.
+        let mut p = plan_adding(9);
+        let mut other = [0u8; 32];
+        other[0] = 8;
+        p.member_seeds
+            .iter_mut()
+            .find(|s| s.node_id[0] == 9)
+            .expect("the new node is seeded")
+            .join_permit = Some(authority::testing::valid(&other, b"aster1ticket"));
+        assert_eq!(refuse(p), ShapeLimit::MemberSeedPermit);
+
+        // A permit for the right node bound to a **different ticket**.
+        let mut p = plan_adding(9);
+        let seed = p
+            .member_seeds
+            .iter_mut()
+            .find(|s| s.node_id[0] == 9)
+            .expect("the new node is seeded");
+        let mut node9 = [0u8; 32];
+        node9[0] = 9;
+        seed.join_permit = Some(authority::testing::valid(&node9, b"aster1elsewhere"));
+        assert_eq!(refuse(p), ShapeLimit::MemberSeedPermit);
+
+        // An existing member carrying a permit: a permit authorises a **join**,
+        // and an incumbent is not joining.
         let mut p = plan(&[1, 2, 3]);
-        p.member_seeds[0].join_permit = None;
+        p.member_seeds[0].join_permit = Some(authority::testing::valid(
+            &p.member_seeds[0].node_id,
+            b"aster1ticket",
+        ));
+        assert_eq!(refuse(p), ShapeLimit::MemberSeedPermit);
+
+        // And the two correct forms are accepted, so the rule is a
+        // correspondence rather than a blanket refusal.
+        for p in [plan(&[1, 2, 3]), plan_adding(9)] {
+            assert!(
+                matches!(
+                    decide_change(
+                        &s,
+                        &ADMIN,
+                        &[7u8; 32],
+                        &ChangeMembershipAction {
+                            operation_id: op(1),
+                            expected_membership_log_id: None,
+                            plan: p,
+                        }
+                    ),
+                    Decision::Apply(_)
+                ),
+                "a correctly seeded plan is accepted"
+            );
+        }
+    }
+
+    /// §12.1: at most two **new** voter identities per change. Three at once
+    /// replaces a quorum with nodes no surviving voter voted for.
+    #[test]
+    fn a_change_cannot_add_more_than_two_new_voters() {
+        let s = base();
+        // All three voters replaced.
+        let p = plan_against(&[7, 8, 9], &s.members);
         assert_eq!(
             shapeless(decide_change(
                 &s,
@@ -841,28 +998,10 @@ mod tests {
                     plan: p,
                 }
             )),
-            ShapeLimit::MemberSeedPermit,
+            ShapeLimit::MembershipNewVoters,
         );
 
-        // Existing member, permit present.
-        let committed = plan(&[1, 2, 3]);
-        s.members = committed.desired_voters.iter().copied().collect();
-        assert_eq!(
-            shapeless(decide_change(
-                &s,
-                &ADMIN,
-                &[7u8; 32],
-                &ChangeMembershipAction {
-                    operation_id: op(1),
-                    expected_membership_log_id: None,
-                    plan: committed,
-                }
-            )),
-            ShapeLimit::MemberSeedPermit,
-        );
-
-        // The same plan with permits dropped is accepted, so the rule is a
-        // correspondence and not a blanket refusal.
+        // Two is the boundary, and it is accepted.
         assert!(matches!(
             decide_change(
                 &s,
@@ -871,11 +1010,33 @@ mod tests {
                 &ChangeMembershipAction {
                     operation_id: op(1),
                     expected_membership_log_id: None,
-                    plan: plan_against(&[1, 2, 3], &s.members),
+                    plan: plan_against(&[1, 8, 9], &s.members),
                 }
             ),
             Decision::Apply(_)
         ));
+    }
+
+    /// A seed with no ticket is route material that routes nowhere, and §12.1
+    /// charges a route row for it regardless.
+    #[test]
+    fn a_seed_with_an_empty_ticket_is_refused() {
+        let s = base();
+        let mut p = plan(&[1, 2, 3]);
+        p.member_seeds[0].ticket = Vec::new();
+        assert_eq!(
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: p,
+                }
+            )),
+            ShapeLimit::MemberSeedTicketEmpty,
+        );
     }
 
     /// §9: every new node must be seeded, or the group commits a membership
@@ -883,8 +1044,8 @@ mod tests {
     #[test]
     fn a_new_node_without_a_seed_is_refused() {
         let s = base();
-        let mut p = plan(&[1, 2, 3]);
-        p.member_seeds.remove(0);
+        let mut p = plan_adding(9);
+        p.member_seeds.retain(|s| s.node_id[0] != 9);
         assert_eq!(
             shapeless(decide_change(
                 &s,
@@ -1291,7 +1452,12 @@ mod tests {
         let mut s = base();
         s.intents.insert(op(1), intent(PHASE_ADDING_LEARNERS, None));
         assert_eq!(
-            decide_change(&s, &ADMIN, &[7u8; 32], &change(op(1), &[9], Some(log(99)))),
+            decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &change(op(1), &[1, 2, 3], Some(log(99)))
+            ),
             Decision::Existing {
                 phase: PHASE_ADDING_LEARNERS
             },
