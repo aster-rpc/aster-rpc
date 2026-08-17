@@ -6,8 +6,8 @@ use crate::id::{AuthorId, Hash, NamespaceId, NamespaceSecret, NodeId, SecretKey}
 use std::time::Duration;
 
 use aster_transport_core::{
-    CoreDoc, CoreDocEntry, CoreDocEvent, CoreDocEventReceiver, CoreDocsClient, CoreDownloadPolicy,
-    CoreLocalAccess, CoreRetireOutcome,
+    CoreAuthorityFingerprint, CoreAuthorityReport, CoreDoc, CoreDocEntry, CoreDocEvent,
+    CoreDocEventReceiver, CoreDocsClient, CoreDownloadPolicy, CoreLocalAccess, CoreRetireOutcome,
 };
 
 /// The default-docs [`AuthorId`] for a node with this secret — the same value
@@ -200,15 +200,111 @@ pub enum RetireOutcome {
     },
 }
 
+/// A stable, opaque correlation value over `(namespace, stored access)`.
+///
+/// **Correlation, not evidence.** A namespace id is the namespace public key,
+/// and a write capability is the one secret behind it — so `(namespace,
+/// access)` already identifies every capability this node can hold for that
+/// namespace, and this hash tells a caller nothing that comparing those two
+/// fields would not. It exists so a caller holding a grant record can compare
+/// one value instead of two, and so a future capability type carrying material
+/// that pair does not determine has a versioned slot to grow into.
+///
+/// The stored-role lookup reads only `(namespace, kind)` and deliberately needs
+/// nothing more: that pair already determines the observable authority
+/// identity, so no secret material is read, exposed, or required to answer the
+/// question. What follows from that is a limit worth stating plainly — the
+/// fingerprint cannot detect same-role secret replacement within a namespace,
+/// because nothing in the observable pair changes when that happens.
+///
+/// It does **not** cover secret material — the report never reads the secret
+/// back — and it cannot detect authority material changing at the same role,
+/// because the current capability model cannot represent that.
+///
+/// The algorithm is BLAKE3 over a domain separator, the 32-byte namespace id,
+/// and one access byte (`Write` = 1, `Read` = 2). The domain string carries the
+/// version, so a later definition can never collide with this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorityFingerprint(CoreAuthorityFingerprint);
+
+impl AuthorityFingerprint {
+    /// Fingerprint a namespace and access pair.
+    ///
+    /// Public so a caller can derive the same value from its own grant record
+    /// and compare it against a report without reimplementing the algorithm.
+    pub fn of(namespace: NamespaceId, access: LocalAccess) -> Self {
+        Self(CoreAuthorityFingerprint::of(
+            namespace.to_bytes(),
+            access.into(),
+        ))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+
+    pub fn to_hex(&self) -> String {
+        self.0.to_hex()
+    }
+}
+
+/// What this node actually holds over a namespace, read back from the store.
+///
+/// Obtained from [`Docs::authority_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityReport(CoreAuthorityReport);
+
+impl AuthorityReport {
+    /// The namespace this report is about.
+    ///
+    /// From [`Doc::authority_report`] this is the open document's own
+    /// namespace. From [`Docs::authority_report`] it is the namespace the
+    /// caller named — the same value it passed in, echoed for convenience, not
+    /// independent evidence about any handle the caller holds.
+    pub fn namespace(&self) -> NamespaceId {
+        NamespaceId::from_bytes(self.0.namespace())
+    }
+
+    /// The access **stored** for it — never the access that was requested.
+    pub fn access(&self) -> LocalAccess {
+        self.0.access().into()
+    }
+
+    /// This report's correlation fingerprint. See [`AuthorityFingerprint`] for
+    /// what it does and does not prove.
+    pub fn fingerprint(&self) -> AuthorityFingerprint {
+        AuthorityFingerprint(self.0.fingerprint())
+    }
+}
+
+impl From<CoreAuthorityReport> for AuthorityReport {
+    fn from(report: CoreAuthorityReport) -> Self {
+        Self(report)
+    }
+}
+
+impl From<CoreLocalAccess> for LocalAccess {
+    fn from(access: CoreLocalAccess) -> Self {
+        match access {
+            CoreLocalAccess::Write => LocalAccess::Write,
+            CoreLocalAccess::Read => LocalAccess::Read,
+        }
+    }
+}
+
+impl From<LocalAccess> for CoreLocalAccess {
+    fn from(access: LocalAccess) -> Self {
+        match access {
+            LocalAccess::Write => CoreLocalAccess::Write,
+            LocalAccess::Read => CoreLocalAccess::Read,
+        }
+    }
+}
+
 impl From<CoreRetireOutcome> for RetireOutcome {
     fn from(outcome: CoreRetireOutcome) -> Self {
         match outcome {
-            CoreRetireOutcome::Retired(CoreLocalAccess::Write) => {
-                RetireOutcome::Retired(LocalAccess::Write)
-            }
-            CoreRetireOutcome::Retired(CoreLocalAccess::Read) => {
-                RetireOutcome::Retired(LocalAccess::Read)
-            }
+            CoreRetireOutcome::Retired(access) => RetireOutcome::Retired(access.into()),
             CoreRetireOutcome::Busy { handles } => RetireOutcome::Busy { handles },
         }
     }
@@ -246,7 +342,7 @@ impl Docs {
 
     /// Create a new document with a fresh random namespace.
     pub async fn create(&self) -> Result<Doc> {
-        Ok(Doc::new(self.inner.create().await?))
+        Ok(Doc::new(self.inner.create().await?, self.inner.clone()))
     }
 
     /// Create a new random author; returns its id.
@@ -266,7 +362,11 @@ impl Docs {
     /// Reopen a namespace already present in the local replica. Returns `None`
     /// if it isn't present (use an `open_or_import_*` method to bootstrap one).
     pub async fn open(&self, id: NamespaceId) -> Result<Option<Doc>> {
-        Ok(self.inner.open(id.to_hex()).await?.map(Doc::new))
+        Ok(self
+            .inner
+            .open(id.to_hex())
+            .await?
+            .map(|d| Doc::new(d, self.inner.clone())))
     }
 
     /// Open-or-import a **writable** namespace from a deterministic 32-byte
@@ -277,6 +377,7 @@ impl Docs {
             self.inner
                 .import_write_namespace(secret.to_bytes().to_vec())
                 .await?,
+            self.inner.clone(),
         ))
     }
 
@@ -304,6 +405,32 @@ impl Docs {
             .into())
     }
 
+    /// Report the authority this node holds over the namespace `id` **names**.
+    ///
+    /// Read back from the local store *after* any import or merge, so the
+    /// access is what this node may do rather than what it asked for. Because
+    /// [`Self::open_or_import_read_namespace`] never narrows an existing write
+    /// capability, a read request over a locally writable namespace correctly
+    /// reports [`LocalAccess::Write`].
+    ///
+    /// **This is keyed by the argument, not by an open document.** The returned
+    /// namespace is the one that was asked about, so this cannot on its own
+    /// establish that some [`Doc`] a caller holds is that namespace. A caller
+    /// gating on a specific open document wants [`Doc::authority_report`],
+    /// which takes the namespace from the document itself; using this instead
+    /// means independently comparing [`Doc::id`].
+    ///
+    /// Errors if the namespace is not in the local store. That is deliberate:
+    /// a caller uses this to decide whether it may serve a namespace, and
+    /// "cannot prove" must not arrive in the same shape as "proved read-only".
+    pub async fn authority_report(&self, id: NamespaceId) -> Result<AuthorityReport> {
+        Ok(self
+            .inner
+            .authority_report(id.to_bytes().to_vec())
+            .await?
+            .into())
+    }
+
     /// Open-or-import a **read-only** namespace from its public id. Idempotent;
     /// never downgrades an existing write capability.
     pub async fn open_or_import_read_namespace(&self, id: NamespaceId) -> Result<Doc> {
@@ -311,18 +438,22 @@ impl Docs {
             self.inner
                 .import_read_namespace(id.to_bytes().to_vec())
                 .await?,
+            self.inner.clone(),
         ))
     }
 
     /// Join a document from a ticket string.
     pub async fn join(&self, ticket: impl Into<String>) -> Result<Doc> {
-        Ok(Doc::new(self.inner.join(ticket.into()).await?))
+        Ok(Doc::new(
+            self.inner.join(ticket.into()).await?,
+            self.inner.clone(),
+        ))
     }
 
     /// Join a document from a ticket and subscribe to live events atomically.
     pub async fn join_and_subscribe(&self, ticket: impl Into<String>) -> Result<(Doc, DocEvents)> {
         let (doc, events) = self.inner.join_and_subscribe(ticket.into()).await?;
-        Ok((Doc::new(doc), DocEvents::new(events)))
+        Ok((Doc::new(doc, self.inner.clone()), DocEvents::new(events)))
     }
 
     /// Join a document by namespace id, syncing from `peer`, and subscribe.
@@ -335,7 +466,7 @@ impl Docs {
             .inner
             .join_and_subscribe_namespace(id.to_hex(), peer.as_str().to_string())
             .await?;
-        Ok((Doc::new(doc), DocEvents::new(events)))
+        Ok((Doc::new(doc, self.inner.clone()), DocEvents::new(events)))
     }
 }
 
@@ -343,11 +474,33 @@ impl Docs {
 #[derive(Clone)]
 pub struct Doc {
     inner: CoreDoc,
+    /// Kept so [`Doc::authority_report`] can answer for *this* document rather
+    /// than for a namespace the caller names. Cheap to clone.
+    docs: CoreDocsClient,
 }
 
 impl Doc {
-    fn new(inner: CoreDoc) -> Self {
-        Self { inner }
+    fn new(inner: CoreDoc, docs: CoreDocsClient) -> Self {
+        Self { inner, docs }
+    }
+
+    /// Report the authority this node actually holds over **this** document.
+    ///
+    /// The namespace is taken from the open document, not from an argument, so
+    /// the report cannot describe some other namespace: what it answers about
+    /// and what the caller holds a handle to are the same thing by
+    /// construction.
+    ///
+    /// The access is read back from the local store after any import or merge.
+    /// Because [`Docs::open_or_import_read_namespace`] never narrows an existing
+    /// write capability, a document opened read-only over a locally writable
+    /// namespace correctly reports [`LocalAccess::Write`].
+    pub async fn authority_report(&self) -> Result<AuthorityReport> {
+        Ok(self
+            .docs
+            .authority_report(self.id()?.to_bytes().to_vec())
+            .await?
+            .into())
     }
 
     /// This document's namespace id.
