@@ -39,6 +39,70 @@ async fn write_authority_reports_write() {
     node.shutdown().await;
 }
 
+/// The `Doc`-bound report answers for the document it is called on.
+///
+/// This is the binding that matters for a caller gating on a specific open
+/// handle: the namespace comes from the document, so the report cannot be
+/// about some other namespace. `Docs::authority_report(id)` echoes the `id` it
+/// was given and therefore proves nothing about any handle on its own.
+#[tokio::test]
+async fn the_doc_bound_report_answers_for_that_doc() {
+    let node = mem_node().await;
+    let write_secret = NamespaceSecret::from_bytes([0x51u8; 32]);
+    let write_id = write_secret.id();
+    let read_id = NamespaceSecret::from_bytes([0x52u8; 32]).id();
+
+    let write_doc = node
+        .docs()
+        .open_or_import_write_namespace(write_secret)
+        .await
+        .unwrap();
+    let read_doc = node
+        .docs()
+        .open_or_import_read_namespace(read_id)
+        .await
+        .unwrap();
+
+    let from_write = write_doc.authority_report().await.unwrap();
+    let from_read = read_doc.authority_report().await.unwrap();
+
+    assert_eq!(from_write.namespace(), write_id);
+    assert_eq!(from_write.access(), LocalAccess::Write);
+    assert_eq!(from_read.namespace(), read_id);
+    assert_eq!(from_read.access(), LocalAccess::Read);
+
+    // Two handles open at once, each reporting its own namespace — the report
+    // follows the document, not the most recent call or some ambient state.
+    assert_ne!(from_write.namespace(), from_read.namespace());
+    assert_ne!(from_write.fingerprint(), from_read.fingerprint());
+    node.shutdown().await;
+}
+
+/// The `Doc`-bound report tracks the store, not the open mode, in the same way
+/// the namespace-keyed one does.
+#[tokio::test]
+async fn a_read_opened_doc_still_reports_stored_write() {
+    let node = mem_node().await;
+    let secret = NamespaceSecret::from_bytes([0x53u8; 32]);
+    let id = secret.id();
+
+    let _write_doc = node
+        .docs()
+        .open_or_import_write_namespace(secret)
+        .await
+        .unwrap();
+    let read_doc = node.docs().open_or_import_read_namespace(id).await.unwrap();
+
+    let report = read_doc.authority_report().await.unwrap();
+    assert_eq!(
+        report.access(),
+        LocalAccess::Write,
+        "the handle was opened read-only, the store holds write, and the \
+         report follows the store",
+    );
+    node.shutdown().await;
+}
+
 /// A genuinely read-only namespace reports read.
 #[tokio::test]
 async fn read_authority_reports_read() {
