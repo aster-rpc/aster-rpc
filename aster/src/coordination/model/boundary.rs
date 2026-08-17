@@ -1022,25 +1022,38 @@ mod tests {
     /// three malformed-prefix cases are checked independently.
     #[test]
     fn each_malformed_prefix_field_keeps_the_action_resource() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut ClientCommandV1)>, Option<[u8; 32]>)> = vec![
-            (
-                "actor id",
-                Box::new(|c: &mut ClientCommandV1| c.actor_node_id = vec![0u8; 31]),
-                None,
-            ),
-            (
-                "client id",
-                Box::new(|c: &mut ClientCommandV1| c.client_id = vec![9u8; 8]),
-                Some(ACTOR),
-            ),
-            (
-                "request hash",
-                Box::new(|c: &mut ClientCommandV1| c.request_hash = vec![0u8; 16]),
-                Some(ACTOR),
-            ),
+        /// One malformed-prefix case: what to break, and who should still be
+        /// attributable afterwards.
+        struct Case {
+            name: &'static str,
+            break_it: fn(&mut ClientCommandV1),
+            expected_actor: Option<[u8; 32]>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "actor id",
+                break_it: |c| c.actor_node_id = vec![0u8; 31],
+                expected_actor: None,
+            },
+            Case {
+                name: "client id",
+                break_it: |c| c.client_id = vec![9u8; 8],
+                expected_actor: Some(ACTOR),
+            },
+            Case {
+                name: "request hash",
+                break_it: |c| c.request_hash = vec![0u8; 16],
+                expected_actor: Some(ACTOR),
+            },
         ];
 
-        for (index, (name, break_it, expected_actor)) in cases.into_iter().enumerate() {
+        for (index, case) in cases.into_iter().enumerate() {
+            let Case {
+                name,
+                break_it,
+                expected_actor,
+            } = case;
             let mut s = genesis();
             s.last_applied = Some(log(0));
 
