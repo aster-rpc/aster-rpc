@@ -106,7 +106,10 @@ impl From<&AuditRow> for AuditRowV1 {
     fn from(row: &AuditRow) -> Self {
         AuditRowV1 {
             leader_node_id: row.leader_node_id.to_vec(),
-            actor_node_id: row.actor.to_vec(),
+            // Empty means absent: §11.3 audits every committed command, and an
+            // entry whose actor id would not narrow has no attribution to
+            // record. A zeroed 32-byte id would read as a real node.
+            actor_node_id: row.actor.map(|a| a.to_vec()).unwrap_or_default(),
             operation_code: row.operation_code,
             resource: row.resource.as_ref().map(|k| ResourceKeyV1 {
                 namespace: k.namespace().to_string(),
@@ -132,7 +135,11 @@ impl TryFrom<&AuditRowV1> for AuditRow {
         };
         Ok(AuditRow {
             leader_node_id: node_id(&row.leader_node_id)?,
-            actor: node_id(&row.actor_node_id)?,
+            actor: if row.actor_node_id.is_empty() {
+                None
+            } else {
+                Some(node_id(&row.actor_node_id)?)
+            },
             operation_code: row.operation_code,
             resource,
             // A stored row does not say which code space it is in, so the
@@ -161,7 +168,7 @@ mod tests {
     fn audit_row() -> AuditRow {
         AuditRow {
             leader_node_id: [0x11u8; 32],
-            actor: [0x22u8; 32],
+            actor: Some([0x22u8; 32]),
             operation_code: 3,
             resource: Some(ResourceKey::new("ns.sub", b"\x00\xffkey".to_vec()).expect("valid")),
             result: AuditResult::Client(Outcome::Mutated),
@@ -321,9 +328,22 @@ mod tests {
         bad_leader.leader_node_id = vec![0u8; 8];
         assert_eq!(AuditRow::try_from(&bad_leader), Err(WireError::NodeIdWidth));
 
+        // A **wrong-width** actor is a corrupt row. Empty is not: it is how
+        // §11.3's row for a committed entry with no validated actor says so.
         let mut bad_actor = good.clone();
-        bad_actor.actor_node_id = Vec::new();
+        bad_actor.actor_node_id = vec![0u8; 8];
         assert_eq!(AuditRow::try_from(&bad_actor), Err(WireError::NodeIdWidth));
+
+        let mut absent_actor = good.clone();
+        absent_actor.actor_node_id = Vec::new();
+        assert_eq!(
+            AuditRow::try_from(&absent_actor).map(|r| r.actor),
+            Ok(None),
+            "an empty actor id is absent attribution, not a malformed one"
+        );
+        // And it survives the trip back out, rather than becoming 32 zero bytes.
+        let round_tripped: AuditRowV1 = (&AuditRow::try_from(&absent_actor).unwrap()).into();
+        assert!(round_tripped.actor_node_id.is_empty());
 
         let mut bad_key = good.clone();
         bad_key.resource = Some(ResourceKeyV1 {

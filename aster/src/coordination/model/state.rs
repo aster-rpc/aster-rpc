@@ -175,7 +175,15 @@ impl AuditResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditRow {
     pub leader_node_id: NodeId,
-    pub actor: NodeId,
+    /// The actor, when one could be validated.
+    ///
+    /// `None` **only** for a committed entry whose actor id itself would not
+    /// narrow. §11.3 requires one audit row for every committed command, and a
+    /// hostile malformed entry is exactly the one that must not vanish from the
+    /// record -- so the row is written either way, with attribution marked
+    /// absent rather than faked. A zeroed NodeId would have recorded an action
+    /// by a node that does not exist.
+    pub actor: Option<NodeId>,
     pub operation_code: i32,
     pub resource: Option<ResourceKey>,
     pub result: AuditResult,
@@ -700,7 +708,7 @@ mod tests {
                     (1, 0),
                     AuditRow {
                         leader_node_id: [8u8; 32],
-                        actor: [7u8; 32],
+                        actor: Some([7u8; 32]),
                         operation_code: 1,
                         resource: None,
                         result: AuditResult::Client(Outcome::Granted),

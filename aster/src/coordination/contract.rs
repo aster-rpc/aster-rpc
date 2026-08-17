@@ -775,6 +775,16 @@ pub const SYS_EXPIRY_STALE: i32 = 2;
 pub const SYS_MEMBERSHIP_ADVANCED: i32 = 3;
 pub const SYS_MEMBERSHIP_PHASE_MISMATCH: i32 = 4;
 
+/// A committed `Expire` whose fields will not narrow (§10.1).
+///
+/// Its own code, not a reuse of `SYS_MEMBERSHIP_PHASE_MISMATCH`: a malformed
+/// expiry answered with a membership code tells an operator the wrong thing
+/// about which subsystem is broken.
+pub const SYS_EXPIRE_MALFORMED: i32 = 5;
+
+/// A committed `MembershipProgress` whose fields will not narrow (§10.1).
+pub const SYS_MEMBERSHIP_MALFORMED: i32 = 6;
+
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/ClientReply")]
 pub struct ClientReplyV1 {
@@ -1112,6 +1122,8 @@ mod command_tests {
             SYS_EXPIRY_STALE,
             SYS_MEMBERSHIP_ADVANCED,
             SYS_MEMBERSHIP_PHASE_MISMATCH,
+            SYS_EXPIRE_MALFORMED,
+            SYS_MEMBERSHIP_MALFORMED,
         ] {
             assert_ne!(c, AUDIT_OP_EXPIRE);
             assert_ne!(c, AUDIT_OP_MEMBERSHIP_PROGRESS);

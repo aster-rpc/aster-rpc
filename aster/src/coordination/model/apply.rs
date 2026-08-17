@@ -437,6 +437,16 @@ pub enum Command {
     RejectedClient {
         client: ClientRef,
         operation_code: i32,
+        /// The resource the action named, **if that identity is itself valid**.
+        ///
+        /// §10.1: a rejected request's identity is stored only when it is valid.
+        /// An oversized `compare_and_set` names a perfectly good resource -- it
+        /// is the encoded command that is too big -- so its saved reply and
+        /// audit row carry it. A request whose *identity* is what was malformed
+        /// carries `None`, because the session and audit charges are
+        /// `256 + KEY` and an unvalidated key would blow the 832-byte row the
+        /// whole reserve proof rests on.
+        resource: Option<ResourceKey>,
     },
     /// A committed command whose **mutation prefix** is ill-formed: an actor id
     /// or client id of the wrong width, or a malformed request hash.
@@ -462,6 +472,18 @@ pub struct ShapelessCommand {
     /// Which reply the caller is waiting for. OpenRaft's `R` is one union, and
     /// a client waiting on a mutation cannot be answered with a system reply.
     pub reply_shape: ReplyShape,
+    /// The system result code for a system command, so a malformed `Expire` is
+    /// not answered with a membership-phase code.
+    pub system_result_code: i32,
+    /// The actor, when the actor id validated but something else in the prefix
+    /// did not.
+    ///
+    /// §11.3 requires exactly one audit row per committed command, so a
+    /// shapeless entry is audited too -- and a valid actor with a malformed
+    /// client id is still attributable. `None` means the actor id itself would
+    /// not narrow, which is the only case where attribution is genuinely
+    /// unavailable.
+    pub actor: Option<NodeId>,
 }
 
 /// Which arm of `CommandReply` a shapeless command must still produce.
@@ -528,13 +550,15 @@ pub fn apply_command(
         Command::RejectedClient {
             client,
             operation_code,
+            resource,
         } => CommandReply::Client(Box::new(apply_rejected_client(
             state,
             log_id,
             client,
             *operation_code,
+            resource.clone(),
         ))),
-        Command::Shapeless(shapeless) => shapeless_reply(state, shapeless),
+        Command::Shapeless(shapeless) => apply_shapeless(state, log_id, shapeless),
         Command::Expire(expire) => CommandReply::System(apply_expire(state, log_id, expire)),
         Command::MembershipProgress(progress) => {
             CommandReply::System(apply_membership_progress(state, log_id, progress))
@@ -566,6 +590,7 @@ fn apply_rejected_client(
     log_id: LogId,
     client: &ClientRef,
     operation_code: i32,
+    resource: Option<ResourceKey>,
 ) -> ClientResult {
     let session = state.sessions.get(&(client.actor, client.client_id));
     let capacity = state.capacity_for(&client.actor);
@@ -583,9 +608,7 @@ fn apply_rejected_client(
         Classification::Refuse { reason, .. } => (
             ClientResult {
                 disposition: Disposition::NotConsumed,
-                // No resource: the request that named one was not well enough
-                // formed to have validated it.
-                reply: rejection(state, None, reason),
+                reply: rejection(state, resource.clone(), reason),
                 replayed: false,
             },
             false,
@@ -593,7 +616,7 @@ fn apply_rejected_client(
         Classification::Unresolved { .. } => (
             ClientResult {
                 disposition: Disposition::Consumed,
-                reply: rejection(state, None, Reason::None),
+                reply: rejection(state, resource.clone(), Reason::None),
                 replayed: false,
             },
             true,
@@ -608,11 +631,12 @@ fn apply_rejected_client(
         log_id,
         AuditRow {
             leader_node_id: log_id.leader_node_id,
-            actor: client.actor,
+            actor: Some(client.actor),
             operation_code,
-            // Never the malformed key: an unvalidated resource in bounded
-            // metadata is what the §12.1 charge is computed from.
-            resource: None,
+            // The validated key or none at all -- never the malformed one. An
+            // unvalidated resource in bounded metadata is what the §12.1 charge
+            // is computed from.
+            resource: result.reply.resource().cloned(),
             result: AuditResult::Client(result.reply.outcome),
             epoch: 0,
             value_revision: 0,
@@ -621,10 +645,17 @@ fn apply_rejected_client(
     result
 }
 
-/// The reply for a command with no usable identity. Writes nothing; the caller
-/// still advances `last_applied`.
-fn shapeless_reply(state: &State, command: &ShapelessCommand) -> CommandReply {
-    match command.reply_shape {
+/// Apply a committed command with no usable session identity (§10.1).
+///
+/// It consumes no sequence and saves no result -- there is no session to key
+/// either by -- but §11.3 requires **exactly one audit row for every committed
+/// user or system command**, and a hostile malformed entry is precisely the one
+/// that must not vanish from the record. The row is written with optional
+/// attribution: an actor id that narrowed is recorded even when the client id or
+/// request hash did not, and `None` marks the case where the actor id itself was
+/// the malformed field.
+fn apply_shapeless(state: &mut State, log_id: LogId, command: &ShapelessCommand) -> CommandReply {
+    let reply = match command.reply_shape {
         ReplyShape::Client => CommandReply::Client(Box::new(ClientResult {
             // Nothing was consumed, because there is no session to consume a
             // sequence in.
@@ -637,10 +668,36 @@ fn shapeless_reply(state: &State, command: &ShapelessCommand) -> CommandReply {
             reason: Reason::None,
         }),
         ReplyShape::System => CommandReply::System(SystemResult {
-            system_result_code: crate::coordination::contract::SYS_MEMBERSHIP_PHASE_MISMATCH,
+            system_result_code: command.system_result_code,
             lease_revision: 0,
         }),
-    }
+    };
+
+    write_audit_row(
+        state,
+        log_id,
+        AuditRow {
+            leader_node_id: log_id.leader_node_id,
+            actor: command.actor,
+            operation_code: command.operation_code,
+            // The identity is what was malformed, so there is none to record.
+            resource: None,
+            // A client-shaped entry audits as a **client** rejection: outcome
+            // 100 in the client code space, matching its operation code. Only a
+            // genuinely system command carries a system result, which is what
+            // keeps the stored row's code space unambiguous without a second
+            // field naming it.
+            result: match command.reply_shape {
+                ReplyShape::System => AuditResult::System(command.system_result_code),
+                ReplyShape::Client | ReplyShape::Retirement => {
+                    AuditResult::Client(Outcome::Rejected)
+                }
+            },
+            epoch: 0,
+            value_revision: 0,
+        },
+    );
+    reply
 }
 
 /// Apply a committed `retire_client` (§10).
@@ -674,7 +731,7 @@ fn apply_retire(state: &mut State, log_id: LogId, command: &RetireCommand) -> Re
         log_id,
         AuditRow {
             leader_node_id: log_id.leader_node_id,
-            actor: command.actor,
+            actor: Some(command.actor),
             operation_code: OPERATION_RETIRE_CLIENT,
             resource: None,
             result: AuditResult::Client(result.outcome),
@@ -793,7 +850,7 @@ fn apply_expire(state: &mut State, log_id: LogId, command: &ExpireCommand) -> Sy
             // A system command has no caller. The proposing leader is already
             // the entry's identity, so the actor carries the same id rather
             // than a placeholder that would read as a real node.
-            actor: log_id.leader_node_id,
+            actor: Some(log_id.leader_node_id),
             operation_code: OPERATION_EXPIRE,
             resource: Some(command.resource.clone()),
             // §5.2: a system command's audit result is its **phase code**, not
@@ -831,7 +888,7 @@ fn apply_membership_progress(
         log_id,
         AuditRow {
             leader_node_id: log_id.leader_node_id,
-            actor: log_id.leader_node_id,
+            actor: Some(log_id.leader_node_id),
             operation_code: OPERATION_MEMBERSHIP_PROGRESS,
             resource: None,
             result: AuditResult::System(code),
@@ -1200,7 +1257,7 @@ fn write_audit(
         // Stored even though term and index are the table key: together they
         // reconstruct this entry's full log id once the log has been purged.
         leader_node_id: log_id.leader_node_id,
-        actor: client.actor,
+        actor: Some(client.actor),
         operation_code: action.operation_code(),
         resource: resource.clone(),
         result: AuditResult::Client(reply.outcome),
@@ -1847,7 +1904,7 @@ mod tests {
                 LogId::new(1, leader, i),
                 AuditRow {
                     leader_node_id: leader,
-                    actor: ACTOR,
+                    actor: Some(ACTOR),
                     operation_code: OPERATION_RETIRE_CLIENT,
                     resource: None,
                     result: AuditResult::System(0),

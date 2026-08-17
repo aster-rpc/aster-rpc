@@ -41,6 +41,7 @@ use super::resource::{self, Fence, RawResourceKey, ResourceAction};
 use super::retire::RetireCommand;
 use super::shape::{self, ShapeLimit};
 use super::state::{LogId, MemberSeed, MembershipPlan, NodeId, State};
+use crate::coordination::contract::{SYS_EXPIRE_MALFORMED, SYS_MEMBERSHIP_MALFORMED};
 
 /// Narrow a wire `Vec<u8>` to a 32-byte node id.
 fn node_id(bytes: &[u8]) -> Result<NodeId, NarrowError> {
@@ -293,6 +294,17 @@ pub fn apply_wire_command(
 /// An earlier revision short-circuited both shape cases to a reply built at this
 /// boundary, so a committed entry left no trace in replicated state at all.
 pub fn command_for_apply(command: &CommandV1) -> Result<Command, NarrowError> {
+    // **Unknown detection comes first, before any shape or size classification.**
+    // An earlier revision checked the encoded size first, so a large action from
+    // a newer version became `RejectedClient { operation_code: 0 }` -- a
+    // deterministic rejection this voter had no business making. §5.3.1 makes an
+    // uninterpretable entry fatal precisely because the voters that *can* read
+    // it will apply it: rejecting it here diverges the group while every local
+    // test stays green.
+    if unknown_variant(command) {
+        return Err(NarrowError::UnknownVariant);
+    }
+
     // §12.1's `max_encoded_command`, checked on the **encoded** form. The bound
     // is not reconstructible from field limits: an action whose fields are each
     // in range can still encode past the cap once framing is counted.
@@ -314,13 +326,27 @@ pub fn command_for_apply(command: &CommandV1) -> Result<Command, NarrowError> {
     }
 }
 
+/// Does this command carry a variant this build cannot interpret?
+///
+/// Checked at both levels: the command union and the action union inside a
+/// client command. A `CommandV1` this voter knows carrying an `ActionV1` it does
+/// not is still an entry it cannot apply.
+fn unknown_variant(command: &CommandV1) -> bool {
+    match command {
+        CommandV1::Unknown(_) => true,
+        CommandV1::Client(c) => matches!(c.action, ActionV1::Unknown(_)),
+        _ => false,
+    }
+}
+
 /// Which forced-apply command a shape violation becomes.
+///
+/// The prefix decides. A validated `(actor, client_id, sequence, request_hash)`
+/// is a session identity even when the action attached to it is nonsense, so it
+/// takes the consuming path; anything less takes the shapeless one.
 fn shape_rejection(command: &CommandV1) -> Command {
     match command {
         CommandV1::Client(c) => {
-            // The prefix is what decides. A validated `(actor, client_id,
-            // sequence, request_hash)` is a session identity even when the
-            // action attached to it is nonsense.
             match (
                 node_id(&c.actor_node_id),
                 client_id(&c.client_id),
@@ -334,29 +360,66 @@ fn shape_rejection(command: &CommandV1) -> Command {
                         request_hash,
                     },
                     operation_code: wire_operation_code(&c.action),
+                    // §10.1: the identity is stored when it is **valid**. An
+                    // oversized command names a perfectly good resource -- the
+                    // encoding is what is too big -- and dropping it would save
+                    // a reply the client cannot match to anything.
+                    resource: wire_resource(&c.action),
                 },
-                _ => Command::Shapeless(ShapelessCommand {
+                // The actor may still have narrowed even when the client id or
+                // hash did not, and an attributable entry should be attributed.
+                (actor, _, _) => Command::Shapeless(ShapelessCommand {
                     operation_code: wire_operation_code(&c.action),
                     reply_shape: ReplyShape::Client,
+                    system_result_code: 0,
+                    actor: actor.ok(),
                 }),
             }
         }
-        CommandV1::RetireClient(_) => Command::Shapeless(ShapelessCommand {
+        CommandV1::RetireClient(r) => Command::Shapeless(ShapelessCommand {
             operation_code: OPERATION_RETIRE_CLIENT,
             reply_shape: ReplyShape::Retirement,
+            system_result_code: 0,
+            actor: node_id(&r.actor_node_id).ok(),
         }),
         CommandV1::Expire(_) => Command::Shapeless(ShapelessCommand {
             operation_code: OPERATION_EXPIRE,
             reply_shape: ReplyShape::System,
+            // Its own code: a malformed expiry answered with a membership
+            // phase code tells an operator the wrong subsystem is broken.
+            system_result_code: SYS_EXPIRE_MALFORMED,
+            // A system command's actor is the proposing leader, which the
+            // caller stamps; nothing in the entry itself names one.
+            actor: None,
         }),
         CommandV1::MembershipProgress(_) => Command::Shapeless(ShapelessCommand {
             operation_code: OPERATION_MEMBERSHIP_PROGRESS,
             reply_shape: ReplyShape::System,
+            system_result_code: SYS_MEMBERSHIP_MALFORMED,
+            actor: None,
         }),
-        // Unreachable: `command_for_apply` returns `UnknownVariant` first, and
-        // `oversized` cannot be the reason an unknown variant is rejected.
+        // Unreachable: `command_for_apply` returns `UnknownVariant` first.
         CommandV1::Unknown(_) => Command::Unknown,
     }
+}
+
+/// The resource a wire action names, **if that identity validates**.
+fn wire_resource(action: &ActionV1) -> Option<super::state::ResourceKey> {
+    let raw = match action {
+        ActionV1::Acquire(a) => raw_key(&a.resource),
+        ActionV1::Renew(a) => raw_key(&a.fence.resource),
+        ActionV1::CompareAndSet(a) => raw_key(&a.fence.resource),
+        ActionV1::Release(a) => raw_key(&a.fence.resource),
+        ActionV1::ReleaseWithValue(a) => raw_key(&a.fence.resource),
+        ActionV1::Revoke(a) => raw_key(&a.resource),
+        ActionV1::SetGrant(a) => raw_key(&a.resource),
+        // These name no resource at all; §8.1 makes them group-level.
+        ActionV1::SetAdmin(_)
+        | ActionV1::ChangeMembership(_)
+        | ActionV1::CancelMembership(_)
+        | ActionV1::Unknown(_) => return None,
+    };
+    raw.validate().ok()
 }
 
 /// The §5.2 method a wire action names.
@@ -603,18 +666,27 @@ mod tests {
             .expect("the reply was saved for replay");
         assert_eq!(saved.outcome, Outcome::Rejected);
         assert_eq!(saved.reason, Reason::None);
-        assert!(
-            saved.snapshot.is_none(),
-            "no resource: the request naming one was not well enough formed to validate it"
-        );
+        // §10.1: a rejected request's identity is stored **when it is valid**.
+        // The oversized command names a perfectly good resource -- the encoding
+        // is what is too big -- so the saved reply carries it, and a client can
+        // match the reply to the request it sent.
+        let snapshot = saved
+            .snapshot
+            .as_ref()
+            .expect("the resource is valid, so it is stored");
+        assert_eq!(snapshot.resource, key());
 
         let audited = s.audit.get(&(1, 1)).expect("an audit row for the entry");
-        assert_eq!(audited.actor, ACTOR);
+        assert_eq!(audited.actor, Some(ACTOR));
         assert_eq!(
             audited.operation_code, 3,
             "compare_and_set, from the variant"
         );
-        assert_eq!(audited.resource, None, "never the unvalidated key");
+        assert_eq!(
+            audited.resource,
+            Some(key()),
+            "a valid identity is recorded; only a malformed one is dropped"
+        );
         assert!(
             matches!(
                 audited.result,
@@ -631,10 +703,21 @@ mod tests {
         // typed reply back, not a reclassification.
         let replay = apply_wire_command(&mut s, log(2), &GROUP, &oversized).expect("no fault");
         match &replay {
-            CommandReplyV1::Client(r) => assert_eq!(
-                r, &first,
-                "a replay returns the saved reply verbatim, field for field"
-            ),
+            CommandReplyV1::Client(r) => {
+                // Verbatim, field for field -- except the redaction flag, which
+                // is what tells the client this is a replay whose value bytes
+                // were never stored.
+                let mut expected = first.clone();
+                if let Some(s) = expected.snapshot.as_mut() {
+                    s.value_redacted = true;
+                }
+                assert_eq!(r, &expected, "a replay returns the saved reply");
+                assert!(
+                    r.snapshot.as_ref().unwrap().value_redacted,
+                    "and marks itself a replay"
+                );
+                assert!(!first.snapshot.as_ref().unwrap().value_redacted);
+            }
             other => panic!("expected a client reply, got {other:?}"),
         }
         assert_eq!(
@@ -649,7 +732,109 @@ mod tests {
         );
     }
 
-    /// The delivery guard runs on a shape rejection like any other command: it
+    /// **Unknown detection precedes every shape and size classification.**
+    ///
+    /// Reached through the real compatibility carrier: a newer peer's action is
+    /// encoded under a v2 union and decoded as `ActionV1`, which lands in
+    /// `Unknown`. Its payload is deliberately larger than `max_encoded_command`,
+    /// because that is the ordering bug -- an earlier revision measured the size
+    /// first and turned a fatal entry into `RejectedClient { operation_code: 0 }`,
+    /// a rejection this voter had no business deciding. The voters that *can*
+    /// read the action would apply it, so the group diverges while every local
+    /// test stays green.
+    #[test]
+    fn an_oversized_unknown_action_is_fatal_not_rejected() {
+        use crate::coordination::model::limits::MAX_ENCODED_COMMAND;
+        use fory_derive::{ForyStruct, ForyUnion};
+
+        // Both variants carry a type this build **does** know -- the carrier can
+        // only hold a payload whose type is registered locally -- under a wire
+        // name and field shape matching the real `CompareAndSetActionV1`. What
+        // makes the decode land in `Unknown` is the variant **id**, not the
+        // payload type: id 12 is a method §5.2 does not define.
+        #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+        #[aster(wire = "aster.coordination.v1/CompareAndSetAction")]
+        struct Stand {
+            #[fory(id = 1)]
+            fence: crate::coordination::contract::FenceV1,
+            #[fory(id = 2)]
+            expected_value_revision: u64,
+            #[fory(id = 3, bytes)]
+            new_value: Vec<u8>,
+        }
+
+        #[derive(ForyUnion, aster_macros::AsterType, Debug, Clone, PartialEq)]
+        #[aster(wire = "aster.coordination.v1/Action")]
+        enum ActionV2 {
+            #[fory(default)]
+            #[fory(id = 3)]
+            CompareAndSet(Stand),
+            /// A method this build does not have.
+            #[fory(id = 12)]
+            Future(Stand),
+            #[fory(unknown)]
+            Unknown(fory_core::UnknownCase),
+        }
+
+        let encoded = crate::coordination::contract::payload_fory::<ActionV2>()
+            .serialize(&ActionV2::Future(Stand {
+                fence: fence_wire(),
+                expected_value_revision: 0,
+                new_value: vec![0xA5u8; MAX_ENCODED_COMMAND + 1],
+            }))
+            .expect("encode");
+        let action: ActionV1 = crate::coordination::contract::payload_fory::<ActionV1>()
+            .deserialize(&encoded)
+            .expect("decode into the carrier");
+        assert!(
+            matches!(action, ActionV1::Unknown(_)),
+            "the fixture must reach the real carrier, not a known variant"
+        );
+
+        let command = CommandV1::Client(ClientCommandV1 {
+            actor_node_id: ACTOR.to_vec(),
+            client_id: vec![9u8; 16],
+            sequence: 1,
+            // Unhashable, which is the point: the action cannot be hashed either.
+            request_hash: vec![0u8; 32],
+            action,
+        });
+        assert!(
+            super::oversized(&command),
+            "the fixture must also exceed the size cap, or it does not test the ordering"
+        );
+
+        assert_eq!(
+            super::command_for_apply(&command).err(),
+            Some(NarrowError::UnknownVariant),
+            "an entry this voter cannot interpret is fatal, whatever its size"
+        );
+
+        let mut s = genesis();
+        s.last_applied = Some(log(0));
+        let before = s.clone();
+        assert_eq!(
+            apply_wire_command(&mut s, log(1), &GROUP, &command),
+            Err(Fault::UnknownCommand)
+        );
+        assert_eq!(
+            before, s,
+            "fatal before anything is written, including last_applied"
+        );
+    }
+
+    /// The same ordering for an unknown **command** variant, which the carrier
+    /// reaches through `CommandV1` rather than `ActionV1`.
+    #[test]
+    fn an_unknown_command_variant_is_fatal_before_any_size_check() {
+        let command = CommandV1::Unknown(unknown_case());
+        assert_eq!(
+            super::command_for_apply(&command).err(),
+            Some(NarrowError::UnknownVariant)
+        );
+    }
+
+    /// The delivery guard runs on a shape rejection like any other command    /// The delivery guard runs on a shape rejection like any other command: it
     /// is applied, so redelivering it is a fatal storage invariant rather than a
     /// second rejection.
     #[test]
@@ -762,15 +947,109 @@ mod tests {
         }
         assert_eq!(s.last_applied, Some(log(1)), "the entry was applied");
         assert_eq!(s.sessions, before.sessions, "no session row: no identity");
+        assert_eq!(s.resources, before.resources, "and no business state");
+
+        // §11.3: exactly one audit row for every committed command. A hostile
+        // malformed entry is precisely the one that must not vanish from the
+        // record, so it is audited with attribution marked absent rather than
+        // dropped or faked.
+        assert_eq!(s.audit.len(), 1);
+        let audited = s.audit.get(&(1, 1)).expect("the entry is audited");
         assert_eq!(
-            s.audit, before.audit,
-            "no audit row: no actor to attribute it to"
+            audited.actor, None,
+            "the actor id is what would not narrow, so attribution is absent"
         );
+        assert_eq!(audited.operation_code, 1, "acquire, read from the variant");
+        assert_eq!(audited.resource, None, "the identity was malformed");
+        assert!(
+            s.reserve_bytes > before.reserve_bytes,
+            "and the row is charged like any other"
+        );
+    }
+
+    /// A **valid actor** with a malformed client id is still attributable. The
+    /// entry cannot name a session -- the client id is half the session key --
+    /// but "no session" and "no actor" are different facts, and the audit row
+    /// records the one that is true.
+    #[test]
+    fn a_malformed_client_id_still_audits_the_actor() {
+        let mut s = genesis();
+        s.last_applied = Some(log(0));
+
+        let mut bad = match client_command(ACTOR, 1, acquire()) {
+            CommandV1::Client(c) => c,
+            other => panic!("expected a client command, got {other:?}"),
+        };
+        bad.client_id = vec![9u8; 8];
+        let bad = CommandV1::Client(bad);
+
+        apply_wire_command(&mut s, log(1), &GROUP, &bad).expect("no fault");
+        let audited = s.audit.get(&(1, 1)).expect("the entry is audited");
         assert_eq!(
-            s.reserve_bytes, before.reserve_bytes,
-            "and no reserve charge"
+            audited.actor,
+            Some(ACTOR),
+            "the actor narrowed, so the row says who it was"
         );
-        assert_eq!(s.resources, before.resources);
+        assert!(
+            s.sessions.is_empty(),
+            "but there is still no session to key"
+        );
+    }
+
+    /// Every malformed system command reports **its own** code. Sharing one
+    /// generic reply told an operator a malformed expiry was a membership phase
+    /// problem.
+    #[test]
+    fn each_malformed_system_command_reports_its_own_code() {
+        use crate::coordination::contract::{
+            ExpireCommandV1, MembershipProgressCommandV1, SYS_EXPIRE_MALFORMED,
+            SYS_MEMBERSHIP_MALFORMED,
+        };
+
+        let mut s = genesis();
+        s.last_applied = Some(log(0));
+
+        // An expiry naming an invalid resource.
+        let expire = CommandV1::Expire(ExpireCommandV1 {
+            resource: ResourceKeyV1 {
+                namespace: "NOT VALID".into(),
+                key: b"k".to_vec(),
+            },
+            epoch: 1,
+            lease_revision: 1,
+        });
+        match apply_wire_command(&mut s, log(1), &GROUP, &expire).expect("no fault") {
+            CommandReplyV1::System(r) => assert_eq!(
+                r.system_result_code, SYS_EXPIRE_MALFORMED,
+                "an expiry problem, not a membership one"
+            ),
+            other => panic!("expected a system reply, got {other:?}"),
+        }
+        assert_eq!(
+            s.audit.get(&(1, 1)).expect("audited").operation_code,
+            100,
+            "the audit row files it under Expire"
+        );
+
+        // A progress report with a malformed operation id.
+        let progress = CommandV1::MembershipProgress(MembershipProgressCommandV1 {
+            operation_id: vec![6u8; 8],
+            expected_phase: 1,
+            new_phase: 2,
+            result_code: 0,
+            observed_membership_log_id: None,
+        });
+        match apply_wire_command(&mut s, log(2), &GROUP, &progress).expect("no fault") {
+            CommandReplyV1::System(r) => {
+                assert_eq!(r.system_result_code, SYS_MEMBERSHIP_MALFORMED)
+            }
+            other => panic!("expected a system reply, got {other:?}"),
+        }
+        assert_ne!(
+            SYS_EXPIRE_MALFORMED, SYS_MEMBERSHIP_MALFORMED,
+            "two subsystems, two codes"
+        );
+        assert_eq!(s.audit.len(), 2, "one row per committed entry");
     }
 
     /// A hash that does not match its action is a request-shape violation, so it
