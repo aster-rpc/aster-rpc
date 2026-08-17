@@ -32,7 +32,7 @@ impl ServiceDispatch for Counter {
     async fn dispatch(&self, _method: &str, mut call: Call) {
         let _ = call.recv_request().await;
         let v = self.n.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = call.respond(vec![v as u8], &RpcStatus::ok());
+        let _ = call.respond(vec![v as u8], &RpcStatus::ok()).await;
     }
 }
 

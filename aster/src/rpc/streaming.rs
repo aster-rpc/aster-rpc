@@ -10,10 +10,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use fory_core::{Fory, ForyDefault, Serializer};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::Receiver;
 
 use aster_transport_core::framing::encode_frame;
-use aster_transport_core::reactor::{OutgoingFrame, RequestFrame};
+use aster_transport_core::reactor::{OutgoingFrame, RequestFrame, ResponseSender};
 
 use super::client::{BidiSink, ResponseStream};
 use crate::error::{Error, Result};
@@ -32,13 +32,13 @@ fn channel_closed() -> Error {
 /// items with [`send`](ResponseSink::send); the dispatcher writes the terminal
 /// trailer once the handler returns.
 pub struct ResponseSink<T> {
-    tx: UnboundedSender<OutgoingFrame>,
+    tx: ResponseSender,
     fory: Arc<Fory>,
     _t: PhantomData<fn() -> T>,
 }
 
 impl<T> ResponseSink<T> {
-    pub(crate) fn new(tx: UnboundedSender<OutgoingFrame>, fory: Arc<Fory>) -> Self {
+    pub(crate) fn new(tx: ResponseSender, fory: Arc<Fory>) -> Self {
         Self {
             tx,
             fory,
@@ -49,11 +49,13 @@ impl<T> ResponseSink<T> {
 
 impl<T: Serializer> ResponseSink<T> {
     /// Encode and send one streaming response item.
-    pub fn send(&self, item: &T) -> Result<()> {
+    /// Async since §12.4 bounded the response channel; see [`Call::send`].
+    pub async fn send(&self, item: &T) -> Result<()> {
         let bytes = self.fory.serialize(item).map_err(encode_err)?;
         let frame = encode_frame(&bytes, 0)?;
         self.tx
             .send(OutgoingFrame::Frame(frame))
+            .await
             .map_err(|_| channel_closed())
     }
 }
@@ -97,7 +99,7 @@ impl<T: Serializer> BidiCall<T> {
 /// with [`recv`](RequestStream::recv) until it returns `None`.
 pub struct RequestStream<T> {
     first: Option<Vec<u8>>,
-    rx: Option<UnboundedReceiver<RequestFrame>>,
+    rx: Option<Receiver<RequestFrame>>,
     first_is_end: bool,
     fory: Arc<Fory>,
     _t: PhantomData<fn() -> T>,
@@ -106,7 +108,7 @@ pub struct RequestStream<T> {
 impl<T> RequestStream<T> {
     pub(crate) fn new(
         first: Option<Vec<u8>>,
-        rx: Option<UnboundedReceiver<RequestFrame>>,
+        rx: Option<Receiver<RequestFrame>>,
         first_is_end: bool,
         fory: Arc<Fory>,
     ) -> Self {

@@ -35,31 +35,21 @@ use aster_transport_ffi::*;
 
 mod common;
 
+use common::{wait_for_successful_operation, wait_for_successful_operations};
+
 // ─── Helper functions ─────────────────────────────────────────────────────
 
-/// Poll until we get a specific event kind, or timeout after max_iters × 10ms.
-unsafe fn poll_for_event(
-    runtime: iroh_runtime_t,
-    event_kind: iroh_event_kind_t,
-    max_iters: u32,
-) -> bool {
-    for _ in 0..max_iters {
-        std::thread::sleep(Duration::from_millis(10));
-        let mut events = [std::mem::zeroed(); 8];
-        let count = iroh_poll_events(runtime, events.as_mut_ptr(), 8, 5);
-        for ev in events.iter().take(count) {
-            if ev.kind == event_kind as u32 {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Wait for node creation by polling for NODE_CREATED event.
-unsafe fn wait_for_node_creation(runtime: iroh_runtime_t) {
-    let created = poll_for_event(runtime, iroh_event_kind_t::IROH_EVENT_NODE_CREATED, 100);
-    assert!(created, "Node should have been created within 1 second");
+unsafe fn wait_for_node_creation(
+    runtime: iroh_runtime_t,
+    operation: iroh_operation_t,
+) -> iroh_node_t {
+    wait_for_successful_operation(
+        runtime,
+        operation,
+        iroh_event_kind_t::IROH_EVENT_NODE_CREATED,
+    )
+    .handle
 }
 
 // ─── Test: accept_submit_then_close ──────────────────────────────────────
@@ -89,12 +79,12 @@ fn test_accept_submit_then_close() {
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
         // Wait for node creation
-        wait_for_node_creation(runtime);
+        let node = wait_for_node_creation(runtime, node_op);
 
         // Submit an accept — we don't have a peer, so this will hang.
         // We immediately close the node to force an ERROR terminal.
         let mut accept_op: iroh_operation_t = 0;
-        let status = iroh_node_accept_aster(runtime, 1, 0, &mut accept_op);
+        let status = iroh_node_accept_aster(runtime, node, 0, &mut accept_op);
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
         // Small delay to ensure accept task is running
@@ -102,7 +92,7 @@ fn test_accept_submit_then_close() {
 
         // Close the node while accept is pending
         let mut close_op: iroh_operation_t = 0;
-        let status = iroh_node_close(runtime, 1, 0, &mut close_op);
+        let status = iroh_node_close(runtime, node, 0, &mut close_op);
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
         // Drain events
@@ -154,11 +144,11 @@ fn test_cancel_races_poll() {
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
         // Wait for node creation
-        wait_for_node_creation(runtime);
+        let node = wait_for_node_creation(runtime, node_op);
 
         // Submit accept
         let mut accept_op: iroh_operation_t = 0;
-        let status = iroh_node_accept_aster(runtime, 1, 0, &mut accept_op);
+        let status = iroh_node_accept_aster(runtime, node, 0, &mut accept_op);
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
         // Small delay
@@ -221,16 +211,16 @@ fn test_handle_close_after_submit() {
         );
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
-        wait_for_node_creation(runtime);
+        let node = wait_for_node_creation(runtime, node_op);
 
         // Submit accept
         let mut accept_op: iroh_operation_t = 0;
-        let status = iroh_node_accept_aster(runtime, 1, 0, &mut accept_op);
+        let status = iroh_node_accept_aster(runtime, node, 0, &mut accept_op);
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
         // Close the node immediately
         let mut close_op: iroh_operation_t = 0;
-        let status = iroh_node_close(runtime, 1, 0, &mut close_op);
+        let status = iroh_node_close(runtime, node, 0, &mut close_op);
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
         // Drain
@@ -276,7 +266,7 @@ fn test_many_outstanding_on_cq() {
             &mut node_op,
         );
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
-        wait_for_node_creation(runtime);
+        let node = wait_for_node_creation(runtime, node_op);
 
         // Submit 100 accept operations rapidly — none will complete (no peer)
         const N: usize = 100;
@@ -284,7 +274,7 @@ fn test_many_outstanding_on_cq() {
 
         for (i, slot) in ops.iter_mut().enumerate().take(N) {
             let mut op: iroh_operation_t = 0;
-            let status = iroh_node_accept_aster(runtime, 1, i as u64, &mut op);
+            let status = iroh_node_accept_aster(runtime, node, i as u64, &mut op);
             if status == iroh_status_t::IROH_STATUS_OK as i32 {
                 *slot = op;
             }
@@ -292,7 +282,7 @@ fn test_many_outstanding_on_cq() {
 
         // Immediately close the node — all pending accepts should get ERROR
         let mut close_op: iroh_operation_t = 0;
-        let status = iroh_node_close(runtime, 1, 0, &mut close_op);
+        let status = iroh_node_close(runtime, node, 0, &mut close_op);
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
         // Drain all events
@@ -384,16 +374,16 @@ fn test_peer_disconnect_mid_read() {
             &mut node_op,
         );
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
-        wait_for_node_creation(runtime);
+        let node = wait_for_node_creation(runtime, node_op);
 
         // Submit accept
         let mut accept_op: iroh_operation_t = 0;
-        let status = iroh_node_accept_aster(runtime, 1, 0, &mut accept_op);
+        let status = iroh_node_accept_aster(runtime, node, 0, &mut accept_op);
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
         // Close node (simulates peer disconnect since no peer will ever connect)
         let mut close_op: iroh_operation_t = 0;
-        let status = iroh_node_close(runtime, 1, 0, &mut close_op);
+        let status = iroh_node_close(runtime, node, 0, &mut close_op);
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
         // Drain
@@ -451,7 +441,7 @@ fn test_batch_completion_delivery() {
             &mut node_op,
         );
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
-        wait_for_node_creation(runtime);
+        let node = wait_for_node_creation(runtime, node_op);
 
         // Submit many accepts — they'll all be pending when we close the node
         const N: usize = 16; // Small batch for predictable testing
@@ -459,7 +449,7 @@ fn test_batch_completion_delivery() {
 
         for (i, slot) in ops.iter_mut().enumerate().take(N) {
             let mut op: iroh_operation_t = 0;
-            let status = iroh_node_accept_aster(runtime, 1, i as u64, &mut op);
+            let status = iroh_node_accept_aster(runtime, node, i as u64, &mut op);
             if status == iroh_status_t::IROH_STATUS_OK as i32 {
                 *slot = op;
             }
@@ -467,7 +457,7 @@ fn test_batch_completion_delivery() {
 
         // Close node — all pending accepts should get ERROR simultaneously
         let mut close_op: iroh_operation_t = 0;
-        let status = iroh_node_close(runtime, 1, 0, &mut close_op);
+        let status = iroh_node_close(runtime, node, 0, &mut close_op);
         assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
 
         // Wait for close event
@@ -537,27 +527,11 @@ fn test_many_nodes_share_runtime_cq() {
             assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
         }
 
-        // Wait for all to complete
-        std::thread::sleep(Duration::from_millis(500));
-
-        // Drain all events - keep polling until we get events or timeout
-        let mut all_events = Vec::new();
-        let mut poll_count = 0;
-        loop {
-            let mut events = [std::mem::zeroed(); 8];
-            let count = iroh_poll_events(runtime, events.as_mut_ptr(), 8, 200);
-            poll_count += 1;
-            if count == 0 {
-                if poll_count >= 3 {
-                    break; // Give up after 3 empty polls
-                }
-                continue;
-            }
-            all_events.extend_from_slice(&events[..count]);
-            if count < 8 {
-                break; // Got less than full batch, probably done
-            }
-        }
+        let all_events = wait_for_successful_operations(
+            runtime,
+            &node_ops,
+            iroh_event_kind_t::IROH_EVENT_NODE_CREATED,
+        );
 
         // Key invariant: no duplicate events
         let mut op_ids = std::collections::HashSet::new();
@@ -571,20 +545,19 @@ fn test_many_nodes_share_runtime_cq() {
             }
         }
 
-        // We should have gotten at least some events
-        assert!(
-            !all_events.is_empty(),
-            "Should have gotten at least some events after creating {} nodes",
-            N
-        );
+        assert_eq!(all_events.len(), N, "every node creation must complete");
 
         // Clean up: close all nodes
-        for i in 1..=N {
+        let mut close_ops = Vec::with_capacity(N);
+        for event in &all_events {
             let mut close_op: iroh_operation_t = 0;
-            iroh_node_close(runtime, i as u64, 0, &mut close_op);
+            assert_eq!(
+                iroh_node_close(runtime, event.handle, 0, &mut close_op),
+                iroh_status_t::IROH_STATUS_OK as i32
+            );
+            close_ops.push(close_op);
         }
-
-        std::thread::sleep(Duration::from_millis(50));
+        wait_for_successful_operations(runtime, &close_ops, iroh_event_kind_t::IROH_EVENT_CLOSED);
 
         iroh_runtime_close(runtime);
     }

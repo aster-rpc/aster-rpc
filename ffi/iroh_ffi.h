@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define IROH_ABI_VERSION_MAJOR 1
+#define IROH_ABI_VERSION_MAJOR 2
 
 #define IROH_ABI_VERSION_MINOR 0
 
@@ -49,6 +49,18 @@
 #define ASTER_EVENT_KIND_CALL 0
 
 #define ASTER_EVENT_KIND_CONNECTION_CLOSED 1
+
+/**
+ * A previously-full response channel has reserved capacity for `call_id`.
+ * No payload buffers are present; the binding must retry the same submit.
+ */
+#define ASTER_EVENT_KIND_RESPONSE_WRITABLE 2
+
+/**
+ * A pending response-capacity reservation closed before becoming writable.
+ * No payload buffers are present; the binding must stop producing this call.
+ */
+#define ASTER_EVENT_KIND_RESPONSE_CLOSED 3
 
 /**
  * Result codes returned by `aster_reactor_recv_frame` in addition to the
@@ -257,11 +269,11 @@ typedef uint64_t aster_reactor_t;
 /**
  * C-visible event descriptor returned by aster_reactor_poll.
  *
- * Despite the historical `aster_reactor_call_t` name, this struct now
- * carries either an inbound call (`event_kind == ASTER_EVENT_KIND_CALL`)
- * or a connection-closed event
- * (`event_kind == ASTER_EVENT_KIND_CONNECTION_CLOSED`). Bindings that
- * support session lifecycle reaping (spec §7.5) MUST handle both kinds.
+ * Despite the historical `aster_reactor_call_t` name, this struct carries
+ * inbound calls, connection-close notifications, and response-capacity
+ * notifications. Capacity notifications populate only `event_kind` and
+ * `call_id`; every pointer and buffer id is zero. Bindings MUST branch on
+ * `event_kind` before reading the remaining fields.
  */
 typedef struct aster_reactor_call_t {
   /**
@@ -1544,13 +1556,50 @@ uint32_t aster_reactor_poll(iroh_runtime_t runtime,
                             uint32_t timeout_ms);
 
 /**
+ * Begin an asynchronous reservation after a submit returned `QUEUE_FULL`.
+ *
+ * `encoded_len` is the exact combined framed-byte length of the submit that
+ * returned `QUEUE_FULL`. This call itself never blocks. Once Tokio owns that
+ * byte charge, one item slot, and queue capacity,
+ * `aster_reactor_poll` emits `ASTER_EVENT_KIND_RESPONSE_WRITABLE` for the
+ * call. The binding then retries the exact same submit; a different length is
+ * rejected. The exact retry consumes the held combined permit and therefore
+ * cannot return `QUEUE_FULL`. If cancellation or disconnect closes the
+ * channel first, poll emits
+ * `ASTER_EVENT_KIND_RESPONSE_CLOSED` instead.
+ *
+ * Only one reservation may be pending per call, matching the ABI's
+ * single-producer-per-call rule.
+ */
+int32_t aster_reactor_reserve_response_capacity(iroh_runtime_t runtime,
+                                                aster_reactor_t reactor,
+                                                uint64_t call_id,
+                                                uint64_t encoded_len);
+
+/**
+ * Cancel a response-capacity wait whose binding thread was interrupted.
+ * Drops either the pending reservation request or an already-held permit.
+ */
+int32_t aster_reactor_cancel_response_reservation(iroh_runtime_t runtime,
+                                                  aster_reactor_t reactor,
+                                                  uint64_t call_id);
+
+/**
  * Submit a unary response (single response frame + trailer) in one FFI call.
  *
- * Convenience wrapper over `aster_reactor_submit_frame` + `aster_reactor_submit_trailer`
- * for the unary path. For server-streaming or bidi, call `submit_frame` N times
- * then `submit_trailer` once.
+ * This is a convenience wrapper over `aster_reactor_submit_frame` plus
+ * `aster_reactor_submit_trailer`. For server-streaming or bidi, call
+ * `submit_frame` N times and then `submit_trailer` once.
  *
- * After this call, the call_id is no longer valid.
+ * After a successful call, `call_id` is no longer valid.
+ *
+ * BACKPRESSURE: the per-call response channel is bounded, so this may return
+ * `IROH_STATUS_QUEUE_FULL`. Nothing was copied, sent, or removed; the caller
+ * retains its buffers and MUST retry the exact submit. This function never
+ * blocks. A binding may use bounded backoff, or call
+ * `aster_reactor_reserve_response_capacity` and wait for the corresponding
+ * reactor-poll notification before retrying. A caller that ignores
+ * `IROH_STATUS_QUEUE_FULL` drops its own response frame.
  */
 int32_t aster_reactor_submit(iroh_runtime_t runtime,
                              aster_reactor_t reactor,
@@ -1565,6 +1614,9 @@ int32_t aster_reactor_submit(iroh_runtime_t runtime,
  * times per call; each call enqueues one Frame on the reactor's mpsc channel.
  * The call_id remains valid until `aster_reactor_submit_trailer` is called.
  *
+ * May return `IROH_STATUS_QUEUE_FULL`; see `aster_reactor_submit` for the
+ * exact-retry and asynchronous-reservation contract. Never blocks.
+ *
  * `frame_ptr`/`frame_len` point to already-framed bytes (including the 4-byte
  * length prefix and 1-byte flags). The binding is responsible for framing.
  */
@@ -1576,8 +1628,14 @@ int32_t aster_reactor_submit_frame(iroh_runtime_t runtime,
 
 /**
  * Submit the trailer for a call and close the stream. After this call, the
- * `call_id` is no longer valid. The trailer payload may be empty — the
+ * `call_id` is no longer valid after a SUCCESSFUL call; on `QUEUE_FULL` it
+ * remains valid and must be retried. The trailer payload may be empty — the
  * reactor still finishes the send side cleanly.
+ *
+ * May return `IROH_STATUS_QUEUE_FULL`; see `aster_reactor_submit` for the
+ * exact-retry and asynchronous-reservation contract. Terminal state is
+ * removed only after capacity is owned, so a retry cannot turn into a
+ * truncated stream.
  */
 int32_t aster_reactor_submit_trailer(iroh_runtime_t runtime,
                                      aster_reactor_t reactor,
@@ -1629,9 +1687,12 @@ int32_t aster_reactor_recv_frame(iroh_runtime_t runtime,
  * Returns:
  *   0 — call is alive (no cancellation observed yet)
  *   1 — call has been cancelled (peer sent FLAG_CANCEL or stream errored)
- *  <0 — `iroh_status_t` error code (e.g. NOT_FOUND if the call_id is unknown,
- *       which the binding may treat as "no longer cancellable" — typically
- *       maps to "already completed")
+ *   IROH_STATUS_NOT_FOUND (2) — the call_id is unknown: already completed, or
+ *       cancelled and reaped. A caller MUST treat this as terminal and stop,
+ *       exactly as it treats 1. It is NOT "alive".
+ *  other `iroh_status_t` codes — error. Note these are POSITIVE values; an
+ *       earlier version of this comment said error codes are <0, which led
+ *       callers to test `status == 1` and read NOT_FOUND as "keep going".
  */
 int32_t aster_reactor_check_cancelled(iroh_runtime_t runtime,
                                       aster_reactor_t reactor,

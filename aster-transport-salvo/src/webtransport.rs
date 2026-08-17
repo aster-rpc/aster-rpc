@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use aster::rpc::codec::{decode_stream_header, StreamHeader};
 use aster::rpc::{CallParts, Dispatcher, OutgoingFrame, RequestFrame};
 use aster_transport_core::framing::FLAG_END_STREAM;
+use aster_transport_core::reactor::{response_channel, FRAME_CHANNEL_DEPTH};
 
 /// Mount the Aster WebTransport endpoint at `/aster/wt`. Nest into your app
 /// router; a browser opens a WebTransport session to this path and runs one
@@ -105,11 +106,16 @@ async fn serve_call<Snd, Rcv>(
         Ok(Some(f)) => f,
         _ => (Vec::new(), FLAG_END_STREAM),
     };
-    let (req_tx, req_rx) = mpsc::unbounded_channel::<RequestFrame>();
+    // Bounded: this reads a LIVE stream, so the channel is the backpressure
+    // seam. An unbounded one let a peer that keeps sending outrun a handler
+    // that is slow to read, with no ceiling on what the process buffers.
+    let (req_tx, req_rx) = mpsc::channel::<RequestFrame>(FRAME_CHANNEL_DEPTH);
     if first_flags & FLAG_END_STREAM == 0 {
         tokio::spawn(async move {
             while let Ok(Some((payload, flags))) = read_frame(&mut recv).await {
-                if req_tx.send(RequestFrame { payload, flags }).is_err() {
+                // `.await` here is the point: it stops reading the stream when
+                // the handler is behind, rather than queueing without limit.
+                if req_tx.send(RequestFrame { payload, flags }).await.is_err() {
                     break;
                 }
                 if flags & FLAG_END_STREAM != 0 {
@@ -121,7 +127,7 @@ async fn serve_call<Snd, Rcv>(
         drop(req_tx);
     }
 
-    let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<OutgoingFrame>();
+    let (resp_tx, mut resp_rx) = response_channel();
     let parts = CallParts {
         peer_id,
         header_payload,
@@ -134,7 +140,8 @@ async fn serve_call<Snd, Rcv>(
     tokio::spawn(async move { dispatcher.dispatch_parts(parts).await });
 
     // Stream response frames out as the handler emits them.
-    while let Some(frame) = resp_rx.recv().await {
+    while let Some(item) = resp_rx.recv().await {
+        let (frame, _lease) = item.into_parts();
         if send.write_all(&raw_bytes(frame)).await.is_err() {
             return;
         }

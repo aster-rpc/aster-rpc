@@ -40,29 +40,35 @@ impl ServiceDispatch for FlakyService {
         let _ = call.recv_request().await;
         match method {
             "echo" => {
-                let _ = call.respond(b"ok".to_vec(), &RpcStatus::ok());
+                let _ = call.respond(b"ok".to_vec(), &RpcStatus::ok()).await;
             }
             // Fails UNAVAILABLE for the first two calls, then succeeds.
             "flaky" => {
                 let n = self.state.flaky_calls.fetch_add(1, Ordering::SeqCst);
                 if n < 2 {
-                    let _ = call.finish(&RpcStatus::error(StatusCode::Unavailable, "flaky"));
+                    let _ = call
+                        .finish(&RpcStatus::error(StatusCode::Unavailable, "flaky"))
+                        .await;
                 } else {
-                    let _ = call.respond(b"recovered".to_vec(), &RpcStatus::ok());
+                    let _ = call.respond(b"recovered".to_vec(), &RpcStatus::ok()).await;
                 }
             }
             // Sleeps past any reasonable client deadline.
             "slow" => {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                let _ = call.respond(b"slow".to_vec(), &RpcStatus::ok());
+                let _ = call.respond(b"slow".to_vec(), &RpcStatus::ok()).await;
             }
             // Always fails; counts how often the server is actually reached.
             "always_fail" => {
                 self.state.fail_calls.fetch_add(1, Ordering::SeqCst);
-                let _ = call.finish(&RpcStatus::error(StatusCode::Unavailable, "down"));
+                let _ = call
+                    .finish(&RpcStatus::error(StatusCode::Unavailable, "down"))
+                    .await;
             }
             other => {
-                let _ = call.finish(&RpcStatus::error(StatusCode::Unimplemented, other));
+                let _ = call
+                    .finish(&RpcStatus::error(StatusCode::Unimplemented, other))
+                    .await;
             }
         }
     }

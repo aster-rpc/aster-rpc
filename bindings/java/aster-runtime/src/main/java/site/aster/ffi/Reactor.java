@@ -6,6 +6,9 @@ import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 
 /**
  * Java FFM wrapper for the Aster reactor C FFI ({@code aster_reactor_*}).
@@ -106,6 +109,12 @@ public final class Reactor implements AutoCloseable {
 
   public static final byte EVENT_KIND_CONNECTION_CLOSED = 1;
 
+  /** A held native channel permit is ready; retry the exact response submit. */
+  public static final byte EVENT_KIND_RESPONSE_WRITABLE = 2;
+
+  /** The call closed while native code was waiting to reserve response capacity. */
+  public static final byte EVENT_KIND_RESPONSE_CLOSED = 3;
+
   // ============================================================================
   // Method handles
   // ============================================================================
@@ -183,6 +192,29 @@ public final class Reactor implements AutoCloseable {
                   ValueLayout.JAVA_INT // trailer_len
                   ));
 
+  private static final MethodHandle RESERVE_RESPONSE_CAPACITY =
+      IrohLibrary.getInstance()
+          .getHandle(
+              "aster_reactor_reserve_response_capacity",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT, // status
+                  ValueLayout.JAVA_LONG, // runtime
+                  ValueLayout.JAVA_LONG, // reactor
+                  ValueLayout.JAVA_LONG, // call_id
+                  ValueLayout.JAVA_LONG // encoded_len
+                  ));
+
+  private static final MethodHandle CANCEL_RESPONSE_RESERVATION =
+      IrohLibrary.getInstance()
+          .getHandle(
+              "aster_reactor_cancel_response_reservation",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT, // status
+                  ValueLayout.JAVA_LONG, // runtime
+                  ValueLayout.JAVA_LONG, // reactor
+                  ValueLayout.JAVA_LONG // call_id
+                  ));
+
   private static final MethodHandle BUFFER_RELEASE =
       IrohLibrary.getInstance()
           .getHandle(
@@ -198,7 +230,7 @@ public final class Reactor implements AutoCloseable {
           .getHandle(
               "aster_reactor_check_cancelled",
               FunctionDescriptor.of(
-                  ValueLayout.JAVA_INT, // 0=alive, 1=cancelled, <0=error
+                  ValueLayout.JAVA_INT, // 0=alive, 1=cancelled, NOT_FOUND(2)=gone, other=error
                   ValueLayout.JAVA_LONG, // runtime
                   ValueLayout.JAVA_LONG, // reactor
                   ValueLayout.JAVA_LONG // call_id
@@ -232,6 +264,8 @@ public final class Reactor implements AutoCloseable {
 
   private final long runtimeHandle;
   private final long handle;
+  private final ConcurrentHashMap<Long, CompletableFuture<Void>> responseCapacityWaiters =
+      new ConcurrentHashMap<>();
   private volatile boolean closed = false;
 
   /**
@@ -298,13 +332,130 @@ public final class Reactor implements AutoCloseable {
       int respLen = responseFrame == null ? 0 : (int) responseFrame.byteSize();
       MemorySegment trailerPtr = trailerFrame == null ? MemorySegment.NULL : trailerFrame;
       int trailerLen = trailerFrame == null ? 0 : (int) trailerFrame.byteSize();
-      int status =
-          (int)
-              SUBMIT.invoke(
-                  runtimeHandle, handle, callId, respPtr, respLen, trailerPtr, trailerLen);
-      checkStatus(status, "aster_reactor_submit");
+      retryWhileQueueFull(
+          callId,
+          (long) respLen + trailerLen,
+          "aster_reactor_submit",
+          () ->
+              (int)
+                  SUBMIT.invoke(
+                      runtimeHandle, handle, callId, respPtr, respLen, trailerPtr, trailerLen));
     } catch (Throwable t) {
       throw rethrow(t);
+    }
+  }
+
+  /** One native submission attempt, returning an {@code iroh_status_t} code. */
+  @FunctionalInterface
+  interface SubmitAttempt {
+    int invoke() throws Throwable;
+  }
+
+  /** Wait until native code owns response capacity for the exact retry. */
+  @FunctionalInterface
+  interface CapacityWait {
+    void await() throws Throwable;
+  }
+
+  /**
+   * Invoke a native submit call, retrying while the reactor's response channel is full.
+   *
+   * <p>The response channel is bounded, so a peer that stops reading eventually fills it. Native
+   * code never blocks on that — it reserves capacity first and returns {@code QUEUE_FULL} without
+   * copying the frame or changing any call state, so the same {@code MemorySegment} stays valid and
+   * the retry is free. Blocking inside the FFI call instead would pin this virtual thread's
+   * carrier, which is exactly the scalability problem {@code CallExecutor} exists to avoid.
+   *
+   * <p>Waiting therefore happens <em>outside</em> the downcall. Native code asynchronously reserves
+   * the exact byte charge and one item slot, then reports that combined permit through the reactor
+   * poll ring. The Java producer waits on a {@link CompletableFuture}, which parks a virtual thread
+   * without pinning its carrier. The exact retry consumes the held permit, so it cannot race back
+   * to {@code QUEUE_FULL}. A cancelled call completes the same waiter as closed, and thread
+   * interruption cancels the native reservation before returning to the caller.
+   */
+  private void retryWhileQueueFull(long callId, long encodedLen, String op, SubmitAttempt attempt)
+      throws Throwable {
+    retryQueueFull(op, attempt, () -> awaitResponseCapacity(callId, encodedLen, op));
+  }
+
+  /** Package-private so the Java retry state machine has a deterministic unit test. */
+  static void retryQueueFull(String op, SubmitAttempt attempt, CapacityWait capacityWait)
+      throws Throwable {
+    while (true) {
+      int status = attempt.invoke();
+      if (status != IrohStatus.QUEUE_FULL.code) {
+        checkStatus(status, op);
+        return;
+      }
+      QUEUE_FULL_HITS.increment();
+      capacityWait.await();
+    }
+  }
+
+  private void awaitResponseCapacity(long callId, long encodedLen, String op) throws Throwable {
+    CompletableFuture<Void> waiter = new CompletableFuture<>();
+    if (responseCapacityWaiters.putIfAbsent(callId, waiter) != null) {
+      throw new IllegalStateException(
+          "concurrent response-capacity waits violate the one-producer contract for call "
+              + callId);
+    }
+
+    int status;
+    try {
+      status = (int) RESERVE_RESPONSE_CAPACITY.invoke(runtimeHandle, handle, callId, encodedLen);
+    } catch (Throwable t) {
+      responseCapacityWaiters.remove(callId, waiter);
+      throw t;
+    }
+    if (status != IrohStatus.OK.code) {
+      responseCapacityWaiters.remove(callId, waiter);
+      checkStatus(status, "aster_reactor_reserve_response_capacity");
+    }
+
+    try {
+      waiter.get();
+    } catch (InterruptedException e) {
+      responseCapacityWaiters.remove(callId, waiter);
+      int cancelStatus = (int) CANCEL_RESPONSE_RESERVATION.invoke(runtimeHandle, handle, callId);
+      if (cancelStatus != IrohStatus.OK.code && cancelStatus != IrohStatus.NOT_FOUND.code) {
+        checkStatus(cancelStatus, "aster_reactor_cancel_response_reservation");
+      }
+      Thread.currentThread().interrupt();
+      throw IrohException.forStatus(
+          IrohStatus.CANCELLED, op + " interrupted while the response channel was full");
+    } catch (ExecutionException e) {
+      throw e.getCause();
+    }
+  }
+
+  /** Reset the diagnostic counter before a benchmark trial. */
+  public static void resetQueueFullStats() {
+    QUEUE_FULL_HITS.reset();
+  }
+
+  private static final java.util.concurrent.atomic.LongAdder QUEUE_FULL_HITS =
+      new java.util.concurrent.atomic.LongAdder();
+
+  /** Diagnostic: total {@code QUEUE_FULL} results observed in this JVM. */
+  public static long queueFullHits() {
+    return QUEUE_FULL_HITS.sum();
+  }
+
+  /** Complete one capacity notification delivered by the server's reactor poll loop. */
+  public void handleResponseCapacityEvent(byte eventKind, long callId) {
+    CompletableFuture<Void> waiter = responseCapacityWaiters.remove(callId);
+    if (waiter == null) {
+      return;
+    }
+    if (eventKind == EVENT_KIND_RESPONSE_WRITABLE) {
+      waiter.complete(null);
+    } else if (eventKind == EVENT_KIND_RESPONSE_CLOSED) {
+      waiter.completeExceptionally(
+          IrohException.forStatus(
+              IrohStatus.NOT_FOUND, "response channel closed for call " + callId));
+    } else {
+      waiter.completeExceptionally(
+          new IllegalArgumentException("not a response-capacity event: " + eventKind));
     }
   }
 
@@ -319,8 +470,11 @@ public final class Reactor implements AutoCloseable {
     try {
       MemorySegment ptr = frame == null ? MemorySegment.NULL : frame;
       int len = frame == null ? 0 : (int) frame.byteSize();
-      int status = (int) SUBMIT_FRAME.invoke(runtimeHandle, handle, callId, ptr, len);
-      checkStatus(status, "aster_reactor_submit_frame");
+      retryWhileQueueFull(
+          callId,
+          len,
+          "aster_reactor_submit_frame",
+          () -> (int) SUBMIT_FRAME.invoke(runtimeHandle, handle, callId, ptr, len));
     } catch (Throwable t) {
       throw rethrow(t);
     }
@@ -337,8 +491,11 @@ public final class Reactor implements AutoCloseable {
     try {
       MemorySegment ptr = trailer == null ? MemorySegment.NULL : trailer;
       int len = trailer == null ? 0 : (int) trailer.byteSize();
-      int status = (int) SUBMIT_TRAILER.invoke(runtimeHandle, handle, callId, ptr, len);
-      checkStatus(status, "aster_reactor_submit_trailer");
+      retryWhileQueueFull(
+          callId,
+          len,
+          "aster_reactor_submit_trailer",
+          () -> (int) SUBMIT_TRAILER.invoke(runtimeHandle, handle, callId, ptr, len));
     } catch (Throwable t) {
       throw rethrow(t);
     }
@@ -452,19 +609,43 @@ public final class Reactor implements AutoCloseable {
   }
 
   /**
-   * Check whether the given call has been cancelled by the peer (or by a transport-level error).
-   * Streaming dispatchers should poll this from any long-running emit loop and stop early when it
-   * returns {@code true}. Returns {@code false} for unknown call ids (a call already cleaned up by
-   * submit/submit_trailer is reported as not-cancelled).
+   * Whether a long-running emit loop for this call should stop.
+   *
+   * <p>Returns {@code true} when the call has been cancelled by the peer <em>or</em> when the call
+   * id is unknown — already completed, or cancelled and reaped. Both mean "stop"; neither means
+   * "keep going".
+   *
+   * <p>This used to be {@code return status == 1}, which read {@code IROH_STATUS_NOT_FOUND} —
+   * positive code 2 — as {@code false} and told the producer to continue streaming on a call that
+   * no longer existed. Since cancellation now reaps per-call state as soon as the response receiver
+   * drops, NOT_FOUND is the <em>common</em> answer after a cancel, not an edge case.
+   *
+   * @return {@code true} if the loop must stop, {@code false} while the call is live
+   * @throws IrohException on any other status
    */
   public boolean checkCancelled(long callId) {
     try {
       int status = (int) CHECK_CANCELLED.invoke(runtimeHandle, handle, callId);
-      return status == 1;
+      if (status == CHECK_CANCELLED_LIVE) {
+        return false;
+      }
+      if (status == CHECK_CANCELLED_CANCELLED || status == IrohStatus.NOT_FOUND.code) {
+        return true;
+      }
+      // Anything else is a real error and must not be silently read as "live".
+      IrohStatus mapped = IrohStatus.fromCode(status);
+      throw IrohException.forStatus(
+          mapped, "aster_reactor_check_cancelled failed: " + mapped.name());
     } catch (Throwable t) {
       throw rethrow(t);
     }
   }
+
+  /** The call is alive and not cancelled. */
+  private static final int CHECK_CANCELLED_LIVE = 0;
+
+  /** The peer sent FLAG_CANCEL, or the stream errored. */
+  private static final int CHECK_CANCELLED_CANCELLED = 1;
 
   /** Destroy the reactor. Idempotent. */
   @Override
@@ -473,6 +654,10 @@ public final class Reactor implements AutoCloseable {
       return;
     }
     closed = true;
+    IrohException closedError =
+        IrohException.forStatus(IrohStatus.NOT_FOUND, "reactor closed during response wait");
+    responseCapacityWaiters.forEach((callId, waiter) -> waiter.completeExceptionally(closedError));
+    responseCapacityWaiters.clear();
     try {
       DESTROY.invoke(runtimeHandle, handle);
     } catch (Throwable t) {

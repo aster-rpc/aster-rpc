@@ -87,15 +87,17 @@ impl ServiceDispatch for Calc {
                     .fory
                     .serialize(&AddResp { sum: req.a + req.b })
                     .unwrap();
-                let _ = call.respond(bytes, &RpcStatus::ok());
+                let _ = call.respond(bytes, &RpcStatus::ok()).await;
             }
             "count" => {
                 let raw = call.recv_request().await.unwrap_or_default();
                 let req: CountReq = self.fory.deserialize(&raw).unwrap();
                 for v in 0..req.n {
-                    let _ = call.send(self.fory.serialize(&NumResp { v }).unwrap());
+                    let _ = call
+                        .send(self.fory.serialize(&NumResp { v }).unwrap())
+                        .await;
                 }
-                let _ = call.finish(&RpcStatus::ok());
+                let _ = call.finish(&RpcStatus::ok()).await;
             }
             _ => {}
         }

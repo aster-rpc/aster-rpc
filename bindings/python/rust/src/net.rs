@@ -1238,73 +1238,104 @@ use std::sync::Mutex as StdMutex;
 
 #[pyclass]
 pub struct ReactorResponseSender {
-    inner: StdMutex<
-        Option<tokio::sync::mpsc::UnboundedSender<aster_transport_core::reactor::OutgoingFrame>>,
-    >,
+    inner: StdMutex<Option<aster_transport_core::reactor::ResponseSender>>,
 }
 
 #[pymethods]
 impl ReactorResponseSender {
     /// Submit a unary response: one Frame + one Trailer, atomically. After
     /// this call the sender is consumed and further submits fail.
-    fn submit(&self, response_frame: Vec<u8>, trailer_frame: Vec<u8>) -> PyResult<()> {
-        let sender = self
-            .inner
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("lock poisoned"))?
-            .take()
-            .ok_or_else(|| {
+    /// Awaitable since §12.4 bounded the response channel.
+    fn submit<'p>(
+        &self,
+        py: Python<'p>,
+        response_frame: Vec<u8>,
+        trailer_frame: Vec<u8>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let sender = {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("lock poisoned"))?;
+            guard.take().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("response already submitted")
-            })?;
-        if !response_frame.is_empty() {
-            let _ = sender.send(aster_transport_core::reactor::OutgoingFrame::Frame(
-                response_frame,
-            ));
-        }
-        let _ = sender.send(aster_transport_core::reactor::OutgoingFrame::Trailer(
-            trailer_frame,
-        ));
-        Ok(())
+            })?
+        };
+        future_into_py(py, async move {
+            if !response_frame.is_empty() {
+                let _ = sender
+                    .send(aster_transport_core::reactor::OutgoingFrame::Frame(
+                        response_frame,
+                    ))
+                    .await;
+            }
+            let _ = sender
+                .send(aster_transport_core::reactor::OutgoingFrame::Trailer(
+                    trailer_frame,
+                ))
+                .await;
+            Ok(())
+        })
     }
 
     /// Streaming: send one response data frame. The sender stays open for
     /// further `send_frame` / `send_trailer` calls. Use this instead of
     /// `submit` for server-streaming, client-streaming, and bidi patterns.
-    fn send_frame(&self, frame: Vec<u8>) -> PyResult<()> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("lock poisoned"))?;
-        let sender = guard.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("response stream already closed")
-        })?;
-        sender
-            .send(aster_transport_core::reactor::OutgoingFrame::Frame(frame))
-            .map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err("reactor dropped response channel")
-            })?;
-        Ok(())
+    /// Awaitable since §12.4 bounded the response channel: awaiting is the
+    /// backpressure. The sender is cloned out of the guard first so no
+    /// `std::sync::MutexGuard` is held across the await.
+    fn send_frame<'p>(&self, py: Python<'p>, frame: Vec<u8>) -> PyResult<Bound<'p, PyAny>> {
+        let sender = {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("lock poisoned"))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err("response stream already closed")
+                })?
+                .clone()
+        };
+        future_into_py(py, async move {
+            sender
+                .send(aster_transport_core::reactor::OutgoingFrame::Frame(frame))
+                .await
+                .map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("reactor dropped response channel")
+                })?;
+            Ok(())
+        })
     }
 
     /// Streaming terminator: send the trailer frame and consume the sender.
     /// After this call the stream is closed and further sends fail.
-    fn send_trailer(&self, trailer_frame: Vec<u8>) -> PyResult<()> {
-        let sender = self
-            .inner
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("lock poisoned"))?
-            .take()
-            .ok_or_else(|| {
+    /// Awaitable for the same reason as [`send_frame`].
+    fn send_trailer<'p>(
+        &self,
+        py: Python<'p>,
+        trailer_frame: Vec<u8>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let sender = {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("lock poisoned"))?;
+            guard.take().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("response stream already closed")
-            })?;
-        sender
-            .send(aster_transport_core::reactor::OutgoingFrame::Trailer(
-                trailer_frame,
-            ))
-            .map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err("reactor dropped response channel")
-            })?;
-        Ok(())
+            })?
+        };
+        future_into_py(py, async move {
+            sender
+                .send(aster_transport_core::reactor::OutgoingFrame::Trailer(
+                    trailer_frame,
+                ))
+                .await
+                .map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("reactor dropped response channel")
+                })?;
+            Ok(())
+        })
     }
 }
 
@@ -1317,9 +1348,7 @@ impl ReactorResponseSender {
 pub struct ReactorRequestReceiver {
     inner: Arc<
         tokio::sync::Mutex<
-            Option<
-                tokio::sync::mpsc::UnboundedReceiver<aster_transport_core::reactor::RequestFrame>,
-            >,
+            Option<tokio::sync::mpsc::Receiver<aster_transport_core::reactor::RequestFrame>>,
         >,
     >,
 }

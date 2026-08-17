@@ -429,6 +429,16 @@ public final class AsterServer implements AutoCloseable {
             handleConnectionClosed(slot);
             continue;
           }
+          if (eventKind == Reactor.EVENT_KIND_RESPONSE_WRITABLE
+              || eventKind == Reactor.EVENT_KIND_RESPONSE_CLOSED) {
+            reactor.handleResponseCapacityEvent(
+                eventKind, slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_CALL_ID));
+            continue;
+          }
+          if (eventKind != Reactor.EVENT_KIND_CALL) {
+            System.err.println("unknown reactor event kind: " + eventKind);
+            continue;
+          }
           AsterCall call = extractCall(slot);
           long headerBuf = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_HEADER_BUFFER);
           long requestBuf = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_REQUEST_BUFFER);

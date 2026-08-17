@@ -44,7 +44,6 @@ use futures_util::StreamExt;
 use salvo::http::{ResBody, StatusCode as HttpStatus};
 use salvo::prelude::*;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use aster::rpc::codec::{
     decode_rpc_status, encode_stream_header, RpcStatus, SerializationMode, StreamHeader,
@@ -54,6 +53,9 @@ use aster::rpc::{
     RequestFrame,
 };
 use aster_transport_core::framing::{decode_frame, FLAG_END_STREAM, FLAG_TRAILER};
+use aster_transport_core::reactor::{
+    response_channel, ResponseItem, ResponseLease, ResponseReceiver,
+};
 
 pub mod tls;
 pub mod webtransport;
@@ -251,8 +253,7 @@ impl AsterHandler {
 
         res.status_code(HttpStatus::OK);
         let _ = res.add_header("content-type", ASTER_FRAMES, true);
-        let stream = UnboundedReceiverStream::new(resp_rx)
-            .map(|f| Ok::<Bytes, std::io::Error>(Bytes::from(raw_bytes(f))));
+        let stream = resp_rx.map(|item| Ok::<Bytes, std::io::Error>(leased_bytes(item)));
         res.body(ResBody::stream(stream));
     }
 
@@ -333,13 +334,14 @@ impl AsterHandler {
     fn respond_ndjson(
         &self,
         res: &mut Response,
-        resp_rx: mpsc::UnboundedReceiver<OutgoingFrame>,
+        resp_rx: ResponseReceiver,
         proj: Arc<dyn Projection>,
         method: String,
     ) {
         res.status_code(HttpStatus::OK);
         let _ = res.add_header("content-type", NDJSON, true);
-        let stream = UnboundedReceiverStream::new(resp_rx).map(move |of| {
+        let stream = resp_rx.map(move |item| {
+            let (of, _lease) = item.into_parts();
             let mut out = Vec::new();
             for_each_frame(raw_bytes(of), |payload, flags| {
                 if flags & FLAG_TRAILER != 0 {
@@ -364,14 +366,15 @@ impl AsterHandler {
     async fn respond_json(
         &self,
         res: &mut Response,
-        mut resp_rx: mpsc::UnboundedReceiver<OutgoingFrame>,
+        mut resp_rx: ResponseReceiver,
         proj: Arc<dyn Projection>,
         method: String,
         media_out: String,
     ) {
         let mut data: Vec<Vec<u8>> = Vec::new();
         let mut status = RpcStatus::ok();
-        while let Some(of) = resp_rx.recv().await {
+        while let Some(item) = resp_rx.recv().await {
+            let (of, _lease) = item.into_parts();
             let mut failed: Option<String> = None;
             for_each_frame(raw_bytes(of), |payload, flags| {
                 if flags & FLAG_TRAILER != 0 {
@@ -417,16 +420,23 @@ impl AsterHandler {
         peer_id: String,
         header_payload: Vec<u8>,
         req_frames: Vec<(Vec<u8>, u8)>,
-    ) -> mpsc::UnboundedReceiver<OutgoingFrame> {
-        let (req_tx, req_rx) = mpsc::unbounded_channel::<RequestFrame>();
+    ) -> ResponseReceiver {
+        // Bounded to match `CallParts`, but sized to the frames already in
+        // hand rather than to `FRAME_CHANNEL_DEPTH`. Unlike the WebTransport
+        // path this is not a live stream: an HTTP request body is fully read
+        // before dispatch, so the memory is already committed and a smaller
+        // bound would only deadlock this synchronous fill loop without saving
+        // anything. `max(1, ..)` because tokio rejects a zero capacity.
         let mut iter = req_frames.into_iter();
         let (request_payload, request_flags) = iter.next().unwrap_or((Vec::new(), FLAG_END_STREAM));
-        for (payload, flags) in iter {
-            let _ = req_tx.send(RequestFrame { payload, flags });
+        let rest: Vec<(Vec<u8>, u8)> = iter.collect();
+        let (req_tx, req_rx) = mpsc::channel::<RequestFrame>(rest.len().max(1));
+        for (payload, flags) in rest {
+            let _ = req_tx.try_send(RequestFrame { payload, flags });
         }
         drop(req_tx);
 
-        let (resp_tx, resp_rx) = mpsc::unbounded_channel::<OutgoingFrame>();
+        let (resp_tx, resp_rx) = response_channel();
         let parts = CallParts {
             peer_id,
             header_payload,
@@ -489,6 +499,25 @@ fn raw_bytes(f: OutgoingFrame) -> Vec<u8> {
     match f {
         OutgoingFrame::Frame(b) | OutgoingFrame::Trailer(b) | OutgoingFrame::CompleteUnary(b) => b,
     }
+}
+
+struct LeasedResponseBytes {
+    bytes: Vec<u8>,
+    _lease: ResponseLease,
+}
+
+impl AsRef<[u8]> for LeasedResponseBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn leased_bytes(item: ResponseItem) -> Bytes {
+    let (frame, lease) = item.into_parts();
+    Bytes::from_owner(LeasedResponseBytes {
+        bytes: raw_bytes(frame),
+        _lease: lease,
+    })
 }
 
 /// Concatenate JSON payloads into a JSON array.

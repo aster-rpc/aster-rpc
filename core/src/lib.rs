@@ -2415,7 +2415,14 @@ impl CoreConnection {
             let send = CoreSendStream::new(send);
             let recv = CoreRecvStream::new(recv);
 
-            let (payload, flags) = match recv.read_one_frame().await {
+            // The peeked frame is either a tunnel-redeem marker or a call
+            // header, and both are small. Bounding it here matters because this
+            // read happens before the reactor -- and therefore before any
+            // per-service limit -- exists.
+            let (payload, flags) = match recv
+                .read_one_frame_capped(crate::framing::MAX_CALL_HEADER_SIZE)
+                .await
+            {
                 Ok(f) => f,
                 Err(e) => {
                     debug!("accept_aster_bi: first-frame read error, dropping stream: {e}");
@@ -3007,6 +3014,31 @@ impl CoreSendStream {
         Ok(s.stopped().await?.map(|v| v.into_inner()))
     }
 
+    /// Abruptly terminate this send direction with an application error code.
+    ///
+    /// Used to **poison** a stream after `FLAG_CANCEL` (§6): a cancelled call
+    /// may have had a response frame partially written when flow control
+    /// blocked, so the byte stream is no longer at a frame boundary and nothing
+    /// may be written after it. Reset makes that explicit to the peer instead
+    /// of leaving a half-frame that the next call's bytes would silently
+    /// extend.
+    ///
+    /// Unlike `finish`, this does not wait for the peer and does not deliver
+    /// buffered data.
+    ///
+    /// **Awaits the lock and propagates failure.** An earlier version used
+    /// `try_lock` and returned `Ok(())` when the lock was held, on the theory
+    /// that a blocked writer would be dropped anyway -- so a reset that never
+    /// happened reported success. Callers must abort and await the writer
+    /// first, which releases the guard at its suspension point; by the time
+    /// this runs the lock is free, and blocking here would be a bug worth
+    /// seeing rather than hiding.
+    pub async fn reset(&self, code: u32) -> Result<()> {
+        let mut s = self.inner.lock().await;
+        s.reset(code.into())?;
+        Ok(())
+    }
+
     /// Set this stream's send priority. Quinn/iroh semantics: a higher value is
     /// scheduled first when several send streams on the same connection compete
     /// for the wire; default is `0`. Errors only if the stream is already closed.
@@ -3030,7 +3062,7 @@ impl CoreSendStream {
 struct RecvInner {
     stream: iroh::endpoint::RecvStream,
     /// Bytes peeked off the wire ahead of the caller — populated by
-    /// [`CoreConnection::accept_bi`] when it consumes the first frame
+    /// [`CoreConnection::accept_aster_bi`] when it consumes the first frame
     /// for `FLAG_TUNNEL` dispatch and the stream turns out to be a
     /// regular RPC stream. Reads drain this buffer before going to
     /// QUIC so the caller sees an unmodified length-prefixed stream.
@@ -3065,7 +3097,7 @@ impl CoreRecvStream {
     }
 
     /// Stash `bytes` at the front of the stream so the next read(s) drain
-    /// them before going to the wire. Used by `CoreConnection::accept_bi`
+    /// them before going to the wire. Used by `CoreConnection::accept_aster_bi`
     /// to put back the first frame after peeking it for `FLAG_TUNNEL`.
     /// Caller must ensure the stream has not been read from yet — this
     /// is enforced in debug builds.
@@ -3130,23 +3162,44 @@ impl CoreRecvStream {
         Ok(out)
     }
 
-    /// Read one length-prefixed frame: `[4B LE len][1B flags][payload]`.
-    /// Used by `CoreConnection::accept_bi` for the `FLAG_TUNNEL` peek and
-    /// by the reactor's per-stream frame reader.
-    pub(crate) async fn read_one_frame(&self) -> Result<(Vec<u8>, u8)> {
+    /// Read one length-prefixed frame: `[4B LE len][1B flags][payload]`,
+    /// refusing a frame whose *declared* body length exceeds `max` before
+    /// allocating for it.
+    ///
+    /// There is deliberately no uncapped variant. Every caller states the limit
+    /// in force -- `CoreConnection::accept_aster_bi`'s `FLAG_TUNNEL` peek and the
+    /// reactor's per-stream reader both do -- so the cap cannot be forgotten by
+    /// reaching for a more convenient method.
+    ///
+    /// This is the only place a caller-declared length becomes an allocation,
+    /// so it is the only place a per-method cap can be enforced. Checking after
+    /// the read -- in the dispatcher, say -- is checking after the harm.
+    pub(crate) async fn read_one_frame_capped(&self, max: u32) -> Result<(Vec<u8>, u8)> {
         let mut len_bytes = [0u8; 4];
         self.read_exact_into(&mut len_bytes).await?;
         let frame_body_len = u32::from_le_bytes(len_bytes) as usize;
         if frame_body_len == 0 {
             return Err(anyhow!("zero-length frame"));
         }
-        if frame_body_len > crate::framing::MAX_FRAME_SIZE as usize {
-            return Err(anyhow!("frame too large: {}", frame_body_len));
+        let cap = max.min(crate::framing::MAX_FRAME_SIZE) as usize;
+        if frame_body_len > cap {
+            return Err(anyhow!(
+                "frame too large: {} exceeds cap {}",
+                frame_body_len,
+                cap
+            ));
         }
         let mut flags_buf = [0u8; 1];
         self.read_exact_into(&mut flags_buf).await?;
         let flags = flags_buf[0];
         let payload_len = frame_body_len - 1;
+        // Counted HERE, at the allocation itself, so the metric covers every
+        // caller -- including `accept_aster_bi`'s peek, which happens before
+        // the reactor exists. Counting in the reactor only would report zero
+        // for a peek that allocated 16 MiB and then blocked.
+        #[cfg(feature = "ingress-metrics")]
+        crate::reactor::ingress_metrics::FRAME_BYTES_ALLOCATED
+            .fetch_add(payload_len as u64, std::sync::atomic::Ordering::Relaxed);
         let mut payload = vec![0u8; payload_len];
         self.read_exact_into(&mut payload).await?;
         Ok((payload, flags))
