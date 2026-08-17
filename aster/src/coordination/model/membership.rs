@@ -136,10 +136,17 @@ fn plan_shape(
     plan: &MembershipPlan,
     current_members: &BTreeSet<NodeId>,
     authority_material: &GroupAuthority,
+    deployment_profile_code: i32,
 ) -> Option<ShapeLimit> {
-    if let Some(limit) =
-        shape::check_membership_plan(plan.desired_voters.len(), plan.retained_learners.len())
-    {
+    // §7.1's profile decides the legal voter counts, read from replicated state
+    // rather than hard-coded. An earlier revision applied the production rule
+    // unconditionally, so a `DevSingle` or `DevEven` group had no legal
+    // membership transition at all.
+    if let Some(limit) = shape::check_membership_plan(
+        plan.desired_voters.len(),
+        plan.retained_learners.len(),
+        deployment_profile_code,
+    ) {
         return Some(limit);
     }
 
@@ -188,10 +195,18 @@ fn plan_shape(
         if !in_plan(&seed.node_id) {
             return Some(ShapeLimit::MemberSeedUnknownNode);
         }
-        // A seed with no ticket is route material that routes nowhere; §12.1
-        // charges a route row for it either way.
-        if seed.ticket.is_empty() {
-            return Some(ShapeLimit::MemberSeedTicketEmpty);
+        // §9: the ticket must be a **canonical Aster ticket**, carry no
+        // credential, and embed this seed's own node id.
+        //
+        // Authenticating a ticket is not validating it. An earlier revision
+        // checked size, non-emptiness, and byte-equality with the signed
+        // permit -- so a correctly signed permit for a literal that is not a
+        // ticket at all replicated happily, and every voter stored dialling
+        // material that dials nothing. A credential-bearing ticket is worse
+        // than useless here: it would put a bearer secret in the replicated
+        // route table.
+        if let Err(limit) = check_seed_ticket(&seed.ticket, &seed.node_id) {
+            return Some(limit);
         }
         // §9: a valid signed join permit is mandatory exactly for a new node and
         // absent for an existing member -- and **valid** means verified, not
@@ -267,19 +282,21 @@ pub fn decide_change(
     request_hash: &[u8; 32],
     action: &ChangeMembershipAction,
 ) -> Decision {
-    // §12.1 request-shape bounds, checked before anything is decided against
-    // replicated state: a plan outside the v1 shape was never a well-posed
-    // request. These were declared and had no caller.
-    if let Some(limit) = plan_shape(&action.plan, &state.members, &state.authority) {
-        return Decision::RefuseShapeless(limit);
-    }
-
-    if !state.admins.contains(actor) {
-        return Decision::Refuse(RefusalReason::PermissionChanged);
-    }
-
-    // A still-known id resolves before anything else: the point of a
-    // group-global id is that resubmitting it is answerable without re-deciding.
+    // **A retained operation resolves first**, before authorization and before
+    // every check whose answer depends on current replicated state.
+    //
+    // The order is load-bearing, not stylistic. §9 promises that resubmitting a
+    // group-global `operation_id` returns its stored status; an earlier revision
+    // validated the plan against current membership first, so once a change
+    // **completed**, its formerly-new nodes were existing members and their
+    // correctly-present join permits became invalid. The promised replay
+    // therefore stopped working precisely after completion -- the moment a
+    // controller most needs to ask "did my operation finish?".
+    //
+    // Neither branch mutates membership, and neither grants the caller
+    // authority to start a new operation: this answers about an operation the
+    // group already accepted, which it accepted from an administrator at the
+    // time.
     if let Some(existing) = state.intents.get(&action.operation_id) {
         if &existing.request_hash == request_hash {
             return Decision::Existing {
@@ -287,6 +304,22 @@ pub fn decide_change(
             };
         }
         return Decision::Refuse(RefusalReason::OperationIdConflict);
+    }
+
+    // §12.1 request-shape bounds, checked before anything is decided against
+    // replicated state: a plan outside the v1 shape was never a well-posed
+    // request. These were declared and had no caller.
+    if let Some(limit) = plan_shape(
+        &action.plan,
+        &state.members,
+        &state.authority,
+        state.deployment_profile_code,
+    ) {
+        return Decision::RefuseShapeless(limit);
+    }
+
+    if !state.admins.contains(actor) {
+        return Decision::Refuse(RefusalReason::PermissionChanged);
     }
 
     // Compared against the committed membership log id, not a synthetic
@@ -378,6 +411,53 @@ pub fn growth_delta(state: &State, effect: &IntentEffect) -> u64 {
         }
     }
     added.saturating_sub(freed)
+}
+
+/// Mint a canonical Open ticket for `node`, for fixtures.
+///
+/// Public behind `cfg(test)` because several modules build membership plans and
+/// all of them must build **real** tickets: a fixture using a literal would let
+/// the validation this exists to test pass vacuously.
+#[cfg(test)]
+pub fn test_ticket(node: &NodeId) -> Vec<u8> {
+    aster_transport_core::ticket::AsterTicket {
+        endpoint_id: *node,
+        relay: None,
+        direct_addrs: Vec::new(),
+        credential: Some(aster_transport_core::ticket::TicketCredential::Open),
+    }
+    .to_base58_string()
+    .expect("a well-formed ticket")
+    .into_bytes()
+}
+
+/// Validate one member-seed ticket (§9).
+///
+/// Decoded on every voter from the committed command, so the verdict is
+/// replicated rather than taken on a controller's word.
+fn check_seed_ticket(ticket: &[u8], node: &NodeId) -> Result<(), ShapeLimit> {
+    if ticket.is_empty() {
+        return Err(ShapeLimit::MemberSeedTicketEmpty);
+    }
+    let text = std::str::from_utf8(ticket).map_err(|_| ShapeLimit::MemberSeedTicketInvalid)?;
+    let parsed = aster_transport_core::ticket::AsterTicket::from_base58_str(text)
+        .map_err(|_| ShapeLimit::MemberSeedTicketInvalid)?;
+
+    // Open only: a route row is replicated group state that every voter and
+    // every future snapshot reader holds, so a credential in it is a secret
+    // distributed to everyone who can read the group.
+    if !matches!(
+        parsed.credential,
+        None | Some(aster_transport_core::ticket::TicketCredential::Open)
+    ) {
+        return Err(ShapeLimit::MemberSeedTicketCredential);
+    }
+    // The ticket must be for the node it seeds. Without this a plan may add
+    // node A while installing a route that dials node B.
+    if &parsed.endpoint_id != node {
+        return Err(ShapeLimit::MemberSeedTicketNode);
+    }
+    Ok(())
 }
 
 /// Which routes to evict so the retained set fits §12.1's cap of 64.
@@ -612,6 +692,7 @@ mod tests {
         s.admins.insert(ADMIN);
         s.admin_revision = 1;
         s.authority = authority::testing::authority();
+        s.deployment_profile_code = shape::PROFILE_PROD;
         s.members = nodes(&[1, 2, 3]).into_iter().collect();
         s.growth_bytes = s.recompute_growth();
         s
@@ -674,12 +755,12 @@ mod tests {
                 .iter()
                 .map(|node| MemberSeed {
                     node_id: *node,
-                    ticket: b"aster1ticket".to_vec(),
+                    ticket: test_ticket(node),
                     // A **real** signed permit for a new node, so a negative
                     // test differs from this one by exactly the field under
                     // test rather than by being unsigned.
                     join_permit: (!members.contains(node))
-                        .then(|| authority::testing::valid(node, b"aster1ticket")),
+                        .then(|| authority::testing::valid(node, &test_ticket(node))),
                 })
                 .collect(),
         }
@@ -1126,12 +1207,12 @@ mod tests {
         let action = change(op(1), &[1, 2, 3], None);
         let fresh = growth_delta(&s, &effect(decide_change(&s, &ADMIN, &[7u8; 32], &action)));
 
-        // Now route all three nodes already, with tickets of the same length.
+        // Now route all three nodes already, with the same tickets.
         for node in plan(&[1, 2, 3]).desired_voters {
             s.routes.insert(
                 node,
                 Route {
-                    ticket: b"aster1ticket".to_vec(),
+                    ticket: test_ticket(&node),
                     introduced_log_id: log(1),
                     source_operation_id: op(0),
                 },
@@ -1186,6 +1267,259 @@ mod tests {
         assert_eq!(
             intent.charge_len(&op(1)),
             p.encoded_len(&op(1), Some(log(7)))
+        );
+    }
+
+    // ── Retained-operation replay ───────────────────────────────────────────
+
+    /// **The replay that stopped working after completion.** §9 promises that
+    /// resubmitting a group-global `operation_id` returns its stored status. An
+    /// earlier revision validated the plan against *current* membership first,
+    /// so once a change completed, the nodes it added were members and their
+    /// correctly-present join permits became invalid -- the resubmission got
+    /// `MemberSeedPermit` instead of `Completed`, precisely when a controller
+    /// most needs to ask whether its operation finished.
+    #[test]
+    fn a_completed_operation_still_replays_after_its_nodes_become_members() {
+        let mut s = base();
+        let action = ChangeMembershipAction {
+            operation_id: op(1),
+            expected_membership_log_id: None,
+            plan: plan_adding(9),
+        };
+
+        // Accept it while node 9 is new.
+        let e = effect(decide_change(&s, &ADMIN, &[7u8; 32], &action));
+        let mut intent = e.intent.clone();
+        intent.status_code = PHASE_COMPLETED;
+        s.intents.insert(op(1), intent);
+
+        // The change completed, so node 9 is now a committed member and its
+        // permit is exactly the thing current-state validation would reject.
+        let mut node9 = [0u8; 32];
+        node9[0] = 9;
+        s.members = [nodes(&[1, 2])[0], nodes(&[1, 2])[1], node9]
+            .into_iter()
+            .collect();
+        assert!(
+            plan_shape(
+                &action.plan,
+                &s.members,
+                &s.authority,
+                s.deployment_profile_code
+            )
+            .is_some(),
+            "the fixture must be one that current-state validation now rejects"
+        );
+
+        assert_eq!(
+            decide_change(&s, &ADMIN, &[7u8; 32], &action),
+            Decision::Existing {
+                phase: PHASE_COMPLETED
+            },
+            "a retained operation answers from its stored status, not from revalidation"
+        );
+    }
+
+    /// The conflict branch resolves at the same point: a different plan under a
+    /// retained id is `OperationIdConflict`, not whatever the new plan would
+    /// have failed on.
+    #[test]
+    fn a_conflicting_plan_under_a_retained_id_reports_the_conflict() {
+        let mut s = base();
+        s.intents
+            .insert(op(1), intent(PHASE_COMPLETED, Some(log(3))));
+        // A plan that is *also* invalid against current state, so a revalidating
+        // implementation would answer with a shape refusal instead.
+        let mut broken = plan(&[1, 2, 3]);
+        broken.desired_voters.reverse();
+
+        assert_eq!(
+            reason(decide_change(
+                &s,
+                &ADMIN,
+                &[9u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: broken,
+                }
+            )),
+            Reason::OperationIdConflict,
+        );
+    }
+
+    // ── Seed tickets ────────────────────────────────────────────────────────
+
+    /// §9: a seed ticket is **validated**, not merely authenticated. A permit
+    /// that correctly signs a string proves the authority meant that string; it
+    /// says nothing about whether the string is a ticket.
+    #[test]
+    fn a_seed_ticket_must_be_a_canonical_open_ticket_for_its_own_node() {
+        let s = base();
+        let mut node9 = [0u8; 32];
+        node9[0] = 9;
+
+        let refuse = |ticket: Vec<u8>| {
+            let mut p = plan_adding(9);
+            let seed = p
+                .member_seeds
+                .iter_mut()
+                .find(|s| s.node_id == node9)
+                .expect("the new node is seeded");
+            seed.ticket = ticket.clone();
+            // Re-sign, so the permit correctly authenticates these exact bytes
+            // and the only thing under test is whether they are a valid ticket.
+            seed.join_permit = Some(authority::testing::valid(&node9, &ticket));
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: p,
+                },
+            ))
+        };
+
+        // The literal the fixtures used to carry, correctly signed.
+        assert_eq!(
+            refuse(b"aster1ticket".to_vec()),
+            ShapeLimit::MemberSeedTicketInvalid,
+            "a signed non-ticket is still not a ticket"
+        );
+        assert_eq!(
+            refuse(b"not-even-prefixed".to_vec()),
+            ShapeLimit::MemberSeedTicketInvalid
+        );
+        assert_eq!(
+            refuse(vec![0xFF, 0xFE]),
+            ShapeLimit::MemberSeedTicketInvalid
+        );
+
+        // A valid ticket for the wrong node: the plan would add node 9 while
+        // installing a route that dials somebody else.
+        let mut other = [0u8; 32];
+        other[0] = 8;
+        assert_eq!(
+            refuse(test_ticket(&other)),
+            ShapeLimit::MemberSeedTicketNode
+        );
+
+        // A credential-bearing ticket. A route row is replicated group state, so
+        // a credential in it is a bearer secret handed to everyone who can read
+        // the group -- including every future snapshot reader.
+        let credentialed = aster_transport_core::ticket::AsterTicket {
+            endpoint_id: node9,
+            relay: None,
+            direct_addrs: Vec::new(),
+            credential: Some(
+                aster_transport_core::ticket::TicketCredential::ConsumerRcan(b"{}".to_vec()),
+            ),
+        }
+        .to_base58_string()
+        .expect("encodes")
+        .into_bytes();
+        assert_eq!(refuse(credentialed), ShapeLimit::MemberSeedTicketCredential);
+
+        // And the canonical one is accepted, so this is validation rather than
+        // a blanket refusal.
+        assert!(matches!(
+            decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: plan_adding(9),
+                }
+            ),
+            Decision::Apply(_)
+        ));
+    }
+
+    // ── Deployment profile ──────────────────────────────────────────────────
+
+    /// §7.1's profile is replicated state, and apply reads it. A hard-coded
+    /// production rule left `DevSingle` and `DevEven` groups with no legal
+    /// membership transition at all.
+    #[test]
+    fn the_replicated_deployment_profile_decides_the_legal_voter_counts() {
+        let permitted =
+            |profile: i32, voters: usize| !shape::profile_permits_voters(profile, voters);
+
+        assert!(permitted(shape::PROFILE_PROD, 3));
+        assert!(permitted(shape::PROFILE_PROD, 5));
+        assert!(!permitted(shape::PROFILE_PROD, 1));
+        assert!(!permitted(shape::PROFILE_PROD, 2));
+        assert!(!permitted(shape::PROFILE_PROD, 4));
+
+        assert!(permitted(shape::PROFILE_DEV_SINGLE, 1));
+        assert!(!permitted(shape::PROFILE_DEV_SINGLE, 3));
+
+        assert!(permitted(shape::PROFILE_DEV_EVEN, 2));
+        assert!(!permitted(shape::PROFILE_DEV_EVEN, 3));
+
+        // An unknown profile permits nothing. Falling back to the production
+        // rule would accept a membership the group's operators never asked for.
+        assert!(!permitted(99, 3));
+        assert!(!permitted(0, 1));
+    }
+
+    /// The same rule reached through a real decision, so the profile is proved
+    /// to be consulted by apply rather than merely declared.
+    #[test]
+    fn a_single_voter_group_can_change_its_membership() {
+        let mut s = base();
+        s.deployment_profile_code = shape::PROFILE_DEV_SINGLE;
+        s.members = nodes(&[1]).into_iter().collect();
+
+        let single = MembershipPlan {
+            desired_voters: nodes(&[1]),
+            retained_learners: Vec::new(),
+            member_seeds: nodes(&[1])
+                .iter()
+                .map(|n| MemberSeed {
+                    node_id: *n,
+                    ticket: test_ticket(n),
+                    join_permit: None,
+                })
+                .collect(),
+        };
+        assert!(
+            matches!(
+                decide_change(
+                    &s,
+                    &ADMIN,
+                    &[7u8; 32],
+                    &ChangeMembershipAction {
+                        operation_id: op(1),
+                        expected_membership_log_id: None,
+                        plan: single.clone(),
+                    }
+                ),
+                Decision::Apply(_)
+            ),
+            "a DevSingle group has a legal one-voter membership"
+        );
+
+        // And the same plan is refused by a production group, so the profile is
+        // what decided it.
+        s.deployment_profile_code = shape::PROFILE_PROD;
+        assert_eq!(
+            shapeless(decide_change(
+                &s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: None,
+                    plan: single,
+                }
+            )),
+            ShapeLimit::MembershipPlanSize,
         );
     }
 
@@ -1378,7 +1712,10 @@ mod tests {
             3,
             "every new node is seeded, which is what §9 requires"
         );
-        assert_eq!(e.intent.plan.member_seeds[0].ticket, b"aster1ticket");
+        assert_eq!(
+            e.intent.plan.member_seeds[0].ticket,
+            test_ticket(&e.intent.plan.desired_voters[0])
+        );
         assert_eq!(e.intent.actor, ADMIN);
         assert_eq!(e.intent.request_hash, [7u8; 32]);
         assert_eq!(e.outcome, Outcome::MembershipAccepted);
@@ -1400,7 +1737,7 @@ mod tests {
         let mut first = [0u8; 32];
         first[0] = 1;
         assert_eq!(*node, first);
-        assert_eq!(route.ticket, b"aster1ticket");
+        assert_eq!(route.ticket, test_ticket(node));
         assert_eq!(route.source_operation_id, op(1));
     }
 

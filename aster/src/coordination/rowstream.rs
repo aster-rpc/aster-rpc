@@ -327,8 +327,17 @@ pub struct RouteRowV1 {
 pub struct AuditRowV1 {
     #[fory(id = 1, bytes)]
     pub leader_node_id: Vec<u8>,
+    /// `None` only when a committed malformed client or retirement command's
+    /// actor bytes could not be narrowed; `Some` is always exactly 32 bytes.
+    ///
+    /// An `Option`, not an empty-vector sentinel. The model, this stored row,
+    /// the snapshot/export row and the public `AuditRecordWireV1` all use the
+    /// same shape and the same width rule -- an earlier revision encoded absence
+    /// as an empty vector while snapshot validation still demanded 32 bytes, so
+    /// the very row §11.3 requires for a malformed entry could not be exported
+    /// or installed.
     #[fory(id = 2, bytes)]
-    pub actor_node_id: Vec<u8>,
+    pub actor_node_id: Option<Vec<u8>>,
     #[fory(id = 3)]
     pub operation_code: i32,
     #[fory(id = 4)]
@@ -884,7 +893,9 @@ pub fn validate_snapshot_row(r: &SnapshotBodyRowV1) -> Result<(), BodyError> {
         SnapshotBodyRowV1::Route(x) => check_node_id(&x.node_id)?,
         SnapshotBodyRowV1::Audit(x) => {
             check_node_id(&x.row.leader_node_id)?;
-            check_node_id(&x.row.actor_node_id)?;
+            if let Some(actor) = &x.row.actor_node_id {
+                check_node_id(actor)?;
+            }
             if let Some(k) = &x.row.resource {
                 check_resource_key(k)?;
             }
@@ -1077,7 +1088,7 @@ mod tests {
             log_index: index,
             row: AuditRowV1 {
                 leader_node_id: nid(4),
-                actor_node_id: nid(5),
+                actor_node_id: Some(nid(5)),
                 operation_code: 1,
                 resource: Some(key("p", b"t")),
                 result_code: 1,
@@ -1267,6 +1278,110 @@ mod tests {
         assert_eq!(keep.rows.len(), 4);
         assert_eq!(keep.rows[1], session_row(1), "the session root survives");
         assert_eq!(keep.rows[3], intent_row(4), "the intent root survives");
+    }
+
+    /// **The audit row §11.3 now requires for a malformed entry must survive a
+    /// snapshot.** An earlier revision encoded an absent actor as an empty
+    /// vector while this validator still demanded exactly 32 bytes, so the row
+    /// could be written into state and then neither exported nor installed.
+    #[test]
+    fn an_audit_row_with_no_actor_survives_a_snapshot_body() {
+        let counts = RowCountsV1 {
+            resources: 0,
+            grants: 0,
+            admins: 1,
+            sessions: 0,
+            intents: 0,
+            routes: 0,
+            audit: 2,
+        };
+        let absent = SnapshotBodyRowV1::Audit(AuditStreamRowV1 {
+            log_term: 1,
+            log_index: 5,
+            row: AuditRowV1 {
+                leader_node_id: nid(1),
+                actor_node_id: None,
+                operation_code: 1,
+                resource: None,
+                result_code: 100,
+                epoch: 0,
+                value_revision: 0,
+            },
+        });
+        let present = SnapshotBodyRowV1::Audit(AuditStreamRowV1 {
+            log_term: 1,
+            log_index: 6,
+            row: AuditRowV1 {
+                leader_node_id: nid(1),
+                actor_node_id: Some(nid(5)),
+                operation_code: 1,
+                resource: None,
+                result_code: 100,
+                epoch: 0,
+                value_revision: 0,
+            },
+        });
+
+        let mut w =
+            BodyWriter::<_, SnapshotBodyRowV1>::new(Vec::new(), &header_for(counts)).unwrap();
+        w.begin_section(SECTION_RESOURCES).unwrap();
+        w.begin_section(SECTION_GRANTS).unwrap();
+        w.begin_section(SECTION_ADMINS).unwrap();
+        w.row(&admin(1)).unwrap();
+        w.begin_section(SECTION_SESSIONS).unwrap();
+        w.begin_section(SECTION_INTENTS).unwrap();
+        w.begin_section(SECTION_ROUTES).unwrap();
+        w.begin_section(SECTION_AUDIT).unwrap();
+        w.row(&absent).expect("an absent actor is writable");
+        w.row(&present).unwrap();
+        let body = w.finish().expect("a complete body");
+
+        #[derive(Default)]
+        struct Keep {
+            rows: Vec<SnapshotBodyRowV1>,
+        }
+        impl BodyVisitor<SnapshotBodyRowV1> for Keep {
+            fn header(&mut self, _h: &SnapshotHeaderV1) -> Result<(), BodyError> {
+                Ok(())
+            }
+            fn row(&mut self, _s: u64, r: SnapshotBodyRowV1) -> Result<(), BodyError> {
+                self.rows.push(r);
+                Ok(())
+            }
+        }
+        let mut keep = Keep::default();
+        read_body::<_, SnapshotBodyRowV1>(&mut body.as_slice(), &mut keep)
+            .expect("an absent actor is installable");
+        assert_eq!(keep.rows[1], absent, "absence survives, unchanged");
+        assert_eq!(keep.rows[2], present);
+    }
+
+    /// `None` is absence; a wrong width is still corruption. There is no
+    /// empty-vector sentinel anywhere in the chain.
+    #[test]
+    fn a_wrong_width_actor_is_still_rejected_by_snapshot_validation() {
+        let row = |actor: Option<Vec<u8>>| {
+            SnapshotBodyRowV1::Audit(AuditStreamRowV1 {
+                log_term: 1,
+                log_index: 5,
+                row: AuditRowV1 {
+                    leader_node_id: nid(1),
+                    actor_node_id: actor,
+                    operation_code: 1,
+                    resource: None,
+                    result_code: 100,
+                    epoch: 0,
+                    value_revision: 0,
+                },
+            })
+        };
+        assert!(validate_snapshot_row(&row(None)).is_ok());
+        assert!(validate_snapshot_row(&row(Some(nid(5)))).is_ok());
+        assert!(validate_snapshot_row(&row(Some(vec![0u8; 8]))).is_err());
+        assert!(
+            validate_snapshot_row(&row(Some(Vec::new()))).is_err(),
+            "an empty vector is a width failure, not an absence sentinel"
+        );
     }
 
     /// Both header roots round-trip through Fory with every field intact. The

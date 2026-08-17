@@ -373,6 +373,10 @@ fn shape_rejection(command: &CommandV1) -> Command {
                     reply_shape: ReplyShape::Client,
                     system_result_code: 0,
                     actor: actor.ok(),
+                    // §10.1 rule 3: a malformed prefix field does not erase a
+                    // separately valid resource identity. A client id of the
+                    // wrong width says nothing about the resource named.
+                    resource: wire_resource(&c.action),
                 }),
             }
         }
@@ -381,6 +385,8 @@ fn shape_rejection(command: &CommandV1) -> Command {
             reply_shape: ReplyShape::Retirement,
             system_result_code: 0,
             actor: node_id(&r.actor_node_id).ok(),
+            // A retirement names no resource.
+            resource: None,
         }),
         CommandV1::Expire(_) => Command::Shapeless(ShapelessCommand {
             operation_code: OPERATION_EXPIRE,
@@ -388,15 +394,19 @@ fn shape_rejection(command: &CommandV1) -> Command {
             // Its own code: a malformed expiry answered with a membership
             // phase code tells an operator the wrong subsystem is broken.
             system_result_code: SYS_EXPIRE_MALFORMED,
-            // A system command's actor is the proposing leader, which the
-            // caller stamps; nothing in the entry itself names one.
+            // A system command's actor is the proposing leader, which apply
+            // stamps from the log id; nothing in the entry itself names one.
             actor: None,
+            // The resource is what would not narrow, which is the only way an
+            // `Expire` reaches this path.
+            resource: None,
         }),
         CommandV1::MembershipProgress(_) => Command::Shapeless(ShapelessCommand {
             operation_code: OPERATION_MEMBERSHIP_PROGRESS,
             reply_shape: ReplyShape::System,
             system_result_code: SYS_MEMBERSHIP_MALFORMED,
             actor: None,
+            resource: None,
         }),
         // Unreachable: `command_for_apply` returns `UnknownVariant` first.
         CommandV1::Unknown(_) => Command::Unknown,
@@ -584,6 +594,7 @@ mod tests {
         // A running group: §12.1 allows at most two new voters per change, so a
         // membership fixture cannot start from an empty committed set.
         s.authority = crate::coordination::model::authority::testing::authority();
+        s.deployment_profile_code = crate::coordination::model::shape::PROFILE_PROD;
         s.members = (1u8..=3).map(|b| [b; 32]).collect();
         s.acl.insert((key(), ACTOR), ALL_RIGHTS);
         s.growth_bytes = s.recompute_growth();
@@ -964,7 +975,13 @@ mod tests {
             "the actor id is what would not narrow, so attribution is absent"
         );
         assert_eq!(audited.operation_code, 1, "acquire, read from the variant");
-        assert_eq!(audited.resource, None, "the identity was malformed");
+        // §10.1 rule 3: the prefix is what was malformed, and that does not
+        // erase the separately valid resource the action named.
+        assert_eq!(
+            audited.resource,
+            Some(key()),
+            "a malformed client id says nothing about the resource"
+        );
         assert!(
             s.reserve_bytes > before.reserve_bytes,
             "and the row is charged like any other"
@@ -1029,10 +1046,15 @@ mod tests {
             ),
             other => panic!("expected a system reply, got {other:?}"),
         }
+        let expire_row = s.audit.get(&(1, 1)).expect("audited");
+        assert_eq!(expire_row.operation_code, 100, "filed under Expire");
+        // A system command has no caller, so it attributes the proposing
+        // leader -- the same rule an ordinary `Expire` row follows. `None` is
+        // reserved for a client command whose actor bytes would not narrow.
         assert_eq!(
-            s.audit.get(&(1, 1)).expect("audited").operation_code,
-            100,
-            "the audit row files it under Expire"
+            expire_row.actor,
+            Some(LEADER),
+            "a malformed system command still names the leader that proposed it"
         );
 
         // A progress report with a malformed operation id.
@@ -1054,6 +1076,11 @@ mod tests {
             "two subsystems, two codes"
         );
         assert_eq!(s.audit.len(), 2, "one row per committed entry");
+        assert_eq!(
+            s.audit.get(&(1, 2)).expect("audited").actor,
+            Some(LEADER),
+            "the same attribution rule for both system commands"
+        );
     }
 
     /// A hash that does not match its action is a request-shape violation, so it
@@ -1664,7 +1691,10 @@ mod tests {
                 member_seeds: (1u8..=3)
                     .map(|b| MemberSeedV1 {
                         node_id: vec![b; 32],
-                        ticket: "aster1ticket".into(),
+                        ticket: String::from_utf8(
+                            crate::coordination::model::membership::test_ticket(&[b; 32]),
+                        )
+                        .expect("ascii"),
                         signed_join_permit: None,
                     })
                     .collect(),

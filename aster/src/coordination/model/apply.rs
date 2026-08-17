@@ -465,7 +465,7 @@ pub enum Command {
 }
 
 /// A committed command with no usable identity (§10.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShapelessCommand {
     /// The §5.2 method the wire variant named, if it named one.
     pub operation_code: i32,
@@ -482,8 +482,16 @@ pub struct ShapelessCommand {
     /// shapeless entry is audited too -- and a valid actor with a malformed
     /// client id is still attributable. `None` means the actor id itself would
     /// not narrow, which is the only case where attribution is genuinely
-    /// unavailable.
+    /// unavailable; a **system** command instead attributes the proposing log
+    /// leader, which apply stamps.
     pub actor: Option<NodeId>,
+    /// The resource the action named, if that identity is itself valid.
+    ///
+    /// §10.1 rule 3: a malformed *prefix* does not erase a separately valid
+    /// resource identity from the reply or the audit row. The two failures are
+    /// independent -- a client id of the wrong width says nothing about the
+    /// resource the request named.
+    pub resource: Option<ResourceKey>,
 }
 
 /// Which arm of `CommandReply` a shapeless command must still produce.
@@ -660,7 +668,7 @@ fn apply_shapeless(state: &mut State, log_id: LogId, command: &ShapelessCommand)
             // Nothing was consumed, because there is no session to consume a
             // sequence in.
             disposition: Disposition::NotConsumed,
-            reply: rejection(state, None, Reason::None),
+            reply: rejection(state, command.resource.clone(), Reason::None),
             replayed: false,
         })),
         ReplyShape::Retirement => CommandReply::Retirement(RetirementResult {
@@ -678,10 +686,16 @@ fn apply_shapeless(state: &mut State, log_id: LogId, command: &ShapelessCommand)
         log_id,
         AuditRow {
             leader_node_id: log_id.leader_node_id,
-            actor: command.actor,
+            // A system command has no caller, so it attributes the proposing
+            // leader -- the same rule ordinary `Expire` and
+            // `MembershipProgress` rows follow. `None` is reserved for a client
+            // or retirement command whose actor bytes would not narrow.
+            actor: match command.reply_shape {
+                ReplyShape::System => Some(log_id.leader_node_id),
+                ReplyShape::Client | ReplyShape::Retirement => command.actor,
+            },
             operation_code: command.operation_code,
-            // The identity is what was malformed, so there is none to record.
-            resource: None,
+            resource: command.resource.clone(),
             // A client-shaped entry audits as a **client** rejection: outcome
             // 100 in the client code space, matching its operation code. Only a
             // genuinely system command carries a system result, which is what

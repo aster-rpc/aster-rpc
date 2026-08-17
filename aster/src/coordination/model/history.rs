@@ -71,6 +71,7 @@ fn genesis() -> State {
     // change, so a history starting from an empty membership could not accept
     // the three-voter plans it generates.
     s.authority = crate::coordination::model::authority::testing::authority();
+    s.deployment_profile_code = crate::coordination::model::shape::PROFILE_PROD;
     s.members = (1u8..=3).map(|b| [b; 32]).collect();
     for n in 0..3u8 {
         for actor in [ALICE, BOB] {
@@ -181,7 +182,7 @@ fn step(state: &State, n: u64) -> Step {
                 member_seeds: (1u8..=3)
                     .map(|b| MemberSeed {
                         node_id: [b; 32],
-                        ticket: vec![n as u8; 16],
+                        ticket: crate::coordination::model::membership::test_ticket(&[b; 32]),
                         join_permit: None,
                     })
                     .collect(),
@@ -803,11 +804,15 @@ fn membership_intents_transition_and_stay_within_their_cap() {
                         member_seeds: (1u8..=3)
                             .map(|b| MemberSeed {
                                 node_id: [b; 32],
-                                ticket: b"aster1ticket".to_vec(),
+                                ticket: crate::coordination::model::membership::test_ticket(
+                                    &[b; 32],
+                                ),
                                 join_permit: (!members.contains(&[b; 32])).then(|| {
                                     crate::coordination::model::authority::testing::valid(
                                         &[b; 32],
-                                        b"aster1ticket",
+                                        &crate::coordination::model::membership::test_ticket(
+                                            &[b; 32],
+                                        ),
                                     )
                                 }),
                             })

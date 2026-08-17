@@ -106,10 +106,12 @@ impl From<&AuditRow> for AuditRowV1 {
     fn from(row: &AuditRow) -> Self {
         AuditRowV1 {
             leader_node_id: row.leader_node_id.to_vec(),
-            // Empty means absent: §11.3 audits every committed command, and an
+            // `None` means absent: §11.3 audits every committed command, and an
             // entry whose actor id would not narrow has no attribution to
-            // record. A zeroed 32-byte id would read as a real node.
-            actor_node_id: row.actor.map(|a| a.to_vec()).unwrap_or_default(),
+            // record. Neither a zeroed 32-byte id nor an empty vector -- the
+            // first reads as a real node, and the second is a width the
+            // snapshot reader rejects.
+            actor_node_id: row.actor.map(|a| a.to_vec()),
             operation_code: row.operation_code,
             resource: row.resource.as_ref().map(|k| ResourceKeyV1 {
                 namespace: k.namespace().to_string(),
@@ -135,10 +137,9 @@ impl TryFrom<&AuditRowV1> for AuditRow {
         };
         Ok(AuditRow {
             leader_node_id: node_id(&row.leader_node_id)?,
-            actor: if row.actor_node_id.is_empty() {
-                None
-            } else {
-                Some(node_id(&row.actor_node_id)?)
+            actor: match &row.actor_node_id {
+                Some(bytes) => Some(node_id(bytes)?),
+                None => None,
             },
             operation_code: row.operation_code,
             resource,
@@ -271,7 +272,7 @@ mod tests {
         let wire: AuditRowV1 = (&row).into();
 
         assert_eq!(wire.leader_node_id, vec![0x11u8; 32]);
-        assert_eq!(wire.actor_node_id, vec![0x22u8; 32]);
+        assert_eq!(wire.actor_node_id, Some(vec![0x22u8; 32]));
         assert_eq!(wire.operation_code, 3);
         assert_eq!(wire.result_code, Outcome::Mutated.code());
         assert_eq!(wire.epoch, 9);
@@ -328,22 +329,33 @@ mod tests {
         bad_leader.leader_node_id = vec![0u8; 8];
         assert_eq!(AuditRow::try_from(&bad_leader), Err(WireError::NodeIdWidth));
 
-        // A **wrong-width** actor is a corrupt row. Empty is not: it is how
+        // A **wrong-width** actor is a corrupt row. `None` is not: it is how
         // §11.3's row for a committed entry with no validated actor says so.
+        // There is no empty-vector sentinel -- an empty `Some` is a width
+        // failure like any other.
         let mut bad_actor = good.clone();
-        bad_actor.actor_node_id = vec![0u8; 8];
+        bad_actor.actor_node_id = Some(vec![0u8; 8]);
         assert_eq!(AuditRow::try_from(&bad_actor), Err(WireError::NodeIdWidth));
 
         let mut absent_actor = good.clone();
-        absent_actor.actor_node_id = Vec::new();
+        absent_actor.actor_node_id = None;
         assert_eq!(
             AuditRow::try_from(&absent_actor).map(|r| r.actor),
             Ok(None),
-            "an empty actor id is absent attribution, not a malformed one"
+            "an absent actor is absent attribution, not a malformed one"
         );
-        // And it survives the trip back out, rather than becoming 32 zero bytes.
+        // And it survives the trip back out, rather than becoming 32 zero bytes
+        // or an empty vector the snapshot reader would reject.
         let round_tripped: AuditRowV1 = (&AuditRow::try_from(&absent_actor).unwrap()).into();
-        assert!(round_tripped.actor_node_id.is_empty());
+        assert_eq!(round_tripped.actor_node_id, None);
+
+        let mut empty_some = good.clone();
+        empty_some.actor_node_id = Some(Vec::new());
+        assert_eq!(
+            AuditRow::try_from(&empty_some),
+            Err(WireError::NodeIdWidth),
+            "an empty vector is a width failure, never an absence sentinel"
+        );
 
         let mut bad_key = good.clone();
         bad_key.resource = Some(ResourceKeyV1 {

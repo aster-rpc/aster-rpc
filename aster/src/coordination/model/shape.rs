@@ -116,6 +116,9 @@ shape_limits! {
     MemberSeedUnknownNode => "a member seed names a node the plan does not contain",
     MemberSeedPermit => "a member seed's join permit does not match its node's status",
     MemberSeedTicketEmpty => "a member seed carries no ticket",
+    MemberSeedTicketInvalid => "a member seed ticket is not a canonical Aster ticket",
+    MemberSeedTicketCredential => "a member seed ticket carries a credential",
+    MemberSeedTicketNode => "a member seed ticket is for another node",
     MembershipNewVoters => "a membership plan adds more than two new voters at once",
 }
 
@@ -175,10 +178,42 @@ pub const MAX_NEW_VOTERS: usize = 2;
 /// A production plan targets exactly 3 or 5 voters -- never an even set, which
 /// has no majority advantage and a worse failure mode -- and retains at most two
 /// learners. Larger replacements use successive committed plans.
-pub fn check_membership_plan(voters: usize, retained_learners: usize) -> Option<ShapeLimit> {
-    let sized = voters == MIN_VOTERS || voters == MAX_VOTERS;
-    (!sized || retained_learners > MAX_RETAINED_LEARNERS).then_some(ShapeLimit::MembershipPlanSize)
+pub fn check_membership_plan(
+    voters: usize,
+    retained_learners: usize,
+    deployment_profile_code: i32,
+) -> Option<ShapeLimit> {
+    if retained_learners > MAX_RETAINED_LEARNERS {
+        return Some(ShapeLimit::MembershipPlanSize);
+    }
+    profile_permits_voters(deployment_profile_code, voters)
+        .then_some(ShapeLimit::MembershipPlanSize)
 }
+
+/// §7.1's deployment profiles, as the exhaustive predicate apply uses.
+///
+/// Returns `true` when the count is **not** permitted, matching the `Option`
+/// idiom of the other shape checks. An unknown profile code permits nothing: a
+/// group whose genesis names a profile this build does not implement must not
+/// fall back to the production rule and quietly accept a membership its
+/// operators did not ask for.
+pub fn profile_permits_voters(deployment_profile_code: i32, voters: usize) -> bool {
+    let permitted = match deployment_profile_code {
+        PROFILE_PROD => voters == MIN_VOTERS || voters == MAX_VOTERS,
+        PROFILE_DEV_SINGLE => voters == 1,
+        PROFILE_DEV_EVEN => voters == 2,
+        _ => false,
+    };
+    !permitted
+}
+
+/// §7.1 profile 1: production. Exactly 3 or 5 voters.
+pub const PROFILE_PROD: i32 = 1;
+/// §7.1 profile 2: a single-voter development group.
+pub const PROFILE_DEV_SINGLE: i32 = 2;
+/// §7.1 profile 3: a two-voter development group, deliberately even -- it has
+/// no fault tolerance and exists to make the even-quorum path testable.
+pub const PROFILE_DEV_EVEN: i32 = 3;
 
 /// How many voters in `desired` are not already committed members?
 pub fn new_voters(desired: &[[u8; 32]], current: &std::collections::BTreeSet<[u8; 32]>) -> usize {
@@ -218,7 +253,7 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ShapeLimit::ALL.len());
-        assert_eq!(ShapeLimit::ALL.len(), 18, "update this count with the enum");
+        assert_eq!(ShapeLimit::ALL.len(), 21, "update this count with the enum");
         // Every variant has its own description; a shared one would make two
         // different failures read identically in a status message.
         let mut descriptions: Vec<_> = ShapeLimit::ALL.iter().map(|l| l.describe()).collect();

@@ -427,6 +427,16 @@ pub struct State {
     pub admin_revision: u64,
     /// The §7.1 material every signed document is verified against.
     pub authority: GroupAuthority,
+    /// §7.1's deployment profile, from the signed genesis (§11's
+    /// `CoordinationMetaV1`): `1 Prod`, `2 DevSingle`, `3 DevEven`.
+    ///
+    /// **Active state-machine input, not descriptive metadata.** Every
+    /// membership transition validates its voter count against this, so every
+    /// voter decides from replicated state. The local development *flags* are
+    /// startup admission for creating or opening such a group; apply never reads
+    /// them. A model that hard-codes the production rule both rejects valid
+    /// development groups and proves nothing about where the decision came from.
+    pub deployment_profile_code: i32,
     /// The current committed voter and learner set.
     ///
     /// Kept beside the log id because §9 protects a route for a node **in the
