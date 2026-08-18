@@ -29,7 +29,7 @@ rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros"
 # Verify the direct edges with `cargo tree -p aster --no-default-features
 # --depth 1` and the full feature graph with `-e features`.
 coordination-client = ["rpc", "dep:blake3"]
-coordination = ["coordination-client", "dep:openraft", "dep:redb", "dep:ed25519-dalek"]
+coordination = ["coordination-client", "dep:openraft", "dep:redb", "dep:ed25519-dalek", "dep:windows-sys"]
 discovery = []
 hooks = []
 metrics = []
@@ -110,6 +110,23 @@ getrandom = "0.2"
 # Parse a peer's relay URL to extract its IP:port for the compact ticket
 # (the wire format stores relay as a socket address — see Ticket::from_node_addr).
 url = "2"
+
+# §11.4 atomic snapshot replacement on Windows. `rename` over an existing file
+# is not the same operation there that it is on Unix, so the replacement step
+# goes through `ReplaceFileW`.
+#
+# Voter-only, and deliberately so: it is enabled by `coordination`, never by
+# `coordination-client`. A client installs no snapshot and replaces no
+# database, so a client-only consumer must not gain this edge — which is what
+# `scripts/check-coordination-deps.sh` proves rather than trusting this
+# comment. The directory lock does *not* need it: `std::fs::File::try_lock()`
+# is stable on the pinned toolchain, so v1 adds no `fs2`/`fs4` edge for an
+# operation the standard library provides.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+], optional = true }
 
 # The quickstart example uses blobs + docs; skip it when those features are off
 # (e.g. the `--no-default-features --features rpc` build matrix).

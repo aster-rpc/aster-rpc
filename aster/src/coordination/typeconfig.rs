@@ -16,6 +16,7 @@
 
 use super::contract::{CommandReplyV1, CommandV1};
 use super::ids::CoordinationNodeId;
+use super::storage::CoordinationSnapshotFile;
 
 /// The node record OpenRaft stores alongside each member id.
 ///
@@ -34,7 +35,14 @@ openraft::declare_raft_types!(
         NodeId = CoordinationNodeId,
         Node = CoordinationNode,
         Entry = openraft::Entry<CoordinationTypeConfig>,
-        SnapshotData = std::io::Cursor<Vec<u8>>,
+        // File-backed, and role-safe. `generic-snapshot-data` reduces
+        // OpenRaft's bound to `OptionalSend + 'static`, so the handle is
+        // opaque to OpenRaft and every byte of I/O is Aster's — including the
+        // ownership rules, which OpenRaft's own storage suite exercises by
+        // moving one store's published handle into another store. A
+        // `Cursor<Vec<u8>>` would additionally hold a whole snapshot body in
+        // memory, which §11.4 forbids.
+        SnapshotData = CoordinationSnapshotFile,
         AsyncRuntime = openraft::TokioRuntime,
 );
 

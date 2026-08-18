@@ -1,0 +1,1458 @@
+//! Directory layout, the lifetime lock, schema creation, and the open
+//! coordinator (§11.1 to §11.3).
+//!
+//! ## Why the open coordinator owns the databases by value
+//!
+//! `Database::check_integrity` takes `&mut Database` and returns
+//! `TransactionInProgress` while any transaction or shared handle is alive. So
+//! the order here is not stylistic: this module creates each database, owns it
+//! outright while checking and validating it, and only then hands it on. A
+//! handle published before the check makes the check impossible to run at all.
+//!
+//! ## One correction to the plan, recorded rather than implemented silently
+//!
+//! §11.2's meta allowlist names schema/group/genesis identity, the authority
+//! binding, the local NodeId, vote, committed, and last-purged — but no codec
+//! version, while §19 requires a *wrong codec* to be refused by name. Without
+//! a persisted value there is nothing to compare, and the failure would
+//! surface as a decode error partway through a load instead. Both meta tables
+//! are `&str -> &[u8]`, so this adds one allowlisted key,
+//! [`KEY_CODEC_VERSION`], to each. The value is a compiled constant, never a
+//! caller's choice.
+
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use redb::{
+    Database, DatabaseError, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
+};
+
+use super::error::{Db, StorageError, StorageResult};
+use super::identity::{OpenPolicy, StorageIdentity, LOGICAL_SCHEMA_VERSION, STORAGE_CODEC_VERSION};
+use crate::coordination::contract::payload_fory;
+use crate::coordination::raft::CoordinationMetaV1;
+
+// ── raft.redb (§11.2) ────────────────────────────────────────────────────────
+
+/// Identity, vote, committed and purge markers.
+pub(crate) const RAFT_META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
+
+/// Log entries keyed by index.
+///
+/// redb stores `u64` keys little-endian, but `Key::compare` decodes both
+/// operands and compares numerically, so `range`, `pop_first` and `pop_last`
+/// iterate in true log order regardless of byte layout. Truncate, purge and
+/// replay depend on that; do not infer ordering from the stored bytes.
+pub(crate) const RAFT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
+
+/// Exactly the tables schema v1 defines in `raft.redb`. Anything else present
+/// is a schema error, never something to drop.
+pub(crate) const RAFT_TABLES: &[&str] = &["raft_meta", "raft_log"];
+
+// ── state.redb (§11.3) ───────────────────────────────────────────────────────
+
+pub(crate) const STATE_META: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("coordination_meta");
+pub(crate) const RESOURCES: TableDefinition<(&str, &[u8]), &[u8]> =
+    TableDefinition::new("resources");
+pub(crate) const ACL: TableDefinition<(&str, &[u8], [u8; 32]), u64> =
+    TableDefinition::new("resource_acl");
+pub(crate) const ADMINS: TableDefinition<[u8; 32], ()> = TableDefinition::new("group_admins");
+pub(crate) const SESSIONS: TableDefinition<([u8; 32], [u8; 16]), &[u8]> =
+    TableDefinition::new("client_sessions");
+pub(crate) const INTENTS: TableDefinition<[u8; 16], &[u8]> =
+    TableDefinition::new("membership_intents");
+pub(crate) const ROUTES: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("node_routes");
+pub(crate) const AUDIT: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("audit");
+
+/// Exactly the tables schema v1 defines in `state.redb`.
+pub(crate) const STATE_TABLES: &[&str] = &[
+    "coordination_meta",
+    "resources",
+    "resource_acl",
+    "group_admins",
+    "client_sessions",
+    "membership_intents",
+    "node_routes",
+    "audit",
+];
+
+/// The `state.redb` data tables, in canonical section order. Used to prove a
+/// state database holds no durable rows.
+const STATE_DATA_TABLES: &[&str] = &[
+    "resources",
+    "resource_acl",
+    "group_admins",
+    "client_sessions",
+    "membership_intents",
+    "node_routes",
+    "audit",
+];
+
+// ── Metadata keys ────────────────────────────────────────────────────────────
+
+pub(crate) const KEY_SCHEMA_VERSION: &str = "schema_version";
+pub(crate) const KEY_CODEC_VERSION: &str = "codec_version";
+pub(crate) const KEY_GROUP_ID: &str = "group_id";
+pub(crate) const KEY_GENESIS_HASH: &str = "genesis_hash";
+pub(crate) const KEY_AUTHORITY_PUBLIC_KEY: &str = "authority_public_key";
+pub(crate) const KEY_AUTHORITY_DOMAIN: &str = "authority_domain";
+pub(crate) const KEY_LOCAL_NODE_ID: &str = "local_node_id";
+pub(crate) const KEY_VOTE: &str = "vote";
+pub(crate) const KEY_COMMITTED: &str = "committed";
+pub(crate) const KEY_LAST_PURGED: &str = "last_purged";
+
+/// The singleton replicated-meta row (§11.3).
+pub(crate) const KEY_META: &str = "meta";
+
+/// Exactly the meta keys `raft.redb` may contain.
+pub(crate) const RAFT_META_KEYS: &[&str] = &[
+    KEY_SCHEMA_VERSION,
+    KEY_CODEC_VERSION,
+    KEY_GROUP_ID,
+    KEY_GENESIS_HASH,
+    KEY_AUTHORITY_PUBLIC_KEY,
+    KEY_AUTHORITY_DOMAIN,
+    KEY_LOCAL_NODE_ID,
+    KEY_VOTE,
+    KEY_COMMITTED,
+    KEY_LAST_PURGED,
+];
+
+/// Exactly the meta keys `state.redb` may contain. The replicated binding
+/// lives inside the Fory `CoordinationMetaV1` under [`KEY_META`]; the codec
+/// version sits beside it because a value that cannot be decoded cannot report
+/// its own codec.
+pub(crate) const STATE_META_KEYS: &[&str] = &[KEY_META, KEY_CODEC_VERSION];
+
+/// The `raft.redb` meta keys that carry durable Raft state rather than
+/// identity. Their presence is what makes a database non-empty.
+const RAFT_DURABLE_KEYS: &[&str] = &[KEY_VOTE, KEY_COMMITTED, KEY_LAST_PURGED];
+
+// ── Layout ───────────────────────────────────────────────────────────────────
+
+/// The §11.1 directory layout, resolved once.
+#[derive(Debug, Clone)]
+pub(crate) struct StorageLayout {
+    root: PathBuf,
+}
+
+impl StorageLayout {
+    pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn database(&self, db: Db) -> PathBuf {
+        self.root.join(db.file_name())
+    }
+
+    pub(crate) fn snapshots(&self) -> PathBuf {
+        self.root.join("snapshots")
+    }
+
+    pub(crate) fn incoming(&self) -> PathBuf {
+        self.root.join("incoming")
+    }
+
+    pub(crate) fn lock(&self) -> PathBuf {
+        self.root.join("LOCK")
+    }
+
+    /// The durable current-snapshot marker. Absent before the first snapshot.
+    pub(crate) fn current_snapshot_marker(&self) -> PathBuf {
+        self.snapshots().join("CURRENT")
+    }
+}
+
+// ── The lifetime lock ────────────────────────────────────────────────────────
+
+/// An exclusive lock on the storage directory, held for the runtime lifetime.
+///
+/// The lock is released by dropping this value, which closes the file. It is
+/// advisory against cooperating processes; arbitrary code already running as
+/// the storage owner is inside the host threat boundary and this does not
+/// pretend otherwise.
+#[derive(Debug)]
+pub(crate) struct DirectoryLock {
+    path: PathBuf,
+    file: File,
+}
+
+impl DirectoryLock {
+    /// Acquire the lock, or fail with the reason it could not be acquired.
+    ///
+    /// The two failure modes are kept apart deliberately. `WouldBlock` is the
+    /// only result that means another voter owns this directory; the standard
+    /// library guarantees it never hides a `WouldBlock` inside
+    /// `TryLockError::Error`, so the split is exact rather than heuristic.
+    pub(crate) fn acquire(path: impl Into<PathBuf>) -> StorageResult<Self> {
+        let path = path.into();
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| StorageError::LockIo {
+                path: path.clone(),
+                source,
+            })?;
+        restrict_permissions(&path, FILE_MODE)?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(Self { path, file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(StorageError::LockContended { path }),
+            Err(std::fs::TryLockError::Error(source)) => Err(StorageError::LockIo { path, source }),
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Release the lock explicitly during an orderly shutdown.
+    pub(crate) fn unlock(self) -> StorageResult<()> {
+        self.file.unlock().map_err(|source| StorageError::LockIo {
+            path: self.path.clone(),
+            source,
+        })
+    }
+}
+
+// ── Permissions ──────────────────────────────────────────────────────────────
+
+const DIR_MODE: u32 = 0o700;
+const FILE_MODE: u32 = 0o600;
+
+/// Set owner-only permissions on a path we just created. A no-op off Unix,
+/// where §11.1 relies on the application directory's inherited user ACL and a
+/// platform test/runbook instead.
+#[cfg(unix)]
+fn restrict_permissions(path: &Path, mode: u32) -> StorageResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|source| StorageError::io("set permissions", path, source))
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &Path, _mode: u32) -> StorageResult<()> {
+    Ok(())
+}
+
+/// Refuse an existing path that is writable beyond its owner.
+#[cfg(unix)]
+fn check_permissions(path: &Path, policy: &OpenPolicy) -> StorageResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if !policy.enforces_permissions() {
+        return Ok(());
+    }
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|source| StorageError::io("read metadata", path, source))?;
+    let mode = meta.permissions().mode() & 0o777;
+    // Group- or other-writable. Read access is not the concern here: §11.1
+    // provides no at-rest encryption and says so, but another writer can
+    // corrupt state the lock is supposed to protect.
+    if mode & 0o022 != 0 {
+        return Err(StorageError::BroadPermissions {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_permissions(_path: &Path, _policy: &OpenPolicy) -> StorageResult<()> {
+    Ok(())
+}
+
+/// Refuse a symlinked path.
+fn reject_symlink(path: &Path) -> StorageResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(StorageError::SymlinkedPath {
+            path: path.to_path_buf(),
+        }),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(StorageError::io("read metadata", path, source)),
+    }
+}
+
+/// Create a directory with owner-only permissions if it is absent, and
+/// validate it if it is not.
+fn ensure_directory(path: &Path, policy: &OpenPolicy) -> StorageResult<()> {
+    reject_symlink(path)?;
+    if path.exists() {
+        check_permissions(path, policy)?;
+        return Ok(());
+    }
+    std::fs::create_dir_all(path)
+        .map_err(|source| StorageError::io("create directory", path, source))?;
+    restrict_permissions(path, DIR_MODE)
+}
+
+// ── Integrity ────────────────────────────────────────────────────────────────
+
+/// What `check_integrity` reported, interpreted per §11.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntegrityOutcome {
+    /// `Ok(true)`: the physical database was clean.
+    Clean,
+    /// `Ok(false)` on a pre-existing database: the accepted unclean-shutdown
+    /// recovery path. The caller still runs every logical check before
+    /// serving; this is emitted, not swallowed.
+    RecoveredFromUncleanShutdown,
+}
+
+/// Run the integrity check and classify its result.
+///
+/// `freshly_created` is not cosmetic. A database this process just made has no
+/// prior crash to recover from, so `Ok(false)` there is evidence about the
+/// storage stack rather than about the last shutdown — and after a snapshot
+/// install it would mean the replacement database was already damaged.
+fn check_integrity(
+    database: &mut Database,
+    db: Db,
+    freshly_created: bool,
+) -> StorageResult<IntegrityOutcome> {
+    match database.check_integrity() {
+        Ok(true) => Ok(IntegrityOutcome::Clean),
+        Ok(false) if freshly_created => Err(StorageError::FreshDatabaseUnclean { db }),
+        Ok(false) => Ok(IntegrityOutcome::RecoveredFromUncleanShutdown),
+        Err(DatabaseError::TransactionInProgress) => {
+            Err(StorageError::TransactionInProgress { db })
+        }
+        Err(source) => Err(StorageError::Integrity { db, source }),
+    }
+}
+
+// ── Scalar meta encoding ─────────────────────────────────────────────────────
+//
+// Identity meta values are fixed-width scalars, not declared Fory roots: §4.2
+// names the roots for OpenRaft values and state rows, and a group id is
+// neither. Encoding is explicit and length-checked in both directions, so a
+// truncated or overlong value is a named codec failure rather than a silent
+// reinterpretation.
+
+fn encode_u32(value: u32) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+fn decode_u32(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<u32> {
+    let array: [u8; 4] = bytes.try_into().map_err(|_| {
+        StorageError::codec(db, what, format!("expected 4 bytes, got {}", bytes.len()))
+    })?;
+    Ok(u32::from_be_bytes(array))
+}
+
+fn decode_array32(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<[u8; 32]> {
+    bytes.try_into().map_err(|_| {
+        StorageError::codec(db, what, format!("expected 32 bytes, got {}", bytes.len()))
+    })
+}
+
+fn decode_string(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<String> {
+    String::from_utf8(bytes.to_vec())
+        .map_err(|source| StorageError::codec(db, what, format!("not valid UTF-8: {source}")))
+}
+
+// ── Open ─────────────────────────────────────────────────────────────────────
+
+/// Whether a database file existed before this open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    Fresh,
+    Existing,
+}
+
+/// A validated, locked, open storage directory.
+///
+/// Holds both databases by value. Checkpoints B, C and D take them from here; the
+/// lock lives as long as this value does.
+#[derive(Debug)]
+pub(crate) struct OpenedStorage {
+    layout: StorageLayout,
+    identity: StorageIdentity,
+    lock: DirectoryLock,
+    raft: Database,
+    state: Database,
+    raft_integrity: IntegrityOutcome,
+    state_integrity: IntegrityOutcome,
+    initialized: bool,
+}
+
+impl OpenedStorage {
+    pub(crate) fn layout(&self) -> &StorageLayout {
+        &self.layout
+    }
+
+    pub(crate) fn identity(&self) -> &StorageIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn lock(&self) -> &DirectoryLock {
+        &self.lock
+    }
+
+    pub(crate) fn raft(&self) -> &Database {
+        &self.raft
+    }
+
+    pub(crate) fn state(&self) -> &Database {
+        &self.state
+    }
+
+    /// How each database's integrity check resolved. Exposed so a caller can
+    /// emit the §11.1 recovery event rather than discovering it in a log line.
+    pub(crate) fn integrity(&self) -> (IntegrityOutcome, IntegrityOutcome) {
+        (self.raft_integrity, self.state_integrity)
+    }
+
+    /// Whether this open found existing initialized storage rather than
+    /// creating it.
+    pub(crate) fn was_initialized(&self) -> bool {
+        self.initialized
+    }
+}
+
+/// Open the storage directory: create or validate the layout, take the
+/// lifetime lock, create or validate both schemas, and bind or verify the
+/// identity.
+///
+/// Fails closed at every ambiguity. In particular, one initialized database
+/// beside one that cannot be proven empty is
+/// [`StorageError::PartialInitialization`] rather than a recreation, because
+/// recreating the missing side would discard whatever the surviving side has
+/// already acknowledged.
+pub(crate) fn open(
+    layout: StorageLayout,
+    identity: StorageIdentity,
+    policy: OpenPolicy,
+) -> StorageResult<OpenedStorage> {
+    ensure_directory(layout.root(), &policy)?;
+    ensure_directory(&layout.snapshots(), &policy)?;
+    ensure_directory(&layout.incoming(), &policy)?;
+
+    // The lock comes before either database is opened, so a losing opener
+    // never touches the files at all.
+    let lock = DirectoryLock::acquire(layout.lock())?;
+
+    let raft_path = layout.database(Db::Raft);
+    let state_path = layout.database(Db::State);
+    reject_symlink(&raft_path)?;
+    reject_symlink(&state_path)?;
+
+    let raft_presence = presence(&raft_path);
+    let state_presence = presence(&state_path);
+    if raft_presence == Presence::Existing {
+        check_permissions(&raft_path, &policy)?;
+    }
+    if state_presence == Presence::Existing {
+        check_permissions(&state_path, &policy)?;
+    }
+
+    let (mut raft, raft_integrity) = open_database(&raft_path, Db::Raft, raft_presence)?;
+    let (mut state, state_integrity) = open_database(&state_path, Db::State, state_presence)?;
+
+    let raft_initialized = classify_raft(&raft, raft_presence)?;
+    let state_initialized = classify_state(&state, state_presence)?;
+
+    let initialized = match (raft_initialized, state_initialized) {
+        (true, true) => true,
+        (false, false) => false,
+        // One side carries durable state and the other proved it never did.
+        // §11.1 allows recreating the empty side only in exactly this case.
+        // Normal `raft.redb`-ahead-of-`state.redb` recovery is not this case:
+        // an initialized state database is initialized whether or not it has
+        // applied anything.
+        (raft_side, state_side) => {
+            return Err(StorageError::PartialInitialization {
+                detail: format!(
+                    "{} is {}, {} is {}",
+                    Db::Raft,
+                    describe(raft_side),
+                    Db::State,
+                    describe(state_side)
+                ),
+            })
+        }
+    };
+
+    if initialized {
+        verify_raft_identity(&raft, &identity)?;
+        verify_state_identity(&state, &identity)?;
+    } else {
+        // Both sides are written and durably committed before the runtime is
+        // eligible to initialize Raft, so a crash between them leaves a
+        // partial initialization that the branch above refuses rather than a
+        // half-bound voter that starts.
+        write_raft_identity(&mut raft, &identity)?;
+        write_state_identity(&mut state, &identity)?;
+    }
+
+    Ok(OpenedStorage {
+        layout,
+        identity,
+        lock,
+        raft,
+        state,
+        raft_integrity,
+        state_integrity,
+        initialized,
+    })
+}
+
+fn describe(initialized: bool) -> &'static str {
+    if initialized {
+        "initialized"
+    } else {
+        "absent or provably empty"
+    }
+}
+
+fn presence(path: &Path) -> Presence {
+    if path.exists() {
+        Presence::Existing
+    } else {
+        Presence::Fresh
+    }
+}
+
+/// Create or open one database and check its integrity while owning it.
+fn open_database(
+    path: &Path,
+    db: Db,
+    presence: Presence,
+) -> StorageResult<(Database, IntegrityOutcome)> {
+    let mut database = Database::create(path).map_err(|source| match source {
+        DatabaseError::TransactionInProgress => StorageError::TransactionInProgress { db },
+        other => StorageError::Integrity { db, source: other },
+    })?;
+    if presence == Presence::Fresh {
+        restrict_permissions(path, FILE_MODE)?;
+    }
+    let outcome = check_integrity(&mut database, db, presence == Presence::Fresh)?;
+    Ok((database, outcome))
+}
+
+/// Validate `raft.redb`'s tables and report whether it holds durable state.
+fn classify_raft(database: &Database, presence: Presence) -> StorageResult<bool> {
+    if presence == Presence::Fresh {
+        return Ok(false);
+    }
+    let read = database
+        .begin_read()
+        .map_err(|source| StorageError::redb(Db::Raft, source))?;
+    check_tables(&read, Db::Raft, RAFT_TABLES)?;
+
+    // An identity binding without durable Raft state is still "initialized":
+    // the binding is what a peer's snapshot and a restart both check against.
+    let has_identity = meta_bytes(&read, Db::Raft, RAFT_META, KEY_GROUP_ID)?.is_some();
+    if has_identity {
+        check_meta_keys(&read, Db::Raft, RAFT_META, RAFT_META_KEYS)?;
+        return Ok(true);
+    }
+
+    // No identity. Prove nothing durable exists before treating it as fresh.
+    for key in RAFT_DURABLE_KEYS {
+        if meta_bytes(&read, Db::Raft, RAFT_META, key)?.is_some() {
+            return Err(StorageError::PartialInitialization {
+                detail: format!("{} carries {key:?} but no identity binding", Db::Raft),
+            });
+        }
+    }
+    if !table_is_empty_u64(&read, Db::Raft, RAFT_LOG)? {
+        return Err(StorageError::PartialInitialization {
+            detail: format!("{} carries log entries but no identity binding", Db::Raft),
+        });
+    }
+    Ok(false)
+}
+
+/// Validate `state.redb`'s tables and report whether it holds durable state.
+fn classify_state(database: &Database, presence: Presence) -> StorageResult<bool> {
+    if presence == Presence::Fresh {
+        return Ok(false);
+    }
+    let read = database
+        .begin_read()
+        .map_err(|source| StorageError::redb(Db::State, source))?;
+    check_tables(&read, Db::State, STATE_TABLES)?;
+
+    let has_meta = meta_bytes(&read, Db::State, STATE_META, KEY_META)?.is_some();
+    if has_meta {
+        check_meta_keys(&read, Db::State, STATE_META, STATE_META_KEYS)?;
+        return Ok(true);
+    }
+
+    for table in STATE_DATA_TABLES {
+        if !named_table_is_empty(&read, Db::State, table)? {
+            return Err(StorageError::PartialInitialization {
+                detail: format!(
+                    "{} carries rows in {table:?} but no replicated meta row",
+                    Db::State
+                ),
+            });
+        }
+    }
+    Ok(false)
+}
+
+/// Every table present must be one schema v1 defines.
+fn check_tables(read: &redb::ReadTransaction, db: Db, allowed: &[&str]) -> StorageResult<()> {
+    let tables = read
+        .list_tables()
+        .map_err(|source| StorageError::redb(db, source))?;
+    for handle in tables {
+        let name = redb::TableHandle::name(&handle).to_string();
+        if !allowed.contains(&name.as_str()) {
+            return Err(StorageError::UnknownTable { db, table: name });
+        }
+    }
+    Ok(())
+}
+
+/// Every metadata key present must be one schema v1 defines.
+fn check_meta_keys(
+    read: &redb::ReadTransaction,
+    db: Db,
+    definition: TableDefinition<&'static str, &'static [u8]>,
+    allowed: &[&str],
+) -> StorageResult<()> {
+    let table = match read.open_table(definition) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(source) => return Err(StorageError::redb(db, source)),
+    };
+    let iter = table
+        .iter()
+        .map_err(|source| StorageError::redb(db, source))?;
+    for entry in iter {
+        let (key, _) = entry.map_err(|source| StorageError::redb(db, source))?;
+        let key = key.value().to_string();
+        if !allowed.contains(&key.as_str()) {
+            return Err(StorageError::UnknownMetaKey { db, key });
+        }
+    }
+    Ok(())
+}
+
+fn meta_bytes(
+    read: &redb::ReadTransaction,
+    db: Db,
+    definition: TableDefinition<&'static str, &'static [u8]>,
+    key: &str,
+) -> StorageResult<Option<Vec<u8>>> {
+    let table = match read.open_table(definition) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(source) => return Err(StorageError::redb(db, source)),
+    };
+    let value = table
+        .get(key)
+        .map_err(|source| StorageError::redb(db, source))?;
+    Ok(value.map(|v| v.value().to_vec()))
+}
+
+fn table_is_empty_u64(
+    read: &redb::ReadTransaction,
+    db: Db,
+    definition: TableDefinition<u64, &'static [u8]>,
+) -> StorageResult<bool> {
+    match read.open_table(definition) {
+        Ok(table) => Ok(table
+            .is_empty()
+            .map_err(|source| StorageError::redb(db, source))?),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(true),
+        Err(source) => Err(StorageError::redb(db, source)),
+    }
+}
+
+/// Emptiness by name, so one helper covers every state data table regardless
+/// of its key and value types.
+fn named_table_is_empty(read: &redb::ReadTransaction, db: Db, name: &str) -> StorageResult<bool> {
+    let tables = read
+        .list_tables()
+        .map_err(|source| StorageError::redb(db, source))?;
+    let exists = tables
+        .into_iter()
+        .any(|h| redb::TableHandle::name(&h) == name);
+    if !exists {
+        return Ok(true);
+    }
+    let untyped: TableDefinition<&str, &[u8]> = TableDefinition::new(name);
+    // Reading an existing table under a different value type is not a data
+    // read here -- `is_empty` consults the tree, not a decoded value -- but
+    // redb still type-checks the definition, so a mismatch reports as a redb
+    // error rather than a silently wrong emptiness answer.
+    match read.open_table(untyped) {
+        Ok(table) => Ok(table
+            .is_empty()
+            .map_err(|source| StorageError::redb(db, source))?),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(true),
+        // A type mismatch means the table exists with real rows behind a
+        // different schema. That is not emptiness.
+        Err(_) => Ok(false),
+    }
+}
+
+// ── Identity binding ─────────────────────────────────────────────────────────
+
+fn write_raft_identity(database: &mut Database, identity: &StorageIdentity) -> StorageResult<()> {
+    let mut write = database
+        .begin_write()
+        .map_err(|source| StorageError::redb(Db::Raft, source))?;
+    write
+        .set_durability(redb::Durability::Immediate)
+        .map_err(|source| StorageError::redb(Db::Raft, source))?;
+    {
+        let mut meta = write
+            .open_table(RAFT_META)
+            .map_err(|source| StorageError::redb(Db::Raft, source))?;
+        let mut put = |key: &str, value: &[u8]| -> StorageResult<()> {
+            meta.insert(key, value)
+                .map(|_| ())
+                .map_err(|source| StorageError::redb(Db::Raft, source))
+        };
+        put(KEY_SCHEMA_VERSION, &encode_u32(LOGICAL_SCHEMA_VERSION))?;
+        put(KEY_CODEC_VERSION, &encode_u32(STORAGE_CODEC_VERSION))?;
+        put(KEY_GROUP_ID, identity.group_id().as_bytes())?;
+        put(KEY_GENESIS_HASH, identity.genesis_hash())?;
+        put(KEY_AUTHORITY_PUBLIC_KEY, identity.authority_public_key())?;
+        put(KEY_AUTHORITY_DOMAIN, identity.authority_domain().as_bytes())?;
+        put(KEY_LOCAL_NODE_ID, identity.local_node_id().as_bytes())?;
+        // The log table is created here so an initialized database always has
+        // both tables, and the allowlist check does not have to special-case
+        // a database that has been bound but never appended to.
+        write
+            .open_table(RAFT_LOG)
+            .map_err(|source| StorageError::redb(Db::Raft, source))?;
+    }
+    write
+        .commit()
+        .map_err(|source| StorageError::redb(Db::Raft, source))
+}
+
+fn write_state_identity(database: &mut Database, identity: &StorageIdentity) -> StorageResult<()> {
+    let meta_row = CoordinationMetaV1 {
+        schema_version: LOGICAL_SCHEMA_VERSION,
+        group_id: identity.group_id().as_bytes().to_vec(),
+        genesis_hash: identity.genesis_hash().to_vec(),
+        authority_public_key: identity.authority_public_key().to_vec(),
+        authority_domain: identity.authority_domain().to_string(),
+        deployment_profile_code: identity.deployment_profile_code(),
+        ..Default::default()
+    };
+    let encoded = payload_fory::<CoordinationMetaV1>()
+        .serialize(&meta_row)
+        .map_err(|source| StorageError::codec(Db::State, "CoordinationMetaV1", source))?;
+
+    let mut write = database
+        .begin_write()
+        .map_err(|source| StorageError::redb(Db::State, source))?;
+    write
+        .set_durability(redb::Durability::Immediate)
+        .map_err(|source| StorageError::redb(Db::State, source))?;
+    {
+        let mut meta = write
+            .open_table(STATE_META)
+            .map_err(|source| StorageError::redb(Db::State, source))?;
+        meta.insert(KEY_META, encoded.as_slice())
+            .map_err(|source| StorageError::redb(Db::State, source))?;
+        meta.insert(
+            KEY_CODEC_VERSION,
+            encode_u32(STORAGE_CODEC_VERSION).as_slice(),
+        )
+        .map_err(|source| StorageError::redb(Db::State, source))?;
+    }
+    // Create every data table so an initialized state database always has the
+    // full §11.3 shape, and a later missing table is a real schema error
+    // rather than "not written to yet".
+    create_state_tables(&write)?;
+    write
+        .commit()
+        .map_err(|source| StorageError::redb(Db::State, source))
+}
+
+fn create_state_tables(write: &redb::WriteTransaction) -> StorageResult<()> {
+    let map = |source: redb::TableError| StorageError::redb(Db::State, source);
+    write.open_table(RESOURCES).map_err(map)?;
+    write.open_table(ACL).map_err(map)?;
+    write.open_table(ADMINS).map_err(map)?;
+    write.open_table(SESSIONS).map_err(map)?;
+    write.open_table(INTENTS).map_err(map)?;
+    write.open_table(ROUTES).map_err(map)?;
+    write.open_table(AUDIT).map_err(map)?;
+    Ok(())
+}
+
+fn verify_raft_identity(database: &Database, identity: &StorageIdentity) -> StorageResult<()> {
+    let read = database
+        .begin_read()
+        .map_err(|source| StorageError::redb(Db::Raft, source))?;
+
+    let required = |key: &'static str| -> StorageResult<Vec<u8>> {
+        meta_bytes(&read, Db::Raft, RAFT_META, key)?
+            .ok_or(StorageError::MissingMetaKey { db: Db::Raft, key })
+    };
+
+    let schema = decode_u32(Db::Raft, "schema_version", &required(KEY_SCHEMA_VERSION)?)?;
+    if schema != LOGICAL_SCHEMA_VERSION {
+        return Err(StorageError::SchemaVersion {
+            db: Db::Raft,
+            found: schema,
+            expected: LOGICAL_SCHEMA_VERSION,
+        });
+    }
+    let codec = decode_u32(Db::Raft, "codec_version", &required(KEY_CODEC_VERSION)?)?;
+    if codec != STORAGE_CODEC_VERSION {
+        return Err(StorageError::CodecVersion {
+            db: Db::Raft,
+            found: codec,
+            expected: STORAGE_CODEC_VERSION,
+        });
+    }
+
+    let mismatch = |field| StorageError::IdentityMismatch {
+        db: Db::Raft,
+        field,
+    };
+
+    if decode_array32(Db::Raft, "group_id", &required(KEY_GROUP_ID)?)?
+        != *identity.group_id().as_bytes()
+    {
+        return Err(mismatch("group_id"));
+    }
+    if decode_array32(Db::Raft, "genesis_hash", &required(KEY_GENESIS_HASH)?)?
+        != *identity.genesis_hash()
+    {
+        return Err(mismatch("genesis_hash"));
+    }
+    if decode_array32(
+        Db::Raft,
+        "authority_public_key",
+        &required(KEY_AUTHORITY_PUBLIC_KEY)?,
+    )? != *identity.authority_public_key()
+    {
+        return Err(mismatch("authority_public_key"));
+    }
+    if decode_string(
+        Db::Raft,
+        "authority_domain",
+        &required(KEY_AUTHORITY_DOMAIN)?,
+    )? != identity.authority_domain()
+    {
+        return Err(mismatch("authority_domain"));
+    }
+    if decode_array32(Db::Raft, "local_node_id", &required(KEY_LOCAL_NODE_ID)?)?
+        != *identity.local_node_id().as_bytes()
+    {
+        return Err(mismatch("local_node_id"));
+    }
+    Ok(())
+}
+
+fn verify_state_identity(database: &Database, identity: &StorageIdentity) -> StorageResult<()> {
+    let read = database
+        .begin_read()
+        .map_err(|source| StorageError::redb(Db::State, source))?;
+
+    let codec_bytes = meta_bytes(&read, Db::State, STATE_META, KEY_CODEC_VERSION)?.ok_or(
+        StorageError::MissingMetaKey {
+            db: Db::State,
+            key: KEY_CODEC_VERSION,
+        },
+    )?;
+    let codec = decode_u32(Db::State, "codec_version", &codec_bytes)?;
+    if codec != STORAGE_CODEC_VERSION {
+        return Err(StorageError::CodecVersion {
+            db: Db::State,
+            found: codec,
+            expected: STORAGE_CODEC_VERSION,
+        });
+    }
+
+    let bytes = meta_bytes(&read, Db::State, STATE_META, KEY_META)?.ok_or(
+        StorageError::MissingMetaKey {
+            db: Db::State,
+            key: KEY_META,
+        },
+    )?;
+    let meta: CoordinationMetaV1 = payload_fory::<CoordinationMetaV1>()
+        .deserialize(&bytes)
+        .map_err(|source| StorageError::codec(Db::State, "CoordinationMetaV1", source))?;
+
+    if meta.schema_version != LOGICAL_SCHEMA_VERSION {
+        return Err(StorageError::SchemaVersion {
+            db: Db::State,
+            found: meta.schema_version,
+            expected: LOGICAL_SCHEMA_VERSION,
+        });
+    }
+
+    let mismatch = |field| StorageError::IdentityMismatch {
+        db: Db::State,
+        field,
+    };
+
+    if meta.group_id.as_slice() != identity.group_id().as_bytes() {
+        return Err(mismatch("group_id"));
+    }
+    if meta.genesis_hash.as_slice() != identity.genesis_hash() {
+        return Err(mismatch("genesis_hash"));
+    }
+    if meta.authority_public_key.as_slice() != identity.authority_public_key() {
+        return Err(mismatch("authority_public_key"));
+    }
+    if meta.authority_domain != identity.authority_domain() {
+        return Err(mismatch("authority_domain"));
+    }
+    // The local NodeId is deliberately *not* checked here: it is bound in
+    // `raft.redb` only. `state.redb` is replicated and a snapshot moves
+    // between nodes, so binding a local id into it would make every installed
+    // snapshot look like an identity mismatch.
+    if meta.deployment_profile_code != identity.deployment_profile_code() {
+        return Err(mismatch("deployment_profile_code"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordination::ids::{CoordinationGroupId, CoordinationNodeId};
+    use crate::coordination::model::shape;
+    use redb::TableHandle;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A fresh directory per test. Not `tempfile`: these tests deliberately
+    /// inspect and mutate the layout between opens, so the path has to outlive
+    /// any one handle.
+    fn scratch() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "aster-coordination-storage-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn identity() -> StorageIdentity {
+        StorageIdentity::new(
+            CoordinationGroupId::from_array([1u8; 32]),
+            [2u8; 32],
+            [3u8; 32],
+            "authority.test",
+            CoordinationNodeId::from_array([4u8; 32]),
+            shape::PROFILE_PROD,
+        )
+    }
+
+    fn open_at(root: &Path, id: StorageIdentity) -> StorageResult<OpenedStorage> {
+        open(StorageLayout::new(root), id, OpenPolicy::production())
+    }
+
+    // ── Layout, lock, and first open ─────────────────────────────────────────
+
+    /// A fresh open builds the whole §11.1 layout and binds both databases.
+    #[test]
+    fn a_fresh_open_creates_the_layout_and_binds_both_databases() {
+        let root = scratch();
+        let opened = open_at(&root, identity()).expect("fresh open");
+
+        assert!(
+            !opened.was_initialized(),
+            "a fresh directory is not initialized"
+        );
+        let layout = opened.layout();
+        assert!(layout.database(Db::Raft).exists());
+        assert!(layout.database(Db::State).exists());
+        assert!(layout.snapshots().is_dir());
+        assert!(layout.incoming().is_dir());
+        assert!(layout.lock().exists());
+        assert!(
+            !layout.current_snapshot_marker().exists(),
+            "CURRENT is absent before the first snapshot"
+        );
+        assert_eq!(
+            opened.integrity(),
+            (IntegrityOutcome::Clean, IntegrityOutcome::Clean),
+            "a database this process just created must be clean"
+        );
+
+        drop(opened);
+        let reopened = open_at(&root, identity()).expect("reopen");
+        assert!(
+            reopened.was_initialized(),
+            "the second open finds the binding the first wrote"
+        );
+    }
+
+    /// A second opener reports contention, and specifically not an I/O error.
+    #[test]
+    fn a_second_opener_reports_lock_contention() {
+        let root = scratch();
+        let first = open_at(&root, identity()).expect("first open");
+
+        let err = open_at(&root, identity()).expect_err("a second voter must not open");
+        assert!(
+            matches!(err, StorageError::LockContended { .. }),
+            "expected contention, got: {err:?}"
+        );
+
+        // And the lock is a lifetime lock: releasing the first opener lets the
+        // next one in. Asserted because a lock that is never released looks
+        // identical to a correct one until an operator restarts a voter.
+        drop(first);
+        open_at(&root, identity()).expect("the lock is released with its holder");
+    }
+
+    /// An I/O failure acquiring the lock is *not* reported as another voter,
+    /// and keeps its source.
+    ///
+    /// Injected by making `LOCK` a directory, which is a real filesystem
+    /// state rather than a mocked error: opening it read/write fails, and the
+    /// failure has nothing to do with contention.
+    #[test]
+    fn a_lock_io_failure_is_not_reported_as_contention() {
+        let root = scratch();
+        std::fs::create_dir_all(root.join("LOCK")).expect("occupy LOCK with a directory");
+
+        let err = open_at(&root, identity()).expect_err("an unusable LOCK must fail the open");
+        let StorageError::LockIo { source, .. } = &err else {
+            panic!("expected StorageLockIo, got: {err:?}");
+        };
+        assert_ne!(
+            source.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the standard library never hides WouldBlock inside TryLockError::Error"
+        );
+        assert!(
+            !err.to_string().contains("locked by another process"),
+            "an operator must not be sent looking for a second voter: {err}"
+        );
+    }
+
+    /// An explicit unlock releases the directory.
+    #[test]
+    fn an_orderly_unlock_releases_the_directory() {
+        let root = scratch();
+        let lock = DirectoryLock::acquire(root.join("LOCK")).expect("acquire");
+        assert_eq!(lock.path(), root.join("LOCK"));
+        lock.unlock().expect("unlock");
+        DirectoryLock::acquire(root.join("LOCK")).expect("reacquire after an orderly unlock");
+    }
+
+    // ── Identity ─────────────────────────────────────────────────────────────
+
+    /// Every identity field is checked on reopen, by name.
+    ///
+    /// Table-driven because the failure mode being guarded against is a field
+    /// that is *persisted* but never *compared* — which no single-field test
+    /// would catch.
+    #[test]
+    fn every_identity_field_is_rechecked_on_reopen() {
+        let base = identity();
+        let cases: Vec<(&str, StorageIdentity)> = vec![
+            (
+                "group_id",
+                StorageIdentity::new(
+                    CoordinationGroupId::from_array([9u8; 32]),
+                    *base.genesis_hash(),
+                    *base.authority_public_key(),
+                    base.authority_domain(),
+                    *base.local_node_id(),
+                    base.deployment_profile_code(),
+                ),
+            ),
+            (
+                "genesis_hash",
+                StorageIdentity::new(
+                    *base.group_id(),
+                    [9u8; 32],
+                    *base.authority_public_key(),
+                    base.authority_domain(),
+                    *base.local_node_id(),
+                    base.deployment_profile_code(),
+                ),
+            ),
+            (
+                "authority_public_key",
+                StorageIdentity::new(
+                    *base.group_id(),
+                    *base.genesis_hash(),
+                    [9u8; 32],
+                    base.authority_domain(),
+                    *base.local_node_id(),
+                    base.deployment_profile_code(),
+                ),
+            ),
+            (
+                "authority_domain",
+                StorageIdentity::new(
+                    *base.group_id(),
+                    *base.genesis_hash(),
+                    *base.authority_public_key(),
+                    "someone-else.test",
+                    *base.local_node_id(),
+                    base.deployment_profile_code(),
+                ),
+            ),
+            (
+                "local_node_id",
+                StorageIdentity::new(
+                    *base.group_id(),
+                    *base.genesis_hash(),
+                    *base.authority_public_key(),
+                    base.authority_domain(),
+                    CoordinationNodeId::from_array([9u8; 32]),
+                    base.deployment_profile_code(),
+                ),
+            ),
+            (
+                "deployment_profile_code",
+                StorageIdentity::new(
+                    *base.group_id(),
+                    *base.genesis_hash(),
+                    *base.authority_public_key(),
+                    base.authority_domain(),
+                    *base.local_node_id(),
+                    shape::PROFILE_DEV_SINGLE,
+                ),
+            ),
+        ];
+
+        for (field, wrong) in cases {
+            let root = scratch();
+            drop(open_at(&root, base.clone()).expect("bind"));
+
+            let err = open_at(&root, wrong)
+                .err()
+                .unwrap_or_else(|| panic!("a wrong {field} must not open"));
+            match err {
+                StorageError::IdentityMismatch { field: got, .. } => {
+                    assert_eq!(got, field, "the failure must name the field that disagreed")
+                }
+                other => panic!("a wrong {field} must be an identity mismatch, got: {other:?}"),
+            }
+        }
+    }
+
+    /// The local NodeId is bound in `raft.redb` only.
+    ///
+    /// `state.redb` is replicated and a snapshot moves between nodes, so a
+    /// local id inside it would make every installed snapshot look like an
+    /// identity mismatch.
+    #[test]
+    fn the_local_node_id_is_absent_from_replicated_state() {
+        let root = scratch();
+        let opened = open_at(&root, identity()).expect("bind");
+        let read = opened.state().begin_read().expect("read");
+        let bytes = meta_bytes(&read, Db::State, STATE_META, KEY_META)
+            .expect("meta")
+            .expect("meta row present");
+        let meta: CoordinationMetaV1 = payload_fory::<CoordinationMetaV1>()
+            .deserialize(&bytes)
+            .expect("decode");
+
+        assert_eq!(meta.group_id, vec![1u8; 32]);
+        assert_eq!(meta.deployment_profile_code, shape::PROFILE_PROD);
+        // The replicated meta has no NodeId field at all; this asserts the
+        // binding did not smuggle one in via another field.
+        assert!(meta.last_applied.is_none());
+        assert_eq!(meta.aggregate_growth_bytes, 0);
+    }
+
+    /// A wrong logical schema version is refused by name.
+    #[test]
+    fn a_wrong_schema_version_is_refused() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        overwrite_raft_meta(&root, KEY_SCHEMA_VERSION, &99u32.to_be_bytes());
+
+        match open_at(&root, identity()) {
+            Err(StorageError::SchemaVersion {
+                found, expected, ..
+            }) => {
+                assert_eq!((found, expected), (99, LOGICAL_SCHEMA_VERSION));
+            }
+            other => panic!("expected a schema-version failure, got: {other:?}"),
+        }
+    }
+
+    /// A wrong storage codec version is refused by name, and separately from
+    /// the schema version.
+    #[test]
+    fn a_wrong_codec_version_is_refused_separately() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        overwrite_raft_meta(&root, KEY_CODEC_VERSION, &77u32.to_be_bytes());
+
+        match open_at(&root, identity()) {
+            Err(StorageError::CodecVersion {
+                found, expected, ..
+            }) => {
+                assert_eq!((found, expected), (77, STORAGE_CODEC_VERSION));
+            }
+            other => panic!("expected a codec-version failure, got: {other:?}"),
+        }
+    }
+
+    /// A truncated meta value is a named codec failure, not a panic and not a
+    /// silent reinterpretation.
+    #[test]
+    fn a_malformed_meta_value_is_a_codec_failure() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        overwrite_raft_meta(&root, KEY_SCHEMA_VERSION, &[0u8, 1]);
+
+        match open_at(&root, identity()) {
+            Err(StorageError::Codec { what, .. }) => assert_eq!(what, "schema_version"),
+            other => panic!("expected a codec failure, got: {other:?}"),
+        }
+    }
+
+    // ── Schema allowlists ────────────────────────────────────────────────────
+
+    /// A table schema v1 does not define fails the open rather than being
+    /// dropped: it is either a newer schema or a file that is not ours.
+    #[test]
+    fn an_unknown_table_fails_the_open() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        {
+            let db = Database::create(root.join("raft.redb")).expect("open raft");
+            let write = db.begin_write().expect("write");
+            let surprise: TableDefinition<u64, u64> = TableDefinition::new("surprise");
+            write.open_table(surprise).expect("create");
+            write.commit().expect("commit");
+        }
+
+        match open_at(&root, identity()) {
+            Err(StorageError::UnknownTable { table, .. }) => assert_eq!(table, "surprise"),
+            other => panic!("expected an unknown-table failure, got: {other:?}"),
+        }
+    }
+
+    /// The same for a metadata key.
+    #[test]
+    fn an_unknown_meta_key_fails_the_open() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        overwrite_raft_meta(&root, "not_in_the_allowlist", b"x");
+
+        match open_at(&root, identity()) {
+            Err(StorageError::UnknownMetaKey { key, .. }) => {
+                assert_eq!(key, "not_in_the_allowlist")
+            }
+            other => panic!("expected an unknown-meta-key failure, got: {other:?}"),
+        }
+    }
+
+    /// The allowlists and the table definitions cannot drift apart.
+    #[test]
+    fn the_allowlists_match_the_declared_tables() {
+        assert!(RAFT_TABLES.contains(&RAFT_META.name()));
+        assert!(RAFT_TABLES.contains(&RAFT_LOG.name()));
+        assert_eq!(RAFT_TABLES.len(), 2, "raft.redb defines exactly two tables");
+
+        for definition_name in [
+            STATE_META.name(),
+            RESOURCES.name(),
+            ACL.name(),
+            ADMINS.name(),
+            SESSIONS.name(),
+            INTENTS.name(),
+            ROUTES.name(),
+            AUDIT.name(),
+        ] {
+            assert!(
+                STATE_TABLES.contains(&definition_name),
+                "{definition_name} is defined but not allowlisted"
+            );
+        }
+        assert_eq!(
+            STATE_TABLES.len(),
+            8,
+            "state.redb defines exactly eight tables"
+        );
+    }
+
+    // ── Partial initialization ───────────────────────────────────────────────
+
+    /// One initialized database beside a deleted one fails closed.
+    ///
+    /// Recreating the missing side would discard whatever the surviving side
+    /// already acknowledged, which is the one outcome storage must never
+    /// produce quietly.
+    #[test]
+    fn a_missing_state_database_beside_an_initialized_log_fails_closed() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        std::fs::remove_file(root.join("state.redb")).expect("remove state");
+
+        match open_at(&root, identity()) {
+            Err(StorageError::PartialInitialization { detail }) => {
+                assert!(detail.contains("raft.redb"), "got: {detail}");
+                assert!(detail.contains("state.redb"), "got: {detail}");
+            }
+            other => panic!("expected partial initialization, got: {other:?}"),
+        }
+    }
+
+    /// And the mirror case.
+    #[test]
+    fn a_missing_log_database_beside_initialized_state_fails_closed() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        std::fs::remove_file(root.join("raft.redb")).expect("remove raft");
+
+        assert!(matches!(
+            open_at(&root, identity()),
+            Err(StorageError::PartialInitialization { .. })
+        ));
+    }
+
+    /// A failed open leaves nothing a voter could start from.
+    ///
+    /// The specific hazard: an open that creates and binds `raft.redb`, then
+    /// fails on `state.redb`, must not leave a directory that looks bound on
+    /// the next attempt. Here the second open fails on identity, and a third
+    /// open with the *original* identity must still succeed unchanged — the
+    /// failed attempt wrote nothing.
+    #[test]
+    fn a_failed_open_never_half_initializes_a_usable_voter() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+
+        let wrong = StorageIdentity::new(
+            CoordinationGroupId::from_array([0xEE; 32]),
+            *identity().genesis_hash(),
+            *identity().authority_public_key(),
+            identity().authority_domain(),
+            *identity().local_node_id(),
+            identity().deployment_profile_code(),
+        );
+        assert!(
+            open_at(&root, wrong).is_err(),
+            "a foreign group must not open"
+        );
+
+        let reopened = open_at(&root, identity()).expect("the original identity still opens");
+        assert!(reopened.was_initialized());
+
+        // And the failed attempt did not leave a lock behind.
+        drop(reopened);
+        open_at(&root, identity()).expect("no lock leaked from the failed open");
+    }
+
+    // ── Filesystem policy ────────────────────────────────────────────────────
+
+    /// A symlinked database path is refused rather than followed: the
+    /// permission and lock checks describe this directory, and a symlink moves
+    /// the bytes somewhere they never looked.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_database_path_is_refused() {
+        let root = scratch();
+        let elsewhere = scratch();
+        let target = elsewhere.join("real.redb");
+        std::fs::write(&target, b"").expect("create target");
+        std::os::unix::fs::symlink(&target, root.join("raft.redb")).expect("symlink");
+
+        match open_at(&root, identity()) {
+            Err(StorageError::SymlinkedPath { path }) => {
+                assert!(path.ends_with("raft.redb"), "got: {}", path.display());
+            }
+            other => panic!("expected a symlink refusal, got: {other:?}"),
+        }
+    }
+
+    /// A group- or world-writable storage directory fails a production open,
+    /// and is accepted only under the explicit development-only override.
+    #[cfg(unix)]
+    #[test]
+    fn broad_permissions_fail_production_but_pass_the_explicit_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777))
+            .expect("widen permissions");
+
+        let err = open(
+            StorageLayout::new(&root),
+            identity(),
+            OpenPolicy::production(),
+        )
+        .expect_err("a world-writable storage directory must fail production startup");
+        assert!(
+            matches!(err, StorageError::BroadPermissions { .. }),
+            "got: {err:?}"
+        );
+
+        open(
+            StorageLayout::new(&root),
+            identity(),
+            OpenPolicy::production().allowing_broad_permissions(),
+        )
+        .expect("the development-only override accepts it");
+    }
+
+    /// New directories and files are owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_layout_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch();
+        // The scratch helper creates the root with the process umask, so
+        // check the paths this module itself creates.
+        let opened = open_at(&root, identity()).expect("open");
+        for path in [opened.layout().snapshots(), opened.layout().incoming()] {
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                DIR_MODE,
+                "{} should be 0700, is {mode:04o}",
+                path.display()
+            );
+        }
+        let lock_mode = std::fs::metadata(opened.layout().lock())
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            lock_mode, FILE_MODE,
+            "LOCK should be 0600, is {lock_mode:04o}"
+        );
+    }
+
+    // ── Test helpers ─────────────────────────────────────────────────────────
+
+    /// Write a raw value into `raft_meta`, bypassing the open coordinator.
+    ///
+    /// Deliberately not going through this module's own writer: a corruption
+    /// test that can only produce states the writer produces proves nothing
+    /// about states a crash or a foreign build can produce.
+    fn overwrite_raft_meta(root: &Path, key: &str, value: &[u8]) {
+        let db = Database::create(root.join("raft.redb")).expect("open raft");
+        let write = db.begin_write().expect("write");
+        {
+            let mut meta = write.open_table(RAFT_META).expect("open meta");
+            meta.insert(key, value).expect("insert");
+        }
+        write.commit().expect("commit");
+    }
+}

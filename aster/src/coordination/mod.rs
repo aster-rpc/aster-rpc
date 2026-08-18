@@ -40,3 +40,9 @@ pub mod convert;
 
 #[cfg(feature = "coordination")]
 pub mod typeconfig;
+
+/// Durable redb storage: schema, log, state machine, snapshots (§11).
+/// Voter-only and crate-private — Slice 3 owns the public start
+/// configuration, so nothing here is nameable by a consumer yet.
+#[cfg(feature = "coordination")]
+pub(crate) mod storage;
