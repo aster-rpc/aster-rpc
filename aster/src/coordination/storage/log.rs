@@ -1917,6 +1917,18 @@ mod tests {
             .purge(log_id(1, 3))
             .await
             .expect("a lower purge is a no-op");
+
+        // Asserted *before* any further purge. An earlier version of this test
+        // re-purged to 5 at the end, which restored the marker and hid the
+        // regression it was supposed to catch -- a mutation removing the guard
+        // passed it.
+        let after_regression = store.get_log_state().await.expect("state");
+        assert_eq!(
+            after_regression.last_purged_log_id,
+            Some(log_id(1, 5)),
+            "a lower purge must not drag the marker backwards"
+        );
+
         store.purge(log_id(1, 5)).await.expect("an equal purge too");
 
         let state = store.get_log_state().await.expect("state");
