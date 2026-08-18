@@ -257,6 +257,60 @@ mod durability_guard {
         );
     }
 
+    /// The retryable variant is only ever raised while encoding.
+    ///
+    /// The allowlist in `puts_durability_in_question` makes exactly two
+    /// failures non-sticky, so a persisted *decode* classified as one silently
+    /// makes a corrupt durable value look like a bad request to retry. That is
+    /// what happened: `schema.rs` decoded its scalars and its replicated meta
+    /// row through the retryable constructor while the classifier's own
+    /// documentation said it could not.
+    ///
+    /// Checked structurally rather than by review, because the next checkpoint
+    /// adds another actor with more persisted values to decode.
+    #[test]
+    fn the_retryable_variant_is_never_raised_next_to_a_decode() {
+        for (name, source) in SOURCES {
+            for (n, line) in production_lines(source) {
+                if !line.contains("encode_failed(") {
+                    continue;
+                }
+                assert!(
+                    !line.contains("deserialize") && !line.contains("try_into"),
+                    "{name}:{} raises the retryable encode variant from what looks \
+                     like a decode; persisted values must use `corrupt`",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    /// And every Fory `deserialize` of a persisted value maps to corruption.
+    #[test]
+    fn persisted_decodes_map_to_stored_corruption() {
+        for (name, source) in SOURCES {
+            let lines: Vec<_> = production_lines(source).collect();
+            for (i, (n, line)) in lines.iter().enumerate() {
+                if !line.contains(".deserialize(") {
+                    continue;
+                }
+                // The `map_err` follows the `deserialize` within a couple of
+                // lines in every formatting rustfmt produces here.
+                let window: String = lines[i..(i + 3).min(lines.len())]
+                    .iter()
+                    .map(|(_, l)| *l)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(
+                    !window.contains("encode_failed("),
+                    "{name}:{} decodes a persisted value but classifies the \
+                     failure as retryable",
+                    n + 1
+                );
+            }
+        }
+    }
+
     /// Source lines outside the trailing `#[cfg(test)]` module.
     ///
     /// Tests legitimately open their own write transactions to build corrupt

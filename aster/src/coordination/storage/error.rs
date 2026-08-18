@@ -284,9 +284,15 @@ pub(crate) enum StorageError {
         source: std::io::Error,
     },
 
-    /// A value did not encode, or a caller-supplied value was invalid.
-    #[error("coordination storage {db}: could not decode {what}: {detail}")]
-    Codec {
+    /// A value the caller supplied could not be encoded, or was invalid.
+    ///
+    /// Named for the direction on purpose. This variant is the *only*
+    /// retryable failure besides [`LogGap`](StorageError::LogGap), and the
+    /// previous name -- `Codec` -- read as "something to do with the codec",
+    /// which is exactly how persisted-value decodes ended up classified as
+    /// retryable. A decode cannot plausibly be an `EncodeFailed`.
+    #[error("coordination storage {db}: could not encode {what}: {detail}")]
+    EncodeFailed {
         db: Db,
         what: &'static str,
         detail: String,
@@ -313,8 +319,12 @@ impl StorageError {
 
     /// Build a [`StorageError::Codec`] from anything displayable.
     /// A failure encoding a value the caller supplied. Retryable.
-    pub(crate) fn codec(db: Db, what: &'static str, detail: impl std::fmt::Display) -> Self {
-        StorageError::Codec {
+    pub(crate) fn encode_failed(
+        db: Db,
+        what: &'static str,
+        detail: impl std::fmt::Display,
+    ) -> Self {
+        StorageError::EncodeFailed {
             db,
             what,
             detail: detail.to_string(),
@@ -339,7 +349,7 @@ impl StorageError {
     ///
     /// Only two things are retryable. A [`LogGap`](StorageError::LogGap) is
     /// refused before any transaction opens, and
-    /// [`Codec`](StorageError::Codec) is raised only while *encoding* a value
+    /// [`EncodeFailed`](StorageError::EncodeFailed) is raised only while *encoding* a value
     /// the caller supplied — also before the transaction. Both leave the store
     /// untouched, and OpenRaft may legitimately follow either with a correct
     /// request. Making the first legal refusal permanently disable a healthy
@@ -352,7 +362,7 @@ impl StorageError {
     pub(crate) fn puts_durability_in_question(&self) -> bool {
         !matches!(
             self,
-            StorageError::LogGap { .. } | StorageError::Codec { .. }
+            StorageError::LogGap { .. } | StorageError::EncodeFailed { .. }
         )
     }
 

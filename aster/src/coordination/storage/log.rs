@@ -67,9 +67,9 @@ fn encode_entry(entry: &Entry<CoordinationTypeConfig>) -> StorageResult<Vec<u8>>
     let mirror = RaftEntryV1::from(entry);
     let bytes = payload_fory::<RaftEntryV1>()
         .serialize(&mirror)
-        .map_err(|source| AsterStorageError::codec(Db::Raft, "RaftEntryV1", source))?;
+        .map_err(|source| AsterStorageError::encode_failed(Db::Raft, "RaftEntryV1", source))?;
     if bytes.len() > MAX_ENTRY_BYTES {
-        return Err(AsterStorageError::codec(
+        return Err(AsterStorageError::encode_failed(
             Db::Raft,
             "RaftEntryV1",
             format!(
@@ -115,7 +115,7 @@ fn encode_vote(vote: &Vote<CoordinationNodeId>) -> StorageResult<Vec<u8>> {
     bounded(
         payload_fory::<VoteV1>()
             .serialize(&mirror)
-            .map_err(|source| AsterStorageError::codec(Db::Raft, "VoteV1", source))?,
+            .map_err(|source| AsterStorageError::encode_failed(Db::Raft, "VoteV1", source))?,
         "VoteV1",
     )
 }
@@ -134,7 +134,7 @@ fn encode_log_id(log_id: &LogId<CoordinationNodeId>) -> StorageResult<Vec<u8>> {
     bounded(
         payload_fory::<LogIdV1>()
             .serialize(&mirror)
-            .map_err(|source| AsterStorageError::codec(Db::Raft, "LogIdV1", source))?,
+            .map_err(|source| AsterStorageError::encode_failed(Db::Raft, "LogIdV1", source))?,
         "LogIdV1",
     )
 }
@@ -172,7 +172,7 @@ fn check_stored_meta_len(bytes: &[u8], what: &'static str) -> StorageResult<()> 
 /// Ceiling check for a value being written. Retryable: nothing is on disk.
 fn check_meta_len(bytes: &[u8], what: &'static str) -> StorageResult<()> {
     if bytes.len() > MAX_META_BYTES {
-        return Err(AsterStorageError::codec(
+        return Err(AsterStorageError::encode_failed(
             Db::Raft,
             what,
             format!(
@@ -229,6 +229,14 @@ enum LogCommand {
     /// through the real `serve` proves the code that ships.
     #[cfg(test)]
     InjectFatal(Reply<()>),
+    /// Block the actor until the test releases it.
+    ///
+    /// Without this there is no way to enqueue commands *behind* a known
+    /// failure in a known order: a caller checks the fatal latch before
+    /// sending, so by the time a test could react to the failure, nothing new
+    /// can be enqueued. Pausing the actor first makes the queue observable.
+    #[cfg(test)]
+    Pause(std::sync::mpsc::Receiver<()>),
 }
 
 /// Whether the actor may keep serving after one command.
@@ -282,6 +290,11 @@ impl LogActor {
                         "injected durability failure",
                     ))
                 }),
+                #[cfg(test)]
+                LogCommand::Pause(gate) => {
+                    let _ = gate.recv();
+                    Outcome::Continue
+                }
             };
 
             if outcome == Outcome::Fatal {
@@ -338,6 +351,8 @@ impl LogActor {
                 LogCommand::Read { reply, .. } => fail(reply),
                 #[cfg(test)]
                 LogCommand::InjectFatal(reply) => fail(reply),
+                #[cfg(test)]
+                LogCommand::Pause(_) => {}
             }
         }
     }
@@ -826,8 +841,38 @@ impl LogHandle {
 
     /// Force a fatal failure through the real command path.
     #[cfg(test)]
-    pub(crate) async fn inject_fatal(&self) -> StorageResult<()> {
+    async fn inject_fatal(&self) -> StorageResult<()> {
         self.call(LogCommand::InjectFatal).await
+    }
+
+    /// Block the actor and return the release handle.
+    #[cfg(test)]
+    async fn pause(&self) -> std::sync::mpsc::Sender<()> {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(LogCommand::Pause(gate_rx))
+            .await
+            .expect("the actor is running");
+        gate_tx
+    }
+
+    /// Enqueue a command without awaiting its reply.
+    ///
+    /// The ordering guarantee this exists for: with the actor paused, two
+    /// successive sends land in the channel in exactly the order issued, which
+    /// is what makes "queued behind a failure" a testable statement rather
+    /// than a race.
+    #[cfg(test)]
+    async fn enqueue<T, F>(&self, build: F) -> oneshot::Receiver<StorageResult<T>>
+    where
+        F: FnOnce(Reply<T>) -> LogCommand,
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(build(reply_tx))
+            .await
+            .expect("the actor is running");
+        reply_rx
     }
 
     /// Whether this store has failed in a way that makes its durability
@@ -861,11 +906,17 @@ impl LogHandle {
         }
     }
 
-    /// Run a *write* through the actor, marking the store fatal if it fails.
+    /// Run a write through the actor.
     ///
-    /// Reads are deliberately not sticky: a failed read reports itself but
-    /// leaves the store usable, because it has not put the durable state in
-    /// question. A failed write has.
+    /// Identical to [`Self::call`] apart from the return type. Stickiness is
+    /// not decided here and is not decided by read-versus-write: the actor
+    /// classifies every command by its *failure*, so a read that hits stored
+    /// corruption or a redb error is sticky too — correctly, since a store
+    /// that cannot read what it holds cannot say what is durable either.
+    ///
+    /// (An earlier comment here claimed reads were never sticky. That was
+    /// true when the caller classified, and stopped being true when the
+    /// classification moved into the actor.)
     async fn call_write<F>(&self, build: F) -> StorageResult<()>
     where
         F: FnOnce(Reply<()>) -> LogCommand,
@@ -2099,42 +2150,62 @@ mod tests {
         assert!(storage.log().handle().is_fatal());
     }
 
-    /// Work queued behind a fatal failure is refused, not served.
+    /// A command queued *behind* a fatal failure is refused and never
+    /// executed.
     ///
-    /// This is the substantive half of the classification move. The writers
-    /// below are in flight when the failure lands, so they are genuinely
-    /// *queued* rather than issued afterwards -- which is exactly the case
-    /// that used to be acknowledged, because the actor kept servicing the
-    /// queue while the caller had not yet latched.
+    /// This is the drain, tested directly. The ordering is forced rather than
+    /// raced: the actor is paused, the failure and the write are enqueued in
+    /// that exact order while it cannot service either, and only then is it
+    /// released. So the write is unambiguously in the channel when the failure
+    /// is classified -- the case the previous version of this test could not
+    /// reach, because a caller checks the latch before sending and therefore
+    /// never enqueues anything once the store is fatal. That test passed a
+    /// mutation which kept serving the queue.
+    ///
+    /// Both halves are asserted, and the second is the one with teeth: the
+    /// write is refused, *and* its effect is absent from disk. An actor that
+    /// keeps serving after a fatal command fails on the disk check, which no
+    /// caller-side latch can prevent.
     #[tokio::test]
-    async fn work_queued_behind_a_fatal_failure_is_refused() {
+    async fn a_command_queued_behind_a_fatal_failure_is_never_executed() {
         let root = scratch();
-        let storage = open(&root);
-        let handle = storage.log().handle().clone();
 
-        let writers: Vec<_> = (0..32)
-            .map(|n| {
-                let mut store = storage.log().clone();
-                tokio::spawn(
-                    async move { store.save_vote(&Vote::new(n + 1, node(3))).await.is_err() },
-                )
-            })
-            .collect();
+        {
+            let storage = open(&root);
+            let handle = storage.log().handle().clone();
 
-        let _ = handle.inject_fatal().await;
+            let release = handle.pause().await;
 
-        let mut refused = 0;
-        for writer in writers {
-            if writer.await.expect("join") {
-                refused += 1;
-            }
+            // Enqueued in this order, into a channel the actor cannot drain.
+            let fatal_rx = handle.enqueue(LogCommand::InjectFatal).await;
+            let vote_rx = handle
+                .enqueue(|reply| LogCommand::SaveVote {
+                    vote: Vote::new(4242, node(7)),
+                    reply,
+                })
+                .await;
+
+            release.send(()).expect("release the actor");
+
+            assert!(
+                fatal_rx.await.expect("reply").is_err(),
+                "the injected failure is reported"
+            );
+            assert!(
+                vote_rx.await.expect("reply").is_err(),
+                "a write queued behind a fatal failure must not be acknowledged"
+            );
+            assert!(handle.is_fatal());
         }
+
+        // And it must not have reached the disk.
+        let db = Database::create(root.join("raft.redb")).expect("reopen raft");
+        let read = db.begin_read().expect("read");
+        let meta = read.open_table(RAFT_META).expect("open meta");
         assert!(
-            refused > 0,
-            "at least one queued write must be refused rather than acknowledged \
-             after durability became uncertain"
+            meta.get(KEY_VOTE).expect("get").is_none(),
+            "the queued vote was executed despite the store already being fatal"
         );
-        assert!(handle.is_fatal());
     }
 
     /// After a fatal failure nothing further is acknowledged.
@@ -2200,8 +2271,10 @@ mod tests {
     /// An encode failure is a rejected input and stays retryable.
     #[test]
     fn an_encode_failure_is_retryable_but_stored_corruption_is_not() {
-        assert!(!AsterStorageError::codec(Db::Raft, "VoteV1", "oversized")
-            .puts_durability_in_question());
+        assert!(
+            !AsterStorageError::encode_failed(Db::Raft, "VoteV1", "oversized")
+                .puts_durability_in_question()
+        );
         assert!(
             AsterStorageError::corrupt(Db::Raft, "VoteV1", "undecodable")
                 .puts_durability_in_question()

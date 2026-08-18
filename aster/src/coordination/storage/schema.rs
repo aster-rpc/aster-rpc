@@ -414,22 +414,28 @@ fn encode_u32(value: u32) -> Vec<u8> {
     value.to_be_bytes().to_vec()
 }
 
+/// Decode a persisted scalar.
+///
+/// Every decoder below reports [`StoredCorruption`](StorageError::StoredCorruption),
+/// never the retryable encode variant. These bytes are already on disk, so a
+/// caller has nothing to retry -- and misclassifying them was how the
+/// allowlist invariant became false while still reading as correct.
 fn decode_u32(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<u32> {
     let array: [u8; 4] = bytes.try_into().map_err(|_| {
-        StorageError::codec(db, what, format!("expected 4 bytes, got {}", bytes.len()))
+        StorageError::corrupt(db, what, format!("expected 4 bytes, got {}", bytes.len()))
     })?;
     Ok(u32::from_be_bytes(array))
 }
 
 fn decode_array32(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<[u8; 32]> {
     bytes.try_into().map_err(|_| {
-        StorageError::codec(db, what, format!("expected 32 bytes, got {}", bytes.len()))
+        StorageError::corrupt(db, what, format!("expected 32 bytes, got {}", bytes.len()))
     })
 }
 
 fn decode_string(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<String> {
     String::from_utf8(bytes.to_vec())
-        .map_err(|source| StorageError::codec(db, what, format!("not valid UTF-8: {source}")))
+        .map_err(|source| StorageError::corrupt(db, what, format!("not valid UTF-8: {source}")))
 }
 
 // ── Open ─────────────────────────────────────────────────────────────────────
@@ -819,7 +825,7 @@ fn classify_state(database: &Database, presence: Presence) -> StorageResult<Side
     if let Some(bytes) = &meta_row {
         let meta: CoordinationMetaV1 = payload_fory::<CoordinationMetaV1>()
             .deserialize(bytes)
-            .map_err(|source| StorageError::codec(Db::State, "CoordinationMetaV1", source))?;
+            .map_err(|source| StorageError::corrupt(Db::State, "CoordinationMetaV1", source))?;
         if replicated_state_is_durable(&meta) {
             durable = true;
         }
@@ -1121,7 +1127,9 @@ fn write_state_identity(database: &mut Database, identity: &StorageIdentity) -> 
     };
     let encoded = payload_fory::<CoordinationMetaV1>()
         .serialize(&meta_row)
-        .map_err(|source| StorageError::codec(Db::State, "CoordinationMetaV1", source))?;
+        // An encode, and the only one in this module: it is the single place a
+        // value this build produced could fail to be written.
+        .map_err(|source| StorageError::encode_failed(Db::State, "CoordinationMetaV1", source))?;
 
     let write = durable_write(database, Db::State)?;
     {
@@ -1261,7 +1269,7 @@ fn verify_state_identity(database: &Database, identity: &StorageIdentity) -> Sto
     )?;
     let meta: CoordinationMetaV1 = payload_fory::<CoordinationMetaV1>()
         .deserialize(&bytes)
-        .map_err(|source| StorageError::codec(Db::State, "CoordinationMetaV1", source))?;
+        .map_err(|source| StorageError::corrupt(Db::State, "CoordinationMetaV1", source))?;
 
     if meta.schema_version != LOGICAL_SCHEMA_VERSION {
         return Err(StorageError::SchemaVersion {
@@ -1674,17 +1682,23 @@ mod tests {
         }
     }
 
-    /// A truncated meta value is a named codec failure, not a panic and not a
-    /// silent reinterpretation.
+    /// A truncated meta value is named stored corruption, not a panic and not
+    /// a silent reinterpretation.
+    ///
+    /// Classified as corruption rather than a retryable codec failure: these
+    /// bytes are already durable. The test previously pinned the wrong
+    /// classification, which is how it survived being wrong.
     #[test]
-    fn a_malformed_meta_value_is_a_codec_failure() {
+    fn a_malformed_meta_value_is_stored_corruption() {
         let root = scratch();
         drop(open_at(&root, identity()).expect("bind"));
         overwrite_raft_meta(&root, KEY_SCHEMA_VERSION, &[0u8, 1]);
 
         match open_at(&root, identity()) {
-            Err(StorageError::Codec { what, .. }) => assert_eq!(what, "schema_version"),
-            other => panic!("expected a codec failure, got: {other:?}"),
+            Err(StorageError::StoredCorruption { what, .. }) => {
+                assert_eq!(what, "schema_version")
+            }
+            other => panic!("expected stored corruption, got: {other:?}"),
         }
     }
 
