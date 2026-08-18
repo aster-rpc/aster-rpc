@@ -137,3 +137,67 @@ impl VoterStorage {
         self.outcome
     }
 }
+
+#[cfg(test)]
+mod durability_guard {
+    //! §11.1: `Durability::None` must not appear anywhere in this subsystem,
+    //! "not even as a throughput option behind configuration".
+    //!
+    //! Guarded at the source level because it cannot be guarded at runtime.
+    //! `Durability::None` defers the fsync; every read in this process still
+    //! sees the data, and so does a clean close and reopen. Only a process
+    //! death between the commit and the fsync tells the two apart, which is
+    //! Checkpoint E's crash matrix. Swapping the setting today fails no
+    //! behavioural test — verified by mutation — so the rule needs an
+    //! assertion of the shape it actually has: a statement about the code.
+
+    /// Every source file in this module tree, checked as text.
+    const SOURCES: &[(&str, &str)] = &[
+        ("mod.rs", include_str!("mod.rs")),
+        ("error.rs", include_str!("error.rs")),
+        ("identity.rs", include_str!("identity.rs")),
+        ("schema.rs", include_str!("schema.rs")),
+        ("log.rs", include_str!("log.rs")),
+        ("machine.rs", include_str!("machine.rs")),
+        ("snapshot.rs", include_str!("snapshot.rs")),
+        ("fixture.rs", include_str!("fixture.rs")),
+    ];
+
+    #[test]
+    fn no_source_in_this_subsystem_selects_the_deferred_fsync_level() {
+        // Built rather than written, so this file does not trip its own check.
+        let forbidden = format!("{}::{}", "Durability", "None");
+        for (name, source) in SOURCES {
+            for (n, line) in source.lines().enumerate() {
+                // Prose that names the level in order to explain why it is
+                // forbidden is not a use of it.
+                let code = line.split("//").next().unwrap_or("");
+                assert!(
+                    !code.contains(&forbidden),
+                    "{name}:{} selects the deferred-fsync durability level, \
+                     which turns OpenRaft's durability contract into a tunable",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    /// And the setting that *is* required appears where writes happen.
+    ///
+    /// The pair matters: a file with neither is not "safe by omission", it is
+    /// a file relying on whatever redb defaults to today.
+    #[test]
+    fn every_write_transaction_selects_immediate_durability() {
+        for (name, source) in SOURCES {
+            let opens_writes = source.contains("begin_write()");
+            if !opens_writes {
+                continue;
+            }
+            assert!(
+                source.contains("Durability::Immediate"),
+                "{name} opens write transactions but never selects \
+                 Durability::Immediate"
+            );
+        }
+    }
+}
