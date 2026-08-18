@@ -22,10 +22,9 @@
 //! own peers cannot read, and the resulting divergence would look like
 //! corruption rather than misconfiguration.
 
-// Checkpoint A builds this; Checkpoints B and C are what call it, so nothing
-// in a non-test build reaches it yet. Scoped to this module deliberately --
-// see the `storage` module docs for why a crate-root allowance would be
-// wrong. Removed when the checkpoint that consumes this module lands.
+// Scoped to this module deliberately -- see the `storage` module docs for why
+// a crate-root allowance would be wrong, and why these come off when Slice 3
+// wires the voter runtime rather than at any Slice 2 checkpoint.
 #![allow(dead_code)]
 
 use crate::coordination::ids::{CoordinationGroupId, CoordinationNodeId};

@@ -15,10 +15,9 @@
 //! these surface to a caller; inventing that mapping here would fix a public
 //! contract this slice cannot verify.
 
-// Checkpoint A builds this; Checkpoints B and C are what call it, so nothing
-// in a non-test build reaches it yet. Scoped to this module deliberately --
-// see the `storage` module docs for why a crate-root allowance would be
-// wrong. Removed when the checkpoint that consumes this module lands.
+// Scoped to this module deliberately -- see the `storage` module docs for why
+// a crate-root allowance would be wrong, and why these come off when Slice 3
+// wires the voter runtime rather than at any Slice 2 checkpoint.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -231,6 +230,37 @@ pub(crate) enum StorageError {
     )]
     PartialInitialization { detail: String },
 
+    /// An append would leave a hole in the log, or the batch itself has one.
+    ///
+    /// Raft's correctness argument examines only the last log id, so a hole is
+    /// not a local inconsistency to be repaired later — it makes every
+    /// subsequent "up to date" conclusion wrong. The batch is refused whole;
+    /// §4.3 requires that nothing be partially written.
+    #[error("coordination log append expected index {expected} but found {found}: {detail}")]
+    LogGap {
+        expected: u64,
+        found: u64,
+        detail: &'static str,
+    },
+
+    /// The storage actor is gone, so nothing can be read or written.
+    #[error(
+        "the coordination storage actor for {db} has stopped; \
+         this store can no longer make durability claims"
+    )]
+    ActorStopped { db: Db },
+
+    /// A durability or callback-path failure already happened.
+    ///
+    /// Sticky by design. Once a write has failed, this store cannot say what
+    /// is durable, so continuing would let a later vote be acknowledged on top
+    /// of a log write that never landed.
+    #[error(
+        "coordination storage is in a fatal state after an earlier durability \
+         failure and will not accept further operations"
+    )]
+    Fatal,
+
     /// A stored value did not decode, or decoded to something invalid.
     #[error("coordination storage {db}: could not decode {what}: {detail}")]
     Codec {
@@ -265,6 +295,25 @@ impl StorageError {
             what,
             detail: detail.to_string(),
         }
+    }
+
+    /// Whether this failure leaves the store unable to say what is durable.
+    ///
+    /// The distinction decides whether a write failure is *sticky*. A refused
+    /// append and a failed commit are both errors, but only one of them puts
+    /// durability in question: a gap is rejected before any transaction opens,
+    /// so the store is untouched and the caller may legitimately retry with a
+    /// correct batch. Treating a rejection as fatal would make the first legal
+    /// refusal permanently disable a healthy voter.
+    pub(crate) fn puts_durability_in_question(&self) -> bool {
+        !matches!(
+            self,
+            // Refused before a transaction opens.
+            StorageError::LogGap { .. }
+                // Encoding is done before the transaction too, so a value this
+                // build cannot encode has written nothing.
+                | StorageError::Codec { .. }
+        )
     }
 
     /// Wrap a redb error that has no more specific variant.

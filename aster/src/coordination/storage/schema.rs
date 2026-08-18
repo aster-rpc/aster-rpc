@@ -19,10 +19,9 @@
 //! very value whose codec is in question. The value is a compiled constant,
 //! never a caller's choice.
 
-// Checkpoint A builds this; Checkpoints B and C are what call it, so nothing
-// in a non-test build reaches it yet. Scoped to this module deliberately --
-// see the `storage` module docs for why a crate-root allowance would be
-// wrong. Removed when the checkpoint that consumes this module lands.
+// Scoped to this module deliberately -- see the `storage` module docs for why
+// a crate-root allowance would be wrong, and why these come off when Slice 3
+// wires the voter runtime rather than at any Slice 2 checkpoint.
 #![allow(dead_code)]
 
 use std::fs::File;
@@ -437,6 +436,17 @@ pub(crate) enum OpenOutcome {
     RecreateRaft,
 }
 
+/// The pieces of a validated open, handed on to the per-database actors.
+#[derive(Debug)]
+pub(crate) struct OpenedParts {
+    pub(crate) layout: StorageLayout,
+    pub(crate) identity: StorageIdentity,
+    pub(crate) lock: DirectoryLock,
+    pub(crate) raft: Database,
+    pub(crate) state: Database,
+    pub(crate) outcome: OpenOutcome,
+}
+
 /// A validated, locked, open storage directory.
 ///
 /// Holds both databases by value. Checkpoints B, C and D take them from here; the
@@ -483,6 +493,24 @@ impl OpenedStorage {
     /// How this open resolved, including whether a pristine side was rebuilt.
     pub(crate) fn outcome(&self) -> OpenOutcome {
         self.outcome
+    }
+
+    /// Break the validated open into its parts so each database can be handed
+    /// to its own single-writer actor.
+    ///
+    /// By value, and only after every check has passed: `check_integrity`
+    /// needs `&mut Database`, so a database published to an actor can never be
+    /// checked again. The lock travels with the parts because releasing it
+    /// here would let a second voter in behind the actors' backs.
+    pub(crate) fn into_parts(self) -> OpenedParts {
+        OpenedParts {
+            layout: self.layout,
+            identity: self.identity,
+            lock: self.lock,
+            raft: self.raft,
+            state: self.state,
+            outcome: self.outcome,
+        }
     }
 
     /// Whether this open found an existing binding rather than creating both
@@ -2069,6 +2097,50 @@ mod tests {
                 .expect("the value survives the refusal");
             assert_eq!(stored, value, "a refused open must not overwrite metadata");
         }
+    }
+
+    /// The same rule on the state side.
+    ///
+    /// Both call sites share one helper, but only the Raft one was
+    /// mutation-protected: removing the `state.redb` call left every test
+    /// green. A production call being correct is not evidence that it stays
+    /// correct.
+    #[test]
+    fn an_unbound_state_database_holding_known_metadata_is_refused() {
+        let root = scratch();
+        {
+            // Bind the log side so classification actually reaches the state
+            // side rather than stopping at a fresh pair.
+            drop(open_at(&root, identity()).expect("bind"));
+            std::fs::remove_file(root.join("state.redb")).expect("remove state");
+            let db = Database::create(root.join("state.redb")).expect("create state");
+            let write = db.begin_write().expect("write");
+            {
+                let mut meta = write.open_table(STATE_META).expect("open meta");
+                meta.insert(KEY_CODEC_VERSION, 55u32.to_be_bytes().as_slice())
+                    .expect("insert");
+            }
+            write.commit().expect("commit");
+        }
+
+        match open_at(&root, identity()) {
+            Err(StorageError::PartialInitialization { detail }) => {
+                assert!(detail.contains("state.redb"), "got: {detail}");
+                assert!(detail.contains("metadata row"), "got: {detail}");
+            }
+            other => panic!("expected partial initialization, got: {other:?}"),
+        }
+
+        let db = Database::create(root.join("state.redb")).expect("reopen state");
+        let read = db.begin_read().expect("read");
+        let stored = meta_bytes(&read, Db::State, STATE_META, KEY_CODEC_VERSION)
+            .expect("meta")
+            .expect("the value survives the refusal");
+        assert_eq!(
+            stored,
+            55u32.to_be_bytes().to_vec(),
+            "a refused open must not overwrite state metadata either"
+        );
     }
 
     /// A wrong-typed metadata table is a schema error, not a generic redb

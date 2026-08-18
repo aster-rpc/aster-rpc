@@ -38,9 +38,8 @@
 //! `Clone`, so the type does not have it; an additional Published reader comes
 //! from an explicit [`SnapshotCatalog::lease`] instead.
 
-// Checkpoint A lands the handle and its ownership rules; Checkpoint D is what
-// builds, installs, and publishes through them, so the id/catalog helpers are
-// not reached by a non-test build yet. Scoped to this module deliberately --
+// Checkpoint D builds, installs, and publishes through this handle; until
+// then only its ownership rules exist. Scoped to this module deliberately --
 // see the `storage` module docs for why a crate-root allowance would be wrong.
 #![allow(dead_code)]
 
