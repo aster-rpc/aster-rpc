@@ -206,8 +206,7 @@ impl DirectoryLock {
 
         match file.try_lock() {
             Ok(()) => Ok(Self { path, file }),
-            Err(std::fs::TryLockError::WouldBlock) => Err(StorageError::LockContended { path }),
-            Err(std::fs::TryLockError::Error(source)) => Err(StorageError::LockIo { path, source }),
+            Err(failure) => Err(classify_lock_failure(path, failure)),
         }
     }
 
@@ -221,6 +220,22 @@ impl DirectoryLock {
             path: self.path.clone(),
             source,
         })
+    }
+}
+
+/// Map a `try_lock` failure to its named storage failure.
+///
+/// A pure function, for the same reason [`classify_integrity`] is one: a real
+/// `TryLockError::Error` needs a filesystem that fails the lock syscall while
+/// still opening the file, which is not something a test can arrange on a
+/// normal volume. Fused into [`DirectoryLock::acquire`], the `Error` arm had
+/// no test at all — an earlier version of this module collapsed both arms into
+/// contention and every lock test still passed, because the only I/O failure
+/// being exercised happened at `File::open`, one step earlier.
+fn classify_lock_failure(path: PathBuf, failure: std::fs::TryLockError) -> StorageError {
+    match failure {
+        std::fs::TryLockError::WouldBlock => StorageError::LockContended { path },
+        std::fs::TryLockError::Error(source) => StorageError::LockIo { path, source },
     }
 }
 
@@ -1032,14 +1047,48 @@ mod tests {
         open_at(&root, identity()).expect("the lock is released with its holder");
     }
 
-    /// An I/O failure acquiring the lock is *not* reported as another voter,
-    /// and keeps its source.
+    /// Both `try_lock` arms map to their own failure, and only `WouldBlock`
+    /// means another voter.
     ///
-    /// Injected by making `LOCK` a directory, which is a real filesystem
-    /// state rather than a mocked error: opening it read/write fails, and the
-    /// failure has nothing to do with contention.
+    /// Tested through the classifier rather than through `acquire`, because a
+    /// genuine `TryLockError::Error` needs a filesystem that opens the file
+    /// and then fails the lock syscall. That is not arrangeable on a normal
+    /// volume, and pretending otherwise is how this arm went uncovered:
+    /// collapsing both into contention left every lock test green, since the
+    /// only I/O failure being exercised was the `File::open` one below.
     #[test]
-    fn a_lock_io_failure_is_not_reported_as_contention() {
+    fn each_try_lock_failure_maps_to_its_own_error() {
+        let path = PathBuf::from("/tmp/example/LOCK");
+
+        let contended = classify_lock_failure(path.clone(), std::fs::TryLockError::WouldBlock);
+        assert!(
+            matches!(contended, StorageError::LockContended { .. }),
+            "WouldBlock is the only result that means another voter: {contended:?}"
+        );
+
+        let io = classify_lock_failure(
+            path,
+            std::fs::TryLockError::Error(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )),
+        );
+        let StorageError::LockIo { source, .. } = &io else {
+            panic!("a lock syscall failure must not be reported as contention: {io:?}");
+        };
+        assert_eq!(
+            source.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "and it must keep the original error rather than a summary"
+        );
+    }
+
+    /// Failing to *open* `LOCK` is also `LockIo`, not contention.
+    ///
+    /// Injected by making `LOCK` a directory: a real filesystem state rather
+    /// than a mocked error. Distinct from the classifier test above — this one
+    /// covers the step before `try_lock` is ever reached.
+    #[test]
+    fn a_lock_open_failure_is_not_reported_as_contention() {
         let root = scratch();
         std::fs::create_dir_all(root.join("LOCK")).expect("occupy LOCK with a directory");
 
