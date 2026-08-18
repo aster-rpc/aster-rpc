@@ -320,7 +320,23 @@ fn check_integrity(
     db: Db,
     freshly_created: bool,
 ) -> StorageResult<IntegrityOutcome> {
-    match database.check_integrity() {
+    classify_integrity(database.check_integrity(), db, freshly_created)
+}
+
+/// The §11.1 classification rule, separated from the redb call that produces
+/// the input.
+///
+/// Split deliberately. `Ok(false)` cannot be provoked on demand — it needs a
+/// process killed mid-commit, which is Checkpoint E's fault harness — so
+/// leaving the rule fused to the I/O would mean the most consequential branch
+/// here had no test until then. As a pure function every arm is directly
+/// evidenced now.
+fn classify_integrity(
+    result: Result<bool, DatabaseError>,
+    db: Db,
+    freshly_created: bool,
+) -> StorageResult<IntegrityOutcome> {
+    match result {
         Ok(true) => Ok(IntegrityOutcome::Clean),
         Ok(false) if freshly_created => Err(StorageError::FreshDatabaseUnclean { db }),
         Ok(false) => Ok(IntegrityOutcome::RecoveredFromUncleanShutdown),
@@ -1050,6 +1066,61 @@ mod tests {
         assert_eq!(lock.path(), root.join("LOCK"));
         lock.unlock().expect("unlock");
         DirectoryLock::acquire(root.join("LOCK")).expect("reacquire after an orderly unlock");
+    }
+
+    // ── Integrity classification ─────────────────────────────────────────────
+
+    /// A clean database is clean regardless of who created it.
+    #[test]
+    fn a_clean_integrity_result_is_clean_either_way() {
+        for freshly_created in [true, false] {
+            assert_eq!(
+                classify_integrity(Ok(true), Db::Raft, freshly_created).expect("clean"),
+                IntegrityOutcome::Clean
+            );
+        }
+    }
+
+    /// `Ok(false)` on a pre-existing database is the accepted recovery path.
+    ///
+    /// This is the *common* case in the Checkpoint E fault matrix, not an
+    /// anomaly: every process-death test reopens a database redb had to
+    /// recover. Rejecting it would make the crash matrix unrunnable; silently
+    /// treating it as `Ok(true)` would erase the one signal that a crash
+    /// happened.
+    #[test]
+    fn an_unclean_pre_existing_database_is_the_named_recovery_path() {
+        assert_eq!(
+            classify_integrity(Ok(false), Db::Raft, false).expect("recovery is accepted"),
+            IntegrityOutcome::RecoveredFromUncleanShutdown
+        );
+    }
+
+    /// `Ok(false)` on a database this process just created is fatal.
+    ///
+    /// It had no prior crash to recover from, so the result is evidence about
+    /// the storage stack. The same rule covers the database built during a
+    /// snapshot install, which must never be acknowledged unclean.
+    #[test]
+    fn an_unclean_freshly_created_database_is_fatal() {
+        let err = classify_integrity(Ok(false), Db::State, true)
+            .expect_err("a fresh database has nothing to recover from");
+        assert!(
+            matches!(err, StorageError::FreshDatabaseUnclean { db: Db::State }),
+            "got: {err:?}"
+        );
+    }
+
+    /// A live handle during the check is a lifecycle failure in this crate,
+    /// reported as itself rather than as corruption.
+    #[test]
+    fn a_live_handle_during_the_check_is_a_lifecycle_failure() {
+        let err = classify_integrity(Err(DatabaseError::TransactionInProgress), Db::Raft, false)
+            .expect_err("a live handle must not be reported as clean");
+        assert!(
+            matches!(err, StorageError::TransactionInProgress { .. }),
+            "got: {err:?}"
+        );
     }
 
     // ── Identity ─────────────────────────────────────────────────────────────
