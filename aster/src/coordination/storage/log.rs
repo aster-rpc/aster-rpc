@@ -2060,15 +2060,20 @@ mod tests {
 
     // ── Fatal ordering ───────────────────────────────────────────────────────
 
-    /// The fatal latch is set before the failure is delivered.
+    /// The latch is set by the time the caller observes the failure.
     ///
-    /// This is the race the classification move closes. When the caller
-    /// classified, the actor sent the failure and immediately picked up the
-    /// next command while the latch was still unset. There is no await between
-    /// receiving the error and reading the latch here, so a caller-side
-    /// classification cannot pass this.
+    /// ## What this does *not* prove
+    ///
+    /// It does not prove the latch is set *before* the reply is sent rather
+    /// than immediately after. The actor runs on its own thread, so it wins
+    /// that race in practice either way and a mutation moving the store after
+    /// the send passes this test -- verified. The ordering is kept because it
+    /// closes the window on principle and costs nothing, but the property with
+    /// teeth is the next test: once fatal, work already queued is refused
+    /// rather than served. That one is deterministic, because the actor stops
+    /// the loop instead of racing anything.
     #[tokio::test]
-    async fn the_fatal_latch_is_set_before_the_failure_is_delivered() {
+    async fn the_fatal_latch_is_set_by_the_time_the_caller_sees_the_failure() {
         let root = scratch();
         let storage = open(&root);
 
@@ -2079,10 +2084,45 @@ mod tests {
             .await
             .expect_err("the injected failure is reported");
         assert!(err.to_string().contains("unusable"), "{err}");
+        assert!(storage.log().handle().is_fatal());
+    }
+
+    /// Work queued behind a fatal failure is refused, not served.
+    ///
+    /// This is the substantive half of the classification move. The writers
+    /// below are in flight when the failure lands, so they are genuinely
+    /// *queued* rather than issued afterwards -- which is exactly the case
+    /// that used to be acknowledged, because the actor kept servicing the
+    /// queue while the caller had not yet latched.
+    #[tokio::test]
+    async fn work_queued_behind_a_fatal_failure_is_refused() {
+        let root = scratch();
+        let storage = open(&root);
+        let handle = storage.log().handle().clone();
+
+        let writers: Vec<_> = (0..32)
+            .map(|n| {
+                let mut store = storage.log().clone();
+                tokio::spawn(
+                    async move { store.save_vote(&Vote::new(n + 1, node(3))).await.is_err() },
+                )
+            })
+            .collect();
+
+        let _ = handle.inject_fatal().await;
+
+        let mut refused = 0;
+        for writer in writers {
+            if writer.await.expect("join") {
+                refused += 1;
+            }
+        }
         assert!(
-            storage.log().handle().is_fatal(),
-            "the latch must already be set by the time the caller sees the error"
+            refused > 0,
+            "at least one queued write must be refused rather than acknowledged \
+             after durability became uncertain"
         );
+        assert!(handle.is_fatal());
     }
 
     /// After a fatal failure nothing further is acknowledged.
