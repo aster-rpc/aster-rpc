@@ -33,7 +33,7 @@ use redb::{
 };
 
 use super::codec::{
-    check_stored_len, decode_array32, decode_persisted_bounded, decode_string, decode_u32,
+    copy_stored_bounded, decode_array32, decode_persisted_bounded, decode_string, decode_u32,
     encode_owned,
 };
 use super::error::{Db, StorageError, StorageResult};
@@ -1042,11 +1042,8 @@ fn meta_bytes(
         .get(key)
         .map_err(|source| StorageError::redb(db, source))?;
     match value {
-        Some(v) => {
-            let borrowed = v.value();
-            check_stored_len(db, key, borrowed, max_bytes)?;
-            Ok(Some(borrowed.to_vec()))
-        }
+        // One call, so the check cannot end up after the copy.
+        Some(v) => Ok(Some(copy_stored_bounded(db, key, v.value(), max_bytes)?)),
         None => Ok(None),
     }
 }

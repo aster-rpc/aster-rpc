@@ -58,6 +58,23 @@ pub(crate) fn check_stored_len(
     Ok(())
 }
 
+/// Copy a borrowed stored value out, refusing anything over its ceiling.
+///
+/// The check and the copy are one operation because their *order* is what
+/// matters and is not observable: checking after `to_vec` produces the same
+/// error for the same input, so no test can tell the two apart -- verified by
+/// mutation. What a test cannot catch, a signature can. There is no borrowed
+/// slice left to copy incorrectly once the caller has this.
+pub(crate) fn copy_stored_bounded(
+    db: Db,
+    what: &'static str,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> StorageResult<Vec<u8>> {
+    check_stored_len(db, what, bytes, max_bytes)?;
+    Ok(bytes.to_vec())
+}
+
 /// Decode a persisted Fory root, refusing anything over its ceiling first.
 ///
 /// The only decoder this module exports. §4.2 requires the bound *before*
