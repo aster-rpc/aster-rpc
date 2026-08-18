@@ -22,6 +22,12 @@
 //! own peers cannot read, and the resulting divergence would look like
 //! corruption rather than misconfiguration.
 
+// Checkpoint A builds this; Checkpoints B and C are what call it, so nothing
+// in a non-test build reaches it yet. Scoped to this module deliberately --
+// see the `storage` module docs for why a crate-root allowance would be
+// wrong. Removed when the checkpoint that consumes this module lands.
+#![allow(dead_code)]
+
 use crate::coordination::ids::{CoordinationGroupId, CoordinationNodeId};
 
 /// The logical schema version this build implements (§11.2).

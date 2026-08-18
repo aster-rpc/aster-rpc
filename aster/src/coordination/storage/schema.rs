@@ -20,6 +20,12 @@
 //! [`KEY_CODEC_VERSION`], to each. The value is a compiled constant, never a
 //! caller's choice.
 
+// Checkpoint A builds this; Checkpoints B and C are what call it, so nothing
+// in a non-test build reaches it yet. Scoped to this module deliberately --
+// see the `storage` module docs for why a crate-root allowance would be
+// wrong. Removed when the checkpoint that consumes this module lands.
+#![allow(dead_code)]
+
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -190,8 +196,17 @@ impl DirectoryLock {
     /// only result that means another voter owns this directory; the standard
     /// library guarantees it never hides a `WouldBlock` inside
     /// `TryLockError::Error`, so the split is exact rather than heuristic.
-    pub(crate) fn acquire(path: impl Into<PathBuf>) -> StorageResult<Self> {
+    pub(crate) fn acquire(path: impl Into<PathBuf>, policy: &OpenPolicy) -> StorageResult<Self> {
         let path = path.into();
+        reject_symlink(&path)?;
+
+        // Whether the lock file already existed decides what happens to its
+        // permissions, and the two are not interchangeable. A pre-existing
+        // group-writable `LOCK` is a production policy violation to *refuse*;
+        // chmodding it would repair the symptom, let startup continue, and
+        // erase the evidence that something else could write the file this
+        // voter's mutual exclusion depends on.
+        let existed = path.exists();
         let file = File::options()
             .read(true)
             .write(true)
@@ -202,7 +217,11 @@ impl DirectoryLock {
                 path: path.clone(),
                 source,
             })?;
-        restrict_permissions(&path, FILE_MODE)?;
+        if existed {
+            check_permissions(&path, policy)?;
+        } else {
+            restrict_permissions(&path, FILE_MODE)?;
+        }
 
         match file.try_lock() {
             Ok(()) => Ok(Self { path, file }),
@@ -401,6 +420,24 @@ enum Presence {
     Existing,
 }
 
+/// How an open resolved.
+///
+/// Reported rather than reduced to a boolean because a recreation is an event
+/// an operator should see: it means this node crashed between its two
+/// first-open commits, and the side that was rebuilt is provably empty rather
+/// than merely assumed so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenOutcome {
+    /// Nothing was bound here; both databases were created and bound.
+    Fresh,
+    /// Both databases were already bound and were verified.
+    Initialized,
+    /// `raft.redb` was bound and pristine; `state.redb` was rebuilt.
+    RecreateState,
+    /// `state.redb` was bound and pristine; `raft.redb` was rebuilt.
+    RecreateRaft,
+}
+
 /// A validated, locked, open storage directory.
 ///
 /// Holds both databases by value. Checkpoints B, C and D take them from here; the
@@ -414,7 +451,7 @@ pub(crate) struct OpenedStorage {
     state: Database,
     raft_integrity: IntegrityOutcome,
     state_integrity: IntegrityOutcome,
-    initialized: bool,
+    outcome: OpenOutcome,
 }
 
 impl OpenedStorage {
@@ -444,10 +481,16 @@ impl OpenedStorage {
         (self.raft_integrity, self.state_integrity)
     }
 
-    /// Whether this open found existing initialized storage rather than
-    /// creating it.
+    /// How this open resolved, including whether a pristine side was rebuilt.
+    pub(crate) fn outcome(&self) -> OpenOutcome {
+        self.outcome
+    }
+
+    /// Whether this open found an existing binding rather than creating both
+    /// sides from nothing. A recreation counts: one side's binding was already
+    /// there and was verified.
     pub(crate) fn was_initialized(&self) -> bool {
-        self.initialized
+        !matches!(self.outcome, OpenOutcome::Fresh)
     }
 }
 
@@ -471,7 +514,7 @@ pub(crate) fn open(
 
     // The lock comes before either database is opened, so a losing opener
     // never touches the files at all.
-    let lock = DirectoryLock::acquire(layout.lock())?;
+    let lock = DirectoryLock::acquire(layout.lock(), &policy)?;
 
     let raft_path = layout.database(Db::Raft);
     let state_path = layout.database(Db::State);
@@ -490,40 +533,63 @@ pub(crate) fn open(
     let (mut raft, raft_integrity) = open_database(&raft_path, Db::Raft, raft_presence)?;
     let (mut state, state_integrity) = open_database(&state_path, Db::State, state_presence)?;
 
-    let raft_initialized = classify_raft(&raft, raft_presence)?;
-    let state_initialized = classify_state(&state, state_presence)?;
+    let raft_side = classify_raft(&raft, raft_presence)?;
+    let state_side = classify_state(&state, state_presence)?;
 
-    let initialized = match (raft_initialized, state_initialized) {
-        (true, true) => true,
-        (false, false) => false,
-        // One side carries durable state and the other proved it never did.
-        // §11.1 allows recreating the empty side only in exactly this case.
-        // Normal `raft.redb`-ahead-of-`state.redb` recovery is not this case:
-        // an initialized state database is initialized whether or not it has
-        // applied anything.
-        (raft_side, state_side) => {
+    use SideState::{BoundPristine, Unbound};
+    let outcome = match (raft_side, state_side) {
+        // Nothing has ever been bound here.
+        (Unbound, Unbound) => OpenOutcome::Fresh,
+
+        // Both bound. Durable state on either side is ordinary: a
+        // `raft.redb` ahead of `state.redb` is normal crash recovery, and
+        // OpenRaft replays its committed log after the durable `last_applied`
+        // marker.
+        (raft_state, state_state) if raft_state.is_bound() && state_state.is_bound() => {
+            OpenOutcome::Initialized
+        }
+
+        // One side bound with nothing behind it: the crash landed between the
+        // two first-open identity commits. Recoverable, because there is
+        // provably nothing to discard. The surviving binding is verified
+        // against the requested identity *before* the empty side is written,
+        // so a foreign survivor cannot seed a new partner.
+        (BoundPristine, Unbound) => OpenOutcome::RecreateState,
+        (Unbound, BoundPristine) => OpenOutcome::RecreateRaft,
+
+        // One side has acknowledged something and the other is gone. Writing
+        // a fresh partner here would discard state the group was already told
+        // about, so this fails closed.
+        (raft_state, state_state) => {
             return Err(StorageError::PartialInitialization {
                 detail: format!(
                     "{} is {}, {} is {}",
                     Db::Raft,
-                    describe(raft_side),
+                    raft_state.describe(),
                     Db::State,
-                    describe(state_side)
+                    state_state.describe()
                 ),
             })
         }
     };
 
-    if initialized {
-        verify_raft_identity(&raft, &identity)?;
-        verify_state_identity(&state, &identity)?;
-    } else {
-        // Both sides are written and durably committed before the runtime is
-        // eligible to initialize Raft, so a crash between them leaves a
-        // partial initialization that the branch above refuses rather than a
-        // half-bound voter that starts.
-        write_raft_identity(&mut raft, &identity)?;
-        write_state_identity(&mut state, &identity)?;
+    match outcome {
+        OpenOutcome::Fresh => {
+            write_raft_identity(&mut raft, &identity)?;
+            write_state_identity(&mut state, &identity)?;
+        }
+        OpenOutcome::Initialized => {
+            verify_raft_identity(&raft, &identity)?;
+            verify_state_identity(&state, &identity)?;
+        }
+        OpenOutcome::RecreateState => {
+            verify_raft_identity(&raft, &identity)?;
+            write_state_identity(&mut state, &identity)?;
+        }
+        OpenOutcome::RecreateRaft => {
+            verify_state_identity(&state, &identity)?;
+            write_raft_identity(&mut raft, &identity)?;
+        }
     }
 
     Ok(OpenedStorage {
@@ -534,16 +600,8 @@ pub(crate) fn open(
         state,
         raft_integrity,
         state_integrity,
-        initialized,
+        outcome,
     })
-}
-
-fn describe(initialized: bool) -> &'static str {
-    if initialized {
-        "initialized"
-    } else {
-        "absent or provably empty"
-    }
 }
 
 fn presence(path: &Path) -> Presence {
@@ -571,71 +629,147 @@ fn open_database(
     Ok((database, outcome))
 }
 
-/// Validate `raft.redb`'s tables and report whether it holds durable state.
-fn classify_raft(database: &Database, presence: Presence) -> StorageResult<bool> {
+/// What one side of the storage pair proved about itself.
+///
+/// The distinction that matters is *pristine versus durable*, not merely
+/// bound versus unbound. A crash between the two first-open identity commits
+/// leaves one bound side with nothing in it, and that is recoverable; a bound
+/// side that has acknowledged a vote or applied an entry is not, because
+/// recreating its partner would discard state the group was already told
+/// about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SideState {
+    /// Absent, or present with no identity binding and provably no durable
+    /// state of any kind.
+    Unbound,
+    /// Identity bound, and nothing durable behind it.
+    BoundPristine,
+    /// Identity bound, with durable state.
+    BoundDurable,
+}
+
+impl SideState {
+    fn is_bound(self) -> bool {
+        !matches!(self, SideState::Unbound)
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            SideState::Unbound => "absent or provably empty",
+            SideState::BoundPristine => "bound with no durable state",
+            SideState::BoundDurable => "bound and carrying durable state",
+        }
+    }
+}
+
+/// Validate `raft.redb`'s schema and classify it.
+fn classify_raft(database: &Database, presence: Presence) -> StorageResult<SideState> {
     if presence == Presence::Fresh {
-        return Ok(false);
+        return Ok(SideState::Unbound);
     }
     let read = database
         .begin_read()
         .map_err(|source| StorageError::redb(Db::Raft, source))?;
-    check_tables(&read, Db::Raft, RAFT_TABLES)?;
+    reject_unknown_tables(&read, Db::Raft, RAFT_TABLES)?;
+    // Metadata is validated whether or not the identity row is there. An
+    // unknown key in an otherwise-unbound database is still a foreign or newer
+    // file, and skipping the check when the binding is absent is exactly the
+    // window a crashed first open leaves open.
+    check_meta_keys(&read, Db::Raft, RAFT_META, RAFT_META_KEYS)?;
 
-    // An identity binding without durable Raft state is still "initialized":
-    // the binding is what a peer's snapshot and a restart both check against.
-    let has_identity = meta_bytes(&read, Db::Raft, RAFT_META, KEY_GROUP_ID)?.is_some();
-    if has_identity {
-        check_meta_keys(&read, Db::Raft, RAFT_META, RAFT_META_KEYS)?;
-        return Ok(true);
+    let bound = meta_bytes(&read, Db::Raft, RAFT_META, KEY_GROUP_ID)?.is_some();
+    if bound {
+        require_raft_tables(&read)?;
     }
 
-    // No identity. Prove nothing durable exists before treating it as fresh.
+    let mut durable = !table_is_empty_u64(&read, Db::Raft, RAFT_LOG)?;
     for key in RAFT_DURABLE_KEYS {
         if meta_bytes(&read, Db::Raft, RAFT_META, key)?.is_some() {
-            return Err(StorageError::PartialInitialization {
-                detail: format!("{} carries {key:?} but no identity binding", Db::Raft),
-            });
+            durable = true;
         }
     }
-    if !table_is_empty_u64(&read, Db::Raft, RAFT_LOG)? {
-        return Err(StorageError::PartialInitialization {
-            detail: format!("{} carries log entries but no identity binding", Db::Raft),
-        });
-    }
-    Ok(false)
+
+    Ok(match (bound, durable) {
+        (true, true) => SideState::BoundDurable,
+        (true, false) => SideState::BoundPristine,
+        (false, false) => SideState::Unbound,
+        // Durable Raft state with no binding to check it against. Nothing can
+        // prove which group that vote or log belongs to, so it is neither
+        // recoverable nor safe to adopt.
+        (false, true) => {
+            return Err(StorageError::PartialInitialization {
+                detail: format!(
+                    "{} carries vote/log/marker state but no identity binding",
+                    Db::Raft
+                ),
+            })
+        }
+    })
 }
 
-/// Validate `state.redb`'s tables and report whether it holds durable state.
-fn classify_state(database: &Database, presence: Presence) -> StorageResult<bool> {
+/// Validate `state.redb`'s schema and classify it.
+fn classify_state(database: &Database, presence: Presence) -> StorageResult<SideState> {
     if presence == Presence::Fresh {
-        return Ok(false);
+        return Ok(SideState::Unbound);
     }
     let read = database
         .begin_read()
         .map_err(|source| StorageError::redb(Db::State, source))?;
-    check_tables(&read, Db::State, STATE_TABLES)?;
+    reject_unknown_tables(&read, Db::State, STATE_TABLES)?;
+    check_meta_keys(&read, Db::State, STATE_META, STATE_META_KEYS)?;
 
-    let has_meta = meta_bytes(&read, Db::State, STATE_META, KEY_META)?.is_some();
-    if has_meta {
-        check_meta_keys(&read, Db::State, STATE_META, STATE_META_KEYS)?;
-        return Ok(true);
+    let meta_row = meta_bytes(&read, Db::State, STATE_META, KEY_META)?;
+    let bound = meta_row.is_some();
+    if bound {
+        require_state_tables(&read)?;
     }
 
-    for table in STATE_DATA_TABLES {
-        if !named_table_is_empty(&read, Db::State, table)? {
-            return Err(StorageError::PartialInitialization {
-                detail: format!(
-                    "{} carries rows in {table:?} but no replicated meta row",
-                    Db::State
-                ),
-            });
+    let mut durable = state_data_tables_have_rows(&read)?;
+    if let Some(bytes) = &meta_row {
+        let meta: CoordinationMetaV1 = payload_fory::<CoordinationMetaV1>()
+            .deserialize(bytes)
+            .map_err(|source| StorageError::codec(Db::State, "CoordinationMetaV1", source))?;
+        if replicated_state_is_durable(&meta) {
+            durable = true;
         }
     }
-    Ok(false)
+
+    Ok(match (bound, durable) {
+        (true, true) => SideState::BoundDurable,
+        (true, false) => SideState::BoundPristine,
+        (false, false) => SideState::Unbound,
+        (false, true) => {
+            return Err(StorageError::PartialInitialization {
+                detail: format!("{} carries rows but no replicated meta row", Db::State),
+            })
+        }
+    })
+}
+
+/// Whether a decoded replicated meta row records anything beyond the identity
+/// binding a first open writes.
+///
+/// Every mutable field is listed rather than only `last_applied`. A field that
+/// advanced without `last_applied` would mean apply and its metadata had
+/// already diverged, and treating that as pristine would let the recovery path
+/// overwrite the evidence.
+fn replicated_state_is_durable(meta: &CoordinationMetaV1) -> bool {
+    meta.last_applied.is_some()
+        || meta.membership != Default::default()
+        || meta.admin_revision != 0
+        || meta.aggregate_growth_bytes != 0
+        || meta.aggregate_reserve_bytes != 0
+        || meta.audit_floor.is_some()
+        || meta.recovery_export_hash.is_some()
+        || meta.recovered_from.is_some()
 }
 
 /// Every table present must be one schema v1 defines.
-fn check_tables(read: &redb::ReadTransaction, db: Db, allowed: &[&str]) -> StorageResult<()> {
+fn reject_unknown_tables(
+    read: &redb::ReadTransaction,
+    db: Db,
+    allowed: &[&str],
+) -> StorageResult<()> {
     let tables = read
         .list_tables()
         .map_err(|source| StorageError::redb(db, source))?;
@@ -646,6 +780,60 @@ fn check_tables(read: &redb::ReadTransaction, db: Db, allowed: &[&str]) -> Stora
         }
     }
     Ok(())
+}
+
+/// Every declared `raft.redb` table must exist under its exact redb types.
+///
+/// Rejecting extras is only half of an exact schema check: without this, a
+/// bound database that had lost `raft_log`, or that carried a `raft_log` under
+/// different key/value types, opened cleanly and read as empty.
+fn require_raft_tables(read: &redb::ReadTransaction) -> StorageResult<()> {
+    require_table(read, Db::Raft, RAFT_META)?;
+    require_table(read, Db::Raft, RAFT_LOG)
+}
+
+/// The same for `state.redb`'s eight tables.
+fn require_state_tables(read: &redb::ReadTransaction) -> StorageResult<()> {
+    require_table(read, Db::State, STATE_META)?;
+    require_table(read, Db::State, RESOURCES)?;
+    require_table(read, Db::State, ACL)?;
+    require_table(read, Db::State, ADMINS)?;
+    require_table(read, Db::State, SESSIONS)?;
+    require_table(read, Db::State, INTENTS)?;
+    require_table(read, Db::State, ROUTES)?;
+    require_table(read, Db::State, AUDIT)
+}
+
+/// Open one declared table for reading purely to prove it exists with the
+/// declared key and value types.
+fn require_table<K, V>(
+    read: &redb::ReadTransaction,
+    db: Db,
+    definition: TableDefinition<'static, K, V>,
+) -> StorageResult<()>
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+{
+    match read.open_table(definition) {
+        Ok(_) => Ok(()),
+        Err(redb::TableError::TableDoesNotExist(table)) => {
+            Err(StorageError::MissingTable { db, table })
+        }
+        Err(redb::TableError::TableTypeMismatch { table, key, value }) => {
+            Err(StorageError::TableTypeMismatch {
+                db,
+                table,
+                detail: format!("found key {key:?}, value {value:?}"),
+            })
+        }
+        Err(redb::TableError::TableIsMultimap(table)) => Err(StorageError::TableTypeMismatch {
+            db,
+            table,
+            detail: "found a multimap table where schema v1 declares a plain table".into(),
+        }),
+        Err(source) => Err(StorageError::redb(db, source)),
+    }
 }
 
 /// Every metadata key present must be one schema v1 defines.
@@ -704,31 +892,47 @@ fn table_is_empty_u64(
     }
 }
 
-/// Emptiness by name, so one helper covers every state data table regardless
-/// of its key and value types.
-fn named_table_is_empty(read: &redb::ReadTransaction, db: Db, name: &str) -> StorageResult<bool> {
-    let tables = read
-        .list_tables()
-        .map_err(|source| StorageError::redb(db, source))?;
-    let exists = tables
-        .into_iter()
-        .any(|h| redb::TableHandle::name(&h) == name);
-    if !exists {
-        return Ok(true);
-    }
-    let untyped: TableDefinition<&str, &[u8]> = TableDefinition::new(name);
-    // Reading an existing table under a different value type is not a data
-    // read here -- `is_empty` consults the tree, not a decoded value -- but
-    // redb still type-checks the definition, so a mismatch reports as a redb
-    // error rather than a silently wrong emptiness answer.
-    match read.open_table(untyped) {
-        Ok(table) => Ok(table
+/// Whether any `state.redb` data table holds a row.
+///
+/// Each table is opened under its own declared key/value types. An earlier
+/// version opened them all as `&str -> &[u8]` to avoid repeating the list, and
+/// redb rejected every table whose real types differ — which the helper then
+/// read as "not empty". Every freshly bound store looked durable, and the
+/// recovery path could never fire.
+fn state_data_tables_have_rows(read: &redb::ReadTransaction) -> StorageResult<bool> {
+    Ok(!is_empty(read, RESOURCES)?
+        || !is_empty(read, ACL)?
+        || !is_empty(read, ADMINS)?
+        || !is_empty(read, SESSIONS)?
+        || !is_empty(read, INTENTS)?
+        || !is_empty(read, ROUTES)?
+        || !is_empty(read, AUDIT)?)
+}
+
+/// Row count emptiness for one declared table. An absent table is empty; a
+/// type mismatch is a schema error rather than an emptiness answer, and is
+/// reported as one by [`require_table`].
+fn is_empty<K, V>(
+    read: &redb::ReadTransaction,
+    definition: TableDefinition<'static, K, V>,
+) -> StorageResult<bool>
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+{
+    match read.open_table(definition) {
+        Ok(table) => table
             .is_empty()
-            .map_err(|source| StorageError::redb(db, source))?),
+            .map_err(|source| StorageError::redb(Db::State, source)),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(true),
-        // A type mismatch means the table exists with real rows behind a
-        // different schema. That is not emptiness.
-        Err(_) => Ok(false),
+        Err(redb::TableError::TableTypeMismatch { table, key, value }) => {
+            Err(StorageError::TableTypeMismatch {
+                db: Db::State,
+                table,
+                detail: format!("found key {key:?}, value {value:?}"),
+            })
+        }
+        Err(source) => Err(StorageError::redb(Db::State, source)),
     }
 }
 
@@ -1111,10 +1315,12 @@ mod tests {
     #[test]
     fn an_orderly_unlock_releases_the_directory() {
         let root = scratch();
-        let lock = DirectoryLock::acquire(root.join("LOCK")).expect("acquire");
+        let lock =
+            DirectoryLock::acquire(root.join("LOCK"), &OpenPolicy::production()).expect("acquire");
         assert_eq!(lock.path(), root.join("LOCK"));
         lock.unlock().expect("unlock");
-        DirectoryLock::acquire(root.join("LOCK")).expect("reacquire after an orderly unlock");
+        DirectoryLock::acquire(root.join("LOCK"), &OpenPolicy::production())
+            .expect("reacquire after an orderly unlock");
     }
 
     // ── Integrity classification ─────────────────────────────────────────────
@@ -1407,21 +1613,58 @@ mod tests {
         );
     }
 
-    // ── Partial initialization ───────────────────────────────────────────────
+    // ── The pristine-versus-durable pairing matrix ───────────────────────────
+    //
+    // The distinction is not "bound versus unbound". A crash between the two
+    // first-open identity commits leaves a bound side with nothing behind it,
+    // and rebuilding its partner discards nothing. A bound side that has
+    // acknowledged a vote or applied an entry is the opposite case: rebuilding
+    // its partner throws away state the group was already told about.
 
-    /// One initialized database beside a deleted one fails closed.
-    ///
-    /// Recreating the missing side would discard whatever the surviving side
-    /// already acknowledged, which is the one outcome storage must never
-    /// produce quietly.
+    /// A pristine `raft.redb` beside a deleted `state.redb` is *recovered*,
+    /// not refused. This is the crash-between-commits case.
     #[test]
-    fn a_missing_state_database_beside_an_initialized_log_fails_closed() {
+    fn a_pristine_log_beside_a_missing_state_database_is_recreated() {
         let root = scratch();
         drop(open_at(&root, identity()).expect("bind"));
         std::fs::remove_file(root.join("state.redb")).expect("remove state");
 
+        let opened = open_at(&root, identity()).expect("a pristine survivor is recoverable");
+        assert_eq!(opened.outcome(), OpenOutcome::RecreateState);
+        assert!(
+            root.join("state.redb").exists(),
+            "the empty side is rebuilt"
+        );
+
+        // And the rebuilt pair is a normal initialized store afterwards.
+        drop(opened);
+        let reopened = open_at(&root, identity()).expect("reopen");
+        assert_eq!(reopened.outcome(), OpenOutcome::Initialized);
+    }
+
+    /// The mirror case.
+    #[test]
+    fn a_pristine_state_beside_a_missing_log_database_is_recreated() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        std::fs::remove_file(root.join("raft.redb")).expect("remove raft");
+
+        let opened = open_at(&root, identity()).expect("a pristine survivor is recoverable");
+        assert_eq!(opened.outcome(), OpenOutcome::RecreateRaft);
+        assert!(root.join("raft.redb").exists());
+    }
+
+    /// A surviving side carrying durable Raft state fails closed.
+    #[test]
+    fn a_durable_log_beside_a_missing_state_database_fails_closed() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        overwrite_raft_meta(&root, KEY_VOTE, b"an acknowledged vote");
+        std::fs::remove_file(root.join("state.redb")).expect("remove state");
+
         match open_at(&root, identity()) {
             Err(StorageError::PartialInitialization { detail }) => {
+                assert!(detail.contains("durable state"), "got: {detail}");
                 assert!(detail.contains("raft.redb"), "got: {detail}");
                 assert!(detail.contains("state.redb"), "got: {detail}");
             }
@@ -1429,17 +1672,173 @@ mod tests {
         }
     }
 
-    /// And the mirror case.
+    /// A log entry alone is durable state, even with no vote or marker.
     #[test]
-    fn a_missing_log_database_beside_initialized_state_fails_closed() {
+    fn a_log_entry_alone_makes_the_log_side_durable() {
         let root = scratch();
         drop(open_at(&root, identity()).expect("bind"));
-        std::fs::remove_file(root.join("raft.redb")).expect("remove raft");
+        {
+            let db = Database::create(root.join("raft.redb")).expect("open raft");
+            let write = db.begin_write().expect("write");
+            {
+                let mut log = write.open_table(RAFT_LOG).expect("open log");
+                log.insert(1u64, b"entry".as_slice()).expect("insert");
+            }
+            write.commit().expect("commit");
+        }
+        std::fs::remove_file(root.join("state.redb")).expect("remove state");
 
         assert!(matches!(
             open_at(&root, identity()),
             Err(StorageError::PartialInitialization { .. })
         ));
+    }
+
+    /// A surviving side that has applied something fails closed.
+    ///
+    /// `last_applied` is inside the Fory meta row, so this also proves the
+    /// durability test decodes that row rather than treating any present
+    /// binding as pristine.
+    #[test]
+    fn an_applied_state_database_beside_a_missing_log_fails_closed() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        advance_state_last_applied(&root);
+        std::fs::remove_file(root.join("raft.redb")).expect("remove raft");
+
+        match open_at(&root, identity()) {
+            Err(StorageError::PartialInitialization { detail }) => {
+                assert!(detail.contains("durable state"), "got: {detail}");
+            }
+            other => panic!("expected partial initialization, got: {other:?}"),
+        }
+    }
+
+    /// Both sides durable is the ordinary case, not partial initialization.
+    ///
+    /// A `raft.redb` ahead of `state.redb` is exactly what a crash after a
+    /// commit but before apply looks like, and OpenRaft replays from the
+    /// durable `last_applied` marker.
+    #[test]
+    fn durable_state_on_both_sides_opens_normally() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        overwrite_raft_meta(&root, KEY_VOTE, b"an acknowledged vote");
+
+        let opened = open_at(&root, identity()).expect("a log ahead of state is normal recovery");
+        assert_eq!(opened.outcome(), OpenOutcome::Initialized);
+    }
+
+    /// The recovery path verifies the surviving binding *before* writing the
+    /// empty side.
+    ///
+    /// Otherwise a foreign survivor would seed a brand-new partner bound to
+    /// the requested identity, manufacturing a store that never existed.
+    #[test]
+    fn recovery_verifies_the_surviving_binding_first() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        std::fs::remove_file(root.join("state.redb")).expect("remove state");
+
+        let foreign = StorageIdentity::new(
+            CoordinationGroupId::from_array([0xAB; 32]),
+            *identity().genesis_hash(),
+            *identity().authority_public_key(),
+            identity().authority_domain(),
+            *identity().local_node_id(),
+            identity().deployment_profile_code(),
+        );
+        assert!(
+            matches!(
+                open_at(&root, foreign),
+                Err(StorageError::IdentityMismatch { .. })
+            ),
+            "a foreign identity must not seed a partner from someone else's survivor"
+        );
+
+        // The file itself is recreated by `Database::create` before anything
+        // can be classified, so its existence proves nothing. What must not
+        // have happened is a *binding* being written into it — otherwise the
+        // rejected identity would have manufactured a store that never
+        // existed. Proven by the real identity still finding a recoverable
+        // pristine survivor rather than an initialized pair.
+        let opened = open_at(&root, identity()).expect("the real identity still recovers");
+        assert_eq!(
+            opened.outcome(),
+            OpenOutcome::RecreateState,
+            "the refused open must not have bound the empty side"
+        );
+    }
+
+    // ── Exact schema validation ──────────────────────────────────────────────
+
+    /// A bound database missing a required table fails closed rather than
+    /// having it recreated.
+    ///
+    /// Rejecting extras is only half an exact check: a lost `raft_log` used to
+    /// open cleanly and read as an empty log.
+    #[test]
+    fn a_missing_required_table_fails_the_open() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        {
+            let db = Database::create(root.join("raft.redb")).expect("open raft");
+            let write = db.begin_write().expect("write");
+            write.delete_table(RAFT_LOG).expect("delete log table");
+            write.commit().expect("commit");
+        }
+
+        match open_at(&root, identity()) {
+            Err(StorageError::MissingTable { table, .. }) => assert_eq!(table, "raft_log"),
+            other => panic!("expected a missing-table failure, got: {other:?}"),
+        }
+    }
+
+    /// A declared name carrying different redb types is a schema error, not an
+    /// empty table.
+    #[test]
+    fn a_declared_table_with_the_wrong_types_fails_the_open() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        {
+            let db = Database::create(root.join("raft.redb")).expect("open raft");
+            let write = db.begin_write().expect("write");
+            write.delete_table(RAFT_LOG).expect("delete log table");
+            // Same name, different key and value types.
+            let impostor: TableDefinition<&str, u64> = TableDefinition::new("raft_log");
+            write.open_table(impostor).expect("create impostor");
+            write.commit().expect("commit");
+        }
+
+        match open_at(&root, identity()) {
+            Err(StorageError::TableTypeMismatch { table, .. }) => assert_eq!(table, "raft_log"),
+            other => panic!("expected a table-type mismatch, got: {other:?}"),
+        }
+    }
+
+    /// Unknown metadata is rejected even when the identity row is absent.
+    ///
+    /// The unbound window is precisely where a crashed first open leaves a
+    /// database, so skipping validation there checks the file least when it is
+    /// least trustworthy.
+    #[test]
+    fn unknown_metadata_is_rejected_in_an_unbound_database() {
+        let root = scratch();
+        std::fs::create_dir_all(&root).expect("root");
+        {
+            let db = Database::create(root.join("raft.redb")).expect("create raft");
+            let write = db.begin_write().expect("write");
+            {
+                let mut meta = write.open_table(RAFT_META).expect("open meta");
+                meta.insert("smuggled", b"x".as_slice()).expect("insert");
+            }
+            write.commit().expect("commit");
+        }
+
+        match open_at(&root, identity()) {
+            Err(StorageError::UnknownMetaKey { key, .. }) => assert_eq!(key, "smuggled"),
+            other => panic!("expected an unknown-meta-key failure, got: {other:?}"),
+        }
     }
 
     /// A failed open leaves nothing a voter could start from.
@@ -1526,6 +1925,46 @@ mod tests {
         .expect("the development-only override accepts it");
     }
 
+    /// A pre-existing broadly writable `LOCK` is refused, not repaired.
+    ///
+    /// Chmodding it would fix the symptom, let startup continue, and erase the
+    /// evidence that something outside this voter could write the file its
+    /// mutual exclusion depends on. Production policy refuses; the explicit
+    /// development override still accepts.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_world_writable_lock_is_refused_not_chmodded() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch();
+        let lock = root.join("LOCK");
+        std::fs::write(&lock, b"").expect("create lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666))
+            .expect("widen lock");
+
+        let err = open_at(&root, identity()).expect_err("a writable LOCK must fail production");
+        assert!(
+            matches!(err, StorageError::BroadPermissions { .. }),
+            "got: {err:?}"
+        );
+
+        let mode = std::fs::metadata(&lock)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o666,
+            "the refusal must leave the evidence in place, not silently repair it"
+        );
+
+        open(
+            StorageLayout::new(&root),
+            identity(),
+            OpenPolicy::production().allowing_broad_permissions(),
+        )
+        .expect("the development-only override accepts it");
+    }
+
     /// New directories and files are owner-only.
     #[cfg(unix)]
     #[test]
@@ -1560,6 +1999,39 @@ mod tests {
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────
+
+    /// Give `state.redb` a `last_applied`, making it durable rather than
+    /// pristine. Written through the real Fory root so the durability test has
+    /// to decode the row rather than pattern-match bytes.
+    fn advance_state_last_applied(root: &Path) {
+        let db = Database::create(root.join("state.redb")).expect("open state");
+        let bytes = {
+            let read = db.begin_read().expect("read");
+            meta_bytes(&read, Db::State, STATE_META, KEY_META)
+                .expect("meta")
+                .expect("meta row present")
+        };
+        let mut meta: CoordinationMetaV1 = payload_fory::<CoordinationMetaV1>()
+            .deserialize(&bytes)
+            .expect("decode");
+        meta.last_applied = Some(crate::coordination::contract::LogIdV1 {
+            term: 1,
+            index: 1,
+            leader_node_id: vec![4u8; 32],
+        });
+        let encoded = payload_fory::<CoordinationMetaV1>()
+            .serialize(&meta)
+            .expect("encode");
+
+        let write = db.begin_write().expect("write");
+        {
+            let mut table = write.open_table(STATE_META).expect("open meta");
+            table
+                .insert(KEY_META, encoded.as_slice())
+                .expect("insert meta");
+        }
+        write.commit().expect("commit");
+    }
 
     /// Write a raw value into `raft_meta`, bypassing the open coordinator.
     ///

@@ -15,6 +15,12 @@
 //! these surface to a caller; inventing that mapping here would fix a public
 //! contract this slice cannot verify.
 
+// Checkpoint A builds this; Checkpoints B and C are what call it, so nothing
+// in a non-test build reaches it yet. Scoped to this module deliberately --
+// see the `storage` module docs for why a crate-root allowance would be
+// wrong. Removed when the checkpoint that consumes this module lands.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 
 /// Which database a failure came from. Both files carry overlapping identity
@@ -142,6 +148,33 @@ pub(crate) enum StorageError {
          does not define"
     )]
     UnknownTable { db: Db, table: String },
+
+    /// An initialized database is missing a table schema v1 declares.
+    ///
+    /// Never created as an implicit repair. A bound database that has lost a
+    /// table has lost whatever was in it, and silently recreating it turns
+    /// data loss into an empty table that reads as legitimate.
+    #[error(
+        "coordination storage {db} is initialized but has no {table:?} table; \
+         schema v1 requires it and startup does not create it as a repair"
+    )]
+    MissingTable { db: Db, table: String },
+
+    /// A table exists under a declared name but with different key or value
+    /// types than schema v1 declares.
+    ///
+    /// A name-only check would accept this. The rows are then unreadable
+    /// through the declared definition, which is a schema error rather than an
+    /// empty table.
+    #[error(
+        "coordination storage {db} table {table:?} has key/value types this \
+         build does not declare ({detail})"
+    )]
+    TableTypeMismatch {
+        db: Db,
+        table: String,
+        detail: String,
+    },
 
     /// A metadata key exists that schema v1 does not define.
     #[error(

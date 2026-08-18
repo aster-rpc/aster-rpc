@@ -19,17 +19,22 @@
 //! configuration that supplies verified genesis, authority, start mode, and
 //! admission; exposing a storage type before then would fix a public contract
 //! this slice cannot verify.
-
-// Checkpoint A builds the open coordinator; Checkpoints B and C are what call
-// it, so in a non-test build nothing yet reaches `schema::open` or the errors
-// it returns. The alternative — wiring a half-implemented log actor now purely
-// to satisfy the lint — is exactly what the checkpoint order exists to
-// prevent.
-//
-// Scoped to this module and temporary: Checkpoint B removes it, and the
-// storage tests already exercise every item below, so a genuinely dead item
-// would show up as an untested one.
-#![allow(dead_code)]
+//!
+//! ## Unreached-by-shipping-code allowances
+//!
+//! [`error`], [`identity`], [`schema`], and [`snapshot`] each carry their own
+//! module-scoped `allow(dead_code)`. Checkpoint A builds the open coordinator
+//! and the snapshot handle, and Checkpoints B, C and D are what call them, so
+//! in a non-test build nothing yet reaches `schema::open`. Wiring a
+//! half-implemented log actor now purely to satisfy the lint is what the
+//! checkpoint order exists to prevent.
+//!
+//! The allowance is deliberately on each module and not on this one. A
+//! crate-root allowance would silently cover every storage module added after
+//! it — including the log and state-machine code Checkpoints B and C are
+//! supposed to make reachable — and a test suite proves exercise, not shipping
+//! reachability. Checkpoint B removes the allowance from `schema`; C and D
+//! remove the rest.
 
 pub(crate) mod error;
 pub(crate) mod identity;
