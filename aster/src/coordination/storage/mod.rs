@@ -293,6 +293,31 @@ mod durability_guard {
         );
     }
 
+    /// No caller reaches the unbounded decode primitive.
+    ///
+    /// `codec` exports only the bounded entry point, so this is enforced by
+    /// visibility already; the test states it because the failure it guards
+    /// against is quiet. `state.redb`'s metadata was copied and decoded with
+    /// no ceiling for an entire checkpoint while the log's was bounded, and
+    /// nothing failed -- an unbounded path looks exactly like a bounded one
+    /// until a corrupt row arrives.
+    #[test]
+    fn only_the_bounded_decoder_is_reachable() {
+        for (name, source) in SOURCES {
+            if *name == "codec.rs" {
+                continue;
+            }
+            for (n, line) in production_lines(source) {
+                assert!(
+                    !line.contains("decode_persisted(")
+                        || line.contains("decode_persisted_bounded("),
+                    "{name}:{} decodes a persisted value without a ceiling",
+                    n + 1
+                );
+            }
+        }
+    }
+
     /// And the retryable variant is raised only from the codec module's
     /// encode helper.
     #[test]

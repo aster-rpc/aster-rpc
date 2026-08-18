@@ -20,6 +20,12 @@
 //!
 //! Checkpoint C's state machine routes its new persisted roots through here.
 
+// Scoped to this module -- see the `storage` module docs. `encode_committed`
+// additionally has no caller until Checkpoint C, which is the point: it exists
+// so the apply path has a fatal encode available rather than reaching for the
+// retryable one.
+#![allow(dead_code)]
+
 use fory_core::serializer::Serializer;
 use fory_core::ForyDefault;
 
@@ -52,11 +58,32 @@ pub(crate) fn check_stored_len(
     Ok(())
 }
 
-/// Decode a persisted Fory root.
+/// Decode a persisted Fory root, refusing anything over its ceiling first.
 ///
-/// The only place in this subsystem where a stored Fory value is decoded, and
-/// it has no way to report anything but corruption.
-pub(crate) fn decode_persisted<T>(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<T>
+/// The only decoder this module exports. §4.2 requires the bound *before*
+/// allocation, and pairing a separate check with a separate decode is exactly
+/// the arrangement that let `state.redb`'s metadata be copied and decoded with
+/// no ceiling at all while the log's was bounded — the two halves were the
+/// caller's to remember, and one caller forgot.
+pub(crate) fn decode_persisted_bounded<T>(
+    db: Db,
+    what: &'static str,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> StorageResult<T>
+where
+    T: WireField + Serializer + ForyDefault,
+{
+    check_stored_len(db, what, bytes, max_bytes)?;
+    decode_persisted(db, what, bytes)
+}
+
+/// The unbounded primitive.
+///
+/// Private on purpose: every persisted value has a declared ceiling, so
+/// reaching this without one is always a mistake. [`decode_persisted_bounded`]
+/// is the way in.
+fn decode_persisted<T>(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<T>
 where
     T: WireField + Serializer + ForyDefault,
 {
@@ -98,6 +125,33 @@ where
     payload_fory::<T>()
         .serialize(value)
         .map_err(|source| StorageError::encode_failed(db, what, source))
+}
+
+/// Encode a value being written as part of applying an already-committed
+/// entry, where failure is **fatal** rather than retryable.
+///
+/// The distinction Checkpoint C needs. [`encode_bounded`] is right for a value
+/// a caller offered: refusing it rejects a request and writes nothing. It is
+/// wrong once the entry is committed — the group has already decided that
+/// entry applies, so a state machine that cannot encode the result has no
+/// retry available and must not report one. Every apply-path encode goes
+/// through here.
+pub(crate) fn encode_committed<T>(
+    db: Db,
+    what: &'static str,
+    value: &T,
+    max_bytes: usize,
+) -> StorageResult<Vec<u8>>
+where
+    T: WireField + Serializer + ForyDefault,
+{
+    encode_bounded(db, what, value, max_bytes).map_err(|err| {
+        StorageError::corrupt(
+            db,
+            what,
+            format!("failed to encode the result of an already-committed entry: {err}"),
+        )
+    })
 }
 
 /// Encode, and refuse a value over its §4.2 ceiling.
@@ -192,6 +246,60 @@ mod tests {
         assert!(
             matches!(err, StorageError::StoredCorruption { .. }),
             "got: {err:?}"
+        );
+    }
+
+    /// An over-ceiling stored value is refused before it is decoded.
+    ///
+    /// The bytes here are not a valid Fory root, so if the ceiling were
+    /// checked after the decode the failure would name the decode instead --
+    /// which is how an unbounded path stays invisible while looking correct.
+    #[test]
+    fn an_over_ceiling_stored_value_is_refused_before_decoding() {
+        let oversized = vec![0xAAu8; 1024];
+        let err = decode_persisted_bounded::<CoordinationMetaV1>(
+            Db::State,
+            "CoordinationMetaV1",
+            &oversized,
+            64,
+        )
+        .expect_err("over the ceiling");
+
+        assert!(
+            err.to_string().contains("over the 64-byte ceiling"),
+            "the ceiling must be what refused it, not the decode: {err}"
+        );
+        assert!(matches!(err, StorageError::StoredCorruption { .. }));
+    }
+
+    /// An apply-path encode failure is fatal, not retryable.
+    ///
+    /// `encode_bounded` and `encode_committed` differ only in classification,
+    /// and only the second is correct once the group has already decided the
+    /// entry applies.
+    #[test]
+    fn a_committed_encode_failure_is_fatal_while_a_caller_encode_is_not() {
+        let meta = CoordinationMetaV1 {
+            authority_domain: "x".repeat(512),
+            ..Default::default()
+        };
+
+        let offered = encode_bounded(Db::State, "CoordinationMetaV1", &meta, 8)
+            .expect_err("over the ceiling");
+        assert!(
+            !offered.puts_durability_in_question(),
+            "a value the caller offered can be refused and retried: {offered:?}"
+        );
+
+        let committed = encode_committed(Db::State, "CoordinationMetaV1", &meta, 8)
+            .expect_err("over the ceiling");
+        assert!(
+            committed.puts_durability_in_question(),
+            "an already-committed entry has no retry available: {committed:?}"
+        );
+        assert!(
+            committed.to_string().contains("already-committed"),
+            "and the message must say why: {committed}"
         );
     }
 

@@ -36,7 +36,7 @@ use openraft::{AnyError, Entry, LogId, LogState, StorageError, StorageIOError, V
 use redb::{Database, ReadableDatabase, ReadableTable};
 use tokio::sync::{mpsc, oneshot};
 
-use super::codec::{check_stored_len, decode_persisted, encode_bounded};
+use super::codec::{decode_persisted_bounded, encode_bounded};
 use super::error::{Db, StorageError as AsterStorageError, StorageResult};
 use super::schema::{KEY_COMMITTED, KEY_LAST_PURGED, KEY_VOTE, RAFT_LOG, RAFT_META};
 use crate::coordination::contract::LogIdV1;
@@ -78,8 +78,8 @@ fn encode_entry(entry: &Entry<CoordinationTypeConfig>) -> StorageResult<Vec<u8>>
 fn decode_entry(bytes: &[u8]) -> StorageResult<Entry<CoordinationTypeConfig>> {
     // Before allocation, not after: a length check that runs only once the
     // value is already decoded has not bounded anything.
-    check_stored_len(Db::Raft, "RaftEntryV1", bytes, MAX_ENTRY_BYTES)?;
-    let mirror: RaftEntryV1 = decode_persisted(Db::Raft, "RaftEntryV1", bytes)?;
+    let mirror: RaftEntryV1 =
+        decode_persisted_bounded(Db::Raft, "RaftEntryV1", bytes, MAX_ENTRY_BYTES)?;
     // The mirror conversion is fallible and stays fallible here. An unknown
     // payload variant is fatal rather than degraded to a blank: applying a
     // blank in its place would commit a gap in the replicated history.
@@ -93,8 +93,7 @@ fn encode_vote(vote: &Vote<CoordinationNodeId>) -> StorageResult<Vec<u8>> {
 }
 
 fn decode_vote(bytes: &[u8]) -> StorageResult<Vote<CoordinationNodeId>> {
-    check_stored_len(Db::Raft, "VoteV1", bytes, MAX_META_BYTES)?;
-    let mirror: VoteV1 = decode_persisted(Db::Raft, "VoteV1", bytes)?;
+    let mirror: VoteV1 = decode_persisted_bounded(Db::Raft, "VoteV1", bytes, MAX_META_BYTES)?;
     Vote::<CoordinationNodeId>::try_from(&mirror)
         .map_err(|err| AsterStorageError::corrupt(Db::Raft, "VoteV1", format!("{err:?}")))
 }
@@ -105,8 +104,7 @@ fn encode_log_id(log_id: &LogId<CoordinationNodeId>) -> StorageResult<Vec<u8>> {
 }
 
 fn decode_log_id(bytes: &[u8]) -> StorageResult<LogId<CoordinationNodeId>> {
-    check_stored_len(Db::Raft, "LogIdV1", bytes, MAX_META_BYTES)?;
-    let mirror: LogIdV1 = decode_persisted(Db::Raft, "LogIdV1", bytes)?;
+    let mirror: LogIdV1 = decode_persisted_bounded(Db::Raft, "LogIdV1", bytes, MAX_META_BYTES)?;
     LogId::<CoordinationNodeId>::try_from(&mirror)
         .map_err(|err| AsterStorageError::corrupt(Db::Raft, "LogIdV1", format!("{err:?}")))
 }

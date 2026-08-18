@@ -32,7 +32,10 @@ use redb::{
     TableDefinition,
 };
 
-use super::codec::{decode_array32, decode_persisted, decode_string, decode_u32, encode_owned};
+use super::codec::{
+    check_stored_len, decode_array32, decode_persisted_bounded, decode_string, decode_u32,
+    encode_owned,
+};
 use super::error::{Db, StorageError, StorageResult};
 use super::identity::{OpenPolicy, StorageIdentity, LOGICAL_SCHEMA_VERSION, STORAGE_CODEC_VERSION};
 use crate::coordination::raft::CoordinationMetaV1;
@@ -93,6 +96,24 @@ const STATE_DATA_TABLES: &[&str] = &[
     "node_routes",
     "audit",
 ];
+
+// ── Value ceilings (§4.2) ────────────────────────────────────────────────────
+
+/// Ceiling on an identity scalar: a version, a 32-byte id, or a domain.
+///
+/// Generous against the real sizes (4 to 32 bytes, plus a hostname) and tight
+/// against a corrupt row: the point is that a damaged length cannot be
+/// allocated, not that it is measured precisely.
+pub(crate) const MAX_META_SCALAR_BYTES: usize = 4 * 1024;
+
+/// Ceiling on the stored `CoordinationMetaV1` row.
+///
+/// Deliberately the snapshot header bound. §11.4's `SnapshotHeaderV1` embeds
+/// this same root, so a meta row larger than a header could be written but
+/// never snapshotted — the voter would accept state it could not later
+/// replicate, and would only discover that when a follower needed it.
+pub(crate) const MAX_COORDINATION_META_BYTES: usize =
+    crate::coordination::rowstream::MAX_HEADER_BYTES as usize;
 
 // ── Metadata keys ────────────────────────────────────────────────────────────
 
@@ -715,14 +736,21 @@ fn classify_raft(database: &Database, presence: Presence) -> StorageResult<SideS
     // window a crashed first open leaves open.
     check_meta_keys(&read, Db::Raft, RAFT_META, RAFT_META_KEYS)?;
 
-    let bound = meta_bytes(&read, Db::Raft, RAFT_META, KEY_GROUP_ID)?.is_some();
+    let bound = meta_bytes(
+        &read,
+        Db::Raft,
+        RAFT_META,
+        KEY_GROUP_ID,
+        MAX_META_SCALAR_BYTES,
+    )?
+    .is_some();
     if bound {
         require_raft_tables(&read)?;
     }
 
     let mut durable = !table_is_empty_u64(&read, Db::Raft, RAFT_LOG)?;
     for key in RAFT_DURABLE_KEYS {
-        if meta_bytes(&read, Db::Raft, RAFT_META, key)?.is_some() {
+        if meta_bytes(&read, Db::Raft, RAFT_META, key, MAX_META_SCALAR_BYTES)?.is_some() {
             durable = true;
         }
     }
@@ -786,7 +814,13 @@ fn classify_state(database: &Database, presence: Presence) -> StorageResult<Side
     reject_unknown_tables(&read, Db::State, STATE_TABLES)?;
     check_meta_keys(&read, Db::State, STATE_META, STATE_META_KEYS)?;
 
-    let meta_row = meta_bytes(&read, Db::State, STATE_META, KEY_META)?;
+    let meta_row = meta_bytes(
+        &read,
+        Db::State,
+        STATE_META,
+        KEY_META,
+        MAX_COORDINATION_META_BYTES,
+    )?;
     let bound = meta_row.is_some();
     if bound {
         require_state_tables(&read)?;
@@ -799,7 +833,12 @@ fn classify_state(database: &Database, presence: Presence) -> StorageResult<Side
 
     let mut durable = state_data_tables_have_rows(&read)?;
     if let Some(bytes) = &meta_row {
-        let meta: CoordinationMetaV1 = decode_persisted(Db::State, "CoordinationMetaV1", bytes)?;
+        let meta: CoordinationMetaV1 = decode_persisted_bounded(
+            Db::State,
+            "CoordinationMetaV1",
+            bytes,
+            MAX_COORDINATION_META_BYTES,
+        )?;
         if replicated_state_is_durable(&meta) {
             durable = true;
         }
@@ -984,11 +1023,17 @@ fn meta_row_count(
     table.len().map_err(|source| StorageError::redb(db, source))
 }
 
+/// Copy one metadata value out, refusing anything over `max_bytes`.
+///
+/// The ceiling is checked against the *borrowed* redb value, before `to_vec`.
+/// Checking after the copy would have already allocated whatever length a
+/// corrupt row claimed, which is the allocation §4.2 exists to prevent.
 fn meta_bytes(
     read: &redb::ReadTransaction,
     db: Db,
     definition: TableDefinition<&'static str, &'static [u8]>,
-    key: &str,
+    key: &'static str,
+    max_bytes: usize,
 ) -> StorageResult<Option<Vec<u8>>> {
     let Some(table) = open_meta_table(read, db, definition)? else {
         return Ok(None);
@@ -996,7 +1041,14 @@ fn meta_bytes(
     let value = table
         .get(key)
         .map_err(|source| StorageError::redb(db, source))?;
-    Ok(value.map(|v| v.value().to_vec()))
+    match value {
+        Some(v) => {
+            let borrowed = v.value();
+            check_stored_len(db, key, borrowed, max_bytes)?;
+            Ok(Some(borrowed.to_vec()))
+        }
+        None => Ok(None),
+    }
 }
 
 fn table_is_empty_u64(
@@ -1141,7 +1193,7 @@ fn verify_raft_identity(database: &Database, identity: &StorageIdentity) -> Stor
         .map_err(|source| StorageError::redb(Db::Raft, source))?;
 
     let required = |key: &'static str| -> StorageResult<Vec<u8>> {
-        meta_bytes(&read, Db::Raft, RAFT_META, key)?
+        meta_bytes(&read, Db::Raft, RAFT_META, key, MAX_META_SCALAR_BYTES)?
             .ok_or(StorageError::MissingMetaKey { db: Db::Raft, key })
     };
 
@@ -1207,12 +1259,17 @@ fn verify_raft_identity(database: &Database, identity: &StorageIdentity) -> Stor
 /// fixed-width scalar outside the Fory row for exactly that reason: a build
 /// that cannot read the row's encoding must still be able to say so by name.
 fn verify_state_codec_version(read: &redb::ReadTransaction) -> StorageResult<()> {
-    let codec_bytes = meta_bytes(read, Db::State, STATE_META, KEY_CODEC_VERSION)?.ok_or(
-        StorageError::MissingMetaKey {
-            db: Db::State,
-            key: KEY_CODEC_VERSION,
-        },
-    )?;
+    let codec_bytes = meta_bytes(
+        read,
+        Db::State,
+        STATE_META,
+        KEY_CODEC_VERSION,
+        MAX_META_SCALAR_BYTES,
+    )?
+    .ok_or(StorageError::MissingMetaKey {
+        db: Db::State,
+        key: KEY_CODEC_VERSION,
+    })?;
     let codec = decode_u32(Db::State, "codec_version", &codec_bytes)?;
     if codec != STORAGE_CODEC_VERSION {
         return Err(StorageError::CodecVersion {
@@ -1231,13 +1288,23 @@ fn verify_state_identity(database: &Database, identity: &StorageIdentity) -> Sto
 
     verify_state_codec_version(&read)?;
 
-    let bytes = meta_bytes(&read, Db::State, STATE_META, KEY_META)?.ok_or(
-        StorageError::MissingMetaKey {
-            db: Db::State,
-            key: KEY_META,
-        },
+    let bytes = meta_bytes(
+        &read,
+        Db::State,
+        STATE_META,
+        KEY_META,
+        MAX_COORDINATION_META_BYTES,
+    )?
+    .ok_or(StorageError::MissingMetaKey {
+        db: Db::State,
+        key: KEY_META,
+    })?;
+    let meta: CoordinationMetaV1 = decode_persisted_bounded(
+        Db::State,
+        "CoordinationMetaV1",
+        &bytes,
+        MAX_COORDINATION_META_BYTES,
     )?;
-    let meta: CoordinationMetaV1 = decode_persisted(Db::State, "CoordinationMetaV1", &bytes)?;
 
     if meta.schema_version != LOGICAL_SCHEMA_VERSION {
         return Err(StorageError::SchemaVersion {
@@ -1601,9 +1668,15 @@ mod tests {
         let root = scratch();
         let opened = open_at(&root, identity()).expect("bind");
         let read = opened.state().begin_read().expect("read");
-        let bytes = meta_bytes(&read, Db::State, STATE_META, KEY_META)
-            .expect("meta")
-            .expect("meta row present");
+        let bytes = meta_bytes(
+            &read,
+            Db::State,
+            STATE_META,
+            KEY_META,
+            MAX_COORDINATION_META_BYTES,
+        )
+        .expect("meta")
+        .expect("meta row present");
         let meta: CoordinationMetaV1 = payload_fory::<CoordinationMetaV1>()
             .deserialize(&bytes)
             .expect("decode");
@@ -2094,9 +2167,15 @@ mod tests {
             // it, which is what makes the failure diagnosable.
             let db = Database::create(root.join("raft.redb")).expect("reopen raft");
             let read = db.begin_read().expect("read");
-            let stored = meta_bytes(&read, Db::Raft, RAFT_META, KEY_CODEC_VERSION)
-                .expect("meta")
-                .expect("the value survives the refusal");
+            let stored = meta_bytes(
+                &read,
+                Db::Raft,
+                RAFT_META,
+                KEY_CODEC_VERSION,
+                MAX_META_SCALAR_BYTES,
+            )
+            .expect("meta")
+            .expect("the value survives the refusal");
             assert_eq!(stored, value, "a refused open must not overwrite metadata");
         }
     }
@@ -2135,13 +2214,65 @@ mod tests {
 
         let db = Database::create(root.join("state.redb")).expect("reopen state");
         let read = db.begin_read().expect("read");
-        let stored = meta_bytes(&read, Db::State, STATE_META, KEY_CODEC_VERSION)
-            .expect("meta")
-            .expect("the value survives the refusal");
+        let stored = meta_bytes(
+            &read,
+            Db::State,
+            STATE_META,
+            KEY_CODEC_VERSION,
+            MAX_META_SCALAR_BYTES,
+        )
+        .expect("meta")
+        .expect("the value survives the refusal");
         assert_eq!(
             stored,
             55u32.to_be_bytes().to_vec(),
             "a refused open must not overwrite state metadata either"
+        );
+    }
+
+    /// An over-ceiling stored meta row is refused before it is copied.
+    ///
+    /// `state.redb`'s metadata used to be copied with `to_vec()` and decoded
+    /// with no ceiling at all, so a corrupt row allocated whatever length it
+    /// claimed before anything looked. The bound is now checked against the
+    /// borrowed redb value.
+    #[test]
+    fn an_over_ceiling_stored_meta_row_is_refused() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        {
+            let db = Database::create(root.join("state.redb")).expect("open state");
+            let write = db.begin_write().expect("write");
+            {
+                let mut meta = write.open_table(STATE_META).expect("open meta");
+                let oversized = vec![0xAAu8; MAX_COORDINATION_META_BYTES + 1];
+                meta.insert(KEY_META, oversized.as_slice()).expect("insert");
+            }
+            write.commit().expect("commit");
+        }
+
+        match open_at(&root, identity()) {
+            Err(StorageError::StoredCorruption { what, detail, .. }) => {
+                assert_eq!(what, KEY_META);
+                assert!(
+                    detail.contains("ceiling"),
+                    "the ceiling must be what refused it: {detail}"
+                );
+            }
+            other => panic!("expected an over-ceiling refusal, got: {other:?}"),
+        }
+    }
+
+    /// The meta ceiling is the snapshot header bound.
+    ///
+    /// Pinned because the two are only equal by intent: a meta row that would
+    /// not fit in a `SnapshotHeaderV1` could be written but never snapshotted,
+    /// and the voter would discover that only when a follower needed it.
+    #[test]
+    fn the_meta_ceiling_matches_the_snapshot_header_bound() {
+        assert_eq!(
+            MAX_COORDINATION_META_BYTES as u64,
+            crate::coordination::rowstream::MAX_HEADER_BYTES
         );
     }
 
@@ -2333,9 +2464,15 @@ mod tests {
         let db = Database::create(root.join("state.redb")).expect("open state");
         let bytes = {
             let read = db.begin_read().expect("read");
-            meta_bytes(&read, Db::State, STATE_META, KEY_META)
-                .expect("meta")
-                .expect("meta row present")
+            meta_bytes(
+                &read,
+                Db::State,
+                STATE_META,
+                KEY_META,
+                MAX_COORDINATION_META_BYTES,
+            )
+            .expect("meta")
+            .expect("meta row present")
         };
         let mut meta: CoordinationMetaV1 = payload_fory::<CoordinationMetaV1>()
             .deserialize(&bytes)
