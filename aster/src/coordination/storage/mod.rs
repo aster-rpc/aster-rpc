@@ -8,6 +8,7 @@
 //!
 //! | Module | Owns |
 //! |---|---|
+//! | [`codec`] | the single decode site for persisted values |
 //! | [`error`] | the named §11.1 failures, kept distinct on purpose |
 //! | [`identity`] | the crate-private storage-open identity and policy |
 //! | [`schema`] | layout, lifetime lock, table/meta allowlists, the open coordinator |
@@ -42,6 +43,7 @@
 //! which is the Slice 3 boundary the plan draws. The allowances come off when
 //! Slice 3 wires the voter runtime, not before.
 
+pub(crate) mod codec;
 pub(crate) mod error;
 /// The OpenRaft storage-suite fixture. Test-only: it exists to hold one group
 /// identity fixed across every store a builder makes, which is what
@@ -174,6 +176,7 @@ mod durability_guard {
     /// Every source file in this module tree, checked as text.
     const SOURCES: &[(&str, &str)] = &[
         ("mod.rs", include_str!("mod.rs")),
+        ("codec.rs", include_str!("codec.rs")),
         ("error.rs", include_str!("error.rs")),
         ("identity.rs", include_str!("identity.rs")),
         ("schema.rs", include_str!("schema.rs")),
@@ -257,58 +260,67 @@ mod durability_guard {
         );
     }
 
-    /// The retryable variant is only ever raised while encoding.
+    /// Persisted values are decoded in exactly one module.
     ///
-    /// The allowlist in `puts_durability_in_question` makes exactly two
-    /// failures non-sticky, so a persisted *decode* classified as one silently
-    /// makes a corrupt durable value look like a bad request to retry. That is
-    /// what happened: `schema.rs` decoded its scalars and its replicated meta
-    /// row through the retryable constructor while the classifier's own
-    /// documentation said it could not.
+    /// The same shape as the write-transaction guard above, and for the same
+    /// reason. The previous attempt matched `try_into` on the constructor's
+    /// line; rustfmt puts them on different lines, so mutating
+    /// `codec::decode_array32` back to the retryable variant passed both
+    /// guards and all 513 tests. A line window cannot express "every decode",
+    /// and widening it only moves where it fails.
     ///
-    /// Checked structurally rather than by review, because the next checkpoint
-    /// adds another actor with more persisted values to decode.
+    /// One decode site can. `codec` has no way to raise the retryable variant
+    /// from a decode, so routing every persisted value through it makes the
+    /// classification structural rather than remembered -- which matters most
+    /// for Checkpoint C, which adds persisted roots this guard has never seen.
     #[test]
-    fn the_retryable_variant_is_never_raised_next_to_a_decode() {
+    fn persisted_values_are_decoded_only_in_the_codec_module() {
+        let mut sites = Vec::new();
         for (name, source) in SOURCES {
+            if *name == "codec.rs" {
+                continue;
+            }
             for (n, line) in production_lines(source) {
-                if !line.contains("encode_failed(") {
-                    continue;
+                if line.contains(".deserialize(") {
+                    sites.push(format!("{name}:{}", n + 1));
                 }
-                assert!(
-                    !line.contains("deserialize") && !line.contains("try_into"),
-                    "{name}:{} raises the retryable encode variant from what looks \
-                     like a decode; persisted values must use `corrupt`",
-                    n + 1
-                );
             }
         }
+        assert!(
+            sites.is_empty(),
+            "persisted Fory values must be decoded through codec::decode_persisted, \
+             which cannot report a retryable failure; found: {sites:?}"
+        );
     }
 
-    /// And every Fory `deserialize` of a persisted value maps to corruption.
+    /// And the retryable variant is raised only from the codec module's
+    /// encode helper.
     #[test]
-    fn persisted_decodes_map_to_stored_corruption() {
+    fn the_retryable_variant_is_raised_only_when_encoding() {
+        let mut sites = Vec::new();
         for (name, source) in SOURCES {
-            let lines: Vec<_> = production_lines(source).collect();
-            for (i, (n, line)) in lines.iter().enumerate() {
-                if !line.contains(".deserialize(") {
-                    continue;
+            for (n, line) in production_lines(source) {
+                // The constructor's own declaration is not a use of it.
+                if line.contains("encode_failed(") && !line.contains("fn encode_failed") {
+                    sites.push((*name, n + 1));
                 }
-                // The `map_err` follows the `deserialize` within a couple of
-                // lines in every formatting rustfmt produces here.
-                let window: String = lines[i..(i + 3).min(lines.len())]
-                    .iter()
-                    .map(|(_, l)| *l)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                assert!(
-                    !window.contains("encode_failed("),
-                    "{name}:{} decodes a persisted value but classifies the \
-                     failure as retryable",
-                    n + 1
-                );
             }
         }
+        for (name, line) in &sites {
+            assert_eq!(
+                *name, "codec.rs",
+                "{name}:{line} raises the retryable variant outside the encode helper"
+            );
+        }
+        // Not "exactly one": `codec` raises it from both the encode itself and
+        // the ceiling check that follows it. The invariant is the *module*,
+        // not the count -- everything in `codec` is on the encode side by
+        // construction, and nothing outside it can reach the constructor's
+        // classification at all.
+        assert!(
+            !sites.is_empty(),
+            "the retryable variant vanished entirely; the encode path should still raise it"
+        );
     }
 
     /// Source lines outside the trailing `#[cfg(test)]` module.

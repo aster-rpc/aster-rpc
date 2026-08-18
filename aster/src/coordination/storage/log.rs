@@ -36,9 +36,10 @@ use openraft::{AnyError, Entry, LogId, LogState, StorageError, StorageIOError, V
 use redb::{Database, ReadableDatabase, ReadableTable};
 use tokio::sync::{mpsc, oneshot};
 
+use super::codec::{check_stored_len, decode_persisted, encode_bounded};
 use super::error::{Db, StorageError as AsterStorageError, StorageResult};
 use super::schema::{KEY_COMMITTED, KEY_LAST_PURGED, KEY_VOTE, RAFT_LOG, RAFT_META};
-use crate::coordination::contract::{payload_fory, LogIdV1};
+use crate::coordination::contract::LogIdV1;
 use crate::coordination::ids::CoordinationNodeId;
 use crate::coordination::raft::{RaftEntryV1, VoteV1};
 use crate::coordination::typeconfig::CoordinationTypeConfig;
@@ -65,20 +66,7 @@ const LOG_ACTOR_QUEUE: usize = 64;
 
 fn encode_entry(entry: &Entry<CoordinationTypeConfig>) -> StorageResult<Vec<u8>> {
     let mirror = RaftEntryV1::from(entry);
-    let bytes = payload_fory::<RaftEntryV1>()
-        .serialize(&mirror)
-        .map_err(|source| AsterStorageError::encode_failed(Db::Raft, "RaftEntryV1", source))?;
-    if bytes.len() > MAX_ENTRY_BYTES {
-        return Err(AsterStorageError::encode_failed(
-            Db::Raft,
-            "RaftEntryV1",
-            format!(
-                "encoded entry is {} bytes, over the {MAX_ENTRY_BYTES}-byte ceiling",
-                bytes.len()
-            ),
-        ));
-    }
-    Ok(bytes)
+    encode_bounded(Db::Raft, "RaftEntryV1", &mirror, MAX_ENTRY_BYTES)
 }
 
 /// Decode a stored entry.
@@ -90,19 +78,8 @@ fn encode_entry(entry: &Entry<CoordinationTypeConfig>) -> StorageResult<Vec<u8>>
 fn decode_entry(bytes: &[u8]) -> StorageResult<Entry<CoordinationTypeConfig>> {
     // Before allocation, not after: a length check that runs only once the
     // value is already decoded has not bounded anything.
-    if bytes.len() > MAX_ENTRY_BYTES {
-        return Err(AsterStorageError::corrupt(
-            Db::Raft,
-            "RaftEntryV1",
-            format!(
-                "stored entry is {} bytes, over the {MAX_ENTRY_BYTES}-byte ceiling",
-                bytes.len()
-            ),
-        ));
-    }
-    let mirror: RaftEntryV1 = payload_fory::<RaftEntryV1>()
-        .deserialize(bytes)
-        .map_err(|source| AsterStorageError::corrupt(Db::Raft, "RaftEntryV1", source))?;
+    check_stored_len(Db::Raft, "RaftEntryV1", bytes, MAX_ENTRY_BYTES)?;
+    let mirror: RaftEntryV1 = decode_persisted(Db::Raft, "RaftEntryV1", bytes)?;
     // The mirror conversion is fallible and stays fallible here. An unknown
     // payload variant is fatal rather than degraded to a blank: applying a
     // blank in its place would commit a gap in the replicated history.
@@ -112,76 +89,26 @@ fn decode_entry(bytes: &[u8]) -> StorageResult<Entry<CoordinationTypeConfig>> {
 
 fn encode_vote(vote: &Vote<CoordinationNodeId>) -> StorageResult<Vec<u8>> {
     let mirror = VoteV1::from(vote);
-    bounded(
-        payload_fory::<VoteV1>()
-            .serialize(&mirror)
-            .map_err(|source| AsterStorageError::encode_failed(Db::Raft, "VoteV1", source))?,
-        "VoteV1",
-    )
+    encode_bounded(Db::Raft, "VoteV1", &mirror, MAX_META_BYTES)
 }
 
 fn decode_vote(bytes: &[u8]) -> StorageResult<Vote<CoordinationNodeId>> {
-    check_stored_meta_len(bytes, "VoteV1")?;
-    let mirror: VoteV1 = payload_fory::<VoteV1>()
-        .deserialize(bytes)
-        .map_err(|source| AsterStorageError::corrupt(Db::Raft, "VoteV1", source))?;
+    check_stored_len(Db::Raft, "VoteV1", bytes, MAX_META_BYTES)?;
+    let mirror: VoteV1 = decode_persisted(Db::Raft, "VoteV1", bytes)?;
     Vote::<CoordinationNodeId>::try_from(&mirror)
         .map_err(|err| AsterStorageError::corrupt(Db::Raft, "VoteV1", format!("{err:?}")))
 }
 
 fn encode_log_id(log_id: &LogId<CoordinationNodeId>) -> StorageResult<Vec<u8>> {
     let mirror = LogIdV1::from(*log_id);
-    bounded(
-        payload_fory::<LogIdV1>()
-            .serialize(&mirror)
-            .map_err(|source| AsterStorageError::encode_failed(Db::Raft, "LogIdV1", source))?,
-        "LogIdV1",
-    )
+    encode_bounded(Db::Raft, "LogIdV1", &mirror, MAX_META_BYTES)
 }
 
 fn decode_log_id(bytes: &[u8]) -> StorageResult<LogId<CoordinationNodeId>> {
-    check_stored_meta_len(bytes, "LogIdV1")?;
-    let mirror: LogIdV1 = payload_fory::<LogIdV1>()
-        .deserialize(bytes)
-        .map_err(|source| AsterStorageError::corrupt(Db::Raft, "LogIdV1", source))?;
+    check_stored_len(Db::Raft, "LogIdV1", bytes, MAX_META_BYTES)?;
+    let mirror: LogIdV1 = decode_persisted(Db::Raft, "LogIdV1", bytes)?;
     LogId::<CoordinationNodeId>::try_from(&mirror)
         .map_err(|err| AsterStorageError::corrupt(Db::Raft, "LogIdV1", format!("{err:?}")))
-}
-
-fn bounded(bytes: Vec<u8>, what: &'static str) -> StorageResult<Vec<u8>> {
-    check_meta_len(&bytes, what)?;
-    Ok(bytes)
-}
-
-/// Ceiling check for a value read back from disk. Fatal: it is already
-/// durable, so there is nothing for the caller to retry.
-fn check_stored_meta_len(bytes: &[u8], what: &'static str) -> StorageResult<()> {
-    if bytes.len() > MAX_META_BYTES {
-        return Err(AsterStorageError::corrupt(
-            Db::Raft,
-            what,
-            format!(
-                "{} bytes, over the {MAX_META_BYTES}-byte metadata ceiling",
-                bytes.len()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Ceiling check for a value being written. Retryable: nothing is on disk.
-fn check_meta_len(bytes: &[u8], what: &'static str) -> StorageResult<()> {
-    if bytes.len() > MAX_META_BYTES {
-        return Err(AsterStorageError::encode_failed(
-            Db::Raft,
-            what,
-            format!(
-                "{} bytes, over the {MAX_META_BYTES}-byte metadata ceiling",
-                bytes.len()
-            ),
-        ));
-    }
-    Ok(())
 }
 
 // ── Actor protocol ───────────────────────────────────────────────────────────

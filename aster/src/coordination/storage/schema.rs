@@ -32,9 +32,9 @@ use redb::{
     TableDefinition,
 };
 
+use super::codec::{decode_array32, decode_persisted, decode_string, decode_u32, encode_owned};
 use super::error::{Db, StorageError, StorageResult};
 use super::identity::{OpenPolicy, StorageIdentity, LOGICAL_SCHEMA_VERSION, STORAGE_CODEC_VERSION};
-use crate::coordination::contract::payload_fory;
 use crate::coordination::raft::CoordinationMetaV1;
 
 // ── raft.redb (§11.2) ────────────────────────────────────────────────────────
@@ -412,30 +412,6 @@ fn classify_integrity(
 
 fn encode_u32(value: u32) -> Vec<u8> {
     value.to_be_bytes().to_vec()
-}
-
-/// Decode a persisted scalar.
-///
-/// Every decoder below reports [`StoredCorruption`](StorageError::StoredCorruption),
-/// never the retryable encode variant. These bytes are already on disk, so a
-/// caller has nothing to retry -- and misclassifying them was how the
-/// allowlist invariant became false while still reading as correct.
-fn decode_u32(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<u32> {
-    let array: [u8; 4] = bytes.try_into().map_err(|_| {
-        StorageError::corrupt(db, what, format!("expected 4 bytes, got {}", bytes.len()))
-    })?;
-    Ok(u32::from_be_bytes(array))
-}
-
-fn decode_array32(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<[u8; 32]> {
-    bytes.try_into().map_err(|_| {
-        StorageError::corrupt(db, what, format!("expected 32 bytes, got {}", bytes.len()))
-    })
-}
-
-fn decode_string(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<String> {
-    String::from_utf8(bytes.to_vec())
-        .map_err(|source| StorageError::corrupt(db, what, format!("not valid UTF-8: {source}")))
 }
 
 // ── Open ─────────────────────────────────────────────────────────────────────
@@ -823,9 +799,7 @@ fn classify_state(database: &Database, presence: Presence) -> StorageResult<Side
 
     let mut durable = state_data_tables_have_rows(&read)?;
     if let Some(bytes) = &meta_row {
-        let meta: CoordinationMetaV1 = payload_fory::<CoordinationMetaV1>()
-            .deserialize(bytes)
-            .map_err(|source| StorageError::corrupt(Db::State, "CoordinationMetaV1", source))?;
+        let meta: CoordinationMetaV1 = decode_persisted(Db::State, "CoordinationMetaV1", bytes)?;
         if replicated_state_is_durable(&meta) {
             durable = true;
         }
@@ -1125,11 +1099,7 @@ fn write_state_identity(database: &mut Database, identity: &StorageIdentity) -> 
         deployment_profile_code: identity.deployment_profile_code(),
         ..Default::default()
     };
-    let encoded = payload_fory::<CoordinationMetaV1>()
-        .serialize(&meta_row)
-        // An encode, and the only one in this module: it is the single place a
-        // value this build produced could fail to be written.
-        .map_err(|source| StorageError::encode_failed(Db::State, "CoordinationMetaV1", source))?;
+    let encoded = encode_owned(Db::State, "CoordinationMetaV1", &meta_row)?;
 
     let write = durable_write(database, Db::State)?;
     {
@@ -1267,9 +1237,7 @@ fn verify_state_identity(database: &Database, identity: &StorageIdentity) -> Sto
             key: KEY_META,
         },
     )?;
-    let meta: CoordinationMetaV1 = payload_fory::<CoordinationMetaV1>()
-        .deserialize(&bytes)
-        .map_err(|source| StorageError::corrupt(Db::State, "CoordinationMetaV1", source))?;
+    let meta: CoordinationMetaV1 = decode_persisted(Db::State, "CoordinationMetaV1", &bytes)?;
 
     if meta.schema_version != LOGICAL_SCHEMA_VERSION {
         return Err(StorageError::SchemaVersion {
@@ -1309,6 +1277,7 @@ fn verify_state_identity(database: &Database, identity: &StorageIdentity) -> Sto
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::contract::payload_fory;
     use crate::coordination::ids::{CoordinationGroupId, CoordinationNodeId};
     use crate::coordination::model::shape;
     use redb::TableHandle;

@@ -317,8 +317,12 @@ impl StorageError {
         }
     }
 
-    /// Build a [`StorageError::Codec`] from anything displayable.
     /// A failure encoding a value the caller supplied. Retryable.
+    ///
+    /// Called only by
+    /// [`codec::encode_owned`](super::codec::encode_owned), which is the one
+    /// place this classification can be applied; see that module for why the
+    /// direction is a function choice rather than a constructor choice.
     pub(crate) fn encode_failed(
         db: Db,
         what: &'static str,
