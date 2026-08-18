@@ -81,11 +81,17 @@ fn encode_entry(entry: &Entry<CoordinationTypeConfig>) -> StorageResult<Vec<u8>>
     Ok(bytes)
 }
 
+/// Decode a stored entry.
+///
+/// Every failure here is
+/// [`StoredCorruption`](AsterStorageError::StoredCorruption) rather than a
+/// retryable codec error: these bytes are already on disk, so "try again" is
+/// not something the caller can usefully do.
 fn decode_entry(bytes: &[u8]) -> StorageResult<Entry<CoordinationTypeConfig>> {
     // Before allocation, not after: a length check that runs only once the
     // value is already decoded has not bounded anything.
     if bytes.len() > MAX_ENTRY_BYTES {
-        return Err(AsterStorageError::codec(
+        return Err(AsterStorageError::corrupt(
             Db::Raft,
             "RaftEntryV1",
             format!(
@@ -96,12 +102,12 @@ fn decode_entry(bytes: &[u8]) -> StorageResult<Entry<CoordinationTypeConfig>> {
     }
     let mirror: RaftEntryV1 = payload_fory::<RaftEntryV1>()
         .deserialize(bytes)
-        .map_err(|source| AsterStorageError::codec(Db::Raft, "RaftEntryV1", source))?;
+        .map_err(|source| AsterStorageError::corrupt(Db::Raft, "RaftEntryV1", source))?;
     // The mirror conversion is fallible and stays fallible here. An unknown
     // payload variant is fatal rather than degraded to a blank: applying a
     // blank in its place would commit a gap in the replicated history.
     Entry::<CoordinationTypeConfig>::try_from(&mirror)
-        .map_err(|err| AsterStorageError::codec(Db::Raft, "RaftEntryV1", format!("{err:?}")))
+        .map_err(|err| AsterStorageError::corrupt(Db::Raft, "RaftEntryV1", format!("{err:?}")))
 }
 
 fn encode_vote(vote: &Vote<CoordinationNodeId>) -> StorageResult<Vec<u8>> {
@@ -115,12 +121,12 @@ fn encode_vote(vote: &Vote<CoordinationNodeId>) -> StorageResult<Vec<u8>> {
 }
 
 fn decode_vote(bytes: &[u8]) -> StorageResult<Vote<CoordinationNodeId>> {
-    check_meta_len(bytes, "VoteV1")?;
+    check_stored_meta_len(bytes, "VoteV1")?;
     let mirror: VoteV1 = payload_fory::<VoteV1>()
         .deserialize(bytes)
-        .map_err(|source| AsterStorageError::codec(Db::Raft, "VoteV1", source))?;
+        .map_err(|source| AsterStorageError::corrupt(Db::Raft, "VoteV1", source))?;
     Vote::<CoordinationNodeId>::try_from(&mirror)
-        .map_err(|err| AsterStorageError::codec(Db::Raft, "VoteV1", format!("{err:?}")))
+        .map_err(|err| AsterStorageError::corrupt(Db::Raft, "VoteV1", format!("{err:?}")))
 }
 
 fn encode_log_id(log_id: &LogId<CoordinationNodeId>) -> StorageResult<Vec<u8>> {
@@ -134,12 +140,12 @@ fn encode_log_id(log_id: &LogId<CoordinationNodeId>) -> StorageResult<Vec<u8>> {
 }
 
 fn decode_log_id(bytes: &[u8]) -> StorageResult<LogId<CoordinationNodeId>> {
-    check_meta_len(bytes, "LogIdV1")?;
+    check_stored_meta_len(bytes, "LogIdV1")?;
     let mirror: LogIdV1 = payload_fory::<LogIdV1>()
         .deserialize(bytes)
-        .map_err(|source| AsterStorageError::codec(Db::Raft, "LogIdV1", source))?;
+        .map_err(|source| AsterStorageError::corrupt(Db::Raft, "LogIdV1", source))?;
     LogId::<CoordinationNodeId>::try_from(&mirror)
-        .map_err(|err| AsterStorageError::codec(Db::Raft, "LogIdV1", format!("{err:?}")))
+        .map_err(|err| AsterStorageError::corrupt(Db::Raft, "LogIdV1", format!("{err:?}")))
 }
 
 fn bounded(bytes: Vec<u8>, what: &'static str) -> StorageResult<Vec<u8>> {
@@ -147,6 +153,23 @@ fn bounded(bytes: Vec<u8>, what: &'static str) -> StorageResult<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Ceiling check for a value read back from disk. Fatal: it is already
+/// durable, so there is nothing for the caller to retry.
+fn check_stored_meta_len(bytes: &[u8], what: &'static str) -> StorageResult<()> {
+    if bytes.len() > MAX_META_BYTES {
+        return Err(AsterStorageError::corrupt(
+            Db::Raft,
+            what,
+            format!(
+                "{} bytes, over the {MAX_META_BYTES}-byte metadata ceiling",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Ceiling check for a value being written. Retryable: nothing is on disk.
 fn check_meta_len(bytes: &[u8], what: &'static str) -> StorageResult<()> {
     if bytes.len() > MAX_META_BYTES {
         return Err(AsterStorageError::codec(
@@ -197,11 +220,30 @@ enum LogCommand {
     /// Stop the actor so it drops its `Database` before the directory lock is
     /// released.
     Shutdown,
+    /// Force a stored-corruption failure through the ordinary `serve` path.
+    ///
+    /// A deliberate test seam. The fatal path is otherwise unreachable at
+    /// runtime now that `validate_persisted_log` catches corrupt durable state
+    /// before an actor exists -- which is exactly what that validation is for.
+    /// Simulating the ordering in a harness would prove the harness; routing
+    /// through the real `serve` proves the code that ships.
+    #[cfg(test)]
+    InjectFatal(Reply<()>),
+}
+
+/// Whether the actor may keep serving after one command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Continue,
+    Fatal,
 }
 
 /// The single-writer thread that owns `raft.redb`.
 struct LogActor {
     database: Database,
+    /// Shared with every handle. Set by the actor *before* it replies, so a
+    /// caller can never observe success after durability became uncertain.
+    fatal: Arc<AtomicBool>,
 }
 
 impl LogActor {
@@ -217,19 +259,85 @@ impl LogActor {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            match command {
+            let outcome = match command {
                 LogCommand::Shutdown => break,
-                LogCommand::LogState(reply) => send(reply, self.log_state()),
-                LogCommand::SaveVote { vote, reply } => send(reply, self.save_vote(&vote)),
-                LogCommand::ReadVote(reply) => send(reply, self.read_vote()),
+                LogCommand::LogState(reply) => self.serve(reply, |a| a.log_state()),
+                LogCommand::SaveVote { vote, reply } => self.serve(reply, |a| a.save_vote(&vote)),
+                LogCommand::ReadVote(reply) => self.serve(reply, |a| a.read_vote()),
                 LogCommand::SaveCommitted { committed, reply } => {
-                    send(reply, self.save_committed(committed.as_ref()))
+                    self.serve(reply, |a| a.save_committed(committed.as_ref()))
                 }
-                LogCommand::ReadCommitted(reply) => send(reply, self.read_committed()),
-                LogCommand::Append { entries, reply } => send(reply, self.append(&entries)),
-                LogCommand::Truncate { log_id, reply } => send(reply, self.truncate(&log_id)),
-                LogCommand::Purge { log_id, reply } => send(reply, self.purge(&log_id)),
-                LogCommand::Read { start, end, reply } => send(reply, self.read(start, end)),
+                LogCommand::ReadCommitted(reply) => self.serve(reply, |a| a.read_committed()),
+                LogCommand::Append { entries, reply } => self.serve(reply, |a| a.append(&entries)),
+                LogCommand::Truncate { log_id, reply } => {
+                    self.serve(reply, |a| a.truncate(&log_id))
+                }
+                LogCommand::Purge { log_id, reply } => self.serve(reply, |a| a.purge(&log_id)),
+                LogCommand::Read { start, end, reply } => self.serve(reply, |a| a.read(start, end)),
+                #[cfg(test)]
+                LogCommand::InjectFatal(reply) => self.serve(reply, |_| {
+                    Err(AsterStorageError::corrupt(
+                        Db::Raft,
+                        "RaftEntryV1",
+                        "injected durability failure",
+                    ))
+                }),
+            };
+
+            if outcome == Outcome::Fatal {
+                // The latch was set before the reply went out. Stopping here
+                // is the other half: the commands already queued behind this
+                // failure were enqueued while the store still looked healthy,
+                // and serving them would acknowledge writes after durability
+                // had become uncertain.
+                self.drain_fatal(&mut rx);
+                break;
+            }
+        }
+    }
+
+    /// Run one command, latch fatality before replying, and report which it
+    /// was.
+    ///
+    /// The ordering is the whole point. Classifying in the Tokio caller --
+    /// which is what this used to do -- leaves a window: the actor sends the
+    /// failure and immediately picks up the next command while the caller has
+    /// not yet set the latch. A vote or append queued behind a failed commit
+    /// could be serviced and acknowledged inside it.
+    fn serve<T, F>(&mut self, reply: Reply<T>, run: F) -> Outcome
+    where
+        F: FnOnce(&mut Self) -> StorageResult<T>,
+    {
+        let result = run(self);
+        let outcome = match &result {
+            Err(err) if err.puts_durability_in_question() => {
+                self.fatal.store(true, Ordering::SeqCst);
+                Outcome::Fatal
+            }
+            _ => Outcome::Continue,
+        };
+        let _ = reply.send(result);
+        outcome
+    }
+
+    /// Answer everything already queued with the fatal error, rather than
+    /// leaving senders waiting on a dropped receiver.
+    fn drain_fatal(&mut self, rx: &mut mpsc::Receiver<LogCommand>) {
+        rx.close();
+        while let Some(command) = rx.blocking_recv() {
+            match command {
+                LogCommand::Shutdown => {}
+                LogCommand::LogState(reply) => fail(reply),
+                LogCommand::SaveVote { reply, .. } => fail(reply),
+                LogCommand::ReadVote(reply) => fail(reply),
+                LogCommand::SaveCommitted { reply, .. } => fail(reply),
+                LogCommand::ReadCommitted(reply) => fail(reply),
+                LogCommand::Append { reply, .. } => fail(reply),
+                LogCommand::Truncate { reply, .. } => fail(reply),
+                LogCommand::Purge { reply, .. } => fail(reply),
+                LogCommand::Read { reply, .. } => fail(reply),
+                #[cfg(test)]
+                LogCommand::InjectFatal(reply) => fail(reply),
             }
         }
     }
@@ -434,14 +542,7 @@ impl LogActor {
     /// it defers the fsync and would turn OpenRaft's durability contract into
     /// a performance tunable.
     fn begin_durable_write(&self) -> StorageResult<redb::WriteTransaction> {
-        let mut write = self
-            .database
-            .begin_write()
-            .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
-        write
-            .set_durability(redb::Durability::Immediate)
-            .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
-        Ok(write)
+        super::schema::durable_write(&self.database, Db::Raft)
     }
 
     fn append(&mut self, entries: &[Entry<CoordinationTypeConfig>]) -> StorageResult<()> {
@@ -452,28 +553,47 @@ impl LogActor {
         // Validate the whole batch before opening a transaction, so a rejected
         // batch cannot leave a partial write behind. §4.3 is explicit that a
         // gap must be refused *without* partially writing.
-        let mut expected = entries[0].log_id.index;
-        for entry in entries {
-            if entry.log_id.index != expected {
+        // Adjacent pairs, with no early exit. An earlier version advanced an
+        // `expected` counter and `break`ed when it overflowed, so a batch of
+        // `[u64::MAX, 0]` stopped validating before it ever looked at the
+        // second entry and was accepted whole.
+        for pair in entries.windows(2) {
+            let (previous, next) = (pair[0].log_id.index, pair[1].log_id.index);
+            if previous.checked_add(1) != Some(next) {
                 return Err(AsterStorageError::LogGap {
-                    expected,
-                    found: entry.log_id.index,
+                    expected: previous.wrapping_add(1),
+                    found: next,
                     detail: "append batch is not internally contiguous",
                 });
             }
-            // Checked, because a batch ending at `u64::MAX` would otherwise
-            // wrap to 0 and silently accept a following entry at index 0.
-            expected = match expected.checked_add(1) {
-                Some(next) => next,
-                // Only reachable on the final entry; a further entry would
-                // have to restart the log, which the contiguity check above
-                // would then reject.
-                None => break,
-            };
         }
 
-        let first = entries[0].log_id.index;
-        let last = entries[entries.len() - 1].log_id.index;
+        let purged = {
+            let read = self
+                .database
+                .begin_read()
+                .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
+            self.marker(&read, KEY_LAST_PURGED)?
+        };
+
+        // Entries at or below the purge marker are already accounted for.
+        // OpenRaft legitimately re-offers them, so this is a successful no-op
+        // rather than a rejection -- but writing them back resurrects rows
+        // beneath the marker, and `get_log_state` then reports a `last_log_id`
+        // *below* `last_purged`, which is not a state Raft has any rule for.
+        let writable: Vec<&Entry<CoordinationTypeConfig>> = match &purged {
+            Some(marker) => entries
+                .iter()
+                .filter(|entry| entry.log_id.index > marker.index)
+                .collect(),
+            None => entries.iter().collect(),
+        };
+        if writable.is_empty() {
+            return Ok(());
+        }
+
+        let first = writable[0].log_id.index;
+        let last = writable[writable.len() - 1].log_id.index;
         {
             let read = self
                 .database
@@ -496,9 +616,7 @@ impl LogActor {
             // It stays as the honest expression of the bound.
             let frontier = match self.last_entry_index(&read)? {
                 Some(retained) => retained.checked_add(1),
-                None => self
-                    .marker(&read, KEY_LAST_PURGED)?
-                    .and_then(|purged| purged.index.checked_add(1)),
+                None => purged.as_ref().and_then(|p| p.index.checked_add(1)),
             };
             if let Some(frontier) = frontier {
                 if first > frontier {
@@ -530,7 +648,7 @@ impl LogActor {
         // Encode everything before the transaction as well: an encode failure
         // partway through would otherwise abort a transaction that had already
         // written earlier entries.
-        let encoded: Vec<(u64, Vec<u8>)> = entries
+        let encoded: Vec<(u64, Vec<u8>)> = writable
             .iter()
             .map(|entry| Ok((entry.log_id.index, encode_entry(entry)?)))
             .collect::<StorageResult<_>>()?;
@@ -573,6 +691,23 @@ impl LogActor {
     /// everything has been deleted, which OpenRaft requires: purging past the
     /// end of the log is legal and must leave `last_log_id == last_purged`.
     fn purge(&mut self, log_id: &LogId<CoordinationNodeId>) -> StorageResult<()> {
+        // A purge that does not advance the marker is a no-op, not a rewrite.
+        // Moving it backwards is worse than useless: the rows above the lower
+        // marker were already deleted by the higher purge, so the log would
+        // report a boundary with nothing behind it and OpenRaft would try to
+        // replicate from indexes that no longer exist.
+        {
+            let read = self
+                .database
+                .begin_read()
+                .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
+            if let Some(existing) = self.marker(&read, KEY_LAST_PURGED)? {
+                if log_id.index <= existing.index {
+                    return Ok(());
+                }
+            }
+        }
+
         let marker = encode_log_id(log_id)?;
         let write = self.begin_durable_write()?;
         {
@@ -595,9 +730,9 @@ impl LogActor {
     }
 }
 
-fn send<T>(reply: Reply<T>, result: StorageResult<T>) {
-    // A dropped receiver means the caller went away; nothing to report to.
-    let _ = reply.send(result);
+/// Answer a queued command that will never run because the store is fatal.
+fn fail<T>(reply: Reply<T>) {
+    let _ = reply.send(Err(AsterStorageError::Fatal));
 }
 
 // ── Handle ───────────────────────────────────────────────────────────────────
@@ -653,26 +788,46 @@ impl std::fmt::Debug for LogHandle {
 
 impl LogHandle {
     /// Start the actor thread and return a handle onto it.
-    pub(crate) fn spawn(database: Database) -> (Self, ActorShutdown) {
+    pub(crate) fn spawn(database: Database) -> StorageResult<(Self, ActorShutdown)> {
         let (tx, rx) = mpsc::channel(LOG_ACTOR_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
         let actor_stop = Arc::clone(&stop);
+        // One latch, shared: the actor sets it before replying, every handle
+        // reads it.
+        let fatal = Arc::new(AtomicBool::new(false));
+        let actor_fatal = Arc::clone(&fatal);
         let thread = std::thread::Builder::new()
             .name("aster-coordination-log".into())
-            .spawn(move || LogActor { database }.run(rx, actor_stop))
-            .expect("spawn the coordination log actor thread");
-        let handle = Self {
-            tx: tx.clone(),
-            fatal: Arc::new(AtomicBool::new(false)),
-        };
-        (
-            handle,
+            .spawn(move || {
+                LogActor {
+                    database,
+                    fatal: actor_fatal,
+                }
+                .run(rx, actor_stop)
+            })
+            // A thread that will not start is a startup failure with a cause
+            // worth reporting, not a panic inside a library.
+            .map_err(|source| AsterStorageError::ActorSpawn {
+                db: Db::Raft,
+                source,
+            })?;
+        Ok((
+            Self {
+                tx: tx.clone(),
+                fatal,
+            },
             ActorShutdown {
                 tx,
                 stop,
                 thread: Some(thread),
             },
-        )
+        ))
+    }
+
+    /// Force a fatal failure through the real command path.
+    #[cfg(test)]
+    pub(crate) async fn inject_fatal(&self) -> StorageResult<()> {
+        self.call(LogCommand::InjectFatal).await
     }
 
     /// Whether this store has failed in a way that makes its durability
@@ -715,18 +870,10 @@ impl LogHandle {
     where
         F: FnOnce(Reply<()>) -> LogCommand,
     {
-        let result = self.call(build).await;
-        if let Err(err) = &result {
-            // Only failures that put durability in question are sticky. A
-            // refused append is a rejected *request*, not a damaged store, and
-            // OpenRaft may legitimately follow it with a correct batch --
-            // making the first legal refusal permanently disable a healthy
-            // voter would be far worse than the gap it refused.
-            if err.puts_durability_in_question() {
-                self.mark_fatal();
-            }
-        }
-        result
+        // No classification here. The actor latches fatality before it
+        // replies, so by the time this sees an error the latch is already set
+        // and nothing queued behind it can still be served.
+        self.call(build).await
     }
 }
 
@@ -765,9 +912,9 @@ pub(crate) struct CoordinationLogStore {
 }
 
 impl CoordinationLogStore {
-    pub(crate) fn new(database: Database) -> (Self, ActorShutdown) {
-        let (handle, shutdown) = LogHandle::spawn(database);
-        (Self { handle }, shutdown)
+    pub(crate) fn new(database: Database) -> StorageResult<(Self, ActorShutdown)> {
+        let (handle, shutdown) = LogHandle::spawn(database)?;
+        Ok((Self { handle }, shutdown))
     }
 
     pub(crate) fn handle(&self) -> &LogHandle {
@@ -900,6 +1047,129 @@ impl RaftLogStorage<CoordinationTypeConfig> for CoordinationLogStore {
     }
 }
 
+// ── Startup validation ───────────────────────────────────────────────────────
+
+/// Validate everything `raft.redb` already holds, before any actor is
+/// published.
+///
+/// Schema and identity validation say the file is *ours*; they say nothing
+/// about whether its contents are readable. Without this, a correctly bound
+/// database full of undecodable entries opened cleanly and returned a live
+/// store, and the corruption surfaced on the first replication read -- by
+/// which time the voter had already told the group it was up.
+///
+/// Runs against a `&Database` the open coordinator still owns, so a failure
+/// here means no actor was ever started.
+pub(crate) fn validate_persisted_log(database: &Database) -> StorageResult<()> {
+    let read = database
+        .begin_read()
+        .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
+
+    // Markers first: they bound everything the entry scan then checks.
+    let mut last_purged = None;
+    match read.open_table(RAFT_META) {
+        Ok(meta) => {
+            for key in [KEY_VOTE, KEY_COMMITTED, KEY_LAST_PURGED] {
+                let value = meta
+                    .get(key)
+                    .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
+                let Some(value) = value else { continue };
+                if key == KEY_VOTE {
+                    decode_vote(value.value())?;
+                } else {
+                    let decoded = decode_log_id(value.value())?;
+                    if key == KEY_LAST_PURGED {
+                        last_purged = Some(decoded);
+                    }
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(source) => return Err(AsterStorageError::redb(Db::Raft, source)),
+    }
+
+    let log = match read.open_table(RAFT_LOG) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(source) => return Err(AsterStorageError::redb(Db::Raft, source)),
+    };
+
+    let mut previous: Option<u64> = None;
+    let rows = log
+        .iter()
+        .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
+    for row in rows {
+        let (key, value) = row.map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
+        let index = key.value();
+
+        // Size and decode. Both report corruption rather than a retryable
+        // codec error, because these bytes are already durable.
+        let entry = decode_entry(value.value())?;
+
+        // The key *is* the index. A row filed under a key that disagrees with
+        // its own decoded log id makes every range query silently wrong:
+        // truncate, purge and replay all address rows by key.
+        if entry.log_id.index != index {
+            return Err(AsterStorageError::corrupt(
+                Db::Raft,
+                "RaftEntryV1",
+                format!(
+                    "row filed at key {index} decodes to log index {}",
+                    entry.log_id.index
+                ),
+            ));
+        }
+
+        // Nothing may survive at or below the purge marker: those indexes are
+        // reported as gone, and a row there contradicts the marker.
+        if let Some(marker) = &last_purged {
+            if index <= marker.index {
+                return Err(AsterStorageError::corrupt(
+                    Db::Raft,
+                    "raft_log",
+                    format!(
+                        "row {index} is at or below the purge marker {}",
+                        marker.index
+                    ),
+                ));
+            }
+        }
+
+        match previous {
+            // Raft examines only the last log id, so a hole here is not a
+            // local inconsistency -- it makes every later "up to date"
+            // conclusion wrong.
+            Some(prev) if prev.checked_add(1) != Some(index) => {
+                return Err(AsterStorageError::corrupt(
+                    Db::Raft,
+                    "raft_log",
+                    format!("retained rows jump from {prev} to {index}"),
+                ));
+            }
+            // The first retained row must continue the marker exactly.
+            None => {
+                if let Some(marker) = &last_purged {
+                    if marker.index.checked_add(1) != Some(index) {
+                        return Err(AsterStorageError::corrupt(
+                            Db::Raft,
+                            "raft_log",
+                            format!(
+                                "first retained row is {index}, but the purge marker {} \
+                                 leaves a hole",
+                                marker.index
+                            ),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        previous = Some(index);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,6 +1218,47 @@ mod tests {
     /// uses.
     fn blank(term: u64, index: u64) -> Entry<CoordinationTypeConfig> {
         Entry::new_blank(log_id(term, index))
+    }
+
+    fn try_open(root: &std::path::Path) -> StorageResult<VoterStorage> {
+        VoterStorage::open(
+            StorageLayout::new(root),
+            identity(),
+            OpenPolicy::production(),
+        )
+    }
+
+    /// Write a raw log row, bypassing every validation the store applies. A
+    /// corruption test that can only produce states the writer produces proves
+    /// nothing about what a crash or a foreign build leaves behind.
+    fn write_log_row(root: &std::path::Path, index: u64, value: &[u8]) {
+        let db = Database::create(root.join("raft.redb")).expect("open raft");
+        let write = db.begin_write().expect("write");
+        {
+            let mut log = write.open_table(RAFT_LOG).expect("open log");
+            log.insert(index, value).expect("insert");
+        }
+        write.commit().expect("commit");
+    }
+
+    fn delete_log_row(root: &std::path::Path, index: u64) {
+        let db = Database::create(root.join("raft.redb")).expect("open raft");
+        let write = db.begin_write().expect("write");
+        {
+            let mut log = write.open_table(RAFT_LOG).expect("open log");
+            log.remove(index).expect("remove");
+        }
+        write.commit().expect("commit");
+    }
+
+    fn write_raft_meta(root: &std::path::Path, key: &str, value: &[u8]) {
+        let db = Database::create(root.join("raft.redb")).expect("open raft");
+        let write = db.begin_write().expect("write");
+        {
+            let mut meta = write.open_table(RAFT_META).expect("open meta");
+            meta.insert(key, value).expect("insert");
+        }
+        write.commit().expect("commit");
     }
 
     fn open(root: &std::path::Path) -> VoterStorage {
@@ -1500,6 +1811,303 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── Boundary holes ───────────────────────────────────────────────────────
+
+    /// A batch that wraps the index space is refused.
+    ///
+    /// `[u64::MAX, 0]` used to be accepted: the validation loop advanced an
+    /// `expected` counter, overflowed, and `break`ed before ever looking at
+    /// the second entry.
+    #[tokio::test]
+    async fn a_batch_that_wraps_the_index_space_is_refused() {
+        let root = scratch();
+        let mut storage = open(&root);
+        let store = storage.log_mut();
+
+        let err = append(store, vec![blank(1, u64::MAX), blank(1, 0)])
+            .await
+            .expect_err("index 0 does not follow u64::MAX");
+        assert!(err.to_string().contains("expected index"), "{err}");
+        assert!(
+            store
+                .try_get_log_entries(0..)
+                .await
+                .expect("read")
+                .is_empty(),
+            "and the refused batch wrote nothing"
+        );
+    }
+
+    /// Entries at or below the purge marker are a successful no-op.
+    ///
+    /// Writing them back resurrects rows beneath the marker, and
+    /// `get_log_state` then reports a `last_log_id` *below* `last_purged` --
+    /// a state Raft has no rule for.
+    #[tokio::test]
+    async fn appending_history_below_the_purge_marker_is_a_no_op() {
+        let root = scratch();
+        let mut storage = open(&root);
+        let store = storage.log_mut();
+
+        append(
+            store,
+            vec![blank(1, 0), blank(1, 1), blank(1, 2), blank(1, 3)],
+        )
+        .await
+        .expect("seed");
+        store.purge(log_id(1, 2)).await.expect("purge through 2");
+
+        append(store, vec![blank(1, 1)])
+            .await
+            .expect("re-offering a purged index succeeds without writing it");
+
+        let read = store.try_get_log_entries(0..).await.expect("read");
+        assert_eq!(
+            read.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            vec![3],
+            "the purged row must not be recreated"
+        );
+        let state = store.get_log_state().await.expect("state");
+        assert_eq!(state.last_purged_log_id, Some(log_id(1, 2)));
+        assert_eq!(
+            state.last_log_id,
+            Some(log_id(1, 3)),
+            "last_log_id must never fall below last_purged"
+        );
+    }
+
+    /// A batch straddling the marker writes only the part above it.
+    #[tokio::test]
+    async fn a_batch_straddling_the_purge_marker_writes_only_its_suffix() {
+        let root = scratch();
+        let mut storage = open(&root);
+        let store = storage.log_mut();
+
+        append(store, vec![blank(1, 0), blank(1, 1), blank(1, 2)])
+            .await
+            .expect("seed");
+        store.purge(log_id(1, 2)).await.expect("purge everything");
+
+        append(
+            store,
+            vec![blank(1, 1), blank(1, 2), blank(1, 3), blank(1, 4)],
+        )
+        .await
+        .expect("the suffix continues the marker");
+
+        let read = store.try_get_log_entries(0..).await.expect("read");
+        assert_eq!(
+            read.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    /// A purge that does not advance the marker is a no-op.
+    #[tokio::test]
+    async fn a_regressive_purge_does_not_move_the_marker() {
+        let root = scratch();
+        let mut storage = open(&root);
+        let store = storage.log_mut();
+
+        let entries: Vec<_> = (0..=10).map(|i| blank(1, i)).collect();
+        append(store, entries).await.expect("seed");
+
+        store.purge(log_id(1, 5)).await.expect("purge to 5");
+        store
+            .purge(log_id(1, 3))
+            .await
+            .expect("a lower purge is a no-op");
+        store.purge(log_id(1, 5)).await.expect("an equal purge too");
+
+        let state = store.get_log_state().await.expect("state");
+        assert_eq!(state.last_purged_log_id, Some(log_id(1, 5)));
+        let read = store.try_get_log_entries(0..).await.expect("read");
+        assert_eq!(
+            read.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            (6..=10).collect::<Vec<_>>(),
+            "and nothing above the marker went missing"
+        );
+    }
+
+    // ── Startup validation ───────────────────────────────────────────────────
+
+    /// A corrupt persisted log refuses the open, before any actor exists.
+    #[tokio::test]
+    async fn a_corrupt_persisted_log_refuses_the_open() {
+        let root = scratch();
+        {
+            let mut storage = open(&root);
+            append(storage.log_mut(), vec![blank(1, 0)])
+                .await
+                .expect("seed");
+        }
+        write_log_row(&root, 0, b"not a Fory RaftEntryV1");
+
+        let err = try_open(&root).expect_err("a corrupt log must not open");
+        assert!(
+            matches!(err, AsterStorageError::StoredCorruption { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    /// Each structural rule refuses the open on its own.
+    #[tokio::test]
+    async fn the_persisted_log_structure_is_validated_at_open() {
+        // A row filed under a key that disagrees with its decoded log index.
+        {
+            let root = scratch();
+            {
+                let mut storage = open(&root);
+                append(storage.log_mut(), vec![blank(1, 0)])
+                    .await
+                    .expect("seed");
+            }
+            let value = encode_entry(&blank(1, 7)).expect("encode");
+            write_log_row(&root, 0, &value);
+            let err = try_open(&root).expect_err("key/index disagreement");
+            assert!(err.to_string().contains("decodes to log index"), "{err}");
+        }
+
+        // A hole between retained rows.
+        {
+            let root = scratch();
+            {
+                let mut storage = open(&root);
+                append(storage.log_mut(), vec![blank(1, 0), blank(1, 1)])
+                    .await
+                    .expect("seed");
+            }
+            let value = encode_entry(&blank(1, 9)).expect("encode");
+            write_log_row(&root, 9, &value);
+            let err = try_open(&root).expect_err("hole between rows");
+            assert!(err.to_string().contains("jump from"), "{err}");
+        }
+
+        // A row surviving at or below the purge marker.
+        {
+            let root = scratch();
+            {
+                let mut storage = open(&root);
+                let store = storage.log_mut();
+                append(store, vec![blank(1, 0), blank(1, 1), blank(1, 2)])
+                    .await
+                    .expect("seed");
+                store.purge(log_id(1, 1)).await.expect("purge");
+            }
+            let value = encode_entry(&blank(1, 1)).expect("encode");
+            write_log_row(&root, 1, &value);
+            let err = try_open(&root).expect_err("row under the marker");
+            assert!(
+                err.to_string().contains("at or below the purge marker"),
+                "{err}"
+            );
+        }
+
+        // A gap between the marker and the first retained row.
+        {
+            let root = scratch();
+            {
+                let mut storage = open(&root);
+                let store = storage.log_mut();
+                append(store, vec![blank(1, 0), blank(1, 1), blank(1, 2)])
+                    .await
+                    .expect("seed");
+                store.purge(log_id(1, 0)).await.expect("purge");
+            }
+            delete_log_row(&root, 1);
+            let err = try_open(&root).expect_err("marker leaves a hole");
+            assert!(err.to_string().contains("leaves a hole"), "{err}");
+        }
+
+        // A corrupt marker, which is what used to be retryable.
+        {
+            let root = scratch();
+            drop(open(&root));
+            write_raft_meta(&root, KEY_LAST_PURGED, b"not a Fory LogIdV1");
+            let err = try_open(&root).expect_err("corrupt purge marker");
+            assert!(
+                matches!(
+                    err,
+                    AsterStorageError::StoredCorruption {
+                        what: "LogIdV1",
+                        ..
+                    }
+                ),
+                "got: {err:?}"
+            );
+        }
+    }
+
+    /// A well-formed store still opens, so the validation is not simply
+    /// refusing everything.
+    #[tokio::test]
+    async fn a_clean_persisted_log_still_opens() {
+        let root = scratch();
+        {
+            let mut storage = open(&root);
+            let store = storage.log_mut();
+            let entries: Vec<_> = (0..=5).map(|i| blank(1, i)).collect();
+            append(store, entries).await.expect("seed");
+            store.purge(log_id(1, 2)).await.expect("purge");
+            store.save_vote(&Vote::new(3, node(8))).await.expect("vote");
+            store
+                .save_committed(Some(log_id(1, 4)))
+                .await
+                .expect("committed");
+        }
+        try_open(&root).expect("a well-formed store opens");
+    }
+
+    // ── Fatal ordering ───────────────────────────────────────────────────────
+
+    /// The fatal latch is set before the failure is delivered.
+    ///
+    /// This is the race the classification move closes. When the caller
+    /// classified, the actor sent the failure and immediately picked up the
+    /// next command while the latch was still unset. There is no await between
+    /// receiving the error and reading the latch here, so a caller-side
+    /// classification cannot pass this.
+    #[tokio::test]
+    async fn the_fatal_latch_is_set_before_the_failure_is_delivered() {
+        let root = scratch();
+        let storage = open(&root);
+
+        let err = storage
+            .log()
+            .handle()
+            .inject_fatal()
+            .await
+            .expect_err("the injected failure is reported");
+        assert!(err.to_string().contains("unusable"), "{err}");
+        assert!(
+            storage.log().handle().is_fatal(),
+            "the latch must already be set by the time the caller sees the error"
+        );
+    }
+
+    /// After a fatal failure nothing further is acknowledged.
+    #[tokio::test]
+    async fn a_fatal_failure_stops_the_actor_before_serving_queued_work() {
+        let root = scratch();
+        let mut storage = open(&root);
+
+        let _ = storage.log().handle().inject_fatal().await;
+
+        let store = storage.log_mut();
+        assert!(
+            store.save_vote(&Vote::new(99, node(3))).await.is_err(),
+            "no write may be acknowledged once the store is fatal"
+        );
+        assert!(
+            append(store, vec![blank(1, 0)]).await.is_err(),
+            "including an append that would otherwise be perfectly legal"
+        );
+        assert!(
+            store.get_log_state().await.is_err(),
+            "and no read may answer from a store that cannot say what is durable"
+        );
+    }
+
     // ── Codec ────────────────────────────────────────────────────────────────
 
     /// Oversized stored values are refused before decode, not after.
@@ -1514,19 +2122,37 @@ mod tests {
         assert!(decode_log_id(&too_big).is_err());
     }
 
-    /// A corrupt stored value is a named codec failure, never a default.
+    /// A corrupt *stored* value is corruption, not a retryable codec error.
+    ///
+    /// The two used to share a variant, which made a corrupt purge marker
+    /// retryable: the store reported the failure, stayed healthy, and was
+    /// asked the same unanswerable question again.
     #[test]
-    fn a_corrupt_stored_value_is_a_named_codec_failure() {
-        let err = decode_entry(b"not a Fory RaftEntryV1").expect_err("corrupt");
+    fn a_corrupt_stored_value_is_reported_as_corruption() {
+        for err in [
+            decode_entry(b"not a Fory RaftEntryV1").expect_err("corrupt entry"),
+            decode_vote(b"not a Fory VoteV1").expect_err("corrupt vote"),
+            decode_log_id(b"not a Fory LogIdV1").expect_err("corrupt marker"),
+        ] {
+            assert!(
+                matches!(err, AsterStorageError::StoredCorruption { .. }),
+                "got: {err:?}"
+            );
+            assert!(
+                err.puts_durability_in_question(),
+                "stored corruption must be sticky: {err:?}"
+            );
+        }
+    }
+
+    /// An encode failure is a rejected input and stays retryable.
+    #[test]
+    fn an_encode_failure_is_retryable_but_stored_corruption_is_not() {
+        assert!(!AsterStorageError::codec(Db::Raft, "VoteV1", "oversized")
+            .puts_durability_in_question());
         assert!(
-            matches!(
-                err,
-                AsterStorageError::Codec {
-                    what: "RaftEntryV1",
-                    ..
-                }
-            ),
-            "got: {err:?}"
+            AsterStorageError::corrupt(Db::Raft, "VoteV1", "undecodable")
+                .puts_durability_in_question()
         );
     }
 

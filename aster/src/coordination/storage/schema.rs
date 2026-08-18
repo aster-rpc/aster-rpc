@@ -328,6 +328,29 @@ fn ensure_directory(path: &Path, policy: &OpenPolicy) -> StorageResult<()> {
     restrict_permissions(path, DIR_MODE)
 }
 
+// ── Write transactions ───────────────────────────────────────────────────────
+
+/// The one place a write transaction is created in this subsystem.
+///
+/// Centralised so the §11.1 durability rule is a property of the code rather
+/// than of reviewer attention. Selecting the deferred-fsync level is
+/// unobservable in any behavioural test — every read in this process and a
+/// clean reopen both still see the data — so the only way to hold the rule is
+/// to leave exactly one place where it can be got wrong, and assert that in
+/// [`durability_guard`](super::durability_guard).
+///
+/// An earlier guard counted occurrences per file, which meant removing the
+/// setting from one of two write paths in the same file still passed.
+pub(crate) fn durable_write(database: &Database, db: Db) -> StorageResult<redb::WriteTransaction> {
+    let mut write = database
+        .begin_write()
+        .map_err(|source| StorageError::redb(db, source))?;
+    write
+        .set_durability(redb::Durability::Immediate)
+        .map_err(|source| StorageError::redb(db, source))?;
+    Ok(write)
+}
+
 // ── Integrity ────────────────────────────────────────────────────────────────
 
 /// What `check_integrity` reported, interpreted per §11.1.
@@ -445,6 +468,11 @@ pub(crate) struct OpenedParts {
     pub(crate) raft: Database,
     pub(crate) state: Database,
     pub(crate) outcome: OpenOutcome,
+    /// Carried, not discarded. §11.1 requires the unclean-shutdown recovery
+    /// path to *emit* an event, and a value dropped here cannot be emitted by
+    /// anyone: Slice 3 owns the health surface but can only report what
+    /// storage hands it.
+    pub(crate) integrity: (IntegrityOutcome, IntegrityOutcome),
 }
 
 /// A validated, locked, open storage directory.
@@ -510,6 +538,7 @@ impl OpenedStorage {
             raft: self.raft,
             state: self.state,
             outcome: self.outcome,
+            integrity: (self.raft_integrity, self.state_integrity),
         }
     }
 
@@ -1051,12 +1080,7 @@ where
 // ── Identity binding ─────────────────────────────────────────────────────────
 
 fn write_raft_identity(database: &mut Database, identity: &StorageIdentity) -> StorageResult<()> {
-    let mut write = database
-        .begin_write()
-        .map_err(|source| StorageError::redb(Db::Raft, source))?;
-    write
-        .set_durability(redb::Durability::Immediate)
-        .map_err(|source| StorageError::redb(Db::Raft, source))?;
+    let write = durable_write(database, Db::Raft)?;
     {
         let mut meta = write
             .open_table(RAFT_META)
@@ -1099,12 +1123,7 @@ fn write_state_identity(database: &mut Database, identity: &StorageIdentity) -> 
         .serialize(&meta_row)
         .map_err(|source| StorageError::codec(Db::State, "CoordinationMetaV1", source))?;
 
-    let mut write = database
-        .begin_write()
-        .map_err(|source| StorageError::redb(Db::State, source))?;
-    write
-        .set_durability(redb::Durability::Immediate)
-        .map_err(|source| StorageError::redb(Db::State, source))?;
+    let write = durable_write(database, Db::State)?;
     {
         let mut meta = write
             .open_table(STATE_META)

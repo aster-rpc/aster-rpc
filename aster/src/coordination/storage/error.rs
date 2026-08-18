@@ -261,7 +261,30 @@ pub(crate) enum StorageError {
     )]
     Fatal,
 
-    /// A stored value did not decode, or decoded to something invalid.
+    /// A value already on disk did not decode, or decoded to something the
+    /// log's own invariants reject.
+    ///
+    /// Deliberately not the same variant as an encode failure. The two are
+    /// both "the codec said no", but one is a bad request that wrote nothing
+    /// and the other is durable state this build can no longer read — and only
+    /// the second means the store has stopped knowing what it holds. Sharing a
+    /// variant made a corrupt purge marker retryable.
+    #[error("coordination storage {db}: stored {what} is unusable: {detail}")]
+    StoredCorruption {
+        db: Db,
+        what: &'static str,
+        detail: String,
+    },
+
+    /// The storage actor thread could not be started.
+    #[error("could not start the coordination storage actor for {db}: {source}")]
+    ActorSpawn {
+        db: Db,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A value did not encode, or a caller-supplied value was invalid.
     #[error("coordination storage {db}: could not decode {what}: {detail}")]
     Codec {
         db: Db,
@@ -289,6 +312,7 @@ impl StorageError {
     }
 
     /// Build a [`StorageError::Codec`] from anything displayable.
+    /// A failure encoding a value the caller supplied. Retryable.
     pub(crate) fn codec(db: Db, what: &'static str, detail: impl std::fmt::Display) -> Self {
         StorageError::Codec {
             db,
@@ -297,22 +321,38 @@ impl StorageError {
         }
     }
 
+    /// A failure reading a value already on disk. Fatal.
+    pub(crate) fn corrupt(db: Db, what: &'static str, detail: impl std::fmt::Display) -> Self {
+        StorageError::StoredCorruption {
+            db,
+            what,
+            detail: detail.to_string(),
+        }
+    }
+
     /// Whether this failure leaves the store unable to say what is durable.
     ///
-    /// The distinction decides whether a write failure is *sticky*. A refused
-    /// append and a failed commit are both errors, but only one of them puts
-    /// durability in question: a gap is rejected before any transaction opens,
-    /// so the store is untouched and the caller may legitimately retry with a
-    /// correct batch. Treating a rejection as fatal would make the first legal
-    /// refusal permanently disable a healthy voter.
+    /// The distinction decides whether a failure is *sticky*, and it is a
+    /// narrow allowlist rather than a denylist on purpose: a variant added
+    /// later is fatal until someone proves it is not, which is the safe
+    /// direction to be wrong in.
+    ///
+    /// Only two things are retryable. A [`LogGap`](StorageError::LogGap) is
+    /// refused before any transaction opens, and
+    /// [`Codec`](StorageError::Codec) is raised only while *encoding* a value
+    /// the caller supplied — also before the transaction. Both leave the store
+    /// untouched, and OpenRaft may legitimately follow either with a correct
+    /// request. Making the first legal refusal permanently disable a healthy
+    /// voter would be far worse than the gap it refused.
+    ///
+    /// Everything else is sticky, including
+    /// [`StoredCorruption`](StorageError::StoredCorruption): a stored value
+    /// that will not decode is not a bad request to retry, it is durable state
+    /// this build can no longer interpret.
     pub(crate) fn puts_durability_in_question(&self) -> bool {
         !matches!(
             self,
-            // Refused before a transaction opens.
-            StorageError::LogGap { .. }
-                // Encoding is done before the transaction too, so a value this
-                // build cannot encode has written nothing.
-                | StorageError::Codec { .. }
+            StorageError::LogGap { .. } | StorageError::Codec { .. }
         )
     }
 

@@ -59,7 +59,7 @@ pub(crate) use snapshot::CoordinationSnapshotFile;
 use error::StorageResult;
 use identity::{OpenPolicy, StorageIdentity};
 use log::{ActorShutdown, CoordinationLogStore};
-use schema::{DirectoryLock, OpenOutcome, StorageLayout};
+use schema::{DirectoryLock, IntegrityOutcome, OpenOutcome, StorageLayout};
 
 /// A validated, locked storage directory with its log actor running.
 ///
@@ -81,6 +81,7 @@ pub(crate) struct VoterStorage {
     log: CoordinationLogStore,
     state: redb::Database,
     outcome: OpenOutcome,
+    integrity: (IntegrityOutcome, IntegrityOutcome),
     /// Field order below is the shutdown order, and it is load-bearing.
     ///
     /// Rust drops fields in declaration order, so the actor is stopped and
@@ -101,13 +102,22 @@ impl VoterStorage {
         policy: OpenPolicy,
     ) -> StorageResult<Self> {
         let parts = schema::open(layout, identity, policy)?.into_parts();
-        let (log, shutdown) = CoordinationLogStore::new(parts.raft);
+
+        // Before any actor exists. Schema and identity validation prove the
+        // file is ours; they prove nothing about whether its contents decode.
+        // A store published first and validated later has already told the
+        // group it is up by the time the first replication read finds the
+        // corruption.
+        log::validate_persisted_log(&parts.raft)?;
+
+        let (log, shutdown) = CoordinationLogStore::new(parts.raft)?;
         Ok(Self {
             layout: parts.layout,
             identity: parts.identity,
             log,
             state: parts.state,
             outcome: parts.outcome,
+            integrity: parts.integrity,
             _shutdown: shutdown,
             _lock: parts.lock,
         })
@@ -135,6 +145,16 @@ impl VoterStorage {
 
     pub(crate) fn outcome(&self) -> OpenOutcome {
         self.outcome
+    }
+
+    /// How each database's integrity check resolved, as `(raft, state)`.
+    ///
+    /// Slice 3 emits the §11.1 recovery event from this. Dropping it here
+    /// would make that event unreportable: by the time anything else can look,
+    /// the databases have been reopened clean and the evidence that a crash
+    /// happened is gone.
+    pub(crate) fn integrity(&self) -> (IntegrityOutcome, IntegrityOutcome) {
+        self.integrity
     }
 }
 
@@ -186,18 +206,64 @@ mod durability_guard {
     ///
     /// The pair matters: a file with neither is not "safe by omission", it is
     /// a file relying on whatever redb defaults to today.
+    /// Production code creates a write transaction in exactly one place.
+    ///
+    /// The previous version of this check was per *file*, and a mutation
+    /// proved it hollow: removing the durability setting from one of two write
+    /// paths in `schema.rs` still passed, because the other occurrence kept
+    /// the file matching. Counting occurrences cannot express "every
+    /// transaction"; having one construction site can.
     #[test]
-    fn every_write_transaction_selects_immediate_durability() {
+    fn production_code_creates_write_transactions_in_exactly_one_place() {
+        let opener = "begin_write()";
+        let mut sites = Vec::new();
         for (name, source) in SOURCES {
-            let opens_writes = source.contains("begin_write()");
-            if !opens_writes {
-                continue;
+            for (n, line) in production_lines(source) {
+                if line.contains(opener) {
+                    sites.push(format!("{name}:{}", n + 1));
+                }
             }
-            assert!(
-                source.contains("Durability::Immediate"),
-                "{name} opens write transactions but never selects \
-                 Durability::Immediate"
-            );
         }
+        assert_eq!(
+            sites.len(),
+            1,
+            "write transactions must be created only by schema::durable_write, \
+             so the durability setting has one place to be got wrong; found: {sites:?}"
+        );
+        assert!(
+            sites[0].starts_with("schema.rs"),
+            "the single construction site must be the helper: {sites:?}"
+        );
+    }
+
+    /// And that one site selects immediate durability.
+    #[test]
+    fn the_single_write_site_selects_immediate_durability() {
+        let mut settings = 0;
+        for (_, source) in SOURCES {
+            for (_, line) in production_lines(source) {
+                if line.contains("set_durability") {
+                    settings += 1;
+                    assert!(
+                        line.contains("Durability::Immediate"),
+                        "the only durability selection must be Immediate: {line}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            settings, 1,
+            "exactly one durability selection in production code"
+        );
+    }
+
+    /// Source lines outside the trailing `#[cfg(test)]` module.
+    ///
+    /// Tests legitimately open their own write transactions to build corrupt
+    /// fixtures the production writer cannot produce, so counting them would
+    /// make the guards above unsatisfiable.
+    fn production_lines(source: &str) -> impl Iterator<Item = (usize, &str)> {
+        let end = source.find("\n#[cfg(test)]\n").unwrap_or(source.len());
+        source[..end].lines().enumerate()
     }
 }
