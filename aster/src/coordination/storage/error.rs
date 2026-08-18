@@ -100,10 +100,15 @@ pub(crate) enum StorageError {
     SymlinkedPath { path: PathBuf },
 
     /// An existing path is writable beyond the owner in a production open.
+    ///
+    /// Refused rather than repaired. Tightening the mode here would fix the
+    /// symptom, let startup continue, and erase the evidence that something
+    /// outside this voter could write the file — which for `LOCK` is the file
+    /// its mutual exclusion depends on.
     #[error(
         "coordination storage path {path} has mode {mode:04o}, which grants \
-         write access beyond its owner; production requires 0700 directories \
-         and 0600 files"
+         write access beyond its owner; production refuses it rather than \
+         changing it. New directories are created 0700 and new files 0600"
     )]
     BroadPermissions { path: PathBuf, mode: u32 },
 

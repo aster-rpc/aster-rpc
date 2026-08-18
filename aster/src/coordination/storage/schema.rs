@@ -9,16 +9,15 @@
 //! outright while checking and validating it, and only then hands it on. A
 //! handle published before the check makes the check impossible to run at all.
 //!
-//! ## One correction to the plan, recorded rather than implemented silently
+//! ## Why `codec_version` sits outside the Fory row
 //!
-//! §11.2's meta allowlist names schema/group/genesis identity, the authority
-//! binding, the local NodeId, vote, committed, and last-purged — but no codec
-//! version, while §19 requires a *wrong codec* to be refused by name. Without
-//! a persisted value there is nothing to compare, and the failure would
-//! surface as a decode error partway through a load instead. Both meta tables
-//! are `&str -> &[u8]`, so this adds one allowlisted key,
-//! [`KEY_CODEC_VERSION`], to each. The value is a compiled constant, never a
-//! caller's choice.
+//! Both meta tables carry [`KEY_CODEC_VERSION`] as a fixed-width scalar
+//! alongside the encoded values, per §11.2 and §11.3. In `state.redb` that
+//! means it sits beside the Fory `"meta"` row rather than inside it, and it is
+//! checked first: a build that cannot read the row's encoding must still be
+//! able to refuse it *by name*, instead of reporting a decode failure on the
+//! very value whose codec is in question. The value is a compiled constant,
+//! never a caller's choice.
 
 // Checkpoint A builds this; Checkpoints B and C are what call it, so nothing
 // in a non-test build reaches it yet. Scoped to this module deliberately --
@@ -722,6 +721,11 @@ fn classify_state(database: &Database, presence: Presence) -> StorageResult<Side
     let bound = meta_row.is_some();
     if bound {
         require_state_tables(&read)?;
+        // Before decoding anything. `codec_version` sits outside the Fory row
+        // precisely so an incompatible codec is refused by name rather than
+        // surfacing as a decode failure on the value whose codec is the thing
+        // in question -- which would send an operator looking for corruption.
+        verify_state_codec_version(&read)?;
     }
 
     let mut durable = state_data_tables_have_rows(&read)?;
@@ -1092,12 +1096,13 @@ fn verify_raft_identity(database: &Database, identity: &StorageIdentity) -> Stor
     Ok(())
 }
 
-fn verify_state_identity(database: &Database, identity: &StorageIdentity) -> StorageResult<()> {
-    let read = database
-        .begin_read()
-        .map_err(|source| StorageError::redb(Db::State, source))?;
-
-    let codec_bytes = meta_bytes(&read, Db::State, STATE_META, KEY_CODEC_VERSION)?.ok_or(
+/// Check `state.redb`'s stored codec version against this build's.
+///
+/// Called before any Fory value from this database is decoded. The key is a
+/// fixed-width scalar outside the Fory row for exactly that reason: a build
+/// that cannot read the row's encoding must still be able to say so by name.
+fn verify_state_codec_version(read: &redb::ReadTransaction) -> StorageResult<()> {
+    let codec_bytes = meta_bytes(read, Db::State, STATE_META, KEY_CODEC_VERSION)?.ok_or(
         StorageError::MissingMetaKey {
             db: Db::State,
             key: KEY_CODEC_VERSION,
@@ -1111,6 +1116,15 @@ fn verify_state_identity(database: &Database, identity: &StorageIdentity) -> Sto
             expected: STORAGE_CODEC_VERSION,
         });
     }
+    Ok(())
+}
+
+fn verify_state_identity(database: &Database, identity: &StorageIdentity) -> StorageResult<()> {
+    let read = database
+        .begin_read()
+        .map_err(|source| StorageError::redb(Db::State, source))?;
+
+    verify_state_codec_version(&read)?;
 
     let bytes = meta_bytes(&read, Db::State, STATE_META, KEY_META)?.ok_or(
         StorageError::MissingMetaKey {
@@ -1727,6 +1741,80 @@ mod tests {
 
         let opened = open_at(&root, identity()).expect("a log ahead of state is normal recovery");
         assert_eq!(opened.outcome(), OpenOutcome::Initialized);
+    }
+
+    /// A state machine ahead of the log side opens normally when both are
+    /// bound.
+    ///
+    /// The inverse of the case above, and equally legitimate: a crash during
+    /// snapshot install can leave `last_applied` ahead of a log that has been
+    /// truncated or purged. OpenRaft's `StorageHelper::get_initial_state`
+    /// closes that hole by purging the log through `last_applied` before
+    /// serving. Refusing it here would make a successfully installed snapshot
+    /// unstartable.
+    #[test]
+    fn an_applied_state_ahead_of_a_pristine_log_opens_normally() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        advance_state_last_applied(&root);
+
+        let opened =
+            open_at(&root, identity()).expect("a snapshot-install crash state must still start");
+        assert_eq!(opened.outcome(), OpenOutcome::Initialized);
+    }
+
+    /// That reconciliation does **not** extend to an absent log side.
+    ///
+    /// Stated as its own case because the two look similar and the difference
+    /// decides whether acknowledged state survives: OpenRaft can purge a log
+    /// it still has, and can do nothing about one that is gone.
+    #[test]
+    fn state_ahead_does_not_license_recreating_an_absent_log() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        advance_state_last_applied(&root);
+        std::fs::remove_file(root.join("raft.redb")).expect("remove raft");
+
+        assert!(
+            matches!(
+                open_at(&root, identity()),
+                Err(StorageError::PartialInitialization { .. })
+            ),
+            "durable applied state beside a missing log must fail closed"
+        );
+    }
+
+    /// An incompatible codec is refused before the Fory row it governs is
+    /// decoded.
+    ///
+    /// The row is left deliberately unreadable as well. If classification
+    /// decoded first, this would surface as a corruption-looking decode
+    /// failure on the value whose codec is exactly what is in question.
+    #[test]
+    fn a_wrong_state_codec_is_refused_before_the_meta_row_is_decoded() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        {
+            let db = Database::create(root.join("state.redb")).expect("open state");
+            let write = db.begin_write().expect("write");
+            {
+                let mut meta = write.open_table(STATE_META).expect("open meta");
+                meta.insert(KEY_CODEC_VERSION, 42u32.to_be_bytes().as_slice())
+                    .expect("insert codec");
+                meta.insert(KEY_META, b"not a valid Fory CoordinationMetaV1".as_slice())
+                    .expect("corrupt meta");
+            }
+            write.commit().expect("commit");
+        }
+
+        match open_at(&root, identity()) {
+            Err(StorageError::CodecVersion {
+                found, expected, ..
+            }) => {
+                assert_eq!((found, expected), (42, STORAGE_CODEC_VERSION));
+            }
+            other => panic!("expected a codec-version failure, got: {other:?}"),
+        }
     }
 
     /// The recovery path verifies the surviving binding *before* writing the
