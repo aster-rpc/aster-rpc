@@ -489,9 +489,11 @@ impl LogActor {
             // completely fresh log has no frontier and may start anywhere,
             // which OpenRaft's own suite relies on
             // (`get_initial_state_re_apply_committed` appends from index 2 to
-            // an empty store). `checked_add` rather than `saturating_add`: at
-            // `u64::MAX` there is no next index at all, and saturating would
-            // silently report the last index as its own successor.
+            // an empty store). `checked_add` because at `u64::MAX` there is no
+            // next index at all -- though note the ceiling case is actually
+            // caught by the hole check below, so swapping this for
+            // `saturating_add` is not observable and no test here would fail.
+            // It stays as the honest expression of the bound.
             let frontier = match self.last_entry_index(&read)? {
                 Some(retained) => retained.checked_add(1),
                 None => self
@@ -1442,13 +1444,26 @@ mod tests {
         );
     }
 
-    /// The append callback fires only after the durable commit.
+    /// Appended entries are readable and durable once `append` returns.
     ///
-    /// `blocking_append` returns once the callback has completed, so a store
-    /// that fired it early would let this observe entries that are not yet
-    /// readable. Checked by reading immediately after the call returns.
+    /// ## What this does *not* prove, and why no test here can
+    ///
+    /// It does not prove the callback fires after the commit rather than
+    /// before. Observing that needs a `LogFlushed` whose completion can be
+    /// watched independently, and `LogFlushed::new` is `pub(crate)` to
+    /// OpenRaft — the only way in is `blocking_append`, which awaits the
+    /// callback and then returns, so both orderings look identical from out
+    /// here.
+    ///
+    /// The ordering is instead enforced by construction: `callback` is
+    /// invoked on the line after `commit()` returns `Ok`, with no branch
+    /// between them. A mutation moving it earlier is not detectable by this
+    /// suite, and saying so is better than a test whose name claims the
+    /// coverage. Checkpoint E's crash matrix is where the property gets real
+    /// evidence, since a callback ahead of the commit is exactly what a
+    /// process death between them exposes.
     #[tokio::test]
-    async fn the_flush_callback_follows_the_durable_commit() {
+    async fn appended_entries_are_readable_when_append_returns() {
         let root = scratch();
         let mut storage = open(&root);
         let store = storage.log_mut();
@@ -1458,31 +1473,30 @@ mod tests {
             .expect("append");
 
         let read = store.try_get_log_entries(0..).await.expect("read");
-        assert_eq!(
-            read.len(),
-            2,
-            "entries must be readable by the time the callback has fired"
-        );
+        assert_eq!(read.len(), 2);
     }
 
-    /// A refused append reports through the callback as well as the return
-    /// value, so OpenRaft is never left waiting on an IO nobody completes.
+    /// A refused append returns promptly rather than hanging.
+    ///
+    /// The implementation also completes the callback on the refusal path.
+    /// That is deliberate but *unverified here*: `blocking_append` propagates
+    /// the `Err` from `append` with `?` and never awaits the callback, so
+    /// removing the completion changes nothing this test can see. It is kept
+    /// because it costs nothing and is correct if OpenRaft ever does await.
     #[tokio::test]
-    async fn a_refused_append_still_completes_its_callback() {
+    async fn a_refused_append_returns_without_hanging() {
         let root = scratch();
         let mut storage = open(&root);
         let store = storage.log_mut();
 
         append(store, vec![blank(1, 0)]).await.expect("seed");
 
-        // `blocking_append` awaits the callback; if a refusal skipped it, this
-        // would hang rather than return an error.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             append(store, vec![blank(1, 7)]),
         )
         .await
-        .expect("the callback must be completed even when the append is refused");
+        .expect("a refused append must not hang");
         assert!(result.is_err());
     }
 
