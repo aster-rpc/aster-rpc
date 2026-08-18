@@ -691,7 +691,10 @@ fn classify_raft(database: &Database, presence: Presence) -> StorageResult<SideS
     Ok(match (bound, durable) {
         (true, true) => SideState::BoundDurable,
         (true, false) => SideState::BoundPristine,
-        (false, false) => SideState::Unbound,
+        (false, false) => {
+            require_no_metadata(&read, Db::Raft, RAFT_META)?;
+            SideState::Unbound
+        }
         // Durable Raft state with no binding to check it against. Nothing can
         // prove which group that vote or log belongs to, so it is neither
         // recoverable nor safe to adopt.
@@ -704,6 +707,33 @@ fn classify_raft(database: &Database, presence: Presence) -> StorageResult<SideS
             })
         }
     })
+}
+
+/// An unbound side must hold no metadata at all before it is treated as
+/// pristine and rebound.
+///
+/// Checking key *names* is not enough. A database holding only a
+/// `codec_version` — wrong, truncated, or simply unexplained — passes the
+/// allowlist, classifies as unbound, and is then overwritten by the recreation
+/// path, which is the opposite of failing closed. Since first-open metadata is
+/// written in one immediate-durability transaction, any metadata without the
+/// binding means this file did not come from a crash of ours.
+fn require_no_metadata(
+    read: &redb::ReadTransaction,
+    db: Db,
+    definition: TableDefinition<&'static str, &'static [u8]>,
+) -> StorageResult<()> {
+    let rows = meta_row_count(read, db, definition)?;
+    if rows > 0 {
+        return Err(StorageError::PartialInitialization {
+            detail: format!(
+                "{db} has no identity binding but holds {rows} metadata row(s); \
+                 first-open metadata commits atomically, so this did not come \
+                 from an interrupted first open"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Validate `state.redb`'s schema and classify it.
@@ -741,7 +771,10 @@ fn classify_state(database: &Database, presence: Presence) -> StorageResult<Side
     Ok(match (bound, durable) {
         (true, true) => SideState::BoundDurable,
         (true, false) => SideState::BoundPristine,
-        (false, false) => SideState::Unbound,
+        (false, false) => {
+            require_no_metadata(&read, Db::State, STATE_META)?;
+            SideState::Unbound
+        }
         (false, true) => {
             return Err(StorageError::PartialInitialization {
                 detail: format!("{} carries rows but no replicated meta row", Db::State),
@@ -840,6 +873,40 @@ where
     }
 }
 
+/// Open a metadata table for reading, or report why it could not be opened.
+///
+/// `Ok(None)` means the table is absent, which is legitimate for a database
+/// nothing has written yet. A same-named table under different key/value types
+/// is *not* absence, and is reported as [`StorageError::TableTypeMismatch`]
+/// rather than a generic redb error — the distinction is what tells an
+/// operator "this file is not ours" apart from "this file is damaged".
+fn open_meta_table<'a>(
+    read: &'a redb::ReadTransaction,
+    db: Db,
+    definition: TableDefinition<&'static str, &'static [u8]>,
+) -> StorageResult<Option<redb::ReadOnlyTable<&'static str, &'static [u8]>>>
+where
+    'a: 'a,
+{
+    match read.open_table(definition) {
+        Ok(table) => Ok(Some(table)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(redb::TableError::TableTypeMismatch { table, key, value }) => {
+            Err(StorageError::TableTypeMismatch {
+                db,
+                table,
+                detail: format!("found key {key:?}, value {value:?}"),
+            })
+        }
+        Err(redb::TableError::TableIsMultimap(table)) => Err(StorageError::TableTypeMismatch {
+            db,
+            table,
+            detail: "found a multimap table where schema v1 declares a plain table".into(),
+        }),
+        Err(source) => Err(StorageError::redb(db, source)),
+    }
+}
+
 /// Every metadata key present must be one schema v1 defines.
 fn check_meta_keys(
     read: &redb::ReadTransaction,
@@ -847,10 +914,8 @@ fn check_meta_keys(
     definition: TableDefinition<&'static str, &'static [u8]>,
     allowed: &[&str],
 ) -> StorageResult<()> {
-    let table = match read.open_table(definition) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-        Err(source) => return Err(StorageError::redb(db, source)),
+    let Some(table) = open_meta_table(read, db, definition)? else {
+        return Ok(());
     };
     let iter = table
         .iter()
@@ -865,16 +930,31 @@ fn check_meta_keys(
     Ok(())
 }
 
+/// How many metadata rows a database holds.
+///
+/// Used to prove an unbound side is genuinely pristine. A first open writes
+/// every metadata key in one immediate-durability transaction, so redb commits
+/// all of them or none: metadata present *without* the identity binding is not
+/// a crash state this code can produce, it is a foreign or damaged file.
+fn meta_row_count(
+    read: &redb::ReadTransaction,
+    db: Db,
+    definition: TableDefinition<&'static str, &'static [u8]>,
+) -> StorageResult<u64> {
+    let Some(table) = open_meta_table(read, db, definition)? else {
+        return Ok(0);
+    };
+    table.len().map_err(|source| StorageError::redb(db, source))
+}
+
 fn meta_bytes(
     read: &redb::ReadTransaction,
     db: Db,
     definition: TableDefinition<&'static str, &'static [u8]>,
     key: &str,
 ) -> StorageResult<Option<Vec<u8>>> {
-    let table = match read.open_table(definition) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(source) => return Err(StorageError::redb(db, source)),
+    let Some(table) = open_meta_table(read, db, definition)? else {
+        return Ok(None);
     };
     let value = table
         .get(key)
@@ -1728,18 +1808,36 @@ mod tests {
         }
     }
 
-    /// Both sides durable is the ordinary case, not partial initialization.
+    /// A durable log beside a pristine state machine opens normally.
     ///
-    /// A `raft.redb` ahead of `state.redb` is exactly what a crash after a
+    /// This is `raft.redb`-ahead-of-`state.redb`: exactly what a crash after
     /// commit but before apply looks like, and OpenRaft replays from the
     /// durable `last_applied` marker.
     #[test]
-    fn durable_state_on_both_sides_opens_normally() {
+    fn a_durable_log_ahead_of_a_pristine_state_opens_normally() {
         let root = scratch();
         drop(open_at(&root, identity()).expect("bind"));
         overwrite_raft_meta(&root, KEY_VOTE, b"an acknowledged vote");
 
         let opened = open_at(&root, identity()).expect("a log ahead of state is normal recovery");
+        assert_eq!(opened.outcome(), OpenOutcome::Initialized);
+    }
+
+    /// Both sides durable is the steady state of a running voter, and the
+    /// matrix case the two "ahead" tests do not cover between them.
+    ///
+    /// Each of those leaves the other side pristine, so
+    /// `(BoundDurable, BoundDurable)` was reachable only in production. A
+    /// classifier that refused it would pass every other test here and refuse
+    /// to start any voter that had ever applied an entry.
+    #[test]
+    fn durable_state_on_both_sides_opens_normally() {
+        let root = scratch();
+        drop(open_at(&root, identity()).expect("bind"));
+        overwrite_raft_meta(&root, KEY_VOTE, b"an acknowledged vote");
+        advance_state_last_applied(&root);
+
+        let opened = open_at(&root, identity()).expect("an ordinary running voter must restart");
         assert_eq!(opened.outcome(), OpenOutcome::Initialized);
     }
 
@@ -1926,6 +2024,72 @@ mod tests {
         match open_at(&root, identity()) {
             Err(StorageError::UnknownMetaKey { key, .. }) => assert_eq!(key, "smuggled"),
             other => panic!("expected an unknown-meta-key failure, got: {other:?}"),
+        }
+    }
+
+    /// An unbound side holding *allowlisted* metadata is refused too.
+    ///
+    /// The name check passes here, which is the whole problem: a lone
+    /// `codec_version` — wrong, truncated, or simply unexplained — used to
+    /// classify as unbound and then be overwritten by the recreation path,
+    /// which is the opposite of failing closed. First-open metadata commits
+    /// atomically, so metadata without a binding did not come from a crash of
+    /// ours.
+    #[test]
+    fn an_unbound_database_holding_known_metadata_is_refused() {
+        for value in [
+            77u32.to_be_bytes().to_vec(), // a wrong codec version
+            vec![0u8, 1],                 // and a truncated one
+        ] {
+            let root = scratch();
+            {
+                let db = Database::create(root.join("raft.redb")).expect("create raft");
+                let write = db.begin_write().expect("write");
+                {
+                    let mut meta = write.open_table(RAFT_META).expect("open meta");
+                    meta.insert(KEY_CODEC_VERSION, value.as_slice())
+                        .expect("insert");
+                }
+                write.commit().expect("commit");
+            }
+
+            match open_at(&root, identity()) {
+                Err(StorageError::PartialInitialization { detail }) => {
+                    assert!(detail.contains("metadata row"), "got: {detail}");
+                }
+                other => panic!("expected partial initialization, got: {other:?}"),
+            }
+
+            // And the refusal left the value alone rather than rebinding over
+            // it, which is what makes the failure diagnosable.
+            let db = Database::create(root.join("raft.redb")).expect("reopen raft");
+            let read = db.begin_read().expect("read");
+            let stored = meta_bytes(&read, Db::Raft, RAFT_META, KEY_CODEC_VERSION)
+                .expect("meta")
+                .expect("the value survives the refusal");
+            assert_eq!(stored, value, "a refused open must not overwrite metadata");
+        }
+    }
+
+    /// A wrong-typed metadata table is a schema error, not a generic redb
+    /// failure.
+    ///
+    /// "This file is not ours" and "this file is damaged" send an operator to
+    /// different procedures, so they must not arrive as the same error.
+    #[test]
+    fn a_wrong_typed_meta_table_reports_a_type_mismatch() {
+        let root = scratch();
+        {
+            let db = Database::create(root.join("raft.redb")).expect("create raft");
+            let write = db.begin_write().expect("write");
+            let impostor: TableDefinition<u64, u64> = TableDefinition::new("raft_meta");
+            write.open_table(impostor).expect("create impostor");
+            write.commit().expect("commit");
+        }
+
+        match open_at(&root, identity()) {
+            Err(StorageError::TableTypeMismatch { table, .. }) => assert_eq!(table, "raft_meta"),
+            other => panic!("expected a table-type mismatch, got: {other:?}"),
         }
     }
 
