@@ -819,6 +819,23 @@ pub struct SystemReplyV1 {
     pub membership_log_id: Option<LogIdV1>,
 }
 
+/// OpenRaft's native Blank and Membership entries: one empty response per
+/// applied entry.
+///
+/// Not a `CommandV1` variant, and deliberately empty. OpenRaft requires one
+/// `R` per entry it applies, including entries the application never
+/// proposed -- a blank written on leader election and a membership change --
+/// so `R` needs an inhabitant for them. Giving them a `Client` or `System`
+/// reply instead would attach a disposition, an outcome and a reason code to
+/// an entry that has none of those, and a projection would then have to
+/// invent what they meant.
+///
+/// It carries no fields today and is a struct rather than a unit so it can
+/// gain one without changing the union's shape (§5.2.1).
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/NonCommandReply")]
+pub struct NonCommandReplyV1 {}
+
 /// `RetireClient`. Has a caller but no sequence, so no disposition.
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/RetirementReply")]
@@ -829,9 +846,11 @@ pub struct RetirementReplyV1 {
     pub reason_code: i32,
 }
 
-/// OpenRaft's `R`. One type serves all four `CommandV1` variants, and
-/// `disposition_code` is meaningful for exactly one of them -- hence a union
-/// rather than a struct carrying fields that do not apply.
+/// OpenRaft's `R`. One type for every applied log entry, including OpenRaft's
+/// own Blank and Membership payloads. `CommandV1` has four variants and only
+/// one of them has a client sequence, so `disposition_code` is meaningless for
+/// `Expire`, `MembershipProgress`, `RetireClient`, Blank and Membership --
+/// hence a union rather than a struct carrying fields that do not apply.
 // MEASURED: 264 bytes (Client) against 56 (System) and 8 (Retirement). Boxing
 // the large variant is NOT available -- Aster's `WireField` is not implemented
 // for `Box<T>`, so a declared field cannot be boxed without leaving the wire
@@ -849,6 +868,10 @@ pub enum CommandReplyV1 {
     System(SystemReplyV1),
     #[fory(id = 3)]
     Retirement(RetirementReplyV1),
+    /// OpenRaft-native Blank and Membership entries: one empty response per
+    /// applied entry, with no application-command or public-RPC semantics.
+    #[fory(id = 4)]
+    NonCommand(NonCommandReplyV1),
     #[fory(unknown)]
     Unknown(fory_core::UnknownCase),
 }
@@ -948,6 +971,11 @@ impl CommandReplyV1 {
             CommandReplyV1::Client(_) => 1,
             CommandReplyV1::System(_) => 2,
             CommandReplyV1::Retirement(_) => 3,
+            // No `CommandV1` maps to this: it answers OpenRaft's native
+            // entries, which are not commands. `expected_reply_variant` above
+            // deliberately never returns 4, so the one-command-one-reply
+            // check cannot be satisfied by a `NonCommand`.
+            CommandReplyV1::NonCommand(_) => 4,
             CommandReplyV1::Unknown(_) => return None,
         })
     }
@@ -1107,6 +1135,50 @@ mod command_tests {
                 c.expected_reply_variant(),
                 r.variant_id(),
                 "command/reply variant pairing broken for {c:?}"
+            );
+        }
+    }
+
+    /// The non-command reply round-trips through the declared root.
+    ///
+    /// An empty struct is exactly where a codec is most likely to be wrong in
+    /// a way nothing notices: there are no fields whose values could disagree,
+    /// so the only thing that can break is the variant tag itself -- and a
+    /// reply decoded as the wrong variant would answer a Blank entry with a
+    /// client disposition.
+    #[test]
+    fn the_non_command_reply_round_trips_as_its_own_variant() {
+        let fory = payload_fory::<CommandReplyV1>();
+        let reply = CommandReplyV1::NonCommand(NonCommandReplyV1 {});
+
+        let bytes = fory.serialize(&reply).expect("encode");
+        let back: CommandReplyV1 = fory.deserialize(&bytes).expect("decode");
+        assert_eq!(back, reply);
+        assert!(
+            matches!(back, CommandReplyV1::NonCommand(_)),
+            "it must not decode as another variant: {back:?}"
+        );
+        assert_eq!(back.variant_id(), Some(4));
+    }
+
+    /// No command maps to the non-command reply.
+    ///
+    /// The pairing check would otherwise be satisfiable by answering a real
+    /// command with an empty reply, which is precisely the mistake the variant
+    /// exists to make impossible: `NonCommand` is for entries the application
+    /// never proposed.
+    #[test]
+    fn no_command_expects_the_non_command_reply() {
+        for command in [
+            client_cmd(1),
+            CommandV1::Expire(ExpireCommandV1::default()),
+            CommandV1::MembershipProgress(MembershipProgressCommandV1::default()),
+            CommandV1::RetireClient(RetireClientCommandV1::default()),
+        ] {
+            assert_ne!(
+                command.expected_reply_variant(),
+                Some(4),
+                "no CommandV1 may be answered with a NonCommand reply: {command:?}"
             );
         }
     }
