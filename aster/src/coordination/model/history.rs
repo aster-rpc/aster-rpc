@@ -97,13 +97,28 @@ struct Step {
 /// `Expire`, `MembershipProgress`, and `retire_client`.
 #[allow(clippy::too_many_lines)]
 fn step(state: &State, n: u64) -> Step {
-    let actor = if n.is_multiple_of(2) { ALICE } else { BOB };
     let client_id = [(n % 3) as u8; 16];
     let resource = (n % 3) as u8;
     let row = state.resources.get(&key(resource));
     let epoch = row.map_or(0, |r| r.epoch);
     let value_revision = row.map_or(0, |r| r.value_revision);
     let lease_revision = row.map_or(0, |r| r.lease_revision);
+
+    // Who issues the command decides whether its branch is reachable at all,
+    // and getting this wrong is invisible: the audit row carries the operation
+    // code whether the command applied or was refused for authorization.
+    //
+    // §8.2 gives `set_admin` and `change_membership` to administrators, and
+    // §8.3 gives the holder-only lease operations to the current holder. An
+    // earlier alphabet issued all of them as a granted-but-not-admin,
+    // not-necessarily-holding actor, so three branches were refusal-only while
+    // every coverage assertion passed.
+    let default_actor = if n.is_multiple_of(2) { ALICE } else { BOB };
+    let actor = match n % 13 {
+        7 | 8 => ADMIN,
+        1 | 3 | 4 => row.and_then(|r| r.holder).unwrap_or(default_actor),
+        _ => default_actor,
+    };
     let holder = row.and_then(|r| r.holder).unwrap_or(actor);
 
     let sequence = state
@@ -620,7 +635,6 @@ fn counters_equal_recomputation_after_every_step_of_a_long_history() {
 #[test]
 fn the_generated_history_reaches_every_command_shape_and_both_dispositions() {
     let (state, _) = run(400);
-
     let mut operations: Vec<i32> = state.audit.values().map(|r| r.operation_code).collect();
     operations.sort_unstable();
     operations.dedup();
@@ -643,6 +657,58 @@ fn the_generated_history_reaches_every_command_shape_and_both_dispositions() {
         assert!(
             operations.contains(&expected),
             "operation {expected} never appeared; the generator does not cover it"
+        );
+    }
+
+    // Reaching an operation code is not reaching its transition. The audit row
+    // carries the code whether the command applied or was refused for
+    // authorization, so a generator that issues every command as the wrong
+    // actor looks fully covered and exercises nothing.
+    //
+    // `set_admin` and `change_membership` were exactly that: issued as a
+    // granted-but-not-admin actor, they were refusal-only for the whole life of
+    // this generator while this test passed.
+    let mut succeeded: Vec<i32> = state
+        .audit
+        .values()
+        .filter(|r| !matches!(r.result, AuditResult::Client(Outcome::Rejected)))
+        .map(|r| r.operation_code)
+        .collect();
+    succeeded.sort_unstable();
+    succeeded.dedup();
+    for expected in [
+        1, // acquire
+        4, // release
+        6, // revoke
+        7, // set_grant
+        8, // set_admin
+        9, // change_membership
+        OPERATION_RETIRE_CLIENT,
+        OPERATION_EXPIRE,
+        OPERATION_MEMBERSHIP_PROGRESS,
+    ] {
+        assert!(
+            succeeded.contains(&expected),
+            "operation {expected} was only ever refused; the generator reaches the code but \
+             not the transition behind it"
+        );
+    }
+
+    // **Recorded, not silently omitted.** Four operations are still
+    // refusal-only in this history, and each for a reason that is a property of
+    // the alphabet rather than of the model: `renew`, `compare_and_set` and
+    // `release_with_value` need a lease the interleaved release, revoke and
+    // `set_grant` steps have usually already taken away, and
+    // `cancel_membership` needs an intent in a cancellable phase at the moment
+    // it fires. Closing those means reshaping the command ordering, which would
+    // change every history-derived assertion in this file, so it is not done
+    // here -- but leaving them off the list above without saying so would make
+    // this oracle claim coverage it does not have.
+    for absent in [2, 3, 5, 11] {
+        assert!(
+            !succeeded.contains(&absent),
+            "operation {absent} now succeeds; add it to the list above rather than leaving \
+             it recorded as a known gap"
         );
     }
 

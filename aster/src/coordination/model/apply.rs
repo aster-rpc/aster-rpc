@@ -89,6 +89,7 @@ use super::state::{
     key_parts, AuditResult, AuditRow, ChangeSet, ClientId, LogId, NodeId, OperationId, ResourceKey,
     ResourceRow, SavedReply, SavedSnapshot, Session, State,
 };
+use super::tables;
 
 /// The `(actor, client_id, sequence, request_hash)` mutation prefix every
 /// client command carries, mirroring the wire type rather than passing four
@@ -765,8 +766,7 @@ fn apply_retire(
                 let previous = state.sessions.get(&key).map(session_charge);
                 state.reserve_bytes =
                     state.reserve_bytes + session_charge(&row) - previous.unwrap_or(0);
-                changes.sessions.insert(key);
-                state.sessions.insert(key, row);
+                tables::put_session(state, changes, key, row);
             }
             RetirementResult {
                 outcome: Outcome::ClientRetired,
@@ -899,9 +899,7 @@ fn apply_expire(
         // Safety-reducing and value-preserving, so the growth charge is
         // unchanged -- expiry is neither refused for budget nor a way out of
         // exhaustion.
-        state
-            .resources
-            .insert(command.resource.clone(), row.clone());
+        tables::put_resource(state, changes, command.resource.clone(), row.clone());
     }
     let row = state.resources.get(&command.resource);
     let lease_revision = row.map_or(0, |r| r.lease_revision);
@@ -979,8 +977,7 @@ fn write_intent(
     changes: &mut ChangeSet,
 ) {
     for id in &effect.evict {
-        changes.intents.insert(*id);
-        if let Some(old) = state.intents.remove(id) {
+        if let Some(old) = tables::remove_intent(state, changes, id) {
             state.growth_bytes -= limits::charge_intent(old.charge_len(id));
         }
     }
@@ -1002,12 +999,10 @@ fn write_intent(
     state.growth_bytes = state.growth_bytes
         + limits::charge_intent(effect.intent.charge_len(&effect.operation_id))
         - previous.unwrap_or(0);
-    changes.intents.insert(effect.operation_id);
-    state.intents.insert(effect.operation_id, effect.intent);
+    tables::put_intent(state, changes, effect.operation_id, effect.intent);
 
     for node in &effect.evict_routes {
-        changes.routes.insert(*node);
-        if let Some(old) = state.routes.remove(node) {
+        if let Some(old) = tables::remove_route(state, changes, node) {
             state.growth_bytes -= limits::charge_route(old.ticket.len());
         }
     }
@@ -1022,8 +1017,7 @@ fn write_intent(
             .map(|r| limits::charge_route(r.ticket.len()));
         state.growth_bytes =
             state.growth_bytes + limits::charge_route(route.ticket.len()) - previous.unwrap_or(0);
-        changes.routes.insert(node);
-        state.routes.insert(node, route);
+        tables::put_route(state, changes, node, route);
     }
 
     // No membership authority is written here, deliberately. §7.3: OpenRaft
@@ -1102,10 +1096,7 @@ fn apply_decided(
     match action.decide(state, &client.actor, &client.request_hash) {
         ActionDecision::Resource(Decision::Apply(effect)) => {
             charge_resource_row(state, &effect.key, effect.row.value.len());
-            changes.resources.insert(effect.key.clone());
-            state
-                .resources
-                .insert(effect.key.clone(), effect.row.clone());
+            tables::put_resource(state, changes, effect.key.clone(), effect.row.clone());
             consumed_success(effect.outcome, effect.key, &effect.row)
         }
 
@@ -1114,23 +1105,19 @@ fn apply_decided(
             // the same step, so there is no shape in which a grant points at a
             // resource that does not exist.
             charge_resource_row(state, &effect.key, effect.row.value.len());
-            changes.resources.insert(effect.key.clone());
-            state
-                .resources
-                .insert(effect.key.clone(), effect.row.clone());
+            tables::put_resource(state, changes, effect.key.clone(), effect.row.clone());
 
             let acl_key = (effect.key.clone(), effect.subject);
-            changes.grants.insert(acl_key.clone());
             let (ns, k) = key_parts(&effect.key);
             match effect.rights {
                 Some(rights) => {
                     if effect.creates_acl_row {
                         state.growth_bytes += limits::charge_acl(ns, k);
                     }
-                    state.acl.insert(acl_key, rights);
+                    tables::put_grant(state, changes, acl_key, rights);
                 }
                 None => {
-                    if state.acl.remove(&acl_key).is_some() {
+                    if tables::remove_grant(state, changes, &acl_key) {
                         state.growth_bytes -= limits::charge_acl(ns, k);
                     }
                 }
@@ -1140,12 +1127,11 @@ fn apply_decided(
         }
 
         ActionDecision::Admin(admin::Decision::Apply(effect)) => {
-            changes.admins.insert(effect.target);
             if effect.enabled {
-                if state.admins.insert(effect.target) {
+                if tables::put_admin(state, changes, effect.target) {
                     state.growth_bytes += limits::charge_admin();
                 }
-            } else if state.admins.remove(&effect.target) {
+            } else if tables::remove_admin(state, changes, &effect.target) {
                 state.growth_bytes -= limits::charge_admin();
             }
             state.admin_revision = effect.admin_revision;
@@ -1321,8 +1307,7 @@ fn write_session(
         retired: state.sessions.get(&key).is_some_and(|s| s.retired),
     };
     state.reserve_bytes = state.reserve_bytes + session_charge(&row) - previous_charge.unwrap_or(0);
-    changes.sessions.insert(key);
-    state.sessions.insert(key, row);
+    tables::put_session(state, changes, key, row);
 }
 
 fn session_charge(session: &Session) -> u64 {
@@ -1370,8 +1355,7 @@ fn write_audit(
 /// limit.
 fn write_audit_row(state: &mut State, log_id: LogId, row: AuditRow, changes: &mut ChangeSet) {
     state.reserve_bytes += limits::charge_audit(row.resource.as_ref().map(key_parts));
-    changes.audit.insert((log_id.term, log_id.index));
-    state.audit.insert((log_id.term, log_id.index), row);
+    tables::put_audit(state, changes, (log_id.term, log_id.index), row);
     state.audit_tip = Some(log_id);
     prune_audit(state, changes);
 }
@@ -1392,8 +1376,7 @@ fn prune_audit(state: &mut State, changes: &mut ChangeSet) {
         };
         let charge = limits::charge_audit(row.resource.as_ref().map(key_parts));
         let leader = row.leader_node_id;
-        changes.audit.insert(key);
-        state.audit.remove(&key);
+        tables::remove_audit(state, changes, key);
         state.reserve_bytes -= charge;
         // The **whole** log id of the oldest row still retained. The pruned
         // row's leader comes from the row itself, since the table key carries

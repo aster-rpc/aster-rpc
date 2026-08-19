@@ -155,6 +155,158 @@ pub(crate) fn meta_to_wire(state: &DurableState) -> CoordinationMetaV1 {
     }
 }
 
+/// Everything the **raw** stored metadata must satisfy.
+///
+/// Runs before the mirror conversions, because those are total in the wrong
+/// direction for storage. `MembershipV1 -> Membership` deduplicates ids and
+/// inserts a default node for any id a config names but the node map omits --
+/// deliberately, so a peer's malformed message cannot panic inside OpenRaft --
+/// and the same totality turns a corrupt row into a repaired one. §11.3 has no
+/// repair path: a row that is not what this group wrote is data loss.
+///
+/// The membership check is a **canonical round trip** rather than a list of
+/// field rules. Converting in and back out again and requiring equality catches
+/// duplicates, manufactured nodes, unsorted configs and unsorted node maps in
+/// one statement, and keeps catching whatever the conversion is taught to
+/// normalise next. Everything this store wrote went out through the same
+/// `From`, so a legitimate row round-trips by construction.
+fn validate_meta_wire(meta: &CoordinationMetaV1) -> StorageResult<()> {
+    let bad = |what: &'static str, detail: String| StorageError::corrupt(Db::State, what, detail);
+    let width = |what: &'static str, bytes: &[u8], expected: usize| -> StorageResult<()> {
+        if bytes.len() != expected {
+            return Err(bad(
+                what,
+                format!("expected {expected} bytes, got {}", bytes.len()),
+            ));
+        }
+        Ok(())
+    };
+
+    // The schema version is a compiled protocol constant, and a stored row
+    // naming another one describes a logical schema this build does not
+    // implement. It was decoded and then discarded, which is worse than not
+    // storing it: the field read as checked.
+    if meta.schema_version != super::identity::LOGICAL_SCHEMA_VERSION {
+        return Err(StorageError::SchemaVersion {
+            db: Db::State,
+            found: meta.schema_version,
+            expected: super::identity::LOGICAL_SCHEMA_VERSION,
+        });
+    }
+
+    width("CoordinationMetaV1.group_id", &meta.group_id, 32)?;
+    width("CoordinationMetaV1.genesis_hash", &meta.genesis_hash, 32)?;
+    width(
+        "CoordinationMetaV1.authority_public_key",
+        &meta.authority_public_key,
+        32,
+    )?;
+    if meta.authority_domain.len()
+        > crate::coordination::model::authority::MAX_AUTHORITY_DOMAIN_BYTES
+    {
+        return Err(bad(
+            "CoordinationMetaV1.authority_domain",
+            format!("{} bytes, over the limit", meta.authority_domain.len()),
+        ));
+    }
+
+    if let Some(hash) = &meta.recovery_export_hash {
+        width("CoordinationMetaV1.recovery_export_hash", hash, 32)?;
+    }
+    if let Some(source) = &meta.recovered_from {
+        width(
+            "RecoveredFromV1.source_group_id",
+            &source.source_group_id,
+            32,
+        )?;
+        width(
+            "RecoveredFromV1.source_genesis_hash",
+            &source.source_genesis_hash,
+            32,
+        )?;
+        width(
+            "RecoveredFromV1.source_authority_public_key",
+            &source.source_authority_public_key,
+            32,
+        )?;
+        width("RecoveredFromV1.export_hash", &source.export_hash, 32)?;
+        if source.source_authority_domain.len()
+            > crate::coordination::model::authority::MAX_AUTHORITY_DOMAIN_BYTES
+        {
+            return Err(bad(
+                "RecoveredFromV1.source_authority_domain",
+                format!(
+                    "{} bytes, over the limit",
+                    source.source_authority_domain.len()
+                ),
+            ));
+        }
+        if let Some(id) = &source.source_last_applied {
+            width(
+                "RecoveredFromV1.source_last_applied",
+                &id.leader_node_id,
+                32,
+            )?;
+        }
+        // §13 ties the two together: the new genesis binds the BLAKE3 over the
+        // imported body, and that is the same hash the provenance records. Two
+        // fields naming one hash have exactly one coherent reading, and a row
+        // where they disagree cannot say which export it came from.
+        //
+        // Only this direction is required. A group may hold an export hash
+        // without full provenance -- §13 writes the provenance pre-initialize,
+        // and a build that has the hash but not the record is behind, not
+        // corrupt -- so the converse is not enforced.
+        match &meta.recovery_export_hash {
+            None => {
+                return Err(bad(
+                    "CoordinationMetaV1.recovery_export_hash",
+                    "recovery provenance is recorded but the export hash it binds is absent".into(),
+                ))
+            }
+            Some(hash) if *hash != source.export_hash => {
+                return Err(bad(
+                    "CoordinationMetaV1.recovery_export_hash",
+                    "the recorded export hash and the provenance disagree".into(),
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+
+    for (what, id) in [
+        ("CoordinationMetaV1.last_applied", &meta.last_applied),
+        ("CoordinationMetaV1.audit_floor", &meta.audit_floor),
+        ("StoredMembershipV1.log_id", &meta.membership.log_id),
+    ] {
+        if let Some(id) = id {
+            width(what, &id.leader_node_id, 32)?;
+        }
+    }
+
+    // The canonical round trip. Skipped only for the one shape that is legally
+    // empty -- a group that has committed no membership -- which the mirror
+    // refuses by design.
+    let wire = &meta.membership.membership;
+    if !(wire.configs.is_empty() && wire.nodes.is_empty()) {
+        let converted =
+            openraft::Membership::<CoordinationNodeId, CoordinationNode>::try_from(wire)
+                .map_err(|err| bad("StoredMembershipV1.membership", format!("{err:?}")))?;
+        let canonical = crate::coordination::raft::MembershipV1::from(&converted);
+        if canonical != *wire {
+            return Err(bad(
+                "StoredMembershipV1.membership",
+                "the stored membership is not the canonical encoding of itself: it holds \
+                 duplicate ids, an id no node map entry covers, or an unsorted config or \
+                 node map, and converting it would silently repair it"
+                    .into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Narrow a stored meta row into the state it describes, with no rows yet.
 ///
 /// The row tables are loaded separately and then validated against this; that
@@ -168,6 +320,15 @@ pub(crate) fn meta_from_wire(meta: &CoordinationMetaV1) -> StorageResult<Durable
             .try_into()
             .map_err(|_| bad(what, format!("expected 32 bytes, got {}", bytes.len())))
     };
+
+    // Everything the raw wire record must satisfy, checked **before** any
+    // conversion runs. The conversions are lossy in ways that are correct for a
+    // peer's message and wrong for a stored row: the membership mirror
+    // deduplicates node ids and manufactures node-map entries a config
+    // references, which for storage means a malformed row is silently repaired
+    // into a plausible one. A repair is a rewrite of replicated state that no
+    // other voter performed.
+    validate_meta_wire(meta)?;
 
     // An empty config set is "no membership has been committed yet", which is
     // exactly what OpenRaft's own `StoredMembership::default()` is and what a
@@ -399,10 +560,22 @@ pub(crate) fn load(database: &Database) -> StorageResult<DurableState> {
 }
 
 /// The full log id of the newest retained audit row.
+///
+/// By **index**, not by table order. The table is keyed `(term, index)`, so
+/// redb sorts it by term first, and `next_back()` returns the highest-term row
+/// -- which is the newest entry in any real history and is not the newest row
+/// in a corrupt one. A row at a higher term and a lower index would become the
+/// reported tip and hide the genuinely newest entry, which is exactly the kind
+/// of quiet substitution the tip exists to prevent.
+///
+/// `check_audit_key_order` separately refuses a table where the two orderings
+/// disagree, so on a valid state this and `next_back()` agree; taking the max
+/// by index means the tip is right even while the disagreement is being
+/// reported.
 fn rebuild_audit_tip(audit: &BTreeMap<(u64, u64), AuditRow>) -> Option<LogId> {
     audit
         .iter()
-        .next_back()
+        .max_by_key(|((_, index), _)| *index)
         .map(|((term, index), row)| LogId::new(*term, row.leader_node_id, *index))
 }
 
@@ -549,16 +722,107 @@ pub(crate) fn validate_meta(state: &DurableState) -> StorageResult<()> {
     Ok(())
 }
 
+/// One §11.3 or §12.1 rule a stored state must satisfy, named so a failure says
+/// which one and so the negative tests can be checked against the list.
+///
+/// A table rather than a run of `if`s because the previous shape ended after
+/// four checks and nobody could see that it had: an impossible state -- an
+/// oversized value, a zero-right grant, a route whose ticket names another
+/// node -- loaded cleanly. A list makes the coverage countable, and
+/// `every_invariant_has_an_independent_negative` fails when a rule is added
+/// without one.
+struct Invariant {
+    name: &'static str,
+    check: fn(&DurableState) -> Result<(), String>,
+}
+
+/// Every rule, in the order a load applies them.
+///
+/// Deliberately **not** derived from the transition. These are read off §11.3,
+/// §12.1, §9 and §5.2 and implemented here, so a state the transition produced
+/// wrongly is refused rather than blessed by the same code that made it.
+static INVARIANTS: &[Invariant] = &[
+    Invariant {
+        name: "table-row-caps",
+        check: check_table_caps,
+    },
+    Invariant {
+        name: "grants-per-resource",
+        check: check_grants_per_resource,
+    },
+    Invariant {
+        name: "sessions-per-actor",
+        check: check_sessions_per_actor,
+    },
+    Invariant {
+        name: "active-clients",
+        check: check_active_clients,
+    },
+    Invariant {
+        name: "aggregate-counters",
+        check: check_aggregate_counters,
+    },
+    Invariant {
+        name: "audit-tip",
+        check: check_audit_tip,
+    },
+    Invariant {
+        name: "audit-floor",
+        check: check_audit_floor,
+    },
+    Invariant {
+        name: "audit-key-order",
+        check: check_audit_key_order,
+    },
+    Invariant {
+        name: "audit-row-shape",
+        check: check_audit_rows,
+    },
+    Invariant {
+        name: "resource-row-shape",
+        check: check_resource_rows,
+    },
+    Invariant {
+        name: "grant-row-shape",
+        check: check_grant_rows,
+    },
+    Invariant {
+        name: "admin-revision",
+        check: check_admin_revision,
+    },
+    Invariant {
+        name: "session-row-shape",
+        check: check_session_rows,
+    },
+    Invariant {
+        name: "intent-row-shape",
+        check: check_intent_rows,
+    },
+    Invariant {
+        name: "route-row-shape",
+        check: check_route_rows,
+    },
+];
+
 /// The half of the check that reads the rows.
 ///
-/// Everything here is recomputed and compared: the caps count real rows, the
-/// counters are re-summed from them, and the audit tip and floor are rebuilt.
+/// Every derived value is recomputed and compared, and every row is checked
+/// against the shape §12.1 declares for it. Nothing here repairs: §11.3 makes
+/// rows, counters and `last_applied` one transaction, so a state where they
+/// disagree is one no sequence of commits could have produced.
 fn validate_rows(state: &DurableState) -> StorageResult<()> {
-    let bad = |what: &'static str, detail: String| StorageError::corrupt(Db::State, what, detail);
-    let model = &state.model;
+    for invariant in INVARIANTS {
+        (invariant.check)(state)
+            .map_err(|detail| StorageError::corrupt(Db::State, invariant.name, detail))?;
+    }
+    Ok(())
+}
 
-    // ── §12.1 slot caps ─────────────────────────────────────────────────────
-    let caps: [(&'static str, u64, u64); 7] = [
+// ── §12.1 slot caps ─────────────────────────────────────────────────────────
+
+fn check_table_caps(state: &DurableState) -> Result<(), String> {
+    let model = &state.model;
+    let caps: [(&str, u64, u64); 7] = [
         (
             "resources",
             model.resources.len() as u64,
@@ -593,162 +857,440 @@ fn validate_rows(state: &DurableState) -> StorageResult<()> {
     ];
     for (table, count, cap) in caps {
         if count > cap {
-            return Err(bad(table, format!("{count} rows, over the {cap}-row cap")));
-        }
-    }
-
-    // Per-resource and per-actor sub-caps. Group totals do not imply them: one
-    // resource may hold every grant, and one actor every session.
-    let mut grants_per_resource: BTreeMap<&ResourceKey, u64> = BTreeMap::new();
-    for (resource, _) in model.acl.keys() {
-        *grants_per_resource.entry(resource).or_default() += 1;
-    }
-    if let Some((resource, count)) = grants_per_resource
-        .into_iter()
-        .find(|(_, n)| *n > limits::MAX_GRANTS_PER_RESOURCE)
-    {
-        return Err(bad(
-            "resource_acl",
-            format!(
-                "{resource:?} holds {count} grants, over the {}-grant cap",
-                limits::MAX_GRANTS_PER_RESOURCE
-            ),
-        ));
-    }
-
-    let mut retained_per_actor: BTreeMap<[u8; 32], u64> = BTreeMap::new();
-    let mut active_per_actor: BTreeMap<[u8; 32], u64> = BTreeMap::new();
-    for ((actor, _), session) in &model.sessions {
-        *retained_per_actor.entry(*actor).or_default() += 1;
-        if !session.retired {
-            *active_per_actor.entry(*actor).or_default() += 1;
-        }
-    }
-    for (scope, counts, cap) in [
-        (
-            "retained",
-            &retained_per_actor,
-            limits::MAX_RETAINED_SESSIONS_PER_ACTOR,
-        ),
-        (
-            "active",
-            &active_per_actor,
-            limits::MAX_ACTIVE_CLIENTS_PER_ACTOR,
-        ),
-    ] {
-        if let Some((actor, count)) = counts.iter().find(|(_, n)| **n > cap) {
-            return Err(bad(
-                "client_sessions",
-                format!("actor {actor:02x?} holds {count} {scope} sessions, over the {cap} cap"),
+            return Err(format!(
+                "{table} holds {count} rows, over the {cap}-row cap"
             ));
         }
     }
-    let active_group = active_per_actor.values().sum::<u64>();
-    if active_group > limits::MAX_ACTIVE_CLIENTS_PER_GROUP {
-        return Err(bad(
-            "client_sessions",
-            format!(
-                "{active_group} active sessions, over the {}-session cap",
-                limits::MAX_ACTIVE_CLIENTS_PER_GROUP
-            ),
+    Ok(())
+}
+
+/// A group total in range does not imply the per-resource one: one resource may
+/// hold every grant.
+fn check_grants_per_resource(state: &DurableState) -> Result<(), String> {
+    let mut per_resource: BTreeMap<&ResourceKey, u64> = BTreeMap::new();
+    for (resource, _) in state.model.acl.keys() {
+        *per_resource.entry(resource).or_default() += 1;
+    }
+    match per_resource
+        .into_iter()
+        .find(|(_, n)| *n > limits::MAX_GRANTS_PER_RESOURCE)
+    {
+        Some((resource, count)) => Err(format!(
+            "{resource:?} holds {count} grants, over the {}-grant cap",
+            limits::MAX_GRANTS_PER_RESOURCE
+        )),
+        None => Ok(()),
+    }
+}
+
+fn check_sessions_per_actor(state: &DurableState) -> Result<(), String> {
+    let mut retained: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+    for (actor, _) in state.model.sessions.keys() {
+        *retained.entry(*actor).or_default() += 1;
+    }
+    match retained
+        .into_iter()
+        .find(|(_, n)| *n > limits::MAX_RETAINED_SESSIONS_PER_ACTOR)
+    {
+        Some((actor, count)) => Err(format!(
+            "actor {actor:02x?} holds {count} retained sessions, over the {} cap",
+            limits::MAX_RETAINED_SESSIONS_PER_ACTOR
+        )),
+        None => Ok(()),
+    }
+}
+
+fn check_active_clients(state: &DurableState) -> Result<(), String> {
+    let mut per_actor: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+    let mut group = 0u64;
+    for ((actor, _), session) in &state.model.sessions {
+        if !session.retired {
+            *per_actor.entry(*actor).or_default() += 1;
+            group += 1;
+        }
+    }
+    if let Some((actor, count)) = per_actor
+        .into_iter()
+        .find(|(_, n)| *n > limits::MAX_ACTIVE_CLIENTS_PER_ACTOR)
+    {
+        return Err(format!(
+            "actor {actor:02x?} holds {count} active clients, over the {} cap",
+            limits::MAX_ACTIVE_CLIENTS_PER_ACTOR
         ));
     }
+    if group > limits::MAX_ACTIVE_CLIENTS_PER_GROUP {
+        return Err(format!(
+            "{group} active clients, over the {}-client cap",
+            limits::MAX_ACTIVE_CLIENTS_PER_GROUP
+        ));
+    }
+    Ok(())
+}
 
-    // ── §12.1 counters ──────────────────────────────────────────────────────
-    //
-    // Recomputed from the rows and compared. The persisted figure is evidence,
-    // never an input: apply maintains it incrementally, so the only thing that
-    // can catch an incremental update that went wrong is the full sum.
+// ── §12.1 counters ──────────────────────────────────────────────────────────
+
+/// Recomputed from the rows and compared. The persisted figure is evidence,
+/// never an input: apply maintains it incrementally, so the only thing that can
+/// catch an incremental update that went wrong is the full sum.
+fn check_aggregate_counters(state: &DurableState) -> Result<(), String> {
+    let model = &state.model;
     let growth = model.recompute_growth();
     if model.growth_bytes != growth {
-        return Err(bad(
-            "aggregate_growth_bytes",
-            format!(
-                "persisted {} but the rows charge {growth}",
-                model.growth_bytes
-            ),
+        return Err(format!(
+            "growth persisted {} but the rows charge {growth}",
+            model.growth_bytes
         ));
     }
     let reserve = model.recompute_reserve();
     if model.reserve_bytes != reserve {
-        return Err(bad(
-            "aggregate_reserve_bytes",
-            format!(
-                "persisted {} but the rows charge {reserve}",
-                model.reserve_bytes
-            ),
+        return Err(format!(
+            "reserve persisted {} but the rows charge {reserve}",
+            model.reserve_bytes
         ));
     }
-    // ── §11.3 audit identity ────────────────────────────────────────────────
+    Ok(())
+}
+
+// ── §11.3 audit identity ────────────────────────────────────────────────────
+
+fn check_audit_tip(state: &DurableState) -> Result<(), String> {
+    let model = &state.model;
     let tip = rebuild_audit_tip(&model.audit);
     if model.audit_tip != tip {
-        return Err(bad(
-            "audit_tip",
-            format!(
-                "state holds {:?} but the rows give {tip:?}",
-                model.audit_tip
-            ),
+        return Err(format!(
+            "state holds {:?} but the rows give {tip:?}",
+            model.audit_tip
         ));
     }
     match (tip, model.last_applied) {
-        (Some(tip), None) => {
-            return Err(bad(
-                "audit_tip",
-                format!("an audit row at {tip:?} with nothing applied"),
-            ))
-        }
+        (Some(tip), None) => Err(format!("an audit row at {tip:?} with nothing applied")),
         (Some(tip), Some(last)) if tip.index > last.index => {
-            return Err(bad(
-                "audit_tip",
-                format!("{tip:?} runs ahead of last_applied {last:?}"),
-            ))
+            Err(format!("{tip:?} runs ahead of last_applied {last:?}"))
         }
         // The case a maximum-index comparison cannot see: the same index under
         // a different term or leader is a *different* entry.
-        (Some(tip), Some(last)) if tip.index == last.index && tip != last => {
-            return Err(bad(
-                "audit_tip",
-                format!("{tip:?} and last_applied {last:?} are different entries at one index"),
-            ))
-        }
-        _ => {}
+        (Some(tip), Some(last)) if tip.index == last.index && tip != last => Err(format!(
+            "{tip:?} and last_applied {last:?} are different entries at one index"
+        )),
+        _ => Ok(()),
     }
+}
 
-    // The floor is the whole log id of the oldest retained row whenever
-    // anything has been pruned. With rows present it is checkable exactly; with
-    // none, the floor names a row that is gone and there is nothing to compare.
-    if let (Some(floor), Some(((term, index), oldest))) =
-        (model.audit_floor, model.audit.iter().next())
-    {
-        let expected = LogId::new(*term, oldest.leader_node_id, *index);
-        if floor != expected {
-            return Err(bad(
-                "audit_floor",
-                format!("persisted {floor:?} but the oldest retained row is {expected:?}"),
+/// The floor is the whole log id of the oldest retained row whenever anything
+/// has been pruned. With rows present it is checkable exactly; with none, the
+/// floor names a row that is gone and there is nothing to compare.
+fn check_audit_floor(state: &DurableState) -> Result<(), String> {
+    let model = &state.model;
+    let Some(floor) = model.audit_floor else {
+        return Ok(());
+    };
+    let Some(((term, index), oldest)) = model.audit.iter().next() else {
+        return Ok(());
+    };
+    let expected = LogId::new(*term, oldest.leader_node_id, *index);
+    if floor != expected {
+        return Err(format!(
+            "persisted {floor:?} but the oldest retained row is {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The audit table is keyed `(term, index)`, so redb orders it by **term
+/// first**. Every rule that treats the last key as the newest row -- the tip
+/// rebuild, the floor, the range `audit_stream` walks -- is only sound while
+/// the two orderings agree, which they do in any real history because term
+/// never decreases as index grows.
+///
+/// A corrupt row at a higher term and a lower index breaks that silently: it
+/// sorts last, becomes the reported tip, and hides the genuinely newest row.
+/// So the agreement is checked rather than assumed.
+fn check_audit_key_order(state: &DurableState) -> Result<(), String> {
+    let mut previous: Option<(u64, u64)> = None;
+    for (term, index) in state.model.audit.keys() {
+        if let Some((prev_term, prev_index)) = previous {
+            if *index <= prev_index {
+                return Err(format!(
+                    "row ({term}, {index}) sorts after ({prev_term}, {prev_index}) by term \
+                     while its index is not greater, so table order and log order disagree"
+                ));
+            }
+        }
+        previous = Some((*term, *index));
+    }
+    Ok(())
+}
+
+/// §5.2 declares eleven client method codes and two system ones. A row naming
+/// anything else describes an operation this build cannot interpret, and its
+/// result code cannot be placed in either code space.
+fn check_audit_rows(state: &DurableState) -> Result<(), String> {
+    for (at, row) in &state.model.audit {
+        let known_client = (1..=11).contains(&row.operation_code);
+        let known_system = row.operation_code
+            == crate::coordination::model::apply::OPERATION_EXPIRE
+            || row.operation_code
+                == crate::coordination::model::apply::OPERATION_MEMBERSHIP_PROGRESS;
+        if !known_client && !known_system {
+            return Err(format!(
+                "row {at:?} names operation code {}, which §5.2 does not declare",
+                row.operation_code
+            ));
+        }
+        // The two code spaces are disjoint, and which one a row is in is
+        // decided by its operation code. A client operation carrying a system
+        // result -- or the reverse -- is a row no apply path writes.
+        if known_system == row.result.is_client() {
+            return Err(format!(
+                "row {at:?} pairs operation code {} with a {} result",
+                row.operation_code,
+                if row.result.is_client() {
+                    "client"
+                } else {
+                    "system"
+                }
             ));
         }
     }
+    Ok(())
+}
 
-    // ── §5.2 client counters ────────────────────────────────────────────────
-    //
-    // A sequence above the ceiling is out of contract *and* dangerous: `last`
-    // is a `u64` read back from storage, so a corrupt `u64::MAX` wraps to 0 in
-    // release and a stale sequence then looks like the exact next one.
-    if let Some(((actor, client), session)) = model
-        .sessions
-        .iter()
-        .find(|(_, s)| s.last_sequence > limits::MAX_COUNTER)
-    {
-        return Err(bad(
-            "client_sessions",
-            format!(
+// ── §12.1 row shapes ────────────────────────────────────────────────────────
+
+fn check_resource_rows(state: &DurableState) -> Result<(), String> {
+    for (key, row) in &state.model.resources {
+        if row.value.len() > limits::MAX_VALUE {
+            return Err(format!(
+                "{key:?} holds a {}-byte value, over the {}-byte limit",
+                row.value.len(),
+                limits::MAX_VALUE
+            ));
+        }
+        // Only a **held** row carries a lease TTL. A released or revoked row
+        // keeps whatever it had, and a row created by a grant never had one, so
+        // the bound applies exactly where the value means something.
+        if row.held && !(limits::MIN_TTL_MS..=limits::MAX_TTL_MS).contains(&row.ttl_ms) {
+            return Err(format!(
+                "{key:?} is held with a {}ms TTL, outside [{}, {}]",
+                row.ttl_ms,
+                limits::MIN_TTL_MS,
+                limits::MAX_TTL_MS
+            ));
+        }
+        for (what, value) in [
+            ("epoch", row.epoch),
+            ("lease_revision", row.lease_revision),
+            ("value_revision", row.value_revision),
+            ("acl_revision", row.acl_revision),
+        ] {
+            if value > limits::MAX_COUNTER {
+                return Err(format!(
+                    "{key:?} holds {what} {value}, over the {} ceiling",
+                    limits::MAX_COUNTER
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A grant row is created and removed with its resource row in one step
+/// (§8.1), and rights of zero *is* the removal, so neither an orphan nor an
+/// empty grant is a state apply can produce.
+fn check_grant_rows(state: &DurableState) -> Result<(), String> {
+    for ((resource, subject), rights) in &state.model.acl {
+        if *rights == 0 {
+            return Err(format!(
+                "{resource:?} grants {subject:02x?} no rights; zero rights is how a grant is \
+                 removed, so the row should not exist"
+            ));
+        }
+        if !limits::rights_are_known(*rights) {
+            return Err(format!(
+                "{resource:?} grants {subject:02x?} rights {rights:#x}, which include a bit v1 \
+                 does not define"
+            ));
+        }
+        if !state.model.resources.contains_key(resource) {
+            return Err(format!(
+                "{resource:?} has a grant for {subject:02x?} but no resource row; the two move \
+                 in one step"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_admin_revision(state: &DurableState) -> Result<(), String> {
+    if state.model.admin_revision > limits::MAX_COUNTER {
+        return Err(format!(
+            "admin_revision {} is over the {} ceiling",
+            state.model.admin_revision,
+            limits::MAX_COUNTER
+        ));
+    }
+    Ok(())
+}
+
+fn check_session_rows(state: &DurableState) -> Result<(), String> {
+    for ((actor, client), session) in &state.model.sessions {
+        // §5.2 stops client counters at `i64::MAX`. The field is a `u64` read
+        // back from storage, so a corrupt `u64::MAX` wraps to 0 in release and
+        // a stale sequence then looks like the exact next one.
+        if session.last_sequence > limits::MAX_COUNTER {
+            return Err(format!(
                 "session {actor:02x?}/{client:02x?} holds sequence {}, over the {} ceiling",
                 session.last_sequence,
                 limits::MAX_COUNTER
-            ),
+            ));
+        }
+        // §11.3: `last_result` is `None` **only** for a sequence-zero
+        // tombstone. Any other missing result is a consumed sequence whose
+        // answer was lost, which is the one thing a client's journal cannot
+        // survive.
+        if session.last_result.is_none() && session.last_sequence != 0 {
+            return Err(format!(
+                "session {actor:02x?}/{client:02x?} consumed sequence {} but saved no result",
+                session.last_sequence
+            ));
+        }
+        let Some(saved) = &session.last_result else {
+            continue;
+        };
+        // §5.2's pairings, which the model asserts after every applied step and
+        // which a stored row must therefore also satisfy.
+        if saved.reason.is_reserved() {
+            return Err(format!(
+                "session {actor:02x?}/{client:02x?} saved reserved reason {:?}",
+                saved.reason
+            ));
+        }
+        if saved.outcome != crate::coordination::reason::Outcome::Rejected
+            && saved.reason != crate::coordination::reason::Reason::None
+        {
+            return Err(format!(
+                "session {actor:02x?}/{client:02x?} saved {:?} with reason {:?}; only a \
+                 rejection carries one",
+                saved.outcome, saved.reason
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Retained intents, checked for **static** shape and for every signature they
+/// carry.
+///
+/// Not re-run through current-membership admission: whether a seed was a join
+/// or an existing member was decided against the membership at acceptance, and
+/// that classification is not reconstructible from the state this row survived
+/// into. What is reconstructible is every bound §12.1 states outright, and
+/// whether the permits a seed carries verify under the group's own authority.
+fn check_intent_rows(state: &DurableState) -> Result<(), String> {
+    use crate::coordination::model::membership::{check_seed_ticket, is_terminal_phase};
+
+    let active = state
+        .model
+        .intents
+        .values()
+        .filter(|intent| !is_terminal_phase(intent.status_code))
+        .count();
+    if active > 1 {
+        return Err(format!(
+            "{active} intents are active; §9 allows one at a time"
         ));
     }
 
+    for (operation_id, intent) in &state.model.intents {
+        let plan = &intent.plan;
+        if shape::profile_permits_voters(
+            state.model.deployment_profile_code,
+            plan.desired_voters.len(),
+        ) {
+            return Err(format!(
+                "intent {operation_id:02x?} plans {} voters, which profile {} does not permit",
+                plan.desired_voters.len(),
+                state.model.deployment_profile_code
+            ));
+        }
+        if plan.retained_learners.len() > shape::MAX_RETAINED_LEARNERS {
+            return Err(format!(
+                "intent {operation_id:02x?} retains {} learners, over the {} cap",
+                plan.retained_learners.len(),
+                shape::MAX_RETAINED_LEARNERS
+            ));
+        }
+        // Sorted and duplicate-free: §9 requires it so two voters encode one
+        // plan identically, which is what makes the request hash comparable.
+        for (what, ids) in [
+            ("desired_voters", &plan.desired_voters),
+            ("retained_learners", &plan.retained_learners),
+        ] {
+            if !shape::sorted_unique(ids) {
+                return Err(format!(
+                    "intent {operation_id:02x?} holds an unsorted or duplicated {what}"
+                ));
+            }
+        }
+        let seed_ids: Vec<[u8; 32]> = plan.member_seeds.iter().map(|s| s.node_id).collect();
+        if !shape::sorted_unique(&seed_ids) {
+            return Err(format!(
+                "intent {operation_id:02x?} holds unsorted or duplicated member seeds"
+            ));
+        }
+        for seed in &plan.member_seeds {
+            if let Some(limit) =
+                shape::check_member_seed(seed.ticket.len(), seed.join_permit.as_ref().map(Vec::len))
+            {
+                return Err(format!(
+                    "intent {operation_id:02x?} seed {:02x?} violates {limit:?}",
+                    seed.node_id
+                ));
+            }
+            if let Err(limit) = check_seed_ticket(&seed.ticket, &seed.node_id) {
+                return Err(format!(
+                    "intent {operation_id:02x?} seed {:02x?} carries a ticket that is not a \
+                     canonical ticket for it: {limit:?}",
+                    seed.node_id
+                ));
+            }
+            // A permit that no longer verifies is a stored credential this
+            // group never issued, whatever it looked like when it arrived.
+            if let Some(permit) = &seed.join_permit {
+                if let Err(err) = crate::coordination::model::authority::verify_join_permit(
+                    &state.model.authority,
+                    permit,
+                    &seed.node_id,
+                    &seed.ticket,
+                ) {
+                    return Err(format!(
+                        "intent {operation_id:02x?} seed {:02x?} carries a join permit that \
+                         does not verify: {err:?}",
+                        seed.node_id
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A route is dialling material **for the node it is filed under**. A ticket
+/// naming another identity would send a dialler to the wrong peer, and the
+/// Iroh handshake would reject it -- after the connection attempt, on every
+/// voter, forever.
+fn check_route_rows(state: &DurableState) -> Result<(), String> {
+    for (node, route) in &state.model.routes {
+        if let Err(limit) =
+            crate::coordination::model::membership::check_seed_ticket(&route.ticket, node)
+        {
+            return Err(format!(
+                "route for {node:02x?} holds a ticket that is not a canonical ticket for it: \
+                 {limit:?}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -976,30 +1518,99 @@ mod tests {
         (dir, database)
     }
 
-    /// The membership a model state implies, so a fixture's two views agree.
-    fn membership_for(model: &State) -> StoredMembership<CoordinationNodeId, CoordinationNode> {
-        let voters: BTreeSet<CoordinationNodeId> = model
-            .members
+    /// The three voters this fixture's group committed.
+    ///
+    /// Declared here rather than read off the model. An earlier version built
+    /// the stored membership *from* `model.members`, which made the rule that
+    /// compares the two a tautology: any member set would have matched the
+    /// membership synthesised from it. The membership is the source now, and
+    /// the model's projection is derived from it exactly as `meta_from_wire`
+    /// does at load.
+    const VOTERS: [[u8; 32]; 3] = [[1u8; 32], [2u8; 32], [3u8; 32]];
+
+    fn committed_membership() -> StoredMembership<CoordinationNodeId, CoordinationNode> {
+        let ids: BTreeSet<CoordinationNodeId> = VOTERS
             .iter()
             .map(|id| CoordinationNodeId::from_array(*id))
             .collect();
         let nodes: BTreeMap<CoordinationNodeId, CoordinationNode> =
-            voters.iter().map(|id| (*id, CoordinationNode)).collect();
+            ids.iter().map(|id| (*id, CoordinationNode)).collect();
         StoredMembership::new(
-            model.membership_log_id.as_ref().map(Into::into),
-            Membership::new(vec![voters], nodes),
+            Some(openraft::LogId {
+                leader_id: openraft::CommittedLeaderId::new(
+                    1,
+                    CoordinationNodeId::from_array([0x11u8; 32]),
+                ),
+                index: 400,
+            }),
+            Membership::new(vec![ids], nodes),
         )
     }
 
     /// A coherent complete state: every row, count, charge, audit tip and
     /// metadata value agrees, because apply produced it.
+    ///
+    /// The intent and route are added on top, because the generated history
+    /// retires membership operations faster than it retains them and those two
+    /// tables would otherwise never be exercised by the validator at all. Both
+    /// are built from the real helpers -- a canonical ticket, a permit signed
+    /// by this group's own authority -- so the positive case runs the signature
+    /// path rather than skipping it.
     fn coherent_state() -> DurableState {
-        let model = sample_applied_state(400);
+        use crate::coordination::model::authority::testing as auth;
+        use crate::coordination::model::membership::{test_ticket, PHASE_COMPLETED};
+        use crate::coordination::model::state::{Intent, MemberSeed, MembershipPlan, Route};
+
+        let mut model = sample_applied_state(400);
         assert!(
             model.counters_match_recomputation(),
             "the history fixture must itself be coherent"
         );
-        let membership = membership_for(&model);
+
+        let membership = committed_membership();
+        // Derived from the membership, which is the only thing §11.3 persists.
+        model.members = membership
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id.as_bytes())
+            .collect();
+        model.membership_log_id = membership.log_id().as_ref().map(LogId::from);
+
+        let seed_node = [4u8; 32];
+        let ticket = test_ticket(&seed_node);
+        model.intents.insert(
+            [0x55u8; 16],
+            Intent {
+                actor: [1u8; 32],
+                request_hash: [0x56u8; 32],
+                expected_membership: None,
+                plan: MembershipPlan {
+                    desired_voters: VOTERS.to_vec(),
+                    retained_learners: Vec::new(),
+                    member_seeds: vec![MemberSeed {
+                        node_id: seed_node,
+                        ticket: ticket.clone(),
+                        join_permit: Some(auth::valid(&seed_node, &ticket)),
+                    }],
+                },
+                status_code: PHASE_COMPLETED,
+                result_code: crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED,
+                accepted_log_id: LogId::new(1, [0x11u8; 32], 390),
+                completed_log_id: Some(LogId::new(1, [0x11u8; 32], 395)),
+                observed_membership_log_id: Some(LogId::new(1, [0x11u8; 32], 400)),
+            },
+        );
+        model.routes.insert(
+            seed_node,
+            Route {
+                ticket,
+                source_operation_id: [0x55u8; 16],
+                introduced_log_id: LogId::new(1, [0x11u8; 32], 390),
+            },
+        );
+        model.growth_bytes = model.recompute_growth();
+        model.reserve_bytes = model.recompute_reserve();
+
         DurableState {
             model,
             membership,
@@ -1210,10 +1821,192 @@ mod tests {
         assert_eq!(state.model.members.len(), shape::MAX_VOTERS + 2 + 2);
     }
 
-    /// Each metadata-local constraint refuses on its own.
+    /// Each **raw wire** rule refuses on its own, before any conversion runs.
+    ///
+    /// These are separate from the validator's rules because they are about the
+    /// stored record rather than about the state it describes, and because the
+    /// conversions below them are lossy in ways that would hide several: the
+    /// membership mirror deduplicates ids and manufactures node-map entries, so
+    /// a malformed row would arrive at the validator already repaired.
+    #[test]
+    fn each_raw_wire_rule_refuses_before_any_conversion() {
+        use crate::coordination::raft::{NodeEntryV1, NodeIdSetV1, NodeIdV1, RecoveredFromV1};
+
+        /// A perturbation of a legal metadata row, and the field its refusal
+        /// must name.
+        type WireCase = (
+            &'static str,
+            Box<dyn Fn(&mut CoordinationMetaV1)>,
+            &'static str,
+        );
+
+        let cases: Vec<WireCase> = vec![
+            (
+                "schema version",
+                Box::new(|m: &mut CoordinationMetaV1| m.schema_version = 99),
+                "SchemaVersion",
+            ),
+            (
+                "group id width",
+                Box::new(|m: &mut CoordinationMetaV1| m.group_id = vec![0xFF; 31]),
+                "group_id",
+            ),
+            (
+                "authority key width",
+                Box::new(|m: &mut CoordinationMetaV1| m.authority_public_key = vec![0xFF; 33]),
+                "authority_public_key",
+            ),
+            (
+                "authority domain length",
+                Box::new(|m: &mut CoordinationMetaV1| {
+                    m.authority_domain = "d".repeat(
+                        crate::coordination::model::authority::MAX_AUTHORITY_DOMAIN_BYTES + 1,
+                    );
+                }),
+                "authority_domain",
+            ),
+            (
+                "last-applied leader width",
+                Box::new(|m: &mut CoordinationMetaV1| {
+                    m.last_applied.as_mut().expect("an id").leader_node_id = vec![0u8; 8];
+                }),
+                "last_applied",
+            ),
+            (
+                "recovery export hash width",
+                Box::new(|m: &mut CoordinationMetaV1| {
+                    m.recovery_export_hash = Some(vec![0xFF; 16]);
+                }),
+                "recovery_export_hash",
+            ),
+            (
+                "provenance without the hash it binds",
+                Box::new(|m: &mut CoordinationMetaV1| m.recovery_export_hash = None),
+                "recovery_export_hash",
+            ),
+            (
+                "provenance disagreeing with the hash",
+                Box::new(|m: &mut CoordinationMetaV1| {
+                    m.recovery_export_hash = Some(vec![0xAB; 32]);
+                }),
+                "recovery_export_hash",
+            ),
+            (
+                "source authority key width",
+                Box::new(|m: &mut CoordinationMetaV1| {
+                    m.recovered_from
+                        .as_mut()
+                        .expect("provenance")
+                        .source_authority_public_key = vec![0xFF; 31];
+                }),
+                "source_authority_public_key",
+            ),
+            (
+                "source last-applied leader width",
+                Box::new(|m: &mut CoordinationMetaV1| {
+                    m.recovered_from
+                        .as_mut()
+                        .expect("provenance")
+                        .source_last_applied
+                        .as_mut()
+                        .expect("an id")
+                        .leader_node_id = vec![0u8; 8];
+                }),
+                "source_last_applied",
+            ),
+            (
+                // The repair the mirror would perform silently: a config names
+                // an id the node map omits, and the conversion inserts a
+                // default entry for it.
+                "a config id with no node-map entry",
+                Box::new(|m: &mut CoordinationMetaV1| {
+                    m.membership
+                        .membership
+                        .nodes
+                        .retain(|n| n.node_id != vec![0u8; 32]);
+                    m.membership
+                        .membership
+                        .configs
+                        .last_mut()
+                        .expect("a config")
+                        .ids
+                        .push(NodeIdV1 {
+                            node_id: vec![0u8; 32],
+                        });
+                }),
+                "membership",
+            ),
+            (
+                // The other repair: a duplicate id collapses into a set.
+                "a duplicated config id",
+                Box::new(|m: &mut CoordinationMetaV1| {
+                    let ids = &mut m
+                        .membership
+                        .membership
+                        .configs
+                        .last_mut()
+                        .expect("a config")
+                        .ids;
+                    let first = ids.first().expect("an id").clone();
+                    ids.push(first);
+                }),
+                "membership",
+            ),
+            (
+                "an unsorted node map",
+                Box::new(|m: &mut CoordinationMetaV1| {
+                    m.membership.membership.nodes.reverse();
+                }),
+                "membership",
+            ),
+            (
+                "a node entry from an unknown format version",
+                Box::new(|m: &mut CoordinationMetaV1| {
+                    m.membership.membership.nodes.push(NodeEntryV1 {
+                        node_id: vec![0xC7; 32],
+                        format_version: 99,
+                    });
+                }),
+                "membership",
+            ),
+        ];
+
+        for (label, break_it, expected) in cases {
+            let mut meta = maximal_legal_meta();
+            break_it(&mut meta);
+            let err = meta_from_wire(&meta)
+                .expect_err(&format!("{label} must be refused before conversion"));
+            assert!(
+                format!("{err:?}").contains(expected),
+                "{label}: expected a failure naming {expected}, got {err:?}"
+            );
+        }
+
+        // And an empty config set is still the one legal empty shape: a group
+        // that has committed no membership yet, which is what a freshly bound
+        // store holds.
+        let mut fresh = maximal_legal_meta();
+        fresh.membership = crate::coordination::raft::StoredMembershipV1 {
+            log_id: None,
+            membership: crate::coordination::raft::MembershipV1 {
+                configs: Vec::new(),
+                nodes: Vec::new(),
+            },
+        };
+        let state = meta_from_wire(&fresh).expect("an uncommitted membership is legal");
+        assert!(state.model.members.is_empty());
+        let _ = NodeIdSetV1 { ids: Vec::new() };
+        let _: Option<RecoveredFromV1> = None;
+    }
+
+    /// Each metadata-local validator rule refuses on its own.
+    ///
+    /// These read the narrowed state rather than the wire record: they are
+    /// about whether the binding describes a group that could exist, not about
+    /// whether the row was well formed.
     #[test]
     fn each_metadata_local_constraint_refuses_on_its_own() {
-        let narrow = |meta: CoordinationMetaV1| meta_from_wire(&meta);
+        let narrow = |meta: CoordinationMetaV1| meta_from_wire(&meta).expect("narrows");
 
         // An authority key that is not a curve point.
         //
@@ -1228,17 +2021,8 @@ mod tests {
             .expect("some repeated byte is not a curve point");
         let mut meta = maximal_legal_meta();
         meta.authority_public_key = not_a_key.to_vec();
-        let state = narrow(meta).expect("32 bytes narrows");
-        let err = validate_meta(&state).expect_err("not a key");
+        let err = validate_meta(&narrow(meta)).expect_err("not a key");
         assert!(err.to_string().contains("decompress"), "got: {err}");
-
-        // A domain past §7.1's limit.
-        let mut meta = maximal_legal_meta();
-        meta.authority_domain =
-            "d".repeat(crate::coordination::model::authority::MAX_AUTHORITY_DOMAIN_BYTES + 1);
-        let state = narrow(meta).expect("narrows");
-        let err = validate_meta(&state).expect_err("too long");
-        assert!(err.to_string().contains("authority_domain"), "got: {err}");
 
         // A counter past its budget. One byte over, not a round number: the
         // check is `>` and an off-by-one would pass a looser fixture.
@@ -1252,8 +2036,7 @@ mod tests {
             } else {
                 meta.aggregate_reserve_bytes = budget + 1;
             }
-            let state = narrow(meta).expect("narrows");
-            let err = validate_meta(&state).expect_err("over budget");
+            let err = validate_meta(&narrow(meta)).expect_err("over budget");
             assert!(err.to_string().contains("budget"), "{field}: {err}");
         }
 
@@ -1261,23 +2044,31 @@ mod tests {
         // OpenRaft and illegal in Aster, which is exactly the distinction
         // §7.1 draws.
         let mut meta = maximal_legal_meta();
-        meta.membership
-            .membership
-            .configs
-            .last_mut()
-            .expect("a config")
-            .ids
-            .pop();
-        let state = narrow(meta).expect("narrows");
-        let err = validate_meta(&state).expect_err("four voters");
+        {
+            let config = meta
+                .membership
+                .membership
+                .configs
+                .last_mut()
+                .expect("a config");
+            let dropped = config.ids.pop().expect("an id");
+            // The node map keeps its entry, so this stays canonical and the
+            // wire rules pass: the subject here is the voter count.
+            assert!(meta
+                .membership
+                .membership
+                .nodes
+                .iter()
+                .any(|n| n.node_id == dropped.node_id));
+        }
+        let err = validate_meta(&narrow(meta)).expect_err("four voters");
         assert!(err.to_string().contains("does not permit"), "got: {err}");
 
         // An unknown profile permits nothing rather than falling back.
         let mut meta = maximal_legal_meta();
         meta.deployment_profile_code = 99;
-        let state = narrow(meta).expect("narrows");
         assert!(
-            validate_meta(&state).is_err(),
+            validate_meta(&narrow(meta)).is_err(),
             "an unknown profile permits nothing"
         );
 
@@ -1288,8 +2079,7 @@ mod tests {
             leader_node_id: vec![3u8; 32],
             index: 9_000_001,
         });
-        let state = narrow(meta).expect("narrows");
-        let err = validate_meta(&state).expect_err("floor ahead");
+        let err = validate_meta(&narrow(meta)).expect_err("floor ahead");
         assert!(err.to_string().contains("audit_floor"), "got: {err}");
     }
 
@@ -1347,68 +2137,279 @@ mod tests {
         assert!(state.model.growth_bytes > 0 && state.model.reserve_bytes > 0);
     }
 
-    /// Every derived value is compared against a recomputation, so a persisted
-    /// one that drifted is refused rather than trusted.
+    // ── The invariant table ─────────────────────────────────────────────────
+
+    /// One perturbation of a coherent state, and the rule it must trip.
+    struct Negative {
+        rule: &'static str,
+        what: &'static str,
+        break_it: fn(&mut DurableState),
+    }
+
+    /// A perturbation for every rule in [`INVARIANTS`].
+    ///
+    /// Each names the rule it targets, and the test below asserts that rule is
+    /// the one that fires -- not merely that the state was refused. A negative
+    /// that trips a *different* rule proves nothing about the one it claims,
+    /// and several of these would: adding a row moves a counter, so anything
+    /// after `aggregate-counters` would be caught by it instead. The harness
+    /// recomputes the counters after every perturbation except that one, so
+    /// each rule is reached on its own.
+    static NEGATIVES: &[Negative] = &[
+        Negative {
+            rule: "table-row-caps",
+            what: "one more admin than §12.1 allows",
+            break_it: |state| {
+                for n in 0..=limits::MAX_ADMINS_PER_GROUP {
+                    let mut id = [0u8; 32];
+                    id[0..8].copy_from_slice(&n.to_be_bytes());
+                    state.model.admins.insert(id);
+                }
+            },
+        },
+        Negative {
+            rule: "grants-per-resource",
+            what: "one resource holding every grant",
+            break_it: |state| {
+                let resource = state
+                    .model
+                    .resources
+                    .keys()
+                    .next()
+                    .expect("a resource")
+                    .clone();
+                for n in 0..=limits::MAX_GRANTS_PER_RESOURCE {
+                    let mut id = [0u8; 32];
+                    id[0..8].copy_from_slice(&n.to_be_bytes());
+                    state
+                        .model
+                        .acl
+                        .insert((resource.clone(), id), limits::RIGHT_READ);
+                }
+            },
+        },
+        Negative {
+            rule: "sessions-per-actor",
+            what: "one actor past the retained-session cap",
+            break_it: |state| {
+                for n in 0..=limits::MAX_RETAINED_SESSIONS_PER_ACTOR {
+                    let mut client = [0u8; 16];
+                    client[0..8].copy_from_slice(&n.to_be_bytes());
+                    state.model.sessions.insert(
+                        ([0xD1u8; 32], client),
+                        Session {
+                            last_sequence: 0,
+                            request_hash: [0u8; 32],
+                            last_result: None,
+                            retired: true,
+                        },
+                    );
+                }
+            },
+        },
+        Negative {
+            rule: "active-clients",
+            what: "one actor past the active-client cap",
+            break_it: |state| {
+                for n in 0..=limits::MAX_ACTIVE_CLIENTS_PER_ACTOR {
+                    let mut client = [0u8; 16];
+                    client[0..8].copy_from_slice(&n.to_be_bytes());
+                    state.model.sessions.insert(
+                        ([0xD2u8; 32], client),
+                        Session {
+                            last_sequence: 0,
+                            request_hash: [0u8; 32],
+                            last_result: None,
+                            retired: false,
+                        },
+                    );
+                }
+            },
+        },
+        Negative {
+            rule: "aggregate-counters",
+            what: "a growth counter one byte off the rows",
+            break_it: |state| state.model.growth_bytes += 1,
+        },
+        Negative {
+            rule: "audit-tip",
+            what: "a tip naming the second-newest row",
+            break_it: |state| {
+                let ((term, index), row) = state
+                    .model
+                    .audit
+                    .iter()
+                    .rev()
+                    .nth(1)
+                    .map(|(k, v)| (*k, v.clone()))
+                    .expect("at least two audit rows");
+                state.model.audit_tip = Some(LogId::new(term, row.leader_node_id, index));
+            },
+        },
+        Negative {
+            rule: "audit-floor",
+            what: "a floor that is not the oldest retained row",
+            break_it: |state| {
+                let ((term, index), row) = state
+                    .model
+                    .audit
+                    .iter()
+                    .next()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .expect("an audit row");
+                state.model.audit_floor = Some(LogId::new(term, row.leader_node_id, index + 1));
+            },
+        },
+        Negative {
+            rule: "audit-key-order",
+            what: "a higher-term row at a lower index",
+            break_it: |state| {
+                let ((term, index), row) = state
+                    .model
+                    .audit
+                    .iter()
+                    .next_back()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .expect("an audit row");
+                state.model.audit.insert((term + 1, index - 1), row);
+            },
+        },
+        Negative {
+            rule: "audit-row-shape",
+            what: "an operation code §5.2 does not declare",
+            break_it: |state| {
+                let key = *state.model.audit.keys().next().expect("an audit row");
+                state
+                    .model
+                    .audit
+                    .get_mut(&key)
+                    .expect("the row")
+                    .operation_code = 42;
+            },
+        },
+        Negative {
+            rule: "resource-row-shape",
+            what: "a value over the §12.1 limit",
+            break_it: |state| {
+                let key = state
+                    .model
+                    .resources
+                    .keys()
+                    .next()
+                    .expect("a resource")
+                    .clone();
+                state.model.resources.get_mut(&key).expect("the row").value =
+                    vec![0u8; limits::MAX_VALUE + 1];
+            },
+        },
+        Negative {
+            rule: "grant-row-shape",
+            what: "a grant conferring no rights",
+            break_it: |state| {
+                let key = state.model.acl.keys().next().expect("a grant").clone();
+                state.model.acl.insert(key, 0);
+            },
+        },
+        Negative {
+            rule: "admin-revision",
+            what: "an admin revision over §5.2's ceiling",
+            break_it: |state| state.model.admin_revision = limits::MAX_COUNTER + 1,
+        },
+        Negative {
+            rule: "session-row-shape",
+            what: "a consumed sequence with no saved result",
+            break_it: |state| {
+                let key = *state
+                    .model
+                    .sessions
+                    .iter()
+                    .find(|(_, s)| s.last_result.is_some())
+                    .map(|(k, _)| k)
+                    .expect("an answered session");
+                state
+                    .model
+                    .sessions
+                    .get_mut(&key)
+                    .expect("the row")
+                    .last_result = None;
+            },
+        },
+        Negative {
+            rule: "intent-row-shape",
+            what: "a member seed whose join permit does not verify",
+            break_it: |state| {
+                // The fixture's own intent, named rather than taken by
+                // iteration order: the generated history retains intents of its
+                // own now, and the lowest operation id is not reliably the one
+                // carrying a seed.
+                let intent = state
+                    .model
+                    .intents
+                    .get_mut(&[0x55u8; 16])
+                    .expect("the fixture's intent");
+                let permit = intent.plan.member_seeds[0]
+                    .join_permit
+                    .as_mut()
+                    .expect("a permit");
+                let last = permit.len() - 1;
+                permit[last] ^= 0xFF;
+            },
+        },
+        Negative {
+            rule: "route-row-shape",
+            what: "a ticket for a different node",
+            break_it: |state| {
+                let node = *state.model.routes.keys().next().expect("a route");
+                let other = crate::coordination::model::membership::test_ticket(&[0x9Eu8; 32]);
+                state.model.routes.get_mut(&node).expect("the row").ticket = other;
+            },
+        },
+    ];
+
+    /// Every rule has a negative, and every negative trips the rule it names.
+    ///
+    /// The second half is what makes the first worth having. A perturbation
+    /// that merely gets the state refused proves nothing about the rule it was
+    /// written for, and the earlier version of these tests had exactly that
+    /// problem: an audit-tip perturbation at the same index was caught by the
+    /// ordering check two lines later while the assertion matched a substring
+    /// both messages carry.
     #[test]
-    fn each_derived_value_is_recomputed_and_compared() {
-        let base = coherent_state();
-
-        let mut drifted = base.clone();
-        drifted.model.growth_bytes += 1;
-        let err = validate(&drifted).expect_err("growth drifted");
-        assert!(err.to_string().contains("the rows charge"), "got: {err}");
-
-        let mut drifted = base.clone();
-        drifted.model.reserve_bytes -= 1;
-        let err = validate(&drifted).expect_err("reserve drifted");
-        assert!(err.to_string().contains("the rows charge"), "got: {err}");
-
-        // The tip is **rebuilt** from the rows, not compared against the
-        // ordering rule that follows it. The perturbation is chosen so only the
-        // rebuild can catch it: a tip naming the second-newest retained row
-        // sits below `last_applied`, so the "runs ahead" and "same index,
-        // different entry" checks both pass. Verified by mutation -- replacing
-        // the rebuild with the persisted value survived a tip perturbed at the
-        // same index, because the ordering check caught that one instead and
-        // the assertion was matching on a substring both messages carry.
-        let mut drifted = base.clone();
-        let ((term, index), second_newest) = drifted
-            .model
-            .audit
-            .iter()
-            .rev()
-            .nth(1)
-            .map(|(k, v)| (*k, v.clone()))
-            .expect("at least two audit rows");
-        drifted.model.audit_tip = Some(LogId::new(term, second_newest.leader_node_id, index));
-        let err = validate(&drifted).expect_err("tip drifted");
-        assert!(
-            err.to_string().contains("but the rows give"),
-            "the rebuild must be what refused it: {err}"
+    fn every_invariant_has_an_independent_negative() {
+        let covered: BTreeSet<&str> = NEGATIVES.iter().map(|n| n.rule).collect();
+        let declared: BTreeSet<&str> = INVARIANTS.iter().map(|i| i.name).collect();
+        assert_eq!(
+            declared, covered,
+            "every §11.3 invariant needs a negative that reaches it, and every negative \
+             needs a rule that exists"
         );
 
-        // And the case a maximum-index comparison cannot see: the same index
-        // under a different leader is a different entry.
-        let mut drifted = base.clone();
-        let tip = drifted.model.audit_tip.expect("a tip");
-        drifted.model.audit_tip = Some(LogId::new(tip.term, [0xEE; 32], tip.index));
-        assert!(
-            validate(&drifted).is_err(),
-            "a different leader at one index"
-        );
+        for negative in NEGATIVES {
+            let mut state = coherent_state();
+            (negative.break_it)(&mut state);
+            // The counters are a function of the rows, so any perturbation that
+            // adds or resizes one moves them. Restoring them keeps the rule
+            // under test the one that fires -- except, of course, when it is
+            // the counters themselves.
+            if negative.rule != "aggregate-counters" {
+                state.model.growth_bytes = state.model.recompute_growth();
+                state.model.reserve_bytes = state.model.recompute_reserve();
+            }
 
-        // A floor that does not name the oldest retained row.
-        let mut drifted = base.clone();
-        let ((term, index), oldest) = drifted
-            .model
-            .audit
-            .iter()
-            .next()
-            .map(|(k, v)| (*k, v.clone()))
-            .expect("a row");
-        drifted.model.audit_floor = Some(LogId::new(term, oldest.leader_node_id, index + 1));
-        let err = validate(&drifted).expect_err("floor drifted");
-        assert!(err.to_string().contains("audit_floor"), "got: {err}");
+            let err = validate(&state).expect_err(&format!(
+                "{}: {} must be refused",
+                negative.rule, negative.what
+            ));
+            let StorageError::StoredCorruption { what, .. } = &err else {
+                panic!("{}: expected stored corruption, got {err:?}", negative.rule);
+            };
+            assert_eq!(
+                *what, negative.rule,
+                "{}: {} tripped `{what}` instead, so the rule it claims to cover is still \
+                 unproven",
+                negative.rule, negative.what
+            );
+        }
     }
 
     /// An audit row for an entry `last_applied` says was never applied is data
@@ -1425,58 +2426,44 @@ mod tests {
         state.model.last_applied = None;
         let err = validate(&state).expect_err("nothing applied");
         assert!(err.to_string().contains("nothing applied"), "got: {err}");
+
+        // The case a maximum-index comparison cannot see: the same index under
+        // a different leader is a different entry.
+        let mut state = coherent_state();
+        let tip = state.model.audit_tip.expect("a tip");
+        state.model.audit_tip = Some(LogId::new(tip.term, [0xEE; 32], tip.index));
+        assert!(validate(&state).is_err(), "a different leader at one index");
     }
 
-    /// A §12.1 cap is checked against the rows actually present.
+    /// The tip is the highest **index**, not the last key in table order.
+    ///
+    /// The table is keyed `(term, index)`, so redb sorts by term first. A
+    /// corrupt row at a higher term and a lower index sorts last, and a tip
+    /// taken from the last key would report it while hiding the genuinely
+    /// newest entry.
     #[test]
-    fn a_table_over_its_cap_is_refused() {
-        let mut state = coherent_state();
-        for n in 0..=limits::MAX_ADMINS_PER_GROUP {
-            let mut id = [0u8; 32];
-            id[0..8].copy_from_slice(&n.to_be_bytes());
-            state.model.admins.insert(id);
-        }
-        state.model.growth_bytes = state.model.recompute_growth();
-        let err = validate(&state).expect_err("over the admin cap");
-        assert!(err.to_string().contains("row cap"), "got: {err}");
-    }
-
-    /// Per-resource and per-actor sub-caps are checked too: a group total in
-    /// range does not imply them, since one resource may hold every grant.
-    #[test]
-    fn the_per_subject_sub_caps_are_checked_independently() {
-        let mut state = coherent_state();
-        let resource = state
+    fn the_audit_tip_is_the_highest_index_not_the_last_key() {
+        let base = coherent_state();
+        let ((term, index), row) = base
             .model
-            .resources
-            .keys()
-            .next()
-            .expect("a resource")
-            .clone();
-        for n in 0..=limits::MAX_GRANTS_PER_RESOURCE {
-            let mut id = [0u8; 32];
-            id[0..8].copy_from_slice(&n.to_be_bytes());
-            state.model.acl.insert((resource.clone(), id), 0);
-        }
-        state.model.growth_bytes = state.model.recompute_growth();
-        let err = validate(&state).expect_err("over the per-resource cap");
-        assert!(err.to_string().contains("grant cap"), "got: {err}");
-    }
+            .audit
+            .iter()
+            .next_back()
+            .map(|(k, v)| (*k, v.clone()))
+            .expect("an audit row");
 
-    /// A stored sequence above §5.2's ceiling is refused rather than read back
-    /// as a `u64` that wraps.
-    #[test]
-    fn a_sequence_over_the_counter_ceiling_is_refused() {
-        let mut state = coherent_state();
-        let key = *state.model.sessions.keys().next().expect("a session");
-        state
-            .model
-            .sessions
-            .get_mut(&key)
-            .expect("the row")
-            .last_sequence = limits::MAX_COUNTER + 1;
-        let err = validate(&state).expect_err("over the ceiling");
-        assert!(err.to_string().contains("ceiling"), "got: {err}");
+        let mut audit = base.model.audit.clone();
+        audit.insert((term + 1, index - 1), row);
+        assert_eq!(
+            audit.iter().next_back().map(|(k, _)| *k),
+            Some((term + 1, index - 1)),
+            "the corrupt row really does sort last, which is the trap"
+        );
+        assert_eq!(
+            super::rebuild_audit_tip(&audit).map(|id| id.index),
+            Some(index),
+            "the tip must still be the newest entry"
+        );
     }
 
     // ── Round trip through redb ─────────────────────────────────────────────

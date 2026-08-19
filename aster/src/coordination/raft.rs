@@ -426,15 +426,33 @@ pub struct SignedCoordinationDocumentV1 {
 }
 
 /// §13's recovery provenance, referenced by [`CoordinationMetaV1`].
+///
+/// Six fields, not three. The source authority and last-applied id were missing
+/// for several revisions, and their absence is not cosmetic: §13 records the
+/// source authority precisely because it is **not matched** against the
+/// importing voter's own binding — an import routinely carries a different one
+/// — and every initial voter compares its copy with the others so the group
+/// agrees on which group is being recovered. A record that cannot say which
+/// authority it came from cannot support that comparison at all.
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/RecoveredFrom")]
 pub struct RecoveredFromV1 {
+    /// Exactly 32 bytes.
     #[fory(id = 1, bytes)]
     pub source_group_id: Vec<u8>,
+    /// Exactly 32 bytes.
     #[fory(id = 2, bytes)]
     pub source_genesis_hash: Vec<u8>,
+    /// Exactly 32 bytes. Recorded, never matched against the local pin.
     #[fory(id = 3, bytes)]
+    pub source_authority_public_key: Vec<u8>,
+    #[fory(id = 4)]
+    pub source_authority_domain: String,
+    /// Exactly 32 bytes: the BLAKE3 the new signed genesis binds.
+    #[fory(id = 5, bytes)]
     pub export_hash: Vec<u8>,
+    #[fory(id = 6)]
+    pub source_last_applied: Option<LogIdV1>,
 }
 
 /// §11's `coordination_meta` root: everything the store needs to know about
@@ -648,7 +666,10 @@ mod tests {
                 recovered_from: Some(RecoveredFromV1 {
                     source_group_id: vec![7u8; 32],
                     source_genesis_hash: vec![8u8; 32],
+                    source_authority_public_key: vec![10u8; 32],
+                    source_authority_domain: "source.aster0.net".into(),
                     export_hash: vec![9u8; 32],
+                    source_last_applied: Some(log.clone()),
                 }),
                 aggregate_growth_bytes: 1234,
                 aggregate_reserve_bytes: 5678,

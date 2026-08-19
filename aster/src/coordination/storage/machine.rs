@@ -571,6 +571,14 @@ mod tests {
             ..State::default()
         };
         model.admins.insert(ACTOR);
+        // The resource row goes in with the grant. §8.1 moves the two together,
+        // so a grant without one is a state apply cannot produce -- and the
+        // validator now says so, which is how this fixture was found to be
+        // describing an impossible group.
+        model.resources.insert(
+            resource(),
+            crate::coordination::model::state::ResourceRow::default(),
+        );
         model.acl.insert((resource(), ACTOR), ALL_RIGHTS);
         model.growth_bytes = model.recompute_growth();
         model.reserve_bytes = model.recompute_reserve();
@@ -593,6 +601,9 @@ mod tests {
         let mut changes = ChangeSet::default();
         changes.admins.extend(state.model.admins.iter().copied());
         changes.grants.extend(state.model.acl.keys().cloned());
+        changes
+            .resources
+            .extend(state.model.resources.keys().cloned());
         rows::commit(&database, state.clone(), &changes).expect("seed");
         // Written with the codec version the loader checks, exactly as
         // `schema::open` would.

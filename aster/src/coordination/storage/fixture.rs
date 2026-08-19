@@ -223,7 +223,14 @@ pub(crate) fn maximal_legal_meta() -> CoordinationMetaV1 {
         recovered_from: Some(RecoveredFromV1 {
             source_group_id: vec![0xFF; 32],
             source_genesis_hash: vec![0xFF; 32],
+            // A source authority is recorded, never matched: §13 imports
+            // routinely carry a different binding from the importing voter's.
+            source_authority_public_key: vec![0xFF; 32],
+            source_authority_domain: "s".repeat(MAX_AUTHORITY_DOMAIN_BYTES),
+            // The same hash `recovery_export_hash` records above; §13 binds one
+            // BLAKE3 and both fields name it.
             export_hash: vec![0xFF; 32],
+            source_last_applied: log_id(8_800_000),
         }),
         // The declared budgets, not a round number above them.
         aggregate_growth_bytes: GROWTH_BUDGET,

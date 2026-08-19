@@ -433,7 +433,7 @@ pub fn test_ticket(node: &NodeId) -> Vec<u8> {
 ///
 /// Decoded on every voter from the committed command, so the verdict is
 /// replicated rather than taken on a controller's word.
-fn check_seed_ticket(ticket: &[u8], node: &NodeId) -> Result<(), ShapeLimit> {
+pub(crate) fn check_seed_ticket(ticket: &[u8], node: &NodeId) -> Result<(), ShapeLimit> {
     if ticket.is_empty() {
         return Err(ShapeLimit::MemberSeedTicketEmpty);
     }

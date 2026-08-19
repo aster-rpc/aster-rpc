@@ -26,4 +26,5 @@ pub mod resource;
 pub mod retire;
 pub mod shape;
 pub mod state;
+pub mod tables;
 pub mod wire;
