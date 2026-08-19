@@ -349,6 +349,46 @@ impl LogId {
     }
 }
 
+/// The durable rows one applied entry touched (§11.3).
+///
+/// Reported *by the transition*, because only the transition knows. §11.3
+/// requires an entry's changed rows, its audit row and `last_applied` to be one
+/// redb transaction, and the storage layer has two other ways to learn which
+/// rows those are, both wrong: deriving them from the reply is a second
+/// implementation of the transition, and diffing whole tables costs `O(state)`
+/// per batch against a 192 MiB budget.
+///
+/// A key here means **touched**, not written. The writer looks each one up in
+/// the post-state and inserts it or deletes it accordingly, so there is no
+/// direction to record and none to get backwards -- which matters for the paths
+/// that do both, like a grant update that inserts an ACL row for `Some(rights)`
+/// and removes it for `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChangeSet {
+    pub resources: BTreeSet<ResourceKey>,
+    pub grants: BTreeSet<GrantKey>,
+    pub admins: BTreeSet<NodeId>,
+    pub sessions: BTreeSet<(NodeId, ClientId)>,
+    pub intents: BTreeSet<OperationId>,
+    pub routes: BTreeSet<NodeId>,
+    pub audit: BTreeSet<(u64, u64)>,
+}
+
+impl ChangeSet {
+    /// Did this entry touch no durable row at all?
+    ///
+    /// True for an OpenRaft `Blank`, which advances only `last_applied`.
+    pub fn is_empty(&self) -> bool {
+        self.resources.is_empty()
+            && self.grants.is_empty()
+            && self.admins.is_empty()
+            && self.sessions.is_empty()
+            && self.intents.is_empty()
+            && self.routes.is_empty()
+            && self.audit.is_empty()
+    }
+}
+
 /// The group's §7.1 verification inputs, from §11's `CoordinationMetaV1`.
 ///
 /// Replicated rather than configured at each voter: apply must reach the same

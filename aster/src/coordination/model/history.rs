@@ -466,6 +466,130 @@ fn every_row_a_history_produces_round_trips_through_its_storage_root() {
     );
 }
 
+/// The recorded change set names every row an entry touched.
+///
+/// This is the property §11.3's one-transaction rule rests on: the storage
+/// layer writes exactly the keys the transition reports, so a key the
+/// transition forgets is a row that stays stale on disk while memory moves on
+/// -- and nothing in the model's own tests would notice, because the model's
+/// state is right either way.
+///
+/// The check mirrors the writer exactly. A second set of tables is updated
+/// *only* from the change set, by looking each recorded key up in the applied
+/// state and copying or deleting it, and the two are compared after every
+/// entry. Over-reporting a key is harmless -- it rewrites an identical row --
+/// so this is a completeness test, which is the direction that can lose data.
+#[test]
+fn the_recorded_change_set_names_every_row_an_entry_touched() {
+    use super::apply::apply_command_recording;
+    use super::state::ChangeSet;
+
+    /// Copy every recorded key from `applied` into `mirror`, deleting the ones
+    /// the entry removed. This is what the redb writer does, in memory.
+    fn replay_changes(mirror: &mut State, applied: &State, changes: &ChangeSet) {
+        for key in &changes.resources {
+            match applied.resources.get(key) {
+                Some(row) => mirror.resources.insert(key.clone(), row.clone()),
+                None => mirror.resources.remove(key),
+            };
+        }
+        for key in &changes.grants {
+            match applied.acl.get(key) {
+                Some(rights) => mirror.acl.insert(key.clone(), *rights),
+                None => mirror.acl.remove(key),
+            };
+        }
+        for key in &changes.admins {
+            if applied.admins.contains(key) {
+                mirror.admins.insert(*key);
+            } else {
+                mirror.admins.remove(key);
+            }
+        }
+        for key in &changes.sessions {
+            match applied.sessions.get(key) {
+                Some(row) => mirror.sessions.insert(*key, row.clone()),
+                None => mirror.sessions.remove(key),
+            };
+        }
+        for key in &changes.intents {
+            match applied.intents.get(key) {
+                Some(row) => mirror.intents.insert(*key, row.clone()),
+                None => mirror.intents.remove(key),
+            };
+        }
+        for key in &changes.routes {
+            match applied.routes.get(key) {
+                Some(row) => mirror.routes.insert(*key, row.clone()),
+                None => mirror.routes.remove(key),
+            };
+        }
+        for key in &changes.audit {
+            match applied.audit.get(key) {
+                Some(row) => mirror.audit.insert(*key, row.clone()),
+                None => mirror.audit.remove(key),
+            };
+        }
+    }
+
+    fn compare(mirror: &State, applied: &State, at: &str) {
+        assert_eq!(mirror.resources, applied.resources, "resources at {at}");
+        assert_eq!(mirror.acl, applied.acl, "grants at {at}");
+        assert_eq!(mirror.admins, applied.admins, "admins at {at}");
+        assert_eq!(mirror.sessions, applied.sessions, "sessions at {at}");
+        assert_eq!(mirror.intents, applied.intents, "intents at {at}");
+        assert_eq!(mirror.routes, applied.routes, "routes at {at}");
+        assert_eq!(mirror.audit, applied.audit, "audit at {at}");
+    }
+
+    // The generated alphabet: resources, grants, admins, sessions and audit.
+    let mut state = genesis();
+    let mut mirror = genesis();
+    let mut touched = 0usize;
+    for n in 0..600u64 {
+        let step = step(&state, n);
+        let mut changes = ChangeSet::default();
+        apply_command_recording(
+            &mut state,
+            LogId::new(1, LEADER, n + 1),
+            &step.command,
+            &mut changes,
+        )
+        .expect("no fault");
+        assert!(
+            !changes.is_empty(),
+            "every command entry writes at least its audit row, but step {n} recorded none"
+        );
+        touched += 1;
+        replay_changes(&mut mirror, &state, &changes);
+        compare(&mirror, &state, &format!("step {n}"));
+    }
+    assert_eq!(touched, 600);
+
+    // And the membership driver, for intents and routes -- which the generated
+    // alphabet retires faster than it retains.
+    let mut mirror = genesis();
+    let mut entries = 0usize;
+    let state = membership_history_observed(70, |applied, changes| {
+        entries += 1;
+        replay_changes(&mut mirror, applied, changes);
+        compare(&mirror, applied, &format!("membership entry {entries}"));
+    });
+    assert_eq!(entries, 70 * 4, "one accept and three reports per round");
+    assert!(
+        !state.intents.is_empty() && !state.routes.is_empty(),
+        "the membership history must leave intents and routes to have checked them"
+    );
+    // Eviction is the case that removes rows rather than adding them, and a
+    // change set that named only insertions would pass everything above without
+    // it.
+    assert_eq!(
+        state.intents.len() as u64,
+        super::limits::MAX_RETAINED_INTENTS,
+        "70 rounds must have evicted, so deletions were exercised"
+    );
+}
+
 /// Counters equal a full recomputation after every applied step -- checked
 /// inside `run`, and restated here so a failure names the property rather than
 /// a helper.
@@ -888,9 +1012,21 @@ fn an_admin_race_is_resolved_by_revision() {
 ///
 /// Extracted because the generated command alphabet retires its intents faster
 /// than it accumulates them, so a state with retained intents and routes has to
-/// be driven deliberately. Two tests need one: the cap/eviction property below,
-/// and the storage round trip above.
+/// be driven deliberately. Three tests need one: the cap/eviction property
+/// below, the storage round trip above, and the change-set completeness check.
 fn membership_history(rounds: u8) -> State {
+    membership_history_observed(rounds, |_, _| {})
+}
+
+/// [`membership_history`], calling `observe` after each applied entry with the
+/// state it produced and the rows it recorded.
+fn membership_history_observed(
+    rounds: u8,
+    mut observe: impl FnMut(&State, &super::state::ChangeSet),
+) -> State {
+    use super::apply::apply_command_recording;
+    use super::state::ChangeSet;
+
     let mut state = genesis();
     let mut index = 0u64;
 
@@ -904,7 +1040,8 @@ fn membership_history(rounds: u8) -> State {
 
         // Accept.
         index += 1;
-        apply_command(
+        let mut changes = ChangeSet::default();
+        apply_command_recording(
             &mut state,
             LogId::new(1, LEADER, index),
             &Command::Client {
@@ -945,8 +1082,10 @@ fn membership_history(rounds: u8) -> State {
                     },
                 }),
             },
+            &mut changes,
         )
         .expect("no fault");
+        observe(&state, &changes);
 
         // Walk the legal phase chain to completion, one report per step.
         for (from, to) in [
@@ -955,7 +1094,8 @@ fn membership_history(rounds: u8) -> State {
             (PHASE_CHANGING_VOTERS, PHASE_COMPLETED),
         ] {
             index += 1;
-            apply_command(
+            let mut changes = ChangeSet::default();
+            apply_command_recording(
                 &mut state,
                 LogId::new(1, LEADER, index),
                 &Command::MembershipProgress(MembershipProgressCommand {
@@ -965,8 +1105,10 @@ fn membership_history(rounds: u8) -> State {
                     observed_membership_log_id: Some(LogId::new(1, LEADER, index)),
                     result_code: crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED,
                 }),
+                &mut changes,
             )
             .expect("no fault");
+            observe(&state, &changes);
         }
 
         assert!(

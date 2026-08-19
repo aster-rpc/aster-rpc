@@ -27,8 +27,9 @@ use crate::coordination::reason::Disposition;
 
 use super::admin::AdminAction;
 use super::apply::{
-    apply_command, Action, ClientRef, ClientResult, Command, CommandReply, Fault, ReplyShape,
-    ShapelessCommand, OPERATION_EXPIRE, OPERATION_MEMBERSHIP_PROGRESS, OPERATION_RETIRE_CLIENT,
+    apply_command_recording, Action, ClientRef, ClientResult, Command, CommandReply, Fault,
+    ReplyShape, ShapelessCommand, OPERATION_EXPIRE, OPERATION_MEMBERSHIP_PROGRESS,
+    OPERATION_RETIRE_CLIENT,
 };
 use super::expire::ExpireCommand;
 use super::grant::GrantAction;
@@ -40,7 +41,7 @@ use super::project::{client_reply, retirement_reply, system_reply, Provenance};
 use super::resource::{self, Fence, RawResourceKey, ResourceAction};
 use super::retire::RetireCommand;
 use super::shape::{self, ShapeLimit};
-use super::state::{LogId, MemberSeed, MembershipPlan, NodeId, State};
+use super::state::{ChangeSet, LogId, MemberSeed, MembershipPlan, NodeId, State};
 use crate::coordination::contract::{SYS_EXPIRE_MALFORMED, SYS_MEMBERSHIP_MALFORMED};
 
 /// Narrow a wire `Vec<u8>` to a 32-byte node id.
@@ -268,6 +269,22 @@ pub fn apply_wire_command(
     group_id: &[u8],
     command: &CommandV1,
 ) -> Result<CommandReplyV1, Fault> {
+    apply_wire_command_recording(state, log_id, group_id, command, &mut ChangeSet::default())
+}
+
+/// [`apply_wire_command`], additionally reporting which durable rows it
+/// touched.
+///
+/// The variant §11.3's storage layer calls: it needs the row set to write one
+/// transaction per apply batch, and the transition is the only thing that knows
+/// it. `changes` accumulates across a batch rather than being replaced.
+pub fn apply_wire_command_recording(
+    state: &mut State,
+    log_id: LogId,
+    group_id: &[u8],
+    command: &CommandV1,
+    changes: &mut ChangeSet,
+) -> Result<CommandReplyV1, Fault> {
     // §5.3.1: a variant this version does not know is fatal. Everything else --
     // including a request the protocol cannot make sense of -- is a command that
     // goes through apply.
@@ -275,7 +292,7 @@ pub fn apply_wire_command(
 
     // A first attempt reports the value it wrote; the value lives in state, not
     // in the saved reply, so it is read here and only here.
-    let reply = apply_command(state, log_id, &model)?;
+    let reply = apply_command_recording(state, log_id, &model, changes)?;
     Ok(to_wire(state, group_id, &model, reply))
 }
 

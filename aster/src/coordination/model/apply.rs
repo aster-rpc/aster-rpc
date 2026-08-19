@@ -86,7 +86,7 @@ use super::resource::{self, Decision, ResourceAction};
 use super::retire::{self, RetireCommand};
 use super::shape::ShapeLimit;
 use super::state::{
-    key_parts, AuditResult, AuditRow, ClientId, LogId, NodeId, OperationId, ResourceKey,
+    key_parts, AuditResult, AuditRow, ChangeSet, ClientId, LogId, NodeId, OperationId, ResourceKey,
     ResourceRow, SavedReply, SavedSnapshot, Session, State,
 };
 
@@ -552,6 +552,24 @@ pub fn apply_command(
     log_id: LogId,
     command: &Command,
 ) -> Result<CommandReply, Fault> {
+    apply_command_recording(state, log_id, command, &mut ChangeSet::default())
+}
+
+/// [`apply_command`], additionally reporting which durable rows it touched.
+///
+/// The storage layer needs the row set to write §11.3's one transaction, and
+/// this is the only place it can honestly come from. `apply_command` above is
+/// the same call with the report discarded, which keeps every caller that does
+/// not persist -- the model's own tests, the preflight paths -- unchanged.
+///
+/// `changes` is **added to**, not replaced: one redb transaction covers a whole
+/// apply batch, so the caller accumulates across entries and commits once.
+pub fn apply_command_recording(
+    state: &mut State,
+    log_id: LogId,
+    command: &Command,
+    changes: &mut ChangeSet,
+) -> Result<CommandReply, Fault> {
     guard_delivery(state, log_id)?;
 
     let reply = match command {
@@ -559,9 +577,9 @@ pub fn apply_command(
         // a voter that cannot interpret an entry must not record having
         // applied it.
         Command::Unknown => return Err(Fault::UnknownCommand),
-        Command::Client { client, action } => {
-            CommandReply::Client(Box::new(apply_client(state, log_id, client, action)))
-        }
+        Command::Client { client, action } => CommandReply::Client(Box::new(apply_client(
+            state, log_id, client, action, changes,
+        ))),
         Command::RejectedClient {
             client,
             operation_code,
@@ -572,14 +590,17 @@ pub fn apply_command(
             client,
             *operation_code,
             resource.clone(),
+            changes,
         ))),
-        Command::Shapeless(shapeless) => apply_shapeless(state, log_id, shapeless),
-        Command::Expire(expire) => CommandReply::System(apply_expire(state, log_id, expire)),
+        Command::Shapeless(shapeless) => apply_shapeless(state, log_id, shapeless, changes),
+        Command::Expire(expire) => {
+            CommandReply::System(apply_expire(state, log_id, expire, changes))
+        }
         Command::MembershipProgress(progress) => {
-            CommandReply::System(apply_membership_progress(state, log_id, progress))
+            CommandReply::System(apply_membership_progress(state, log_id, progress, changes))
         }
         Command::RetireClient(retire) => {
-            CommandReply::Retirement(apply_retire(state, log_id, retire))
+            CommandReply::Retirement(apply_retire(state, log_id, retire, changes))
         }
     };
 
@@ -606,6 +627,7 @@ fn apply_rejected_client(
     client: &ClientRef,
     operation_code: i32,
     resource: Option<ResourceKey>,
+    changes: &mut ChangeSet,
 ) -> ClientResult {
     let session = state.sessions.get(&(client.actor, client.client_id));
     let capacity = state.capacity_for(&client.actor);
@@ -639,7 +661,7 @@ fn apply_rejected_client(
     };
 
     if writes_session {
-        write_session(state, client, Some(result.reply.clone()));
+        write_session(state, client, Some(result.reply.clone()), changes);
     }
     write_audit_row(
         state,
@@ -656,6 +678,7 @@ fn apply_rejected_client(
             epoch: 0,
             value_revision: 0,
         },
+        changes,
     );
     result
 }
@@ -669,7 +692,12 @@ fn apply_rejected_client(
 /// attribution: an actor id that narrowed is recorded even when the client id or
 /// request hash did not, and `None` marks the case where the actor id itself was
 /// the malformed field.
-fn apply_shapeless(state: &mut State, log_id: LogId, command: &ShapelessCommand) -> CommandReply {
+fn apply_shapeless(
+    state: &mut State,
+    log_id: LogId,
+    command: &ShapelessCommand,
+    changes: &mut ChangeSet,
+) -> CommandReply {
     let reply = match command.reply_shape {
         ReplyShape::Client => CommandReply::Client(Box::new(ClientResult {
             // Nothing was consumed, because there is no session to consume a
@@ -717,12 +745,18 @@ fn apply_shapeless(state: &mut State, log_id: LogId, command: &ShapelessCommand)
             epoch: 0,
             value_revision: 0,
         },
+        changes,
     );
     reply
 }
 
 /// Apply a committed `retire_client` (§10).
-fn apply_retire(state: &mut State, log_id: LogId, command: &RetireCommand) -> RetirementResult {
+fn apply_retire(
+    state: &mut State,
+    log_id: LogId,
+    command: &RetireCommand,
+    changes: &mut ChangeSet,
+) -> RetirementResult {
     let decision = retire::decide(state, command);
     let result = match &decision {
         retire::Decision::Apply(effect) => {
@@ -731,6 +765,7 @@ fn apply_retire(state: &mut State, log_id: LogId, command: &RetireCommand) -> Re
                 let previous = state.sessions.get(&key).map(session_charge);
                 state.reserve_bytes =
                     state.reserve_bytes + session_charge(&row) - previous.unwrap_or(0);
+                changes.sessions.insert(key);
                 state.sessions.insert(key, row);
             }
             RetirementResult {
@@ -759,6 +794,7 @@ fn apply_retire(state: &mut State, log_id: LogId, command: &RetireCommand) -> Re
             epoch: 0,
             value_revision: 0,
         },
+        changes,
     );
     result
 }
@@ -806,6 +842,7 @@ fn apply_client(
     log_id: LogId,
     client: &ClientRef,
     action: &Action,
+    changes: &mut ChangeSet,
 ) -> ClientResult {
     let session = state.sessions.get(&(client.actor, client.client_id));
     let capacity = state.capacity_for(&client.actor);
@@ -838,18 +875,25 @@ fn apply_client(
             false,
         ),
 
-        Classification::Unresolved { .. } => (apply_decided(state, log_id, client, action), true),
+        Classification::Unresolved { .. } => {
+            (apply_decided(state, log_id, client, action, changes), true)
+        }
     };
 
     if writes_session {
-        write_session(state, client, Some(result.reply.clone()));
+        write_session(state, client, Some(result.reply.clone()), changes);
     }
-    write_audit(state, log_id, client, &result.reply, action);
+    write_audit(state, log_id, client, &result.reply, action, changes);
     result
 }
 
 /// Apply a committed system `Expire` (§9.1).
-fn apply_expire(state: &mut State, log_id: LogId, command: &ExpireCommand) -> SystemResult {
+fn apply_expire(
+    state: &mut State,
+    log_id: LogId,
+    command: &ExpireCommand,
+    changes: &mut ChangeSet,
+) -> SystemResult {
     let decision = expire::decide(state, command);
     if let expire::Decision::Apply { row } = &decision {
         // Safety-reducing and value-preserving, so the growth charge is
@@ -882,6 +926,7 @@ fn apply_expire(state: &mut State, log_id: LogId, command: &ExpireCommand) -> Sy
             epoch,
             value_revision: 0,
         },
+        changes,
     );
 
     SystemResult {
@@ -895,10 +940,11 @@ fn apply_membership_progress(
     state: &mut State,
     log_id: LogId,
     command: &MembershipProgressCommand,
+    changes: &mut ChangeSet,
 ) -> SystemResult {
     let code = match membership::decide_progress(state, command) {
         Some(effect) => {
-            write_intent(state, log_id, effect);
+            write_intent(state, log_id, effect, changes);
             crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED
         }
         None => crate::coordination::contract::SYS_MEMBERSHIP_PHASE_MISMATCH,
@@ -916,6 +962,7 @@ fn apply_membership_progress(
             epoch: 0,
             value_revision: 0,
         },
+        changes,
     );
 
     SystemResult {
@@ -925,8 +972,14 @@ fn apply_membership_progress(
 }
 
 /// Store an intent and evict whatever its acceptance displaced.
-fn write_intent(state: &mut State, log_id: LogId, mut effect: membership::IntentEffect) {
+fn write_intent(
+    state: &mut State,
+    log_id: LogId,
+    mut effect: membership::IntentEffect,
+    changes: &mut ChangeSet,
+) {
     for id in &effect.evict {
+        changes.intents.insert(*id);
         if let Some(old) = state.intents.remove(id) {
             state.growth_bytes -= limits::charge_intent(old.charge_len(id));
         }
@@ -949,9 +1002,11 @@ fn write_intent(state: &mut State, log_id: LogId, mut effect: membership::Intent
     state.growth_bytes = state.growth_bytes
         + limits::charge_intent(effect.intent.charge_len(&effect.operation_id))
         - previous.unwrap_or(0);
+    changes.intents.insert(effect.operation_id);
     state.intents.insert(effect.operation_id, effect.intent);
 
     for node in &effect.evict_routes {
+        changes.routes.insert(*node);
         if let Some(old) = state.routes.remove(node) {
             state.growth_bytes -= limits::charge_route(old.ticket.len());
         }
@@ -967,6 +1022,7 @@ fn write_intent(state: &mut State, log_id: LogId, mut effect: membership::Intent
             .map(|r| limits::charge_route(r.ticket.len()));
         state.growth_bytes =
             state.growth_bytes + limits::charge_route(route.ticket.len()) - previous.unwrap_or(0);
+        changes.routes.insert(node);
         state.routes.insert(node, route);
     }
 
@@ -1034,10 +1090,12 @@ fn apply_decided(
     log_id: LogId,
     client: &ClientRef,
     action: &Action,
+    changes: &mut ChangeSet,
 ) -> ClientResult {
     match action.decide(state, &client.actor, &client.request_hash) {
         ActionDecision::Resource(Decision::Apply(effect)) => {
             charge_resource_row(state, &effect.key, effect.row.value.len());
+            changes.resources.insert(effect.key.clone());
             state
                 .resources
                 .insert(effect.key.clone(), effect.row.clone());
@@ -1049,11 +1107,13 @@ fn apply_decided(
             // the same step, so there is no shape in which a grant points at a
             // resource that does not exist.
             charge_resource_row(state, &effect.key, effect.row.value.len());
+            changes.resources.insert(effect.key.clone());
             state
                 .resources
                 .insert(effect.key.clone(), effect.row.clone());
 
             let acl_key = (effect.key.clone(), effect.subject);
+            changes.grants.insert(acl_key.clone());
             let (ns, k) = key_parts(&effect.key);
             match effect.rights {
                 Some(rights) => {
@@ -1073,6 +1133,7 @@ fn apply_decided(
         }
 
         ActionDecision::Admin(admin::Decision::Apply(effect)) => {
+            changes.admins.insert(effect.target);
             if effect.enabled {
                 if state.admins.insert(effect.target) {
                     state.growth_bytes += limits::charge_admin();
@@ -1096,7 +1157,7 @@ fn apply_decided(
 
         ActionDecision::Membership(membership::Decision::Apply(effect)) => {
             let (outcome, operation_id) = (effect.outcome, effect.operation_id);
-            write_intent(state, log_id, *effect);
+            write_intent(state, log_id, *effect, changes);
             membership_reply(outcome, operation_id, state.membership_log_id)
         }
 
@@ -1238,7 +1299,12 @@ fn consumed_success(outcome: Outcome, key: ResourceKey, row: &ResourceRow) -> Cl
 }
 
 /// Create or update the session row, maintaining the reserve counter.
-fn write_session(state: &mut State, client: &ClientRef, result: Option<SavedReply>) {
+fn write_session(
+    state: &mut State,
+    client: &ClientRef,
+    result: Option<SavedReply>,
+    changes: &mut ChangeSet,
+) {
     let key = (client.actor, client.client_id);
     let previous_charge = state.sessions.get(&key).map(session_charge);
     let row = Session {
@@ -1248,6 +1314,7 @@ fn write_session(state: &mut State, client: &ClientRef, result: Option<SavedRepl
         retired: state.sessions.get(&key).is_some_and(|s| s.retired),
     };
     state.reserve_bytes = state.reserve_bytes + session_charge(&row) - previous_charge.unwrap_or(0);
+    changes.sessions.insert(key);
     state.sessions.insert(key, row);
 }
 
@@ -1272,6 +1339,7 @@ fn write_audit(
     client: &ClientRef,
     reply: &SavedReply,
     action: &Action,
+    changes: &mut ChangeSet,
 ) {
     let resource = reply.resource().cloned();
     let row = AuditRow {
@@ -1288,16 +1356,17 @@ fn write_audit(
         epoch: reply.snapshot.as_ref().map_or(0, |s| s.epoch),
         value_revision: reply.snapshot.as_ref().map_or(0, |s| s.value_revision),
     };
-    write_audit_row(state, log_id, row);
+    write_audit_row(state, log_id, row, changes);
 }
 
 /// Insert a prebuilt audit row, advance the tip, and prune to the retention
 /// limit.
-fn write_audit_row(state: &mut State, log_id: LogId, row: AuditRow) {
+fn write_audit_row(state: &mut State, log_id: LogId, row: AuditRow, changes: &mut ChangeSet) {
     state.reserve_bytes += limits::charge_audit(row.resource.as_ref().map(key_parts));
+    changes.audit.insert((log_id.term, log_id.index));
     state.audit.insert((log_id.term, log_id.index), row);
     state.audit_tip = Some(log_id);
-    prune_audit(state);
+    prune_audit(state, changes);
 }
 
 /// Prune the oldest audit rows down to §12.1's retention limit.
@@ -1309,13 +1378,14 @@ fn write_audit_row(state: &mut State, log_id: LogId, row: AuditRow) {
 ///
 /// `audit_floor` advances with it, so `audit_stream` can answer `OUT_OF_RANGE`
 /// with the floor rather than silently returning a partial range (§5.2).
-fn prune_audit(state: &mut State) {
+fn prune_audit(state: &mut State, changes: &mut ChangeSet) {
     while state.audit.len() as u64 > limits::MAX_AUDIT_ROWS {
         let Some((&key, row)) = state.audit.iter().next() else {
             break;
         };
         let charge = limits::charge_audit(row.resource.as_ref().map(key_parts));
         let leader = row.leader_node_id;
+        changes.audit.insert(key);
         state.audit.remove(&key);
         state.reserve_bytes -= charge;
         // The **whole** log id of the oldest row still retained. The pruned
@@ -1917,7 +1987,18 @@ mod tests {
         // floor can be checked for the whole identity rather than a term and an
         // index.
         let total = limits::MAX_AUDIT_ROWS + 1;
+        // A **fresh** change set per row, which is what a batch is: the row
+        // that gets evicted was written in an entry whose transaction committed
+        // long ago, so the entry that evicts it has to record the deletion
+        // itself. Accumulating one set across the whole run would have hidden
+        // that -- the evicted key would still be present from its own
+        // insertion, and the assertion below would pass with the eviction
+        // record removed. Verified by mutation, twice: the generated histories
+        // never reach this path at all, and the accumulating version of this
+        // test did not distinguish it either.
+        let mut changes = ChangeSet::default();
         for i in 1..=total {
+            changes = ChangeSet::default();
             let mut leader = [0u8; 32];
             leader[0..8].copy_from_slice(&i.to_be_bytes());
             write_audit_row(
@@ -1932,6 +2013,7 @@ mod tests {
                     epoch: 0,
                     value_revision: 0,
                 },
+                &mut changes,
             );
         }
 
@@ -1943,6 +2025,19 @@ mod tests {
         assert!(
             !s.audit.contains_key(&(1, 1)),
             "the single oldest row is the one that went"
+        );
+
+        // §11.3 writes the pruned row's deletion in the same transaction as the
+        // row that displaced it, so pruning has to be *recorded*. A change set
+        // that named only insertions would leave the evicted row on disk while
+        // memory and the reserve counter both moved on -- and every other
+        // assertion in this test would still pass, because they all read
+        // memory.
+        assert_eq!(
+            changes.audit,
+            std::collections::BTreeSet::from([(1, 1), (1, total)]),
+            "the entry that crosses the cap writes its own row and deletes the \
+             one it displaced, and its transaction must name both"
         );
         assert!(s.audit.contains_key(&(1, 2)), "the new oldest is retained");
         assert!(s.audit.contains_key(&(1, total)), "the tip is never pruned");
@@ -1971,6 +2066,84 @@ mod tests {
             .map(|r| limits::charge_audit(r.resource.as_ref().map(key_parts)))
             .sum();
         assert_eq!(s.reserve_bytes, expected);
+    }
+
+    /// A displaced route's deletion is recorded alongside the route that
+    /// displaced it.
+    ///
+    /// Its own test because no history reaches it: the membership driver
+    /// re-seeds the same three nodes every round, so the route table never
+    /// approaches its 64-row cap, and mutation confirmed the change-set
+    /// property passed with this record removed. §9 decides *which* routes are
+    /// displaced -- this checks only that whatever it decides is written down.
+    #[test]
+    fn a_displaced_route_is_recorded_as_well_as_the_one_that_displaced_it() {
+        use crate::coordination::model::state::Route;
+
+        let displaced = [0x0Du8; 32];
+        let introduced = [0x0Eu8; 32];
+
+        let mut s = State::default();
+        s.routes.insert(
+            displaced,
+            Route {
+                ticket: b"old".to_vec(),
+                source_operation_id: [1u8; 16],
+                introduced_log_id: LogId::new(1, LEADER, 1),
+            },
+        );
+        s.growth_bytes = limits::charge_route(3);
+
+        let mut changes = ChangeSet::default();
+        write_intent(
+            &mut s,
+            LogId::new(1, LEADER, 2),
+            membership::IntentEffect {
+                operation_id: [2u8; 16],
+                intent: intent_fixture(),
+                outcome: Outcome::MembershipAccepted,
+                evict: Vec::new(),
+                routes: vec![(
+                    introduced,
+                    Route {
+                        ticket: b"new".to_vec(),
+                        source_operation_id: [2u8; 16],
+                        introduced_log_id: LogId::new(1, LEADER, 2),
+                    },
+                )],
+                evict_routes: vec![displaced],
+                membership_log_id: None,
+                intent_members: Vec::new(),
+            },
+            &mut changes,
+        );
+
+        assert!(
+            !s.routes.contains_key(&displaced) && s.routes.contains_key(&introduced),
+            "the effect must have replaced one route with the other"
+        );
+        assert_eq!(
+            changes.routes,
+            std::collections::BTreeSet::from([displaced, introduced]),
+            "a change set naming only the new route would leave the displaced \
+             one on disk while the growth counter says it is gone"
+        );
+    }
+
+    /// A minimal active intent, for effects whose subject is not the intent.
+    fn intent_fixture() -> crate::coordination::model::state::Intent {
+        use crate::coordination::model::state::{Intent, MembershipPlan};
+        Intent {
+            actor: ACTOR,
+            request_hash: [0u8; 32],
+            expected_membership: None,
+            plan: MembershipPlan::default(),
+            status_code: membership::PHASE_PENDING,
+            result_code: 0,
+            accepted_log_id: LogId::new(1, LEADER, 2),
+            completed_log_id: None,
+            observed_membership_log_id: None,
+        }
     }
 
     /// The leader stamped on row `i` by the retention fixture.
