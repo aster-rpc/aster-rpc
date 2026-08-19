@@ -118,7 +118,19 @@ enum Outcome {
 struct StateActor {
     database: Database,
     /// The **published** state: what is on disk, and nothing more.
-    state: DurableState,
+    ///
+    /// `Option` because an apply batch *moves* it out. The state is a whole
+    /// group -- up to 192 MiB of resource values under §12.1 -- so cloning it
+    /// per batch would copy the entire store to apply one command. Taking it
+    /// instead makes the batch's working value the only one that exists, and
+    /// `rows::commit` hands it back only on success.
+    ///
+    /// That also makes "every failure after the take is fatal" structural
+    /// rather than a property of the error classifier: an error path leaves
+    /// this `None`, and every reader below answers `Fatal` when it is. There is
+    /// no state to serve, because the only copy was the one the failed batch
+    /// was holding.
+    state: Option<DurableState>,
     fatal: Arc<AtomicBool>,
     /// Fail the next batch's commit, after its entries have already mutated
     /// the working copy.
@@ -141,11 +153,9 @@ impl StateActor {
             }
             let outcome = match command {
                 StateCommand::Shutdown => break,
-                StateCommand::AppliedState(reply) => self.serve(reply, |a| Ok(a.applied_state())),
+                StateCommand::AppliedState(reply) => self.serve(reply, StateActor::applied_state),
                 StateCommand::Apply { entries, reply } => self.serve(reply, |a| a.apply(&entries)),
-                StateCommand::Snapshot(reply) => {
-                    self.serve(reply, |a| Ok(Box::new(a.state.clone())))
-                }
+                StateCommand::Snapshot(reply) => self.serve(reply, |a| a.published().map(Box::new)),
                 #[cfg(test)]
                 StateCommand::FailNextCommit(reply) => self.serve(reply, |a| {
                     a.fail_next_commit = true;
@@ -209,11 +219,23 @@ impl StateActor {
         }
     }
 
-    fn applied_state(&self) -> Applied {
-        (
-            self.state.model.last_applied.as_ref().map(Into::into),
-            self.state.membership.clone(),
-        )
+    /// The published state, or `Fatal` if a batch took it and never gave it
+    /// back.
+    fn published(&self) -> StorageResult<DurableState> {
+        // Checkpoint D replaces this clone on the snapshot path with the
+        // planned read-transaction stream; §11.4 forbids materialising a body
+        // in memory, and a snapshot builder that cloned the state would do
+        // exactly that. It stays here meanwhile because nothing on the apply
+        // path uses it.
+        self.state.clone().ok_or(StorageError::Fatal)
+    }
+
+    fn applied_state(&mut self) -> StorageResult<Applied> {
+        let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
+        Ok((
+            state.model.last_applied.as_ref().map(Into::into),
+            state.membership.clone(),
+        ))
     }
 
     /// Apply one batch: every entry into a private copy, one transaction, then
@@ -223,10 +245,12 @@ impl StateActor {
             return Ok(Vec::new());
         }
 
-        // The private working value. Nothing outside this function can observe
-        // it, and if the commit below fails it is dropped rather than
-        // published -- which is what keeps memory from running ahead of disk.
-        let mut working = self.state.clone();
+        // The private working value, **moved** out of the actor rather than
+        // copied from it. Nothing outside this function can observe it, and if
+        // anything below fails it is dropped rather than published -- which is
+        // what keeps memory from running ahead of disk, and now also means
+        // there is no published state left to serve until a commit returns one.
+        let mut working = self.state.take().ok_or(StorageError::Fatal)?;
         let mut changes = ChangeSet::default();
         let mut replies = Vec::with_capacity(entries.len());
         let group = working.model.authority.group_id;
@@ -287,7 +311,7 @@ impl StateActor {
         // failure latches fatal before it replies, and a fatal store answers
         // nothing further -- so it is carried by the signature rather than by a
         // test whose name would imply it had been checked.
-        self.state = rows::commit(&self.database, working, &changes)?;
+        self.state = Some(rows::commit(&self.database, working, &changes)?);
         Ok(replies)
     }
 }
@@ -346,7 +370,7 @@ impl StateHandle {
             .spawn(move || {
                 StateActor {
                     database,
-                    state,
+                    state: Some(state),
                     fatal: actor_fatal,
                     #[cfg(test)]
                     fail_next_commit: false,
@@ -1235,9 +1259,14 @@ mod tests {
     /// actor latches fatal *before* it replies, and a fatal store refuses
     /// everything afterwards -- so no reader exists that could tell the two
     /// apart. Mutation confirmed it: moving the publication above the commit
-    /// passed all 576 tests. That ordering is carried by `rows::commit` taking
-    /// the working state by value and handing it back only on success, which
-    /// is a form that cannot be got wrong rather than a claim about coverage.
+    /// passed all 576 tests.
+    ///
+    /// Two forms carry it instead of a test. `rows::commit` takes the working
+    /// state by value and hands it back only on success, so there is nothing to
+    /// publish early; and the actor *moved* its state into the batch, so a
+    /// failure leaves it holding none at all. The second is what the assertion
+    /// below now rests on -- there is no published state, rather than a
+    /// published state nobody may read.
     #[tokio::test]
     async fn a_failed_commit_publishes_neither_memory_nor_disk() {
         let dir = scratch_dir();
@@ -1256,8 +1285,9 @@ mod tests {
         );
         assert!(machine.handle().is_fatal(), "durability is in question");
 
-        // A fatal store answers nothing further -- which is also why the
-        // in-memory half of §4.4 is unobservable here; see the note above.
+        // There is no published state to answer with: the batch took it and the
+        // commit never gave it back. See the note above for why the in-memory
+        // ordering itself is unobservable.
         assert!(machine.handle().published().await.is_err());
 
         // Disk: unchanged, which is what a reopen shows.
