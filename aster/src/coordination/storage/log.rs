@@ -36,6 +36,7 @@ use openraft::{AnyError, Entry, LogId, LogState, StorageError, StorageIOError, V
 use redb::{Database, ReadableDatabase, ReadableTable};
 use tokio::sync::{mpsc, oneshot};
 
+use super::actor::ActorShutdown;
 use super::codec::{decode_persisted_bounded, encode_bounded};
 use super::error::{Db, StorageError as AsterStorageError, StorageResult};
 use super::schema::{KEY_COMMITTED, KEY_LAST_PURGED, KEY_VOTE, RAFT_LOG, RAFT_META};
@@ -113,7 +114,7 @@ fn decode_log_id(bytes: &[u8]) -> StorageResult<LogId<CoordinationNodeId>> {
 
 type Reply<T> = oneshot::Sender<StorageResult<T>>;
 
-enum LogCommand {
+pub(crate) enum LogCommand {
     LogState(Reply<LogState<CoordinationTypeConfig>>),
     SaveVote {
         vote: Vote<CoordinationNodeId>,
@@ -677,38 +678,12 @@ fn fail<T>(reply: Reply<T>) {
 
 // ── Handle ───────────────────────────────────────────────────────────────────
 
-/// Stops the log actor and waits for it to release its database.
+/// The log actor's shutdown guard.
 ///
-/// This exists because of an ordering that is easy to get wrong and silent
-/// when you do: the actor thread owns the `Database`, so dropping the store
-/// only *asks* it to stop. If the directory lock were released before the
-/// thread actually exited, the next open of that directory would find the file
-/// still held — a restart failing with `DatabaseAlreadyOpen` in the best case,
-/// and in the worst a second voter admitted while the first still has the log
-/// open.
-///
-/// So this guard is dropped before the lock, and it joins.
-#[derive(Debug)]
-pub(crate) struct ActorShutdown {
-    tx: mpsc::Sender<LogCommand>,
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for ActorShutdown {
-    fn drop(&mut self) {
-        // The flag handles the case where the queue is full and `try_send`
-        // cannot get a `Shutdown` in: the actor checks it before servicing
-        // each command, so it converges either way. `try_send` is used rather
-        // than a blocking send because `Drop` may run on a Tokio worker, where
-        // blocking would stall the runtime.
-        self.stop.store(true, Ordering::SeqCst);
-        let _ = self.tx.try_send(LogCommand::Shutdown);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
+/// See [`ActorShutdown`](super::actor::ActorShutdown) for the ordering it
+/// enforces and why it is shared with the state machine's actor rather than
+/// written twice.
+pub(crate) type LogShutdown = ActorShutdown<LogCommand>;
 
 /// A handle onto the log actor. Cloneable: OpenRaft hands log readers to
 /// several replication tasks, and they all funnel to the one writer thread.
@@ -728,7 +703,7 @@ impl std::fmt::Debug for LogHandle {
 
 impl LogHandle {
     /// Start the actor thread and return a handle onto it.
-    pub(crate) fn spawn(database: Database) -> StorageResult<(Self, ActorShutdown)> {
+    pub(crate) fn spawn(database: Database) -> StorageResult<(Self, LogShutdown)> {
         let (tx, rx) = mpsc::channel(LOG_ACTOR_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
         let actor_stop = Arc::clone(&stop);
@@ -756,11 +731,7 @@ impl LogHandle {
                 tx: tx.clone(),
                 fatal,
             },
-            ActorShutdown {
-                tx,
-                stop,
-                thread: Some(thread),
-            },
+            ActorShutdown::new(tx, stop, thread, || LogCommand::Shutdown),
         ))
     }
 
@@ -888,7 +859,7 @@ pub(crate) struct CoordinationLogStore {
 }
 
 impl CoordinationLogStore {
-    pub(crate) fn new(database: Database) -> StorageResult<(Self, ActorShutdown)> {
+    pub(crate) fn new(database: Database) -> StorageResult<(Self, LogShutdown)> {
         let (handle, shutdown) = LogHandle::spawn(database)?;
         Ok((Self { handle }, shutdown))
     }

@@ -1041,6 +1041,18 @@ fn write_intent(
 /// Reject a delivery that cannot belong to a committed history, before any
 /// mutation.
 ///
+/// Crate-visible because Slice 2's state machine shares it. OpenRaft's own
+/// `Blank` and `Membership` entries are not `CommandV1`s and so do not reach
+/// [`apply_command`], but §10.2's rule is about *delivery*, not about what was
+/// delivered: a native entry at or below `last_applied` is the same broken
+/// history a duplicate command would be. A second copy of the rule in the
+/// storage layer would be a second place for it to drift.
+///
+/// Note it requires a **strictly greater** index, not a contiguous one. A
+/// state machine legitimately receives an index above `last_applied + 1` --
+/// OpenRaft's own suite does exactly that -- and the append-continuity rules
+/// belong to the log store, not here.
+///
 /// Two independent conditions:
 ///
 /// * `log_id.index <= last_applied.index` -- an already-applied entry, an older
@@ -1054,7 +1066,7 @@ fn write_intent(
 /// Note what is deliberately *not* consulted: whether an audit row already
 /// exists for this identity. Audit is prunable and lossy, so its absence proves
 /// nothing and its presence cannot identify a command.
-fn guard_delivery(state: &State, log_id: LogId) -> Result<(), Fault> {
+pub fn guard_delivery(state: &State, log_id: LogId) -> Result<(), Fault> {
     if let Some(last) = state.last_applied {
         if log_id.index <= last.index {
             return Err(Fault::LogIdNotAdvancing {

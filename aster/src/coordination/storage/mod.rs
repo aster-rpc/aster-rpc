@@ -8,6 +8,7 @@
 //!
 //! | Module | Owns |
 //! |---|---|
+//! | [`actor`] | the shared single-writer shutdown guard |
 //! | [`codec`] | the single decode site for persisted values |
 //! | [`error`] | the named §11.1 failures, kept distinct on purpose |
 //! | [`identity`] | the crate-private storage-open identity and policy |
@@ -44,6 +45,7 @@
 //! which is the Slice 3 boundary the plan draws. The allowances come off when
 //! Slice 3 wires the voter runtime, not before.
 
+pub(crate) mod actor;
 pub(crate) mod codec;
 pub(crate) mod error;
 /// The OpenRaft storage-suite fixture. Test-only: it exists to hold one group
@@ -62,7 +64,8 @@ pub(crate) use snapshot::CoordinationSnapshotFile;
 
 use error::StorageResult;
 use identity::{OpenPolicy, StorageIdentity};
-use log::{ActorShutdown, CoordinationLogStore};
+use log::{CoordinationLogStore, LogShutdown};
+use machine::{CoordinationStateMachine, StateShutdown};
 use schema::{DirectoryLock, IntegrityOutcome, OpenOutcome, StorageLayout};
 
 /// A validated, locked storage directory with its log actor running.
@@ -83,17 +86,18 @@ pub(crate) struct VoterStorage {
     layout: StorageLayout,
     identity: StorageIdentity,
     log: CoordinationLogStore,
-    state: redb::Database,
+    state: CoordinationStateMachine,
     outcome: OpenOutcome,
     integrity: (IntegrityOutcome, IntegrityOutcome),
     /// Field order below is the shutdown order, and it is load-bearing.
     ///
-    /// Rust drops fields in declaration order, so the actor is stopped and
-    /// joined -- releasing its `Database` -- before the directory lock goes.
-    /// Reversed, a restart would find the lock free but the database still
-    /// open, and a second voter could be admitted while the first still holds
-    /// the log.
-    _shutdown: ActorShutdown,
+    /// Rust drops fields in declaration order, so **both** actors are stopped
+    /// and joined -- releasing their `Database` handles -- before the directory
+    /// lock goes. Reversed, a restart would find the lock free but a database
+    /// still open, and a second voter could be admitted while the first still
+    /// has the file open.
+    _log_shutdown: LogShutdown,
+    _state_shutdown: StateShutdown,
     _lock: DirectoryLock,
 }
 
@@ -114,15 +118,19 @@ impl VoterStorage {
         // corruption.
         log::validate_persisted_log(&parts.raft)?;
 
-        let (log, shutdown) = CoordinationLogStore::new(parts.raft)?;
+        let (log, log_shutdown) = CoordinationLogStore::new(parts.raft)?;
+        // The state machine's own load validates every §11.3 row and the whole
+        // state before its actor exists, for the same reason.
+        let (state, state_shutdown) = CoordinationStateMachine::new(parts.state)?;
         Ok(Self {
             layout: parts.layout,
             identity: parts.identity,
             log,
-            state: parts.state,
+            state,
             outcome: parts.outcome,
             integrity: parts.integrity,
-            _shutdown: shutdown,
+            _log_shutdown: log_shutdown,
+            _state_shutdown: state_shutdown,
             _lock: parts.lock,
         })
     }
@@ -135,8 +143,12 @@ impl VoterStorage {
         &mut self.log
     }
 
-    pub(crate) fn state(&self) -> &redb::Database {
+    pub(crate) fn state(&self) -> &CoordinationStateMachine {
         &self.state
+    }
+
+    pub(crate) fn state_mut(&mut self) -> &mut CoordinationStateMachine {
+        &mut self.state
     }
 
     pub(crate) fn layout(&self) -> &StorageLayout {
@@ -178,6 +190,7 @@ mod durability_guard {
     /// Every source file in this module tree, checked as text.
     const SOURCES: &[(&str, &str)] = &[
         ("mod.rs", include_str!("mod.rs")),
+        ("actor.rs", include_str!("actor.rs")),
         ("codec.rs", include_str!("codec.rs")),
         ("error.rs", include_str!("error.rs")),
         ("identity.rs", include_str!("identity.rs")),
@@ -319,6 +332,63 @@ mod durability_guard {
                 );
             }
         }
+    }
+
+    /// Every encode on the §11.3 apply path is the fatal one.
+    ///
+    /// `encode_bounded` and `encode_committed` differ only in classification,
+    /// and both are correct somewhere: the log store legitimately uses the
+    /// retryable one, because an entry OpenRaft hands it to append has not been
+    /// committed yet and refusing it writes nothing. Once an entry *is*
+    /// committed the group has already decided it applies, so a state machine
+    /// that cannot encode the result has no retry to offer and must not report
+    /// one — §4.4 forbids continuing with memory ahead of disk.
+    ///
+    /// Stated as a rule about the two files that own that path rather than as
+    /// a count, for the same reason the write-transaction and decode guards
+    /// are: a count cannot express "every encode", and a per-line window is
+    /// what rustfmt defeated last time. Written alongside the actor rather
+    /// than after it, so the first apply-path encode was already covered.
+    #[test]
+    fn apply_path_encodes_are_fatal_not_retryable() {
+        const APPLY_PATH: &[&str] = &["rows.rs", "machine.rs"];
+        let mut sites = Vec::new();
+        for (name, source) in SOURCES {
+            if !APPLY_PATH.contains(name) {
+                continue;
+            }
+            for (n, line) in production_lines(source) {
+                for retryable in ["encode_bounded(", "encode_owned("] {
+                    if line.contains(retryable) {
+                        sites.push(format!("{name}:{}", n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            sites.is_empty(),
+            "the apply path must encode through codec::encode_committed, which \
+             classifies a failure as fatal rather than retryable; found: {sites:?}"
+        );
+
+        // And it does encode: a guard that passed because nothing on this path
+        // encodes at all would say nothing about the classification.
+        let committed: usize = SOURCES
+            .iter()
+            .filter(|(name, _)| APPLY_PATH.contains(name))
+            .flat_map(|(_, source)| production_lines(source))
+            .filter(|(_, line)| line.contains("encode_committed("))
+            .count();
+        // Five §11.3 tables carry a Fory root -- resources, sessions, intents,
+        // routes and audit -- plus the meta row. `group_admins` and
+        // `resource_acl` do not: their values are redb's own `()` and `u64`,
+        // so there is nothing to encode and nothing to classify.
+        assert_eq!(
+            committed, 6,
+            "the five Fory-valued §11.3 tables and the meta row each encode once \
+             on this path; a different count means a table stopped being written, \
+             gained a second write site, or the guard is looking at the wrong files"
+        );
     }
 
     /// And the retryable variant is raised only from the codec module's

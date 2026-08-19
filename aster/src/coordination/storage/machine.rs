@@ -1,20 +1,37 @@
 //! `RaftStateMachine` over `state.redb` (§11.3).
 //!
-//! Checkpoint C. The §11.3 tables are created and validated by
-//! [`super::schema`]; what is missing is the bounded state actor, the typed
-//! conversions between each model row and its declared Fory storage root, the
-//! one-transaction apply batch, and `CommandReplyV1::NonCommand` for
-//! OpenRaft's native Blank and Membership entries.
+//! ## The rule this module exists to hold
 //!
-//! The transition decision stays single-sourced in
-//! [`model::boundary::apply_wire_command`](crate::coordination::model::boundary::apply_wire_command);
-//! this module persists its result, it does not re-derive it.
+//! One apply batch is one redb transaction, and **memory never moves ahead of
+//! disk**. The actor mutates a private clone of its state, commits every
+//! entry's rows in a single transaction, and only then publishes that clone and
+//! answers OpenRaft. A commit that fails leaves the published state exactly
+//! where it was and latches the store fatal; the working copy is dropped
+//! unread.
+//!
+//! Doing it the other way round is the failure §4.4 forbids outright, and it is
+//! silent: every read in the process would see the newer state, and only a
+//! restart — or a follower asking for a snapshot — would find the disk behind.
+//!
+//! ## Why OpenRaft's own entries go through the same guard
+//!
+//! `Blank` and `Membership` are not `CommandV1`s, so they do not reach
+//! [`apply_command`](crate::coordination::model::apply::apply_command). §10.2's
+//! delivery rule is about delivery rather than about what was delivered, so
+//! they share
+//! [`guard_delivery`](crate::coordination::model::apply::guard_delivery)
+//! instead of getting a second copy of it. Neither writes an audit row or runs
+//! an application transition: a `Blank` advances `last_applied` and nothing
+//! else, and a `Membership` additionally records the exact `StoredMembership`.
+//! Both answer [`CommandReplyV1::NonCommand`], because OpenRaft requires one
+//! response per applied entry whatever the entry was.
 //!
 //! ## One rule fixed in advance
 //!
 //! Every encode on the apply path goes through
 //! [`codec::encode_committed`](super::codec::encode_committed), never
-//! [`encode_bounded`](super::codec::encode_bounded).
+//! [`encode_bounded`](super::codec::encode_bounded) — enforced structurally by
+//! `apply_path_encodes_are_fatal_not_retryable` in [`super`].
 //!
 //! The two differ only in classification, and the difference matters exactly
 //! here. A retryable `EncodeFailed` is correct for a value a *caller* offered:
@@ -23,3 +40,1145 @@
 //! cannot encode the result has no retry available — reporting one would let
 //! the runtime carry on with memory ahead of disk, which §4.4 forbids
 //! outright.
+
+// See the `storage` module docs: nothing in a shipping build reaches
+// `VoterStorage::open` until Slice 3 supplies a verified identity.
+#![allow(dead_code)]
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use openraft::storage::RaftStateMachine;
+use openraft::{
+    EntryPayload, LogId as RaftLogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta,
+    StorageError as RaftStorageError, StorageIOError, StoredMembership,
+};
+use redb::Database;
+use tokio::sync::{mpsc, oneshot};
+
+use super::actor::ActorShutdown;
+use super::error::{Db, StorageError, StorageResult};
+use super::rows::{self, DurableState};
+use super::CoordinationSnapshotFile;
+use crate::coordination::contract::{CommandReplyV1, NonCommandReplyV1};
+use crate::coordination::ids::CoordinationNodeId;
+use crate::coordination::model::apply::guard_delivery;
+use crate::coordination::model::boundary::apply_wire_command_recording;
+use crate::coordination::model::state::{ChangeSet, LogId};
+use crate::coordination::typeconfig::{CoordinationNode, CoordinationTypeConfig};
+
+/// Depth of the state actor's command queue.
+///
+/// Bounded for the same reason the log's is: an unbounded queue in front of a
+/// slow disk converts back pressure into unbounded memory growth. Smaller than
+/// the log's because each item is a whole apply batch rather than one command.
+const STATE_ACTOR_QUEUE: usize = 16;
+
+/// The applied membership OpenRaft asks for at startup.
+type Applied = (
+    Option<RaftLogId<CoordinationNodeId>>,
+    StoredMembership<CoordinationNodeId, CoordinationNode>,
+);
+
+type Entry = openraft::Entry<CoordinationTypeConfig>;
+type Reply<T> = oneshot::Sender<StorageResult<T>>;
+
+// ── Actor protocol ───────────────────────────────────────────────────────────
+
+pub(crate) enum StateCommand {
+    AppliedState(Reply<Applied>),
+    Apply {
+        entries: Vec<Entry>,
+        reply: Reply<Vec<CommandReplyV1>>,
+    },
+    /// Hand out a copy of the published state.
+    ///
+    /// Reads go through the actor rather than through a second redb read
+    /// transaction so that "what is published" has one answer. A reader that
+    /// opened its own transaction could observe the rows of a batch whose
+    /// in-memory publication had not happened yet.
+    Snapshot(Reply<Box<DurableState>>),
+    Shutdown,
+    /// Force a fatal failure through the ordinary serve path.
+    #[cfg(test)]
+    InjectFatal(Reply<()>),
+    /// Arm the commit failure described on [`StateActor::fail_next_commit`].
+    #[cfg(test)]
+    FailNextCommit(Reply<()>),
+}
+
+/// Whether the actor may keep serving after one command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Continue,
+    Fatal,
+}
+
+/// The single-writer thread that owns `state.redb`.
+struct StateActor {
+    database: Database,
+    /// The **published** state: what is on disk, and nothing more.
+    state: DurableState,
+    fatal: Arc<AtomicBool>,
+    /// Fail the next batch's commit, after its entries have already mutated
+    /// the working copy.
+    ///
+    /// A deliberate test seam, and the only way to reach the case that matters
+    /// most here: a commit that fails *after* the transition ran. Faking it in
+    /// a harness would prove the harness; this routes through the real `apply`,
+    /// so the working copy really has been mutated by the time the failure
+    /// happens and "nothing was published" is a statement about production
+    /// code.
+    #[cfg(test)]
+    fail_next_commit: bool,
+}
+
+impl StateActor {
+    fn run(mut self, mut rx: mpsc::Receiver<StateCommand>, stop: Arc<AtomicBool>) {
+        while let Some(command) = rx.blocking_recv() {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let outcome = match command {
+                StateCommand::Shutdown => break,
+                StateCommand::AppliedState(reply) => self.serve(reply, |a| Ok(a.applied_state())),
+                StateCommand::Apply { entries, reply } => self.serve(reply, |a| a.apply(&entries)),
+                StateCommand::Snapshot(reply) => {
+                    self.serve(reply, |a| Ok(Box::new(a.state.clone())))
+                }
+                #[cfg(test)]
+                StateCommand::FailNextCommit(reply) => self.serve(reply, |a| {
+                    a.fail_next_commit = true;
+                    Ok(())
+                }),
+                #[cfg(test)]
+                StateCommand::InjectFatal(reply) => self.serve(reply, |_| {
+                    Err(StorageError::corrupt(
+                        Db::State,
+                        "CoordinationMetaV1",
+                        "injected durability failure",
+                    ))
+                }),
+            };
+            if outcome == Outcome::Fatal {
+                self.drain_fatal(&mut rx);
+                break;
+            }
+        }
+    }
+
+    /// Run one command, latch fatality **before** replying, and report which it
+    /// was.
+    ///
+    /// The ordering is the point, and it is the same one the log actor holds:
+    /// classifying in the caller leaves a window in which a batch queued behind
+    /// a failed commit is serviced and acknowledged.
+    fn serve<T, F>(&mut self, reply: Reply<T>, run: F) -> Outcome
+    where
+        F: FnOnce(&mut Self) -> StorageResult<T>,
+    {
+        let result = run(self);
+        let outcome = match &result {
+            Err(err) if err.puts_durability_in_question() => {
+                self.fatal.store(true, Ordering::SeqCst);
+                Outcome::Fatal
+            }
+            _ => Outcome::Continue,
+        };
+        let _ = reply.send(result);
+        outcome
+    }
+
+    /// Refuse everything already queued behind a failure.
+    ///
+    /// Those commands were enqueued while the store still looked healthy, and
+    /// serving them would acknowledge writes after durability became uncertain.
+    fn drain_fatal(&mut self, rx: &mut mpsc::Receiver<StateCommand>) {
+        rx.close();
+        while let Some(command) = rx.blocking_recv() {
+            match command {
+                StateCommand::Shutdown => break,
+                StateCommand::AppliedState(reply) => fail(reply),
+                StateCommand::Apply { reply, .. } => fail(reply),
+                StateCommand::Snapshot(reply) => fail(reply),
+                #[cfg(test)]
+                StateCommand::InjectFatal(reply) => fail(reply),
+                #[cfg(test)]
+                StateCommand::FailNextCommit(reply) => fail(reply),
+            }
+        }
+    }
+
+    fn applied_state(&self) -> Applied {
+        (
+            self.state.model.last_applied.as_ref().map(Into::into),
+            self.state.membership.clone(),
+        )
+    }
+
+    /// Apply one batch: every entry into a private copy, one transaction, then
+    /// publish.
+    fn apply(&mut self, entries: &[Entry]) -> StorageResult<Vec<CommandReplyV1>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The private working value. Nothing outside this function can observe
+        // it, and if the commit below fails it is dropped rather than
+        // published -- which is what keeps memory from running ahead of disk.
+        let mut working = self.state.clone();
+        let mut changes = ChangeSet::default();
+        let mut replies = Vec::with_capacity(entries.len());
+        let group = working.model.authority.group_id;
+
+        for entry in entries {
+            let log_id = LogId::from(&entry.log_id);
+            let reply = match &entry.payload {
+                // §11.3: a blank advances `last_applied` and nothing else. No
+                // audit row -- there is no command to audit -- and no
+                // transition.
+                EntryPayload::Blank => {
+                    guard_delivery(&working.model, log_id).map_err(fatal_fault)?;
+                    working.model.last_applied = Some(log_id);
+                    CommandReplyV1::NonCommand(NonCommandReplyV1 {})
+                }
+                // A membership entry records the exact `StoredMembership`
+                // OpenRaft asked for. The model's member set and membership log
+                // id are **derived** from it rather than stored beside it: only
+                // the membership itself is persisted (§11.3), so anything kept
+                // separately would be re-derived differently at the next open.
+                EntryPayload::Membership(membership) => {
+                    guard_delivery(&working.model, log_id).map_err(fatal_fault)?;
+                    working.membership =
+                        StoredMembership::new(Some(entry.log_id), membership.clone());
+                    working.model.members =
+                        membership.nodes().map(|(id, _)| *id.as_bytes()).collect();
+                    working.model.membership_log_id = Some(log_id);
+                    working.model.last_applied = Some(log_id);
+                    CommandReplyV1::NonCommand(NonCommandReplyV1 {})
+                }
+                EntryPayload::Normal(command) => apply_wire_command_recording(
+                    &mut working.model,
+                    log_id,
+                    &group,
+                    command,
+                    &mut changes,
+                )
+                .map_err(fatal_fault)?,
+            };
+            replies.push(reply);
+        }
+
+        // One transaction for the whole batch, including the meta row that
+        // carries `last_applied`, the counters, the audit floor and the
+        // membership.
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_commit) {
+            return Err(StorageError::corrupt(
+                Db::State,
+                "CoordinationMetaV1",
+                "injected commit failure",
+            ));
+        }
+        rows::commit(&self.database, &working, &changes)?;
+
+        // Publication is the last thing that happens, and only once the commit
+        // has returned.
+        self.state = working;
+        Ok(replies)
+    }
+}
+
+/// A model fault is fatal for the store.
+///
+/// §5.3.1 and §10.2 both make their conditions fatal rather than
+/// client-visible: an entry this voter cannot interpret, and an entry at or
+/// below `last_applied`, are each evidence that this node's history and the
+/// group's have diverged. Continuing would mean writing state that disagrees
+/// with a peer's.
+fn fatal_fault(fault: crate::coordination::model::apply::Fault) -> StorageError {
+    StorageError::corrupt(Db::State, "apply", format!("{fault:?}"))
+}
+
+fn fail<T>(reply: Reply<T>) {
+    let _ = reply.send(Err(StorageError::Fatal));
+}
+
+// ── Handle ───────────────────────────────────────────────────────────────────
+
+/// The state actor's shutdown guard.
+pub(crate) type StateShutdown = ActorShutdown<StateCommand>;
+
+#[derive(Clone)]
+pub(crate) struct StateHandle {
+    tx: mpsc::Sender<StateCommand>,
+    fatal: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for StateHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateHandle")
+            .field("fatal", &self.fatal.load(Ordering::SeqCst))
+            .finish()
+    }
+}
+
+impl StateHandle {
+    /// Load and validate the durable state, then start the actor on it.
+    ///
+    /// The load happens **before** the thread exists, for the same reason the
+    /// log's validation does: a store published first and validated later has
+    /// already told the group it is up by the time the first apply finds the
+    /// corruption.
+    pub(crate) fn spawn(database: Database) -> StorageResult<(Self, StateShutdown)> {
+        let state = rows::load(&database)?;
+
+        let (tx, rx) = mpsc::channel(STATE_ACTOR_QUEUE);
+        let stop = Arc::new(AtomicBool::new(false));
+        let actor_stop = Arc::clone(&stop);
+        let fatal = Arc::new(AtomicBool::new(false));
+        let actor_fatal = Arc::clone(&fatal);
+        let thread = std::thread::Builder::new()
+            .name("aster-coordination-state".into())
+            .spawn(move || {
+                StateActor {
+                    database,
+                    state,
+                    fatal: actor_fatal,
+                    #[cfg(test)]
+                    fail_next_commit: false,
+                }
+                .run(rx, actor_stop)
+            })
+            .map_err(|source| StorageError::ActorSpawn {
+                db: Db::State,
+                source,
+            })?;
+
+        Ok((
+            Self {
+                tx: tx.clone(),
+                fatal,
+            },
+            ActorShutdown::new(tx, stop, thread, || StateCommand::Shutdown),
+        ))
+    }
+
+    pub(crate) fn is_fatal(&self) -> bool {
+        self.fatal.load(Ordering::SeqCst)
+    }
+
+    fn mark_fatal(&self) {
+        self.fatal.store(true, Ordering::SeqCst);
+    }
+
+    async fn call<T, F>(&self, build: F) -> StorageResult<T>
+    where
+        F: FnOnce(Reply<T>) -> StateCommand,
+    {
+        if self.is_fatal() {
+            return Err(StorageError::Fatal);
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self.tx.send(build(reply_tx)).await.is_err() {
+            self.mark_fatal();
+            return Err(StorageError::ActorStopped { db: Db::State });
+        }
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => {
+                self.mark_fatal();
+                Err(StorageError::ActorStopped { db: Db::State })
+            }
+        }
+    }
+
+    /// A copy of the published state, for tests and for Checkpoint D's
+    /// snapshot builder.
+    pub(crate) async fn published(&self) -> StorageResult<Box<DurableState>> {
+        self.call(StateCommand::Snapshot).await
+    }
+
+    #[cfg(test)]
+    async fn inject_fatal(&self) -> StorageResult<()> {
+        self.call(StateCommand::InjectFatal).await
+    }
+
+    #[cfg(test)]
+    async fn fail_next_commit(&self) -> StorageResult<()> {
+        self.call(StateCommand::FailNextCommit).await
+    }
+}
+
+// ── OpenRaft error mapping ───────────────────────────────────────────────────
+
+fn io_state(err: StorageError) -> RaftStorageError<CoordinationNodeId> {
+    RaftStorageError::IO {
+        source: StorageIOError::write_state_machine(openraft::AnyError::new(&err)),
+    }
+}
+
+fn io_read_state(err: StorageError) -> RaftStorageError<CoordinationNodeId> {
+    RaftStorageError::IO {
+        source: StorageIOError::read_state_machine(openraft::AnyError::new(&err)),
+    }
+}
+
+// ── The store ────────────────────────────────────────────────────────────────
+
+/// `RaftStateMachine` over `state.redb`.
+#[derive(Clone, Debug)]
+pub(crate) struct CoordinationStateMachine {
+    handle: StateHandle,
+}
+
+impl CoordinationStateMachine {
+    pub(crate) fn new(database: Database) -> StorageResult<(Self, StateShutdown)> {
+        let (handle, shutdown) = StateHandle::spawn(database)?;
+        Ok((Self { handle }, shutdown))
+    }
+
+    pub(crate) fn handle(&self) -> &StateHandle {
+        &self.handle
+    }
+}
+
+/// The snapshot builder. Checkpoint D gives it a body; until then it exists so
+/// the trait is satisfiable and the type config is exercised.
+#[derive(Clone, Debug)]
+pub(crate) struct CoordinationSnapshotBuilder;
+
+impl RaftSnapshotBuilder<CoordinationTypeConfig> for CoordinationSnapshotBuilder {
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<Snapshot<CoordinationTypeConfig>, RaftStorageError<CoordinationNodeId>> {
+        Err(not_until_checkpoint_d("build_snapshot"))
+    }
+}
+
+/// The snapshot paths land in Checkpoint D, and refusing is the honest
+/// placeholder.
+///
+/// Not `unimplemented!()`: a panic inside a library is not a failure a runtime
+/// can report, and OpenRaft's suite is not run against this store until
+/// Checkpoint D supplies the real paths — so nothing reaches these except a
+/// caller that has got ahead of the plan, which should get an error saying so.
+fn not_until_checkpoint_d(what: &'static str) -> RaftStorageError<CoordinationNodeId> {
+    io_state(StorageError::corrupt(
+        Db::State,
+        "snapshot",
+        format!("{what} lands in Checkpoint D"),
+    ))
+}
+
+impl RaftStateMachine<CoordinationTypeConfig> for CoordinationStateMachine {
+    type SnapshotBuilder = CoordinationSnapshotBuilder;
+
+    async fn applied_state(&mut self) -> Result<Applied, RaftStorageError<CoordinationNodeId>> {
+        self.handle
+            .call(StateCommand::AppliedState)
+            .await
+            .map_err(io_read_state)
+    }
+
+    async fn apply<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<Vec<CommandReplyV1>, RaftStorageError<CoordinationNodeId>>
+    where
+        I: IntoIterator<Item = Entry> + Send,
+        I::IntoIter: Send,
+    {
+        let entries: Vec<Entry> = entries.into_iter().collect();
+        self.handle
+            .call(|reply| StateCommand::Apply { entries, reply })
+            .await
+            .map_err(io_state)
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        CoordinationSnapshotBuilder
+    }
+
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<CoordinationSnapshotFile>, RaftStorageError<CoordinationNodeId>> {
+        Err(not_until_checkpoint_d("begin_receiving_snapshot"))
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        _meta: &SnapshotMeta<CoordinationNodeId, CoordinationNode>,
+        _snapshot: Box<CoordinationSnapshotFile>,
+    ) -> Result<(), RaftStorageError<CoordinationNodeId>> {
+        Err(not_until_checkpoint_d("install_snapshot"))
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<CoordinationTypeConfig>>, RaftStorageError<CoordinationNodeId>>
+    {
+        Err(not_until_checkpoint_d("get_current_snapshot"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordination::contract::{
+        AcquireActionV1, ActionV1, ClientCommandV1, CommandV1, ExpireCommandV1,
+        MembershipProgressCommandV1, ResourceKeyV1, SetGrantActionV1,
+    };
+    use crate::coordination::model::limits::ALL_RIGHTS;
+    use crate::coordination::model::state::{GroupAuthority, ResourceKey, State};
+    use crate::coordination::reason::Outcome as ModelOutcome;
+    use openraft::{CommittedLeaderId, Membership};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    const ACTOR: [u8; 32] = [0x0A; 32];
+    const CLIENT: [u8; 16] = [0x0C; 16];
+    const LEADER: [u8; 32] = [0x11; 32];
+
+    fn scratch_dir() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "aster-coordination-machine-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn resource() -> ResourceKey {
+        ResourceKey::new("ns", b"lock".to_vec()).expect("valid")
+    }
+
+    /// A group that is already running: one administrator, and `ACTOR` granted
+    /// every right on one resource, so an ordinary command can succeed rather
+    /// than being refused for authorization before it reaches storage.
+    fn genesis_state() -> DurableState {
+        let mut model = State {
+            authority: crate::coordination::model::authority::testing::authority(),
+            deployment_profile_code: crate::coordination::model::shape::PROFILE_PROD,
+            admin_revision: 1,
+            ..State::default()
+        };
+        model.admins.insert(ACTOR);
+        model.acl.insert((resource(), ACTOR), ALL_RIGHTS);
+        model.growth_bytes = model.recompute_growth();
+        model.reserve_bytes = model.recompute_reserve();
+        DurableState {
+            model,
+            membership: StoredMembership::default(),
+            recovery_export_hash: None,
+            recovered_from: None,
+        }
+    }
+
+    /// A bound `state.redb` holding `genesis_state`, ready for an actor.
+    fn seeded(dir: &std::path::Path) -> Database {
+        let database = Database::create(dir.join("state.redb")).expect("create");
+        let write = super::super::schema::durable_write(&database, Db::State).expect("write");
+        super::super::schema::create_state_tables(&write).expect("tables");
+        write.commit().expect("commit");
+
+        let state = genesis_state();
+        let mut changes = ChangeSet::default();
+        changes.admins.extend(state.model.admins.iter().copied());
+        changes.grants.extend(state.model.acl.keys().cloned());
+        rows::commit(&database, &state, &changes).expect("seed");
+        // Written with the codec version the loader checks, exactly as
+        // `schema::open` would.
+        let write = super::super::schema::durable_write(&database, Db::State).expect("write");
+        {
+            let mut table = write
+                .open_table(super::super::schema::STATE_META)
+                .expect("meta");
+            table
+                .insert(
+                    super::super::schema::KEY_CODEC_VERSION,
+                    super::super::identity::STORAGE_CODEC_VERSION
+                        .to_be_bytes()
+                        .as_slice(),
+                )
+                .expect("insert");
+        }
+        write.commit().expect("commit");
+        database
+    }
+
+    fn machine(dir: &std::path::Path) -> (CoordinationStateMachine, StateShutdown) {
+        CoordinationStateMachine::new(seeded(dir)).expect("open the state machine")
+    }
+
+    /// Reopen the same directory, which is what proves a write was durable.
+    fn reopen(dir: &std::path::Path) -> (CoordinationStateMachine, StateShutdown) {
+        let database = Database::create(dir.join("state.redb")).expect("reopen");
+        CoordinationStateMachine::new(database).expect("reopen the state machine")
+    }
+
+    fn log_id(index: u64) -> RaftLogId<CoordinationNodeId> {
+        RaftLogId {
+            leader_id: CommittedLeaderId::new(1, CoordinationNodeId::from_array(LEADER)),
+            index,
+        }
+    }
+
+    fn blank(index: u64) -> Entry {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    fn membership_entry(index: u64, voters: &[[u8; 32]]) -> Entry {
+        let ids: std::collections::BTreeSet<CoordinationNodeId> = voters
+            .iter()
+            .map(|v| CoordinationNodeId::from_array(*v))
+            .collect();
+        let nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
+            ids.iter().map(|id| (*id, CoordinationNode)).collect();
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Membership(Membership::new(vec![ids], nodes)),
+        }
+    }
+
+    fn normal(index: u64, command: CommandV1) -> Entry {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(command),
+        }
+    }
+
+    /// A client command with the **canonical** request hash for its action.
+    ///
+    /// Not an arbitrary 32 bytes: §10 narrows a committed command only if its
+    /// hash matches the action it carries, so a fixture that invents one
+    /// produces a committed shape rejection rather than the command it meant to
+    /// write -- which is what the first version of these tests did.
+    fn client(sequence: u64, action: ActionV1) -> CommandV1 {
+        let hash = crate::coordination::hash::request_hash(&action).expect("hashable");
+        CommandV1::Client(ClientCommandV1 {
+            actor_node_id: ACTOR.to_vec(),
+            client_id: CLIENT.to_vec(),
+            sequence,
+            request_hash: hash.to_vec(),
+            action,
+        })
+    }
+
+    fn acquire_action() -> ActionV1 {
+        ActionV1::Acquire(AcquireActionV1 {
+            resource: ResourceKeyV1 {
+                namespace: "ns".into(),
+                key: b"lock".to_vec(),
+            },
+            ttl_ms: 30_000,
+        })
+    }
+
+    fn acquire(sequence: u64) -> CommandV1 {
+        client(sequence, acquire_action())
+    }
+
+    async fn published(machine: &CoordinationStateMachine) -> DurableState {
+        *machine.handle().published().await.expect("published")
+    }
+
+    // ── Native entries ──────────────────────────────────────────────────────
+
+    /// A blank advances `last_applied` and writes nothing else: no audit row,
+    /// no transition, and one `NonCommand` reply.
+    #[tokio::test]
+    async fn a_blank_advances_last_applied_and_nothing_else() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+        let before = published(&machine).await;
+
+        let replies = machine.apply([blank(1)]).await.expect("apply");
+        assert_eq!(replies.len(), 1, "one reply per applied entry");
+        assert!(matches!(replies[0], CommandReplyV1::NonCommand(_)));
+
+        let after = published(&machine).await;
+        assert_eq!(after.model.last_applied.map(|id| id.index), Some(1));
+        assert!(after.model.audit.is_empty(), "a blank audits nothing");
+        assert_eq!(
+            after.model.resources, before.model.resources,
+            "and runs no transition"
+        );
+        assert_eq!(after.model.growth_bytes, before.model.growth_bytes);
+        assert_eq!(after.model.reserve_bytes, before.model.reserve_bytes);
+
+        drop(shutdown);
+        drop(machine);
+        let (mut machine, _shutdown) = reopen(&dir);
+        let (applied, _) = machine.applied_state().await.expect("applied state");
+        assert_eq!(applied.map(|id| id.index), Some(1), "and it was durable");
+    }
+
+    /// A membership entry records the exact `StoredMembership`, and it survives
+    /// a reopen -- which is what `applied_state` must return at startup.
+    #[tokio::test]
+    async fn a_membership_entry_records_the_stored_membership_durably() {
+        let dir = scratch_dir();
+        let voters = [[1u8; 32], [2u8; 32], [3u8; 32]];
+        let (mut machine, shutdown) = machine(&dir);
+
+        let replies = machine
+            .apply([membership_entry(4, &voters)])
+            .await
+            .expect("apply");
+        assert!(matches!(replies[0], CommandReplyV1::NonCommand(_)));
+
+        let after = published(&machine).await;
+        assert!(
+            after.model.audit.is_empty(),
+            "a membership entry audits nothing"
+        );
+        assert_eq!(
+            after.model.members,
+            voters
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the model's member set is derived from the entry"
+        );
+        assert_eq!(after.model.membership_log_id.map(|id| id.index), Some(4));
+
+        drop(shutdown);
+        drop(machine);
+        let (mut machine, _shutdown) = reopen(&dir);
+        let (applied, membership) = machine.applied_state().await.expect("applied state");
+        assert_eq!(applied.map(|id| id.index), Some(4));
+        assert_eq!(membership.log_id().map(|id| id.index), Some(4));
+        assert_eq!(membership.membership().voter_ids().count(), 3);
+    }
+
+    // ── Delivery ────────────────────────────────────────────────────────────
+
+    /// An index above `last_applied + 1` is accepted. OpenRaft's own suite
+    /// delivers index 2 with nothing applied, and §10.2's guard requires
+    /// strictly greater rather than contiguous -- append continuity is the log
+    /// store's rule, not this one's.
+    #[tokio::test]
+    async fn an_advancing_but_non_contiguous_index_is_accepted() {
+        let dir = scratch_dir();
+        let (mut machine, _shutdown) = machine(&dir);
+
+        machine.apply([blank(1)]).await.expect("index 1");
+        machine.apply([blank(9)]).await.expect("index 9 after 1");
+
+        let after = published(&machine).await;
+        assert_eq!(after.model.last_applied.map(|id| id.index), Some(9));
+    }
+
+    /// A delivery at or below `last_applied` is fatal before any mutation, and
+    /// the store stays fatal afterwards. It is not an idempotent apply path.
+    #[tokio::test]
+    async fn a_delivery_at_or_below_last_applied_is_fatal() {
+        for repeat in [5u64, 4] {
+            let dir = scratch_dir();
+            let (mut machine, _shutdown) = machine(&dir);
+            machine.apply([blank(5)]).await.expect("index 5");
+
+            let err = machine
+                .apply([blank(repeat)])
+                .await
+                .expect_err("a redelivered index");
+            assert!(
+                format!("{err:?}").contains("LogIdNotAdvancing"),
+                "index {repeat}: {err:?}"
+            );
+            assert!(
+                machine.handle().is_fatal(),
+                "index {repeat}: the store must latch fatal"
+            );
+            assert!(
+                machine.apply([blank(6)]).await.is_err(),
+                "index {repeat}: and stay fatal"
+            );
+        }
+    }
+
+    /// A command this build cannot interpret is fatal on every voter (§5.3.1),
+    /// not skipped -- skipping would diverge from the voters that can apply it.
+    #[tokio::test]
+    async fn an_unknown_command_is_fatal() {
+        let dir = scratch_dir();
+        let (mut machine, _shutdown) = machine(&dir);
+
+        let err = machine
+            .apply([normal(
+                1,
+                CommandV1::Unknown(fory_core::UnknownCase::new(99u32, ())),
+            )])
+            .await
+            .expect_err("an unknown variant");
+        assert!(format!("{err:?}").contains("UnknownCommand"), "{err:?}");
+        assert!(machine.handle().is_fatal());
+
+        // And nothing was applied: `last_applied` must not record an entry this
+        // voter could not interpret.
+        drop(_shutdown);
+        drop(machine);
+        let (mut machine, _shutdown) = reopen(&dir);
+        let (applied, _) = machine.applied_state().await.expect("applied state");
+        assert_eq!(applied, None);
+    }
+
+    // ── Normal commands ─────────────────────────────────────────────────────
+
+    /// A committed command persists its effects, its audit row, its session and
+    /// both counters, and every one of them survives a reopen.
+    #[tokio::test]
+    async fn a_committed_command_persists_everything_it_wrote() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+
+        let replies = machine.apply([normal(1, acquire(1))]).await.expect("apply");
+        assert_eq!(replies.len(), 1);
+        let CommandReplyV1::Client(reply) = &replies[0] else {
+            panic!(
+                "a client command answers a client reply, got {:?}",
+                replies[0]
+            );
+        };
+        assert_eq!(reply.outcome_code, ModelOutcome::Granted.code());
+
+        drop(shutdown);
+        drop(machine);
+        let (machine, _shutdown) = reopen(&dir);
+        let state = published(&machine).await;
+
+        let row = state
+            .model
+            .resources
+            .get(&resource())
+            .expect("the lease row");
+        assert!(row.held && row.holder == Some(ACTOR));
+        assert_eq!(state.model.last_applied.map(|id| id.index), Some(1));
+        assert_eq!(state.model.audit.len(), 1, "exactly one row per command");
+        assert!(state.model.sessions.contains_key(&(ACTOR, CLIENT)));
+        assert!(state.model.growth_bytes > 0 && state.model.reserve_bytes > 0);
+        // The load revalidates, so getting here at all means the counters and
+        // the audit tip recomputed from the rows on disk.
+    }
+
+    /// A duplicate request committed at a new, higher index replays its saved
+    /// reply verbatim, writes its own audit row, and repeats no effect.
+    #[tokio::test]
+    async fn a_committed_replay_answers_from_the_session_and_still_audits() {
+        let dir = scratch_dir();
+        let (mut machine, _shutdown) = machine(&dir);
+
+        let first = machine.apply([normal(1, acquire(1))]).await.expect("first");
+        let before = published(&machine).await;
+
+        let second = machine
+            .apply([normal(2, acquire(1))])
+            .await
+            .expect("replay");
+        // §4.3: a replay differs from the first attempt in exactly one field.
+        // The value was never saved, so it is reported redacted rather than
+        // absent -- and every other field comes from the saved snapshot, which
+        // is what makes the replay exact.
+        let (CommandReplyV1::Client(a), CommandReplyV1::Client(b)) = (&first[0], &second[0]) else {
+            panic!("expected client replies");
+        };
+        let mut redacted = a.clone();
+        let snapshot = redacted.snapshot.as_mut().expect("a snapshot");
+        snapshot.value = None;
+        snapshot.value_redacted = true;
+        assert_eq!(&redacted, b, "only the value and its flag may differ");
+
+        let after = published(&machine).await;
+        assert_eq!(
+            after.model.resources, before.model.resources,
+            "a replay repeats no business effect"
+        );
+        assert_eq!(
+            after.model.audit.len(),
+            2,
+            "but it is still an applied entry"
+        );
+        assert_eq!(after.model.last_applied.map(|id| id.index), Some(2));
+    }
+
+    /// A committed rejection is saved, audited, and replays identically after a
+    /// reopen -- the property a client's retry depends on.
+    #[tokio::test]
+    async fn a_committed_rejection_survives_a_reopen_and_replays() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+
+        // Sequence 2 with nothing at sequence 1 is refused by the classifier.
+        let rejected = machine.apply([normal(1, acquire(9))]).await.expect("apply");
+        let CommandReplyV1::Client(reply) = &rejected[0] else {
+            panic!("expected a client reply");
+        };
+        assert_eq!(reply.outcome_code, ModelOutcome::Rejected.code());
+        assert_ne!(
+            reply.reason_code, 0,
+            "a classifier refusal keeps its reason"
+        );
+
+        drop(shutdown);
+        drop(machine);
+        let (machine, _shutdown) = reopen(&dir);
+        let state = published(&machine).await;
+        assert_eq!(state.model.audit.len(), 1, "a rejection is still audited");
+        assert_eq!(state.model.last_applied.map(|id| id.index), Some(1));
+    }
+
+    /// A **known** command with a malformed field is a committed rejection, not
+    /// a halt: every voter refuses it identically, and halting would make a
+    /// malformed field an availability kill switch (§10.1).
+    #[tokio::test]
+    async fn a_malformed_known_command_is_a_committed_rejection() {
+        let dir = scratch_dir();
+        let (mut machine, _shutdown) = machine(&dir);
+
+        let malformed = client(
+            1,
+            ActionV1::SetGrant(SetGrantActionV1 {
+                resource: ResourceKeyV1 {
+                    namespace: "ns".into(),
+                    key: b"lock".to_vec(),
+                },
+                // Not a node id. The hash is canonical, so the width is what
+                // refuses this rather than a hash mismatch.
+                target_node_id: vec![0u8; 8],
+                rights: ALL_RIGHTS,
+                expected_acl_revision: 0,
+            }),
+        );
+
+        let replies = machine
+            .apply([normal(1, malformed)])
+            .await
+            .expect("not fatal");
+        let CommandReplyV1::Client(reply) = &replies[0] else {
+            panic!("expected a client reply");
+        };
+        assert_eq!(reply.outcome_code, ModelOutcome::Rejected.code());
+        assert!(
+            !machine.handle().is_fatal(),
+            "a malformed field is not a halt"
+        );
+
+        let state = published(&machine).await;
+        assert_eq!(
+            state.model.audit.len(),
+            1,
+            "and it is audited like any other"
+        );
+    }
+
+    /// A system command audits under the system code space, not as a client
+    /// outcome, and answers a system reply.
+    #[tokio::test]
+    async fn a_system_command_audits_in_its_own_code_space() {
+        let dir = scratch_dir();
+        let (mut machine, _shutdown) = machine(&dir);
+        machine
+            .apply([normal(1, acquire(1))])
+            .await
+            .expect("acquire");
+
+        let held = published(&machine).await;
+        let row = held.model.resources.get(&resource()).expect("the row");
+
+        let replies = machine
+            .apply([normal(
+                2,
+                CommandV1::Expire(ExpireCommandV1 {
+                    resource: ResourceKeyV1 {
+                        namespace: "ns".into(),
+                        key: b"lock".to_vec(),
+                    },
+                    epoch: row.epoch,
+                    lease_revision: row.lease_revision,
+                }),
+            )])
+            .await
+            .expect("expire");
+        assert!(matches!(replies[0], CommandReplyV1::System(_)));
+
+        let state = published(&machine).await;
+        let audit = state.model.audit.get(&(1, 2)).expect("the expiry's row");
+        assert!(
+            !audit.result.is_client(),
+            "a system result is not a client outcome"
+        );
+        assert!(!state.model.resources[&resource()].held, "and it expired");
+    }
+
+    /// A stale membership progress report commits harmlessly: it names an
+    /// operation that does not exist, so it changes nothing and still audits.
+    #[tokio::test]
+    async fn a_stale_membership_report_commits_and_audits_without_effect() {
+        let dir = scratch_dir();
+        let (mut machine, _shutdown) = machine(&dir);
+
+        let replies = machine
+            .apply([normal(
+                1,
+                CommandV1::MembershipProgress(MembershipProgressCommandV1 {
+                    operation_id: vec![0x77; 16],
+                    expected_phase: 1,
+                    new_phase: 2,
+                    observed_membership_log_id: None,
+                    result_code: 0,
+                }),
+            )])
+            .await
+            .expect("apply");
+        assert!(matches!(replies[0], CommandReplyV1::System(_)));
+
+        let state = published(&machine).await;
+        assert!(state.model.intents.is_empty(), "it named no real intent");
+        assert_eq!(state.model.audit.len(), 1, "and is audited anyway");
+    }
+
+    // ── The batch ───────────────────────────────────────────────────────────
+
+    /// A mixed batch produces one reply per entry, in order, and commits once.
+    #[tokio::test]
+    async fn a_mixed_batch_answers_every_entry_and_commits_together() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+
+        let replies = machine
+            .apply([
+                blank(1),
+                normal(2, acquire(1)),
+                membership_entry(3, &[[1u8; 32], [2u8; 32], [3u8; 32]]),
+                normal(4, acquire(2)),
+            ])
+            .await
+            .expect("apply");
+
+        assert_eq!(replies.len(), 4, "one response per applied entry");
+        assert!(matches!(replies[0], CommandReplyV1::NonCommand(_)));
+        assert!(matches!(replies[1], CommandReplyV1::Client(_)));
+        assert!(matches!(replies[2], CommandReplyV1::NonCommand(_)));
+        assert!(matches!(replies[3], CommandReplyV1::Client(_)));
+
+        drop(shutdown);
+        drop(machine);
+        let (mut machine, _shutdown) = reopen(&dir);
+        let (applied, membership) = machine.applied_state().await.expect("applied state");
+        assert_eq!(
+            applied.map(|id| id.index),
+            Some(4),
+            "the whole batch landed"
+        );
+        assert_eq!(membership.log_id().map(|id| id.index), Some(3));
+        let state = published(&machine).await;
+        assert_eq!(state.model.audit.len(), 2, "one row per *command* entry");
+    }
+
+    /// A batch whose commit fails publishes nothing: not the memory, not the
+    /// disk, and not a success to OpenRaft.
+    ///
+    /// The case §4.4 is about. Every entry in the batch has already mutated the
+    /// working copy by the time the commit is attempted, so this is the exact
+    /// shape in which memory could run ahead of disk.
+    #[tokio::test]
+    async fn a_failed_commit_publishes_neither_memory_nor_disk() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+        machine.apply([normal(1, acquire(1))]).await.expect("first");
+        let before = published(&machine).await;
+
+        machine.handle().fail_next_commit().await.expect("arm");
+        let err = machine
+            .apply([blank(2), normal(3, acquire(2))])
+            .await
+            .expect_err("the commit fails");
+        assert!(
+            format!("{err:?}").contains("injected commit failure"),
+            "{err:?}"
+        );
+        assert!(machine.handle().is_fatal(), "durability is in question");
+
+        // Memory: unchanged. The published state is still the one that was
+        // committed, not the working copy the batch mutated.
+        assert!(
+            machine.handle().published().await.is_err(),
+            "a fatal store answers nothing further"
+        );
+
+        // Disk: unchanged too, which is what a reopen shows.
+        drop(shutdown);
+        drop(machine);
+        let (machine, _shutdown) = reopen(&dir);
+        let after = published(&machine).await;
+        assert_eq!(
+            after.model.last_applied, before.model.last_applied,
+            "the failed batch left no trace on disk"
+        );
+        assert_eq!(after.model.audit.len(), before.model.audit.len());
+        assert_eq!(after.model.resources, before.model.resources);
+    }
+
+    /// An empty batch is a no-op rather than an empty transaction.
+    #[tokio::test]
+    async fn an_empty_batch_writes_nothing() {
+        let dir = scratch_dir();
+        let (mut machine, _shutdown) = machine(&dir);
+        let before = published(&machine).await;
+        let replies = machine.apply(Vec::<Entry>::new()).await.expect("apply");
+        assert!(replies.is_empty());
+        assert_eq!(published(&machine).await, before);
+    }
+
+    /// Once fatal, everything queued behind the failure is refused rather than
+    /// served -- those commands were enqueued while the store still looked
+    /// healthy.
+    #[tokio::test]
+    async fn a_fatal_store_refuses_every_later_command() {
+        let dir = scratch_dir();
+        let (mut machine, _shutdown) = machine(&dir);
+        machine
+            .handle()
+            .inject_fatal()
+            .await
+            .expect_err("the injected failure");
+
+        assert!(machine.handle().is_fatal());
+        assert!(machine.applied_state().await.is_err());
+        assert!(machine.apply([blank(1)]).await.is_err());
+        assert!(machine.handle().published().await.is_err());
+    }
+
+    /// The store's authority is what the group's rows are bound to, so a state
+    /// whose stored key is not a key never reaches an actor.
+    #[tokio::test]
+    async fn a_state_that_fails_validation_never_publishes_an_actor() {
+        let dir = scratch_dir();
+        let database = seeded(&dir);
+        let mut state = genesis_state();
+        // Scanned rather than guessed: roughly half of all 32-byte strings
+        // decompress, and `[0x01; 32]` -- the obvious choice -- is one of them.
+        let not_a_key = (0u16..=255)
+            .map(|n| [n as u8; 32])
+            .find(|bytes| ed25519_dalek::VerifyingKey::from_bytes(bytes).is_err())
+            .expect("some repeated byte is not a curve point");
+        state.model.authority = GroupAuthority {
+            public_key: not_a_key,
+            ..state.model.authority
+        };
+        rows::commit(&database, &state, &ChangeSet::default()).expect("write the bad meta");
+        drop(database);
+
+        let database = Database::create(dir.join("state.redb")).expect("reopen");
+        let err = CoordinationStateMachine::new(database).expect_err("validation refuses it");
+        assert!(err.puts_durability_in_question(), "{err:?}");
+    }
+}

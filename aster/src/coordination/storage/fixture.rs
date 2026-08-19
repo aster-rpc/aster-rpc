@@ -52,7 +52,14 @@ impl SuiteFixture {
             root: root.into(),
             group_id: CoordinationGroupId::from_array([seed; 32]),
             genesis_hash: [seed.wrapping_add(1); 32],
-            authority_public_key: [seed.wrapping_add(2); 32],
+            // A key the Ed25519 verifier accepts, derived from the seed so two
+            // fixtures are two authorities. Arbitrary bytes used to do here,
+            // and stopped when the state machine started checking that a
+            // replicated authority key is a curve point -- correctly: a group
+            // whose key verifies nothing can never accept a join permit.
+            authority_public_key: ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
             authority_domain: format!("fixture-{seed}.test"),
             deployment_profile_code: shape::PROFILE_PROD,
             next: AtomicU64::new(0),

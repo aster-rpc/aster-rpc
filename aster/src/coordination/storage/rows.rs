@@ -169,9 +169,20 @@ pub(crate) fn meta_from_wire(meta: &CoordinationMetaV1) -> StorageResult<Durable
             .map_err(|_| bad(what, format!("expected 32 bytes, got {}", bytes.len())))
     };
 
-    let membership =
+    // An empty config set is "no membership has been committed yet", which is
+    // exactly what OpenRaft's own `StoredMembership::default()` is and what a
+    // freshly bound store holds. The mirror conversion refuses it -- correctly,
+    // since an empty *joint config* on a running group is a corrupt record --
+    // so the two cases are separated here rather than by weakening the mirror.
+    let membership = if meta.membership.log_id.is_none()
+        && meta.membership.membership.configs.is_empty()
+        && meta.membership.membership.nodes.is_empty()
+    {
+        StoredMembership::<CoordinationNodeId, CoordinationNode>::default()
+    } else {
         StoredMembership::<CoordinationNodeId, CoordinationNode>::try_from(&meta.membership)
-            .map_err(|err| bad("CoordinationMetaV1.membership", format!("{err:?}")))?;
+            .map_err(|err| bad("CoordinationMetaV1.membership", format!("{err:?}")))?
+    };
 
     // The model's member set is *derived* from the stored membership, never
     // stored beside it: two copies of the same fact are two things that can
