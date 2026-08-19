@@ -1363,14 +1363,39 @@ mod tests {
         let err = validate(&drifted).expect_err("reserve drifted");
         assert!(err.to_string().contains("the rows charge"), "got: {err}");
 
-        // The tip is rebuilt from the rows: a persisted one that names a
-        // different entry is refused, including at the same index under a
-        // different leader -- the case a maximum-index scan cannot see.
+        // The tip is **rebuilt** from the rows, not compared against the
+        // ordering rule that follows it. The perturbation is chosen so only the
+        // rebuild can catch it: a tip naming the second-newest retained row
+        // sits below `last_applied`, so the "runs ahead" and "same index,
+        // different entry" checks both pass. Verified by mutation -- replacing
+        // the rebuild with the persisted value survived a tip perturbed at the
+        // same index, because the ordering check caught that one instead and
+        // the assertion was matching on a substring both messages carry.
+        let mut drifted = base.clone();
+        let ((term, index), second_newest) = drifted
+            .model
+            .audit
+            .iter()
+            .rev()
+            .nth(1)
+            .map(|(k, v)| (*k, v.clone()))
+            .expect("at least two audit rows");
+        drifted.model.audit_tip = Some(LogId::new(term, second_newest.leader_node_id, index));
+        let err = validate(&drifted).expect_err("tip drifted");
+        assert!(
+            err.to_string().contains("but the rows give"),
+            "the rebuild must be what refused it: {err}"
+        );
+
+        // And the case a maximum-index comparison cannot see: the same index
+        // under a different leader is a different entry.
         let mut drifted = base.clone();
         let tip = drifted.model.audit_tip.expect("a tip");
         drifted.model.audit_tip = Some(LogId::new(tip.term, [0xEE; 32], tip.index));
-        let err = validate(&drifted).expect_err("tip drifted");
-        assert!(err.to_string().contains("audit_tip"), "got: {err}");
+        assert!(
+            validate(&drifted).is_err(),
+            "a different leader at one index"
+        );
 
         // A floor that does not name the oldest retained row.
         let mut drifted = base.clone();
