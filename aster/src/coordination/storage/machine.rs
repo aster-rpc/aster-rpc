@@ -935,6 +935,68 @@ mod tests {
         assert_eq!(state.model.last_applied.map(|id| id.index), Some(1));
     }
 
+    /// A committed `CounterExhausted` survives a reopen and replays exactly.
+    ///
+    /// §5.2 makes reason `15` terminal, so the saved reply is the client's
+    /// permanent answer -- and a saved answer that did not survive a restart
+    /// would let the same sequence be reclassified into a different one.
+    #[tokio::test]
+    async fn a_committed_counter_exhaustion_survives_a_reopen_and_replays() {
+        let dir = scratch_dir();
+
+        // A lease whose epoch is already at §5.2's ceiling, so the next acquire
+        // has nowhere to advance it to.
+        let database = seeded(&dir);
+        let mut state = genesis_state();
+        state.model.resources.insert(
+            resource(),
+            crate::coordination::model::state::ResourceRow {
+                epoch: crate::coordination::model::limits::MAX_COUNTER,
+                lease_revision: crate::coordination::model::limits::MAX_COUNTER,
+                ..Default::default()
+            },
+        );
+        state.model.growth_bytes = state.model.recompute_growth();
+        let mut changes = ChangeSet::default();
+        changes.admins.extend(state.model.admins.iter().copied());
+        changes.grants.extend(state.model.acl.keys().cloned());
+        changes.resources.insert(resource());
+        rows::commit(&database, &state, &changes).expect("seed the exhausted row");
+        drop(database);
+
+        let (mut machine, shutdown) = reopen(&dir);
+        let replies = machine.apply([normal(1, acquire(1))]).await.expect("apply");
+        let CommandReplyV1::Client(first) = &replies[0] else {
+            panic!("expected a client reply");
+        };
+        assert_eq!(first.outcome_code, ModelOutcome::Rejected.code());
+        assert_eq!(
+            first.reason_code,
+            crate::coordination::reason::Reason::CounterExhausted.code(),
+            "the exhaustion must be the reason, not a generic rejection"
+        );
+        let first = first.clone();
+
+        drop(shutdown);
+        drop(machine);
+        let (mut machine, _shutdown) = reopen(&dir);
+        let state = published(&machine).await;
+        assert_eq!(state.model.audit.len(), 1, "the rejection was audited");
+        assert_eq!(state.model.last_applied.map(|id| id.index), Some(1));
+
+        // And the client's retry replays the same terminal answer rather than
+        // being reclassified.
+        let replayed = machine
+            .apply([normal(2, acquire(1))])
+            .await
+            .expect("replay");
+        let CommandReplyV1::Client(second) = &replayed[0] else {
+            panic!("expected a client reply");
+        };
+        assert_eq!(second.outcome_code, first.outcome_code);
+        assert_eq!(second.reason_code, first.reason_code);
+    }
+
     /// A **known** command with a malformed field is a committed rejection, not
     /// a halt: every voter refuses it identically, and halting would make a
     /// malformed field an availability kill switch (§10.1).
