@@ -308,6 +308,17 @@ fn run(steps: u64) -> (State, Vec<String>) {
     (state, trace)
 }
 
+/// A state produced by `steps` of the generated history.
+///
+/// Exposed for the storage layer's complete-state tests. A fixture built by
+/// hand cannot be trusted to be coherent -- its counters, audit tip and row
+/// counts would agree only because someone typed them to -- whereas one that
+/// came out of apply is coherent because apply produced it, which is the
+/// property the validator exists to check.
+pub(crate) fn sample_applied_state(steps: u64) -> State {
+    run(steps).0
+}
+
 fn render(reply: &CommandReply) -> String {
     match reply {
         CommandReply::Client(r) => format!(

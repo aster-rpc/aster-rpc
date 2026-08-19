@@ -13,6 +13,7 @@
 //! | [`identity`] | the crate-private storage-open identity and policy |
 //! | [`schema`] | layout, lifetime lock, table/meta allowlists, the open coordinator |
 //! | [`log`] | `RaftLogStorage` over `raft.redb` (Checkpoint B) |
+//! | [`rows`] | typed §11.3 row I/O, the whole-state load, and its validator |
 //! | [`machine`] | `RaftStateMachine` over `state.redb` (Checkpoint C) |
 //! | [`snapshot`] | the role-safe snapshot handle and catalog (Checkpoint D) |
 //!
@@ -53,6 +54,7 @@ pub(crate) mod fixture;
 pub(crate) mod identity;
 pub(crate) mod log;
 pub(crate) mod machine;
+pub(crate) mod rows;
 pub(crate) mod schema;
 pub(crate) mod snapshot;
 
@@ -182,6 +184,7 @@ mod durability_guard {
         ("schema.rs", include_str!("schema.rs")),
         ("log.rs", include_str!("log.rs")),
         ("machine.rs", include_str!("machine.rs")),
+        ("rows.rs", include_str!("rows.rs")),
         ("snapshot.rs", include_str!("snapshot.rs")),
         ("fixture.rs", include_str!("fixture.rs")),
     ];
