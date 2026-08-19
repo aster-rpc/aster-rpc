@@ -2537,11 +2537,11 @@ mod tests {
         assert_eq!(legal.deployment_profile_code, PROFILE_PROD);
         assert_eq!(legal.aggregate_growth_bytes, GROWTH_BUDGET);
         assert_eq!(legal.aggregate_reserve_bytes, RESERVE_BUDGET);
-        // Demonstrated by *use*, not by decoding. `VerifyingKey::from_bytes`
-        // accepts every 32-byte string in this dalek version -- decompression
-        // is deferred -- so `is_ok()` passed against `[0xFF; 32]` and proved
-        // nothing. Verifying a real signature is what separates a key from a
-        // byte string.
+        // Demonstrated by *use*, not by parsing. `VerifyingKey::from_bytes`
+        // does decompress immediately -- it is a real check -- but `[0xFF; 32]`
+        // happens to decode to a point, so `is_ok()` passed against it. The
+        // property that matters is not "these bytes parse" but "these bytes
+        // correspond to the signer", and only a verification shows that.
         {
             use ed25519_dalek::{Signer, Verifier};
 
