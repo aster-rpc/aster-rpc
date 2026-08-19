@@ -34,6 +34,17 @@ pub const SECTION_AUDIT: u64 = 7;
 
 pub const MAX_HEADER_BYTES: u64 = 64 * 1024;
 
+/// The snapshot **body format** version stamped into
+/// [`SnapshotHeaderV1::format_version`].
+///
+/// Distinct from the logical schema version and from the storage-value codec
+/// version, and named because those are three different compatibility
+/// concerns: the row-stream framing can change while the logical schema does
+/// not, a redb value encoding can change while the framing does not, and a
+/// logical migration can happen with both unchanged. Populating one from
+/// another reads as correct precisely because they are all `1` today.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
 /// Per-section limits. One global 1 MiB row cap was far too loose: an admin row
 /// is 32 bytes of payload and had four orders of magnitude of headroom.
 pub struct SectionLimits {

@@ -2272,62 +2272,84 @@ mod tests {
         }
     }
 
-    /// A joint membership at the protocol maximum, with its node map derived
-    /// from the configs rather than invented alongside them.
+    /// The widest membership a production group can actually reach.
     ///
-    /// Returning both halves from one place is the point: an earlier fixture
-    /// listed configs of `0..4` and `100..104` beside a node map of `0..9`, so
-    /// the map did not describe the members at all — and the assertion checked
-    /// only its length, so it passed.
-    fn maximal_joint_membership() -> crate::coordination::raft::MembershipV1 {
-        use crate::coordination::model::shape::MAX_VOTERS;
+    /// Not "two disjoint five-voter configs". That shape is representable in
+    /// OpenRaft and unreachable in Aster: it introduces five new voters at
+    /// once, and `MAX_NEW_VOTERS` is two. An OpenRaft round trip proves
+    /// OpenRaft representability, which is not the same claim.
+    ///
+    /// The reachable maximum is one `ChangeMembership` step at its widest:
+    ///
+    /// - old config: `MAX_VOTERS` voters, `0..5`
+    /// - new config: the three retained from old, plus `MAX_NEW_VOTERS` new
+    /// - node map: the seven-node union, **plus** up to
+    ///   `MAX_RETAINED_LEARNERS` learners
+    ///
+    /// Learners are the reason the node map is not simply the union: OpenRaft
+    /// represents them as nodes outside every config, so an exact-union
+    /// assertion would have excluded them and understated the maximum.
+    fn maximal_reachable_membership() -> crate::coordination::raft::MembershipV1 {
+        use crate::coordination::model::shape::{
+            MAX_NEW_VOTERS, MAX_RETAINED_LEARNERS, MAX_VOTERS,
+        };
         use crate::coordination::raft::{MembershipV1, NodeEntryV1, NodeIdSetV1, NodeIdV1};
 
         let node_id = |n: usize| vec![n as u8; 32];
-        let config = |base: usize| NodeIdSetV1 {
-            ids: (base..base + MAX_VOTERS)
+        let set = |ids: Vec<usize>| NodeIdSetV1 {
+            ids: ids
+                .into_iter()
                 .map(|n| NodeIdV1 {
                     node_id: node_id(n),
                 })
                 .collect(),
         };
-        // Joint consensus over two disjoint configurations: the widest legal
-        // membership, and the case a `ChangeMembership` passes through.
-        let configs = vec![config(0), config(MAX_VOTERS)];
 
-        // Derived, so the map covers exactly the union of the configs.
-        let mut members: Vec<Vec<u8>> = configs
-            .iter()
-            .flat_map(|c| c.ids.iter().map(|id| id.node_id.clone()))
+        let retained = MAX_VOTERS - MAX_NEW_VOTERS;
+        let old: Vec<usize> = (0..MAX_VOTERS).collect();
+        // The retained tail of `old`, then the new voters.
+        let new: Vec<usize> = (MAX_NEW_VOTERS..MAX_VOTERS)
+            .chain(MAX_VOTERS..MAX_VOTERS + MAX_NEW_VOTERS)
             .collect();
-        members.sort();
+        debug_assert_eq!(new.len(), MAX_VOTERS);
+        debug_assert_eq!(
+            old.iter().filter(|n| new.contains(n)).count(),
+            retained,
+            "exactly the retained voters overlap"
+        );
+
+        let configs = vec![set(old.clone()), set(new.clone())];
+
+        // Voters first, then the learners that sit outside every config.
+        let mut members: Vec<usize> = old.into_iter().chain(new).collect();
+        members.sort_unstable();
         members.dedup();
+        let learners: Vec<usize> = (100..100 + MAX_RETAINED_LEARNERS).collect();
 
         MembershipV1 {
             configs,
             nodes: members
                 .into_iter()
-                .map(|node_id| NodeEntryV1 {
-                    node_id,
+                .chain(learners)
+                .map(|n| NodeEntryV1 {
+                    node_id: node_id(n),
                     format_version: crate::coordination::convert::NODE_FORMAT_VERSION,
                 })
                 .collect(),
         }
     }
 
-    /// The largest `CoordinationMetaV1` this protocol can legally hold.
+    /// The largest `CoordinationMetaV1` a production group can legally hold.
     ///
     /// Every field is named — no `..Default::default()` — so adding a field
     /// breaks this construction and forces whoever adds it to decide its
     /// maximum rather than inherit a default and leave the sizing proof stale.
     ///
-    /// *Legal*, not merely large: the authority domain is at
-    /// [`MAX_AUTHORITY_DOMAIN_BYTES`] rather than the generic 4095-byte string
-    /// ceiling, the schema version is the one this build writes, the profile
-    /// is a real profile, and the counters are values a running group could
-    /// actually reach.
+    /// Every bound comes from the declared cap constant rather than a literal,
+    /// so this cannot drift from the limits the model enforces.
     fn maximal_legal_meta() -> CoordinationMetaV1 {
         use crate::coordination::model::authority::MAX_AUTHORITY_DOMAIN_BYTES;
+        use crate::coordination::model::limits::{GROWTH_BUDGET, RESERVE_BUDGET};
         use crate::coordination::model::shape::PROFILE_PROD;
         use crate::coordination::raft::{RecoveredFromV1, StoredMembershipV1};
 
@@ -2343,13 +2365,17 @@ mod tests {
             schema_version: LOGICAL_SCHEMA_VERSION,
             group_id: vec![0xFF; 32],
             genesis_hash: vec![0xFF; 32],
-            authority_public_key: vec![0xFF; 32],
+            // A key the Ed25519 verifier actually accepts. Arbitrary bytes are
+            // not a public key: most 32-byte strings decode to nothing on the
+            // curve, so sizing against one proves nothing about a real
+            // authority binding.
+            authority_public_key: authority_public_key().to_vec(),
             authority_domain: "d".repeat(MAX_AUTHORITY_DOMAIN_BYTES),
             deployment_profile_code: PROFILE_PROD,
             last_applied: log_id(9_000_000),
             membership: StoredMembershipV1 {
                 log_id: log_id(8_999_000),
-                membership: maximal_joint_membership(),
+                membership: maximal_reachable_membership(),
             },
             admin_revision: 1_000_000,
             recovery_export_hash: Some(vec![0xFF; 32]),
@@ -2358,19 +2384,44 @@ mod tests {
                 source_genesis_hash: vec![0xFF; 32],
                 export_hash: vec![0xFF; 32],
             }),
-            aggregate_growth_bytes: 1 << 40,
-            aggregate_reserve_bytes: 1 << 40,
+            // The declared budgets, not a round number above them.
+            aggregate_growth_bytes: GROWTH_BUDGET,
+            aggregate_reserve_bytes: RESERVE_BUDGET,
             audit_floor: log_id(8_900_000),
         }
+    }
+
+    /// The row counts a group can legally reach, each from its own cap.
+    fn maximal_legal_row_counts() -> crate::coordination::rowstream::RowCountsV1 {
+        use crate::coordination::model::limits::{
+            MAX_ACL_ROWS_PER_GROUP, MAX_ADMINS_PER_GROUP, MAX_AUDIT_ROWS, MAX_RESOURCES_PER_GROUP,
+            MAX_RETAINED_INTENTS, MAX_RETAINED_ROUTES, MAX_RETAINED_SESSIONS_PER_GROUP,
+        };
+        crate::coordination::rowstream::RowCountsV1 {
+            resources: MAX_RESOURCES_PER_GROUP,
+            grants: MAX_ACL_ROWS_PER_GROUP,
+            admins: MAX_ADMINS_PER_GROUP,
+            sessions: MAX_RETAINED_SESSIONS_PER_GROUP,
+            intents: MAX_RETAINED_INTENTS,
+            routes: MAX_RETAINED_ROUTES,
+            audit: MAX_AUDIT_ROWS,
+        }
+    }
+
+    /// A verifier-accepted authority public key, deterministically derived.
+    fn authority_public_key() -> [u8; 32] {
+        crate::coordination::model::authority::testing::signing_key()
+            .verifying_key()
+            .to_bytes()
     }
 
     /// A deliberately *over*-sized meta, used only to measure the header
     /// envelope conservatively.
     ///
-    /// Not legal state, and labelled so. Its scalars are at their type maxima
+    /// Not legal state, and labelled so. Its scalars sit at their type maxima
     /// and its domain at the generic string ceiling, which makes every
-    /// variable-length encoding at least as wide as anything real. Measuring
-    /// the envelope against it cannot understate the wrapper.
+    /// variable-length encoding at least as wide as anything real, so the
+    /// envelope measured from it cannot be understated.
     fn oversized_meta_for_envelope() -> CoordinationMetaV1 {
         use crate::coordination::contract::MAX_WIRE_STRING;
 
@@ -2384,52 +2435,69 @@ mod tests {
         meta
     }
 
-    /// The maximal legal membership survives the OpenRaft round trip.
-    ///
-    /// A fixture that does not convert is not evidence about legal state: it
-    /// would prove the ceiling against a shape the voter can never hold. The
-    /// mirror conversion is the same one storage uses, and it is fallible
-    /// precisely so a membership like the previous fixture's — a node map that
-    /// does not describe its configs — cannot pass silently.
+    /// The maximal membership is one Aster can actually reach, and survives
+    /// the OpenRaft round trip.
     #[test]
-    fn the_maximal_membership_is_a_real_openraft_membership() {
-        use crate::coordination::model::shape::MAX_VOTERS;
+    fn the_maximal_membership_is_reachable_and_round_trips() {
+        use crate::coordination::model::shape::{
+            profile_permits_voters, MAX_NEW_VOTERS, MAX_RETAINED_LEARNERS, MAX_VOTERS, PROFILE_PROD,
+        };
         use crate::coordination::typeconfig::{CoordinationNode, CoordinationTypeConfig};
         use openraft::Membership;
+        use std::collections::BTreeSet;
 
+        let mirror = maximal_reachable_membership();
+        let ids = |set: &crate::coordination::raft::NodeIdSetV1| -> BTreeSet<Vec<u8>> {
+            set.ids.iter().map(|i| i.node_id.clone()).collect()
+        };
+
+        let old = ids(&mirror.configs[0]);
+        let new = ids(&mirror.configs[1]);
+
+        // Aster legality, which is the claim the old fixture could not make.
+        //
+        // `profile_permits_voters` returns `true` when the count is *not*
+        // permitted -- it matches the `Option` idiom of the other shape
+        // checks, so it reads backwards here. Written the wrong way round
+        // first, and caught only because the fixture is legal.
+        assert!(!profile_permits_voters(PROFILE_PROD, old.len()));
+        assert!(!profile_permits_voters(PROFILE_PROD, new.len()));
+        assert_eq!(old.len(), MAX_VOTERS);
+        assert_eq!(
+            new.difference(&old).count(),
+            MAX_NEW_VOTERS,
+            "a single step may introduce at most MAX_NEW_VOTERS voters"
+        );
+
+        // The node map covers every voter, and its remainder is learners
+        // within the retention cap. Not an exact union: OpenRaft represents
+        // learners as nodes outside every config, so requiring equality would
+        // have excluded them and understated the maximum.
+        let nodes: BTreeSet<Vec<u8>> = mirror.nodes.iter().map(|n| n.node_id.clone()).collect();
+        let voters: BTreeSet<Vec<u8>> = old.union(&new).cloned().collect();
+        assert!(
+            voters.is_subset(&nodes),
+            "every voter must appear in the node map"
+        );
+        let learners: BTreeSet<Vec<u8>> = nodes.difference(&voters).cloned().collect();
+        assert_eq!(
+            learners.len(),
+            MAX_RETAINED_LEARNERS,
+            "the maximum retains MAX_RETAINED_LEARNERS learners outside the configs"
+        );
+
+        // And it is a real OpenRaft membership, through the same mirror
+        // conversion storage uses.
         let _ = std::marker::PhantomData::<CoordinationTypeConfig>;
-        let mirror = maximal_joint_membership();
-
         let membership: Membership<CoordinationNodeId, CoordinationNode> = (&mirror)
             .try_into()
             .expect("the maximal membership converts");
-
-        // Node-map identity by *set*, not by count. The count assertion this
-        // replaces passed against a map of unrelated ids.
-        let declared: std::collections::BTreeSet<CoordinationNodeId> = mirror
-            .nodes
-            .iter()
-            .map(|n| CoordinationNodeId::from_slice(&n.node_id).expect("32 bytes"))
-            .collect();
-        let members: std::collections::BTreeSet<CoordinationNodeId> = mirror
-            .configs
-            .iter()
-            .flat_map(|c| c.ids.iter())
-            .map(|id| CoordinationNodeId::from_slice(&id.node_id).expect("32 bytes"))
-            .collect();
-        assert_eq!(
-            declared, members,
-            "the node map must be exactly the union of the configs"
-        );
-        assert_eq!(members.len(), MAX_VOTERS * 2);
-
         let back = crate::coordination::raft::MembershipV1::from(&membership);
-        let round_tripped: std::collections::BTreeSet<Vec<u8>> =
+        let round_tripped: BTreeSet<Vec<u8>> =
             back.nodes.iter().map(|n| n.node_id.clone()).collect();
         assert_eq!(
-            round_tripped,
-            declared.iter().map(|id| id.as_bytes().to_vec()).collect(),
-            "and it survives the round trip storage performs"
+            round_tripped, nodes,
+            "the node map survives the round trip storage performs"
         );
     }
 
@@ -2443,33 +2511,43 @@ mod tests {
     /// yields a header *over* it.
     ///
     /// The two halves use different fixtures on purpose. The lower bound —
-    /// "does not reject legal state" — must use genuinely legal state or it
-    /// proves nothing about a real voter. The envelope is measured against a
-    /// deliberately oversized meta, so the wrapper allowance cannot be
-    /// understated.
+    /// "does not reject legal state" — must use genuinely legal state, built
+    /// from the declared caps, or it proves nothing about a real voter. The
+    /// envelope is measured against a deliberately oversized meta so the
+    /// wrapper allowance cannot be understated.
     #[test]
     fn the_meta_ceiling_admits_only_snapshottable_rows() {
         use crate::coordination::contract::MAX_WIRE_STRING;
         use crate::coordination::model::authority::MAX_AUTHORITY_DOMAIN_BYTES;
-        use crate::coordination::model::shape::{MAX_VOTERS, PROFILE_PROD};
-        use crate::coordination::rowstream::{RowCountsV1, SnapshotHeaderV1, MAX_HEADER_BYTES};
+        use crate::coordination::model::limits::{GROWTH_BUDGET, RESERVE_BUDGET};
+        use crate::coordination::model::shape::PROFILE_PROD;
+        use crate::coordination::rowstream::{
+            RowCountsV1, SnapshotHeaderV1, MAX_HEADER_BYTES, SNAPSHOT_FORMAT_VERSION,
+        };
 
         // ── The fixture is still maximal, and still legal ────────────────────
         //
         // Every assertion below is an upper bound, so a token row satisfies
         // all of them: shrinking a field would leave this green while proving
-        // nothing. Checked by shape, because a byte floor catches the domain
-        // but not the membership.
+        // nothing. Checked against the declared caps, not literals.
         let legal = maximal_legal_meta();
         assert_eq!(legal.authority_domain.len(), MAX_AUTHORITY_DOMAIN_BYTES);
         assert!(legal.authority_domain.is_ascii());
         assert_eq!(legal.schema_version, LOGICAL_SCHEMA_VERSION);
         assert_eq!(legal.deployment_profile_code, PROFILE_PROD);
-        assert_eq!(legal.membership.membership.configs.len(), 2);
-        for config in &legal.membership.membership.configs {
-            assert_eq!(config.ids.len(), MAX_VOTERS);
-        }
-        assert_eq!(legal.membership.membership.nodes.len(), MAX_VOTERS * 2);
+        assert_eq!(legal.aggregate_growth_bytes, GROWTH_BUDGET);
+        assert_eq!(legal.aggregate_reserve_bytes, RESERVE_BUDGET);
+        assert!(
+            ed25519_dalek::VerifyingKey::from_bytes(
+                &legal
+                    .authority_public_key
+                    .clone()
+                    .try_into()
+                    .expect("32 bytes")
+            )
+            .is_ok(),
+            "the authority key must be one the verifier accepts"
+        );
         assert!(
             legal.last_applied.is_some()
                 && legal.audit_floor.is_some()
@@ -2492,20 +2570,14 @@ mod tests {
             encoded_legal.len()
         );
 
-        // 2. The maximal legal header fits, directly.
+        // 2. The maximal legal header fits, directly. Its format version is
+        //    the snapshot body format, not the storage codec version: those
+        //    are different compatibility concerns that happen to share a value.
         let legal_header = SnapshotHeaderV1 {
-            format_version: STORAGE_CODEC_VERSION,
+            format_version: SNAPSHOT_FORMAT_VERSION,
             schema_version: LOGICAL_SCHEMA_VERSION,
             meta: legal,
-            row_counts: RowCountsV1 {
-                resources: 1_000_000,
-                grants: 1_000_000,
-                admins: 1_000,
-                sessions: 1_000_000,
-                intents: 1_000,
-                routes: 1_000,
-                audit: 100_000,
-            },
+            row_counts: maximal_legal_row_counts(),
         };
         let encoded_legal_header = payload_fory::<SnapshotHeaderV1>()
             .serialize(&legal_header)
