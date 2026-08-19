@@ -20,12 +20,20 @@
 
 use openraft::{CommittedLeaderId, LogId as RaftLogId};
 
-use crate::coordination::contract::{LogIdV1, ResourceKeyV1};
+use crate::coordination::contract::{
+    ChangeMembershipActionV1, LogIdV1, MemberSeedV1, NodeIdV1, ResourceKeyV1, SavedReplyV1,
+    SavedSnapshotV1,
+};
 use crate::coordination::ids::{CoordinationNodeId, ResourceKey};
-use crate::coordination::reason::Outcome;
+use crate::coordination::raft::{ClientSessionV1, MembershipIntentV1, NodeRouteV1, ResourceRowV1};
+use crate::coordination::reason::{Disposition, Outcome, Reason};
 use crate::coordination::rowstream::AuditRowV1;
 
-use super::state::{AuditResult, AuditRow, LogId, NodeId};
+use super::membership::is_terminal_phase;
+use super::state::{
+    AuditResult, AuditRow, Intent, LogId, MemberSeed, MembershipPlan, NodeId, OperationId,
+    ResourceRow, Route, SavedReply, SavedSnapshot, Session,
+};
 
 /// The OpenRaft log id for this type config.
 ///
@@ -42,14 +50,76 @@ pub type OpenRaftLogId = RaftLogId<CoordinationNodeId>;
 pub enum WireError {
     /// A `Vec<u8>` node id that was not exactly 32 bytes.
     NodeIdWidth,
+    /// A `Vec<u8>` operation id that was not exactly 16 bytes.
+    OperationIdWidth,
+    /// A `Vec<u8>` request hash that was not exactly 32 bytes.
+    HashWidth,
     /// A `(namespace, key)` pair that fails §4.2 validation.
     ResourceKey,
     /// An outcome code outside §5.2.
     OutcomeCode,
+    /// A reason code outside §5.2.
+    ReasonCode,
+    /// A disposition code a stored reply cannot carry.
+    ///
+    /// §10 saves a result only for a sequence the entry **consumed**, so a
+    /// stored `NotConsumed` describes a row no apply path writes.
+    DispositionCode,
+    /// A membership phase outside §9's declared set.
+    PhaseCode,
+    /// A member-seed ticket that is not valid UTF-8.
+    ///
+    /// The wire carries a ticket as a Fory `String` and the model holds its
+    /// bytes, so a stored ticket that will not narrow back is a row this build
+    /// cannot faithfully re-emit. Lossy replacement would silently change
+    /// dialling material.
+    TicketEncoding,
+    /// `held` and `holder` disagreed: a lease held by nobody, or a free
+    /// resource with a holder.
+    LeaseIncoherent,
+    /// A terminal intent with no completion log id, or an active one with one.
+    ///
+    /// §9 evicts terminal intents by completion log id, so the pairing is what
+    /// makes eviction ordered at all.
+    IntentCompletionIncoherent,
+    /// A stored value bound to a different group than the store it was read
+    /// from.
+    GroupMismatch,
+    /// A stored row's embedded key disagreed with the redb key it was filed
+    /// under.
+    KeyMismatch,
 }
 
 fn node_id(bytes: &[u8]) -> Result<NodeId, WireError> {
     bytes.try_into().map_err(|_| WireError::NodeIdWidth)
+}
+
+fn operation_id(bytes: &[u8]) -> Result<OperationId, WireError> {
+    bytes.try_into().map_err(|_| WireError::OperationIdWidth)
+}
+
+fn hash(bytes: &[u8]) -> Result<[u8; 32], WireError> {
+    bytes.try_into().map_err(|_| WireError::HashWidth)
+}
+
+fn resource_key(wire: &ResourceKeyV1) -> Result<ResourceKey, WireError> {
+    ResourceKey::new(wire.namespace.clone(), wire.key.clone()).map_err(|_| WireError::ResourceKey)
+}
+
+fn resource_key_to_wire(key: &ResourceKey) -> ResourceKeyV1 {
+    ResourceKeyV1 {
+        namespace: key.namespace().to_string(),
+        key: key.key().to_vec(),
+    }
+}
+
+/// Narrow an optional stored log id, refusing a malformed one rather than
+/// reading it as absent.
+fn opt_log_id(wire: &Option<LogIdV1>) -> Result<Option<LogId>, WireError> {
+    match wire {
+        Some(id) => Ok(Some(LogId::try_from(id)?)),
+        None => Ok(None),
+    }
 }
 
 // ── LogId ↔ LogIdV1 ─────────────────────────────────────────────────────────
@@ -113,10 +183,7 @@ impl From<&AuditRow> for AuditRowV1 {
             // snapshot reader rejects.
             actor_node_id: row.actor.map(|a| a.to_vec()),
             operation_code: row.operation_code,
-            resource: row.resource.as_ref().map(|k| ResourceKeyV1 {
-                namespace: k.namespace().to_string(),
-                key: k.key().to_vec(),
-            }),
+            resource: row.resource.as_ref().map(resource_key_to_wire),
             result_code: row.result.code(),
             epoch: row.epoch,
             value_revision: row.value_revision,
@@ -129,10 +196,7 @@ impl TryFrom<&AuditRowV1> for AuditRow {
 
     fn try_from(row: &AuditRowV1) -> Result<Self, WireError> {
         let resource = match &row.resource {
-            Some(k) => Some(
-                ResourceKey::new(k.namespace.clone(), k.key.clone())
-                    .map_err(|_| WireError::ResourceKey)?,
-            ),
+            Some(k) => Some(resource_key(k)?),
             None => None,
         };
         Ok(AuditRow {
@@ -154,6 +218,363 @@ impl TryFrom<&AuditRowV1> for AuditRow {
             },
             epoch: row.epoch,
             value_revision: row.value_revision,
+        })
+    }
+}
+
+// ── ResourceRow ↔ ResourceRowV1 ─────────────────────────────────────────────
+
+impl From<&ResourceRow> for ResourceRowV1 {
+    fn from(row: &ResourceRow) -> Self {
+        ResourceRowV1 {
+            epoch: row.epoch,
+            held: row.held,
+            // `None` when unheld, never 32 zero bytes: an all-zero NodeId is a
+            // NodeId, so a sentinel would be a lease held by a node whose key
+            // is all zeros.
+            holder_node_id: row.holder.map(|h| h.to_vec()),
+            ttl_ms: row.ttl_ms,
+            lease_revision: row.lease_revision,
+            value_revision: row.value_revision,
+            value: row.value.clone(),
+            acl_revision: row.acl_revision,
+        }
+    }
+}
+
+impl TryFrom<&ResourceRowV1> for ResourceRow {
+    type Error = WireError;
+
+    fn try_from(row: &ResourceRowV1) -> Result<Self, WireError> {
+        let holder = match &row.holder_node_id {
+            Some(bytes) => Some(node_id(bytes)?),
+            None => None,
+        };
+        // Every model path assigns the two together -- `decide_acquire` sets
+        // both, and every release, revoke and expiry clears both -- so a row
+        // where they disagree came from somewhere other than this state
+        // machine.
+        if row.held != holder.is_some() {
+            return Err(WireError::LeaseIncoherent);
+        }
+        Ok(ResourceRow {
+            epoch: row.epoch,
+            held: row.held,
+            holder,
+            ttl_ms: row.ttl_ms,
+            lease_revision: row.lease_revision,
+            value_revision: row.value_revision,
+            value: row.value.clone(),
+            acl_revision: row.acl_revision,
+        })
+    }
+}
+
+// ── SavedSnapshot ↔ SavedSnapshotV1 ─────────────────────────────────────────
+//
+// Both of these take the group id, because the wire type carries one and the
+// model's does not. It is not padding: a session row is replicated state, so
+// the group it names must be the group holding it, and a row that names another
+// group is a row from another store.
+
+pub fn saved_snapshot_to_wire(group_id: &[u8], saved: &SavedSnapshot) -> SavedSnapshotV1 {
+    SavedSnapshotV1 {
+        group_id: group_id.to_vec(),
+        resource: resource_key_to_wire(&saved.resource),
+        epoch: saved.epoch,
+        holder: saved.holder.map(|h| h.to_vec()),
+        held: saved.held,
+        ttl_ms: saved.ttl_ms,
+        lease_revision: saved.lease_revision,
+        value_revision: saved.value_revision,
+        acl_revision: saved.acl_revision,
+    }
+}
+
+pub fn saved_snapshot_from_wire(
+    group_id: &[u8],
+    wire: &SavedSnapshotV1,
+) -> Result<SavedSnapshot, WireError> {
+    if wire.group_id != group_id {
+        return Err(WireError::GroupMismatch);
+    }
+    let holder = match &wire.holder {
+        Some(bytes) => Some(node_id(bytes)?),
+        None => None,
+    };
+    if wire.held != holder.is_some() {
+        return Err(WireError::LeaseIncoherent);
+    }
+    Ok(SavedSnapshot {
+        resource: resource_key(&wire.resource)?,
+        epoch: wire.epoch,
+        holder,
+        held: wire.held,
+        ttl_ms: wire.ttl_ms,
+        lease_revision: wire.lease_revision,
+        value_revision: wire.value_revision,
+        acl_revision: wire.acl_revision,
+    })
+}
+
+// ── SavedReply ↔ SavedReplyV1 ───────────────────────────────────────────────
+
+/// The one disposition a **stored** reply can carry.
+///
+/// §10 saves a result only where the entry consumed the sequence: a classifier
+/// refusal is `NotConsumed` and writes no session row at all. So the stored
+/// field is not free-form, and a row carrying anything else is not a row this
+/// state machine wrote.
+const STORED_DISPOSITION: Disposition = Disposition::Consumed;
+
+pub fn saved_reply_to_wire(group_id: &[u8], reply: &SavedReply) -> SavedReplyV1 {
+    SavedReplyV1 {
+        disposition_code: disposition_code(STORED_DISPOSITION),
+        outcome_code: reply.outcome.code(),
+        reason_code: reply.reason.code(),
+        snapshot: reply
+            .snapshot
+            .as_ref()
+            .map(|s| saved_snapshot_to_wire(group_id, s)),
+        acl_revision: reply.acl_revision,
+        admin_revision: reply.admin_revision,
+        operation_id: reply.operation_id.map(|id| id.to_vec()),
+        membership_log_id: reply.membership_log_id.as_ref().map(Into::into),
+    }
+}
+
+pub fn saved_reply_from_wire(
+    group_id: &[u8],
+    wire: &SavedReplyV1,
+) -> Result<SavedReply, WireError> {
+    if wire.disposition_code != disposition_code(STORED_DISPOSITION) {
+        return Err(WireError::DispositionCode);
+    }
+    let snapshot = match &wire.snapshot {
+        Some(s) => Some(saved_snapshot_from_wire(group_id, s)?),
+        None => None,
+    };
+    Ok(SavedReply {
+        outcome: Outcome::from_code(wire.outcome_code).ok_or(WireError::OutcomeCode)?,
+        reason: Reason::from_code(wire.reason_code).ok_or(WireError::ReasonCode)?,
+        snapshot,
+        acl_revision: wire.acl_revision,
+        admin_revision: wire.admin_revision,
+        operation_id: match &wire.operation_id {
+            Some(bytes) => Some(operation_id(bytes)?),
+            None => None,
+        },
+        membership_log_id: opt_log_id(&wire.membership_log_id)?,
+    })
+}
+
+/// The §5.2.1 disposition code. Shared with [`super::project`] rather than
+/// restated, so the stored and public forms cannot drift apart.
+fn disposition_code(disposition: Disposition) -> i32 {
+    match disposition {
+        Disposition::Consumed => 1,
+        Disposition::NotConsumed => 2,
+    }
+}
+
+// ── Session ↔ ClientSessionV1 ───────────────────────────────────────────────
+
+pub fn session_to_wire(group_id: &[u8], session: &Session) -> ClientSessionV1 {
+    ClientSessionV1 {
+        last_sequence: session.last_sequence,
+        request_hash: session.request_hash.to_vec(),
+        last_result: session
+            .last_result
+            .as_ref()
+            .map(|r| saved_reply_to_wire(group_id, r)),
+        retired: session.retired,
+    }
+}
+
+pub fn session_from_wire(group_id: &[u8], wire: &ClientSessionV1) -> Result<Session, WireError> {
+    Ok(Session {
+        last_sequence: wire.last_sequence,
+        request_hash: hash(&wire.request_hash)?,
+        last_result: match &wire.last_result {
+            Some(reply) => Some(saved_reply_from_wire(group_id, reply)?),
+            None => None,
+        },
+        retired: wire.retired,
+    })
+}
+
+// ── MembershipPlan ↔ ChangeMembershipActionV1 ───────────────────────────────
+
+/// Build the stored plan action.
+///
+/// Takes the operation id and expected membership because the declared type
+/// carries both, and because the §12.1 intent charge is measured from exactly
+/// this value -- [`MembershipPlan::encoded_len`] calls this, so the charge and
+/// the bytes written are the same thing rather than two constructions someone
+/// keeps in step.
+///
+/// Fallible for one reason: a ticket is a Fory `String` on the wire and bytes
+/// in the model. Every ticket that entered through the command boundary came
+/// *from* a `String`, so this succeeds for anything the model built; a stored
+/// ticket that will not narrow is a row this build cannot re-emit faithfully,
+/// and replacing the invalid bytes would change dialling material.
+pub fn plan_to_wire(
+    plan: &MembershipPlan,
+    operation_id: &OperationId,
+    expected_membership: Option<LogId>,
+) -> Result<ChangeMembershipActionV1, WireError> {
+    let ids = |nodes: &[NodeId]| -> Vec<NodeIdV1> {
+        nodes
+            .iter()
+            .map(|n| NodeIdV1 {
+                node_id: n.to_vec(),
+            })
+            .collect()
+    };
+    let mut member_seeds = Vec::with_capacity(plan.member_seeds.len());
+    for seed in &plan.member_seeds {
+        member_seeds.push(MemberSeedV1 {
+            node_id: seed.node_id.to_vec(),
+            ticket: String::from_utf8(seed.ticket.clone())
+                .map_err(|_| WireError::TicketEncoding)?,
+            signed_join_permit: seed.join_permit.clone(),
+        });
+    }
+    Ok(ChangeMembershipActionV1 {
+        operation_id: operation_id.to_vec(),
+        expected_membership_log_id: expected_membership.as_ref().map(Into::into),
+        desired_voters: ids(&plan.desired_voters),
+        retained_learners: ids(&plan.retained_learners),
+        member_seeds,
+    })
+}
+
+/// Narrow a stored plan action back to its three parts.
+///
+/// Returns the operation id and expected membership alongside the plan rather
+/// than discarding them: they are what the caller checks the row key and the
+/// intent's own `expected_membership` against.
+pub fn plan_from_wire(
+    wire: &ChangeMembershipActionV1,
+) -> Result<(OperationId, Option<LogId>, MembershipPlan), WireError> {
+    let nodes = |ids: &[NodeIdV1]| -> Result<Vec<NodeId>, WireError> {
+        ids.iter().map(|n| node_id(&n.node_id)).collect()
+    };
+    let mut member_seeds = Vec::with_capacity(wire.member_seeds.len());
+    for seed in &wire.member_seeds {
+        member_seeds.push(MemberSeed {
+            node_id: node_id(&seed.node_id)?,
+            ticket: seed.ticket.clone().into_bytes(),
+            join_permit: seed.signed_join_permit.clone(),
+        });
+    }
+    Ok((
+        operation_id(&wire.operation_id)?,
+        opt_log_id(&wire.expected_membership_log_id)?,
+        MembershipPlan {
+            desired_voters: nodes(&wire.desired_voters)?,
+            retained_learners: nodes(&wire.retained_learners)?,
+            member_seeds,
+        },
+    ))
+}
+
+// ── Intent ↔ MembershipIntentV1 ─────────────────────────────────────────────
+
+pub fn intent_to_wire(
+    operation_id: &OperationId,
+    intent: &Intent,
+) -> Result<MembershipIntentV1, WireError> {
+    Ok(MembershipIntentV1 {
+        actor_node_id: intent.actor.to_vec(),
+        request_hash: intent.request_hash.to_vec(),
+        expected_membership: intent.expected_membership.as_ref().map(Into::into),
+        desired_plan: plan_to_wire(&intent.plan, operation_id, intent.expected_membership)?,
+        status_code: intent.status_code,
+        result_code: intent.result_code,
+        accepted_log_id: (&intent.accepted_log_id).into(),
+        completed_log_id: intent.completed_log_id.as_ref().map(Into::into),
+        observed_membership_log_id: intent.observed_membership_log_id.as_ref().map(Into::into),
+    })
+}
+
+/// Narrow a stored intent, filed under `operation_id`.
+///
+/// The stored plan repeats the operation id and the expected membership, so
+/// both are **checked** against the row rather than preferred or overwritten. A
+/// row whose two copies disagree has no defensible reading: picking either one
+/// would make a plan the controller re-runs after a restart differ from the
+/// plan that was accepted.
+pub fn intent_from_wire(
+    operation_id: &OperationId,
+    wire: &MembershipIntentV1,
+) -> Result<Intent, WireError> {
+    let (plan_operation_id, plan_expected, plan) = plan_from_wire(&wire.desired_plan)?;
+    if plan_operation_id != *operation_id {
+        return Err(WireError::KeyMismatch);
+    }
+    let expected_membership = opt_log_id(&wire.expected_membership)?;
+    if plan_expected != expected_membership {
+        return Err(WireError::KeyMismatch);
+    }
+    if !PHASES.contains(&wire.status_code) {
+        return Err(WireError::PhaseCode);
+    }
+    let completed_log_id = opt_log_id(&wire.completed_log_id)?;
+    // §9 orders eviction of terminal intents by completion log id, and apply
+    // stamps it exactly when an intent becomes terminal. Either half without
+    // the other makes that ordering undefined.
+    if is_terminal_phase(wire.status_code) != completed_log_id.is_some() {
+        return Err(WireError::IntentCompletionIncoherent);
+    }
+    Ok(Intent {
+        actor: node_id(&wire.actor_node_id)?,
+        request_hash: hash(&wire.request_hash)?,
+        expected_membership,
+        plan,
+        status_code: wire.status_code,
+        result_code: wire.result_code,
+        accepted_log_id: LogId::try_from(&wire.accepted_log_id)?,
+        completed_log_id,
+        observed_membership_log_id: opt_log_id(&wire.observed_membership_log_id)?,
+    })
+}
+
+/// Every §9 phase, listed so an unknown stored code is refused rather than
+/// carried into an intent the phase machine cannot advance.
+const PHASES: [i32; 7] = [
+    super::membership::PHASE_PENDING,
+    super::membership::PHASE_ADDING_LEARNERS,
+    super::membership::PHASE_CHANGING_VOTERS,
+    super::membership::PHASE_COMPLETED,
+    super::membership::PHASE_FAILED,
+    super::membership::PHASE_CANCEL_REQUESTED,
+    super::membership::PHASE_CANCELLED,
+];
+
+// ── Route ↔ NodeRouteV1 ─────────────────────────────────────────────────────
+
+impl From<&Route> for NodeRouteV1 {
+    fn from(route: &Route) -> Self {
+        NodeRouteV1 {
+            // Bytes, not a `String`: a route is stored dialling material and
+            // the declared type keeps it opaque, so no encoding question
+            // arises on this side.
+            ticket_bytes: route.ticket.clone(),
+            source_operation_id: route.source_operation_id.to_vec(),
+            introduced_log_id: (&route.introduced_log_id).into(),
+        }
+    }
+}
+
+impl TryFrom<&NodeRouteV1> for Route {
+    type Error = WireError;
+
+    fn try_from(wire: &NodeRouteV1) -> Result<Self, WireError> {
+        Ok(Route {
+            ticket: wire.ticket_bytes.clone(),
+            source_operation_id: operation_id(&wire.source_operation_id)?,
+            introduced_log_id: LogId::try_from(&wire.introduced_log_id)?,
         })
     }
 }
@@ -385,5 +806,444 @@ mod tests {
             LogId::new(term, decoded.leader_node_id, index),
             LogId::new(5, [0x11u8; 32], 77)
         );
+    }
+
+    // ── §11.3 storage rows ──────────────────────────────────────────────────
+
+    const GROUP: [u8; 32] = [0xC0; 32];
+    const OTHER_GROUP: [u8; 32] = [0xC1; 32];
+
+    fn key() -> ResourceKey {
+        ResourceKey::new("ns.sub", b"\x00\xffkey".to_vec()).expect("valid")
+    }
+
+    fn held_row() -> ResourceRow {
+        ResourceRow {
+            epoch: 4,
+            held: true,
+            holder: Some([0x33u8; 32]),
+            ttl_ms: 30_000,
+            lease_revision: 2,
+            value_revision: 3,
+            value: b"payload".to_vec(),
+            acl_revision: 1,
+        }
+    }
+
+    fn saved_reply() -> SavedReply {
+        SavedReply {
+            outcome: Outcome::Mutated,
+            reason: Reason::None,
+            snapshot: Some(SavedSnapshot::of(key(), &held_row())),
+            acl_revision: 1,
+            admin_revision: 6,
+            operation_id: Some([0x44u8; 16]),
+            membership_log_id: Some(LogId::new(2, [0x55u8; 32], 11)),
+        }
+    }
+
+    fn plan() -> MembershipPlan {
+        MembershipPlan {
+            desired_voters: vec![[0x61u8; 32], [0x62u8; 32], [0x63u8; 32]],
+            retained_learners: vec![[0x64u8; 32]],
+            member_seeds: vec![MemberSeed {
+                node_id: [0x65u8; 32],
+                ticket: b"aster1seed".to_vec(),
+                join_permit: Some(vec![0x66u8; 8]),
+            }],
+        }
+    }
+
+    fn intent() -> Intent {
+        Intent {
+            actor: [0x71u8; 32],
+            request_hash: [0x72u8; 32],
+            expected_membership: Some(LogId::new(3, [0x73u8; 32], 21)),
+            plan: plan(),
+            status_code: super::super::membership::PHASE_ADDING_LEARNERS,
+            result_code: 0,
+            accepted_log_id: LogId::new(3, [0x73u8; 32], 22),
+            completed_log_id: None,
+            observed_membership_log_id: Some(LogId::new(3, [0x73u8; 32], 20)),
+        }
+    }
+
+    const OPERATION: OperationId = [0x88u8; 16];
+
+    /// Both lease states survive the round trip, and an unheld row reports no
+    /// holder rather than 32 zero bytes.
+    #[test]
+    fn a_resource_row_round_trips_at_both_lease_states() {
+        let held = held_row();
+        let wire: ResourceRowV1 = (&held).into();
+        assert_eq!(wire.holder_node_id, Some(vec![0x33u8; 32]));
+        assert_eq!(ResourceRow::try_from(&wire), Ok(held));
+
+        let free = ResourceRow {
+            held: false,
+            holder: None,
+            ..held_row()
+        };
+        let wire: ResourceRowV1 = (&free).into();
+        assert_eq!(wire.holder_node_id, None, "never a zeroed sentinel");
+        assert_eq!(ResourceRow::try_from(&wire), Ok(free));
+    }
+
+    /// A lease held by nobody, and a free resource with a holder, are both
+    /// refused. Every model path assigns `held` and `holder` together, so a row
+    /// where they disagree did not come from this state machine.
+    #[test]
+    fn an_incoherent_lease_is_refused_in_both_directions() {
+        let mut held_by_nobody: ResourceRowV1 = (&held_row()).into();
+        held_by_nobody.holder_node_id = None;
+        assert_eq!(
+            ResourceRow::try_from(&held_by_nobody),
+            Err(WireError::LeaseIncoherent)
+        );
+
+        let mut free_with_holder: ResourceRowV1 = (&held_row()).into();
+        free_with_holder.held = false;
+        assert_eq!(
+            ResourceRow::try_from(&free_with_holder),
+            Err(WireError::LeaseIncoherent)
+        );
+
+        // And a holder that is not a NodeId is a width failure, which is a
+        // different fault from an incoherent pair.
+        let mut bad_width: ResourceRowV1 = (&held_row()).into();
+        bad_width.holder_node_id = Some(vec![0u8; 31]);
+        assert_eq!(
+            ResourceRow::try_from(&bad_width),
+            Err(WireError::NodeIdWidth)
+        );
+    }
+
+    /// A saved reply round-trips whole, including the snapshot the exact-replay
+    /// property depends on.
+    #[test]
+    fn a_saved_reply_round_trips_with_every_field() {
+        let reply = saved_reply();
+        let wire = saved_reply_to_wire(&GROUP, &reply);
+
+        assert_eq!(wire.outcome_code, Outcome::Mutated.code());
+        assert_eq!(wire.operation_id, Some(vec![0x44u8; 16]));
+        let snap = wire.snapshot.as_ref().expect("a snapshot");
+        assert_eq!(snap.group_id, GROUP.to_vec());
+        assert_eq!(snap.holder, Some(vec![0x33u8; 32]));
+
+        assert_eq!(saved_reply_from_wire(&GROUP, &wire), Ok(reply));
+    }
+
+    /// A reply whose snapshot names another group is refused. A session row is
+    /// replicated state, so the group it names must be the group holding it.
+    #[test]
+    fn a_saved_reply_bound_to_another_group_is_refused() {
+        let wire = saved_reply_to_wire(&OTHER_GROUP, &saved_reply());
+        assert_eq!(
+            saved_reply_from_wire(&GROUP, &wire),
+            Err(WireError::GroupMismatch)
+        );
+    }
+
+    /// A stored reply carries the consumed disposition, because §10 saves a
+    /// result only where the entry consumed the sequence. A classifier refusal
+    /// is `NotConsumed` and writes no session row at all.
+    #[test]
+    fn a_stored_reply_must_be_consumed() {
+        let wire = saved_reply_to_wire(&GROUP, &saved_reply());
+        assert_eq!(wire.disposition_code, 1);
+
+        let mut not_consumed = wire.clone();
+        not_consumed.disposition_code = 2;
+        assert_eq!(
+            saved_reply_from_wire(&GROUP, &not_consumed),
+            Err(WireError::DispositionCode)
+        );
+
+        let mut nonsense = wire;
+        nonsense.disposition_code = 0;
+        assert_eq!(
+            saved_reply_from_wire(&GROUP, &nonsense),
+            Err(WireError::DispositionCode)
+        );
+    }
+
+    /// Each fallible field of a stored reply refuses on its own, so a corrupt
+    /// row cannot be partially accepted.
+    #[test]
+    fn each_malformed_saved_reply_field_is_refused_on_its_own() {
+        let good = saved_reply_to_wire(&GROUP, &saved_reply());
+
+        let cases: Vec<(&str, SavedReplyV1, WireError)> = vec![
+            (
+                "outcome",
+                SavedReplyV1 {
+                    outcome_code: 999,
+                    ..good.clone()
+                },
+                WireError::OutcomeCode,
+            ),
+            (
+                "reason",
+                SavedReplyV1 {
+                    reason_code: 999,
+                    ..good.clone()
+                },
+                WireError::ReasonCode,
+            ),
+            (
+                "operation id",
+                SavedReplyV1 {
+                    operation_id: Some(vec![0u8; 15]),
+                    ..good.clone()
+                },
+                WireError::OperationIdWidth,
+            ),
+            (
+                "membership leader",
+                SavedReplyV1 {
+                    membership_log_id: Some(LogIdV1 {
+                        term: 1,
+                        leader_node_id: vec![0u8; 8],
+                        index: 1,
+                    }),
+                    ..good.clone()
+                },
+                WireError::NodeIdWidth,
+            ),
+            (
+                "snapshot key",
+                SavedReplyV1 {
+                    snapshot: Some(SavedSnapshotV1 {
+                        resource: ResourceKeyV1 {
+                            namespace: "NOT VALID".into(),
+                            key: b"k".to_vec(),
+                        },
+                        ..good.snapshot.clone().expect("a snapshot")
+                    }),
+                    ..good.clone()
+                },
+                WireError::ResourceKey,
+            ),
+        ];
+
+        for (label, wire, expected) in cases {
+            assert_eq!(
+                saved_reply_from_wire(&GROUP, &wire),
+                Err(expected),
+                "{label} must refuse on its own"
+            );
+        }
+    }
+
+    /// A session row round-trips at both shapes that exist: an answered
+    /// sequence, and a sequence-zero tombstone with no saved result.
+    #[test]
+    fn a_session_round_trips_with_and_without_a_saved_result() {
+        let answered = Session {
+            last_sequence: 5,
+            request_hash: [0x99u8; 32],
+            last_result: Some(saved_reply()),
+            retired: false,
+        };
+        let wire = session_to_wire(&GROUP, &answered);
+        assert_eq!(session_from_wire(&GROUP, &wire), Ok(answered));
+
+        // A tombstone is a row, not an absence: `retired` is what marks it, and
+        // `last_result` stays whatever was preserved.
+        let tombstone = Session {
+            last_sequence: 0,
+            request_hash: [0u8; 32],
+            last_result: None,
+            retired: true,
+        };
+        let wire = session_to_wire(&GROUP, &tombstone);
+        assert!(wire.retired);
+        assert!(wire.last_result.is_none());
+        assert_eq!(session_from_wire(&GROUP, &wire), Ok(tombstone));
+    }
+
+    #[test]
+    fn a_session_with_a_malformed_request_hash_is_refused() {
+        let mut wire = session_to_wire(
+            &GROUP,
+            &Session {
+                last_sequence: 1,
+                request_hash: [0u8; 32],
+                last_result: None,
+                retired: false,
+            },
+        );
+        wire.request_hash = vec![0u8; 31];
+        assert_eq!(session_from_wire(&GROUP, &wire), Err(WireError::HashWidth));
+    }
+
+    /// An intent round-trips whole, plan included.
+    #[test]
+    fn an_intent_round_trips_with_its_plan() {
+        let intent = intent();
+        let wire = intent_to_wire(&OPERATION, &intent).expect("encode");
+
+        assert_eq!(wire.desired_plan.operation_id, OPERATION.to_vec());
+        assert_eq!(wire.desired_plan.desired_voters.len(), 3);
+        assert_eq!(wire.desired_plan.member_seeds[0].ticket, "aster1seed");
+
+        assert_eq!(intent_from_wire(&OPERATION, &wire), Ok(intent));
+    }
+
+    /// The stored plan repeats the operation id and expected membership, and
+    /// both are checked against the row rather than preferred. A row whose two
+    /// copies disagree has no defensible reading: a controller re-running the
+    /// plan after a restart would run something other than what was accepted.
+    #[test]
+    fn a_stored_intent_whose_plan_disagrees_with_its_row_is_refused() {
+        let wire = intent_to_wire(&OPERATION, &intent()).expect("encode");
+
+        assert_eq!(
+            intent_from_wire(&[0x89u8; 16], &wire),
+            Err(WireError::KeyMismatch),
+            "filed under a different operation id"
+        );
+
+        let mut drifted = wire.clone();
+        drifted.expected_membership = Some(LogIdV1 {
+            term: 99,
+            leader_node_id: vec![0x73u8; 32],
+            index: 99,
+        });
+        assert_eq!(
+            intent_from_wire(&OPERATION, &drifted),
+            Err(WireError::KeyMismatch),
+            "the intent and its plan expect different memberships"
+        );
+
+        // And the same disagreement from the other side.
+        let mut drifted = wire;
+        drifted.desired_plan.expected_membership_log_id = None;
+        assert_eq!(
+            intent_from_wire(&OPERATION, &drifted),
+            Err(WireError::KeyMismatch)
+        );
+    }
+
+    /// A phase outside §9's set is refused rather than carried into an intent
+    /// the phase machine cannot advance.
+    #[test]
+    fn an_unknown_membership_phase_is_refused() {
+        let good = intent_to_wire(&OPERATION, &intent()).expect("encode");
+        for phase in [0, 8, -1, i32::MAX] {
+            let mut wire = good.clone();
+            wire.status_code = phase;
+            assert_eq!(
+                intent_from_wire(&OPERATION, &wire),
+                Err(WireError::PhaseCode),
+                "phase {phase} is not declared"
+            );
+        }
+
+        // Every declared phase is accepted, paired with the completion log id
+        // that phase requires.
+        for phase in super::PHASES {
+            let mut model = intent();
+            model.status_code = phase;
+            model.completed_log_id =
+                super::is_terminal_phase(phase).then_some(LogId::new(3, [0x73u8; 32], 30));
+            let wire = intent_to_wire(&OPERATION, &model).expect("encode");
+            assert_eq!(intent_from_wire(&OPERATION, &wire), Ok(model));
+        }
+    }
+
+    /// §9 evicts terminal intents by completion log id, and apply stamps it
+    /// exactly when an intent becomes terminal. Either half without the other
+    /// leaves that ordering undefined.
+    #[test]
+    fn an_intents_completion_log_id_must_match_its_phase() {
+        let mut active = intent();
+        active.status_code = super::super::membership::PHASE_PENDING;
+        active.completed_log_id = Some(LogId::new(3, [0x73u8; 32], 30));
+        let wire = intent_to_wire(&OPERATION, &active).expect("encode");
+        assert_eq!(
+            intent_from_wire(&OPERATION, &wire),
+            Err(WireError::IntentCompletionIncoherent),
+            "an active intent has not completed"
+        );
+
+        let mut terminal = intent();
+        terminal.status_code = super::super::membership::PHASE_COMPLETED;
+        terminal.completed_log_id = None;
+        let wire = intent_to_wire(&OPERATION, &terminal).expect("encode");
+        assert_eq!(
+            intent_from_wire(&OPERATION, &wire),
+            Err(WireError::IntentCompletionIncoherent),
+            "a terminal intent has no eviction ordering without one"
+        );
+    }
+
+    /// A ticket that is not valid UTF-8 is refused rather than replaced.
+    ///
+    /// Every ticket that entered through the command boundary came from a Fory
+    /// `String`, so this is unreachable from a conforming history -- which is
+    /// the point: `from_utf8_lossy` would have silently rewritten dialling
+    /// material for the one input that is not.
+    #[test]
+    fn a_non_utf8_ticket_is_refused_rather_than_replaced() {
+        let mut broken = intent();
+        broken.plan.member_seeds[0].ticket = vec![0xff, 0xfe];
+        assert_eq!(
+            intent_to_wire(&OPERATION, &broken),
+            Err(WireError::TicketEncoding)
+        );
+    }
+
+    /// The §12.1 intent charge measures the same value that is stored.
+    ///
+    /// An earlier revision built its own copy of the action for measurement,
+    /// so the two could differ without anything failing.
+    #[test]
+    fn the_intent_charge_measures_the_bytes_that_are_stored() {
+        use crate::coordination::contract::{payload_fory, ChangeMembershipActionV1};
+
+        let intent = intent();
+        let stored = intent_to_wire(&OPERATION, &intent).expect("encode");
+        let encoded = payload_fory::<ChangeMembershipActionV1>()
+            .serialize(&stored.desired_plan)
+            .expect("encode");
+        assert_eq!(intent.charge_len(&OPERATION), encoded.len());
+    }
+
+    /// A route round-trips, and its two fallible fields refuse independently.
+    #[test]
+    fn a_route_round_trips_and_refuses_malformed_fields() {
+        let route = Route {
+            ticket: b"aster1route".to_vec(),
+            source_operation_id: [0xA1u8; 16],
+            introduced_log_id: LogId::new(4, [0xA2u8; 32], 44),
+        };
+        let wire: NodeRouteV1 = (&route).into();
+        assert_eq!(Route::try_from(&wire), Ok(route));
+
+        let mut bad_operation = wire.clone();
+        bad_operation.source_operation_id = vec![0u8; 15];
+        assert_eq!(
+            Route::try_from(&bad_operation),
+            Err(WireError::OperationIdWidth)
+        );
+
+        let mut bad_leader = wire;
+        bad_leader.introduced_log_id.leader_node_id = vec![0u8; 8];
+        assert_eq!(Route::try_from(&bad_leader), Err(WireError::NodeIdWidth));
+    }
+
+    /// A route ticket is opaque bytes on both sides, so no encoding question
+    /// arises there -- unlike a member seed's, which is a Fory `String`.
+    #[test]
+    fn a_route_ticket_survives_bytes_no_string_could_carry() {
+        let route = Route {
+            ticket: vec![0xff, 0xfe, 0x00],
+            source_operation_id: [0u8; 16],
+            introduced_log_id: LogId::new(1, [0u8; 32], 1),
+        };
+        let wire: NodeRouteV1 = (&route).into();
+        assert_eq!(Route::try_from(&wire), Ok(route));
     }
 }

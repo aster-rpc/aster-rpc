@@ -519,6 +519,25 @@ pub struct ResourceRowV1 {
     pub acl_revision: u64,
 }
 
+/// A stored node route (§11.3): the advisory dialling hint retained for a node
+/// a membership change introduced.
+///
+/// `introduced_log_id` is not decorative. §9 evicts routes oldest-first by the
+/// log id that introduced them, and `source_operation_id` cannot order them —
+/// the intent that carries the acceptance ordering is itself evictable, so an
+/// evicted intent would take its route's ordering key with it.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/NodeRoute")]
+pub struct NodeRouteV1 {
+    #[fory(id = 1, bytes)]
+    pub ticket_bytes: Vec<u8>,
+    /// Exactly 16 bytes.
+    #[fory(id = 2, bytes)]
+    pub source_operation_id: Vec<u8>,
+    #[fory(id = 3)]
+    pub introduced_log_id: LogIdV1,
+}
+
 /// A stored client session (§11).
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/ClientSession")]
@@ -656,6 +675,36 @@ mod tests {
                 request_hash: vec![0xAA; 32],
                 last_result: None,
                 retired: true,
+            }
+        );
+        round_trip!(
+            MembershipIntentV1,
+            MembershipIntentV1 {
+                actor_node_id: vec![0x21; 32],
+                request_hash: vec![0x22; 32],
+                expected_membership: Some(log.clone()),
+                desired_plan: crate::coordination::contract::ChangeMembershipActionV1 {
+                    operation_id: vec![0x23; 16],
+                    expected_membership_log_id: Some(log.clone()),
+                    desired_voters: vec![crate::coordination::contract::NodeIdV1 {
+                        node_id: vec![0x24; 32],
+                    }],
+                    retained_learners: Vec::new(),
+                    member_seeds: Vec::new(),
+                },
+                status_code: 3,
+                result_code: 0,
+                accepted_log_id: log.clone(),
+                completed_log_id: None,
+                observed_membership_log_id: Some(log.clone()),
+            }
+        );
+        round_trip!(
+            NodeRouteV1,
+            NodeRouteV1 {
+                ticket_bytes: b"aster1seed".to_vec(),
+                source_operation_id: vec![0x25; 16],
+                introduced_log_id: log.clone(),
             }
         );
     }

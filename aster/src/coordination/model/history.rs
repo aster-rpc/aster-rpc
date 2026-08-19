@@ -344,6 +344,128 @@ fn replaying_one_history_reproduces_state_replies_and_audit_exactly() {
     assert_eq!(first_state, second_state, "final state differed");
 }
 
+/// Every row a real history produces round-trips through its §11.3 storage
+/// root, unchanged.
+///
+/// The point of driving this from the generator rather than from fixtures: the
+/// decoders refuse several pairings the model is *claimed* never to produce --
+/// `held` without a holder, a terminal intent with no completion log id, a
+/// saved reply that was not consumed. Each of those refusals is either a real
+/// corruption check or a bug that makes legitimate state unreadable, and only
+/// running the model against them tells the two apart. Hand-written fixtures
+/// would have proved the checks agree with themselves.
+#[test]
+fn every_row_a_history_produces_round_trips_through_its_storage_root() {
+    use super::state::{AuditRow, ResourceRow, Route};
+    use super::wire::{
+        intent_from_wire, intent_to_wire, session_from_wire, session_to_wire, WireError,
+    };
+    use crate::coordination::raft::{ClientSessionV1, NodeRouteV1, ResourceRowV1};
+    use crate::coordination::rowstream::AuditRowV1;
+
+    let (client_state, _) = run(600);
+    // Two histories, because neither reaches every table on its own: the
+    // generated alphabet retires membership operations faster than it retains
+    // them, so intents and routes come from the membership driver, and sessions
+    // and resources from the generated one.
+    let membership_state = membership_history(80);
+    let group = client_state.authority.group_id;
+    assert_eq!(membership_state.authority.group_id, group);
+
+    let mut counts = [0usize; 5];
+
+    for state in [&client_state, &membership_state] {
+        for (key, row) in &state.resources {
+            let wire: ResourceRowV1 = row.into();
+            assert_eq!(
+                ResourceRow::try_from(&wire).as_ref(),
+                Ok(row),
+                "resource {key:?} did not survive its storage root"
+            );
+            counts[0] += 1;
+        }
+        for (key, session) in &state.sessions {
+            let wire: ClientSessionV1 = session_to_wire(&group, session);
+            assert_eq!(
+                session_from_wire(&group, &wire).as_ref(),
+                Ok(session),
+                "session {key:?} did not survive its storage root"
+            );
+            counts[1] += 1;
+        }
+        for (operation_id, intent) in &state.intents {
+            let wire = intent_to_wire(operation_id, intent).expect("a history intent must encode");
+            assert_eq!(
+                intent_from_wire(operation_id, &wire).as_ref(),
+                Ok(intent),
+                "intent {operation_id:?} did not survive its storage root"
+            );
+            counts[2] += 1;
+        }
+        for (node, route) in &state.routes {
+            let wire: NodeRouteV1 = route.into();
+            assert_eq!(
+                Route::try_from(&wire).as_ref(),
+                Ok(route),
+                "route {node:?} did not survive its storage root"
+            );
+            counts[3] += 1;
+        }
+        for (at, row) in &state.audit {
+            let wire: AuditRowV1 = row.into();
+            assert_eq!(
+                AuditRow::try_from(&wire).as_ref(),
+                Ok(row),
+                "audit row {at:?} did not survive its storage root"
+            );
+            counts[4] += 1;
+        }
+    }
+
+    for (table, n) in ["resources", "sessions", "intents", "routes", "audit"]
+        .into_iter()
+        .zip(counts)
+    {
+        assert!(n > 0, "the history produced no {table} rows to check");
+    }
+
+    // And the refusals are refusals, not conditions this history happens never
+    // to reach: real rows are perturbed into the exact shapes the decoders
+    // reject. A round-trip suite alone would pass just as happily against a
+    // decoder that validated nothing.
+    let session = client_state
+        .sessions
+        .values()
+        .find(|s| s.last_result.as_ref().is_some_and(|r| r.snapshot.is_some()))
+        .expect("a history session carrying a saved snapshot");
+
+    let mut not_consumed = session_to_wire(&group, session);
+    not_consumed
+        .last_result
+        .as_mut()
+        .expect("a saved reply")
+        .disposition_code = 2;
+    assert_eq!(
+        session_from_wire(&group, &not_consumed),
+        Err(WireError::DispositionCode)
+    );
+
+    let foreign = session_to_wire(&[0u8; 32], session);
+    assert_eq!(
+        session_from_wire(&group, &foreign),
+        Err(WireError::GroupMismatch)
+    );
+
+    let row = client_state.resources.values().next().expect("a resource");
+    let mut incoherent: ResourceRowV1 = row.into();
+    incoherent.held = !incoherent.held;
+    assert_eq!(
+        ResourceRow::try_from(&incoherent),
+        Err(WireError::LeaseIncoherent),
+        "flipping `held` alone must be refused whichever way the row started"
+    );
+}
+
 /// Counters equal a full recomputation after every applied step -- checked
 /// inside `run`, and restated here so a failure names the property rather than
 /// a helper.
@@ -762,14 +884,17 @@ fn an_admin_race_is_resolved_by_revision() {
     assert!(!state.admins.contains(&BOB));
 }
 
-/// Every membership-intent transition the model defines is reachable, the
-/// terminal-history cap never grows past 64, and eviction is by completion.
-#[test]
-fn membership_intents_transition_and_stay_within_their_cap() {
+/// Accept `rounds` membership changes and walk each to completion.
+///
+/// Extracted because the generated command alphabet retires its intents faster
+/// than it accumulates them, so a state with retained intents and routes has to
+/// be driven deliberately. Two tests need one: the cap/eviction property below,
+/// and the storage round trip above.
+fn membership_history(rounds: u8) -> State {
     let mut state = genesis();
     let mut index = 0u64;
 
-    for round in 0..80u8 {
+    for round in 0..rounds {
         // The client's next sequence: one per accepted change, since the
         // interleaved progress reports are system commands and consume none.
         let sequence = u64::from(round) + 1;
@@ -850,6 +975,15 @@ fn membership_intents_transition_and_stay_within_their_cap() {
         );
         assert!(state.counters_match_recomputation());
     }
+
+    state
+}
+
+/// Every membership-intent transition the model defines is reachable, the
+/// terminal-history cap never grows past 64, and eviction is by completion.
+#[test]
+fn membership_intents_transition_and_stay_within_their_cap() {
+    let state = membership_history(80);
 
     assert_eq!(
         state.intents.len() as u64,

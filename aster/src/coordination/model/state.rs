@@ -229,44 +229,25 @@ impl MembershipPlan {
     /// maximum rather than zero, because charging zero for something
     /// unmeasurable is the one answer guaranteed to be wrong in the unsafe
     /// direction.
+    ///
+    /// The value measured is built by [`super::wire::plan_to_wire`], which is
+    /// also what §11.3 stores. An earlier revision built its own copy here and
+    /// narrowed the ticket with `from_utf8_lossy`, so a charge could in
+    /// principle be measured from bytes that differ from the ones written.
     pub fn encoded_len(
         &self,
         operation_id: &OperationId,
         expected_membership: Option<LogId>,
     ) -> usize {
-        use crate::coordination::contract::{
-            payload_fory, ChangeMembershipActionV1, LogIdV1, MemberSeedV1, NodeIdV1,
-        };
+        use crate::coordination::contract::{payload_fory, ChangeMembershipActionV1};
 
-        let wire = ChangeMembershipActionV1 {
-            operation_id: operation_id.to_vec(),
-            expected_membership_log_id: expected_membership.map(|id| LogIdV1::from(&id)),
-            desired_voters: self
-                .desired_voters
-                .iter()
-                .map(|n| NodeIdV1 {
-                    node_id: n.to_vec(),
-                })
-                .collect(),
-            retained_learners: self
-                .retained_learners
-                .iter()
-                .map(|n| NodeIdV1 {
-                    node_id: n.to_vec(),
-                })
-                .collect(),
-            member_seeds: self
-                .member_seeds
-                .iter()
-                .map(|s| MemberSeedV1 {
-                    node_id: s.node_id.to_vec(),
-                    ticket: String::from_utf8_lossy(&s.ticket).into_owned(),
-                    signed_join_permit: s.join_permit.clone(),
-                })
-                .collect(),
-        };
-        payload_fory::<ChangeMembershipActionV1>()
-            .serialize(&wire)
+        super::wire::plan_to_wire(self, operation_id, expected_membership)
+            .ok()
+            .and_then(|wire| {
+                payload_fory::<ChangeMembershipActionV1>()
+                    .serialize(&wire)
+                    .ok()
+            })
             .map_or(limits::MAX_ENCODED_COMMAND, |bytes| bytes.len())
     }
 }
