@@ -2537,17 +2537,28 @@ mod tests {
         assert_eq!(legal.deployment_profile_code, PROFILE_PROD);
         assert_eq!(legal.aggregate_growth_bytes, GROWTH_BUDGET);
         assert_eq!(legal.aggregate_reserve_bytes, RESERVE_BUDGET);
-        assert!(
-            ed25519_dalek::VerifyingKey::from_bytes(
+        // Demonstrated by *use*, not by decoding. `VerifyingKey::from_bytes`
+        // accepts every 32-byte string in this dalek version -- decompression
+        // is deferred -- so `is_ok()` passed against `[0xFF; 32]` and proved
+        // nothing. Verifying a real signature is what separates a key from a
+        // byte string.
+        {
+            use ed25519_dalek::{Signer, Verifier};
+
+            let signing = crate::coordination::model::authority::testing::signing_key();
+            let signature = signing.sign(b"aster-coordination/fixture-probe");
+            let verifying = ed25519_dalek::VerifyingKey::from_bytes(
                 &legal
                     .authority_public_key
                     .clone()
                     .try_into()
-                    .expect("32 bytes")
+                    .expect("32 bytes"),
             )
-            .is_ok(),
-            "the authority key must be one the verifier accepts"
-        );
+            .expect("decode");
+            verifying
+                .verify(b"aster-coordination/fixture-probe", &signature)
+                .expect("the authority key must actually verify what its signer produced");
+        }
         assert!(
             legal.last_applied.is_some()
                 && legal.audit_floor.is_some()
@@ -2571,8 +2582,15 @@ mod tests {
         );
 
         // 2. The maximal legal header fits, directly. Its format version is
-        //    the snapshot body format, not the storage codec version: those
-        //    are different compatibility concerns that happen to share a value.
+        //    the snapshot body format, not the storage codec version.
+        //
+        //    Those are different compatibility concerns that happen to share
+        //    the value 1 today, which is exactly why substituting one for the
+        //    other read as correct -- and why no test here can catch the
+        //    substitution: the constants are equal, so a mutation swapping
+        //    them is a no-op. Verified. The guard that can catch it belongs
+        //    with Checkpoint D's production header construction, where there
+        //    is a call site to constrain.
         let legal_header = SnapshotHeaderV1 {
             format_version: SNAPSHOT_FORMAT_VERSION,
             schema_version: LOGICAL_SCHEMA_VERSION,
