@@ -52,14 +52,23 @@ pub struct SectionLimits {
     pub max_row_bytes: u64,
 }
 
+/// Intent rows a snapshot section may carry.
+///
+/// 65, not 64: §9 retains 64 *terminal* intents and never evicts the active
+/// one, so a legal group holds one more row than the cap. Declared here rather
+/// than imported because `model` is voter-only and this module is in the client
+/// graph; `the_intent_section_limit_matches_the_model` pins the two together
+/// under the voter feature.
+const MAX_INTENT_ROWS: u64 = 65;
+
 pub fn limits(section: u64) -> Option<SectionLimits> {
     let (max_rows, max_row_bytes) = match section {
         SECTION_RESOURCES => (100_000u64, 128 * 1024u64), // 64 KiB value + 576 key + framing
         SECTION_GRANTS => (100_000, 2 * 1024),
         SECTION_ADMINS => (64, 256),
         SECTION_SESSIONS => (1_024 + 16_384, 4 * 1024),
-        SECTION_INTENTS => (64, 64 * 1024), // desired plan carries seeds + permits
-        SECTION_ROUTES => (64, 16 * 1024),  // ticket
+        SECTION_INTENTS => (MAX_INTENT_ROWS, 64 * 1024), // plan carries seeds + permits
+        SECTION_ROUTES => (64, 16 * 1024),               // ticket
         SECTION_AUDIT => (100_000, 2 * 1024),
         _ => return None,
     };
@@ -1049,6 +1058,25 @@ pub fn read_body<R: Read, T: BodyRow>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The section limit and the model's ceiling are one number.
+    ///
+    /// Declared twice because `model` is voter-only, so this is the only place
+    /// that can compare them -- and a stream that admitted fewer intent rows
+    /// than a store can hold would refuse to carry a legal group's snapshot.
+    #[cfg(feature = "coordination")]
+    #[test]
+    fn the_intent_section_limit_matches_the_model() {
+        assert_eq!(
+            MAX_INTENT_ROWS,
+            crate::coordination::model::limits::MAX_INTENT_ROWS
+        );
+        assert_eq!(
+            MAX_INTENT_ROWS,
+            crate::coordination::model::limits::MAX_RETAINED_INTENTS + 1,
+            "64 terminal intents plus the one active intent §9 never evicts"
+        );
+    }
 
     fn key(ns: &str, k: &[u8]) -> ResourceKeyV1 {
         ResourceKeyV1 {

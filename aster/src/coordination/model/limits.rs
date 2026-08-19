@@ -91,6 +91,14 @@ pub const MAX_AUDIT_ROWS: u64 = 100_000;
 /// a 65th is produced -- which is why reason `20 IntentSlotsExhausted` is
 /// reserved and never emitted.
 pub const MAX_RETAINED_INTENTS: u64 = 64;
+
+/// Intent **rows** a store or a snapshot section may hold.
+///
+/// One more than the retained cap, and the difference is normative: §9 says
+/// "if all 64 slots hold terminal intents *and* one is active, a new intent is
+/// still accepted; the cap only bounds terminal history". A storage ceiling of
+/// 64 therefore refuses a state the transition is required to produce.
+pub const MAX_INTENT_ROWS: u64 = MAX_RETAINED_INTENTS + 1;
 /// Node routes retained (§12.1).
 pub const MAX_RETAINED_ROUTES: u64 = 64;
 

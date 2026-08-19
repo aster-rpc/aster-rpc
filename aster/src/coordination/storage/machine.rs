@@ -1398,6 +1398,227 @@ mod tests {
         assert_eq!(state.model.last_applied.map(|id| id.index), Some(3));
     }
 
+    // ── States a legal group reaches and a store must reopen ────────────────
+
+    /// A membership carrying four learners reopens.
+    ///
+    /// §9 bounds retained and transient learners at two **each**, so a group in
+    /// `AddingLearners` legally names four. A store that read the retained
+    /// bound as the total would open cleanly right up until the moment a change
+    /// added its transient learners, and then refuse to start.
+    ///
+    /// Driven through a native membership entry and a real reopen, because the
+    /// failure is at load: the running store had already accepted the state.
+    #[tokio::test]
+    async fn a_membership_with_four_learners_reopens() {
+        use openraft::Membership;
+
+        use crate::coordination::model::membership::PHASE_ADDING_LEARNERS;
+        use crate::coordination::model::state::{Intent, MembershipPlan};
+
+        let dir = scratch_dir();
+        // Four learners are legal *because* a change is in flight, so the group
+        // has to actually be in one: an intent in `AddingLearners` is what
+        // makes the two transient learners transient rather than retained.
+        let database = seeded(&dir);
+        let mut state = genesis_state();
+        state.model.last_applied = Some(LogId::new(1, LEADER, 1));
+        let mut changes = ChangeSet::default();
+        changes.admins.extend(state.model.admins.iter().copied());
+        changes.grants.extend(state.model.acl.keys().cloned());
+        changes
+            .resources
+            .extend(state.model.resources.keys().cloned());
+        let operation = [0x61u8; 16];
+        state.model.intents.insert(
+            operation,
+            Intent {
+                actor: ACTOR,
+                request_hash: [0x62u8; 32],
+                expected_membership: None,
+                plan: MembershipPlan {
+                    desired_voters: (1u8..=3).map(|b| [b; 32]).collect(),
+                    retained_learners: vec![[0x71u8; 32], [0x72u8; 32]],
+                    member_seeds: Vec::new(),
+                },
+                status_code: PHASE_ADDING_LEARNERS,
+                result_code: 0,
+                accepted_log_id: LogId::new(1, LEADER, 1),
+                completed_log_id: None,
+                observed_membership_log_id: None,
+            },
+        );
+        changes.intents.insert(operation);
+        state.model.growth_bytes = state.model.recompute_growth();
+        rows::commit(&database, state.clone(), &changes).expect("seed the change in flight");
+        drop(database);
+
+        let (mut machine, shutdown) = reopen(&dir);
+
+        let voters: std::collections::BTreeSet<CoordinationNodeId> = (1u8..=3)
+            .map(|b| CoordinationNodeId::from_array([b; 32]))
+            .collect();
+        // Two retained plus two transient, which is the widest §9 permits.
+        let mut nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
+            voters.iter().map(|id| (*id, CoordinationNode)).collect();
+        for byte in [0x71u8, 0x72, 0x73, 0x74] {
+            nodes.insert(CoordinationNodeId::from_array([byte; 32]), CoordinationNode);
+        }
+        machine
+            .apply([Entry {
+                log_id: log_id(2),
+                payload: EntryPayload::Membership(Membership::new(vec![voters], nodes)),
+            }])
+            .await
+            .expect("apply");
+
+        let running = published(&machine).await;
+        assert_eq!(running.model.membership.learners.len(), 4);
+        assert_eq!(running.model.membership.voters.len(), 3);
+
+        drop(shutdown);
+        drop(machine);
+        let (machine, _shutdown) = reopen(&dir);
+        let restarted = published(&machine).await;
+        assert_eq!(
+            restarted.model.membership, running.model.membership,
+            "four learners is a state a change reaches, so a store must reopen it"
+        );
+    }
+
+    /// A joint membership keeps the voters it is moving out of.
+    ///
+    /// OpenRaft counts both configurations' members as voters while a change is
+    /// in flight, and §9 protects a route for a node in the current committed
+    /// membership. Projecting only the target configuration dropped the
+    /// departing voters, so the store and OpenRaft disagreed about who could
+    /// vote -- and a departing voter's route became evictable.
+    #[tokio::test]
+    async fn a_joint_membership_keeps_both_configurations_voters() {
+        use openraft::Membership;
+
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+
+        let ids = |bytes: &[u8]| -> std::collections::BTreeSet<CoordinationNodeId> {
+            bytes
+                .iter()
+                .map(|b| CoordinationNodeId::from_array([*b; 32]))
+                .collect()
+        };
+        let old = ids(&[1, 2, 3]);
+        let new = ids(&[1, 2, 4]);
+        let nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
+            old.union(&new).map(|id| (*id, CoordinationNode)).collect();
+
+        machine
+            .apply([Entry {
+                log_id: log_id(1),
+                payload: EntryPayload::Membership(Membership::new(
+                    vec![old.clone(), new.clone()],
+                    nodes,
+                )),
+            }])
+            .await
+            .expect("apply");
+
+        let running = published(&machine).await;
+        assert!(running.model.membership.joint, "a change is in flight");
+        assert_eq!(
+            running.model.membership.voters,
+            [1u8, 2, 3, 4]
+                .iter()
+                .map(|b| [*b; 32])
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the departing voter still votes"
+        );
+        assert!(
+            running.model.membership.contains(&[3u8; 32]),
+            "and its route is still protected"
+        );
+        assert!(running.model.membership.learners.is_empty());
+
+        drop(shutdown);
+        drop(machine);
+        let (machine, _shutdown) = reopen(&dir);
+        assert_eq!(
+            published(&machine).await.model.membership,
+            running.model.membership
+        );
+    }
+
+    /// Sixty-four terminal intents *and* one active reopens.
+    ///
+    /// §9: "if all 64 slots hold terminal intents and one is active, a new
+    /// intent is still accepted; the cap only bounds terminal history". A
+    /// 64-row storage ceiling refused a state the transition is required to
+    /// produce, and the only way to find out was to fill the table and restart.
+    #[tokio::test]
+    async fn sixty_four_terminal_intents_and_one_active_reopens() {
+        use crate::coordination::model::membership::{PHASE_COMPLETED, PHASE_PENDING};
+        use crate::coordination::model::state::{Intent, MembershipPlan};
+
+        let dir = scratch_dir();
+        let database = seeded(&dir);
+        let mut state = genesis_state();
+
+        let voters: Vec<[u8; 32]> = (1u8..=3).map(|b| [b; 32]).collect();
+        let mut changes = ChangeSet::default();
+        changes.admins.extend(state.model.admins.iter().copied());
+        changes.grants.extend(state.model.acl.keys().cloned());
+        changes
+            .resources
+            .extend(state.model.resources.keys().cloned());
+        state.model.last_applied = Some(LogId::new(1, LEADER, 1_000));
+
+        let intent = |phase: i32, n: u64| Intent {
+            actor: ACTOR,
+            request_hash: [0x31u8; 32],
+            expected_membership: None,
+            plan: MembershipPlan {
+                desired_voters: voters.clone(),
+                retained_learners: Vec::new(),
+                member_seeds: Vec::new(),
+            },
+            status_code: phase,
+            result_code: 0,
+            accepted_log_id: LogId::new(1, LEADER, n),
+            completed_log_id: (phase == PHASE_COMPLETED).then(|| LogId::new(1, LEADER, n + 1)),
+            observed_membership_log_id: None,
+        };
+
+        for n in 0..crate::coordination::model::limits::MAX_RETAINED_INTENTS {
+            let mut id = [0u8; 16];
+            id[0..8].copy_from_slice(&n.to_be_bytes());
+            state
+                .model
+                .intents
+                .insert(id, intent(PHASE_COMPLETED, n + 1));
+            changes.intents.insert(id);
+        }
+        // The one active intent §9 never evicts, on top of a full terminal
+        // history.
+        let active = [0xFFu8; 16];
+        state
+            .model
+            .intents
+            .insert(active, intent(PHASE_PENDING, 900));
+        changes.intents.insert(active);
+        state.model.growth_bytes = state.model.recompute_growth();
+
+        rows::commit(&database, state.clone(), &changes).expect("seed 65 intents");
+        drop(database);
+
+        let (machine, _shutdown) = reopen(&dir);
+        let loaded = published(&machine).await;
+        assert_eq!(
+            loaded.model.intents.len() as u64,
+            crate::coordination::model::limits::MAX_INTENT_ROWS,
+            "sixty-four terminal intents plus the active one"
+        );
+        assert!(loaded.model.intents.contains_key(&active));
+    }
+
     // ── The batch ───────────────────────────────────────────────────────────
 
     /// A mixed batch produces one reply per entry, in order, and commits once.

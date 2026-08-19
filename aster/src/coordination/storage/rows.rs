@@ -143,10 +143,15 @@ pub(crate) fn project_membership(
     membership: &openraft::Membership<CoordinationNodeId, CoordinationNode>,
 ) -> CommittedMembership {
     let configs = membership.get_joint_config();
-    let voters: BTreeSet<[u8; 32]> = configs
-        .last()
-        .map(|set| set.iter().map(|id| *id.as_bytes()).collect())
-        .unwrap_or_default();
+    // The **union** of every configuration, which is what OpenRaft means by a
+    // voter: during a joint change `{A,B,C} -> {A,B,D}`, `C` still votes, and
+    // taking only the target configuration dropped it. That made §9's route
+    // protection let go of a current voter's route, and made the member set the
+    // membership checks read disagree with the one OpenRaft uses for quorum.
+    //
+    // Completion is unaffected: it refuses a joint membership outright, and
+    // with one configuration the union is that configuration.
+    let voters: BTreeSet<[u8; 32]> = membership.voter_ids().map(|id| *id.as_bytes()).collect();
     // A learner is a node the map names that no configuration does -- which is
     // how OpenRaft represents one, and the reason the node map is not simply
     // the union of the configs.
@@ -738,16 +743,24 @@ pub(crate) fn validate_meta(state: &DurableState) -> StorageResult<()> {
             ));
         }
     }
-    // §9 caps the learners a change may retain, and OpenRaft represents them as
-    // nodes outside every configuration -- so the node map's envelope is the
-    // union of the configurations plus at most that many.
-    if model.membership.learners.len() > shape::MAX_RETAINED_LEARNERS {
+    // §9 bounds retained and transient learners **independently** at two each,
+    // so a membership mid-change legally names four. Reading the retained bound
+    // as the total made a group in `AddingLearners` unreopenable: it had added
+    // its transient learners and could no longer load them back.
+    //
+    // The envelope is checked here, on the membership alone. The tighter
+    // settled-state rule needs to know whether a change is in flight, which is
+    // a question about the intent table, so it lives in `intent-row-shape`.
+    let envelope = shape::MAX_RETAINED_LEARNERS + shape::MAX_TRANSIENT_LEARNERS;
+    if model.membership.learners.len() > envelope {
         return Err(bad(
             "membership",
             format!(
-                "{} retained learners, over the {} cap",
+                "{} learners, over the {envelope}-learner envelope ({} retained plus {} \
+                 transient)",
                 model.membership.learners.len(),
-                shape::MAX_RETAINED_LEARNERS
+                shape::MAX_RETAINED_LEARNERS,
+                shape::MAX_TRANSIENT_LEARNERS
             ),
         ));
     }
@@ -966,7 +979,7 @@ fn check_table_caps(state: &DurableState) -> Result<(), String> {
         (
             "membership_intents",
             model.intents.len() as u64,
-            limits::MAX_RETAINED_INTENTS,
+            limits::MAX_INTENT_ROWS,
         ),
         (
             "node_routes",
@@ -1146,22 +1159,54 @@ fn check_audit_key_order(state: &DurableState) -> Result<(), String> {
 /// anything else describes an operation this build cannot interpret, and its
 /// result code cannot be placed in either code space.
 fn check_audit_rows(state: &DurableState) -> Result<(), String> {
+    use crate::coordination::contract::{
+        SYS_EXPIRED, SYS_EXPIRE_MALFORMED, SYS_EXPIRY_STALE, SYS_MEMBERSHIP_ADVANCED,
+        SYS_MEMBERSHIP_MALFORMED, SYS_MEMBERSHIP_PHASE_MISMATCH,
+    };
+    use crate::coordination::model::apply::{OPERATION_EXPIRE, OPERATION_MEMBERSHIP_PROGRESS};
+    use crate::coordination::reason::Outcome;
+
     for (at, row) in &state.model.audit {
-        let known_client = (1..=11).contains(&row.operation_code);
-        let known_system = row.operation_code
-            == crate::coordination::model::apply::OPERATION_EXPIRE
-            || row.operation_code
-                == crate::coordination::model::apply::OPERATION_MEMBERSHIP_PROGRESS;
-        if !known_client && !known_system {
-            return Err(format!(
-                "row {at:?} names operation code {}, which §5.2 does not declare",
-                row.operation_code
-            ));
-        }
-        // The two code spaces are disjoint, and which one a row is in is
-        // decided by its operation code. A client operation carrying a system
-        // result -- or the reverse -- is a row no apply path writes.
-        if known_system == row.result.is_client() {
+        // The exact pairing, not merely the code space. `Expire` reporting
+        // `SYS_MEMBERSHIP_MALFORMED`, or `Acquire` reporting `Released`, are
+        // both in the right space and describe results no apply path produces.
+        let allowed: &[i32] = match row.operation_code {
+            1 => &[Outcome::Granted as i32, Outcome::Rejected as i32],
+            2 => &[Outcome::Renewed as i32, Outcome::Rejected as i32],
+            3 => &[Outcome::Mutated as i32, Outcome::Rejected as i32],
+            // Release and release-with-value share an outcome; they differ in
+            // what they write, not in what they report.
+            4 | 5 => &[Outcome::Released as i32, Outcome::Rejected as i32],
+            6 => &[Outcome::Revoked as i32, Outcome::Rejected as i32],
+            7 => &[Outcome::GrantUpdated as i32, Outcome::Rejected as i32],
+            8 => &[Outcome::AdminUpdated as i32, Outcome::Rejected as i32],
+            9 => &[Outcome::MembershipAccepted as i32, Outcome::Rejected as i32],
+            10 => &[Outcome::ClientRetired as i32, Outcome::Rejected as i32],
+            11 => &[
+                Outcome::MembershipCancelled as i32,
+                Outcome::Rejected as i32,
+            ],
+            OPERATION_EXPIRE => &[SYS_EXPIRED, SYS_EXPIRY_STALE, SYS_EXPIRE_MALFORMED],
+            OPERATION_MEMBERSHIP_PROGRESS => &[
+                SYS_MEMBERSHIP_ADVANCED,
+                SYS_MEMBERSHIP_PHASE_MISMATCH,
+                SYS_MEMBERSHIP_MALFORMED,
+            ],
+            other => {
+                return Err(format!(
+                    "row {at:?} names operation code {other}, which §5.2 does not declare"
+                ))
+            }
+        };
+
+        // Which code space the row is in is decided by its operation, and the
+        // decoder used the same rule to build it -- so a mismatch here means
+        // the stored code was reconstructed into the wrong space.
+        let system = matches!(
+            row.operation_code,
+            OPERATION_EXPIRE | OPERATION_MEMBERSHIP_PROGRESS
+        );
+        if system == row.result.is_client() {
             return Err(format!(
                 "row {at:?} pairs operation code {} with a {} result",
                 row.operation_code,
@@ -1172,6 +1217,15 @@ fn check_audit_rows(state: &DurableState) -> Result<(), String> {
                 }
             ));
         }
+        if !allowed.contains(&row.result.code()) {
+            return Err(format!(
+                "row {at:?} records result {} for operation {}, which that operation cannot \
+                 produce",
+                row.result.code(),
+                row.operation_code
+            ));
+        }
+
         for (what, value) in [("epoch", row.epoch), ("value_revision", row.value_revision)] {
             if value > limits::MAX_COUNTER {
                 return Err(format!(
@@ -1186,6 +1240,16 @@ fn check_audit_rows(state: &DurableState) -> Result<(), String> {
 
 // ── §12.1 row shapes ────────────────────────────────────────────────────────
 
+/// The TTLs a stored row can legally carry: zero, or a §12.1 lease duration.
+///
+/// Zero is the value a row that has never been acquired holds -- a resource
+/// created by `set_grant`, or one whose lease was released without the TTL
+/// being cleared. Everything else came from an `acquire` that §12.1 bounded.
+/// Anything between is a duration no command could have set.
+fn ttl_is_legal(ttl_ms: u64) -> bool {
+    ttl_ms == 0 || (limits::MIN_TTL_MS..=limits::MAX_TTL_MS).contains(&ttl_ms)
+}
+
 fn check_resource_rows(state: &DurableState) -> Result<(), String> {
     for (key, row) in &state.model.resources {
         if row.value.len() > limits::MAX_VALUE {
@@ -1195,12 +1259,14 @@ fn check_resource_rows(state: &DurableState) -> Result<(), String> {
                 limits::MAX_VALUE
             ));
         }
-        // Only a **held** row carries a lease TTL. A released or revoked row
-        // keeps whatever it had, and a row created by a grant never had one, so
-        // the bound applies exactly where the value means something.
-        if row.held && !(limits::MIN_TTL_MS..=limits::MAX_TTL_MS).contains(&row.ttl_ms) {
+        // A **free** row is bounded too. It keeps whatever TTL its last lease
+        // had, and that value was bounded when it was set -- so the legal set
+        // is the same one plus zero, not "anything at all". Exempting free rows
+        // let an arbitrary duration sit in state until the next acquire
+        // overwrote it, and be reported by every read in between.
+        if !ttl_is_legal(row.ttl_ms) {
             return Err(format!(
-                "{key:?} is held with a {}ms TTL, outside [{}, {}]",
+                "{key:?} holds a {}ms TTL, which is neither zero nor within [{}, {}]",
                 row.ttl_ms,
                 limits::MIN_TTL_MS,
                 limits::MAX_TTL_MS
@@ -1335,6 +1401,15 @@ fn check_session_rows(state: &DurableState) -> Result<(), String> {
                 ));
             }
         }
+        if !ttl_is_legal(snapshot.ttl_ms) {
+            return Err(format!(
+                "session {actor:02x?}/{client:02x?} saved a {}ms TTL, which is neither zero \
+                 nor within [{}, {}]",
+                snapshot.ttl_ms,
+                limits::MIN_TTL_MS,
+                limits::MAX_TTL_MS
+            ));
+        }
         if snapshot.held != snapshot.holder.is_some() {
             return Err(format!(
                 "session {actor:02x?}/{client:02x?} saved a snapshot whose held flag and \
@@ -1356,6 +1431,11 @@ fn check_session_rows(state: &DurableState) -> Result<(), String> {
 fn check_intent_rows(state: &DurableState) -> Result<(), String> {
     use crate::coordination::model::membership::{check_seed_ticket, is_terminal_phase};
 
+    // The two bounds §9 states, enforced separately rather than as one row
+    // count. "If all 64 slots hold terminal intents *and* one is active, a new
+    // intent is still accepted; the cap only bounds terminal history" -- so 65
+    // rows is a legal group, and a single 64-row ceiling refused a state the
+    // transition is required to produce.
     let active = state
         .model
         .intents
@@ -1365,6 +1445,24 @@ fn check_intent_rows(state: &DurableState) -> Result<(), String> {
     if active > 1 {
         return Err(format!(
             "{active} intents are active; §9 allows one at a time"
+        ));
+    }
+    let terminal = state.model.intents.len() - active;
+    if terminal as u64 > limits::MAX_RETAINED_INTENTS {
+        return Err(format!(
+            "{terminal} terminal intents, over the {}-intent retention cap",
+            limits::MAX_RETAINED_INTENTS
+        ));
+    }
+
+    // The settled-state learner rule, which needs the intent table to answer.
+    // Transient learners exist only while a change is being applied, so with
+    // nothing in flight the membership may name only the retained ones.
+    if active == 0 && state.model.membership.learners.len() > shape::MAX_RETAINED_LEARNERS {
+        return Err(format!(
+            "{} learners with no change in flight; §9 retains {}",
+            state.model.membership.learners.len(),
+            shape::MAX_RETAINED_LEARNERS
         ));
     }
 
@@ -2025,7 +2123,14 @@ mod tests {
         // small: a check that accepted anything would accept this too.
         assert_eq!(state.model.growth_bytes, limits::GROWTH_BUDGET);
         assert_eq!(state.model.reserve_bytes, limits::RESERVE_BUDGET);
-        assert_eq!(state.model.membership.voters.len(), shape::MAX_VOTERS);
+        // The **union** of both configurations: a joint change's old voters
+        // still vote, so the widest legal binding names the retained three plus
+        // two leaving and two joining.
+        assert_eq!(
+            state.model.membership.voters.len(),
+            shape::MAX_VOTERS + shape::MAX_NEW_VOTERS,
+            "every voter of both configurations"
+        );
         assert_eq!(
             state.model.membership.learners.len(),
             shape::MAX_RETAINED_LEARNERS
@@ -2400,16 +2505,19 @@ mod tests {
                 "at most two",
             ),
             (
-                "more retained learners than §9 allows",
+                // Five, not three: §9 bounds retained and transient learners at
+                // two **each**, so four is inside the envelope and a group
+                // mid-change legally holds them.
+                "more learners than the retained-plus-transient envelope",
                 stored(
                     MembershipV1 {
                         configs: vec![set(&[1, 2, 3])],
-                        nodes: nodes(&[1, 2, 3, 7, 8, 9]),
+                        nodes: nodes(&[1, 2, 3, 5, 6, 7, 8, 9]),
                     },
                     applied(100),
                 ),
                 applied(9_000_000),
-                "retained learners",
+                "learner envelope",
             ),
             (
                 "a committed membership with no log id",
@@ -2802,6 +2910,94 @@ mod tests {
             },
         },
         Negative {
+            rule: "intent-row-shape",
+            what: "transient learners with no change in flight",
+            break_it: |state| {
+                // Four learners is legal *while* a change is being applied. The
+                // fixture's only intent is terminal, so nothing is in flight
+                // and §9 retains two.
+                //
+                // Added to the stored membership and re-projected, not just to
+                // the projection: a projection that disagreed with its source
+                // would be caught by `validate_meta` first, and this negative
+                // would prove nothing about the rule it names.
+                let mut nodes: BTreeMap<CoordinationNodeId, CoordinationNode> = state
+                    .membership
+                    .membership()
+                    .nodes()
+                    .map(|(id, _)| (*id, CoordinationNode))
+                    .collect();
+                for byte in [0x91u8, 0x92, 0x93] {
+                    nodes.insert(CoordinationNodeId::from_array([byte; 32]), CoordinationNode);
+                }
+                let configs: Vec<BTreeSet<CoordinationNodeId>> =
+                    state.membership.membership().get_joint_config().clone();
+                state.membership = StoredMembership::new(
+                    state.membership.log_id().to_owned(),
+                    Membership::new(configs, nodes),
+                );
+                state.model.membership = project_membership(state.membership.membership());
+                // And nothing in flight. The generated history leaves an active
+                // intent of its own, which would put the state legitimately
+                // inside the wider envelope.
+                state.model.intents.retain(|_, intent| {
+                    crate::coordination::model::membership::is_terminal_phase(intent.status_code)
+                });
+            },
+        },
+        Negative {
+            rule: "audit-row-shape",
+            what: "an outcome the operation cannot produce",
+            break_it: |state| {
+                let key = *state.model.audit.keys().next().expect("an audit row");
+                let row = state.model.audit.get_mut(&key).expect("the row");
+                row.operation_code = 1; // acquire
+                row.result = crate::coordination::model::state::AuditResult::Client(
+                    crate::coordination::reason::Outcome::Released,
+                );
+            },
+        },
+        Negative {
+            rule: "resource-row-shape",
+            what: "a free row carrying an impossible TTL",
+            break_it: |state| {
+                let key = state
+                    .model
+                    .resources
+                    .iter()
+                    .find(|(_, row)| !row.held)
+                    .map(|(k, _)| k.clone())
+                    .expect("a free resource");
+                state.model.resources.get_mut(&key).expect("the row").ttl_ms =
+                    limits::MIN_TTL_MS - 1;
+            },
+        },
+        Negative {
+            rule: "session-row-shape",
+            what: "a saved snapshot carrying an impossible TTL",
+            break_it: |state| {
+                let key = *state
+                    .model
+                    .sessions
+                    .iter()
+                    .find(|(_, s)| s.last_result.as_ref().is_some_and(|r| r.snapshot.is_some()))
+                    .map(|(k, _)| k)
+                    .expect("a session with a saved snapshot");
+                state
+                    .model
+                    .sessions
+                    .get_mut(&key)
+                    .expect("the row")
+                    .last_result
+                    .as_mut()
+                    .expect("a reply")
+                    .snapshot
+                    .as_mut()
+                    .expect("a snapshot")
+                    .ttl_ms = limits::MAX_TTL_MS + 1;
+            },
+        },
+        Negative {
             rule: "stamped-log-ids",
             what: "an intent accepted above last_applied",
             break_it: |state| {
@@ -3037,11 +3233,7 @@ mod tests {
                 "held",
                 Rule("session-row-shape: pairing with holder"),
             ),
-            (
-                "SavedSnapshotV1",
-                "ttl_ms",
-                Unconstrained("a saved TTL is whatever the row held when it was saved"),
-            ),
+            ("SavedSnapshotV1", "ttl_ms", Rule("session-row-shape")),
             (
                 "SavedSnapshotV1",
                 "lease_revision",
@@ -3282,8 +3474,8 @@ mod tests {
             .filter(|(_, _, c)| matches!(c, Unconstrained(_)))
             .count();
         assert_eq!(
-            unconstrained, 4,
-            "four fields have no bound because every value of their type is legal state; a \
+            unconstrained, 3,
+            "three fields have no bound because every value of their type is legal state; a \
              different count means one was added or removed without a decision"
         );
     }

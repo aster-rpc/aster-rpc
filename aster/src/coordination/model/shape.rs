@@ -166,6 +166,14 @@ pub const MIN_VOTERS: usize = 3;
 pub const MAX_VOTERS: usize = 5;
 pub const MAX_RETAINED_LEARNERS: usize = 2;
 
+/// §9's *other* learner bound: the learners a change adds while it is being
+/// applied.
+///
+/// "Retained and transient learners are each bounded to two", so a membership
+/// mid-change can legally name four. Reading the retained bound as the total is
+/// what makes a group in `AddingLearners` unreopenable.
+pub const MAX_TRANSIENT_LEARNERS: usize = 2;
+
 /// §12.1: at most two **new** voter identities per change.
 ///
 /// The bound §12.1's `max_encoded_command` arithmetic assumes, and the reason a
