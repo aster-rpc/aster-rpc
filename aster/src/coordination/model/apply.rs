@@ -1026,16 +1026,11 @@ fn write_intent(
         state.routes.insert(node, route);
     }
 
-    if let Some(id) = effect.membership_log_id {
-        state.membership_log_id = Some(id);
-        // A completed change makes its plan the committed membership, which is
-        // what protects those nodes' routes from eviction.
-        state.members = effect
-            .intent_members
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-    }
+    // No membership authority is written here, deliberately. §7.3: OpenRaft
+    // membership entries remain the authority, so `members` and
+    // `membership_log_id` move only when the storage layer applies a native
+    // `EntryPayload::Membership`. An intent records what a controller observed;
+    // it never establishes it.
 }
 
 /// Reject a delivery that cannot belong to a committed history, before any
@@ -2124,8 +2119,6 @@ mod tests {
                     },
                 )],
                 evict_routes: vec![displaced],
-                membership_log_id: None,
-                intent_members: Vec::new(),
             },
             &mut changes,
         );

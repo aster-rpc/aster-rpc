@@ -256,13 +256,6 @@ pub struct IntentEffect {
     pub routes: Vec<(NodeId, Route)>,
     /// Routes displaced by the ones above.
     pub evict_routes: Vec<NodeId>,
-    /// The committed membership this command observed, if it advanced it.
-    pub membership_log_id: Option<LogId>,
-    /// The voters and learners this plan makes current, when it completes.
-    ///
-    /// Carried on the effect rather than re-read, so the member set and the
-    /// membership log id are established by the same value.
-    pub intent_members: Vec<NodeId>,
 }
 
 impl Decision {
@@ -367,8 +360,6 @@ pub fn decide_change(
         evict: Vec::new(),
         evict_routes: route_evictions(state, &routes),
         routes,
-        membership_log_id: None,
-        intent_members: Vec::new(),
     };
 
     // §12.1: intent and route rows are growth-funded, so an accepted plan must
@@ -591,8 +582,6 @@ pub fn decide_cancel(state: &State, actor: &NodeId, action: &CancelMembershipAct
         evict,
         routes: Vec::new(),
         evict_routes: Vec::new(),
-        membership_log_id: None,
-        intent_members: Vec::new(),
     }))
 }
 
@@ -612,8 +601,25 @@ pub fn decide_progress(state: &State, command: &MembershipProgressCommand) -> Op
         return None;
     }
 
+    // §7.3: OpenRaft membership entries remain the authority. A completion
+    // report **observes** that authority; it does not confer it. So `Completed`
+    // is only reachable once the native entry it claims has already been
+    // applied -- the observed id must be the committed membership id, and the
+    // committed member set must already be the plan's target.
+    //
+    // An earlier revision copied the report's id and plan straight into
+    // `membership_log_id` and `members`, which made a controller's claim
+    // authoritative until the next restart, where §11.3 derives both from the
+    // stored `StoredMembership` instead. Two answers to "who are the voters",
+    // one of which survived reboot.
+    if command.new_phase == PHASE_COMPLETED && !completion_is_observable(state, existing, command) {
+        return None;
+    }
+
     let mut intent = existing.clone();
     intent.status_code = command.new_phase;
+    // An observation, recorded on the intent and nowhere else. `membership_status`
+    // returns it (§5.2); no rule reads it as authority.
     intent.observed_membership_log_id = command.observed_membership_log_id;
 
     let becoming_terminal = is_terminal_phase(command.new_phase);
@@ -632,22 +638,37 @@ pub fn decide_progress(state: &State, command: &MembershipProgressCommand) -> Op
         },
         routes: Vec::new(),
         evict_routes: Vec::new(),
-        // A completed change is what advances committed membership.
-        membership_log_id: (command.new_phase == PHASE_COMPLETED)
-            .then_some(command.observed_membership_log_id)
-            .flatten(),
-        intent_members: if command.new_phase == PHASE_COMPLETED {
-            existing
-                .plan
-                .desired_voters
-                .iter()
-                .chain(&existing.plan.retained_learners)
-                .copied()
-                .collect()
-        } else {
-            Vec::new()
-        },
     })
+}
+
+/// Has the native membership entry this completion report claims already been
+/// applied?
+///
+/// Two questions, and both are about **committed** state rather than about the
+/// report: the id the controller says it observed must be the one the group
+/// committed, and the members that entry established must already be the
+/// plan's target. A report that passes both tells us nothing new, which is
+/// exactly the point -- it is a phase transition, not a membership change.
+///
+/// Failing either is a phase-mismatch no-op rather than a rejection: the
+/// controller retries after every membership entry, so a report that arrives
+/// before its entry is ordinary and must commit harmlessly.
+fn completion_is_observable(
+    state: &State,
+    intent: &Intent,
+    command: &MembershipProgressCommand,
+) -> bool {
+    if command.observed_membership_log_id != state.membership_log_id {
+        return false;
+    }
+    let target: std::collections::BTreeSet<NodeId> = intent
+        .plan
+        .desired_voters
+        .iter()
+        .chain(&intent.plan.retained_learners)
+        .copied()
+        .collect();
+    state.members == target
 }
 
 /// The system result code a progress report records.
@@ -1755,8 +1776,16 @@ mod tests {
         assert_eq!(e.evict_routes, next);
     }
 
+    /// §7.3: a completion report **observes** OpenRaft's authority, it does not
+    /// confer it. `Completed` is unreachable until the native membership entry
+    /// it claims has already been applied.
+    ///
+    /// An earlier revision copied the report's id and plan straight into
+    /// `membership_log_id` and `members`. That made a controller's claim
+    /// authoritative -- until the next restart, where §11.3 derives both from
+    /// the stored `StoredMembership` and would have disagreed.
     #[test]
-    fn completing_a_change_makes_its_plan_the_protected_member_set() {
+    fn a_completion_report_is_a_no_op_until_its_native_entry_has_landed() {
         let mut s = base();
         let e = effect(decide_change(
             &s,
@@ -1765,26 +1794,64 @@ mod tests {
             &change(op(1), &[1, 2, 3], None),
         ));
         let mut pending = e.intent.clone();
-        // Only the last hop of the phase walk commits a new membership.
+        // Only the last hop of the phase walk can complete.
         pending.status_code = PHASE_CHANGING_VOTERS;
         s.intents.insert(op(1), pending);
 
-        let done = (decide_progress(
+        let report = |observed| MembershipProgressCommand {
+            operation_id: op(1),
+            expected_phase: PHASE_CHANGING_VOTERS,
+            new_phase: PHASE_COMPLETED,
+            result_code: 0,
+            observed_membership_log_id: observed,
+        };
+
+        // The committed membership id is still `None`, so a report claiming to
+        // have observed one is ahead of the log it describes.
+        assert_eq!(
+            decide_progress(&s, &report(Some(log(9)))),
+            None,
+            "an unobserved membership id cannot complete a change"
+        );
+
+        // With the native entry applied -- committed id and members both moved
+        // by the storage layer -- the same report completes.
+        s.membership_log_id = Some(log(9));
+        let done = decide_progress(&s, &report(Some(log(9))))
+            .expect("the observation now matches committed state");
+        assert_eq!(done.intent.status_code, PHASE_COMPLETED);
+        assert_eq!(done.intent.observed_membership_log_id, Some(log(9)));
+
+        // And the members the plan names must already be the committed ones. A
+        // plan whose target has not landed cannot complete even with a matching
+        // id.
+        let mut wrong_members = s.clone();
+        wrong_members.members = nodes(&[1, 2, 4]).into_iter().collect();
+        assert_eq!(
+            decide_progress(&wrong_members, &report(Some(log(9)))),
+            None,
+            "the committed member set must already be the plan's target"
+        );
+    }
+
+    /// Every other phase may still be reported, and none of them consults the
+    /// committed membership: only `Completed` claims a native entry.
+    #[test]
+    fn a_non_completing_report_does_not_require_an_observed_membership() {
+        let mut s = base();
+        s.intents.insert(op(1), intent(PHASE_PENDING, None));
+        let e = decide_progress(
             &s,
             &MembershipProgressCommand {
                 operation_id: op(1),
-                expected_phase: PHASE_CHANGING_VOTERS,
-                new_phase: PHASE_COMPLETED,
+                expected_phase: PHASE_PENDING,
+                new_phase: PHASE_ADDING_LEARNERS,
+                observed_membership_log_id: None,
                 result_code: 0,
-                observed_membership_log_id: Some(log(9)),
             },
-        ))
-        .expect("a pending intent advances")
-        .intent_members;
-        assert_eq!(done.len(), 3, "three voters, no learners");
-        let mut first = [0u8; 32];
-        first[0] = 1;
-        assert!(done.contains(&first));
+        )
+        .expect("an ordinary advance");
+        assert_eq!(e.intent.status_code, PHASE_ADDING_LEARNERS);
     }
 
     #[test]
@@ -2167,6 +2234,9 @@ mod tests {
     fn a_progress_report_retains_its_observed_log_id_and_result_code() {
         let mut s = base();
         s.intents.insert(op(1), intent(PHASE_CHANGING_VOTERS, None));
+        // The native entry this report observes has already been applied; the
+        // subject here is what the intent retains, not whether it may complete.
+        s.membership_log_id = Some(log(42));
 
         let e = decide_progress(
             &s,
@@ -2182,11 +2252,9 @@ mod tests {
 
         assert_eq!(e.intent.observed_membership_log_id, Some(log(42)));
         assert_eq!(e.intent.result_code, SYS_MEMBERSHIP_ADVANCED);
-        assert_eq!(
-            e.membership_log_id,
-            Some(log(42)),
-            "completing a change advances committed membership"
-        );
+        // Recorded on the intent and nowhere else: §7.3 leaves committed
+        // membership to OpenRaft's own entries, so an effect carries no field
+        // that could move it.
     }
 
     #[test]

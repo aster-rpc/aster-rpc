@@ -1148,6 +1148,70 @@ mod tests {
         assert_eq!(state.model.audit.len(), 2, "one row per *command* entry");
     }
 
+    /// The running store's membership projection is exactly what a restart
+    /// derives.
+    ///
+    /// This is the divergence §7.3 forbids. `members` and `membership_log_id`
+    /// are derived from the stored `StoredMembership` at every open, so any
+    /// path that writes them from something else -- a controller's progress
+    /// report was one -- gives the group two answers to "who are the voters",
+    /// and only one of them survives a reboot.
+    ///
+    /// Asserted over a batch that mixes a membership entry with commands,
+    /// rather than about one code path, so a future writer of those fields
+    /// fails here whatever route it takes.
+    #[tokio::test]
+    async fn the_membership_projection_survives_a_restart_unchanged() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+
+        machine
+            .apply([
+                normal(1, acquire(1)),
+                membership_entry(2, &[[1u8; 32], [2u8; 32], [3u8; 32]]),
+                normal(3, acquire(2)),
+                // A progress report naming an operation that does not exist:
+                // a no-op that must still not touch membership authority.
+                normal(
+                    4,
+                    CommandV1::MembershipProgress(MembershipProgressCommandV1 {
+                        operation_id: vec![0x77; 16],
+                        expected_phase: 3,
+                        new_phase: 4,
+                        observed_membership_log_id: Some(crate::coordination::contract::LogIdV1 {
+                            term: 9,
+                            leader_node_id: vec![0xEE; 32],
+                            index: 99,
+                        }),
+                        result_code: 0,
+                    }),
+                ),
+            ])
+            .await
+            .expect("apply");
+        let running = published(&machine).await;
+
+        drop(shutdown);
+        drop(machine);
+        let (machine, _shutdown) = reopen(&dir);
+        let restarted = published(&machine).await;
+
+        assert_eq!(
+            running.model.members, restarted.model.members,
+            "the member set a restart derives must be the one the store was using"
+        );
+        assert_eq!(
+            running.model.membership_log_id, restarted.model.membership_log_id,
+            "and so must the membership log id"
+        );
+        assert_eq!(running.membership, restarted.membership);
+        assert_eq!(
+            running.model.membership_log_id.map(|id| id.index),
+            Some(2),
+            "the native entry is what set it, not the report claiming index 99"
+        );
+    }
+
     /// A batch whose commit fails leaves the disk untouched, reports the
     /// failure, and latches the store fatal.
     ///

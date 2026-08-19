@@ -1105,6 +1105,20 @@ fn membership_history_observed(
             (PHASE_CHANGING_VOTERS, PHASE_COMPLETED),
         ] {
             index += 1;
+            // §7.3: `Completed` is only reachable once the native OpenRaft
+            // membership entry it observes has been applied. This driver is
+            // model-level, so it stands in for the storage layer applying that
+            // entry -- which is the only thing that may move committed
+            // membership. The plan's target is already the committed member
+            // set, so only the id moves.
+            if to == PHASE_COMPLETED {
+                state.membership_log_id = Some(LogId::new(1, LEADER, index));
+            }
+            let observed = if to == PHASE_COMPLETED {
+                state.membership_log_id
+            } else {
+                Some(LogId::new(1, LEADER, index))
+            };
             let mut changes = ChangeSet::default();
             apply_command_recording(
                 &mut state,
@@ -1113,7 +1127,7 @@ fn membership_history_observed(
                     operation_id: op,
                     expected_phase: from,
                     new_phase: to,
-                    observed_membership_log_id: Some(LogId::new(1, LEADER, index)),
+                    observed_membership_log_id: observed,
                     result_code: crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED,
                 }),
                 &mut changes,
