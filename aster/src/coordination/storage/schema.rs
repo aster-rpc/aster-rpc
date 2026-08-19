@@ -2382,19 +2382,57 @@ mod tests {
 
         // 0. The fixture is still maximal.
         //
-        //    Every assertion below is vacuous against a small meta -- a token
-        //    row satisfies all of them -- so shrinking any field would leave
-        //    the test green while proving nothing. Verified by mutation:
-        //    replacing the authority domain with a single character passed
-        //    everything. The floor is well under the measured 5607 so ordinary
-        //    encoding drift does not trip it, and well over anything a
-        //    defaulted or truncated fixture could reach.
-        assert!(
-            encoded_meta.len() >= 5_000,
-            "the 'maximal' meta encodes to only {} bytes; a field has stopped \
-             being built at its legal maximum and the proof below is vacuous",
-            encoded_meta.len()
-        );
+        //    Every assertion below is an upper bound, so a token row satisfies
+        //    all of them and shrinking any field would leave the test green
+        //    while proving nothing about the maximal case it names. Checked by
+        //    shape rather than only by size: a byte floor catches the
+        //    authority domain, which dominates the encoding, but not the
+        //    membership -- both were verified by mutation, and reducing the
+        //    joint membership to a single config passed a size-only check.
+        {
+            use crate::coordination::contract::MAX_WIRE_STRING;
+            use crate::coordination::model::shape::MAX_VOTERS;
+
+            let m = &header.meta;
+            assert_eq!(
+                m.authority_domain.len(),
+                MAX_WIRE_STRING,
+                "the authority domain must be at its legal maximum"
+            );
+            assert_eq!(
+                m.membership.membership.configs.len(),
+                2,
+                "membership must be joint; a single config is not the maximum"
+            );
+            for config in &m.membership.membership.configs {
+                assert_eq!(
+                    config.ids.len(),
+                    MAX_VOTERS,
+                    "each config must hold the maximum voters"
+                );
+            }
+            assert_eq!(
+                m.membership.membership.nodes.len(),
+                MAX_VOTERS * 2,
+                "the node map must cover both configs' members"
+            );
+            assert!(
+                m.last_applied.is_some()
+                    && m.audit_floor.is_some()
+                    && m.recovery_export_hash.is_some()
+                    && m.recovered_from.is_some(),
+                "every optional must be present in the maximal case"
+            );
+
+            // And a coarse backstop for anything the shape checks above do not
+            // name, including fields added later.
+            assert!(
+                encoded_meta.len() >= 5_000,
+                "the 'maximal' meta encodes to only {} bytes; something has \
+                 stopped being built at its legal maximum",
+                encoded_meta.len()
+            );
+        }
 
         // 1. The ceiling does not reject legal state. A voter that refused its
         //    own maximal membership would fail to start rather than fail to
