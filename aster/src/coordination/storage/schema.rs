@@ -108,12 +108,24 @@ pub(crate) const MAX_META_SCALAR_BYTES: usize = 4 * 1024;
 
 /// Ceiling on the stored `CoordinationMetaV1` row.
 ///
-/// Deliberately the snapshot header bound. §11.4's `SnapshotHeaderV1` embeds
-/// this same root, so a meta row larger than a header could be written but
-/// never snapshotted — the voter would accept state it could not later
-/// replicate, and would only discover that when a follower needed it.
-pub(crate) const MAX_COORDINATION_META_BYTES: usize =
-    crate::coordination::rowstream::MAX_HEADER_BYTES as usize;
+/// The invariant this has to satisfy is *not* "equals the snapshot header
+/// bound". §11.4's `SnapshotHeaderV1` embeds this root **plus** two version
+/// fields, seven row counts, and Fory envelope, so a meta row at exactly
+/// `MAX_HEADER_BYTES` produces a header above it: the voter would accept state
+/// it could never snapshot, and would discover that only when a follower
+/// needed it. An earlier version of this constant was that equality, and the
+/// test that "proved" it pinned the same false oracle.
+///
+/// What it must satisfy is that anything this ceiling *admits* still fits in a
+/// header once wrapped. The maximal legal meta measures 5607 bytes — bounded
+/// by `MAX_WIRE_STRING` for the authority domain and `MAX_VOTERS` for the
+/// joint membership — and the header envelope around it measures 171. 16 KiB
+/// leaves roughly threefold headroom for fields added later while keeping
+/// `16384 + envelope` far below the 64 KiB header bound.
+///
+/// Both directions are proved by measurement in
+/// `the_meta_ceiling_admits_only_snapshottable_rows`, not asserted here.
+pub(crate) const MAX_COORDINATION_META_BYTES: usize = 16 * 1024;
 
 // ── Metadata keys ────────────────────────────────────────────────────────────
 
@@ -2260,16 +2272,142 @@ mod tests {
         }
     }
 
-    /// The meta ceiling is the snapshot header bound.
+    /// The maximal legal `CoordinationMetaV1`.
     ///
-    /// Pinned because the two are only equal by intent: a meta row that would
-    /// not fit in a `SnapshotHeaderV1` could be written but never snapshotted,
-    /// and the voter would discover that only when a follower needed it.
+    /// Every field is named. No `..Default::default()`, on purpose: adding a
+    /// field to the root must break this construction and force whoever added
+    /// it to decide what its maximum is, rather than silently inheriting a
+    /// default and leaving the ceiling proof stale.
+    ///
+    /// "Maximal" means each field at its largest *legal* value: the authority
+    /// domain at `MAX_WIRE_STRING`, the membership joint with `MAX_VOTERS` in
+    /// each config and every node distinct, and every scalar and optional at
+    /// its widest.
+    fn maximal_legal_meta() -> CoordinationMetaV1 {
+        use crate::coordination::contract::MAX_WIRE_STRING;
+        use crate::coordination::model::shape::MAX_VOTERS;
+        use crate::coordination::raft::{
+            MembershipV1, NodeEntryV1, NodeIdSetV1, NodeIdV1, RecoveredFromV1, StoredMembershipV1,
+        };
+
+        let widest_log_id = || {
+            Some(crate::coordination::contract::LogIdV1 {
+                term: u64::MAX,
+                index: u64::MAX,
+                leader_node_id: vec![0xFF; 32],
+            })
+        };
+        let config = |base: u8| NodeIdSetV1 {
+            ids: (0..MAX_VOTERS)
+                .map(|i| NodeIdV1 {
+                    node_id: vec![base.wrapping_add(i as u8); 32],
+                })
+                .collect(),
+        };
+
+        CoordinationMetaV1 {
+            schema_version: u32::MAX,
+            group_id: vec![0xFF; 32],
+            genesis_hash: vec![0xFF; 32],
+            authority_public_key: vec![0xFF; 32],
+            authority_domain: "d".repeat(MAX_WIRE_STRING),
+            deployment_profile_code: i32::MAX,
+            last_applied: widest_log_id(),
+            membership: StoredMembershipV1 {
+                log_id: widest_log_id(),
+                // Joint: two configs, disjoint, so the node map is the union.
+                membership: MembershipV1 {
+                    configs: vec![config(0), config(100)],
+                    nodes: (0..(MAX_VOTERS * 2))
+                        .map(|i| NodeEntryV1 {
+                            node_id: vec![i as u8; 32],
+                            format_version: u32::MAX,
+                        })
+                        .collect(),
+                },
+            },
+            admin_revision: u64::MAX,
+            recovery_export_hash: Some(vec![0xFF; 32]),
+            recovered_from: Some(RecoveredFromV1 {
+                source_group_id: vec![0xFF; 32],
+                source_genesis_hash: vec![0xFF; 32],
+                export_hash: vec![0xFF; 32],
+            }),
+            aggregate_growth_bytes: u64::MAX,
+            aggregate_reserve_bytes: u64::MAX,
+            audit_floor: widest_log_id(),
+        }
+    }
+
+    /// The ceiling admits only rows that can still be snapshotted, and rejects
+    /// no legal row.
+    ///
+    /// Both directions matter and neither is the constant equality this used
+    /// to assert. `MAX_COORDINATION_META_BYTES == MAX_HEADER_BYTES` proved
+    /// nothing: `SnapshotHeaderV1` wraps the meta in two version fields, seven
+    /// row counts and Fory envelope, so a row at exactly the header bound
+    /// yields a header *over* it. The old test pinned that false oracle, and a
+    /// mutation of the constant only disturbed the equality rather than
+    /// exposing anything.
+    ///
+    /// The envelope is measured here rather than assumed, from a complete
+    /// maximal header.
     #[test]
-    fn the_meta_ceiling_matches_the_snapshot_header_bound() {
-        assert_eq!(
-            MAX_COORDINATION_META_BYTES as u64,
-            crate::coordination::rowstream::MAX_HEADER_BYTES
+    fn the_meta_ceiling_admits_only_snapshottable_rows() {
+        use crate::coordination::rowstream::{RowCountsV1, SnapshotHeaderV1, MAX_HEADER_BYTES};
+
+        let meta = maximal_legal_meta();
+        let encoded_meta = payload_fory::<CoordinationMetaV1>()
+            .serialize(&meta)
+            .expect("encode the maximal legal meta");
+
+        // The complete maximal legal header, also constructed exhaustively.
+        let header = SnapshotHeaderV1 {
+            format_version: u32::MAX,
+            schema_version: u32::MAX,
+            meta,
+            row_counts: RowCountsV1 {
+                resources: u64::MAX,
+                grants: u64::MAX,
+                admins: u64::MAX,
+                sessions: u64::MAX,
+                intents: u64::MAX,
+                routes: u64::MAX,
+                audit: u64::MAX,
+            },
+        };
+        let encoded_header = payload_fory::<SnapshotHeaderV1>()
+            .serialize(&header)
+            .expect("encode the maximal legal header");
+
+        // 1. The ceiling does not reject legal state. A voter that refused its
+        //    own maximal membership would fail to start rather than fail to
+        //    snapshot.
+        assert!(
+            encoded_meta.len() <= MAX_COORDINATION_META_BYTES,
+            "the maximal legal meta encodes to {} bytes, over the {MAX_COORDINATION_META_BYTES}-byte ceiling",
+            encoded_meta.len()
+        );
+
+        // 2. The maximal legal header fits, directly.
+        assert!(
+            (encoded_header.len() as u64) <= MAX_HEADER_BYTES,
+            "the maximal legal header encodes to {} bytes, over the {MAX_HEADER_BYTES}-byte bound",
+            encoded_header.len()
+        );
+
+        // 3. And the invariant that actually constrains the ceiling: anything
+        //    it admits must still fit once wrapped. This is what fails if the
+        //    ceiling is raised toward the header bound.
+        let envelope = encoded_header
+            .len()
+            .checked_sub(encoded_meta.len())
+            .expect("the header cannot be smaller than the meta it embeds");
+        assert!(
+            (MAX_COORDINATION_META_BYTES + envelope) as u64 <= MAX_HEADER_BYTES,
+            "a meta row at the {MAX_COORDINATION_META_BYTES}-byte ceiling plus a \
+             {envelope}-byte header envelope exceeds the {MAX_HEADER_BYTES}-byte \
+             header bound: such a row could be accepted from disk but never snapshotted"
         );
     }
 
