@@ -2380,6 +2380,22 @@ mod tests {
             .serialize(&header)
             .expect("encode the maximal legal header");
 
+        // 0. The fixture is still maximal.
+        //
+        //    Every assertion below is vacuous against a small meta -- a token
+        //    row satisfies all of them -- so shrinking any field would leave
+        //    the test green while proving nothing. Verified by mutation:
+        //    replacing the authority domain with a single character passed
+        //    everything. The floor is well under the measured 5607 so ordinary
+        //    encoding drift does not trip it, and well over anything a
+        //    defaulted or truncated fixture could reach.
+        assert!(
+            encoded_meta.len() >= 5_000,
+            "the 'maximal' meta encodes to only {} bytes; a field has stopped \
+             being built at its legal maximum and the proof below is vacuous",
+            encoded_meta.len()
+        );
+
         // 1. The ceiling does not reject legal state. A voter that refused its
         //    own maximal membership would fail to start rather than fail to
         //    snapshot.
