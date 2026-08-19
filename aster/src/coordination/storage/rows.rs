@@ -46,7 +46,7 @@ use crate::coordination::ids::{CoordinationNodeId, ResourceKey};
 use crate::coordination::model::limits;
 use crate::coordination::model::shape;
 use crate::coordination::model::state::{
-    AuditRow, ChangeSet, GroupAuthority, LogId, ResourceRow, Route, State,
+    AuditRow, ChangeSet, CommittedMembership, GroupAuthority, LogId, ResourceRow, Route, State,
 };
 use crate::coordination::model::wire::{
     intent_from_wire, intent_to_wire, session_from_wire, session_to_wire,
@@ -133,6 +133,39 @@ impl DurableState {
     }
 }
 
+/// Project OpenRaft's membership onto the roles §9 and §7.3 read.
+///
+/// The single derivation, shared by the loader and by the state machine's
+/// native-entry path. §11.3 persists only the `StoredMembership`, so this runs
+/// again at every open; a second implementation would mean a restart could
+/// disagree with the running store about who the voters are.
+pub(crate) fn project_membership(
+    membership: &openraft::Membership<CoordinationNodeId, CoordinationNode>,
+) -> CommittedMembership {
+    let configs = membership.get_joint_config();
+    let voters: BTreeSet<[u8; 32]> = configs
+        .last()
+        .map(|set| set.iter().map(|id| *id.as_bytes()).collect())
+        .unwrap_or_default();
+    // A learner is a node the map names that no configuration does -- which is
+    // how OpenRaft represents one, and the reason the node map is not simply
+    // the union of the configs.
+    let learners: BTreeSet<[u8; 32]> = membership
+        .nodes()
+        .map(|(id, _)| *id.as_bytes())
+        .filter(|id| {
+            !configs
+                .iter()
+                .any(|set| set.iter().any(|c| c.as_bytes() == id))
+        })
+        .collect();
+    CommittedMembership {
+        voters,
+        learners,
+        joint: configs.len() > 1,
+    }
+}
+
 // ── Meta ↔ CoordinationMetaV1 ────────────────────────────────────────────────
 
 pub(crate) fn meta_to_wire(state: &DurableState) -> CoordinationMetaV1 {
@@ -153,6 +186,34 @@ pub(crate) fn meta_to_wire(state: &DurableState) -> CoordinationMetaV1 {
         aggregate_reserve_bytes: state.model.reserve_bytes,
         audit_floor: state.model.audit_floor.as_ref().map(Into::into),
     }
+}
+
+/// §7.1's authority domain: 1 to 128 ASCII bytes.
+///
+/// Not merely a maximum. An empty domain names no authority at all, and a
+/// non-ASCII one is not a domain any signed document can be verified against --
+/// the permit's own domain is compared bytewise, so a value that is merely
+/// short enough is not a value.
+fn check_authority_domain(what: &'static str, domain: &str) -> StorageResult<()> {
+    let max = crate::coordination::model::authority::MAX_AUTHORITY_DOMAIN_BYTES;
+    if domain.is_empty() {
+        return Err(StorageError::corrupt(Db::State, what, "empty"));
+    }
+    if domain.len() > max {
+        return Err(StorageError::corrupt(
+            Db::State,
+            what,
+            format!("{} bytes, over the {max}-byte limit", domain.len()),
+        ));
+    }
+    if !domain.is_ascii() {
+        return Err(StorageError::corrupt(
+            Db::State,
+            what,
+            "not ASCII; a domain is compared bytewise against signed documents",
+        ));
+    }
+    Ok(())
 }
 
 /// Everything the **raw** stored metadata must satisfy.
@@ -201,14 +262,10 @@ fn validate_meta_wire(meta: &CoordinationMetaV1) -> StorageResult<()> {
         &meta.authority_public_key,
         32,
     )?;
-    if meta.authority_domain.len()
-        > crate::coordination::model::authority::MAX_AUTHORITY_DOMAIN_BYTES
-    {
-        return Err(bad(
-            "CoordinationMetaV1.authority_domain",
-            format!("{} bytes, over the limit", meta.authority_domain.len()),
-        ));
-    }
+    check_authority_domain(
+        "CoordinationMetaV1.authority_domain",
+        &meta.authority_domain,
+    )?;
 
     if let Some(hash) = &meta.recovery_export_hash {
         width("CoordinationMetaV1.recovery_export_hash", hash, 32)?;
@@ -230,17 +287,10 @@ fn validate_meta_wire(meta: &CoordinationMetaV1) -> StorageResult<()> {
             32,
         )?;
         width("RecoveredFromV1.export_hash", &source.export_hash, 32)?;
-        if source.source_authority_domain.len()
-            > crate::coordination::model::authority::MAX_AUTHORITY_DOMAIN_BYTES
-        {
-            return Err(bad(
-                "RecoveredFromV1.source_authority_domain",
-                format!(
-                    "{} bytes, over the limit",
-                    source.source_authority_domain.len()
-                ),
-            ));
-        }
+        check_authority_domain(
+            "RecoveredFromV1.source_authority_domain",
+            &source.source_authority_domain,
+        )?;
         if let Some(id) = &source.source_last_applied {
             width(
                 "RecoveredFromV1.source_last_applied",
@@ -345,14 +395,10 @@ pub(crate) fn meta_from_wire(meta: &CoordinationMetaV1) -> StorageResult<Durable
             .map_err(|err| bad("CoordinationMetaV1.membership", format!("{err:?}")))?
     };
 
-    // The model's member set is *derived* from the stored membership, never
-    // stored beside it: two copies of the same fact are two things that can
-    // disagree, and §9 protects a route by asking whether its node is a member.
-    let members: BTreeSet<[u8; 32]> = membership
-        .membership()
-        .nodes()
-        .map(|(id, _)| *id.as_bytes())
-        .collect();
+    // The model's view is *derived* from the stored membership, never stored
+    // beside it: two copies of the same fact are two things that can disagree,
+    // and §9 protects a route by asking whether its node is a member.
+    let projection = project_membership(membership.membership());
     let membership_log_id = membership.log_id().as_ref().map(LogId::from);
 
     let log_id = |what: &'static str, wire: &Option<LogIdV1>| -> StorageResult<Option<LogId>> {
@@ -378,7 +424,7 @@ pub(crate) fn meta_from_wire(meta: &CoordinationMetaV1) -> StorageResult<Durable
             growth_bytes: meta.aggregate_growth_bytes,
             reserve_bytes: meta.aggregate_reserve_bytes,
             audit_floor: log_id("CoordinationMetaV1.audit_floor", &meta.audit_floor)?,
-            members,
+            membership: projection,
             membership_log_id,
             // Filled by `load`, and `audit_tip` is rebuilt from the rows
             // rather than persisted at all.
@@ -621,18 +667,7 @@ pub(crate) fn validate_meta(state: &DurableState) -> StorageResult<()> {
             "the stored key does not decompress to an Ed25519 public key".into(),
         ));
     }
-    if model.authority.domain.len()
-        > crate::coordination::model::authority::MAX_AUTHORITY_DOMAIN_BYTES
-    {
-        return Err(bad(
-            "authority_domain",
-            format!(
-                "{} bytes, over the {}-byte limit",
-                model.authority.domain.len(),
-                crate::coordination::model::authority::MAX_AUTHORITY_DOMAIN_BYTES
-            ),
-        ));
-    }
+    check_authority_domain("authority_domain", &model.authority.domain)?;
 
     // §12.1's budgets bound the counters whatever the rows say. A counter above
     // its budget describes a state apply would never have admitted.
@@ -658,40 +693,121 @@ pub(crate) fn validate_meta(state: &DurableState) -> StorageResult<()> {
 
     // ── §7.1 profile and §9 membership ──────────────────────────────────────
     //
-    // An unknown profile code permits nothing, so it cannot reach a state
-    // machine that would then fall back to the production rule.
-    let voters = state
-        .membership
-        .membership()
-        .get_joint_config()
-        .last()
-        .map_or(0, std::collections::BTreeSet::len);
-    if voters > 0 && shape::profile_permits_voters(model.deployment_profile_code, voters) {
+    // The profile is checked whatever the membership looks like. An earlier
+    // version only reached this when the last config was non-empty, so a group
+    // whose genesis named a profile this build does not implement opened
+    // cleanly for as long as it had committed no membership -- and then decided
+    // its first change against a rule it had never been admitted under.
+    if !shape::PROFILES.contains(&model.deployment_profile_code) {
         return Err(bad(
             "deployment_profile_code",
             format!(
-                "profile {} does not permit {voters} voters",
+                "profile {} is not one §7.1 declares",
                 model.deployment_profile_code
             ),
         ));
     }
 
-    // The model's projection of the stored membership is derived at load, so a
-    // disagreement here means the derivation itself drifted rather than that
-    // two persisted copies differ.
-    let members: BTreeSet<[u8; 32]> = state
-        .membership
-        .membership()
-        .nodes()
-        .map(|(id, _)| *id.as_bytes())
-        .collect();
-    if model.members != members {
+    let configs = state.membership.membership().get_joint_config();
+    // §9 has exactly two shapes: uniform, and joint during one change. Three
+    // configurations is not a membership OpenRaft produces or Aster can reason
+    // about.
+    if configs.len() > 2 {
         return Err(bad(
             "membership",
-            "the member set does not match the stored membership".into(),
+            format!(
+                "{} joint configurations; §9 allows at most two",
+                configs.len()
+            ),
         ));
     }
+    // **Every** configuration, not only the last. A joint membership is legal
+    // only if both halves are, and checking the target alone would admit a
+    // change out of a configuration this profile never permitted -- which is
+    // the half a voter has to be able to reach quorum in while the change is in
+    // flight.
+    for (n, config) in configs.iter().enumerate() {
+        if shape::profile_permits_voters(model.deployment_profile_code, config.len()) {
+            return Err(bad(
+                "membership",
+                format!(
+                    "configuration {n} holds {} voters, which profile {} does not permit",
+                    config.len(),
+                    model.deployment_profile_code
+                ),
+            ));
+        }
+    }
+    // §9 caps the learners a change may retain, and OpenRaft represents them as
+    // nodes outside every configuration -- so the node map's envelope is the
+    // union of the configurations plus at most that many.
+    if model.membership.learners.len() > shape::MAX_RETAINED_LEARNERS {
+        return Err(bad(
+            "membership",
+            format!(
+                "{} retained learners, over the {} cap",
+                model.membership.learners.len(),
+                shape::MAX_RETAINED_LEARNERS
+            ),
+        ));
+    }
+
+    // A membership that names anyone was committed by an entry, and an entry
+    // has a log id. The two move together or the record is not one this group
+    // wrote.
     let membership_log_id = state.membership.log_id().as_ref().map(LogId::from);
+    let named = !configs.is_empty() || state.membership.membership().nodes().next().is_some();
+    if named != membership_log_id.is_some() {
+        return Err(bad(
+            "membership",
+            if named {
+                "a committed membership with no log id".into()
+            } else {
+                "a membership log id with no membership".into()
+            },
+        ));
+    }
+
+    // A membership entry is an applied entry, so its id cannot sit above
+    // `last_applied` -- and at the same index it must *be* that entry, not a
+    // different one from another term or leader. The second case is what a
+    // maximum-index comparison cannot see.
+    if let Some(id) = membership_log_id {
+        match model.last_applied {
+            None => {
+                return Err(bad(
+                    "membership",
+                    format!("a membership at {id:?} with nothing applied"),
+                ))
+            }
+            Some(last) if id.index > last.index => {
+                return Err(bad(
+                    "membership",
+                    format!("{id:?} runs ahead of last_applied {last:?}"),
+                ))
+            }
+            Some(last) if id.index == last.index && id != last => {
+                return Err(bad(
+                    "membership",
+                    format!("{id:?} and last_applied {last:?} are different entries at one index"),
+                ))
+            }
+            _ => {}
+        }
+    }
+
+    // The model's projection is derived from the stored membership at load, so
+    // this compares a derivation with its source rather than two persisted
+    // copies. It earns its place on the paths that do *not* go through
+    // `meta_from_wire` -- a snapshot install, and any hand-built state -- and
+    // as a guard against the derivation itself drifting.
+    let projection = project_membership(state.membership.membership());
+    if model.membership != projection {
+        return Err(bad(
+            "membership",
+            "the membership projection does not match the stored membership".into(),
+        ));
+    }
     if model.membership_log_id != membership_log_id {
         return Err(bad(
             "membership",
@@ -801,6 +917,10 @@ static INVARIANTS: &[Invariant] = &[
     Invariant {
         name: "route-row-shape",
         check: check_route_rows,
+    },
+    Invariant {
+        name: "stamped-log-ids",
+        check: check_stamped_log_ids,
     },
 ];
 
@@ -1052,6 +1172,14 @@ fn check_audit_rows(state: &DurableState) -> Result<(), String> {
                 }
             ));
         }
+        for (what, value) in [("epoch", row.epoch), ("value_revision", row.value_revision)] {
+            if value > limits::MAX_COUNTER {
+                return Err(format!(
+                    "row {at:?} records {what} {value}, over the {} ceiling",
+                    limits::MAX_COUNTER
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1175,6 +1303,44 @@ fn check_session_rows(state: &DurableState) -> Result<(), String> {
                 saved.outcome, saved.reason
             ));
         }
+        // The saved snapshot is what a replay reports, so its counters are as
+        // client-visible as the row's own -- and they came from a resource row
+        // that was itself bounded when it was written.
+        for (what, value) in [
+            ("acl_revision", saved.acl_revision),
+            ("admin_revision", saved.admin_revision),
+        ] {
+            if value > limits::MAX_COUNTER {
+                return Err(format!(
+                    "session {actor:02x?}/{client:02x?} saved {what} {value}, over the {} \
+                     ceiling",
+                    limits::MAX_COUNTER
+                ));
+            }
+        }
+        let Some(snapshot) = &saved.snapshot else {
+            continue;
+        };
+        for (what, value) in [
+            ("epoch", snapshot.epoch),
+            ("lease_revision", snapshot.lease_revision),
+            ("value_revision", snapshot.value_revision),
+            ("acl_revision", snapshot.acl_revision),
+        ] {
+            if value > limits::MAX_COUNTER {
+                return Err(format!(
+                    "session {actor:02x?}/{client:02x?} saved snapshot {what} {value}, over \
+                     the {} ceiling",
+                    limits::MAX_COUNTER
+                ));
+            }
+        }
+        if snapshot.held != snapshot.holder.is_some() {
+            return Err(format!(
+                "session {actor:02x?}/{client:02x?} saved a snapshot whose held flag and \
+                 holder disagree"
+            ));
+        }
     }
     Ok(())
 }
@@ -1272,6 +1438,51 @@ fn check_intent_rows(state: &DurableState) -> Result<(), String> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Every log id apply stamps onto a row names an entry that has been applied.
+///
+/// Intent acceptance and completion, and route introduction, are stamped with
+/// the log id of the entry doing the stamping, so none of them can sit above
+/// `last_applied` -- and an intent cannot complete before it was accepted. A
+/// row that says otherwise describes an ordering no log produced, which matters
+/// because §9 evicts by exactly these ids: a stamp from the future is an
+/// eviction order that never comes round.
+fn check_stamped_log_ids(state: &DurableState) -> Result<(), String> {
+    let model = &state.model;
+    let within = |what: &str, id: LogId| -> Result<(), String> {
+        match model.last_applied {
+            None => Err(format!("{what} is stamped {id:?} with nothing applied")),
+            Some(last) if id.index > last.index => Err(format!(
+                "{what} is stamped {id:?}, above last_applied {last:?}"
+            )),
+            _ => Ok(()),
+        }
+    };
+
+    for (operation_id, intent) in &model.intents {
+        within(
+            &format!("intent {operation_id:02x?} acceptance"),
+            intent.accepted_log_id,
+        )?;
+        if let Some(completed) = intent.completed_log_id {
+            within(&format!("intent {operation_id:02x?} completion"), completed)?;
+            if completed.index < intent.accepted_log_id.index {
+                return Err(format!(
+                    "intent {operation_id:02x?} completed at {completed:?} before it was \
+                     accepted at {:?}",
+                    intent.accepted_log_id
+                ));
+            }
+        }
+        if let Some(observed) = intent.observed_membership_log_id {
+            within(&format!("intent {operation_id:02x?} observation"), observed)?;
+        }
+    }
+    for (node, route) in &model.routes {
+        within(&format!("route for {node:02x?}"), route.introduced_log_id)?;
     }
     Ok(())
 }
@@ -1569,11 +1780,7 @@ mod tests {
 
         let membership = committed_membership();
         // Derived from the membership, which is the only thing §11.3 persists.
-        model.members = membership
-            .membership()
-            .nodes()
-            .map(|(id, _)| *id.as_bytes())
-            .collect();
+        model.membership = project_membership(membership.membership());
         model.membership_log_id = membership.log_id().as_ref().map(LogId::from);
 
         let seed_node = [4u8; 32];
@@ -1818,7 +2025,15 @@ mod tests {
         // small: a check that accepted anything would accept this too.
         assert_eq!(state.model.growth_bytes, limits::GROWTH_BUDGET);
         assert_eq!(state.model.reserve_bytes, limits::RESERVE_BUDGET);
-        assert_eq!(state.model.members.len(), shape::MAX_VOTERS + 2 + 2);
+        assert_eq!(state.model.membership.voters.len(), shape::MAX_VOTERS);
+        assert_eq!(
+            state.model.membership.learners.len(),
+            shape::MAX_RETAINED_LEARNERS
+        );
+        assert!(
+            state.model.membership.joint,
+            "the widest legal shape is joint"
+        );
     }
 
     /// Each **raw wire** rule refuses on its own, before any conversion runs.
@@ -1864,6 +2079,28 @@ mod tests {
                     );
                 }),
                 "authority_domain",
+            ),
+            (
+                "an empty authority domain",
+                Box::new(|m: &mut CoordinationMetaV1| m.authority_domain = String::new()),
+                "authority_domain",
+            ),
+            (
+                // A domain is compared bytewise against the domain inside a
+                // signed permit, so "short enough" is not the rule.
+                "a non-ASCII authority domain",
+                Box::new(|m: &mut CoordinationMetaV1| m.authority_domain = "aster0.nét".into()),
+                "authority_domain",
+            ),
+            (
+                "an empty source authority domain",
+                Box::new(|m: &mut CoordinationMetaV1| {
+                    m.recovered_from
+                        .as_mut()
+                        .expect("provenance")
+                        .source_authority_domain = String::new();
+                }),
+                "source_authority_domain",
             ),
             (
                 "last-applied leader width",
@@ -1994,7 +2231,7 @@ mod tests {
             },
         };
         let state = meta_from_wire(&fresh).expect("an uncommitted membership is legal");
-        assert!(state.model.members.is_empty());
+        assert!(state.model.membership.members().is_empty());
         let _ = NodeIdSetV1 { ids: Vec::new() };
         let _: Option<RecoveredFromV1> = None;
     }
@@ -2083,6 +2320,190 @@ mod tests {
         assert!(err.to_string().contains("audit_floor"), "got: {err}");
     }
 
+    /// Every way a stored membership can be unreachable, refused on its own.
+    ///
+    /// Each of these was accepted before. The validator checked only the last
+    /// joint configuration, so an illegal *first* half passed; it never asked
+    /// whether the membership had a log id at all, nor whether that id named an
+    /// entry this store had applied.
+    #[test]
+    fn each_unreachable_membership_is_refused_on_its_own() {
+        use crate::coordination::raft::{MembershipV1, NodeEntryV1, NodeIdSetV1, NodeIdV1};
+
+        let node = |b: u8| NodeIdV1 {
+            node_id: vec![b; 32],
+        };
+        let set = |bytes: &[u8]| NodeIdSetV1 {
+            ids: bytes.iter().map(|b| node(*b)).collect(),
+        };
+        let nodes = |bytes: &[u8]| -> Vec<NodeEntryV1> {
+            let mut out: Vec<NodeEntryV1> = bytes
+                .iter()
+                .map(|b| NodeEntryV1 {
+                    node_id: vec![*b; 32],
+                    format_version: crate::coordination::convert::NODE_FORMAT_VERSION,
+                })
+                .collect();
+            out.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            out
+        };
+        let stored = |membership: MembershipV1, log_id: Option<LogIdV1>| {
+            crate::coordination::raft::StoredMembershipV1 { log_id, membership }
+        };
+        let applied = |index: u64| {
+            Some(LogIdV1 {
+                term: 9,
+                leader_node_id: vec![3u8; 32],
+                index,
+            })
+        };
+
+        // A legal joint change under PROFILE_PROD: three voters to three, with
+        // one swapped. Both halves are permitted counts.
+        let legal_joint = MembershipV1 {
+            configs: vec![set(&[1, 2, 3]), set(&[1, 2, 4])],
+            nodes: nodes(&[1, 2, 3, 4]),
+        };
+
+        let cases: Vec<(
+            &str,
+            crate::coordination::raft::StoredMembershipV1,
+            Option<LogIdV1>,
+            &str,
+        )> = vec![
+            (
+                // The case the previous check could not see: the configuration
+                // being moved *out of* is one this profile never permitted, and
+                // it is the half a voter needs quorum in while the change is in
+                // flight.
+                "an invalid first config with a valid last one",
+                stored(
+                    MembershipV1 {
+                        configs: vec![set(&[1, 2, 3, 4]), set(&[1, 2, 3])],
+                        nodes: nodes(&[1, 2, 3, 4]),
+                    },
+                    applied(100),
+                ),
+                applied(9_000_000),
+                "configuration 0",
+            ),
+            (
+                "a three-way joint configuration",
+                stored(
+                    MembershipV1 {
+                        configs: vec![set(&[1, 2, 3]), set(&[1, 2, 4]), set(&[1, 2, 5])],
+                        nodes: nodes(&[1, 2, 3, 4, 5]),
+                    },
+                    applied(100),
+                ),
+                applied(9_000_000),
+                "at most two",
+            ),
+            (
+                "more retained learners than §9 allows",
+                stored(
+                    MembershipV1 {
+                        configs: vec![set(&[1, 2, 3])],
+                        nodes: nodes(&[1, 2, 3, 7, 8, 9]),
+                    },
+                    applied(100),
+                ),
+                applied(9_000_000),
+                "retained learners",
+            ),
+            (
+                "a committed membership with no log id",
+                stored(legal_joint.clone(), None),
+                applied(9_000_000),
+                "no log id",
+            ),
+            (
+                "a membership ahead of last_applied",
+                stored(legal_joint.clone(), applied(9_000_001)),
+                applied(9_000_000),
+                "runs ahead",
+            ),
+            (
+                "a membership at the applied index from another term",
+                stored(
+                    legal_joint.clone(),
+                    Some(LogIdV1 {
+                        term: 8,
+                        leader_node_id: vec![3u8; 32],
+                        index: 9_000_000,
+                    }),
+                ),
+                applied(9_000_000),
+                "different entries at one index",
+            ),
+            (
+                "a membership at the applied index from another leader",
+                stored(
+                    legal_joint.clone(),
+                    Some(LogIdV1 {
+                        term: 9,
+                        leader_node_id: vec![0xEE; 32],
+                        index: 9_000_000,
+                    }),
+                ),
+                applied(9_000_000),
+                "different entries at one index",
+            ),
+            (
+                "a membership with nothing applied",
+                stored(legal_joint.clone(), applied(100)),
+                None,
+                "nothing applied",
+            ),
+        ];
+
+        for (label, membership, last_applied, expected) in cases {
+            let mut meta = maximal_legal_meta();
+            meta.membership = membership;
+            meta.last_applied = last_applied;
+            let state = meta_from_wire(&meta)
+                .unwrap_or_else(|err| panic!("{label} must narrow before it is judged: {err}"));
+            let err = validate_meta(&state).expect_err(&format!("{label} must be refused"));
+            assert!(
+                err.to_string().contains(expected),
+                "{label}: expected a failure naming {expected}, got {err}"
+            );
+        }
+
+        // And the legal joint change itself is accepted, so the rules above are
+        // refusing the shapes rather than everything joint.
+        let mut meta = maximal_legal_meta();
+        meta.membership = stored(legal_joint, applied(100));
+        meta.last_applied = applied(9_000_000);
+        let state = meta_from_wire(&meta).expect("narrows");
+        validate_meta(&state).expect("a legal joint change is reachable");
+        assert!(state.model.membership.joint);
+    }
+
+    /// A log-id-only membership is refused too: the pair moves together.
+    #[test]
+    fn a_membership_log_id_without_a_membership_is_refused() {
+        let mut meta = maximal_legal_meta();
+        meta.membership.membership = crate::coordination::raft::MembershipV1 {
+            configs: Vec::new(),
+            nodes: Vec::new(),
+        };
+        // Refused at the wire layer rather than by the validator: the empty
+        // shape is legal only as a *pair*, so a log id beside an empty
+        // membership never narrows at all. The validator's own rule covers the
+        // paths that do not go through `meta_from_wire`.
+        let err = meta_from_wire(&meta).expect_err("an id with no membership");
+        assert!(
+            format!("{err:?}").contains("EmptyMembership"),
+            "got: {err:?}"
+        );
+
+        // And with the id removed it is the ordinary uncommitted shape.
+        meta.membership.log_id = None;
+        let state = meta_from_wire(&meta).expect("an uncommitted membership narrows");
+        validate_meta(&state).expect("and is legal");
+    }
+
     /// The member set and membership log id are derived from the stored
     /// membership, so a state whose projection disagrees is refused.
     ///
@@ -2093,9 +2514,34 @@ mod tests {
     #[test]
     fn a_membership_projection_that_drifted_is_refused() {
         let mut state = meta_from_wire(&maximal_legal_meta()).expect("narrows");
-        state.model.members.insert([0xEE; 32]);
-        let err = validate_meta(&state).expect_err("extra member");
-        assert!(err.to_string().contains("member set"), "got: {err}");
+        // A **role swap**, which leaves every count and the combined member set
+        // exactly as they were. A projection compared as one set would not see
+        // it at all.
+        let voter = *state
+            .model
+            .membership
+            .voters
+            .iter()
+            .next()
+            .expect("a voter");
+        let learner = *state
+            .model
+            .membership
+            .learners
+            .iter()
+            .next()
+            .expect("a learner");
+        state.model.membership.voters.remove(&voter);
+        state.model.membership.voters.insert(learner);
+        state.model.membership.learners.remove(&learner);
+        state.model.membership.learners.insert(voter);
+        assert_eq!(
+            state.model.membership.members(),
+            project_membership(state.membership.membership()).members(),
+            "the swap must leave the combined set untouched, or it proves nothing"
+        );
+        let err = validate_meta(&state).expect_err("swapped roles");
+        assert!(err.to_string().contains("projection"), "got: {err}");
 
         let mut state = meta_from_wire(&maximal_legal_meta()).expect("narrows");
         state.model.membership_log_id = Some(LogId::new(1, [0u8; 32], 1));
@@ -2356,6 +2802,19 @@ mod tests {
             },
         },
         Negative {
+            rule: "stamped-log-ids",
+            what: "an intent accepted above last_applied",
+            break_it: |state| {
+                let last = state.model.last_applied.expect("an applied entry");
+                state
+                    .model
+                    .intents
+                    .get_mut(&[0x55u8; 16])
+                    .expect("the fixture's intent")
+                    .accepted_log_id = LogId::new(last.term, last.leader_node_id, last.index + 1);
+            },
+        },
+        Negative {
             rule: "route-row-shape",
             what: "a ticket for a different node",
             break_it: |state| {
@@ -2365,6 +2824,469 @@ mod tests {
             },
         },
     ];
+
+    /// Every field §11.3 declares is named by a rule that constrains it.
+    ///
+    /// `every_invariant_has_an_independent_negative` proves the two *code*
+    /// lists agree with each other, which is a real property and not this one:
+    /// both lists could omit the same field and stay consistent. This sweep is
+    /// written from the declared types instead -- every field of the stored meta
+    /// row and of each §11.3 row value -- and asks which rule covers it. A field
+    /// added to any of those types fails here until someone decides whether it
+    /// needs a bound and says so.
+    ///
+    /// `Unconstrained` is a real answer for a field whose whole domain is legal:
+    /// `held` is a bool, and every bool is a state. Recording it is what makes
+    /// the sweep a decision rather than an omission.
+    #[test]
+    fn every_declared_field_is_covered_by_a_rule_or_recorded_as_unconstrained() {
+        /// Which rule constrains a declared field, or why none does.
+        enum Cover {
+            /// The named rule in [`INVARIANTS`], or a `validate_meta` /
+            /// `validate_meta_wire` check.
+            Rule(&'static str),
+            /// Every value of the field's type is legal state.
+            Unconstrained(&'static str),
+        }
+        use Cover::{Rule, Unconstrained};
+
+        // Written from the declared types, field by field, in their order.
+        let sweep: &[(&str, &str, Cover)] = &[
+            // CoordinationMetaV1 (§11.3)
+            (
+                "CoordinationMetaV1",
+                "schema_version",
+                Rule("wire: schema version"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "group_id",
+                Rule("wire: 32-byte width"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "genesis_hash",
+                Rule("wire: 32-byte width"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "authority_public_key",
+                Rule("meta: curve point"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "authority_domain",
+                Rule("meta: 1..=128 ASCII"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "deployment_profile_code",
+                Rule("meta: declared profile"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "last_applied",
+                Rule("wire: leader width; audit-tip"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "membership",
+                Rule("meta: reachability"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "admin_revision",
+                Rule("admin-revision"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "recovery_export_hash",
+                Rule("wire: width and §13 pairing"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "recovered_from",
+                Rule("wire: widths and domain"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "aggregate_growth_bytes",
+                Rule("aggregate-counters"),
+            ),
+            (
+                "CoordinationMetaV1",
+                "aggregate_reserve_bytes",
+                Rule("aggregate-counters"),
+            ),
+            ("CoordinationMetaV1", "audit_floor", Rule("audit-floor")),
+            // RecoveredFromV1 (§13)
+            (
+                "RecoveredFromV1",
+                "source_group_id",
+                Rule("wire: 32-byte width"),
+            ),
+            (
+                "RecoveredFromV1",
+                "source_genesis_hash",
+                Rule("wire: 32-byte width"),
+            ),
+            (
+                "RecoveredFromV1",
+                "source_authority_public_key",
+                Rule("wire: 32-byte width"),
+            ),
+            (
+                "RecoveredFromV1",
+                "source_authority_domain",
+                Rule("wire: 1..=128 ASCII"),
+            ),
+            (
+                "RecoveredFromV1",
+                "export_hash",
+                Rule("wire: width and §13 pairing"),
+            ),
+            (
+                "RecoveredFromV1",
+                "source_last_applied",
+                Rule("wire: leader width"),
+            ),
+            // ResourceRowV1 (§11.3)
+            ("ResourceRowV1", "epoch", Rule("resource-row-shape")),
+            (
+                "ResourceRowV1",
+                "held",
+                Unconstrained("a bool; the pairing with `holder` is checked by the codec"),
+            ),
+            (
+                "ResourceRowV1",
+                "holder_node_id",
+                Rule("codec: width and lease coherence"),
+            ),
+            ("ResourceRowV1", "ttl_ms", Rule("resource-row-shape")),
+            (
+                "ResourceRowV1",
+                "lease_revision",
+                Rule("resource-row-shape"),
+            ),
+            (
+                "ResourceRowV1",
+                "value_revision",
+                Rule("resource-row-shape"),
+            ),
+            ("ResourceRowV1", "value", Rule("resource-row-shape")),
+            ("ResourceRowV1", "acl_revision", Rule("resource-row-shape")),
+            // resource_acl (§11.3) -- a redb `u64`, no Fory root
+            ("resource_acl", "rights", Rule("grant-row-shape")),
+            (
+                "resource_acl",
+                "key",
+                Rule("grant-row-shape: the resource must exist"),
+            ),
+            // ClientSessionV1 (§11.3)
+            (
+                "ClientSessionV1",
+                "last_sequence",
+                Rule("session-row-shape"),
+            ),
+            (
+                "ClientSessionV1",
+                "request_hash",
+                Rule("codec: 32-byte width"),
+            ),
+            ("ClientSessionV1", "last_result", Rule("session-row-shape")),
+            (
+                "ClientSessionV1",
+                "retired",
+                Unconstrained("a bool; a tombstone and a live row are both states"),
+            ),
+            // SavedReplyV1, inside a session row
+            (
+                "SavedReplyV1",
+                "disposition_code",
+                Rule("codec: stored replies are Consumed"),
+            ),
+            ("SavedReplyV1", "outcome_code", Rule("codec: §5.2 outcome")),
+            (
+                "SavedReplyV1",
+                "reason_code",
+                Rule("codec: §5.2 reason; session-row-shape pairing"),
+            ),
+            ("SavedReplyV1", "snapshot", Rule("session-row-shape")),
+            ("SavedReplyV1", "acl_revision", Rule("session-row-shape")),
+            ("SavedReplyV1", "admin_revision", Rule("session-row-shape")),
+            ("SavedReplyV1", "operation_id", Rule("codec: 16-byte width")),
+            (
+                "SavedReplyV1",
+                "membership_log_id",
+                Rule("codec: leader width"),
+            ),
+            (
+                "SavedSnapshotV1",
+                "group_id",
+                Rule("codec: the holding group"),
+            ),
+            ("SavedSnapshotV1", "resource", Rule("codec: §4.2 identity")),
+            ("SavedSnapshotV1", "epoch", Rule("session-row-shape")),
+            (
+                "SavedSnapshotV1",
+                "holder",
+                Rule("codec: width and lease coherence"),
+            ),
+            (
+                "SavedSnapshotV1",
+                "held",
+                Rule("session-row-shape: pairing with holder"),
+            ),
+            (
+                "SavedSnapshotV1",
+                "ttl_ms",
+                Unconstrained("a saved TTL is whatever the row held when it was saved"),
+            ),
+            (
+                "SavedSnapshotV1",
+                "lease_revision",
+                Rule("session-row-shape"),
+            ),
+            (
+                "SavedSnapshotV1",
+                "value_revision",
+                Rule("session-row-shape"),
+            ),
+            ("SavedSnapshotV1", "acl_revision", Rule("session-row-shape")),
+            // MembershipIntentV1 (§11.3)
+            (
+                "MembershipIntentV1",
+                "actor_node_id",
+                Rule("codec: 32-byte width"),
+            ),
+            (
+                "MembershipIntentV1",
+                "request_hash",
+                Rule("codec: 32-byte width"),
+            ),
+            (
+                "MembershipIntentV1",
+                "expected_membership",
+                Rule("codec: agrees with the plan"),
+            ),
+            (
+                "MembershipIntentV1",
+                "desired_plan",
+                Rule("intent-row-shape"),
+            ),
+            ("MembershipIntentV1", "status_code", Rule("codec: §9 phase")),
+            (
+                "MembershipIntentV1",
+                "result_code",
+                Unconstrained("caller-supplied by §7.3's progress report; §5.2 declares no set"),
+            ),
+            (
+                "MembershipIntentV1",
+                "accepted_log_id",
+                Rule("stamped-log-ids"),
+            ),
+            (
+                "MembershipIntentV1",
+                "completed_log_id",
+                Rule("stamped-log-ids; codec pairing"),
+            ),
+            (
+                "MembershipIntentV1",
+                "observed_membership_log_id",
+                Rule("stamped-log-ids"),
+            ),
+            // NodeRouteV1 (§11.3)
+            ("NodeRouteV1", "ticket_bytes", Rule("route-row-shape")),
+            (
+                "NodeRouteV1",
+                "source_operation_id",
+                Rule("codec: 16-byte width"),
+            ),
+            ("NodeRouteV1", "introduced_log_id", Rule("stamped-log-ids")),
+            // AuditRowV1 (§11.3)
+            ("AuditRowV1", "leader_node_id", Rule("codec: 32-byte width")),
+            (
+                "AuditRowV1",
+                "actor_node_id",
+                Rule("codec: width or absent"),
+            ),
+            ("AuditRowV1", "operation_code", Rule("audit-row-shape")),
+            ("AuditRowV1", "resource", Rule("codec: §4.2 identity")),
+            (
+                "AuditRowV1",
+                "result_code",
+                Rule("audit-row-shape: code space"),
+            ),
+            ("AuditRowV1", "epoch", Rule("audit-row-shape")),
+            ("AuditRowV1", "value_revision", Rule("audit-row-shape")),
+            // group_admins (§11.3) -- a redb key with a unit value
+            (
+                "group_admins",
+                "subject_node_id",
+                Rule("codec: redb key width"),
+            ),
+        ];
+
+        // A field added to any of these types is a **compile** error here, not a
+        // count that drifts: each pattern is exhaustive, so the sweep cannot
+        // fall behind the declarations it claims to cover. The counts below
+        // then check the sweep against the patterns.
+        #[allow(unused_variables, clippy::too_many_arguments)]
+        fn exhaustive(
+            meta: CoordinationMetaV1,
+            recovered: crate::coordination::raft::RecoveredFromV1,
+            resource: ResourceRowV1,
+            session: ClientSessionV1,
+            reply: crate::coordination::contract::SavedReplyV1,
+            snapshot: crate::coordination::contract::SavedSnapshotV1,
+            intent: MembershipIntentV1,
+            route: NodeRouteV1,
+            audit: AuditRowV1,
+        ) {
+            let CoordinationMetaV1 {
+                schema_version,
+                group_id,
+                genesis_hash,
+                authority_public_key,
+                authority_domain,
+                deployment_profile_code,
+                last_applied,
+                membership,
+                admin_revision,
+                recovery_export_hash,
+                recovered_from,
+                aggregate_growth_bytes,
+                aggregate_reserve_bytes,
+                audit_floor,
+            } = meta;
+            let crate::coordination::raft::RecoveredFromV1 {
+                source_group_id,
+                source_genesis_hash,
+                source_authority_public_key,
+                source_authority_domain,
+                export_hash,
+                source_last_applied,
+            } = recovered;
+            let ResourceRowV1 {
+                epoch,
+                held,
+                holder_node_id,
+                ttl_ms,
+                lease_revision,
+                value_revision,
+                value,
+                acl_revision,
+            } = resource;
+            let ClientSessionV1 {
+                last_sequence,
+                request_hash,
+                last_result,
+                retired,
+            } = session;
+            let crate::coordination::contract::SavedReplyV1 {
+                disposition_code,
+                outcome_code,
+                reason_code,
+                snapshot: saved,
+                acl_revision,
+                admin_revision,
+                operation_id,
+                membership_log_id,
+            } = reply;
+            let crate::coordination::contract::SavedSnapshotV1 {
+                group_id,
+                resource,
+                epoch,
+                holder,
+                held,
+                ttl_ms,
+                lease_revision,
+                value_revision,
+                acl_revision,
+            } = snapshot;
+            let MembershipIntentV1 {
+                actor_node_id,
+                request_hash,
+                expected_membership,
+                desired_plan,
+                status_code,
+                result_code,
+                accepted_log_id,
+                completed_log_id,
+                observed_membership_log_id,
+            } = intent;
+            let NodeRouteV1 {
+                ticket_bytes,
+                source_operation_id,
+                introduced_log_id,
+            } = route;
+            let AuditRowV1 {
+                leader_node_id,
+                actor_node_id,
+                operation_code,
+                resource,
+                result_code,
+                epoch,
+                value_revision,
+            } = audit;
+        }
+        let _ = exhaustive;
+
+        let declared: BTreeMap<&str, usize> = BTreeMap::from([
+            ("CoordinationMetaV1", 14),
+            ("RecoveredFromV1", 6),
+            ("ResourceRowV1", 8),
+            ("resource_acl", 2),
+            ("ClientSessionV1", 4),
+            ("SavedReplyV1", 8),
+            ("SavedSnapshotV1", 9),
+            ("MembershipIntentV1", 9),
+            ("NodeRouteV1", 3),
+            ("AuditRowV1", 7),
+            ("group_admins", 1),
+        ]);
+        let mut swept: BTreeMap<&str, usize> = BTreeMap::new();
+        for (ty, _, _) in sweep {
+            *swept.entry(ty).or_default() += 1;
+        }
+        assert_eq!(
+            declared, swept,
+            "the sweep must name every field of every §11.3 type; a count that moved means a \
+             field was added or removed and its bound has not been decided"
+        );
+
+        // And every covered field names a rule that exists, so a renamed rule
+        // cannot leave a field pointing at nothing.
+        let rules: BTreeSet<&str> = INVARIANTS.iter().map(|i| i.name).collect();
+        for (ty, field, cover) in sweep {
+            if let Rule(name) = cover {
+                // Rules outside `INVARIANTS` -- the codec's own narrowing, and
+                // `validate_meta` -- are named by prefix rather than by
+                // identifier, and carry their subject in the text.
+                let is_invariant_rule = rules.iter().any(|r| name.starts_with(r));
+                let is_prefixed = name.starts_with("wire:")
+                    || name.starts_with("meta:")
+                    || name.starts_with("codec:");
+                assert!(
+                    is_invariant_rule || is_prefixed,
+                    "{ty}.{field} names rule `{name}`, which is neither an invariant nor a \
+                     declared check"
+                );
+            }
+        }
+
+        // The unconstrained fields are few and each says why. If this grows,
+        // the growth is the thing to look at.
+        let unconstrained = sweep
+            .iter()
+            .filter(|(_, _, c)| matches!(c, Unconstrained(_)))
+            .count();
+        assert_eq!(
+            unconstrained, 4,
+            "four fields have no bound because every value of their type is legal state; a \
+             different count means one was added or removed without a decision"
+        );
+    }
 
     /// Every rule has a negative, and every negative trips the rule it names.
     ///

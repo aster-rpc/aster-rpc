@@ -45,7 +45,9 @@ use super::membership::{
 };
 use super::resource::{Fence, RawResourceKey, ResourceAction};
 use super::retire::RetireCommand;
-use super::state::{AuditResult, LogId, MemberSeed, MembershipPlan, NodeId, ResourceKey, State};
+use super::state::{
+    AuditResult, CommittedMembership, LogId, MemberSeed, MembershipPlan, NodeId, ResourceKey, State,
+};
 
 const ADMIN: NodeId = [1u8; 32];
 const ALICE: NodeId = [2u8; 32];
@@ -72,7 +74,7 @@ fn genesis() -> State {
     // the three-voter plans it generates.
     s.authority = crate::coordination::model::authority::testing::authority();
     s.deployment_profile_code = crate::coordination::model::shape::PROFILE_PROD;
-    s.members = (1u8..=3).map(|b| [b; 32]).collect();
+    s.membership = CommittedMembership::uniform((1u8..=3).map(|b| [b; 32]));
     for n in 0..3u8 {
         for actor in [ALICE, BOB] {
             s.acl.insert((key(n), actor), ALL_RIGHTS);
@@ -1113,7 +1115,7 @@ fn membership_history_observed(
         let sequence = u64::from(round) + 1;
         let op = [round; 16];
         let expected = state.membership_log_id;
-        let members = state.members.clone();
+        let members = state.membership.members();
 
         // Accept.
         index += 1;

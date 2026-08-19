@@ -275,8 +275,7 @@ impl StateActor {
                     guard_delivery(&working.model, log_id).map_err(fatal_fault)?;
                     working.membership =
                         StoredMembership::new(Some(entry.log_id), membership.clone());
-                    working.model.members =
-                        membership.nodes().map(|(id, _)| *id.as_bytes()).collect();
+                    working.model.membership = rows::project_membership(membership);
                     working.model.membership_log_id = Some(log_id);
                     working.model.last_applied = Some(log_id);
                     CommandReplyV1::NonCommand(NonCommandReplyV1 {})
@@ -553,8 +552,9 @@ impl RaftStateMachine<CoordinationTypeConfig> for CoordinationStateMachine {
 mod tests {
     use super::*;
     use crate::coordination::contract::{
-        AcquireActionV1, ActionV1, ClientCommandV1, CommandV1, ExpireCommandV1,
-        MembershipProgressCommandV1, ResourceKeyV1, SetGrantActionV1,
+        AcquireActionV1, ActionV1, ClientCommandV1, CommandV1, CompareAndSetActionV1,
+        ExpireCommandV1, MembershipProgressCommandV1, ReleaseWithValueActionV1, RenewActionV1,
+        ResourceKeyV1, SetGrantActionV1,
     };
     use crate::coordination::model::limits::ALL_RIGHTS;
     use crate::coordination::model::state::{GroupAuthority, ResourceKey, State};
@@ -779,7 +779,7 @@ mod tests {
             "a membership entry audits nothing"
         );
         assert_eq!(
-            after.model.members,
+            after.model.membership.voters,
             voters
                 .iter()
                 .copied()
@@ -1145,6 +1145,259 @@ mod tests {
         assert_eq!(state.model.audit.len(), 1, "and is audited anyway");
     }
 
+    // ── Success corridors ───────────────────────────────────────────────────
+    //
+    // The long generated history reaches every command shape but only ever
+    // *refuses* four of them: `renew`, `compare_and_set`, `release_with_value`
+    // and `cancel_membership` need a lease or an intent that its interleaved
+    // steps have usually already taken away. Reshaping the alphabet to fix that
+    // would move every history-derived assertion in the model, so the coverage
+    // comes from short deliberate corridors instead -- each one applied through
+    // the real state machine and then reopened, which is the half a model-level
+    // test cannot give.
+
+    fn fence(epoch: u64) -> crate::coordination::contract::FenceV1 {
+        crate::coordination::contract::FenceV1 {
+            group_id: crate::coordination::model::authority::testing::authority()
+                .group_id
+                .to_vec(),
+            resource: ResourceKeyV1 {
+                namespace: "ns".into(),
+                key: b"lock".to_vec(),
+            },
+            epoch,
+            holder: ACTOR.to_vec(),
+        }
+    }
+
+    /// The whole lease lifecycle applies and survives a reopen.
+    ///
+    /// One corridor rather than four tests: the interesting part is that each
+    /// step's fence and expected revision come from the state the previous step
+    /// left, so a step that silently failed would strand the next one.
+    #[tokio::test]
+    async fn a_lease_corridor_applies_and_survives_a_reopen() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+
+        let granted = |replies: &[CommandReplyV1], step: &str| -> i32 {
+            let CommandReplyV1::Client(reply) = &replies[0] else {
+                panic!("{step}: expected a client reply, got {:?}", replies[0]);
+            };
+            assert_ne!(
+                reply.outcome_code,
+                ModelOutcome::Rejected.code(),
+                "{step} was refused with reason {}",
+                reply.reason_code
+            );
+            reply.outcome_code
+        };
+
+        // 1. acquire
+        let replies = machine
+            .apply([normal(1, acquire(1))])
+            .await
+            .expect("acquire");
+        assert_eq!(granted(&replies, "acquire"), ModelOutcome::Granted.code());
+        let epoch = published(&machine).await.model.resources[&resource()].epoch;
+
+        // 2. renew, fenced by what the acquire established
+        let replies = machine
+            .apply([normal(
+                2,
+                client(
+                    2,
+                    ActionV1::Renew(RenewActionV1 {
+                        fence: fence(epoch),
+                    }),
+                ),
+            )])
+            .await
+            .expect("renew");
+        assert_eq!(granted(&replies, "renew"), ModelOutcome::Renewed.code());
+
+        // 3. compare-and-set at the current value revision
+        let before = published(&machine).await;
+        let row = &before.model.resources[&resource()];
+        assert!(
+            row.held && row.holder == Some(ACTOR),
+            "still held after renew"
+        );
+        let replies = machine
+            .apply([normal(
+                3,
+                client(
+                    3,
+                    ActionV1::CompareAndSet(CompareAndSetActionV1 {
+                        fence: fence(row.epoch),
+                        expected_value_revision: row.value_revision,
+                        new_value: b"payload".to_vec(),
+                    }),
+                ),
+            )])
+            .await
+            .expect("compare and set");
+        assert_eq!(
+            granted(&replies, "compare_and_set"),
+            ModelOutcome::Mutated.code()
+        );
+
+        // 4. release with a final value
+        let before = published(&machine).await;
+        let row = &before.model.resources[&resource()];
+        assert_eq!(row.value, b"payload", "the CAS value is what the row holds");
+        let replies = machine
+            .apply([normal(
+                4,
+                client(
+                    4,
+                    ActionV1::ReleaseWithValue(ReleaseWithValueActionV1 {
+                        fence: fence(row.epoch),
+                        expected_value_revision: row.value_revision,
+                        final_value: b"final".to_vec(),
+                    }),
+                ),
+            )])
+            .await
+            .expect("release with value");
+        assert_eq!(
+            granted(&replies, "release_with_value"),
+            ModelOutcome::Released.code()
+        );
+
+        drop(shutdown);
+        drop(machine);
+        let (machine, _shutdown) = reopen(&dir);
+        let state = published(&machine).await;
+        let row = &state.model.resources[&resource()];
+        assert!(!row.held && row.holder.is_none(), "the lease was released");
+        assert_eq!(row.value, b"final", "and the final value is durable");
+        assert_eq!(state.model.audit.len(), 4, "one row per committed command");
+        assert_eq!(state.model.last_applied.map(|id| id.index), Some(4));
+    }
+
+    /// A membership intent is accepted, then cancelled, and both survive a
+    /// reopen.
+    ///
+    /// `cancel_membership` is the fourth operation the long history never
+    /// reaches: cancelling needs an intent in a cancellable phase at the moment
+    /// the command fires, and the generator's interleaving rarely leaves one.
+    #[tokio::test]
+    async fn a_membership_cancel_corridor_applies_and_survives_a_reopen() {
+        use crate::coordination::contract::{
+            CancelMembershipActionV1, ChangeMembershipActionV1, MemberSeedV1, NodeIdV1,
+        };
+        use crate::coordination::model::authority::testing as auth;
+        use crate::coordination::model::membership::{test_ticket, PHASE_CANCELLED, PHASE_PENDING};
+
+        let dir = scratch_dir();
+        // The corridor needs a running group: §12.1 admits at most two new
+        // voters per change, so a plan proposed against an empty membership is
+        // refused before it can be cancelled.
+        let database = seeded(&dir);
+        let voters: Vec<[u8; 32]> = (1u8..=3).map(|b| [b; 32]).collect();
+        let mut state = genesis_state();
+        state.model.membership =
+            crate::coordination::model::state::CommittedMembership::uniform(voters.clone());
+        let mut changes = ChangeSet::default();
+        changes.admins.extend(state.model.admins.iter().copied());
+        changes.grants.extend(state.model.acl.keys().cloned());
+        changes
+            .resources
+            .extend(state.model.resources.keys().cloned());
+        rows::commit(&database, state.clone(), &changes).expect("seed");
+        drop(database);
+
+        // The stored membership has to agree with the projection, so the store
+        // is opened through a state whose `StoredMembership` really names them.
+        let (mut machine, shutdown) = reopen(&dir);
+        machine
+            .apply([membership_entry(1, &voters)])
+            .await
+            .expect("the native membership entry");
+
+        let operation = [0x42u8; 16];
+        let seeds: Vec<MemberSeedV1> = voters
+            .iter()
+            .map(|node| MemberSeedV1 {
+                node_id: node.to_vec(),
+                ticket: String::from_utf8(test_ticket(node)).expect("a text ticket"),
+                // Already members, so §9 wants no join permit.
+                signed_join_permit: None,
+            })
+            .collect();
+        let plan = ChangeMembershipActionV1 {
+            operation_id: operation.to_vec(),
+            expected_membership_log_id: Some(crate::coordination::contract::LogIdV1 {
+                term: 1,
+                leader_node_id: LEADER.to_vec(),
+                index: 1,
+            }),
+            desired_voters: voters
+                .iter()
+                .map(|n| NodeIdV1 {
+                    node_id: n.to_vec(),
+                })
+                .collect(),
+            retained_learners: Vec::new(),
+            member_seeds: seeds,
+        };
+        let _ = auth::authority();
+
+        let replies = machine
+            .apply([normal(2, client(1, ActionV1::ChangeMembership(plan)))])
+            .await
+            .expect("accept");
+        let CommandReplyV1::Client(reply) = &replies[0] else {
+            panic!("expected a client reply");
+        };
+        assert_eq!(
+            reply.outcome_code,
+            ModelOutcome::MembershipAccepted.code(),
+            "the plan must be accepted, not refused with reason {}",
+            reply.reason_code
+        );
+        assert_eq!(
+            published(&machine).await.model.intents[&operation].status_code,
+            PHASE_PENDING
+        );
+
+        let replies = machine
+            .apply([normal(
+                3,
+                client(
+                    2,
+                    ActionV1::CancelMembership(CancelMembershipActionV1 {
+                        operation_id: operation.to_vec(),
+                        expected_phase_code: PHASE_PENDING,
+                    }),
+                ),
+            )])
+            .await
+            .expect("cancel");
+        let CommandReplyV1::Client(reply) = &replies[0] else {
+            panic!("expected a client reply");
+        };
+        assert_eq!(
+            reply.outcome_code,
+            ModelOutcome::MembershipCancelled.code(),
+            "cancelling a pending intent must succeed, not fail with reason {}",
+            reply.reason_code
+        );
+
+        drop(shutdown);
+        drop(machine);
+        let (machine, _shutdown) = reopen(&dir);
+        let state = published(&machine).await;
+        let intent = &state.model.intents[&operation];
+        assert_eq!(intent.status_code, PHASE_CANCELLED, "and it is durable");
+        assert!(
+            intent.completed_log_id.is_some(),
+            "a terminal intent carries the id it completed at"
+        );
+        assert_eq!(state.model.last_applied.map(|id| id.index), Some(3));
+    }
+
     // ── The batch ───────────────────────────────────────────────────────────
 
     /// A mixed batch produces one reply per entry, in order, and commits once.
@@ -1232,8 +1485,8 @@ mod tests {
         let restarted = published(&machine).await;
 
         assert_eq!(
-            running.model.members, restarted.model.members,
-            "the member set a restart derives must be the one the store was using"
+            running.model.membership, restarted.model.membership,
+            "the membership a restart derives must be the one the store was using"
         );
         assert_eq!(
             running.model.membership_log_id, restarted.model.membership_log_id,

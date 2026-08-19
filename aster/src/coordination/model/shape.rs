@@ -216,6 +216,14 @@ pub const PROFILE_DEV_SINGLE: i32 = 2;
 /// no fault tolerance and exists to make the even-quorum path testable.
 pub const PROFILE_DEV_EVEN: i32 = 3;
 
+/// Every profile §7.1 declares.
+///
+/// Listed so a stored code can be checked for membership in the set, which
+/// `profile_permits_voters` cannot answer on its own: it reports whether a
+/// *count* is permitted, and an unknown profile permits no count -- so a group
+/// that has committed no membership yet slips past it entirely.
+pub const PROFILES: [i32; 3] = [PROFILE_PROD, PROFILE_DEV_SINGLE, PROFILE_DEV_EVEN];
+
 /// How many voters in `desired` are not already committed members?
 pub fn new_voters(desired: &[[u8; 32]], current: &std::collections::BTreeSet<[u8; 32]>) -> usize {
     desired.iter().filter(|v| !current.contains(*v)).count()

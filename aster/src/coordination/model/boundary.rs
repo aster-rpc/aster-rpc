@@ -581,6 +581,7 @@ mod tests {
     };
     use crate::coordination::hash::request_hash;
     use crate::coordination::model::limits::ALL_RIGHTS;
+    use crate::coordination::model::state::CommittedMembership;
     use crate::coordination::model::state::ResourceKey;
     use crate::coordination::reason::{Outcome, Reason};
 
@@ -612,7 +613,7 @@ mod tests {
         // membership fixture cannot start from an empty committed set.
         s.authority = crate::coordination::model::authority::testing::authority();
         s.deployment_profile_code = crate::coordination::model::shape::PROFILE_PROD;
-        s.members = (1u8..=3).map(|b| [b; 32]).collect();
+        s.membership = CommittedMembership::uniform((1u8..=3).map(|b| [b; 32]));
         s.acl.insert((key(), ACTOR), ALL_RIGHTS);
         s.growth_bytes = s.recompute_growth();
         s.reserve_bytes = s.recompute_reserve();

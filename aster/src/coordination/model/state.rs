@@ -404,6 +404,56 @@ pub struct GroupAuthority {
     pub genesis_hash: [u8; 32],
 }
 
+/// The committed membership as §9 and §7.3 need to read it.
+///
+/// Derived from OpenRaft's own `Membership` at every open and at every native
+/// membership entry, never stored beside it: §11.3 persists the
+/// `StoredMembership` and nothing else, so anything kept separately would be
+/// re-derived differently at the next restart.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommittedMembership {
+    /// The voters of the **final** configuration.
+    ///
+    /// During a joint change that is the configuration being moved *to*, which
+    /// is not yet the committed one -- see [`Self::joint`].
+    pub voters: BTreeSet<NodeId>,
+    /// Nodes the node map names that no configuration does.
+    pub learners: BTreeSet<NodeId>,
+    /// Whether a joint change is in flight, meaning more than one
+    /// configuration.
+    ///
+    /// §7.3's completion rule turns on this: a joint entry is the *middle* of a
+    /// change, and a plan that reports itself complete while one is in flight
+    /// has not observed the uniform membership it claims.
+    pub joint: bool,
+}
+
+impl CommittedMembership {
+    /// A uniform committed membership of `voters` and no learners.
+    ///
+    /// Test-only: production derives this from OpenRaft's own membership, and a
+    /// constructor that took a bare list would let a fixture assert a shape the
+    /// derivation never produces.
+    #[cfg(test)]
+    pub fn uniform(voters: impl IntoIterator<Item = NodeId>) -> Self {
+        Self {
+            voters: voters.into_iter().collect(),
+            learners: BTreeSet::new(),
+            joint: false,
+        }
+    }
+
+    /// Every node the membership names, whatever its role.
+    pub fn members(&self) -> BTreeSet<NodeId> {
+        self.voters.union(&self.learners).copied().collect()
+    }
+
+    /// Does the membership name this node at all?
+    pub fn contains(&self, node: &NodeId) -> bool {
+        self.voters.contains(node) || self.learners.contains(node)
+    }
+}
+
 /// The complete replicated state.
 ///
 /// `PartialEq` is derived deliberately: tests that assert "nothing changed"
@@ -458,13 +508,20 @@ pub struct State {
     /// them. A model that hard-codes the production rule both rejects valid
     /// development groups and proves nothing about where the decision came from.
     pub deployment_profile_code: i32,
-    /// The current committed voter and learner set.
+    /// The current committed membership, **with roles preserved**.
     ///
-    /// Kept beside the log id because §9 protects a route for a node **in the
-    /// current committed membership** from eviction, and a log id alone cannot
-    /// answer "is this node a member?". Storing only the id made that rule
-    /// unimplementable.
-    pub members: BTreeSet<NodeId>,
+    /// Kept beside the log id because §9 protects a route for a node in the
+    /// current committed membership from eviction, and a log id alone cannot
+    /// answer "is this node a member?".
+    ///
+    /// Roles rather than one combined set, because a combined set cannot answer
+    /// the question §7.3 asks at completion. A joint entry moving
+    /// `{A,B,C} -> {A,B,D}` with `C` retained as a learner has node map
+    /// `{A,B,C,D}`, which is exactly the union of the target voters and
+    /// retained learners -- so a completion predicate comparing combined sets
+    /// accepts the *joint* entry as though the final uniform membership had
+    /// landed, and accepts a voter/learner role swap too.
+    pub membership: CommittedMembership,
     /// The committed membership's log id, or `None` before the first change.
     ///
     /// `change_membership` carries an `expected_membership_log_id`, not a

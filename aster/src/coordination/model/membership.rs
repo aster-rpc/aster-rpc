@@ -315,7 +315,7 @@ pub fn decide_change(
     // request. These were declared and had no caller.
     if let Some(limit) = plan_shape(
         &action.plan,
-        &state.members,
+        &state.membership.members(),
         &state.authority,
         state.deployment_profile_code,
     ) {
@@ -497,7 +497,7 @@ fn route_evictions(state: &State, incoming: &[(NodeId, Route)]) -> Vec<NodeId> {
     let mut candidates: Vec<((u64, u64), NodeId)> = state
         .routes
         .iter()
-        .filter(|(node, _)| !state.members.contains(*node))
+        .filter(|(node, _)| !state.membership.contains(node))
         .filter(|(node, _)| !incoming.iter().any(|(n, _)| n == *node))
         .map(|(node, route)| {
             (
@@ -644,13 +644,26 @@ pub fn decide_progress(state: &State, command: &MembershipProgressCommand) -> Op
 /// Has the native membership entry this completion report claims already been
 /// applied?
 ///
-/// Two questions, and both are about **committed** state rather than about the
-/// report: the id the controller says it observed must be the one the group
-/// committed, and the members that entry established must already be the
-/// plan's target. A report that passes both tells us nothing new, which is
-/// exactly the point -- it is a phase transition, not a membership change.
+/// Four questions, and every one is about **committed** state rather than about
+/// the report. A report that passes them all tells us nothing new, which is
+/// exactly the point: it is a phase transition, not a membership change.
 ///
-/// Failing either is a phase-mismatch no-op rather than a rejection: the
+/// The roles are load-bearing. An earlier revision compared the plan's target
+/// against a single combined member set, and a normal joint transition slips
+/// straight through that:
+///
+/// ```text
+/// old voters      {A, B, C}
+/// target voters   {A, B, D}   retained learner {C}
+/// joint node map  {A, B, C, D}
+/// target union    {A, B, C, D}
+/// ```
+///
+/// The joint entry -- the *middle* of the change -- is accepted as though the
+/// final uniform membership had landed, and a voter/learner role swap passes
+/// for the same reason.
+///
+/// Failing any of them is a phase-mismatch no-op rather than a rejection: the
 /// controller retries after every membership entry, so a report that arrives
 /// before its entry is ordinary and must commit harmlessly.
 fn completion_is_observable(
@@ -658,17 +671,20 @@ fn completion_is_observable(
     intent: &Intent,
     command: &MembershipProgressCommand,
 ) -> bool {
+    // The exact entry, not merely some entry.
     if command.observed_membership_log_id != state.membership_log_id {
         return false;
     }
-    let target: std::collections::BTreeSet<NodeId> = intent
-        .plan
-        .desired_voters
-        .iter()
-        .chain(&intent.plan.retained_learners)
-        .copied()
-        .collect();
-    state.members == target
+    // A joint membership is a change still in flight. Nothing that observes one
+    // has observed a completed change.
+    if state.membership.joint {
+        return false;
+    }
+    let voters: std::collections::BTreeSet<NodeId> =
+        intent.plan.desired_voters.iter().copied().collect();
+    let learners: std::collections::BTreeSet<NodeId> =
+        intent.plan.retained_learners.iter().copied().collect();
+    state.membership.voters == voters && state.membership.learners == learners
 }
 
 /// The system result code a progress report records.
@@ -711,6 +727,7 @@ fn evictions(state: &State, incoming_terminal: u64) -> Vec<OperationId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::model::state::CommittedMembership;
     use crate::coordination::model::state::MemberSeed;
     use crate::coordination::reason::Reason;
 
@@ -739,7 +756,7 @@ mod tests {
         s.admin_revision = 1;
         s.authority = authority::testing::authority();
         s.deployment_profile_code = shape::PROFILE_PROD;
-        s.members = nodes(&[1, 2, 3]).into_iter().collect();
+        s.membership = CommittedMembership::uniform(nodes(&[1, 2, 3]));
         s.growth_bytes = s.recompute_growth();
         s
     }
@@ -1113,7 +1130,7 @@ mod tests {
     fn a_change_cannot_add_more_than_two_new_voters() {
         let s = base();
         // All three voters replaced.
-        let p = plan_against(&[7, 8, 9], &s.members);
+        let p = plan_against(&[7, 8, 9], &s.membership.members());
         assert_eq!(
             shapeless(decide_change(
                 &s,
@@ -1137,7 +1154,7 @@ mod tests {
                 &ChangeMembershipAction {
                     operation_id: op(1),
                     expected_membership_log_id: None,
-                    plan: plan_against(&[1, 8, 9], &s.members),
+                    plan: plan_against(&[1, 8, 9], &s.membership.members()),
                 }
             ),
             Decision::Apply(_)
@@ -1407,13 +1424,11 @@ mod tests {
         // permit is exactly the thing current-state validation would reject.
         let mut node9 = [0u8; 32];
         node9[0] = 9;
-        s.members = [nodes(&[1, 2])[0], nodes(&[1, 2])[1], node9]
-            .into_iter()
-            .collect();
+        s.membership = CommittedMembership::uniform([nodes(&[1, 2])[0], nodes(&[1, 2])[1], node9]);
         assert!(
             plan_shape(
                 &action.plan,
-                &s.members,
+                &s.membership.members(),
                 &s.authority,
                 s.deployment_profile_code
             )
@@ -1623,7 +1638,7 @@ mod tests {
     fn a_single_voter_group_can_change_its_membership() {
         let mut s = base();
         s.deployment_profile_code = shape::PROFILE_DEV_SINGLE;
-        s.members = nodes(&[1]).into_iter().collect();
+        s.membership = CommittedMembership::uniform(nodes(&[1]));
 
         let single = MembershipPlan {
             desired_voters: nodes(&[1]),
@@ -1755,7 +1770,7 @@ mod tests {
         // voter's can cost quorum.
         let mut oldest = [0u8; 32];
         oldest[31] = 0xAA;
-        s.members.insert(oldest);
+        s.membership.voters.insert(oldest);
 
         let e = effect(decide_change(
             &s,
@@ -1826,11 +1841,90 @@ mod tests {
         // plan whose target has not landed cannot complete even with a matching
         // id.
         let mut wrong_members = s.clone();
-        wrong_members.members = nodes(&[1, 2, 4]).into_iter().collect();
+        wrong_members.membership = CommittedMembership::uniform(nodes(&[1, 2, 4]));
         assert_eq!(
             decide_progress(&wrong_members, &report(Some(log(9)))),
             None,
             "the committed member set must already be the plan's target"
+        );
+    }
+
+    /// A completion report is refused when the roles differ, even though the
+    /// combined member set is identical.
+    ///
+    /// The case a union comparison cannot see at all, and the one the `joint`
+    /// check does not cover either: this membership is uniform, so it *looks*
+    /// like a settled change. Only comparing voters with voters and learners
+    /// with learners distinguishes "the plan landed" from "some other plan over
+    /// the same nodes landed".
+    ///
+    /// Verified by mutation: reverting to the union comparison passed every
+    /// other test.
+    #[test]
+    fn a_completion_report_is_refused_when_only_the_roles_differ() {
+        use crate::coordination::model::state::CommittedMembership;
+
+        let voters = nodes(&[1, 2, 3]);
+        let learner = nodes(&[4])[0];
+
+        let mut s = base();
+        s.membership_log_id = Some(log(9));
+        // What the plan asked for: three voters, one retained learner.
+        let mut intent = intent(PHASE_CHANGING_VOTERS, None);
+        intent.plan.desired_voters = voters.clone();
+        intent.plan.retained_learners = vec![learner];
+        s.intents.insert(op(1), intent);
+
+        let report = MembershipProgressCommand {
+            operation_id: op(1),
+            expected_phase: PHASE_CHANGING_VOTERS,
+            new_phase: PHASE_COMPLETED,
+            result_code: 0,
+            observed_membership_log_id: Some(log(9)),
+        };
+
+        // What committed instead: the same four nodes, one role swapped. A
+        // union comparison sees no difference whatsoever.
+        let swapped = {
+            let mut v = voters.clone();
+            v.pop();
+            v.push(learner);
+            v.sort_unstable();
+            v
+        };
+        let dropped = *voters.last().expect("a voter");
+        s.membership = CommittedMembership {
+            voters: swapped.into_iter().collect(),
+            learners: std::collections::BTreeSet::from([dropped]),
+            joint: false,
+        };
+        let plan_union: std::collections::BTreeSet<NodeId> =
+            voters.iter().copied().chain([learner]).collect();
+        assert_eq!(
+            s.membership.members(),
+            plan_union,
+            "the swap must leave the combined set identical, or this proves nothing"
+        );
+        assert!(
+            !s.membership.joint,
+            "and uniform, so `joint` cannot catch it"
+        );
+
+        assert_eq!(
+            decide_progress(&s, &report),
+            None,
+            "a membership over the right nodes in the wrong roles is not this plan"
+        );
+
+        // With the roles as the plan asked, the same report completes.
+        s.membership = CommittedMembership {
+            voters: voters.into_iter().collect(),
+            learners: std::collections::BTreeSet::from([learner]),
+            joint: false,
+        };
+        assert!(
+            decide_progress(&s, &report).is_some(),
+            "and the plan's own shape completes"
         );
     }
 
