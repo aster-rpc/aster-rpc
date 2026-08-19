@@ -28,6 +28,15 @@ pub const JOIN_DOMAIN: &[u8] = b"aster-coordination/join/v1\0";
 /// The `format_version` a v1 permit and its envelope must declare.
 pub const PERMIT_FORMAT_VERSION: u32 = 1;
 
+/// The protocol limit on an authority domain: 128 ASCII bytes.
+///
+/// Named because it is a *protocol* bound rather than the generic
+/// [`MAX_WIRE_STRING`] ceiling that applies to opaque strings. Storage sizing
+/// needs the real one — using the generic 4095 to build a "maximal legal"
+/// value overstates legal state by a factor of thirty, which is exactly the
+/// mistake that produced a bogus worst-case measurement.
+pub const MAX_AUTHORITY_DOMAIN_BYTES: usize = 128;
+
 /// Why a signed join permit was refused.
 ///
 /// One variant per reason, not a single `Invalid`: an operator holding a permit
@@ -145,7 +154,7 @@ fn check_permit(
         || permit.candidate_node_id.len() != 32
         || permit.join_nonce.len() != 32
         || permit.authority_domain.is_empty()
-        || permit.authority_domain.len() > 128
+        || permit.authority_domain.len() > MAX_AUTHORITY_DOMAIN_BYTES
         || !permit.authority_domain.is_ascii()
         || permit.candidate_ticket.is_empty()
         || permit.candidate_ticket.len() > MAX_WIRE_STRING
