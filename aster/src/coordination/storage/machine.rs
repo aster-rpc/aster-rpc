@@ -280,11 +280,14 @@ impl StateActor {
                 "injected commit failure",
             ));
         }
-        rows::commit(&self.database, &working, &changes)?;
-
-        // Publication is the last thing that happens, and only once the commit
-        // has returned.
-        self.state = working;
+        // Publication and the commit are one statement, and deliberately: the
+        // working copy is *moved* into `rows::commit` and comes back only if
+        // the commit returned, so there is no committed-looking state to
+        // publish early. The ordering is unobservable from outside -- a commit
+        // failure latches fatal before it replies, and a fatal store answers
+        // nothing further -- so it is carried by the signature rather than by a
+        // test whose name would imply it had been checked.
+        self.state = rows::commit(&self.database, working, &changes)?;
         Ok(replies)
     }
 }
@@ -590,7 +593,7 @@ mod tests {
         let mut changes = ChangeSet::default();
         changes.admins.extend(state.model.admins.iter().copied());
         changes.grants.extend(state.model.acl.keys().cloned());
-        rows::commit(&database, &state, &changes).expect("seed");
+        rows::commit(&database, state.clone(), &changes).expect("seed");
         // Written with the codec version the loader checks, exactly as
         // `schema::open` would.
         let write = super::super::schema::durable_write(&database, Db::State).expect("write");
@@ -961,7 +964,7 @@ mod tests {
         changes.admins.extend(state.model.admins.iter().copied());
         changes.grants.extend(state.model.acl.keys().cloned());
         changes.resources.insert(resource());
-        rows::commit(&database, &state, &changes).expect("seed the exhausted row");
+        rows::commit(&database, state.clone(), &changes).expect("seed the exhausted row");
         drop(database);
 
         let (mut machine, shutdown) = reopen(&dir);
@@ -1145,12 +1148,21 @@ mod tests {
         assert_eq!(state.model.audit.len(), 2, "one row per *command* entry");
     }
 
-    /// A batch whose commit fails publishes nothing: not the memory, not the
-    /// disk, and not a success to OpenRaft.
+    /// A batch whose commit fails leaves the disk untouched, reports the
+    /// failure, and latches the store fatal.
     ///
     /// The case §4.4 is about. Every entry in the batch has already mutated the
     /// working copy by the time the commit is attempted, so this is the exact
     /// shape in which memory could run ahead of disk.
+    ///
+    /// **What this does not check**, deliberately: whether the working copy was
+    /// published in memory. It cannot. A commit failure is always sticky, the
+    /// actor latches fatal *before* it replies, and a fatal store refuses
+    /// everything afterwards -- so no reader exists that could tell the two
+    /// apart. Mutation confirmed it: moving the publication above the commit
+    /// passed all 576 tests. That ordering is carried by `rows::commit` taking
+    /// the working state by value and handing it back only on success, which
+    /// is a form that cannot be got wrong rather than a claim about coverage.
     #[tokio::test]
     async fn a_failed_commit_publishes_neither_memory_nor_disk() {
         let dir = scratch_dir();
@@ -1169,14 +1181,11 @@ mod tests {
         );
         assert!(machine.handle().is_fatal(), "durability is in question");
 
-        // Memory: unchanged. The published state is still the one that was
-        // committed, not the working copy the batch mutated.
-        assert!(
-            machine.handle().published().await.is_err(),
-            "a fatal store answers nothing further"
-        );
+        // A fatal store answers nothing further -- which is also why the
+        // in-memory half of §4.4 is unobservable here; see the note above.
+        assert!(machine.handle().published().await.is_err());
 
-        // Disk: unchanged too, which is what a reopen shows.
+        // Disk: unchanged, which is what a reopen shows.
         drop(shutdown);
         drop(machine);
         let (machine, _shutdown) = reopen(&dir);
@@ -1236,7 +1245,7 @@ mod tests {
             public_key: not_a_key,
             ..state.model.authority
         };
-        rows::commit(&database, &state, &ChangeSet::default()).expect("write the bad meta");
+        rows::commit(&database, state.clone(), &ChangeSet::default()).expect("write the bad meta");
         drop(database);
 
         let database = Database::create(dir.join("state.redb")).expect("reopen");

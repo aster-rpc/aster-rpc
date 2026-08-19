@@ -765,11 +765,26 @@ fn validate_rows(state: &DurableState) -> StorageResult<()> {
 /// Every encode goes through [`encode_committed`]: these values are the result
 /// of entries the group has already decided apply, so a value that will not
 /// encode has no retry available and must not report one (§4.4).
+///
+/// ## Why it takes the state by value and hands it back
+///
+/// So that publishing a state that was not committed is not expressible. The
+/// caller gives up its working copy to call this and does not get one back
+/// until the commit has returned, which makes "memory never moves ahead of
+/// disk" a property of the signature rather than of the order two statements
+/// happen to be written in.
+///
+/// That ordering cannot be tested from outside. A commit failure always latches
+/// the store fatal *before* it replies, and a fatal store answers nothing
+/// further, so no reader can ever observe a state published early — verified by
+/// mutation: moving the publication one line earlier passed all 576 tests. An
+/// untestable rule needs a form that cannot be got wrong rather than a test
+/// whose name implies it was checked.
 pub(crate) fn commit(
     database: &Database,
-    state: &DurableState,
+    state: DurableState,
     changes: &ChangeSet,
-) -> StorageResult<()> {
+) -> StorageResult<DurableState> {
     let group = state.group_id();
     let write = durable_write(database, Db::State)?;
 
@@ -912,7 +927,7 @@ pub(crate) fn commit(
         let bytes = encode_committed(
             Db::State,
             "CoordinationMetaV1",
-            &meta_to_wire(state),
+            &meta_to_wire(&state),
             MAX_COORDINATION_META_BYTES,
         )?;
         table
@@ -920,9 +935,8 @@ pub(crate) fn commit(
             .map_err(state_err)?;
     }
 
-    write
-        .commit()
-        .map_err(|source| StorageError::redb(Db::State, source))
+    write.commit().map_err(state_err)?;
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -1452,7 +1466,7 @@ mod tests {
         let (_dir, database) = scratch_database();
         let state = coherent_state();
 
-        commit(&database, &state, &every_row(&state)).expect("commit");
+        commit(&database, state.clone(), &every_row(&state)).expect("commit");
         let loaded = load(&database).expect("load");
 
         assert_eq!(loaded.model.resources, state.model.resources);
@@ -1481,7 +1495,7 @@ mod tests {
     fn a_recorded_deletion_removes_the_row_from_disk() {
         let (_dir, database) = scratch_database();
         let mut state = coherent_state();
-        commit(&database, &state, &every_row(&state)).expect("commit");
+        commit(&database, state.clone(), &every_row(&state)).expect("commit");
 
         let admin = *state.model.admins.iter().next().expect("an admin");
         state.model.admins.remove(&admin);
@@ -1489,7 +1503,7 @@ mod tests {
 
         let mut changes = ChangeSet::default();
         changes.admins.insert(admin);
-        commit(&database, &state, &changes).expect("commit the deletion");
+        commit(&database, state.clone(), &changes).expect("commit the deletion");
 
         let loaded = load(&database).expect("load");
         assert!(
@@ -1505,7 +1519,7 @@ mod tests {
     fn a_corrupt_row_is_refused_at_load() {
         let (_dir, database) = scratch_database();
         let state = coherent_state();
-        commit(&database, &state, &every_row(&state)).expect("commit");
+        commit(&database, state.clone(), &every_row(&state)).expect("commit");
 
         let key = *state.model.routes.keys().next().unwrap_or(&[0u8; 32]);
         let write = durable_write(&database, Db::State).expect("write");
@@ -1530,7 +1544,7 @@ mod tests {
     fn an_undefined_rights_bit_is_refused_at_load() {
         let (_dir, database) = scratch_database();
         let state = coherent_state();
-        commit(&database, &state, &every_row(&state)).expect("commit");
+        commit(&database, state.clone(), &every_row(&state)).expect("commit");
 
         let (resource, subject) = state.model.acl.keys().next().expect("a grant").clone();
         let write = durable_write(&database, Db::State).expect("write");
