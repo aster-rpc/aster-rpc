@@ -1991,15 +1991,58 @@ mod tests {
         );
     }
 
-    /// The envelope refusal is answered pre-proposal; a plan admitted before the
-    /// envelope filled is refused at apply, Consumed, saved and replayed.
+    /// A plan that introduces four nodes: two new voters and two new retained
+    /// learners.
     ///
-    /// The interleaving is **constructed**, not asserted about: the plan is
-    /// admitted against a state with room, the envelope then fills underneath
-    /// it, and the same plan is applied against the state that resulted. An
-    /// earlier version evaluated both halves against an already-full state,
-    /// which is a stage-3 denial and a forced apply of the same condition --
-    /// not a race, whatever its name said.
+    /// Shared so both tests below submit the *same* plan against different
+    /// memberships, which is what makes "admitted here, refused there" a
+    /// statement about the state rather than about two fixtures.
+    fn envelope_action(state: &State) -> crate::coordination::model::apply::Action {
+        let mut wider = nodes(&[1, 2, 3]);
+        wider.extend((0x91u8..0x93).map(|b| [b; 32]));
+        wider.sort_unstable();
+        let mut retained = vec![[0x94u8; 32], [0x95u8; 32]];
+        retained.sort_unstable();
+        let mut member_seeds: Vec<MemberSeed> = wider
+            .iter()
+            .chain(&retained)
+            .map(|node| MemberSeed {
+                node_id: *node,
+                ticket: test_ticket(node),
+                join_permit: (!state.membership.contains(node))
+                    .then(|| authority::testing::valid(node, &test_ticket(node))),
+            })
+            .collect();
+        member_seeds.sort_by_key(|seed| seed.node_id);
+        crate::coordination::model::apply::Action::ChangeMembership(ChangeMembershipAction {
+            operation_id: op(1),
+            expected_membership_log_id: state.membership_log_id,
+            plan: MembershipPlan {
+                desired_voters: wider,
+                retained_learners: retained,
+                member_seeds,
+            },
+        })
+    }
+
+    /// The envelope refusal is answered pre-proposal, and a **forced** commit of
+    /// the same command is saved and replayed.
+    ///
+    /// The second half is not a race, and an earlier version of this test
+    /// claimed it was. It cannot be one: `decide_change` compares
+    /// `expected_membership_log_id` *before* it reaches the envelope, only a
+    /// native membership entry changes the committed membership, and that entry
+    /// advances the membership log id too. So a membership that moved between
+    /// admission and apply is fenced by `13 MembershipRevisionMismatch` first --
+    /// see `a_membership_change_after_admission_is_fenced_by_the_revision_check`.
+    /// The old test manufactured the opposite by replacing the membership
+    /// without advancing its log id, which is a state no transition produces.
+    ///
+    /// What the second half really covers is §10.1's forced apply: an entry a
+    /// conforming leader would have denied at stage 3, proposed anyway by a
+    /// hostile or buggy one. Every voter must apply it identically, save the
+    /// answer, and replay it -- refusing to apply a committed entry is
+    /// divergence.
     ///
     /// Both halves, because getting the first wrong silently produces the
     /// second for *every* refusal: classifying 25 with the apply-time §9 rules
@@ -2007,9 +2050,9 @@ mod tests {
     /// terminal, for a condition §5.2 declares retryable. The client would have
     /// stopped retrying a plan that a cleanup would have let through.
     #[test]
-    fn the_envelope_refusal_is_denied_pre_proposal_and_saved_when_it_loses_the_race() {
+    fn the_envelope_refusal_is_denied_pre_proposal_and_a_forced_commit_is_saved() {
         use crate::coordination::model::apply::{
-            apply_client_command, preflight, Action, Admission, ClientRef,
+            apply_client_command, preflight, Admission, ClientRef,
         };
         use crate::coordination::model::state::CommittedMembership;
         use crate::coordination::reason::Disposition;
@@ -2023,32 +2066,7 @@ mod tests {
         };
         s.last_applied = Some(log(1));
 
-        let mut wider = voters.clone();
-        wider.extend((0x91u8..0x93).map(|b| [b; 32]));
-        wider.sort_unstable();
-        let mut retained = vec![[0x94u8; 32], [0x95u8; 32]];
-        retained.sort_unstable();
-        let mut member_seeds: Vec<MemberSeed> = wider
-            .iter()
-            .chain(&retained)
-            .map(|node| MemberSeed {
-                node_id: *node,
-                ticket: test_ticket(node),
-                join_permit: (!s.membership.contains(node))
-                    .then(|| authority::testing::valid(node, &test_ticket(node))),
-            })
-            .collect();
-        member_seeds.sort_by_key(|seed| seed.node_id);
-        let action = Action::ChangeMembership(ChangeMembershipAction {
-            operation_id: op(1),
-            expected_membership_log_id: None,
-            plan: MembershipPlan {
-                desired_voters: wider,
-                retained_learners: retained,
-                member_seeds,
-            },
-        });
-
+        let action = envelope_action(&s);
         let client = ClientRef {
             actor: ADMIN,
             client_id: [3u8; 16],
@@ -2065,29 +2083,10 @@ mod tests {
             "a leader must answer this before proposing"
         );
 
-        // Now the actual race. Rewind to a group with room -- the retained two
-        // rather than the stranded six -- where this same plan introduces four
-        // nodes, projects to exactly the envelope, and is admitted.
+        // §10.1's forced apply: the same entry, committed anyway. A voter that
+        // refused it would diverge from one that applied it, so it is applied,
+        // saved and replayed like any other committed rejection.
         let mut applied = s.clone();
-        applied.membership = CommittedMembership {
-            voters: voters.iter().copied().collect(),
-            learners: (0x81u8..0x83).map(|b| [b; 32]).collect(),
-            joint: false,
-        };
-        assert_eq!(
-            preflight(&applied, &client, &action),
-            Admission::Admit,
-            "with room the leader proposes it, which is what makes the race possible"
-        );
-
-        // Between that admission and this entry's apply, another change strands
-        // two more learners. The plan the leader already proposed now projects
-        // past the envelope.
-        applied.membership = s.membership.clone();
-
-        // Refused at apply, and *that* one is Consumed and saved -- the ordinary
-        // stage-3 shape, not an exception -- so the client's retry replays it
-        // rather than being reclassified.
         let first = apply_client_command(&mut applied, log(2), &client, &action).expect("no fault");
         assert_eq!(first.disposition, Disposition::Consumed);
         assert_eq!(first.reply.reason, Reason::MembershipLearnerEnvelope);
@@ -2110,6 +2109,76 @@ mod tests {
             apply_client_command(&mut applied, log(3), &client, &action).expect("no fault");
         assert!(replayed.replayed, "answered from the session table");
         assert_eq!(replayed.reply, first.reply, "and replayed exactly");
+    }
+
+    /// A membership that moves between admission and apply is fenced by
+    /// `13 MembershipRevisionMismatch`, not by the envelope.
+    ///
+    /// This is the genuine interleaving, and it is why the envelope cannot lose
+    /// a race: the two facts move together. Only a native membership entry
+    /// changes `CommittedMembership`, that entry advances `membership_log_id`,
+    /// and `decide_change` compares the expected log id before it reaches the
+    /// envelope. A plan admitted against one membership therefore meets the
+    /// revision check first when it applies against another.
+    #[test]
+    fn a_membership_change_after_admission_is_fenced_by_the_revision_check() {
+        use crate::coordination::model::apply::{
+            apply_client_command, preflight, Admission, ClientRef,
+        };
+        use crate::coordination::model::state::CommittedMembership;
+
+        let voters = nodes(&[1, 2, 3]);
+        let mut s = base();
+        // Room for the plan: the retained two, so introducing four projects to
+        // exactly the envelope.
+        s.membership = CommittedMembership {
+            voters: voters.iter().copied().collect(),
+            learners: (0x81u8..0x83).map(|b| [b; 32]).collect(),
+            joint: false,
+        };
+        s.membership_log_id = None;
+        s.last_applied = Some(log(1));
+
+        let action = envelope_action(&s);
+        let client = ClientRef {
+            actor: ADMIN,
+            client_id: [3u8; 16],
+            sequence: 1,
+            request_hash: [4u8; 32],
+        };
+        assert_eq!(
+            preflight(&s, &client, &action),
+            Admission::Admit,
+            "with room the leader proposes it"
+        );
+
+        // A native membership entry lands in between. It strands four more
+        // learners -- taking the group from the retained two to the full
+        // envelope of six -- **and** advances the membership log id, because the
+        // storage layer derives both from the same entry.
+        let mut applied = s.clone();
+        applied.membership = CommittedMembership {
+            voters: voters.iter().copied().collect(),
+            learners: (0x81u8..0x87).map(|b| [b; 32]).collect(),
+            joint: false,
+        };
+        applied.membership_log_id = Some(log(2));
+
+        // The plan now projects to ten, but that is not what refuses it: the
+        // revision check runs first, and reports the condition the client can
+        // actually act on -- resubmit against the membership that exists.
+        let result =
+            apply_client_command(&mut applied, log(3), &client, &action).expect("no fault");
+        assert_eq!(
+            result.reply.reason,
+            Reason::MembershipRevisionMismatch,
+            "the membership moved, and that is the fence"
+        );
+        assert_ne!(
+            result.reply.reason,
+            Reason::MembershipLearnerEnvelope,
+            "the envelope is unreachable here, which is why the earlier `race` test was wrong"
+        );
     }
 
     /// The refusal is a §10 stage-3 coordination outcome, not a request-shape
