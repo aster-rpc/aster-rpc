@@ -743,24 +743,21 @@ pub(crate) fn validate_meta(state: &DurableState) -> StorageResult<()> {
             ));
         }
     }
-    // §9 bounds retained and transient learners **independently** at two each,
-    // so a membership mid-change legally names four. Reading the retained bound
-    // as the total made a group in `AddingLearners` unreopenable: it had added
-    // its transient learners and could no longer load them back.
+    // §9's learner envelope: the departing retained learners, the new voters
+    // the controller has added as learners and not yet promoted, and the
+    // arriving retained learners. See `shape::MAX_LEARNER_ENVELOPE` for why the
+    // sum is the bound and not the retained cap.
     //
-    // The envelope is checked here, on the membership alone. The tighter
-    // settled-state rule needs to know whether a change is in flight, which is
-    // a question about the intent table, so it lives in `intent-row-shape`.
-    let envelope = shape::MAX_RETAINED_LEARNERS + shape::MAX_TRANSIENT_LEARNERS;
-    if model.membership.learners.len() > envelope {
+    // There is no tighter settled-state rule. `Failed` is reachable from any
+    // active phase and changes no membership, so a group can legally sit at the
+    // envelope with nothing in flight.
+    if model.membership.learners.len() > shape::MAX_LEARNER_ENVELOPE {
         return Err(bad(
             "membership",
             format!(
-                "{} learners, over the {envelope}-learner envelope ({} retained plus {} \
-                 transient)",
+                "{} learners, over the {}-learner envelope",
                 model.membership.learners.len(),
-                shape::MAX_RETAINED_LEARNERS,
-                shape::MAX_TRANSIENT_LEARNERS
+                shape::MAX_LEARNER_ENVELOPE
             ),
         ));
     }
@@ -2143,7 +2140,8 @@ mod tests {
         );
         assert_eq!(
             state.model.membership.learners.len(),
-            shape::MAX_RETAINED_LEARNERS
+            shape::MAX_LEARNER_ENVELOPE,
+            "the whole envelope, which is what the validator admits"
         );
         assert!(
             state.model.membership.joint,
@@ -2515,14 +2513,14 @@ mod tests {
                 "at most two",
             ),
             (
-                // Five, not three: §9 bounds retained and transient learners at
-                // two **each**, so four is inside the envelope and a group
-                // mid-change legally holds them.
-                "more learners than the retained-plus-transient envelope",
+                // Seven, not three: the envelope is the departing retained
+                // learners plus the unpromoted new voters plus the arriving
+                // retained learners, so six is a state a legal plan reaches.
+                "more learners than the mid-change envelope",
                 stored(
                     MembershipV1 {
                         configs: vec![set(&[1, 2, 3])],
-                        nodes: nodes(&[1, 2, 3, 5, 6, 7, 8, 9]),
+                        nodes: nodes(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
                     },
                     applied(100),
                 ),

@@ -127,13 +127,13 @@ use crate::coordination::raft::CoordinationMetaV1;
 /// - old config: `MAX_VOTERS` voters, `0..5`
 /// - new config: the three retained from old, plus `MAX_NEW_VOTERS` new
 /// - node map: the seven-node union, **plus** up to
-///   `MAX_RETAINED_LEARNERS` learners
+///   the full `MAX_LEARNER_ENVELOPE`, which is what the validator admits
 ///
 /// Learners are the reason the node map is not simply the union: OpenRaft
 /// represents them as nodes outside every config, so an exact-union
 /// assertion would have excluded them and understated the maximum.
 pub(crate) fn maximal_reachable_membership() -> crate::coordination::raft::MembershipV1 {
-    use crate::coordination::model::shape::{MAX_NEW_VOTERS, MAX_RETAINED_LEARNERS, MAX_VOTERS};
+    use crate::coordination::model::shape::{MAX_LEARNER_ENVELOPE, MAX_NEW_VOTERS, MAX_VOTERS};
     use crate::coordination::raft::{MembershipV1, NodeEntryV1, NodeIdSetV1, NodeIdV1};
 
     let node_id = |n: usize| vec![n as u8; 32];
@@ -165,7 +165,12 @@ pub(crate) fn maximal_reachable_membership() -> crate::coordination::raft::Membe
     let mut members: Vec<usize> = old.into_iter().chain(new).collect();
     members.sort_unstable();
     members.dedup();
-    let learners: Vec<usize> = (100..100 + MAX_RETAINED_LEARNERS).collect();
+    // The full §9 envelope, not the retained pair. The widest node map the
+    // validator admits is a joint membership carrying every learner a change
+    // can transiently hold, and the metadata ceiling has to admit whatever the
+    // validator does -- so this is sized against the check rather than against
+    // the narrower shape a joint entry happens to reach.
+    let learners: Vec<usize> = (100..100 + MAX_LEARNER_ENVELOPE).collect();
 
     MembershipV1 {
         configs,

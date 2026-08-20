@@ -117,11 +117,18 @@ pub(crate) const MAX_META_SCALAR_BYTES: usize = 4 * 1024;
 /// test that "proved" it pinned the same false oracle.
 ///
 /// What it must satisfy is that anything this ceiling *admits* still fits in a
-/// header once wrapped. The maximal legal meta measures 5607 bytes — bounded
-/// by `MAX_WIRE_STRING` for the authority domain and `MAX_VOTERS` for the
-/// joint membership — and the header envelope around it measures 171. 16 KiB
-/// leaves roughly threefold headroom for fields added later while keeping
-/// `16384 + envelope` far below the 64 KiB header bound.
+/// header once wrapped. The maximal legal meta measures **1849 bytes**: a joint
+/// membership at `MAX_VOTERS` with the whole §9 learner envelope outside it —
+/// thirteen node entries — plus a 128-byte authority domain and every optional
+/// present. The header envelope around it is measured separately in the same
+/// test. 16 KiB leaves close to ninefold headroom for fields added later while
+/// keeping `16384 + envelope` far below the 64 KiB header bound.
+///
+/// The figure moved twice and both moves are worth recording: it was 5607 when
+/// the domain was sized at the generic `MAX_WIRE_STRING` rather than §7.1's
+/// 128 bytes, and it grew again when the learner envelope widened from two to
+/// six. Neither moved the ceiling, which is the point of leaving this much
+/// room.
 ///
 /// Both directions are proved by measurement in
 /// `the_meta_ceiling_admits_only_snapshottable_rows`, not asserted here.
@@ -2281,7 +2288,7 @@ mod tests {
     #[test]
     fn the_maximal_membership_is_reachable_and_round_trips() {
         use crate::coordination::model::shape::{
-            profile_permits_voters, MAX_NEW_VOTERS, MAX_RETAINED_LEARNERS, MAX_VOTERS, PROFILE_PROD,
+            profile_permits_voters, MAX_LEARNER_ENVELOPE, MAX_NEW_VOTERS, MAX_VOTERS, PROFILE_PROD,
         };
         use crate::coordination::typeconfig::{CoordinationNode, CoordinationTypeConfig};
         use openraft::Membership;
@@ -2323,8 +2330,8 @@ mod tests {
         let learners: BTreeSet<Vec<u8>> = nodes.difference(&voters).cloned().collect();
         assert_eq!(
             learners.len(),
-            MAX_RETAINED_LEARNERS,
-            "the maximum retains MAX_RETAINED_LEARNERS learners outside the configs"
+            MAX_LEARNER_ENVELOPE,
+            "the maximum carries the whole §9 learner envelope outside the configs"
         );
 
         // And it is a real OpenRaft membership, through the same mirror

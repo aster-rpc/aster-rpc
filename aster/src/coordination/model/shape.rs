@@ -166,13 +166,25 @@ pub const MIN_VOTERS: usize = 3;
 pub const MAX_VOTERS: usize = 5;
 pub const MAX_RETAINED_LEARNERS: usize = 2;
 
-/// §9's *other* learner bound: the learners a change adds while it is being
-/// applied.
+/// The learners a membership can name while a change is being applied.
 ///
-/// "Retained and transient learners are each bounded to two", so a membership
-/// mid-change can legally name four. Reading the retained bound as the total is
-/// what makes a group in `AddingLearners` unreopenable.
-pub const MAX_TRANSIENT_LEARNERS: usize = 2;
+/// Three groups, each bounded by a cap already declared, and the sum is what a
+/// node map has to hold mid-change rather than a fourth constant:
+///
+/// * the retained learners the change is **replacing**, which §9 removes only
+///   at step 5, after the joint transition;
+/// * the **new voters**, which the controller adds as learners at step 2 and
+///   promotes at step 4;
+/// * the retained learners the change is **arriving at**.
+///
+/// So six, from `2 + MAX_NEW_VOTERS + 2`. §9 bounds retained and transient
+/// learners at two *each*, and a plan may legally replace both learners while
+/// adding both new voters — nothing in §9 forbids it, and forbidding it would
+/// be a rule this implementation invented. An earlier envelope of four read the
+/// retained bound as the total and made that plan's own mid-change state
+/// unloadable.
+pub const MAX_LEARNER_ENVELOPE: usize =
+    MAX_RETAINED_LEARNERS + MAX_NEW_VOTERS + MAX_RETAINED_LEARNERS;
 
 /// §12.1: at most two **new** voter identities per change.
 ///
