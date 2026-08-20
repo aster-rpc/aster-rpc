@@ -128,7 +128,8 @@ use crate::coordination::raft::CoordinationMetaV1;
 /// - node map: the seven-node union plus the full `MAX_LEARNER_ENVELOPE`
 ///
 /// Thirteen nodes. **No transition reaches that**, and
-/// `the_maximal_membership_is_reachable_and_round_trips` states the two
+/// `the_widest_admitted_membership_round_trips_and_bounds_both_reachable_peaks`
+/// states the two
 /// reachable peaks separately: five voters with six learners before the joint
 /// step, or seven voters with four after it -- eleven either way, because the
 /// two new voters are learners in the first and voters in the second.

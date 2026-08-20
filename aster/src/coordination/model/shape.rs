@@ -131,6 +131,30 @@ shape_limits! {
         "a membership plan would exceed the learner envelope before it settles",
 }
 
+/// The `retain` flag §7.3 step 4 passes to `change_membership`.
+///
+/// **False, normatively.** OpenRaft's `retain = true` turns every member absent
+/// from the new voter set into a learner, so a plan that removes voters adds
+/// learners the plan never named — and the projection below, which counts the
+/// nodes a plan *introduces*, cannot see them.
+///
+/// The counterexample is a shrink: five voters and six stranded learners,
+/// cleaning up to three voters. It introduces no node, so the projection is six
+/// and admission accepts it. Under `retain = true` the two departing voters
+/// become learners, the committed uniform membership carries eight, and the
+/// storage layer — correctly — refuses to persist a membership it could not
+/// reopen, on every voter at once.
+///
+/// `retain = false` removes them instead, which is also what §9 already
+/// expresses: a departing voter that should stay is named in the plan's
+/// `retained_learners`, and is then a current member rather than an
+/// introduction. Nothing is lost and the projection becomes exact.
+///
+/// A constant rather than an argument, for the same reason the storage codec
+/// version is: a controller that could be *asked* to retain could commit a
+/// membership no voter can load.
+pub const MEMBERSHIP_RETAIN: bool = false;
+
 /// The learners a plan's execution would transiently hold.
 ///
 /// §7.3 step 2 adds every node the plan names that is not already a member, and
@@ -143,6 +167,10 @@ shape_limits! {
 /// transient learners in the node map with no intent active, so the next plan
 /// starts from six rather than two; without this the envelope ratcheted, and a
 /// second plan produced a membership the store applied and could not reopen.
+///
+/// This counts introductions only, which is exact **because**
+/// [`MEMBERSHIP_RETAIN`] is false: a departing voter is removed rather than
+/// demoted, so no learner appears that the plan did not name.
 pub fn projected_learners(
     current_learners: &std::collections::BTreeSet<[u8; 32]>,
     current_members: &std::collections::BTreeSet<[u8; 32]>,

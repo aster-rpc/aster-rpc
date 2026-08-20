@@ -1733,6 +1733,102 @@ mod tests {
         assert!(membership.membership().nodes().next().is_none());
     }
 
+    /// The §7.3 shrink that `retain = true` would have made unloadable.
+    ///
+    /// Five voters and six stranded learners, cleaning up to three voters. The
+    /// plan introduces no node, so admission's projection is six and it is
+    /// accepted -- correctly. What the controller then commits depends entirely
+    /// on a flag §7.3 did not specify:
+    ///
+    /// * `retain = false` removes the two departing voters, leaving the six
+    ///   learners that were already there. Within the envelope, and it loads.
+    /// * `retain = true` turns them into learners, giving eight. Over the
+    ///   envelope, so the store refuses it -- on every voter at once, because
+    ///   every voter applies the same committed entry.
+    ///
+    /// Both memberships are built here rather than driven through a controller,
+    /// because the controller is Slice 3's. What this pins is that the choice
+    /// matters and which way it goes.
+    #[tokio::test]
+    async fn a_shrink_commits_only_under_the_normative_retain_mode() {
+        use crate::coordination::model::shape::{MAX_LEARNER_ENVELOPE, MEMBERSHIP_RETAIN};
+        use openraft::Membership;
+
+        // No assertion on the constant itself -- it is a compile-time value, and
+        // asserting a literal against itself proves nothing. The first half of
+        // this test *uses* it, so flipping it to true makes that half fail with
+        // the eight-learner refusal the second half describes. That is the
+        // stronger statement anyway: the constant is load-bearing, not
+        // documented.
+
+        let node = |b: u8| CoordinationNodeId::from_array([b; 32]);
+        let stranded: Vec<CoordinationNodeId> = (0..MAX_LEARNER_ENVELOPE)
+            .map(|n| node(0x80 + n as u8))
+            .collect();
+        let departing = [node(4), node(5)];
+
+        // What each flag commits, given voters {1..5} shrinking to {1,2,3}.
+        let membership = |retain: bool| {
+            let voters: std::collections::BTreeSet<CoordinationNodeId> =
+                (1u8..=3).map(node).collect();
+            let mut nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
+                voters.iter().map(|id| (*id, CoordinationNode)).collect();
+            for learner in &stranded {
+                nodes.insert(*learner, CoordinationNode);
+            }
+            if retain {
+                for leaving in departing {
+                    nodes.insert(leaving, CoordinationNode);
+                }
+            }
+            Membership::new(vec![voters], nodes)
+        };
+
+        // The normative mode: the learners already there, and nothing added.
+        let dir = scratch_dir();
+        let (mut removing, shutdown) = machine(&dir);
+        removing
+            .apply([Entry {
+                log_id: log_id(1),
+                payload: EntryPayload::Membership(membership(MEMBERSHIP_RETAIN)),
+            }])
+            .await
+            .expect("a shrink under retain = false commits");
+        let running = published(&removing).await;
+        assert_eq!(
+            running.model.membership.learners.len(),
+            MAX_LEARNER_ENVELOPE
+        );
+        assert_eq!(running.model.membership.voters.len(), 3);
+
+        drop(shutdown);
+        drop(removing);
+        let (restarted, restarted_shutdown) = reopen(&dir);
+        assert_eq!(
+            published(&restarted).await.model.membership,
+            running.model.membership,
+            "and it reopens"
+        );
+        drop(restarted_shutdown);
+        drop(restarted);
+
+        // The mode §7.3 now forbids, and what it would have cost.
+        let dir = scratch_dir();
+        let (mut retaining, _shutdown) = machine(&dir);
+        let err = retaining
+            .apply([Entry {
+                log_id: log_id(1),
+                payload: EntryPayload::Membership(membership(true)),
+            }])
+            .await
+            .expect_err("retain = true demotes the departing voters");
+        assert!(format!("{err:?}").contains("envelope"), "{err:?}");
+        assert!(
+            retaining.handle().is_fatal(),
+            "and it would have been fatal on every voter, not one"
+        );
+    }
+
     /// Sixty-four terminal intents *and* one active reopens.
     ///
     /// §9: "if all 64 slots hold terminal intents and one is active, a new
