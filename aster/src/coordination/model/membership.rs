@@ -1991,8 +1991,15 @@ mod tests {
         );
     }
 
-    /// The envelope refusal is answered pre-proposal, and a racing one that
-    /// reaches the log is Consumed, saved and replayed exactly.
+    /// The envelope refusal is answered pre-proposal; a plan admitted before the
+    /// envelope filled is refused at apply, Consumed, saved and replayed.
+    ///
+    /// The interleaving is **constructed**, not asserted about: the plan is
+    /// admitted against a state with room, the envelope then fills underneath
+    /// it, and the same plan is applied against the state that resulted. An
+    /// earlier version evaluated both halves against an already-full state,
+    /// which is a stage-3 denial and a forced apply of the same condition --
+    /// not a race, whatever its name said.
     ///
     /// Both halves, because getting the first wrong silently produces the
     /// second for *every* refusal: classifying 25 with the apply-time §9 rules
@@ -2000,7 +2007,7 @@ mod tests {
     /// terminal, for a condition §5.2 declares retryable. The client would have
     /// stopped retrying a plan that a cleanup would have let through.
     #[test]
-    fn the_envelope_refusal_is_denied_pre_proposal_and_saved_only_when_it_races() {
+    fn the_envelope_refusal_is_denied_pre_proposal_and_saved_when_it_loses_the_race() {
         use crate::coordination::model::apply::{
             apply_client_command, preflight, Action, Admission, ClientRef,
         };
@@ -2058,11 +2065,29 @@ mod tests {
             "a leader must answer this before proposing"
         );
 
-        // And the race: a plan admitted before the envelope filled, refused at
-        // apply. That one *is* Consumed and saved -- the ordinary stage-3 shape,
-        // not an exception -- so the client's retry replays it rather than
-        // being reclassified.
+        // Now the actual race. Rewind to a group with room -- the retained two
+        // rather than the stranded six -- where this same plan introduces four
+        // nodes, projects to exactly the envelope, and is admitted.
         let mut applied = s.clone();
+        applied.membership = CommittedMembership {
+            voters: voters.iter().copied().collect(),
+            learners: (0x81u8..0x83).map(|b| [b; 32]).collect(),
+            joint: false,
+        };
+        assert_eq!(
+            preflight(&applied, &client, &action),
+            Admission::Admit,
+            "with room the leader proposes it, which is what makes the race possible"
+        );
+
+        // Between that admission and this entry's apply, another change strands
+        // two more learners. The plan the leader already proposed now projects
+        // past the envelope.
+        applied.membership = s.membership.clone();
+
+        // Refused at apply, and *that* one is Consumed and saved -- the ordinary
+        // stage-3 shape, not an exception -- so the client's retry replays it
+        // rather than being reclassified.
         let first = apply_client_command(&mut applied, log(2), &client, &action).expect("no fault");
         assert_eq!(first.disposition, Disposition::Consumed);
         assert_eq!(first.reply.reason, Reason::MembershipLearnerEnvelope);

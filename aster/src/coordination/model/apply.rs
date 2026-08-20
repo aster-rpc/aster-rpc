@@ -359,7 +359,7 @@ fn project_refusal(refusal: Option<RefusalReason>, shapeless: Option<ShapeLimit>
         (Some(RefusalReason::PermissionChanged), None) => {
             Admission::Status(StatusDenial::NotAuthorized)
         }
-        // Stage 3: exactly the four reason-coded admission denials.
+        // Stage 3: exactly the reason-coded admission denials §10 declares.
         (Some(reason), None) if reason.is_admission_denial() => Admission::Deny(reason),
         // Everything else is **admitted** precisely so it reaches the log and
         // commits a saved result. The clearest case is `6 AclRevisionMismatch`:
