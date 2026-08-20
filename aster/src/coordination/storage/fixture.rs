@@ -115,24 +115,32 @@ impl SuiteFixture {
 use super::identity::LOGICAL_SCHEMA_VERSION;
 use crate::coordination::raft::CoordinationMetaV1;
 
-/// The widest membership a production group can actually reach.
+/// The widest membership the **validator admits**, which is deliberately wider
+/// than any single transition reaches.
 ///
-/// Not "two disjoint five-voter configs". That shape is representable in
-/// OpenRaft and unreachable in Aster: it introduces five new voters at
-/// once, and `MAX_NEW_VOTERS` is two. An OpenRaft round trip proves
-/// OpenRaft representability, which is not the same claim.
-///
-/// The reachable maximum is one `ChangeMembership` step at its widest:
+/// This is the sizing fixture, and sizing has to be against what can be
+/// *loaded* rather than against what can be produced: the ceiling's job is to
+/// admit everything the validator does, so measuring it against a narrower
+/// shape would leave a gap between "accepted" and "storable".
 ///
 /// - old config: `MAX_VOTERS` voters, `0..5`
 /// - new config: the three retained from old, plus `MAX_NEW_VOTERS` new
-/// - node map: the seven-node union, **plus** up to
-///   the full `MAX_LEARNER_ENVELOPE`, which is what the validator admits
+/// - node map: the seven-node union plus the full `MAX_LEARNER_ENVELOPE`
+///
+/// Thirteen nodes. **No transition reaches that**, and
+/// `the_maximal_membership_is_reachable_and_round_trips` states the two
+/// reachable peaks separately: five voters with six learners before the joint
+/// step, or seven voters with four after it -- eleven either way, because the
+/// two new voters are learners in the first and voters in the second.
+/// Combining both peaks is what makes this conservative rather than reachable.
+///
+/// It is still not "two disjoint five-voter configs": that shape introduces
+/// five new voters at once and `MAX_NEW_VOTERS` is two.
 ///
 /// Learners are the reason the node map is not simply the union: OpenRaft
 /// represents them as nodes outside every config, so an exact-union
 /// assertion would have excluded them and understated the maximum.
-pub(crate) fn maximal_reachable_membership() -> crate::coordination::raft::MembershipV1 {
+pub(crate) fn widest_admitted_membership() -> crate::coordination::raft::MembershipV1 {
     use crate::coordination::model::shape::{MAX_LEARNER_ENVELOPE, MAX_NEW_VOTERS, MAX_VOTERS};
     use crate::coordination::raft::{MembershipV1, NodeEntryV1, NodeIdSetV1, NodeIdV1};
 
@@ -221,7 +229,7 @@ pub(crate) fn maximal_legal_meta() -> CoordinationMetaV1 {
         last_applied: log_id(9_000_000),
         membership: StoredMembershipV1 {
             log_id: log_id(8_999_000),
-            membership: maximal_reachable_membership(),
+            membership: widest_admitted_membership(),
         },
         admin_revision: 1_000_000,
         recovery_export_hash: Some(vec![0xFF; 32]),
@@ -247,15 +255,17 @@ pub(crate) fn maximal_legal_meta() -> CoordinationMetaV1 {
 /// The row counts a group can legally reach, each from its own cap.
 pub(crate) fn maximal_legal_row_counts() -> crate::coordination::rowstream::RowCountsV1 {
     use crate::coordination::model::limits::{
-        MAX_ACL_ROWS_PER_GROUP, MAX_ADMINS_PER_GROUP, MAX_AUDIT_ROWS, MAX_RESOURCES_PER_GROUP,
-        MAX_RETAINED_INTENTS, MAX_RETAINED_ROUTES, MAX_RETAINED_SESSIONS_PER_GROUP,
+        MAX_ACL_ROWS_PER_GROUP, MAX_ADMINS_PER_GROUP, MAX_AUDIT_ROWS, MAX_INTENT_ROWS,
+        MAX_RESOURCES_PER_GROUP, MAX_RETAINED_ROUTES, MAX_RETAINED_SESSIONS_PER_GROUP,
     };
     crate::coordination::rowstream::RowCountsV1 {
         resources: MAX_RESOURCES_PER_GROUP,
         grants: MAX_ACL_ROWS_PER_GROUP,
         admins: MAX_ADMINS_PER_GROUP,
         sessions: MAX_RETAINED_SESSIONS_PER_GROUP,
-        intents: MAX_RETAINED_INTENTS,
+        // Rows, not the retention cap: §9 retains 64 terminal intents and
+        // never evicts the active one, so a full group streams 65.
+        intents: MAX_INTENT_ROWS,
         routes: MAX_RETAINED_ROUTES,
         audit: MAX_AUDIT_ROWS,
     }

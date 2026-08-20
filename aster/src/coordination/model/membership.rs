@@ -32,8 +32,6 @@
 //! expected phase, so a controller report could drive an intent from `Pending`
 //! straight to `Cancelled`, or out of a terminal phase entirely.
 
-use std::collections::BTreeSet;
-
 use super::authority;
 use super::limits::{charge_intent, charge_route, MAX_RETAINED_INTENTS, MAX_RETAINED_ROUTES};
 use super::shape::{self, ShapeLimit};
@@ -134,10 +132,11 @@ pub enum Decision {
 /// two things it compares.
 fn plan_shape(
     plan: &MembershipPlan,
-    current_members: &BTreeSet<NodeId>,
+    current: &crate::coordination::model::state::CommittedMembership,
     authority_material: &GroupAuthority,
     deployment_profile_code: i32,
 ) -> Option<ShapeLimit> {
+    let current_members = &current.members();
     // §7.1's profile decides the legal voter counts, read from replicated state
     // rather than hard-coded. An earlier revision applied the production rule
     // unconditionally, so a `DevSingle` or `DevEven` group had no legal
@@ -176,6 +175,26 @@ fn plan_shape(
     // stops describing the worst case.
     if shape::new_voters(&plan.desired_voters, current_members) > shape::MAX_NEW_VOTERS {
         return Some(ShapeLimit::MembershipNewVoters);
+    }
+
+    // §9's learner envelope, checked against the learners **already there**
+    // rather than against the retained two. §7.3 step 2 adds every node this
+    // plan names that is not a member, and step 5 removes what it is not
+    // retaining, so the peak is the union of the two sets.
+    //
+    // Without this the envelope ratcheted. A change that fails during
+    // `AddingLearners` leaves six learners with no intent active, the next plan
+    // adds four more, and the store applies a ten-learner membership it cannot
+    // reopen. It also keeps the group recoverable: a cleanup plan adds nothing,
+    // so its projection is the current count and it is always admitted.
+    if shape::projected_learners(
+        &current.learners,
+        current_members,
+        &plan.desired_voters,
+        &plan.retained_learners,
+    ) > shape::MAX_LEARNER_ENVELOPE
+    {
+        return Some(ShapeLimit::MembershipLearnerEnvelope);
     }
 
     let in_plan =
@@ -315,7 +334,7 @@ pub fn decide_change(
     // request. These were declared and had no caller.
     if let Some(limit) = plan_shape(
         &action.plan,
-        &state.membership.members(),
+        &state.membership,
         &state.authority,
         state.deployment_profile_code,
     ) {
@@ -730,6 +749,7 @@ mod tests {
     use crate::coordination::model::state::CommittedMembership;
     use crate::coordination::model::state::MemberSeed;
     use crate::coordination::reason::Reason;
+    use std::collections::BTreeSet;
 
     const ADMIN: NodeId = [1u8; 32];
     const OTHER: NodeId = [2u8; 32];
@@ -1428,7 +1448,7 @@ mod tests {
         assert!(
             plan_shape(
                 &action.plan,
-                &s.membership.members(),
+                &s.membership,
                 &s.authority,
                 s.deployment_profile_code
             )
@@ -1846,6 +1866,123 @@ mod tests {
             decide_progress(&wrong_members, &report(Some(log(9)))),
             None,
             "the committed member set must already be the plan's target"
+        );
+    }
+
+    /// The learner envelope does not ratchet across a failed change.
+    ///
+    /// Six is the peak only when a change *starts* from the retained two.
+    /// `Failed` leaves those six in place with no intent active, so the next
+    /// plan starts from six -- and a plan adding four more nodes would reach
+    /// ten. The store applied that and could not reopen it.
+    ///
+    /// The bound is therefore the projection, not a count of what the plan
+    /// adds: current learners plus the nodes it introduces. A cleanup plan
+    /// introduces none, so it is always admitted and the group is never wedged.
+    #[test]
+    fn the_learner_envelope_does_not_ratchet_after_a_failed_change() {
+        use crate::coordination::model::state::CommittedMembership;
+
+        /// A plan whose every member carries a real seed, permitted where the
+        /// node is new. Seeds are checked after the envelope, so only the
+        /// *admitted* cases need them -- but a fixture missing them would
+        /// report the wrong limit and prove nothing.
+        fn seeded(
+            voters: &[NodeId],
+            learners: &[NodeId],
+            members: &BTreeSet<NodeId>,
+        ) -> MembershipPlan {
+            let mut desired_voters = voters.to_vec();
+            desired_voters.sort_unstable();
+            let mut retained_learners = learners.to_vec();
+            retained_learners.sort_unstable();
+            let mut member_seeds: Vec<MemberSeed> = desired_voters
+                .iter()
+                .chain(&retained_learners)
+                .map(|node| MemberSeed {
+                    node_id: *node,
+                    ticket: test_ticket(node),
+                    join_permit: (!members.contains(node))
+                        .then(|| authority::testing::valid(node, &test_ticket(node))),
+                })
+                .collect();
+            member_seeds.sort_by_key(|seed| seed.node_id);
+            MembershipPlan {
+                desired_voters,
+                retained_learners,
+                member_seeds,
+            }
+        }
+
+        let voters = nodes(&[1, 2, 3]);
+        // Where a failure during `AddingLearners` leaves the group: the full
+        // envelope, and nothing in flight to justify it.
+        let stranded: BTreeSet<NodeId> = (0x81u8..0x87).map(|b| [b; 32]).collect();
+        assert_eq!(stranded.len(), shape::MAX_LEARNER_ENVELOPE);
+
+        let mut s = base();
+        s.membership = CommittedMembership {
+            voters: voters.iter().copied().collect(),
+            learners: stranded.clone(),
+            joint: false,
+        };
+
+        // A plan that introduces four fresh nodes would reach ten.
+        let mut wider = voters.clone();
+        wider.extend((0x91u8..0x93).map(|b| [b; 32]));
+        let greedy = seeded(
+            &wider,
+            &[[0x94u8; 32], [0x95u8; 32]],
+            &s.membership.members(),
+        );
+        assert_eq!(
+            plan_shape(
+                &greedy,
+                &s.membership,
+                &s.authority,
+                s.deployment_profile_code
+            ),
+            Some(ShapeLimit::MembershipLearnerEnvelope),
+            "four more on top of six is ten, and the store could not reopen it"
+        );
+
+        // A cleanup plan introduces nothing, so its projection is what is
+        // already there. It must stay admitted, or the group has no way back.
+        let keep: Vec<NodeId> = stranded.iter().copied().take(2).collect();
+        let cleanup = seeded(&voters, &keep, &s.membership.members());
+        assert_eq!(
+            plan_shape(
+                &cleanup,
+                &s.membership,
+                &s.authority,
+                s.deployment_profile_code
+            ),
+            None,
+            "a plan that adds no node must always be admitted, whatever is stranded"
+        );
+
+        // And from the ordinary starting point -- the retained two -- the plan
+        // the design permits is still admitted. The rule bounds the projection,
+        // not the plan.
+        s.membership = CommittedMembership {
+            voters: voters.iter().copied().collect(),
+            learners: (0x81u8..0x83).map(|b| [b; 32]).collect(),
+            joint: false,
+        };
+        let ordinary = seeded(
+            &wider,
+            &[[0x94u8; 32], [0x95u8; 32]],
+            &s.membership.members(),
+        );
+        assert_eq!(
+            plan_shape(
+                &ordinary,
+                &s.membership,
+                &s.authority,
+                s.deployment_profile_code
+            ),
+            None,
+            "two retained plus two new voters plus two new learners is six, which is legal"
         );
     }
 

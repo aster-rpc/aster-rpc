@@ -1364,8 +1364,8 @@ mod tests {
     use crate::coordination::ids::{CoordinationGroupId, CoordinationNodeId};
     use crate::coordination::model::shape;
     use crate::coordination::storage::fixture::{
-        maximal_legal_meta, maximal_legal_row_counts, maximal_reachable_membership,
-        oversized_meta_for_envelope,
+        maximal_legal_meta, maximal_legal_row_counts, oversized_meta_for_envelope,
+        widest_admitted_membership,
     };
     use redb::TableHandle;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2286,7 +2286,7 @@ mod tests {
     /// The maximal membership is one Aster can actually reach, and survives
     /// the OpenRaft round trip.
     #[test]
-    fn the_maximal_membership_is_reachable_and_round_trips() {
+    fn the_widest_admitted_membership_round_trips_and_bounds_both_reachable_peaks() {
         use crate::coordination::model::shape::{
             profile_permits_voters, MAX_LEARNER_ENVELOPE, MAX_NEW_VOTERS, MAX_VOTERS, PROFILE_PROD,
         };
@@ -2294,7 +2294,20 @@ mod tests {
         use openraft::Membership;
         use std::collections::BTreeSet;
 
-        let mirror = maximal_reachable_membership();
+        // The two shapes a single transition actually reaches, stated before
+        // the fixture is used so the gap between "admitted" and "reachable" is
+        // written down rather than implied. The fixture combines both peaks --
+        // seven voters *and* six learners -- which no transition does: the two
+        // new voters are learners in the first and voters in the second.
+        let before_joint = MAX_VOTERS + MAX_LEARNER_ENVELOPE;
+        let during_joint = (MAX_VOTERS + MAX_NEW_VOTERS) + (MAX_LEARNER_ENVELOPE - MAX_NEW_VOTERS);
+        assert_eq!(
+            before_joint, during_joint,
+            "both reachable peaks are the same node count; the new voters change role, \
+             not the total"
+        );
+
+        let mirror = widest_admitted_membership();
         let ids = |set: &crate::coordination::raft::NodeIdSetV1| -> BTreeSet<Vec<u8>> {
             set.ids.iter().map(|i| i.node_id.clone()).collect()
         };
@@ -2332,6 +2345,13 @@ mod tests {
             learners.len(),
             MAX_LEARNER_ENVELOPE,
             "the maximum carries the whole §9 learner envelope outside the configs"
+        );
+        assert!(
+            nodes.len() > before_joint,
+            "the sizing fixture must be a strict superset of what a transition reaches \
+             ({} nodes against {before_joint}), or the ceiling is measured against the \
+             narrower shape",
+            nodes.len()
         );
 
         // And it is a real OpenRaft membership, through the same mirror

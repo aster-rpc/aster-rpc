@@ -273,9 +273,29 @@ impl StateActor {
                 // separately would be re-derived differently at the next open.
                 EntryPayload::Membership(membership) => {
                     guard_delivery(&working.model, log_id).map_err(fatal_fault)?;
+                    let projection = rows::project_membership(membership);
+                    // The writer must not write what the reader refuses. §9's
+                    // envelope is enforced at admission, so a membership over
+                    // it means a controller ignored that -- and persisting it
+                    // would leave a store that applied cleanly and cannot
+                    // reopen, which is the worst place to find out.
+                    if projection.learners.len()
+                        > crate::coordination::model::shape::MAX_LEARNER_ENVELOPE
+                    {
+                        return Err(StorageError::corrupt(
+                            Db::State,
+                            "membership",
+                            format!(
+                                "a membership entry names {} learners, over the {}-learner \
+                                 envelope; the store would not reopen",
+                                projection.learners.len(),
+                                crate::coordination::model::shape::MAX_LEARNER_ENVELOPE
+                            ),
+                        ));
+                    }
                     working.membership =
                         StoredMembership::new(Some(entry.log_id), membership.clone());
-                    working.model.membership = rows::project_membership(membership);
+                    working.model.membership = projection;
                     working.model.membership_log_id = Some(log_id);
                     working.model.last_applied = Some(log_id);
                     CommandReplyV1::NonCommand(NonCommandReplyV1 {})
@@ -1665,6 +1685,52 @@ mod tests {
             running.model.membership,
             "a state apply produced must reopen, whatever the controller still owes"
         );
+    }
+
+    /// A membership entry over §9's envelope is refused at apply, not
+    /// discovered at the next restart.
+    ///
+    /// Admission bounds the *plan*, so this can only arise from a controller
+    /// that ignored it -- but the store is what persists the result, and a
+    /// store that wrote it would apply cleanly and then fail to reopen. The
+    /// worst place to find out is a restart, so the writer refuses what the
+    /// reader would.
+    #[tokio::test]
+    async fn a_membership_entry_over_the_envelope_is_refused_before_it_is_written() {
+        use crate::coordination::model::shape::MAX_LEARNER_ENVELOPE;
+        use openraft::Membership;
+
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+
+        let voters: std::collections::BTreeSet<CoordinationNodeId> = (1u8..=3)
+            .map(|b| CoordinationNodeId::from_array([b; 32]))
+            .collect();
+        let mut nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
+            voters.iter().map(|id| (*id, CoordinationNode)).collect();
+        for n in 0..=MAX_LEARNER_ENVELOPE {
+            nodes.insert(
+                CoordinationNodeId::from_array([0x90 + n as u8; 32]),
+                CoordinationNode,
+            );
+        }
+
+        let err = machine
+            .apply([Entry {
+                log_id: log_id(1),
+                payload: EntryPayload::Membership(Membership::new(vec![voters], nodes)),
+            }])
+            .await
+            .expect_err("one learner over the envelope");
+        assert!(format!("{err:?}").contains("envelope"), "{err:?}");
+        assert!(machine.handle().is_fatal());
+
+        drop(shutdown);
+        drop(machine);
+        let (mut machine, _shutdown) = reopen(&dir);
+        let (applied, membership) = machine.applied_state().await.expect("applied state");
+        assert_eq!(applied, None, "nothing was written");
+        assert!(membership.membership().nodes().next().is_none());
     }
 
     /// Sixty-four terminal intents *and* one active reopens.

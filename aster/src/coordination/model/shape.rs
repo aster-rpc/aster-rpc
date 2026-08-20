@@ -121,6 +121,43 @@ shape_limits! {
     MemberSeedTicketNode => "a member seed ticket is for another node",
     MemberSeedTicketNonCanonical => "a member seed ticket is not its own canonical encoding",
     MembershipNewVoters => "a membership plan adds more than two new voters at once",
+    /// Applying the plan would push the node map past §9's learner envelope.
+    ///
+    /// Distinct from `MembershipNewVoters`, which bounds the plan against the
+    /// *voters*: this bounds it against the learners already present. The two
+    /// differ exactly when a previous change left learners behind, which is
+    /// what a `Failed` intent does.
+    MembershipLearnerEnvelope =>
+        "a membership plan would exceed the learner envelope before it settles",
+}
+
+/// The learners a plan's execution would transiently hold.
+///
+/// §7.3 step 2 adds every node the plan names that is not already a member, and
+/// step 5 removes the learners it is not retaining -- so the peak is the
+/// learners already present *plus* the ones being added, before either
+/// promotion or removal happens.
+///
+/// Passing the current learners rather than assuming the retained two is the
+/// whole point. A change that fails during `AddingLearners` leaves its
+/// transient learners in the node map with no intent active, so the next plan
+/// starts from six rather than two; without this the envelope ratcheted, and a
+/// second plan produced a membership the store applied and could not reopen.
+pub fn projected_learners(
+    current_learners: &std::collections::BTreeSet<[u8; 32]>,
+    current_members: &std::collections::BTreeSet<[u8; 32]>,
+    desired_voters: &[[u8; 32]],
+    retained_learners: &[[u8; 32]],
+) -> usize {
+    let missing = desired_voters
+        .iter()
+        .chain(retained_learners)
+        .filter(|node| !current_members.contains(*node));
+    current_learners
+        .iter()
+        .chain(missing)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
 }
 
 /// Validate a raw `(namespace, key)` into the durable key type.
@@ -282,7 +319,7 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ShapeLimit::ALL.len());
-        assert_eq!(ShapeLimit::ALL.len(), 22, "update this count with the enum");
+        assert_eq!(ShapeLimit::ALL.len(), 23, "update this count with the enum");
         // Every variant has its own description; a shared one would make two
         // different failures read identically in a status message.
         let mut descriptions: Vec<_> = ShapeLimit::ALL.iter().map(|l| l.describe()).collect();
