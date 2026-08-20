@@ -242,6 +242,28 @@ reasons! {
         /// `(100, 0)` shapeless encoding is reserved by §10.1 for request-shape
         /// violations, which this is not -- it is derived from replicated state.
         LastAdministrator = 24,
+        /// §9's learner envelope would be exceeded before the change settles.
+        ///
+        /// A **coordination outcome**, not a request-shape violation, and §10
+        /// draws that line by whether the violation has a reason to report: "a
+        /// request that is too big is shapeless to the protocol; a group that
+        /// is full is a coordination outcome". This is the second — the plan is
+        /// well formed, and whether it fits depends on how many learners a
+        /// previous change left behind.
+        ///
+        /// Added to §5.2 rather than reusing a code, and rather than taking
+        /// §10.1's `(100, 0)` shapeless encoding: that pairing is reserved for
+        /// request-shape violations, and using it here would tell a client its
+        /// request was malformed when it was not, and terminal when it is not.
+        /// `19 StateBudgetExhausted` is the §12.1 byte budget, which this is
+        /// not; `14 MembershipIntentActive` says an intent is active, and the
+        /// defining feature of this condition is that none is.
+        ///
+        /// Retryable: a cleanup plan removes the stranded learners, and that is
+        /// an ordinary v1 command. `22 ResourceSlotsExhausted` and
+        /// `23 AclSlotsExhausted` are the precedent — §12.1 caps carrying reason
+        /// codes at stage 3.
+        MembershipLearnerEnvelope = 25,
     }
 }
 
@@ -276,7 +298,10 @@ impl Reason {
             | Reason::NotHolder
             | Reason::PermissionChanged
             | Reason::MembershipIntentActive
-            | Reason::MembershipCannotCancel => false,
+            | Reason::MembershipCannotCancel
+            // Decided against the committed membership, so it reaches the log
+            // like every other §9 refusal.
+            | Reason::MembershipLearnerEnvelope => false,
 
             // Classifier results (§8.2.1), never admission decisions.
             Reason::None
@@ -324,7 +349,10 @@ impl Reason {
             | Reason::StateBudgetExhausted
             // Adding a second administrator clears it, and that is an ordinary
             // v1 command.
-            | Reason::LastAdministrator => false,
+            | Reason::LastAdministrator
+            // A cleanup plan removes the stranded learners, and that is an
+            // ordinary v1 command too.
+            | Reason::MembershipLearnerEnvelope => false,
 
             Reason::None
             | Reason::HeldByOther
@@ -459,7 +487,7 @@ mod tests {
     const RESERVED_CODES: [i32; 1] = [20];
 
     /// §5.2 declares reasons 0 through 24 with no gaps.
-    const REASON_CODE_RANGE: std::ops::RangeInclusive<i32> = 0..=24;
+    const REASON_CODE_RANGE: std::ops::RangeInclusive<i32> = 0..=25;
 
     /// §5.2's outcome codes.
     const OUTCOME_CODES: [i32; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100];
@@ -494,9 +522,9 @@ mod tests {
             assert_eq!(Reason::from_code(reason.code()), Some(*reason));
         }
         // Data, not a bug: an unrecognised code must be reportable rather than
-        // fatal. -1 and 24 bracket the declared range; i32::MAX is the corrupt
+        // fatal. -1 and 26 bracket the declared range; i32::MAX is the corrupt
         // case.
-        for code in [-1, 25, 99, i32::MAX, i32::MIN] {
+        for code in [-1, 26, 99, i32::MAX, i32::MIN] {
             assert_eq!(Reason::from_code(code), None, "code {code} must not map");
         }
     }

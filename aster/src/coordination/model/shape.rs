@@ -121,14 +121,6 @@ shape_limits! {
     MemberSeedTicketNode => "a member seed ticket is for another node",
     MemberSeedTicketNonCanonical => "a member seed ticket is not its own canonical encoding",
     MembershipNewVoters => "a membership plan adds more than two new voters at once",
-    /// Applying the plan would push the node map past §9's learner envelope.
-    ///
-    /// Distinct from `MembershipNewVoters`, which bounds the plan against the
-    /// *voters*: this bounds it against the learners already present. The two
-    /// differ exactly when a previous change left learners behind, which is
-    /// what a `Failed` intent does.
-    MembershipLearnerEnvelope =>
-        "a membership plan would exceed the learner envelope before it settles",
 }
 
 /// The `retain` flag §7.3 step 4 passes to `change_membership`.
@@ -156,6 +148,11 @@ shape_limits! {
 pub const MEMBERSHIP_RETAIN: bool = false;
 
 /// The learners a plan's execution would transiently hold.
+///
+/// Not a [`ShapeLimit`]: exceeding the envelope is a property of the *group*
+/// rather than of the request, so §10 puts it at stage 3 with a reason code
+/// (`25 MembershipLearnerEnvelope`) rather than at stage 4. This is the
+/// arithmetic; `membership::decide_change` is where the refusal is raised.
 ///
 /// §7.3 step 2 adds every node the plan names that is not already a member, and
 /// step 5 removes the learners it is not retaining -- so the peak is the
@@ -347,7 +344,7 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ShapeLimit::ALL.len());
-        assert_eq!(ShapeLimit::ALL.len(), 23, "update this count with the enum");
+        assert_eq!(ShapeLimit::ALL.len(), 22, "update this count with the enum");
         // Every variant has its own description; a shared one would make two
         // different failures read identically in a status message.
         let mut descriptions: Vec<_> = ShapeLimit::ALL.iter().map(|l| l.describe()).collect();

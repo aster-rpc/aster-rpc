@@ -177,26 +177,6 @@ fn plan_shape(
         return Some(ShapeLimit::MembershipNewVoters);
     }
 
-    // §9's learner envelope, checked against the learners **already there**
-    // rather than against the retained two. §7.3 step 2 adds every node this
-    // plan names that is not a member, and step 5 removes what it is not
-    // retaining, so the peak is the union of the two sets.
-    //
-    // Without this the envelope ratcheted. A change that fails during
-    // `AddingLearners` leaves six learners with no intent active, the next plan
-    // adds four more, and the store applies a ten-learner membership it cannot
-    // reopen. It also keeps the group recoverable: a cleanup plan adds nothing,
-    // so its projection is the current count and it is always admitted.
-    if shape::projected_learners(
-        &current.learners,
-        current_members,
-        &plan.desired_voters,
-        &plan.retained_learners,
-    ) > shape::MAX_LEARNER_ENVELOPE
-    {
-        return Some(ShapeLimit::MembershipLearnerEnvelope);
-    }
-
     let in_plan =
         |node: &NodeId| plan.desired_voters.contains(node) || plan.retained_learners.contains(node);
     for seed in &plan.member_seeds {
@@ -354,6 +334,31 @@ pub fn decide_change(
         .any(|i| !is_terminal_phase(i.status_code))
     {
         return Decision::Refuse(RefusalReason::MembershipIntentActive);
+    }
+
+    // §9's learner envelope, checked against the learners **already there**
+    // rather than against the retained two. §7.3 step 2 adds every node this
+    // plan names that is not a member, and step 5 removes what it is not
+    // retaining, so the peak is the union of the two sets.
+    //
+    // Here rather than in `plan_shape`, and reason-coded rather than shapeless:
+    // whether a well-formed plan fits depends on how many learners a *previous*
+    // change left behind, which makes it a coordination outcome (§10) and not a
+    // property of the request.
+    //
+    // Without it the envelope ratcheted. A change that fails during
+    // `AddingLearners` leaves six learners with no intent active, the next plan
+    // adds four more, and the store applies a ten-learner membership it cannot
+    // reopen. It also keeps the group recoverable: a cleanup plan adds nothing,
+    // so its projection is the current count and it is always admitted.
+    if shape::projected_learners(
+        &state.membership.learners,
+        &state.membership.members(),
+        &action.plan.desired_voters,
+        &action.plan.retained_learners,
+    ) > shape::MAX_LEARNER_ENVELOPE
+    {
+        return Decision::Refuse(RefusalReason::MembershipLearnerEnvelope);
     }
 
     let intent = Intent {
@@ -1876,17 +1881,21 @@ mod tests {
     /// plan starts from six -- and a plan adding four more nodes would reach
     /// ten. The store applied that and could not reopen it.
     ///
-    /// The bound is therefore the projection, not a count of what the plan
-    /// adds: current learners plus the nodes it introduces. A cleanup plan
-    /// introduces none, so it is always admitted and the group is never wedged.
+    /// The bound is the projection, not a count of what the plan adds: current
+    /// learners plus the nodes it introduces. A cleanup plan introduces none,
+    /// so it is always admitted and the group is never wedged.
+    ///
+    /// Refused with a **reason code** at stage 3, not as a request-shape
+    /// violation: the plan is well formed, and whether it fits depends on what
+    /// a previous change left behind (§10).
     #[test]
     fn the_learner_envelope_does_not_ratchet_after_a_failed_change() {
         use crate::coordination::model::state::CommittedMembership;
 
         /// A plan whose every member carries a real seed, permitted where the
-        /// node is new. Seeds are checked after the envelope, so only the
-        /// *admitted* cases need them -- but a fixture missing them would
-        /// report the wrong limit and prove nothing.
+        /// node is new. Seeds are checked in `plan_shape`, before the envelope
+        /// is reached, so a fixture missing them would report the wrong
+        /// refusal and prove nothing.
         fn seeded(
             voters: &[NodeId],
             learners: &[NodeId],
@@ -1927,6 +1936,19 @@ mod tests {
             joint: false,
         };
 
+        let submit = |s: &State, plan: MembershipPlan| {
+            decide_change(
+                s,
+                &ADMIN,
+                &[7u8; 32],
+                &ChangeMembershipAction {
+                    operation_id: op(1),
+                    expected_membership_log_id: s.membership_log_id,
+                    plan,
+                },
+            )
+        };
+
         // A plan that introduces four fresh nodes would reach ten.
         let mut wider = voters.clone();
         wider.extend((0x91u8..0x93).map(|b| [b; 32]));
@@ -1936,13 +1958,8 @@ mod tests {
             &s.membership.members(),
         );
         assert_eq!(
-            plan_shape(
-                &greedy,
-                &s.membership,
-                &s.authority,
-                s.deployment_profile_code
-            ),
-            Some(ShapeLimit::MembershipLearnerEnvelope),
+            reason(submit(&s, greedy.clone())),
+            Reason::MembershipLearnerEnvelope,
             "four more on top of six is ten, and the store could not reopen it"
         );
 
@@ -1950,14 +1967,8 @@ mod tests {
         // already there. It must stay admitted, or the group has no way back.
         let keep: Vec<NodeId> = stranded.iter().copied().take(2).collect();
         let cleanup = seeded(&voters, &keep, &s.membership.members());
-        assert_eq!(
-            plan_shape(
-                &cleanup,
-                &s.membership,
-                &s.authority,
-                s.deployment_profile_code
-            ),
-            None,
+        assert!(
+            matches!(submit(&s, cleanup), Decision::Apply(_)),
             "a plan that adds no node must always be admitted, whatever is stranded"
         );
 
@@ -1974,15 +1985,33 @@ mod tests {
             &[[0x94u8; 32], [0x95u8; 32]],
             &s.membership.members(),
         );
-        assert_eq!(
-            plan_shape(
-                &ordinary,
-                &s.membership,
-                &s.authority,
-                s.deployment_profile_code
-            ),
-            None,
+        assert!(
+            matches!(submit(&s, ordinary), Decision::Apply(_)),
             "two retained plus two new voters plus two new learners is six, which is legal"
+        );
+    }
+
+    /// The refusal is a §10 stage-3 coordination outcome, not a request-shape
+    /// violation.
+    ///
+    /// Stated separately because the difference is entirely in what a client
+    /// sees: `(100 Rejected, 0 None)` says "your request was malformed and will
+    /// stay malformed", and this request is neither.
+    #[test]
+    fn the_learner_envelope_refusal_is_reason_coded_and_retryable() {
+        assert_eq!(Reason::MembershipLearnerEnvelope.code(), 25);
+        assert!(
+            !Reason::MembershipLearnerEnvelope.is_terminal_when_not_consumed(),
+            "a cleanup plan clears it, and that is an ordinary v1 command"
+        );
+        assert!(
+            !Reason::MembershipLearnerEnvelope.is_reserved(),
+            "it is emitted, unlike 20"
+        );
+        assert_ne!(
+            Reason::MembershipLearnerEnvelope,
+            Reason::None,
+            "§10.1's shapeless pairing is reserved for request-shape violations"
         );
     }
 
