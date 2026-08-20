@@ -1910,6 +1910,178 @@ mod tests {
         );
     }
 
+    /// A plan admitted against one membership is fenced by
+    /// `13 MembershipRevisionMismatch` when it applies against another --
+    /// across a restart, through the real state machine.
+    ///
+    /// This ties together the four facts that make `25 MembershipLearnerEnvelope`
+    /// unable to lose a race, none of which is guarded on its own:
+    ///
+    /// 1. `decide_change` compares the expected membership log id **before** it
+    ///    reaches the envelope;
+    /// 2. only a native `EntryPayload::Membership` changes the committed
+    ///    membership;
+    /// 3. that same entry advances `membership_log_id`;
+    /// 4. a reopen derives both from the stored `StoredMembership`, so the
+    ///    pairing survives a restart rather than being an in-memory
+    ///    coincidence.
+    ///
+    /// The model-level tests assign `membership` and `membership_log_id` by
+    /// hand, which is exactly how an earlier fixture came to describe a state no
+    /// transition produces -- membership moved, log id did not -- and "proved" a
+    /// race that cannot happen. Here nothing is assigned: both facts move only
+    /// because a membership entry was applied, and the store is closed and
+    /// reopened in between so the second half reads them off disk.
+    #[tokio::test]
+    async fn a_plan_admitted_against_one_membership_is_fenced_after_a_restart() {
+        use crate::coordination::contract::{
+            ChangeMembershipActionV1, LogIdV1, MemberSeedV1, NodeIdV1,
+        };
+        use crate::coordination::model::apply::{preflight, Admission, ClientRef};
+        use crate::coordination::model::authority::testing as auth;
+        use crate::coordination::model::boundary::action_from_wire;
+        use crate::coordination::model::membership::test_ticket;
+        use crate::coordination::model::state::CommittedMembership;
+        use crate::coordination::reason::Reason;
+        use openraft::Membership;
+
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+
+        let voters: Vec<[u8; 32]> = (1u8..=3).map(|b| [b; 32]).collect();
+        let native = |index: u64, learners: std::ops::Range<u8>| {
+            let ids: std::collections::BTreeSet<CoordinationNodeId> = voters
+                .iter()
+                .map(|v| CoordinationNodeId::from_array(*v))
+                .collect();
+            let mut nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
+                ids.iter().map(|id| (*id, CoordinationNode)).collect();
+            for byte in learners {
+                nodes.insert(CoordinationNodeId::from_array([byte; 32]), CoordinationNode);
+            }
+            Entry {
+                log_id: log_id(index),
+                payload: EntryPayload::Membership(Membership::new(vec![ids], nodes)),
+            }
+        };
+
+        // 1. L1: the retained two.
+        machine.apply([native(1, 0x81..0x83)]).await.expect("L1");
+        let at_l1 = published(&machine).await;
+        assert_eq!(at_l1.model.membership.learners.len(), 2);
+        let l1 = at_l1.model.membership_log_id.expect("L1 has a log id");
+        assert_eq!(l1.index, 1, "the native entry is what set it");
+
+        // 2. A plan against L1: two new voters and two new retained learners,
+        //    so it introduces four and projects to exactly the envelope.
+        let new_voters: Vec<[u8; 32]> = (0x91u8..0x93).map(|b| [b; 32]).collect();
+        let new_learners: Vec<[u8; 32]> = (0x94u8..0x96).map(|b| [b; 32]).collect();
+        let mut desired = voters.clone();
+        desired.extend(new_voters.iter().copied());
+        desired.sort_unstable();
+
+        let seed = |node: &[u8; 32], state: &CommittedMembership| MemberSeedV1 {
+            node_id: node.to_vec(),
+            ticket: String::from_utf8(test_ticket(node)).expect("a text ticket"),
+            signed_join_permit: (!state.contains(node))
+                .then(|| auth::valid(node, &test_ticket(node))),
+        };
+        let mut member_seeds: Vec<MemberSeedV1> = desired
+            .iter()
+            .chain(&new_learners)
+            .map(|node| seed(node, &at_l1.model.membership))
+            .collect();
+        member_seeds.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+        let plan = ActionV1::ChangeMembership(ChangeMembershipActionV1 {
+            operation_id: vec![0x66; 16],
+            // Bound to L1, which is the whole point: this is what the fence
+            // compares against once the membership has moved.
+            expected_membership_log_id: Some(LogIdV1 {
+                term: l1.term,
+                leader_node_id: l1.leader_node_id.to_vec(),
+                index: l1.index,
+            }),
+            desired_voters: desired
+                .iter()
+                .map(|n| NodeIdV1 {
+                    node_id: n.to_vec(),
+                })
+                .collect(),
+            retained_learners: new_learners
+                .iter()
+                .map(|n| NodeIdV1 {
+                    node_id: n.to_vec(),
+                })
+                .collect(),
+            member_seeds,
+        });
+
+        let requester = ClientRef {
+            actor: ACTOR,
+            client_id: CLIENT,
+            sequence: 1,
+            request_hash: crate::coordination::hash::request_hash(&plan).expect("hashable"),
+        };
+        assert_eq!(
+            preflight(
+                &at_l1.model,
+                &requester,
+                &action_from_wire(&plan).expect("narrows")
+            ),
+            Admission::Admit,
+            "against L1 the plan fits the envelope exactly, so a leader proposes it"
+        );
+
+        // 3. L2 lands first: four more learners, taking the group to the full
+        //    envelope. The log id moves with it, because the same entry sets
+        //    both.
+        machine.apply([native(2, 0x81..0x87)]).await.expect("L2");
+        let at_l2 = published(&machine).await;
+        assert_eq!(at_l2.model.membership.learners.len(), 6);
+        assert_ne!(
+            at_l2.model.membership_log_id,
+            Some(l1),
+            "the membership moved"
+        );
+
+        // 4. Close and reopen, so the second half reads both facts off disk
+        //    rather than out of the actor's memory.
+        drop(shutdown);
+        drop(machine);
+        let (mut machine, _shutdown) = reopen(&dir);
+        let restarted = published(&machine).await;
+        assert_eq!(
+            restarted.model.membership, at_l2.model.membership,
+            "the derivation survives the restart"
+        );
+        assert_eq!(
+            restarted.model.membership_log_id,
+            at_l2.model.membership_log_id
+        );
+
+        // 5. The plan the leader proposed against L1, applied against L2.
+        let replies = machine
+            .apply([normal(3, client(1, plan))])
+            .await
+            .expect("committed, so it applies");
+        let CommandReplyV1::Client(reply) = &replies[0] else {
+            panic!("expected a client reply");
+        };
+        assert_eq!(reply.disposition_code, 1, "Consumed");
+        assert_eq!(
+            reply.reason_code,
+            Reason::MembershipRevisionMismatch.code(),
+            "the membership moved, and that is the fence"
+        );
+        assert_ne!(
+            reply.reason_code,
+            Reason::MembershipLearnerEnvelope.code(),
+            "the envelope is unreachable here -- reaching it would mean the revision \
+             check, the native-entry authority or the durable derivation had come apart"
+        );
+    }
+
     /// Sixty-four terminal intents *and* one active reopens.
     ///
     /// §9: "if all 64 slots hold terminal intents and one is active, a new
@@ -2034,18 +2206,84 @@ mod tests {
     /// fails here whatever route it takes.
     #[tokio::test]
     async fn the_membership_projection_survives_a_restart_unchanged() {
+        use crate::coordination::model::membership::{PHASE_ADDING_LEARNERS, PHASE_PENDING};
+        use crate::coordination::model::state::{Intent, MembershipPlan};
+
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        // A real intent, in a phase a progress report can advance. Without one
+        // the reports below are no-ops that never reach `write_intent`, and the
+        // rule they are meant to guard is never exercised -- which is how a
+        // reintroduced non-native write of `membership_log_id` survived
+        // mutation with every test green.
+        let database = seeded(&dir);
+        let mut seed_state = genesis_state();
+        seed_state.model.last_applied = Some(LogId::new(1, LEADER, 1));
+        let mut changes = ChangeSet::default();
+        changes
+            .admins
+            .extend(seed_state.model.admins.iter().copied());
+        changes.grants.extend(seed_state.model.acl.keys().cloned());
+        changes
+            .resources
+            .extend(seed_state.model.resources.keys().cloned());
+        let operation = [0x78u8; 16];
+        seed_state.model.intents.insert(
+            operation,
+            Intent {
+                actor: ACTOR,
+                request_hash: [0x79u8; 32],
+                expected_membership: None,
+                plan: MembershipPlan {
+                    desired_voters: (1u8..=3).map(|b| [b; 32]).collect(),
+                    retained_learners: Vec::new(),
+                    member_seeds: Vec::new(),
+                },
+                status_code: PHASE_PENDING,
+                result_code: 0,
+                accepted_log_id: LogId::new(1, LEADER, 1),
+                completed_log_id: None,
+                observed_membership_log_id: None,
+            },
+        );
+        changes.intents.insert(operation);
+        seed_state.model.growth_bytes = seed_state.model.recompute_growth();
+        rows::commit(&database, seed_state.clone(), &changes).expect("seed a pending intent");
+        drop(database);
+
+        let (mut machine, shutdown) = reopen(&dir);
 
         machine
             .apply([
-                normal(1, acquire(1)),
-                membership_entry(2, &[[1u8; 32], [2u8; 32], [3u8; 32]]),
-                normal(3, acquire(2)),
+                normal(2, acquire(1)),
+                membership_entry(3, &[[1u8; 32], [2u8; 32], [3u8; 32]]),
+                normal(4, acquire(2)),
+                // A report that **does** reach `write_intent`, carrying an
+                // observation that is not the committed membership. §7.3 lets
+                // an intent record what a controller claims to have seen; it
+                // must not let that claim become authority.
+                normal(
+                    5,
+                    CommandV1::MembershipProgress(MembershipProgressCommandV1 {
+                        operation_id: operation.to_vec(),
+                        expected_phase: PHASE_PENDING,
+                        new_phase: PHASE_ADDING_LEARNERS,
+                        // A plausible id -- an entry that really was applied --
+                        // but not the one the committed membership names. A
+                        // fabricated future id would be caught by
+                        // `stamped-log-ids` instead, which would prove that
+                        // rule rather than this one.
+                        observed_membership_log_id: Some(crate::coordination::contract::LogIdV1 {
+                            term: 1,
+                            leader_node_id: LEADER.to_vec(),
+                            index: 1,
+                        }),
+                        result_code: 0,
+                    }),
+                ),
                 // A progress report naming an operation that does not exist:
                 // a no-op that must still not touch membership authority.
                 normal(
-                    4,
+                    6,
                     CommandV1::MembershipProgress(MembershipProgressCommandV1 {
                         operation_id: vec![0x77; 16],
                         expected_phase: 3,
@@ -2079,8 +2317,19 @@ mod tests {
         assert_eq!(running.membership, restarted.membership);
         assert_eq!(
             running.model.membership_log_id.map(|id| id.index),
-            Some(2),
-            "the native entry is what set it, not the report claiming index 99"
+            Some(3),
+            "the native entry is what set it, not either report's claim"
+        );
+        assert_eq!(
+            running.model.intents[&operation].observed_membership_log_id,
+            Some(LogId::new(1, LEADER, 1)),
+            "the observation is recorded on the intent, which is where §5.2 reads it"
+        );
+        assert_ne!(
+            running.model.intents[&operation].observed_membership_log_id,
+            running.model.membership_log_id,
+            "and it differs from the committed one, or a write of it back would be \
+             indistinguishable from doing nothing"
         );
     }
 
