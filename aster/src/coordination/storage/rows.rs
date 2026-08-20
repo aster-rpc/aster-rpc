@@ -1240,14 +1240,22 @@ fn check_audit_rows(state: &DurableState) -> Result<(), String> {
 
 // ── §12.1 row shapes ────────────────────────────────────────────────────────
 
-/// The TTLs a stored row can legally carry: zero, or a §12.1 lease duration.
+/// The TTLs a stored row can legally carry.
 ///
-/// Zero is the value a row that has never been acquired holds -- a resource
-/// created by `set_grant`, or one whose lease was released without the TTL
-/// being cleared. Everything else came from an `acquire` that §12.1 bounded.
-/// Anything between is a duration no command could have set.
-fn ttl_is_legal(ttl_ms: u64) -> bool {
-    ttl_ms == 0 || (limits::MIN_TTL_MS..=limits::MAX_TTL_MS).contains(&ttl_ms)
+/// A **held** row's TTL is the lease it is holding, and §12.1 bounds every
+/// `acquire` that could have set one -- so zero is not among them. A held lease
+/// with no duration is a lease that expired the moment it was granted, and the
+/// expiry path would never fire for it.
+///
+/// A **free** row may additionally be zero: a resource created by `set_grant`
+/// never had a lease, and a released one keeps whatever its last lease had,
+/// which was bounded when it was set. Anything else is a duration no command
+/// could have produced.
+fn ttl_is_legal(ttl_ms: u64, held: bool) -> bool {
+    if (limits::MIN_TTL_MS..=limits::MAX_TTL_MS).contains(&ttl_ms) {
+        return true;
+    }
+    !held && ttl_ms == 0
 }
 
 fn check_resource_rows(state: &DurableState) -> Result<(), String> {
@@ -1264,12 +1272,11 @@ fn check_resource_rows(state: &DurableState) -> Result<(), String> {
         // is the same one plus zero, not "anything at all". Exempting free rows
         // let an arbitrary duration sit in state until the next acquire
         // overwrote it, and be reported by every read in between.
-        if !ttl_is_legal(row.ttl_ms) {
+        if !ttl_is_legal(row.ttl_ms, row.held) {
             return Err(format!(
-                "{key:?} holds a {}ms TTL, which is neither zero nor within [{}, {}]",
-                row.ttl_ms,
-                limits::MIN_TTL_MS,
-                limits::MAX_TTL_MS
+                "{key:?} is {} with a {}ms TTL, which is not a duration §12.1 admits",
+                if row.held { "held" } else { "free" },
+                row.ttl_ms
             ));
         }
         for (what, value) in [
@@ -1401,13 +1408,12 @@ fn check_session_rows(state: &DurableState) -> Result<(), String> {
                 ));
             }
         }
-        if !ttl_is_legal(snapshot.ttl_ms) {
+        if !ttl_is_legal(snapshot.ttl_ms, snapshot.held) {
             return Err(format!(
-                "session {actor:02x?}/{client:02x?} saved a {}ms TTL, which is neither zero \
-                 nor within [{}, {}]",
+                "session {actor:02x?}/{client:02x?} saved a {}ms TTL on a {} resource, which \
+                 is not a duration §12.1 admits",
                 snapshot.ttl_ms,
-                limits::MIN_TTL_MS,
-                limits::MAX_TTL_MS
+                if snapshot.held { "held" } else { "free" }
             ));
         }
         if snapshot.held != snapshot.holder.is_some() {
@@ -1455,16 +1461,20 @@ fn check_intent_rows(state: &DurableState) -> Result<(), String> {
         ));
     }
 
-    // The settled-state learner rule, which needs the intent table to answer.
-    // Transient learners exist only while a change is being applied, so with
-    // nothing in flight the membership may name only the retained ones.
-    if active == 0 && state.model.membership.learners.len() > shape::MAX_RETAINED_LEARNERS {
-        return Err(format!(
-            "{} learners with no change in flight; §9 retains {}",
-            state.model.membership.learners.len(),
-            shape::MAX_RETAINED_LEARNERS
-        ));
-    }
+    // **No settled-state learner rule.** An earlier revision required at most
+    // the retained two once nothing was in flight, and that made a reachable
+    // state unloadable: §9 lets any active phase transition to `Failed`, and
+    // `Failed` changes no membership. An intent that fails during
+    // `AddingLearners` therefore leaves its transient learners in the node map
+    // with no intent active, and the group could not be restarted.
+    //
+    // Cancellation is sequenced -- the controller removes the learners it
+    // introduced and only then records `Cancelled` -- but failure is not, and
+    // §9 reserves `Failed` for a deterministic outcome that cannot succeed
+    // unchanged. Convergence back to the retained set is the controller's job
+    // and takes further committed entries; it is not a property every stored
+    // state satisfies, so it is not something a validator can require. The
+    // envelope in `validate_meta` is the enforceable bound.
 
     for (operation_id, intent) in &state.model.intents {
         let plan = &intent.plan;
@@ -2910,42 +2920,6 @@ mod tests {
             },
         },
         Negative {
-            rule: "intent-row-shape",
-            what: "transient learners with no change in flight",
-            break_it: |state| {
-                // Four learners is legal *while* a change is being applied. The
-                // fixture's only intent is terminal, so nothing is in flight
-                // and §9 retains two.
-                //
-                // Added to the stored membership and re-projected, not just to
-                // the projection: a projection that disagreed with its source
-                // would be caught by `validate_meta` first, and this negative
-                // would prove nothing about the rule it names.
-                let mut nodes: BTreeMap<CoordinationNodeId, CoordinationNode> = state
-                    .membership
-                    .membership()
-                    .nodes()
-                    .map(|(id, _)| (*id, CoordinationNode))
-                    .collect();
-                for byte in [0x91u8, 0x92, 0x93] {
-                    nodes.insert(CoordinationNodeId::from_array([byte; 32]), CoordinationNode);
-                }
-                let configs: Vec<BTreeSet<CoordinationNodeId>> =
-                    state.membership.membership().get_joint_config().clone();
-                state.membership = StoredMembership::new(
-                    state.membership.log_id().to_owned(),
-                    Membership::new(configs, nodes),
-                );
-                state.model.membership = project_membership(state.membership.membership());
-                // And nothing in flight. The generated history leaves an active
-                // intent of its own, which would put the state legitimately
-                // inside the wider envelope.
-                state.model.intents.retain(|_, intent| {
-                    crate::coordination::model::membership::is_terminal_phase(intent.status_code)
-                });
-            },
-        },
-        Negative {
             rule: "audit-row-shape",
             what: "an outcome the operation cannot produce",
             break_it: |state| {
@@ -2970,6 +2944,53 @@ mod tests {
                     .expect("a free resource");
                 state.model.resources.get_mut(&key).expect("the row").ttl_ms =
                     limits::MIN_TTL_MS - 1;
+            },
+        },
+        Negative {
+            rule: "resource-row-shape",
+            what: "a held row with no lease duration",
+            break_it: |state| {
+                // Zero is legal on a *free* row and not on a held one: a held
+                // lease with no duration expired the moment it was granted, and
+                // the expiry path would never fire for it.
+                let key = state
+                    .model
+                    .resources
+                    .iter()
+                    .find(|(_, row)| row.held)
+                    .map(|(k, _)| k.clone())
+                    .expect("a held resource");
+                state.model.resources.get_mut(&key).expect("the row").ttl_ms = 0;
+            },
+        },
+        Negative {
+            rule: "session-row-shape",
+            what: "a saved snapshot of a held resource with no lease duration",
+            break_it: |state| {
+                let key = *state
+                    .model
+                    .sessions
+                    .iter()
+                    .find(|(_, s)| {
+                        s.last_result
+                            .as_ref()
+                            .and_then(|r| r.snapshot.as_ref())
+                            .is_some_and(|snapshot| snapshot.held)
+                    })
+                    .map(|(k, _)| k)
+                    .expect("a session whose saved snapshot was held");
+                state
+                    .model
+                    .sessions
+                    .get_mut(&key)
+                    .expect("the row")
+                    .last_result
+                    .as_mut()
+                    .expect("a reply")
+                    .snapshot
+                    .as_mut()
+                    .expect("a snapshot")
+                    .ttl_ms = 0;
             },
         },
         Negative {

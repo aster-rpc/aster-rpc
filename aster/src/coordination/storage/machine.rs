@@ -1547,6 +1547,126 @@ mod tests {
         );
     }
 
+    /// An intent that **fails** during `AddingLearners` leaves its transient
+    /// learners behind, and the store reopens anyway.
+    ///
+    /// §9 lets any active phase transition to `Failed`, and `Failed` changes no
+    /// membership -- so the four learners that were legal a moment earlier are
+    /// still there with nothing in flight. A validator that required the
+    /// retained two once no intent was active made this state unloadable: the
+    /// running store had accepted it, and only a restart found out.
+    ///
+    /// Driven through the real transition rather than seeded, because the point
+    /// is that apply produces it.
+    #[tokio::test]
+    async fn an_intent_that_fails_mid_change_leaves_a_reopenable_state() {
+        use crate::coordination::contract::MembershipProgressCommandV1;
+        use crate::coordination::model::membership::{
+            PHASE_ADDING_LEARNERS, PHASE_FAILED, PHASE_PENDING,
+        };
+        use crate::coordination::model::state::{Intent, MembershipPlan};
+        use openraft::Membership;
+
+        let dir = scratch_dir();
+        let database = seeded(&dir);
+        let mut state = genesis_state();
+        state.model.last_applied = Some(LogId::new(1, LEADER, 1));
+        let mut changes = ChangeSet::default();
+        changes.admins.extend(state.model.admins.iter().copied());
+        changes.grants.extend(state.model.acl.keys().cloned());
+        changes
+            .resources
+            .extend(state.model.resources.keys().cloned());
+        let operation = [0x64u8; 16];
+        state.model.intents.insert(
+            operation,
+            Intent {
+                actor: ACTOR,
+                request_hash: [0x65u8; 32],
+                expected_membership: None,
+                plan: MembershipPlan {
+                    desired_voters: (1u8..=3).map(|b| [b; 32]).collect(),
+                    retained_learners: vec![[0x81u8; 32], [0x82u8; 32]],
+                    member_seeds: Vec::new(),
+                },
+                status_code: PHASE_PENDING,
+                result_code: 0,
+                accepted_log_id: LogId::new(1, LEADER, 1),
+                completed_log_id: None,
+                observed_membership_log_id: None,
+            },
+        );
+        changes.intents.insert(operation);
+        state.model.growth_bytes = state.model.recompute_growth();
+        rows::commit(&database, state.clone(), &changes).expect("seed a pending intent");
+        drop(database);
+
+        let (mut machine, shutdown) = reopen(&dir);
+
+        // The controller adds every missing node as a learner, so the node map
+        // grows past the retained two while the change is in flight.
+        let voters: std::collections::BTreeSet<CoordinationNodeId> = (1u8..=3)
+            .map(|b| CoordinationNodeId::from_array([b; 32]))
+            .collect();
+        let mut nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
+            voters.iter().map(|id| (*id, CoordinationNode)).collect();
+        for byte in [0x81u8, 0x82, 0x83, 0x84] {
+            nodes.insert(CoordinationNodeId::from_array([byte; 32]), CoordinationNode);
+        }
+        machine
+            .apply([Entry {
+                log_id: log_id(2),
+                payload: EntryPayload::Membership(Membership::new(vec![voters], nodes)),
+            }])
+            .await
+            .expect("the learners land");
+
+        let progress = |from: i32, to: i32| {
+            CommandV1::MembershipProgress(MembershipProgressCommandV1 {
+                operation_id: operation.to_vec(),
+                expected_phase: from,
+                new_phase: to,
+                observed_membership_log_id: None,
+                result_code: crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED,
+            })
+        };
+        machine
+            .apply([normal(3, progress(PHASE_PENDING, PHASE_ADDING_LEARNERS))])
+            .await
+            .expect("adding learners");
+        // §9: any active phase may fail, and failing changes no membership.
+        machine
+            .apply([normal(4, progress(PHASE_ADDING_LEARNERS, PHASE_FAILED))])
+            .await
+            .expect("fail");
+
+        let running = published(&machine).await;
+        assert_eq!(
+            running.model.intents[&operation].status_code, PHASE_FAILED,
+            "the change failed"
+        );
+        assert_eq!(
+            running.model.membership.learners.len(),
+            4,
+            "and left the learners it had introduced"
+        );
+        assert!(
+            running.model.intents.values().all(|intent| {
+                crate::coordination::model::membership::is_terminal_phase(intent.status_code)
+            }),
+            "with nothing in flight to justify them"
+        );
+
+        drop(shutdown);
+        drop(machine);
+        let (machine, _shutdown) = reopen(&dir);
+        assert_eq!(
+            published(&machine).await.model.membership,
+            running.model.membership,
+            "a state apply produced must reopen, whatever the controller still owes"
+        );
+    }
+
     /// Sixty-four terminal intents *and* one active reopens.
     ///
     /// §9: "if all 64 slots hold terminal intents and one is active, a new
