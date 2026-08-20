@@ -1991,6 +1991,102 @@ mod tests {
         );
     }
 
+    /// The envelope refusal is answered pre-proposal, and a racing one that
+    /// reaches the log is Consumed, saved and replayed exactly.
+    ///
+    /// Both halves, because getting the first wrong silently produces the
+    /// second for *every* refusal: classifying 25 with the apply-time §9 rules
+    /// made `preflight` admit it, and apply then saved a `Consumed` rejection --
+    /// terminal, for a condition §5.2 declares retryable. The client would have
+    /// stopped retrying a plan that a cleanup would have let through.
+    #[test]
+    fn the_envelope_refusal_is_denied_pre_proposal_and_saved_only_when_it_races() {
+        use crate::coordination::model::apply::{
+            apply_client_command, preflight, Action, Admission, ClientRef,
+        };
+        use crate::coordination::model::state::CommittedMembership;
+        use crate::coordination::reason::Disposition;
+
+        let voters = nodes(&[1, 2, 3]);
+        let mut s = base();
+        s.membership = CommittedMembership {
+            voters: voters.iter().copied().collect(),
+            learners: (0x81u8..0x87).map(|b| [b; 32]).collect(),
+            joint: false,
+        };
+        s.last_applied = Some(log(1));
+
+        let mut wider = voters.clone();
+        wider.extend((0x91u8..0x93).map(|b| [b; 32]));
+        wider.sort_unstable();
+        let mut retained = vec![[0x94u8; 32], [0x95u8; 32]];
+        retained.sort_unstable();
+        let mut member_seeds: Vec<MemberSeed> = wider
+            .iter()
+            .chain(&retained)
+            .map(|node| MemberSeed {
+                node_id: *node,
+                ticket: test_ticket(node),
+                join_permit: (!s.membership.contains(node))
+                    .then(|| authority::testing::valid(node, &test_ticket(node))),
+            })
+            .collect();
+        member_seeds.sort_by_key(|seed| seed.node_id);
+        let action = Action::ChangeMembership(ChangeMembershipAction {
+            operation_id: op(1),
+            expected_membership_log_id: None,
+            plan: MembershipPlan {
+                desired_voters: wider,
+                retained_learners: retained,
+                member_seeds,
+            },
+        });
+
+        let client = ClientRef {
+            actor: ADMIN,
+            client_id: [3u8; 16],
+            sequence: 1,
+            request_hash: [4u8; 32],
+        };
+
+        // Stage 3: a leader sees the condition in committed state and answers
+        // without proposing. Nothing is written, so the client may retry the
+        // same sequence once a cleanup lands.
+        assert_eq!(
+            preflight(&s, &client, &action),
+            Admission::Deny(RefusalReason::MembershipLearnerEnvelope),
+            "a leader must answer this before proposing"
+        );
+
+        // And the race: a plan admitted before the envelope filled, refused at
+        // apply. That one *is* Consumed and saved -- the ordinary stage-3 shape,
+        // not an exception -- so the client's retry replays it rather than
+        // being reclassified.
+        let mut applied = s.clone();
+        let first = apply_client_command(&mut applied, log(2), &client, &action).expect("no fault");
+        assert_eq!(first.disposition, Disposition::Consumed);
+        assert_eq!(first.reply.reason, Reason::MembershipLearnerEnvelope);
+        // Terminal **for this sequence**, and that is not a contradiction with
+        // the reason being retryable: `Consumed` means a result was saved, so
+        // every retry of that sequence is answered from the session table. The
+        // reason's retryability governs the `NotConsumed` answer above, where
+        // nothing was written and the same sequence may be re-sent. Conflating
+        // the two is what the assertion here first got wrong.
+        assert!(
+            first.is_terminal(),
+            "a consumed sequence has a saved answer, whatever the reason"
+        );
+        assert!(
+            !Reason::MembershipLearnerEnvelope.is_terminal_when_not_consumed(),
+            "while the reason itself stays retryable, which is what stage 3 reports"
+        );
+
+        let replayed =
+            apply_client_command(&mut applied, log(3), &client, &action).expect("no fault");
+        assert!(replayed.replayed, "answered from the session table");
+        assert_eq!(replayed.reply, first.reply, "and replayed exactly");
+    }
+
     /// The refusal is a §10 stage-3 coordination outcome, not a request-shape
     /// violation.
     ///

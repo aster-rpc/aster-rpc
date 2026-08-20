@@ -145,6 +145,17 @@ shape_limits! {
 /// A constant rather than an argument, for the same reason the storage codec
 /// version is: a controller that could be *asked* to retain could commit a
 /// membership no voter can load.
+///
+/// **It has no shipping consumer yet.** Slice 2 declares it and only Slice 2's
+/// tests reference it; §7.3's controller is Slice 3's, and its gate carries the
+/// obligation to read this rather than pass a literal. Until then this pins the
+/// decision, not the call.
+///
+/// `retain = false` alone is also not sufficient. It removes a departing voter
+/// even when the plan names it in `retained_learners`, so §7.3 step 5 must
+/// **replace** the node map with the exact voters plus retained learners rather
+/// than add before it removes -- see
+/// `step_five_replaces_the_node_map_rather_than_adding_first`.
 pub const MEMBERSHIP_RETAIN: bool = false;
 
 /// The learners a plan's execution would transiently hold.

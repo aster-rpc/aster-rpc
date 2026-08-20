@@ -1829,6 +1829,87 @@ mod tests {
         );
     }
 
+    /// Step 5 must replace the node map, not add before it removes.
+    ///
+    /// `retain = false` removes a departing voter *even when the plan names it
+    /// in `retained_learners`*, so step 4 can drop a node step 5 has to put
+    /// back. That makes the ordering load-bearing: five voters with six
+    /// stranded learners, shrinking to three while retaining two of the
+    /// departing ones, is within the envelope at both ends and over it in
+    /// between.
+    ///
+    /// The controller is Slice 3's, so what this pins is the shape of the
+    /// entries it may commit. The atomic replacement applies and reopens; the
+    /// re-add-first intermediate is refused on every voter.
+    #[tokio::test]
+    async fn step_five_replaces_the_node_map_rather_than_adding_first() {
+        use crate::coordination::model::shape::MAX_LEARNER_ENVELOPE;
+        use openraft::Membership;
+
+        let node = |b: u8| CoordinationNodeId::from_array([b; 32]);
+        let stranded: Vec<CoordinationNodeId> = (0..MAX_LEARNER_ENVELOPE)
+            .map(|n| node(0x80 + n as u8))
+            .collect();
+        // The two departing voters the plan asks to keep as learners.
+        let retained = [node(4), node(5)];
+        let desired: std::collections::BTreeSet<CoordinationNodeId> = (1u8..=3).map(node).collect();
+
+        let map = |learners: &[CoordinationNodeId]| {
+            let mut nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
+                desired.iter().map(|id| (*id, CoordinationNode)).collect();
+            for learner in learners {
+                nodes.insert(*learner, CoordinationNode);
+            }
+            Membership::new(vec![desired.clone()], nodes)
+        };
+
+        // What §7.3 step 5 now requires: the exact voters plus the retained
+        // learners, in one entry.
+        let dir = scratch_dir();
+        let (mut atomic, shutdown) = machine(&dir);
+        atomic
+            .apply([Entry {
+                log_id: log_id(1),
+                payload: EntryPayload::Membership(map(&retained)),
+            }])
+            .await
+            .expect("a node-map replacement commits");
+        let running = published(&atomic).await;
+        assert_eq!(running.model.membership.learners.len(), 2);
+
+        drop(shutdown);
+        drop(atomic);
+        let (restarted, restarted_shutdown) = reopen(&dir);
+        assert_eq!(
+            published(&restarted).await.model.membership,
+            running.model.membership,
+            "and it reopens"
+        );
+        drop(restarted_shutdown);
+        drop(restarted);
+
+        // The intermediate a re-add-first sequence would commit: the six
+        // stranded learners plus the two being restored.
+        let mut both: Vec<CoordinationNodeId> = stranded.clone();
+        both.extend(retained);
+        assert_eq!(both.len(), MAX_LEARNER_ENVELOPE + 2);
+
+        let dir = scratch_dir();
+        let (mut adding, _shutdown) = machine(&dir);
+        let err = adding
+            .apply([Entry {
+                log_id: log_id(1),
+                payload: EntryPayload::Membership(map(&both)),
+            }])
+            .await
+            .expect_err("adding before removing exceeds the envelope");
+        assert!(format!("{err:?}").contains("envelope"), "{err:?}");
+        assert!(
+            adding.handle().is_fatal(),
+            "and it would have been fatal on every voter"
+        );
+    }
+
     /// Sixty-four terminal intents *and* one active reopens.
     ///
     /// §9: "if all 64 slots hold terminal intents and one is active, a new

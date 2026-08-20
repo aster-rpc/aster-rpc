@@ -280,7 +280,13 @@ impl Reason {
             | Reason::StateBudgetExhausted
             | Reason::ResourceSlotsExhausted
             | Reason::AclSlotsExhausted
-            | Reason::LastAdministrator => true,
+            | Reason::LastAdministrator
+            // A group condition a leader can see before proposing, and one a
+            // cleanup plan clears -- so it must be answerable `NotConsumed`.
+            // Classifying it with the apply-time refusals instead made
+            // `project` admit it, and apply then saved a **Consumed** rejection:
+            // terminal, for a condition §5.2 declares retryable.
+            | Reason::MembershipLearnerEnvelope => true,
 
             // Consumed conflicts. These must reach the log and save a result:
             // denied pre-proposal, a client that may not alter the request at
@@ -298,10 +304,7 @@ impl Reason {
             | Reason::NotHolder
             | Reason::PermissionChanged
             | Reason::MembershipIntentActive
-            | Reason::MembershipCannotCancel
-            // Decided against the committed membership, so it reaches the log
-            // like every other §9 refusal.
-            | Reason::MembershipLearnerEnvelope => false,
+            | Reason::MembershipCannotCancel => false,
 
             // Classifier results (§8.2.1), never admission decisions.
             Reason::None
@@ -478,7 +481,7 @@ mod tests {
     // wrong arm left every case passing.
 
     /// §10 stage 3: the reason-coded admission denials.
-    const ADMISSION_DENIAL_CODES: [i32; 5] = [15, 19, 22, 23, 24];
+    const ADMISSION_DENIAL_CODES: [i32; 6] = [15, 19, 22, 23, 24, 25];
 
     /// §10: `NotConsumed` refusals no v1 command can clear.
     const TERMINAL_NOT_CONSUMED_CODES: [i32; 4] = [11, 15, 18, 22];
@@ -486,7 +489,7 @@ mod tests {
     /// §5.2: defined so it cannot be reused, but never emitted.
     const RESERVED_CODES: [i32; 1] = [20];
 
-    /// §5.2 declares reasons 0 through 24 with no gaps.
+    /// §5.2 declares reasons 0 through 25 with no gaps.
     const REASON_CODE_RANGE: std::ops::RangeInclusive<i32> = 0..=25;
 
     /// §5.2's outcome codes.
@@ -645,7 +648,7 @@ mod tests {
         assert_eq!(consumed, Reason::ALL.len());
         assert_eq!(
             not_consumed, 4,
-            "§10 names four terminal NotConsumed reasons"
+            "§10 names four terminal NotConsumed reasons; 25 is not one of them"
         );
     }
 

@@ -2304,7 +2304,7 @@ mod tests {
     // ── Projection ──────────────────────────────────────────────────────────
 
     #[test]
-    fn only_the_four_admission_reasons_are_denied_before_proposal() {
+    fn only_the_declared_admission_reasons_are_denied_before_proposal() {
         for refusal in RefusalReason::ALL {
             if *refusal == RefusalReason::PermissionChanged {
                 continue;
