@@ -602,9 +602,20 @@ pub(crate) struct CoordinationStateMachine {
     current: Arc<Mutex<Option<SnapshotFile>>>,
     /// The same gate the actor issues read leases from.
     ///
-    /// Held here so that exclusive access does not have to go through the
-    /// actor: waiting out the readers is a blocking wait, and the actor thread
-    /// is what a reader may be waiting on.
+    /// Held here so exclusive access is reachable without the actor — which
+    /// shutdown needs, since it runs after the actor has stopped.
+    ///
+    /// It used to say the actor *could not* wait out readers, because a reader
+    /// might be waiting on the actor. That is not true, and the install path
+    /// depends on it not being true: a lease holder makes exactly one actor
+    /// call, the one that hands it the transaction, and everything afterwards —
+    /// streaming the body, releasing the transaction, publishing `CURRENT` —
+    /// runs off the actor entirely. So the actor can block in `quiesce` and
+    /// every outstanding holder can still finish and let go.
+    ///
+    /// `a_lease_holder_never_waits_on_the_actor` is that premise, tested rather
+    /// than asserted: it pauses the actor and drives a complete build and
+    /// publication through to release with the actor unable to answer anything.
     reads: ReadGate,
 }
 
@@ -3226,6 +3237,66 @@ mod tests {
         );
     }
 
+    /// Nothing an outstanding lease holder does needs the actor.
+    ///
+    /// The premise that makes actor-side quiescence safe. The install has to
+    /// wait out readers *while holding the actor still* — the classification
+    /// and the rename must see one `last_applied`, and only the actor can
+    /// guarantee no apply lands between them. That wait is a deadlock the
+    /// moment a holder needs the actor to finish, and the field's own comment
+    /// used to claim it did.
+    ///
+    /// Both holder paths are driven here with the actor paused and unable to
+    /// answer anything:
+    ///
+    /// - a `GuardedRead` streams a complete body and releases its transaction;
+    /// - the `ReadLease` that survives it publishes `CURRENT` and is released.
+    ///
+    /// A regression fails on the bounded wait rather than hanging the suite,
+    /// which is why the whole sequence runs on its own thread.
+    #[tokio::test]
+    async fn a_lease_holder_never_waits_on_the_actor() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&dir);
+        // The one actor call a holder makes.
+        let read = machine
+            .handle()
+            .read_transaction()
+            .await
+            .expect("a read transaction");
+
+        // From here the actor answers nothing at all.
+        let release = machine.handle().pause().await;
+
+        let (done, finished) = mpsc::channel();
+        let worker = {
+            let layout = machine.layout.clone();
+            let machine = machine.clone();
+            std::thread::spawn(move || {
+                let built = snapshot::build(&layout, &read).expect("stream the body");
+                let lease = read.release_transaction();
+                let published = machine.publish(&lease, built).expect("publish CURRENT");
+                drop(lease);
+                done.send(published.meta.snapshot_id.clone())
+                    .expect("report");
+            })
+        };
+
+        let id = finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a lease holder completes with the actor unable to answer");
+        worker.join().expect("join");
+        assert!(id.starts_with("aster-coordination-v1:"));
+
+        // And the gate is free again, which is what a quiescing actor waits for.
+        assert_eq!(machine.reads.outstanding(), 0);
+
+        release.send(()).expect("let the actor go");
+    }
+
     // ── Install: receiving (§11.4) ──────────────────────────────────────────
 
     /// A store with one published snapshot, and a Published handle on it.
@@ -3496,13 +3567,12 @@ mod tests {
         // holding the file to production's own open, so this call succeeding is
         // already the reopen assertion. A candidate missing `codec_version`
         // fails here rather than after it has replaced `state.redb`.
-        let verified =
-            super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), &staged)
-                .expect("the candidate rebuilds and opens as production would");
+        let verified = super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), staged)
+            .expect("the candidate rebuilds and opens as production would");
         let rebuilt = candidate_in(&dir).expect("the candidate is under incoming/");
-        assert_seven_sections(verified.state(), "after the rebuild");
+        assert_seven_sections(verified.rebuilt(), "after the rebuild");
         assert_eq!(
-            verified.state(),
+            verified.rebuilt(),
             &before,
             "the rebuilt state is the state the body was streamed from"
         );
@@ -3563,7 +3633,7 @@ mod tests {
         )
         .expect("row decoding and body binding both succeed");
 
-        let err = super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), &staged)
+        let err = super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), staged)
             .expect_err("whole-state validation is part of rebuilding");
         let detail = format!("{err:?}");
         assert!(detail.contains("aggregate-counters"), "{detail}");
@@ -3598,7 +3668,7 @@ mod tests {
         )
         .expect("stage the source");
         let verified =
-            super::super::snapshot::rebuild_candidate(&layout, &staged).expect("a valid candidate");
+            super::super::snapshot::rebuild_candidate(&layout, staged).expect("a valid candidate");
 
         // The store's own handles go first: that is what the install's quiesce
         // is for, and a rename over an open database is not what is being
@@ -3676,7 +3746,7 @@ mod tests {
         )
         .expect("swap the staged bytes under the verified handle");
 
-        let err = super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), &staged)
+        let err = super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), staged)
             .expect_err("the rebuilt rows must be the verified rows");
         assert!(format!("{err:?}").contains("verified"), "{err:?}");
     }
@@ -3717,7 +3787,7 @@ mod tests {
         bytes[at] = if bytes[at] == b'A' { b'B' } else { b'A' };
         std::fs::write(staged.path(), &bytes).expect("edit one row in place");
 
-        let err = super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), &staged)
+        let err = super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), staged)
             .expect_err("the rebuilt bytes must hash to what was verified");
         assert!(format!("{err:?}").contains("hashed to"), "{err:?}");
     }
@@ -3763,15 +3833,16 @@ mod tests {
             &bad.meta,
         )
         .expect("the bad body stages");
-        super::super::snapshot::rebuild_candidate(&layout, &staged_bad)
+        let bad_body = staged_bad.path().to_path_buf();
+        super::super::snapshot::rebuild_candidate(&layout, staged_bad)
             .expect_err("its counters do not describe its rows");
         assert!(
             candidate_in(&dir).is_none(),
             "a candidate that failed verification must not survive it"
         );
         assert!(
-            staged_bad.path().exists(),
-            "and the staged body it was built from is still held"
+            !bad_body.exists(),
+            "and the staged body goes with it: the prepared install owned both"
         );
 
         // Immediately afterwards, with a body that is sound.
@@ -3784,9 +3855,9 @@ mod tests {
             &crate::coordination::raft::SnapshotMetaV1::from(&good.meta),
         )
         .expect("the good body stages");
-        let verified = super::super::snapshot::rebuild_candidate(&layout, &staged_good)
+        let verified = super::super::snapshot::rebuild_candidate(&layout, staged_good)
             .expect("the retry is not blocked by the first attempt's leftovers");
-        assert_seven_sections(verified.state(), "after the retry");
+        assert_seven_sections(verified.rebuilt(), "after the retry");
 
         // And nothing removes it once a replacement has taken it.
         drop(machine);
@@ -3807,9 +3878,13 @@ mod tests {
     /// metadata would be asserting against itself, and the equal case in
     /// particular only means anything when both sides really did apply the same
     /// entries.
+    ///
+    /// Each case prepares a real candidate, because that is the order the
+    /// install runs in and because the decision is a method on the prepared
+    /// value -- there is no staged body to classify on its own.
     #[tokio::test]
     async fn the_install_decision_covers_stale_equal_and_higher() {
-        use super::super::snapshot::{decide_install, Install};
+        use super::super::snapshot::Install;
 
         // A source at applied index 2.
         let source_dir = scratch_dir();
@@ -3831,15 +3906,15 @@ mod tests {
             let dir = scratch_dir();
             let (machine, _s, _d, dir) = receiver(dir);
             let durable = durable_of(&machine).await;
-            let staged = super::super::snapshot::receive(
-                &StorageLayout::new(&dir),
+            let prepared = prepare(
+                &dir,
                 &published.snapshot,
                 &durable,
                 &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
-            )
-            .expect("stage");
+            );
             assert_eq!(
-                decide_install(&staged, &durable, || panic!("no digest at a higher index"))
+                prepared
+                    .decide(&durable, || panic!("no digest at a higher index"))
                     .expect("decide"),
                 Install::Replace,
                 "index 2 over index 1 replaces"
@@ -3855,54 +3930,49 @@ mod tests {
                 .await
                 .expect("move past the candidate");
             let durable = durable_of(&machine).await;
-            let staged = super::super::snapshot::receive(
-                &StorageLayout::new(&dir),
+            let prepared = prepare(
+                &dir,
                 &published.snapshot,
                 &durable,
                 &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
-            )
-            .expect("stage");
-            let decision = decide_install(&staged, &durable, || panic!("no digest when stale"))
+            );
+            let decision = prepared
+                .decide(&durable, || panic!("no digest when stale"))
                 .expect("decide");
             assert!(
                 matches!(decision, Install::Stale(_)),
                 "index 2 under index 3 is a rollback: {decision:?}"
             );
+            assert!(!decision.latches_fatal(), "and being behind is not fatal");
+            assert!(!decision.replaces_state());
         }
 
         // ── Equal, same content: the lost-acknowledgement repair ────────────
         {
-            // The receiver *is* the source store, reopened: same rows, same
-            // log id, so its own canonical digest is the candidate's.
             let dir = scratch_dir();
             let (mut machine, _s, _d, dir) = receiver(dir);
             let durable = durable_of(&machine).await;
-            let staged = super::super::snapshot::receive(
-                &StorageLayout::new(&dir),
-                &published.snapshot,
-                &durable,
-                &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
-            )
-            .expect("stage");
-            // Its own body, at its own applied index.
+            // Its own body, at its own applied index: the state it would be
+            // asked to install after a lost acknowledgement.
             let mine = {
                 let mut builder = machine.get_snapshot_builder().await;
                 builder.build_snapshot().await.expect("build")
             };
-            let self_staged = super::super::snapshot::receive(
-                &StorageLayout::new(&dir),
+            let prepared = prepare(
+                &dir,
                 &mine.snapshot,
                 &durable,
                 &crate::coordination::raft::SnapshotMetaV1::from(&mine.meta),
-            )
-            .expect("stage my own");
-            let digest = *self_staged.digest();
+            );
+            let digest = *prepared.staged().digest();
+            let decision = prepared.decide(&durable, || Ok(digest)).expect("decide");
             assert_eq!(
-                decide_install(&self_staged, &durable, || Ok(digest)).expect("decide"),
+                decision,
                 Install::Repair,
                 "the same state arriving again repairs rather than replaces"
             );
-            let _ = staged;
+            assert!(!decision.replaces_state(), "and never rewrites the state");
+            assert!(!decision.latches_fatal());
         }
 
         // ── Equal index, different log id: divergent history ────────────────
@@ -3910,7 +3980,7 @@ mod tests {
         // Two leaders can write different entries at the same index, so the
         // index matching is not the two sides agreeing about anything. Reached
         // by giving the source's state the same index under a later term:
-        // everything else — group, genesis, authority, profile, index —
+        // everything else -- group, genesis, authority, profile, index --
         // matches, which is exactly the case the identity checks cannot see.
         {
             let forked_dir = scratch_dir();
@@ -3931,24 +4001,24 @@ mod tests {
                 Some(1),
                 "the receiver is at the same index"
             );
-            let staged = super::super::snapshot::receive(
-                &StorageLayout::new(&dir),
-                &CoordinationSnapshotFile::incoming(body.path),
-                &durable,
-                &body.meta,
-            )
-            .expect("a body from the same group stages");
-            let decision = decide_install(&staged, &durable, || {
-                panic!("the log ids disagree; there is nothing to hash")
-            })
-            .expect("decide");
+            let source = CoordinationSnapshotFile::incoming(body.path);
+            let prepared = prepare(&dir, &source, &durable, &body.meta);
+            let decision = prepared
+                .decide(&durable, || {
+                    panic!("the log ids disagree; there is nothing to hash")
+                })
+                .expect("decide");
             assert!(
                 matches!(decision, Install::Fatal(_)),
                 "same index under a different term is not the same entry: {decision:?}"
             );
+            assert!(
+                decision.latches_fatal(),
+                "divergent history stops the store"
+            );
         }
 
-        // ── Equal index, different content: divergent history ───────────────
+        // ── Equal index, same log id, different content ─────────────────────
         {
             let dir = scratch_dir();
             let (mut machine, _s, _d, dir) = receiver(dir);
@@ -3957,20 +4027,34 @@ mod tests {
                 let mut builder = machine.get_snapshot_builder().await;
                 builder.build_snapshot().await.expect("build")
             };
-            let self_staged = super::super::snapshot::receive(
-                &StorageLayout::new(&dir),
+            let prepared = prepare(
+                &dir,
                 &mine.snapshot,
                 &durable,
                 &crate::coordination::raft::SnapshotMetaV1::from(&mine.meta),
-            )
-            .expect("stage my own");
-            let decision =
-                decide_install(&self_staged, &durable, || Ok([0x5a; 32])).expect("decide");
+            );
+            let decision = prepared
+                .decide(&durable, || Ok([0x5a; 32]))
+                .expect("decide");
             assert!(
                 matches!(decision, Install::Fatal(_)),
                 "same log id, different bodies: {decision:?}"
             );
+            assert!(decision.latches_fatal());
         }
+    }
+
+    /// Receive and rebuild, which is what every install does before deciding.
+    fn prepare(
+        dir: &std::path::Path,
+        source: &CoordinationSnapshotFile,
+        durable: &DurableState,
+        meta: &crate::coordination::raft::SnapshotMetaV1,
+    ) -> super::super::snapshot::PreparedInstall {
+        let layout = StorageLayout::new(dir);
+        let staged = super::super::snapshot::receive(&layout, source, durable, meta)
+            .expect("stage the source");
+        super::super::snapshot::rebuild_candidate(&layout, staged).expect("rebuild the candidate")
     }
 
     /// A candidate replaces the store it was built for, and only that one.
@@ -4005,7 +4089,7 @@ mod tests {
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage for A");
-        let verified = super::super::snapshot::rebuild_candidate(&layout_a, &staged)
+        let verified = super::super::snapshot::rebuild_candidate(&layout_a, staged)
             .expect("a candidate for A");
 
         drop(machine_a);
@@ -4075,7 +4159,7 @@ mod tests {
         )
         .expect("stage");
         let verified =
-            super::super::snapshot::rebuild_candidate(&layout, &staged).expect("a valid candidate");
+            super::super::snapshot::rebuild_candidate(&layout, staged).expect("a valid candidate");
         let candidate = candidate_in(&dir).expect("the candidate is under incoming/");
 
         // The store's own handles close first: that is what the install's
@@ -4127,7 +4211,7 @@ mod tests {
         )
         .expect("stage");
         let verified =
-            super::super::snapshot::rebuild_candidate(&layout, &staged).expect("a valid candidate");
+            super::super::snapshot::rebuild_candidate(&layout, staged).expect("a valid candidate");
         let candidate = candidate_in(&dir).expect("the candidate is under incoming/");
         let installed = std::fs::read(&candidate).expect("the candidate's bytes");
 
@@ -4170,7 +4254,7 @@ mod tests {
 
         {
             let verified =
-                super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), &staged)
+                super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), staged)
                     .expect("a valid candidate");
             assert!(
                 candidate_in(&dir).is_some(),
@@ -4208,7 +4292,8 @@ mod tests {
         .expect("stage the source");
 
         let layout = StorageLayout::new(&dir);
-        super::super::snapshot::rebuild_candidate(&layout, &staged)
+        let meta_row = staged.header().meta.clone();
+        super::super::snapshot::rebuild_candidate(&layout, staged)
             .expect("a complete binding opens as production");
 
         // The same rows and meta row, without the codec version: what the
@@ -4225,7 +4310,7 @@ mod tests {
                 let bytes = super::super::codec::encode_committed(
                     Db::State,
                     "CoordinationMetaV1",
-                    &staged.header().meta,
+                    &meta_row,
                     super::super::schema::MAX_COORDINATION_META_BYTES,
                 )
                 .expect("encode");

@@ -622,6 +622,37 @@ pub(crate) enum Install {
     Fatal(String),
 }
 
+impl Install {
+    /// Whether reaching this outcome means the store can no longer say what is
+    /// durable.
+    ///
+    /// Carried on the outcome rather than decided at the call site, because the
+    /// two refusals look alike and are not alike. `Stale` is an ordinary "no":
+    /// a leader offered a snapshot this voter is already past, nothing is
+    /// wrong, and the store keeps serving. `Fatal` is this voter's history and
+    /// the group's disagreeing, which is §5.3.1 fatal — a handler that returned
+    /// both as plain errors would keep serving reads from a state it had just
+    /// been told it should not have.
+    pub(crate) fn latches_fatal(&self) -> bool {
+        match self {
+            Install::Fatal(_) => true,
+            Install::Replace | Install::Repair | Install::Stale(_) => false,
+        }
+    }
+
+    /// Whether the business state is replaced, as opposed to only the marker.
+    ///
+    /// Exactly one outcome does. `Repair` publishes over a state that is
+    /// already correct; replacing there would rewrite a database with itself,
+    /// through a quiesce and a rename, for nothing.
+    pub(crate) fn replaces_state(&self) -> bool {
+        match self {
+            Install::Replace => true,
+            Install::Repair | Install::Stale(_) | Install::Fatal(_) => false,
+        }
+    }
+}
+
 /// Compare a validated candidate against the durable state it would replace.
 ///
 /// ## When this may be called
@@ -642,7 +673,7 @@ pub(crate) enum Install {
 /// own, lazily: it streams the whole state, which is worth avoiding on the
 /// ordinary higher-index path and is unavoidable here — a cheaper comparison
 /// does not exist, because every cheaper thing already matched.
-pub(crate) fn decide_install(
+fn decide_install(
     staged: &StagedSnapshot,
     durable: &super::rows::DurableState,
     canonical: impl FnOnce() -> StorageResult<[u8; 32]>,
@@ -805,8 +836,8 @@ fn framing(path: &Path, err: BodyError) -> StorageError {
 /// never a file anything can open.
 pub(crate) fn rebuild_candidate(
     layout: &StorageLayout,
-    staged: &StagedSnapshot,
-) -> StorageResult<super::schema::VerifiedCandidate> {
+    staged: StagedSnapshot,
+) -> StorageResult<PreparedInstall> {
     let body = staged.path();
     let handle = File::open(body)
         .map_err(|source| StorageError::io("rebuilding a state database", body, source))?;
@@ -864,7 +895,67 @@ pub(crate) fn rebuild_candidate(
     // Held to production's complete open before it is allowed to replace
     // anything. This includes `rows::load`'s counter and cross-table checks,
     // and returns that already-validated state to the replacement caller.
-    super::schema::verify_state_database(candidate)
+    let candidate = super::schema::verify_state_database(candidate)?;
+    Ok(PreparedInstall { staged, candidate })
+}
+
+/// A verified body and the database rebuilt from it, as one value.
+///
+/// The pairing is the point. With a staged body and a candidate as separate
+/// values, a caller can classify one and replace the other: the decision would
+/// be about body A's log id while the file that lands is B's rows, and every
+/// check either half runs would pass. Nothing downstream could notice, because
+/// each half is internally consistent.
+///
+/// So [`rebuild_candidate`] *consumes* the staged body, and every later step --
+/// the decision, the replacement, and the byte-verbatim publication that needs
+/// the original bytes -- goes through this one value. Two of them cannot be
+/// crossed because there is only ever one.
+#[derive(Debug)]
+pub(crate) struct PreparedInstall {
+    staged: StagedSnapshot,
+    candidate: super::schema::VerifiedCandidate,
+}
+
+impl PreparedInstall {
+    /// The verified body: its metadata to publish, and its bytes to promote.
+    pub(crate) fn staged(&self) -> &StagedSnapshot {
+        &self.staged
+    }
+
+    /// The state the rebuilt database was proved to hold.
+    pub(crate) fn rebuilt(&self) -> &super::rows::DurableState {
+        self.candidate.state()
+    }
+
+    /// Classify this install against the state it would overwrite.
+    ///
+    /// A method rather than a free function so the value classified and the
+    /// value installed are necessarily the same one.
+    pub(crate) fn decide(
+        &self,
+        durable: &super::rows::DurableState,
+        canonical: impl FnOnce() -> StorageResult<[u8; 32]>,
+    ) -> StorageResult<Install> {
+        decide_install(&self.staged, durable, canonical)
+    }
+
+    /// Rename the candidate over `state.redb`, and hand back the state it holds
+    /// together with the body still owed a publication.
+    pub(crate) fn replace(self) -> StorageResult<(super::rows::DurableState, StagedSnapshot)> {
+        let PreparedInstall { staged, candidate } = self;
+        let state = candidate.replace()?;
+        Ok((state, staged))
+    }
+
+    /// Give up the rebuilt database and keep the body.
+    ///
+    /// The `Repair` path: the business state is already correct, so the
+    /// candidate is dropped -- which removes it -- and only the marker is
+    /// published. Replacing here would rewrite a database with itself.
+    pub(crate) fn into_staged(self) -> StagedSnapshot {
+        self.staged
+    }
 }
 
 /// Inserts each streamed row into the table it came from.
