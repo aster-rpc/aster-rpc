@@ -24,7 +24,7 @@
 // wires the voter runtime rather than at any Slice 2 checkpoint.
 #![allow(dead_code)]
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use redb::{
@@ -1209,17 +1209,86 @@ pub(crate) fn write_state_binding(
     Ok(())
 }
 
+/// A newly-created state candidate whose path did not exist at creation.
+///
+/// Kept as a distinct type because candidate integrity is checked with
+/// `freshly_created = true`. Accepting an arbitrary [`Database`] there would
+/// make that assertion a caller convention and let an old candidate retain
+/// rows the rebuild never visited.
+pub(crate) struct StateCandidate {
+    path: PathBuf,
+    database: Database,
+}
+
+impl StateCandidate {
+    pub(crate) fn database(&self) -> &Database {
+        &self.database
+    }
+}
+
+/// Create an absent state candidate with the production file permissions.
+///
+/// `Database::create(path)` also opens an existing database. A rebuild needs
+/// the stronger operation: every row in the candidate must come from this
+/// rebuild, so an existing path is refused atomically rather than reused.
+pub(crate) fn create_state_candidate(path: &Path) -> StorageResult<StateCandidate> {
+    reject_symlink(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| StorageError::io("creating a state candidate", path, source))?;
+    if let Err(err) = restrict_permissions(path, FILE_MODE) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(err);
+    }
+    let database = match Database::builder().create_file(file) {
+        Ok(database) => database,
+        Err(source) => {
+            let err = match source {
+                DatabaseError::TransactionInProgress => {
+                    StorageError::TransactionInProgress { db: Db::State }
+                }
+                other => StorageError::Integrity {
+                    db: Db::State,
+                    source: other,
+                },
+            };
+            let _ = std::fs::remove_file(path);
+            return Err(err);
+        }
+    };
+    Ok(StateCandidate {
+        path: path.to_path_buf(),
+        database,
+    })
+}
+
 /// Open a state database exactly as production would, and refuse it if
 /// production could not.
 ///
 /// What an install's post-replacement reopen runs, hoisted so a candidate can
-/// be held to it *before* it replaces anything. `freshly_created` is true: this
-/// database was built by this process moments ago, so `Ok(false)` from
+/// be held to it *before* it replaces anything. The [`StateCandidate`] type is
+/// the construction proof for `freshly_created = true`, so `Ok(false)` from
 /// `check_integrity` is evidence about the storage stack rather than about a
 /// previous shutdown.
-pub(crate) fn verify_state_database(path: &Path) -> StorageResult<()> {
-    reject_symlink(path)?;
-    let mut database = Database::create(path).map_err(|source| match source {
+///
+/// Returning the loaded state makes the complete production-open validation
+/// inseparable from rebuild: schema classification alone cannot detect valid
+/// individual rows whose counters or cross-table relationships disagree.
+pub(crate) fn verify_state_database(
+    candidate: StateCandidate,
+) -> StorageResult<super::rows::DurableState> {
+    let StateCandidate { path, database } = candidate;
+    drop(database);
+
+    // A distinct open is intentional: this is the exact boundary the install
+    // will cross after replacement, not validation through the builder handle
+    // that happened to write the bytes.
+    reject_symlink(&path)?;
+    let mut database = Database::open(&path).map_err(|source| match source {
         DatabaseError::TransactionInProgress => {
             StorageError::TransactionInProgress { db: Db::State }
         }
@@ -1230,15 +1299,16 @@ pub(crate) fn verify_state_database(path: &Path) -> StorageResult<()> {
     })?;
     check_integrity(&mut database, Db::State, true)?;
     match classify_state(&database, Presence::Existing)? {
-        SideState::BoundDurable | SideState::BoundPristine => Ok(()),
+        SideState::BoundDurable | SideState::BoundPristine => {}
         SideState::Unbound => Err(StorageError::PartialInitialization {
             detail: format!(
                 "{} at {} carries no identity binding",
                 Db::State,
                 path.display()
             ),
-        }),
+        })?,
     }
+    super::rows::load(&database)
 }
 
 pub(crate) fn create_state_tables(write: &redb::WriteTransaction) -> StorageResult<()> {

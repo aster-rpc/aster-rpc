@@ -926,6 +926,7 @@ mod tests {
     use crate::coordination::model::state::{GroupAuthority, ResourceKey, State};
     use crate::coordination::reason::Outcome as ModelOutcome;
     use openraft::{CommittedLeaderId, Membership};
+    use redb::ReadableDatabase as _;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
 
@@ -3470,19 +3471,16 @@ mod tests {
     /// field, or reconstructed one from another, disagrees here even though
     /// the body it produced would still round-trip through itself.
     ///
-    /// Deliberately a state with rows in five of the seven sections. Comparing
-    /// two empty databases would pass under a rebuild that inserted nothing.
+    /// Deliberately a state with rows in all seven sections. Comparing two
+    /// empty databases would pass under a rebuild that inserted nothing, and
+    /// leaving one section empty would not witness that section's mapping.
     #[tokio::test]
     async fn a_body_rebuilds_the_state_it_was_streamed_from() {
         let source_dir = scratch_dir();
         let ((source, _source_shutdown, _source_drain), published) =
             a_published_source(&source_dir).await;
         let before = durable_of(&source).await;
-        assert!(!before.model.resources.is_empty(), "resources");
-        assert!(!before.model.acl.is_empty(), "grants");
-        assert!(!before.model.admins.is_empty(), "admins");
-        assert!(!before.model.sessions.is_empty(), "sessions");
-        assert!(!before.model.audit.is_empty(), "audit");
+        assert_seven_sections(&before, "before the rebuild");
 
         let dir = scratch_dir();
         let (machine, _shutdown, _drain) = machine(&dir);
@@ -3499,15 +3497,115 @@ mod tests {
         // holding the file to production's own open, so this call succeeding is
         // already the reopen assertion. A candidate missing `codec_version`
         // fails here rather than after it has replaced `state.redb`.
-        super::super::snapshot::rebuild_candidate(&rebuilt, &staged)
+        let after = super::super::snapshot::rebuild_candidate(&rebuilt, &staged)
             .expect("the candidate rebuilds and opens as production would");
-
-        let database = Database::create(&rebuilt).expect("reopen");
-        let after = rows::load(&database).expect("the rebuilt database loads and validates");
         assert_seven_sections(&after, "after the rebuild");
         assert_eq!(
             after, before,
             "the rebuilt state is the state the body was streamed from"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&rebuilt)
+                    .expect("candidate metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "a candidate gets the same owner-only mode as state.redb"
+            );
+        }
+    }
+
+    /// Row-valid input is not necessarily a state production can open.
+    ///
+    /// The body below is canonical and every individual row decodes. Its only
+    /// defect is a persisted aggregate counter that disagrees with those rows.
+    /// Receiving therefore succeeds, and the rebuild itself must run the full
+    /// `rows::load` validation before the candidate can replace anything.
+    #[tokio::test]
+    async fn a_rebuild_refuses_row_valid_input_with_invalid_whole_state() {
+        let valid_dir = scratch_dir();
+        let ((valid, _valid_shutdown, _valid_drain), _published) =
+            a_published_source(&valid_dir).await;
+        let mut invalid = durable_of(&valid).await;
+        invalid.model.growth_bytes = invalid
+            .model
+            .growth_bytes
+            .checked_add(1)
+            .expect("the test counter has headroom");
+
+        // `rows::commit` deliberately writes the caller's committed state; it
+        // is not the loader's independent validator. That lets this fixture
+        // produce the exact on-disk corruption the production load must catch.
+        let source_dir = scratch_dir();
+        let database = seeded_with(&source_dir, invalid);
+        let read = database.begin_read().expect("read the invalid source");
+        let built = super::super::snapshot::build(&StorageLayout::new(&source_dir), &read)
+            .expect("row-valid state still has a canonical body");
+        drop(read);
+        drop(database);
+
+        let supplied = built.meta.clone();
+        let source = CoordinationSnapshotFile::incoming(built.path);
+        let dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&dir);
+        let staged = super::super::snapshot::receive(
+            &StorageLayout::new(&dir),
+            &source,
+            &durable_of(&machine).await,
+            &supplied,
+        )
+        .expect("row decoding and body binding both succeed");
+
+        let err = super::super::snapshot::rebuild_candidate(
+            &dir.join("incoming").join("invalid-state.redb"),
+            &staged,
+        )
+        .expect_err("whole-state validation is part of rebuilding");
+        let detail = format!("{err:?}");
+        assert!(detail.contains("aggregate-counters"), "{detail}");
+        assert!(detail.contains("growth persisted"), "{detail}");
+    }
+
+    /// A rebuild never opens or modifies an existing candidate path.
+    ///
+    /// `Database::create` is also an open operation. Reusing it here would let
+    /// rows absent from the body survive from an abandoned earlier candidate,
+    /// and would make the integrity check's `freshly_created` claim untrue.
+    #[tokio::test]
+    async fn a_rebuild_refuses_an_existing_candidate_without_touching_it() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let receiver_dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&receiver_dir);
+        let staged = super::super::snapshot::receive(
+            &StorageLayout::new(&receiver_dir),
+            &published.snapshot,
+            &durable_of(&machine).await,
+            &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+        )
+        .expect("stage the source");
+
+        let occupied_dir = scratch_dir();
+        drop(seeded_with(&occupied_dir, genesis_state()));
+        let candidate = occupied_dir.join("state.redb");
+        let before = std::fs::read(&candidate).expect("existing candidate bytes");
+
+        let err = super::super::snapshot::rebuild_candidate(&candidate, &staged)
+            .expect_err("an existing candidate is never reopened");
+        assert!(
+            format!("{err:?}").contains("creating a state candidate"),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&candidate).expect("candidate after refusal"),
+            before,
+            "refusal occurs before the existing database is touched"
         );
     }
 
@@ -3634,15 +3732,16 @@ mod tests {
         .expect("stage the source");
 
         let good = dir.join("incoming").join("bound.redb");
-        super::super::snapshot::rebuild_candidate(&good, &staged).expect("a complete binding");
-        super::super::schema::verify_state_database(&good).expect("and it opens as production");
+        super::super::snapshot::rebuild_candidate(&good, &staged)
+            .expect("a complete binding opens as production");
 
         // The same rows and meta row, without the codec version: what the
         // rebuild wrote before `write_state_binding` owned the whole binding.
         let bare = dir.join("incoming").join("bare.redb");
+        let candidate = super::super::schema::create_state_candidate(&bare).expect("create");
         {
-            let database = Database::create(&bare).expect("create");
-            let write = super::super::schema::durable_write(&database, Db::State).expect("write");
+            let write = super::super::schema::durable_write(candidate.database(), Db::State)
+                .expect("write");
             super::super::schema::create_state_tables(&write).expect("tables");
             {
                 let mut table = write
@@ -3661,7 +3760,7 @@ mod tests {
             }
             write.commit().expect("commit");
         }
-        let err = super::super::schema::verify_state_database(&bare)
+        let err = super::super::schema::verify_state_database(candidate)
             .expect_err("a state database without its codec version is not openable");
         assert!(format!("{err:?}").contains("codec"), "{err:?}");
     }

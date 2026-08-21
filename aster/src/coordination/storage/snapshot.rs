@@ -63,8 +63,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use redb::Database;
-
 use super::codec::encode_committed;
 use super::error::{Db, StorageError, StorageResult};
 // The row ceilings come from `rows`, not from a second list here: install must
@@ -709,20 +707,15 @@ fn framing(path: &Path, err: BodyError) -> StorageError {
 ///
 /// One write transaction, as §11.4 requires — a partially written rebuild is
 /// never a file anything can open.
-pub(crate) fn rebuild_candidate(path: &Path, staged: &StagedSnapshot) -> StorageResult<()> {
+pub(crate) fn rebuild_candidate(
+    path: &Path,
+    staged: &StagedSnapshot,
+) -> StorageResult<super::rows::DurableState> {
     let body = staged.path();
     let handle = File::open(body)
         .map_err(|source| StorageError::io("rebuilding a state database", body, source))?;
-    let database = Database::create(path).map_err(|source| match source {
-        redb::DatabaseError::TransactionInProgress => {
-            StorageError::TransactionInProgress { db: Db::State }
-        }
-        other => StorageError::Integrity {
-            db: Db::State,
-            source: other,
-        },
-    })?;
-    let write = durable_write(&database, Db::State)?;
+    let candidate = super::schema::create_state_candidate(path)?;
+    let write = durable_write(candidate.database(), Db::State)?;
 
     // The complete §11.1 binding, from `schema`, rather than the tables and the
     // meta row assembled here. A candidate missing `codec_version` loads
@@ -771,10 +764,11 @@ pub(crate) fn rebuild_candidate(path: &Path, staged: &StagedSnapshot) -> Storage
     write
         .commit()
         .map_err(|source| StorageError::redb(Db::State, source))?;
-    drop(database);
 
-    // Held to production's own open before it is allowed to replace anything.
-    super::schema::verify_state_database(path)
+    // Held to production's complete open before it is allowed to replace
+    // anything. This includes `rows::load`'s counter and cross-table checks,
+    // and returns that already-validated state to the replacement caller.
+    super::schema::verify_state_database(candidate)
 }
 
 /// Inserts each streamed row into the table it came from.
