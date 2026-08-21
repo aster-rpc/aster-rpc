@@ -118,6 +118,15 @@ pub(crate) enum StateCommand {
     /// Arm the commit failure described on [`StateActor::fail_next_commit`].
     #[cfg(test)]
     FailNextCommit(Reply<()>),
+    /// Block the actor until the test releases it.
+    ///
+    /// Without this there is no way to enqueue work *behind* a known failure:
+    /// [`StateHandle::call`] checks the fatal latch before sending, so by the
+    /// time a test can react to a failure it can no longer put anything in the
+    /// queue -- and the drain below has nothing to refuse. Pausing the actor
+    /// first is what makes the queue observable.
+    #[cfg(test)]
+    Pause(std::sync::mpsc::Receiver<()>),
 }
 
 /// Whether the actor may keep serving after one command.
@@ -188,6 +197,11 @@ impl StateActor {
                         "injected durability failure",
                     ))
                 }),
+                #[cfg(test)]
+                StateCommand::Pause(gate) => {
+                    let _ = gate.recv();
+                    Outcome::Continue
+                }
             };
             if outcome == Outcome::Fatal {
                 self.drain_fatal(&mut rx);
@@ -236,6 +250,8 @@ impl StateActor {
                 StateCommand::InjectFatal(reply) => fail(reply),
                 #[cfg(test)]
                 StateCommand::FailNextCommit(reply) => fail(reply),
+                #[cfg(test)]
+                StateCommand::Pause(_) => {}
             }
         }
     }
@@ -520,6 +536,37 @@ impl StateHandle {
     #[cfg(test)]
     async fn fail_next_commit(&self) -> StorageResult<()> {
         self.call(StateCommand::FailNextCommit).await
+    }
+
+    /// Block the actor and return the release handle.
+    #[cfg(test)]
+    async fn pause(&self) -> std::sync::mpsc::Sender<()> {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(StateCommand::Pause(gate_rx))
+            .await
+            .expect("the actor is running");
+        gate_tx
+    }
+
+    /// Enqueue a command without awaiting its reply, bypassing the caller-side
+    /// latch.
+    ///
+    /// The ordering guarantee this exists for: with the actor paused, two
+    /// successive sends land in the channel in exactly the order issued, which
+    /// is what makes "queued behind a failure" a testable statement rather than
+    /// a race.
+    #[cfg(test)]
+    async fn enqueue<T, F>(&self, build: F) -> oneshot::Receiver<StorageResult<T>>
+    where
+        F: FnOnce(Reply<T>) -> StateCommand,
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(build(reply_tx))
+            .await
+            .expect("the actor is running");
+        reply_rx
     }
 }
 
@@ -2731,9 +2778,12 @@ mod tests {
         assert_eq!(published(&machine).await, before);
     }
 
-    /// Once fatal, everything queued behind the failure is refused rather than
-    /// served -- those commands were enqueued while the store still looked
-    /// healthy.
+    /// Once fatal, a *later* call is refused.
+    ///
+    /// This is the caller-side latch only. Each call below is issued after the
+    /// failure has already been reported, so [`StateHandle::call`] rejects it
+    /// without sending -- nothing here reaches the actor, and nothing here says
+    /// anything about the drain. The test below is the one that does.
     #[tokio::test]
     async fn a_fatal_store_refuses_every_later_command() {
         let dir = scratch_dir();
@@ -2748,6 +2798,67 @@ mod tests {
         assert!(machine.applied_state().await.is_err());
         assert!(machine.apply([blank(1)]).await.is_err());
         assert!(machine.handle().published().await.is_err());
+    }
+
+    /// A batch queued *behind* a fatal failure is refused and never applied.
+    ///
+    /// This is the drain, tested directly. The ordering is forced rather than
+    /// raced: the actor is paused, the failure and the batch are enqueued in
+    /// that exact order while it cannot service either, and only then is it
+    /// released. So the batch is unambiguously in the channel when the failure
+    /// is classified -- the case the test above cannot reach, because a caller
+    /// checks the latch before sending and therefore never enqueues anything
+    /// once the store is fatal.
+    ///
+    /// Both halves are asserted, and the second is the one with teeth: the
+    /// batch is refused, *and* its effect is absent from disk. An actor that
+    /// keeps serving after a fatal command fails on the disk check, which no
+    /// caller-side latch can prevent.
+    #[tokio::test]
+    async fn a_batch_queued_behind_a_fatal_failure_is_never_applied() {
+        let dir = scratch_dir();
+        let before;
+
+        {
+            let (machine, shutdown, _drain) = machine(&dir);
+            let handle = machine.handle().clone();
+            before = published(&machine).await;
+
+            let release = handle.pause().await;
+
+            // Enqueued in this order, into a channel the actor cannot drain.
+            let fatal_rx = handle.enqueue(StateCommand::InjectFatal).await;
+            let apply_rx = handle
+                .enqueue(|reply| StateCommand::Apply {
+                    entries: vec![normal(1, acquire(1))],
+                    reply,
+                })
+                .await;
+
+            release.send(()).expect("release the actor");
+
+            assert!(
+                fatal_rx.await.expect("reply").is_err(),
+                "the injected failure is reported"
+            );
+            assert!(
+                apply_rx.await.expect("reply").is_err(),
+                "a batch queued behind a fatal failure must not be acknowledged"
+            );
+            assert!(handle.is_fatal());
+
+            drop(shutdown);
+            drop(machine);
+        }
+
+        // And it must not have reached the disk.
+        let after = durable(&dir);
+        assert_eq!(
+            after.model.last_applied, before.model.last_applied,
+            "the queued batch was applied despite the store already being fatal"
+        );
+        assert_eq!(after.model.resources, before.model.resources);
+        assert_eq!(after.model.audit.len(), before.model.audit.len());
     }
 
     /// The store's authority is what the group's rows are bound to, so a state

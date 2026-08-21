@@ -895,16 +895,17 @@ impl CatalogInner {
     ///
     /// Deliberately best-effort: failing to remove a superseded file is a
     /// disk-hygiene problem, not a correctness one — the marker already names
-    /// its successor, and startup sweeps retired orphans after validating
-    /// `CURRENT`. Turning it into a hard error would fail an install that has
-    /// already durably succeeded.
+    /// its successor. Turning it into a hard error would fail an install that
+    /// has already durably succeeded.
     ///
     /// But best-effort is not the same as forgotten. A removal that fails is
-    /// kept and retried on the next collection, because the case that fails is
-    /// the ordinary one on Windows — a handle still open somewhere unlinks with
-    /// an error rather than deferring — and dropping the entry there would
-    /// leave every superseded body to a startup sweep that has not been written
-    /// yet.
+    /// kept and retried on the next collection. Not because of this store's own
+    /// descriptors — Rust opens files with `FILE_SHARE_DELETE`, so they do not
+    /// block a removal on Windows either — but because a *foreign* handle
+    /// opened without that sharing mode does (a scanner, a backup agent, an
+    /// operator's editor), as do the ordinary transient errors. Dropping the
+    /// entry on the first failure would leave that body to a startup sweep that
+    /// has not been written yet.
     ///
     /// It sweeps the whole map rather than one id for the same reason: the
     /// event that lets a stuck removal succeed is usually some *other* handle
@@ -951,9 +952,11 @@ impl SnapshotCatalog {
     ///
     /// An open descriptor closes that on both platforms in the way each of them
     /// works: on Unix the inode survives an unlink until the last handle goes,
-    /// and on Windows the unlink fails while a handle is open, which the
-    /// catalog already treats as best-effort. The lease count stays because it
-    /// is what makes the *unlink* wait rather than merely be deferred.
+    /// and on Windows a `DeleteFileW` against a file opened with
+    /// `FILE_SHARE_DELETE` — which is how Rust opens every file — leaves the
+    /// bytes readable through the existing handle rather than tearing them
+    /// away. The lease count stays because it is what makes the removal *wait*
+    /// on this store's readers rather than merely be survivable by them.
     pub(crate) fn lease(
         &self,
         snapshot_id: impl Into<String>,
@@ -1028,8 +1031,9 @@ impl IncomingSnapshot {
 
 impl Drop for IncomingSnapshot {
     /// Removes the temporary. Best-effort for the same reason as
-    /// [`CatalogInner::collect`]: an orphan under `incoming/` is swept at
-    /// startup, and a failed unlink must not poison an unwind.
+    /// [`CatalogInner::collect`]: a failed unlink must not poison an unwind.
+    /// An orphan left under `incoming/` is inert — nothing reads that directory
+    /// by name — and is owed to the startup sweep that does not exist yet.
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -1046,9 +1050,8 @@ pub struct PublishedSnapshot {
     /// happened to the directory entry since.
     ///
     /// `Option` only so that [`Drop`] can close it *before* the catalog tries
-    /// to unlink — on Windows an open handle makes the removal fail, and this
-    /// handle's own descriptor would otherwise be the thing blocking the
-    /// collection its own release triggered.
+    /// to unlink. See that impl for why the ordering is conservative rather
+    /// than required.
     file: Option<File>,
     catalog: Arc<Mutex<CatalogInner>>,
 }
@@ -1080,11 +1083,15 @@ impl PublishedSnapshot {
 impl Drop for PublishedSnapshot {
     /// Closes the descriptor, then releases the lease.
     ///
-    /// In that order, and the order is the point: the collection this release
-    /// may trigger unlinks the file, and on Windows an unlink fails while any
-    /// handle is open. Releasing first would have this handle blocking the
-    /// removal of the very snapshot it had just stopped reading, leaving it to
-    /// a retry that may never come.
+    /// Conservative ordering rather than a requirement, and worth being precise
+    /// about because the obvious Windows folklore is wrong here: Rust opens
+    /// files with `FILE_SHARE_DELETE`, so the collection this release triggers
+    /// removes the file whether or not this descriptor is still open. What the
+    /// order does buy is the classic delete-pending window — a Win32 deletion
+    /// keeps the directory entry, and refuses new opens under that name, until
+    /// the last handle closes. Closing first ends that window immediately
+    /// instead of leaving a name that exists and cannot be opened. On Unix it
+    /// makes no observable difference at all.
     ///
     /// Never unlinks directly: this handle may be the leader's current
     /// snapshot, moved into a follower by OpenRaft's suite and dropped there.
@@ -1628,11 +1635,12 @@ mod tests {
 
     /// A failed removal is kept and retried, not forgotten.
     ///
-    /// Unix-only because it needs an unlink that fails: a read-only directory
-    /// refuses the removal there. It is the *Windows* case it stands in for —
-    /// an open handle makes `remove_file` fail outright rather than defer — and
-    /// on that platform forgetting the entry would leave every superseded body
-    /// on disk until a startup sweep that does not exist yet.
+    /// Unix-only because it needs an unlink that fails, and a read-only
+    /// directory is how one is arranged there. What it stands in for is any
+    /// removal this store cannot complete on the first attempt — a foreign
+    /// Windows handle opened without `FILE_SHARE_DELETE`, a transient error —
+    /// where forgetting the entry would leave a superseded body on disk until a
+    /// startup sweep that does not exist yet.
     #[test]
     #[cfg(unix)]
     fn a_removal_that_fails_is_retried_rather_than_forgotten() {
