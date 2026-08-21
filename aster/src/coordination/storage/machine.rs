@@ -3884,7 +3884,7 @@ mod tests {
     /// value -- there is no staged body to classify on its own.
     #[tokio::test]
     async fn the_install_decision_covers_stale_equal_and_higher() {
-        use super::super::snapshot::Install;
+        use super::super::snapshot::ResolvedInstall;
 
         // A source at applied index 2.
         let source_dir = scratch_dir();
@@ -3912,13 +3912,15 @@ mod tests {
                 &durable,
                 &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
             );
-            assert_eq!(
-                prepared
-                    .decide(&durable, || panic!("no digest at a higher index"))
-                    .expect("decide"),
-                Install::Replace,
-                "index 2 over index 1 replaces"
+            let resolved = prepared
+                .resolve(&durable, || panic!("no digest at a higher index"))
+                .expect("resolve");
+            assert!(
+                matches!(resolved, ResolvedInstall::Replace(_)),
+                "index 2 over index 1 replaces: {resolved:?}"
             );
+            // And only this arm can. The others do not carry a prepared
+            // install, so `replace` is not reachable from them at all.
         }
 
         // ── Stale: the receiver has applied past the candidate ──────────────
@@ -3936,15 +3938,18 @@ mod tests {
                 &durable,
                 &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
             );
-            let decision = prepared
-                .decide(&durable, || panic!("no digest when stale"))
-                .expect("decide");
+            let candidate = candidate_in(&dir).expect("a candidate was built");
+            let resolved = prepared
+                .resolve(&durable, || panic!("no digest when stale"))
+                .expect("resolve");
             assert!(
-                matches!(decision, Install::Stale(_)),
-                "index 2 under index 3 is a rollback: {decision:?}"
+                matches!(resolved, ResolvedInstall::Stale(_)),
+                "index 2 under index 3 is a rollback: {resolved:?}"
             );
-            assert!(!decision.latches_fatal(), "and being behind is not fatal");
-            assert!(!decision.replaces_state());
+            assert!(
+                !candidate.exists(),
+                "a refused install keeps neither artifact"
+            );
         }
 
         // ── Equal, same content: the lost-acknowledgement repair ────────────
@@ -3965,14 +3970,19 @@ mod tests {
                 &crate::coordination::raft::SnapshotMetaV1::from(&mine.meta),
             );
             let digest = *prepared.staged().digest();
-            let decision = prepared.decide(&durable, || Ok(digest)).expect("decide");
-            assert_eq!(
-                decision,
-                Install::Repair,
-                "the same state arriving again repairs rather than replaces"
+            let candidate = candidate_in(&dir).expect("a candidate was built");
+            let resolved = prepared.resolve(&durable, || Ok(digest)).expect("resolve");
+            let ResolvedInstall::Repair(body) = resolved else {
+                panic!("the same state arriving again repairs rather than replaces: {resolved:?}");
+            };
+            assert!(
+                !candidate.exists(),
+                "the rebuilt database goes: repairing never rewrites the state"
             );
-            assert!(!decision.replaces_state(), "and never rewrites the state");
-            assert!(!decision.latches_fatal());
+            assert!(
+                body.path().exists(),
+                "and the body stays, because CURRENT may still owe a publication"
+            );
         }
 
         // ── Equal index, different log id: divergent history ────────────────
@@ -4003,18 +4013,19 @@ mod tests {
             );
             let source = CoordinationSnapshotFile::incoming(body.path);
             let prepared = prepare(&dir, &source, &durable, &body.meta);
-            let decision = prepared
-                .decide(&durable, || {
+            let candidate = candidate_in(&dir).expect("a candidate was built");
+            let resolved = prepared
+                .resolve(&durable, || {
                     panic!("the log ids disagree; there is nothing to hash")
                 })
-                .expect("decide");
+                .expect("resolve");
             assert!(
-                matches!(decision, Install::Fatal(_)),
-                "same index under a different term is not the same entry: {decision:?}"
+                matches!(resolved, ResolvedInstall::Fatal(_)),
+                "same index under a different term is not the same entry: {resolved:?}"
             );
             assert!(
-                decision.latches_fatal(),
-                "divergent history stops the store"
+                !candidate.exists(),
+                "divergent history keeps neither artifact"
             );
         }
 
@@ -4033,14 +4044,13 @@ mod tests {
                 &durable,
                 &crate::coordination::raft::SnapshotMetaV1::from(&mine.meta),
             );
-            let decision = prepared
-                .decide(&durable, || Ok([0x5a; 32]))
-                .expect("decide");
+            let resolved = prepared
+                .resolve(&durable, || Ok([0x5a; 32]))
+                .expect("resolve");
             assert!(
-                matches!(decision, Install::Fatal(_)),
-                "same log id, different bodies: {decision:?}"
+                matches!(resolved, ResolvedInstall::Fatal(_)),
+                "same log id, different bodies: {resolved:?}"
             );
-            assert!(decision.latches_fatal());
         }
     }
 
