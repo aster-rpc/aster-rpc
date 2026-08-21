@@ -184,18 +184,27 @@ impl ScratchKind {
         }
     }
 
-    /// What may legitimately appear under `snapshots/`.
-    fn in_snapshots() -> &'static [ScratchKind] {
-        &[ScratchKind::Building, ScratchKind::Current]
-    }
+    /// Every kind, so recognition can ask each one where it belongs rather
+    /// than keeping a second list of which are legal where.
+    const ALL: &'static [ScratchKind] = &[
+        ScratchKind::Building,
+        ScratchKind::Current,
+        ScratchKind::Receiving,
+        ScratchKind::Installing,
+        ScratchKind::Candidate,
+    ];
 
-    /// What may legitimately appear under `incoming/`.
-    fn in_incoming() -> &'static [ScratchKind] {
-        &[
-            ScratchKind::Receiving,
-            ScratchKind::Installing,
-            ScratchKind::Candidate,
-        ]
+    /// The one directory this kind may appear in.
+    ///
+    /// Creation and recognition both go through here, so a kind cannot be
+    /// written somewhere recognition would not look for it.
+    pub(super) fn dir(self, layout: &StorageLayout) -> PathBuf {
+        match self {
+            ScratchKind::Building | ScratchKind::Current => layout.snapshots(),
+            ScratchKind::Receiving | ScratchKind::Installing | ScratchKind::Candidate => {
+                layout.incoming()
+            }
+        }
     }
 }
 
@@ -226,17 +235,30 @@ fn is_scratch(name: &str, kinds: &[ScratchKind]) -> bool {
     }) else {
         return false;
     };
-    let decimal = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    // Parsed at the widths the format writes, and required to round-trip.
+    // "Any run of digits" is wider than what `scratch_name` can emit, in two
+    // ways at once: it accepts numbers no process id or counter can reach, and
+    // it accepts `0001` for a value that is always written `1`. Either is a
+    // name this store cannot have produced, which makes it somebody else's.
+    let pid = |part: &str| part.parse::<u32>().is_ok_and(|n| n.to_string() == part);
+    let counter = |part: &str| part.parse::<u64>().is_ok_and(|n| n.to_string() == part);
+
     let mut parts = rest.split('-');
-    matches!(parts.next(), Some(pid) if decimal(pid))
-        && matches!(parts.next(), Some(counter) if decimal(counter))
+    matches!(parts.next(), Some(part) if pid(part))
+        && matches!(parts.next(), Some(part) if counter(part))
         && parts.next().is_none()
 }
 
 impl Scratch {
-    fn new(dir: &Path, kind: ScratchKind) -> Self {
+    /// Where it goes is the kind's to say, not the caller's.
+    ///
+    /// A directory and a kind as independent arguments let a valid kind be
+    /// written somewhere recognition would never look for it -- a `building`
+    /// scratch under `incoming/`, say -- which is a leak the sweep is
+    /// structurally unable to find. One answer, used to place and to recognise.
+    fn new(layout: &StorageLayout, kind: ScratchKind) -> Self {
         Self {
-            path: Some(dir.join(scratch_name(kind))),
+            path: Some(kind.dir(layout).join(scratch_name(kind))),
         }
     }
 
@@ -585,7 +607,7 @@ pub(crate) fn build(
     read: &redb::ReadTransaction,
 ) -> StorageResult<SnapshotFile> {
     let dir = layout.snapshots();
-    let scratch = Scratch::new(&dir, ScratchKind::Building);
+    let scratch = Scratch::new(layout, ScratchKind::Building);
 
     let handle =
         File::create(scratch.path()).map_err(io("creating a snapshot body", scratch.path()))?;
@@ -929,10 +951,15 @@ pub(crate) fn sweep_orphans(
     let snapshots = layout.snapshots();
     let incoming = layout.incoming();
 
-    for (dir, kinds) in [
-        (&snapshots, ScratchKind::in_snapshots()),
-        (&incoming, ScratchKind::in_incoming()),
-    ] {
+    for dir in [&snapshots, &incoming] {
+        // Which kinds belong here is the kinds' own answer, so this cannot
+        // disagree with where creation puts them.
+        let kinds: Vec<ScratchKind> = ScratchKind::ALL
+            .iter()
+            .copied()
+            .filter(|kind| &kind.dir(layout) == dir)
+            .collect();
+
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             // A store that has never built or received a snapshot has neither
@@ -951,7 +978,7 @@ pub(crate) fn sweep_orphans(
                 .file_type()
                 .map_err(io("sweeping a storage directory", dir))?
                 .is_file();
-            if is_file && is_scratch(&name, kinds) {
+            if is_file && is_scratch(&name, &kinds) {
                 match std::fs::remove_file(entry.path()) {
                     Ok(()) => swept.partials += 1,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1131,7 +1158,7 @@ pub(crate) fn receive(
 ) -> StorageResult<StagedSnapshot> {
     let dir = layout.incoming();
     std::fs::create_dir_all(&dir).map_err(io("creating the incoming directory", &dir))?;
-    let scratch = Scratch::new(&dir, ScratchKind::Installing);
+    let scratch = Scratch::new(layout, ScratchKind::Installing);
 
     let copied = {
         let handle =
@@ -1657,7 +1684,7 @@ pub(crate) fn decide_publication(
 /// Write `snapshots/CURRENT` atomically.
 fn publish_current(layout: &StorageLayout, meta: &SnapshotMetaV1) -> StorageResult<()> {
     let dir = layout.snapshots();
-    let scratch = Scratch::new(&dir, ScratchKind::Current);
+    let scratch = Scratch::new(layout, ScratchKind::Current);
     let bytes = super::codec::encode_committed(
         Db::State,
         "SnapshotMetaV1",
@@ -2810,10 +2837,99 @@ mod tests {
     /// failure between the two left a partial body under a name nothing sweeps
     /// and nothing can identify. Provoked here by renaming into a directory
     /// that does not exist.
+    /// Every kind round-trips, and only in the directory it belongs to.
+    ///
+    /// The producer and the recogniser checked against each other, for all five
+    /// kinds rather than the two the sweep test happens to create. A kind whose
+    /// tag was mistyped, or whose directory disagreed between the two, shows up
+    /// here and nowhere else -- the sweep would simply never collect it, which
+    /// is a leak no assertion about deleted files can see.
+    #[test]
+    fn every_scratch_kind_is_recognised_where_it_is_written() {
+        let dir = temp_dir();
+        let layout = StorageLayout::new(&dir);
+        let snapshots: Vec<ScratchKind> = ScratchKind::ALL
+            .iter()
+            .copied()
+            .filter(|k| k.dir(&layout) == layout.snapshots())
+            .collect();
+        let incoming: Vec<ScratchKind> = ScratchKind::ALL
+            .iter()
+            .copied()
+            .filter(|k| k.dir(&layout) == layout.incoming())
+            .collect();
+        assert_eq!(snapshots.len() + incoming.len(), ScratchKind::ALL.len());
+
+        for kind in ScratchKind::ALL {
+            let name = scratch_name(*kind);
+            let (here, there) = if kind.dir(&layout) == layout.snapshots() {
+                (&snapshots, &incoming)
+            } else {
+                (&incoming, &snapshots)
+            };
+            assert!(
+                is_scratch(&name, here),
+                "{name:?} is written here and must be recognised here"
+            );
+            assert!(
+                !is_scratch(&name, there),
+                "{name:?} belongs to the other directory and must not be swept from this one"
+            );
+        }
+    }
+
+    /// Names that resemble a scratch file without being one.
+    ///
+    /// The recogniser has been wider than the producer twice: first by matching
+    /// any dotted `.partial`, then by accepting any run of digits where the
+    /// format writes a `u32` process id and a `u64` counter in canonical
+    /// decimal. Both admitted names this store cannot emit, and the sweep
+    /// deletes what it admits.
+    #[test]
+    fn a_name_this_store_cannot_write_is_not_a_scratch_file() {
+        let kinds = &[ScratchKind::Building, ScratchKind::Candidate];
+        for name in [
+            // Not the shape at all.
+            "building-1-0.partial",
+            ".building-1-0",
+            ".operator-copy.partial",
+            // A kind, but not one of these.
+            ".receiving-1-0.partial",
+            // Field counts.
+            ".building-1.partial",
+            ".building-1-0-2.partial",
+            ".building--0.partial",
+            // Not decimal.
+            ".building-x-0.partial",
+            ".building-1-x.partial",
+            ".building-+1-0.partial",
+            // Decimal, but not what the format writes: zero-padded.
+            ".building-0001-0.partial",
+            ".candidate-1-00.partial",
+            // Decimal and unpadded, but wider than the fields.
+            ".candidate-4294967296-0.partial",
+            ".candidate-1-18446744073709551616.partial",
+        ] {
+            assert!(
+                !is_scratch(name, kinds),
+                "{name:?} is not a name `scratch_name` can produce"
+            );
+        }
+
+        // And the boundaries that are legal.
+        assert!(is_scratch(".building-0-0.partial", kinds));
+        assert!(is_scratch(
+            ".candidate-4294967295-18446744073709551615.partial",
+            kinds
+        ));
+    }
+
     #[test]
     fn a_failed_promotion_removes_the_partial_file() {
         let dir = temp_dir();
-        let scratch = Scratch::new(&dir, ScratchKind::Building);
+        let layout = StorageLayout::new(&dir);
+        std::fs::create_dir_all(layout.snapshots()).expect("snapshots dir");
+        let scratch = Scratch::new(&layout, ScratchKind::Building);
         let partial = scratch.path().to_path_buf();
         std::fs::write(&partial, b"half a body").expect("write");
 
