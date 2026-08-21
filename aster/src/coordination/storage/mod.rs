@@ -297,14 +297,23 @@ mod durability_guard {
     /// somewhere the walk never looks, so the compiled module tree and the
     /// guarded file set would quietly stop being the same thing.
     ///
-    /// A substring prohibition rather than a parser: the point is that neither
-    /// appears at all. `include_str!` is unaffected -- a different token, and
-    /// the mechanism this guard is built on.
+    /// `cfg_attr` is prohibited with them, because it reaches the same place by
+    /// a route no substring check on `path` can follow:
+    /// `#[cfg_attr(all(), path = "../outside.rs")]` compiles, survives rustfmt,
+    /// and has a condition that is simply true. Recognising *that* needs
+    /// attribute-aware parsing, and hand-parsing Rust here has been wrong every
+    /// time it has been tried. Nothing under this directory uses `cfg_attr`
+    /// today, so forbidding it costs nothing and the day it is wanted is the
+    /// day someone decides deliberately what it may carry.
+    ///
+    /// A substring prohibition rather than a parser: the point is that none of
+    /// the three appears at all. `include_str!` is unaffected -- a different
+    /// token, and the mechanism this guard is built on.
     #[test]
     fn no_source_is_pulled_in_from_outside_this_directory() {
         for (name, source) in SOURCES {
             for (n, line) in production_lines(source) {
-                for escape in ["#[path", "include!"] {
+                for escape in ["#[path", "include!", "cfg_attr"] {
                     assert!(
                         !line.contains(escape),
                         "{name}:{} uses {escape:?} to pull in a source the directory walk \
