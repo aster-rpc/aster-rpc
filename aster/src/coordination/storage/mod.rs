@@ -242,6 +242,11 @@ mod durability_guard {
             );
         }
 
+        // Names this guard does not get an opinion about. `rustc` has already
+        // accepted them, and refusing one lets its module escape.
+        assert_eq!(declared_module("mod r#type;"), Some("r#type"));
+        assert_eq!(declared_module("pub(crate) mod café;"), Some("café"));
+
         for line in [
             "mod child {",
             "use crate::child;",
@@ -330,7 +335,9 @@ mod durability_guard {
     fn every_declared_module_is_guarded() {
         let declared: std::collections::BTreeSet<String> = production_lines(include_str!("mod.rs"))
             .filter_map(|(_, line)| declared_module(line))
-            .map(|name| format!("{name}.rs"))
+            // `mod r#type;` lives in `type.rs`: the escape is how the source
+            // spells a keyword, not part of the file name.
+            .map(|name| format!("{}.rs", name.strip_prefix("r#").unwrap_or(name)))
             .collect();
         let guarded: std::collections::BTreeSet<String> = SOURCES
             .iter()
@@ -598,20 +605,21 @@ mod durability_guard {
     /// exists to prevent.
     ///
     /// So it does not look at visibility at all. A declaration is a statement
-    /// whose last two tokens are `mod` and an identifier; whatever precedes
-    /// them is visibility by definition, in whatever form Rust grows next.
-    /// `mod name {` is deliberately not matched: an inline module is in the
-    /// file being scanned and is covered as part of it.
+    /// whose last two tokens are `mod` and a name; whatever precedes them is
+    /// visibility by definition, in whatever form Rust grows next. `mod name {`
+    /// is deliberately not matched: an inline module is in the file being
+    /// scanned and is covered as part of it.
+    ///
+    /// The name is not validated either, and for the same reason. This reads
+    /// source that has already compiled, so `rustc` has settled what a module
+    /// name may be -- and it admits more than an ASCII check does. `mod r#type;`
+    /// and `mod café;` are both legal, and a guard that refused to recognise
+    /// them would let exactly those modules escape every check in this file.
     fn declared_module(line: &str) -> Option<&str> {
         let code = line.split("//").next()?.trim().strip_suffix(';')?;
         let mut tokens = code.split_whitespace().rev();
         let name = tokens.next()?;
-        if tokens.next()? != "mod" {
-            return None;
-        }
-        (name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        .then_some(name)
+        (tokens.next()? == "mod").then_some(name)
     }
 
     pub(super) fn production_end(source: &str) -> usize {
