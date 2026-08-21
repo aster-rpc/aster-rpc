@@ -61,7 +61,7 @@ use super::error::{Db, StorageError, StorageResult};
 use super::reads::{GuardedRead, Quiesced, ReadDrain, ReadGate, ReadLease};
 use super::rows::{self, DurableState};
 use super::schema::StorageLayout;
-use super::snapshot::{self, Publication, SnapshotCatalog, SnapshotFile};
+use super::snapshot::{self, SnapshotCatalog, SnapshotFile};
 use super::CoordinationSnapshotFile;
 use crate::coordination::contract::{CommandReplyV1, NonCommandReplyV1};
 use crate::coordination::ids::CoordinationNodeId;
@@ -358,17 +358,15 @@ impl StateActor {
                 // Closed before the rename, reopened after: redb holds the file
                 // this is about to be renamed over.
                 drop(self.database.take());
-                let (installed, body) = granted.replace()?;
+                let replaced = granted.replace()?;
 
-                // Service does not resume on the replacement alone. The reopen
-                // is what proves the file that landed is a database this build
-                // can serve, and the load behind it re-runs every §11.3 and
-                // §12.1 check against the rows that arrived.
-                let (database, reloaded) =
-                    super::schema::open_installed_state(&self.layout.database(Db::State))?;
+                // Service does not resume on the replacement alone, and the
+                // publication capability is not reachable until it has: the
+                // reopen proves the file that landed is a database this build
+                // can serve *and* is the one this install validated.
+                let (database, reloaded, body) = replaced.reopen(&self.layout)?;
                 self.database = Some(database);
                 self.state = Some(reloaded);
-                let _ = installed;
                 body
             }
         };
@@ -876,36 +874,11 @@ impl CoordinationStateMachine {
         current: &mut Option<SnapshotFile>,
         built: SnapshotFile,
     ) -> StorageResult<Snapshot<CoordinationTypeConfig>> {
-        let serving =
-            match snapshot::decide_publication(&built.meta, current.as_ref().map(|f| &f.meta)) {
-                Publication::Publish => {
-                    snapshot::publish_current(&self.layout, &built.meta)?;
-                    if let Some(previous) = current.replace(built.clone()) {
-                        self.catalog
-                            .retire(&previous.meta.snapshot_id, &previous.path);
-                    }
-                    built
-                }
-                // The body is already on disk under its digest name, so this
-                // republishes the marker and nothing else. That is the repair
-                // §11.4 requires after a lost acknowledgement, not a no-op.
-                Publication::Idempotent => {
-                    snapshot::publish_current(&self.layout, &built.meta)?;
-                    built
-                }
-                // A builder that finished behind the current snapshot. The marker
-                // does not move and the file goes, which is what "discarded" has to
-                // mean if it is not to accumulate.
-                Publication::Discard => {
-                    self.catalog.retire(&built.meta.snapshot_id, &built.path);
-                    current
-                        .clone()
-                        .expect("only a published snapshot can be ahead of a candidate")
-                }
-                Publication::Fatal(detail) => {
-                    return Err(StorageError::corrupt(Db::State, "snapshot", detail))
-                }
-            };
+        // The decision and the marker write live together in `snapshot`, so
+        // this module has no way to publish a marker at all -- which is what
+        // stops a local build reaching `publish_current` directly and skipping
+        // §11.4's monotonicity rule that the install path is held to.
+        let serving = snapshot::publish_built(&self.layout, &self.catalog, current, built)?;
         self.lease(current, &serving)
     }
 
@@ -3533,9 +3506,112 @@ mod tests {
             .expect("and the install completes once the lease is released");
     }
 
-    /// A snapshot this store has already applied past is refused, not fatal.
+    /// A valid database that is not the installed one is refused.
+    ///
+    /// The reopen asks two questions, and this is the second. A rename that put
+    /// *something else* in place leaves a file that opens, passes integrity,
+    /// carries a correct binding and loads a well-formed state -- every check
+    /// before this one passes on it. Only comparing against what the candidate
+    /// was validated to contain says otherwise.
+    ///
+    /// Driven through a directly-assembled `ReplacedInstall`, because producing
+    /// it for real needs the file to change between the rename and the reopen,
+    /// which is Checkpoint E's fault injection.
     #[tokio::test]
-    async fn an_install_behind_the_state_is_refused_without_stopping_the_store() {
+    async fn a_reopen_refuses_a_database_that_is_not_the_one_installed() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        // A store whose `state.redb` is perfectly valid and holds other state.
+        let dir = scratch_dir();
+        let staged = {
+            let (machine, shutdown, drain) = machine(&dir);
+            let staged = super::super::snapshot::receive(
+                &StorageLayout::new(&dir),
+                &published.snapshot,
+                &durable_of(&machine).await,
+                &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+            )
+            .expect("stage");
+            // The reopen opens `state.redb` itself, exactly as it would after a
+            // real rename, so the store's own handle goes first.
+            drop(machine);
+            drop(drain);
+            drop(shutdown);
+            staged
+        };
+
+        // Claim to have installed the sender's state, over a database that
+        // still holds the receiver's.
+        let sender = seven_section_state();
+        let replaced = super::super::snapshot::ReplacedInstall::for_test(sender, staged);
+        let err = replaced
+            .reopen(&StorageLayout::new(&dir))
+            .expect_err("a valid database that is not the installed one is not installed");
+        assert!(
+            format!("{err:?}").contains("not the one this install validated"),
+            "{err:?}"
+        );
+    }
+
+    /// Promoting an installed body does not disturb a reader of what was there.
+    ///
+    /// The reason promotion is a rename and not a copy. A copy opens the
+    /// destination and truncates it, so a reader holding that file sees its
+    /// bytes change underneath -- and the file it holds is one this store told
+    /// it was immutable. A rename leaves that inode alone and moves the name.
+    ///
+    /// Reachable because a digest name can be occupied by an orphan whose
+    /// content is *not* what the name claims: an earlier run's partial write.
+    /// Promotion replaces it, which is the repair -- and must not reach into
+    /// the bytes an existing reader is already holding.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn promoting_over_an_orphan_leaves_its_readers_alone() {
+        use std::io::Read as _;
+
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let (mut machine, _shutdown, _drain) = machine(&dir);
+
+        // An orphan under the name the install will publish to, holding
+        // something else entirely, with a reader on it.
+        let target = body_path(&dir, &published.meta.snapshot_id);
+        std::fs::create_dir_all(dir.join("snapshots")).expect("snapshots dir");
+        std::fs::write(&target, b"an earlier run's partial body").expect("orphan");
+        let mut reader = std::fs::File::open(&target).expect("a reader on the orphan");
+
+        machine
+            .install_snapshot(&published.meta, published.snapshot)
+            .await
+            .expect("the install succeeds");
+
+        let mut held = Vec::new();
+        reader.read_to_end(&mut held).expect("read what it holds");
+        assert_eq!(
+            held, b"an earlier run's partial body",
+            "the reader's bytes changed underneath it: promotion copied rather than renamed"
+        );
+        assert_ne!(
+            std::fs::read(&target).expect("the published body"),
+            held,
+            "while the name now points at the installed body"
+        );
+    }
+
+    /// A snapshot this store has already applied past stops the store.
+    ///
+    /// It read as an ordinary race at first -- a leader sending a snapshot
+    /// built before this follower caught up -- and was classified as a benign
+    /// refusal. OpenRaft does not leave that reading open: it filters snapshots
+    /// at or below `committed` before calling the state machine, so arriving
+    /// here means the durable state and the state OpenRaft believes this node
+    /// has already disagree. The nonfatal projection was unreachable anyway,
+    /// since any error out of `install_snapshot` ends the state-machine worker.
+    #[tokio::test]
+    async fn an_install_behind_the_state_stops_the_store() {
         let source_dir = scratch_dir();
         let (_source, published) = a_published_source(&source_dir).await;
 
@@ -3561,18 +3637,14 @@ mod tests {
         );
 
         assert!(
-            !machine.handle().is_fatal(),
-            "being ahead of a leader's snapshot is not this store's fault"
-        );
-        assert_eq!(
-            durable_of(&machine).await,
-            before,
-            "and its state is untouched"
+            machine.handle().is_fatal(),
+            "reaching this branch means OpenRaft and the durable state disagree"
         );
         assert!(
             leftovers(&dir).is_empty(),
             "with neither artifact left behind"
         );
+        let _ = before;
     }
 
     /// Nothing an outstanding lease holder does needs the actor.

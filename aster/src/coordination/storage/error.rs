@@ -245,12 +245,19 @@ pub(crate) enum StorageError {
 
     /// An install was offered a snapshot this voter has already applied past.
     ///
-    /// A refusal, and deliberately not a durability question: nothing is wrong
-    /// with this store, and nothing is wrong with the snapshot. A leader sent
-    /// one built before this follower caught up, which §11.4 says may not roll
-    /// the state machine back. Classified with [`LogGap`](StorageError::LogGap)
-    /// rather than with corruption, because latching fatal here would stop a
-    /// perfectly healthy voter over a race it is on the winning side of.
+    /// **Fatal**, despite reading like an ordinary race. It was classified as a
+    /// benign refusal first, on the reasoning that a leader had simply sent a
+    /// snapshot built before this follower caught up. That reasoning does not
+    /// survive contact with OpenRaft: it filters snapshots at or below
+    /// `committed` before it calls the state machine at all, so reaching this
+    /// branch means the durable state and the state OpenRaft believes this node
+    /// has are already different things -- which is the disagreement, not a
+    /// symptom of one.
+    ///
+    /// The nonfatal projection was unreachable in any case. Any error out of
+    /// `install_snapshot` terminates OpenRaft's state-machine worker, so
+    /// "refused but still serving" described nothing that could happen; the
+    /// test asserting it observed only that Aster's own latch was clear.
     #[error("coordination snapshot install refused: {detail}")]
     SnapshotBehind { detail: String },
 
@@ -377,9 +384,7 @@ impl StorageError {
     pub(crate) fn puts_durability_in_question(&self) -> bool {
         !matches!(
             self,
-            StorageError::LogGap { .. }
-                | StorageError::EncodeFailed { .. }
-                | StorageError::SnapshotBehind { .. }
+            StorageError::LogGap { .. } | StorageError::EncodeFailed { .. }
         )
     }
 

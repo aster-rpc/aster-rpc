@@ -585,6 +585,28 @@ impl StagedSnapshot {
         self.len
     }
 
+    /// Rename the staged body into place, or drop it if the bytes are already
+    /// there.
+    ///
+    /// Consumes the scratch, exactly as [`build`] does. A copy onto the digest
+    /// name is not atomic: a failure part-way leaves a partial file under a
+    /// name that vouches for its contents, and a copy over a name a reader
+    /// still holds truncates that reader's inode underneath it. A rename does
+    /// neither -- the old inode survives for whoever has it open, and the name
+    /// either moves or does not.
+    fn promote(self, to: &Path) -> StorageResult<()> {
+        match digest_of(to)? {
+            Existing::Digest(existing) if existing == self.digest => drop(self.scratch),
+            _ => {
+                self.scratch.promote(to)?;
+                if let Some(dir) = to.parent() {
+                    fsync_dir(dir)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The metadata to publish: **the caller's**, not a fresh derivation.
     ///
     /// The two are equal — [`receive`] refuses the source otherwise — and that
@@ -659,12 +681,69 @@ impl ReplaceInstall {
 
     /// Rename the candidate over `state.redb`.
     ///
-    /// Returns the state now on disk, and the body still owed a publication --
-    /// as a capability rather than as bytes, so publishing stays reachable only
-    /// from an install that earned it.
-    pub(crate) fn replace(self) -> StorageResult<(super::rows::DurableState, PublishInstall)> {
-        let (state, staged) = self.0.replace()?;
-        Ok((state, PublishInstall(staged)))
+    /// Yields a [`ReplacedInstall`] rather than a publication capability. The
+    /// replacement is not the end of the operation: §11.4 requires the file
+    /// that landed to be reopened and revalidated before anything serves from
+    /// it, and handing `PublishInstall` back here made that step skippable --
+    /// which is exactly why removing it failed no test.
+    pub(crate) fn replace(self) -> StorageResult<ReplacedInstall> {
+        let (expected, staged) = self.0.replace()?;
+        Ok(ReplacedInstall { expected, staged })
+    }
+}
+
+/// A replacement that has landed and has not yet been proved.
+///
+/// Holds the state the candidate was *validated* to contain, so the reopen can
+/// compare. Carries no way to publish: the only exit is
+/// [`ReplacedInstall::reopen`], which produces the publication capability only
+/// after the database on disk has been opened as production opens it and found
+/// to hold what was installed.
+#[derive(Debug)]
+pub(crate) struct ReplacedInstall {
+    expected: super::rows::DurableState,
+    staged: StagedSnapshot,
+}
+
+impl ReplacedInstall {
+    /// Assemble one without a replacement, so the comparison below can be
+    /// driven against a database that is valid and wrong.
+    ///
+    /// That case cannot be produced from outside: it needs the file under
+    /// `state.redb` to change between the rename and the reopen, which is the
+    /// fault injection Checkpoint E brings. Reaching the branch directly is the
+    /// difference between a check that is present and one that is evidenced.
+    #[cfg(test)]
+    pub(crate) fn for_test(expected: super::rows::DurableState, staged: StagedSnapshot) -> Self {
+        Self { expected, staged }
+    }
+
+    /// Reopen the replaced `state.redb`, revalidate it, and grant publication.
+    ///
+    /// Two questions, and the second is the one the earlier shape could not
+    /// ask. The reopen proves the file is a database this build can serve --
+    /// integrity, binding, and every §11.3 and §12.1 check that `rows::load`
+    /// runs. The comparison then proves it is the *right* one: a valid database
+    /// that is not the candidate is a rename that put something else in place,
+    /// and every check above would pass on it.
+    pub(crate) fn reopen(
+        self,
+        layout: &StorageLayout,
+    ) -> StorageResult<(redb::Database, super::rows::DurableState, PublishInstall)> {
+        let ReplacedInstall { expected, staged } = self;
+        let (database, reloaded) =
+            super::schema::open_installed_state(&layout.database(Db::State))?;
+
+        if reloaded != expected {
+            return Err(corrupt(format!(
+                "the database now at {} loads as a valid state that is not the one this \
+                 install validated: applied {:?} rather than {:?}",
+                layout.database(Db::State).display(),
+                reloaded.model.last_applied,
+                expected.model.last_applied
+            )));
+        }
+        Ok((database, reloaded, PublishInstall(staged)))
     }
 }
 
@@ -681,6 +760,52 @@ impl RepairInstall {
     /// The body whose marker is owed. The business state is already correct.
     pub(crate) fn publishable(self) -> PublishInstall {
         PublishInstall(self.0)
+    }
+}
+
+/// Apply §11.4's publication rule to a body this store built, and publish it.
+///
+/// The local-build counterpart of [`publish_installed`], and the reason
+/// [`publish_current`] is private. The decision and the marker write have to be
+/// one operation: a caller that could reach the raw helper could republish a
+/// marker for a body the monotonicity rule had just discarded, and the install
+/// path is held to that rule by construction while the build path was held to
+/// it by remembering.
+///
+/// Called with the publication critical section held, and returns whatever is
+/// current afterwards -- which for a discarded candidate is the snapshot that
+/// was already there.
+pub(crate) fn publish_built(
+    layout: &StorageLayout,
+    catalog: &SnapshotCatalog,
+    current: &mut Option<SnapshotFile>,
+    built: SnapshotFile,
+) -> StorageResult<SnapshotFile> {
+    match decide_publication(&built.meta, current.as_ref().map(|f| &f.meta)) {
+        Publication::Publish => {
+            publish_current(layout, &built.meta)?;
+            if let Some(previous) = current.replace(built.clone()) {
+                catalog.retire(&previous.meta.snapshot_id, &previous.path);
+            }
+            Ok(built)
+        }
+        // The body is already on disk under its digest name, so this
+        // republishes the marker and nothing else. That is the repair §11.4
+        // requires after a lost acknowledgement, not a no-op.
+        Publication::Idempotent => {
+            publish_current(layout, &built.meta)?;
+            Ok(built)
+        }
+        // A builder that finished behind the current snapshot. The marker does
+        // not move and the file goes, which is what "discarded" has to mean if
+        // it is not to accumulate.
+        Publication::Discard => {
+            catalog.retire(&built.meta.snapshot_id, &built.path);
+            Ok(current
+                .clone()
+                .expect("only a published snapshot can be ahead of a candidate"))
+        }
+        Publication::Fatal(detail) => Err(corrupt(detail)),
     }
 }
 
@@ -705,30 +830,18 @@ pub(crate) fn publish_installed(
 ) -> StorageResult<SnapshotFile> {
     let dir = layout.snapshots();
     std::fs::create_dir_all(&dir).map_err(io("creating the snapshots directory", &dir))?;
-    let path = dir.join(file_name_for(body.digest()));
 
-    // The same reuse rule `build` follows: a file already under this name is a
-    // *claim* to have this content, and the digest is what replaces claims.
-    match digest_of(&path)? {
-        Existing::Digest(existing) if existing == *body.digest() => {}
-        _ => {
-            std::fs::copy(body.body(), &path)
-                .map_err(io("promoting an installed snapshot body", &path))?;
-            File::open(&path)
-                .and_then(|handle| handle.sync_all())
-                .map_err(io("fsyncing an installed snapshot body", &path))?;
-            fsync_dir(&dir)?;
-        }
-    }
+    let PublishInstall(staged) = body;
+    let path = dir.join(file_name_for(staged.digest()));
+    let meta = staged.meta().clone();
+    let len = staged.len();
 
-    let meta = body.meta().clone();
+    // The same protocol `build` uses, for the same reasons: rename, never copy,
+    // and fsync the directory the name appeared in.
+    staged.promote(&path)?;
     publish_current(layout, &meta)?;
 
-    let published = SnapshotFile {
-        len: body.len(),
-        meta,
-        path,
-    };
+    let published = SnapshotFile { len, meta, path };
     catalog.retire_all_but(&published.meta.snapshot_id, &dir)?;
     Ok(published)
 }
@@ -1324,7 +1437,7 @@ pub(crate) fn decide_publication(
 }
 
 /// Write `snapshots/CURRENT` atomically.
-pub(crate) fn publish_current(layout: &StorageLayout, meta: &SnapshotMetaV1) -> StorageResult<()> {
+fn publish_current(layout: &StorageLayout, meta: &SnapshotMetaV1) -> StorageResult<()> {
     let dir = layout.snapshots();
     let scratch = Scratch::new(&dir, "current");
     let bytes = super::codec::encode_committed(
@@ -2094,10 +2207,8 @@ mod tests {
             "`PreparedInstall::replace` became reachable, which makes the verdict optional"
         );
         assert!(
-            flat.contains(
-                "pub(crate) fn replace(self) -> StorageResult<(super::rows::DurableState, PublishInstall)>"
-            ),
-            "`ReplaceInstall::replace` is the granted one"
+            flat.contains("pub(crate) fn replace(self) -> StorageResult<ReplacedInstall>"),
+            "`ReplaceInstall::replace` yields a replacement to be proved, not a publication"
         );
 
         // No capability may be granted from outside this module: each is a
@@ -2113,6 +2224,21 @@ mod tests {
                 "{capability}'s field must stay private, or anyone can grant themselves it"
             );
         }
+
+        // `ReplacedInstall` carries two fields rather than one, so it is a
+        // braced struct; what matters is the same -- nothing outside can build
+        // it, which means no field may be public.
+        let braced = flat
+            .split("pub(crate) struct ReplacedInstall {")
+            .nth(1)
+            .expect("ReplacedInstall must be declared")
+            .split('}')
+            .next()
+            .expect("a struct body");
+        assert!(
+            !braced.contains("pub "),
+            "ReplacedInstall's fields must stay private: {braced:?}"
+        );
 
         // The two the verdict grants are built in exactly one place each:
         // their declaration, and `resolve`.
@@ -2130,11 +2256,21 @@ mod tests {
         // occurrences rather than left uncounted. Uncounted, a direct
         // `StagedSnapshot -> PublishInstall` conversion would satisfy every
         // check above and hand publication to a body no verdict had approved.
+        // No occurrence count for `ReplacedInstall`: the number would have to be
+        // read off a failing run and updated whenever the type is mentioned,
+        // which is a test that asks the implementation what to expect. Its
+        // private fields already say nothing outside can build one, and the
+        // count below says `reopen` is the only thing on this path that
+        // produces a publication.
+        // Constructions only: a `let PublishInstall(..)` destructure consumes
+        // the capability rather than granting it, and counting it as a grant
+        // would make the number drift with the code that spends it.
+        let grants =
+            flat.matches("PublishInstall(").count() - flat.matches("let PublishInstall(").count();
         assert_eq!(
-            flat.matches("PublishInstall(").count(),
-            3,
-            "PublishInstall should appear three times: its declaration, the \
-             Replace conversion, and the Repair conversion"
+            grants, 3,
+            "PublishInstall should be granted in exactly two places -- the proved \
+             replacement and the repair -- plus its declaration"
         );
     }
 
