@@ -998,12 +998,22 @@ mod tests {
         std::fs::create_dir_all(dir.join("snapshots")).expect("snapshots dir");
         std::fs::create_dir_all(dir.join("incoming")).expect("incoming dir");
 
+        // Every key the state holds, in every section. A change set that named
+        // only three of the seven wrote three of the seven and left the
+        // counters describing a state the rows do not add up to -- which
+        // `validate` then reports, confusingly, as corruption.
         let mut changes = ChangeSet::default();
         changes.admins.extend(state.model.admins.iter().copied());
         changes.grants.extend(state.model.acl.keys().cloned());
         changes
             .resources
             .extend(state.model.resources.keys().cloned());
+        changes
+            .sessions
+            .extend(state.model.sessions.keys().cloned());
+        changes.intents.extend(state.model.intents.keys().copied());
+        changes.routes.extend(state.model.routes.keys().copied());
+        changes.audit.extend(state.model.audit.keys().copied());
         rows::commit(&database, state.clone(), &changes).expect("seed");
         // Written with the codec version the loader checks, exactly as
         // `schema::open` would.
@@ -3222,12 +3232,18 @@ mod tests {
     /// The handle is what a real install is given: OpenRaft's suite moves a
     /// leader's own current snapshot into a follower, so the source is a
     /// foreign store's live file rather than anything this receiver wrote.
+    /// The applied command is what fills the last two sections: an `acquire`
+    /// writes a client session and an audit row on top of the seeded five.
     async fn a_published_source(
         dir: &std::path::Path,
     ) -> (Store, Snapshot<CoordinationTypeConfig>) {
-        let (mut machine, shutdown, drain) = machine(dir);
+        let (mut machine, shutdown, drain) = CoordinationStateMachine::new(
+            seeded_with(dir, seven_section_state()),
+            StorageLayout::new(dir),
+        )
+        .expect("open a store with every section populated");
         machine
-            .apply([normal(1, acquire(1))])
+            .apply([normal(2, acquire(1))])
             .await
             .expect("one command");
         let built = {
@@ -3235,6 +3251,81 @@ mod tests {
             builder.build_snapshot().await.expect("build")
         };
         ((machine, shutdown, drain), built)
+    }
+
+    /// A state with a row in **every** §11.4 section.
+    ///
+    /// Seven sections, because a fixture that leaves one empty cannot tell a
+    /// rebuild that skips that table from one that does not: deleting the
+    /// `intents` and `routes` writes passed the whole suite while this fixture
+    /// had neither.
+    ///
+    /// Intents and routes are seeded through `rows::commit` rather than driven
+    /// by `apply`, and that is a statement about Slice 2 rather than a
+    /// shortcut: nothing in this slice writes a route at all. §7.3's controller
+    /// is Slice 3's, and it is what will produce them from member seeds.
+    fn seven_section_state() -> DurableState {
+        use crate::coordination::model::membership::{test_ticket, PHASE_PENDING};
+        use crate::coordination::model::state::{Intent, MembershipPlan, Route};
+
+        let voters: Vec<[u8; 32]> = (1u8..=3).map(|b| [b; 32]).collect();
+        let mut state = genesis_state();
+        state.model.membership =
+            crate::coordination::model::state::CommittedMembership::uniform(voters.clone());
+
+        let operation = [0x42u8; 16];
+        state.model.intents.insert(
+            operation,
+            Intent {
+                actor: ACTOR,
+                request_hash: [0x43u8; 32],
+                expected_membership: None,
+                plan: MembershipPlan {
+                    desired_voters: voters.clone(),
+                    retained_learners: Vec::new(),
+                    member_seeds: Vec::new(),
+                },
+                status_code: PHASE_PENDING,
+                result_code: 0,
+                accepted_log_id: LogId::new(1, LEADER, 1),
+                completed_log_id: None,
+                observed_membership_log_id: None,
+            },
+        );
+        // A route's node must be a member: §9 protects one by asking exactly
+        // that, so a route for a stranger is a state the validator refuses.
+        for node in &voters {
+            state.model.routes.insert(
+                *node,
+                Route {
+                    ticket: test_ticket(node),
+                    source_operation_id: operation,
+                    introduced_log_id: LogId::new(1, LEADER, 1),
+                },
+            );
+        }
+        // The intent and the routes are stamped at index 1, so the state has
+        // to have applied it: a log id stamped on a row of a state that has
+        // applied nothing is a state `validate` refuses, and rightly.
+        state.model.last_applied = Some(LogId::new(1, LEADER, 1));
+        state.model.growth_bytes = state.model.recompute_growth();
+        state.model.reserve_bytes = state.model.recompute_reserve();
+        state
+    }
+
+    /// Assert every §11.4 section carries at least one row.
+    fn assert_seven_sections(state: &DurableState, when: &str) {
+        for (what, empty) in [
+            ("resources", state.model.resources.is_empty()),
+            ("grants", state.model.acl.is_empty()),
+            ("admins", state.model.admins.is_empty()),
+            ("sessions", state.model.sessions.is_empty()),
+            ("intents", state.model.intents.is_empty()),
+            ("routes", state.model.routes.is_empty()),
+            ("audit", state.model.audit.is_empty()),
+        ] {
+            assert!(!empty, "{what} is empty {when}");
+        }
     }
 
     /// Install reads its source and leaves it exactly as it found it.
@@ -3404,19 +3495,175 @@ mod tests {
         .expect("stage the source");
 
         let rebuilt = dir.join("incoming").join("rebuilt.redb");
-        let database = Database::create(&rebuilt).expect("create the fresh database");
-        let write = super::super::schema::durable_write(&database, Db::State).expect("write");
-        super::super::schema::create_state_tables(&write).expect("tables");
-        write.commit().expect("commit");
+        // The candidate builds and verifies itself: `rebuild_candidate` ends by
+        // holding the file to production's own open, so this call succeeding is
+        // already the reopen assertion. A candidate missing `codec_version`
+        // fails here rather than after it has replaced `state.redb`.
+        super::super::snapshot::rebuild_candidate(&rebuilt, &staged)
+            .expect("the candidate rebuilds and opens as production would");
 
-        super::super::snapshot::rebuild_from_body(&database, staged.header(), staged.path())
-            .expect("rebuild");
-
+        let database = Database::create(&rebuilt).expect("reopen");
         let after = rows::load(&database).expect("the rebuilt database loads and validates");
+        assert_seven_sections(&after, "after the rebuild");
         assert_eq!(
             after, before,
             "the rebuilt state is the state the body was streamed from"
         );
+    }
+
+    /// The rows rebuilt are the rows that were verified.
+    ///
+    /// Install verifies a body and then reads it again to rebuild, so the two
+    /// reads have to be provably of the same bytes. The earlier shape took a
+    /// header and a path as separate arguments and discarded the header the
+    /// body carried, which let a header from one body be paired with the rows
+    /// of another: identity checked against the first, counts matched the
+    /// second, and the installed state was neither.
+    ///
+    /// Driven by replacing the staged file with a *different valid body*
+    /// between the two steps -- a real time-of-check/time-of-use, not a
+    /// corruption -- so nothing about the framing is wrong and only the
+    /// identity of the bytes has changed.
+    #[tokio::test]
+    async fn a_body_swapped_after_verification_is_refused() {
+        let first_dir = scratch_dir();
+        let (_first, first) = a_published_source(&first_dir).await;
+
+        // A second, different body: another store, one more command applied.
+        let second_dir = scratch_dir();
+        let ((mut second, _s2, _d2), _) = a_published_source(&second_dir).await;
+        second
+            .apply([normal(3, acquire(2))])
+            .await
+            .expect("diverge");
+        let other = {
+            let mut builder = second.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build")
+        };
+        assert_ne!(first.meta.snapshot_id, other.meta.snapshot_id);
+
+        let dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&dir);
+        let staged = super::super::snapshot::receive(
+            &StorageLayout::new(&dir),
+            &first.snapshot,
+            &durable_of(&machine).await,
+            &crate::coordination::raft::SnapshotMetaV1::from(&first.meta),
+        )
+        .expect("stage the first body");
+
+        std::fs::copy(
+            body_path(&second_dir, &other.meta.snapshot_id),
+            staged.path(),
+        )
+        .expect("swap the staged bytes under the verified handle");
+
+        let err = super::super::snapshot::rebuild_candidate(
+            &dir.join("incoming").join("swapped.redb"),
+            &staged,
+        )
+        .expect_err("the rebuilt rows must be the verified rows");
+        assert!(format!("{err:?}").contains("verified"), "{err:?}");
+    }
+
+    /// A row edited without disturbing the header is refused too.
+    ///
+    /// The companion to the swap above, and the reason both checks exist.
+    /// Mutation testing showed the swap is caught by the header comparison
+    /// alone -- the digest check never runs -- so on its own it would leave the
+    /// digest check unevidenced. This is the case the header *cannot* see: one
+    /// byte inside a route's ticket, so every count, every section boundary and
+    /// every ordering key is exactly as verified, and only the bytes differ.
+    #[tokio::test]
+    async fn a_row_edited_after_verification_is_refused() {
+        use crate::coordination::model::membership::test_ticket;
+
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&dir);
+        let staged = super::super::snapshot::receive(
+            &StorageLayout::new(&dir),
+            &published.snapshot,
+            &durable_of(&machine).await,
+            &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+        )
+        .expect("stage the source");
+
+        let mut bytes = std::fs::read(staged.path()).expect("the staged body");
+        let ticket = test_ticket(&[1u8; 32]);
+        let at = bytes
+            .windows(ticket.len())
+            .position(|w| w == ticket.as_slice())
+            .expect("the route's ticket is in the body");
+        // Base58 to base58: still a legal string of the same length, so nothing
+        // structural changes.
+        bytes[at] = if bytes[at] == b'A' { b'B' } else { b'A' };
+        std::fs::write(staged.path(), &bytes).expect("edit one row in place");
+
+        let err = super::super::snapshot::rebuild_candidate(
+            &dir.join("incoming").join("edited.redb"),
+            &staged,
+        )
+        .expect_err("the rebuilt bytes must hash to what was verified");
+        assert!(format!("{err:?}").contains("hashed to"), "{err:?}");
+    }
+
+    /// A candidate that cannot be opened the way production opens a state
+    /// database is not a candidate.
+    ///
+    /// The specific hole this closes: `rows::load` is happy without
+    /// `codec_version`, so a rebuild that wrote tables and a meta row looked
+    /// complete under every assertion the round-trip test makes — and would
+    /// have failed at the reopen *after* replacing `state.redb`, which is the
+    /// one moment there is nothing to fall back to.
+    #[tokio::test]
+    async fn a_candidate_without_the_full_binding_is_refused() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&dir);
+        let staged = super::super::snapshot::receive(
+            &StorageLayout::new(&dir),
+            &published.snapshot,
+            &durable_of(&machine).await,
+            &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+        )
+        .expect("stage the source");
+
+        let good = dir.join("incoming").join("bound.redb");
+        super::super::snapshot::rebuild_candidate(&good, &staged).expect("a complete binding");
+        super::super::schema::verify_state_database(&good).expect("and it opens as production");
+
+        // The same rows and meta row, without the codec version: what the
+        // rebuild wrote before `write_state_binding` owned the whole binding.
+        let bare = dir.join("incoming").join("bare.redb");
+        {
+            let database = Database::create(&bare).expect("create");
+            let write = super::super::schema::durable_write(&database, Db::State).expect("write");
+            super::super::schema::create_state_tables(&write).expect("tables");
+            {
+                let mut table = write
+                    .open_table(super::super::schema::STATE_META)
+                    .expect("meta");
+                let bytes = super::super::codec::encode_committed(
+                    Db::State,
+                    "CoordinationMetaV1",
+                    &staged.header().meta,
+                    super::super::schema::MAX_COORDINATION_META_BYTES,
+                )
+                .expect("encode");
+                table
+                    .insert(super::super::schema::KEY_META, bytes.as_slice())
+                    .expect("insert");
+            }
+            write.commit().expect("commit");
+        }
+        let err = super::super::schema::verify_state_database(&bare)
+            .expect_err("a state database without its codec version is not openable");
+        assert!(format!("{err:?}").contains("codec"), "{err:?}");
     }
 
     /// A key that is not this schema's width never reaches a table.

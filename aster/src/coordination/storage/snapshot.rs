@@ -75,8 +75,8 @@ use super::rows::{
     MAX_SESSION_ROW_BYTES,
 };
 use super::schema::{
-    durable_write, StorageLayout, ACL, ADMINS, AUDIT, INTENTS, KEY_META,
-    MAX_COORDINATION_META_BYTES, RESOURCES, ROUTES, SESSIONS, STATE_META,
+    durable_write, StorageLayout, ACL, ADMINS, AUDIT, INTENTS, MAX_COORDINATION_META_BYTES,
+    RESOURCES, ROUTES, SESSIONS,
 };
 use crate::coordination::contract::LogIdV1;
 use crate::coordination::raft::{NodeRouteV1, ResourceRowV1, SnapshotMetaV1};
@@ -558,6 +558,8 @@ pub(crate) struct StagedSnapshot {
     header: SnapshotHeaderV1,
     digest: [u8; 32],
     len: u64,
+    /// The metadata the caller supplied, checked equal to the derived one.
+    supplied: SnapshotMetaV1,
 }
 
 impl StagedSnapshot {
@@ -578,9 +580,17 @@ impl StagedSnapshot {
         self.len
     }
 
-    /// The metadata these bytes imply — derived, never the supplied copy.
-    pub(crate) fn meta(&self) -> SnapshotMetaV1 {
-        meta_for(&self.header, &self.digest)
+    /// The metadata to publish: **the caller's**, not a fresh derivation.
+    ///
+    /// The two are equal — [`receive`] refuses the source otherwise — and that
+    /// is exactly why the derived one must not be substituted here. §11.4
+    /// requires `get_current_snapshot` to return the metadata OpenRaft
+    /// supplied, because `testing::Suite::transfer_snapshot` compares it; a
+    /// re-derivation returns something that happens to match today and stops
+    /// matching the moment a field is derivable but not identical. Carrying the
+    /// supplied value keeps the equality a checked fact rather than a habit.
+    pub(crate) fn meta(&self) -> &SnapshotMetaV1 {
+        &self.supplied
     }
 }
 
@@ -661,6 +671,7 @@ pub(crate) fn receive(
         header,
         digest,
         len,
+        supplied: supplied.clone(),
     })
 }
 
@@ -698,22 +709,45 @@ fn framing(path: &Path, err: BodyError) -> StorageError {
 ///
 /// One write transaction, as §11.4 requires — a partially written rebuild is
 /// never a file anything can open.
-pub(crate) fn rebuild_from_body(
-    database: &Database,
-    header: &SnapshotHeaderV1,
-    body: &Path,
-) -> StorageResult<()> {
-    let handle = std::fs::File::open(body)
+pub(crate) fn rebuild_candidate(path: &Path, staged: &StagedSnapshot) -> StorageResult<()> {
+    let body = staged.path();
+    let handle = File::open(body)
         .map_err(|source| StorageError::io("rebuilding a state database", body, source))?;
-    let write = durable_write(database, Db::State)?;
+    let database = Database::create(path).map_err(|source| match source {
+        redb::DatabaseError::TransactionInProgress => {
+            StorageError::TransactionInProgress { db: Db::State }
+        }
+        other => StorageError::Integrity {
+            db: Db::State,
+            source: other,
+        },
+    })?;
+    let write = durable_write(&database, Db::State)?;
+
+    // The complete §11.1 binding, from `schema`, rather than the tables and the
+    // meta row assembled here. A candidate missing `codec_version` loads
+    // through `rows::load` and is refused by the reopen that follows the
+    // replacement -- at the one moment there is nothing to fall back to.
+    //
+    // The meta row is the header's, verbatim: it is the root `read_meta` would
+    // produce, it has already been checked against this store's identity, and
+    // re-deriving it from the rebuilt rows would be a third opinion about state
+    // the body already states.
+    super::schema::write_state_binding(&write, &staged.header().meta)?;
 
     {
         let mut visitor = Rebuilding {
             write: &write,
+            expected: staged.header(),
             failure: None,
         };
-        let read =
-            read_body::<_, SnapshotBodyRowV1>(&mut std::io::BufReader::new(handle), &mut visitor);
+        // Digested on the way through, so the rows inserted below are provably
+        // the rows that were verified. Reading a path and trusting a header
+        // that arrived beside it is exactly the pairing this avoids: a header
+        // from one body and rows from another agree on nothing and fail
+        // nothing.
+        let mut reader = Digesting::new(BufReader::new(handle));
+        let read = read_body::<_, SnapshotBodyRowV1>(&mut reader, &mut visitor);
         // The visitor's own error wins where it has one: `BodyError::Io` is
         // what it had to answer with, and it is the least informative thing
         // that could be reported about a row this build cannot encode.
@@ -721,31 +755,26 @@ pub(crate) fn rebuild_from_body(
             return Err(failure);
         }
         read.map_err(|err| framing(body, err))?;
-    }
 
-    // The meta row is the header's, verbatim. It is the same root `read_meta`
-    // would produce, it has already been checked against this store's identity,
-    // and re-deriving it from the rebuilt rows would be a third opinion about
-    // state the body already states.
-    {
-        let mut table = write
-            .open_table(STATE_META)
-            .map_err(|source| StorageError::redb(Db::State, source))?;
-        let bytes = encode_committed(
-            Db::State,
-            "CoordinationMetaV1",
-            &header.meta,
-            MAX_COORDINATION_META_BYTES,
-        )?;
-        table
-            .insert(KEY_META, bytes.as_slice())
-            .map_err(|source| StorageError::redb(Db::State, source))?;
+        let (_, digest, len) = reader.into_parts();
+        if &digest != staged.digest() || len != staged.len() {
+            return Err(corrupt(format!(
+                "the staged body hashed to {} over {len} bytes while rebuilding, and to {} \
+                 over {} bytes when it was verified",
+                snapshot_id_for(&digest),
+                snapshot_id_for(staged.digest()),
+                staged.len()
+            )));
+        }
     }
 
     write
         .commit()
         .map_err(|source| StorageError::redb(Db::State, source))?;
-    Ok(())
+    drop(database);
+
+    // Held to production's own open before it is allowed to replace anything.
+    super::schema::verify_state_database(path)
 }
 
 /// Inserts each streamed row into the table it came from.
@@ -757,6 +786,9 @@ pub(crate) fn rebuild_from_body(
 /// serialize. So the real error is kept here and preferred by the caller.
 struct Rebuilding<'a> {
     write: &'a redb::WriteTransaction,
+    /// The header [`receive`] verified. The one this read observes must equal
+    /// it, or the rows being inserted are not the rows that were checked.
+    expected: &'a SnapshotHeaderV1,
     failure: Option<StorageError>,
 }
 
@@ -787,7 +819,28 @@ impl Rebuilding<'_> {
 }
 
 impl BodyVisitor<SnapshotBodyRowV1> for Rebuilding<'_> {
-    fn header(&mut self, _header: &SnapshotHeaderV1) -> Result<(), BodyError> {
+    /// The header this read sees must be the one that was verified.
+    ///
+    /// The rebuild used to take a header and a path as two arguments and
+    /// discard the one the body carried, so a header describing body A could
+    /// be paired with the rows of body B: the identity checks would pass
+    /// against A's meta, the counts would match B's sections, and the installed
+    /// state would be neither.
+    ///
+    /// **Subsumed by the digest check, and kept anyway.** The digest covers the
+    /// header too, so every body this refuses that one would refuse as well —
+    /// mutation testing confirms it: removing this comparison fails nothing.
+    /// It stays because it fails at the header, before a single row is decoded
+    /// or inserted, and because it is what gives `expected` a reason to be on
+    /// this struct. It is a fast path, not a second opinion; the two cannot
+    /// disagree.
+    fn header(&mut self, header: &SnapshotHeaderV1) -> Result<(), BodyError> {
+        if header != self.expected {
+            self.failure.get_or_insert_with(|| {
+                corrupt("the body being rebuilt does not carry the header that was verified")
+            });
+            return Err(BodyError::Io);
+        }
         Ok(())
     }
 

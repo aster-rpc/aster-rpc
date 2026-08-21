@@ -1167,28 +1167,78 @@ fn write_state_identity(database: &mut Database, identity: &StorageIdentity) -> 
         deployment_profile_code: identity.deployment_profile_code(),
         ..Default::default()
     };
-    let encoded = encode_owned(Db::State, "CoordinationMetaV1", &meta_row)?;
-
     let write = durable_write(database, Db::State)?;
-    {
-        let mut meta = write
-            .open_table(STATE_META)
-            .map_err(|source| StorageError::redb(Db::State, source))?;
-        meta.insert(KEY_META, encoded.as_slice())
-            .map_err(|source| StorageError::redb(Db::State, source))?;
-        meta.insert(
+    // Every data table exists from the start, so an initialized state database
+    // always has the full §11.3 shape and a later missing table is a real
+    // schema error rather than "not written to yet".
+    write_state_binding(&write, &meta_row)?;
+    write
+        .commit()
+        .map_err(|source| StorageError::redb(Db::State, source))
+}
+
+/// Everything a fresh state database must carry before it is a state database.
+///
+/// The full §11.1 binding, in one place, so a caller that builds a candidate
+/// cannot get a *part* of it right. `KEY_CODEC_VERSION` is the one that goes
+/// missing: nothing before [`classify_state`] needs it, `rows::load` is happy
+/// without it, and the database is then unopenable by the very reopen an
+/// install performs after replacing `state.redb` — which is a failure at the
+/// least recoverable moment there is.
+///
+/// The meta row comes from the caller because an install's is the snapshot
+/// header's, verbatim, and a bootstrap's is derived from its identity.
+pub(crate) fn write_state_binding(
+    write: &redb::WriteTransaction,
+    meta: &CoordinationMetaV1,
+) -> StorageResult<()> {
+    create_state_tables(write)?;
+    let encoded = encode_owned(Db::State, "CoordinationMetaV1", meta)?;
+    let mut table = write
+        .open_table(STATE_META)
+        .map_err(|source| StorageError::redb(Db::State, source))?;
+    table
+        .insert(KEY_META, encoded.as_slice())
+        .map_err(|source| StorageError::redb(Db::State, source))?;
+    table
+        .insert(
             KEY_CODEC_VERSION,
             encode_u32(STORAGE_CODEC_VERSION).as_slice(),
         )
         .map_err(|source| StorageError::redb(Db::State, source))?;
+    Ok(())
+}
+
+/// Open a state database exactly as production would, and refuse it if
+/// production could not.
+///
+/// What an install's post-replacement reopen runs, hoisted so a candidate can
+/// be held to it *before* it replaces anything. `freshly_created` is true: this
+/// database was built by this process moments ago, so `Ok(false)` from
+/// `check_integrity` is evidence about the storage stack rather than about a
+/// previous shutdown.
+pub(crate) fn verify_state_database(path: &Path) -> StorageResult<()> {
+    reject_symlink(path)?;
+    let mut database = Database::create(path).map_err(|source| match source {
+        DatabaseError::TransactionInProgress => {
+            StorageError::TransactionInProgress { db: Db::State }
+        }
+        other => StorageError::Integrity {
+            db: Db::State,
+            source: other,
+        },
+    })?;
+    check_integrity(&mut database, Db::State, true)?;
+    match classify_state(&database, Presence::Existing)? {
+        SideState::BoundDurable | SideState::BoundPristine => Ok(()),
+        SideState::Unbound => Err(StorageError::PartialInitialization {
+            detail: format!(
+                "{} at {} carries no identity binding",
+                Db::State,
+                path.display()
+            ),
+        }),
     }
-    // Create every data table so an initialized state database always has the
-    // full §11.3 shape, and a later missing table is a real schema error
-    // rather than "not written to yet".
-    create_state_tables(&write)?;
-    write
-        .commit()
-        .map_err(|source| StorageError::redb(Db::State, source))
 }
 
 pub(crate) fn create_state_tables(write: &redb::WriteTransaction) -> StorageResult<()> {
