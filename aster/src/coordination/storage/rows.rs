@@ -86,23 +86,24 @@ const ID16: usize = 16;
 const ROW_KEY: usize = limits::MAX_NAMESPACE + limits::MAX_KEY;
 
 /// `ResourceRowV1`: a value, a holder, and counters.
-const MAX_RESOURCE_ROW_BYTES: usize = limits::MAX_VALUE + ID32 + ROW_FRAMING_ALLOWANCE;
+pub(super) const MAX_RESOURCE_ROW_BYTES: usize = limits::MAX_VALUE + ID32 + ROW_FRAMING_ALLOWANCE;
 
 /// `ClientSessionV1`: a request hash and a saved reply, whose snapshot carries
 /// the group id, a resource key and a holder.
-const MAX_SESSION_ROW_BYTES: usize =
+pub(super) const MAX_SESSION_ROW_BYTES: usize =
     ID32 + ID32 + ROW_KEY + ID32 + ID16 + ID32 + ROW_FRAMING_ALLOWANCE;
 
 /// `MembershipIntentV1`: the encoded plan dominates, and §12.1 bounds that on
 /// its encoded form rather than field by field.
-const MAX_INTENT_ROW_BYTES: usize =
+pub(super) const MAX_INTENT_ROW_BYTES: usize =
     limits::MAX_ENCODED_COMMAND + ID32 + ID32 + 4 * ID32 + ROW_FRAMING_ALLOWANCE;
 
 /// `NodeRouteV1`: a ticket, an operation id, and a log id.
-const MAX_ROUTE_ROW_BYTES: usize = limits::MAX_TICKET + ID16 + ID32 + ROW_FRAMING_ALLOWANCE;
+pub(super) const MAX_ROUTE_ROW_BYTES: usize =
+    limits::MAX_TICKET + ID16 + ID32 + ROW_FRAMING_ALLOWANCE;
 
 /// `AuditRowV1`: two node ids and a resource key.
-const MAX_AUDIT_ROW_BYTES: usize = ID32 + ID32 + ROW_KEY + ROW_FRAMING_ALLOWANCE;
+pub(super) const MAX_AUDIT_ROW_BYTES: usize = ID32 + ID32 + ROW_KEY + ROW_FRAMING_ALLOWANCE;
 
 /// Every redb failure in this module names `state.redb`.
 ///

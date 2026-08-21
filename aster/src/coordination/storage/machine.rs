@@ -3371,6 +3371,104 @@ mod tests {
             .expect("the metadata the body actually implies");
     }
 
+    /// A body rebuilds the state it was streamed from, row for row.
+    ///
+    /// The independent oracle is the *source store's* durable state: the
+    /// rebuild is compared against what the sender's database actually held,
+    /// not against anything the rebuild computed. A conversion that dropped a
+    /// field, or reconstructed one from another, disagrees here even though
+    /// the body it produced would still round-trip through itself.
+    ///
+    /// Deliberately a state with rows in five of the seven sections. Comparing
+    /// two empty databases would pass under a rebuild that inserted nothing.
+    #[tokio::test]
+    async fn a_body_rebuilds_the_state_it_was_streamed_from() {
+        let source_dir = scratch_dir();
+        let ((source, _source_shutdown, _source_drain), published) =
+            a_published_source(&source_dir).await;
+        let before = durable_of(&source).await;
+        assert!(!before.model.resources.is_empty(), "resources");
+        assert!(!before.model.acl.is_empty(), "grants");
+        assert!(!before.model.admins.is_empty(), "admins");
+        assert!(!before.model.sessions.is_empty(), "sessions");
+        assert!(!before.model.audit.is_empty(), "audit");
+
+        let dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&dir);
+        let staged = super::super::snapshot::receive(
+            &StorageLayout::new(&dir),
+            &published.snapshot,
+            &durable_of(&machine).await,
+            &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+        )
+        .expect("stage the source");
+
+        let rebuilt = dir.join("incoming").join("rebuilt.redb");
+        let database = Database::create(&rebuilt).expect("create the fresh database");
+        let write = super::super::schema::durable_write(&database, Db::State).expect("write");
+        super::super::schema::create_state_tables(&write).expect("tables");
+        write.commit().expect("commit");
+
+        super::super::snapshot::rebuild_from_body(&database, staged.header(), staged.path())
+            .expect("rebuild");
+
+        let after = rows::load(&database).expect("the rebuilt database loads and validates");
+        assert_eq!(
+            after, before,
+            "the rebuilt state is the state the body was streamed from"
+        );
+    }
+
+    /// A key that is not this schema's width never reaches a table.
+    ///
+    /// Written after the rebuild's own width check turned out to be
+    /// unreachable: `read_body` runs `validate_snapshot_row` before a visitor
+    /// sees a row, so a 31-byte node id is refused one layer earlier than the
+    /// rebuild. This asserts the layer that *does* catch it rather than the one
+    /// that would if it were reached — a body carrying such a row cannot even
+    /// be written, which is the strongest form the property takes.
+    ///
+    /// The rebuild keeps its own conversion regardless; it is what produces the
+    /// `[u8; 32]` at all, and leaving its failure to an `unwrap` would put the
+    /// width rule in one module with nothing in this one depending on it.
+    #[test]
+    fn a_row_key_of_the_wrong_width_never_reaches_a_table() {
+        use crate::coordination::rowstream::{
+            validate_snapshot_row, BodyWriter, GrantRowV1, RowCountsV1, SnapshotBodyRowV1,
+            SnapshotHeaderV1,
+        };
+
+        let short = SnapshotBodyRowV1::Grant(GrantRowV1 {
+            key: crate::coordination::contract::ResourceKeyV1 {
+                namespace: "ns".into(),
+                key: b"lock".to_vec(),
+            },
+            // Thirty-one bytes: decodes, orders, and is not a NodeId.
+            subject_node_id: vec![0x07; 31],
+            rights: 1,
+        });
+        let err = validate_snapshot_row(&short).expect_err("31 bytes is not a subject");
+        assert!(format!("{err:?}").contains("32 bytes"), "{err:?}");
+
+        // And the writer refuses it too, so no such body exists to install.
+        let dir = scratch_dir();
+        let header = SnapshotHeaderV1 {
+            row_counts: RowCountsV1 {
+                grants: 1,
+                ..Default::default()
+            },
+            ..header_for(&genesis_state())
+        };
+        let handle = std::fs::File::create(dir.join("short-key.body")).expect("create");
+        let mut writer = BodyWriter::<_, SnapshotBodyRowV1>::new(handle, &header).expect("header");
+        writer
+            .begin_section(crate::coordination::rowstream::SECTION_GRANTS)
+            .expect("section");
+        writer
+            .row(&short)
+            .expect_err("a body cannot be written with a key of the wrong width");
+    }
+
     /// What a store's `incoming/` holds after a failed install.
     fn leftovers(dir: &std::path::Path) -> Vec<PathBuf> {
         match std::fs::read_dir(dir.join("incoming")) {

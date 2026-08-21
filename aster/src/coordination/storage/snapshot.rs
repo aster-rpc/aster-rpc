@@ -63,10 +63,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use redb::Database;
+
+use super::codec::encode_committed;
 use super::error::{Db, StorageError, StorageResult};
-use super::schema::{StorageLayout, MAX_COORDINATION_META_BYTES};
+// The row ceilings come from `rows`, not from a second list here: install must
+// bound a row exactly as the writer that produced it does, and two lists that
+// have to agree are two lists that eventually do not.
+use super::rows::{
+    MAX_AUDIT_ROW_BYTES, MAX_INTENT_ROW_BYTES, MAX_RESOURCE_ROW_BYTES, MAX_ROUTE_ROW_BYTES,
+    MAX_SESSION_ROW_BYTES,
+};
+use super::schema::{
+    durable_write, StorageLayout, ACL, ADMINS, AUDIT, INTENTS, KEY_META,
+    MAX_COORDINATION_META_BYTES, RESOURCES, ROUTES, SESSIONS, STATE_META,
+};
 use crate::coordination::contract::LogIdV1;
-use crate::coordination::raft::SnapshotMetaV1;
+use crate::coordination::raft::{NodeRouteV1, ResourceRowV1, SnapshotMetaV1};
 use crate::coordination::rowstream::{
     read_body, BodyError, BodyVisitor, SnapshotBodyRowV1, SnapshotHeaderV1, MAX_SNAPSHOT_BODY_BYTES,
 };
@@ -649,6 +662,263 @@ pub(crate) fn receive(
         digest,
         len,
     })
+}
+
+/// A framing failure over a body this store is reading.
+fn framing(path: &Path, err: BodyError) -> StorageError {
+    match err {
+        BodyError::Io => StorageError::io(
+            "reading a snapshot body",
+            path,
+            std::io::Error::other("the snapshot body reader failed"),
+        ),
+        other => corrupt(format!(
+            "{} is not a readable body: {other:?}",
+            path.display()
+        )),
+    }
+}
+
+/// Rebuild `state.redb`'s tables from a canonical body (§11.4 install).
+///
+/// The exact inverse of [`stream_body`], and next to it for that reason: the
+/// two mappings have to stay in step, and a section added to one and forgotten
+/// in the other is a body that writes and does not install.
+///
+/// ## Why it targets tables rather than the model
+///
+/// The obvious rebuild reconstructs a [`DurableState`] from the rows and
+/// commits it. That needs a second wire-to-model conversion for every row type
+/// — a second opinion about what a stored row means, and the one that disagreed
+/// would be whichever was not being tested. Writing the *tables* instead means
+/// the model conversion is still [`load`]'s, run once afterwards, and so are
+/// §11.3's and §12.1's whole-state checks. No foreign database file is opened
+/// either way: these are this build's own rows, decoded by this build's own
+/// decoder, into a database this store created.
+///
+/// One write transaction, as §11.4 requires — a partially written rebuild is
+/// never a file anything can open.
+pub(crate) fn rebuild_from_body(
+    database: &Database,
+    header: &SnapshotHeaderV1,
+    body: &Path,
+) -> StorageResult<()> {
+    let handle = std::fs::File::open(body)
+        .map_err(|source| StorageError::io("rebuilding a state database", body, source))?;
+    let write = durable_write(database, Db::State)?;
+
+    {
+        let mut visitor = Rebuilding {
+            write: &write,
+            failure: None,
+        };
+        let read =
+            read_body::<_, SnapshotBodyRowV1>(&mut std::io::BufReader::new(handle), &mut visitor);
+        // The visitor's own error wins where it has one: `BodyError::Io` is
+        // what it had to answer with, and it is the least informative thing
+        // that could be reported about a row this build cannot encode.
+        if let Some(failure) = visitor.failure {
+            return Err(failure);
+        }
+        read.map_err(|err| framing(body, err))?;
+    }
+
+    // The meta row is the header's, verbatim. It is the same root `read_meta`
+    // would produce, it has already been checked against this store's identity,
+    // and re-deriving it from the rebuilt rows would be a third opinion about
+    // state the body already states.
+    {
+        let mut table = write
+            .open_table(STATE_META)
+            .map_err(|source| StorageError::redb(Db::State, source))?;
+        let bytes = encode_committed(
+            Db::State,
+            "CoordinationMetaV1",
+            &header.meta,
+            MAX_COORDINATION_META_BYTES,
+        )?;
+        table
+            .insert(KEY_META, bytes.as_slice())
+            .map_err(|source| StorageError::redb(Db::State, source))?;
+    }
+
+    write
+        .commit()
+        .map_err(|source| StorageError::redb(Db::State, source))?;
+    Ok(())
+}
+
+/// Inserts each streamed row into the table it came from.
+///
+/// Carries the first storage failure out itself. [`BodyVisitor`] can only
+/// answer in [`BodyError`], which has no variant for "this row could not be
+/// encoded under its declared ceiling" -- and flattening that into
+/// `BodyError::Io` would report a disk problem for a row this build cannot
+/// serialize. So the real error is kept here and preferred by the caller.
+struct Rebuilding<'a> {
+    write: &'a redb::WriteTransaction,
+    failure: Option<StorageError>,
+}
+
+impl Rebuilding<'_> {
+    /// Record a storage failure and stop the read.
+    fn fail(&mut self, err: StorageError) -> BodyError {
+        self.failure.get_or_insert(err);
+        BodyError::Io
+    }
+
+    /// A fixed-width key, or a refusal.
+    ///
+    /// Never padded or truncated. A body carrying a 31-byte node id is a body
+    /// whose keys are not this schema's keys, and coercing it would install a
+    /// row under an identity nobody wrote.
+    ///
+    /// **Unreachable, and kept anyway.** `read_body` runs
+    /// `validate_snapshot_row` before a visitor sees a row, and that already
+    /// refuses a node id that is not 32 bytes -- so no body this function can
+    /// be handed reaches the refusal below, and no test drives it. The
+    /// conversion is still required to produce the key at all, and what it
+    /// does on failure is not something to leave to an `unwrap`: the width
+    /// rule would then live in one place, in another module, with nothing
+    /// here depending on it.
+    fn key<const N: usize>(what: &'static str, bytes: &[u8]) -> Result<[u8; N], BodyError> {
+        bytes.try_into().map_err(|_| BodyError::InvalidRow(what))
+    }
+}
+
+impl BodyVisitor<SnapshotBodyRowV1> for Rebuilding<'_> {
+    fn header(&mut self, _header: &SnapshotHeaderV1) -> Result<(), BodyError> {
+        Ok(())
+    }
+
+    fn row(&mut self, _section: u64, row: SnapshotBodyRowV1) -> Result<(), BodyError> {
+        match row {
+            SnapshotBodyRowV1::Resource(r) => {
+                let bytes = encode_committed(
+                    Db::State,
+                    "ResourceRowV1",
+                    &ResourceRowV1 {
+                        epoch: r.epoch,
+                        held: r.held,
+                        holder_node_id: r.holder_node_id,
+                        ttl_ms: r.ttl_ms,
+                        lease_revision: r.lease_revision,
+                        value_revision: r.value_revision,
+                        value: r.value,
+                        acl_revision: r.acl_revision,
+                    },
+                    MAX_RESOURCE_ROW_BYTES,
+                )
+                .map_err(|err| self.fail(err))?;
+                let mut table = self
+                    .write
+                    .open_table(RESOURCES)
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+                table
+                    .insert(
+                        (r.key.namespace.as_str(), r.key.key.as_slice()),
+                        bytes.as_slice(),
+                    )
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+            }
+            SnapshotBodyRowV1::Grant(r) => {
+                let subject: [u8; 32] = Self::key("grant subject", &r.subject_node_id)?;
+                let mut table = self
+                    .write
+                    .open_table(ACL)
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+                table
+                    .insert(
+                        (r.key.namespace.as_str(), r.key.key.as_slice(), subject),
+                        r.rights,
+                    )
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+            }
+            SnapshotBodyRowV1::Admin(r) => {
+                let subject: [u8; 32] = Self::key("admin subject", &r.subject_node_id)?;
+                let mut table = self
+                    .write
+                    .open_table(ADMINS)
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+                table
+                    .insert(subject, ())
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+            }
+            SnapshotBodyRowV1::Session(r) => {
+                let actor: [u8; 32] = Self::key("session actor", &r.actor_node_id)?;
+                let client: [u8; 16] = Self::key("session client id", &r.client_id)?;
+                let bytes = encode_committed(
+                    Db::State,
+                    "ClientSessionV1",
+                    &r.session,
+                    MAX_SESSION_ROW_BYTES,
+                )
+                .map_err(|err| self.fail(err))?;
+                let mut table = self
+                    .write
+                    .open_table(SESSIONS)
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+                table
+                    .insert((actor, client), bytes.as_slice())
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+            }
+            SnapshotBodyRowV1::Intent(r) => {
+                let operation: [u8; 16] = Self::key("intent operation id", &r.operation_id)?;
+                let bytes = encode_committed(
+                    Db::State,
+                    "MembershipIntentV1",
+                    &r.intent,
+                    MAX_INTENT_ROW_BYTES,
+                )
+                .map_err(|err| self.fail(err))?;
+                let mut table = self
+                    .write
+                    .open_table(INTENTS)
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+                table
+                    .insert(operation, bytes.as_slice())
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+            }
+            SnapshotBodyRowV1::Route(r) => {
+                let node: [u8; 32] = Self::key("route node id", &r.node_id)?;
+                let bytes = encode_committed(
+                    Db::State,
+                    "NodeRouteV1",
+                    &NodeRouteV1 {
+                        ticket_bytes: r.ticket_bytes,
+                        source_operation_id: r.source_operation_id,
+                        introduced_log_id: r.introduced_log_id,
+                    },
+                    MAX_ROUTE_ROW_BYTES,
+                )
+                .map_err(|err| self.fail(err))?;
+                let mut table = self
+                    .write
+                    .open_table(ROUTES)
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+                table
+                    .insert(node, bytes.as_slice())
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+            }
+            SnapshotBodyRowV1::Audit(r) => {
+                let bytes = encode_committed(Db::State, "AuditRowV1", &r.row, MAX_AUDIT_ROW_BYTES)
+                    .map_err(|err| self.fail(err))?;
+                let mut table = self
+                    .write
+                    .open_table(AUDIT)
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+                table
+                    .insert((r.log_term, r.log_index), bytes.as_slice())
+                    .map_err(|err| self.fail(StorageError::redb(Db::State, err)))?;
+            }
+            // Unreachable through `read_body`, which refuses a row with no
+            // section before a visitor sees it. Stated rather than assumed,
+            // because "the framing already rejected it" is exactly the kind of
+            // claim that stops being true when a variant is added.
+            SnapshotBodyRowV1::Unknown(_) => return Err(BodyError::UnknownVariant),
+        }
+        Ok(())
+    }
 }
 
 // ── The durable current marker ───────────────────────────────────────────────
