@@ -3124,6 +3124,90 @@ mod tests {
         );
     }
 
+    /// A read reports the version *its* transaction pins, not the store's.
+    ///
+    /// The distinction §11.4's read cut turns on, and it is invisible until the
+    /// two disagree: an older transaction is held across a later apply, so the
+    /// actor's applied state moves to 2 while the transaction still contains 1.
+    /// An implementation that answered from actor memory -- the obvious
+    /// shortcut, and one with the same Rust type -- would report 2 for a
+    /// transaction that will only ever show 1, and a barrier at 2 would be
+    /// satisfied by a read that cannot serve it.
+    ///
+    /// The second half is the ordinary case: a transaction taken *after* the
+    /// barrier is ahead of it, and must be accepted rather than required to
+    /// match.
+    #[tokio::test]
+    async fn a_read_answers_the_barrier_from_its_own_pinned_version() {
+        use super::super::reads::BarrierFit;
+        use crate::coordination::model::state::LogId as ModelLogId;
+
+        let dir = scratch_dir();
+        let (mut machine, _shutdown, _drain) = machine(&dir);
+
+        machine.apply([blank(1)]).await.expect("apply");
+        let older = machine
+            .handle()
+            .read_transaction()
+            .await
+            .expect("a read transaction at index 1");
+        assert_eq!(
+            older.pinned().expect("meta").log_id().map(|id| id.index),
+            Some(1)
+        );
+
+        machine.apply([blank(2)]).await.expect("apply");
+        assert_eq!(
+            machine
+                .applied_state()
+                .await
+                .expect("applied")
+                .0
+                .map(|id| id.index),
+            Some(2),
+            "the store has moved on underneath the held transaction"
+        );
+
+        let barrier = ModelLogId::new(1, LEADER, 2);
+        assert_eq!(
+            older.pinned().expect("meta").log_id().map(|id| id.index),
+            Some(1),
+            "the held transaction still contains the version it pinned"
+        );
+        assert_eq!(
+            older.pinned().expect("meta").against(Some(&barrier)),
+            BarrierFit::Behind,
+            "so it cannot serve a read barriered at 2"
+        );
+
+        let newer = machine
+            .handle()
+            .read_transaction()
+            .await
+            .expect("a read transaction at index 2");
+        assert_eq!(
+            newer.pinned().expect("meta").against(Some(&barrier)),
+            BarrierFit::Satisfied
+        );
+
+        // And past the barrier, not merely at it: the transaction taken after a
+        // third entry is what a real handler holds, and equality would reject it.
+        machine.apply([blank(3)]).await.expect("apply");
+        let ahead = machine
+            .handle()
+            .read_transaction()
+            .await
+            .expect("a read transaction at index 3");
+        assert_eq!(
+            ahead.pinned().expect("meta").log_id().map(|id| id.index),
+            Some(3)
+        );
+        assert_eq!(
+            ahead.pinned().expect("meta").against(Some(&barrier)),
+            BarrierFit::Satisfied
+        );
+    }
+
     /// A snapshot header that belongs to this store.
     fn header_for(state: &DurableState) -> crate::coordination::rowstream::SnapshotHeaderV1 {
         crate::coordination::rowstream::SnapshotHeaderV1 {

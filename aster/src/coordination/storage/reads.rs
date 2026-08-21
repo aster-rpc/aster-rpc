@@ -50,6 +50,8 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
+use crate::coordination::model::state::LogId;
+
 /// Whether the gate is handing out leases, and why not.
 ///
 /// A derived view of [`GateState`], for tests and for the messages that
@@ -312,6 +314,86 @@ impl GuardedRead {
     pub(crate) fn release_transaction(self) -> ReadLease {
         self.lease
     }
+
+    /// Which applied version this transaction contains, read from `STATE_META`
+    /// **inside it**.
+    ///
+    /// A linearizable read observes the version its transaction pins, and that
+    /// is not the version the barrier established. `ensure_linearizable` waits
+    /// for the state machine to reach its read log id and returns; by the time
+    /// a handler holds a transaction, later batches may already have committed.
+    /// So the pinned version is at or past the barrier and is never reliably
+    /// equal to it -- which is still linearizable, but only if the pinned
+    /// version is the one checked, and only if authorization and data then come
+    /// from this same transaction.
+    ///
+    /// Which is why this reads the row here rather than reporting what the
+    /// actor holds. [`StateHandle::applied_state`](super::machine::StateHandle)
+    /// answers from the actor's in-memory state, and that state can be *newer*
+    /// than any outstanding transaction: satisfying a barrier from it would
+    /// confirm a version this read will never observe.
+    pub(crate) fn pinned(&self) -> super::error::StorageResult<PinnedVersion> {
+        super::rows::pinned_applied(&self.transaction).map(PinnedVersion)
+    }
+}
+
+/// The applied log id one pinned read transaction contains.
+///
+/// A newtype rather than a bare `Option<LogId>` so that
+/// [`against`](PinnedVersion::against) can only be asked about a version some
+/// transaction actually holds. The obvious other source -- the actor's applied
+/// state -- has the same Rust type and the wrong meaning, and substituting it
+/// is the one mistake this whole API exists to stop. Different type, compile
+/// error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PinnedVersion(Option<LogId>);
+
+impl PinnedVersion {
+    pub(crate) fn log_id(&self) -> Option<&LogId> {
+        self.0.as_ref()
+    }
+
+    /// How this version stands against a linearizable barrier.
+    ///
+    /// `barrier` is what `Raft::ensure_linearizable` returned, converted to the
+    /// model's log id. `None` means the barrier established that nothing has
+    /// been applied group-wide, which every version is at or past.
+    pub(crate) fn against(&self, barrier: Option<&LogId>) -> BarrierFit {
+        let Some(barrier) = barrier else {
+            return BarrierFit::Satisfied;
+        };
+        let Some(pinned) = self.0.as_ref() else {
+            return BarrierFit::Behind;
+        };
+        // Explicitly by index. `LogId` has no `Ord` for exactly this reason: a
+        // derived one would compare `term` first, which orders two entries by
+        // the leader that wrote them rather than by position in the log.
+        match pinned.index.cmp(&barrier.index) {
+            std::cmp::Ordering::Less => BarrierFit::Behind,
+            std::cmp::Ordering::Greater => BarrierFit::Satisfied,
+            std::cmp::Ordering::Equal if pinned == barrier => BarrierFit::Satisfied,
+            std::cmp::Ordering::Equal => BarrierFit::Diverged,
+        }
+    }
+}
+
+/// How a pinned version stands against a linearizable barrier.
+///
+/// Three outcomes rather than a bool, because "behind" and "disagrees" are not
+/// the same failure and must not be retried the same way. A transaction older
+/// than the barrier is ordinary: the read takes a newer one. Two *different*
+/// log ids at one applied index mean this voter applied an entry the barrier's
+/// leader did not -- divergent history, which §5.3.1 makes fatal. Folded into
+/// one boolean, the second is indistinguishable from the first and a handler
+/// would retry its way around a split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BarrierFit {
+    /// At or past the barrier: this transaction may serve the read.
+    Satisfied,
+    /// Older than the barrier.
+    Behind,
+    /// Same applied index, different log id.
+    Diverged,
 }
 
 impl std::ops::Deref for GuardedRead {
@@ -572,6 +654,64 @@ mod tests {
             .expect("and the close is not left waiting for a guard that was never issued");
         quiescing.join().expect("join");
         closing.join().expect("join");
+    }
+
+    /// The barrier rule, in all four shapes it has to answer.
+    ///
+    /// Ahead is the ordinary case and the one a bare equality check would get
+    /// wrong: a read handler holds its transaction *after* the barrier
+    /// resolved, so later batches have usually committed by then.
+    #[test]
+    fn a_pinned_version_is_measured_against_the_barrier_by_index() {
+        let id = |index| LogId::new(1, [0x11; 32], index);
+        let pinned = |version: Option<LogId>| PinnedVersion(version);
+
+        assert_eq!(
+            pinned(Some(id(7))).against(Some(&id(5))),
+            BarrierFit::Satisfied,
+            "a transaction past the barrier serves the read"
+        );
+        assert_eq!(
+            pinned(Some(id(5))).against(Some(&id(5))),
+            BarrierFit::Satisfied
+        );
+        assert_eq!(
+            pinned(Some(id(3))).against(Some(&id(5))),
+            BarrierFit::Behind,
+            "an older transaction cannot answer a newer barrier"
+        );
+        assert_eq!(
+            pinned(None).against(Some(&id(5))),
+            BarrierFit::Behind,
+            "and neither can one that has applied nothing"
+        );
+        assert_eq!(
+            pinned(None).against(None),
+            BarrierFit::Satisfied,
+            "a barrier that established nothing is met by everything"
+        );
+        assert_eq!(pinned(Some(id(5))).against(None), BarrierFit::Satisfied);
+    }
+
+    /// Two different entries at one applied index is not staleness.
+    ///
+    /// The case the three-way answer exists for. A `bool` would report this
+    /// exactly as it reports "behind", and the handler would retry -- around a
+    /// divergence, forever, serving nothing and reporting nothing wrong.
+    #[test]
+    fn an_equal_index_under_another_leader_is_divergence_not_staleness() {
+        let barrier = LogId::new(1, [0x11; 32], 5);
+
+        assert_eq!(
+            PinnedVersion(Some(LogId::new(1, [0x22; 32], 5))).against(Some(&barrier)),
+            BarrierFit::Diverged,
+            "same term and index, a different leader: different entries"
+        );
+        assert_eq!(
+            PinnedVersion(Some(LogId::new(2, [0x11; 32], 5))).against(Some(&barrier)),
+            BarrierFit::Diverged,
+            "and a different term is the same kind of disagreement"
+        );
     }
 
     fn guarded(gate: &ReadGate, database: &redb::Database) -> Option<GuardedRead> {

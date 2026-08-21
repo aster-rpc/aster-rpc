@@ -522,6 +522,21 @@ fn read_meta(read: &redb::ReadTransaction) -> StorageResult<CoordinationMetaV1> 
     )
 }
 
+/// The applied log id a *specific* read transaction contains.
+///
+/// Read from `STATE_META` inside the caller's transaction, and narrowed through
+/// the same [`read_meta`] and [`meta_from_wire`] the full [`load`] uses -- so
+/// this is the version that load would report, not a cheaper second opinion
+/// about the same row.
+///
+/// Deliberately not a whole [`load`]: the caller has a version pinned and wants
+/// to know which one, and reading every table to answer would cost `O(state)`
+/// on the path §11.4 requires to stay cheap.
+pub(crate) fn pinned_applied(read: &redb::ReadTransaction) -> StorageResult<Option<LogId>> {
+    let meta = read_meta(read)?;
+    Ok(meta_from_wire(&meta)?.model.last_applied)
+}
+
 /// Read and validate the complete state.
 ///
 /// Every row is narrowed through its declared root with that table's ceiling
