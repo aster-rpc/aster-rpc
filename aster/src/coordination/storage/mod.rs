@@ -216,6 +216,87 @@ mod durability_guard {
         ("fixture.rs", include_str!("fixture.rs")),
     ];
 
+    /// Every guard here reads only what [`production_end`] admits, so the
+    /// boundary itself needs a guard.
+    ///
+    /// Taking the *last* `#[cfg(test)]` module fixes truncation and introduces
+    /// the opposite assumption: that nothing follows it. Production appended
+    /// after the test module would sit outside every check above, silently, and
+    /// the file would still compile and still report clean.
+    ///
+    /// Checked by shape rather than by parsing: inside a module everything is
+    /// indented, so a column-zero item after the boundary is production that
+    /// escaped. The module header itself is the one exception.
+    #[test]
+    fn nothing_production_follows_the_test_module() {
+        const ITEMS: &[&str] = &[
+            "pub ",
+            "pub(crate) ",
+            "pub(super) ",
+            "fn ",
+            "impl ",
+            "struct ",
+            "enum ",
+            "const ",
+            "static ",
+            "type ",
+            "use ",
+            "trait ",
+            "macro_rules!",
+        ];
+        for (name, source) in SOURCES {
+            let end = production_end(source);
+            if end == source.len() {
+                continue;
+            }
+            for (n, line) in source[end..].lines().enumerate() {
+                if line.starts_with("#[cfg(test)]") || line.starts_with("mod ") {
+                    continue;
+                }
+                assert!(
+                    !ITEMS.iter().any(|item| line.starts_with(item)),
+                    "{name}:{} is production code after the test module, where no guard in \
+                     this file can see it: {line:?}",
+                    end + n + 1
+                );
+            }
+        }
+    }
+
+    /// `SOURCES` is hand-written, so it can fall behind the module tree.
+    ///
+    /// A new storage module that nobody adds here is exempt from every guard
+    /// above -- the deferred fsync, the single write site, the bounded decoder
+    /// -- and nothing says so. The declarations in this file are the authority;
+    /// this asserts the list matches them.
+    #[test]
+    fn every_declared_module_is_guarded() {
+        let declared: std::collections::BTreeSet<String> = include_str!("mod.rs")
+            .lines()
+            .filter_map(|line| {
+                let line = line
+                    .trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub ");
+                // `mod name;` only: an inline `mod name {` is in this file and
+                // is covered as part of it.
+                line.strip_prefix("mod ")
+                    .and_then(|rest| rest.strip_suffix(';'))
+                    .map(|name| format!("{name}.rs"))
+            })
+            .collect();
+        let guarded: std::collections::BTreeSet<String> = SOURCES
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .filter(|name| name != "mod.rs")
+            .collect();
+
+        assert_eq!(
+            declared, guarded,
+            "every module this file declares must be in SOURCES, and nothing else; \
+             a module missing here is exempt from every guard in this module"
+        );
+    }
+
     #[test]
     fn no_source_in_this_subsystem_selects_the_deferred_fsync_level() {
         // Built rather than written, so this file does not trip its own check.

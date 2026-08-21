@@ -2029,10 +2029,8 @@ mod tests {
             );
         }
 
-        // And the two the verdict grants are built in exactly one place each:
-        // their declaration, and `resolve`. `PublishInstall` is deliberately
-        // not counted -- both acting outcomes converge on it, so it has two
-        // legitimate constructions.
+        // The two the verdict grants are built in exactly one place each:
+        // their declaration, and `resolve`.
         for capability in ["ReplaceInstall(", "RepairInstall("] {
             assert_eq!(
                 flat.matches(capability).count(),
@@ -2041,6 +2039,18 @@ mod tests {
                  construction inside `resolve`"
             );
         }
+
+        // `PublishInstall` has two legitimate constructions, because both
+        // acting outcomes converge on it -- so it is pinned at exactly three
+        // occurrences rather than left uncounted. Uncounted, a direct
+        // `StagedSnapshot -> PublishInstall` conversion would satisfy every
+        // check above and hand publication to a body no verdict had approved.
+        assert_eq!(
+            flat.matches("PublishInstall(").count(),
+            3,
+            "PublishInstall should appear three times: its declaration, the \
+             Replace conversion, and the Repair conversion"
+        );
     }
 
     fn temp_dir() -> PathBuf {
