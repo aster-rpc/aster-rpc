@@ -216,49 +216,6 @@ mod durability_guard {
         ("fixture.rs", include_str!("fixture.rs")),
     ];
 
-    /// The declaration parser, against every visibility Rust offers.
-    ///
-    /// Tested directly rather than only through file mutations. A parser that
-    /// silently matches nothing makes every guard built on it pass, and a
-    /// mutation that adds a declaration then looks caught when it was never
-    /// seen -- which is exactly what happened when an edit to this file failed
-    /// to apply and the mutation "survived" against unchanged code.
-    #[test]
-    fn a_module_declaration_is_recognised_whatever_precedes_it() {
-        for line in [
-            "mod child;",
-            "pub mod child;",
-            "pub(crate) mod child;",
-            "pub(super) mod child;",
-            "pub(self) mod child;",
-            "pub(in crate::coordination) mod child;",
-            "    pub(crate) mod child;",
-            "pub(crate) mod child; // with a trailing comment",
-        ] {
-            assert_eq!(
-                declared_module(line),
-                Some("child"),
-                "not recognised as a declaration: {line:?}"
-            );
-        }
-
-        // Names this guard does not get an opinion about. `rustc` has already
-        // accepted them, and refusing one lets its module escape.
-        assert_eq!(declared_module("mod r#type;"), Some("r#type"));
-        assert_eq!(declared_module("pub(crate) mod café;"), Some("café"));
-
-        for line in [
-            "mod child {",
-            "use crate::child;",
-            "// mod child;",
-            "/// mod child;",
-            "let modules = child;",
-            "type child = ();",
-        ] {
-            assert_eq!(declared_module(line), None, "wrongly matched: {line:?}");
-        }
-    }
-
     /// Every guard here reads only what [`production_end`] admits, so the
     /// boundary itself needs a guard.
     ///
@@ -299,57 +256,65 @@ mod durability_guard {
         }
     }
 
-    /// A guarded file may not point at a source that is not guarded.
+    /// `SOURCES` is hand-written, so it can fall behind the directory.
     ///
-    /// `every_declared_module_is_guarded` reads this file's declarations, so it
-    /// sees nothing about a `mod other;` written inside `snapshot.rs` -- which
-    /// would compile, would pull in `snapshot/other.rs`, and would be checked
-    /// by nothing. Forbidden outright rather than enumerated: no module here
-    /// has children, and the day one does, extending `SOURCES` should be the
-    /// deliberate act that makes this pass again.
-    #[test]
-    fn no_guarded_module_declares_a_child_source() {
-        for (name, source) in SOURCES {
-            if *name == "mod.rs" {
-                continue;
-            }
-            for (n, line) in production_lines(source) {
-                assert!(
-                    declared_module(line).is_none(),
-                    "{name}:{} declares an out-of-line module, whose source no guard in this \
-                     file reads: {:?}",
-                    n + 1,
-                    line.trim()
-                );
-            }
-        }
-    }
-
-    /// `SOURCES` is hand-written, so it can fall behind the module tree.
-    ///
-    /// A new storage module that nobody adds here is exempt from every guard
+    /// A new storage source that nobody adds here is exempt from every guard
     /// above -- the deferred fsync, the single write site, the bounded decoder
-    /// -- and nothing says so. The declarations in this file are the authority;
-    /// this asserts the list matches them.
+    /// -- and nothing says so.
+    ///
+    /// Compared against the **filesystem**, not against `mod` declarations
+    /// parsed out of the source. Four versions of that parser were four
+    /// different wrong answers -- `pub(self)`, then `pub(in ...)`, then raw and
+    /// non-ASCII names, then a trailing block comment -- each fixing the last
+    /// counterexample. The set of files in a directory is not a question that
+    /// needs a Rust lexer, and every escape found so far was an escape from the
+    /// lexer rather than from the rule.
     #[test]
-    fn every_declared_module_is_guarded() {
-        let declared: std::collections::BTreeSet<String> = production_lines(include_str!("mod.rs"))
-            .filter_map(|(_, line)| declared_module(line))
-            // `mod r#type;` lives in `type.rs`: the escape is how the source
-            // spells a keyword, not part of the file name.
-            .map(|name| format!("{}.rs", name.strip_prefix("r#").unwrap_or(name)))
-            .collect();
+    fn every_source_in_this_directory_is_guarded() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coordination/storage");
+        let mut found = Vec::new();
+        sources_on_disk(&dir, "", &mut found);
+
+        let on_disk: std::collections::BTreeSet<String> = found.into_iter().collect();
         let guarded: std::collections::BTreeSet<String> = SOURCES
             .iter()
             .map(|(name, _)| (*name).to_string())
-            .filter(|name| name != "mod.rs")
             .collect();
 
         assert_eq!(
-            declared, guarded,
-            "every module this file declares must be in SOURCES, and nothing else; \
-             a module missing here is exempt from every guard in this module"
+            on_disk,
+            guarded,
+            "every .rs file under {} must be in SOURCES, and nothing else; a source \
+             missing here is exempt from every guard in this module",
+            dir.display()
         );
+    }
+
+    /// No source may be pulled in from outside this directory.
+    ///
+    /// The one thing the directory walk cannot see. `#[path = "../elsewhere.rs"]`
+    /// and `include!` both make a file part of this subsystem while leaving it
+    /// somewhere the walk never looks, so the compiled module tree and the
+    /// guarded file set would quietly stop being the same thing.
+    ///
+    /// A substring prohibition rather than a parser: the point is that neither
+    /// appears at all. `include_str!` is unaffected -- a different token, and
+    /// the mechanism this guard is built on.
+    #[test]
+    fn no_source_is_pulled_in_from_outside_this_directory() {
+        for (name, source) in SOURCES {
+            for (n, line) in production_lines(source) {
+                for escape in ["#[path", "include!"] {
+                    assert!(
+                        !line.contains(escape),
+                        "{name}:{} uses {escape:?} to pull in a source the directory walk \
+                         cannot see: {:?}",
+                        n + 1,
+                        line.trim()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -596,36 +561,34 @@ mod durability_guard {
     /// The cost of taking the last is that an earlier `#[cfg(test)]` module is
     /// scanned as production. That is the safe direction -- more is checked,
     /// not less -- and the seam it admits contains nothing any guard forbids.
-    /// The module an out-of-line declaration names, whatever precedes it.
-    ///
-    /// Both callers below used to strip a list of visibility prefixes, and both
-    /// lists were incomplete in different ways -- one missed `pub(self)` and
-    /// `pub(in ...)`, the other missed `pub(super)` as well. Each of those
-    /// compiles, and each escaped `SOURCES`, which is the one thing this parser
-    /// exists to prevent.
-    ///
-    /// So it does not look at visibility at all. A declaration is a statement
-    /// whose last two tokens are `mod` and a name; whatever precedes them is
-    /// visibility by definition, in whatever form Rust grows next. `mod name {`
-    /// is deliberately not matched: an inline module is in the file being
-    /// scanned and is covered as part of it.
-    ///
-    /// The name is not validated either, and for the same reason. This reads
-    /// source that has already compiled, so `rustc` has settled what a module
-    /// name may be -- and it admits more than an ASCII check does. `mod r#type;`
-    /// and `mod café;` are both legal, and a guard that refused to recognise
-    /// them would let exactly those modules escape every check in this file.
-    fn declared_module(line: &str) -> Option<&str> {
-        let code = line.split("//").next()?.trim().strip_suffix(';')?;
-        let mut tokens = code.split_whitespace().rev();
-        let name = tokens.next()?;
-        (tokens.next()? == "mod").then_some(name)
-    }
-
     pub(super) fn production_end(source: &str) -> usize {
         source
             .rfind("\n#[cfg(test)]\nmod ")
             .map(|at| at + 1)
             .unwrap_or(source.len())
+    }
+
+    /// Every `.rs` file beneath this directory, relative to it.
+    ///
+    /// The successor to a parser that read `mod` declarations out of the
+    /// source. That parser was rewritten four times and was wrong four times --
+    /// it missed `pub(self)`, then `pub(in ...)`, then raw and non-ASCII names,
+    /// then a trailing block comment -- because each fix answered the last
+    /// counterexample rather than the question. Hand-lexing Rust to find out
+    /// which files exist is the wrong instrument for a question the filesystem
+    /// answers exactly.
+    fn sources_on_disk(dir: &std::path::Path, prefix: &str, into: &mut Vec<String>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|err| panic!("reading {}: {err}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("a directory entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if path.is_dir() {
+                sources_on_disk(&path, &format!("{prefix}{name}/"), into);
+            } else if name.ends_with(".rs") {
+                into.push(format!("{prefix}{name}"));
+            }
+        }
     }
 }
