@@ -599,6 +599,95 @@ impl StagedSnapshot {
     }
 }
 
+/// What installing a candidate over the durable state resolves to (§11.4).
+///
+/// A decision an independent test can drive, rather than branches inside the
+/// install path. The rule is "monotonic by applied index, with full identity
+/// **and** content at an equal one", and the equal case is the one that matters
+/// most and is hardest to reach from the outside: it is what a lost
+/// acknowledgement produces, and it must repair rather than replace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Install {
+    /// Ahead of the durable state: replace `state.redb`.
+    Replace,
+    /// The same state arriving again. The business state is already correct;
+    /// only the marker may need publishing. This is the lost-acknowledgement
+    /// repair, and replacing here would rewrite a database with itself.
+    Repair,
+    /// Behind the durable state. Installing it would roll the state machine
+    /// back, which no snapshot may do.
+    Stale(String),
+    /// The same index describing different history, or the same history
+    /// hashing differently. Not recoverable.
+    Fatal(String),
+}
+
+/// Compare a validated candidate against the durable state it would replace.
+///
+/// ## When this may be called
+///
+/// **Only under exclusive access to the state**, and against the state that
+/// replacement would actually overwrite. The comparison and the rename have to
+/// see the same `last_applied`: an apply landing between them turns an accepted
+/// higher snapshot into a rollback, and nothing downstream could tell. That is
+/// why this takes the durable state by reference rather than a handle it could
+/// re-read — the caller has to have it already, which it only does if it is
+/// holding the actor still.
+///
+/// ## Why the equal case hashes
+///
+/// At an equal full log id the two claim to describe the same entry, and §11.4
+/// makes the canonical body a pure function of replicated state at
+/// `last_applied`. So the digests must agree. `canonical` computes this store's
+/// own, lazily: it streams the whole state, which is worth avoiding on the
+/// ordinary higher-index path and is unavoidable here — a cheaper comparison
+/// does not exist, because every cheaper thing already matched.
+pub(crate) fn decide_install(
+    staged: &StagedSnapshot,
+    durable: &super::rows::DurableState,
+    canonical: impl FnOnce() -> StorageResult<[u8; 32]>,
+) -> StorageResult<Install> {
+    let candidate = staged.meta();
+    let candidate_index = candidate.last_log_id.as_ref().map(|id| id.index);
+    let durable_index = durable.model.last_applied.as_ref().map(|id| id.index);
+
+    if candidate_index < durable_index {
+        return Ok(Install::Stale(format!(
+            "the candidate is at applied index {candidate_index:?} and this store has applied \
+             through {durable_index:?}; installing it would roll the state machine back"
+        )));
+    }
+    if candidate_index > durable_index {
+        return Ok(Install::Replace);
+    }
+
+    // Equal index. Identity first, because the digest comparison below is only
+    // meaningful between two bodies claiming to describe the same entry.
+    let expected = durable.model.last_applied.as_ref().map(LogIdV1::from);
+    if candidate.last_log_id != expected {
+        return Ok(Install::Fatal(format!(
+            "the candidate claims log id {:?} at index {candidate_index:?}, and this store \
+             applied {expected:?}",
+            candidate.last_log_id
+        )));
+    }
+
+    // The staged digest, not one decoded back out of the id string. `receive`
+    // already proved the two agree, and re-deriving bytes from the text would
+    // be a second opinion about what the id means.
+    let theirs = staged.digest();
+    let ours = canonical()?;
+    if &ours == theirs {
+        return Ok(Install::Repair);
+    }
+    Ok(Install::Fatal(format!(
+        "the candidate is {} at the same log id this store's own state hashes to {}; one of \
+         the two describes a history this voter never had",
+        snapshot_id_for(theirs),
+        snapshot_id_for(&ours)
+    )))
+}
+
 /// Copy an install source into receiver-owned staging and verify it.
 ///
 /// ## Why it is copied at all

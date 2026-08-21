@@ -3799,6 +3799,180 @@ mod tests {
         );
     }
 
+    /// Every outcome of the install decision, driven from real stores.
+    ///
+    /// The rule is monotonic by applied index, with full identity **and**
+    /// content at an equal one. Each case is reached by moving the *receiver*
+    /// rather than by constructing a candidate: a fixture that hand-built the
+    /// metadata would be asserting against itself, and the equal case in
+    /// particular only means anything when both sides really did apply the same
+    /// entries.
+    #[tokio::test]
+    async fn the_install_decision_covers_stale_equal_and_higher() {
+        use super::super::snapshot::{decide_install, Install};
+
+        // A source at applied index 2.
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        // A receiver at applied index 1: the seeded seven-section state, with
+        // nothing applied on top.
+        let receiver = |dir: std::path::PathBuf| {
+            let (machine, shutdown, drain) = CoordinationStateMachine::new(
+                seeded_with(&dir, seven_section_state()),
+                StorageLayout::new(&dir),
+            )
+            .expect("open");
+            (machine, shutdown, drain, dir)
+        };
+
+        // ── Higher: the receiver is behind the candidate ────────────────────
+        {
+            let dir = scratch_dir();
+            let (machine, _s, _d, dir) = receiver(dir);
+            let durable = durable_of(&machine).await;
+            let staged = super::super::snapshot::receive(
+                &StorageLayout::new(&dir),
+                &published.snapshot,
+                &durable,
+                &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+            )
+            .expect("stage");
+            assert_eq!(
+                decide_install(&staged, &durable, || panic!("no digest at a higher index"))
+                    .expect("decide"),
+                Install::Replace,
+                "index 2 over index 1 replaces"
+            );
+        }
+
+        // ── Stale: the receiver has applied past the candidate ──────────────
+        {
+            let dir = scratch_dir();
+            let (mut machine, _s, _d, dir) = receiver(dir);
+            machine
+                .apply([blank(2), blank(3)])
+                .await
+                .expect("move past the candidate");
+            let durable = durable_of(&machine).await;
+            let staged = super::super::snapshot::receive(
+                &StorageLayout::new(&dir),
+                &published.snapshot,
+                &durable,
+                &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+            )
+            .expect("stage");
+            let decision = decide_install(&staged, &durable, || panic!("no digest when stale"))
+                .expect("decide");
+            assert!(
+                matches!(decision, Install::Stale(_)),
+                "index 2 under index 3 is a rollback: {decision:?}"
+            );
+        }
+
+        // ── Equal, same content: the lost-acknowledgement repair ────────────
+        {
+            // The receiver *is* the source store, reopened: same rows, same
+            // log id, so its own canonical digest is the candidate's.
+            let dir = scratch_dir();
+            let (mut machine, _s, _d, dir) = receiver(dir);
+            let durable = durable_of(&machine).await;
+            let staged = super::super::snapshot::receive(
+                &StorageLayout::new(&dir),
+                &published.snapshot,
+                &durable,
+                &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+            )
+            .expect("stage");
+            // Its own body, at its own applied index.
+            let mine = {
+                let mut builder = machine.get_snapshot_builder().await;
+                builder.build_snapshot().await.expect("build")
+            };
+            let self_staged = super::super::snapshot::receive(
+                &StorageLayout::new(&dir),
+                &mine.snapshot,
+                &durable,
+                &crate::coordination::raft::SnapshotMetaV1::from(&mine.meta),
+            )
+            .expect("stage my own");
+            let digest = *self_staged.digest();
+            assert_eq!(
+                decide_install(&self_staged, &durable, || Ok(digest)).expect("decide"),
+                Install::Repair,
+                "the same state arriving again repairs rather than replaces"
+            );
+            let _ = staged;
+        }
+
+        // ── Equal index, different log id: divergent history ────────────────
+        //
+        // Two leaders can write different entries at the same index, so the
+        // index matching is not the two sides agreeing about anything. Reached
+        // by giving the source's state the same index under a later term:
+        // everything else — group, genesis, authority, profile, index —
+        // matches, which is exactly the case the identity checks cannot see.
+        {
+            let forked_dir = scratch_dir();
+            let mut forked = seven_section_state();
+            forked.model.last_applied = Some(LogId::new(2, LEADER, 1));
+            let database = seeded_with(&forked_dir, forked);
+            let read = database.begin_read().expect("read");
+            let body = super::super::snapshot::build(&StorageLayout::new(&forked_dir), &read)
+                .expect("a canonical body at (term 2, index 1)");
+            drop(read);
+            drop(database);
+
+            let dir = scratch_dir();
+            let (machine, _s, _d, dir) = receiver(dir);
+            let durable = durable_of(&machine).await;
+            assert_eq!(
+                durable.model.last_applied.map(|id| id.index),
+                Some(1),
+                "the receiver is at the same index"
+            );
+            let staged = super::super::snapshot::receive(
+                &StorageLayout::new(&dir),
+                &CoordinationSnapshotFile::incoming(body.path),
+                &durable,
+                &body.meta,
+            )
+            .expect("a body from the same group stages");
+            let decision = decide_install(&staged, &durable, || {
+                panic!("the log ids disagree; there is nothing to hash")
+            })
+            .expect("decide");
+            assert!(
+                matches!(decision, Install::Fatal(_)),
+                "same index under a different term is not the same entry: {decision:?}"
+            );
+        }
+
+        // ── Equal index, different content: divergent history ───────────────
+        {
+            let dir = scratch_dir();
+            let (mut machine, _s, _d, dir) = receiver(dir);
+            let durable = durable_of(&machine).await;
+            let mine = {
+                let mut builder = machine.get_snapshot_builder().await;
+                builder.build_snapshot().await.expect("build")
+            };
+            let self_staged = super::super::snapshot::receive(
+                &StorageLayout::new(&dir),
+                &mine.snapshot,
+                &durable,
+                &crate::coordination::raft::SnapshotMetaV1::from(&mine.meta),
+            )
+            .expect("stage my own");
+            let decision =
+                decide_install(&self_staged, &durable, || Ok([0x5a; 32])).expect("decide");
+            assert!(
+                matches!(decision, Install::Fatal(_)),
+                "same log id, different bodies: {decision:?}"
+            );
+        }
+    }
+
     /// A candidate replaces the store it was built for, and only that one.
     ///
     /// The hole this closes was not that two layouts could be *confused* — it
