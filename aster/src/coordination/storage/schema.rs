@@ -1312,15 +1312,19 @@ impl VerifiedCandidate {
     /// guarantee rests on the stronger fact that a candidate never names its
     /// target. "Renamed but not yet durable" is then not something to clean up
     /// after; it is something for the caller to stop the store over.
-    pub(crate) fn replace(self) -> StorageResult<super::rows::DurableState> {
+    pub(crate) fn replace(self) -> StorageResult<(super::rows::DurableState, PathBuf)> {
         let VerifiedCandidate {
             mut candidate,
             state,
         } = self;
-        super::snapshot::atomic_replace(candidate.path(), &candidate.target)?;
+        let target = candidate.target.clone();
+        super::snapshot::atomic_replace(candidate.path(), &target)?;
         candidate.disarm();
         super::snapshot::fsync_dir_durably(&candidate.root)?;
-        Ok(state)
+        // The target goes with the state: whatever reopens this replacement
+        // must reopen *this* file, not one named later by a caller who might
+        // name a different store's.
+        Ok((state, target))
     }
 }
 

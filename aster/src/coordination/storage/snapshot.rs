@@ -454,9 +454,31 @@ fn digest_of(path: &Path) -> StorageResult<Existing> {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SnapshotFile {
     /// The OpenRaft metadata, derived from the body rather than supplied.
-    pub(crate) meta: SnapshotMetaV1,
-    pub(crate) path: PathBuf,
-    pub(crate) len: u64,
+    meta: SnapshotMetaV1,
+    path: PathBuf,
+    len: u64,
+}
+
+impl SnapshotFile {
+    /// Read-only, and the fields are private, which is the point.
+    ///
+    /// This is the token for "a body this store published, under a name that
+    /// hashes to it". `pub(crate)` fields made it forgeable: any module could
+    /// assemble one from a path and a metadata record it had chosen and hand it
+    /// to publication, which would then write a `CURRENT` naming a body nothing
+    /// had verified. Privatising `publish_current` did not help, because the
+    /// argument was the hole.
+    pub(crate) fn meta(&self) -> &SnapshotMetaV1 {
+        &self.meta
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
 }
 
 /// Derive the OpenRaft metadata a body implies.
@@ -653,8 +675,12 @@ pub(crate) enum ResolvedInstall {
     /// header, and the two refusals below carry only a message.
     Repair(Box<RepairInstall>),
     /// Behind the durable state. Installing it would roll the state machine
-    /// back, which no snapshot may do -- an ordinary refusal, and not fatal:
-    /// a leader offered a snapshot this voter is already past.
+    /// back, which no snapshot may do.
+    ///
+    /// Fatal, though it does not read that way. OpenRaft filters snapshots at
+    /// or below `committed` before it calls the state machine, so this arriving
+    /// at all means the durable state and the state OpenRaft believes this node
+    /// has are already different things.
     Stale(String),
     /// The same index describing different history, or the same history hashing
     /// differently. This voter's history and the group's disagree, which §5.3.1
@@ -687,8 +713,12 @@ impl ReplaceInstall {
     /// it, and handing `PublishInstall` back here made that step skippable --
     /// which is exactly why removing it failed no test.
     pub(crate) fn replace(self) -> StorageResult<ReplacedInstall> {
-        let (expected, staged) = self.0.replace()?;
-        Ok(ReplacedInstall { expected, staged })
+        let (expected, staged, target) = self.0.replace()?;
+        Ok(ReplacedInstall {
+            expected,
+            staged,
+            target,
+        })
     }
 }
 
@@ -703,6 +733,15 @@ impl ReplaceInstall {
 pub(crate) struct ReplacedInstall {
     expected: super::rows::DurableState,
     staged: StagedSnapshot,
+    /// The file the rename actually replaced.
+    ///
+    /// Carried rather than named again at reopen time. Taking a layout there
+    /// let a candidate replaced in one store be reopened against another of the
+    /// same group -- and if that store happened to hold the expected state, the
+    /// comparison passed and handed back the *wrong* database. The same
+    /// cross-store substitution `replace` had already been fixed for, one step
+    /// further along.
+    target: PathBuf,
 }
 
 impl ReplacedInstall {
@@ -714,8 +753,16 @@ impl ReplacedInstall {
     /// fault injection Checkpoint E brings. Reaching the branch directly is the
     /// difference between a check that is present and one that is evidenced.
     #[cfg(test)]
-    pub(crate) fn for_test(expected: super::rows::DurableState, staged: StagedSnapshot) -> Self {
-        Self { expected, staged }
+    pub(crate) fn for_test(
+        expected: super::rows::DurableState,
+        staged: StagedSnapshot,
+        target: PathBuf,
+    ) -> Self {
+        Self {
+            expected,
+            staged,
+            target,
+        }
     }
 
     /// Reopen the replaced `state.redb`, revalidate it, and grant publication.
@@ -728,17 +775,19 @@ impl ReplacedInstall {
     /// and every check above would pass on it.
     pub(crate) fn reopen(
         self,
-        layout: &StorageLayout,
     ) -> StorageResult<(redb::Database, super::rows::DurableState, PublishInstall)> {
-        let ReplacedInstall { expected, staged } = self;
-        let (database, reloaded) =
-            super::schema::open_installed_state(&layout.database(Db::State))?;
+        let ReplacedInstall {
+            expected,
+            staged,
+            target,
+        } = self;
+        let (database, reloaded) = super::schema::open_installed_state(&target)?;
 
         if reloaded != expected {
             return Err(corrupt(format!(
                 "the database now at {} loads as a valid state that is not the one this \
                  install validated: applied {:?} rather than {:?}",
-                layout.database(Db::State).display(),
+                target.display(),
                 reloaded.model.last_applied,
                 expected.model.last_applied
             )));
@@ -1167,10 +1216,10 @@ impl PreparedInstall {
     /// only way to hold one is to have matched `Replace`.
     ///
     /// [`resolve`]: PreparedInstall::resolve
-    fn replace(self) -> StorageResult<(super::rows::DurableState, StagedSnapshot)> {
+    fn replace(self) -> StorageResult<(super::rows::DurableState, StagedSnapshot, PathBuf)> {
         let PreparedInstall { staged, candidate } = self;
-        let state = candidate.replace()?;
-        Ok((state, staged))
+        let (state, target) = candidate.replace()?;
+        Ok((state, staged, target))
     }
 
     /// Give up the rebuilt database and keep the body. Private: the only
@@ -2196,14 +2245,14 @@ mod tests {
             .join(" ");
 
         // The prepared install may not replace: only the capability may.
+        let prepared_replace =
+            "fn replace(self) -> StorageResult<(super::rows::DurableState, StagedSnapshot, PathBuf)>";
         assert!(
-            flat.contains(
-                "fn replace(self) -> StorageResult<(super::rows::DurableState, StagedSnapshot)>"
-            ),
+            flat.contains(prepared_replace),
             "`PreparedInstall::replace` must stay private"
         );
         assert!(
-            !flat.contains("pub(crate) fn replace(self) -> StorageResult<(super::rows::DurableState, StagedSnapshot)>"),
+            !flat.contains(&format!("pub(crate) {prepared_replace}")),
             "`PreparedInstall::replace` became reachable, which makes the verdict optional"
         );
         assert!(
@@ -2256,6 +2305,22 @@ mod tests {
         // occurrences rather than left uncounted. Uncounted, a direct
         // `StagedSnapshot -> PublishInstall` conversion would satisfy every
         // check above and hand publication to a body no verdict had approved.
+        // A published body is a capability as much as the install ones are: it
+        // says "this store wrote these bytes under a name that hashes to
+        // them", and publication believes it. Public fields made it
+        // assemblable from a chosen path and a chosen metadata record.
+        let fields = flat
+            .split("pub(crate) struct SnapshotFile {")
+            .nth(1)
+            .expect("SnapshotFile must be declared")
+            .split('}')
+            .next()
+            .expect("a struct body");
+        assert!(
+            !fields.contains("pub"),
+            "SnapshotFile's fields must stay private: {fields:?}"
+        );
+
         // No occurrence count for `ReplacedInstall`: the number would have to be
         // read off a failing run and updated whenever the type is mentioned,
         // which is a test that asks the implementation what to expect. Its

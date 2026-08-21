@@ -343,8 +343,9 @@ impl StateActor {
         };
 
         let body = match resolved {
-            // Nothing is wrong with this store; a leader offered a snapshot it
-            // is already past.
+            // Not the benign race it reads as: OpenRaft filters these out
+            // before calling the state machine, so reaching here means its
+            // view and the durable state have already diverged.
             snapshot::ResolvedInstall::Stale(detail) => {
                 return Err(StorageError::SnapshotBehind { detail })
             }
@@ -364,7 +365,7 @@ impl StateActor {
                 // publication capability is not reachable until it has: the
                 // reopen proves the file that landed is a database this build
                 // can serve *and* is the one this install validated.
-                let (database, reloaded, body) = replaced.reopen(&self.layout)?;
+                let (database, reloaded, body) = replaced.reopen()?;
                 self.database = Some(database);
                 self.state = Some(reloaded);
                 body
@@ -915,8 +916,8 @@ impl CoordinationStateMachine {
         file: &SnapshotFile,
     ) -> StorageResult<Snapshot<CoordinationTypeConfig>> {
         Ok(Snapshot {
-            meta: rows::snapshot_meta_from_wire(&file.meta)?,
-            snapshot: Box::new(self.catalog.lease(&file.meta.snapshot_id, &file.path)?),
+            meta: rows::snapshot_meta_from_wire(file.meta())?,
+            snapshot: Box::new(self.catalog.lease(&file.meta().snapshot_id, file.path())?),
         })
     }
 }
@@ -3244,11 +3245,11 @@ mod tests {
         // says this store still has work outstanding does not.
         let lease = stale.release_transaction();
         assert_eq!(
-            older.meta.last_log_id.as_ref().map(|id| id.index),
+            older.meta().last_log_id.as_ref().map(|id| id.index),
             Some(1),
             "the stale transaction still sees the version it pinned"
         );
-        let discarded = older.path.clone();
+        let discarded = older.path().to_path_buf();
 
         let serving = machine.publish(&lease, older).expect("publication decides");
         assert_eq!(
@@ -3271,7 +3272,8 @@ mod tests {
             reload_current(&layout, &dir)
                 .expect("load")
                 .expect("still published")
-                .meta,
+                .meta()
+                .clone(),
             crate::coordination::raft::SnapshotMetaV1::from(&newer),
             "and the durable marker still names the newer snapshot"
         );
@@ -3544,9 +3546,13 @@ mod tests {
         // Claim to have installed the sender's state, over a database that
         // still holds the receiver's.
         let sender = seven_section_state();
-        let replaced = super::super::snapshot::ReplacedInstall::for_test(sender, staged);
+        let replaced = super::super::snapshot::ReplacedInstall::for_test(
+            sender,
+            staged,
+            dir.join("state.redb"),
+        );
         let err = replaced
-            .reopen(&StorageLayout::new(&dir))
+            .reopen()
             .expect_err("a valid database that is not the installed one is not installed");
         assert!(
             format!("{err:?}").contains("not the one this install validated"),
@@ -3616,7 +3622,7 @@ mod tests {
         let (_source, published) = a_published_source(&source_dir).await;
 
         let dir = scratch_dir();
-        let (mut machine, _shutdown, _drain) = CoordinationStateMachine::new(
+        let (mut machine, shutdown, drain) = CoordinationStateMachine::new(
             seeded_with(&dir, seven_section_state()),
             StorageLayout::new(&dir),
         )
@@ -3644,7 +3650,19 @@ mod tests {
             leftovers(&dir).is_empty(),
             "with neither artifact left behind"
         );
-        let _ = before;
+
+        // Fatal for this store, and yet nothing of the refused install reached
+        // disk: the state a reopen finds is the one that was there before.
+        // Captured and then discarded, this assertion was missing entirely.
+        drop(machine);
+        drop(drain);
+        drop(shutdown);
+        let (machine, _shutdown, _drain) = reopen(&dir);
+        assert_eq!(
+            durable_of(&machine).await,
+            before,
+            "a refused install leaves the durable state exactly as it was"
+        );
     }
 
     /// Nothing an outstanding lease holder does needs the actor.
@@ -4031,8 +4049,8 @@ mod tests {
         drop(read);
         drop(database);
 
-        let supplied = built.meta.clone();
-        let source = CoordinationSnapshotFile::incoming(built.path);
+        let supplied = built.meta().clone();
+        let source = CoordinationSnapshotFile::incoming(built.path().to_path_buf());
         let dir = scratch_dir();
         let (machine, _shutdown, _drain) = machine(&dir);
         let staged = super::super::snapshot::receive(
@@ -4240,9 +4258,9 @@ mod tests {
 
         let staged_bad = super::super::snapshot::receive(
             &layout,
-            &CoordinationSnapshotFile::incoming(bad.path),
+            &CoordinationSnapshotFile::incoming(bad.path()),
             &state,
-            &bad.meta,
+            bad.meta(),
         )
         .expect("the bad body stages");
         let bad_body = staged_bad.path().to_path_buf();
@@ -4426,8 +4444,8 @@ mod tests {
                 Some(1),
                 "the receiver is at the same index"
             );
-            let source = CoordinationSnapshotFile::incoming(body.path);
-            let prepared = prepare(&dir, &source, &durable, &body.meta);
+            let source = CoordinationSnapshotFile::incoming(body.path());
+            let prepared = prepare(&dir, &source, &durable, body.meta());
             let candidate = candidate_in(&dir).expect("a candidate was built");
             let resolved = prepared
                 .resolve(&durable, || {
@@ -5385,7 +5403,8 @@ mod tests {
             reload_current(&layout, &dir)
                 .expect("load")
                 .expect("republished")
-                .meta,
+                .meta()
+                .clone(),
             crate::coordination::raft::SnapshotMetaV1::from(&first),
             "the marker is repaired without the body being rewritten"
         );
