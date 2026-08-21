@@ -210,10 +210,12 @@ impl Drop for Scratch {
 /// with install.
 #[cfg(not(windows))]
 pub(super) fn atomic_replace(from: &Path, to: &Path) -> StorageResult<()> {
-    // The error names the destination, not the scratch file: the scratch name
-    // carries a pid and a counter and means nothing to whoever reads the log,
-    // while the destination is the snapshot that failed to appear.
-    std::fs::rename(from, to).map_err(io("replacing a snapshot file", to))
+    // The error names the destination, not the source: a scratch or candidate
+    // name carries a pid and a counter and means nothing to whoever reads the
+    // log, while the destination is the file that failed to appear. It is also
+    // what distinguishes the two callers -- a snapshot body and `state.redb` --
+    // without this helper having to know which one it is serving.
+    std::fs::rename(from, to).map_err(io("replacing a file", to))
 }
 
 #[cfg(windows)]
@@ -242,7 +244,7 @@ pub(super) fn atomic_replace(from: &Path, to: &Path) -> StorageResult<()> {
     };
     if moved == 0 {
         return Err(StorageError::io(
-            "replacing a snapshot file",
+            "replacing a file",
             to,
             std::io::Error::last_os_error(),
         ));

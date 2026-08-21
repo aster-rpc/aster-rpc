@@ -3617,7 +3617,7 @@ mod tests {
         );
         assert_ne!(candidate_bytes, old, "and the two differ, so a no-op shows");
 
-        verified.replace(&layout).expect("the replacement succeeds");
+        verified.replace().expect("the replacement succeeds");
         assert_eq!(
             std::fs::read(&target).expect("the state database"),
             candidate_bytes,
@@ -3792,10 +3792,78 @@ mod tests {
         drop(machine);
         drop(drain);
         drop(shutdown);
-        verified.replace(&layout).expect("the rename succeeds");
+        verified.replace().expect("the rename succeeds");
         assert!(
             layout.database(Db::State).exists(),
             "the candidate is now the state database"
+        );
+    }
+
+    /// A candidate replaces the store it was built for, and only that one.
+    ///
+    /// The hole this closes was not that two layouts could be *confused* — it
+    /// was that nothing said they could not be. `replace` took a layout, so a
+    /// candidate rebuilt and validated against store A's identity and applied
+    /// index could be handed store B's layout and overwrite B's `state.redb`
+    /// with A's state. Both stores are in the same group here, which is the
+    /// hard case: every identity check passes, and only the *destination* is
+    /// wrong.
+    ///
+    /// The cross-store call is now a compile error — `replace` takes no
+    /// arguments — so what remains testable is that the bound target is A's and
+    /// that B is untouched by A's install.
+    #[tokio::test]
+    async fn a_candidate_replaces_only_the_store_it_was_built_for() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        // Two stores of the same group, so nothing but the destination differs.
+        let a = scratch_dir();
+        let b = scratch_dir();
+        let (machine_a, shutdown_a, drain_a) = machine(&a);
+        let (machine_b, shutdown_b, drain_b) = machine(&b);
+        let layout_a = StorageLayout::new(&a);
+
+        let staged = super::super::snapshot::receive(
+            &layout_a,
+            &published.snapshot,
+            &durable_of(&machine_a).await,
+            &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+        )
+        .expect("stage for A");
+        let verified = super::super::snapshot::rebuild_candidate(&layout_a, &staged)
+            .expect("a candidate for A");
+
+        drop(machine_a);
+        drop(drain_a);
+        drop(shutdown_a);
+        drop(machine_b);
+        drop(drain_b);
+        drop(shutdown_b);
+
+        let a_state = a.join("state.redb");
+        let b_state = b.join("state.redb");
+        let a_before = std::fs::read(&a_state).expect("A's state");
+        let b_before = std::fs::read(&b_state).expect("B's state");
+        let candidate_bytes =
+            std::fs::read(candidate_in(&a).expect("A's candidate")).expect("candidate bytes");
+
+        verified.replace().expect("the replacement succeeds");
+
+        assert_eq!(
+            std::fs::read(&a_state).expect("A's state"),
+            candidate_bytes,
+            "A took the candidate"
+        );
+        assert_ne!(
+            std::fs::read(&a_state).expect("A's state"),
+            a_before,
+            "and A really changed"
+        );
+        assert_eq!(
+            std::fs::read(&b_state).expect("B's state"),
+            b_before,
+            "B is byte-identical: a candidate built for A cannot reach it"
         );
     }
 
@@ -3848,9 +3916,7 @@ mod tests {
         // The root refuses new names, so the rename onto `state.redb` fails.
         // `incoming/` stays writable, so removing the candidate does not.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
-        let err = verified
-            .replace(&layout)
-            .expect_err("the rename cannot succeed");
+        let err = verified.replace().expect_err("the rename cannot succeed");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert!(format!("{err:?}").contains("state.redb"), "{err:?}");
 
@@ -3897,7 +3963,7 @@ mod tests {
 
         super::super::snapshot::fault::fail_next_directory_fsync();
         let err = verified
-            .replace(&layout)
+            .replace()
             .expect_err("the injected post-rename durability failure is reported");
         assert!(format!("{err:?}").contains("injected"), "{err:?}");
 

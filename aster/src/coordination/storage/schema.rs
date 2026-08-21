@@ -1224,8 +1224,20 @@ pub(crate) fn write_state_binding(
 /// one forgotten `?` at a time.
 #[derive(Debug)]
 pub(crate) struct StateCandidate {
-    /// `None` once a caller has taken ownership of the file.
+    /// `None` once the replacement has taken ownership of the file.
     path: Option<PathBuf>,
+    /// The one database this candidate may ever become, fixed at creation.
+    ///
+    /// Carried rather than supplied at replacement time. A candidate is built
+    /// and validated *for a store* -- its rows were checked against that
+    /// store's identity and applied index -- so letting the replacement name a
+    /// target lets a candidate verified for one store overwrite another's
+    /// `state.redb`. Two layouts is not a mistake a caller has to avoid if
+    /// there is only ever one.
+    target: PathBuf,
+    /// The directory whose entry the rename changes, and which must be synced
+    /// for it to survive a crash.
+    root: PathBuf,
     /// `None` once verification has closed the builder handle.
     database: Option<Database>,
 }
@@ -1251,8 +1263,8 @@ impl StateCandidate {
     /// Stop owning the file. Private, and reachable only from
     /// [`VerifiedCandidate::replace`] one statement after the rename that makes
     /// the file somebody else's.
-    fn disarm(mut self) -> PathBuf {
-        self.path.take().expect("a candidate is disarmed once")
+    fn disarm(&mut self) {
+        self.path = None;
     }
 }
 
@@ -1300,15 +1312,14 @@ impl VerifiedCandidate {
     /// guarantee rests on the stronger fact that a candidate never names its
     /// target. "Renamed but not yet durable" is then not something to clean up
     /// after; it is something for the caller to stop the store over.
-    pub(crate) fn replace(
-        self,
-        layout: &StorageLayout,
-    ) -> StorageResult<super::rows::DurableState> {
-        let VerifiedCandidate { candidate, state } = self;
-        let target = layout.database(Db::State);
-        super::snapshot::atomic_replace(candidate.path(), &target)?;
-        drop(candidate.disarm());
-        super::snapshot::fsync_dir_durably(layout.root())?;
+    pub(crate) fn replace(self) -> StorageResult<super::rows::DurableState> {
+        let VerifiedCandidate {
+            mut candidate,
+            state,
+        } = self;
+        super::snapshot::atomic_replace(candidate.path(), &candidate.target)?;
+        candidate.disarm();
+        super::snapshot::fsync_dir_durably(&candidate.root)?;
         Ok(state)
     }
 }
@@ -1330,14 +1341,17 @@ pub(crate) fn create_state_candidate(layout: &StorageLayout) -> StorageResult<St
     let dir = layout.incoming();
     std::fs::create_dir_all(&dir)
         .map_err(|source| StorageError::io("creating the incoming directory", &dir, source))?;
-    create_state_candidate_at(&dir.join(super::snapshot::scratch_name("candidate")))
+    create_state_candidate_at(
+        &dir.join(super::snapshot::scratch_name("candidate")),
+        layout,
+    )
 }
 
 /// The path-taking half, for the tests that must produce an occupied path.
 ///
 /// Not reachable from any install path: production goes through
 /// [`create_state_candidate`], which derives the location.
-fn create_state_candidate_at(path: &Path) -> StorageResult<StateCandidate> {
+fn create_state_candidate_at(path: &Path, layout: &StorageLayout) -> StorageResult<StateCandidate> {
     reject_symlink(path)?;
     let file = OpenOptions::new()
         .read(true)
@@ -1352,6 +1366,8 @@ fn create_state_candidate_at(path: &Path) -> StorageResult<StateCandidate> {
     // added without.
     let mut candidate = StateCandidate {
         path: Some(path.to_path_buf()),
+        target: layout.database(Db::State),
+        root: layout.root().to_path_buf(),
         database: None,
     };
     restrict_permissions(path, FILE_MODE)?;
@@ -1612,7 +1628,7 @@ mod tests {
         std::fs::write(&occupied, b"not a database, and not to be touched").expect("write");
         let before = std::fs::read(&occupied).expect("read");
 
-        let err = create_state_candidate_at(&occupied)
+        let err = create_state_candidate_at(&occupied, &StorageLayout::new(&dir))
             .expect_err("an existing path is never adopted as a candidate");
         assert!(
             format!("{err:?}").contains("creating a state candidate"),
@@ -1666,7 +1682,7 @@ mod tests {
         let flat: String = production.split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(
-            flat.contains("fn disarm(mut self) -> PathBuf {"),
+            flat.contains("fn disarm(&mut self) {"),
             "`disarm` must stay private: it is the whole of cleanup-on-drop's exit"
         );
         assert!(
@@ -1678,9 +1694,8 @@ mod tests {
         // and renaming a file over itself succeeds -- installing nothing while
         // reporting success.
         assert!(
-            flat.contains("pub(crate) fn replace( self, layout: &StorageLayout, )")
-                || flat.contains("pub(crate) fn replace(self, layout: &StorageLayout)"),
-            "`replace` must take the layout, never a caller-supplied target"
+            flat.contains("pub(crate) fn replace(self) ->"),
+            "`replace` must take no arguments: the candidate carries its own target"
         );
         assert_eq!(
             flat.matches("disarm()").count(),
