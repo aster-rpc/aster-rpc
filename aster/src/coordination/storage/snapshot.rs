@@ -684,6 +684,55 @@ impl RepairInstall {
     }
 }
 
+/// Promote an installed body under its digest name and publish `CURRENT`.
+///
+/// Consumes the capability, so this is reachable only from an install that a
+/// verdict granted. The body is promoted **byte-verbatim** — the bytes that
+/// were verified, not a re-encoding of the database rebuilt from them — and the
+/// metadata written is the one OpenRaft supplied, carried through unchanged
+/// since `receive` proved it describes these bytes. §11.4 requires
+/// `get_current_snapshot` to return exactly that, because the suite compares
+/// it.
+///
+/// Called with the publication critical section already held, and every
+/// predecessor is retired before it returns: a reader admitted between the
+/// marker moving and the retirement would see a catalog that still offers a
+/// snapshot the marker no longer names.
+pub(crate) fn publish_installed(
+    layout: &StorageLayout,
+    catalog: &SnapshotCatalog,
+    body: PublishInstall,
+) -> StorageResult<SnapshotFile> {
+    let dir = layout.snapshots();
+    std::fs::create_dir_all(&dir).map_err(io("creating the snapshots directory", &dir))?;
+    let path = dir.join(file_name_for(body.digest()));
+
+    // The same reuse rule `build` follows: a file already under this name is a
+    // *claim* to have this content, and the digest is what replaces claims.
+    match digest_of(&path)? {
+        Existing::Digest(existing) if existing == *body.digest() => {}
+        _ => {
+            std::fs::copy(body.body(), &path)
+                .map_err(io("promoting an installed snapshot body", &path))?;
+            File::open(&path)
+                .and_then(|handle| handle.sync_all())
+                .map_err(io("fsyncing an installed snapshot body", &path))?;
+            fsync_dir(&dir)?;
+        }
+    }
+
+    let meta = body.meta().clone();
+    publish_current(layout, &meta)?;
+
+    let published = SnapshotFile {
+        len: body.len(),
+        meta,
+        path,
+    };
+    catalog.retire_all_but(&published.meta.snapshot_id, &dir)?;
+    Ok(published)
+}
+
 /// The right to publish a body and its `CURRENT` marker.
 ///
 /// Where both acting outcomes converge: a replacement and a repair differ in
@@ -703,6 +752,14 @@ impl PublishInstall {
     /// The verified bytes, to promote byte-verbatim under their digest name.
     pub(crate) fn body(&self) -> &Path {
         self.0.path()
+    }
+
+    pub(crate) fn digest(&self) -> &[u8; 32] {
+        self.0.digest()
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.0.len()
     }
 }
 
@@ -1466,7 +1523,7 @@ fn check_not_ahead(
 /// forbids materialising a body. Reached only at an equal applied index, which
 /// is where a cheaper comparison does not exist — the whole point is that the
 /// metadata already matches.
-fn canonical_digest(database: &redb::Database) -> StorageResult<[u8; 32]> {
+pub(crate) fn canonical_digest(database: &redb::Database) -> StorageResult<[u8; 32]> {
     use redb::ReadableDatabase as _;
 
     let read = database
@@ -1737,6 +1794,34 @@ impl SnapshotCatalog {
 
     /// Retire a snapshot: it stops being discoverable now, and its file is
     /// removed as soon as the last outstanding lease is released.
+    /// Retire every published body in `dir` except the one just published.
+    ///
+    /// OpenRaft's "all other snapshots should be deleted" (§11.4), satisfied at
+    /// the catalog boundary: before install returns, only `CURRENT` is
+    /// discoverable, and a predecessor's file survives solely while an
+    /// already-issued lease pins it.
+    ///
+    /// Reads the directory rather than tracking what this process published,
+    /// because a predecessor may have been published by a previous run of it.
+    /// Names that are not digest-shaped are left alone: they are not snapshots
+    /// this store issued, and removing what it does not recognise is how a
+    /// sweep becomes a hazard.
+    pub(crate) fn retire_all_but(&self, keep: &str, dir: &Path) -> StorageResult<()> {
+        let entries = std::fs::read_dir(dir).map_err(io("listing published snapshots", dir))?;
+        for entry in entries {
+            let entry = entry.map_err(io("listing published snapshots", dir))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_suffix(SNAPSHOT_FILE_SUFFIX) else {
+                continue;
+            };
+            let id = format!("{SNAPSHOT_ID_PREFIX}{stem}");
+            if file_stem_for(&id) == Some(stem) && id != keep {
+                self.retire(&id, entry.path());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn retire(&self, snapshot_id: &str, path: impl Into<PathBuf>) {
         let mut inner = self.inner.lock().expect("snapshot catalog mutex");
         inner.retired.insert(snapshot_id.to_string(), path.into());

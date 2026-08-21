@@ -60,7 +60,7 @@ use crate::coordination::model::state::LogId;
 /// `Closed` erased the record that a replacement still held the gate — and
 /// `close` then stopped waiting for it. See [`GateState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Admission {
+pub(crate) enum Admission {
     /// Reads are issued.
     Open,
     /// One [`Quiesced`] holds the gate. Exclusive: a second request waits.
@@ -243,7 +243,7 @@ impl ReadGate {
     }
 
     #[cfg(test)]
-    fn admission(&self) -> Admission {
+    pub(crate) fn admission(&self) -> Admission {
         self.inner
             .state
             .lock()

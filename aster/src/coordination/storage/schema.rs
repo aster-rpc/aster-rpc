@@ -1436,6 +1436,45 @@ pub(crate) fn verify_state_database(
     Ok(VerifiedCandidate { candidate, state })
 }
 
+/// Open `state.redb` immediately after an install renamed a candidate over it.
+///
+/// The same checks [`verify_state_database`] runs on the candidate, run again
+/// on the file that actually landed. Not a formality: the candidate was proved
+/// good *before* the rename, and what this proves is that the rename put that
+/// file where this store will read it. Between them sits the one operation
+/// whose failure mode is a database that is neither the old one nor the new.
+///
+/// `freshly_created` is true for the integrity check, because this database was
+/// built by this process moments ago — `Ok(false)` here is evidence about the
+/// storage stack, not about a previous shutdown.
+pub(crate) fn open_installed_state(
+    path: &Path,
+) -> StorageResult<(Database, super::rows::DurableState)> {
+    reject_symlink(path)?;
+    let mut database = Database::open(path).map_err(|source| match source {
+        DatabaseError::TransactionInProgress => {
+            StorageError::TransactionInProgress { db: Db::State }
+        }
+        other => StorageError::Integrity {
+            db: Db::State,
+            source: other,
+        },
+    })?;
+    check_integrity(&mut database, Db::State, true)?;
+    match classify_state(&database, Presence::Existing)? {
+        SideState::BoundDurable | SideState::BoundPristine => {}
+        SideState::Unbound => Err(StorageError::PartialInitialization {
+            detail: format!(
+                "{} at {} carries no identity binding after installation",
+                Db::State,
+                path.display()
+            ),
+        })?,
+    }
+    let state = super::rows::load(&database)?;
+    Ok((database, state))
+}
+
 pub(crate) fn create_state_tables(write: &redb::WriteTransaction) -> StorageResult<()> {
     let map = |source: redb::TableError| StorageError::redb(Db::State, source);
     write.open_table(RESOURCES).map_err(map)?;

@@ -115,6 +115,15 @@ pub(crate) enum StateCommand {
     /// Force a fatal failure through the ordinary serve path.
     #[cfg(test)]
     InjectFatal(Reply<()>),
+    /// Install a snapshot over this store's state.
+    ///
+    /// Carries the source handle, so the actor owns it for the whole operation
+    /// and drops it -- and, if it is Incoming, removes it -- when done.
+    Install {
+        source: Box<CoordinationSnapshotFile>,
+        supplied: crate::coordination::raft::SnapshotMetaV1,
+        reply: Reply<()>,
+    },
     /// Arm the commit failure described on [`StateActor::fail_next_commit`].
     #[cfg(test)]
     FailNextCommit(Reply<()>),
@@ -138,7 +147,22 @@ enum Outcome {
 
 /// The single-writer thread that owns `state.redb`.
 struct StateActor {
-    database: Database,
+    /// `Option` because install closes it: `state.redb` cannot be renamed over
+    /// while redb still holds it, and the reopen that follows is what proves
+    /// the replacement landed. Every other path expects it present.
+    database: Option<Database>,
+    /// Where this store's files are, for the install that runs here.
+    layout: StorageLayout,
+    /// Shared with the machine, so a snapshot published by an install and one
+    /// published by a build go through the same catalog.
+    catalog: SnapshotCatalog,
+    /// The publication critical section, shared with the machine.
+    ///
+    /// Taken **after** [`StateActor::reads`] is quiesced, never before. A
+    /// builder holds its read lease across `publish`, which takes this mutex;
+    /// an install that took the mutex first and then waited for the lease would
+    /// be waiting for a builder that is waiting for it.
+    current: Arc<Mutex<Option<SnapshotFile>>>,
     /// Counts the read transactions this actor has handed out.
     reads: ReadGate,
     /// The **published** state: what is on disk, and nothing more.
@@ -182,6 +206,11 @@ impl StateActor {
                 StateCommand::ReadTransaction(reply) => {
                     self.serve(reply, StateActor::read_transaction)
                 }
+                StateCommand::Install {
+                    source,
+                    supplied,
+                    reply,
+                } => self.serve(reply, |a| a.install(&source, &supplied)),
                 #[cfg(test)]
                 StateCommand::Snapshot(reply) => self.serve(reply, |a| a.published().map(Box::new)),
                 #[cfg(test)]
@@ -244,6 +273,7 @@ impl StateActor {
                 StateCommand::AppliedState(reply) => fail(reply),
                 StateCommand::Apply { reply, .. } => fail(reply),
                 StateCommand::ReadTransaction(reply) => fail(reply),
+                StateCommand::Install { reply, .. } => fail(reply),
                 #[cfg(test)]
                 StateCommand::Snapshot(reply) => fail(reply),
                 #[cfg(test)]
@@ -254,6 +284,98 @@ impl StateActor {
                 StateCommand::Pause(_) => {}
             }
         }
+    }
+
+    /// The open `state.redb`.
+    ///
+    /// Absent only while install has closed it to rename over it, which is a
+    /// window no command can be serviced inside: install holds the actor for
+    /// its whole duration.
+    fn database(&self) -> &Database {
+        self.database
+            .as_ref()
+            .expect("state.redb is open outside an install's replacement window")
+    }
+
+    /// Install a snapshot over this store's state (§11.4).
+    ///
+    /// Runs here, on the actor, because only the actor can close `state.redb`
+    /// before the rename and reopen it after — and because the classification
+    /// and the rename must see one `last_applied`. An apply landing between
+    /// them turns an accepted higher snapshot into a rollback, and the actor
+    /// servicing one command at a time is what makes that structural rather
+    /// than timed.
+    ///
+    /// ## The two locks, in this order
+    ///
+    /// Quiescence first, the publication mutex second. A snapshot builder holds
+    /// its read lease across `publish`, which takes that mutex; an install that
+    /// took the mutex first and then waited out the leases would be waiting for
+    /// a builder that is waiting for it. Neither would ever finish, and neither
+    /// is doing anything wrong.
+    ///
+    /// Both are then held through everything that follows — replacement,
+    /// reopen, revalidation, body promotion, `CURRENT`, retirement, and the
+    /// in-memory update — because a store whose database and marker disagree is
+    /// exactly what a reader must never be admitted to.
+    fn install(
+        &mut self,
+        source: &CoordinationSnapshotFile,
+        supplied: &crate::coordination::raft::SnapshotMetaV1,
+    ) -> StorageResult<()> {
+        // Outside exclusion: streaming and rebuilding are proportional to the
+        // state, and neither touches anything a reader can see.
+        let staged = {
+            let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
+            snapshot::receive(&self.layout, source, state, supplied)?
+        };
+        let prepared = snapshot::rebuild_candidate(&self.layout, staged)?;
+
+        let _exclusive = self
+            .reads
+            .quiesce()
+            .ok_or(StorageError::ActorStopped { db: Db::State })?;
+        let mut current = self.current.lock().expect("the current-snapshot mutex");
+
+        let resolved = {
+            let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
+            prepared.resolve(state, || snapshot::canonical_digest(self.database()))?
+        };
+
+        let body = match resolved {
+            // Nothing is wrong with this store; a leader offered a snapshot it
+            // is already past.
+            snapshot::ResolvedInstall::Stale(detail) => {
+                return Err(StorageError::SnapshotBehind { detail })
+            }
+            // This voter's history and the group's disagree.
+            snapshot::ResolvedInstall::Fatal(detail) => {
+                return Err(StorageError::corrupt(Db::State, "snapshot", detail))
+            }
+            // The business state is already correct: only the marker is owed.
+            snapshot::ResolvedInstall::Repair(repair) => repair.publishable(),
+            snapshot::ResolvedInstall::Replace(granted) => {
+                // Closed before the rename, reopened after: redb holds the file
+                // this is about to be renamed over.
+                drop(self.database.take());
+                let (installed, body) = granted.replace()?;
+
+                // Service does not resume on the replacement alone. The reopen
+                // is what proves the file that landed is a database this build
+                // can serve, and the load behind it re-runs every §11.3 and
+                // §12.1 check against the rows that arrived.
+                let (database, reloaded) =
+                    super::schema::open_installed_state(&self.layout.database(Db::State))?;
+                self.database = Some(database);
+                self.state = Some(reloaded);
+                let _ = installed;
+                body
+            }
+        };
+
+        let published = snapshot::publish_installed(&self.layout, &self.catalog, body)?;
+        *current = Some(published);
+        Ok(())
     }
 
     /// The published state, or `Fatal` if a batch took it and never gave it
@@ -286,7 +408,7 @@ impl StateActor {
         self.reads
             .reserve()
             .ok_or(StorageError::ActorStopped { db: Db::State })?
-            .read(&self.database)
+            .read(self.database())
             .map_err(|source| StorageError::redb(Db::State, source))
     }
 
@@ -390,7 +512,7 @@ impl StateActor {
         // failure latches fatal before it replies, and a fatal store answers
         // nothing further -- so it is carried by the signature rather than by a
         // test whose name would imply it had been checked.
-        self.state = Some(rows::commit(&self.database, working, &changes)?);
+        self.state = Some(rows::commit(self.database(), working, &changes)?);
         Ok(replies)
     }
 }
@@ -438,10 +560,14 @@ impl StateHandle {
     /// first apply finds the corruption. The caller does it rather than this
     /// function because `CURRENT` has to be checked against the loaded state,
     /// and that check also belongs before any actor.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         database: Database,
         state: DurableState,
         reads: ReadGate,
+        layout: StorageLayout,
+        catalog: SnapshotCatalog,
+        current: Arc<Mutex<Option<SnapshotFile>>>,
     ) -> StorageResult<(Self, StateShutdown)> {
         let (tx, rx) = mpsc::channel(STATE_ACTOR_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
@@ -452,8 +578,11 @@ impl StateHandle {
             .name("aster-coordination-state".into())
             .spawn(move || {
                 StateActor {
-                    database,
+                    database: Some(database),
                     reads,
+                    layout,
+                    catalog,
+                    current,
                     state: Some(state),
                     fatal: actor_fatal,
                     #[cfg(test)]
@@ -633,13 +762,27 @@ impl CoordinationStateMachine {
         let current = snapshot::load_current(&layout, &database, &state)?;
 
         let reads = ReadGate::new();
-        let (handle, shutdown) = StateHandle::spawn(database, state, reads.clone())?;
+        let catalog = SnapshotCatalog::new();
+        let current = Arc::new(Mutex::new(current));
+        // The actor gets its own handles on the layout, the catalog and the
+        // current marker because install runs *inside* it: only the actor can
+        // close `state.redb` before the rename and reopen it after, and §11.4
+        // requires the publication that follows to happen without releasing
+        // exclusion.
+        let (handle, shutdown) = StateHandle::spawn(
+            database,
+            state,
+            reads.clone(),
+            layout.clone(),
+            catalog.clone(),
+            Arc::clone(&current),
+        )?;
         Ok((
             Self {
                 handle,
                 layout,
-                catalog: SnapshotCatalog::new(),
-                current: Arc::new(Mutex::new(current)),
+                catalog,
+                current,
                 reads: reads.clone(),
             },
             shutdown,
@@ -911,10 +1054,18 @@ impl RaftStateMachine<CoordinationTypeConfig> for CoordinationStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        _meta: &SnapshotMeta<CoordinationNodeId, CoordinationNode>,
-        _snapshot: Box<CoordinationSnapshotFile>,
+        meta: &SnapshotMeta<CoordinationNodeId, CoordinationNode>,
+        snapshot: Box<CoordinationSnapshotFile>,
     ) -> Result<(), RaftStorageError<CoordinationNodeId>> {
-        Err(not_yet_implemented("install_snapshot"))
+        let supplied = crate::coordination::raft::SnapshotMetaV1::from(meta);
+        self.handle
+            .call(|reply| StateCommand::Install {
+                source: snapshot,
+                supplied,
+                reply,
+            })
+            .await
+            .map_err(io_state)
     }
 
     async fn get_current_snapshot(
@@ -3234,6 +3385,193 @@ mod tests {
         assert_eq!(
             ahead.pinned().expect("meta").against(Some(&barrier)),
             BarrierFit::Satisfied
+        );
+    }
+
+    /// A leader's snapshot becomes this follower's state, marker and all.
+    ///
+    /// The whole of §11.4's install, through the trait method OpenRaft calls.
+    /// The source is a foreign store's `Published` handle -- which is what the
+    /// suite hands install -- and the assertions are about the receiver
+    /// afterwards: its state is the sender's, its marker names the sender's
+    /// snapshot with the metadata OpenRaft supplied, and the body under that
+    /// name is byte-identical to the sender's rather than a re-encoding of the
+    /// database rebuilt from it.
+    #[tokio::test]
+    async fn a_snapshot_installs_over_this_store_s_state() {
+        let source_dir = scratch_dir();
+        let (source, published) = a_published_source(&source_dir).await;
+        let sender = durable_of(&source.0).await;
+        let sender_bytes =
+            std::fs::read(body_path(&source_dir, &published.meta.snapshot_id)).expect("the body");
+
+        // A receiver of the same group that has applied nothing.
+        let dir = scratch_dir();
+        let (mut machine, shutdown, drain) = machine(&dir);
+        assert!(durable_of(&machine).await.model.last_applied.is_none());
+
+        machine
+            .install_snapshot(&published.meta, published.snapshot)
+            .await
+            .expect("the install succeeds");
+
+        let after = durable_of(&machine).await;
+        assert_eq!(after, sender, "the receiver now holds the sender's state");
+        assert_seven_sections(&after, "after the install");
+
+        let current = machine
+            .get_current_snapshot()
+            .await
+            .expect("read")
+            .expect("the receiver has a current snapshot");
+        assert_eq!(
+            current.meta, published.meta,
+            "and returns the metadata OpenRaft supplied, unchanged"
+        );
+        assert_eq!(
+            body_of(&current.snapshot),
+            sender_bytes,
+            "the published body is the sender's bytes verbatim"
+        );
+        assert!(
+            leftovers(&dir).is_empty(),
+            "and the staging that produced it is gone"
+        );
+
+        // Durable: the marker and the state survive a reopen.
+        drop(current);
+        drop(machine);
+        drop(drain);
+        drop(shutdown);
+        let (machine, _shutdown, _drain) = reopen(&dir);
+        assert_eq!(durable_of(&machine).await, sender);
+    }
+
+    /// An install and a builder in flight together both finish.
+    ///
+    /// The lock cycle this exists to rule out, driven rather than argued. A
+    /// builder holds its read lease across `publish`, which takes the
+    /// publication mutex; an install that took that mutex *before* waiting out
+    /// the leases would be holding what the builder needs while waiting for
+    /// what the builder holds. Neither is doing anything wrong and neither ever
+    /// finishes.
+    ///
+    /// So: a lease is taken first, the install is sent and blocks quiescing,
+    /// and only then does the builder stream, publish and release. Under the
+    /// correct order the publish goes straight through and the install
+    /// proceeds; under the reverse it never returns, and the bounded wait turns
+    /// that into a failure instead of a hung suite.
+    #[tokio::test]
+    async fn an_install_and_a_builder_in_flight_together_both_finish() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&dir);
+
+        // A lease, held: the install cannot complete until this goes.
+        let read = machine
+            .handle()
+            .read_transaction()
+            .await
+            .expect("a read transaction");
+
+        // The install starts and blocks in `quiesce`, holding no mutex.
+        let installing = {
+            let mut machine = machine.clone();
+            let meta = published.meta.clone();
+            let source = published.snapshot;
+            tokio::spawn(async move { machine.install_snapshot(&meta, source).await })
+        };
+
+        // Wait until the install is actually inside `quiesce`. Without this the
+        // builder usually publishes before the install has reached either lock,
+        // and the interleaving that matters never happens -- which is exactly
+        // what let a reversed order pass this test the first time it was
+        // written.
+        for _ in 0..10_000 {
+            if machine.reads.admission() == super::super::reads::Admission::Quiesced {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            machine.reads.admission(),
+            super::super::reads::Admission::Quiesced,
+            "the install never reached its wait"
+        );
+
+        // The builder's remaining work, off the actor and on its own thread so
+        // a blocked publish fails the wait rather than the runtime.
+        let (done, finished) = mpsc::channel();
+        let builder = {
+            let layout = machine.layout.clone();
+            let machine = machine.clone();
+            std::thread::spawn(move || {
+                let built = snapshot::build(&layout, &read).expect("stream");
+                let lease = read.release_transaction();
+                // The publication mutex. Blocked forever if the install took it
+                // before waiting for this very lease.
+                let published = machine.publish(&lease, built).expect("publish");
+                done.send(published.meta.snapshot_id.clone())
+                    .expect("report");
+                drop(lease);
+            })
+        };
+
+        finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the builder publishes while the install waits for its lease");
+        builder.join().expect("join");
+
+        installing
+            .await
+            .expect("join")
+            .expect("and the install completes once the lease is released");
+    }
+
+    /// A snapshot this store has already applied past is refused, not fatal.
+    #[tokio::test]
+    async fn an_install_behind_the_state_is_refused_without_stopping_the_store() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let (mut machine, _shutdown, _drain) = CoordinationStateMachine::new(
+            seeded_with(&dir, seven_section_state()),
+            StorageLayout::new(&dir),
+        )
+        .expect("open");
+        machine
+            .apply([blank(2), blank(3)])
+            .await
+            .expect("move past the candidate");
+        let before = durable_of(&machine).await;
+
+        let err = machine
+            .install_snapshot(&published.meta, published.snapshot)
+            .await
+            .expect_err("a snapshot this store is past cannot be installed");
+        assert!(
+            format!("{err:?}").contains("roll the state machine back"),
+            "{err:?}"
+        );
+
+        assert!(
+            !machine.handle().is_fatal(),
+            "being ahead of a leader's snapshot is not this store's fault"
+        );
+        assert_eq!(
+            durable_of(&machine).await,
+            before,
+            "and its state is untouched"
+        );
+        assert!(
+            leftovers(&dir).is_empty(),
+            "with neither artifact left behind"
         );
     }
 

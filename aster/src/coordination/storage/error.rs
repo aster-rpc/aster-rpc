@@ -243,6 +243,17 @@ pub(crate) enum StorageError {
         detail: &'static str,
     },
 
+    /// An install was offered a snapshot this voter has already applied past.
+    ///
+    /// A refusal, and deliberately not a durability question: nothing is wrong
+    /// with this store, and nothing is wrong with the snapshot. A leader sent
+    /// one built before this follower caught up, which §11.4 says may not roll
+    /// the state machine back. Classified with [`LogGap`](StorageError::LogGap)
+    /// rather than with corruption, because latching fatal here would stop a
+    /// perfectly healthy voter over a race it is on the winning side of.
+    #[error("coordination snapshot install refused: {detail}")]
+    SnapshotBehind { detail: String },
+
     /// The storage actor is gone, so nothing can be read or written.
     #[error(
         "the coordination storage actor for {db} has stopped; \
@@ -366,7 +377,9 @@ impl StorageError {
     pub(crate) fn puts_durability_in_question(&self) -> bool {
         !matches!(
             self,
-            StorageError::LogGap { .. } | StorageError::EncodeFailed { .. }
+            StorageError::LogGap { .. }
+                | StorageError::EncodeFailed { .. }
+                | StorageError::SnapshotBehind { .. }
         )
     }
 
