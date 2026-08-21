@@ -1255,6 +1255,12 @@ impl StateCandidate {
             .expect("a candidate holds its path until it is replaced")
     }
 
+    /// The candidate's path, for the test that asserts the sweep recognises it.
+    #[cfg(test)]
+    pub(crate) fn path_for_test(&self) -> &Path {
+        self.path()
+    }
+
     /// Close the builder handle. Verification reopens the file instead.
     fn close(&mut self) {
         drop(self.database.take());
@@ -1342,15 +1348,11 @@ impl VerifiedCandidate {
 /// the stronger operation: every row in the candidate must come from this
 /// rebuild, so an existing path is refused atomically rather than reused.
 pub(crate) fn create_state_candidate(layout: &StorageLayout) -> StorageResult<StateCandidate> {
-    let dir = layout.incoming();
-    std::fs::create_dir_all(&dir)
-        .map_err(|source| StorageError::io("creating the incoming directory", &dir, source))?;
-    create_state_candidate_at(
-        &dir.join(super::snapshot::scratch_name(
-            super::snapshot::ScratchKind::Candidate,
-        )),
-        layout,
-    )
+    let path = super::snapshot::scratch_path(layout, super::snapshot::ScratchKind::Candidate);
+    let dir = path.parent().expect("a scratch path has a directory");
+    std::fs::create_dir_all(dir)
+        .map_err(|source| StorageError::io("creating the incoming directory", dir, source))?;
+    create_state_candidate_at(&path, layout)
 }
 
 /// The path-taking half, for the tests that must produce an occupied path.

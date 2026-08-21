@@ -159,58 +159,70 @@ struct Scratch {
 /// wider than the generation: it matched `.operator-copy.partial`, which this
 /// store never writes and has no business deleting. A shape that is written in
 /// one place and read in another drifts; a shape that is one value cannot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ScratchKind {
-    /// A snapshot body being streamed, under `snapshots/`.
-    Building,
-    /// A `CURRENT` marker being written, under `snapshots/`.
-    Current,
-    /// A body a transport is filling in, under `incoming/`.
-    Receiving,
-    /// An install source being staged, under `incoming/`.
-    Installing,
-    /// A state database being rebuilt, under `incoming/`.
-    Candidate,
-}
-
-impl ScratchKind {
-    fn tag(self) -> &'static str {
-        match self {
-            ScratchKind::Building => "building",
-            ScratchKind::Current => "current",
-            ScratchKind::Receiving => "receiving",
-            ScratchKind::Installing => "installing",
-            ScratchKind::Candidate => "candidate",
+/// Declare the kinds, their tags, and where each belongs -- once.
+///
+/// The variants, `ALL`, `tag` and `dir` were four hand-maintained lists of the
+/// same five things, and `ALL` in particular could fall behind silently: a kind
+/// missing from it is invisible to the sweep and to every test, which is a leak
+/// nothing reports. One table generates all four, so a kind that exists is a
+/// kind that is swept.
+macro_rules! scratch_kinds {
+    ($($(#[$doc:meta])* $variant:ident => $tag:literal in $dir:ident),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(super) enum ScratchKind {
+            $($(#[$doc])* $variant),+
         }
-    }
 
-    /// Every kind, so recognition can ask each one where it belongs rather
-    /// than keeping a second list of which are legal where.
-    const ALL: &'static [ScratchKind] = &[
-        ScratchKind::Building,
-        ScratchKind::Current,
-        ScratchKind::Receiving,
-        ScratchKind::Installing,
-        ScratchKind::Candidate,
-    ];
+        impl ScratchKind {
+            /// Every kind, generated with them.
+            const ALL: &'static [ScratchKind] = &[$(ScratchKind::$variant),+];
 
-    /// The one directory this kind may appear in.
-    ///
-    /// Creation and recognition both go through here, so a kind cannot be
-    /// written somewhere recognition would not look for it.
-    pub(super) fn dir(self, layout: &StorageLayout) -> PathBuf {
-        match self {
-            ScratchKind::Building | ScratchKind::Current => layout.snapshots(),
-            ScratchKind::Receiving | ScratchKind::Installing | ScratchKind::Candidate => {
-                layout.incoming()
+            fn tag(self) -> &'static str {
+                match self {
+                    $(ScratchKind::$variant => $tag),+
+                }
+            }
+
+            /// The one directory this kind may appear in.
+            fn dir(self, layout: &StorageLayout) -> PathBuf {
+                match self {
+                    $(ScratchKind::$variant => layout.$dir()),+
+                }
             }
         }
-    }
+    };
+}
+
+scratch_kinds! {
+    /// A snapshot body being streamed.
+    Building => "building" in snapshots,
+    /// A `CURRENT` marker being written.
+    Current => "current" in snapshots,
+    /// A body a transport is filling in.
+    Receiving => "receiving" in incoming,
+    /// An install source being staged.
+    Installing => "installing" in incoming,
+    /// A state database being rebuilt.
+    Candidate => "candidate" in incoming,
+}
+
+/// Where a new scratch file of this kind goes: the only way to make one.
+///
+/// Name and directory together, because separately they drift. Two producers
+/// chose `layout.incoming()` themselves and joined a bare name onto it, so
+/// moving either to the wrong directory compiled -- and the kind's own `dir`
+/// said otherwise, which nothing noticed because the tests asked `dir` rather
+/// than asking the producers.
+pub(super) fn scratch_path(layout: &StorageLayout, kind: ScratchKind) -> PathBuf {
+    kind.dir(layout).join(scratch_name(kind))
 }
 
 /// A name no digest can collide with: digests are 64 hex characters, and this
 /// is neither hex nor 64 characters.
-pub(super) fn scratch_name(kind: ScratchKind) -> String {
+///
+/// Private: a bare name is half of a location, and the half that does not carry
+/// the constraint.
+fn scratch_name(kind: ScratchKind) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     format!(".{}-{}-{n}.partial", kind.tag(), std::process::id())
@@ -258,7 +270,7 @@ impl Scratch {
     /// structurally unable to find. One answer, used to place and to recognise.
     fn new(layout: &StorageLayout, kind: ScratchKind) -> Self {
         Self {
-            path: Some(kind.dir(layout).join(scratch_name(kind))),
+            path: Some(scratch_path(layout, kind)),
         }
     }
 
@@ -661,11 +673,10 @@ pub(crate) fn build(
 /// OpenRaft's own suite discards the value and hands install a `Published`
 /// handle from a different store instead.
 pub(crate) fn begin_receiving(layout: &StorageLayout) -> StorageResult<CoordinationSnapshotFile> {
-    let dir = layout.incoming();
-    std::fs::create_dir_all(&dir).map_err(io("creating the incoming directory", &dir))?;
-    Ok(CoordinationSnapshotFile::incoming(
-        dir.join(scratch_name(ScratchKind::Receiving)),
-    ))
+    let path = scratch_path(layout, ScratchKind::Receiving);
+    let dir = path.parent().expect("a scratch path has a directory");
+    std::fs::create_dir_all(dir).map_err(io("creating the incoming directory", dir))?;
+    Ok(CoordinationSnapshotFile::incoming(path))
 }
 
 /// A source body copied into receiver-owned staging and verified against this
@@ -2831,12 +2842,6 @@ mod tests {
         );
     }
 
-    /// A rename that fails leaves no partial file behind.
-    ///
-    /// `keep()` disarmed the cleanup before the rename was attempted, so a
-    /// failure between the two left a partial body under a name nothing sweeps
-    /// and nothing can identify. Provoked here by renaming into a directory
-    /// that does not exist.
     /// Every kind round-trips, and only in the directory it belongs to.
     ///
     /// The producer and the recogniser checked against each other, for all five
@@ -2848,34 +2853,94 @@ mod tests {
     fn every_scratch_kind_is_recognised_where_it_is_written() {
         let dir = temp_dir();
         let layout = StorageLayout::new(&dir);
-        let snapshots: Vec<ScratchKind> = ScratchKind::ALL
-            .iter()
-            .copied()
-            .filter(|k| k.dir(&layout) == layout.snapshots())
-            .collect();
+        let kinds_in = |directory: &Path| -> Vec<ScratchKind> {
+            ScratchKind::ALL
+                .iter()
+                .copied()
+                .filter(|k| k.dir(&layout) == directory)
+                .collect()
+        };
+        let snapshots = kinds_in(&layout.snapshots());
+        let incoming = kinds_in(&layout.incoming());
+        assert_eq!(
+            snapshots.len() + incoming.len(),
+            ScratchKind::ALL.len(),
+            "every kind lives in one of the two directories"
+        );
+
+        for kind in ScratchKind::ALL {
+            // Through the producer, not through `dir`. Asking `dir` where a
+            // kind belongs and then asserting `dir` agrees with itself is what
+            // let two producers choose their own directory unnoticed.
+            let path = scratch_path(&layout, *kind);
+            let landed = path.parent().expect("a directory");
+            let name = path
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .into_owned();
+
+            assert!(
+                is_scratch(&name, &kinds_in(landed)),
+                "{} is written here and must be recognised here",
+                path.display()
+            );
+            let elsewhere = if landed == layout.snapshots() {
+                layout.incoming()
+            } else {
+                layout.snapshots()
+            };
+            assert!(
+                !is_scratch(&name, &kinds_in(&elsewhere)),
+                "{} belongs to the other directory and must not be swept from this one",
+                path.display()
+            );
+        }
+    }
+
+    /// The producers that do not go through `Scratch` land where they claim.
+    ///
+    /// `begin_receiving` and `create_state_candidate` build their own paths, so
+    /// the property every other kind gets from `Scratch::new` has to be
+    /// asserted for them directly -- against the sweep's own recogniser, which
+    /// is what would silently stop collecting them.
+    #[test]
+    fn the_standalone_producers_are_recognised_by_the_sweep() {
+        let dir = temp_dir();
+        let layout = StorageLayout::new(&dir);
         let incoming: Vec<ScratchKind> = ScratchKind::ALL
             .iter()
             .copied()
             .filter(|k| k.dir(&layout) == layout.incoming())
             .collect();
-        assert_eq!(snapshots.len() + incoming.len(), ScratchKind::ALL.len());
 
-        for kind in ScratchKind::ALL {
-            let name = scratch_name(*kind);
-            let (here, there) = if kind.dir(&layout) == layout.snapshots() {
-                (&snapshots, &incoming)
-            } else {
-                (&incoming, &snapshots)
-            };
-            assert!(
-                is_scratch(&name, here),
-                "{name:?} is written here and must be recognised here"
-            );
-            assert!(
-                !is_scratch(&name, there),
-                "{name:?} belongs to the other directory and must not be swept from this one"
-            );
-        }
+        let receiving = begin_receiving(&layout).expect("a receiver-owned temporary");
+        let path = match &receiving {
+            CoordinationSnapshotFile::Incoming(handle) => handle.path().to_path_buf(),
+            CoordinationSnapshotFile::Published(_) => panic!("begin_receiving yields Incoming"),
+        };
+        assert_eq!(path.parent(), Some(layout.incoming().as_path()));
+        assert!(
+            is_scratch(
+                &path.file_name().expect("a name").to_string_lossy(),
+                &incoming
+            ),
+            "the sweep must recognise what `begin_receiving` writes: {}",
+            path.display()
+        );
+
+        let candidate = super::super::schema::create_state_candidate(&layout).expect("a candidate");
+        let path = candidate.path_for_test().to_path_buf();
+        drop(candidate);
+        assert_eq!(path.parent(), Some(layout.incoming().as_path()));
+        assert!(
+            is_scratch(
+                &path.file_name().expect("a name").to_string_lossy(),
+                &incoming
+            ),
+            "and what `create_state_candidate` writes: {}",
+            path.display()
+        );
     }
 
     /// Names that resemble a scratch file without being one.
@@ -2924,6 +2989,12 @@ mod tests {
         ));
     }
 
+    /// A rename that fails leaves no partial file behind.
+    ///
+    /// Promotion disarmed the cleanup before the rename was attempted, so a
+    /// failure between the two left a partial body under a name nothing sweeps
+    /// and nothing can identify. Provoked here by renaming into a directory
+    /// that does not exist.
     #[test]
     fn a_failed_promotion_removes_the_partial_file() {
         let dir = temp_dir();
