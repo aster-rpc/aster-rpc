@@ -153,7 +153,7 @@ struct Scratch {
 
 /// A name no digest can collide with: digests are 64 hex characters, and this
 /// is neither hex nor 64 characters.
-fn scratch_name(tag: &str) -> String {
+pub(super) fn scratch_name(tag: &str) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     format!(".{tag}-{}-{n}.partial", std::process::id())
@@ -260,7 +260,7 @@ pub(super) fn atomic_replace(from: &Path, to: &Path) -> StorageResult<()> {
 fn fsync_dir(dir: &Path) -> StorageResult<()> {
     File::open(dir)
         .and_then(|handle| handle.sync_all())
-        .map_err(io("fsyncing the snapshot directory", dir))
+        .map_err(io("fsyncing a storage directory", dir))
 }
 
 #[cfg(not(unix))]
@@ -370,8 +370,13 @@ pub(crate) mod fault {
         static FAIL_DIRECTORY_FSYNC: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// The next `publish_current` on this thread fails *after* the marker has
-    /// been renamed into place.
+    /// The next durable directory sync on this thread fails *after* the rename
+    /// it follows has already taken effect.
+    ///
+    /// Serves both post-rename callers: publishing `CURRENT`, and replacing
+    /// `state.redb` with an installed candidate. Naming one of them here would
+    /// make the other look like a borrowed seam rather than the same
+    /// situation.
     pub(crate) fn fail_next_directory_fsync() {
         FAIL_DIRECTORY_FSYNC.with(|flag| flag.set(true));
     }
@@ -379,7 +384,7 @@ pub(crate) mod fault {
     pub(super) fn maybe_fail_directory_fsync(dir: &Path) -> StorageResult<()> {
         if FAIL_DIRECTORY_FSYNC.with(|flag| flag.replace(false)) {
             return Err(StorageError::io(
-                "fsyncing the snapshot directory",
+                "fsyncing a storage directory",
                 dir,
                 std::io::Error::other("injected post-rename durability failure"),
             ));
@@ -708,13 +713,13 @@ fn framing(path: &Path, err: BodyError) -> StorageError {
 /// One write transaction, as §11.4 requires — a partially written rebuild is
 /// never a file anything can open.
 pub(crate) fn rebuild_candidate(
-    path: &Path,
+    layout: &StorageLayout,
     staged: &StagedSnapshot,
 ) -> StorageResult<super::schema::VerifiedCandidate> {
     let body = staged.path();
     let handle = File::open(body)
         .map_err(|source| StorageError::io("rebuilding a state database", body, source))?;
-    let candidate = super::schema::create_state_candidate(path)?;
+    let candidate = super::schema::create_state_candidate(layout)?;
     let write = durable_write(candidate.database(), Db::State)?;
 
     // The complete §11.1 binding, from `schema`, rather than the tables and the

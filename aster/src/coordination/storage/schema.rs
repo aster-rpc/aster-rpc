@@ -1216,13 +1216,12 @@ pub(crate) fn write_state_binding(
 /// make that assertion a caller convention and let an old candidate retain
 /// rows the rebuild never visited.
 ///
-/// **Removed on drop unless kept.** The two rules compose into a trap
-/// otherwise: creation refuses an existing path, so a rebuild that failed
-/// after creating the file makes every retry at that path fail too — with
-/// `AlreadyExists`, naming the previous attempt's leftovers rather than the
-/// reason the first one failed. Cleanup rides on the value that owns the file
-/// so no error path has to remember it, and [`StateCandidate::keep`] is the
-/// single deliberate way to end it.
+/// **Removed on drop unless replaced.** Cleanup rides on the value that owns
+/// the file, so no error path has to remember it, and
+/// [`VerifiedCandidate::replace`] is the single deliberate way to end it. The
+/// alternative was every failure between creation and replacement removing the
+/// file itself, which is the shape that accumulates orphans under `incoming/`
+/// one forgotten `?` at a time.
 #[derive(Debug)]
 pub(crate) struct StateCandidate {
     /// `None` once a caller has taken ownership of the file.
@@ -1241,7 +1240,7 @@ impl StateCandidate {
     fn path(&self) -> &Path {
         self.path
             .as_deref()
-            .expect("a candidate holds its path until it is kept")
+            .expect("a candidate holds its path until it is replaced")
     }
 
     /// Close the builder handle. Verification reopens the file instead.
@@ -1301,21 +1300,44 @@ impl VerifiedCandidate {
     /// guarantee rests on the stronger fact that a candidate never names its
     /// target. "Renamed but not yet durable" is then not something to clean up
     /// after; it is something for the caller to stop the store over.
-    pub(crate) fn replace(self, target: &Path) -> StorageResult<super::rows::DurableState> {
+    pub(crate) fn replace(
+        self,
+        layout: &StorageLayout,
+    ) -> StorageResult<super::rows::DurableState> {
         let VerifiedCandidate { candidate, state } = self;
-        super::snapshot::atomic_replace(candidate.path(), target)?;
+        let target = layout.database(Db::State);
+        super::snapshot::atomic_replace(candidate.path(), &target)?;
         drop(candidate.disarm());
-        super::snapshot::fsync_dir_durably(target.parent().unwrap_or_else(|| Path::new(".")))?;
+        super::snapshot::fsync_dir_durably(layout.root())?;
         Ok(state)
     }
 }
 
-/// Create an absent state candidate with the production file permissions.
+/// Create an absent state candidate under the layout's `incoming/`, with the
+/// production file permissions.
+///
+/// The location is derived, not supplied. A caller that names the path knows
+/// it, and a caller that knows it can pass it back as the *target* of the
+/// replacement -- where renaming a file over itself succeeds as a no-op, so
+/// the install disarms cleanup, reports success, and leaves `state.redb`
+/// exactly as it was. Deriving both ends from one [`StorageLayout`] is what
+/// makes that unspellable rather than merely unwise.
 ///
 /// `Database::create(path)` also opens an existing database. A rebuild needs
 /// the stronger operation: every row in the candidate must come from this
 /// rebuild, so an existing path is refused atomically rather than reused.
-pub(crate) fn create_state_candidate(path: &Path) -> StorageResult<StateCandidate> {
+pub(crate) fn create_state_candidate(layout: &StorageLayout) -> StorageResult<StateCandidate> {
+    let dir = layout.incoming();
+    std::fs::create_dir_all(&dir)
+        .map_err(|source| StorageError::io("creating the incoming directory", &dir, source))?;
+    create_state_candidate_at(&dir.join(super::snapshot::scratch_name("candidate")))
+}
+
+/// The path-taking half, for the tests that must produce an occupied path.
+///
+/// Not reachable from any install path: production goes through
+/// [`create_state_candidate`], which derives the location.
+fn create_state_candidate_at(path: &Path) -> StorageResult<StateCandidate> {
     reject_symlink(path)?;
     let file = OpenOptions::new()
         .read(true)
@@ -1577,6 +1599,50 @@ mod tests {
     use redb::TableHandle;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// An occupied path is refused, and the file that was there is untouched.
+    ///
+    /// The evidence for `create_new`, which production reaches through the
+    /// deriving constructor. Reusing a path would let rows absent from the body
+    /// survive from an abandoned earlier candidate, and would make the
+    /// integrity check's `freshly_created` claim untrue.
+    #[test]
+    fn an_occupied_candidate_path_is_refused_without_being_opened() {
+        let dir = scratch();
+        let occupied = dir.join("already-there");
+        std::fs::write(&occupied, b"not a database, and not to be touched").expect("write");
+        let before = std::fs::read(&occupied).expect("read");
+
+        let err = create_state_candidate_at(&occupied)
+            .expect_err("an existing path is never adopted as a candidate");
+        assert!(
+            format!("{err:?}").contains("creating a state candidate"),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&occupied).expect("read"),
+            before,
+            "the refusal happens before anything opens or writes it"
+        );
+    }
+
+    /// A derived candidate is never the state database.
+    #[test]
+    fn a_derived_candidate_is_not_the_state_database() {
+        let dir = scratch();
+        let layout = StorageLayout::new(&dir);
+        let candidate = create_state_candidate(&layout).expect("create");
+        assert_ne!(
+            candidate.path(),
+            layout.database(Db::State),
+            "a candidate that named the state database would replace nothing"
+        );
+        assert!(
+            candidate.path().starts_with(layout.incoming()),
+            "and it lives under incoming/: {}",
+            candidate.path().display()
+        );
+    }
+
     /// A candidate's path never leaves the type that owns it.
     ///
     /// The fourth of the replacement's ordering rules, and the only one no
@@ -1595,19 +1661,35 @@ mod tests {
         let source = include_str!("schema.rs");
         let end = source.find("\n#[cfg(test)]\n").unwrap_or(source.len());
         let production = &source[..end];
+        // Whitespace-collapsed, so rustfmt wrapping a signature is not a
+        // finding. The guard is about what the API offers, not its layout.
+        let flat: String = production.split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(
-            production.contains("    fn disarm(mut self) -> PathBuf {"),
+            flat.contains("fn disarm(mut self) -> PathBuf {"),
             "`disarm` must stay private: it is the whole of cleanup-on-drop's exit"
         );
+        assert!(
+            !flat.contains("pub(crate) fn disarm") && !flat.contains("pub(super) fn disarm"),
+            "`disarm` must not become reachable outside this module"
+        );
+        // And the replacement derives its target rather than accepting one. A
+        // caller that can name the target can name the candidate's own path,
+        // and renaming a file over itself succeeds -- installing nothing while
+        // reporting success.
+        assert!(
+            flat.contains("pub(crate) fn replace( self, layout: &StorageLayout, )")
+                || flat.contains("pub(crate) fn replace(self, layout: &StorageLayout)"),
+            "`replace` must take the layout, never a caller-supplied target"
+        );
         assert_eq!(
-            production.matches("disarm()").count(),
+            flat.matches("disarm()").count(),
             1,
             "exactly one call site, and `replace` is it"
         );
         for banned in ["pub(crate) fn keep", "pub(super) fn keep", "pub fn keep"] {
             assert!(
-                !production.contains(banned),
+                !flat.contains(banned),
                 "a candidate must not hand its path to a caller: found {banned:?}"
             );
         }
@@ -1619,7 +1701,7 @@ mod tests {
             "pub(super) fn into_path",
         ] {
             assert!(
-                !production.contains(owning),
+                !flat.contains(owning),
                 "found an owning path accessor: {owning:?}"
             );
         }

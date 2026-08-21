@@ -3492,13 +3492,14 @@ mod tests {
         )
         .expect("stage the source");
 
-        let rebuilt = dir.join("incoming").join("rebuilt.redb");
         // The candidate builds and verifies itself: `rebuild_candidate` ends by
         // holding the file to production's own open, so this call succeeding is
         // already the reopen assertion. A candidate missing `codec_version`
         // fails here rather than after it has replaced `state.redb`.
-        let verified = super::super::snapshot::rebuild_candidate(&rebuilt, &staged)
-            .expect("the candidate rebuilds and opens as production would");
+        let verified =
+            super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), &staged)
+                .expect("the candidate rebuilds and opens as production would");
+        let rebuilt = candidate_in(&dir).expect("the candidate is under incoming/");
         assert_seven_sections(verified.state(), "after the rebuild");
         assert_eq!(
             verified.state(),
@@ -3562,51 +3563,69 @@ mod tests {
         )
         .expect("row decoding and body binding both succeed");
 
-        let err = super::super::snapshot::rebuild_candidate(
-            &dir.join("incoming").join("invalid-state.redb"),
-            &staged,
-        )
-        .expect_err("whole-state validation is part of rebuilding");
+        let err = super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), &staged)
+            .expect_err("whole-state validation is part of rebuilding");
         let detail = format!("{err:?}");
         assert!(detail.contains("aggregate-counters"), "{detail}");
         assert!(detail.contains("growth persisted"), "{detail}");
     }
 
-    /// A rebuild never opens or modifies an existing candidate path.
+    /// A candidate is never the state database it will replace.
     ///
-    /// `Database::create` is also an open operation. Reusing it here would let
-    /// rows absent from the body survive from an abandoned earlier candidate,
-    /// and would make the integrity check's `freshly_created` claim untrue.
+    /// The regression for a hole that was structural rather than logical:
+    /// `replace` used to take the target as an argument, and the caller of
+    /// `rebuild_candidate` already knew the candidate's path. Passing it back
+    /// renames a file over itself -- which succeeds, as a no-op -- so cleanup
+    /// was disarmed, success was reported, and `state.redb` was untouched. An
+    /// install that silently did nothing.
+    ///
+    /// Both ends now come from one `StorageLayout`, so there is no argument to
+    /// pass. What remains testable is that the two derived names really are
+    /// different, and that a replacement really does move the bytes.
     #[tokio::test]
-    async fn a_rebuild_refuses_an_existing_candidate_without_touching_it() {
+    async fn a_replacement_moves_the_candidate_onto_the_state_database() {
         let source_dir = scratch_dir();
         let (_source, published) = a_published_source(&source_dir).await;
 
-        let receiver_dir = scratch_dir();
-        let (machine, _shutdown, _drain) = machine(&receiver_dir);
+        let dir = scratch_dir();
+        let (machine, shutdown, drain) = machine(&dir);
+        let layout = StorageLayout::new(&dir);
         let staged = super::super::snapshot::receive(
-            &StorageLayout::new(&receiver_dir),
+            &layout,
             &published.snapshot,
             &durable_of(&machine).await,
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage the source");
+        let verified =
+            super::super::snapshot::rebuild_candidate(&layout, &staged).expect("a valid candidate");
 
-        let occupied_dir = scratch_dir();
-        drop(seeded_with(&occupied_dir, genesis_state()));
-        let candidate = occupied_dir.join("state.redb");
-        let before = std::fs::read(&candidate).expect("existing candidate bytes");
+        // The store's own handles go first: that is what the install's quiesce
+        // is for, and a rename over an open database is not what is being
+        // tested here.
+        drop(machine);
+        drop(drain);
+        drop(shutdown);
 
-        let err = super::super::snapshot::rebuild_candidate(&candidate, &staged)
-            .expect_err("an existing candidate is never reopened");
-        assert!(
-            format!("{err:?}").contains("creating a state candidate"),
-            "{err:?}"
+        let target = dir.join("state.redb");
+        let old = std::fs::read(&target).expect("the state this store was serving");
+        let candidate = candidate_in(&dir).expect("one candidate, under incoming/");
+        let candidate_bytes = std::fs::read(&candidate).expect("the candidate's bytes");
+        assert_ne!(
+            candidate, target,
+            "a candidate that named its own target would replace nothing"
         );
+        assert_ne!(candidate_bytes, old, "and the two differ, so a no-op shows");
+
+        verified.replace(&layout).expect("the replacement succeeds");
         assert_eq!(
-            std::fs::read(&candidate).expect("candidate after refusal"),
-            before,
-            "refusal occurs before the existing database is touched"
+            std::fs::read(&target).expect("the state database"),
+            candidate_bytes,
+            "the state database is now the candidate's bytes, not the old ones"
+        );
+        assert!(
+            candidate_in(&dir).is_none(),
+            "and no candidate is left under incoming/"
         );
     }
 
@@ -3657,11 +3676,8 @@ mod tests {
         )
         .expect("swap the staged bytes under the verified handle");
 
-        let err = super::super::snapshot::rebuild_candidate(
-            &dir.join("incoming").join("swapped.redb"),
-            &staged,
-        )
-        .expect_err("the rebuilt rows must be the verified rows");
+        let err = super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), &staged)
+            .expect_err("the rebuilt rows must be the verified rows");
         assert!(format!("{err:?}").contains("verified"), "{err:?}");
     }
 
@@ -3701,11 +3717,8 @@ mod tests {
         bytes[at] = if bytes[at] == b'A' { b'B' } else { b'A' };
         std::fs::write(staged.path(), &bytes).expect("edit one row in place");
 
-        let err = super::super::snapshot::rebuild_candidate(
-            &dir.join("incoming").join("edited.redb"),
-            &staged,
-        )
-        .expect_err("the rebuilt bytes must hash to what was verified");
+        let err = super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), &staged)
+            .expect_err("the rebuilt bytes must hash to what was verified");
         assert!(format!("{err:?}").contains("hashed to"), "{err:?}");
     }
 
@@ -3739,10 +3752,9 @@ mod tests {
         drop(database);
 
         let dir = scratch_dir();
-        let (machine, _shutdown, _drain) = machine(&dir);
+        let (machine, shutdown, drain) = machine(&dir);
         let state = durable_of(&machine).await;
         let layout = StorageLayout::new(&dir);
-        let candidate_path = dir.join("incoming").join("retried.redb");
 
         let staged_bad = super::super::snapshot::receive(
             &layout,
@@ -3751,14 +3763,18 @@ mod tests {
             &bad.meta,
         )
         .expect("the bad body stages");
-        super::super::snapshot::rebuild_candidate(&candidate_path, &staged_bad)
+        super::super::snapshot::rebuild_candidate(&layout, &staged_bad)
             .expect_err("its counters do not describe its rows");
         assert!(
-            !candidate_path.exists(),
+            candidate_in(&dir).is_none(),
             "a candidate that failed verification must not survive it"
         );
+        assert!(
+            staged_bad.path().exists(),
+            "and the staged body it was built from is still held"
+        );
 
-        // The same path, immediately, with a body that is sound.
+        // Immediately afterwards, with a body that is sound.
         let good_dir = scratch_dir();
         let (_good, good) = a_published_source(&good_dir).await;
         let staged_good = super::super::snapshot::receive(
@@ -3768,17 +3784,18 @@ mod tests {
             &crate::coordination::raft::SnapshotMetaV1::from(&good.meta),
         )
         .expect("the good body stages");
-        let verified = super::super::snapshot::rebuild_candidate(&candidate_path, &staged_good)
+        let verified = super::super::snapshot::rebuild_candidate(&layout, &staged_good)
             .expect("the retry is not blocked by the first attempt's leftovers");
         assert_seven_sections(verified.state(), "after the retry");
 
         // And nothing removes it once a replacement has taken it.
-        let target = dir.join("replaced.redb");
-        verified.replace(&target).expect("the rename succeeds");
-        assert!(target.exists(), "the candidate is now the target");
+        drop(machine);
+        drop(drain);
+        drop(shutdown);
+        verified.replace(&layout).expect("the rename succeeds");
         assert!(
-            !candidate_path.exists(),
-            "and the candidate name is free again"
+            layout.database(Db::State).exists(),
+            "the candidate is now the state database"
         );
     }
 
@@ -3786,12 +3803,17 @@ mod tests {
     ///
     /// The ordering this exists to pin: cleanup is disarmed *after* the rename,
     /// never before. Disarming first — which is what handing the caller a path
-    /// did — leaves a candidate on disk that nothing owns, and creation refuses
-    /// that path forever afterwards.
+    /// did — leaves a candidate on disk that nothing owns.
     ///
-    /// Unix-only because it needs a rename that fails: a read-only directory
-    /// refuses one there. What it stands in for is any rename this store cannot
-    /// complete, on either platform.
+    /// The rename attempted is the real one, against this store's own
+    /// `state.redb`. An earlier version aimed at a sealed directory elsewhere,
+    /// which never touched the state it claimed to preserve — so it would have
+    /// passed against a `replace` that renamed nothing at all. Sealing the
+    /// storage root instead makes the destination refuse the rename while the
+    /// candidate, one directory down under `incoming/`, is still removable.
+    ///
+    /// Unix-only because it needs a rename that fails, and a read-only
+    /// directory is how one is arranged there.
     #[tokio::test]
     #[cfg(unix)]
     async fn a_failed_replacement_removes_the_candidate_and_keeps_the_old_state() {
@@ -3802,38 +3824,39 @@ mod tests {
 
         let dir = scratch_dir();
         let (machine, shutdown, drain) = machine(&dir);
+        let layout = StorageLayout::new(&dir);
         let staged = super::super::snapshot::receive(
-            &StorageLayout::new(&dir),
+            &layout,
             &published.snapshot,
             &durable_of(&machine).await,
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage");
-        let candidate_path = dir.join("incoming").join("doomed.redb");
-        let verified = super::super::snapshot::rebuild_candidate(&candidate_path, &staged)
-            .expect("a valid candidate");
+        let verified =
+            super::super::snapshot::rebuild_candidate(&layout, &staged).expect("a valid candidate");
+        let candidate = candidate_in(&dir).expect("the candidate is under incoming/");
 
-        // The store's own database has to be closed before anything renames
-        // over it, which is what the real install's quiesce is for.
+        // The store's own handles close first: that is what the install's
+        // quiesce is for, and a rename over an open database is a different
+        // question.
         drop(machine);
         drop(drain);
         drop(shutdown);
-        let target = dir.join("state.redb");
+        let target = layout.database(Db::State);
         let before = std::fs::read(&target).expect("the old state database");
 
-        // A destination directory that refuses the rename.
-        let sealed = dir.join("sealed");
-        std::fs::create_dir_all(&sealed).expect("mkdir");
-        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        // The root refuses new names, so the rename onto `state.redb` fails.
+        // `incoming/` stays writable, so removing the candidate does not.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
         let err = verified
-            .replace(&sealed.join("state.redb"))
+            .replace(&layout)
             .expect_err("the rename cannot succeed");
-        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert!(format!("{err:?}").contains("state.redb"), "{err:?}");
 
         assert!(
-            !candidate_path.exists(),
-            "a candidate whose replacement failed is removed, not left to block the retry"
+            !candidate.exists(),
+            "a candidate whose replacement failed is removed, not left behind"
         );
         assert_eq!(
             std::fs::read(&target).expect("the old state database"),
@@ -3855,36 +3878,36 @@ mod tests {
 
         let dir = scratch_dir();
         let (machine, shutdown, drain) = machine(&dir);
+        let layout = StorageLayout::new(&dir);
         let staged = super::super::snapshot::receive(
-            &StorageLayout::new(&dir),
+            &layout,
             &published.snapshot,
             &durable_of(&machine).await,
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage");
-        let candidate_path = dir.join("incoming").join("durable.redb");
-        let verified = super::super::snapshot::rebuild_candidate(&candidate_path, &staged)
-            .expect("a valid candidate");
-        let installed = std::fs::read(&candidate_path).expect("the candidate's bytes");
+        let verified =
+            super::super::snapshot::rebuild_candidate(&layout, &staged).expect("a valid candidate");
+        let candidate = candidate_in(&dir).expect("the candidate is under incoming/");
+        let installed = std::fs::read(&candidate).expect("the candidate's bytes");
 
         drop(machine);
         drop(drain);
         drop(shutdown);
 
         super::super::snapshot::fault::fail_next_directory_fsync();
-        let target = dir.join("state.redb");
         let err = verified
-            .replace(&target)
+            .replace(&layout)
             .expect_err("the injected post-rename durability failure is reported");
         assert!(format!("{err:?}").contains("injected"), "{err:?}");
 
         assert_eq!(
-            std::fs::read(&target).expect("the state database"),
+            std::fs::read(layout.database(Db::State)).expect("the state database"),
             installed,
             "the replacement stands: undoing it would discard the installed state"
         );
         assert!(
-            !candidate_path.exists(),
+            !candidate.exists(),
             "and the candidate name is free, because the rename did happen"
         );
     }
@@ -3905,15 +3928,18 @@ mod tests {
         )
         .expect("stage");
 
-        let path = dir.join("incoming").join("abandoned.redb");
         {
-            let verified = super::super::snapshot::rebuild_candidate(&path, &staged)
-                .expect("a valid candidate");
-            assert!(path.exists(), "it is on disk while it is held");
+            let verified =
+                super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), &staged)
+                    .expect("a valid candidate");
+            assert!(
+                candidate_in(&dir).is_some(),
+                "it is on disk while it is held"
+            );
             drop(verified);
         }
         assert!(
-            !path.exists(),
+            candidate_in(&dir).is_none(),
             "an install that gives up after validating still leaves nothing behind"
         );
     }
@@ -3941,14 +3967,13 @@ mod tests {
         )
         .expect("stage the source");
 
-        let good = dir.join("incoming").join("bound.redb");
-        super::super::snapshot::rebuild_candidate(&good, &staged)
+        let layout = StorageLayout::new(&dir);
+        super::super::snapshot::rebuild_candidate(&layout, &staged)
             .expect("a complete binding opens as production");
 
         // The same rows and meta row, without the codec version: what the
         // rebuild wrote before `write_state_binding` owned the whole binding.
-        let bare = dir.join("incoming").join("bare.redb");
-        let candidate = super::super::schema::create_state_candidate(&bare).expect("create");
+        let candidate = super::super::schema::create_state_candidate(&layout).expect("create");
         {
             let write = super::super::schema::durable_write(candidate.database(), Db::State)
                 .expect("write");
@@ -4023,6 +4048,17 @@ mod tests {
         writer
             .row(&short)
             .expect_err("a body cannot be written with a key of the wrong width");
+    }
+
+    /// The candidate a rebuild derived, found by the tag its name carries.
+    ///
+    /// Tests cannot name it: the whole point of deriving both ends from the
+    /// layout is that no caller supplies the path. `incoming/` also holds the
+    /// staged body, so the tag is what tells them apart.
+    fn candidate_in(dir: &std::path::Path) -> Option<PathBuf> {
+        leftovers(dir)
+            .into_iter()
+            .find(|p| p.to_string_lossy().contains("candidate"))
     }
 
     /// What a store's `incoming/` holds after a failed install.
