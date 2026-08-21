@@ -151,18 +151,92 @@ struct Scratch {
     path: Option<PathBuf>,
 }
 
+/// Every kind of scratch file this store creates.
+///
+/// One definition, used to *make* the names and to *recognise* them. They were
+/// two things -- a tag string at each creation site, and a "starts with a dot,
+/// ends in `.partial`" test in the sweep -- and the recognition was therefore
+/// wider than the generation: it matched `.operator-copy.partial`, which this
+/// store never writes and has no business deleting. A shape that is written in
+/// one place and read in another drifts; a shape that is one value cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScratchKind {
+    /// A snapshot body being streamed, under `snapshots/`.
+    Building,
+    /// A `CURRENT` marker being written, under `snapshots/`.
+    Current,
+    /// A body a transport is filling in, under `incoming/`.
+    Receiving,
+    /// An install source being staged, under `incoming/`.
+    Installing,
+    /// A state database being rebuilt, under `incoming/`.
+    Candidate,
+}
+
+impl ScratchKind {
+    fn tag(self) -> &'static str {
+        match self {
+            ScratchKind::Building => "building",
+            ScratchKind::Current => "current",
+            ScratchKind::Receiving => "receiving",
+            ScratchKind::Installing => "installing",
+            ScratchKind::Candidate => "candidate",
+        }
+    }
+
+    /// What may legitimately appear under `snapshots/`.
+    fn in_snapshots() -> &'static [ScratchKind] {
+        &[ScratchKind::Building, ScratchKind::Current]
+    }
+
+    /// What may legitimately appear under `incoming/`.
+    fn in_incoming() -> &'static [ScratchKind] {
+        &[
+            ScratchKind::Receiving,
+            ScratchKind::Installing,
+            ScratchKind::Candidate,
+        ]
+    }
+}
+
 /// A name no digest can collide with: digests are 64 hex characters, and this
 /// is neither hex nor 64 characters.
-pub(super) fn scratch_name(tag: &str) -> String {
+pub(super) fn scratch_name(kind: ScratchKind) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    format!(".{tag}-{}-{n}.partial", std::process::id())
+    format!(".{}-{}-{n}.partial", kind.tag(), std::process::id())
+}
+
+/// Whether `name` is a scratch file *this store* would have written here.
+///
+/// The exact grammar [`scratch_name`] produces, not a resemblance to it:
+/// a leading dot, one of the kinds legal in this directory, a decimal process
+/// id, a decimal counter, and the suffix. Anything else is somebody else's
+/// file, and the sweep's contract is that it survives.
+fn is_scratch(name: &str, kinds: &[ScratchKind]) -> bool {
+    let Some(rest) = name
+        .strip_prefix('.')
+        .and_then(|n| n.strip_suffix(".partial"))
+    else {
+        return false;
+    };
+    let Some(rest) = kinds.iter().find_map(|kind| {
+        rest.strip_prefix(kind.tag())
+            .and_then(|r| r.strip_prefix('-'))
+    }) else {
+        return false;
+    };
+    let decimal = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = rest.split('-');
+    matches!(parts.next(), Some(pid) if decimal(pid))
+        && matches!(parts.next(), Some(counter) if decimal(counter))
+        && parts.next().is_none()
 }
 
 impl Scratch {
-    fn new(dir: &Path, tag: &str) -> Self {
+    fn new(dir: &Path, kind: ScratchKind) -> Self {
         Self {
-            path: Some(dir.join(scratch_name(tag))),
+            path: Some(dir.join(scratch_name(kind))),
         }
     }
 
@@ -511,7 +585,7 @@ pub(crate) fn build(
     read: &redb::ReadTransaction,
 ) -> StorageResult<SnapshotFile> {
     let dir = layout.snapshots();
-    let scratch = Scratch::new(&dir, "building");
+    let scratch = Scratch::new(&dir, ScratchKind::Building);
 
     let handle =
         File::create(scratch.path()).map_err(io("creating a snapshot body", scratch.path()))?;
@@ -568,7 +642,7 @@ pub(crate) fn begin_receiving(layout: &StorageLayout) -> StorageResult<Coordinat
     let dir = layout.incoming();
     std::fs::create_dir_all(&dir).map_err(io("creating the incoming directory", &dir))?;
     Ok(CoordinationSnapshotFile::incoming(
-        dir.join(scratch_name("receiving")),
+        dir.join(scratch_name(ScratchKind::Receiving)),
     ))
 }
 
@@ -855,7 +929,10 @@ pub(crate) fn sweep_orphans(
     let snapshots = layout.snapshots();
     let incoming = layout.incoming();
 
-    for dir in [&snapshots, &incoming] {
+    for (dir, kinds) in [
+        (&snapshots, ScratchKind::in_snapshots()),
+        (&incoming, ScratchKind::in_incoming()),
+    ] {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             // A store that has never built or received a snapshot has neither
@@ -867,7 +944,14 @@ pub(crate) fn sweep_orphans(
             let entry = entry.map_err(io("sweeping a storage directory", dir))?;
             let name = entry.file_name().to_string_lossy().into_owned();
 
-            if name.starts_with('.') && name.ends_with(".partial") {
+            // A regular file, of a kind this store writes here. A directory
+            // that happened to be named like one would otherwise fail the
+            // removal and take startup down with it.
+            let is_file = entry
+                .file_type()
+                .map_err(io("sweeping a storage directory", dir))?
+                .is_file();
+            if is_file && is_scratch(&name, kinds) {
                 match std::fs::remove_file(entry.path()) {
                     Ok(()) => swept.partials += 1,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1047,7 +1131,7 @@ pub(crate) fn receive(
 ) -> StorageResult<StagedSnapshot> {
     let dir = layout.incoming();
     std::fs::create_dir_all(&dir).map_err(io("creating the incoming directory", &dir))?;
-    let scratch = Scratch::new(&dir, "installing");
+    let scratch = Scratch::new(&dir, ScratchKind::Installing);
 
     let copied = {
         let handle =
@@ -1573,7 +1657,7 @@ pub(crate) fn decide_publication(
 /// Write `snapshots/CURRENT` atomically.
 fn publish_current(layout: &StorageLayout, meta: &SnapshotMetaV1) -> StorageResult<()> {
     let dir = layout.snapshots();
-    let scratch = Scratch::new(&dir, "current");
+    let scratch = Scratch::new(&dir, ScratchKind::Current);
     let bytes = super::codec::encode_committed(
         Db::State,
         "SnapshotMetaV1",
@@ -1966,8 +2050,9 @@ impl CatalogInner {
     /// block a removal on Windows either — but because a *foreign* handle
     /// opened without that sharing mode does (a scanner, a backup agent, an
     /// operator's editor), as do the ordinary transient errors. Dropping the
-    /// entry on the first failure would leave that body to a startup sweep that
-    /// has not been written yet.
+    /// entry on the first failure would leave that body to the startup sweep,
+    /// which only runs on the next open -- so the retry is what keeps a
+    /// transient failure from costing a whole process lifetime of disk.
     ///
     /// It sweeps the whole map rather than one id for the same reason: the
     /// event that lets a stuck removal succeed is usually some *other* handle
@@ -2728,7 +2813,7 @@ mod tests {
     #[test]
     fn a_failed_promotion_removes_the_partial_file() {
         let dir = temp_dir();
-        let scratch = Scratch::new(&dir, "failing");
+        let scratch = Scratch::new(&dir, ScratchKind::Building);
         let partial = scratch.path().to_path_buf();
         std::fs::write(&partial, b"half a body").expect("write");
 

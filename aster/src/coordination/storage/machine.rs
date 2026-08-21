@@ -3640,6 +3640,26 @@ mod tests {
         std::fs::write(&named_like_a_body, b"not a digest name").expect("lookalike");
         std::fs::write(&odd, b"someone's notes").expect("odd file");
 
+        // Files that merely *resemble* a scratch name. None matches the grammar
+        // `scratch_name` produces, and a sweep that went by "dot ... .partial"
+        // deleted all of them.
+        let resemblances = [
+            snapshots.join(".operator-copy.partial"),
+            snapshots.join(".installing-1-0.partial"), // right shape, wrong directory
+            incoming.join(".building-1-0.partial"),    // likewise
+            incoming.join(".receiving-notanumber-0.partial"),
+            incoming.join(".receiving-1.partial"),
+            incoming.join(".receiving-1-0-2.partial"),
+        ];
+        for path in &resemblances {
+            std::fs::write(path, b"not this store's").expect("resemblance");
+        }
+
+        // And a directory shaped like one, which the sweep would not merely
+        // delete wrongly but would fail startup trying to.
+        let shaped_dir = incoming.join(".installing-2-0.partial");
+        std::fs::create_dir(&shaped_dir).expect("a directory in scratch's clothing");
+
         let (machine, _shutdown, _drain) = reopen(&dir);
 
         assert!(current.exists(), "the body the marker names survives");
@@ -3652,6 +3672,17 @@ mod tests {
             "including one that carries the published suffix without a digest name"
         );
         assert!(odd.exists(), "in either directory");
+        for path in &resemblances {
+            assert!(
+                path.exists(),
+                "a name that only resembles a scratch file is not this store's to delete: {}",
+                path.display()
+            );
+        }
+        assert!(
+            shaped_dir.is_dir(),
+            "and a directory shaped like one is left alone rather than failing the open"
+        );
 
         // And the store still serves the snapshot it kept.
         let mut machine = machine;

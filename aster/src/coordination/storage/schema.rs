@@ -1346,7 +1346,9 @@ pub(crate) fn create_state_candidate(layout: &StorageLayout) -> StorageResult<St
     std::fs::create_dir_all(&dir)
         .map_err(|source| StorageError::io("creating the incoming directory", &dir, source))?;
     create_state_candidate_at(
-        &dir.join(super::snapshot::scratch_name("candidate")),
+        &dir.join(super::snapshot::scratch_name(
+            super::snapshot::ScratchKind::Candidate,
+        )),
         layout,
     )
 }
