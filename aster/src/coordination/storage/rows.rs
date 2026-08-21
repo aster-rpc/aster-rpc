@@ -31,9 +31,10 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
-use openraft::StoredMembership;
-use redb::{Database, ReadableDatabase, ReadableTable};
+use openraft::{SnapshotMeta, StoredMembership};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 use super::codec::{decode_persisted_bounded, encode_committed};
 use super::error::{Db, StorageError, StorageResult};
@@ -41,7 +42,7 @@ use super::schema::{
     durable_write, ACL, ADMINS, AUDIT, INTENTS, KEY_META, MAX_COORDINATION_META_BYTES, RESOURCES,
     ROUTES, SESSIONS, STATE_META,
 };
-use crate::coordination::contract::LogIdV1;
+use crate::coordination::contract::{LogIdV1, ResourceKeyV1};
 use crate::coordination::ids::{CoordinationNodeId, ResourceKey};
 use crate::coordination::model::limits;
 use crate::coordination::model::shape;
@@ -53,9 +54,14 @@ use crate::coordination::model::wire::{
 };
 use crate::coordination::raft::{
     ClientSessionV1, CoordinationMetaV1, MembershipIntentV1, NodeRouteV1, RecoveredFromV1,
-    ResourceRowV1, StoredMembershipV1,
+    ResourceRowV1, SnapshotMetaV1, StoredMembershipV1,
 };
-use crate::coordination::rowstream::AuditRowV1;
+use crate::coordination::rowstream::{
+    AdminRowV1, AuditRowV1, AuditStreamRowV1, BodyError, BodyWriter, GrantRowV1, IntentRowV1,
+    RouteRowV1, RowCountsV1, SessionRowV1, SnapshotBodyRowV1, SnapshotHeaderV1,
+    SnapshotResourceRowV1, SECTION_ADMINS, SECTION_AUDIT, SECTION_GRANTS, SECTION_INTENTS,
+    SECTION_RESOURCES, SECTION_ROUTES, SECTION_SESSIONS, SNAPSHOT_FORMAT_VERSION,
+};
 use crate::coordination::typeconfig::CoordinationNode;
 
 // ── Value ceilings (§4.2) ────────────────────────────────────────────────────
@@ -367,6 +373,59 @@ fn validate_meta_wire(meta: &CoordinationMetaV1) -> StorageResult<()> {
 /// The row tables are loaded separately and then validated against this; that
 /// order is deliberate, since the ceilings and caps the loader applies come
 /// from constants rather than from anything the meta claims.
+/// The **stored** reading of a `StoredMembershipV1`.
+///
+/// One value is legal here that is not legal in a message. An empty config set
+/// is "no membership has been committed yet", which is exactly OpenRaft's own
+/// `StoredMembership::default()` and what a freshly bound store holds; the
+/// mirror conversion refuses it, correctly, because an empty joint config
+/// arriving from a peer is a corrupt record. The two cases are separated here
+/// rather than by weakening the mirror.
+///
+/// Shared by [`meta_from_wire`] and [`snapshot_meta_from_wire`] rather than
+/// written twice, and that is not tidiness. The snapshot path had its own
+/// conversion for one checkpoint, and the result was a store that could build a
+/// snapshot of a group whose membership had never been applied and then refuse
+/// to serve the snapshot it had just published.
+pub(crate) fn stored_membership_from_wire(
+    what: &'static str,
+    wire: &StoredMembershipV1,
+) -> StorageResult<StoredMembership<CoordinationNodeId, CoordinationNode>> {
+    if wire.log_id.is_none()
+        && wire.membership.configs.is_empty()
+        && wire.membership.nodes.is_empty()
+    {
+        return Ok(StoredMembership::default());
+    }
+    StoredMembership::try_from(wire)
+        .map_err(|err| StorageError::corrupt(Db::State, what, format!("{err:?}")))
+}
+
+/// Narrow a stored `SnapshotMetaV1` to the value OpenRaft is handed.
+///
+/// The metadata a snapshot advertises describes this store's own durable state,
+/// so it obeys the storage reading of a membership above, not the message one.
+pub(crate) fn snapshot_meta_from_wire(
+    wire: &SnapshotMetaV1,
+) -> StorageResult<SnapshotMeta<CoordinationNodeId, CoordinationNode>> {
+    let last_log_id = wire
+        .last_log_id
+        .as_ref()
+        .map(openraft::LogId::<CoordinationNodeId>::try_from)
+        .transpose()
+        .map_err(|err| {
+            StorageError::corrupt(Db::State, "SnapshotMetaV1.last_log_id", format!("{err:?}"))
+        })?;
+    Ok(SnapshotMeta {
+        last_log_id,
+        last_membership: stored_membership_from_wire(
+            "SnapshotMetaV1.last_membership",
+            &wire.last_membership,
+        )?,
+        snapshot_id: wire.snapshot_id.clone(),
+    })
+}
+
 pub(crate) fn meta_from_wire(meta: &CoordinationMetaV1) -> StorageResult<DurableState> {
     let bad = |what: &'static str, detail: String| StorageError::corrupt(Db::State, what, detail);
 
@@ -385,20 +444,8 @@ pub(crate) fn meta_from_wire(meta: &CoordinationMetaV1) -> StorageResult<Durable
     // other voter performed.
     validate_meta_wire(meta)?;
 
-    // An empty config set is "no membership has been committed yet", which is
-    // exactly what OpenRaft's own `StoredMembership::default()` is and what a
-    // freshly bound store holds. The mirror conversion refuses it -- correctly,
-    // since an empty *joint config* on a running group is a corrupt record --
-    // so the two cases are separated here rather than by weakening the mirror.
-    let membership = if meta.membership.log_id.is_none()
-        && meta.membership.membership.configs.is_empty()
-        && meta.membership.membership.nodes.is_empty()
-    {
-        StoredMembership::<CoordinationNodeId, CoordinationNode>::default()
-    } else {
-        StoredMembership::<CoordinationNodeId, CoordinationNode>::try_from(&meta.membership)
-            .map_err(|err| bad("CoordinationMetaV1.membership", format!("{err:?}")))?
-    };
+    let membership =
+        stored_membership_from_wire("CoordinationMetaV1.membership", &meta.membership)?;
 
     // The model's view is *derived* from the stored membership, never stored
     // beside it: two copies of the same fact are two things that can disagree,
@@ -443,17 +490,14 @@ pub(crate) fn meta_from_wire(meta: &CoordinationMetaV1) -> StorageResult<Durable
 
 // ── Loading ──────────────────────────────────────────────────────────────────
 
-/// Read and validate the complete state.
+/// The replicated meta row, narrowed and decoded.
 ///
-/// Every row is narrowed through its declared root with that table's ceiling
-/// applied before allocation, and the result is then checked as a whole. A
-/// loader that validated rows individually and stopped there would accept a
-/// state whose every row is well-formed and whose counters describe a different
-/// state entirely.
-pub(crate) fn load(database: &Database) -> StorageResult<DurableState> {
-    let read = database.begin_read().map_err(state_err)?;
-
-    let meta_bytes = {
+/// Shared by [`load`] and by [`stream_body`] rather than written twice. The
+/// snapshot header embeds this exact root (§11.4), so a second reader with its
+/// own ceiling would be a second opinion about what the meta row is — and the
+/// one that disagreed would be whichever was not being tested.
+fn read_meta(read: &redb::ReadTransaction) -> StorageResult<CoordinationMetaV1> {
+    let bytes = {
         let table = read.open_table(STATE_META).map_err(state_err)?;
         let value =
             table
@@ -470,12 +514,25 @@ pub(crate) fn load(database: &Database) -> StorageResult<DurableState> {
             MAX_COORDINATION_META_BYTES,
         )?
     };
-    let meta: CoordinationMetaV1 = decode_persisted_bounded(
+    decode_persisted_bounded(
         Db::State,
         "CoordinationMetaV1",
-        &meta_bytes,
+        &bytes,
         MAX_COORDINATION_META_BYTES,
-    )?;
+    )
+}
+
+/// Read and validate the complete state.
+///
+/// Every row is narrowed through its declared root with that table's ceiling
+/// applied before allocation, and the result is then checked as a whole. A
+/// loader that validated rows individually and stopped there would accept a
+/// state whose every row is well-formed and whose counters describe a different
+/// state entirely.
+pub(crate) fn load(database: &Database) -> StorageResult<DurableState> {
+    let read = database.begin_read().map_err(state_err)?;
+
+    let meta = read_meta(&read)?;
     let mut state = meta_from_wire(&meta)?;
     let group = state.group_id();
 
@@ -628,6 +685,202 @@ fn rebuild_audit_tip(audit: &BTreeMap<(u64, u64), AuditRow>) -> Option<LogId> {
         .iter()
         .max_by_key(|((_, index), _)| *index)
         .map(|((term, index), row)| LogId::new(*term, row.leader_node_id, *index))
+}
+
+// ── Streaming the canonical body (§11.4) ─────────────────────────────────────
+
+/// A framing failure while writing this voter's own state.
+///
+/// Split by kind rather than flattened, because the two mean opposite things. A
+/// [`BodyError::Io`] is the disk refusing a write — the state is fine and the
+/// file is not. Everything else means a row that is on disk cannot be expressed
+/// in the canonical format, which is state this build can no longer serialize
+/// and therefore data loss.
+fn body_error(path: &Path, err: BodyError) -> StorageError {
+    match err {
+        BodyError::Io => StorageError::io(
+            "writing the snapshot body",
+            path,
+            std::io::Error::other("the snapshot body writer failed"),
+        ),
+        other => StorageError::corrupt(Db::State, "snapshot_body", format!("{other:?}")),
+    }
+}
+
+/// Write the canonical §11.4 body for one read transaction.
+///
+/// ## Why the transaction comes in rather than the state
+///
+/// §11.4 makes the body a pure function of the replicated state at
+/// `last_applied`, read under one snapshot-consistent transaction. Handing this
+/// a `DurableState` instead would make it a function of *memory*, and the whole
+/// point of the state machine's take-and-return discipline is that memory is
+/// only ever behind. It would also mean cloning up to 192 MiB of resource values
+/// to serialize them — the clone [`super::machine`] carried as a placeholder
+/// until this existed.
+///
+/// Row order is redb's iteration order, which is the order the framing requires:
+/// every §11.3 key is a tuple of byte strings or fixed-width integers, compared
+/// component-wise, and that is exactly [`crate::coordination::rowstream::OrderKey`]'s
+/// comparison. The writer re-checks it per row, so the two agreeing is asserted
+/// on every snapshot rather than assumed here.
+pub(crate) fn stream_body<W: std::io::Write>(
+    read: &redb::ReadTransaction,
+    path: &Path,
+    writer: W,
+) -> StorageResult<(W, SnapshotHeaderV1)> {
+    let framing = |err: BodyError| body_error(path, err);
+
+    let resources = read.open_table(RESOURCES).map_err(state_err)?;
+    let acl = read.open_table(ACL).map_err(state_err)?;
+    let admins = read.open_table(ADMINS).map_err(state_err)?;
+    let sessions = read.open_table(SESSIONS).map_err(state_err)?;
+    let intents = read.open_table(INTENTS).map_err(state_err)?;
+    let routes = read.open_table(ROUTES).map_err(state_err)?;
+    let audit = read.open_table(AUDIT).map_err(state_err)?;
+
+    // Counted before the header is written, from the same transaction the rows
+    // come from. A count taken anywhere else could disagree with the rows, and
+    // the writer would then refuse its own body at the section that ran short.
+    let row_counts = RowCountsV1 {
+        resources: resources.len().map_err(state_err)?,
+        grants: acl.len().map_err(state_err)?,
+        admins: admins.len().map_err(state_err)?,
+        sessions: sessions.len().map_err(state_err)?,
+        intents: intents.len().map_err(state_err)?,
+        routes: routes.len().map_err(state_err)?,
+        audit: audit.len().map_err(state_err)?,
+    };
+
+    // The one production `SnapshotHeaderV1`. `format_version` is the body
+    // framing version and `schema_version` is the logical state version; both
+    // are 1 today, so swapping them is invisible to every runtime check --
+    // `the_header_takes_each_version_from_its_own_constant` is what holds them
+    // apart, and it can only do so because this is the only construction site.
+    let header = SnapshotHeaderV1 {
+        format_version: SNAPSHOT_FORMAT_VERSION,
+        schema_version: super::identity::LOGICAL_SCHEMA_VERSION,
+        meta: read_meta(read)?,
+        row_counts,
+    };
+
+    let mut body = BodyWriter::<W, SnapshotBodyRowV1>::new(writer, &header).map_err(framing)?;
+
+    body.begin_section(SECTION_RESOURCES).map_err(framing)?;
+    for entry in resources.iter().map_err(state_err)? {
+        let (key, value) = entry.map_err(state_err)?;
+        let (namespace, raw) = key.value();
+        let wire: ResourceRowV1 = decode_persisted_bounded(
+            Db::State,
+            "ResourceRowV1",
+            value.value(),
+            MAX_RESOURCE_ROW_BYTES,
+        )?;
+        body.row(&SnapshotBodyRowV1::Resource(SnapshotResourceRowV1 {
+            key: ResourceKeyV1 {
+                namespace: namespace.to_string(),
+                key: raw.to_vec(),
+            },
+            epoch: wire.epoch,
+            held: wire.held,
+            holder_node_id: wire.holder_node_id,
+            ttl_ms: wire.ttl_ms,
+            lease_revision: wire.lease_revision,
+            value_revision: wire.value_revision,
+            value: wire.value,
+            acl_revision: wire.acl_revision,
+        }))
+        .map_err(framing)?;
+    }
+
+    body.begin_section(SECTION_GRANTS).map_err(framing)?;
+    for entry in acl.iter().map_err(state_err)? {
+        let (key, value) = entry.map_err(state_err)?;
+        let (namespace, raw, subject) = key.value();
+        body.row(&SnapshotBodyRowV1::Grant(GrantRowV1 {
+            key: ResourceKeyV1 {
+                namespace: namespace.to_string(),
+                key: raw.to_vec(),
+            },
+            subject_node_id: subject.to_vec(),
+            rights: value.value(),
+        }))
+        .map_err(framing)?;
+    }
+
+    body.begin_section(SECTION_ADMINS).map_err(framing)?;
+    for entry in admins.iter().map_err(state_err)? {
+        let (key, _) = entry.map_err(state_err)?;
+        body.row(&SnapshotBodyRowV1::Admin(AdminRowV1 {
+            subject_node_id: key.value().to_vec(),
+        }))
+        .map_err(framing)?;
+    }
+
+    body.begin_section(SECTION_SESSIONS).map_err(framing)?;
+    for entry in sessions.iter().map_err(state_err)? {
+        let (key, value) = entry.map_err(state_err)?;
+        let (actor, client) = key.value();
+        let session: ClientSessionV1 = decode_persisted_bounded(
+            Db::State,
+            "ClientSessionV1",
+            value.value(),
+            MAX_SESSION_ROW_BYTES,
+        )?;
+        body.row(&SnapshotBodyRowV1::Session(SessionRowV1 {
+            actor_node_id: actor.to_vec(),
+            client_id: client.to_vec(),
+            session,
+        }))
+        .map_err(framing)?;
+    }
+
+    body.begin_section(SECTION_INTENTS).map_err(framing)?;
+    for entry in intents.iter().map_err(state_err)? {
+        let (key, value) = entry.map_err(state_err)?;
+        let intent: MembershipIntentV1 = decode_persisted_bounded(
+            Db::State,
+            "MembershipIntentV1",
+            value.value(),
+            MAX_INTENT_ROW_BYTES,
+        )?;
+        body.row(&SnapshotBodyRowV1::Intent(IntentRowV1 {
+            operation_id: key.value().to_vec(),
+            intent,
+        }))
+        .map_err(framing)?;
+    }
+
+    body.begin_section(SECTION_ROUTES).map_err(framing)?;
+    for entry in routes.iter().map_err(state_err)? {
+        let (key, value) = entry.map_err(state_err)?;
+        let route: NodeRouteV1 =
+            decode_persisted_bounded(Db::State, "NodeRouteV1", value.value(), MAX_ROUTE_ROW_BYTES)?;
+        body.row(&SnapshotBodyRowV1::Route(RouteRowV1 {
+            node_id: key.value().to_vec(),
+            ticket_bytes: route.ticket_bytes,
+            source_operation_id: route.source_operation_id,
+            introduced_log_id: route.introduced_log_id,
+        }))
+        .map_err(framing)?;
+    }
+
+    body.begin_section(SECTION_AUDIT).map_err(framing)?;
+    for entry in audit.iter().map_err(state_err)? {
+        let (key, value) = entry.map_err(state_err)?;
+        let (log_term, log_index) = key.value();
+        let row: AuditRowV1 =
+            decode_persisted_bounded(Db::State, "AuditRowV1", value.value(), MAX_AUDIT_ROW_BYTES)?;
+        body.row(&SnapshotBodyRowV1::Audit(AuditStreamRowV1 {
+            log_term,
+            log_index,
+            row,
+        }))
+        .map_err(framing)?;
+    }
+
+    let writer = body.finish().map_err(framing)?;
+    Ok((writer, header))
 }
 
 // ── Validation ───────────────────────────────────────────────────────────────
@@ -1810,6 +2063,52 @@ mod tests {
     use openraft::Membership;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The snapshot header takes each version from its own constant.
+    ///
+    /// A statement about the source, and it has to be. `SNAPSHOT_FORMAT_VERSION`
+    /// (the body framing), `LOGICAL_SCHEMA_VERSION` (the state schema) and the
+    /// storage codec version are three different compatibility concerns that
+    /// are all `1` today, so substituting one for another is a no-op at
+    /// runtime — verified, when this check was deferred out of
+    /// `the_meta_ceiling_admits_only_snapshottable_rows` for exactly that
+    /// reason. No behavioural test can distinguish values that are equal.
+    ///
+    /// What makes the source check sound rather than a proxy is that there is
+    /// **one** header construction, asserted here. The day the constants
+    /// diverge this becomes redundant and a version mismatch becomes an
+    /// ordinary failure; until then it is the only thing standing between a
+    /// mistyped field name and a body that claims a framing version it does not
+    /// use.
+    #[test]
+    fn the_header_takes_each_version_from_its_own_constant() {
+        let source = include_str!("rows.rs");
+        let end = source.find("\n#[cfg(test)]\n").unwrap_or(source.len());
+        let flat: String = source[..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let literal = "SnapshotHeaderV1 {";
+        assert_eq!(
+            flat.matches(literal).count(),
+            1,
+            "a second header construction would need its own guard; this one \
+             can only speak for the site it can find"
+        );
+
+        let after = flat.split(literal).nth(1).expect("one construction");
+        let fields = &after[..after.find("};").unwrap_or(after.len())];
+        assert!(
+            fields.contains("format_version: SNAPSHOT_FORMAT_VERSION"),
+            "the body's format version must come from the framing constant, \
+             not from the schema or codec version: {fields}"
+        );
+        assert!(
+            fields.contains("schema_version: super::identity::LOGICAL_SCHEMA_VERSION"),
+            "the schema version must come from the logical schema constant: {fields}"
+        );
+    }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 

@@ -1,9 +1,20 @@
-//! The role-safe snapshot handle and its catalog (§11.4).
+//! Snapshot files: the role-safe handle, the catalog, and the §11.4 create /
+//! digest / publish path.
 //!
-//! Checkpoint A lands the *type* and its ownership rules, because the
-//! production OpenRaft type config names it and the `Cursor<Vec<u8>>`
-//! placeholder must not survive to the point where anything claims storage
-//! progress. Building, installing, and publishing `CURRENT` are Checkpoint D.
+//! The rows themselves are [`super::rows`]'s: it owns the §11.3 tables and
+//! streams them into the canonical body. This module owns everything about the
+//! *file* — where it is written, what its name is derived from, when it becomes
+//! discoverable, and when it stops being.
+//!
+//! ## Why the body decode is not `codec`'s
+//!
+//! `codec` is the one decode site for values persisted *by this store*, and
+//! its ceiling is a property of the row type. A snapshot body arrives from
+//! another node, is far larger than any row, and is bounded section by section
+//! by [`crate::coordination::rowstream`] — which refuses a declared count or
+//! row length before allocating for it. Routing it through `codec` would mean
+//! either a 512 MiB ceiling on every row decode or a body read that could not
+//! be streamed at all.
 //!
 //! ## Why two roles rather than one path
 //!
@@ -38,14 +49,25 @@
 //! `Clone`, so the type does not have it; an additional Published reader comes
 //! from an explicit [`SnapshotCatalog::lease`] instead.
 
-// Checkpoint D builds, installs, and publishes through this handle; until
-// then only its ownership rules exist. Scoped to this module deliberately --
-// see the `storage` module docs for why a crate-root allowance would be wrong.
+// See the `storage` module docs: nothing in a shipping build reaches
+// `VoterStorage::open` until Slice 3 supplies a verified identity. Scoped to
+// this module deliberately -- a crate-root allowance would cover every storage
+// module added after it.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+use super::error::{Db, StorageError, StorageResult};
+use super::schema::{StorageLayout, MAX_COORDINATION_META_BYTES};
+use crate::coordination::raft::SnapshotMetaV1;
+use crate::coordination::rowstream::{
+    read_body, BodyError, BodyVisitor, SnapshotBodyRowV1, SnapshotHeaderV1,
+};
 
 /// Snapshot ids are content-derived (§11.4): the domain prefix plus the
 /// lowercase hex BLAKE3 of the canonical body.
@@ -79,6 +101,430 @@ pub(crate) fn file_stem_for(snapshot_id: &str) -> Option<&str> {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
     valid.then_some(stem)
+}
+
+/// The digest-only file name a body is published under.
+///
+/// The outbound counterpart of [`file_stem_for`], and deliberately a different
+/// function: this one takes a digest we computed, that one narrows a string
+/// another node chose. Sharing them would put a foreign string one refactor
+/// away from naming a path.
+pub(crate) fn file_name_for(digest: &[u8; 32]) -> String {
+    let id = snapshot_id_for(digest);
+    let mut name = String::from(&id[SNAPSHOT_ID_PREFIX.len()..]);
+    name.push_str(SNAPSHOT_FILE_SUFFIX);
+    name
+}
+
+// ── Files ────────────────────────────────────────────────────────────────────
+
+fn io<'a>(what: &'static str, path: &'a Path) -> impl Fn(std::io::Error) -> StorageError + 'a {
+    move |source| StorageError::io(what, path, source)
+}
+
+fn corrupt(detail: impl std::fmt::Display) -> StorageError {
+    StorageError::corrupt(Db::State, "snapshot", detail)
+}
+
+/// A file that is removed unless it is promoted.
+///
+/// Every path here writes to a scratch name first, and every one of them has a
+/// failure between the create and the rename. Without this, each of those
+/// failures leaks a partial body into `snapshots/` that looks like nothing in
+/// particular — it has no digest name, so nothing sweeps it and nothing can say
+/// what it was.
+struct Scratch {
+    path: Option<PathBuf>,
+}
+
+impl Scratch {
+    /// A name no digest can collide with: digests are 64 hex characters, and
+    /// this is neither hex nor 64 characters.
+    fn new(dir: &Path, tag: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self {
+            path: Some(dir.join(format!(".{tag}-{}-{n}.partial", std::process::id()))),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("a scratch file has a path")
+    }
+
+    /// Give up the unlink-on-drop guarantee, returning the path to rename.
+    fn keep(mut self) -> PathBuf {
+        self.path.take().expect("a scratch file has a path")
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Make `to` name `from`'s content, atomically.
+///
+/// `rename(2)` on Unix and `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows;
+/// both replace an existing destination in one step, so a reader sees the old
+/// name or the new one and never a partial file. Replacing `state.redb` while
+/// redb still has it open is the harder case and is not this — that one needs
+/// the handles closed first, which is why it lives with install rather than
+/// here.
+fn atomic_replace(from: PathBuf, to: &Path) -> StorageResult<()> {
+    // The error names the destination, not the scratch file: the scratch name
+    // carries a pid and a counter and means nothing to whoever reads the log,
+    // while the destination is the snapshot that failed to appear.
+    std::fs::rename(&from, to).map_err(io("replacing a snapshot file", to))
+}
+
+/// fsync a directory so a rename within it is durable.
+///
+/// Unix only, and not an omission on Windows: there is no directory handle to
+/// synchronize there, and `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` is the
+/// platform's equivalent guarantee. Stating that here rather than leaving a
+/// silent `cfg` gap, because "we fsync the directory" is a claim §11.4 makes
+/// and only one platform can honour literally.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> StorageResult<()> {
+    File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(io("fsyncing the snapshot directory", dir))
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> StorageResult<()> {
+    Ok(())
+}
+
+/// A pass-through that digests everything crossing it.
+///
+/// One type for both directions on purpose: the digest a build computes and the
+/// digest a load recomputes have to be over the same bytes in the same way, and
+/// two implementations of "BLAKE3 as it goes" is exactly the kind of pair that
+/// agrees until it does not.
+struct Digesting<T> {
+    inner: T,
+    hasher: blake3::Hasher,
+    len: u64,
+}
+
+impl<T> Digesting<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+            len: 0,
+        }
+    }
+
+    fn into_parts(self) -> (T, [u8; 32], u64) {
+        let Digesting { inner, hasher, len } = self;
+        (inner, *hasher.finalize().as_bytes(), len)
+    }
+}
+
+impl<W: Write> Write for Digesting<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<R: Read> Read for Digesting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+}
+
+// ── Build ────────────────────────────────────────────────────────────────────
+
+/// An immutable snapshot file and the metadata derived from its body.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SnapshotFile {
+    /// The OpenRaft metadata, derived from the body rather than supplied.
+    pub(crate) meta: SnapshotMetaV1,
+    pub(crate) path: PathBuf,
+    pub(crate) len: u64,
+}
+
+/// Derive the OpenRaft metadata a body implies.
+///
+/// `last_log_id` and `last_membership` come from the header's replicated meta,
+/// and `snapshot_id` from the digest — so the metadata cannot describe a body
+/// other than the one it was computed from. §11.4 requires the reverse check on
+/// install, and this is the function that makes the two comparable.
+fn meta_for(header: &SnapshotHeaderV1, digest: &[u8; 32]) -> SnapshotMetaV1 {
+    SnapshotMetaV1 {
+        last_log_id: header.meta.last_applied.clone(),
+        last_membership: header.meta.membership.clone(),
+        snapshot_id: snapshot_id_for(digest),
+    }
+}
+
+/// Stream `read`'s state into an immutable snapshot file under `snapshots/`.
+///
+/// Writes to a scratch name, fsyncs it, renames it to the digest-only published
+/// name, and fsyncs the directory — in that order, because a directory entry
+/// naming a body that is not yet on disk is a snapshot another node can ask for
+/// and this one cannot serve.
+///
+/// Does **not** publish `CURRENT`. Building and publishing are separate because
+/// §11.4's monotonicity rule is about publication: a builder that finishes below
+/// the current snapshot has still produced a valid file, and the decision to
+/// discard it is not the writer's to make.
+pub(crate) fn build(
+    layout: &StorageLayout,
+    read: &redb::ReadTransaction,
+) -> StorageResult<SnapshotFile> {
+    let dir = layout.snapshots();
+    let scratch = Scratch::new(&dir, "building");
+
+    let handle =
+        File::create(scratch.path()).map_err(io("creating a snapshot body", scratch.path()))?;
+    let (digesting, header) =
+        super::rows::stream_body(read, scratch.path(), Digesting::new(BufWriter::new(handle)))?;
+    let (buffered, digest, len) = digesting.into_parts();
+    let handle = buffered
+        .into_inner()
+        .map_err(|err| StorageError::io("flushing a snapshot body", scratch.path(), err.into()))?;
+    handle
+        .sync_all()
+        .map_err(io("fsyncing a snapshot body", scratch.path()))?;
+    drop(handle);
+
+    let path = dir.join(file_name_for(&digest));
+    if path.exists() {
+        // The name *is* the digest, so an existing file with this name has this
+        // content. Rebuilding an identical body is the ordinary case after a
+        // lost acknowledgement, not a collision.
+        drop(scratch);
+    } else {
+        atomic_replace(scratch.keep(), &path)?;
+        fsync_dir(&dir)?;
+    }
+
+    Ok(SnapshotFile {
+        meta: meta_for(&header, &digest),
+        path,
+        len,
+    })
+}
+
+// ── The durable current marker ───────────────────────────────────────────────
+
+/// What publishing a candidate against the current marker resolves to (§11.4).
+///
+/// Written as a decision an independent test can drive, rather than as branches
+/// inside the publish path: the rule is "monotonic by applied index, with full
+/// identity at an equal index", and a test that has to construct two real stores
+/// to exercise the fatal case would exercise it once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Publication {
+    /// Newer than the current marker: replace it.
+    Publish,
+    /// The same snapshot arriving again. Republishing the marker is legal and
+    /// is how a lost acknowledgement is repaired; the body is already there.
+    Idempotent,
+    /// Behind the current marker. The file stays, the marker does not move.
+    Discard,
+    /// The same index describing different history. Not recoverable.
+    Fatal(String),
+}
+
+/// Compare a candidate against the current marker by **applied index**, never by
+/// a derived `(term, index)` ordering.
+pub(crate) fn decide_publication(
+    candidate: &SnapshotMetaV1,
+    current: Option<&SnapshotMetaV1>,
+) -> Publication {
+    let Some(current) = current else {
+        return Publication::Publish;
+    };
+    let candidate_index = candidate.last_log_id.as_ref().map(|id| id.index);
+    let current_index = current.last_log_id.as_ref().map(|id| id.index);
+
+    if candidate_index > current_index {
+        return Publication::Publish;
+    }
+    if candidate_index < current_index {
+        return Publication::Discard;
+    }
+    // Equal index. Two voters at the same complete `last_applied` must emit
+    // byte-identical bodies (§11.4), so anything but full equality here is
+    // evidence of nondeterminism or corruption rather than a leader change.
+    if candidate.last_log_id != current.last_log_id {
+        return Publication::Fatal(format!(
+            "two snapshots at index {candidate_index:?} name different log ids: \
+             {:?} and {:?}",
+            candidate.last_log_id, current.last_log_id
+        ));
+    }
+    if candidate.snapshot_id != current.snapshot_id {
+        return Publication::Fatal(format!(
+            "two snapshots at the same log id have different content: {} and {}",
+            candidate.snapshot_id, current.snapshot_id
+        ));
+    }
+    Publication::Idempotent
+}
+
+/// Write `snapshots/CURRENT` atomically.
+pub(crate) fn publish_current(layout: &StorageLayout, meta: &SnapshotMetaV1) -> StorageResult<()> {
+    let dir = layout.snapshots();
+    let scratch = Scratch::new(&dir, "current");
+    let bytes = super::codec::encode_committed(
+        Db::State,
+        "SnapshotMetaV1",
+        meta,
+        MAX_COORDINATION_META_BYTES,
+    )?;
+
+    {
+        let mut handle = File::create(scratch.path())
+            .map_err(io("creating the current marker", scratch.path()))?;
+        handle
+            .write_all(&bytes)
+            .map_err(io("writing the current marker", scratch.path()))?;
+        handle
+            .sync_all()
+            .map_err(io("fsyncing the current marker", scratch.path()))?;
+    }
+
+    atomic_replace(scratch.keep(), &layout.current_snapshot_marker())?;
+    fsync_dir(&dir)
+}
+
+/// Read `snapshots/CURRENT` and prove it describes the body it names.
+///
+/// A missing marker is `Ok(None)` — a store that has never snapshotted. A
+/// marker that is present and wrong is `DATA_LOSS`: §11.4 is explicit that a
+/// missing file, malformed id, digest mismatch, or metadata mismatch is not an
+/// absent snapshot, because treating it as one would silently offer a follower
+/// a full log replay instead of reporting that this voter's snapshot is gone.
+pub(crate) fn load_current(layout: &StorageLayout) -> StorageResult<Option<SnapshotFile>> {
+    let marker = layout.current_snapshot_marker();
+    let stat = match std::fs::metadata(&marker) {
+        Ok(stat) => stat,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(StorageError::io("reading the current marker", &marker, err)),
+    };
+    // Bounded before the read allocates, not after.
+    if stat.len() > MAX_COORDINATION_META_BYTES as u64 {
+        return Err(corrupt(format!(
+            "the current marker is {} bytes, over the {MAX_COORDINATION_META_BYTES}-byte ceiling",
+            stat.len()
+        )));
+    }
+    let bytes = std::fs::read(&marker).map_err(io("reading the current marker", &marker))?;
+    let meta: SnapshotMetaV1 = super::codec::decode_persisted_bounded(
+        Db::State,
+        "SnapshotMetaV1",
+        &bytes,
+        MAX_COORDINATION_META_BYTES,
+    )?;
+
+    let stem = file_stem_for(&meta.snapshot_id).ok_or_else(|| {
+        corrupt(format!(
+            "the current marker names {:?}, which is not a content-derived snapshot id",
+            meta.snapshot_id
+        ))
+    })?;
+    let path = layout
+        .snapshots()
+        .join(format!("{stem}{SNAPSHOT_FILE_SUFFIX}"));
+
+    let (header, digest, len) = read_and_verify(&path)?;
+    let derived = meta_for(&header, &digest);
+    if derived.snapshot_id != meta.snapshot_id {
+        return Err(corrupt(format!(
+            "the body under {} hashes to {}, not the id the marker names",
+            path.display(),
+            derived.snapshot_id
+        )));
+    }
+    if derived.last_log_id != meta.last_log_id {
+        return Err(corrupt(format!(
+            "the marker names last log id {:?} and the body carries {:?}",
+            meta.last_log_id, derived.last_log_id
+        )));
+    }
+    if derived.last_membership != meta.last_membership {
+        return Err(corrupt(
+            "the marker's membership is not the membership the body carries",
+        ));
+    }
+
+    Ok(Some(SnapshotFile { meta, path, len }))
+}
+
+/// Read a body end to end, digesting it and validating every row.
+///
+/// Not a header-only read. §11.4 says "hash and decode the complete body", and
+/// the difference is the whole point: a header names counts, and only reading
+/// the rows proves the counts are true, the sections are complete, and each row
+/// still decodes under this build.
+fn read_and_verify(path: &Path) -> StorageResult<(SnapshotHeaderV1, [u8; 32], u64)> {
+    let handle = match File::open(path) {
+        Ok(handle) => handle,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(corrupt(format!(
+                "the current marker names {}, which does not exist",
+                path.display()
+            )))
+        }
+        Err(err) => return Err(StorageError::io("opening a snapshot body", path, err)),
+    };
+
+    let mut reader = Digesting::new(BufReader::new(handle));
+    let mut visitor = CapturingHeader { header: None };
+    read_body::<_, SnapshotBodyRowV1>(&mut reader, &mut visitor).map_err(|err| match err {
+        BodyError::Io => StorageError::io(
+            "reading a snapshot body",
+            path,
+            std::io::Error::other("the snapshot body reader failed"),
+        ),
+        other => corrupt(format!(
+            "{} is not a readable body: {other:?}",
+            path.display()
+        )),
+    })?;
+    let (_, digest, len) = reader.into_parts();
+
+    let header = visitor
+        .header
+        .ok_or_else(|| corrupt("a body was read without a header"))?;
+    Ok((header, digest, len))
+}
+
+/// Keeps the header and forgets every row, which is what makes the read a
+/// streaming one: retaining rows here would put the whole state back in memory
+/// and undo the property [`super::rows::stream_body`] exists to have.
+struct CapturingHeader {
+    header: Option<SnapshotHeaderV1>,
+}
+
+impl BodyVisitor<SnapshotBodyRowV1> for CapturingHeader {
+    fn header(&mut self, header: &SnapshotHeaderV1) -> Result<(), BodyError> {
+        self.header = Some(header.clone());
+        Ok(())
+    }
+
+    fn row(&mut self, _section: u64, _row: SnapshotBodyRowV1) -> Result<(), BodyError> {
+        Ok(())
+    }
 }
 
 // ── Catalog ──────────────────────────────────────────────────────────────────
@@ -447,6 +893,102 @@ mod tests {
         assert!(path.exists(), "one reader remains");
         drop(second);
         assert!(!path.exists(), "the last reader releases it");
+    }
+
+    // ── Naming ───────────────────────────────────────────────────────────────
+
+    /// The name a body is published under is the id's digest and nothing else.
+    #[test]
+    fn a_published_file_is_named_by_its_digest_alone() {
+        let digest = [0x9au8; 32];
+        let name = file_name_for(&digest);
+        assert_eq!(name, format!("{}{SNAPSHOT_FILE_SUFFIX}", "9a".repeat(32)));
+        assert_eq!(
+            file_stem_for(&snapshot_id_for(&digest)),
+            Some(name.trim_end_matches(SNAPSHOT_FILE_SUFFIX)),
+            "the outbound name and the inbound stem must agree, or a body this \
+             node published could not be found by the id it advertised"
+        );
+    }
+
+    // ── Publication (§11.4) ──────────────────────────────────────────────────
+
+    fn meta(index: u64, term: u64, digest: u8) -> SnapshotMetaV1 {
+        SnapshotMetaV1 {
+            last_log_id: Some(crate::coordination::contract::LogIdV1 {
+                term,
+                leader_node_id: vec![0x11; 32],
+                index,
+            }),
+            last_membership: Default::default(),
+            snapshot_id: snapshot_id_for(&[digest; 32]),
+        }
+    }
+
+    /// The rule is monotonic by **applied index**, with full identity required
+    /// at an equal index.
+    ///
+    /// Driven as a table against the decision rather than through two real
+    /// stores, because the two outcomes that matter most — a stale builder and
+    /// a divergent one — are the ones a pair of healthy stores will not
+    /// produce on demand.
+    #[test]
+    fn publication_is_monotonic_by_index_and_exact_at_an_equal_one() {
+        let current = meta(10, 2, 0xaa);
+
+        assert_eq!(decide_publication(&current, None), Publication::Publish);
+        assert_eq!(
+            decide_publication(&meta(11, 2, 0xbb), Some(&current)),
+            Publication::Publish
+        );
+        assert_eq!(
+            decide_publication(&meta(9, 2, 0xbb), Some(&current)),
+            Publication::Discard,
+            "a builder that finished behind the current snapshot is discarded"
+        );
+        assert_eq!(
+            decide_publication(&meta(10, 2, 0xaa), Some(&current)),
+            Publication::Idempotent,
+            "the same log id and the same content is the same snapshot"
+        );
+
+        // A different leader at the same index is two histories, and a
+        // different body at the same log id is nondeterminism. §11.4 makes both
+        // fatal rather than letting either overwrite the other.
+        assert!(matches!(
+            decide_publication(&meta(10, 3, 0xaa), Some(&current)),
+            Publication::Fatal(_)
+        ));
+        assert!(matches!(
+            decide_publication(&meta(10, 2, 0xbb), Some(&current)),
+            Publication::Fatal(_)
+        ));
+    }
+
+    /// A snapshot of a store with nothing applied sorts before every other one,
+    /// and is still exact against itself.
+    ///
+    /// `None` is not a missing value here — it is index "before entry one",
+    /// which a bootstrapping voter really does snapshot at.
+    #[test]
+    fn an_unapplied_snapshot_is_behind_every_applied_one() {
+        let empty = SnapshotMetaV1 {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: snapshot_id_for(&[0u8; 32]),
+        };
+        assert_eq!(
+            decide_publication(&meta(1, 1, 0xaa), Some(&empty)),
+            Publication::Publish
+        );
+        assert_eq!(
+            decide_publication(&empty, Some(&meta(1, 1, 0xaa))),
+            Publication::Discard
+        );
+        assert_eq!(
+            decide_publication(&empty, Some(&empty)),
+            Publication::Idempotent
+        );
     }
 
     /// Retiring a snapshot nobody is reading removes it immediately.

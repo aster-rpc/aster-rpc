@@ -46,19 +46,21 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use openraft::storage::RaftStateMachine;
 use openraft::{
     EntryPayload, LogId as RaftLogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta,
     StorageError as RaftStorageError, StorageIOError, StoredMembership,
 };
-use redb::Database;
+use redb::{Database, ReadableDatabase};
 use tokio::sync::{mpsc, oneshot};
 
 use super::actor::ActorShutdown;
 use super::error::{Db, StorageError, StorageResult};
 use super::rows::{self, DurableState};
+use super::schema::StorageLayout;
+use super::snapshot::{self, Publication, SnapshotCatalog, SnapshotFile};
 use super::CoordinationSnapshotFile;
 use crate::coordination::contract::{CommandReplyV1, NonCommandReplyV1};
 use crate::coordination::ids::CoordinationNodeId;
@@ -91,12 +93,22 @@ pub(crate) enum StateCommand {
         entries: Vec<Entry>,
         reply: Reply<Vec<CommandReplyV1>>,
     },
+    /// Open a snapshot-consistent read transaction and hand it out.
+    ///
+    /// The transaction is created **by the actor** so it can only observe a
+    /// committed batch — the actor is between batches whenever it services a
+    /// command — and then leaves, because §11.4 requires the body to stream
+    /// without blocking the writer. redb's MVCC is what makes both true at
+    /// once: the version this pins does not move, and later applies do not wait
+    /// for it.
+    ReadTransaction(Reply<redb::ReadTransaction>),
     /// Hand out a copy of the published state.
     ///
-    /// Reads go through the actor rather than through a second redb read
-    /// transaction so that "what is published" has one answer. A reader that
-    /// opened its own transaction could observe the rows of a batch whose
-    /// in-memory publication had not happened yet.
+    /// Test-only, and deliberately so. It clones the whole state — up to 192
+    /// MiB under §12.1 — which was acceptable only while it stood in for the
+    /// snapshot builder. [`StateCommand::ReadTransaction`] is that builder now,
+    /// so no production path copies the state to read it.
+    #[cfg(test)]
     Snapshot(Reply<Box<DurableState>>),
     Shutdown,
     /// Force a fatal failure through the ordinary serve path.
@@ -155,6 +167,10 @@ impl StateActor {
                 StateCommand::Shutdown => break,
                 StateCommand::AppliedState(reply) => self.serve(reply, StateActor::applied_state),
                 StateCommand::Apply { entries, reply } => self.serve(reply, |a| a.apply(&entries)),
+                StateCommand::ReadTransaction(reply) => {
+                    self.serve(reply, StateActor::read_transaction)
+                }
+                #[cfg(test)]
                 StateCommand::Snapshot(reply) => self.serve(reply, |a| a.published().map(Box::new)),
                 #[cfg(test)]
                 StateCommand::FailNextCommit(reply) => self.serve(reply, |a| {
@@ -210,6 +226,8 @@ impl StateActor {
                 StateCommand::Shutdown => break,
                 StateCommand::AppliedState(reply) => fail(reply),
                 StateCommand::Apply { reply, .. } => fail(reply),
+                StateCommand::ReadTransaction(reply) => fail(reply),
+                #[cfg(test)]
                 StateCommand::Snapshot(reply) => fail(reply),
                 #[cfg(test)]
                 StateCommand::InjectFatal(reply) => fail(reply),
@@ -221,13 +239,26 @@ impl StateActor {
 
     /// The published state, or `Fatal` if a batch took it and never gave it
     /// back.
+    #[cfg(test)]
     fn published(&self) -> StorageResult<DurableState> {
-        // Checkpoint D replaces this clone on the snapshot path with the
-        // planned read-transaction stream; §11.4 forbids materialising a body
-        // in memory, and a snapshot builder that cloned the state would do
-        // exactly that. It stays here meanwhile because nothing on the apply
-        // path uses it.
         self.state.clone().ok_or(StorageError::Fatal)
+    }
+
+    /// A read transaction over the committed state.
+    ///
+    /// Refused while the state is taken, for the same reason every other reader
+    /// is: a batch is holding the only copy, and whether its transaction
+    /// commits is not yet known. The check is on the *in-memory* state rather
+    /// than on redb, because redb would happily hand out the last committed
+    /// version and that version is about to be either superseded or the last
+    /// thing this store ever agreed on.
+    fn read_transaction(&mut self) -> StorageResult<redb::ReadTransaction> {
+        if self.state.is_none() {
+            return Err(StorageError::Fatal);
+        }
+        self.database
+            .begin_read()
+            .map_err(|source| StorageError::redb(Db::State, source))
     }
 
     fn applied_state(&mut self) -> StorageResult<Applied> {
@@ -439,8 +470,13 @@ impl StateHandle {
         }
     }
 
-    /// A copy of the published state, for tests and for Checkpoint D's
-    /// snapshot builder.
+    /// A snapshot-consistent read transaction over `state.redb`.
+    pub(crate) async fn read_transaction(&self) -> StorageResult<redb::ReadTransaction> {
+        self.call(StateCommand::ReadTransaction).await
+    }
+
+    /// A copy of the published state, for tests that compare memory with disk.
+    #[cfg(test)]
     pub(crate) async fn published(&self) -> StorageResult<Box<DurableState>> {
         self.call(StateCommand::Snapshot).await
     }
@@ -476,44 +512,156 @@ fn io_read_state(err: StorageError) -> RaftStorageError<CoordinationNodeId> {
 #[derive(Clone, Debug)]
 pub(crate) struct CoordinationStateMachine {
     handle: StateHandle,
+    layout: StorageLayout,
+    catalog: SnapshotCatalog,
+    /// The published `CURRENT`, as validated at open and maintained since.
+    ///
+    /// Held rather than re-read because `get_current_snapshot` is on the
+    /// replication path: re-reading would hash and decode the entire body on
+    /// every follower request, which is work proportional to the state for a
+    /// question already answered. The disk marker stays authoritative — this is
+    /// only ever written from a publication that has already landed.
+    current: Arc<Mutex<Option<SnapshotFile>>>,
 }
 
 impl CoordinationStateMachine {
-    pub(crate) fn new(database: Database) -> StorageResult<(Self, StateShutdown)> {
+    pub(crate) fn new(
+        database: Database,
+        layout: StorageLayout,
+    ) -> StorageResult<(Self, StateShutdown)> {
+        // Before the actor exists, like the state load itself. A `CURRENT` that
+        // names a body this build cannot read is data loss, and a store that
+        // announced itself first would be offering that snapshot to followers
+        // by the time anything noticed.
+        let current = snapshot::load_current(&layout)?;
         let (handle, shutdown) = StateHandle::spawn(database)?;
-        Ok((Self { handle }, shutdown))
+        Ok((
+            Self {
+                handle,
+                layout,
+                catalog: SnapshotCatalog::new(),
+                current: Arc::new(Mutex::new(current)),
+            },
+            shutdown,
+        ))
     }
 
     pub(crate) fn handle(&self) -> &StateHandle {
         &self.handle
     }
+
+    /// Apply §11.4's publication rule to a freshly built body, and return the
+    /// file that is current afterwards.
+    ///
+    /// Separate from `build_snapshot` so that an out-of-order builder is a
+    /// state a test can reach without a seam: taking a read transaction,
+    /// applying more entries, and only then streaming that transaction is a
+    /// builder that genuinely finished behind the current snapshot, and it can
+    /// be handed straight to this.
+    pub(crate) fn publish(&self, built: SnapshotFile) -> StorageResult<SnapshotFile> {
+        let mut current = self.current.lock().expect("the current-snapshot mutex");
+        match snapshot::decide_publication(&built.meta, current.as_ref().map(|f| &f.meta)) {
+            Publication::Publish => {
+                snapshot::publish_current(&self.layout, &built.meta)?;
+                if let Some(previous) = current.replace(built.clone()) {
+                    self.catalog
+                        .retire(&previous.meta.snapshot_id, &previous.path);
+                }
+                Ok(built)
+            }
+            // The body is already on disk under its digest name, so this
+            // republishes the marker and nothing else. That is the repair
+            // §11.4 requires after a lost acknowledgement, not a no-op.
+            Publication::Idempotent => {
+                snapshot::publish_current(&self.layout, &built.meta)?;
+                Ok(built)
+            }
+            // A builder that finished behind the current snapshot. The marker
+            // does not move and the file goes, which is what "discarded" has to
+            // mean if it is not to accumulate.
+            Publication::Discard => {
+                self.catalog.retire(&built.meta.snapshot_id, &built.path);
+                Ok(current
+                    .clone()
+                    .expect("only a published snapshot can be ahead of a candidate"))
+            }
+            Publication::Fatal(detail) => Err(StorageError::corrupt(Db::State, "snapshot", detail)),
+        }
+    }
+
+    /// A Published lease on a snapshot, as OpenRaft's `Snapshot`.
+    ///
+    /// The error type is OpenRaft's, and it is 280 bytes. Boxing it here would
+    /// mean unboxing it at the two trait methods that call this, whose
+    /// signatures the trait fixes — so the lint's remedy is unavailable and its
+    /// warning is about a type this crate does not own.
+    #[allow(clippy::result_large_err)]
+    fn serve(
+        &self,
+        file: &SnapshotFile,
+    ) -> Result<Snapshot<CoordinationTypeConfig>, RaftStorageError<CoordinationNodeId>> {
+        let meta = rows::snapshot_meta_from_wire(&file.meta).map_err(io_read_state)?;
+        Ok(Snapshot {
+            meta,
+            snapshot: Box::new(self.catalog.lease(&file.meta.snapshot_id, &file.path)),
+        })
+    }
 }
 
-/// The snapshot builder. Checkpoint D gives it a body; until then it exists so
-/// the trait is satisfiable and the type config is exercised.
+/// The snapshot builder.
+///
+/// Carries its own copies rather than borrowing the store: OpenRaft takes the
+/// builder away and may call it while the state machine is being used
+/// elsewhere, which is the whole reason `get_snapshot_builder` returns a value
+/// instead of a reference.
 #[derive(Clone, Debug)]
-pub(crate) struct CoordinationSnapshotBuilder;
+pub(crate) struct CoordinationSnapshotBuilder {
+    machine: CoordinationStateMachine,
+}
 
 impl RaftSnapshotBuilder<CoordinationTypeConfig> for CoordinationSnapshotBuilder {
     async fn build_snapshot(
         &mut self,
     ) -> Result<Snapshot<CoordinationTypeConfig>, RaftStorageError<CoordinationNodeId>> {
-        Err(not_until_checkpoint_d("build_snapshot"))
+        let read = self
+            .machine
+            .handle
+            .read_transaction()
+            .await
+            .map_err(io_read_state)?;
+
+        // Off the actor thread and off the reactor: streaming a body is
+        // blocking file I/O proportional to the state, and the read transaction
+        // pins its own version, so neither the writer nor the runtime waits on
+        // it.
+        let layout = self.machine.layout.clone();
+        let built = tokio::task::spawn_blocking(move || snapshot::build(&layout, &read))
+            .await
+            .map_err(|err| {
+                io_state(StorageError::corrupt(
+                    Db::State,
+                    "snapshot",
+                    format!("the snapshot builder did not finish: {err}"),
+                ))
+            })?
+            .map_err(io_state)?;
+
+        let serving = self.machine.publish(built).map_err(io_state)?;
+        self.machine.serve(&serving)
     }
 }
 
-/// The snapshot paths land in Checkpoint D, and refusing is the honest
+/// Install lands in Checkpoint D's second half, and refusing is the honest
 /// placeholder.
 ///
 /// Not `unimplemented!()`: a panic inside a library is not a failure a runtime
-/// can report, and OpenRaft's suite is not run against this store until
-/// Checkpoint D supplies the real paths — so nothing reaches these except a
-/// caller that has got ahead of the plan, which should get an error saying so.
-fn not_until_checkpoint_d(what: &'static str) -> RaftStorageError<CoordinationNodeId> {
+/// can report, so a caller that has got ahead of the plan should get an error
+/// saying so rather than take the process down.
+fn not_yet_implemented(what: &'static str) -> RaftStorageError<CoordinationNodeId> {
     io_state(StorageError::corrupt(
         Db::State,
         "snapshot",
-        format!("{what} lands in Checkpoint D"),
+        format!("{what} is not implemented yet"),
     ))
 }
 
@@ -543,13 +691,15 @@ impl RaftStateMachine<CoordinationTypeConfig> for CoordinationStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        CoordinationSnapshotBuilder
+        CoordinationSnapshotBuilder {
+            machine: self.clone(),
+        }
     }
 
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<CoordinationSnapshotFile>, RaftStorageError<CoordinationNodeId>> {
-        Err(not_until_checkpoint_d("begin_receiving_snapshot"))
+        Err(not_yet_implemented("begin_receiving_snapshot"))
     }
 
     async fn install_snapshot(
@@ -557,14 +707,22 @@ impl RaftStateMachine<CoordinationTypeConfig> for CoordinationStateMachine {
         _meta: &SnapshotMeta<CoordinationNodeId, CoordinationNode>,
         _snapshot: Box<CoordinationSnapshotFile>,
     ) -> Result<(), RaftStorageError<CoordinationNodeId>> {
-        Err(not_until_checkpoint_d("install_snapshot"))
+        Err(not_yet_implemented("install_snapshot"))
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<CoordinationTypeConfig>>, RaftStorageError<CoordinationNodeId>>
     {
-        Err(not_until_checkpoint_d("get_current_snapshot"))
+        let file = self
+            .current
+            .lock()
+            .expect("the current-snapshot mutex")
+            .clone();
+        match file {
+            Some(file) => self.serve(&file).map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -640,6 +798,11 @@ mod tests {
         let write = super::super::schema::durable_write(&database, Db::State).expect("write");
         super::super::schema::create_state_tables(&write).expect("tables");
         write.commit().expect("commit");
+        // The §11.1 directories a real open would have made. A snapshot build
+        // writes into `snapshots/`, and a fixture that omitted it would fail
+        // for the wrong reason.
+        std::fs::create_dir_all(dir.join("snapshots")).expect("snapshots dir");
+        std::fs::create_dir_all(dir.join("incoming")).expect("incoming dir");
 
         let state = genesis_state();
         let mut changes = ChangeSet::default();
@@ -670,13 +833,15 @@ mod tests {
     }
 
     fn machine(dir: &std::path::Path) -> (CoordinationStateMachine, StateShutdown) {
-        CoordinationStateMachine::new(seeded(dir)).expect("open the state machine")
+        CoordinationStateMachine::new(seeded(dir), StorageLayout::new(dir))
+            .expect("open the state machine")
     }
 
     /// Reopen the same directory, which is what proves a write was durable.
     fn reopen(dir: &std::path::Path) -> (CoordinationStateMachine, StateShutdown) {
         let database = Database::create(dir.join("state.redb")).expect("reopen");
-        CoordinationStateMachine::new(database).expect("reopen the state machine")
+        CoordinationStateMachine::new(database, StorageLayout::new(dir))
+            .expect("reopen the state machine")
     }
 
     fn log_id(index: u64) -> RaftLogId<CoordinationNodeId> {
@@ -2440,7 +2605,391 @@ mod tests {
         drop(database);
 
         let database = Database::create(dir.join("state.redb")).expect("reopen");
-        let err = CoordinationStateMachine::new(database).expect_err("validation refuses it");
+        let err = CoordinationStateMachine::new(database, StorageLayout::new(&dir))
+            .expect_err("validation refuses it");
+        assert!(err.puts_durability_in_question(), "{err:?}");
+    }
+
+    // ── Snapshots (§11.4) ────────────────────────────────────────────────────
+
+    /// The published body's path, from the id it is advertised under.
+    fn body_path(dir: &std::path::Path, snapshot_id: &str) -> PathBuf {
+        let stem = super::snapshot::file_stem_for(snapshot_id).expect("a content-derived id");
+        dir.join("snapshots")
+            .join(format!("{stem}{}", super::snapshot::SNAPSHOT_FILE_SUFFIX))
+    }
+
+    /// Build, publish, and still be current after a restart.
+    ///
+    /// The reopen is the point. The in-memory `current` is rebuilt from
+    /// `snapshots/CURRENT` and re-verified against the body, so a marker that
+    /// was written but not fsynced, a body under the wrong name, or metadata
+    /// that does not match what the body carries all fail here rather than at
+    /// the first follower that asks for a snapshot.
+    #[tokio::test]
+    async fn a_built_snapshot_is_published_and_still_current_after_a_reopen() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+
+        assert!(
+            machine
+                .get_current_snapshot()
+                .await
+                .expect("read")
+                .is_none(),
+            "a store that has never snapshotted has no current snapshot, and \
+             that is not an error"
+        );
+
+        machine
+            .apply([
+                blank(1),
+                membership_entry(2, &[[1u8; 32], [2u8; 32], [3u8; 32]]),
+            ])
+            .await
+            .expect("apply");
+
+        let built = {
+            let mut builder = machine.get_snapshot_builder().await;
+            let snapshot = builder.build_snapshot().await.expect("build");
+            snapshot.meta.clone()
+        };
+
+        assert_eq!(
+            built.last_log_id.map(|id| id.index),
+            Some(2),
+            "the snapshot is taken at the applied index, not at the last command"
+        );
+        assert!(
+            body_path(&dir, &built.snapshot_id).exists(),
+            "the body is published under its digest"
+        );
+        assert!(dir.join("snapshots").join("CURRENT").exists());
+
+        drop(shutdown);
+        let (mut machine, shutdown) = reopen(&dir);
+        let after = machine
+            .get_current_snapshot()
+            .await
+            .expect("read")
+            .expect("the marker survives the restart");
+        assert_eq!(after.meta, built);
+        assert_eq!(after.snapshot.path(), body_path(&dir, &built.snapshot_id));
+        assert!(
+            !after.snapshot.deletes_on_drop(),
+            "what a reader is handed is a Published lease; dropping it must not \
+             take this voter's own snapshot with it"
+        );
+        drop(after);
+        drop(shutdown);
+    }
+
+    /// The advertised id is BLAKE3 of the published file, computed here rather
+    /// than asked of the code that produced it.
+    ///
+    /// Without an independent oracle the digest only has to be *consistent*: a
+    /// writer that hashed the header alone and a reader that did the same would
+    /// agree with each other, publish stable ids, survive restarts, and give
+    /// two voters at the same state the same id — every other assertion here
+    /// would still pass while the id said nothing about the rows.
+    #[tokio::test]
+    async fn the_snapshot_id_is_blake3_of_the_published_file() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+        machine
+            .apply([
+                blank(1),
+                membership_entry(2, &[[1u8; 32], [2u8; 32], [3u8; 32]]),
+            ])
+            .await
+            .expect("apply");
+
+        let mut builder = machine.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.expect("build");
+        let bytes = std::fs::read(snapshot.snapshot.path()).expect("read the published body");
+
+        let expected = format!(
+            "{}{}",
+            super::snapshot::SNAPSHOT_ID_PREFIX,
+            blake3::hash(&bytes).to_hex()
+        );
+        assert_eq!(snapshot.meta.snapshot_id, expected);
+        assert!(
+            bytes.len() > 64,
+            "a body with rows in it, so hashing only the header would differ"
+        );
+        drop(snapshot);
+        drop(shutdown);
+    }
+
+    /// Two stores in different directories with the same replicated state emit
+    /// byte-identical bodies and the same content id.
+    ///
+    /// This is what makes equal-index idempotence sound: if a body could carry
+    /// anything node-local, two healthy voters at the same `last_applied` would
+    /// disagree on the digest and §11.4's equal-index rule would call it
+    /// corruption. `the_local_node_id_is_absent_from_replicated_state` is the
+    /// other half — it keeps the one node-local field out of `state.redb`,
+    /// which is the only thing this body is a function of.
+    #[tokio::test]
+    async fn two_stores_at_the_same_applied_state_emit_the_same_bytes() {
+        let mut ids = Vec::new();
+        let mut bodies = Vec::new();
+        let mut dirs = Vec::new();
+        for _ in 0..2 {
+            let dir = scratch_dir();
+            let (mut machine, shutdown) = machine(&dir);
+            machine
+                .apply([
+                    blank(1),
+                    membership_entry(2, &[[1u8; 32], [2u8; 32], [3u8; 32]]),
+                ])
+                .await
+                .expect("apply");
+            let mut builder = machine.get_snapshot_builder().await;
+            let snapshot = builder.build_snapshot().await.expect("build");
+            ids.push(snapshot.meta.snapshot_id.clone());
+            bodies.push(std::fs::read(snapshot.snapshot.path()).expect("read the body"));
+            drop(snapshot);
+            drop(shutdown);
+            dirs.push(dir);
+        }
+
+        assert_ne!(dirs[0], dirs[1], "the two stores are genuinely separate");
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(bodies[0], bodies[1]);
+        assert!(!bodies[0].is_empty());
+    }
+
+    /// A builder that finishes behind the current snapshot cannot move the
+    /// marker back.
+    ///
+    /// The stale builder is real rather than injected: the read transaction is
+    /// taken before the second entry applies, so streaming it afterwards
+    /// produces exactly the body §11.4 describes — one that was correct when it
+    /// started and is behind by the time it finishes.
+    #[tokio::test]
+    async fn an_out_of_order_builder_cannot_regress_the_marker() {
+        let dir = scratch_dir();
+        let layout = StorageLayout::new(&dir);
+        let (mut machine, shutdown) = machine(&dir);
+
+        machine.apply([blank(1)]).await.expect("apply");
+        let stale = machine
+            .handle()
+            .read_transaction()
+            .await
+            .expect("a read transaction at index 1");
+        machine.apply([blank(2)]).await.expect("apply");
+
+        let newer = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build").meta.clone()
+        };
+        assert_eq!(newer.last_log_id.as_ref().map(|id| id.index), Some(2));
+
+        let older = super::snapshot::build(&layout, &stale).expect("stream the stale transaction");
+        assert_eq!(
+            older.meta.last_log_id.as_ref().map(|id| id.index),
+            Some(1),
+            "the stale transaction still sees the version it pinned"
+        );
+        let discarded = older.path.clone();
+
+        let serving = machine.publish(older).expect("publication decides");
+        assert_eq!(
+            serving.meta.snapshot_id, newer.snapshot_id,
+            "the current snapshot is unchanged"
+        );
+        assert!(
+            !discarded.exists(),
+            "a discarded body is removed rather than left to accumulate"
+        );
+        assert_eq!(
+            super::snapshot::load_current(&layout)
+                .expect("load")
+                .expect("still published")
+                .meta,
+            crate::coordination::raft::SnapshotMetaV1::from(&newer),
+            "and the durable marker still names the newer snapshot"
+        );
+        drop(shutdown);
+    }
+
+    /// A complete, valid body that is not the body its name claims.
+    ///
+    /// The one corruption the metadata checks cannot catch on their own: two
+    /// stores at the same log id with different state produce metadata that
+    /// agrees field for field and bodies that differ. Only the digest separates
+    /// them, which is why the digest is what the file is named after — and why
+    /// this test builds the second body from a genuinely different group rather
+    /// than by flipping bytes, which any of the other checks would also catch.
+    #[tokio::test]
+    async fn a_body_that_is_not_the_body_its_name_claims_refuses_the_open() {
+        let mine = scratch_dir();
+        let theirs = scratch_dir();
+
+        let published = {
+            let (mut machine, shutdown) = machine(&mine);
+            machine.apply([blank(1)]).await.expect("apply");
+            let mut builder = machine.get_snapshot_builder().await;
+            let meta = builder.build_snapshot().await.expect("build").meta.clone();
+            drop(shutdown);
+            meta
+        };
+
+        let (other_meta, other_bytes) = {
+            let (mut machine, shutdown) = machine(&theirs);
+            // The same log id, different state: an acquire at index 1 rather
+            // than a blank.
+            machine.apply([normal(1, acquire(1))]).await.expect("apply");
+            let mut builder = machine.get_snapshot_builder().await;
+            let snapshot = builder.build_snapshot().await.expect("build");
+            let bytes = std::fs::read(snapshot.snapshot.path()).expect("read");
+            let meta = snapshot.meta.clone();
+            drop(snapshot);
+            drop(shutdown);
+            (meta, bytes)
+        };
+
+        assert_eq!(
+            other_meta.last_log_id, published.last_log_id,
+            "the two bodies describe the same log entry"
+        );
+        assert_eq!(other_meta.last_membership, published.last_membership);
+        assert_ne!(
+            other_meta.snapshot_id, published.snapshot_id,
+            "and differ only in content, which is the case under test"
+        );
+
+        std::fs::write(body_path(&mine, &published.snapshot_id), other_bytes)
+            .expect("substitute the body");
+
+        let database = Database::create(mine.join("state.redb")).expect("reopen");
+        let err = CoordinationStateMachine::new(database, StorageLayout::new(&mine))
+            .expect_err("a body that does not hash to its name is refused");
+        assert!(err.puts_durability_in_question(), "{err:?}");
+    }
+
+    /// Rebuilding the identical snapshot republishes the marker and nothing
+    /// else — the repair path after a lost acknowledgement.
+    #[tokio::test]
+    async fn rebuilding_the_same_snapshot_repairs_the_marker_idempotently() {
+        let dir = scratch_dir();
+        let layout = StorageLayout::new(&dir);
+        let (mut machine, shutdown) = machine(&dir);
+        machine.apply([blank(1)]).await.expect("apply");
+
+        let first = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build").meta.clone()
+        };
+        // The marker is lost, which is what a crash between the state
+        // replacement and the marker publication leaves behind.
+        std::fs::remove_file(layout.current_snapshot_marker()).expect("drop the marker");
+
+        let second = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder
+                .build_snapshot()
+                .await
+                .expect("rebuild")
+                .meta
+                .clone()
+        };
+        assert_eq!(second, first, "the same state produces the same snapshot");
+        assert_eq!(
+            super::snapshot::load_current(&layout)
+                .expect("load")
+                .expect("republished")
+                .meta,
+            crate::coordination::raft::SnapshotMetaV1::from(&first),
+            "the marker is repaired without the body being rewritten"
+        );
+        drop(shutdown);
+    }
+
+    /// A marker naming a body that is not there is data loss, not "no
+    /// snapshot".
+    #[tokio::test]
+    async fn a_marker_whose_body_is_missing_refuses_the_open() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+        machine.apply([blank(1)]).await.expect("apply");
+        let built = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build").meta.clone()
+        };
+        drop(shutdown);
+
+        std::fs::remove_file(body_path(&dir, &built.snapshot_id)).expect("remove the body");
+
+        let database = Database::create(dir.join("state.redb")).expect("reopen");
+        let err = CoordinationStateMachine::new(database, StorageLayout::new(&dir))
+            .expect_err("a marker without its body is refused");
+        assert!(err.puts_durability_in_question(), "{err:?}");
+    }
+
+    /// A body that is truncated no longer hashes to the name it is under.
+    #[tokio::test]
+    async fn a_truncated_body_refuses_the_open() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown) = machine(&dir);
+        machine.apply([blank(1)]).await.expect("apply");
+        let built = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build").meta.clone()
+        };
+        drop(shutdown);
+
+        let path = body_path(&dir, &built.snapshot_id);
+        let bytes = std::fs::read(&path).expect("read");
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).expect("truncate");
+
+        let database = Database::create(dir.join("state.redb")).expect("reopen");
+        let err = CoordinationStateMachine::new(database, StorageLayout::new(&dir))
+            .expect_err("a truncated body is refused");
+        assert!(err.puts_durability_in_question(), "{err:?}");
+    }
+
+    /// A marker whose metadata disagrees with its body is data loss, even
+    /// though both the marker and the body are individually well formed.
+    ///
+    /// This is the check that stops the marker being believed on its own. It is
+    /// the same rule install applies to the `SnapshotMeta` OpenRaft supplies,
+    /// so getting it wrong here would mean getting it wrong there.
+    #[tokio::test]
+    async fn a_marker_that_disagrees_with_its_body_refuses_the_open() {
+        let dir = scratch_dir();
+        let layout = StorageLayout::new(&dir);
+        let (mut machine, shutdown) = machine(&dir);
+        machine.apply([blank(1)]).await.expect("apply");
+        let built = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build").meta.clone()
+        };
+        drop(shutdown);
+
+        // The same body, under the same id, described as a different entry.
+        let mut lying = crate::coordination::raft::SnapshotMetaV1::from(&built);
+        lying.last_log_id = lying
+            .last_log_id
+            .map(|id| crate::coordination::contract::LogIdV1 {
+                index: id.index + 1,
+                ..id
+            });
+        let bytes = super::super::codec::encode_committed(
+            Db::State,
+            "SnapshotMetaV1",
+            &lying,
+            super::super::schema::MAX_COORDINATION_META_BYTES,
+        )
+        .expect("encode");
+        std::fs::write(layout.current_snapshot_marker(), bytes).expect("rewrite the marker");
+
+        let database = Database::create(dir.join("state.redb")).expect("reopen");
+        let err = CoordinationStateMachine::new(database, StorageLayout::new(&dir))
+            .expect_err("a marker that does not describe its body is refused");
         assert!(err.puts_durability_in_question(), "{err:?}");
     }
 }

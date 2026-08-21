@@ -121,7 +121,8 @@ impl VoterStorage {
         let (log, log_shutdown) = CoordinationLogStore::new(parts.raft)?;
         // The state machine's own load validates every §11.3 row and the whole
         // state before its actor exists, for the same reason.
-        let (state, state_shutdown) = CoordinationStateMachine::new(parts.state)?;
+        let (state, state_shutdown) =
+            CoordinationStateMachine::new(parts.state, parts.layout.clone())?;
         Ok(Self {
             layout: parts.layout,
             identity: parts.identity,
