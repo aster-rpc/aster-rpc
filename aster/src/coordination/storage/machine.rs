@@ -762,6 +762,10 @@ impl CoordinationStateMachine {
 
         let reads = ReadGate::new();
         let catalog = SnapshotCatalog::new();
+        // After `CURRENT` has been validated and before anything can publish or
+        // read: the marker is what says which body to keep, and the catalog is
+        // empty, so a retirement here unlinks at once.
+        snapshot::sweep_orphans(&layout, &catalog, current.as_ref())?;
         let current = Arc::new(Mutex::new(current));
         // The actor gets its own handles on the layout, the catalog and the
         // current marker because install runs *inside* it: only the actor can
@@ -3506,6 +3510,185 @@ mod tests {
             .await
             .expect("join")
             .expect("and the install completes once the lease is released");
+    }
+
+    /// The same snapshot arriving twice repairs the marker and nothing else.
+    ///
+    /// The lost-acknowledgement case §11.4 exists for: the install landed, the
+    /// leader never heard so, and it sends the same snapshot again. The state
+    /// is already correct, so replacing would rewrite a database with itself --
+    /// through a quiesce, a rename and a reopen -- and every one of those is a
+    /// chance to fail where nothing needed to happen.
+    ///
+    /// Driven by installing twice from the same sender. The second install is
+    /// the one under test, and what it must *not* do is as much the point as
+    /// what it must: the state database is compared byte for byte across it,
+    /// because a rewrite would produce a different file holding the same state
+    /// and every other assertion here would still pass.
+    #[tokio::test]
+    async fn the_same_snapshot_arriving_again_repairs_the_marker_only() {
+        let source_dir = scratch_dir();
+        let (source, first) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let (mut machine, _shutdown, _drain) = machine(&dir);
+        machine
+            .install_snapshot(&first.meta, first.snapshot)
+            .await
+            .expect("the first install");
+
+        let installed = durable_of(&machine).await;
+        let state_db = std::fs::read(dir.join("state.redb")).expect("the installed database");
+        let body = std::fs::read(body_path(&dir, &first.meta.snapshot_id)).expect("the body");
+
+        // The leader resends: a fresh lease on the same published snapshot.
+        let again = {
+            let (mut sender, _s, _d) = source;
+            sender
+                .get_current_snapshot()
+                .await
+                .expect("read")
+                .expect("the sender still has it")
+        };
+        assert_eq!(again.meta, first.meta, "the same snapshot, not a new one");
+
+        machine
+            .install_snapshot(&again.meta, again.snapshot)
+            .await
+            .expect("the second install");
+
+        assert_eq!(
+            durable_of(&machine).await,
+            installed,
+            "the state is unchanged"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("state.redb")).expect("the database"),
+            state_db,
+            "and the database file itself was never rewritten"
+        );
+        assert_eq!(
+            std::fs::read(body_path(&dir, &first.meta.snapshot_id)).expect("the body"),
+            body,
+            "nor was the published body"
+        );
+        assert!(
+            leftovers(&dir).is_empty(),
+            "and the repair left no candidate behind"
+        );
+
+        let serving = machine
+            .get_current_snapshot()
+            .await
+            .expect("read")
+            .expect("still published");
+        assert_eq!(serving.meta, first.meta);
+    }
+
+    /// Startup removes what previous runs abandoned, and nothing else.
+    ///
+    /// Every other cleanup path here is best-effort *because* this one exists:
+    /// a failed promotion removes its own scratch, a superseded body is retired
+    /// by its successor, a candidate is removed by its own `Drop` -- and none
+    /// of that runs if the process dies first. Each file is bounded; how many
+    /// of them accumulate across repeated crashes is not.
+    ///
+    /// Drives all four cases at once, because the interesting property is which
+    /// files survive *together*: keeping the current body while removing its
+    /// predecessors is one rule, not two.
+    #[tokio::test]
+    async fn startup_sweeps_what_earlier_runs_left_behind() {
+        let dir = scratch_dir();
+        let published = {
+            let (mut machine, shutdown, drain) = machine(&dir);
+            machine.apply([normal(1, acquire(1))]).await.expect("apply");
+            let built = {
+                let mut builder = machine.get_snapshot_builder().await;
+                builder.build_snapshot().await.expect("build")
+            };
+            drop(machine);
+            drop(drain);
+            drop(shutdown);
+            built.meta.snapshot_id.clone()
+        };
+
+        let snapshots = dir.join("snapshots");
+        let incoming = dir.join("incoming");
+        let current = body_path(&dir, &published);
+
+        // A predecessor the marker no longer names: a real digest name, over
+        // content that does not matter -- the sweep goes by the name, since a
+        // body it is about to remove is not worth hashing.
+        let stale = snapshots.join(format!("{}.snapshot", "ab".repeat(32)));
+        std::fs::write(&stale, b"a superseded body").expect("stale body");
+
+        // Scratch files from interrupted work, in both directories.
+        let building = snapshots.join(".building-1-0.partial");
+        let installing = incoming.join(".installing-1-0.partial");
+        std::fs::write(&building, b"half a body").expect("scratch");
+        std::fs::write(&installing, b"half a staged body").expect("scratch");
+
+        // Things that are not this store's to delete. The middle one is the
+        // case that matters: it carries the published suffix, so it reaches the
+        // digest check rather than being filtered out before it -- which is
+        // where a sweep that trusted the suffix alone would delete an
+        // operator's file.
+        let operator = snapshots.join("backup-before-upgrade.snapshot.bak");
+        let named_like_a_body = snapshots.join("operator-copy.snapshot");
+        let odd = incoming.join("notes.txt");
+        std::fs::write(&operator, b"an operator's copy").expect("operator file");
+        std::fs::write(&named_like_a_body, b"not a digest name").expect("lookalike");
+        std::fs::write(&odd, b"someone's notes").expect("odd file");
+
+        let (machine, _shutdown, _drain) = reopen(&dir);
+
+        assert!(current.exists(), "the body the marker names survives");
+        assert!(!stale.exists(), "a body it does not name does not");
+        assert!(!building.exists(), "nor an abandoned build scratch");
+        assert!(!installing.exists(), "nor an abandoned staging scratch");
+        assert!(operator.exists(), "an unrecognised name is left alone");
+        assert!(
+            named_like_a_body.exists(),
+            "including one that carries the published suffix without a digest name"
+        );
+        assert!(odd.exists(), "in either directory");
+
+        // And the store still serves the snapshot it kept.
+        let mut machine = machine;
+        let serving = machine
+            .get_current_snapshot()
+            .await
+            .expect("read")
+            .expect("still published");
+        assert_eq!(serving.meta.snapshot_id, published);
+    }
+
+    /// With no marker, every digest-named body is an orphan.
+    ///
+    /// The case that decides whether the sweep is keyed on the marker or on
+    /// something it inferred: a store that has never published has nothing to
+    /// keep, and a sweep that guessed would have to guess here.
+    #[tokio::test]
+    async fn startup_without_a_marker_sweeps_every_body() {
+        let dir = scratch_dir();
+        {
+            let (machine, shutdown, drain) = machine(&dir);
+            drop(machine);
+            drop(drain);
+            drop(shutdown);
+        }
+        assert!(
+            !dir.join("snapshots").join("CURRENT").exists(),
+            "this store has never published"
+        );
+
+        let orphan = dir
+            .join("snapshots")
+            .join(format!("{}.snapshot", "cd".repeat(32)));
+        std::fs::write(&orphan, b"a body from a run that never published").expect("orphan");
+
+        let (_machine, _shutdown, _drain) = reopen(&dir);
+        assert!(!orphan.exists(), "with no marker, no body is current");
     }
 
     /// A valid database that is not the installed one is refused.

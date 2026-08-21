@@ -812,6 +812,91 @@ impl RepairInstall {
     }
 }
 
+/// What a startup sweep removed, so a test can tell it apart from a no-op.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Swept {
+    /// Published bodies the marker no longer names.
+    pub(crate) retired: usize,
+    /// Abandoned scratch files, under either directory.
+    pub(crate) partials: usize,
+}
+
+/// Clean up after previous runs, once `CURRENT` has been validated.
+///
+/// The startup half of §11.4's cleanup, and the reason every other path here
+/// can be best-effort. A failed promotion removes its own scratch, a superseded
+/// body is retired by its successor, and a candidate is removed by its own
+/// `Drop` — but none of that runs if the process dies first. Each file is
+/// individually bounded; *how many* of them accumulate across repeated crashes
+/// is not, and nothing else ever looks.
+///
+/// ## What it will and will not touch
+///
+/// Only names this store issues. A digest-named body is retired through the
+/// catalog rather than unlinked, so the rule that a leased file outlives its
+/// retirement holds here too — at startup there are no leases, so they go
+/// immediately, but the sweep does not need to know that. A scratch file is
+/// recognised by the shape [`scratch_name`] gives it and removed outright.
+///
+/// Anything else is left alone, deliberately. An operator's copy of a body, a
+/// backup, an editor's temporary: none of those are this store's to delete, and
+/// a sweep that removes what it does not recognise is a worse failure than the
+/// accumulation it prevents.
+///
+/// Runs under the directory lock, after `CURRENT` has been validated — before
+/// it, the marker cannot say which body to keep, and a sweep that guessed would
+/// delete the one file that mattered.
+pub(crate) fn sweep_orphans(
+    layout: &StorageLayout,
+    catalog: &SnapshotCatalog,
+    current: Option<&SnapshotFile>,
+) -> StorageResult<Swept> {
+    let mut swept = Swept::default();
+    let snapshots = layout.snapshots();
+    let incoming = layout.incoming();
+
+    for dir in [&snapshots, &incoming] {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            // A store that has never built or received a snapshot has neither
+            // directory, which is not something to sweep.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(StorageError::io("sweeping a storage directory", dir, err)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(io("sweeping a storage directory", dir))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+
+            if name.starts_with('.') && name.ends_with(".partial") {
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => swept.partials += 1,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(StorageError::io("removing an abandoned scratch", dir, err))
+                    }
+                }
+                continue;
+            }
+
+            // Digest-named bodies, and only in `snapshots/`: a file under
+            // `incoming/` with a digest name was never published, and is not
+            // the catalog's to retire.
+            if dir == &snapshots {
+                if let Some(stem) = name.strip_suffix(SNAPSHOT_FILE_SUFFIX) {
+                    let id = format!("{SNAPSHOT_ID_PREFIX}{stem}");
+                    let recognised = file_stem_for(&id) == Some(stem);
+                    let keep = current.is_some_and(|file| file.meta().snapshot_id == id);
+                    if recognised && !keep {
+                        catalog.retire(&id, entry.path());
+                        swept.retired += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(swept)
+}
+
 /// Apply §11.4's publication rule to a body this store built, and publish it.
 ///
 /// The local-build counterpart of [`publish_installed`], and the reason
@@ -2038,7 +2123,7 @@ impl Drop for IncomingSnapshot {
     /// Removes the temporary. Best-effort for the same reason as
     /// [`CatalogInner::collect`]: a failed unlink must not poison an unwind.
     /// An orphan left under `incoming/` is inert — nothing reads that directory
-    /// by name — and is owed to the startup sweep that does not exist yet.
+    /// by name — and is collected by the startup sweep on the next open.
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -2772,7 +2857,7 @@ mod tests {
     /// removal this store cannot complete on the first attempt — a foreign
     /// Windows handle opened without `FILE_SHARE_DELETE`, a transient error —
     /// where forgetting the entry would leave a superseded body on disk until a
-    /// startup sweep that does not exist yet.
+    /// startup sweep, which is where a removal no retry reaches is collected.
     #[test]
     #[cfg(unix)]
     fn a_removal_that_fails_is_retried_rather_than_forgotten() {
