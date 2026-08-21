@@ -39,8 +39,9 @@
 //! Hence: Incoming owns a receiver-local temporary and deletes it on drop;
 //! Published names an immutable file and never unlinks on drop. A predecessor
 //! is retired logically, and the catalog unlinks it only after its last lease
-//! is released, which is also what makes replacement work on Windows where an
-//! open file cannot be removed.
+//! is released — which keeps the *name* resolvable for as long as any reader in
+//! this store might still open it, on a platform where a deleted-but-open file
+//! refuses new opens under that name.
 //!
 //! ## No blanket `Clone`
 //!
@@ -1337,8 +1338,13 @@ mod tests {
     }
 
     /// A retired snapshot with a live reader is pinned until that reader
-    /// finishes. Required on Windows, where an open file cannot be removed,
-    /// and correct everywhere else.
+    /// finishes.
+    ///
+    /// The lease is what defers the *removal*; the reader's own descriptor is
+    /// what would survive one. Deferring matters because a name that has been
+    /// deleted stops being openable — immediately on Unix, and on Windows once
+    /// the last handle closes — and a reader within this store may still be
+    /// about to open it.
     #[test]
     fn a_retired_snapshot_is_pinned_until_its_last_lease_ends() {
         let dir = temp_dir();
@@ -1552,9 +1558,10 @@ mod tests {
         // A second store instance, which knows nothing about the handle above.
         let reopened = SnapshotCatalog::new();
         reopened.retire(&snapshot_id_for(&[7u8; 32]), &path);
-        // The name is gone on Unix; on Windows the open descriptor refuses the
-        // unlink and the catalog keeps the retirement for a later attempt.
-        // Either way the read below must not depend on which happened.
+        // The removal succeeds on both platforms — the open descriptor shares
+        // delete — but only Unix makes the entry disappear at once; a Windows
+        // deletion is pending until this handle closes and the name lingers.
+        // The read below must not depend on which happened.
         #[cfg(unix)]
         assert!(!path.exists(), "the directory entry is gone");
 
