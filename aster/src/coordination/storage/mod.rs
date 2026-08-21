@@ -441,7 +441,29 @@ mod durability_guard {
     /// fixtures the production writer cannot produce, so counting them would
     /// make the guards above unsatisfiable.
     fn production_lines(source: &str) -> impl Iterator<Item = (usize, &str)> {
-        let end = source.find("\n#[cfg(test)]\n").unwrap_or(source.len());
-        source[..end].lines().enumerate()
+        source[..production_end(source)].lines().enumerate()
+    }
+
+    /// Where a file's production code ends: at its **last** `#[cfg(test)]`
+    /// module.
+    ///
+    /// Not the first one. A file may carry a test-only module long before its
+    /// test module -- `snapshot.rs` declares its fault-injection seam at line
+    /// 365 of nearly two thousand -- and cutting there narrowed every guard
+    /// below to the first fifth of that file. A guard that scans less than it
+    /// claims to reports clean for the same reason one that scans nothing does.
+    ///
+    /// Not the *name* `tests` either: this module is `durability_guard`, so
+    /// keying on the name would leave `mod.rs` scanning its own guards, whose
+    /// bodies contain every literal they search for.
+    ///
+    /// The cost of taking the last is that an earlier `#[cfg(test)]` module is
+    /// scanned as production. That is the safe direction -- more is checked,
+    /// not less -- and the seam it admits contains nothing any guard forbids.
+    pub(super) fn production_end(source: &str) -> usize {
+        source
+            .rfind("\n#[cfg(test)]\nmod ")
+            .map(|at| at + 1)
+            .unwrap_or(source.len())
     }
 }

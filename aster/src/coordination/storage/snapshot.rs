@@ -621,7 +621,7 @@ pub(crate) enum ResolvedInstall {
     ///
     /// Boxed because a prepared install carries the whole validated state, and
     /// the other three outcomes would otherwise each pay for it.
-    Replace(Box<PreparedInstall>),
+    Replace(Box<ReplaceInstall>),
     /// The same state arriving again, so the business state is already correct
     /// and only the marker may need publishing. This is the
     /// lost-acknowledgement repair; replacing here would rewrite a database
@@ -629,7 +629,7 @@ pub(crate) enum ResolvedInstall {
     ///
     /// Boxed for the same reason as `Replace`: a staged body carries its whole
     /// header, and the two refusals below carry only a message.
-    Repair(Box<StagedSnapshot>),
+    Repair(Box<RepairInstall>),
     /// Behind the durable state. Installing it would roll the state machine
     /// back, which no snapshot may do -- an ordinary refusal, and not fatal:
     /// a leader offered a snapshot this voter is already past.
@@ -638,6 +638,72 @@ pub(crate) enum ResolvedInstall {
     /// differently. This voter's history and the group's disagree, which §5.3.1
     /// makes fatal.
     Fatal(String),
+}
+
+/// The right to replace `state.redb`, granted only by a `Replace` verdict.
+///
+/// A newtype with a private field, which is the whole mechanism: nothing
+/// outside this module can construct one, and [`PreparedInstall::resolve`] only
+/// does when the candidate is genuinely ahead of the durable state. Leaving
+/// `replace` on the prepared install left the verdict optional -- a caller
+/// holding what `rebuild_candidate` returned could replace without ever asking
+/// whether it should.
+#[derive(Debug)]
+pub(crate) struct ReplaceInstall(PreparedInstall);
+
+impl ReplaceInstall {
+    /// The state the rebuilt database was proved to hold, before it lands.
+    pub(crate) fn rebuilt(&self) -> &super::rows::DurableState {
+        self.0.rebuilt()
+    }
+
+    /// Rename the candidate over `state.redb`.
+    ///
+    /// Returns the state now on disk, and the body still owed a publication --
+    /// as a capability rather than as bytes, so publishing stays reachable only
+    /// from an install that earned it.
+    pub(crate) fn replace(self) -> StorageResult<(super::rows::DurableState, PublishInstall)> {
+        let (state, staged) = self.0.replace()?;
+        Ok((state, PublishInstall(staged)))
+    }
+}
+
+/// The right to publish a marker over state that is already correct, granted
+/// only by a `Repair` verdict.
+///
+/// Distinct from [`ReplaceInstall`] because the two differ in what they may
+/// touch: this one must never reach `state.redb`, and there is no method here
+/// that could.
+#[derive(Debug)]
+pub(crate) struct RepairInstall(StagedSnapshot);
+
+impl RepairInstall {
+    /// The body whose marker is owed. The business state is already correct.
+    pub(crate) fn publishable(self) -> PublishInstall {
+        PublishInstall(self.0)
+    }
+}
+
+/// The right to publish a body and its `CURRENT` marker.
+///
+/// Where both acting outcomes converge: a replacement and a repair differ in
+/// whether `state.redb` moves, and agree that `CURRENT` must end up naming this
+/// body with the metadata OpenRaft supplied. Publication will be written on
+/// this type alone, so a bare [`StagedSnapshot`] -- which `receive` hands out
+/// before anything has been decided -- can never acquire it.
+#[derive(Debug)]
+pub(crate) struct PublishInstall(StagedSnapshot);
+
+impl PublishInstall {
+    /// The metadata to publish: the caller's, carried through unchanged.
+    pub(crate) fn meta(&self) -> &SnapshotMetaV1 {
+        self.0.meta()
+    }
+
+    /// The verified bytes, to promote byte-verbatim under their digest name.
+    pub(crate) fn body(&self) -> &Path {
+        self.0.path()
+    }
 }
 
 /// Copy an install source into receiver-owned staging and verify it.
@@ -886,7 +952,7 @@ impl PreparedInstall {
             )));
         }
         if candidate_index > durable_index {
-            return Ok(ResolvedInstall::Replace(Box::new(self)));
+            return Ok(ResolvedInstall::Replace(Box::new(ReplaceInstall(self))));
         }
 
         // Equal index. Identity first, because the digest comparison below is
@@ -909,7 +975,9 @@ impl PreparedInstall {
         if ours == theirs {
             // The candidate goes; the body stays, because `CURRENT` may still
             // owe a publication.
-            return Ok(ResolvedInstall::Repair(Box::new(self.into_staged())));
+            return Ok(ResolvedInstall::Repair(Box::new(RepairInstall(
+                self.into_staged(),
+            ))));
         }
         Ok(ResolvedInstall::Fatal(format!(
             "the candidate is {} at the same log id this store's own state hashes to {}; one of \
@@ -921,7 +989,15 @@ impl PreparedInstall {
 
     /// Rename the candidate over `state.redb`, and hand back the state it holds
     /// together with the body still owed a publication.
-    pub(crate) fn replace(self) -> StorageResult<(super::rows::DurableState, StagedSnapshot)> {
+    ///
+    /// Private. Reaching this from a prepared install would skip [`resolve`]
+    /// entirely -- replacing without ever asking whether replacing is what the
+    /// candidate's applied index calls for, which is how a stale snapshot rolls
+    /// the state machine back. [`ReplaceInstall`] is the only caller, and the
+    /// only way to hold one is to have matched `Replace`.
+    ///
+    /// [`resolve`]: PreparedInstall::resolve
+    fn replace(self) -> StorageResult<(super::rows::DurableState, StagedSnapshot)> {
         let PreparedInstall { staged, candidate } = self;
         let state = candidate.replace()?;
         Ok((state, staged))
@@ -1897,6 +1973,75 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Acting on an install is reachable only through the verdict that grants
+    /// it.
+    ///
+    /// The rule no runtime test can express, because what it forbids does not
+    /// compile: `rebuild_candidate` hands back a `PreparedInstall`, and while
+    /// `replace` was `pub(crate)` on that type a caller could install without
+    /// ever asking whether installing was the right answer — skipping the
+    /// applied-index comparison that stops a stale snapshot rolling the state
+    /// machine back.
+    ///
+    /// So the capabilities are newtypes with private fields, constructed only
+    /// inside `resolve`, and this guards the three facts that make that hold:
+    /// the acting methods hang off the capabilities, `PreparedInstall::replace`
+    /// is private, and nothing offers a constructor.
+    #[test]
+    fn acting_on_an_install_is_reachable_only_through_its_verdict() {
+        let source = include_str!("snapshot.rs");
+        let end = super::super::durability_guard::production_end(source);
+        let flat: String = source[..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // The prepared install may not replace: only the capability may.
+        assert!(
+            flat.contains(
+                "fn replace(self) -> StorageResult<(super::rows::DurableState, StagedSnapshot)>"
+            ),
+            "`PreparedInstall::replace` must stay private"
+        );
+        assert!(
+            !flat.contains("pub(crate) fn replace(self) -> StorageResult<(super::rows::DurableState, StagedSnapshot)>"),
+            "`PreparedInstall::replace` became reachable, which makes the verdict optional"
+        );
+        assert!(
+            flat.contains(
+                "pub(crate) fn replace(self) -> StorageResult<(super::rows::DurableState, PublishInstall)>"
+            ),
+            "`ReplaceInstall::replace` is the granted one"
+        );
+
+        // No capability may be granted from outside this module: each is a
+        // newtype whose field is private, so `Capability(value)` only compiles
+        // here.
+        for capability in ["ReplaceInstall", "RepairInstall", "PublishInstall"] {
+            assert!(
+                flat.contains(&format!("pub(crate) struct {capability}(")),
+                "{capability} must be a newtype"
+            );
+            assert!(
+                !flat.contains(&format!("pub(crate) struct {capability}(pub")),
+                "{capability}'s field must stay private, or anyone can grant themselves it"
+            );
+        }
+
+        // And the two the verdict grants are built in exactly one place each:
+        // their declaration, and `resolve`. `PublishInstall` is deliberately
+        // not counted -- both acting outcomes converge on it, so it has two
+        // legitimate constructions.
+        for capability in ["ReplaceInstall(", "RepairInstall("] {
+            assert_eq!(
+                flat.matches(capability).count(),
+                2,
+                "{capability} should appear twice: its declaration and its one \
+                 construction inside `resolve`"
+            );
+        }
+    }
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

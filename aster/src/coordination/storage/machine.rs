@@ -3667,8 +3667,10 @@ mod tests {
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage the source");
-        let verified =
-            super::super::snapshot::rebuild_candidate(&layout, staged).expect("a valid candidate");
+        let verified = granted(
+            super::super::snapshot::rebuild_candidate(&layout, staged).expect("a valid candidate"),
+            &durable_of(&machine).await,
+        );
 
         // The store's own handles go first: that is what the install's quiesce
         // is for, and a rename over an open database is not what is being
@@ -3855,8 +3857,11 @@ mod tests {
             &crate::coordination::raft::SnapshotMetaV1::from(&good.meta),
         )
         .expect("the good body stages");
-        let verified = super::super::snapshot::rebuild_candidate(&layout, staged_good)
-            .expect("the retry is not blocked by the first attempt's leftovers");
+        let verified = granted(
+            super::super::snapshot::rebuild_candidate(&layout, staged_good)
+                .expect("the retry is not blocked by the first attempt's leftovers"),
+            &state,
+        );
         assert_seven_sections(verified.rebuilt(), "after the retry");
 
         // And nothing removes it once a replacement has taken it.
@@ -3980,7 +3985,7 @@ mod tests {
                 "the rebuilt database goes: repairing never rewrites the state"
             );
             assert!(
-                body.path().exists(),
+                body.publishable().body().exists(),
                 "and the body stays, because CURRENT may still owe a publication"
             );
         }
@@ -4054,6 +4059,24 @@ mod tests {
         }
     }
 
+    /// Resolve a prepared install and take the replacement it grants.
+    ///
+    /// Every test that replaces goes through the verdict, because that is the
+    /// only route: `replace` hangs off the capability, not off the prepared
+    /// value.
+    fn granted(
+        prepared: super::super::snapshot::PreparedInstall,
+        durable: &DurableState,
+    ) -> super::super::snapshot::ReplaceInstall {
+        match prepared
+            .resolve(durable, || panic!("a higher candidate does not hash"))
+            .expect("resolve")
+        {
+            super::super::snapshot::ResolvedInstall::Replace(granted) => *granted,
+            other => panic!("expected a replacement: {other:?}"),
+        }
+    }
+
     /// Receive and rebuild, which is what every install does before deciding.
     fn prepare(
         dir: &std::path::Path,
@@ -4099,8 +4122,11 @@ mod tests {
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage for A");
-        let verified = super::super::snapshot::rebuild_candidate(&layout_a, staged)
-            .expect("a candidate for A");
+        let verified = granted(
+            super::super::snapshot::rebuild_candidate(&layout_a, staged)
+                .expect("a candidate for A"),
+            &durable_of(&machine_a).await,
+        );
 
         drop(machine_a);
         drop(drain_a);
@@ -4168,8 +4194,10 @@ mod tests {
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage");
-        let verified =
-            super::super::snapshot::rebuild_candidate(&layout, staged).expect("a valid candidate");
+        let verified = granted(
+            super::super::snapshot::rebuild_candidate(&layout, staged).expect("a valid candidate"),
+            &durable_of(&machine).await,
+        );
         let candidate = candidate_in(&dir).expect("the candidate is under incoming/");
 
         // The store's own handles close first: that is what the install's
@@ -4220,8 +4248,10 @@ mod tests {
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage");
-        let verified =
-            super::super::snapshot::rebuild_candidate(&layout, staged).expect("a valid candidate");
+        let verified = granted(
+            super::super::snapshot::rebuild_candidate(&layout, staged).expect("a valid candidate"),
+            &durable_of(&machine).await,
+        );
         let candidate = candidate_in(&dir).expect("the candidate is under incoming/");
         let installed = std::fs::read(&candidate).expect("the candidate's bytes");
 
