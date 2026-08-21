@@ -135,18 +135,23 @@ fn corrupt(detail: impl std::fmt::Display) -> StorageError {
 /// failures leaks a partial body into `snapshots/` that looks like nothing in
 /// particular — it has no digest name, so nothing sweeps it and nothing can say
 /// what it was.
+#[derive(Debug)]
 struct Scratch {
     path: Option<PathBuf>,
 }
 
+/// A name no digest can collide with: digests are 64 hex characters, and this
+/// is neither hex nor 64 characters.
+fn scratch_name(tag: &str) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!(".{tag}-{}-{n}.partial", std::process::id())
+}
+
 impl Scratch {
-    /// A name no digest can collide with: digests are 64 hex characters, and
-    /// this is neither hex nor 64 characters.
     fn new(dir: &Path, tag: &str) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
         Self {
-            path: Some(dir.join(format!(".{tag}-{}-{n}.partial", std::process::id()))),
+            path: Some(dir.join(scratch_name(tag))),
         }
     }
 
@@ -508,6 +513,144 @@ pub(crate) fn build(
     })
 }
 
+// ── Install: receiving ───────────────────────────────────────────────────────
+
+/// Name a receiver-owned temporary for a snapshot that is about to arrive.
+///
+/// The file is deliberately **not** created. This handle says where a body
+/// will be written, not that one has been; creating an empty file would make
+/// "nothing ever arrived" indistinguishable from "an empty body arrived", and
+/// an empty body is not a valid one. `install_snapshot` requires nothing about
+/// who wrote the file either — Slice 3's transport fills this in, and
+/// OpenRaft's own suite discards the value and hands install a `Published`
+/// handle from a different store instead.
+pub(crate) fn begin_receiving(layout: &StorageLayout) -> StorageResult<CoordinationSnapshotFile> {
+    let dir = layout.incoming();
+    std::fs::create_dir_all(&dir).map_err(io("creating the incoming directory", &dir))?;
+    Ok(CoordinationSnapshotFile::incoming(
+        dir.join(scratch_name("receiving")),
+    ))
+}
+
+/// A source body copied into receiver-owned staging and verified against this
+/// store, with nothing installed yet.
+///
+/// Holds a [`Scratch`], so abandoning an install — by error, by `?`, or by
+/// panic — removes the staged file rather than leaving a body under
+/// `incoming/` that nothing can identify. Promotion is a later step's job and
+/// consumes this value.
+#[derive(Debug)]
+pub(crate) struct StagedSnapshot {
+    scratch: Scratch,
+    header: SnapshotHeaderV1,
+    digest: [u8; 32],
+    len: u64,
+}
+
+impl StagedSnapshot {
+    /// The staged bytes, for the steps that read them again.
+    pub(crate) fn path(&self) -> &Path {
+        self.scratch.path()
+    }
+
+    pub(crate) fn header(&self) -> &SnapshotHeaderV1 {
+        &self.header
+    }
+
+    pub(crate) fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// The metadata these bytes imply — derived, never the supplied copy.
+    pub(crate) fn meta(&self) -> SnapshotMetaV1 {
+        meta_for(&self.header, &self.digest)
+    }
+}
+
+/// Copy an install source into receiver-owned staging and verify it.
+///
+/// ## Why it is copied at all
+///
+/// §11.4 requires install to treat its source as immutable: it may be another
+/// store's `Published` handle, moved here by OpenRaft's suite, whose file that
+/// store is still serving. Nothing here renames, mutates, promotes, or deletes
+/// it. The receiver gets its own bytes, and every later step reads those —
+/// which also means a source that changes underneath us cannot change what was
+/// validated.
+///
+/// ## What is verified, and in which order
+///
+/// The copy is bounded first, because a hostile source is a source: it goes
+/// through [`Digesting`], so §11.4's ceiling stops it at 512 MiB rather than
+/// when the disk fills. Only then is the *staged* file read end to end — not
+/// the source — so the header, the digest, and every row's framing describe
+/// the bytes this store now owns rather than the ones it was shown.
+///
+/// Identity comes next ([`check_identity`]), and deliberately not
+/// [`check_binding`]: an installable snapshot is normally *ahead* of
+/// `state.redb`, which is the one thing that function forbids.
+///
+/// The supplied `SnapshotMeta` is checked last and is not trusted out-of-band
+/// metadata: its `snapshot_id` must be the content-derived id, and its log id
+/// and membership must be the ones the header carries. That check applies
+/// equally to an Incoming body written by this node's transport and to a
+/// Published handle from a foreign store, because neither is evidence about
+/// the other.
+pub(crate) fn receive(
+    layout: &StorageLayout,
+    source: &CoordinationSnapshotFile,
+    state: &super::rows::DurableState,
+    supplied: &SnapshotMetaV1,
+) -> StorageResult<StagedSnapshot> {
+    let dir = layout.incoming();
+    std::fs::create_dir_all(&dir).map_err(io("creating the incoming directory", &dir))?;
+    let scratch = Scratch::new(&dir, "installing");
+
+    let copied = {
+        let handle =
+            File::create(scratch.path()).map_err(io("staging a snapshot body", scratch.path()))?;
+        // Through `Digesting`, not a `take`: its own documentation is that every
+        // byte of every body crosses it, so it is the one place the aggregate
+        // ceiling cannot be applied to one path and forgotten on another. This
+        // is that other path.
+        let mut writer = Digesting::new(BufWriter::new(handle));
+        std::io::copy(&mut source.reader()?, &mut writer)
+            .map_err(io("staging a snapshot body", scratch.path()))?;
+        let (buffered, digest, _) = writer.into_parts();
+        let handle = buffered.into_inner().map_err(|err| {
+            StorageError::io(
+                "flushing a staged snapshot body",
+                scratch.path(),
+                err.into(),
+            )
+        })?;
+        handle
+            .sync_all()
+            .map_err(io("fsyncing a staged snapshot body", scratch.path()))?;
+        digest
+    };
+
+    let (header, digest, len) = read_and_verify(scratch.path())?;
+    if digest != copied {
+        return Err(corrupt(
+            "the staged snapshot body changed between being written and being read",
+        ));
+    }
+    check_identity(&header, state)?;
+    check_claimed_meta("the supplied snapshot metadata", supplied, &header, &digest)?;
+
+    Ok(StagedSnapshot {
+        scratch,
+        header,
+        digest,
+        len,
+    })
+}
+
 // ── The durable current marker ───────────────────────────────────────────────
 
 /// What publishing a candidate against the current marker resolves to (§11.4).
@@ -618,11 +761,29 @@ pub(crate) fn check_binding(
     state: &super::rows::DurableState,
     canonical: impl FnOnce() -> StorageResult<[u8; 32]>,
 ) -> StorageResult<()> {
+    check_identity(header, state)?;
+    check_not_ahead(header, digest, state, canonical)
+}
+
+/// The half of the binding that has no direction: which group, which genesis,
+/// which authority, which build.
+///
+/// Split out because install needs exactly this half and cannot have the other.
+/// [`check_binding`] additionally requires the body not to be *ahead* of
+/// `state.redb`, which is right for a marker this store wrote and wrong for a
+/// snapshot arriving from a leader — an installable snapshot is normally ahead,
+/// and that is the entire reason it is being installed. Reusing the whole
+/// function there would have rejected every real install; writing the identity
+/// checks a second time would have produced two lists that drift.
+pub(crate) fn check_identity(
+    header: &SnapshotHeaderV1,
+    state: &super::rows::DurableState,
+) -> StorageResult<()> {
     use crate::coordination::rowstream::SNAPSHOT_FORMAT_VERSION;
 
     let mismatch = |what: &str, found: String, expected: String| {
         corrupt(format!(
-            "the current snapshot's {what} is {found}, and this store's is {expected}"
+            "the snapshot's {what} is {found}, and this store's is {expected}"
         ))
     };
 
@@ -674,7 +835,16 @@ pub(crate) fn check_binding(
             state.model.deployment_profile_code.to_string(),
         ));
     }
+    Ok(())
+}
 
+/// The direction rule for a snapshot this store is supposed to have *written*.
+fn check_not_ahead(
+    header: &SnapshotHeaderV1,
+    digest: &[u8; 32],
+    state: &super::rows::DurableState,
+    canonical: impl FnOnce() -> StorageResult<[u8; 32]>,
+) -> StorageResult<()> {
     // A snapshot ahead of the database it describes cannot have been produced
     // by this store: the body is streamed from a committed read transaction, so
     // its applied index is one this `state.redb` had already reached. Ahead
@@ -799,28 +969,48 @@ pub(crate) fn load_current(
         .join(format!("{stem}{SNAPSHOT_FILE_SUFFIX}"));
 
     let (header, digest, len) = read_and_verify(&path)?;
-    let derived = meta_for(&header, &digest);
-    if derived.snapshot_id != meta.snapshot_id {
-        return Err(corrupt(format!(
-            "the body under {} hashes to {}, not the id the marker names",
-            path.display(),
-            derived.snapshot_id
-        )));
-    }
-    if derived.last_log_id != meta.last_log_id {
-        return Err(corrupt(format!(
-            "the marker names last log id {:?} and the body carries {:?}",
-            meta.last_log_id, derived.last_log_id
-        )));
-    }
-    if derived.last_membership != meta.last_membership {
-        return Err(corrupt(
-            "the marker's membership is not the membership the body carries",
-        ));
-    }
+    check_claimed_meta("the current marker", &meta, &header, &digest)?;
     check_binding(&header, &digest, state, || canonical_digest(database))?;
 
     Ok(Some(SnapshotFile { meta, path, len }))
+}
+
+/// Everything a claim *about* a body must match in the body itself.
+///
+/// The claim comes from outside: `snapshots/CURRENT` for a load, and
+/// OpenRaft's `SnapshotMeta` argument for an install. §11.4 says both are
+/// untrusted in the same way and must be checked against the same three
+/// derived facts, so this is one function rather than two lists — a second
+/// list is how the install side ends up checking two of the three.
+///
+/// `claimed_by` names the source in the message, because "the marker disagrees
+/// with the body" and "the leader's metadata disagrees with the body it sent"
+/// are different operational problems.
+fn check_claimed_meta(
+    claimed_by: &str,
+    claimed: &SnapshotMetaV1,
+    header: &SnapshotHeaderV1,
+    digest: &[u8; 32],
+) -> StorageResult<()> {
+    let derived = meta_for(header, digest);
+    if derived.snapshot_id != claimed.snapshot_id {
+        return Err(corrupt(format!(
+            "{claimed_by} names {}, and the body hashes to {}",
+            claimed.snapshot_id, derived.snapshot_id
+        )));
+    }
+    if derived.last_log_id != claimed.last_log_id {
+        return Err(corrupt(format!(
+            "{claimed_by} names last log id {:?}, and the body carries {:?}",
+            claimed.last_log_id, derived.last_log_id
+        )));
+    }
+    if derived.last_membership != claimed.last_membership {
+        return Err(corrupt(format!(
+            "{claimed_by}'s membership is not the membership the body carries"
+        )));
+    }
+    Ok(())
 }
 
 /// Read a body end to end, digesting it and validating every row.

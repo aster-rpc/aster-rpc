@@ -893,7 +893,9 @@ impl RaftStateMachine<CoordinationTypeConfig> for CoordinationStateMachine {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<CoordinationSnapshotFile>, RaftStorageError<CoordinationNodeId>> {
-        Err(not_yet_implemented("begin_receiving_snapshot"))
+        super::snapshot::begin_receiving(&self.layout)
+            .map(Box::new)
+            .map_err(io_state)
     }
 
     async fn install_snapshot(
@@ -980,6 +982,12 @@ mod tests {
 
     /// A bound `state.redb` holding `genesis_state`, ready for an actor.
     fn seeded(dir: &std::path::Path) -> Database {
+        seeded_with(dir, genesis_state())
+    }
+
+    /// The same seed under a caller-chosen state, for the tests that need two
+    /// stores that are *not* the same group.
+    fn seeded_with(dir: &std::path::Path, state: DurableState) -> Database {
         let database = Database::create(dir.join("state.redb")).expect("create");
         let write = super::super::schema::durable_write(&database, Db::State).expect("write");
         super::super::schema::create_state_tables(&write).expect("tables");
@@ -990,7 +998,6 @@ mod tests {
         std::fs::create_dir_all(dir.join("snapshots")).expect("snapshots dir");
         std::fs::create_dir_all(dir.join("incoming")).expect("incoming dir");
 
-        let state = genesis_state();
         let mut changes = ChangeSet::default();
         changes.admins.extend(state.model.admins.iter().copied());
         changes.grants.extend(state.model.acl.keys().cloned());
@@ -3206,6 +3213,175 @@ mod tests {
             ahead.pinned().expect("meta").against(Some(&barrier)),
             BarrierFit::Satisfied
         );
+    }
+
+    // ── Install: receiving (§11.4) ──────────────────────────────────────────
+
+    /// A store with one published snapshot, and a Published handle on it.
+    ///
+    /// The handle is what a real install is given: OpenRaft's suite moves a
+    /// leader's own current snapshot into a follower, so the source is a
+    /// foreign store's live file rather than anything this receiver wrote.
+    async fn a_published_source(
+        dir: &std::path::Path,
+    ) -> (Store, Snapshot<CoordinationTypeConfig>) {
+        let (mut machine, shutdown, drain) = machine(dir);
+        machine
+            .apply([normal(1, acquire(1))])
+            .await
+            .expect("one command");
+        let built = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build")
+        };
+        ((machine, shutdown, drain), built)
+    }
+
+    /// Install reads its source and leaves it exactly as it found it.
+    ///
+    /// The property §11.4 states and the one an implementation is most likely
+    /// to break for convenience: the obvious way to install a body is to rename
+    /// it into place, and the source here belongs to a *different store* that is
+    /// still serving it. So the receiver takes a copy, into its own `incoming/`,
+    /// and the source's bytes and directory entry are asserted untouched
+    /// afterwards.
+    #[tokio::test]
+    async fn an_install_source_is_copied_and_never_touched() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+        let source_path = body_path(&source_dir, &published.meta.snapshot_id);
+        let source_bytes = std::fs::read(&source_path).expect("the source body");
+
+        let dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&dir);
+        let staged = super::super::snapshot::receive(
+            &StorageLayout::new(&dir),
+            &published.snapshot,
+            &durable_of(&machine).await,
+            &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+        )
+        .expect("a foreign store's published snapshot is an install source");
+
+        assert!(
+            staged.path().starts_with(dir.join("incoming")),
+            "the receiver stages under its own incoming/, not beside the source: {}",
+            staged.path().display()
+        );
+        assert_eq!(
+            std::fs::read(staged.path()).expect("the staged body"),
+            source_bytes,
+            "and stages the source byte for byte"
+        );
+        assert_eq!(staged.len(), source_bytes.len() as u64);
+        assert_eq!(staged.meta().snapshot_id, published.meta.snapshot_id);
+
+        assert!(source_path.exists(), "the source is not consumed");
+        assert_eq!(
+            std::fs::read(&source_path).expect("the source body"),
+            source_bytes,
+            "nor mutated"
+        );
+        assert!(
+            source_dir.join("snapshots").join("CURRENT").exists(),
+            "nor is the other store's marker disturbed"
+        );
+    }
+
+    /// A body from another group is refused, and refused on identity rather
+    /// than on being ahead.
+    ///
+    /// Install's direction rule is the opposite of a load's -- an installable
+    /// snapshot is normally ahead of `state.redb` -- so the identity half had to
+    /// be separable. This is what proves the separation kept its teeth: the
+    /// source is both ahead *and* foreign, and it must be refused for being
+    /// foreign.
+    #[tokio::test]
+    async fn a_source_bound_to_another_group_is_refused() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let mut elsewhere = genesis_state();
+        elsewhere.model.authority.group_id = [0x5a; 32];
+        let (machine, _shutdown, _drain) =
+            CoordinationStateMachine::new(seeded_with(&dir, elsewhere), StorageLayout::new(&dir))
+                .expect("a store for a different group");
+
+        let err = super::super::snapshot::receive(
+            &StorageLayout::new(&dir),
+            &published.snapshot,
+            &durable_of(&machine).await,
+            &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+        )
+        .expect_err("another group's state is not installable here");
+        assert!(format!("{err:?}").contains("group id"), "{err:?}");
+        assert!(
+            leftovers(&dir).is_empty(),
+            "and a refused install stages nothing that survives it"
+        );
+    }
+
+    /// The supplied metadata is checked against the body, not believed.
+    ///
+    /// All three fields, because a check that covered two of them would pass
+    /// every test that used a consistent fixture. Each case starts from the
+    /// metadata that *does* match and changes exactly one field.
+    #[tokio::test]
+    async fn supplied_metadata_that_disagrees_with_the_body_is_refused() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+        let truthful = crate::coordination::raft::SnapshotMetaV1::from(&published.meta);
+
+        let dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&dir);
+        let state = durable_of(&machine).await;
+        let layout = StorageLayout::new(&dir);
+
+        let refused = |supplied: crate::coordination::raft::SnapshotMetaV1, what: &str| {
+            let err =
+                super::super::snapshot::receive(&layout, &published.snapshot, &state, &supplied)
+                    .expect_err("supplied metadata is not evidence about the body");
+            assert!(format!("{err:?}").contains(what), "{err:?}");
+        };
+
+        let mut wrong_id = truthful.clone();
+        wrong_id.snapshot_id = super::super::snapshot::snapshot_id_for(&[0x99; 32]);
+        refused(wrong_id, "hashes to");
+
+        let mut wrong_log_id = truthful.clone();
+        wrong_log_id.last_log_id = Some(crate::coordination::contract::LogIdV1 {
+            term: 9,
+            leader_node_id: LEADER.to_vec(),
+            index: 9,
+        });
+        refused(wrong_log_id, "last log id");
+
+        let mut wrong_membership = truthful.clone();
+        wrong_membership.last_membership.membership.configs =
+            vec![crate::coordination::raft::NodeIdSetV1 {
+                ids: vec![crate::coordination::raft::NodeIdV1 {
+                    node_id: LEADER.to_vec(),
+                }],
+            }];
+        refused(wrong_membership, "membership");
+
+        // The truthful copy still works, so the three refusals above are about
+        // the fields changed and not about the fixture.
+        super::super::snapshot::receive(&layout, &published.snapshot, &state, &truthful)
+            .expect("the metadata the body actually implies");
+    }
+
+    /// What a store's `incoming/` holds after a failed install.
+    fn leftovers(dir: &std::path::Path) -> Vec<PathBuf> {
+        match std::fs::read_dir(dir.join("incoming")) {
+            Ok(entries) => entries.map(|e| e.expect("entry").path()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The receiver's own durable state, as install compares against it.
+    async fn durable_of(machine: &CoordinationStateMachine) -> DurableState {
+        *machine.handle().published().await.expect("published")
     }
 
     /// A snapshot header that belongs to this store.
