@@ -216,6 +216,44 @@ mod durability_guard {
         ("fixture.rs", include_str!("fixture.rs")),
     ];
 
+    /// The declaration parser, against every visibility Rust offers.
+    ///
+    /// Tested directly rather than only through file mutations. A parser that
+    /// silently matches nothing makes every guard built on it pass, and a
+    /// mutation that adds a declaration then looks caught when it was never
+    /// seen -- which is exactly what happened when an edit to this file failed
+    /// to apply and the mutation "survived" against unchanged code.
+    #[test]
+    fn a_module_declaration_is_recognised_whatever_precedes_it() {
+        for line in [
+            "mod child;",
+            "pub mod child;",
+            "pub(crate) mod child;",
+            "pub(super) mod child;",
+            "pub(self) mod child;",
+            "pub(in crate::coordination) mod child;",
+            "    pub(crate) mod child;",
+            "pub(crate) mod child; // with a trailing comment",
+        ] {
+            assert_eq!(
+                declared_module(line),
+                Some("child"),
+                "not recognised as a declaration: {line:?}"
+            );
+        }
+
+        for line in [
+            "mod child {",
+            "use crate::child;",
+            "// mod child;",
+            "/// mod child;",
+            "let modules = child;",
+            "type child = ();",
+        ] {
+            assert_eq!(declared_module(line), None, "wrongly matched: {line:?}");
+        }
+    }
+
     /// Every guard here reads only what [`production_end`] admits, so the
     /// boundary itself needs a guard.
     ///
@@ -271,16 +309,12 @@ mod durability_guard {
                 continue;
             }
             for (n, line) in production_lines(source) {
-                let code = line.split("//").next().unwrap_or("").trim();
-                let declaration = code
-                    .trim_start_matches("pub(crate) ")
-                    .trim_start_matches("pub(super) ")
-                    .trim_start_matches("pub ");
                 assert!(
-                    !(declaration.starts_with("mod ") && declaration.ends_with(';')),
+                    declared_module(line).is_none(),
                     "{name}:{} declares an out-of-line module, whose source no guard in this \
-                     file reads: {code:?}",
-                    n + 1
+                     file reads: {:?}",
+                    n + 1,
+                    line.trim()
                 );
             }
         }
@@ -294,18 +328,9 @@ mod durability_guard {
     /// this asserts the list matches them.
     #[test]
     fn every_declared_module_is_guarded() {
-        let declared: std::collections::BTreeSet<String> = include_str!("mod.rs")
-            .lines()
-            .filter_map(|line| {
-                let line = line
-                    .trim_start_matches("pub(crate) ")
-                    .trim_start_matches("pub ");
-                // `mod name;` only: an inline `mod name {` is in this file and
-                // is covered as part of it.
-                line.strip_prefix("mod ")
-                    .and_then(|rest| rest.strip_suffix(';'))
-                    .map(|name| format!("{name}.rs"))
-            })
+        let declared: std::collections::BTreeSet<String> = production_lines(include_str!("mod.rs"))
+            .filter_map(|(_, line)| declared_module(line))
+            .map(|name| format!("{name}.rs"))
             .collect();
         let guarded: std::collections::BTreeSet<String> = SOURCES
             .iter()
@@ -564,6 +589,31 @@ mod durability_guard {
     /// The cost of taking the last is that an earlier `#[cfg(test)]` module is
     /// scanned as production. That is the safe direction -- more is checked,
     /// not less -- and the seam it admits contains nothing any guard forbids.
+    /// The module an out-of-line declaration names, whatever precedes it.
+    ///
+    /// Both callers below used to strip a list of visibility prefixes, and both
+    /// lists were incomplete in different ways -- one missed `pub(self)` and
+    /// `pub(in ...)`, the other missed `pub(super)` as well. Each of those
+    /// compiles, and each escaped `SOURCES`, which is the one thing this parser
+    /// exists to prevent.
+    ///
+    /// So it does not look at visibility at all. A declaration is a statement
+    /// whose last two tokens are `mod` and an identifier; whatever precedes
+    /// them is visibility by definition, in whatever form Rust grows next.
+    /// `mod name {` is deliberately not matched: an inline module is in the
+    /// file being scanned and is covered as part of it.
+    fn declared_module(line: &str) -> Option<&str> {
+        let code = line.split("//").next()?.trim().strip_suffix(';')?;
+        let mut tokens = code.split_whitespace().rev();
+        let name = tokens.next()?;
+        if tokens.next()? != "mod" {
+            return None;
+        }
+        (name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then_some(name)
+    }
+
     pub(super) fn production_end(source: &str) -> usize {
         source
             .rfind("\n#[cfg(test)]\nmod ")
