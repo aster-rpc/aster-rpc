@@ -1282,6 +1282,47 @@ mod tests {
         try_open(&dir).expect("and the directory opens again afterwards");
     }
 
+    /// And it outlives exclusive access, which holds no lease at all.
+    ///
+    /// Install takes the database file to itself — waiting the readers out and
+    /// then renaming a new `state.redb` over the old one — and the way it gets
+    /// there is by waiting for the lease count to reach *zero*. So a shutdown
+    /// that watched only that count saw a perfectly idle store at the one
+    /// moment the database file did not exist, released `LOCK`, and let a
+    /// second voter open onto the replacement mid-rename.
+    #[tokio::test]
+    async fn the_directory_lock_is_held_until_exclusive_access_ends() {
+        use std::time::Duration;
+
+        let dir = scratch();
+        let storage = open(&dir);
+        let exclusive = storage
+            .state()
+            .quiesce_reads()
+            .expect("exclusive access to state.redb");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closing = std::thread::spawn(move || {
+            drop(storage);
+            tx.send(()).expect("report the close");
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "closing must not complete while a replacement holds the database"
+        );
+        assert!(
+            matches!(try_open(&dir), Err(AsterStorageError::LockContended { .. })),
+            "and no second opener may be admitted meanwhile"
+        );
+
+        drop(exclusive);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the close completes once exclusive access ends");
+        closing.join().expect("join the closing thread");
+        try_open(&dir).expect("and the directory opens again afterwards");
+    }
+
     /// `append` needs a `LogFlushed`, whose constructor is crate-private to
     /// OpenRaft. `RaftLogStorageExt::blocking_append` is the supported way in,
     /// and it also asserts what we care about: it does not return until the

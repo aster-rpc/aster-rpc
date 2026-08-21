@@ -382,21 +382,46 @@ mod fault {
     }
 }
 
-/// BLAKE3 of a file's bytes, or `None` if it is not there.
+/// What is already sitting under a name a build is about to publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Existing {
+    /// Nothing under that name.
+    Absent,
+    /// Present, and its bytes hash to this.
+    Digest([u8; 32]),
+    /// Present and not comparable, so certainly not the body just written.
+    Unusable,
+}
+
+/// Hash whatever is already under a published name.
 ///
 /// Streamed rather than read whole: a snapshot body is bounded at 512 MiB, and
 /// the point of this whole path is that no step holds one in memory.
-fn digest_of(path: &Path) -> StorageResult<Option<[u8; 32]>> {
+///
+/// Over-ceiling content is [`Existing::Unusable`] rather than an error. A body
+/// this store just built is bounded by that same ceiling, so anything larger
+/// provably is not it — and the only alternatives were to hash 512 MiB of junk
+/// to reach a foregone conclusion, or to fail the build outright, which would
+/// wedge snapshotting permanently on one oversized orphan sitting under a name
+/// nothing can now be published to.
+fn digest_of(path: &Path) -> StorageResult<Existing> {
     let handle = match File::open(path) {
         Ok(handle) => handle,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Existing::Absent),
         Err(err) => return Err(StorageError::io("hashing a snapshot body", path, err)),
     };
+    let stat = handle
+        .metadata()
+        .map_err(io("hashing a snapshot body", path))?;
+    if stat.len() > MAX_SNAPSHOT_BODY_BYTES {
+        return Ok(Existing::Unusable);
+    }
+
     let mut reader = Digesting::new(BufReader::new(handle));
     std::io::copy(&mut reader, &mut std::io::sink())
         .map_err(io("hashing a snapshot body", path))?;
     let (_, digest, _) = reader.into_parts();
-    Ok(Some(digest))
+    Ok(Existing::Digest(digest))
 }
 
 // ── Build ────────────────────────────────────────────────────────────────────
@@ -468,7 +493,7 @@ pub(crate) fn build(
     // is a repair rather than a risk: no reader can be served worse by bytes
     // that hash to the name they are under than by bytes that do not.
     match digest_of(&path)? {
-        Some(existing) if existing == digest => drop(scratch),
+        Existing::Digest(existing) if existing == digest => drop(scratch),
         _ => {
             scratch.promote(&path)?;
             fsync_dir(&dir)?;
@@ -866,22 +891,37 @@ struct CatalogInner {
 }
 
 impl CatalogInner {
-    /// Unlink a retired snapshot once nothing is reading it.
+    /// Unlink every retired snapshot nothing is reading.
     ///
     /// Deliberately best-effort: failing to remove a superseded file is a
     /// disk-hygiene problem, not a correctness one — the marker already names
     /// its successor, and startup sweeps retired orphans after validating
     /// `CURRENT`. Turning it into a hard error would fail an install that has
     /// already durably succeeded.
-    fn collect(&mut self, snapshot_id: &str) {
-        let outstanding = self.leases.get(snapshot_id).copied().unwrap_or(0);
-        if outstanding > 0 {
-            return;
-        }
-        self.leases.remove(snapshot_id);
-        if let Some(path) = self.retired.remove(snapshot_id) {
-            let _ = std::fs::remove_file(path);
-        }
+    ///
+    /// But best-effort is not the same as forgotten. A removal that fails is
+    /// kept and retried on the next collection, because the case that fails is
+    /// the ordinary one on Windows — a handle still open somewhere unlinks with
+    /// an error rather than deferring — and dropping the entry there would
+    /// leave every superseded body to a startup sweep that has not been written
+    /// yet.
+    ///
+    /// It sweeps the whole map rather than one id for the same reason: the
+    /// event that lets a stuck removal succeed is usually some *other* handle
+    /// closing.
+    fn collect(&mut self) {
+        let CatalogInner { leases, retired } = self;
+        leases.retain(|_, count| *count > 0);
+        retired.retain(|snapshot_id, path| {
+            if leases.contains_key(snapshot_id) {
+                return true;
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => false,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            }
+        });
     }
 }
 
@@ -929,7 +969,7 @@ impl SnapshotCatalog {
         Ok(CoordinationSnapshotFile::Published(PublishedSnapshot {
             snapshot_id,
             path,
-            file,
+            file: Some(file),
             catalog: Arc::clone(&self.inner),
         }))
     }
@@ -939,7 +979,7 @@ impl SnapshotCatalog {
     pub(crate) fn retire(&self, snapshot_id: &str, path: impl Into<PathBuf>) {
         let mut inner = self.inner.lock().expect("snapshot catalog mutex");
         inner.retired.insert(snapshot_id.to_string(), path.into());
-        inner.collect(snapshot_id);
+        inner.collect();
     }
 
     /// Outstanding lease count, for tests that assert a superseded file is
@@ -953,6 +993,17 @@ impl SnapshotCatalog {
             .get(snapshot_id)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Whether a retirement is still owed a removal, for the test that a failed
+    /// unlink is retried rather than forgotten.
+    #[cfg(test)]
+    pub(crate) fn awaiting_removal(&self, snapshot_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("snapshot catalog mutex")
+            .retired
+            .contains_key(snapshot_id)
     }
 }
 
@@ -990,10 +1041,15 @@ impl Drop for IncomingSnapshot {
 pub struct PublishedSnapshot {
     snapshot_id: String,
     path: PathBuf,
-    /// Held, not used through this field. Its existence is the guarantee: the
-    /// bytes remain readable for as long as this handle does, whichever store
-    /// issued it and whatever has happened to the directory entry since.
-    file: File,
+    /// The pin. Its existence is the guarantee: the bytes remain readable for
+    /// as long as this handle does, whichever store issued it and whatever has
+    /// happened to the directory entry since.
+    ///
+    /// `Option` only so that [`Drop`] can close it *before* the catalog tries
+    /// to unlink — on Windows an open handle makes the removal fail, and this
+    /// handle's own descriptor would otherwise be the thing blocking the
+    /// collection its own release triggered.
+    file: Option<File>,
     catalog: Arc<Mutex<CatalogInner>>,
 }
 
@@ -1006,37 +1062,83 @@ impl PublishedSnapshot {
     ///
     /// Reading by path would reintroduce exactly what the held descriptor
     /// exists to prevent: the name can be gone, or can name a successor, by the
-    /// time a holder gets round to reading. This clones the descriptor this
-    /// handle already owns, so it reads the bytes the lease was taken over.
-    pub(crate) fn reader(&self) -> StorageResult<File> {
-        use std::io::Seek as _;
-
-        let mut handle = self
-            .file
-            .try_clone()
-            .map_err(io("reading a published snapshot", &self.path))?;
-        handle
-            .rewind()
-            .map_err(io("reading a published snapshot", &self.path))?;
-        Ok(handle)
+    /// time a holder gets round to reading.
+    fn reader(&self) -> SnapshotReader<'_> {
+        SnapshotReader {
+            file: FileRef::Pinned(self.pinned()),
+            pos: 0,
+        }
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+    fn pinned(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("a published snapshot holds its descriptor until it is dropped")
     }
 }
 
 impl Drop for PublishedSnapshot {
-    /// Releases the lease. Never unlinks directly: this handle may be the
-    /// leader's current snapshot, moved into a follower by OpenRaft's suite
-    /// and dropped there. Only the catalog removes a file, and only one that
-    /// has been retired.
+    /// Closes the descriptor, then releases the lease.
+    ///
+    /// In that order, and the order is the point: the collection this release
+    /// may trigger unlinks the file, and on Windows an unlink fails while any
+    /// handle is open. Releasing first would have this handle blocking the
+    /// removal of the very snapshot it had just stopped reading, leaving it to
+    /// a retry that may never come.
+    ///
+    /// Never unlinks directly: this handle may be the leader's current
+    /// snapshot, moved into a follower by OpenRaft's suite and dropped there.
+    /// Only the catalog removes a file, and only one that has been retired.
     fn drop(&mut self) {
+        drop(self.file.take());
+
         let mut inner = self.catalog.lock().expect("snapshot catalog mutex");
         if let Some(count) = inner.leases.get_mut(&self.snapshot_id) {
             *count = count.saturating_sub(1);
         }
-        inner.collect(&self.snapshot_id);
+        inner.collect();
+    }
+}
+
+/// A sequential reader over a snapshot body, whichever role holds it.
+///
+/// Reads are position-independent — every one names its own offset — so several
+/// of these can run over one pinned descriptor at once. A `try_clone` would not
+/// have done: cloned descriptors share the *file offset*, so two concurrent
+/// readers over one Published handle would each consume the other's progress
+/// and neither would see the whole body.
+#[derive(Debug)]
+pub(crate) struct SnapshotReader<'a> {
+    file: FileRef<'a>,
+    pos: u64,
+}
+
+#[derive(Debug)]
+enum FileRef<'a> {
+    /// Opened by this reader, over a file the receiver owns.
+    Owned(File),
+    /// Borrowed from the handle that pins it, so it cannot outlive the pin.
+    Pinned(&'a File),
+}
+
+impl FileRef<'_> {
+    fn get(&self) -> &File {
+        match self {
+            FileRef::Owned(file) => file,
+            FileRef::Pinned(file) => file,
+        }
+    }
+}
+
+impl Read for SnapshotReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        let read = std::os::unix::fs::FileExt::read_at(self.file.get(), buf, self.pos)?;
+        #[cfg(windows)]
+        let read = std::os::windows::fs::FileExt::seek_read(self.file.get(), buf, self.pos)?;
+
+        self.pos += read as u64;
+        Ok(read)
     }
 }
 
@@ -1057,15 +1159,29 @@ impl CoordinationSnapshotFile {
         CoordinationSnapshotFile::Incoming(IncomingSnapshot::new(path))
     }
 
-    /// The file this handle names, whichever role it holds.
+    /// Read the body this handle names, whichever role it holds.
     ///
-    /// Install reads through this without caring which role produced it: the
-    /// source may be another store's Published handle, and validation is what
-    /// grants trust, not provenance.
-    pub(crate) fn path(&self) -> &Path {
+    /// The one way in. Install does not care which role produced its source —
+    /// it may be another store's Published handle — and it must not care by
+    /// *name*: a path is a lookup that can resolve to a successor, or to
+    /// nothing, by the time the read happens, which is precisely what a
+    /// Published handle's descriptor is held to prevent. Offering `path()`
+    /// alongside this would leave the safe route optional.
+    ///
+    /// An Incoming body is opened here instead, because there is no earlier
+    /// descriptor to inherit: the file is receiver-owned staging, written by
+    /// whoever is filling it in, and this handle is what deletes it.
+    pub(crate) fn reader(&self) -> StorageResult<SnapshotReader<'_>> {
         match self {
-            CoordinationSnapshotFile::Incoming(incoming) => incoming.path(),
-            CoordinationSnapshotFile::Published(published) => published.path(),
+            CoordinationSnapshotFile::Incoming(incoming) => {
+                let file = File::open(incoming.path())
+                    .map_err(io("reading an incoming snapshot", incoming.path()))?;
+                Ok(SnapshotReader {
+                    file: FileRef::Owned(file),
+                    pos: 0,
+                })
+            }
+            CoordinationSnapshotFile::Published(published) => Ok(published.reader()),
         }
     }
 
@@ -1339,6 +1455,47 @@ mod tests {
         assert_eq!(MAX_SNAPSHOT_BODY_BYTES, 512 * 1024 * 1024, "§11.4");
     }
 
+    /// Content over the ceiling is not comparable, and is not an error either.
+    ///
+    /// `digest_of` hashes through the same bounded reader as everything else,
+    /// so an oversized orphan under a published name made the *hash* fail — and
+    /// with it the build that was about to replace it. That is the one case
+    /// where failing closed wedges the store: nothing could ever be published
+    /// under that name again, because every attempt died on the file it was
+    /// there to overwrite. It is a mismatch, which is exactly what the repair
+    /// path already knows how to handle.
+    ///
+    /// Sparse, and Unix-only for that reason: the ceiling is about the declared
+    /// length, and `ftruncate` states one without writing half a gigabyte.
+    /// Windows would allocate it.
+    #[test]
+    #[cfg(unix)]
+    fn content_over_the_ceiling_is_a_mismatch_rather_than_a_failure() {
+        let dir = temp_dir();
+
+        let ordinary = dir.join("ordinary.snapshot");
+        std::fs::write(&ordinary, b"a small body").expect("write");
+        assert_eq!(
+            digest_of(&ordinary).expect("hash"),
+            Existing::Digest(*blake3::hash(b"a small body").as_bytes())
+        );
+
+        let oversized = dir.join("oversized.snapshot");
+        File::create(&oversized)
+            .expect("create")
+            .set_len(MAX_SNAPSHOT_BODY_BYTES + 1)
+            .expect("declare a length over the ceiling");
+        assert_eq!(
+            digest_of(&oversized).expect("an oversized file is not a hashing failure"),
+            Existing::Unusable
+        );
+
+        assert_eq!(
+            digest_of(&dir.join("absent.snapshot")).expect("hash"),
+            Existing::Absent
+        );
+    }
+
     /// A rename that fails leaves no partial file behind.
     ///
     /// `keep()` disarmed the cleanup before the rename was attempted, so a
@@ -1388,20 +1545,128 @@ mod tests {
         // A second store instance, which knows nothing about the handle above.
         let reopened = SnapshotCatalog::new();
         reopened.retire(&snapshot_id_for(&[7u8; 32]), &path);
+        // The name is gone on Unix; on Windows the open descriptor refuses the
+        // unlink and the catalog keeps the retirement for a later attempt.
+        // Either way the read below must not depend on which happened.
+        #[cfg(unix)]
+        assert!(!path.exists(), "the directory entry is gone");
 
-        let CoordinationSnapshotFile::Published(published) = &handle else {
-            panic!("a leased snapshot is Published");
-        };
-        let mut bytes = Vec::new();
-        published
-            .reader()
-            .expect("the handle still names readable bytes")
-            .read_to_end(&mut bytes)
-            .expect("read");
         assert_eq!(
-            bytes, b"the published bytes",
+            read_through(&handle),
+            b"the published bytes",
             "the pin is the open descriptor, not the directory entry"
         );
+    }
+
+    /// Both roles are read the same way, and neither is read by name.
+    #[test]
+    fn either_role_reads_through_its_own_handle() {
+        let dir = temp_dir();
+
+        let staging = dir.join("incoming.snapshot");
+        std::fs::write(&staging, b"the received bytes").expect("write");
+        let incoming = CoordinationSnapshotFile::incoming(&staging);
+        assert_eq!(read_through(&incoming), b"the received bytes");
+
+        let published_path = dir.join("published.snapshot");
+        std::fs::write(&published_path, b"the published bytes").expect("write");
+        let catalog = SnapshotCatalog::new();
+        let published = catalog
+            .lease(snapshot_id_for(&[9u8; 32]), &published_path)
+            .expect("lease");
+        assert_eq!(read_through(&published), b"the published bytes");
+    }
+
+    /// Two readers over one pinned descriptor do not consume each other.
+    ///
+    /// The defect a cloned descriptor would reintroduce: `File::try_clone`
+    /// shares the file *offset*, so interleaving two readers over one Published
+    /// handle gave each of them a disjoint half of the body and neither the
+    /// whole of it. Install streams a source while replication may be serving
+    /// the same snapshot, so this is a real pairing, not a hypothetical one.
+    #[test]
+    fn concurrent_readers_over_one_handle_each_see_the_whole_body() {
+        let dir = temp_dir();
+        let path = dir.join("shared.snapshot");
+        let body: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        std::fs::write(&path, &body).expect("write");
+
+        let catalog = SnapshotCatalog::new();
+        let handle = catalog
+            .lease(snapshot_id_for(&[3u8; 32]), &path)
+            .expect("lease");
+
+        let mut first = handle.reader().expect("a reader");
+        let mut second = handle.reader().expect("a second reader");
+
+        // Interleaved on purpose: a shared cursor only shows up when the two
+        // readers advance in turn.
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for _ in 0..8 {
+            let mut chunk = [0u8; 256];
+            first.read_exact(&mut chunk).expect("read");
+            a.extend_from_slice(&chunk);
+            second.read_exact(&mut chunk).expect("read");
+            b.extend_from_slice(&chunk);
+        }
+        first.read_to_end(&mut a).expect("read");
+        second.read_to_end(&mut b).expect("read");
+
+        assert_eq!(a, body);
+        assert_eq!(b, body);
+    }
+
+    fn read_through(handle: &CoordinationSnapshotFile) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        handle
+            .reader()
+            .expect("the handle names readable bytes")
+            .read_to_end(&mut bytes)
+            .expect("read");
+        bytes
+    }
+
+    /// A failed removal is kept and retried, not forgotten.
+    ///
+    /// Unix-only because it needs an unlink that fails: a read-only directory
+    /// refuses the removal there. It is the *Windows* case it stands in for —
+    /// an open handle makes `remove_file` fail outright rather than defer — and
+    /// on that platform forgetting the entry would leave every superseded body
+    /// on disk until a startup sweep that does not exist yet.
+    #[test]
+    #[cfg(unix)]
+    fn a_removal_that_fails_is_retried_rather_than_forgotten() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = temp_dir();
+        let stuck = dir.join("stuck.snapshot");
+        let other = dir.join("other.snapshot");
+        write(&stuck);
+        write(&other);
+
+        let catalog = SnapshotCatalog::new();
+        let stuck_id = snapshot_id_for(&[1u8; 32]);
+        let other_id = snapshot_id_for(&[2u8; 32]);
+
+        let sealed = |mode: u32| {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod")
+        };
+
+        sealed(0o555);
+        catalog.retire(&stuck_id, &stuck);
+        assert!(stuck.exists(), "the removal could not succeed");
+        assert!(
+            catalog.awaiting_removal(&stuck_id),
+            "and the catalog still owes it"
+        );
+
+        sealed(0o755);
+        // Any later collection is the retry; retiring something else is the
+        // ordinary trigger.
+        catalog.retire(&other_id, &other);
+        assert!(!stuck.exists(), "the retry removed it");
+        assert!(!other.exists());
+        assert!(!catalog.awaiting_removal(&stuck_id));
     }
 
     // ── Publication (§11.4) ──────────────────────────────────────────────────

@@ -58,7 +58,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::actor::ActorShutdown;
 use super::error::{Db, StorageError, StorageResult};
-use super::reads::{GuardedRead, ReadDrain, ReadGate, ReadLease};
+use super::reads::{GuardedRead, Quiesced, ReadDrain, ReadGate, ReadLease};
 use super::rows::{self, DurableState};
 use super::schema::StorageLayout;
 use super::snapshot::{self, Publication, SnapshotCatalog, SnapshotFile};
@@ -553,6 +553,12 @@ pub(crate) struct CoordinationStateMachine {
     /// question already answered. The disk marker stays authoritative — this is
     /// only ever written from a publication that has already landed.
     current: Arc<Mutex<Option<SnapshotFile>>>,
+    /// The same gate the actor issues read leases from.
+    ///
+    /// Held here so that exclusive access does not have to go through the
+    /// actor: waiting out the readers is a blocking wait, and the actor thread
+    /// is what a reader may be waiting on.
+    reads: ReadGate,
 }
 
 impl CoordinationStateMachine {
@@ -576,6 +582,7 @@ impl CoordinationStateMachine {
                 layout,
                 catalog: SnapshotCatalog::new(),
                 current: Arc::new(Mutex::new(current)),
+                reads: reads.clone(),
             },
             shutdown,
             ReadDrain::new(reads),
@@ -584,6 +591,16 @@ impl CoordinationStateMachine {
 
     pub(crate) fn handle(&self) -> &StateHandle {
         &self.handle
+    }
+
+    /// Exclusive access to `state.redb`: no read is open, and none is issued,
+    /// until the returned guard drops.
+    ///
+    /// What install replaces the database file under. `None` means the store is
+    /// closing, and a caller that gets it must not touch the directory — the
+    /// shutdown it lost to is releasing the lock.
+    pub(crate) fn quiesce_reads(&self) -> Option<Quiesced> {
+        self.reads.quiesce()
     }
 
     /// Apply §11.4's publication rule to a freshly built body, and lease
@@ -620,8 +637,30 @@ impl CoordinationStateMachine {
         _lease: &ReadLease,
         built: SnapshotFile,
     ) -> StorageResult<Snapshot<CoordinationTypeConfig>> {
+        self.under_current(|this, current| this.publish_inner(current, built))
+    }
+
+    /// The publication critical section: refuse, act, and latch under one lock.
+    ///
+    /// The three were separate steps, and the gap between them was reachable.
+    /// Two publishers could both pass the fatal check before either took the
+    /// mutex; the first would replace `CURRENT`, fail to fsync, and latch —
+    /// after the second had already been admitted and was deciding
+    /// monotonicity against metadata that no longer described the disk. Holding
+    /// the mutex across all three makes "was this store serviceable when I
+    /// decided?" and "is it serviceable now?" the same question.
+    ///
+    /// Reading is inside it too. `get_current_snapshot` is a report about the
+    /// same marker, so a report issued between a failed replacement and its
+    /// latch would name a snapshot the store can no longer vouch for.
+    #[allow(clippy::result_large_err)]
+    fn under_current<T>(
+        &self,
+        op: impl FnOnce(&Self, &mut Option<SnapshotFile>) -> StorageResult<T>,
+    ) -> StorageResult<T> {
+        let mut current = self.current.lock().expect("the current-snapshot mutex");
         self.handle.check_serviceable()?;
-        let result = self.publish_inner(built);
+        let result = op(self, &mut current);
         if let Err(err) = &result {
             if err.puts_durability_in_question() {
                 self.handle.mark_fatal();
@@ -633,9 +672,9 @@ impl CoordinationStateMachine {
     #[allow(clippy::result_large_err)]
     fn publish_inner(
         &self,
+        current: &mut Option<SnapshotFile>,
         built: SnapshotFile,
     ) -> StorageResult<Snapshot<CoordinationTypeConfig>> {
-        let mut current = self.current.lock().expect("the current-snapshot mutex");
         let serving =
             match snapshot::decide_publication(&built.meta, current.as_ref().map(|f| &f.meta)) {
                 Publication::Publish => {
@@ -666,38 +705,39 @@ impl CoordinationStateMachine {
                     return Err(StorageError::corrupt(Db::State, "snapshot", detail))
                 }
             };
-        self.lease(&current, &serving)
+        self.lease(current, &serving)
     }
 
     /// The current snapshot, leased.
+    ///
+    /// A store whose last publication failed cannot say what is current: the
+    /// marker may have been replaced and not made durable, so the value held
+    /// here and the value on disk may already disagree. That check, and the
+    /// latch for a lease that cannot open the file it names, are the reason
+    /// this goes through the publication critical section rather than taking
+    /// the mutex itself.
     pub(crate) fn current_snapshot(
         &self,
     ) -> StorageResult<Option<Snapshot<CoordinationTypeConfig>>> {
-        // A store whose last publication failed cannot say what is current:
-        // the marker may have been replaced and not made durable, so the value
-        // held here and the value on disk may already disagree.
-        self.handle.check_serviceable()?;
-        let current = self.current.lock().expect("the current-snapshot mutex");
-        match current.clone() {
-            Some(file) => self.lease(&current, &file).map(Some),
+        self.under_current(|this, current| match current.clone() {
+            Some(file) => this.lease(current, &file).map(Some),
             None => Ok(None),
-        }
+        })
     }
 
     /// Pin a snapshot file and describe it as OpenRaft's `Snapshot`.
     ///
-    /// Takes the guard it must be called under, rather than merely documenting
+    /// Takes what only the guard can produce, rather than merely documenting
     /// that requirement. Choosing a file and pinning it have to be one step:
     /// [`publish`](Self::publish) retires and unlinks a superseded body under
     /// this same lock, so a caller that selected a file, released the lock, and
-    /// then leased it could be handed a path that no longer exists. The
-    /// parameter is unused at runtime and load-bearing at compile time — it is
-    /// the only way to hold this ordering in a signature, since the lock
-    /// protects a *file on disk* rather than the value it guards.
+    /// then leased it could be handed a path that no longer exists. A borrow of
+    /// the guarded value is unreachable without holding the mutex, so the
+    /// parameter is unused at runtime and load-bearing at compile time.
     #[allow(clippy::result_large_err)]
     fn lease(
         &self,
-        _current: &std::sync::MutexGuard<'_, Option<SnapshotFile>>,
+        _current: &Option<SnapshotFile>,
         file: &SnapshotFile,
     ) -> StorageResult<Snapshot<CoordinationTypeConfig>> {
         Ok(Snapshot {
@@ -2739,6 +2779,23 @@ mod tests {
     // ── Snapshots (§11.4) ────────────────────────────────────────────────────
 
     /// The published body's path, from the id it is advertised under.
+    /// The bytes a handle names, read the way production reads them.
+    ///
+    /// Through the handle rather than `std::fs::read` of a path: a path is what
+    /// the role-safe reader exists to keep out of callers' hands, and a test
+    /// that reached round it would stop noticing if the pin regressed.
+    fn body_of(handle: &CoordinationSnapshotFile) -> Vec<u8> {
+        use std::io::Read as _;
+
+        let mut bytes = Vec::new();
+        handle
+            .reader()
+            .expect("a readable body")
+            .read_to_end(&mut bytes)
+            .expect("read the body");
+        bytes
+    }
+
     fn body_path(dir: &std::path::Path, snapshot_id: &str) -> PathBuf {
         let stem = super::snapshot::file_stem_for(snapshot_id).expect("a content-derived id");
         dir.join("snapshots")
@@ -2800,7 +2857,11 @@ mod tests {
             .expect("read")
             .expect("the marker survives the restart");
         assert_eq!(after.meta, built);
-        assert_eq!(after.snapshot.path(), body_path(&dir, &built.snapshot_id));
+        assert_eq!(
+            body_of(&after.snapshot),
+            std::fs::read(body_path(&dir, &built.snapshot_id)).expect("the published body"),
+            "the handle reads the body the restored marker names"
+        );
         assert!(
             !after.snapshot.deletes_on_drop(),
             "what a reader is handed is a Published lease; dropping it must not \
@@ -2832,7 +2893,7 @@ mod tests {
 
         let mut builder = machine.get_snapshot_builder().await;
         let snapshot = builder.build_snapshot().await.expect("build");
-        let bytes = std::fs::read(snapshot.snapshot.path()).expect("read the published body");
+        let bytes = body_of(&snapshot.snapshot);
 
         let expected = format!(
             "{}{}",
@@ -2875,7 +2936,7 @@ mod tests {
             let mut builder = machine.get_snapshot_builder().await;
             let snapshot = builder.build_snapshot().await.expect("build");
             ids.push(snapshot.meta.snapshot_id.clone());
-            bodies.push(std::fs::read(snapshot.snapshot.path()).expect("read the body"));
+            bodies.push(body_of(&snapshot.snapshot));
             drop(snapshot);
             drop(shutdown);
             dirs.push(dir);
@@ -3162,6 +3223,60 @@ mod tests {
         drop(shutdown);
     }
 
+    /// Including an orphan too large to hash.
+    ///
+    /// The repair above promises to verify an existing body before reusing it,
+    /// and the verification is a bounded hash — so the one orphan that could
+    /// not be verified was the one over the ceiling, and the build died on the
+    /// file it was there to replace. That failure is permanent: nothing can
+    /// ever be published under that name again.
+    ///
+    /// Sparse and Unix-only for the reason given in `snapshot`'s own test:
+    /// `ftruncate` declares a length over the ceiling without writing half a
+    /// gigabyte, and Windows would allocate it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_rebuild_repairs_an_orphan_too_large_to_hash() {
+        use crate::coordination::rowstream::MAX_SNAPSHOT_BODY_BYTES;
+
+        let dir = scratch_dir();
+        let (mut machine, shutdown, drain) = machine(&dir);
+        machine.apply([blank(1)]).await.expect("apply");
+
+        let built = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build").meta.clone()
+        };
+        let path = body_path(&dir, &built.snapshot_id);
+        let intact = std::fs::read(&path).expect("read the published body");
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open the published body")
+            .set_len(MAX_SNAPSHOT_BODY_BYTES + 1)
+            .expect("declare a length over the ceiling");
+
+        let again = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder
+                .build_snapshot()
+                .await
+                .expect("an oversized orphan must not wedge the build")
+                .meta
+                .clone()
+        };
+        assert_eq!(again.snapshot_id, built.snapshot_id);
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            intact,
+            "the name vouches for its bytes again"
+        );
+
+        drop(drain);
+        drop(shutdown);
+    }
+
     /// A reader keeps the snapshot it was handed while a newer one is
     /// published.
     ///
@@ -3185,7 +3300,8 @@ mod tests {
             .expect("read")
             .expect("published");
         let first = reader.meta.snapshot_id.clone();
-        let first_path = reader.snapshot.path().to_path_buf();
+        let first_path = body_path(&dir, &first);
+        let first_bytes = body_of(&reader.snapshot);
 
         machine.apply([blank(2)]).await.expect("apply");
         let second = {
@@ -3196,6 +3312,11 @@ mod tests {
         assert!(
             first_path.exists(),
             "the superseded body is pinned while a reader still holds it"
+        );
+        assert_eq!(
+            body_of(&reader.snapshot),
+            first_bytes,
+            "and still reads its own body, not the one that replaced it"
         );
 
         drop(reader);
@@ -3243,6 +3364,45 @@ mod tests {
         );
         assert!(machine.apply([blank(2)]).await.is_err(), "nor apply");
         assert!(machine.applied_state().await.is_err());
+
+        drop(drain);
+        drop(shutdown);
+    }
+
+    /// A report that cannot open the body it names stops the store too.
+    ///
+    /// Publication is not the only way the marker and the disk can part
+    /// company. `get_current_snapshot` answers from the metadata it holds and
+    /// pins the file in the same step, and a pin that fails means the body the
+    /// marker names is no longer there — a follower would be told a snapshot
+    /// exists and then handed nothing. Returning the error without latching
+    /// left the store willing to make that same claim to the next caller.
+    #[tokio::test]
+    async fn a_current_snapshot_that_cannot_be_pinned_stops_the_store() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown, drain) = machine(&dir);
+        machine.apply([blank(1)]).await.expect("apply");
+        let built = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build").meta.clone()
+        };
+
+        // The body goes from under the marker: a lost file, or a `snapshots/`
+        // directory someone tidied.
+        std::fs::remove_file(body_path(&dir, &built.snapshot_id)).expect("remove the body");
+
+        machine
+            .get_current_snapshot()
+            .await
+            .expect_err("a snapshot that cannot be pinned cannot be reported");
+        assert!(
+            machine.handle().is_fatal(),
+            "a marker naming a body that is gone is not a transient read error"
+        );
+        assert!(
+            machine.get_current_snapshot().await.is_err(),
+            "so the next caller is refused rather than told the snapshot exists"
+        );
 
         drop(drain);
         drop(shutdown);
@@ -3329,7 +3489,7 @@ mod tests {
             machine.apply([normal(1, acquire(1))]).await.expect("apply");
             let mut builder = machine.get_snapshot_builder().await;
             let snapshot = builder.build_snapshot().await.expect("build");
-            let bytes = std::fs::read(snapshot.snapshot.path()).expect("read");
+            let bytes = body_of(&snapshot.snapshot);
             let meta = snapshot.meta.clone();
             drop(snapshot);
             drop(shutdown);

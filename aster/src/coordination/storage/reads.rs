@@ -19,6 +19,11 @@
 //! Both are the same missing fact: *how many reads are in flight*. One counter
 //! answers it, and the two operations that need it are the same wait.
 //!
+//! Exclusive access is the third thing that wait must cover, and it is the one
+//! that is easy to miss: a replacement holds the database with **no** lease
+//! outstanding, because waiting the count to zero is how it got there. So
+//! shutdown watches the count *and* the exclusive claim; see [`GateState`].
+//!
 //! ## The lease is about the store, not the transaction
 //!
 //! A builder holds its read transaction only while streaming, and then goes on
@@ -47,11 +52,11 @@ use std::sync::{Arc, Condvar, Mutex};
 
 /// Whether the gate is handing out leases, and why not.
 ///
-/// Three states rather than a flag, because "not admitting" had two meanings
-/// that behave differently and a `bool` could not tell them apart: a
-/// replacement pausing reads must resume them, and a store that has closed must
-/// not — and with one flag, dropping a paused guard after the store closed
-/// reopened a gate nothing was left to serve.
+/// A derived view of [`GateState`], for tests and for the messages that
+/// describe a refusal. It is *not* the stored form: the two reasons a gate
+/// stops admitting are independent facts and were held in one slot, so setting
+/// `Closed` erased the record that a replacement still held the gate — and
+/// `close` then stopped waiting for it. See [`GateState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Admission {
     /// Reads are issued.
@@ -62,10 +67,37 @@ enum Admission {
     Closed,
 }
 
+/// The two independent facts, plus the count.
+///
+/// `exclusive` and `closed` are orthogonal, and the orthogonality is the whole
+/// correctness argument: a store can be asked to close *while* a replacement
+/// holds exclusive access, and shutdown must then wait for that replacement
+/// exactly as it waits for a read. One enum could not represent both at once,
+/// which is how the previous version released the directory `LOCK` out from
+/// under an install that was still renaming `state.redb`.
 #[derive(Debug)]
 struct GateState {
     outstanding: usize,
-    admission: Admission,
+    /// A [`Quiesced`] exists, or a [`ReadGate::quiesce`] has claimed the gate
+    /// and is waiting out the reads before it hands one back. Both are states
+    /// in which nothing else may touch the database file.
+    exclusive: bool,
+    /// Terminal, set by [`ReadGate::close`] and never cleared.
+    closed: bool,
+}
+
+impl GateState {
+    fn admission(&self) -> Admission {
+        // Closed first: it outranks everything, and a gate that is both closed
+        // and still held by a departing quiescer is closed.
+        if self.closed {
+            Admission::Closed
+        } else if self.exclusive {
+            Admission::Quiesced
+        } else {
+            Admission::Open
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -94,7 +126,8 @@ impl ReadGate {
             inner: Arc::new(GateInner {
                 state: Mutex::new(GateState {
                     outstanding: 0,
-                    admission: Admission::Open,
+                    exclusive: false,
+                    closed: false,
                 }),
                 changed: Condvar::new(),
             }),
@@ -116,7 +149,7 @@ impl ReadGate {
     /// and after either of those the current database is not this one.
     pub(crate) fn reserve(&self) -> Option<ReadLease> {
         let mut state = self.inner.state.lock().expect("read gate mutex");
-        if state.admission != Admission::Open {
+        if state.admission() != Admission::Open {
             return None;
         }
         state.outstanding += 1;
@@ -132,22 +165,39 @@ impl ReadGate {
     /// `state.redb`. It is exclusive — a second request waits for the first to
     /// finish rather than both believing they hold it — and it returns `None`
     /// once the store has closed, because there is then nothing to replace.
+    ///
+    /// A close that arrives *while* this is waiting also yields `None`, and the
+    /// claim is handed back before returning. Returning a guard in that case
+    /// would be worse than useless: the caller would believe it held a database
+    /// whose store was already letting the directory lock go.
+    ///
+    /// The obligation that comes with the guard: shutdown waits for it, so
+    /// whatever holds it must not, in turn, wait on anything shutdown stops
+    /// first. Replacing the file is such work; a round trip through the state
+    /// actor is not.
     pub(crate) fn quiesce(&self) -> Option<Quiesced> {
         let mut state = self.inner.state.lock().expect("read gate mutex");
-        loop {
-            match state.admission {
-                Admission::Closed => return None,
-                Admission::Quiesced => {
-                    state = self.inner.changed.wait(state).expect("read gate mutex")
-                }
-                Admission::Open => {
-                    state.admission = Admission::Quiesced;
-                    break;
-                }
-            }
-        }
-        while state.outstanding > 0 {
+
+        // Claim exclusivity first, so that the wait below is not a wait behind
+        // a stream of newly issued reads.
+        while !state.closed && state.exclusive {
             state = self.inner.changed.wait(state).expect("read gate mutex");
+        }
+        if state.closed {
+            return None;
+        }
+        state.exclusive = true;
+
+        while !state.closed && state.outstanding > 0 {
+            state = self.inner.changed.wait(state).expect("read gate mutex");
+        }
+        if state.closed {
+            // Give the claim back by hand rather than through a guard that was
+            // never issued: `close` is blocked on exactly this flag, and would
+            // otherwise wait for a `Quiesced` that is not going to exist.
+            state.exclusive = false;
+            self.inner.changed.notify_all();
+            return None;
         }
         Some(Quiesced {
             inner: Arc::clone(&self.inner),
@@ -155,11 +205,17 @@ impl ReadGate {
     }
 
     /// The shutdown counterpart: shut the gate permanently and wait out every
-    /// lease.
+    /// lease **and** any exclusive holder.
     ///
-    /// Terminal on purpose. A `Quiesced` outstanding at this moment finds the
-    /// gate `Closed` when it drops and leaves it that way, so a replacement
-    /// that was in flight cannot reopen a store that has gone.
+    /// Waiting for the quiescer is not symmetry for its own sake. Exclusive
+    /// access is what install renames `state.redb` under, and it is held
+    /// without any lease outstanding — by construction, since it waits for the
+    /// count to reach zero. A close that only counted leases therefore saw an
+    /// idle gate at the exact moment the database file was being replaced, and
+    /// released the directory `LOCK` under it.
+    ///
+    /// Terminal on purpose: `closed` is never cleared, so a replacement that
+    /// was in flight cannot reopen a store that has gone.
     ///
     /// Held by [`ReadDrain`] rather than called directly, so that "the lock is
     /// not released while a read is live" is a consequence of field order in
@@ -168,9 +224,9 @@ impl ReadGate {
     /// something.
     fn close(&self) {
         let mut state = self.inner.state.lock().expect("read gate mutex");
-        state.admission = Admission::Closed;
+        state.closed = true;
         self.inner.changed.notify_all();
-        while state.outstanding > 0 {
+        while state.outstanding > 0 || state.exclusive {
             state = self.inner.changed.wait(state).expect("read gate mutex");
         }
     }
@@ -186,7 +242,11 @@ impl ReadGate {
 
     #[cfg(test)]
     fn admission(&self) -> Admission {
-        self.inner.state.lock().expect("read gate mutex").admission
+        self.inner
+            .state
+            .lock()
+            .expect("read gate mutex")
+            .admission()
     }
 }
 
@@ -269,13 +329,15 @@ pub(crate) struct Quiesced {
 }
 
 impl Drop for Quiesced {
+    /// Gives the claim back, and nothing else.
+    ///
+    /// Reopening is not a decision made here: `closed` is a separate fact this
+    /// does not touch, so a gate the store has already shut stays shut and a
+    /// gate it has not reopens. Dropping this is also what releases a `close`
+    /// that has been waiting for exclusive access to end.
     fn drop(&mut self) {
         let mut state = self.inner.state.lock().expect("read gate mutex");
-        // Only a gate this guard actually holds is reopened. If the store
-        // closed while this was outstanding, `Closed` is terminal and stays.
-        if state.admission == Admission::Quiesced {
-            state.admission = Admission::Open;
-        }
+        state.exclusive = false;
         self.inner.changed.notify_all();
     }
 }
@@ -418,17 +480,40 @@ mod tests {
         thread.join().expect("join");
     }
 
-    /// A closed gate stays closed, even under a replacement already in flight.
+    /// Closing waits for exclusive access to end, and the gate is closed for
+    /// good afterwards.
+    ///
+    /// The first half is the defect: a quiescer holds the gate with *no* lease
+    /// outstanding — waiting the leases out is how it got the gate — so a close
+    /// that counted only leases saw an idle store and returned. In
+    /// [`VoterStorage`](super::VoterStorage) that means the directory `LOCK`
+    /// goes while install is part-way through replacing `state.redb`, and a
+    /// second voter opens onto a half-replaced database.
     #[test]
-    fn a_quiesce_outstanding_at_close_cannot_reopen_the_gate() {
+    fn a_close_waits_for_the_quiescer_and_then_stays_shut() {
         let gate = ReadGate::new();
         let (_dir, database) = scratch_database();
         let replacing = gate.quiesce().expect("quiesce");
+        assert_eq!(gate.outstanding(), 0, "a quiescer holds no lease");
 
-        drop(ReadDrain::new(gate.clone())); // the store closes
-        assert_eq!(gate.admission(), Admission::Closed);
+        let (tx, rx) = mpsc::channel();
+        let closing = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                drop(ReadDrain::new(gate));
+                tx.send(()).expect("report");
+            })
+        };
 
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "closing must not complete while a replacement holds the database"
+        );
         drop(replacing);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("and completes once it lets go");
+        closing.join().expect("join");
+
         assert_eq!(
             gate.admission(),
             Admission::Closed,
@@ -439,8 +524,73 @@ mod tests {
         assert!(gate.quiesce().is_none(), "and nothing may quiesce it again");
     }
 
+    /// A quiesce that is waiting out a read when the store closes gets nothing.
+    ///
+    /// The other interleaving. Here the claim is already made and the wait is
+    /// on a live reader; the close arrives, and when the reader finally goes
+    /// both wake. Handing the caller exclusive access at that point would give
+    /// install a database whose store was already releasing the directory lock.
+    #[test]
+    fn a_quiesce_waiting_when_the_store_closes_gets_nothing() {
+        let gate = ReadGate::new();
+        let (_dir, database) = scratch_database();
+        let read = guarded(&gate, &database).expect("an open gate issues");
+
+        let (answers, answered) = mpsc::channel();
+        let quiescing = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let held = gate.quiesce();
+                answers.send(held.is_some()).expect("report");
+            })
+        };
+        wait_for(&gate, Admission::Quiesced);
+
+        let (closed, closes) = mpsc::channel();
+        let closing = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                drop(ReadDrain::new(gate));
+                closed.send(()).expect("report");
+            })
+        };
+        assert!(
+            closes.recv_timeout(Duration::from_millis(250)).is_err(),
+            "the close is itself waiting for the outstanding read"
+        );
+
+        drop(read);
+        assert!(
+            !answered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the quiesce resolves"),
+            "a quiesce that was waiting when the store closed must not return \
+             exclusive access to a store that is going away"
+        );
+        closes
+            .recv_timeout(Duration::from_secs(10))
+            .expect("and the close is not left waiting for a guard that was never issued");
+        quiescing.join().expect("join");
+        closing.join().expect("join");
+    }
+
     fn guarded(gate: &ReadGate, database: &redb::Database) -> Option<GuardedRead> {
         Some(gate.reserve()?.read(database).expect("read"))
+    }
+
+    /// Spin until another thread has moved the gate into `wanted`.
+    ///
+    /// Bounded so that a regression fails the test rather than hanging the
+    /// suite; the states this waits for are set microseconds after the thread
+    /// starts.
+    fn wait_for(gate: &ReadGate, wanted: Admission) {
+        for _ in 0..10_000 {
+            if gate.admission() == wanted {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the gate never reached {wanted:?}");
     }
 
     /// A directory that is removed when the returned handle drops, and a redb
