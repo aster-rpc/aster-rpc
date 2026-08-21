@@ -58,6 +58,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::actor::ActorShutdown;
 use super::error::{Db, StorageError, StorageResult};
+use super::reads::{GuardedRead, ReadDrain, ReadGate};
 use super::rows::{self, DurableState};
 use super::schema::StorageLayout;
 use super::snapshot::{self, Publication, SnapshotCatalog, SnapshotFile};
@@ -101,7 +102,7 @@ pub(crate) enum StateCommand {
     /// without blocking the writer. redb's MVCC is what makes both true at
     /// once: the version this pins does not move, and later applies do not wait
     /// for it.
-    ReadTransaction(Reply<redb::ReadTransaction>),
+    ReadTransaction(Reply<GuardedRead>),
     /// Hand out a copy of the published state.
     ///
     /// Test-only, and deliberately so. It clones the whole state — up to 192
@@ -129,6 +130,8 @@ enum Outcome {
 /// The single-writer thread that owns `state.redb`.
 struct StateActor {
     database: Database,
+    /// Counts the read transactions this actor has handed out.
+    reads: ReadGate,
     /// The **published** state: what is on disk, and nothing more.
     ///
     /// `Option` because an apply batch *moves* it out. The state is a whole
@@ -252,13 +255,22 @@ impl StateActor {
     /// than on redb, because redb would happily hand out the last committed
     /// version and that version is about to be either superseded or the last
     /// thing this store ever agreed on.
-    fn read_transaction(&mut self) -> StorageResult<redb::ReadTransaction> {
+    fn read_transaction(&mut self) -> StorageResult<GuardedRead> {
         if self.state.is_none() {
             return Err(StorageError::Fatal);
         }
-        self.database
+        let transaction = self
+            .database
             .begin_read()
-            .map_err(|source| StorageError::redb(Db::State, source))
+            .map_err(|source| StorageError::redb(Db::State, source))?;
+        // The lease and the transaction are handed out together, so a reader
+        // cannot exist that the store's shutdown -- or a replacement -- does not
+        // know to wait for. A shut gate means this store is closing or its file
+        // is about to be swapped; either way the version just pinned is not the
+        // one the caller wants.
+        self.reads
+            .issue(transaction)
+            .ok_or(StorageError::ActorStopped { db: Db::State })
     }
 
     fn applied_state(&mut self) -> StorageResult<Applied> {
@@ -401,15 +413,19 @@ impl std::fmt::Debug for StateHandle {
 }
 
 impl StateHandle {
-    /// Load and validate the durable state, then start the actor on it.
+    /// Start the actor on an already-loaded state.
     ///
-    /// The load happens **before** the thread exists, for the same reason the
-    /// log's validation does: a store published first and validated later has
-    /// already told the group it is up by the time the first apply finds the
-    /// corruption.
-    pub(crate) fn spawn(database: Database) -> StorageResult<(Self, StateShutdown)> {
-        let state = rows::load(&database)?;
-
+    /// The state is loaded and validated by the caller, **before** this exists,
+    /// for the same reason the log's validation is: a store published first and
+    /// validated later has already told the group it is up by the time the
+    /// first apply finds the corruption. The caller does it rather than this
+    /// function because `CURRENT` has to be checked against the loaded state,
+    /// and that check also belongs before any actor.
+    pub(crate) fn spawn(
+        database: Database,
+        state: DurableState,
+        reads: ReadGate,
+    ) -> StorageResult<(Self, StateShutdown)> {
         let (tx, rx) = mpsc::channel(STATE_ACTOR_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
         let actor_stop = Arc::clone(&stop);
@@ -420,6 +436,7 @@ impl StateHandle {
             .spawn(move || {
                 StateActor {
                     database,
+                    reads,
                     state: Some(state),
                     fatal: actor_fatal,
                     #[cfg(test)]
@@ -471,7 +488,7 @@ impl StateHandle {
     }
 
     /// A snapshot-consistent read transaction over `state.redb`.
-    pub(crate) async fn read_transaction(&self) -> StorageResult<redb::ReadTransaction> {
+    pub(crate) async fn read_transaction(&self) -> StorageResult<GuardedRead> {
         self.call(StateCommand::ReadTransaction).await
     }
 
@@ -528,13 +545,17 @@ impl CoordinationStateMachine {
     pub(crate) fn new(
         database: Database,
         layout: StorageLayout,
-    ) -> StorageResult<(Self, StateShutdown)> {
-        // Before the actor exists, like the state load itself. A `CURRENT` that
-        // names a body this build cannot read is data loss, and a store that
-        // announced itself first would be offering that snapshot to followers
-        // by the time anything noticed.
-        let current = snapshot::load_current(&layout)?;
-        let (handle, shutdown) = StateHandle::spawn(database)?;
+    ) -> StorageResult<(Self, StateShutdown, ReadDrain)> {
+        // Both before the actor exists. The state load validates every §11.3
+        // row; `CURRENT` is then checked against that state, because a marker
+        // is only meaningful relative to the store it sits beside. A store that
+        // announced itself first would be offering a snapshot to followers by
+        // the time anything noticed either was wrong.
+        let state = rows::load(&database)?;
+        let current = snapshot::load_current(&layout, &state)?;
+
+        let reads = ReadGate::new();
+        let (handle, shutdown) = StateHandle::spawn(database, state, reads.clone())?;
         Ok((
             Self {
                 handle,
@@ -543,6 +564,7 @@ impl CoordinationStateMachine {
                 current: Arc::new(Mutex::new(current)),
             },
             shutdown,
+            ReadDrain::new(reads),
         ))
     }
 
@@ -550,59 +572,84 @@ impl CoordinationStateMachine {
         &self.handle
     }
 
-    /// Apply §11.4's publication rule to a freshly built body, and return the
-    /// file that is current afterwards.
+    /// Apply §11.4's publication rule to a freshly built body, and lease
+    /// whatever is current afterwards.
     ///
     /// Separate from `build_snapshot` so that an out-of-order builder is a
     /// state a test can reach without a seam: taking a read transaction,
     /// applying more entries, and only then streaming that transaction is a
     /// builder that genuinely finished behind the current snapshot, and it can
     /// be handed straight to this.
-    pub(crate) fn publish(&self, built: SnapshotFile) -> StorageResult<SnapshotFile> {
+    ///
+    /// Returns a lease rather than a file because the two cannot be separated;
+    /// see [`lease`](Self::lease).
+    pub(crate) fn publish(
+        &self,
+        built: SnapshotFile,
+    ) -> StorageResult<Snapshot<CoordinationTypeConfig>> {
         let mut current = self.current.lock().expect("the current-snapshot mutex");
-        match snapshot::decide_publication(&built.meta, current.as_ref().map(|f| &f.meta)) {
-            Publication::Publish => {
-                snapshot::publish_current(&self.layout, &built.meta)?;
-                if let Some(previous) = current.replace(built.clone()) {
-                    self.catalog
-                        .retire(&previous.meta.snapshot_id, &previous.path);
+        let serving =
+            match snapshot::decide_publication(&built.meta, current.as_ref().map(|f| &f.meta)) {
+                Publication::Publish => {
+                    snapshot::publish_current(&self.layout, &built.meta)?;
+                    if let Some(previous) = current.replace(built.clone()) {
+                        self.catalog
+                            .retire(&previous.meta.snapshot_id, &previous.path);
+                    }
+                    built
                 }
-                Ok(built)
-            }
-            // The body is already on disk under its digest name, so this
-            // republishes the marker and nothing else. That is the repair
-            // §11.4 requires after a lost acknowledgement, not a no-op.
-            Publication::Idempotent => {
-                snapshot::publish_current(&self.layout, &built.meta)?;
-                Ok(built)
-            }
-            // A builder that finished behind the current snapshot. The marker
-            // does not move and the file goes, which is what "discarded" has to
-            // mean if it is not to accumulate.
-            Publication::Discard => {
-                self.catalog.retire(&built.meta.snapshot_id, &built.path);
-                Ok(current
-                    .clone()
-                    .expect("only a published snapshot can be ahead of a candidate"))
-            }
-            Publication::Fatal(detail) => Err(StorageError::corrupt(Db::State, "snapshot", detail)),
+                // The body is already on disk under its digest name, so this
+                // republishes the marker and nothing else. That is the repair
+                // §11.4 requires after a lost acknowledgement, not a no-op.
+                Publication::Idempotent => {
+                    snapshot::publish_current(&self.layout, &built.meta)?;
+                    built
+                }
+                // A builder that finished behind the current snapshot. The marker
+                // does not move and the file goes, which is what "discarded" has to
+                // mean if it is not to accumulate.
+                Publication::Discard => {
+                    self.catalog.retire(&built.meta.snapshot_id, &built.path);
+                    current
+                        .clone()
+                        .expect("only a published snapshot can be ahead of a candidate")
+                }
+                Publication::Fatal(detail) => {
+                    return Err(StorageError::corrupt(Db::State, "snapshot", detail))
+                }
+            };
+        self.lease(&current, &serving)
+    }
+
+    /// The current snapshot, leased.
+    pub(crate) fn current_snapshot(
+        &self,
+    ) -> StorageResult<Option<Snapshot<CoordinationTypeConfig>>> {
+        let current = self.current.lock().expect("the current-snapshot mutex");
+        match current.clone() {
+            Some(file) => self.lease(&current, &file).map(Some),
+            None => Ok(None),
         }
     }
 
-    /// A Published lease on a snapshot, as OpenRaft's `Snapshot`.
+    /// Pin a snapshot file and describe it as OpenRaft's `Snapshot`.
     ///
-    /// The error type is OpenRaft's, and it is 280 bytes. Boxing it here would
-    /// mean unboxing it at the two trait methods that call this, whose
-    /// signatures the trait fixes — so the lint's remedy is unavailable and its
-    /// warning is about a type this crate does not own.
+    /// Takes the guard it must be called under, rather than merely documenting
+    /// that requirement. Choosing a file and pinning it have to be one step:
+    /// [`publish`](Self::publish) retires and unlinks a superseded body under
+    /// this same lock, so a caller that selected a file, released the lock, and
+    /// then leased it could be handed a path that no longer exists. The
+    /// parameter is unused at runtime and load-bearing at compile time — it is
+    /// the only way to hold this ordering in a signature, since the lock
+    /// protects a *file on disk* rather than the value it guards.
     #[allow(clippy::result_large_err)]
-    fn serve(
+    fn lease(
         &self,
+        _current: &std::sync::MutexGuard<'_, Option<SnapshotFile>>,
         file: &SnapshotFile,
-    ) -> Result<Snapshot<CoordinationTypeConfig>, RaftStorageError<CoordinationNodeId>> {
-        let meta = rows::snapshot_meta_from_wire(&file.meta).map_err(io_read_state)?;
+    ) -> StorageResult<Snapshot<CoordinationTypeConfig>> {
         Ok(Snapshot {
-            meta,
+            meta: rows::snapshot_meta_from_wire(&file.meta)?,
             snapshot: Box::new(self.catalog.lease(&file.meta.snapshot_id, &file.path)),
         })
     }
@@ -646,8 +693,7 @@ impl RaftSnapshotBuilder<CoordinationTypeConfig> for CoordinationSnapshotBuilder
             })?
             .map_err(io_state)?;
 
-        let serving = self.machine.publish(built).map_err(io_state)?;
-        self.machine.serve(&serving)
+        self.machine.publish(built).map_err(io_state)
     }
 }
 
@@ -714,15 +760,7 @@ impl RaftStateMachine<CoordinationTypeConfig> for CoordinationStateMachine {
         &mut self,
     ) -> Result<Option<Snapshot<CoordinationTypeConfig>>, RaftStorageError<CoordinationNodeId>>
     {
-        let file = self
-            .current
-            .lock()
-            .expect("the current-snapshot mutex")
-            .clone();
-        match file {
-            Some(file) => self.serve(&file).map(Some),
-            None => Ok(None),
-        }
+        self.current_snapshot().map_err(io_read_state)
     }
 }
 
@@ -832,16 +870,27 @@ mod tests {
         database
     }
 
-    fn machine(dir: &std::path::Path) -> (CoordinationStateMachine, StateShutdown) {
+    /// The drain rides along: dropping it is what waits out an open read, and
+    /// a test that dropped it early would be asserting against a store whose
+    /// shutdown ordering it had already broken.
+    type Store = (CoordinationStateMachine, StateShutdown, ReadDrain);
+
+    fn machine(dir: &std::path::Path) -> Store {
         CoordinationStateMachine::new(seeded(dir), StorageLayout::new(dir))
             .expect("open the state machine")
     }
 
     /// Reopen the same directory, which is what proves a write was durable.
-    fn reopen(dir: &std::path::Path) -> (CoordinationStateMachine, StateShutdown) {
+    fn reopen(dir: &std::path::Path) -> Store {
         let database = Database::create(dir.join("state.redb")).expect("reopen");
         CoordinationStateMachine::new(database, StorageLayout::new(dir))
             .expect("reopen the state machine")
+    }
+
+    /// The durable state a marker check compares against.
+    fn durable(dir: &std::path::Path) -> DurableState {
+        let database = Database::create(dir.join("state.redb")).expect("open");
+        rows::load(&database).expect("load")
     }
 
     fn log_id(index: u64) -> RaftLogId<CoordinationNodeId> {
@@ -920,7 +969,7 @@ mod tests {
     #[tokio::test]
     async fn a_blank_advances_last_applied_and_nothing_else() {
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
         let before = published(&machine).await;
 
         let replies = machine.apply([blank(1)]).await.expect("apply");
@@ -939,7 +988,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (mut machine, _shutdown) = reopen(&dir);
+        let (mut machine, _shutdown, _drain) = reopen(&dir);
         let (applied, _) = machine.applied_state().await.expect("applied state");
         assert_eq!(applied.map(|id| id.index), Some(1), "and it was durable");
     }
@@ -950,7 +999,7 @@ mod tests {
     async fn a_membership_entry_records_the_stored_membership_durably() {
         let dir = scratch_dir();
         let voters = [[1u8; 32], [2u8; 32], [3u8; 32]];
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
 
         let replies = machine
             .apply([membership_entry(4, &voters)])
@@ -975,7 +1024,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (mut machine, _shutdown) = reopen(&dir);
+        let (mut machine, _shutdown, _drain) = reopen(&dir);
         let (applied, membership) = machine.applied_state().await.expect("applied state");
         assert_eq!(applied.map(|id| id.index), Some(4));
         assert_eq!(membership.log_id().map(|id| id.index), Some(4));
@@ -991,7 +1040,7 @@ mod tests {
     #[tokio::test]
     async fn an_advancing_but_non_contiguous_index_is_accepted() {
         let dir = scratch_dir();
-        let (mut machine, _shutdown) = machine(&dir);
+        let (mut machine, _shutdown, _drain) = machine(&dir);
 
         machine.apply([blank(1)]).await.expect("index 1");
         machine.apply([blank(9)]).await.expect("index 9 after 1");
@@ -1006,7 +1055,7 @@ mod tests {
     async fn a_delivery_at_or_below_last_applied_is_fatal() {
         for repeat in [5u64, 4] {
             let dir = scratch_dir();
-            let (mut machine, _shutdown) = machine(&dir);
+            let (mut machine, _shutdown, _drain) = machine(&dir);
             machine.apply([blank(5)]).await.expect("index 5");
 
             let err = machine
@@ -1033,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_command_is_fatal() {
         let dir = scratch_dir();
-        let (mut machine, _shutdown) = machine(&dir);
+        let (mut machine, _shutdown, _drain) = machine(&dir);
 
         let err = machine
             .apply([normal(
@@ -1049,7 +1098,7 @@ mod tests {
         // voter could not interpret.
         drop(_shutdown);
         drop(machine);
-        let (mut machine, _shutdown) = reopen(&dir);
+        let (mut machine, _shutdown, _drain) = reopen(&dir);
         let (applied, _) = machine.applied_state().await.expect("applied state");
         assert_eq!(applied, None);
     }
@@ -1061,7 +1110,7 @@ mod tests {
     #[tokio::test]
     async fn a_committed_command_persists_everything_it_wrote() {
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
 
         let replies = machine.apply([normal(1, acquire(1))]).await.expect("apply");
         assert_eq!(replies.len(), 1);
@@ -1075,7 +1124,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (machine, _shutdown) = reopen(&dir);
+        let (machine, _shutdown, _drain) = reopen(&dir);
         let state = published(&machine).await;
 
         let row = state
@@ -1097,7 +1146,7 @@ mod tests {
     #[tokio::test]
     async fn a_committed_replay_answers_from_the_session_and_still_audits() {
         let dir = scratch_dir();
-        let (mut machine, _shutdown) = machine(&dir);
+        let (mut machine, _shutdown, _drain) = machine(&dir);
 
         let first = machine.apply([normal(1, acquire(1))]).await.expect("first");
         let before = published(&machine).await;
@@ -1137,7 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn a_committed_rejection_survives_a_reopen_and_replays() {
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
 
         // Sequence 2 with nothing at sequence 1 is refused by the classifier.
         let rejected = machine.apply([normal(1, acquire(9))]).await.expect("apply");
@@ -1152,7 +1201,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (machine, _shutdown) = reopen(&dir);
+        let (machine, _shutdown, _drain) = reopen(&dir);
         let state = published(&machine).await;
         assert_eq!(state.model.audit.len(), 1, "a rejection is still audited");
         assert_eq!(state.model.last_applied.map(|id| id.index), Some(1));
@@ -1187,7 +1236,7 @@ mod tests {
         rows::commit(&database, state.clone(), &changes).expect("seed the exhausted row");
         drop(database);
 
-        let (mut machine, shutdown) = reopen(&dir);
+        let (mut machine, shutdown, _drain) = reopen(&dir);
         let replies = machine.apply([normal(1, acquire(1))]).await.expect("apply");
         let CommandReplyV1::Client(first) = &replies[0] else {
             panic!("expected a client reply");
@@ -1202,7 +1251,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (mut machine, _shutdown) = reopen(&dir);
+        let (mut machine, _shutdown, _drain) = reopen(&dir);
         let state = published(&machine).await;
         assert_eq!(state.model.audit.len(), 1, "the rejection was audited");
         assert_eq!(state.model.last_applied.map(|id| id.index), Some(1));
@@ -1226,7 +1275,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_known_command_is_a_committed_rejection() {
         let dir = scratch_dir();
-        let (mut machine, _shutdown) = machine(&dir);
+        let (mut machine, _shutdown, _drain) = machine(&dir);
 
         let malformed = client(
             1,
@@ -1269,7 +1318,7 @@ mod tests {
     #[tokio::test]
     async fn a_system_command_audits_in_its_own_code_space() {
         let dir = scratch_dir();
-        let (mut machine, _shutdown) = machine(&dir);
+        let (mut machine, _shutdown, _drain) = machine(&dir);
         machine
             .apply([normal(1, acquire(1))])
             .await
@@ -1308,7 +1357,7 @@ mod tests {
     #[tokio::test]
     async fn a_stale_membership_report_commits_and_audits_without_effect() {
         let dir = scratch_dir();
-        let (mut machine, _shutdown) = machine(&dir);
+        let (mut machine, _shutdown, _drain) = machine(&dir);
 
         let replies = machine
             .apply([normal(
@@ -1363,7 +1412,7 @@ mod tests {
     #[tokio::test]
     async fn a_lease_corridor_applies_and_survives_a_reopen() {
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
 
         let granted = |replies: &[CommandReplyV1], step: &str| -> i32 {
             let CommandReplyV1::Client(reply) = &replies[0] else {
@@ -1452,7 +1501,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (machine, _shutdown) = reopen(&dir);
+        let (machine, _shutdown, _drain) = reopen(&dir);
         let state = published(&machine).await;
         let row = &state.model.resources[&resource()];
         assert!(!row.held && row.holder.is_none(), "the lease was released");
@@ -1495,7 +1544,7 @@ mod tests {
 
         // The stored membership has to agree with the projection, so the store
         // is opened through a state whose `StoredMembership` really names them.
-        let (mut machine, shutdown) = reopen(&dir);
+        let (mut machine, shutdown, _drain) = reopen(&dir);
         machine
             .apply([membership_entry(1, &voters)])
             .await
@@ -1572,7 +1621,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (machine, _shutdown) = reopen(&dir);
+        let (machine, _shutdown, _drain) = reopen(&dir);
         let state = published(&machine).await;
         let intent = &state.model.intents[&operation];
         assert_eq!(intent.status_code, PHASE_CANCELLED, "and it is durable");
@@ -1638,7 +1687,7 @@ mod tests {
         rows::commit(&database, state.clone(), &changes).expect("seed the change in flight");
         drop(database);
 
-        let (mut machine, shutdown) = reopen(&dir);
+        let (mut machine, shutdown, _drain) = reopen(&dir);
 
         let voters: std::collections::BTreeSet<CoordinationNodeId> = (1u8..=3)
             .map(|b| CoordinationNodeId::from_array([b; 32]))
@@ -1663,7 +1712,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (machine, _shutdown) = reopen(&dir);
+        let (machine, _shutdown, _drain) = reopen(&dir);
         let restarted = published(&machine).await;
         assert_eq!(
             restarted.model.membership, running.model.membership,
@@ -1683,7 +1732,7 @@ mod tests {
         use openraft::Membership;
 
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
 
         let ids = |bytes: &[u8]| -> std::collections::BTreeSet<CoordinationNodeId> {
             bytes
@@ -1725,7 +1774,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (machine, _shutdown) = reopen(&dir);
+        let (machine, _shutdown, _drain) = reopen(&dir);
         assert_eq!(
             published(&machine).await.model.membership,
             running.model.membership
@@ -1786,7 +1835,7 @@ mod tests {
         rows::commit(&database, state.clone(), &changes).expect("seed a pending intent");
         drop(database);
 
-        let (mut machine, shutdown) = reopen(&dir);
+        let (mut machine, shutdown, _drain) = reopen(&dir);
 
         // The controller adds every missing node as a learner, so the node map
         // grows past the retained two while the change is in flight.
@@ -1844,7 +1893,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (machine, _shutdown) = reopen(&dir);
+        let (machine, _shutdown, _drain) = reopen(&dir);
         assert_eq!(
             published(&machine).await.model.membership,
             running.model.membership,
@@ -1866,7 +1915,7 @@ mod tests {
         use openraft::Membership;
 
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
 
         let voters: std::collections::BTreeSet<CoordinationNodeId> = (1u8..=3)
             .map(|b| CoordinationNodeId::from_array([b; 32]))
@@ -1892,7 +1941,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (mut machine, _shutdown) = reopen(&dir);
+        let (mut machine, _shutdown, _drain) = reopen(&dir);
         let (applied, membership) = machine.applied_state().await.expect("applied state");
         assert_eq!(applied, None, "nothing was written");
         assert!(membership.membership().nodes().next().is_none());
@@ -1951,7 +2000,7 @@ mod tests {
 
         // The normative mode: the learners already there, and nothing added.
         let dir = scratch_dir();
-        let (mut removing, shutdown) = machine(&dir);
+        let (mut removing, shutdown, _drain) = machine(&dir);
         removing
             .apply([Entry {
                 log_id: log_id(1),
@@ -1968,7 +2017,7 @@ mod tests {
 
         drop(shutdown);
         drop(removing);
-        let (restarted, restarted_shutdown) = reopen(&dir);
+        let (restarted, restarted_shutdown, _drain) = reopen(&dir);
         assert_eq!(
             published(&restarted).await.model.membership,
             running.model.membership,
@@ -1979,7 +2028,7 @@ mod tests {
 
         // The mode §7.3 now forbids, and what it would have cost.
         let dir = scratch_dir();
-        let (mut retaining, _shutdown) = machine(&dir);
+        let (mut retaining, _shutdown, _drain) = machine(&dir);
         let err = retaining
             .apply([Entry {
                 log_id: log_id(1),
@@ -2031,7 +2080,7 @@ mod tests {
         // What §7.3 step 5 now requires: the exact voters plus the retained
         // learners, in one entry.
         let dir = scratch_dir();
-        let (mut atomic, shutdown) = machine(&dir);
+        let (mut atomic, shutdown, _drain) = machine(&dir);
         atomic
             .apply([Entry {
                 log_id: log_id(1),
@@ -2044,7 +2093,7 @@ mod tests {
 
         drop(shutdown);
         drop(atomic);
-        let (restarted, restarted_shutdown) = reopen(&dir);
+        let (restarted, restarted_shutdown, _drain) = reopen(&dir);
         assert_eq!(
             published(&restarted).await.model.membership,
             running.model.membership,
@@ -2060,7 +2109,7 @@ mod tests {
         assert_eq!(both.len(), MAX_LEARNER_ENVELOPE + 2);
 
         let dir = scratch_dir();
-        let (mut adding, _shutdown) = machine(&dir);
+        let (mut adding, _shutdown, _drain) = machine(&dir);
         let err = adding
             .apply([Entry {
                 log_id: log_id(1),
@@ -2111,7 +2160,7 @@ mod tests {
         use openraft::Membership;
 
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
 
         let voters: Vec<[u8; 32]> = (1u8..=3).map(|b| [b; 32]).collect();
         let native = |index: u64, learners: std::ops::Range<u8>| {
@@ -2214,7 +2263,7 @@ mod tests {
         //    rather than out of the actor's memory.
         drop(shutdown);
         drop(machine);
-        let (mut machine, _shutdown) = reopen(&dir);
+        let (mut machine, _shutdown, _drain) = reopen(&dir);
         let restarted = published(&machine).await;
         assert_eq!(
             restarted.model.membership, at_l2.model.membership,
@@ -2309,7 +2358,7 @@ mod tests {
         rows::commit(&database, state.clone(), &changes).expect("seed 65 intents");
         drop(database);
 
-        let (machine, _shutdown) = reopen(&dir);
+        let (machine, _shutdown, _drain) = reopen(&dir);
         let loaded = published(&machine).await;
         assert_eq!(
             loaded.model.intents.len() as u64,
@@ -2325,7 +2374,7 @@ mod tests {
     #[tokio::test]
     async fn a_mixed_batch_answers_every_entry_and_commits_together() {
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
 
         let replies = machine
             .apply([
@@ -2345,7 +2394,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (mut machine, _shutdown) = reopen(&dir);
+        let (mut machine, _shutdown, _drain) = reopen(&dir);
         let (applied, membership) = machine.applied_state().await.expect("applied state");
         assert_eq!(
             applied.map(|id| id.index),
@@ -2415,7 +2464,7 @@ mod tests {
         rows::commit(&database, seed_state.clone(), &changes).expect("seed a pending intent");
         drop(database);
 
-        let (mut machine, shutdown) = reopen(&dir);
+        let (mut machine, shutdown, _drain) = reopen(&dir);
 
         machine
             .apply([
@@ -2468,7 +2517,7 @@ mod tests {
 
         drop(shutdown);
         drop(machine);
-        let (machine, _shutdown) = reopen(&dir);
+        let (machine, _shutdown, _drain) = reopen(&dir);
         let restarted = published(&machine).await;
 
         assert_eq!(
@@ -2521,7 +2570,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_commit_publishes_neither_memory_nor_disk() {
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
         machine.apply([normal(1, acquire(1))]).await.expect("first");
         let before = published(&machine).await;
 
@@ -2544,7 +2593,7 @@ mod tests {
         // Disk: unchanged, which is what a reopen shows.
         drop(shutdown);
         drop(machine);
-        let (machine, _shutdown) = reopen(&dir);
+        let (machine, _shutdown, _drain) = reopen(&dir);
         let after = published(&machine).await;
         assert_eq!(
             after.model.last_applied, before.model.last_applied,
@@ -2558,7 +2607,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_batch_writes_nothing() {
         let dir = scratch_dir();
-        let (mut machine, _shutdown) = machine(&dir);
+        let (mut machine, _shutdown, _drain) = machine(&dir);
         let before = published(&machine).await;
         let replies = machine.apply(Vec::<Entry>::new()).await.expect("apply");
         assert!(replies.is_empty());
@@ -2571,7 +2620,7 @@ mod tests {
     #[tokio::test]
     async fn a_fatal_store_refuses_every_later_command() {
         let dir = scratch_dir();
-        let (mut machine, _shutdown) = machine(&dir);
+        let (mut machine, _shutdown, _drain) = machine(&dir);
         machine
             .handle()
             .inject_fatal()
@@ -2629,7 +2678,7 @@ mod tests {
     #[tokio::test]
     async fn a_built_snapshot_is_published_and_still_current_after_a_reopen() {
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
 
         assert!(
             machine
@@ -2667,7 +2716,7 @@ mod tests {
         assert!(dir.join("snapshots").join("CURRENT").exists());
 
         drop(shutdown);
-        let (mut machine, shutdown) = reopen(&dir);
+        let (mut machine, shutdown, _drain) = reopen(&dir);
         let after = machine
             .get_current_snapshot()
             .await
@@ -2695,7 +2744,7 @@ mod tests {
     #[tokio::test]
     async fn the_snapshot_id_is_blake3_of_the_published_file() {
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
         machine
             .apply([
                 blank(1),
@@ -2738,7 +2787,7 @@ mod tests {
         let mut dirs = Vec::new();
         for _ in 0..2 {
             let dir = scratch_dir();
-            let (mut machine, shutdown) = machine(&dir);
+            let (mut machine, shutdown, _drain) = machine(&dir);
             machine
                 .apply([
                     blank(1),
@@ -2772,7 +2821,7 @@ mod tests {
     async fn an_out_of_order_builder_cannot_regress_the_marker() {
         let dir = scratch_dir();
         let layout = StorageLayout::new(&dir);
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, drain) = machine(&dir);
 
         machine.apply([blank(1)]).await.expect("apply");
         let stale = machine
@@ -2805,14 +2854,237 @@ mod tests {
             !discarded.exists(),
             "a discarded body is removed rather than left to accumulate"
         );
+
+        // Closed in the order the store closes in: the builder's read ends,
+        // then the drain returns, then the actor releases `state.redb`. Reading
+        // the marker back needs the database, so the test cannot get there
+        // without performing exactly that sequence.
+        drop(stale);
+        drop(drain);
+        drop(shutdown);
         assert_eq!(
-            super::snapshot::load_current(&layout)
+            super::snapshot::load_current(&layout, &durable(&dir))
                 .expect("load")
                 .expect("still published")
                 .meta,
             crate::coordination::raft::SnapshotMetaV1::from(&newer),
             "and the durable marker still names the newer snapshot"
         );
+    }
+
+    /// A snapshot header that belongs to this store.
+    fn header_for(state: &DurableState) -> crate::coordination::rowstream::SnapshotHeaderV1 {
+        crate::coordination::rowstream::SnapshotHeaderV1 {
+            format_version: crate::coordination::rowstream::SNAPSHOT_FORMAT_VERSION,
+            schema_version: super::super::identity::LOGICAL_SCHEMA_VERSION,
+            meta: rows::meta_to_wire(state),
+            row_counts: Default::default(),
+        }
+    }
+
+    /// A body is not accepted merely because it is internally consistent.
+    ///
+    /// Every check before this one asks whether the marker and the body agree
+    /// with each other. They always do in a *complete foreign snapshot*: same
+    /// framing, same digest, same membership as its own header claims. So the
+    /// body is also checked against what `state.redb` is bound to, one field at
+    /// a time here so that a check quietly dropped from the middle of that list
+    /// fails on its own name rather than being covered by a neighbour.
+    #[test]
+    fn a_snapshot_body_must_belong_to_this_store() {
+        let mut state = genesis_state();
+        state.model.last_applied = Some(LogId::new(1, LEADER, 5));
+
+        let good = header_for(&state);
+        super::snapshot::check_binding(&good, &state).expect("its own header is accepted");
+
+        type Header = crate::coordination::rowstream::SnapshotHeaderV1;
+        type Mutation = (&'static str, Box<dyn Fn(&mut Header)>);
+
+        let mutations: Vec<Mutation> = vec![
+            ("body format version", Box::new(|h| h.format_version += 1)),
+            ("schema version", Box::new(|h| h.schema_version += 1)),
+            ("group id", Box::new(|h| h.meta.group_id = vec![0x5a; 32])),
+            (
+                "genesis hash",
+                Box::new(|h| h.meta.genesis_hash = vec![0x5b; 32]),
+            ),
+            (
+                "authority key",
+                Box::new(|h| h.meta.authority_public_key = vec![0x5c; 32]),
+            ),
+            (
+                "authority domain",
+                Box::new(|h| h.meta.authority_domain = "elsewhere.invalid".into()),
+            ),
+            (
+                "deployment profile",
+                Box::new(|h| h.meta.deployment_profile_code += 1),
+            ),
+            (
+                "applied index ahead of the database",
+                Box::new(|h| {
+                    h.meta.last_applied = Some(crate::coordination::contract::LogIdV1 {
+                        term: 1,
+                        leader_node_id: LEADER.to_vec(),
+                        index: 6,
+                    })
+                }),
+            ),
+        ];
+
+        for (what, mutate) in mutations {
+            let mut header = good.clone();
+            mutate(&mut header);
+            let err = super::snapshot::check_binding(&header, &state).unwrap_err();
+            assert!(
+                err.puts_durability_in_question(),
+                "{what}: {err:?} should be fatal"
+            );
+        }
+
+        // A snapshot *behind* the database is the ordinary case: the state has
+        // applied entries since the body was streamed.
+        let mut behind = good.clone();
+        behind.meta.last_applied = Some(crate::coordination::contract::LogIdV1 {
+            term: 1,
+            leader_node_id: LEADER.to_vec(),
+            index: 4,
+        });
+        super::snapshot::check_binding(&behind, &state).expect("behind is not a failure");
+    }
+
+    /// The whole `snapshots/` directory of another group, dropped in beside
+    /// this one's `state.redb`, is refused at open.
+    ///
+    /// The end-to-end half of the check above: it proves the binding is on the
+    /// path a store actually takes, not merely available to be called.
+    #[tokio::test]
+    async fn a_foreign_snapshot_directory_is_refused_at_open() {
+        let theirs = scratch_dir();
+        let mine = scratch_dir();
+
+        {
+            let (mut machine, shutdown, drain) = machine(&theirs);
+            machine.apply([blank(1)]).await.expect("apply");
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build");
+            drop(drain);
+            drop(shutdown);
+        }
+
+        // A store bound to a different group, and otherwise identical.
+        {
+            let database = seeded(&mine);
+            let mut state = genesis_state();
+            state.model.authority.group_id = [0x5a; 32];
+            rows::commit(&database, state, &ChangeSet::default()).expect("rebind the group");
+        }
+
+        for entry in std::fs::read_dir(theirs.join("snapshots")).expect("read") {
+            let entry = entry.expect("entry");
+            std::fs::copy(entry.path(), mine.join("snapshots").join(entry.file_name()))
+                .expect("plant the foreign snapshot");
+        }
+
+        let database = Database::create(mine.join("state.redb")).expect("reopen");
+        let err = CoordinationStateMachine::new(database, StorageLayout::new(&mine))
+            .expect_err("another group's snapshot is not this group's");
+        assert!(err.puts_durability_in_question(), "{err:?}");
+    }
+
+    /// A rebuild repairs a body whose name no longer describes it.
+    ///
+    /// The digest name is a claim about content, and an orphan left under that
+    /// name by an earlier run is a claim nothing checked. Reusing it because the
+    /// path exists publishes whatever it happens to contain — so the existing
+    /// bytes are hashed, and a body that does not hash to its own name is
+    /// replaced by the one that does.
+    #[tokio::test]
+    async fn a_rebuild_repairs_a_body_whose_name_no_longer_matches_it() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown, drain) = machine(&dir);
+        machine.apply([blank(1)]).await.expect("apply");
+
+        let built = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build").meta.clone()
+        };
+        let path = body_path(&dir, &built.snapshot_id);
+        let intact = std::fs::read(&path).expect("read the published body");
+
+        std::fs::write(&path, b"an orphan from an earlier run").expect("corrupt");
+
+        let again = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder
+                .build_snapshot()
+                .await
+                .expect("rebuild")
+                .meta
+                .clone()
+        };
+        assert_eq!(again.snapshot_id, built.snapshot_id);
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            intact,
+            "the body under a digest name must be the body that hashes to it"
+        );
+
+        drop(drain);
+        drop(shutdown);
+        let (mut machine, shutdown, drain) = reopen(&dir);
+        machine
+            .get_current_snapshot()
+            .await
+            .expect("read")
+            .expect("and the repaired snapshot opens");
+        drop(drain);
+        drop(shutdown);
+    }
+
+    /// A reader keeps the snapshot it was handed while a newer one is
+    /// published.
+    ///
+    /// Publication retires the predecessor under the same lock that hands out a
+    /// lease, so a reader cannot be given a path that is about to be unlinked —
+    /// that ordering is carried by `lease`'s signature, which takes the guard.
+    /// What this proves is the other half: the pin is real, and it ends.
+    #[tokio::test]
+    async fn a_reader_keeps_its_snapshot_while_a_newer_one_is_published() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown, drain) = machine(&dir);
+
+        machine.apply([blank(1)]).await.expect("apply");
+        {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build");
+        }
+        let reader = machine
+            .get_current_snapshot()
+            .await
+            .expect("read")
+            .expect("published");
+        let first = reader.meta.snapshot_id.clone();
+        let first_path = reader.snapshot.path().to_path_buf();
+
+        machine.apply([blank(2)]).await.expect("apply");
+        let second = {
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build").meta.clone()
+        };
+        assert_ne!(second.snapshot_id, first, "a newer snapshot was published");
+        assert!(
+            first_path.exists(),
+            "the superseded body is pinned while a reader still holds it"
+        );
+
+        drop(reader);
+        assert!(
+            !first_path.exists(),
+            "and the catalog unlinks it once the last lease ends"
+        );
+        drop(drain);
         drop(shutdown);
     }
 
@@ -2830,7 +3102,7 @@ mod tests {
         let theirs = scratch_dir();
 
         let published = {
-            let (mut machine, shutdown) = machine(&mine);
+            let (mut machine, shutdown, _drain) = machine(&mine);
             machine.apply([blank(1)]).await.expect("apply");
             let mut builder = machine.get_snapshot_builder().await;
             let meta = builder.build_snapshot().await.expect("build").meta.clone();
@@ -2839,7 +3111,7 @@ mod tests {
         };
 
         let (other_meta, other_bytes) = {
-            let (mut machine, shutdown) = machine(&theirs);
+            let (mut machine, shutdown, _drain) = machine(&theirs);
             // The same log id, different state: an acquire at index 1 rather
             // than a blank.
             machine.apply([normal(1, acquire(1))]).await.expect("apply");
@@ -2877,7 +3149,7 @@ mod tests {
     async fn rebuilding_the_same_snapshot_repairs_the_marker_idempotently() {
         let dir = scratch_dir();
         let layout = StorageLayout::new(&dir);
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, drain) = machine(&dir);
         machine.apply([blank(1)]).await.expect("apply");
 
         let first = {
@@ -2898,15 +3170,17 @@ mod tests {
                 .clone()
         };
         assert_eq!(second, first, "the same state produces the same snapshot");
+
+        drop(drain);
+        drop(shutdown);
         assert_eq!(
-            super::snapshot::load_current(&layout)
+            super::snapshot::load_current(&layout, &durable(&dir))
                 .expect("load")
                 .expect("republished")
                 .meta,
             crate::coordination::raft::SnapshotMetaV1::from(&first),
             "the marker is repaired without the body being rewritten"
         );
-        drop(shutdown);
     }
 
     /// A marker naming a body that is not there is data loss, not "no
@@ -2914,7 +3188,7 @@ mod tests {
     #[tokio::test]
     async fn a_marker_whose_body_is_missing_refuses_the_open() {
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
         machine.apply([blank(1)]).await.expect("apply");
         let built = {
             let mut builder = machine.get_snapshot_builder().await;
@@ -2934,7 +3208,7 @@ mod tests {
     #[tokio::test]
     async fn a_truncated_body_refuses_the_open() {
         let dir = scratch_dir();
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
         machine.apply([blank(1)]).await.expect("apply");
         let built = {
             let mut builder = machine.get_snapshot_builder().await;
@@ -2962,7 +3236,7 @@ mod tests {
     async fn a_marker_that_disagrees_with_its_body_refuses_the_open() {
         let dir = scratch_dir();
         let layout = StorageLayout::new(&dir);
-        let (mut machine, shutdown) = machine(&dir);
+        let (mut machine, shutdown, _drain) = machine(&dir);
         machine.apply([blank(1)]).await.expect("apply");
         let built = {
             let mut builder = machine.get_snapshot_builder().await;

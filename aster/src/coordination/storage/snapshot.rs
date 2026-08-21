@@ -166,14 +166,23 @@ impl Drop for Scratch {
     }
 }
 
-/// Make `to` name `from`'s content, atomically.
+/// Make `to` name `from`'s content, atomically and durably.
 ///
-/// `rename(2)` on Unix and `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows;
-/// both replace an existing destination in one step, so a reader sees the old
-/// name or the new one and never a partial file. Replacing `state.redb` while
-/// redb still has it open is the harder case and is not this — that one needs
-/// the handles closed first, which is why it lives with install rather than
-/// here.
+/// Two implementations, because the platforms give the guarantee in different
+/// places and only one of them is `std::fs::rename`.
+///
+/// On Unix the rename is atomic and the *directory entry* still has to be
+/// fsynced, which [`fsync_dir`] does at each call site. On Windows
+/// `std::fs::rename` is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` and
+/// nothing else — the replacement is atomic but not write-through, and there is
+/// no directory handle to synchronize instead, so the durability half was
+/// simply missing. `MOVEFILE_WRITE_THROUGH` is what supplies it, and it has to
+/// be asked for.
+///
+/// Replacing `state.redb` while redb still has it open is the harder case and
+/// is not this — that one needs the handles closed first, which is why it lives
+/// with install.
+#[cfg(not(windows))]
 fn atomic_replace(from: PathBuf, to: &Path) -> StorageResult<()> {
     // The error names the destination, not the scratch file: the scratch name
     // carries a pid and a counter and means nothing to whoever reads the log,
@@ -181,13 +190,46 @@ fn atomic_replace(from: PathBuf, to: &Path) -> StorageResult<()> {
     std::fs::rename(&from, to).map_err(io("replacing a snapshot file", to))
 }
 
+#[cfg(windows)]
+fn atomic_replace(from: PathBuf, to: &Path) -> StorageResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let (source, destination) = (wide(&from), wide(to));
+    // SAFETY: both buffers are NUL-terminated and outlive the call, which is
+    // the whole of `MoveFileExW`'s contract on its two path arguments.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(StorageError::io(
+            "replacing a snapshot file",
+            to,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
 /// fsync a directory so a rename within it is durable.
 ///
-/// Unix only, and not an omission on Windows: there is no directory handle to
-/// synchronize there, and `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` is the
-/// platform's equivalent guarantee. Stating that here rather than leaving a
-/// silent `cfg` gap, because "we fsync the directory" is a claim §11.4 makes
-/// and only one platform can honour literally.
+/// Unix only, and now genuinely not an omission on Windows: there is no
+/// directory handle to synchronize there, and the write-through flag on the
+/// replacement above is the platform's equivalent guarantee — which is why it
+/// had to be implemented before this comment could claim it.
 #[cfg(unix)]
 fn fsync_dir(dir: &Path) -> StorageResult<()> {
     File::open(dir)
@@ -249,6 +291,23 @@ impl<R: Read> Read for Digesting<R> {
     }
 }
 
+/// BLAKE3 of a file's bytes, or `None` if it is not there.
+///
+/// Streamed rather than read whole: a snapshot body is bounded at 512 MiB, and
+/// the point of this whole path is that no step holds one in memory.
+fn digest_of(path: &Path) -> StorageResult<Option<[u8; 32]>> {
+    let handle = match File::open(path) {
+        Ok(handle) => handle,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(StorageError::io("hashing a snapshot body", path, err)),
+    };
+    let mut reader = Digesting::new(BufReader::new(handle));
+    std::io::copy(&mut reader, &mut std::io::sink())
+        .map_err(io("hashing a snapshot body", path))?;
+    let (_, digest, _) = reader.into_parts();
+    Ok(Some(digest))
+}
+
 // ── Build ────────────────────────────────────────────────────────────────────
 
 /// An immutable snapshot file and the metadata derived from its body.
@@ -306,14 +365,23 @@ pub(crate) fn build(
     drop(handle);
 
     let path = dir.join(file_name_for(&digest));
-    if path.exists() {
-        // The name *is* the digest, so an existing file with this name has this
-        // content. Rebuilding an identical body is the ordinary case after a
-        // lost acknowledgement, not a collision.
-        drop(scratch);
-    } else {
-        atomic_replace(scratch.keep(), &path)?;
-        fsync_dir(&dir)?;
+    // A file already under this name is *claimed* to have this content, and a
+    // claim is what the digest exists to replace. Rebuilding an identical body
+    // is the ordinary case after a lost acknowledgement, so the file is usually
+    // exactly right — but "usually" is how a corrupted or half-written orphan
+    // from an earlier run gets published under a name that vouches for it.
+    //
+    // So the existing bytes are hashed and compared against the body just
+    // written. Equal means reuse; anything else means the name is a lie and the
+    // freshly fsynced scratch — whose digest *is* this name — replaces it. That
+    // is a repair rather than a risk: no reader can be served worse by bytes
+    // that hash to the name they are under than by bytes that do not.
+    match digest_of(&path)? {
+        Some(existing) if existing == digest => drop(scratch),
+        _ => {
+            atomic_replace(scratch.keep(), &path)?;
+            fsync_dir(&dir)?;
+        }
     }
 
     Ok(SnapshotFile {
@@ -407,14 +475,119 @@ pub(crate) fn publish_current(layout: &StorageLayout, meta: &SnapshotMetaV1) -> 
     fsync_dir(&dir)
 }
 
-/// Read `snapshots/CURRENT` and prove it describes the body it names.
+/// Everything that must hold between a snapshot body and the store it sits
+/// beside (§11.4, §11.1).
+///
+/// Internal agreement is not enough. A marker and a body that agree with each
+/// other are a *complete and consistent snapshot of some group*, and a foreign
+/// one satisfies every check in that family — same file format, same digest,
+/// same membership as its own header claims. Dropping another voter's
+/// `snapshots/` directory in beside this `state.redb` would then be accepted
+/// and served to followers as this group's state.
+///
+/// So the body is also checked against the identity `state.redb` is bound to,
+/// and against how far that database has actually applied. The comparison is
+/// against the loaded state rather than against the store's `StorageIdentity`
+/// because the profile and applied index are replicated facts that only the
+/// state carries.
+pub(crate) fn check_binding(
+    header: &SnapshotHeaderV1,
+    state: &super::rows::DurableState,
+) -> StorageResult<()> {
+    use crate::coordination::rowstream::SNAPSHOT_FORMAT_VERSION;
+
+    let mismatch = |what: &str, found: String, expected: String| {
+        corrupt(format!(
+            "the current snapshot's {what} is {found}, and this store's is {expected}"
+        ))
+    };
+
+    if header.format_version != SNAPSHOT_FORMAT_VERSION {
+        return Err(mismatch(
+            "body format version",
+            header.format_version.to_string(),
+            SNAPSHOT_FORMAT_VERSION.to_string(),
+        ));
+    }
+    if header.schema_version != super::identity::LOGICAL_SCHEMA_VERSION {
+        return Err(mismatch(
+            "schema version",
+            header.schema_version.to_string(),
+            super::identity::LOGICAL_SCHEMA_VERSION.to_string(),
+        ));
+    }
+
+    let authority = &state.model.authority;
+    let bindings: [(&str, &[u8], &[u8]); 3] = [
+        ("group id", &header.meta.group_id, &authority.group_id),
+        (
+            "genesis hash",
+            &header.meta.genesis_hash,
+            &authority.genesis_hash,
+        ),
+        (
+            "authority key",
+            &header.meta.authority_public_key,
+            &authority.public_key,
+        ),
+    ];
+    for (what, found, expected) in bindings {
+        if found != expected {
+            return Err(mismatch(what, hex(found), hex(expected)));
+        }
+    }
+    if header.meta.authority_domain != authority.domain {
+        return Err(mismatch(
+            "authority domain",
+            format!("{:?}", header.meta.authority_domain),
+            format!("{:?}", authority.domain),
+        ));
+    }
+    if header.meta.deployment_profile_code != state.model.deployment_profile_code {
+        return Err(mismatch(
+            "deployment profile",
+            header.meta.deployment_profile_code.to_string(),
+            state.model.deployment_profile_code.to_string(),
+        ));
+    }
+
+    // A snapshot ahead of the database it describes cannot have been produced
+    // by this store: the body is streamed from a committed read transaction, so
+    // its applied index is one this `state.redb` had already reached. Ahead
+    // means the state was replaced by an older one, or the snapshot came from
+    // somewhere else. Behind is ordinary — the state has applied entries since.
+    let snapshot_index = header.meta.last_applied.as_ref().map(|id| id.index);
+    let applied_index = state.model.last_applied.as_ref().map(|id| id.index);
+    if snapshot_index > applied_index {
+        return Err(corrupt(format!(
+            "the current snapshot is at applied index {snapshot_index:?}, ahead of \
+             state.redb at {applied_index:?}; a snapshot this store built could not be"
+        )));
+    }
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Read `snapshots/CURRENT`, prove it describes the body it names, and prove
+/// the body belongs to this store.
 ///
 /// A missing marker is `Ok(None)` — a store that has never snapshotted. A
 /// marker that is present and wrong is `DATA_LOSS`: §11.4 is explicit that a
 /// missing file, malformed id, digest mismatch, or metadata mismatch is not an
 /// absent snapshot, because treating it as one would silently offer a follower
 /// a full log replay instead of reporting that this voter's snapshot is gone.
-pub(crate) fn load_current(layout: &StorageLayout) -> StorageResult<Option<SnapshotFile>> {
+pub(crate) fn load_current(
+    layout: &StorageLayout,
+    state: &super::rows::DurableState,
+) -> StorageResult<Option<SnapshotFile>> {
     let marker = layout.current_snapshot_marker();
     let stat = match std::fs::metadata(&marker) {
         Ok(stat) => stat,
@@ -466,6 +639,7 @@ pub(crate) fn load_current(layout: &StorageLayout) -> StorageResult<Option<Snaps
             "the marker's membership is not the membership the body carries",
         ));
     }
+    check_binding(&header, state)?;
 
     Ok(Some(SnapshotFile { meta, path, len }))
 }
@@ -908,6 +1082,35 @@ mod tests {
             Some(name.trim_end_matches(SNAPSHOT_FILE_SUFFIX)),
             "the outbound name and the inbound stem must agree, or a body this \
              node published could not be found by the id it advertised"
+        );
+    }
+
+    /// The Windows replacement asks for write-through.
+    ///
+    /// A statement about the source, because this host cannot execute that arm
+    /// and CI's Windows job would compile a version without the flag perfectly
+    /// happily. The flag is the entire durability guarantee on that platform:
+    /// `std::fs::rename` is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`
+    /// alone, and there is no directory handle to fsync instead, so dropping it
+    /// silently reduces every snapshot publication to "atomic but not durable"
+    /// — which is exactly the state this replaced.
+    #[test]
+    fn the_windows_replacement_is_write_through() {
+        let source = include_str!("snapshot.rs");
+        let end = source.find("\n#[cfg(test)]\n").unwrap_or(source.len());
+        let flat: String = source[..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let marker = "#[cfg(windows)] fn atomic_replace";
+        let arm = flat
+            .split(marker)
+            .nth(1)
+            .expect("a Windows replacement implementation");
+        assert!(
+            arm.contains("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH"),
+            "the Windows replacement must be both atomic and write-through"
         );
     }
 

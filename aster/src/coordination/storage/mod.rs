@@ -16,6 +16,7 @@
 //! | [`log`] | `RaftLogStorage` over `raft.redb` (Checkpoint B) |
 //! | [`rows`] | typed §11.3 row I/O, the whole-state load, and its validator |
 //! | [`machine`] | `RaftStateMachine` over `state.redb` (Checkpoint C) |
+//! | [`reads`] | outstanding read transactions, and waiting them out |
 //! | [`snapshot`] | the role-safe snapshot handle and catalog (Checkpoint D) |
 //!
 //! Everything here is crate-private. Slice 3 owns the public start
@@ -56,6 +57,7 @@ pub(crate) mod fixture;
 pub(crate) mod identity;
 pub(crate) mod log;
 pub(crate) mod machine;
+pub(crate) mod reads;
 pub(crate) mod rows;
 pub(crate) mod schema;
 pub(crate) mod snapshot;
@@ -66,6 +68,7 @@ use error::StorageResult;
 use identity::{OpenPolicy, StorageIdentity};
 use log::{CoordinationLogStore, LogShutdown};
 use machine::{CoordinationStateMachine, StateShutdown};
+use reads::ReadDrain;
 use schema::{DirectoryLock, IntegrityOutcome, OpenOutcome, StorageLayout};
 
 /// A validated, locked storage directory with its log actor running.
@@ -96,7 +99,15 @@ pub(crate) struct VoterStorage {
     /// lock goes. Reversed, a restart would find the lock free but a database
     /// still open, and a second voter could be admitted while the first still
     /// has the file open.
+    ///
+    /// [`ReadDrain`] sits between them for the same reason and a subtler one. A
+    /// redb `ReadTransaction` is `'static` -- it keeps its version alive
+    /// through its own `Arc` and does not borrow the `Database` -- so a
+    /// snapshot builder holding one is a reader this store cannot see. Draining
+    /// first means the state actor does not release the database, and the lock
+    /// does not go, while a builder is still reading a version of it.
     _log_shutdown: LogShutdown,
+    _reads: ReadDrain,
     _state_shutdown: StateShutdown,
     _lock: DirectoryLock,
 }
@@ -121,7 +132,7 @@ impl VoterStorage {
         let (log, log_shutdown) = CoordinationLogStore::new(parts.raft)?;
         // The state machine's own load validates every §11.3 row and the whole
         // state before its actor exists, for the same reason.
-        let (state, state_shutdown) =
+        let (state, state_shutdown, reads) =
             CoordinationStateMachine::new(parts.state, parts.layout.clone())?;
         Ok(Self {
             layout: parts.layout,
@@ -131,6 +142,7 @@ impl VoterStorage {
             outcome: parts.outcome,
             integrity: parts.integrity,
             _log_shutdown: log_shutdown,
+            _reads: reads,
             _state_shutdown: state_shutdown,
             _lock: parts.lock,
         })
@@ -198,6 +210,7 @@ mod durability_guard {
         ("schema.rs", include_str!("schema.rs")),
         ("log.rs", include_str!("log.rs")),
         ("machine.rs", include_str!("machine.rs")),
+        ("reads.rs", include_str!("reads.rs")),
         ("rows.rs", include_str!("rows.rs")),
         ("snapshot.rs", include_str!("snapshot.rs")),
         ("fixture.rs", include_str!("fixture.rs")),

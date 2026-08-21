@@ -1217,6 +1217,57 @@ mod tests {
         .expect("open voter storage")
     }
 
+    /// The directory lock outlives every read transaction handed out over
+    /// `state.redb`.
+    ///
+    /// A redb `ReadTransaction` is `'static` — it keeps its version alive
+    /// through its own `Arc` rather than borrowing the `Database` — so a
+    /// snapshot builder holding one is a reader nothing in the store's shutdown
+    /// path could see. Without the read drain, closing the store released
+    /// `LOCK` while that builder was still reading the old database, and a
+    /// second voter could be admitted on top of it and then publish `CURRENT`
+    /// from a version the new owner knew nothing about.
+    ///
+    /// The negative half is a timing observation, and it fails in the right
+    /// direction: with no drain the close completes at once and the first
+    /// `recv_timeout` succeeds. The `LockContended` assertion under it is not
+    /// timing-dependent — the closing thread is parked inside the drain, which
+    /// runs before the lock is released.
+    #[tokio::test]
+    async fn the_directory_lock_is_held_until_every_read_transaction_ends() {
+        use std::time::Duration;
+
+        let dir = scratch();
+        let storage = open(&dir);
+        let read = storage
+            .state()
+            .handle()
+            .read_transaction()
+            .await
+            .expect("a read transaction");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closing = std::thread::spawn(move || {
+            drop(storage);
+            tx.send(()).expect("report the close");
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "closing the store must not complete while a read is still open"
+        );
+        assert!(
+            matches!(try_open(&dir), Err(AsterStorageError::LockContended { .. })),
+            "and no second opener may be admitted meanwhile"
+        );
+
+        drop(read);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the close completes once the read ends");
+        closing.join().expect("join the closing thread");
+        try_open(&dir).expect("and the directory opens again afterwards");
+    }
+
     /// `append` needs a `LogFlushed`, whose constructor is crate-private to
     /// OpenRaft. `RaftLogStorageExt::blocking_append` is the supported way in,
     /// and it also asserts what we care about: it does not return until the
