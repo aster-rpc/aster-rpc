@@ -710,7 +710,7 @@ fn framing(path: &Path, err: BodyError) -> StorageError {
 pub(crate) fn rebuild_candidate(
     path: &Path,
     staged: &StagedSnapshot,
-) -> StorageResult<super::rows::DurableState> {
+) -> StorageResult<super::schema::VerifiedCandidate> {
     let body = staged.path();
     let handle = File::open(body)
         .map_err(|source| StorageError::io("rebuilding a state database", body, source))?;

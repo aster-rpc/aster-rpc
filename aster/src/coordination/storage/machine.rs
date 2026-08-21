@@ -3497,11 +3497,12 @@ mod tests {
         // holding the file to production's own open, so this call succeeding is
         // already the reopen assertion. A candidate missing `codec_version`
         // fails here rather than after it has replaced `state.redb`.
-        let after = super::super::snapshot::rebuild_candidate(&rebuilt, &staged)
+        let verified = super::super::snapshot::rebuild_candidate(&rebuilt, &staged)
             .expect("the candidate rebuilds and opens as production would");
-        assert_seven_sections(&after, "after the rebuild");
+        assert_seven_sections(verified.state(), "after the rebuild");
         assert_eq!(
-            after, before,
+            verified.state(),
+            &before,
             "the rebuilt state is the state the body was streamed from"
         );
 
@@ -3706,6 +3707,104 @@ mod tests {
         )
         .expect_err("the rebuilt bytes must hash to what was verified");
         assert!(format!("{err:?}").contains("hashed to"), "{err:?}");
+    }
+
+    /// A failed rebuild leaves the path free for the retry.
+    ///
+    /// Two rules that trap each other if cleanup is left to the error paths:
+    /// creation refuses an existing path, so a rebuild that failed *after*
+    /// creating the file makes every later attempt at that path fail too — with
+    /// `AlreadyExists`, naming the leftovers of the first attempt instead of
+    /// the reason it failed. The candidate therefore removes its file on drop,
+    /// and the same path is usable immediately afterwards.
+    ///
+    /// The first attempt fails inside verification, which is the interesting
+    /// side: the file exists, is a complete redb database, and has been written
+    /// to — the state is what is wrong with it.
+    #[tokio::test]
+    async fn a_failed_rebuild_leaves_its_path_free_for_a_retry() {
+        use redb::ReadableDatabase as _;
+
+        // A body whose rows are all valid and whose counters are not.
+        let valid_dir = scratch_dir();
+        let ((valid, _vs, _vd), _) = a_published_source(&valid_dir).await;
+        let mut broken = durable_of(&valid).await;
+        broken.model.growth_bytes = broken.model.growth_bytes.saturating_add(1);
+        let broken_dir = scratch_dir();
+        let database = seeded_with(&broken_dir, broken);
+        let read = database.begin_read().expect("read");
+        let bad = super::super::snapshot::build(&StorageLayout::new(&broken_dir), &read)
+            .expect("a canonical body");
+        drop(read);
+        drop(database);
+
+        let dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&dir);
+        let state = durable_of(&machine).await;
+        let layout = StorageLayout::new(&dir);
+        let candidate_path = dir.join("incoming").join("retried.redb");
+
+        let staged_bad = super::super::snapshot::receive(
+            &layout,
+            &CoordinationSnapshotFile::incoming(bad.path),
+            &state,
+            &bad.meta,
+        )
+        .expect("the bad body stages");
+        super::super::snapshot::rebuild_candidate(&candidate_path, &staged_bad)
+            .expect_err("its counters do not describe its rows");
+        assert!(
+            !candidate_path.exists(),
+            "a candidate that failed verification must not survive it"
+        );
+
+        // The same path, immediately, with a body that is sound.
+        let good_dir = scratch_dir();
+        let (_good, good) = a_published_source(&good_dir).await;
+        let staged_good = super::super::snapshot::receive(
+            &layout,
+            &good.snapshot,
+            &state,
+            &crate::coordination::raft::SnapshotMetaV1::from(&good.meta),
+        )
+        .expect("the good body stages");
+        let verified = super::super::snapshot::rebuild_candidate(&candidate_path, &staged_good)
+            .expect("the retry is not blocked by the first attempt's leftovers");
+        assert_seven_sections(verified.state(), "after the retry");
+
+        // And nothing removes it once it has been kept.
+        let (kept, _state) = verified.keep();
+        assert_eq!(kept, candidate_path);
+        assert!(kept.exists(), "a kept candidate is the caller's to place");
+    }
+
+    /// An abandoned candidate does not outlive the value that owns it.
+    #[tokio::test]
+    async fn a_candidate_dropped_without_being_kept_is_removed() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let (machine, _shutdown, _drain) = machine(&dir);
+        let staged = super::super::snapshot::receive(
+            &StorageLayout::new(&dir),
+            &published.snapshot,
+            &durable_of(&machine).await,
+            &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+        )
+        .expect("stage");
+
+        let path = dir.join("incoming").join("abandoned.redb");
+        {
+            let verified = super::super::snapshot::rebuild_candidate(&path, &staged)
+                .expect("a valid candidate");
+            assert!(path.exists(), "it is on disk while it is held");
+            drop(verified);
+        }
+        assert!(
+            !path.exists(),
+            "an install that gives up after validating still leaves nothing behind"
+        );
     }
 
     /// A candidate that cannot be opened the way production opens a state

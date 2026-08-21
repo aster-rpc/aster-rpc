@@ -1215,14 +1215,79 @@ pub(crate) fn write_state_binding(
 /// `freshly_created = true`. Accepting an arbitrary [`Database`] there would
 /// make that assertion a caller convention and let an old candidate retain
 /// rows the rebuild never visited.
+///
+/// **Removed on drop unless kept.** The two rules compose into a trap
+/// otherwise: creation refuses an existing path, so a rebuild that failed
+/// after creating the file makes every retry at that path fail too — with
+/// `AlreadyExists`, naming the previous attempt's leftovers rather than the
+/// reason the first one failed. Cleanup rides on the value that owns the file
+/// so no error path has to remember it, and [`StateCandidate::keep`] is the
+/// single deliberate way to end it.
+#[derive(Debug)]
 pub(crate) struct StateCandidate {
-    path: PathBuf,
-    database: Database,
+    /// `None` once a caller has taken ownership of the file.
+    path: Option<PathBuf>,
+    /// `None` once verification has closed the builder handle.
+    database: Option<Database>,
 }
 
 impl StateCandidate {
     pub(crate) fn database(&self) -> &Database {
-        &self.database
+        self.database
+            .as_ref()
+            .expect("a candidate holds its database until it is verified")
+    }
+
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("a candidate holds its path until it is kept")
+    }
+
+    /// Close the builder handle. Verification reopens the file instead.
+    fn close(&mut self) {
+        drop(self.database.take());
+    }
+
+    /// Take the file, and with it the responsibility for removing it.
+    ///
+    /// The only way out of cleanup-on-drop, and it consumes the candidate: what
+    /// follows is the replacement, after which the file is `state.redb` and
+    /// removing it would be the opposite of the intent.
+    pub(crate) fn keep(mut self) -> PathBuf {
+        self.path.take().expect("a candidate is kept once")
+    }
+}
+
+impl Drop for StateCandidate {
+    fn drop(&mut self) {
+        drop(self.database.take());
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// A candidate that has passed production's complete open, and the state it
+/// was proved to hold.
+///
+/// The candidate stays armed: an install that fails *after* validation — while
+/// quiescing, or replacing — must leave nothing behind either.
+#[derive(Debug)]
+pub(crate) struct VerifiedCandidate {
+    candidate: StateCandidate,
+    state: super::rows::DurableState,
+}
+
+impl VerifiedCandidate {
+    pub(crate) fn state(&self) -> &super::rows::DurableState {
+        &self.state
+    }
+
+    /// The validated state and the file, with cleanup handed to the caller.
+    pub(crate) fn keep(self) -> (PathBuf, super::rows::DurableState) {
+        let VerifiedCandidate { candidate, state } = self;
+        (candidate.keep(), state)
     }
 }
 
@@ -1239,31 +1304,29 @@ pub(crate) fn create_state_candidate(path: &Path) -> StorageResult<StateCandidat
         .create_new(true)
         .open(path)
         .map_err(|source| StorageError::io("creating a state candidate", path, source))?;
-    if let Err(err) = restrict_permissions(path, FILE_MODE) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(err);
-    }
-    let database = match Database::builder().create_file(file) {
-        Ok(database) => database,
-        Err(source) => {
-            let err = match source {
-                DatabaseError::TransactionInProgress => {
-                    StorageError::TransactionInProgress { db: Db::State }
-                }
-                other => StorageError::Integrity {
-                    db: Db::State,
-                    source: other,
-                },
-            };
-            let _ = std::fs::remove_file(path);
-            return Err(err);
-        }
+
+    // Armed from the moment the file exists, so every failure below unwinds
+    // through `Drop` rather than through its own removal. The two that used to
+    // be written by hand are exactly the two a third failure would have been
+    // added without.
+    let mut candidate = StateCandidate {
+        path: Some(path.to_path_buf()),
+        database: None,
     };
-    Ok(StateCandidate {
-        path: path.to_path_buf(),
-        database,
-    })
+    restrict_permissions(path, FILE_MODE)?;
+
+    candidate.database = Some(Database::builder().create_file(file).map_err(
+        |source| match source {
+            DatabaseError::TransactionInProgress => {
+                StorageError::TransactionInProgress { db: Db::State }
+            }
+            other => StorageError::Integrity {
+                db: Db::State,
+                source: other,
+            },
+        },
+    )?);
+    Ok(candidate)
 }
 
 /// Open a state database exactly as production would, and refuse it if
@@ -1279,16 +1342,19 @@ pub(crate) fn create_state_candidate(path: &Path) -> StorageResult<StateCandidat
 /// inseparable from rebuild: schema classification alone cannot detect valid
 /// individual rows whose counters or cross-table relationships disagree.
 pub(crate) fn verify_state_database(
-    candidate: StateCandidate,
-) -> StorageResult<super::rows::DurableState> {
-    let StateCandidate { path, database } = candidate;
-    drop(database);
+    mut candidate: StateCandidate,
+) -> StorageResult<VerifiedCandidate> {
+    // The builder handle goes, but the candidate does not: it still owns the
+    // file, so a refusal below removes it rather than leaving a rejected
+    // database under a name the next attempt cannot create.
+    candidate.close();
+    let path = candidate.path();
 
     // A distinct open is intentional: this is the exact boundary the install
     // will cross after replacement, not validation through the builder handle
     // that happened to write the bytes.
-    reject_symlink(&path)?;
-    let mut database = Database::open(&path).map_err(|source| match source {
+    reject_symlink(path)?;
+    let mut database = Database::open(path).map_err(|source| match source {
         DatabaseError::TransactionInProgress => {
             StorageError::TransactionInProgress { db: Db::State }
         }
@@ -1308,7 +1374,9 @@ pub(crate) fn verify_state_database(
             ),
         })?,
     }
-    super::rows::load(&database)
+    let state = super::rows::load(&database)?;
+    drop(database);
+    Ok(VerifiedCandidate { candidate, state })
 }
 
 pub(crate) fn create_state_tables(write: &redb::WriteTransaction) -> StorageResult<()> {
