@@ -3772,10 +3772,121 @@ mod tests {
             .expect("the retry is not blocked by the first attempt's leftovers");
         assert_seven_sections(verified.state(), "after the retry");
 
-        // And nothing removes it once it has been kept.
-        let (kept, _state) = verified.keep();
-        assert_eq!(kept, candidate_path);
-        assert!(kept.exists(), "a kept candidate is the caller's to place");
+        // And nothing removes it once a replacement has taken it.
+        let target = dir.join("replaced.redb");
+        verified.replace(&target).expect("the rename succeeds");
+        assert!(target.exists(), "the candidate is now the target");
+        assert!(
+            !candidate_path.exists(),
+            "and the candidate name is free again"
+        );
+    }
+
+    /// A rename that fails removes the candidate and leaves the old state.
+    ///
+    /// The ordering this exists to pin: cleanup is disarmed *after* the rename,
+    /// never before. Disarming first — which is what handing the caller a path
+    /// did — leaves a candidate on disk that nothing owns, and creation refuses
+    /// that path forever afterwards.
+    ///
+    /// Unix-only because it needs a rename that fails: a read-only directory
+    /// refuses one there. What it stands in for is any rename this store cannot
+    /// complete, on either platform.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_failed_replacement_removes_the_candidate_and_keeps_the_old_state() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let (machine, shutdown, drain) = machine(&dir);
+        let staged = super::super::snapshot::receive(
+            &StorageLayout::new(&dir),
+            &published.snapshot,
+            &durable_of(&machine).await,
+            &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+        )
+        .expect("stage");
+        let candidate_path = dir.join("incoming").join("doomed.redb");
+        let verified = super::super::snapshot::rebuild_candidate(&candidate_path, &staged)
+            .expect("a valid candidate");
+
+        // The store's own database has to be closed before anything renames
+        // over it, which is what the real install's quiesce is for.
+        drop(machine);
+        drop(drain);
+        drop(shutdown);
+        let target = dir.join("state.redb");
+        let before = std::fs::read(&target).expect("the old state database");
+
+        // A destination directory that refuses the rename.
+        let sealed = dir.join("sealed");
+        std::fs::create_dir_all(&sealed).expect("mkdir");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let err = verified
+            .replace(&sealed.join("state.redb"))
+            .expect_err("the rename cannot succeed");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(format!("{err:?}").contains("state.redb"), "{err:?}");
+
+        assert!(
+            !candidate_path.exists(),
+            "a candidate whose replacement failed is removed, not left to block the retry"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("the old state database"),
+            before,
+            "and the state this store was serving is untouched"
+        );
+    }
+
+    /// A durability failure *after* the rename keeps the new database.
+    ///
+    /// The other side of the same ordering, and the one where deleting would be
+    /// the disaster: the rename has taken effect, so the file is the store's
+    /// state now. Reaching the fsync with an error means "installed but not
+    /// proven durable", which is a reason to stop the store, not to undo it.
+    #[tokio::test]
+    async fn a_durability_failure_after_the_rename_keeps_the_new_database() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let (machine, shutdown, drain) = machine(&dir);
+        let staged = super::super::snapshot::receive(
+            &StorageLayout::new(&dir),
+            &published.snapshot,
+            &durable_of(&machine).await,
+            &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+        )
+        .expect("stage");
+        let candidate_path = dir.join("incoming").join("durable.redb");
+        let verified = super::super::snapshot::rebuild_candidate(&candidate_path, &staged)
+            .expect("a valid candidate");
+        let installed = std::fs::read(&candidate_path).expect("the candidate's bytes");
+
+        drop(machine);
+        drop(drain);
+        drop(shutdown);
+
+        super::super::snapshot::fault::fail_next_directory_fsync();
+        let target = dir.join("state.redb");
+        let err = verified
+            .replace(&target)
+            .expect_err("the injected post-rename durability failure is reported");
+        assert!(format!("{err:?}").contains("injected"), "{err:?}");
+
+        assert_eq!(
+            std::fs::read(&target).expect("the state database"),
+            installed,
+            "the replacement stands: undoing it would discard the installed state"
+        );
+        assert!(
+            !candidate_path.exists(),
+            "and the candidate name is free, because the rename did happen"
+        );
     }
 
     /// An abandoned candidate does not outlive the value that owns it.

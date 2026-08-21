@@ -1249,13 +1249,11 @@ impl StateCandidate {
         drop(self.database.take());
     }
 
-    /// Take the file, and with it the responsibility for removing it.
-    ///
-    /// The only way out of cleanup-on-drop, and it consumes the candidate: what
-    /// follows is the replacement, after which the file is `state.redb` and
-    /// removing it would be the opposite of the intent.
-    pub(crate) fn keep(mut self) -> PathBuf {
-        self.path.take().expect("a candidate is kept once")
+    /// Stop owning the file. Private, and reachable only from
+    /// [`VerifiedCandidate::replace`] one statement after the rename that makes
+    /// the file somebody else's.
+    fn disarm(mut self) -> PathBuf {
+        self.path.take().expect("a candidate is disarmed once")
     }
 }
 
@@ -1284,10 +1282,31 @@ impl VerifiedCandidate {
         &self.state
     }
 
-    /// The validated state and the file, with cleanup handed to the caller.
-    pub(crate) fn keep(self) -> (PathBuf, super::rows::DurableState) {
+    /// Rename this candidate over `target`, then stop owning it.
+    ///
+    /// The only exit from cleanup-on-drop, and it is fused to the rename on
+    /// purpose. Handing a caller the path first — which is what this used to do
+    /// — disarms cleanup *before* the operation that might fail, so a rename
+    /// that never happened leaves the candidate on disk forever and blocks
+    /// every retry at that path. There is no accessor for the path, so no call
+    /// site can reproduce that ordering.
+    ///
+    /// The disarm sits immediately after the rename and before the directory
+    /// fsync, which reads as the thing that keeps a post-rename failure from
+    /// deleting the new database. It is not: a candidate owns the name it was
+    /// *created* under, and after a successful rename that name is gone, so
+    /// dropping it armed would remove nothing. Mutation testing says so —
+    /// moving the disarm after the fsync fails no test. The ordering is here
+    /// because it states the intent at the point it becomes true, and the
+    /// guarantee rests on the stronger fact that a candidate never names its
+    /// target. "Renamed but not yet durable" is then not something to clean up
+    /// after; it is something for the caller to stop the store over.
+    pub(crate) fn replace(self, target: &Path) -> StorageResult<super::rows::DurableState> {
         let VerifiedCandidate { candidate, state } = self;
-        (candidate.keep(), state)
+        super::snapshot::atomic_replace(candidate.path(), target)?;
+        drop(candidate.disarm());
+        super::snapshot::fsync_dir_durably(target.parent().unwrap_or_else(|| Path::new(".")))?;
+        Ok(state)
     }
 }
 
@@ -1557,6 +1576,54 @@ mod tests {
     };
     use redb::TableHandle;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A candidate's path never leaves the type that owns it.
+    ///
+    /// The fourth of the replacement's ordering rules, and the only one no
+    /// runtime test can express: every other rule is about *when* cleanup ends,
+    /// and this one is about there being no second way to end it. An accessor
+    /// returning the path — which is what `keep` was — lets a caller disarm
+    /// before the rename it was supposed to survive, and the failure that
+    /// follows is a candidate nothing owns and a path creation refuses forever.
+    ///
+    /// So the check is on the source: the only thing that may hand out
+    /// ownership is `disarm`, it must be private, and only `replace` may call
+    /// it. A borrow of the path is fine and is what `replace` uses — a `&Path`
+    /// cannot disarm anything.
+    #[test]
+    fn nothing_outside_replace_can_take_a_candidate_s_path() {
+        let source = include_str!("schema.rs");
+        let end = source.find("\n#[cfg(test)]\n").unwrap_or(source.len());
+        let production = &source[..end];
+
+        assert!(
+            production.contains("    fn disarm(mut self) -> PathBuf {"),
+            "`disarm` must stay private: it is the whole of cleanup-on-drop's exit"
+        );
+        assert_eq!(
+            production.matches("disarm()").count(),
+            1,
+            "exactly one call site, and `replace` is it"
+        );
+        for banned in ["pub(crate) fn keep", "pub(super) fn keep", "pub fn keep"] {
+            assert!(
+                !production.contains(banned),
+                "a candidate must not hand its path to a caller: found {banned:?}"
+            );
+        }
+        // And nothing returns the path by value from either type.
+        for owning in [
+            "pub(crate) fn path(&self) -> PathBuf",
+            "pub(super) fn path(&self) -> PathBuf",
+            "pub(crate) fn into_path",
+            "pub(super) fn into_path",
+        ] {
+            assert!(
+                !production.contains(owning),
+                "found an owning path accessor: {owning:?}"
+            );
+        }
+    }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 

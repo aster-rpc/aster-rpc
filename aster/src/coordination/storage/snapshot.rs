@@ -209,7 +209,7 @@ impl Drop for Scratch {
 /// is not this — that one needs the handles closed first, which is why it lives
 /// with install.
 #[cfg(not(windows))]
-fn atomic_replace(from: &Path, to: &Path) -> StorageResult<()> {
+pub(super) fn atomic_replace(from: &Path, to: &Path) -> StorageResult<()> {
     // The error names the destination, not the scratch file: the scratch name
     // carries a pid and a counter and means nothing to whoever reads the log,
     // while the destination is the snapshot that failed to appear.
@@ -217,7 +217,7 @@ fn atomic_replace(from: &Path, to: &Path) -> StorageResult<()> {
 }
 
 #[cfg(windows)]
-fn atomic_replace(from: &Path, to: &Path) -> StorageResult<()> {
+pub(super) fn atomic_replace(from: &Path, to: &Path) -> StorageResult<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -1053,8 +1053,18 @@ pub(crate) fn publish_current(layout: &StorageLayout, meta: &SnapshotMetaV1) -> 
     // worst of both: readers in this process see the new one, a crash may
     // restore the old, and nothing can say which. Reaching here with an error
     // is what latches the store fatal at the caller.
-    fault::maybe_fail_directory_fsync(&dir)?;
-    fsync_dir(&dir)
+    fsync_dir_durably(&dir)
+}
+
+/// [`fsync_dir`] with the post-rename failure seam in front of it.
+///
+/// Both callers are past a rename that has already taken effect, and both need
+/// the same thing from a test: a durability failure at exactly the point where
+/// the new name is visible and the old one is gone. Sharing the seam keeps
+/// "renamed but not durable" one situation rather than two that drift.
+pub(super) fn fsync_dir_durably(dir: &Path) -> StorageResult<()> {
+    fault::maybe_fail_directory_fsync(dir)?;
+    fsync_dir(dir)
 }
 
 /// Everything that must hold between a snapshot body and the store it sits
@@ -1931,10 +1941,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let marker = "#[cfg(windows)] fn atomic_replace";
+        // Matched on the attribute and the name, not on the visibility between
+        // them: this guard exists to police the *flags*, and it should not fail
+        // because the function became reachable from another module.
+        let marker = "#[cfg(windows)]";
         let arm = flat
             .split(marker)
-            .nth(1)
+            .find(|arm| arm.trim_start().starts_with("pub(super) fn atomic_replace"))
             .expect("a Windows replacement implementation");
         assert!(
             arm.contains("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH"),
