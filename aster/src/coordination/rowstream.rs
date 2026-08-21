@@ -34,6 +34,16 @@ pub const SECTION_AUDIT: u64 = 7;
 
 pub const MAX_HEADER_BYTES: u64 = 64 * 1024;
 
+/// §11.4's maximum snapshot size, as a bound on the whole body.
+///
+/// The per-section row counts and per-row byte ceilings already bound each
+/// piece, and their product is far larger than this: 100,000 resource rows at
+/// 128 KiB is 12 GiB. So the aggregate is a separate limit, not a consequence
+/// of the others — a body that respects every section limit and still runs to
+/// gigabytes is exactly the storage-pressure failure §11.4 says it is, and
+/// discovering that by writing it is too late.
+pub const MAX_SNAPSHOT_BODY_BYTES: u64 = 512 * 1024 * 1024;
+
 /// The snapshot **body format** version stamped into
 /// [`SnapshotHeaderV1::format_version`].
 ///

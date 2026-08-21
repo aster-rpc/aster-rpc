@@ -1261,9 +1261,23 @@ mod tests {
             "and no second opener may be admitted meanwhile"
         );
 
-        drop(read);
+        // Giving up the *transaction* does not give up the store. A builder
+        // reaches this point with its body streamed and its publication still
+        // to do, and publishing into a directory a new owner had been admitted
+        // to is the failure this half guards.
+        let lease = read.release_transaction();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "releasing the transaction must not release the store"
+        );
+        assert!(
+            matches!(try_open(&dir), Err(AsterStorageError::LockContended { .. })),
+            "the publication window is still inside the lock"
+        );
+
+        drop(lease);
         rx.recv_timeout(Duration::from_secs(10))
-            .expect("the close completes once the read ends");
+            .expect("the close completes once the lease ends");
         closing.join().expect("join the closing thread");
         try_open(&dir).expect("and the directory opens again afterwards");
     }

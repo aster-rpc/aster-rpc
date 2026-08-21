@@ -64,9 +64,10 @@ use std::sync::{Arc, Mutex};
 
 use super::error::{Db, StorageError, StorageResult};
 use super::schema::{StorageLayout, MAX_COORDINATION_META_BYTES};
+use crate::coordination::contract::LogIdV1;
 use crate::coordination::raft::SnapshotMetaV1;
 use crate::coordination::rowstream::{
-    read_body, BodyError, BodyVisitor, SnapshotBodyRowV1, SnapshotHeaderV1,
+    read_body, BodyError, BodyVisitor, SnapshotBodyRowV1, SnapshotHeaderV1, MAX_SNAPSHOT_BODY_BYTES,
 };
 
 /// Snapshot ids are content-derived (§11.4): the domain prefix plus the
@@ -152,9 +153,17 @@ impl Scratch {
         self.path.as_deref().expect("a scratch file has a path")
     }
 
-    /// Give up the unlink-on-drop guarantee, returning the path to rename.
-    fn keep(mut self) -> PathBuf {
-        self.path.take().expect("a scratch file has a path")
+    /// Rename this file into place, keeping the unlink-on-drop guarantee until
+    /// the rename has actually succeeded.
+    ///
+    /// Handing the path out and renaming it separately disarmed the cleanup one
+    /// statement too early: a rename that failed then left the partial file
+    /// behind under a name nothing sweeps and nothing can identify.
+    fn promote(mut self, to: &Path) -> StorageResult<()> {
+        let from = self.path().to_path_buf();
+        atomic_replace(&from, to)?;
+        self.path = None;
+        Ok(())
     }
 }
 
@@ -183,15 +192,15 @@ impl Drop for Scratch {
 /// is not this — that one needs the handles closed first, which is why it lives
 /// with install.
 #[cfg(not(windows))]
-fn atomic_replace(from: PathBuf, to: &Path) -> StorageResult<()> {
+fn atomic_replace(from: &Path, to: &Path) -> StorageResult<()> {
     // The error names the destination, not the scratch file: the scratch name
     // carries a pid and a counter and means nothing to whoever reads the log,
     // while the destination is the snapshot that failed to appear.
-    std::fs::rename(&from, to).map_err(io("replacing a snapshot file", to))
+    std::fs::rename(from, to).map_err(io("replacing a snapshot file", to))
 }
 
 #[cfg(windows)]
-fn atomic_replace(from: PathBuf, to: &Path) -> StorageResult<()> {
+fn atomic_replace(from: &Path, to: &Path) -> StorageResult<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -204,7 +213,7 @@ fn atomic_replace(from: PathBuf, to: &Path) -> StorageResult<()> {
             .collect()
     }
 
-    let (source, destination) = (wide(&from), wide(to));
+    let (source, destination) = (wide(from), wide(to));
     // SAFETY: both buffers are NUL-terminated and outlive the call, which is
     // the whole of `MoveFileExW`'s contract on its two path arguments.
     let moved = unsafe {
@@ -242,38 +251,69 @@ fn fsync_dir(_dir: &Path) -> StorageResult<()> {
     Ok(())
 }
 
-/// A pass-through that digests everything crossing it.
+/// A pass-through that digests everything crossing it, and refuses to carry
+/// more than §11.4's maximum snapshot.
 ///
 /// One type for both directions on purpose: the digest a build computes and the
 /// digest a load recomputes have to be over the same bytes in the same way, and
 /// two implementations of "BLAKE3 as it goes" is exactly the kind of pair that
-/// agrees until it does not.
+/// agrees until it does not. The aggregate bound rides along for the same
+/// reason — every byte of every body crosses this, so it is the one place the
+/// limit cannot be applied to one path and forgotten on the other.
+///
+/// The row stream bounds each section's row count and each row's encoded
+/// length, and neither implies this: their product is gigabytes. A build that
+/// would exceed it fails while writing its scratch file rather than after
+/// publishing something no reader will accept.
 struct Digesting<T> {
     inner: T,
     hasher: blake3::Hasher,
     len: u64,
+    limit: u64,
 }
 
 impl<T> Digesting<T> {
     fn new(inner: T) -> Self {
+        Self::bounded(inner, MAX_SNAPSHOT_BODY_BYTES)
+    }
+
+    /// The bound as a parameter, so it can be exercised without writing half a
+    /// gigabyte. `new` supplies the real one, and
+    /// `the_production_bound_is_the_declared_maximum` pins that.
+    fn bounded(inner: T, limit: u64) -> Self {
         Self {
             inner,
             hasher: blake3::Hasher::new(),
             len: 0,
+            limit,
         }
     }
 
     fn into_parts(self) -> (T, [u8; 32], u64) {
-        let Digesting { inner, hasher, len } = self;
+        let Digesting {
+            inner, hasher, len, ..
+        } = self;
         (inner, *hasher.finalize().as_bytes(), len)
+    }
+
+    /// Account for `n` more bytes, refusing to pass the §11.4 ceiling.
+    fn account(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.hasher.update(bytes);
+        self.len += bytes.len() as u64;
+        if self.len > self.limit {
+            return Err(std::io::Error::other(format!(
+                "a snapshot body over the {}-byte maximum",
+                self.limit
+            )));
+        }
+        Ok(())
     }
 }
 
 impl<W: Write> Write for Digesting<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.inner.write(buf)?;
-        self.hasher.update(&buf[..n]);
-        self.len += n as u64;
+        self.account(&buf[..n])?;
         Ok(n)
     }
 
@@ -285,9 +325,60 @@ impl<W: Write> Write for Digesting<W> {
 impl<R: Read> Read for Digesting<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
-        self.hasher.update(&buf[..n]);
-        self.len += n as u64;
+        self.account(&buf[..n])?;
         Ok(n)
+    }
+}
+
+/// A seam for the one failure that cannot be provoked from outside.
+///
+/// `publish_current` can rename `CURRENT` into place and then fail to fsync the
+/// directory. That leaves the marker replaced and not durable — and it is the
+/// case that decides whether a publication failure latches the store fatal or
+/// quietly leaves memory and disk disagreeing. No filesystem this test suite
+/// can create fails only at that point, so the failure is injected there, the
+/// same way [`super::machine`] injects a commit failure after a transition has
+/// already run.
+///
+/// Thread-local rather than a global: the tests that use it drive the whole
+/// publication on their own thread, and a process-global flag would leak into
+/// whatever else happened to be publishing.
+#[cfg(test)]
+pub(crate) mod fault {
+    use super::{StorageError, StorageResult};
+    use std::cell::Cell;
+    use std::path::Path;
+
+    thread_local! {
+        static FAIL_DIRECTORY_FSYNC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The next `publish_current` on this thread fails *after* the marker has
+    /// been renamed into place.
+    pub(crate) fn fail_next_directory_fsync() {
+        FAIL_DIRECTORY_FSYNC.with(|flag| flag.set(true));
+    }
+
+    pub(super) fn maybe_fail_directory_fsync(dir: &Path) -> StorageResult<()> {
+        if FAIL_DIRECTORY_FSYNC.with(|flag| flag.replace(false)) {
+            return Err(StorageError::io(
+                "fsyncing the snapshot directory",
+                dir,
+                std::io::Error::other("injected post-rename durability failure"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+mod fault {
+    use super::StorageResult;
+    use std::path::Path;
+
+    #[inline]
+    pub(super) fn maybe_fail_directory_fsync(_dir: &Path) -> StorageResult<()> {
+        Ok(())
     }
 }
 
@@ -379,7 +470,7 @@ pub(crate) fn build(
     match digest_of(&path)? {
         Some(existing) if existing == digest => drop(scratch),
         _ => {
-            atomic_replace(scratch.keep(), &path)?;
+            scratch.promote(&path)?;
             fsync_dir(&dir)?;
         }
     }
@@ -471,7 +562,12 @@ pub(crate) fn publish_current(layout: &StorageLayout, meta: &SnapshotMetaV1) -> 
             .map_err(io("fsyncing the current marker", scratch.path()))?;
     }
 
-    atomic_replace(scratch.keep(), &layout.current_snapshot_marker())?;
+    scratch.promote(&layout.current_snapshot_marker())?;
+    // A marker that has been renamed into place but not made durable is the
+    // worst of both: readers in this process see the new one, a crash may
+    // restore the old, and nothing can say which. Reaching here with an error
+    // is what latches the store fatal at the caller.
+    fault::maybe_fail_directory_fsync(&dir)?;
     fsync_dir(&dir)
 }
 
@@ -492,7 +588,9 @@ pub(crate) fn publish_current(layout: &StorageLayout, meta: &SnapshotMetaV1) -> 
 /// state carries.
 pub(crate) fn check_binding(
     header: &SnapshotHeaderV1,
+    digest: &[u8; 32],
     state: &super::rows::DurableState,
+    canonical: impl FnOnce() -> StorageResult<[u8; 32]>,
 ) -> StorageResult<()> {
     use crate::coordination::rowstream::SNAPSHOT_FORMAT_VERSION;
 
@@ -564,7 +662,61 @@ pub(crate) fn check_binding(
              state.redb at {applied_index:?}; a snapshot this store built could not be"
         )));
     }
+
+    // At the *same* index the identity checks above are exhausted and still
+    // insufficient. Two stores in the same group can apply different entries at
+    // the same log id, so a body copied from one to the other agrees on group,
+    // genesis, authority, profile, index — and describes different state.
+    //
+    // §11.4's determinism invariant is what closes it: at one complete
+    // `last_applied`, the canonical body is a pure function of replicated
+    // state, so this store can recompute the digest its own database implies
+    // and compare. The full log id has to match first, because the digest
+    // comparison is only meaningful between two bodies claiming to describe the
+    // same entry.
+    if snapshot_index == applied_index {
+        let expected = state.model.last_applied.as_ref().map(LogIdV1::from);
+        if header.meta.last_applied != expected {
+            return Err(corrupt(format!(
+                "the current snapshot claims log id {:?} at index {snapshot_index:?}, \
+                 and state.redb applied {expected:?}",
+                header.meta.last_applied
+            )));
+        }
+        let canonical = canonical()?;
+        if &canonical != digest {
+            return Err(corrupt(format!(
+                "the current snapshot is {} at the same log id this store's own \
+                 state hashes to {}; one of the two describes a history this \
+                 voter never had",
+                snapshot_id_for(digest),
+                snapshot_id_for(&canonical)
+            )));
+        }
+    }
     Ok(())
+}
+
+/// The digest `state.redb` would produce if it were snapshotted now.
+///
+/// Streamed to a sink rather than a file: only the digest is wanted, and §11.4
+/// forbids materialising a body. Reached only at an equal applied index, which
+/// is where a cheaper comparison does not exist — the whole point is that the
+/// metadata already matches.
+fn canonical_digest(database: &redb::Database) -> StorageResult<[u8; 32]> {
+    use redb::ReadableDatabase as _;
+
+    let read = database
+        .begin_read()
+        .map_err(|source| StorageError::redb(Db::State, source))?;
+    let (_, digest, _) = super::rows::stream_body(
+        &read,
+        Path::new("<canonical>"),
+        Digesting::new(std::io::sink()),
+    )?
+    .0
+    .into_parts();
+    Ok(digest)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -586,6 +738,7 @@ fn hex(bytes: &[u8]) -> String {
 /// a full log replay instead of reporting that this voter's snapshot is gone.
 pub(crate) fn load_current(
     layout: &StorageLayout,
+    database: &redb::Database,
     state: &super::rows::DurableState,
 ) -> StorageResult<Option<SnapshotFile>> {
     let marker = layout.current_snapshot_marker();
@@ -639,7 +792,7 @@ pub(crate) fn load_current(
             "the marker's membership is not the membership the body carries",
         ));
     }
-    check_binding(&header, state)?;
+    check_binding(&header, &digest, state, || canonical_digest(database))?;
 
     Ok(Some(SnapshotFile { meta, path, len }))
 }
@@ -747,23 +900,38 @@ impl SnapshotCatalog {
         Self::default()
     }
 
-    /// Take a reader lease on a published snapshot, pinning its file until the
-    /// returned handle is dropped.
+    /// Take a reader lease on a published snapshot, **opening** its file.
+    ///
+    /// The open handle is the pin that survives this store. A catalog lease
+    /// only counts readers within one store instance, and a Published handle
+    /// legitimately outlives that: OpenRaft's suite moves one into a different
+    /// store, and Slice 3's transport holds one across a replication call. Drop
+    /// and reopen the store and the new catalog sees no leases at all, so it
+    /// would happily unlink a predecessor an old handle still names.
+    ///
+    /// An open descriptor closes that on both platforms in the way each of them
+    /// works: on Unix the inode survives an unlink until the last handle goes,
+    /// and on Windows the unlink fails while a handle is open, which the
+    /// catalog already treats as best-effort. The lease count stays because it
+    /// is what makes the *unlink* wait rather than merely be deferred.
     pub(crate) fn lease(
         &self,
         snapshot_id: impl Into<String>,
         path: impl Into<PathBuf>,
-    ) -> CoordinationSnapshotFile {
+    ) -> StorageResult<CoordinationSnapshotFile> {
         let snapshot_id = snapshot_id.into();
+        let path = path.into();
+        let file = File::open(&path).map_err(io("opening a published snapshot", &path))?;
         {
             let mut inner = self.inner.lock().expect("snapshot catalog mutex");
             *inner.leases.entry(snapshot_id.clone()).or_insert(0) += 1;
         }
-        CoordinationSnapshotFile::Published(PublishedSnapshot {
+        Ok(CoordinationSnapshotFile::Published(PublishedSnapshot {
             snapshot_id,
-            path: path.into(),
+            path,
+            file,
             catalog: Arc::clone(&self.inner),
-        })
+        }))
     }
 
     /// Retire a snapshot: it stops being discoverable now, and its file is
@@ -816,17 +984,41 @@ impl Drop for IncomingSnapshot {
     }
 }
 
-/// An immutable published snapshot, with a lease pinning its file.
+/// An immutable published snapshot, with a lease and an open descriptor
+/// pinning its file.
 #[derive(Debug)]
 pub struct PublishedSnapshot {
     snapshot_id: String,
     path: PathBuf,
+    /// Held, not used through this field. Its existence is the guarantee: the
+    /// bytes remain readable for as long as this handle does, whichever store
+    /// issued it and whatever has happened to the directory entry since.
+    file: File,
     catalog: Arc<Mutex<CatalogInner>>,
 }
 
 impl PublishedSnapshot {
     pub(crate) fn snapshot_id(&self) -> &str {
         &self.snapshot_id
+    }
+
+    /// A reader over the pinned bytes, independent of the directory entry.
+    ///
+    /// Reading by path would reintroduce exactly what the held descriptor
+    /// exists to prevent: the name can be gone, or can name a successor, by the
+    /// time a holder gets round to reading. This clones the descriptor this
+    /// handle already owns, so it reads the bytes the lease was taken over.
+    pub(crate) fn reader(&self) -> StorageResult<File> {
+        use std::io::Seek as _;
+
+        let mut handle = self
+            .file
+            .try_clone()
+            .map_err(io("reading a published snapshot", &self.path))?;
+        handle
+            .rewind()
+            .map_err(io("reading a published snapshot", &self.path))?;
+        Ok(handle)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -976,7 +1168,7 @@ mod tests {
 
         let catalog = SnapshotCatalog::new();
         let id = snapshot_id_for(&[2u8; 32]);
-        let handle = catalog.lease(&id, &path);
+        let handle = catalog.lease(&id, &path).expect("lease");
         assert!(!handle.deletes_on_drop());
         drop(handle);
 
@@ -1001,7 +1193,7 @@ mod tests {
         let id = snapshot_id_for(&[3u8; 32]);
 
         let mut receiving = Box::new(CoordinationSnapshotFile::incoming(&incoming_path));
-        let source = Box::new(catalog.lease(&id, &published_path));
+        let source = Box::new(catalog.lease(&id, &published_path).expect("lease"));
         *receiving = *source;
 
         assert!(
@@ -1033,7 +1225,7 @@ mod tests {
         let catalog = SnapshotCatalog::new();
         let id = snapshot_id_for(&[4u8; 32]);
 
-        let reader = catalog.lease(&id, &path);
+        let reader = catalog.lease(&id, &path).expect("lease");
         catalog.retire(&id, &path);
         assert!(
             path.exists(),
@@ -1059,8 +1251,8 @@ mod tests {
         let catalog = SnapshotCatalog::new();
         let id = snapshot_id_for(&[5u8; 32]);
 
-        let first = catalog.lease(&id, &path);
-        let second = catalog.lease(&id, &path);
+        let first = catalog.lease(&id, &path).expect("lease");
+        let second = catalog.lease(&id, &path).expect("lease");
         catalog.retire(&id, &path);
 
         drop(first);
@@ -1111,6 +1303,104 @@ mod tests {
         assert!(
             arm.contains("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH"),
             "the Windows replacement must be both atomic and write-through"
+        );
+    }
+
+    // ── The aggregate bound (§11.4) ──────────────────────────────────────────
+
+    /// The whole body is bounded, not merely each section.
+    ///
+    /// The per-section row counts and per-row byte ceilings multiply out to
+    /// gigabytes, so respecting all of them says nothing about the total. Both
+    /// directions carry the check because both cross the same wrapper: a body
+    /// too large to write is refused while its scratch file is being written,
+    /// and one too large to read is refused before it has all been read.
+    #[test]
+    fn a_body_over_the_maximum_is_refused_in_both_directions() {
+        let mut writer = Digesting::bounded(Vec::new(), 8);
+        writer.write_all(b"12345678").expect("up to the bound");
+        let over = writer.write_all(b"9");
+        assert!(over.is_err(), "a write past the bound is refused");
+
+        let body = vec![0xab; 16];
+        let mut reader = Digesting::bounded(body.as_slice(), 8);
+        let mut sink = Vec::new();
+        assert!(
+            std::io::copy(&mut reader, &mut sink).is_err(),
+            "and so is a read past it"
+        );
+    }
+
+    /// And the bound the production constructor applies is the declared one.
+    #[test]
+    fn the_production_bound_is_the_declared_maximum() {
+        let digesting = Digesting::new(std::io::sink());
+        assert_eq!(digesting.limit, MAX_SNAPSHOT_BODY_BYTES);
+        assert_eq!(MAX_SNAPSHOT_BODY_BYTES, 512 * 1024 * 1024, "§11.4");
+    }
+
+    /// A rename that fails leaves no partial file behind.
+    ///
+    /// `keep()` disarmed the cleanup before the rename was attempted, so a
+    /// failure between the two left a partial body under a name nothing sweeps
+    /// and nothing can identify. Provoked here by renaming into a directory
+    /// that does not exist.
+    #[test]
+    fn a_failed_promotion_removes_the_partial_file() {
+        let dir = temp_dir();
+        let scratch = Scratch::new(&dir, "failing");
+        let partial = scratch.path().to_path_buf();
+        std::fs::write(&partial, b"half a body").expect("write");
+
+        let nowhere = dir.join("absent").join("target.snapshot");
+        scratch
+            .promote(&nowhere)
+            .expect_err("renaming into a directory that does not exist");
+
+        assert!(
+            !partial.exists(),
+            "a promotion that failed must not leave its scratch file behind"
+        );
+        assert!(!nowhere.exists());
+    }
+
+    /// A Published handle keeps reading after its store, and its directory
+    /// entry, are gone.
+    ///
+    /// The catalog counts leases within one store instance, and a Published
+    /// handle legitimately outlives that — OpenRaft's suite moves one into a
+    /// different store. Reopen the store and the new catalog sees no leases, so
+    /// a lease count alone would let it unlink a body an old handle still
+    /// names.
+    #[test]
+    fn a_published_handle_outlives_the_catalog_that_issued_it() {
+        let dir = temp_dir();
+        let path = dir.join("outliving.snapshot");
+        std::fs::write(&path, b"the published bytes").expect("write");
+
+        let handle = {
+            let catalog = SnapshotCatalog::new();
+            catalog
+                .lease(snapshot_id_for(&[7u8; 32]), &path)
+                .expect("lease")
+        };
+
+        // A second store instance, which knows nothing about the handle above.
+        let reopened = SnapshotCatalog::new();
+        reopened.retire(&snapshot_id_for(&[7u8; 32]), &path);
+
+        let CoordinationSnapshotFile::Published(published) = &handle else {
+            panic!("a leased snapshot is Published");
+        };
+        let mut bytes = Vec::new();
+        published
+            .reader()
+            .expect("the handle still names readable bytes")
+            .read_to_end(&mut bytes)
+            .expect("read");
+        assert_eq!(
+            bytes, b"the published bytes",
+            "the pin is the open descriptor, not the directory entry"
         );
     }
 

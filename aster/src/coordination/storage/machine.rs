@@ -53,12 +53,12 @@ use openraft::{
     EntryPayload, LogId as RaftLogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta,
     StorageError as RaftStorageError, StorageIOError, StoredMembership,
 };
-use redb::{Database, ReadableDatabase};
+use redb::Database;
 use tokio::sync::{mpsc, oneshot};
 
 use super::actor::ActorShutdown;
 use super::error::{Db, StorageError, StorageResult};
-use super::reads::{GuardedRead, ReadDrain, ReadGate};
+use super::reads::{GuardedRead, ReadDrain, ReadGate, ReadLease};
 use super::rows::{self, DurableState};
 use super::schema::StorageLayout;
 use super::snapshot::{self, Publication, SnapshotCatalog, SnapshotFile};
@@ -259,18 +259,19 @@ impl StateActor {
         if self.state.is_none() {
             return Err(StorageError::Fatal);
         }
-        let transaction = self
-            .database
-            .begin_read()
-            .map_err(|source| StorageError::redb(Db::State, source))?;
-        // The lease and the transaction are handed out together, so a reader
-        // cannot exist that the store's shutdown -- or a replacement -- does not
-        // know to wait for. A shut gate means this store is closing or its file
-        // is about to be swapped; either way the version just pinned is not the
-        // one the caller wants.
+        // The lease comes first, and `ReadLease::read` is what makes that a
+        // property of the types rather than of these two statements' order: a
+        // transaction created before a lease existed is a reader a replacement
+        // could not see, and the reversed order looked perfectly correct.
+        //
+        // A shut gate means this store is closing or its file is about to be
+        // swapped; either way the version about to be pinned is not the one the
+        // caller wants, so this refuses rather than queues.
         self.reads
-            .issue(transaction)
-            .ok_or(StorageError::ActorStopped { db: Db::State })
+            .reserve()
+            .ok_or(StorageError::ActorStopped { db: Db::State })?
+            .read(&self.database)
+            .map_err(|source| StorageError::redb(Db::State, source))
     }
 
     fn applied_state(&mut self) -> StorageResult<Applied> {
@@ -462,7 +463,20 @@ impl StateHandle {
         self.fatal.load(Ordering::SeqCst)
     }
 
-    fn mark_fatal(&self) {
+    /// The same refusal every actor command makes, for work that does not go
+    /// through the actor.
+    ///
+    /// Snapshot publication writes files rather than rows, so it never reaches
+    /// [`call`](Self::call) and would otherwise be the one path that keeps
+    /// serving after the store has stopped being able to say what is durable.
+    pub(crate) fn check_serviceable(&self) -> StorageResult<()> {
+        if self.is_fatal() {
+            return Err(StorageError::Fatal);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_fatal(&self) {
         self.fatal.store(true, Ordering::SeqCst);
     }
 
@@ -552,7 +566,7 @@ impl CoordinationStateMachine {
         // announced itself first would be offering a snapshot to followers by
         // the time anything noticed either was wrong.
         let state = rows::load(&database)?;
-        let current = snapshot::load_current(&layout, &state)?;
+        let current = snapshot::load_current(&layout, &database, &state)?;
 
         let reads = ReadGate::new();
         let (handle, shutdown) = StateHandle::spawn(database, state, reads.clone())?;
@@ -583,7 +597,41 @@ impl CoordinationStateMachine {
     ///
     /// Returns a lease rather than a file because the two cannot be separated;
     /// see [`lease`](Self::lease).
+    ///
+    /// ## Why it demands a `ReadLease`
+    ///
+    /// Publication writes `CURRENT` into the store's directory, and it happens
+    /// *after* the builder has finished with its read transaction. Ending the
+    /// lease with the transaction left that write unguarded: shutdown could
+    /// drain, release `LOCK`, and admit a new owner, and a builder that was
+    /// merely slow would then overwrite that new owner's marker with a snapshot
+    /// of a database it no longer had. Requiring the lease here makes the gap
+    /// inexpressible rather than merely tested — the borrow must outlive the
+    /// call, so a builder cannot drop it early and still reach this.
+    ///
+    /// A publication failure latches the store fatal for the same reason a
+    /// failed commit does. `publish_current` can replace the marker and then
+    /// fail to make the replacement durable, at which point neither disk nor
+    /// memory can be trusted to say what is published; carrying on would let a
+    /// later publication decide monotonicity from metadata that is already
+    /// wrong.
     pub(crate) fn publish(
+        &self,
+        _lease: &ReadLease,
+        built: SnapshotFile,
+    ) -> StorageResult<Snapshot<CoordinationTypeConfig>> {
+        self.handle.check_serviceable()?;
+        let result = self.publish_inner(built);
+        if let Err(err) = &result {
+            if err.puts_durability_in_question() {
+                self.handle.mark_fatal();
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn publish_inner(
         &self,
         built: SnapshotFile,
     ) -> StorageResult<Snapshot<CoordinationTypeConfig>> {
@@ -625,6 +673,10 @@ impl CoordinationStateMachine {
     pub(crate) fn current_snapshot(
         &self,
     ) -> StorageResult<Option<Snapshot<CoordinationTypeConfig>>> {
+        // A store whose last publication failed cannot say what is current:
+        // the marker may have been replaced and not made durable, so the value
+        // held here and the value on disk may already disagree.
+        self.handle.check_serviceable()?;
         let current = self.current.lock().expect("the current-snapshot mutex");
         match current.clone() {
             Some(file) => self.lease(&current, &file).map(Some),
@@ -650,7 +702,7 @@ impl CoordinationStateMachine {
     ) -> StorageResult<Snapshot<CoordinationTypeConfig>> {
         Ok(Snapshot {
             meta: rows::snapshot_meta_from_wire(&file.meta)?,
-            snapshot: Box::new(self.catalog.lease(&file.meta.snapshot_id, &file.path)),
+            snapshot: Box::new(self.catalog.lease(&file.meta.snapshot_id, &file.path)?),
         })
     }
 }
@@ -681,19 +733,28 @@ impl RaftSnapshotBuilder<CoordinationTypeConfig> for CoordinationSnapshotBuilder
         // blocking file I/O proportional to the state, and the read transaction
         // pins its own version, so neither the writer nor the runtime waits on
         // it.
+        //
+        // The closure hands the lease back with the body. Dropping the whole
+        // `GuardedRead` here would end the lease at the same moment as the
+        // transaction, leaving publication -- which happens next, and writes
+        // into this store's directory -- outside the window the drain waits
+        // for.
         let layout = self.machine.layout.clone();
-        let built = tokio::task::spawn_blocking(move || snapshot::build(&layout, &read))
-            .await
-            .map_err(|err| {
-                io_state(StorageError::corrupt(
-                    Db::State,
-                    "snapshot",
-                    format!("the snapshot builder did not finish: {err}"),
-                ))
-            })?
-            .map_err(io_state)?;
+        let (lease, built) = tokio::task::spawn_blocking(move || {
+            let built = snapshot::build(&layout, &read);
+            (read.release_transaction(), built)
+        })
+        .await
+        .map_err(|err| {
+            io_state(StorageError::corrupt(
+                Db::State,
+                "snapshot",
+                format!("the snapshot builder did not finish: {err}"),
+            ))
+        })?;
+        let built = built.map_err(io_state)?;
 
-        self.machine.publish(built).map_err(io_state)
+        self.machine.publish(&lease, built).map_err(io_state)
     }
 }
 
@@ -889,8 +950,24 @@ mod tests {
 
     /// The durable state a marker check compares against.
     fn durable(dir: &std::path::Path) -> DurableState {
-        let database = Database::create(dir.join("state.redb")).expect("open");
-        rows::load(&database).expect("load")
+        rows::load(&opened(dir)).expect("load")
+    }
+
+    fn opened(dir: &std::path::Path) -> Database {
+        Database::create(dir.join("state.redb")).expect("open")
+    }
+
+    /// Read `CURRENT` back from disk, through one database handle.
+    ///
+    /// redb refuses a second open of the same file, so the state and the marker
+    /// check have to share one -- which is also how the production path does it.
+    fn reload_current(
+        layout: &StorageLayout,
+        dir: &std::path::Path,
+    ) -> super::super::error::StorageResult<Option<super::snapshot::SnapshotFile>> {
+        let database = opened(dir);
+        let state = rows::load(&database).expect("load");
+        super::snapshot::load_current(layout, &database, &state)
     }
 
     fn log_id(index: u64) -> RaftLogId<CoordinationNodeId> {
@@ -2838,6 +2915,9 @@ mod tests {
         assert_eq!(newer.last_log_id.as_ref().map(|id| id.index), Some(2));
 
         let older = super::snapshot::build(&layout, &stale).expect("stream the stale transaction");
+        // The same shape the builder uses: the version pin ends, the lease that
+        // says this store still has work outstanding does not.
+        let lease = stale.release_transaction();
         assert_eq!(
             older.meta.last_log_id.as_ref().map(|id| id.index),
             Some(1),
@@ -2845,7 +2925,7 @@ mod tests {
         );
         let discarded = older.path.clone();
 
-        let serving = machine.publish(older).expect("publication decides");
+        let serving = machine.publish(&lease, older).expect("publication decides");
         assert_eq!(
             serving.meta.snapshot_id, newer.snapshot_id,
             "the current snapshot is unchanged"
@@ -2859,11 +2939,11 @@ mod tests {
         // then the drain returns, then the actor releases `state.redb`. Reading
         // the marker back needs the database, so the test cannot get there
         // without performing exactly that sequence.
-        drop(stale);
+        drop(lease);
         drop(drain);
         drop(shutdown);
         assert_eq!(
-            super::snapshot::load_current(&layout, &durable(&dir))
+            reload_current(&layout, &dir)
                 .expect("load")
                 .expect("still published")
                 .meta,
@@ -2896,7 +2976,18 @@ mod tests {
         state.model.last_applied = Some(LogId::new(1, LEADER, 5));
 
         let good = header_for(&state);
-        super::snapshot::check_binding(&good, &state).expect("its own header is accepted");
+        // `good` describes this state at this state's own applied index, so it
+        // reaches the equal-index comparison and supplies the digest its own
+        // database would produce.
+        super::snapshot::check_binding(&good, &[0xaa; 32], &state, || Ok([0xaa; 32]))
+            .expect("its own header is accepted");
+
+        // Every mutation below must be refused *before* the equal-index
+        // comparison is reached -- either because an identity field differs or
+        // because the index does. A closure that panics is what asserts that: a
+        // plausible constant would let a dropped identity check fall through to
+        // a digest comparison that happens to agree.
+        let unreached = || panic!("an identity mismatch must be refused before the digest");
 
         type Header = crate::coordination::rowstream::SnapshotHeaderV1;
         type Mutation = (&'static str, Box<dyn Fn(&mut Header)>);
@@ -2936,7 +3027,8 @@ mod tests {
         for (what, mutate) in mutations {
             let mut header = good.clone();
             mutate(&mut header);
-            let err = super::snapshot::check_binding(&header, &state).unwrap_err();
+            let err =
+                super::snapshot::check_binding(&header, &[0u8; 32], &state, unreached).unwrap_err();
             assert!(
                 err.puts_durability_in_question(),
                 "{what}: {err:?} should be fatal"
@@ -2951,7 +3043,34 @@ mod tests {
             leader_node_id: LEADER.to_vec(),
             index: 4,
         });
-        super::snapshot::check_binding(&behind, &state).expect("behind is not a failure");
+        super::snapshot::check_binding(&behind, &[0u8; 32], &state, unreached)
+            .expect("behind is not a failure");
+
+        // At an equal applied index the identity fields are exhausted, so the
+        // complete log id is required and the body is compared with what this
+        // store's own state hashes to.
+        let mut equal = good.clone();
+        equal.meta.last_applied = Some(crate::coordination::contract::LogIdV1 {
+            term: 1,
+            leader_node_id: LEADER.to_vec(),
+            index: 5,
+        });
+        super::snapshot::check_binding(&equal, &[0xaa; 32], &state, || Ok([0xaa; 32]))
+            .expect("the body this state would produce is accepted");
+
+        let err = super::snapshot::check_binding(&equal, &[0xaa; 32], &state, || Ok([0xbb; 32]))
+            .expect_err("a different body at the same log id is not this store's");
+        assert!(err.puts_durability_in_question(), "{err:?}");
+
+        let mut wrong_leader = equal.clone();
+        wrong_leader.meta.last_applied = Some(crate::coordination::contract::LogIdV1 {
+            term: 2,
+            leader_node_id: LEADER.to_vec(),
+            index: 5,
+        });
+        let err = super::snapshot::check_binding(&wrong_leader, &[0xaa; 32], &state, unreached)
+            .expect_err("a different log id at the same index is two histories");
+        assert!(err.puts_durability_in_question(), "{err:?}");
     }
 
     /// The whole `snapshots/` directory of another group, dropped in beside
@@ -3088,6 +3207,99 @@ mod tests {
         drop(shutdown);
     }
 
+    /// A publication that half-succeeds latches the store fatal.
+    ///
+    /// `publish_current` can rename `CURRENT` into place and then fail to make
+    /// the replacement durable. Returning that error and carrying on was the
+    /// defect: the marker on disk had moved, the value held in memory had not,
+    /// and the next publication would decide monotonicity from metadata that
+    /// was already wrong — which is how a marker regresses without anything
+    /// ever reporting corruption.
+    #[tokio::test]
+    async fn a_publication_that_cannot_be_made_durable_stops_the_store() {
+        let dir = scratch_dir();
+        let (mut machine, shutdown, drain) = machine(&dir);
+        machine.apply([blank(1)]).await.expect("apply");
+
+        super::snapshot::fault::fail_next_directory_fsync();
+        let mut builder = machine.get_snapshot_builder().await;
+        builder
+            .build_snapshot()
+            .await
+            .expect_err("the publication cannot be made durable");
+
+        assert!(
+            machine.handle().is_fatal(),
+            "a publication that cannot be made durable leaves the store unable \
+             to say what is published"
+        );
+        assert!(
+            machine.get_current_snapshot().await.is_err(),
+            "so it must not answer from the metadata it happens to be holding"
+        );
+        assert!(
+            builder.build_snapshot().await.is_err(),
+            "nor build another snapshot on top of it"
+        );
+        assert!(machine.apply([blank(2)]).await.is_err(), "nor apply");
+        assert!(machine.applied_state().await.is_err());
+
+        drop(drain);
+        drop(shutdown);
+    }
+
+    /// Two stores in the same group at the same log id, describing different
+    /// state.
+    ///
+    /// Everything the identity checks compare is equal here — group, genesis,
+    /// authority, domain, profile, applied index, complete log id — because
+    /// both stores really are the same group and really did apply an entry at
+    /// index 1. Only the *content* differs, and §11.4's determinism invariant
+    /// is what makes that decidable: at one complete `last_applied` the
+    /// canonical body is a pure function of replicated state, so a store can
+    /// recompute the digest its own database implies and refuse a body that
+    /// disagrees.
+    #[tokio::test]
+    async fn a_same_group_snapshot_of_different_state_is_refused_at_open() {
+        let theirs = scratch_dir();
+        let mine = scratch_dir();
+
+        // The same log id on both sides: index 1, same term, same leader. One
+        // applies a blank, the other a real command.
+        {
+            let (mut machine, shutdown, drain) = machine(&theirs);
+            machine.apply([normal(1, acquire(1))]).await.expect("apply");
+            let mut builder = machine.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build");
+            drop(drain);
+            drop(shutdown);
+        }
+        let published = {
+            let (mut machine, shutdown, drain) = machine(&mine);
+            machine.apply([blank(1)]).await.expect("apply");
+            let mut builder = machine.get_snapshot_builder().await;
+            let meta = builder.build_snapshot().await.expect("build").meta.clone();
+            drop(drain);
+            drop(shutdown);
+            meta
+        };
+
+        // Their whole snapshots directory, marker included, replaces mine. Both
+        // sides are internally consistent; the marker names the body, and the
+        // body hashes to the name.
+        std::fs::remove_file(body_path(&mine, &published.snapshot_id)).expect("clear mine");
+        for entry in std::fs::read_dir(theirs.join("snapshots")).expect("read") {
+            let entry = entry.expect("entry");
+            std::fs::copy(entry.path(), mine.join("snapshots").join(entry.file_name()))
+                .expect("plant it");
+        }
+
+        let database = Database::create(mine.join("state.redb")).expect("reopen");
+        let err = CoordinationStateMachine::new(database, StorageLayout::new(&mine))
+            .expect_err("a body describing state this voter never had");
+        assert!(err.puts_durability_in_question(), "{err:?}");
+    }
+
     /// A complete, valid body that is not the body its name claims.
     ///
     /// The one corruption the metadata checks cannot catch on their own: two
@@ -3174,7 +3386,7 @@ mod tests {
         drop(drain);
         drop(shutdown);
         assert_eq!(
-            super::snapshot::load_current(&layout, &durable(&dir))
+            reload_current(&layout, &dir)
                 .expect("load")
                 .expect("republished")
                 .meta,
