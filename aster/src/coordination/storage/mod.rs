@@ -221,43 +221,66 @@ mod durability_guard {
     ///
     /// Taking the *last* `#[cfg(test)]` module fixes truncation and introduces
     /// the opposite assumption: that nothing follows it. Production appended
-    /// after the test module would sit outside every check above, silently, and
-    /// the file would still compile and still report clean.
+    /// after the test module sits outside every check above, silently, in a
+    /// file that still compiles and still reports clean.
     ///
-    /// Checked by shape rather than by parsing: inside a module everything is
-    /// indented, so a column-zero item after the boundary is production that
-    /// escaped. The module header itself is the one exception.
+    /// This finds the module's **closing brace** rather than enumerating what
+    /// production looks like. A list of item prefixes is a list that is wrong
+    /// as soon as someone writes `async fn`, `unsafe fn`, or `mod` -- each of
+    /// which escapes a prefix check while compiling perfectly. The close is one
+    /// fact and covers all of them: under rustfmt a top-level module ends with
+    /// a `}` in column zero, everything inside it is indented, and so the first
+    /// such line is the end of the file's test code. After it, only whitespace.
     #[test]
-    fn nothing_production_follows_the_test_module() {
-        const ITEMS: &[&str] = &[
-            "pub ",
-            "pub(crate) ",
-            "pub(super) ",
-            "fn ",
-            "impl ",
-            "struct ",
-            "enum ",
-            "const ",
-            "static ",
-            "type ",
-            "use ",
-            "trait ",
-            "macro_rules!",
-        ];
+    fn nothing_follows_the_test_module() {
         for (name, source) in SOURCES {
             let end = production_end(source);
             if end == source.len() {
                 continue;
             }
-            for (n, line) in source[end..].lines().enumerate() {
-                if line.starts_with("#[cfg(test)]") || line.starts_with("mod ") {
-                    continue;
-                }
+            let before = source[..end].lines().count();
+            let tail: Vec<&str> = source[end..].lines().collect();
+            let close = tail
+                .iter()
+                .position(|line| *line == "}")
+                .unwrap_or_else(|| panic!("{name}: the test module has no column-zero close"));
+
+            for (n, line) in tail.iter().enumerate().skip(close + 1) {
                 assert!(
-                    !ITEMS.iter().any(|item| line.starts_with(item)),
-                    "{name}:{} is production code after the test module, where no guard in \
-                     this file can see it: {line:?}",
-                    end + n + 1
+                    line.trim().is_empty(),
+                    "{name}:{} is outside the test module and outside every guard in this \
+                     file: {line:?}",
+                    before + n + 1
+                );
+            }
+        }
+    }
+
+    /// A guarded file may not point at a source that is not guarded.
+    ///
+    /// `every_declared_module_is_guarded` reads this file's declarations, so it
+    /// sees nothing about a `mod other;` written inside `snapshot.rs` -- which
+    /// would compile, would pull in `snapshot/other.rs`, and would be checked
+    /// by nothing. Forbidden outright rather than enumerated: no module here
+    /// has children, and the day one does, extending `SOURCES` should be the
+    /// deliberate act that makes this pass again.
+    #[test]
+    fn no_guarded_module_declares_a_child_source() {
+        for (name, source) in SOURCES {
+            if *name == "mod.rs" {
+                continue;
+            }
+            for (n, line) in production_lines(source) {
+                let code = line.split("//").next().unwrap_or("").trim();
+                let declaration = code
+                    .trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub(super) ")
+                    .trim_start_matches("pub ");
+                assert!(
+                    !(declaration.starts_with("mod ") && declaration.ends_with(';')),
+                    "{name}:{} declares an out-of-line module, whose source no guard in this \
+                     file reads: {code:?}",
+                    n + 1
                 );
             }
         }
