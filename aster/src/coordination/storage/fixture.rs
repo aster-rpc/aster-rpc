@@ -86,15 +86,46 @@ impl SuiteFixture {
     /// Open the next store: a new directory and NodeId under the one fixed
     /// group identity.
     pub(crate) fn build(&self) -> VoterStorage {
+        self.build_at().1
+    }
+
+    /// The next store, and the directory it lives in.
+    ///
+    /// The directory comes back so a caller can close the store and open the
+    /// same files again -- which is the only way to exercise a *restarted*
+    /// store rather than one that has only ever existed in this process.
+    pub(crate) fn build_at(&self) -> (PathBuf, VoterStorage) {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
         let dir = self.root.join(format!("store-{n}"));
         std::fs::create_dir_all(&dir).expect("create store dir");
-        VoterStorage::open(
+        let store = VoterStorage::open(
             StorageLayout::new(&dir),
             self.identity_for(n),
             OpenPolicy::production(),
         )
-        .expect("open a fixture store")
+        .expect("open a fixture store");
+        (dir, store)
+    }
+
+    /// Reopen a directory this fixture already made.
+    ///
+    /// The identity is recovered from the directory name rather than sampled
+    /// again: a store must reopen under the identity it was bound with, and
+    /// handing it a fresh one would be testing the identity check instead of
+    /// the restart.
+    pub(crate) fn open_existing(&self, dir: &std::path::Path) -> VoterStorage {
+        let n: u64 = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("store-"))
+            .and_then(|n| n.parse().ok())
+            .expect("a directory this fixture made");
+        VoterStorage::open(
+            StorageLayout::new(dir),
+            self.identity_for(n),
+            OpenPolicy::production(),
+        )
+        .expect("reopen a fixture store")
     }
 }
 

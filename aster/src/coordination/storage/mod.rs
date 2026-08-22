@@ -48,6 +48,7 @@
 
 pub(crate) mod actor;
 pub(crate) mod codec;
+pub(crate) mod crash;
 pub(crate) mod error;
 /// The OpenRaft storage-suite fixture. Test-only: it exists to hold one group
 /// identity fixed across every store a builder makes, which is what
@@ -65,11 +66,74 @@ pub(crate) mod snapshot;
 pub(crate) use snapshot::CoordinationSnapshotFile;
 
 use error::StorageResult;
+#[cfg(test)]
+use fixture::SuiteFixture;
 use identity::{OpenPolicy, StorageIdentity};
 use log::{CoordinationLogStore, LogShutdown};
 use machine::{CoordinationStateMachine, StateShutdown};
 use reads::ReadDrain;
 use schema::{DirectoryLock, IntegrityOutcome, OpenOutcome, StorageLayout};
+
+// ── OpenRaft's own storage suite ─────────────────────────────────────────────
+
+/// A [`StoreBuilder`] over [`SuiteFixture`].
+///
+/// `Reopen` is the variant that matters. `Fresh` hands the suite a new
+/// directory each time, which is what every storage implementation's own suite
+/// run does; `Reopen` builds a store, closes it, and opens the same directory
+/// again -- so what the suite exercises is a *restarted* store rather than one
+/// that has only ever existed in this process. A store that passed only when
+/// fresh would be one whose durability never left memory.
+#[cfg(test)]
+pub(crate) struct SuiteBuilder {
+    fixture: SuiteFixture,
+    reopen: bool,
+}
+
+#[cfg(test)]
+impl SuiteBuilder {
+    pub(crate) fn fresh(root: impl Into<std::path::PathBuf>, seed: u8) -> Self {
+        Self {
+            fixture: SuiteFixture::new(root, seed),
+            reopen: false,
+        }
+    }
+
+    pub(crate) fn reopened(root: impl Into<std::path::PathBuf>, seed: u8) -> Self {
+        Self {
+            fixture: SuiteFixture::new(root, seed),
+            reopen: true,
+        }
+    }
+}
+
+#[cfg(test)]
+impl
+    openraft::testing::StoreBuilder<
+        crate::coordination::typeconfig::CoordinationTypeConfig,
+        CoordinationLogStore,
+        CoordinationStateMachine,
+        SuiteGuard,
+    > for SuiteBuilder
+{
+    async fn build(
+        &self,
+    ) -> Result<
+        (SuiteGuard, CoordinationLogStore, CoordinationStateMachine),
+        openraft::StorageError<crate::coordination::ids::CoordinationNodeId>,
+    > {
+        let (dir, store) = self.fixture.build_at();
+        if self.reopen {
+            // Closed before it is used: both actors joined, both databases
+            // released, the lock gone. What the suite then drives is a store
+            // that read its own files back.
+            drop(store);
+            let reopened = self.fixture.open_existing(&dir);
+            return Ok(reopened.into_suite_parts());
+        }
+        Ok(store.into_suite_parts())
+    }
+}
 
 /// A validated, locked storage directory with its log actor running.
 ///
@@ -106,6 +170,18 @@ pub(crate) struct VoterStorage {
     /// snapshot builder holding one is a reader this store cannot see. Draining
     /// first means the state actor does not release the database, and the lock
     /// does not go, while a builder is still reading a version of it.
+    _log_shutdown: LogShutdown,
+    _reads: ReadDrain,
+    _state_shutdown: StateShutdown,
+    _lock: DirectoryLock,
+}
+
+/// What a store that has been split into its two halves still owns.
+///
+/// Same four values in the same order as [`VoterStorage`], for the same
+/// reason: dropping this stops and joins both actors, releasing their database
+/// handles, before the directory lock is released.
+pub(crate) struct SuiteGuard {
     _log_shutdown: LogShutdown,
     _reads: ReadDrain,
     _state_shutdown: StateShutdown,
@@ -168,6 +244,41 @@ impl VoterStorage {
     /// without running it would be observing the state as it was *before*
     /// recovery -- which for a voter killed between an append and its apply is
     /// the wrong state entirely.
+    /// Split into the two halves OpenRaft's `StoreBuilder` hands back, plus a
+    /// guard that owns the shutdown.
+    ///
+    /// The guard exists because the shutdown ordering documented on the fields
+    /// above is a property of *this* struct, and handing out the log store and
+    /// the state machine separately would leave nothing holding it. Inside
+    /// `SuiteGuard` the same four values sit in the same order, so both actors
+    /// are still stopped and joined before the directory lock goes.
+    pub(crate) fn into_suite_parts(
+        self,
+    ) -> (SuiteGuard, CoordinationLogStore, CoordinationStateMachine) {
+        let VoterStorage {
+            layout: _,
+            identity: _,
+            log,
+            state,
+            outcome: _,
+            integrity: _,
+            _log_shutdown,
+            _reads,
+            _state_shutdown,
+            _lock,
+        } = self;
+        (
+            SuiteGuard {
+                _log_shutdown,
+                _reads,
+                _state_shutdown,
+                _lock,
+            },
+            log,
+            state,
+        )
+    }
+
     pub(crate) fn recovery_parts(
         &mut self,
     ) -> (&mut CoordinationLogStore, &mut CoordinationStateMachine) {
@@ -219,6 +330,7 @@ mod durability_guard {
         ("mod.rs", include_str!("mod.rs")),
         ("actor.rs", include_str!("actor.rs")),
         ("codec.rs", include_str!("codec.rs")),
+        ("crash.rs", include_str!("crash.rs")),
         ("error.rs", include_str!("error.rs")),
         ("identity.rs", include_str!("identity.rs")),
         ("schema.rs", include_str!("schema.rs")),

@@ -382,6 +382,7 @@ fn ensure_directory(path: &Path, policy: &OpenPolicy) -> StorageResult<()> {
 /// An earlier guard counted occurrences per file, which meant removing the
 /// setting from one of two write paths in the same file still passed.
 pub(crate) fn durable_write(database: &Database, db: Db) -> StorageResult<redb::WriteTransaction> {
+    super::crash::reached(super::crash::CrashPoint::TransactionBegin);
     let mut write = database
         .begin_write()
         .map_err(|source| StorageError::redb(db, source))?;
@@ -389,6 +390,26 @@ pub(crate) fn durable_write(database: &Database, db: Db) -> StorageResult<redb::
         .set_durability(redb::Durability::Immediate)
         .map_err(|source| StorageError::redb(db, source))?;
     Ok(write)
+}
+
+/// Commit a durable transaction, and nothing else.
+///
+/// Paired with [`durable_write`] so the two process-death boundaries either
+/// side of a commit are declared once rather than at each of the nine call
+/// sites. A caller that opened a transaction here and committed it by hand
+/// would be a caller the crash matrix silently skipped.
+///
+/// The boundary *before* the commit is where the staged rows exist only inside
+/// the transaction; the one *after* is where redb has returned from an
+/// immediate-durability commit. What separates them is the whole question the
+/// matrix asks.
+pub(crate) fn durable_commit(write: redb::WriteTransaction, db: Db) -> StorageResult<()> {
+    super::crash::reached(super::crash::CrashPoint::TransactionWrite);
+    write
+        .commit()
+        .map_err(|source| StorageError::redb(db, source))?;
+    super::crash::reached(super::crash::CrashPoint::TransactionCommit);
+    Ok(())
 }
 
 // ── Integrity ────────────────────────────────────────────────────────────────
@@ -1152,9 +1173,7 @@ fn write_raft_identity(database: &mut Database, identity: &StorageIdentity) -> S
             .open_table(RAFT_LOG)
             .map_err(|source| StorageError::redb(Db::Raft, source))?;
     }
-    write
-        .commit()
-        .map_err(|source| StorageError::redb(Db::Raft, source))
+    durable_commit(write, Db::Raft)
 }
 
 fn write_state_identity(database: &mut Database, identity: &StorageIdentity) -> StorageResult<()> {
@@ -1172,9 +1191,7 @@ fn write_state_identity(database: &mut Database, identity: &StorageIdentity) -> 
     // always has the full §11.3 shape and a later missing table is a real
     // schema error rather than "not written to yet".
     write_state_binding(&write, &meta_row)?;
-    write
-        .commit()
-        .map_err(|source| StorageError::redb(Db::State, source))
+    durable_commit(write, Db::State)
 }
 
 /// Everything a fresh state database must carry before it is a state database.
@@ -1326,7 +1343,9 @@ impl VerifiedCandidate {
         let target = candidate.target.clone();
         super::snapshot::atomic_replace(candidate.path(), &target)?;
         candidate.disarm();
+        super::crash::reached(super::crash::CrashPoint::ReplacementRename);
         super::snapshot::fsync_dir_durably(&candidate.root)?;
+        super::crash::reached(super::crash::CrashPoint::ReplacementDirectorySync);
         // The target goes with the state: whatever reopens this replacement
         // must reopen *this* file, not one named later by a caller who might
         // name a different store's.

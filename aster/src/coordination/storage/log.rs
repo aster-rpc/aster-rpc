@@ -459,9 +459,7 @@ impl LogActor {
             meta.insert(key, value)
                 .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
         }
-        write
-            .commit()
-            .map_err(|source| AsterStorageError::redb(Db::Raft, source))
+        super::schema::durable_commit(write, Db::Raft)
     }
 
     fn remove_meta(&mut self, key: &str) -> StorageResult<()> {
@@ -473,9 +471,7 @@ impl LogActor {
             meta.remove(key)
                 .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
         }
-        write
-            .commit()
-            .map_err(|source| AsterStorageError::redb(Db::Raft, source))
+        super::schema::durable_commit(write, Db::Raft)
     }
 
     /// Every write transaction in this subsystem is immediate-durability.
@@ -604,9 +600,7 @@ impl LogActor {
                     .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
             }
         }
-        write
-            .commit()
-            .map_err(|source| AsterStorageError::redb(Db::Raft, source))
+        super::schema::durable_commit(write, Db::Raft)
     }
 
     /// Remove `[log_id.index, +oo)`, in one transaction and one bounded range
@@ -620,9 +614,7 @@ impl LogActor {
             log.retain_in(log_id.index.., |_, _| false)
                 .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
         }
-        write
-            .commit()
-            .map_err(|source| AsterStorageError::redb(Db::Raft, source))
+        super::schema::durable_commit(write, Db::Raft)
     }
 
     /// Remove `(-oo, log_id.index]` and advance the purge marker, in one
@@ -665,9 +657,7 @@ impl LogActor {
             meta.insert(KEY_LAST_PURGED, marker.as_slice())
                 .map_err(|source| AsterStorageError::redb(Db::Raft, source))?;
         }
-        write
-            .commit()
-            .map_err(|source| AsterStorageError::redb(Db::Raft, source))
+        super::schema::durable_commit(write, Db::Raft)
     }
 }
 

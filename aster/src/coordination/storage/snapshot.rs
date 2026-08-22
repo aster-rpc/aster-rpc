@@ -708,9 +708,11 @@ pub(crate) fn build(
     let handle = buffered
         .into_inner()
         .map_err(|err| StorageError::io("flushing a snapshot body", scratch.path(), err.into()))?;
+    super::crash::reached(super::crash::CrashPoint::SnapshotBodyWrite);
     handle
         .sync_all()
         .map_err(io("fsyncing a snapshot body", scratch.path()))?;
+    super::crash::reached(super::crash::CrashPoint::SnapshotBodyFsync);
     drop(handle);
 
     let path = dir.join(file_name_for(&digest));
@@ -972,6 +974,7 @@ impl ReplacedInstall {
         // filesystem that put something else in place.
         fault::maybe_swap_installed_state(&target)?;
         let (database, reloaded) = super::schema::open_installed_state(&target)?;
+        super::crash::reached(super::crash::CrashPoint::PostReplacementReopen);
 
         if reloaded != expected {
             return Err(corrupt(format!(
@@ -1412,9 +1415,8 @@ pub(crate) fn rebuild_candidate(
         }
     }
 
-    write
-        .commit()
-        .map_err(|source| StorageError::redb(Db::State, source))?;
+    super::schema::durable_commit(write, Db::State)?;
+    super::crash::reached(super::crash::CrashPoint::CandidateCommit);
 
     // Held to production's complete open before it is allowed to replace
     // anything. This includes `rows::load`'s counter and cross-table checks,
@@ -1830,7 +1832,9 @@ fn publish_current(layout: &StorageLayout, meta: &SnapshotMetaV1) -> StorageResu
     // worst of both: readers in this process see the new one, a crash may
     // restore the old, and nothing can say which. Reaching here with an error
     // is what latches the store fatal at the caller.
-    fsync_dir_durably(&dir)
+    fsync_dir_durably(&dir)?;
+    super::crash::reached(super::crash::CrashPoint::CurrentPublication);
+    Ok(())
 }
 
 /// [`fsync_dir`] with the post-rename failure seam in front of it.

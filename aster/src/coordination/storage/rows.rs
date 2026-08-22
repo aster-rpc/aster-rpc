@@ -2062,7 +2062,7 @@ pub(crate) fn commit(
             .map_err(state_err)?;
     }
 
-    write.commit().map_err(state_err)?;
+    super::schema::durable_commit(write, Db::State)?;
     Ok(state)
 }
 

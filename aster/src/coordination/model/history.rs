@@ -76,7 +76,7 @@ const SETUP_CLIENT: [u8; 16] = [0x5Eu8; 16];
 
 /// How many entries [`setup_command`] occupies: one `set_grant` per
 /// `(resource, actor)`, three resources and two actors.
-const SETUP_ENTRIES: u64 = 6;
+pub(crate) const SETUP_ENTRIES: u64 = 6;
 
 /// The state `initialize` leaves behind: a committed membership at
 /// `LogId::default()`, that entry applied, and the founding administrator.

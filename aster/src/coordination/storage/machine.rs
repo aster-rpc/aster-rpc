@@ -518,6 +518,11 @@ impl StateActor {
         // nothing further -- so it is carried by the signature rather than by a
         // test whose name would imply it had been checked.
         self.state = Some(rows::commit(self.database(), working, &changes)?);
+        // The batch is durable and its replies exist. Dying here is the lost
+        // acknowledgement: the entry applied, and the caller never learned it.
+        // What must not follow is the entry being applied a second time, which
+        // is the §10 session table's job and what the matrix checks.
+        super::crash::reached(super::crash::CrashPoint::Acknowledgement);
         Ok(replies)
     }
 }
@@ -1104,6 +1109,9 @@ mod tests {
     const ACTOR: [u8; 32] = [0x0A; 32];
     const CLIENT: [u8; 16] = [0x0C; 16];
     const LEADER: [u8; 32] = [0x11; 32];
+
+    use super::super::fixture::SuiteFixture;
+    use super::super::SuiteBuilder;
 
     fn scratch_dir() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -4556,6 +4564,630 @@ mod tests {
             .await
             .expect("commit it");
         storage
+    }
+
+    // ── The process-death matrix ────────────────────────────────────────────
+    //
+    // See `crash.rs` for what killing a process is and is not evidence of. In
+    // short: no destructor runs, which is the point; the kernel page cache
+    // survives, which is why nothing here is a claim about fsync.
+
+    use super::super::crash::{CrashPoint, Expected};
+
+    const SCENARIO_VAR: &str = "ASTER_COORDINATION_CRASH_SCENARIO";
+    const DIR_VAR: &str = "ASTER_COORDINATION_CRASH_DIR";
+
+    /// The durable operations the matrix crashes, and the boundaries each one
+    /// passes through.
+    ///
+    /// One declaration again, for the same reason the boundary list is one: the
+    /// set of cases the harness runs and the set it claims to run are the same
+    /// text. `every_boundary_is_covered_by_some_operation` closes the loop from
+    /// the other side -- a boundary no operation reaches is a boundary the
+    /// matrix would silently never exercise.
+    macro_rules! operations {
+        ($($(#[$doc:meta])* $variant:ident = $name:literal => [$($point:ident),* $(,)?]),+ $(,)?) => {
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            enum Operation { $($(#[$doc])* $variant,)+ }
+
+            impl Operation {
+                const ALL: &'static [Operation] = &[$(Operation::$variant,)+];
+
+                fn name(self) -> &'static str {
+                    match self { $(Operation::$variant => $name,)+ }
+                }
+
+                fn parse(name: &str) -> Option<Self> {
+                    match name { $($name => Some(Operation::$variant),)+ _ => None }
+                }
+
+                /// The boundaries this operation reaches, in order.
+                fn boundaries(self) -> &'static [CrashPoint] {
+                    match self { $(Operation::$variant => &[$(CrashPoint::$point,)*],)+ }
+                }
+            }
+        };
+    }
+
+    operations! {
+        /// Persisting a vote: one metadata transaction on `raft.redb`.
+        Vote = "vote" => [TransactionBegin, TransactionWrite, TransactionCommit],
+        /// Appending entries to the log.
+        ///
+        /// One transaction, deliberately. An operation that spans two makes
+        /// `TransactionCommit` ambiguous at the *operation* level -- the first
+        /// commit is durable while the second never happened -- and the honest
+        /// repair is a finer operation, not a wider expectation. This was
+        /// found by the matrix: "append and move the marker" was one case, and
+        /// killing it after the first commit left the entries durable and the
+        /// marker where it started.
+        Append = "append" => [TransactionBegin, TransactionWrite, TransactionCommit],
+        /// Moving the committed marker over entries already appended.
+        CommitMarker = "commit-marker" => [TransactionBegin, TransactionWrite, TransactionCommit],
+        /// Applying a batch of committed entries to `state.redb`.
+        Apply = "apply" => [TransactionBegin, TransactionWrite, TransactionCommit, Acknowledgement],
+        /// Building a snapshot body and publishing `CURRENT`.
+        Build = "build" => [SnapshotBodyWrite, SnapshotBodyFsync, CurrentPublication],
+        /// Installing a peer's snapshot over this store's state.
+        Install = "install" => [
+            CandidateCommit,
+            ReplacementRename,
+            ReplacementDirectorySync,
+            PostReplacementReopen,
+        ],
+    }
+
+    /// Everything a reopen can observe, gathered through production paths.
+    ///
+    /// Deliberately the whole of it rather than the field a case happens to be
+    /// about: a crash in the vote transaction must leave the *log* alone too,
+    /// and an assertion narrowed to the vote would not say so. The durable
+    /// state carries the session rows, so saved replies are compared here as
+    /// well -- a route that kept the rows and lost the replies differs in this
+    /// value.
+    #[derive(Debug, PartialEq)]
+    struct Observation {
+        vote: Option<openraft::Vote<CoordinationNodeId>>,
+        committed: Option<RaftLogId<CoordinationNodeId>>,
+        entries: Vec<(u64, String)>,
+        applied: Option<RaftLogId<CoordinationNodeId>>,
+        membership: StoredMembership<CoordinationNodeId, CoordinationNode>,
+        state: DurableState,
+        digest: [u8; 32],
+        current: Option<String>,
+    }
+
+    /// Open a store the way production does, run OpenRaft's own recovery, and
+    /// record what is there.
+    ///
+    /// `get_initial_state` is not optional: `VoterStorage::open` starts the
+    /// actors and validates the files and performs no replay, so a store killed
+    /// between an append and its apply would be observed in the state it had
+    /// *before* recovery -- which is the wrong state, and the one a naive
+    /// harness would compare against.
+    async fn observe(dir: &std::path::Path) -> Observation {
+        use openraft::storage::RaftLogReader as _;
+        use openraft::storage::RaftLogStorage as _;
+        use openraft::StorageHelper;
+
+        use openraft::storage::RaftStateMachine as _;
+
+        let mut storage = voter(dir);
+        {
+            let (log, state) = storage.recovery_parts();
+            StorageHelper::new(log, state)
+                .get_initial_state()
+                .await
+                .expect("OpenRaft's own recovery must run before anything is read");
+        }
+        // Through the state machine's own accessor rather than the recovered
+        // `RaftState`: this is what OpenRaft asks the store on every restart,
+        // so it is the value a real voter would act on.
+        let (applied, membership) = storage
+            .state_mut()
+            .applied_state()
+            .await
+            .expect("the applied state");
+        let mut reader = storage.log_mut().get_log_reader().await;
+        let entries = reader
+            .try_get_log_entries(0..u64::MAX)
+            .await
+            .expect("read the log back")
+            .into_iter()
+            .map(|e| (e.log_id.index, format!("{:?}", e.payload)))
+            .collect();
+        let vote = storage.log_mut().read_vote().await.expect("read the vote");
+        let committed = storage
+            .log_mut()
+            .read_committed()
+            .await
+            .expect("read the committed marker");
+        let state = durable_of(storage.state()).await;
+        // Only after the store is closed: redb refuses a second open of a file
+        // it already holds, and the marker read needs its own handle.
+        drop(storage);
+        let current = current_marker(dir);
+        Observation {
+            vote,
+            committed,
+            entries,
+            applied,
+            membership,
+            state,
+            digest: canonical_digest_of(dir),
+            current,
+        }
+    }
+
+    /// The snapshot id `CURRENT` names, if the marker is there at all.
+    fn current_marker(dir: &std::path::Path) -> Option<String> {
+        let layout = StorageLayout::new(dir);
+        let database = opened(dir);
+        let state = rows::load(&database).expect("load");
+        super::snapshot::load_current(&layout, &database, &state)
+            .expect("the marker must be readable or absent, never broken")
+            .map(|file| file.meta().snapshot_id.clone())
+    }
+
+    /// A store set up identically for every case: seeded, initialized, with the
+    /// history's setup prefix applied and a snapshot already published.
+    ///
+    /// The setup runs in the **parent**, so the child does nothing but the one
+    /// operation being crashed. A child that also did the setup would make the
+    /// first `durable_write` its own, and every transaction case would be
+    /// measuring the setup instead.
+    async fn crash_fixture(dir: &std::path::Path) {
+        let history = crate::coordination::model::history::sample_history(FIXTURE_STEPS);
+        use openraft::storage::RaftLogStorage as _;
+        use openraft::storage::RaftLogStorageExt as _;
+
+        let mut storage = initialized(dir, &history).await;
+        let entries: Vec<Entry> = history
+            .entries
+            .iter()
+            .map(|(log_id, command)| Entry {
+                log_id: raft_log_id(log_id),
+                payload: EntryPayload::Normal(command.clone()),
+            })
+            .collect();
+        // Appended *and* applied, so the log and the state agree the way a
+        // running voter's do. A fixture that only applied would leave the log
+        // holding index zero alone, and an append in the operation under test
+        // would be refused for a gap before it reached any boundary.
+        let last = entries.last().expect("entries").log_id;
+        storage
+            .log_mut()
+            .blocking_append(entries.clone())
+            .await
+            .expect("append the history");
+        storage
+            .log_mut()
+            .save_committed(Some(last))
+            .await
+            .expect("commit it");
+        storage
+            .state_mut()
+            .apply(entries)
+            .await
+            .expect("the setup prefix applies");
+        drop(storage);
+    }
+
+    /// How many entries `crash_fixture` leaves in the log, above index zero.
+    const FIXTURE_STEPS: u64 = 8;
+
+    /// On-disk setup an operation needs that is **not** the operation.
+    ///
+    /// Run by the parent on all three directories, so `before` is observed
+    /// from the same state the crashed store started in. Moving the marker
+    /// presupposes entries to move it over, and appending those is a
+    /// transaction of its own; leaving it inside the operation made
+    /// `before` a store without them, and every marker case failed for the
+    /// difference rather than for the crash.
+    async fn stage_for(dir: &std::path::Path, operation: Operation) {
+        use openraft::storage::RaftLogStorageExt as _;
+
+        if operation != Operation::CommitMarker {
+            return;
+        }
+        let mut storage = voter(dir);
+        storage
+            .log_mut()
+            .blocking_append(tail_entries())
+            .await
+            .expect("stage the entries the marker will cover");
+        drop(storage);
+    }
+
+    /// Run one durable operation to completion, or to the boundary the
+    /// environment armed.
+    ///
+    /// The same function on both sides. The parent calls it to learn what
+    /// finishing looks like; the child calls it and is killed part-way. A
+    /// harness with two implementations would be comparing a crash of one
+    /// against the completion of the other.
+    async fn perform(dir: &std::path::Path, operation: Operation) {
+        use openraft::storage::RaftLogStorage as _;
+        use openraft::storage::RaftLogStorageExt as _;
+
+        // An install needs a peer's snapshot, and building one is itself a
+        // sequence of boundaries. It happens here, before the seam is armed,
+        // in a store of its own -- so what the matrix crashes is the install
+        // and not the build that fed it.
+        let source = if operation == Operation::Install {
+            Some(peer_snapshot().await)
+        } else {
+            None
+        };
+
+        let mut storage = voter(dir);
+        // Everything above this line is setup, including the open's own
+        // transactions. The boundary the environment names starts counting now.
+        super::super::crash::arm();
+
+        match operation {
+            Operation::Vote => {
+                let vote = openraft::Vote::new(7, CoordinationNodeId::from_array([9u8; 32]));
+                storage
+                    .log_mut()
+                    .save_vote(&vote)
+                    .await
+                    .expect("save a vote");
+            }
+            Operation::Append => {
+                storage
+                    .log_mut()
+                    .blocking_append(tail_entries())
+                    .await
+                    .expect("append");
+            }
+            Operation::CommitMarker => {
+                let last = tail_entries().last().expect("entries").log_id;
+                storage
+                    .log_mut()
+                    .save_committed(Some(last))
+                    .await
+                    .expect("commit the marker");
+            }
+            Operation::Apply => {
+                // The entry after the ones the fixture applied, from the same
+                // generated history, so it is a command a voter would really
+                // see at that index rather than a synthetic one.
+                let history =
+                    crate::coordination::model::history::sample_history(FIXTURE_STEPS + 1);
+                let (log_id, command) = history.entries.last().expect("an entry").clone();
+                storage
+                    .state_mut()
+                    .apply([Entry {
+                        log_id: raft_log_id(&log_id),
+                        payload: EntryPayload::Normal(command),
+                    }])
+                    .await
+                    .expect("apply");
+            }
+            Operation::Build => {
+                let mut builder = storage.state_mut().get_snapshot_builder().await;
+                builder.build_snapshot().await.expect("build");
+            }
+            Operation::Install => {
+                let (meta, body) = source.expect("an install has a source");
+                let staged = dir.join("from-the-leader");
+                std::fs::write(&staged, &body).expect("the sender's bytes");
+                storage
+                    .state_mut()
+                    .install_snapshot(&meta, Box::new(CoordinationSnapshotFile::incoming(staged)))
+                    .await
+                    .expect("install");
+            }
+        }
+        drop(storage);
+    }
+
+    /// Two entries just past what `crash_fixture` left in the log.
+    ///
+    /// Contiguous with it: §4.3 refuses a gap outright, so an append at an
+    /// arbitrary index would fail before reaching any boundary at all.
+    fn tail_entries() -> Vec<Entry> {
+        let at = crate::coordination::model::history::SETUP_ENTRIES + FIXTURE_STEPS + 1;
+        vec![blank(at), blank(at + 1)]
+    }
+
+    /// A snapshot from a peer of the same group, ahead of what the fixture
+    /// applied.
+    ///
+    /// Ahead, because §11.4 refuses an install at or below what this store has
+    /// already applied -- a source built from the same history length would be
+    /// classified stale and the install would never reach a boundary.
+    async fn peer_snapshot() -> (SnapshotMeta<CoordinationNodeId, CoordinationNode>, Vec<u8>) {
+        let dir = scratch_dir();
+        let history = crate::coordination::model::history::sample_history(FIXTURE_STEPS * 3);
+        let mut storage = initialized(&dir, &history).await;
+        let entries: Vec<Entry> = history
+            .entries
+            .iter()
+            .map(|(log_id, command)| Entry {
+                log_id: raft_log_id(log_id),
+                payload: EntryPayload::Normal(command.clone()),
+            })
+            .collect();
+        storage.state_mut().apply(entries).await.expect("apply");
+        let built = {
+            let mut builder = storage.state_mut().get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build")
+        };
+        let body = std::fs::read(body_path(&dir, &built.meta.snapshot_id)).expect("the body");
+        drop(storage);
+        (built.meta, body)
+    }
+
+    /// The child half of the matrix.
+    ///
+    /// A no-op unless the environment names a boundary, so it costs the ordinary
+    /// suite one skipped test. When it is armed it opens the store the parent
+    /// prepared, runs the one operation, and blocks inside `reached` for the
+    /// parent to kill -- it never returns, and reaching the end of it means the
+    /// boundary was not on the path, which the parent is told by the absence of
+    /// the ready line.
+    #[tokio::test]
+    async fn crash_child() {
+        let Ok(scenario) = std::env::var(SCENARIO_VAR) else {
+            return;
+        };
+        let operation = Operation::parse(&scenario).expect("the parent named an operation");
+        let dir =
+            std::path::PathBuf::from(std::env::var(DIR_VAR).expect("the parent named a directory"));
+        perform(&dir, operation).await;
+        // Only reachable when the armed boundary was never hit. Said out loud,
+        // because the parent's alternative diagnosis -- a child that died for
+        // its own reasons -- looks identical from the outside.
+        panic!("the child ran {scenario} to completion without reaching its boundary");
+    }
+
+    /// How long a child may take to reach its boundary.
+    ///
+    /// Generous: a child opens a store and runs a real operation, and a loaded
+    /// CI host is slower than a laptop. It exists to bound a *hang*, not to
+    /// time anything.
+    const CHILD_TIMEOUT_SECONDS: u64 = 120;
+
+    /// Kill a child at `point` while it runs `operation` in `dir`, and prove
+    /// that is where it died.
+    ///
+    /// The child announces the boundary on stdout and parks; the parent kills
+    /// it there. `kill` is `SIGKILL`, so no destructor runs, no database is
+    /// closed and nothing Rust buffered is flushed -- which is the whole reason
+    /// this is a subprocess rather than a `drop`.
+    fn kill_at(dir: &std::path::Path, operation: Operation, point: CrashPoint) {
+        use std::io::BufRead as _;
+
+        let exe = std::env::current_exe().expect("the test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "coordination::storage::machine::tests::crash_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(super::super::crash::BOUNDARY_VAR, point.name())
+            .env(SCENARIO_VAR, operation.name())
+            .env(DIR_VAR, dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the child");
+
+        // The read happens on its own thread with a deadline on this one, so a
+        // boundary that stops being reachable fails in seconds instead of
+        // blocking the reader until something else kills the child. The first
+        // version had no deadline and a missed boundary cost thirteen minutes
+        // before it reported. No new dependency for it: killing the child from
+        // here closes its stdout, which is what releases the reader.
+        let stdout = child.stdout.take().expect("piped");
+        let (found, waiting) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let marker = super::super::crash::READY;
+            let announced = std::io::BufReader::new(stdout).lines().find_map(|line| {
+                let line = line.ok()?;
+                // Searched rather than stripped: libtest writes its own
+                // `test <name> ... ` with no trailing newline, so the
+                // announcement can share a line with it. Matching on a prefix
+                // is what made the first run of this hang.
+                let at = line.find(marker)?;
+                Some(line[at + marker.len()..].trim().to_owned())
+            });
+            let _ = found.send(announced);
+        });
+        let announced = waiting
+            .recv_timeout(std::time::Duration::from_secs(CHILD_TIMEOUT_SECONDS))
+            .unwrap_or(None);
+
+        // Before the assertion: a child that never announced is a child still
+        // running, and leaving it alive would hold the directory open for the
+        // reopen below and hang the suite instead of failing it.
+        let _ = child.kill();
+        let status = child.wait().expect("reap the child");
+        let _ = reader.join();
+
+        let announced = announced.unwrap_or_else(|| {
+            panic!(
+                "the child running {} never reached {} (exit {status:?}); \
+                 a boundary that is never hit is a boundary the matrix does not test",
+                operation.name(),
+                point.name()
+            )
+        });
+        assert_eq!(
+            announced,
+            point.name(),
+            "the child stopped at a different boundary than the one armed"
+        );
+    }
+
+    /// Every reachable boundary of every operation, killed and recovered.
+    ///
+    /// The comparison is against two observations the harness *made* rather
+    /// than against values written here: `before` is the fixture, `after` is the
+    /// same operation run to completion in a sibling directory. A crashed store
+    /// must equal one of them exactly, chosen by the boundary's own declared
+    /// expectation -- so "either" is never the default, and a boundary whose
+    /// outcome regresses from `After` to `Before` fails rather than passing
+    /// under a permissive union.
+    #[tokio::test]
+    async fn every_boundary_recovers_to_a_state_the_protocol_permits() {
+        for operation in Operation::ALL {
+            let before_dir = scratch_dir();
+            crash_fixture(&before_dir).await;
+            stage_for(&before_dir, *operation).await;
+            let before = observe(&before_dir).await;
+
+            let after_dir = scratch_dir();
+            crash_fixture(&after_dir).await;
+            stage_for(&after_dir, *operation).await;
+            perform(&after_dir, *operation).await;
+            let after = observe(&after_dir).await;
+            assert_ne!(
+                before,
+                after,
+                "{} changes nothing, so no boundary in it can be distinguished",
+                operation.name()
+            );
+
+            for point in operation.boundaries() {
+                let dir = scratch_dir();
+                crash_fixture(&dir).await;
+                stage_for(&dir, *operation).await;
+                kill_at(&dir, *operation, *point);
+                let crashed = observe(&dir).await;
+
+                let what = format!("{} killed at {}", operation.name(), point.name());
+                match point.expected() {
+                    Expected::Before => assert_eq!(
+                        crashed, before,
+                        "{what} must leave no trace of the operation"
+                    ),
+                    Expected::After => {
+                        assert_eq!(crashed, after, "{what} must be durable")
+                    }
+                    Expected::Either => assert!(
+                        crashed == before || crashed == after,
+                        "{what} must recover to one of the two states the \
+                         protocol permits, and to nothing else"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Every boundary is reached by some operation.
+    ///
+    /// The other half of the declaration: `operations!` says which boundaries
+    /// each operation passes, and this says the union is the whole list. A
+    /// boundary added to `crash_points!` and forgotten here would otherwise sit
+    /// in the enum, be counted by the inventory test, and never be crashed.
+    #[test]
+    fn every_boundary_is_covered_by_some_operation() {
+        let covered: std::collections::BTreeSet<&str> = Operation::ALL
+            .iter()
+            .flat_map(|o| o.boundaries())
+            .map(|p| p.name())
+            .collect();
+        let all: std::collections::BTreeSet<&str> =
+            CrashPoint::ALL.iter().map(|p| p.name()).collect();
+        assert_eq!(covered, all, "a boundary no operation reaches is untested");
+    }
+
+    // ── OpenRaft's own storage suite ────────────────────────────────────────
+
+    /// The whole of `Suite::test_all` against a freshly built store.
+    ///
+    /// This is the conformance bar every OpenRaft storage implementation is
+    /// measured against, and it is not a substitute for the tests in this
+    /// crate: it checks the protocol contract -- vote monotonicity, log ranges,
+    /// truncate and purge, membership recovery, snapshot transfer -- and knows
+    /// nothing about §11's identity binding, row ceilings or crash boundaries.
+    #[test]
+    fn the_openraft_storage_suite_passes_on_a_fresh_store() {
+        openraft::testing::Suite::test_all(SuiteBuilder::fresh(scratch_dir(), 11))
+            .expect("OpenRaft's storage suite");
+    }
+
+    /// The same suite, with every store closed and reopened before use.
+    ///
+    /// The variant that says something about *durability*: a fresh store has
+    /// only ever existed in this process, so an implementation that kept its
+    /// state in memory and wrote nothing would pass the run above. Here each
+    /// store is built, dropped -- both actors joined, both databases released,
+    /// the directory lock gone -- and opened again from its files.
+    #[test]
+    fn the_openraft_storage_suite_passes_on_a_reopened_store() {
+        openraft::testing::Suite::test_all(SuiteBuilder::reopened(scratch_dir(), 12))
+            .expect("OpenRaft's storage suite, after a restart");
+    }
+
+    /// A `Normal` command survives a restart, and the store comes back
+    /// non-empty.
+    ///
+    /// Separate from the suite because the suite's entries are `Blank` and
+    /// `Membership`: `test_all` never appends an application command, so a
+    /// store that lost every `Normal` payload on reload would pass all of it.
+    /// This appends one, commits it, closes the store, reopens it, and requires
+    /// the payload back -- byte for byte, through the log reader OpenRaft uses.
+    #[tokio::test]
+    async fn a_normal_command_and_a_non_empty_log_survive_a_restart() {
+        use openraft::storage::RaftLogReader as _;
+        use openraft::storage::RaftLogStorage as _;
+        use openraft::storage::RaftLogStorageExt as _;
+
+        let fixture = SuiteFixture::new(scratch_dir(), 13);
+        let (dir, mut store) = fixture.build_at();
+
+        let entries = vec![
+            Entry {
+                log_id: openraft::LogId::default(),
+                payload: openraft::EntryPayload::Membership(uniform_membership(
+                    &crate::coordination::model::history::INITIAL_VOTERS,
+                )),
+            },
+            Entry {
+                log_id: log_id(1),
+                payload: openraft::EntryPayload::Normal(acquire(1)),
+            },
+        ];
+        let last = entries.last().expect("entries").log_id;
+        store
+            .log_mut()
+            .blocking_append(entries)
+            .await
+            .expect("append");
+        store
+            .log_mut()
+            .save_committed(Some(last))
+            .await
+            .expect("commit");
+        let vote = openraft::Vote::new_committed(4, *fixture.identity_for(0).local_node_id());
+        store.log_mut().save_vote(&vote).await.expect("save a vote");
+        drop(store);
+
+        let mut store = fixture.open_existing(&dir);
+        let mut reader = store.log_mut().get_log_reader().await;
+        let back = reader
+            .try_get_log_entries(0..u64::MAX)
+            .await
+            .expect("read the log back");
+        assert_eq!(back.len(), 2, "the log came back empty or short");
+        assert_eq!(back[0].log_id, openraft::LogId::default());
+        match &back[1].payload {
+            openraft::EntryPayload::Normal(command) => {
+                assert_eq!(command, &acquire(1), "the application command changed")
+            }
+            other => panic!("index 1 came back as {other:?} rather than a command"),
+        }
+        assert_eq!(
+            store.log_mut().read_committed().await.expect("committed"),
+            Some(last)
+        );
+        assert_eq!(store.log_mut().read_vote().await.expect("vote"), Some(vote));
+        drop(store);
     }
 
     /// The canonical digest of whatever `state.redb` a directory holds.
