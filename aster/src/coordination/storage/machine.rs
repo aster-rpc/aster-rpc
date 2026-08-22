@@ -4258,10 +4258,10 @@ mod tests {
             // assumed: a seed that quietly differed from the model's genesis
             // would make every downstream comparison a comparison against the
             // wrong initial condition.
-            assert_eq!(
-                durable_of(storage.state()).await,
-                expected_durable(history.genesis.clone()),
-                "the seeded store is not the state the model starts from"
+            assert_durable(
+                &durable_of(storage.state()).await,
+                &history.genesis,
+                "the seeded store",
             );
             let replies = storage.state_mut().apply(entries()).await.expect("apply");
             let built = {
@@ -4334,19 +4334,13 @@ mod tests {
         // stored membership or in the recovery provenance would leave every
         // model comparison green and every digest comparison green, because the
         // digests were only ever compared with each other.
-        let expected = expected_durable(history.final_state.clone());
-        assert_eq!(
-            direct_state, expected,
-            "direct apply must reach the state the model computed"
+        assert_durable(&direct_state, &history.final_state, "direct apply");
+        assert_durable(
+            &replayed_state,
+            &history.final_state,
+            "committed-log recovery",
         );
-        assert_eq!(
-            replayed_state, expected,
-            "and so must committed-log recovery"
-        );
-        assert_eq!(
-            installed_state, expected,
-            "and so must installing a snapshot of it"
-        );
+        assert_durable(&installed_state, &history.final_state, "snapshot install");
 
         let direct_digest = canonical_digest_of(&direct);
         assert_eq!(canonical_digest_of(&replayed), direct_digest, "same bytes");
@@ -4443,30 +4437,15 @@ mod tests {
         }
     }
 
-    /// The complete durable state that goes with a generated model state.
+    /// The durable state a store is **seeded** with.
     ///
-    /// The three fields beside `.model` are stated once, here, and used both to
-    /// seed a store and to say what a route must reach -- so the seed and the
-    /// expectation cannot drift apart, and neither is derived from what a route
-    /// produced.
-    ///
-    /// The cost of stating them once, measured rather than assumed: injecting
-    /// recovery provenance *here* survives, because all three routes inherit
-    /// the seed and the expectation moves with it. Injecting it into the seed
-    /// alone is caught immediately by the caller's genesis assertion, and
-    /// caught again by the route comparisons if that assertion is removed. So
-    /// these fields are genuinely compared; what cannot be caught is this
-    /// function being wrong about them, which is the same class of limit as a
-    /// defect inside `apply_command`.
-    ///
-    /// The stored membership is the one index zero committed and nothing in the
-    /// history changes it: a `ChangeMembership` *action* writes an intent for a
-    /// controller to act on, and the `EntryPayload::Membership` entry that would
-    /// move this field never arrives in a generated history. The recovery
-    /// provenance is absent because no route here is a recovery: install
-    /// replaces a store from a peer's snapshot, which §11.4 does not treat as
-    /// the operator-driven recovery those two fields record.
-    fn expected_durable(model: crate::coordination::model::state::State) -> DurableState {
+    /// Its sole construction site, and deliberately not the source of the
+    /// expectation. An earlier revision used one function for both, so
+    /// injecting recovery provenance moved the seed and the expectation
+    /// together and survived -- which is not the unavoidable limit a defect
+    /// inside `apply_command` is, just a helper doing two jobs. `assert_durable`
+    /// now states the expectation independently, and that mutation fails.
+    fn seed_durable(model: crate::coordination::model::state::State) -> DurableState {
         DurableState {
             model,
             membership: StoredMembership::new(
@@ -4478,17 +4457,77 @@ mod tests {
         }
     }
 
-    /// A voter store in the state `initialize` leaves behind, holding the
-    /// history's genesis.
+    /// Assert an observed durable state is the one a route must reach.
     ///
-    /// Three things make it legal rather than merely convenient. The first open
-    /// creates and binds both databases -- a `state.redb` carrying durable
-    /// state beside an absent `raft.redb` is a partial initialization and open
-    /// refuses it. The seeded `StoredMembership` carries the same log id the
-    /// model's `membership_log_id` does, because §11.3's validator refuses "a
-    /// membership with nothing applied". And index 0 goes into the log and is
-    /// **not** applied again: the seeded state has already applied it, which is
-    /// what makes recovery start at index 1 the way a real reopen would.
+    /// Destructured, so a field added to `DurableState` stops compiling here
+    /// rather than going silently unchecked. The membership is checked by its
+    /// **parts** -- the log id index zero carries, the voter set, and the
+    /// absence of learners -- rather than by rebuilding the value the seed
+    /// used, and the two provenance fields are checked against literal `None`
+    /// written here. Nothing in this function reads `seed_durable`.
+    ///
+    /// The membership is expected unchanged because nothing in a generated
+    /// history moves it: a `ChangeMembership` *action* writes an intent for a
+    /// controller to act on, and the `EntryPayload::Membership` entry that would
+    /// move this field never arrives. The provenance is expected absent because
+    /// no route here is an operator-driven §13 recovery -- install replaces a
+    /// store from a peer's snapshot, which is not that.
+    fn assert_durable(
+        observed: &DurableState,
+        model: &crate::coordination::model::state::State,
+        at: &str,
+    ) {
+        let DurableState {
+            model: seen,
+            membership,
+            recovery_export_hash,
+            recovered_from,
+        } = observed;
+
+        assert_eq!(seen, model, "{at}: the model state");
+        assert_eq!(
+            membership.log_id(),
+            &Some(RaftLogId::default()),
+            "{at}: the stored membership must still be the one index zero committed"
+        );
+        let voters: Vec<[u8; 32]> = membership
+            .membership()
+            .voter_ids()
+            .map(|id| *id.as_bytes())
+            .collect();
+        assert_eq!(
+            voters,
+            crate::coordination::model::history::INITIAL_VOTERS.to_vec(),
+            "{at}: the voter set"
+        );
+        assert_eq!(
+            membership.membership().learner_ids().count(),
+            0,
+            "{at}: no history here adds a learner"
+        );
+        assert_eq!(
+            recovery_export_hash, &None,
+            "{at}: no route here is a recovery, so nothing may record one"
+        );
+        assert_eq!(recovered_from, &None, "{at}: likewise");
+    }
+
+    /// A voter store holding the history's genesis: the state `initialize`
+    /// leaves behind, and nothing more.
+    ///
+    /// No resources, no grants and no sessions are seeded. Those arrive as the
+    /// history's own setup commands, so every route *applies* them rather than
+    /// being handed their effects.
+    ///
+    /// Three things make the seeding legal rather than merely convenient. The
+    /// first open creates and binds both databases -- a `state.redb` carrying
+    /// durable state beside an absent `raft.redb` is a partial initialization
+    /// and open refuses it. The seeded `StoredMembership` carries the same log
+    /// id the model's `membership_log_id` does, because §11.3's validator
+    /// refuses "a membership with nothing applied". And index 0 goes into the
+    /// log and is **not** applied again: the seeded state has already applied
+    /// it, which is what makes recovery start at index 1 the way a real reopen
+    /// would.
     async fn initialized(
         dir: &std::path::Path,
         history: &crate::coordination::model::history::SampleHistory,
@@ -4499,7 +4538,7 @@ mod tests {
         drop(voter(dir));
         {
             let database = opened(dir);
-            let state = expected_durable(history.genesis.clone());
+            let state = seed_durable(history.genesis.clone());
             rows::commit(&database, state.clone(), &every_key_in(&state))
                 .expect("seed the generated genesis");
         }

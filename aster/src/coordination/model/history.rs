@@ -70,18 +70,27 @@ fn key(n: u8) -> ResourceKey {
     raw(n).validate().expect("valid")
 }
 
-/// A running group: one administrator, three resources, and rights granted to
-/// two actors on each -- enough for holder, non-holder and revocation paths to
-/// be reachable without every command being refused for authorization.
+/// The client the setup prefix issues under. Distinct from the alphabet's three
+/// client ids, so the prefix advances a session of its own.
+const SETUP_CLIENT: [u8; 16] = [0x5Eu8; 16];
+
+/// How many entries [`setup_command`] occupies: one `set_grant` per
+/// `(resource, actor)`, three resources and two actors.
+const SETUP_ENTRIES: u64 = 6;
+
+/// The state `initialize` leaves behind: a committed membership at
+/// `LogId::default()`, that entry applied, and the founding administrator.
 ///
-/// It is **not** the state `initialize` leaves behind; it already holds
-/// resources and grants that only later commands could have written. What it
-/// borrows from that state is the pair of index-zero facts: the membership was
-/// committed at `LogId::default()` and that entry has been applied. Both,
-/// together, because §11.3's validator refuses "a membership with nothing
-/// applied" -- so a fixture carrying only one of them is a state no store can
-/// hold, and every history built on it would be describing a group that cannot
-/// exist.
+/// Both index-zero facts, together, because §11.3's validator refuses "a
+/// membership with nothing applied" -- a fixture carrying one of them is a
+/// state no store can hold.
+///
+/// **Nothing else.** No resources, no grants, and no sessions: §8.1 creates a
+/// resource row only when a grant is set on it, so a fixture that inserted the
+/// rows directly would be describing a state no sequence of commands produces,
+/// and would be missing the session rows the commands that produced it must
+/// have left behind. Passing the durable validator is not the same as being
+/// reachable. [`setup_command`] writes them, as commands, in every history.
 fn genesis() -> State {
     let mut s = State::default();
     s.admins.insert(ADMIN);
@@ -94,29 +103,77 @@ fn genesis() -> State {
     s.membership = CommittedMembership::uniform(INITIAL_VOTERS);
     s.membership_log_id = Some(initial_log_id());
     s.last_applied = Some(initial_log_id());
-    for n in 0..3u8 {
-        // The resource row goes in with the grant. §8.1 moves the two together,
-        // so a grant without one is a state apply cannot produce -- and §11.3's
-        // validator refuses to open a store holding it. The pure model never
-        // opens a store, so this fixture described an impossible group for as
-        // long as nothing tried: driving the generated history through storage
-        // is what found it.
-        s.resources
-            .insert(key(n), super::state::ResourceRow::default());
-        for actor in [ALICE, BOB] {
-            s.acl.insert((key(n), actor), ALL_RIGHTS);
-        }
-    }
     s.growth_bytes = s.recompute_growth();
     s.reserve_bytes = s.recompute_reserve();
     s
 }
 
-/// One step of a generated history: a command and the client that issued it.
-struct Step {
-    command: Command,
-    /// The actor whose sequence advances, if any.
-    sequencer: Option<(NodeId, [u8; 16])>,
+/// The deterministic prefix that turns [`genesis`] into a group with rights:
+/// the administrator grants both actors every right on all three resources.
+///
+/// Six commands, so that what the generated alphabet starts from is a state
+/// apply produced -- resource rows created by the grants that §8.1 moves with
+/// them, and a session row for the administrator that issued them. Both are
+/// things a hand-inserted fixture silently lacked.
+fn setup_command(state: &State, n: u64) -> Command {
+    let resource = (n / 2) as u8;
+    let subject = if n.is_multiple_of(2) { ALICE } else { BOB };
+    Command::Client {
+        client: ClientRef {
+            actor: ADMIN,
+            client_id: SETUP_CLIENT,
+            sequence: state
+                .sessions
+                .get(&(ADMIN, SETUP_CLIENT))
+                .map_or(1, |s| s.last_sequence + 1),
+            request_hash: [0u8; 32],
+        },
+        action: Action::Grant(GrantAction {
+            resource: raw(resource),
+            subject,
+            rights: ALL_RIGHTS,
+            expected_acl_revision: state
+                .resources
+                .get(&key(resource))
+                .map_or(0, |r| r.acl_revision),
+        }),
+    }
+}
+
+/// The command at position `n` of a history: the setup prefix, then the
+/// generated alphabet.
+///
+/// One sequence with one indexing rule, so a history and its oracle cannot
+/// disagree about where the alphabet begins.
+fn history_command(state: &State, n: u64) -> Command {
+    if n < SETUP_ENTRIES {
+        setup_command(state, n)
+    } else {
+        step(state, n - SETUP_ENTRIES)
+    }
+}
+
+/// [`genesis`] with the setup prefix applied -- the state the generated
+/// alphabet starts from, for the hand-written tests that need rights but do not
+/// drive a whole history.
+///
+/// Their own commands must start at `SETUP_ENTRIES + 1`; the prefix occupies
+/// everything below it.
+fn running_group() -> State {
+    let mut state = genesis();
+    for n in 0..SETUP_ENTRIES {
+        let command = history_command(&state, n);
+        let reply =
+            apply_command(&mut state, LogId::new(1, LEADER, n + 1), &command).expect("no fault");
+        // Loudly, because a refused prefix leaves no grants at all and turns
+        // every history built on it into a study of authorization refusals
+        // while every coverage assertion still passes.
+        assert!(
+            matches!(&reply, CommandReply::Client(r) if r.reply.outcome != Outcome::Rejected),
+            "the setup prefix must apply; command {n} was refused: {reply:?}"
+        );
+    }
+    state
 }
 
 /// The command alphabet, indexed by a step counter.
@@ -125,7 +182,7 @@ struct Step {
 /// resource actions, `set_grant`, `set_admin`, both membership actions, system
 /// `Expire`, `MembershipProgress`, and `retire_client`.
 #[allow(clippy::too_many_lines)]
-fn step(state: &State, n: u64) -> Step {
+fn step(state: &State, n: u64) -> Command {
     let client_id = [(n % 3) as u8; 16];
     let resource = (n % 3) as u8;
     let row = state.resources.get(&key(resource));
@@ -160,7 +217,6 @@ fn step(state: &State, n: u64) -> Step {
         sequence,
         request_hash: [(n % 251) as u8; 32],
     };
-    let sequencer = Some((actor, client_id));
 
     let fence = Fence {
         resource: raw(resource),
@@ -250,45 +306,79 @@ fn step(state: &State, n: u64) -> Step {
             },
         }),
         10 => {
-            return Step {
-                command: Command::Expire(ExpireCommand {
-                    resource: key(resource),
-                    epoch,
-                    lease_revision,
-                }),
-                sequencer: None,
-            }
+            return Command::Expire(ExpireCommand {
+                resource: key(resource),
+                epoch,
+                lease_revision,
+            })
         }
         11 => {
-            return Step {
-                command: Command::MembershipProgress(MembershipProgressCommand {
-                    operation_id: [(n % 7) as u8; 16],
-                    expected_phase: PHASE_PENDING,
-                    new_phase: PHASE_ADDING_LEARNERS,
-                    observed_membership_log_id: Some(LogId::new(1, LEADER, n + 1)),
-                    result_code: crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED,
-                }),
-                sequencer: None,
-            }
+            return Command::MembershipProgress(MembershipProgressCommand {
+                operation_id: [(n % 7) as u8; 16],
+                expected_phase: PHASE_PENDING,
+                new_phase: PHASE_ADDING_LEARNERS,
+                observed_membership_log_id: Some(LogId::new(1, LEADER, n + 1)),
+                result_code: crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED,
+            })
         }
         _ => {
-            return Step {
-                command: Command::RetireClient(RetireCommand {
-                    actor,
-                    target_actor: actor,
-                    // A different client id from the sequenced ones most of the
-                    // time, so retirement does not simply close every session.
-                    target_client_id: [(n % 5 + 3) as u8; 16],
-                }),
-                sequencer: None,
-            };
+            return Command::RetireClient(RetireCommand {
+                actor,
+                target_actor: actor,
+                // A different client id from the sequenced ones most of the
+                // time, so retirement does not simply close every session.
+                target_client_id: [(n % 5 + 3) as u8; 16],
+            });
         }
     };
 
-    Step {
-        command: Command::Client { client, action },
-        sequencer,
+    Command::Client { client, action }
+}
+
+/// The setup prefix writes what a hand-inserted fixture could not.
+///
+/// The fixture this replaced held resource rows and grants that it simply
+/// assigned, alongside a `last_applied` claiming index zero. It passed §11.3's
+/// durable validator, and it was still a state no sequence of commands
+/// produces: the commands that would have written those rows leave a session
+/// row behind, and there was none. Reachability is a stronger claim than
+/// validity, and this is the difference stated as a test.
+#[test]
+fn the_setup_prefix_writes_rows_no_fixture_could_assign() {
+    let genesis = genesis();
+    assert!(
+        genesis.resources.is_empty() && genesis.acl.is_empty() && genesis.sessions.is_empty(),
+        "the post-initialize state has no resources, grants or sessions to inherit"
+    );
+
+    let running = running_group();
+    for n in 0..3u8 {
+        assert!(
+            running.resources.contains_key(&key(n)),
+            "§8.1 creates the resource row with the grant"
+        );
+        for actor in [ALICE, BOB] {
+            assert_eq!(running.acl.get(&(key(n), actor)), Some(&ALL_RIGHTS));
+        }
     }
+
+    // The row that a directly-assigned fixture cannot have: the administrator
+    // issued six commands, so its session records the last of them.
+    let session = running
+        .sessions
+        .get(&(ADMIN, SETUP_CLIENT))
+        .expect("the administrator that granted the rights has a session");
+    assert_eq!(session.last_sequence, SETUP_ENTRIES);
+    assert!(
+        session.last_result.is_some(),
+        "and a saved answer, which is what a replay of the last grant returns"
+    );
+    assert!(!session.retired);
+
+    assert!(
+        running.counters_match_recomputation(),
+        "the prefix leaves the byte counters describing the rows it wrote"
+    );
 }
 
 /// Assert every per-step invariant.
@@ -342,14 +432,16 @@ fn run(steps: u64) -> (State, Vec<String>) {
     // let a first command at index 0 through the monotonicity check.
     let mut previous = state.last_applied;
 
-    for n in 0..steps {
-        let step = step(&state, n);
+    // The setup prefix is part of the history, not a fixture beside it: the
+    // rights it grants are what makes the alphabet reach anything, and the rows
+    // it writes are the ones a hand-built genesis got wrong.
+    for n in 0..SETUP_ENTRIES + steps {
+        let command = history_command(&state, n);
         let log_id = LogId::new(1, LEADER, n + 1);
-        let reply = apply_command(&mut state, log_id, &step.command).expect("no fault");
+        let reply = apply_command(&mut state, log_id, &command).expect("no fault");
         trace.push(render(&reply));
         assert_invariants(&state, previous, n);
         previous = state.last_applied;
-        let _ = step.sequencer;
     }
 
     for ((term, index), row) in &state.audit {
@@ -412,10 +504,6 @@ pub(crate) fn initial_log_id() -> LogId {
 
 /// `steps` generated commands, encoded for the log, with the model's answers.
 pub(crate) fn sample_history(steps: u64) -> SampleHistory {
-    // The shared fixture already carries the index-zero facts, and carries them
-    // for every history rather than only this one. Overlaying them here left
-    // the coverage and change-set histories running from a state the durable
-    // validator would refuse to open.
     let genesis = genesis();
 
     let group = genesis.authority.group_id;
@@ -424,9 +512,13 @@ pub(crate) fn sample_history(steps: u64) -> SampleHistory {
     let mut replies = Vec::new();
     let mut previous = genesis.last_applied;
 
-    for n in 0..steps {
+    // Prefix included, so every route *applies* it rather than being handed its
+    // effects. A store seeded with the rights already in place would never
+    // exercise the commands that put them there, and its session table would be
+    // missing the row those commands leave.
+    for n in 0..SETUP_ENTRIES + steps {
         let log_id = LogId::new(1, LEADER, n + 1);
-        let (model, wire) = canonical(step(&state, n).command, &group);
+        let (model, wire) = canonical(history_command(&state, n), &group);
         let reply = apply_command(&mut state, log_id, &model).expect("no fault");
         assert_invariants(&state, previous, n);
         previous = state.last_applied;
@@ -822,16 +914,15 @@ fn action_to_wire(action: &Action, group: &NodeId) -> ActionV1 {
 fn every_generated_action_survives_the_encoding_this_module_does() {
     use super::boundary::{action_from_wire, command_from_wire};
 
-    let mut state = State {
-        membership_log_id: Some(initial_log_id()),
-        ..genesis()
-    };
+    // The same sequence `sample_history` encodes, prefix included: the setup
+    // grants are entries a route applies, so their encoding has to round-trip
+    // like any other.
+    let mut state = genesis();
     let group = state.authority.group_id;
     let mut seen = std::collections::BTreeSet::new();
 
-    for n in 0..400 {
-        let original = step(&state, n).command;
-        let (model, wire) = canonical(original, &group);
+    for n in 0..SETUP_ENTRIES + 400 {
+        let (model, wire) = canonical(history_command(&state, n), &group);
         // Whatever a voter narrows this entry back to must be the command the
         // oracle applied -- including the request hash, which the boundary
         // verifies against the encoded action rather than trusting.
@@ -1114,16 +1205,16 @@ fn the_recorded_change_set_names_every_row_an_entry_touched() {
     }
 
     // The generated alphabet: resources, grants, admins, sessions and audit.
-    let mut state = genesis();
-    let mut mirror = genesis();
+    let mut state = running_group();
+    let mut mirror = running_group();
     let mut touched = 0usize;
     for n in 0..600u64 {
-        let step = step(&state, n);
+        let command = step(&state, n);
         let mut changes = ChangeSet::default();
         apply_command_recording(
             &mut state,
-            LogId::new(1, LEADER, n + 1),
-            &step.command,
+            LogId::new(1, LEADER, SETUP_ENTRIES + n + 1),
+            &command,
             &mut changes,
         )
         .expect("no fault");
@@ -1139,7 +1230,7 @@ fn the_recorded_change_set_names_every_row_an_entry_touched() {
 
     // And the membership driver, for intents and routes -- which the generated
     // alphabet retires faster than it retains.
-    let mut mirror = genesis();
+    let mut mirror = running_group();
     let mut entries = 0usize;
     let state = membership_history_observed(70, |applied, changes| {
         entries += 1;
@@ -1308,23 +1399,23 @@ fn no_saved_rejection_loses_its_reason_over_a_long_history() {
 /// at every point in a history rather than once.
 #[test]
 fn every_consumed_sequence_replays_identically() {
-    let mut state = genesis();
+    let mut state = running_group();
     let mut replays = 0;
     // Strictly monotonic across both the original and its duplicate: a
     // committed duplicate occupies its own log position, so rewinding the index
     // would be modelling something the log cannot do.
-    let mut index = 0u64;
+    let mut index = SETUP_ENTRIES;
 
     for n in 0..200u64 {
-        let step = step(&state, n);
+        let command = step(&state, n);
         index += 1;
-        let reply = apply_command(&mut state, LogId::new(1, LEADER, index), &step.command)
-            .expect("no fault");
+        let reply =
+            apply_command(&mut state, LogId::new(1, LEADER, index), &command).expect("no fault");
 
         // Re-issue the same client command at the next index and require the
         // identical answer.
         if let (Command::Client { client, action }, CommandReply::Client(first)) =
-            (&step.command, &reply)
+            (&command, &reply)
         {
             if first.disposition == Disposition::Consumed {
                 let business = (
@@ -1393,24 +1484,24 @@ fn retirement_ordering_is_determined_in_both_directions() {
     });
 
     // Ordering A: the mutation commits, then retirement.
-    let mut a = genesis();
+    let mut a = running_group();
     let first = apply_command(
         &mut a,
-        LogId::new(1, LEADER, 1),
+        LogId::new(1, LEADER, SETUP_ENTRIES + 1),
         &Command::Client {
             client: client.clone(),
             action: action.clone(),
         },
     )
     .expect("no fault");
-    apply_command(&mut a, LogId::new(1, LEADER, 2), &retire).expect("no fault");
+    apply_command(&mut a, LogId::new(1, LEADER, SETUP_ENTRIES + 2), &retire).expect("no fault");
 
     // Ordering B: retirement commits first.
-    let mut b = genesis();
-    apply_command(&mut b, LogId::new(1, LEADER, 1), &retire).expect("no fault");
+    let mut b = running_group();
+    apply_command(&mut b, LogId::new(1, LEADER, SETUP_ENTRIES + 1), &retire).expect("no fault");
     let refused = apply_command(
         &mut b,
-        LogId::new(1, LEADER, 2),
+        LogId::new(1, LEADER, SETUP_ENTRIES + 2),
         &Command::Client {
             client: client.clone(),
             action: action.clone(),
@@ -1431,7 +1522,7 @@ fn retirement_ordering_is_determined_in_both_directions() {
     // which is the whole reason retirement retains the saved reply.
     let replay = apply_command(
         &mut a,
-        LogId::new(1, LEADER, 3),
+        LogId::new(1, LEADER, SETUP_ENTRIES + 3),
         &Command::Client { client, action },
     )
     .expect("no fault");
@@ -1455,7 +1546,7 @@ fn retirement_ordering_is_determined_in_both_directions() {
 /// changes nothing.
 #[test]
 fn renew_and_expire_resolve_by_log_order() {
-    let mut state = genesis();
+    let mut state = running_group();
     let acquire = Command::Client {
         client: ClientRef {
             actor: ALICE,
@@ -1468,7 +1559,12 @@ fn renew_and_expire_resolve_by_log_order() {
             ttl_ms: 30_000,
         }),
     };
-    apply_command(&mut state, LogId::new(1, LEADER, 1), &acquire).expect("no fault");
+    apply_command(
+        &mut state,
+        LogId::new(1, LEADER, SETUP_ENTRIES + 1),
+        &acquire,
+    )
+    .expect("no fault");
     let held = state.resources.get(&key(0)).unwrap().clone();
 
     // Ordering A: renew first, then the expiry armed against the old lease
@@ -1476,7 +1572,7 @@ fn renew_and_expire_resolve_by_log_order() {
     let mut a = state.clone();
     apply_command(
         &mut a,
-        LogId::new(1, LEADER, 2),
+        LogId::new(1, LEADER, SETUP_ENTRIES + 2),
         &Command::Client {
             client: ClientRef {
                 actor: ALICE,
@@ -1496,7 +1592,7 @@ fn renew_and_expire_resolve_by_log_order() {
     .expect("no fault");
     let stale = apply_command(
         &mut a,
-        LogId::new(1, LEADER, 3),
+        LogId::new(1, LEADER, SETUP_ENTRIES + 3),
         &Command::Expire(ExpireCommand {
             resource: key(0),
             epoch: held.epoch,
@@ -1521,7 +1617,7 @@ fn renew_and_expire_resolve_by_log_order() {
     let mut b = state.clone();
     apply_command(
         &mut b,
-        LogId::new(1, LEADER, 2),
+        LogId::new(1, LEADER, SETUP_ENTRIES + 2),
         &Command::Expire(ExpireCommand {
             resource: key(0),
             epoch: held.epoch,
@@ -1533,7 +1629,7 @@ fn renew_and_expire_resolve_by_log_order() {
 
     let renew = apply_command(
         &mut b,
-        LogId::new(1, LEADER, 3),
+        LogId::new(1, LEADER, SETUP_ENTRIES + 3),
         &Command::Client {
             client: ClientRef {
                 actor: ALICE,
@@ -1561,7 +1657,7 @@ fn renew_and_expire_resolve_by_log_order() {
 /// the first's revision, and exactly one wins per revision.
 #[test]
 fn an_acl_race_is_resolved_by_revision_and_only_one_wins() {
-    let mut state = genesis();
+    let mut state = running_group();
     let base = state.resources.get(&key(0)).map_or(0, |r| r.acl_revision);
 
     let grant = |seq: u64, subject: NodeId, hash: u8| Command::Client {
@@ -1579,10 +1675,18 @@ fn an_acl_race_is_resolved_by_revision_and_only_one_wins() {
         }),
     };
 
-    let first =
-        apply_command(&mut state, LogId::new(1, LEADER, 1), &grant(1, ALICE, 1)).expect("no fault");
-    let second =
-        apply_command(&mut state, LogId::new(1, LEADER, 2), &grant(2, BOB, 2)).expect("no fault");
+    let first = apply_command(
+        &mut state,
+        LogId::new(1, LEADER, SETUP_ENTRIES + 1),
+        &grant(1, ALICE, 1),
+    )
+    .expect("no fault");
+    let second = apply_command(
+        &mut state,
+        LogId::new(1, LEADER, SETUP_ENTRIES + 2),
+        &grant(2, BOB, 2),
+    )
+    .expect("no fault");
 
     match (first, second) {
         (CommandReply::Client(a), CommandReply::Client(b)) => {
@@ -1604,7 +1708,7 @@ fn an_acl_race_is_resolved_by_revision_and_only_one_wins() {
 /// The same race on the administrator table.
 #[test]
 fn an_admin_race_is_resolved_by_revision() {
-    let mut state = genesis();
+    let mut state = running_group();
     let set = |seq: u64, target: NodeId, hash: u8| Command::Client {
         client: ClientRef {
             actor: ADMIN,
@@ -1619,9 +1723,18 @@ fn an_admin_race_is_resolved_by_revision() {
         }),
     };
 
-    apply_command(&mut state, LogId::new(1, LEADER, 1), &set(1, ALICE, 1)).expect("no fault");
-    let loser =
-        apply_command(&mut state, LogId::new(1, LEADER, 2), &set(2, BOB, 2)).expect("no fault");
+    apply_command(
+        &mut state,
+        LogId::new(1, LEADER, SETUP_ENTRIES + 1),
+        &set(1, ALICE, 1),
+    )
+    .expect("no fault");
+    let loser = apply_command(
+        &mut state,
+        LogId::new(1, LEADER, SETUP_ENTRIES + 2),
+        &set(2, BOB, 2),
+    )
+    .expect("no fault");
 
     match loser {
         CommandReply::Client(r) => {
@@ -1654,8 +1767,8 @@ fn membership_history_observed(
     use super::apply::apply_command_recording;
     use super::state::ChangeSet;
 
-    let mut state = genesis();
-    let mut index = 0u64;
+    let mut state = running_group();
+    let mut index = SETUP_ENTRIES;
 
     for round in 0..rounds {
         // The client's next sequence: one per accepted change, since the
@@ -1794,13 +1907,18 @@ fn membership_intents_transition_and_stay_within_their_cap() {
 /// Tombstones are permanent: no command route removes a client-session row.
 #[test]
 fn no_command_route_ever_removes_a_session_row() {
-    let mut state = genesis();
+    let mut state = running_group();
     let mut seen: usize = 0;
 
     for n in 0..500u64 {
-        let step = step(&state, n);
+        let command = step(&state, n);
         let before = state.sessions.len();
-        apply_command(&mut state, LogId::new(1, LEADER, n + 1), &step.command).expect("no fault");
+        apply_command(
+            &mut state,
+            LogId::new(1, LEADER, SETUP_ENTRIES + n + 1),
+            &command,
+        )
+        .expect("no fault");
         assert!(
             state.sessions.len() >= before,
             "the session table shrank at step {n}"
