@@ -31,10 +31,11 @@
 
 use crate::coordination::contract::{
     AcquireActionV1, ActionV1, CancelMembershipActionV1, ChangeMembershipActionV1, ClientCommandV1,
-    CommandV1, CompareAndSetActionV1, ExpireCommandV1, FenceV1, LogIdV1, MemberSeedV1,
-    MembershipProgressCommandV1, NodeIdV1, ReleaseActionV1, ReleaseWithValueActionV1,
-    RenewActionV1, ResourceKeyV1, RetireClientCommandV1, RevokeActionV1, SetAdminActionV1,
-    SetGrantActionV1,
+    ClientReplyV1, CommandReplyV1, CommandV1, CompareAndSetActionV1, ExpireCommandV1, FenceV1,
+    LogIdV1, MemberSeedV1, MembershipProgressCommandV1, NodeIdV1, ReleaseActionV1,
+    ReleaseWithValueActionV1, RenewActionV1, ResourceKeyV1, ResourceSnapshotV1,
+    RetireClientCommandV1, RetirementReplyV1, RevokeActionV1, SetAdminActionV1, SetGrantActionV1,
+    SystemReplyV1,
 };
 use crate::coordination::reason::{Disposition, Outcome, Reason};
 
@@ -177,10 +178,14 @@ fn step(state: &State, n: u64) -> Step {
         }),
         5 => Action::Resource(ResourceAction::Revoke {
             resource: raw(resource),
-            expected_epoch: if n.is_multiple_of(4) {
-                Some(epoch)
-            } else {
-                None
+            // Three branches, not two. An earlier alphabet offered the row's
+            // own epoch or nothing, so a conditional revoke never *differed*
+            // from an unconditional one and the field could be dropped at the
+            // wire boundary with no observable effect.
+            expected_epoch: match n % 4 {
+                0 => Some(epoch),
+                1 => Some(epoch.wrapping_add(7)),
+                _ => None,
             },
         }),
         6 => Action::Grant(GrantAction {
@@ -361,16 +366,19 @@ pub(crate) fn sample_applied_state(steps: u64) -> State {
 /// snapshot install all end in a state the state machine computed -- install
 /// merely copies one -- so a defect shared by the wire boundary and apply makes
 /// all three agree with each other and with nothing else. Here the commands
-/// were encoded by [`command_to_wire`], and the replies and the final state
-/// came from [`apply_command`] alone: neither has been through
-/// `boundary::command_from_wire`, which is the code the comparison is checking.
+/// were encoded by [`canonical`] and [`action_to_wire`], the replies were built
+/// by [`expected_reply`] from the model state, and the final state came from
+/// [`apply_command`]: none of it has been through `boundary::command_from_wire`
+/// or `boundary::to_wire`, which are the code the comparison is checking.
 pub(crate) struct SampleHistory {
-    /// The state every route starts from -- a running group, not a default.
+    /// The state every route starts from -- a legal post-`initialize` state,
+    /// not a default and not a hand-tuned one.
     pub genesis: State,
     /// The committed entries in order, each with the log id it applied at.
+    /// Index 0 is **not** among them: `genesis` has already applied it.
     pub entries: Vec<(LogId, CommandV1)>,
-    /// What the model replied to each entry, in the same order.
-    pub replies: Vec<CommandReply>,
+    /// The complete reply each entry must produce, in the same order.
+    pub replies: Vec<CommandReplyV1>,
     /// The state the model ends in.
     pub final_state: State,
 }
@@ -389,14 +397,14 @@ pub(crate) fn initial_log_id() -> LogId {
 /// `steps` generated commands, encoded for the log, with the model's answers.
 pub(crate) fn sample_history(steps: u64) -> SampleHistory {
     let genesis = State {
-        // The group was initialized, so its committed membership carries the
-        // log id of the entry that committed it. The pure generator leaves this
-        // `None` because it has no log at all; a store that replays the real
-        // index-0 entry would then differ from this oracle in that one field,
-        // and tuning the oracle afterwards to match is exactly the move a
-        // hand-written fixture makes. Stating it as an initial condition is
-        // the honest form: a committed membership with no log id is not a state
-        // any voter is ever in.
+        // The state a voter is in the instant after `initialize`: index 0 is
+        // applied, and the committed membership carries the log id of the entry
+        // that committed it. Both fields, not one -- §11.3's validator refuses
+        // to open "a membership with nothing applied", so a genesis that set
+        // only `membership_log_id` was not a state any store can hold, and the
+        // routes reached agreement only because the native index-0 entry
+        // repaired the difference before command one.
+        last_applied: Some(initial_log_id()),
         membership_log_id: Some(initial_log_id()),
         ..genesis()
     };
@@ -405,7 +413,9 @@ pub(crate) fn sample_history(steps: u64) -> SampleHistory {
     let mut state = genesis.clone();
     let mut entries = Vec::new();
     let mut replies = Vec::new();
-    let mut previous = None;
+    // Index 0, because that is what `genesis` has applied. Starting from `None`
+    // would let a first command at index 0 through the monotonicity check.
+    let mut previous = genesis.last_applied;
 
     for n in 0..steps {
         let log_id = LogId::new(1, LEADER, n + 1);
@@ -414,7 +424,7 @@ pub(crate) fn sample_history(steps: u64) -> SampleHistory {
         assert_invariants(&state, previous, n);
         previous = state.last_applied;
         entries.push((log_id, wire));
-        replies.push(reply);
+        replies.push(expected_reply(&state, &group, &model, &reply));
     }
 
     SampleHistory {
@@ -422,6 +432,173 @@ pub(crate) fn sample_history(steps: u64) -> SampleHistory {
         entries,
         replies,
         final_state: state,
+    }
+}
+
+/// The complete reply an entry must produce, built from the model state.
+///
+/// Every field, constructed exhaustively -- no `..` and no formatted subset.
+/// State equality cannot stand in for this: a voter can reach exactly the right
+/// rows and still answer wrongly, and the two failures a partial projection
+/// hides are the ones that matter most. Leaking a live register value on a
+/// replay is a §4.3 confidentiality break, and dropping
+/// `SystemReplyV1::membership_log_id` silently removes the field a controller
+/// paces membership progress against.
+///
+/// `state` is the state **after** the command applied, which is where the live
+/// value and the current membership log id are read from.
+fn expected_reply(
+    state: &State,
+    group: &NodeId,
+    command: &Command,
+    reply: &CommandReply,
+) -> CommandReplyV1 {
+    match reply {
+        CommandReply::Client(r) => {
+            // §4.3's four-way table. A replay physically has no value -- the
+            // bytes were never saved -- and says so with `value_redacted`. A
+            // first attempt carries one only if the actor holds READ on that
+            // resource: §8.1 grants bind one exact triple, so ACQUIRE is
+            // permission to take a lease and not to read what it guards.
+            let value = if r.replayed {
+                None
+            } else {
+                r.reply.resource().and_then(|key| {
+                    let actor = match command {
+                        Command::Client { client, .. } => client.actor,
+                        _ => return None,
+                    };
+                    let readable =
+                        super::resource::granted_rights(state, key, &actor) & RIGHT_READ != 0;
+                    readable
+                        .then(|| state.resources.get(key).map(|row| row.value.clone()))
+                        .flatten()
+                })
+            };
+            CommandReplyV1::Client(ClientReplyV1 {
+                disposition_code: match r.disposition {
+                    Disposition::Consumed => 1,
+                    Disposition::NotConsumed => 2,
+                },
+                outcome_code: r.reply.outcome.code(),
+                reason_code: r.reply.reason.code(),
+                snapshot: r.reply.snapshot.as_ref().map(|s| ResourceSnapshotV1 {
+                    group_id: group.to_vec(),
+                    resource: ResourceKeyV1 {
+                        namespace: s.resource.namespace().to_string(),
+                        key: s.resource.key().to_vec(),
+                    },
+                    epoch: s.epoch,
+                    holder: s.holder.map(|h| h.to_vec()),
+                    held: s.held,
+                    ttl_ms: s.ttl_ms,
+                    lease_revision: s.lease_revision,
+                    value_revision: s.value_revision,
+                    acl_revision: s.acl_revision,
+                    value: value.clone(),
+                    value_redacted: r.replayed,
+                }),
+                acl_revision: r.reply.acl_revision,
+                admin_revision: r.reply.admin_revision,
+                operation_id: r.reply.operation_id.map(|id| id.to_vec()),
+                membership_log_id: r.reply.membership_log_id.as_ref().map(log_id_to_wire),
+            })
+        }
+        CommandReply::System(r) => CommandReplyV1::System(SystemReplyV1 {
+            system_result_code: r.system_result_code,
+            lease_revision: r.lease_revision,
+            // Read from state, not from the result: a system command has no
+            // client and no saved row, so this is the current committed
+            // membership at the moment it applied.
+            membership_log_id: state.membership_log_id.as_ref().map(log_id_to_wire),
+        }),
+        CommandReply::Retirement(r) => CommandReplyV1::Retirement(RetirementReplyV1 {
+            outcome_code: r.outcome.code(),
+            reason_code: r.reason.code(),
+        }),
+    }
+}
+
+/// A session that survived the history with a saved answer, and the entry whose
+/// reply it saved.
+pub(crate) struct SavedProbe {
+    /// Where in [`SampleHistory::entries`] the saving command sits.
+    pub at: usize,
+    /// What resubmitting that command must answer.
+    pub expected: CommandReplyV1,
+}
+
+/// Every persisted session with a saved answer, paired with the entry that
+/// saved it.
+///
+/// Located by **identity**, not by position: the session row carries the actor,
+/// client, sequence and request hash of the command whose reply it holds, and
+/// exactly one entry matches all four. Taking "the last command this session
+/// issued" instead picks up a trailing attempt that was refused without
+/// consuming -- whose reply was never saved, and whose probe can then only be
+/// skipped, leaving the count proving one session rather than all of them.
+pub(crate) fn saved_sessions(history: &SampleHistory) -> Vec<SavedProbe> {
+    let mut probes = Vec::new();
+    for ((actor, client_id), session) in &history.final_state.sessions {
+        if session.last_result.is_none() {
+            continue;
+        }
+        let mut found = None;
+        for (at, (_, command)) in history.entries.iter().enumerate() {
+            let CommandV1::Client(c) = command else {
+                continue;
+            };
+            if c.actor_node_id == actor.as_slice()
+                && c.client_id == client_id.as_slice()
+                && c.sequence == session.last_sequence
+                && c.request_hash == session.request_hash.as_slice()
+            {
+                assert!(found.is_none(), "two entries match one session row");
+                found = Some(at);
+            }
+        }
+        let at = found.expect("the session's saved answer came from some entry");
+        // The claim [`replayed_answer`] rests on: a session saves the answer to
+        // a sequence it consumed, so the retry's disposition is `Consumed` and
+        // unchanged. If a `NotConsumed` answer were ever saved, the probe built
+        // from it would be wrong in a way no assertion here would explain.
+        assert!(
+            matches!(&history.replies[at], CommandReplyV1::Client(r) if r.disposition_code == 1),
+            "entry {at} was saved by a session without being consumed"
+        );
+        probes.push(SavedProbe {
+            at,
+            expected: replayed_answer(&history.replies[at]),
+        });
+    }
+    probes
+}
+
+/// What the answer to entry `at` becomes when it is asked for a second time.
+///
+/// **Two fields change, and the disposition is not among them.** §5.2's
+/// disposition answers "was this sequence consumed?", and it was -- by the
+/// first delivery. Returning `NotConsumed` on the retry would tell a client its
+/// request had not taken effect when it had, which is the one thing an
+/// idempotency key exists to prevent. A session only ever saves an answer whose
+/// sequence it consumed, so a replayed answer is always `Consumed`;
+/// [`saved_sessions`] asserts that rather than assuming it.
+///
+/// What does change is §4.3's redaction: the saved snapshot has no value field
+/// at all, so the value is absent and flagged as redacted rather than absent
+/// and unexplained. Substituting the current bytes would hand back something
+/// the original command did not produce.
+pub(crate) fn replayed_answer(original: &CommandReplyV1) -> CommandReplyV1 {
+    match original {
+        CommandReplyV1::Client(r) => CommandReplyV1::Client(ClientReplyV1 {
+            snapshot: r.snapshot.as_ref().map(|s| ResourceSnapshotV1 {
+                value: None,
+                value_redacted: true,
+                ..s.clone()
+            }),
+            ..r.clone()
+        }),
+        other => other.clone(),
     }
 }
 
