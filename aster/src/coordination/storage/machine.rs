@@ -325,11 +325,17 @@ impl StateActor {
     ) -> StorageResult<()> {
         // Outside exclusion: streaming and rebuilding are proportional to the
         // state, and neither touches anything a reader can see.
+        //
+        // Failures here are about the *source*, so a decode or bounds refusal
+        // is reclassified as a rejection rather than left as the stored
+        // corruption it would be if this store had written those bytes. A
+        // local I/O failure is not reclassified: staging ran out of disk is
+        // this store's problem however it arrived.
         let staged = {
             let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
-            snapshot::receive(&self.layout, source, state, supplied)?
+            snapshot::receive(&self.layout, source, state, supplied).map_err(rejected)?
         };
-        let prepared = snapshot::rebuild_candidate(&self.layout, staged)?;
+        let prepared = snapshot::rebuild_candidate(&self.layout, staged).map_err(rejected)?;
 
         let _exclusive = self
             .reads
@@ -525,6 +531,23 @@ impl StateActor {
 /// with a peer's.
 fn fatal_fault(fault: crate::coordination::model::apply::Fault) -> StorageError {
     StorageError::corrupt(Db::State, "apply", format!("{fault:?}"))
+}
+
+/// Reclassify a validation failure as a refusal of somebody else's bytes.
+///
+/// Only the codec's verdict moves. `StoredCorruption` means "this build cannot
+/// read what is on disk", which is fatal when the disk is ours and merely a bad
+/// message when the bytes arrived from a peer -- and install is the one place
+/// that distinction has to be made, because it is the one place the two kinds
+/// of bytes meet. Everything else keeps its classification: a failed fsync
+/// while staging is this store's failure no matter what provoked it.
+fn rejected(err: StorageError) -> StorageError {
+    match err {
+        StorageError::StoredCorruption { db, what, detail } => StorageError::SnapshotRejected {
+            detail: format!("{db} {what}: {detail}"),
+        },
+        other => other,
+    }
 }
 
 fn fail<T>(reply: Reply<T>) {
@@ -3510,6 +3533,171 @@ mod tests {
             .await
             .expect("join")
             .expect("and the install completes once the lease is released");
+    }
+
+    /// A source that does not survive validation is refused, not swallowed —
+    /// and does not stop this store.
+    ///
+    /// §11.4 puts the decoder and the bounds checks in front of install so a
+    /// corrupt or hostile snapshot is *rejected*. Being rejected is the
+    /// property under test on both sides: the install fails, and the receiver
+    /// is still a working voter afterwards. A store that latched fatal here
+    /// would let any peer stop a healthy one by sending rubbish, which is a
+    /// worse outcome than the install failing.
+    ///
+    /// Each case corrupts a real published body and installs it through the
+    /// real path, so what refuses it is the production decoder rather than a
+    /// fixture asserting its own expectations.
+    #[tokio::test]
+    async fn a_source_that_fails_validation_is_refused_without_stopping_the_store() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+        let good = std::fs::read(body_path(&source_dir, &published.meta.snapshot_id))
+            .expect("the published body");
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("truncated mid-body", good[..good.len() / 2].to_vec()),
+            ("truncated to a header", good[..8].to_vec()),
+            ("a flipped byte in the framing", {
+                let mut bytes = good.clone();
+                bytes[1] ^= 0xff;
+                bytes
+            }),
+            ("a flipped byte deep in the rows", {
+                let mut bytes = good.clone();
+                let at = good.len() * 3 / 4;
+                bytes[at] ^= 0xff;
+                bytes
+            }),
+            ("extra bytes appended", {
+                let mut bytes = good.clone();
+                bytes.extend_from_slice(b"and then some");
+                bytes
+            }),
+        ];
+
+        for (what, corrupt) in cases {
+            let dir = scratch_dir();
+            let (mut machine, _shutdown, _drain) = machine(&dir);
+            let before = durable_of(&machine).await;
+
+            let body = dir.join("corrupt.body");
+            std::fs::write(&body, &corrupt).expect("write the corrupt source");
+            let source = CoordinationSnapshotFile::incoming(body);
+
+            let err = machine
+                .install_snapshot(&published.meta, Box::new(source))
+                .await
+                .expect_err(&format!("{what}: a corrupt source must not install"));
+            let detail = format!("{err:?}");
+            assert!(
+                detail.contains("rejected"),
+                "{what}: a source failure is a rejection, not a durability question: {detail}"
+            );
+
+            assert!(
+                !machine.handle().is_fatal(),
+                "{what}: a peer's bad bytes must not stop this voter"
+            );
+            assert_eq!(
+                durable_of(&machine).await,
+                before,
+                "{what}: and must not touch its state"
+            );
+            assert!(
+                leftovers(&dir).is_empty(),
+                "{what}: nor leave staging behind"
+            );
+            assert!(
+                !dir.join("snapshots").join("CURRENT").exists(),
+                "{what}: nor publish anything"
+            );
+        }
+    }
+
+    /// A body whose rows are valid and whose counters are not is the sender's
+    /// fault too.
+    ///
+    /// It passes everything `receive` checks -- framing, digest, identity,
+    /// supplied metadata -- and fails in the rebuild, when `rows::load` runs
+    /// §12.1's whole-state checks against what arrived. Still somebody else's
+    /// bytes, so still a rejection: the boundary is the exclusion, not the
+    /// function that happens to notice.
+    #[tokio::test]
+    async fn a_source_that_fails_the_rebuild_is_refused_the_same_way() {
+        let valid_dir = scratch_dir();
+        let ((valid, _v, _d), _) = a_published_source(&valid_dir).await;
+        let mut broken = durable_of(&valid).await;
+        broken.model.growth_bytes = broken.model.growth_bytes.saturating_add(1);
+
+        let broken_dir = scratch_dir();
+        let database = seeded_with(&broken_dir, broken);
+        let read = database.begin_read().expect("read");
+        let body = super::super::snapshot::build(&StorageLayout::new(&broken_dir), &read)
+            .expect("row-valid state still has a canonical body");
+        drop(read);
+        drop(database);
+
+        let dir = scratch_dir();
+        let (mut machine, _shutdown, _drain) = machine(&dir);
+        let before = durable_of(&machine).await;
+
+        let meta = rows::snapshot_meta_from_wire(body.meta()).expect("meta");
+        let source = CoordinationSnapshotFile::incoming(body.path().to_path_buf());
+        let err = machine
+            .install_snapshot(&meta, Box::new(source))
+            .await
+            .expect_err("counters that do not describe the rows are not installable");
+        let detail = format!("{err:?}");
+        assert!(detail.contains("rejected"), "{detail}");
+        assert!(detail.contains("aggregate-counters"), "{detail}");
+
+        assert!(
+            !machine.handle().is_fatal(),
+            "a peer's inconsistent body must not stop this voter"
+        );
+        assert_eq!(durable_of(&machine).await, before);
+    }
+
+    /// A local failure while staging is *not* reclassified.
+    ///
+    /// The other side of the same line. Reclassifying the codec's verdict is
+    /// right because the bytes are the sender's; reclassifying an I/O failure
+    /// would be wrong for exactly the same reason, since a disk this store
+    /// cannot write to is its own problem however the work arrived.
+    ///
+    /// Unix-only because it needs a directory this process cannot write.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_local_failure_while_staging_still_stops_the_store() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let (mut machine, _shutdown, _drain) = machine(&dir);
+
+        let incoming = dir.join("incoming");
+        std::fs::create_dir_all(&incoming).expect("incoming");
+        std::fs::set_permissions(&incoming, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+        let err = machine
+            .install_snapshot(&published.meta, published.snapshot)
+            .await
+            .expect_err("staging cannot write");
+        std::fs::set_permissions(&incoming, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let detail = format!("{err:?}");
+        assert!(
+            !detail.contains("rejected"),
+            "this store's own disk failing is not the sender's fault: {detail}"
+        );
+        assert!(
+            machine.handle().is_fatal(),
+            "and it is a durability question, like every other failure to write"
+        );
     }
 
     /// A replacement that lands the wrong database stops the install dead.

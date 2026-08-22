@@ -243,6 +243,23 @@ pub(crate) enum StorageError {
         detail: &'static str,
     },
 
+    /// An install source did not survive validation.
+    ///
+    /// **Not** a durability question, and the distinction is whose bytes failed.
+    /// `StoredCorruption` means state *this store wrote* can no longer be read,
+    /// which is why it is fatal. A snapshot arriving from a peer is somebody
+    /// else's bytes: truncated in flight, built by another group, or describing
+    /// something other than what its metadata claims. §11.4 puts the decoder
+    /// and the bounds checks in front of install precisely so those are
+    /// **rejected** -- and a store that latched fatal on them would let any
+    /// peer stop a healthy voter by sending rubbish.
+    ///
+    /// The line is the exclusion. Everything before it validates the sender's
+    /// bytes and refuses; everything after it -- the replacement, the reopen,
+    /// the publication -- is this store's own durability and latches.
+    #[error("coordination snapshot install rejected: {detail}")]
+    SnapshotRejected { detail: String },
+
     /// An install was offered a snapshot this voter has already applied past.
     ///
     /// **Fatal**, despite reading like an ordinary race. It was classified as a
@@ -384,7 +401,9 @@ impl StorageError {
     pub(crate) fn puts_durability_in_question(&self) -> bool {
         !matches!(
             self,
-            StorageError::LogGap { .. } | StorageError::EncodeFailed { .. }
+            StorageError::LogGap { .. }
+                | StorageError::EncodeFailed { .. }
+                | StorageError::SnapshotRejected { .. }
         )
     }
 
