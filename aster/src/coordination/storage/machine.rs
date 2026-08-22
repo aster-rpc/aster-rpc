@@ -5454,12 +5454,13 @@ mod tests {
 
     /// Every reachable boundary of every operation, killed and recovered.
     ///
-    /// Both axes are held, separately. The on-disk axis says what the killed
-    /// process left; the recovered axis says what a voter comes back holding
-    /// once `get_initial_state` has run. Checking only the second would let a
-    /// transaction that survived pass as one that was replayed, and checking
-    /// only the first would report a replayed command as a lost one -- the two
-    /// together are what makes `Replayed` a claim rather than a hedge.
+    /// Both axes are held, separately. The `pre_replay` axis says what the
+    /// opened store held before OpenRaft replayed anything; the `recovered`
+    /// axis says what a voter comes back holding once `get_initial_state` has
+    /// run. Checking only the second would let a transaction that survived pass
+    /// as one that was replayed, and checking only the first would report a
+    /// replayed command as a lost one -- the two together are what makes
+    /// `Replayed` a claim rather than a hedge.
     ///
     /// Neither axis defaults to a union: `Either` is declared per cell and
     /// nothing declares it, so a cell whose outcome regresses from durable to
