@@ -3911,23 +3911,18 @@ mod tests {
         let _ = before;
     }
 
-    /// The same entries reach the same state by all three routes.
+    /// Applying a batch and applying it one entry at a time across restarts
+    /// reach the same state.
     ///
-    /// §16's equivalence requirement, and the one that ties the rest together:
-    /// a voter can arrive at a state by applying entries as they arrive, by
-    /// replaying them after a restart, or by installing a snapshot somebody
-    /// else built of it. If those three could differ, every other guarantee
-    /// here is about one route only -- and the equal-index repair path in
-    /// particular compares a snapshot against a state that may have been
-    /// reached either way.
-    ///
-    /// Compared by canonical digest as well as by state, because the digest is
-    /// what the protocol actually compares: two states that are equal by the
-    /// model and hash differently would pass every assertion this suite makes
-    /// and fail against a peer.
+    /// A batch-partition property: the split into `apply` calls, and the store
+    /// lifetimes between them, must not be visible in what is committed. It was
+    /// called an equivalence test for log replay and is not one -- nothing here
+    /// appends to `raft.redb` or recovers through OpenRaft. The real replay
+    /// route is `every_route_to_a_state_agrees`; this is the cheaper property
+    /// it rests on, and worth keeping separately because it isolates the
+    /// batching from the recovery.
     #[tokio::test]
-    async fn direct_apply_log_replay_and_install_agree() {
-        // The entries, applied identically by every route.
+    async fn a_batch_and_its_partition_across_restarts_agree() {
         let entries = || {
             vec![
                 normal(2, acquire(1)),
@@ -3936,52 +3931,45 @@ mod tests {
                 normal(5, acquire(2)),
             ]
         };
-        let digest_of = |dir: &std::path::Path| {
-            let database = Database::create(dir.join("state.redb")).expect("reopen");
-            super::super::snapshot::canonical_digest(&database).expect("hash the state")
-        };
 
-        // 1. Applied in one batch, as a caught-up voter would.
-        let direct = scratch_dir();
-        let (direct_state, published) = {
+        let batched_dir = scratch_dir();
+        let (batched, batched_replies) = {
             let (mut machine, shutdown, drain) = CoordinationStateMachine::new(
-                seeded_with(&direct, seven_section_state()),
-                StorageLayout::new(&direct),
+                seeded_with(&batched_dir, seven_section_state()),
+                StorageLayout::new(&batched_dir),
             )
             .expect("open");
-            machine.apply(entries()).await.expect("apply");
+            let replies = machine.apply(entries()).await.expect("apply");
             let state = durable_of(&machine).await;
-            let built = {
-                let mut builder = machine.get_snapshot_builder().await;
-                builder.build_snapshot().await.expect("build")
-            };
             drop(machine);
             drop(drain);
             drop(shutdown);
-            (state, built)
+            (state, replies)
         };
 
-        // 2. Applied one at a time across two restarts, as replay does.
-        let replayed = scratch_dir();
+        let split_dir = scratch_dir();
+        let mut split_replies = Vec::new();
         {
             let mut remaining = entries();
             let mut store = Some(
                 CoordinationStateMachine::new(
-                    seeded_with(&replayed, seven_section_state()),
-                    StorageLayout::new(&replayed),
+                    seeded_with(&split_dir, seven_section_state()),
+                    StorageLayout::new(&split_dir),
                 )
                 .expect("open"),
             );
             while !remaining.is_empty() {
                 let (mut machine, shutdown, drain) = store.take().expect("a store");
-                machine
-                    .apply([remaining.remove(0)])
-                    .await
-                    .expect("apply one");
+                split_replies.extend(
+                    machine
+                        .apply([remaining.remove(0)])
+                        .await
+                        .expect("apply one"),
+                );
                 drop(machine);
                 drop(drain);
                 drop(shutdown);
-                store = Some(reopen(&replayed));
+                store = Some(reopen(&split_dir));
             }
             let (machine, shutdown, drain) = store.take().expect("a store");
             drop(machine);
@@ -3989,49 +3977,217 @@ mod tests {
             drop(shutdown);
         }
 
-        // 3. Installed from the snapshot the first route built.
-        let installed = scratch_dir();
-        {
-            let (mut machine, shutdown, drain) = machine(&installed);
-            machine
-                .install_snapshot(&published.meta, published.snapshot)
-                .await
-                .expect("install");
-            drop(machine);
-            drop(drain);
-            drop(shutdown);
-        }
-
-        let replayed_state = {
-            let (machine, _s, _d) = reopen(&replayed);
+        let split = {
+            let (machine, _s, _d) = reopen(&split_dir);
             durable_of(&machine).await
         };
+        assert_eq!(split, batched, "the partition is not visible in the state");
+        assert_eq!(
+            split_replies, batched_replies,
+            "nor in the replies: a client cannot tell how its entry was batched"
+        );
+        assert_eq!(
+            canonical_digest_of(&split_dir),
+            canonical_digest_of(&batched_dir),
+            "nor in what the state hashes to"
+        );
+    }
+
+    /// Every route to a state agrees: direct apply, committed-log replay
+    /// through OpenRaft's own recovery, and snapshot install.
+    ///
+    /// §16's equivalence requirement. The replay route is the one that has to
+    /// be real: entries are **appended to `raft.redb`** and the committed log
+    /// id persisted, the state is left behind, the store is closed, and the
+    /// reopen runs `StorageHelper::get_initial_state` -- OpenRaft's own
+    /// reapply path -- rather than anything this suite wrote. `VoterStorage`
+    /// alone would not do it: it opens and validates the two actors and
+    /// performs no replay, so a test that inspected its result would be
+    /// observing the state *before* recovery.
+    ///
+    /// Replies are compared too, and for the replay and install routes that
+    /// means the saved-reply projection: the same client command is submitted
+    /// again afterwards, and the session classifier must answer with the reply
+    /// the original apply produced. A route that reached the right state and
+    /// lost its saved replies would satisfy every byte comparison here.
+    #[tokio::test]
+    async fn every_route_to_a_state_agrees() {
+        use openraft::storage::RaftLogStorage as _;
+        use openraft::storage::RaftLogStorageExt as _;
+        use openraft::StorageHelper;
+
+        // Index 0 is the membership entry `initialize` writes. Without it the
+        // log starts at 1 and recovery refuses to read `[0, n)` -- which is
+        // OpenRaft telling the truth about a log no real voter could have.
+        let voters: Vec<[u8; 32]> = (1u8..=3).map(|b| [b; 32]).collect();
+        let entries = || {
+            vec![
+                membership_entry(0, &voters),
+                normal(1, acquire(1)),
+                blank(2),
+                normal(3, acquire(2)),
+            ]
+        };
+        // Submitted again after each route, to draw the saved reply back out.
+        let replay_of = normal(4, acquire(1));
+
+        // ── Direct: apply, then snapshot for the third route ────────────────
+        let direct = scratch_dir();
+        let (direct_state, direct_replies, published) = {
+            let mut storage = voter(&direct);
+            let replies = storage.state_mut().apply(entries()).await.expect("apply");
+            let built = {
+                let mut builder = storage.state_mut().get_snapshot_builder().await;
+                builder.build_snapshot().await.expect("build")
+            };
+            let state = durable_of(storage.state()).await;
+            let body =
+                std::fs::read(body_path(&direct, &built.meta.snapshot_id)).expect("the built body");
+            drop(storage);
+            (state, replies, (built.meta, body))
+        };
+
+        // ── Replay: append and commit, apply nothing, recover on reopen ─────
+        let replayed = scratch_dir();
+        {
+            let mut storage = voter(&replayed);
+            let last = entries().last().expect("entries").log_id;
+            // `blocking_append` is the supported way in -- `LogFlushed`'s
+            // constructor is crate-private to OpenRaft -- and it does not
+            // return until the flush callback has fired.
+            storage
+                .log_mut()
+                .blocking_append(entries())
+                .await
+                .expect("append");
+            storage
+                .log_mut()
+                .save_committed(Some(last))
+                .await
+                .expect("commit");
+            // Deliberately not applied: the state is behind the log, which is
+            // exactly the crash this route recovers from.
+            assert!(
+                durable_of(storage.state())
+                    .await
+                    .model
+                    .last_applied
+                    .is_none(),
+                "nothing applied before the close"
+            );
+            drop(storage);
+        }
+        let replayed_state = {
+            let mut storage = voter(&replayed);
+            let (log, state) = storage.recovery_parts();
+            StorageHelper::new(log, state)
+                .get_initial_state()
+                .await
+                .expect("OpenRaft's own recovery reapplies the committed entries");
+            let recovered = durable_of(storage.state()).await;
+            drop(storage);
+            recovered
+        };
+
+        // ── Install: from the body the direct route built ───────────────────
+        let installed = scratch_dir();
+        {
+            let mut storage = voter(&installed);
+            let body = installed.join("from-the-leader");
+            std::fs::write(&body, &published.1).expect("the sender's bytes");
+            storage
+                .state_mut()
+                .install_snapshot(
+                    &published.0,
+                    Box::new(CoordinationSnapshotFile::incoming(body)),
+                )
+                .await
+                .expect("install");
+            drop(storage);
+        }
         let installed_state = {
-            let (machine, _s, _d) = reopen(&installed);
-            durable_of(&machine).await
+            let storage = voter(&installed);
+            let state = durable_of(storage.state()).await;
+            drop(storage);
+            state
         };
 
         assert_eq!(
             replayed_state, direct_state,
-            "replaying one entry at a time across restarts must reach the same state as \
-             applying them together"
+            "committed-log replay must reach the state direct apply did"
         );
         assert_eq!(
             installed_state, direct_state,
             "and so must installing a snapshot of it"
         );
 
-        let direct_digest = digest_of(&direct);
+        let direct_digest = canonical_digest_of(&direct);
         assert_eq!(
-            digest_of(&replayed),
+            canonical_digest_of(&replayed),
             direct_digest,
-            "the replayed state must also *hash* the same: a peer compares digests, not models"
+            "the replayed state must also *hash* the same: a peer compares digests"
         );
         assert_eq!(
-            digest_of(&installed),
+            canonical_digest_of(&installed),
             direct_digest,
             "and so must the installed one"
         );
+
+        // ── And the replies survive both routes ─────────────────────────────
+        //
+        // The same client command again. Its saved reply is what the session
+        // classifier answers with, so a route that reached the right state and
+        // dropped its sessions passes every comparison above and fails here.
+        let saved = |dir: &std::path::Path| {
+            let dir = dir.to_path_buf();
+            let entry = replay_of.clone();
+            async move {
+                let mut storage = voter(&dir);
+                let replies = storage
+                    .state_mut()
+                    .apply([entry])
+                    .await
+                    .expect("resubmit the same command");
+                drop(storage);
+                replies
+            }
+        };
+        let from_direct = saved(&direct).await;
+        assert_eq!(
+            saved(&replayed).await,
+            from_direct,
+            "replay must keep the saved replies, not merely the resulting rows"
+        );
+        assert_eq!(saved(&installed).await, from_direct, "and so must install");
+        let _ = direct_replies;
+    }
+
+    /// The canonical digest of whatever `state.redb` a directory holds.
+    fn canonical_digest_of(dir: &std::path::Path) -> [u8; 32] {
+        let database = Database::create(dir.join("state.redb")).expect("reopen");
+        super::super::snapshot::canonical_digest(&database).expect("hash the state")
+    }
+
+    /// A complete voter store, opened as production opens one.
+    fn voter(dir: &std::path::Path) -> super::super::VoterStorage {
+        super::super::VoterStorage::open(
+            StorageLayout::new(dir),
+            voter_identity(),
+            super::super::identity::OpenPolicy::production(),
+        )
+        .expect("open voter storage")
+    }
+
+    fn voter_identity() -> super::super::identity::StorageIdentity {
+        let authority = crate::coordination::model::authority::testing::authority();
+        super::super::identity::StorageIdentity::new(
+            crate::coordination::ids::CoordinationGroupId::from_array(authority.group_id),
+            authority.genesis_hash,
+            authority.public_key,
+            authority.domain.clone(),
+            CoordinationNodeId::from_array([9u8; 32]),
+            crate::coordination::model::shape::PROFILE_PROD,
+        )
     }
 
     /// Two stores at the same state produce the same bytes.

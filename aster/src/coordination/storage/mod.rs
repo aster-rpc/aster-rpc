@@ -160,6 +160,20 @@ impl VoterStorage {
         &self.state
     }
 
+    /// Both stores at once, for the recovery OpenRaft performs on reopen.
+    ///
+    /// `open` starts the actors and validates what is on disk; it does **not**
+    /// replay the committed log, which is `StorageHelper::get_initial_state`'s
+    /// job and needs the two together. A caller that inspected this store
+    /// without running it would be observing the state as it was *before*
+    /// recovery -- which for a voter killed between an append and its apply is
+    /// the wrong state entirely.
+    pub(crate) fn recovery_parts(
+        &mut self,
+    ) -> (&mut CoordinationLogStore, &mut CoordinationStateMachine) {
+        (&mut self.log, &mut self.state)
+    }
+
     pub(crate) fn state_mut(&mut self) -> &mut CoordinationStateMachine {
         &mut self.state
     }
