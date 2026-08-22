@@ -546,6 +546,11 @@ fn rejected(err: StorageError) -> StorageError {
         StorageError::StoredCorruption { db, what, detail } => StorageError::SnapshotRejected {
             detail: format!("{db} {what}: {detail}"),
         },
+        // Same reasoning as the codec's verdict: a body this store could not
+        // build would be its own problem, and one a peer sent is a message.
+        too_large @ StorageError::SnapshotTooLarge { .. } => StorageError::SnapshotRejected {
+            detail: too_large.to_string(),
+        },
         other => other,
     }
 }
@@ -3535,19 +3540,29 @@ mod tests {
             .expect("and the install completes once the lease is released");
     }
 
-    /// A source that does not survive validation is refused, not swallowed —
-    /// and does not stop this store.
+    /// A source that does not survive validation is refused, and leaves this
+    /// store's own state and latch untouched.
     ///
     /// §11.4 puts the decoder and the bounds checks in front of install so a
-    /// corrupt or hostile snapshot is *rejected*. Being rejected is the
-    /// property under test on both sides: the install fails, and the receiver
-    /// is still a working voter afterwards. A store that latched fatal here
-    /// would let any peer stop a healthy one by sending rubbish, which is a
-    /// worse outcome than the install failing.
+    /// corrupt or hostile snapshot is *rejected*. Each case corrupts a real
+    /// published body and installs it through the real path, so what refuses it
+    /// is the production decoder rather than a fixture asserting its own
+    /// expectations.
     ///
-    /// Each case corrupts a real published body and installs it through the
-    /// real path, so what refuses it is the production decoder rather than a
-    /// fixture asserting its own expectations.
+    /// **What this does not prove.** It calls the state machine directly, so
+    /// "the store is not fatal" is a statement about Aster's actor and nothing
+    /// more. Through OpenRaft the voter does *not* survive: any storage error
+    /// out of `install_snapshot` becomes `Fatal` in its state-machine worker,
+    /// and returning `Ok` instead would be worse -- OpenRaft would advance its
+    /// applied and snapshot state for a snapshot that was never installed.
+    ///
+    /// Rejecting rather than latching is still the right classification here,
+    /// and it is a precondition for the design that fixes the rest: validation
+    /// and rebuild move ahead of `Raft::install_full_snapshot`, so only a
+    /// sealed, already-proved snapshot ever enters OpenRaft and a refusal is
+    /// answered before OpenRaft is involved. That is a Slice 3 contract and
+    /// needs a real-Raft test; until it exists, no claim here extends past this
+    /// actor.
     #[tokio::test]
     async fn a_source_that_fails_validation_is_refused_without_stopping_the_store() {
         let source_dir = scratch_dir();
@@ -3614,6 +3629,91 @@ mod tests {
                 "{what}: nor publish anything"
             );
         }
+    }
+
+    /// A source over the aggregate ceiling is refused before it is read.
+    ///
+    /// §12.3 wants the size refused before allocation, and the ceiling arrived
+    /// as a generic `io::Error` -- indistinguishable from a failed write, so an
+    /// oversized source latched the actor fatal after all the trouble taken to
+    /// bound it. Sparse, because half a gigabyte of real bytes would make this
+    /// a benchmark rather than a test; the length is what the precheck reads.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_source_over_the_ceiling_is_refused_before_it_is_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        let dir = scratch_dir();
+        let (mut machine, _shutdown, _drain) = machine(&dir);
+
+        let oversized = dir.join("oversized.body");
+        let handle = std::fs::File::create(&oversized).expect("create");
+        handle
+            .set_len(crate::coordination::rowstream::MAX_SNAPSHOT_BODY_BYTES + 1)
+            .expect("a sparse file past the ceiling");
+        drop(handle);
+
+        let err = machine
+            .install_snapshot(
+                &published.meta,
+                Box::new(CoordinationSnapshotFile::incoming(oversized)),
+            )
+            .await
+            .expect_err("a body past the ceiling is not installable");
+        let detail = format!("{err:?}");
+        assert!(detail.contains("rejected"), "{detail}");
+        assert!(detail.contains("exceeds"), "{detail}");
+
+        assert!(
+            !machine.handle().is_fatal(),
+            "an oversized message is the sender's problem, not this store's"
+        );
+        assert!(
+            leftovers(&dir).is_empty(),
+            "and nothing was staged before the refusal"
+        );
+
+        // Refused *before* it is read, not merely refused. With `incoming/`
+        // unwritable, staging cannot even begin -- so a run that reaches the
+        // copy fails as a local I/O error and latches fatal, while one that
+        // checks the declared length first still reports the ceiling. Without
+        // this the streaming bound catches the same file a moment later and
+        // the precheck could be deleted unnoticed.
+        let sealed_dir = scratch_dir();
+        let (mut sealed, _s, _d) =
+            CoordinationStateMachine::new(seeded(&sealed_dir), StorageLayout::new(&sealed_dir))
+                .expect("open");
+        let oversized = sealed_dir.join("oversized.body");
+        let handle = std::fs::File::create(&oversized).expect("create");
+        handle
+            .set_len(crate::coordination::rowstream::MAX_SNAPSHOT_BODY_BYTES + 1)
+            .expect("sparse");
+        drop(handle);
+
+        let incoming = sealed_dir.join("incoming");
+        std::fs::create_dir_all(&incoming).expect("incoming");
+        std::fs::set_permissions(&incoming, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let err = sealed
+            .install_snapshot(
+                &published.meta,
+                Box::new(CoordinationSnapshotFile::incoming(oversized)),
+            )
+            .await
+            .expect_err("still refused");
+        std::fs::set_permissions(&incoming, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let detail = format!("{err:?}");
+        assert!(
+            detail.contains("exceeds"),
+            "the size is checked before anything is written: {detail}"
+        );
+        assert!(
+            !sealed.handle().is_fatal(),
+            "so an unwritable staging directory is never reached"
+        );
     }
 
     /// A body whose rows are valid and whose counters are not is the sender's

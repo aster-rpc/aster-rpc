@@ -423,6 +423,16 @@ impl<T> Digesting<T> {
         (inner, *hasher.finalize().as_bytes(), len)
     }
 
+    /// Whether the ceiling was what stopped this stream.
+    ///
+    /// `io::Error` cannot carry the distinction, so the flag is read back off
+    /// the wrapper after a failed copy: a caller that treated "over the limit"
+    /// as an ordinary write failure would classify a peer's oversized body as
+    /// this store's durability problem.
+    fn over_limit(&self) -> bool {
+        self.len > self.limit
+    }
+
     /// Account for `n` more bytes, refusing to pass the §11.4 ceiling.
     fn account(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.hasher.update(bytes);
@@ -1240,6 +1250,19 @@ pub(crate) fn receive(
     state: &super::rows::DurableState,
     supplied: &SnapshotMetaV1,
 ) -> StorageResult<StagedSnapshot> {
+    // Before a byte is copied. §12.3 wants the size refused before allocation,
+    // and a sparse file half a gigabyte long costs nothing to reject by its
+    // length -- while the streaming bound below still covers a source that
+    // grows, or lies, after this.
+    if let Some(declared) = source.declared_len()? {
+        if declared > MAX_SNAPSHOT_BODY_BYTES {
+            return Err(StorageError::SnapshotTooLarge {
+                limit: MAX_SNAPSHOT_BODY_BYTES,
+                found: declared,
+            });
+        }
+    }
+
     let dir = layout.incoming();
     std::fs::create_dir_all(&dir).map_err(io("creating the incoming directory", &dir))?;
     let scratch = Scratch::new(layout, ScratchKind::Installing);
@@ -1252,8 +1275,17 @@ pub(crate) fn receive(
         // ceiling cannot be applied to one path and forgotten on another. This
         // is that other path.
         let mut writer = Digesting::new(BufWriter::new(handle));
-        std::io::copy(&mut source.reader()?, &mut writer)
-            .map_err(io("staging a snapshot body", scratch.path()))?;
+        let copied = std::io::copy(&mut source.reader()?, &mut writer);
+        // Read the ceiling off the wrapper before the error is classified: an
+        // oversized source is a message to refuse, and the `io::Error` it
+        // arrives as cannot say so.
+        if writer.over_limit() {
+            return Err(StorageError::SnapshotTooLarge {
+                limit: MAX_SNAPSHOT_BODY_BYTES,
+                found: writer.len,
+            });
+        }
+        copied.map_err(io("staging a snapshot body", scratch.path()))?;
         let (buffered, digest, _) = writer.into_parts();
         let handle = buffered.into_inner().map_err(|err| {
             StorageError::io(
@@ -2478,6 +2510,25 @@ impl CoordinationSnapshotFile {
         }
     }
 
+    /// How long the source claims to be, if it can say.
+    ///
+    /// A claim, not a measurement: it is read from the descriptor before any
+    /// byte is copied, so a source that grows afterwards is still the streaming
+    /// bound's problem. Cheap enough to run always, and it is what makes a
+    /// sparse oversized file free to refuse.
+    pub(crate) fn declared_len(&self) -> StorageResult<Option<u64>> {
+        let path = match self {
+            CoordinationSnapshotFile::Incoming(incoming) => incoming.path(),
+            CoordinationSnapshotFile::Published(published) => published.path.as_path(),
+        };
+        match std::fs::metadata(path) {
+            Ok(stat) => Ok(Some(stat.len())),
+            // Absent is not a size question; the read that follows reports it.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(StorageError::io("sizing an install source", path, err)),
+        }
+    }
+
     /// Whether dropping this handle removes its file.
     pub(crate) fn deletes_on_drop(&self) -> bool {
         matches!(self, CoordinationSnapshotFile::Incoming(_))
@@ -2863,6 +2914,28 @@ mod tests {
         assert!(
             std::io::copy(&mut reader, &mut sink).is_err(),
             "and so is a read past it"
+        );
+    }
+
+    /// The streaming bound survives the precheck being added in front of it.
+    ///
+    /// The precheck reads a declared length, and a declaration is not a
+    /// measurement: a source can grow after it, or lie about it, or not be a
+    /// file at all. So the wrapper still stops the copy, and still says the
+    /// ceiling was why -- which is what keeps an oversized body a message to
+    /// refuse rather than an unclassifiable write failure.
+    #[test]
+    fn the_streaming_bound_reports_the_ceiling_rather_than_a_write_failure() {
+        let mut writer = Digesting::bounded(Vec::new(), 8);
+        assert!(!writer.over_limit());
+
+        writer.write_all(b"12345678").expect("at the limit");
+        assert!(!writer.over_limit(), "eight bytes is not over eight");
+
+        let err = writer.write_all(b"9").expect_err("one more is");
+        assert!(
+            writer.over_limit(),
+            "and the wrapper says the ceiling was why, which {err} cannot"
         );
     }
 

@@ -243,6 +243,20 @@ pub(crate) enum StorageError {
         detail: &'static str,
     },
 
+    /// A body crossed §11.4's aggregate ceiling.
+    ///
+    /// Typed, rather than the generic I/O failure it used to be, because the
+    /// same limit means opposite things on the two paths that share it. A body
+    /// this store is *building* that will not fit is this store's state having
+    /// outgrown what it can serialize -- a durability question. A body arriving
+    /// from a peer that will not fit is a message to refuse, and blurring the
+    /// two into `io::Error` meant an oversized source latched the actor fatal
+    /// after §12.3 had gone to the trouble of bounding it before allocation.
+    ///
+    /// Install reclassifies it; the build path leaves it alone.
+    #[error("coordination snapshot body exceeds the {limit}-byte maximum ({found} bytes)")]
+    SnapshotTooLarge { limit: u64, found: u64 },
+
     /// An install source did not survive validation.
     ///
     /// **Not** a durability question, and the distinction is whose bytes failed.
@@ -257,6 +271,16 @@ pub(crate) enum StorageError {
     /// The line is the exclusion. Everything before it validates the sender's
     /// bytes and refuses; everything after it -- the replacement, the reopen,
     /// the publication -- is this store's own durability and latches.
+    ///
+    /// **This is not yet enough on its own.** OpenRaft turns any storage error
+    /// out of `install_snapshot` into a `Fatal` that ends its state-machine
+    /// worker, so a rejection reaching it still stops the voter -- and
+    /// answering `Ok` would be worse, because OpenRaft would then advance its
+    /// applied and snapshot state for an install that never happened. The
+    /// classification is the half that belongs to storage; the other half is a
+    /// Slice 3 contract, in which validation and rebuild happen *before*
+    /// `Raft::install_full_snapshot` and only a sealed, already-proved snapshot
+    /// is handed to OpenRaft at all.
     #[error("coordination snapshot install rejected: {detail}")]
     SnapshotRejected { detail: String },
 
