@@ -2,12 +2,20 @@
 //!
 //! ## What this is evidence of, and what it is not
 //!
-//! The parent sends `SIGKILL` through [`std::process::Child::kill`]. The child
+//! The parent ends the child with [`std::process::Child::kill`] -- `SIGKILL` on
+//! Unix, `TerminateProcess` on Windows; the claim this module makes is
+//! unconditional termination, not a particular signal. Either way the child
 //! stops without unwinding, so no destructor runs, no `Drop` closes a database,
 //! and nothing Rust buffered is flushed on the way out. That is what makes this
 //! evidence about a *crash* rather than about an orderly shutdown, and it is a
 //! stronger statement than dropping a handle in-process, which runs every
 //! cleanup path the code has.
+//!
+//! The harness checks that this is what happened rather than assuming it: the
+//! parent requires a child that announced its boundary to have died by the
+//! kill, because one that had already returned would have closed its files
+//! through the ordinary paths and the store observed afterwards would be a
+//! clean shutdown wearing a crash's name.
 //!
 //! It is **not** power-loss evidence, and nothing here should be read as
 //! proving a flush. The kernel page cache outlives the process: bytes already
@@ -27,12 +35,21 @@
 //!
 //! ## One declaration
 //!
-//! [`crash_points!`] emits the boundary list, the name each is armed by, the
-//! parser that turns a name back into a boundary, and what recovery must find.
-//! A boundary cannot be added to the enum without stating its expected outcome,
-//! and cannot be given an outcome without joining the list the harness runs --
-//! which is the property a hand-maintained table beside a hand-maintained enum
-//! does not have.
+//! [`crash_points!`] emits the boundary list, the name each is armed by, and the
+//! parser that turns a name back into a boundary -- one text, so the set the
+//! harness arms and the set the code calls cannot drift apart.
+//!
+//! What it deliberately does **not** emit is the outcome. A boundary is a place
+//! in a durable operation, and the same place means different things to
+//! different operations: `transaction-commit` is the moment a vote becomes
+//! durable, and it is also the moment an install's rebuilt *candidate* commits
+//! under `incoming/` while `state.redb` is still the old one -- durable for the
+//! first, discarded for the second. Worse, a write transaction that is thrown
+//! away is not the same as an operation that did not happen: an apply crashed
+//! before its commit loses the transaction and then has it replayed, because
+//! the entry it covered is already committed in the log. The outcome therefore
+//! belongs to the (operation, boundary) cell, and is declared beside the
+//! operations in `machine.rs` rather than here.
 
 // Compiled in every configuration, deliberately. Splitting the boundary list
 // into a test copy and a production stub is the same producer/recogniser split
@@ -41,27 +58,77 @@
 // *harness* -- the environment, the ready line, the parking -- while `reached`
 // compiles to an empty inline call outside tests.
 
-/// What a reopen must find after the child died at a boundary.
+/// One of the two states a reopen may be compared against.
 ///
-/// Deliberately three-valued rather than "either": `Either` is for the
-/// boundaries where the protocol genuinely permits both, and using it where the
-/// answer is determined would turn a real regression into a pass. Every use of
-/// it names, in its own doc, what makes that boundary undetermined.
+/// Deliberately three-valued rather than "either": [`Expected::Either`] is for
+/// the answers the protocol genuinely leaves open, and using it where the
+/// answer is determined would turn a real regression into a pass. Every
+/// [`Outcome`] that produces it says, in its own doc, what makes it undetermined
+/// -- and none currently does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum Expected {
-    /// The operation left no trace. Recovery must find exactly the state that
-    /// was there before it started.
+    /// Exactly what was there before the operation started.
     Before,
-    /// The operation is durable. Recovery must find its effect.
+    /// Exactly what the same operation run to completion leaves behind.
     After,
-    /// Undetermined *at this boundary*, and narrowed to these two: recovery may
-    /// find either, and nothing else.
+    /// Undetermined, and narrowed to those two: either, and nothing else.
     Either,
 }
 
+/// What dying at one boundary of one operation means, on both axes.
+///
+/// Two axes because a crash has two honest answers and they are not always the
+/// same one. *On disk* is what the killed process left behind, read the instant
+/// the store is reopened. *Recovered* is what the voter comes back holding,
+/// after `StorageHelper::get_initial_state` has done what OpenRaft does on every
+/// restart. Collapsing them would force a choice between claiming a discarded
+/// transaction survived and claiming a committed command was lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum Outcome {
+    /// The operation left nothing, and nothing puts it back. redb throws away
+    /// an uncommitted transaction, and there is no committed log entry standing
+    /// behind this operation to make recovery redo it.
+    Discarded,
+    /// The operation's effect is on disk and recovery keeps it.
+    Durable,
+    /// The write was thrown away and OpenRaft's recovery redoes it from the
+    /// log. Only reachable where the log already holds the operation's input as
+    /// committed -- which, for an apply, is the ordinary production case: an
+    /// entry is committed before it is applied, so a crash inside the apply
+    /// transaction is repaired by replay rather than lost.
+    Replayed,
+    /// The protocol permits both answers at this cell. Nothing declares it: it
+    /// exists so that a genuinely undetermined boundary can be stated as one
+    /// instead of being hidden inside a widened comparison, and any use of it
+    /// must say at the cell what makes the answer open.
+    Undetermined,
+}
+
+#[allow(dead_code)]
+impl Outcome {
+    /// What the killed process must have left, before recovery runs.
+    pub(crate) fn on_disk(self) -> Expected {
+        match self {
+            Outcome::Discarded | Outcome::Replayed => Expected::Before,
+            Outcome::Durable => Expected::After,
+            Outcome::Undetermined => Expected::Either,
+        }
+    }
+
+    /// What a production reopen must come back holding.
+    pub(crate) fn recovered(self) -> Expected {
+        match self {
+            Outcome::Discarded => Expected::Before,
+            Outcome::Durable | Outcome::Replayed => Expected::After,
+            Outcome::Undetermined => Expected::Either,
+        }
+    }
+}
+
 macro_rules! crash_points {
-    ($($(#[$doc:meta])* $variant:ident = $name:literal => $expected:ident),+ $(,)?) => {
+    ($($(#[$doc:meta])* $variant:ident = $name:literal),+ $(,)?) => {
         /// A point in a durable operation at which the child stops and blocks.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         #[allow(dead_code)]
@@ -84,51 +151,50 @@ macro_rules! crash_points {
             pub(crate) fn parse(name: &str) -> Option<Self> {
                 match name { $($name => Some(CrashPoint::$variant),)+ _ => None }
             }
-
-            /// What a reopen must find after dying here.
-            pub(crate) fn expected(self) -> Expected {
-                match self { $(CrashPoint::$variant => Expected::$expected,)+ }
-            }
         }
     };
 }
 
 crash_points! {
     /// Before `begin_write`. Nothing has been staged, let alone written.
-    TransactionBegin = "transaction-begin" => Before,
-    /// Rows staged inside the write transaction, before `commit`. redb
-    /// discards an uncommitted transaction, so the entry never happened.
-    TransactionWrite = "transaction-write" => Before,
+    TransactionBegin = "transaction-begin",
+    /// Rows staged inside the write transaction, before `commit`. redb discards
+    /// an uncommitted transaction, so these rows are not going to survive.
+    TransactionWrite = "transaction-write",
     /// `commit` has returned. The transaction was opened with
-    /// `Durability::Immediate`, so returning means committed.
-    TransactionCommit = "transaction-commit" => After,
-    /// The reply has been produced for the caller. Strictly after the commit
-    /// that produced it, so anything the commit made durable is still durable.
-    Acknowledgement = "acknowledgement" => After,
+    /// `Durability::Immediate`, so returning means committed -- though *which*
+    /// database committed is the operation's business: for an install this is
+    /// the candidate under `incoming/`, not the live state.
+    TransactionCommit = "transaction-commit",
+    /// The reply has been produced for the caller, strictly after the commit
+    /// that produced it. This is the lost acknowledgement: the batch is durable
+    /// and the caller never learned it.
+    Acknowledgement = "acknowledgement",
     /// Part-way through streaming a snapshot body into its scratch file.
     /// Nothing is published, and the state the body was taken from is
     /// untouched.
-    SnapshotBodyWrite = "snapshot-body-write" => Before,
+    SnapshotBodyWrite = "snapshot-body-write",
     /// The body is written and about to be, or has just been, fsynced. Still a
     /// scratch file under `snapshots/`: publication is the later rename.
-    SnapshotBodyFsync = "snapshot-body-fsync" => Before,
+    SnapshotBodyFsync = "snapshot-body-fsync",
     /// The rebuilt incoming candidate has committed. It is a complete database
     /// under `incoming/`, and this store's `state.redb` is still the old one.
-    CandidateCommit = "candidate-commit" => Before,
+    CandidateCommit = "candidate-commit",
     /// The rename has returned: `state.redb` **is** the candidate. The old
     /// database is gone and there is nothing to go back to.
-    ReplacementRename = "replacement-rename" => After,
+    ReplacementRename = "replacement-rename",
     /// After the rename, at the directory sync that publishes it. The rename
     /// was already visible to the next open; see this module's header for why
     /// that says nothing about the sync itself.
-    ReplacementDirectorySync = "replacement-directory-sync" => After,
+    ReplacementDirectorySync = "replacement-directory-sync",
     /// The replaced database has been reopened and revalidated, and `CURRENT`
-    /// has not yet been moved. The state is the installed one; the marker
-    /// still names what the store had before, which the startup sweep is what
+    /// has not yet been moved. The state is the installed one; the marker still
+    /// names what the store had before, which the startup sweep is what
     /// reconciles.
-    PostReplacementReopen = "post-replacement-reopen" => After,
-    /// `CURRENT` now names the installed snapshot.
-    CurrentPublication = "current-publication" => After,
+    PostReplacementReopen = "post-replacement-reopen",
+    /// `CURRENT` has been renamed into place and its directory fsynced, so the
+    /// marker names the snapshot this operation published.
+    CurrentPublication = "current-publication",
 }
 
 /// The environment variable naming the boundary the child stops at.
@@ -258,6 +324,28 @@ mod tests {
         );
     }
 
+    /// The two axes, spelled out.
+    ///
+    /// `Replayed` is the one worth pinning: it is the only outcome whose axes
+    /// disagree, and the whole reason the expectation had to leave `CrashPoint`.
+    /// Written as literals rather than derived from the accessors, so a mutation
+    /// that made replay indistinguishable from durability fails here as well as
+    /// in the matrix -- and fails saying which of the two claims moved.
+    #[test]
+    fn a_replayed_write_is_absent_on_disk_and_present_after_recovery() {
+        assert_eq!(Outcome::Discarded.on_disk(), Expected::Before);
+        assert_eq!(Outcome::Discarded.recovered(), Expected::Before);
+
+        assert_eq!(Outcome::Durable.on_disk(), Expected::After);
+        assert_eq!(Outcome::Durable.recovered(), Expected::After);
+
+        assert_eq!(Outcome::Replayed.on_disk(), Expected::Before);
+        assert_eq!(Outcome::Replayed.recovered(), Expected::After);
+
+        assert_eq!(Outcome::Undetermined.on_disk(), Expected::Either);
+        assert_eq!(Outcome::Undetermined.recovered(), Expected::Either);
+    }
+
     /// An unarmed process runs straight through every boundary.
     ///
     /// The whole suite depends on it: `reached` is called from production paths
@@ -270,8 +358,8 @@ mod tests {
             "the suite itself must never run armed"
         );
         // Armed, and still passing through: with no boundary named there is
-        // nothing to match, which is what keeps the seam inert for the 692
-        // other tests that drive these same production paths.
+        // nothing to match, which is what keeps the seam inert for every other
+        // test in this crate that drives these same production paths.
         arm();
         for point in CrashPoint::ALL {
             reached(*point);

@@ -78,12 +78,22 @@ use schema::{DirectoryLock, IntegrityOutcome, OpenOutcome, StorageLayout};
 
 /// A [`StoreBuilder`] over [`SuiteFixture`].
 ///
-/// `Reopen` is the variant that matters. `Fresh` hands the suite a new
-/// directory each time, which is what every storage implementation's own suite
-/// run does; `Reopen` builds a store, closes it, and opens the same directory
-/// again -- so what the suite exercises is a *restarted* store rather than one
-/// that has only ever existed in this process. A store that passed only when
-/// fresh would be one whose durability never left memory.
+/// `Fresh` hands the suite a new directory each time, which is what every
+/// storage implementation's own suite run does. `Reopen` builds a store, closes
+/// it -- both actors joined, both databases released -- and opens the same
+/// directory again before handing it over, so every store the suite is given has
+/// already been through the open path once and been validated as an existing
+/// store rather than created as a new one.
+///
+/// It is worth being exact about what that does and does not show. The reopen
+/// happens *before* the suite writes anything, so this is not evidence that a
+/// suite case's writes survive a restart -- the store is empty at the moment it
+/// is closed and reopened. What it covers is the second open itself: schema and
+/// identity revalidation, actor restart, and the suite's whole contract holding
+/// against a store that was recovered rather than created. Evidence that written
+/// state survives a restart is a separate test, `machine.rs`'s
+/// `a_normal_command_and_a_non_empty_log_survive_a_restart`, and the crash
+/// matrix beside it.
 #[cfg(test)]
 pub(crate) struct SuiteBuilder {
     fixture: SuiteFixture,

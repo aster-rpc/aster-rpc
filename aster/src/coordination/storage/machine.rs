@@ -1113,7 +1113,60 @@ mod tests {
     use super::super::fixture::SuiteFixture;
     use super::super::SuiteBuilder;
 
-    fn scratch_dir() -> PathBuf {
+    /// A scratch directory that removes itself when the test drops it.
+    ///
+    /// Owned rather than left behind. A store here is a redb file, a log, a
+    /// snapshot body and whatever a case published, and the crash matrix alone
+    /// builds three of them per cell -- tens of megabytes per run, under a
+    /// `$TMPDIR` that a laptop sweeps on reboot and a long-lived CI host does
+    /// not. The unique name is kept anyway, so two concurrent runs still cannot
+    /// collide.
+    ///
+    /// Deliberately not conditional on the test passing: a failing assertion
+    /// unwinds through this and the directory goes, because a matrix that left
+    /// its evidence behind only on failure would fill the disk exactly when a
+    /// run is being repeated.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ScratchDir(PathBuf);
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for ScratchDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl ScratchDir {
+        /// A copy of the path for the few callers that need to own one, which
+        /// keeps the removal with the guard rather than with the copy.
+        fn to_path_buf(&self) -> PathBuf {
+            self.0.clone()
+        }
+    }
+
+    /// Borrowed, never consumed. `From<ScratchDir>` is deliberately absent: it
+    /// would let a caller move the path out of the guard, and the directory
+    /// would then outlive the only thing that removes it.
+    impl From<&ScratchDir> for PathBuf {
+        fn from(dir: &ScratchDir) -> PathBuf {
+            dir.to_path_buf()
+        }
+    }
+
+    fn scratch_dir() -> ScratchDir {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "aster-coordination-machine-{}-{n}",
@@ -1121,7 +1174,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+        ScratchDir(dir)
     }
 
     fn resource() -> ResourceKey {
@@ -4399,7 +4452,7 @@ mod tests {
             ("committed-log recovery", &replayed),
             ("snapshot install", &installed),
         ] {
-            let answers = saved(dir.clone()).await;
+            let answers = saved(dir.to_path_buf()).await;
             assert_eq!(answers.len(), probes.len());
             for (answer, probe) in answers.iter().zip(&probes) {
                 assert_eq!(
@@ -4572,21 +4625,29 @@ mod tests {
     // short: no destructor runs, which is the point; the kernel page cache
     // survives, which is why nothing here is a claim about fsync.
 
-    use super::super::crash::{CrashPoint, Expected};
+    use super::super::crash::{CrashPoint, Expected, Outcome};
 
     const SCENARIO_VAR: &str = "ASTER_COORDINATION_CRASH_SCENARIO";
     const DIR_VAR: &str = "ASTER_COORDINATION_CRASH_DIR";
 
-    /// The durable operations the matrix crashes, and the boundaries each one
-    /// passes through.
+    /// The durable operations the matrix crashes, the boundaries each one
+    /// passes through, and what dying at each of them means.
     ///
     /// One declaration again, for the same reason the boundary list is one: the
     /// set of cases the harness runs and the set it claims to run are the same
     /// text. `every_boundary_is_covered_by_some_operation` closes the loop from
     /// the other side -- a boundary no operation reaches is a boundary the
     /// matrix would silently never exercise.
+    ///
+    /// The outcome lives here rather than on `CrashPoint` because it is a
+    /// property of the *cell*. Two operations cross `transaction-commit` and
+    /// mean opposite things by it, and one operation crosses
+    /// `transaction-begin` and is repaired by replay rather than lost. A single
+    /// column indexed by boundary cannot say either.
     macro_rules! operations {
-        ($($(#[$doc:meta])* $variant:ident = $name:literal => [$($point:ident),* $(,)?]),+ $(,)?) => {
+        ($($(#[$doc:meta])* $variant:ident = $name:literal => [
+            $($(#[$cell:meta])* $point:ident => $outcome:ident),* $(,)?
+        ]),+ $(,)?) => {
             #[derive(Clone, Copy, Debug, PartialEq, Eq)]
             enum Operation { $($(#[$doc])* $variant,)+ }
 
@@ -4601,9 +4662,14 @@ mod tests {
                     match name { $($name => Some(Operation::$variant),)+ _ => None }
                 }
 
-                /// The boundaries this operation reaches, in order.
-                fn boundaries(self) -> &'static [CrashPoint] {
-                    match self { $(Operation::$variant => &[$(CrashPoint::$point,)*],)+ }
+                /// The boundaries this operation reaches, in order, each with
+                /// what a reopen must find after dying there.
+                fn cells(self) -> &'static [(CrashPoint, Outcome)] {
+                    match self {
+                        $(Operation::$variant => &[
+                            $($(#[$cell])* (CrashPoint::$point, Outcome::$outcome),)*
+                        ],)+
+                    }
                 }
             }
         };
@@ -4611,78 +4677,161 @@ mod tests {
 
     operations! {
         /// Persisting a vote: one metadata transaction on `raft.redb`.
-        Vote = "vote" => [TransactionBegin, TransactionWrite, TransactionCommit],
+        Vote = "vote" => [
+            TransactionBegin => Discarded,
+            TransactionWrite => Discarded,
+            TransactionCommit => Durable,
+        ],
         /// Appending entries to the log.
         ///
         /// One transaction, deliberately. An operation that spans two makes
         /// `TransactionCommit` ambiguous at the *operation* level -- the first
         /// commit is durable while the second never happened -- and the honest
-        /// repair is a finer operation, not a wider expectation. This was
-        /// found by the matrix: "append and move the marker" was one case, and
-        /// killing it after the first commit left the entries durable and the
-        /// marker where it started.
-        Append = "append" => [TransactionBegin, TransactionWrite, TransactionCommit],
+        /// repair is a finer operation, not a wider expectation. This was found
+        /// by the matrix: "append and move the marker" was one case, and killing
+        /// it after the first commit left the entries durable and the marker
+        /// where it started.
+        Append = "append" => [
+            TransactionBegin => Discarded,
+            TransactionWrite => Discarded,
+            TransactionCommit => Durable,
+        ],
         /// Moving the committed marker over entries already appended.
-        CommitMarker = "commit-marker" => [TransactionBegin, TransactionWrite, TransactionCommit],
-        /// Applying a batch of committed entries to `state.redb`.
-        Apply = "apply" => [TransactionBegin, TransactionWrite, TransactionCommit, Acknowledgement],
+        ///
+        /// Durable here means more than a moved marker: the entries the marker
+        /// now covers are above `last_applied`, so the reopen replays them and
+        /// comes back with them applied. That is the point of comparing the
+        /// whole recovered view rather than the marker.
+        CommitMarker = "commit-marker" => [
+            TransactionBegin => Discarded,
+            TransactionWrite => Discarded,
+            TransactionCommit => Durable,
+        ],
+        /// Dropping an uncommitted suffix a leader conflicted with.
+        Truncate = "truncate" => [
+            TransactionBegin => Discarded,
+            TransactionWrite => Discarded,
+            TransactionCommit => Durable,
+        ],
+        /// Deleting an applied prefix and advancing the purge marker.
+        ///
+        /// Deletion and marker are one transaction, which is what makes a
+        /// single expectation honest: a boundary that left the rows gone and the
+        /// marker behind would be a log reporting a boundary with nothing behind
+        /// it, and it would show up here as neither `before` nor `after`.
+        Purge = "purge" => [
+            TransactionBegin => Discarded,
+            TransactionWrite => Discarded,
+            TransactionCommit => Durable,
+        ],
+        /// Applying a committed entry to `state.redb`.
+        ///
+        /// The operation whose cells forced the outcome off `CrashPoint`. An
+        /// entry is committed in the log *before* it is applied -- that is the
+        /// only order production ever runs in -- so a crash inside the apply
+        /// transaction is not a lost command. redb discards the transaction, and
+        /// then `get_initial_state` replays the entry the committed marker still
+        /// covers. Calling those cells `Before` would assert that a voter may
+        /// come back having forgotten a committed command.
+        Apply = "apply" => [
+            TransactionBegin => Replayed,
+            TransactionWrite => Replayed,
+            TransactionCommit => Durable,
+            Acknowledgement => Durable,
+        ],
         /// Building a snapshot body and publishing `CURRENT`.
-        Build = "build" => [SnapshotBodyWrite, SnapshotBodyFsync, CurrentPublication],
+        Build = "build" => [
+            SnapshotBodyWrite => Discarded,
+            SnapshotBodyFsync => Discarded,
+            CurrentPublication => Durable,
+        ],
         /// Installing a peer's snapshot over this store's state.
+        ///
+        /// The candidate is rebuilt in a database of its own under `incoming/`,
+        /// through the same `durable_write`/`durable_commit` pair every other
+        /// write uses -- so an install crosses the three transaction boundaries
+        /// as well, and `transaction-commit` here is the moment that *candidate*
+        /// became durable while `state.redb` was still untouched. It is the one
+        /// cell where the boundary that means "durable" everywhere else means
+        /// the operation left no trace.
         Install = "install" => [
-            CandidateCommit,
-            ReplacementRename,
-            ReplacementDirectorySync,
-            PostReplacementReopen,
+            TransactionBegin => Discarded,
+            TransactionWrite => Discarded,
+            TransactionCommit => Discarded,
+            CandidateCommit => Discarded,
+            ReplacementRename => Durable,
+            ReplacementDirectorySync => Durable,
+            PostReplacementReopen => Durable,
+            CurrentPublication => Durable,
         ],
     }
 
-    /// Everything a reopen can observe, gathered through production paths.
+    /// Everything a reopen can read out of a store through production paths.
     ///
     /// Deliberately the whole of it rather than the field a case happens to be
     /// about: a crash in the vote transaction must leave the *log* alone too,
-    /// and an assertion narrowed to the vote would not say so. The durable
-    /// state carries the session rows, so saved replies are compared here as
-    /// well -- a route that kept the rows and lost the replies differs in this
-    /// value.
+    /// and an assertion narrowed to the vote would not say so. The durable state
+    /// carries the session rows, so saved replies are compared here as well -- a
+    /// route that kept the rows and lost the replies differs in this value. The
+    /// entries are the typed values OpenRaft hands back rather than a formatting
+    /// of them, which is what puts each entry's term and leader id into the
+    /// comparison; the pair of `(index, Debug(payload))` this replaced silently
+    /// dropped both.
+    ///
+    /// `log_state` is the one field carried **structurally rather than proved**.
+    /// It is the complete state OpenRaft asks the log for, and the purge marker
+    /// in it is the one log fact no entry can show -- but no cell in the matrix
+    /// distinguishes it on its own, because every operation that moves the
+    /// marker also changes the entries beside it. Blanking it leaves the matrix
+    /// green (mutation M260). What does hold the marker to account is the log's
+    /// own tests, `purging_past_the_end_leaves_the_marker_as_the_last_log_id`
+    /// and `a_regressive_purge_does_not_move_the_marker`, and the reopen itself:
+    /// a purge that advanced its marker without deleting the rows produces a
+    /// store `VoterStorage::open` refuses (mutation M257).
     #[derive(Debug, PartialEq)]
-    struct Observation {
+    struct View {
         vote: Option<openraft::Vote<CoordinationNodeId>>,
         committed: Option<RaftLogId<CoordinationNodeId>>,
-        entries: Vec<(u64, String)>,
+        entries: Vec<Entry>,
+        log_state: openraft::storage::LogState<CoordinationTypeConfig>,
         applied: Option<RaftLogId<CoordinationNodeId>>,
         membership: StoredMembership<CoordinationNodeId, CoordinationNode>,
         state: DurableState,
+    }
+
+    /// A [`View`] plus the two facts that need the store closed to read.
+    #[derive(Debug, PartialEq)]
+    struct Recovered {
+        view: View,
         digest: [u8; 32],
         current: Option<String>,
     }
 
-    /// Open a store the way production does, run OpenRaft's own recovery, and
-    /// record what is there.
+    /// What a reopen finds, on both axes.
     ///
-    /// `get_initial_state` is not optional: `VoterStorage::open` starts the
-    /// actors and validates the files and performs no replay, so a store killed
-    /// between an append and its apply would be observed in the state it had
-    /// *before* recovery -- which is the wrong state, and the one a naive
-    /// harness would compare against.
-    async fn observe(dir: &std::path::Path) -> Observation {
+    /// Two, because a crash has two answers and they are not always the same
+    /// one. `on_disk` is what the killed process actually left, read the instant
+    /// the store is open and before OpenRaft is allowed to repair anything.
+    /// `recovered` is what the voter comes back holding once it has. An
+    /// observation that only recorded the second could not tell a transaction
+    /// that survived from one that was thrown away and replayed; one that only
+    /// recorded the first would call a replayed command a lost one.
+    #[derive(Debug, PartialEq)]
+    struct Observation {
+        on_disk: View,
+        recovered: Recovered,
+    }
+
+    /// Read everything an open store can be asked, through the same accessors
+    /// OpenRaft uses.
+    async fn view_of(storage: &mut super::super::VoterStorage) -> View {
         use openraft::storage::RaftLogReader as _;
         use openraft::storage::RaftLogStorage as _;
-        use openraft::StorageHelper;
-
         use openraft::storage::RaftStateMachine as _;
 
-        let mut storage = voter(dir);
-        {
-            let (log, state) = storage.recovery_parts();
-            StorageHelper::new(log, state)
-                .get_initial_state()
-                .await
-                .expect("OpenRaft's own recovery must run before anything is read");
-        }
-        // Through the state machine's own accessor rather than the recovered
-        // `RaftState`: this is what OpenRaft asks the store on every restart,
-        // so it is the value a real voter would act on.
+        // Through the state machine's own accessor rather than a recovered
+        // `RaftState`: this is what OpenRaft asks the store on every restart, so
+        // it is the value a real voter would act on.
         let (applied, membership) = storage
             .state_mut()
             .applied_state()
@@ -4692,10 +4841,12 @@ mod tests {
         let entries = reader
             .try_get_log_entries(0..u64::MAX)
             .await
-            .expect("read the log back")
-            .into_iter()
-            .map(|e| (e.log_id.index, format!("{:?}", e.payload)))
-            .collect();
+            .expect("read the log back");
+        let log_state = storage
+            .log_mut()
+            .get_log_state()
+            .await
+            .expect("the log state");
         let vote = storage.log_mut().read_vote().await.expect("read the vote");
         let committed = storage
             .log_mut()
@@ -4703,19 +4854,49 @@ mod tests {
             .await
             .expect("read the committed marker");
         let state = durable_of(storage.state()).await;
-        // Only after the store is closed: redb refuses a second open of a file
-        // it already holds, and the marker read needs its own handle.
-        drop(storage);
-        let current = current_marker(dir);
-        Observation {
+        View {
             vote,
             committed,
             entries,
+            log_state,
             applied,
             membership,
             state,
-            digest: canonical_digest_of(dir),
-            current,
+        }
+    }
+
+    /// Open a store the way production does, read what is on disk, then run
+    /// OpenRaft's own recovery and read again.
+    ///
+    /// `get_initial_state` is not optional: `VoterStorage::open` starts the
+    /// actors and validates the files and performs no replay, so a store killed
+    /// between an entry being committed and its apply would be observed in the
+    /// state it had *before* recovery -- which is the wrong state, and the one a
+    /// naive harness would compare against. Reading on both sides of it is what
+    /// lets the harness say which of the two did the work.
+    async fn observe(dir: &std::path::Path) -> Observation {
+        use openraft::StorageHelper;
+
+        let mut storage = voter(dir);
+        let on_disk = view_of(&mut storage).await;
+        {
+            let (log, state) = storage.recovery_parts();
+            StorageHelper::new(log, state)
+                .get_initial_state()
+                .await
+                .expect("OpenRaft's own recovery must run before anything is claimed");
+        }
+        let view = view_of(&mut storage).await;
+        // Only after the store is closed: redb refuses a second open of a file
+        // it already holds, and both of these need their own handle.
+        drop(storage);
+        Observation {
+            on_disk,
+            recovered: Recovered {
+                view,
+                digest: canonical_digest_of(dir),
+                current: current_marker(dir),
+            },
         }
     }
 
@@ -4729,8 +4910,12 @@ mod tests {
             .map(|file| file.meta().snapshot_id.clone())
     }
 
-    /// A store set up identically for every case: seeded, initialized, with the
-    /// history's setup prefix applied and a snapshot already published.
+    /// A store set up identically for every case: seeded, initialized, and with
+    /// the generated history appended, committed and applied.
+    ///
+    /// No snapshot is published, so `CURRENT` starts absent and the two
+    /// operations that publish one are visible in the marker rather than only in
+    /// the state.
     ///
     /// The setup runs in the **parent**, so the child does nothing but the one
     /// operation being crashed. A child that also did the setup would make the
@@ -4778,24 +4963,64 @@ mod tests {
 
     /// On-disk setup an operation needs that is **not** the operation.
     ///
-    /// Run by the parent on all three directories, so `before` is observed
-    /// from the same state the crashed store started in. Moving the marker
-    /// presupposes entries to move it over, and appending those is a
-    /// transaction of its own; leaving it inside the operation made
-    /// `before` a store without them, and every marker case failed for the
+    /// Run by the parent on all three directories, so `before` is observed from
+    /// the same state the crashed store started in. Two things follow from
+    /// that, and both were found by the matrix rather than reasoned into it.
+    ///
+    /// The first is that an operation's own preparation cannot live inside it:
+    /// moving the marker presupposes entries to move it over, and appending
+    /// those is a transaction of its own, so leaving it in the operation made
+    /// `before` a store without them and every marker case failed for the
     /// difference rather than for the crash.
+    ///
+    /// The second is what the preparation has to *be*. An apply is only ever
+    /// reached for an entry the log already holds as committed; applying one
+    /// that is in neither is a state no voter is ever in, and a crash tested
+    /// there proves nothing about the crash production would have. Staging it
+    /// the way production does is also what makes the apply cells honest, since
+    /// a committed entry is exactly what recovery replays.
     async fn stage_for(dir: &std::path::Path, operation: Operation) {
+        use openraft::storage::RaftLogStorage as _;
         use openraft::storage::RaftLogStorageExt as _;
 
-        if operation != Operation::CommitMarker {
-            return;
-        }
         let mut storage = voter(dir);
-        storage
-            .log_mut()
-            .blocking_append(tail_entries())
-            .await
-            .expect("stage the entries the marker will cover");
+        match operation {
+            // Entries for the marker to move over, left uncommitted: moving it
+            // is the operation.
+            Operation::CommitMarker => storage
+                .log_mut()
+                .blocking_append(tail_entries())
+                .await
+                .expect("stage the entries the marker will cover"),
+            // An uncommitted suffix, which is the only kind a leader may make a
+            // follower drop.
+            Operation::Truncate => storage
+                .log_mut()
+                .blocking_append(tail_entries())
+                .await
+                .expect("stage the suffix the truncate removes"),
+            // Appended *and* committed, because that is the only way an entry
+            // ever reaches the state machine.
+            Operation::Apply => {
+                let entry = apply_entry();
+                let at = entry.log_id;
+                storage
+                    .log_mut()
+                    .blocking_append([entry])
+                    .await
+                    .expect("append the entry the apply covers");
+                storage
+                    .log_mut()
+                    .save_committed(Some(at))
+                    .await
+                    .expect("commit it, as a leader would before it was applied");
+            }
+            Operation::Vote
+            | Operation::Append
+            | Operation::Purge
+            | Operation::Build
+            | Operation::Install => {}
+        }
         drop(storage);
     }
 
@@ -4849,19 +5074,22 @@ mod tests {
                     .await
                     .expect("commit the marker");
             }
+            Operation::Truncate => {
+                storage
+                    .log_mut()
+                    .truncate(tail_entries().first().expect("a suffix").log_id)
+                    .await
+                    .expect("truncate");
+            }
+            Operation::Purge => {
+                storage.log_mut().purge(purge_upto()).await.expect("purge");
+            }
             Operation::Apply => {
-                // The entry after the ones the fixture applied, from the same
-                // generated history, so it is a command a voter would really
-                // see at that index rather than a synthetic one.
-                let history =
-                    crate::coordination::model::history::sample_history(FIXTURE_STEPS + 1);
-                let (log_id, command) = history.entries.last().expect("an entry").clone();
+                // The entry `stage_for` appended and committed, so the operation
+                // is the apply alone.
                 storage
                     .state_mut()
-                    .apply([Entry {
-                        log_id: raft_log_id(&log_id),
-                        payload: EntryPayload::Normal(command),
-                    }])
+                    .apply([apply_entry()])
                     .await
                     .expect("apply");
             }
@@ -4888,8 +5116,47 @@ mod tests {
     /// Contiguous with it: §4.3 refuses a gap outright, so an append at an
     /// arbitrary index would fail before reaching any boundary at all.
     fn tail_entries() -> Vec<Entry> {
-        let at = crate::coordination::model::history::SETUP_ENTRIES + FIXTURE_STEPS + 1;
-        vec![blank(at), blank(at + 1)]
+        vec![blank(next_index()), blank(next_index() + 1)]
+    }
+
+    /// The first index past what `crash_fixture` left in the log.
+    fn next_index() -> u64 {
+        crate::coordination::model::history::SETUP_ENTRIES + FIXTURE_STEPS + 1
+    }
+
+    /// The entry the `Apply` case commits and then applies.
+    ///
+    /// Drawn from the same generated history one step longer, so it is the
+    /// command a voter would really see at that index rather than a synthetic
+    /// one -- and so the state it produces is one the pure model agrees with.
+    fn apply_entry() -> Entry {
+        let history = crate::coordination::model::history::sample_history(FIXTURE_STEPS + 1);
+        let (log_id, command) = history.entries.last().expect("an entry").clone();
+        let entry = Entry {
+            log_id: raft_log_id(&log_id),
+            payload: EntryPayload::Normal(command),
+        };
+        assert_eq!(
+            entry.log_id.index,
+            next_index(),
+            "the applied entry must be the one that follows the fixture"
+        );
+        entry
+    }
+
+    /// The log id `Purge` deletes up to: the last entry of the history's setup
+    /// prefix, which is far below `last_applied` and so legal to purge.
+    fn purge_upto() -> RaftLogId<CoordinationNodeId> {
+        let history = crate::coordination::model::history::sample_history(FIXTURE_STEPS);
+        let setup = crate::coordination::model::history::SETUP_ENTRIES as usize;
+        let (log_id, _) = &history.entries[setup - 1];
+        let at = raft_log_id(log_id);
+        assert_eq!(
+            at.index,
+            crate::coordination::model::history::SETUP_ENTRIES,
+            "the purge boundary must be the last setup entry"
+        );
+        at
     }
 
     /// A snapshot from a peer of the same group, ahead of what the fixture
@@ -5001,10 +5268,15 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(CHILD_TIMEOUT_SECONDS))
             .unwrap_or(None);
 
-        // Before the assertion: a child that never announced is a child still
+        // Before the assertions: a child that never announced is a child still
         // running, and leaving it alive would hold the directory open for the
         // reopen below and hang the suite instead of failing it.
-        let _ = child.kill();
+        //
+        // The result is checked rather than dropped. A `kill` that failed would
+        // leave the child parked at its boundary, `wait` would block until
+        // something else ended it, and the case would be reported by a timeout
+        // somewhere unrelated instead of here.
+        child.kill().expect("kill the parked child");
         let status = child.wait().expect("reap the child");
         let _ = reader.join();
 
@@ -5021,17 +5293,74 @@ mod tests {
             point.name(),
             "the child stopped at a different boundary than the one armed"
         );
+
+        // It announced, so it was parked and it was this `kill` that ended it.
+        // Worth stating: a child that had already exited on its own -- panicked,
+        // or run past the boundary and returned -- would have closed its files
+        // through the ordinary paths, and the store observed below would be the
+        // product of a clean shutdown wearing a crash's name.
+        assert!(
+            !status.success(),
+            "a killed child cannot have exited successfully: {status:?}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            // 9 is SIGKILL on every Unix this builds for, and naming the number
+            // avoids a dependency on libc for one constant.
+            assert_eq!(
+                status.signal(),
+                Some(9),
+                "the child must have died by SIGKILL, not by returning: {status:?}"
+            );
+        }
+        // Elsewhere the platform decides what an unconditional termination is;
+        // `success()` above is the portable half of the same statement, and this
+        // module's header claims process death rather than a particular signal.
+    }
+
+    /// Hold one observed value against the two the harness measured.
+    ///
+    /// The comparison is never against a literal written here. `before` is the
+    /// prepared store, `after` is the same operation run to completion in a
+    /// sibling directory, and the crashed store must equal one of them exactly.
+    fn must_match<T: std::fmt::Debug + PartialEq>(
+        expected: Expected,
+        axis: &str,
+        what: &str,
+        crashed: &T,
+        before: &T,
+        after: &T,
+    ) {
+        match expected {
+            Expected::Before => assert_eq!(
+                crashed, before,
+                "{what}: {axis} must be exactly what the operation started from"
+            ),
+            Expected::After => assert_eq!(
+                crashed, after,
+                "{what}: {axis} must be exactly what the completed operation leaves"
+            ),
+            Expected::Either => assert!(
+                crashed == before || crashed == after,
+                "{what}: {axis} must be one of the two states the protocol \
+                 permits, and nothing else"
+            ),
+        }
     }
 
     /// Every reachable boundary of every operation, killed and recovered.
     ///
-    /// The comparison is against two observations the harness *made* rather
-    /// than against values written here: `before` is the fixture, `after` is the
-    /// same operation run to completion in a sibling directory. A crashed store
-    /// must equal one of them exactly, chosen by the boundary's own declared
-    /// expectation -- so "either" is never the default, and a boundary whose
-    /// outcome regresses from `After` to `Before` fails rather than passing
-    /// under a permissive union.
+    /// Both axes are held, separately. The on-disk axis says what the killed
+    /// process left; the recovered axis says what a voter comes back holding
+    /// once `get_initial_state` has run. Checking only the second would let a
+    /// transaction that survived pass as one that was replayed, and checking
+    /// only the first would report a replayed command as a lost one -- the two
+    /// together are what makes `Replayed` a claim rather than a hedge.
+    ///
+    /// Neither axis defaults to a union: `Either` is declared per cell and
+    /// nothing declares it, so a cell whose outcome regresses from durable to
+    /// discarded fails rather than passing under a permissive comparison.
     #[tokio::test]
     async fn every_boundary_recovers_to_a_state_the_protocol_permits() {
         for operation in Operation::ALL {
@@ -5045,34 +5374,80 @@ mod tests {
             stage_for(&after_dir, *operation).await;
             perform(&after_dir, *operation).await;
             let after = observe(&after_dir).await;
+            // On one axis or the other. An apply's two recovered views are
+            // *equal* -- recovery replays the entry the crash lost, which is the
+            // whole point -- and it is the on-disk axis that tells the two
+            // stores apart.
             assert_ne!(
                 before,
                 after,
-                "{} changes nothing, so no boundary in it can be distinguished",
+                "{} changes nothing on either axis, so no boundary in it can be \
+                 distinguished from any other",
                 operation.name()
             );
 
-            for point in operation.boundaries() {
+            for (point, outcome) in operation.cells() {
                 let dir = scratch_dir();
                 crash_fixture(&dir).await;
                 stage_for(&dir, *operation).await;
                 kill_at(&dir, *operation, *point);
                 let crashed = observe(&dir).await;
 
-                let what = format!("{} killed at {}", operation.name(), point.name());
-                match point.expected() {
-                    Expected::Before => assert_eq!(
-                        crashed, before,
-                        "{what} must leave no trace of the operation"
+                let what = format!(
+                    "{} killed at {} ({outcome:?})",
+                    operation.name(),
+                    point.name()
+                );
+                must_match(
+                    outcome.on_disk(),
+                    "what the killed process left on disk",
+                    &what,
+                    &crashed.on_disk,
+                    &before.on_disk,
+                    &after.on_disk,
+                );
+                must_match(
+                    outcome.recovered(),
+                    "what the reopened voter recovered",
+                    &what,
+                    &crashed.recovered,
+                    &before.recovered,
+                    &after.recovered,
+                );
+
+                // The two axes above cannot, on their own, tell `Discarded`
+                // from `Replayed` for an apply: the staged store and the
+                // applied one recover to the *same* state -- which is the
+                // property, not a defect -- so both labels satisfy the same
+                // comparison. What separates them is whether the reopen had to
+                // do anything, and that is a fact about the crashed store
+                // alone. Asserting it here is what makes the label a claim
+                // rather than a comment, and what makes swapping one for the
+                // other fail.
+                let owed = (
+                    crashed.on_disk.applied,
+                    crashed.recovered.view.applied,
+                    &crashed.on_disk.state,
+                    &crashed.recovered.view.state,
+                );
+                match outcome {
+                    Outcome::Discarded => assert_eq!(
+                        (owed.0, owed.2),
+                        (owed.1, owed.3),
+                        "{what}: discarded means the reopen found nothing owed \
+                         to the state machine and left it exactly as the crash \
+                         did"
                     ),
-                    Expected::After => {
-                        assert_eq!(crashed, after, "{what} must be durable")
-                    }
-                    Expected::Either => assert!(
-                        crashed == before || crashed == after,
-                        "{what} must recover to one of the two states the \
-                         protocol permits, and to nothing else"
+                    Outcome::Replayed => assert_ne!(
+                        owed.0, owed.1,
+                        "{what}: replayed means the reopen redid the write the \
+                         crash threw away; a store that came back at the same \
+                         applied index never lost it in the first place"
                     ),
+                    // `Durable` says nothing either way -- a committed marker
+                    // is durable *and* leaves the entries it now covers for the
+                    // reopen to apply -- and nothing declares `Undetermined`.
+                    Outcome::Durable | Outcome::Undetermined => {}
                 }
             }
         }
@@ -5088,12 +5463,31 @@ mod tests {
     fn every_boundary_is_covered_by_some_operation() {
         let covered: std::collections::BTreeSet<&str> = Operation::ALL
             .iter()
-            .flat_map(|o| o.boundaries())
-            .map(|p| p.name())
+            .flat_map(|o| o.cells())
+            .map(|(point, _)| point.name())
             .collect();
         let all: std::collections::BTreeSet<&str> =
             CrashPoint::ALL.iter().map(|p| p.name()).collect();
         assert_eq!(covered, all, "a boundary no operation reaches is untested");
+    }
+
+    /// No cell is declared twice within one operation.
+    ///
+    /// A duplicate would arm the same boundary twice and quietly give the second
+    /// declaration no effect, so the table would say more than the harness ran.
+    #[test]
+    fn no_operation_declares_a_boundary_twice() {
+        for operation in Operation::ALL {
+            let mut seen = std::collections::BTreeSet::new();
+            for (point, _) in operation.cells() {
+                assert!(
+                    seen.insert(point.name()),
+                    "{} declares {} twice",
+                    operation.name(),
+                    point.name()
+                );
+            }
+        }
     }
 
     // ── OpenRaft's own storage suite ────────────────────────────────────────
@@ -5107,20 +5501,28 @@ mod tests {
     /// nothing about §11's identity binding, row ceilings or crash boundaries.
     #[test]
     fn the_openraft_storage_suite_passes_on_a_fresh_store() {
-        openraft::testing::Suite::test_all(SuiteBuilder::fresh(scratch_dir(), 11))
+        let root = scratch_dir();
+        openraft::testing::Suite::test_all(SuiteBuilder::fresh(root.to_path_buf(), 11))
             .expect("OpenRaft's storage suite");
     }
 
     /// The same suite, with every store closed and reopened before use.
     ///
-    /// The variant that says something about *durability*: a fresh store has
-    /// only ever existed in this process, so an implementation that kept its
-    /// state in memory and wrote nothing would pass the run above. Here each
-    /// store is built, dropped -- both actors joined, both databases released,
-    /// the directory lock gone -- and opened again from its files.
+    /// Each store is built, dropped -- both actors joined, both databases
+    /// released, the directory lock gone -- and opened again from its files
+    /// before the suite is given it. What that covers is the *second open*: the
+    /// whole contract holding against a store this build recovered rather than
+    /// created.
+    ///
+    /// It is not evidence that the suite's own writes survive a restart, and
+    /// should not be read as any: the reopen happens before the suite writes
+    /// anything, so the store closed here is an empty one. That claim belongs to
+    /// `a_normal_command_and_a_non_empty_log_survive_a_restart` below and to the
+    /// crash matrix above, which reopen stores with state in them.
     #[test]
     fn the_openraft_storage_suite_passes_on_a_reopened_store() {
-        openraft::testing::Suite::test_all(SuiteBuilder::reopened(scratch_dir(), 12))
+        let root = scratch_dir();
+        openraft::testing::Suite::test_all(SuiteBuilder::reopened(root.to_path_buf(), 12))
             .expect("OpenRaft's storage suite, after a restart");
     }
 
@@ -5138,7 +5540,8 @@ mod tests {
         use openraft::storage::RaftLogStorage as _;
         use openraft::storage::RaftLogStorageExt as _;
 
-        let fixture = SuiteFixture::new(scratch_dir(), 13);
+        let root = scratch_dir();
+        let fixture = SuiteFixture::new(root.to_path_buf(), 13);
         let (dir, mut store) = fixture.build_at();
 
         let entries = vec![
@@ -5248,8 +5651,12 @@ mod tests {
             (built.meta, bytes)
         };
 
-        let (left_meta, left) = build(scratch_dir()).await;
-        let (right_meta, right) = build(scratch_dir()).await;
+        // Bound rather than passed inline: the guard is what removes the
+        // directory, and a temporary would drop it at the end of its statement.
+        let left_dir = scratch_dir();
+        let right_dir = scratch_dir();
+        let (left_meta, left) = build(left_dir.to_path_buf()).await;
+        let (right_meta, right) = build(right_dir.to_path_buf()).await;
 
         // The ids first, so a regression reports two short strings rather than
         // two half-kilobyte byte vectors -- and then the bytes, because equal
@@ -6306,7 +6713,7 @@ mod tests {
         // ── Higher: the receiver is behind the candidate ────────────────────
         {
             let dir = scratch_dir();
-            let (machine, _s, _d, dir) = receiver(dir);
+            let (machine, _s, _d, dir) = receiver(dir.to_path_buf());
             let durable = durable_of(&machine).await;
             let prepared = prepare(
                 &dir,
@@ -6328,7 +6735,7 @@ mod tests {
         // ── Stale: the receiver has applied past the candidate ──────────────
         {
             let dir = scratch_dir();
-            let (mut machine, _s, _d, dir) = receiver(dir);
+            let (mut machine, _s, _d, dir) = receiver(dir.to_path_buf());
             machine
                 .apply([blank(2), blank(3)])
                 .await
@@ -6357,7 +6764,7 @@ mod tests {
         // ── Equal, same content: the lost-acknowledgement repair ────────────
         {
             let dir = scratch_dir();
-            let (mut machine, _s, _d, dir) = receiver(dir);
+            let (mut machine, _s, _d, dir) = receiver(dir.to_path_buf());
             let durable = durable_of(&machine).await;
             // Its own body, at its own applied index: the state it would be
             // asked to install after a lost acknowledgement.
@@ -6406,7 +6813,7 @@ mod tests {
             drop(database);
 
             let dir = scratch_dir();
-            let (machine, _s, _d, dir) = receiver(dir);
+            let (machine, _s, _d, dir) = receiver(dir.to_path_buf());
             let durable = durable_of(&machine).await;
             assert_eq!(
                 durable.model.last_applied.map(|id| id.index),
@@ -6434,7 +6841,7 @@ mod tests {
         // ── Equal index, same log id, different content ─────────────────────
         {
             let dir = scratch_dir();
-            let (mut machine, _s, _d, dir) = receiver(dir);
+            let (mut machine, _s, _d, dir) = receiver(dir.to_path_buf());
             let durable = durable_of(&machine).await;
             let mine = {
                 let mut builder = machine.get_snapshot_builder().await;
