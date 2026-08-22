@@ -11,6 +11,11 @@ pub mod reason;
 pub mod rowstream;
 pub mod service;
 
+/// The §8.4 verified admission source. Voter-only: a client is admitted *by* a
+/// voter and consults no directory itself.
+#[cfg(feature = "coordination")]
+pub mod admission;
+
 /// Host-side configuration for a voter. Needs `coordination`: it names a
 /// storage directory and is accepted only by
 /// [`builtin_coordination`](crate::rpc::AsterServerBuilder::builtin_coordination).
@@ -37,6 +42,11 @@ pub mod raft;
 /// is the one place `openraft` types appear outside the type config.
 #[cfg(feature = "coordination")]
 pub mod convert;
+
+/// Resolving a configured start mode into a verified storage binding (§7.2).
+/// Crate-private: it produces a `StorageIdentity`, which is itself crate-private.
+#[cfg(feature = "coordination")]
+pub(crate) mod start;
 
 #[cfg(feature = "coordination")]
 pub mod typeconfig;

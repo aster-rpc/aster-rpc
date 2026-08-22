@@ -177,7 +177,7 @@ const RAFT_DURABLE_KEYS: &[&str] = &[KEY_VOTE, KEY_COMMITTED, KEY_LAST_PURGED];
 // ── Layout ───────────────────────────────────────────────────────────────────
 
 /// The §11.1 directory layout, resolved once.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageLayout {
     root: PathBuf,
 }
