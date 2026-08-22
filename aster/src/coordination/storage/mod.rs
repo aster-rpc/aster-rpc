@@ -61,6 +61,9 @@ pub(crate) mod machine;
 pub(crate) mod reads;
 pub(crate) mod rows;
 pub(crate) mod schema;
+/// The owning scratch directory every test module here builds its stores in.
+#[cfg(test)]
+pub(crate) mod scratch;
 pub(crate) mod snapshot;
 
 pub(crate) use snapshot::CoordinationSnapshotFile;
@@ -348,6 +351,7 @@ mod durability_guard {
         ("machine.rs", include_str!("machine.rs")),
         ("reads.rs", include_str!("reads.rs")),
         ("rows.rs", include_str!("rows.rs")),
+        ("scratch.rs", include_str!("scratch.rs")),
         ("snapshot.rs", include_str!("snapshot.rs")),
         ("fixture.rs", include_str!("fixture.rs")),
     ];

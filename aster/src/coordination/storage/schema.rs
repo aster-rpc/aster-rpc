@@ -1670,6 +1670,7 @@ fn verify_state_identity(database: &Database, identity: &StorageIdentity) -> Sto
 
 #[cfg(test)]
 mod tests {
+    use super::super::scratch::ScratchDir;
     use super::*;
     use crate::coordination::contract::payload_fory;
     use crate::coordination::ids::{CoordinationGroupId, CoordinationNodeId};
@@ -1679,7 +1680,6 @@ mod tests {
         widest_admitted_membership,
     };
     use redb::TableHandle;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// An occupied path is refused, and the file that was there is untouched.
     ///
@@ -1788,20 +1788,12 @@ mod tests {
         }
     }
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
     /// A fresh directory per test. Not `tempfile`: these tests deliberately
     /// inspect and mutate the layout between opens, so the path has to outlive
-    /// any one handle.
-    fn scratch() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "aster-coordination-storage-{}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+    /// any one handle -- which is what the guard gives, rather than a handle
+    /// whose lifetime is the file's.
+    fn scratch() -> ScratchDir {
+        ScratchDir::new("storage")
     }
 
     fn identity() -> StorageIdentity {

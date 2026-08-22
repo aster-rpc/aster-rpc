@@ -1102,9 +1102,6 @@ mod tests {
     use openraft::{CommittedLeaderId, Membership};
     use redb::ReadableDatabase as _;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicU64;
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     const ACTOR: [u8; 32] = [0x0A; 32];
     const CLIENT: [u8; 16] = [0x0C; 16];
@@ -1113,68 +1110,10 @@ mod tests {
     use super::super::fixture::SuiteFixture;
     use super::super::SuiteBuilder;
 
-    /// A scratch directory that removes itself when the test drops it.
-    ///
-    /// Owned rather than left behind. A store here is a redb file, a log, a
-    /// snapshot body and whatever a case published, and the crash matrix alone
-    /// builds three of them per cell -- tens of megabytes per run, under a
-    /// `$TMPDIR` that a laptop sweeps on reboot and a long-lived CI host does
-    /// not. The unique name is kept anyway, so two concurrent runs still cannot
-    /// collide.
-    ///
-    /// Deliberately not conditional on the test passing: a failing assertion
-    /// unwinds through this and the directory goes, because a matrix that left
-    /// its evidence behind only on failure would fill the disk exactly when a
-    /// run is being repeated.
-    #[derive(Debug, PartialEq, Eq)]
-    struct ScratchDir(PathBuf);
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    impl std::ops::Deref for ScratchDir {
-        type Target = std::path::Path;
-
-        fn deref(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl AsRef<std::path::Path> for ScratchDir {
-        fn as_ref(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl ScratchDir {
-        /// A copy of the path for the few callers that need to own one, which
-        /// keeps the removal with the guard rather than with the copy.
-        fn to_path_buf(&self) -> PathBuf {
-            self.0.clone()
-        }
-    }
-
-    /// Borrowed, never consumed. `From<ScratchDir>` is deliberately absent: it
-    /// would let a caller move the path out of the guard, and the directory
-    /// would then outlive the only thing that removes it.
-    impl From<&ScratchDir> for PathBuf {
-        fn from(dir: &ScratchDir) -> PathBuf {
-            dir.to_path_buf()
-        }
-    }
+    use super::super::scratch::ScratchDir;
 
     fn scratch_dir() -> ScratchDir {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "aster-coordination-machine-{}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        ScratchDir(dir)
+        ScratchDir::new("machine")
     }
 
     fn resource() -> ResourceKey {

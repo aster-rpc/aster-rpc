@@ -332,20 +332,11 @@ pub(crate) fn oversized_meta_for_envelope() -> CoordinationMetaV1 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::scratch::ScratchDir;
     use super::*;
-    use std::sync::atomic::AtomicU64 as Counter;
 
-    static COUNTER: Counter = Counter::new(0);
-
-    fn scratch() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "aster-coordination-fixture-{}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+    fn scratch() -> ScratchDir {
+        ScratchDir::new("fixture")
     }
 
     /// One fixture, many stores: group identity fixed, NodeId and directory
@@ -357,7 +348,8 @@ mod tests {
     /// would be read as a storage bug.
     #[test]
     fn one_fixture_holds_its_group_identity_across_every_store() {
-        let fixture = SuiteFixture::new(scratch(), 7);
+        let root = scratch();
+        let fixture = SuiteFixture::new(root.to_path_buf(), 7);
 
         let first = fixture.identity_for(0);
         let second = fixture.identity_for(1);
@@ -385,7 +377,8 @@ mod tests {
     /// Two stores really do open side by side, each with its own lock.
     #[test]
     fn two_stores_from_one_fixture_open_concurrently() {
-        let fixture = SuiteFixture::new(scratch(), 11);
+        let root = scratch();
+        let fixture = SuiteFixture::new(root.to_path_buf(), 11);
 
         let leader = fixture.build();
         let follower = fixture.build();
@@ -402,8 +395,12 @@ mod tests {
     /// negatives are built from.
     #[test]
     fn a_second_fixture_is_a_different_group() {
-        let one = SuiteFixture::new(scratch(), 1);
-        let two = SuiteFixture::new(scratch(), 2);
+        // Bound, not passed inline: the guard is what removes the tree, and a
+        // temporary would drop it at the end of its own statement.
+        let one_root = scratch();
+        let two_root = scratch();
+        let one = SuiteFixture::new(one_root.to_path_buf(), 1);
+        let two = SuiteFixture::new(two_root.to_path_buf(), 2);
         assert_ne!(
             one.identity_for(0).group_id(),
             two.identity_for(0).group_id(),

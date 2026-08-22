@@ -2560,6 +2560,7 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod tests {
+    use super::super::scratch::ScratchDir;
     use super::*;
 
     /// Acting on an install is reachable only through the verdict that grants
@@ -2680,14 +2681,15 @@ mod tests {
         );
     }
 
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aster-snapshot-role-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// A scratch directory per call.
+    ///
+    /// It used to be one directory per *thread*, named for the process and the
+    /// `ThreadId` and created without clearing -- so under `--test-threads=1`
+    /// every case in this module shared one directory and inherited whatever
+    /// the previous one left in it. Nothing removed it either. Per call and
+    /// owned fixes both.
+    fn temp_dir() -> ScratchDir {
+        ScratchDir::new("snapshot-role")
     }
 
     fn write(path: &Path) {

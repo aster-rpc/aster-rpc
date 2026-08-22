@@ -449,6 +449,7 @@ impl Drop for ReadDrain {
 
 #[cfg(test)]
 mod tests {
+    use super::super::scratch::ScratchDir;
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -733,26 +734,14 @@ mod tests {
         panic!("the gate never reached {wanted:?}");
     }
 
-    /// A directory that is removed when the returned handle drops, and a redb
-    /// database inside it.
+    /// A scratch directory and a redb database inside it.
+    ///
+    /// The tuple order is load-bearing: local bindings drop in reverse order of
+    /// declaration, so `database` is closed before `dir` removes the tree it
+    /// lives in.
     fn scratch_database() -> (ScratchDir, redb::Database) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "aster-coordination-reads-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("create");
-        let database = redb::Database::create(path.join("state.redb")).expect("create");
-        (ScratchDir(path), database)
-    }
-
-    struct ScratchDir(std::path::PathBuf);
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+        let dir = ScratchDir::new("reads");
+        let database = redb::Database::create(dir.join("state.redb")).expect("create");
+        (dir, database)
     }
 }

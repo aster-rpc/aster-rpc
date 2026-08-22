@@ -2068,6 +2068,7 @@ pub(crate) fn commit(
 
 #[cfg(test)]
 mod tests {
+    use super::super::scratch::ScratchDir;
     use super::*;
     use crate::coordination::model::history::sample_applied_state;
     use crate::coordination::model::state::{
@@ -2077,8 +2078,6 @@ mod tests {
     use crate::coordination::reason::{Outcome, Reason};
     use crate::coordination::storage::fixture::maximal_legal_meta;
     use openraft::Membership;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// The snapshot header takes each version from its own constant.
     ///
@@ -2126,27 +2125,61 @@ mod tests {
         );
     }
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// A bare `state.redb` with the §11.3 tables and no identity binding.
+    /// A bare `state.redb` with the §11.3 tables and no identity binding, and
+    /// the directory it lives in.
     ///
     /// Deliberately not a bound store: these tests write states whose group is
     /// the model history's, and binding would tie the file to a different one.
     /// Identity binding is `schema`'s subject and is tested there.
-    fn scratch_database() -> (PathBuf, Database) {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "aster-coordination-rows-{}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        let path = dir.join("state.redb");
-        let database = Database::create(&path).expect("create state.redb");
+    ///
+    /// **The field order is load-bearing.** Struct fields drop in declaration
+    /// order, so `database` is closed before `dir` removes the tree the file is
+    /// in. The other order removes an open database: harmless-looking on Unix,
+    /// where the handle survives the unlink, and an outright failure on Windows
+    /// -- so the directory would be the one thing the guard exists to prevent,
+    /// a leftover, and only on the platform with no one watching.
+    struct ScratchDatabase {
+        database: Database,
+        dir: ScratchDir,
+    }
+
+    fn scratch_database() -> ScratchDatabase {
+        let dir = ScratchDir::new("rows");
+        let database = Database::create(dir.join("state.redb")).expect("create state.redb");
         let write = durable_write(&database, Db::State).expect("write");
         super::super::schema::create_state_tables(&write).expect("create tables");
         write.commit().expect("commit");
-        (dir, database)
+        ScratchDatabase { database, dir }
+    }
+
+    /// The order above, asserted rather than trusted to survive an edit.
+    ///
+    /// A reordering compiles and passes every other test in this file; what it
+    /// changes is only whether the removal happens while redb still holds the
+    /// file. Reading the directory back after the fixture drops is the one
+    /// observation that notices.
+    #[test]
+    fn the_scratch_database_closes_before_its_directory_is_removed() {
+        let path = {
+            let scratch = scratch_database();
+            let path = scratch.dir.to_path_buf();
+            assert!(
+                path.join("state.redb").exists(),
+                "the database must be there"
+            );
+            // Written to, so redb holds the file for real rather than merely
+            // having created it.
+            let write = durable_write(&scratch.database, Db::State).expect("write");
+            write.open_table(ROUTES).expect("open").len().expect("len");
+            write.commit().expect("commit");
+            path
+        };
+        assert!(
+            !path.exists(),
+            "{} survived its guard, so the database was still open when the \
+             tree was removed",
+            path.display()
+        );
     }
 
     /// The three voters this fixture's group committed.
@@ -3923,11 +3956,12 @@ mod tests {
     /// the codec are all things a double would not have.
     #[test]
     fn a_complete_state_round_trips_through_redb() {
-        let (_dir, database) = scratch_database();
+        let scratch = scratch_database();
+        let database = &scratch.database;
         let state = coherent_state();
 
-        commit(&database, state.clone(), &every_row(&state)).expect("commit");
-        let loaded = load(&database).expect("load");
+        commit(database, state.clone(), &every_row(&state)).expect("commit");
+        let loaded = load(database).expect("load");
 
         assert_eq!(loaded.model.resources, state.model.resources);
         assert_eq!(loaded.model.acl, state.model.acl);
@@ -3953,9 +3987,10 @@ mod tests {
     /// A deletion is persisted as a deletion, not merely dropped from memory.
     #[test]
     fn a_recorded_deletion_removes_the_row_from_disk() {
-        let (_dir, database) = scratch_database();
+        let scratch = scratch_database();
+        let database = &scratch.database;
         let mut state = coherent_state();
-        commit(&database, state.clone(), &every_row(&state)).expect("commit");
+        commit(database, state.clone(), &every_row(&state)).expect("commit");
 
         let admin = *state.model.admins.iter().next().expect("an admin");
         state.model.admins.remove(&admin);
@@ -3963,9 +3998,9 @@ mod tests {
 
         let mut changes = ChangeSet::default();
         changes.admins.insert(admin);
-        commit(&database, state.clone(), &changes).expect("commit the deletion");
+        commit(database, state.clone(), &changes).expect("commit the deletion");
 
-        let loaded = load(&database).expect("load");
+        let loaded = load(database).expect("load");
         assert!(
             !loaded.model.admins.contains(&admin),
             "a change set naming a removed key must delete the row"
@@ -3977,12 +4012,13 @@ mod tests {
     /// before the value is decoded.
     #[test]
     fn a_corrupt_row_is_refused_at_load() {
-        let (_dir, database) = scratch_database();
+        let scratch = scratch_database();
+        let database = &scratch.database;
         let state = coherent_state();
-        commit(&database, state.clone(), &every_row(&state)).expect("commit");
+        commit(database, state.clone(), &every_row(&state)).expect("commit");
 
         let key = *state.model.routes.keys().next().unwrap_or(&[0u8; 32]);
-        let write = durable_write(&database, Db::State).expect("write");
+        let write = durable_write(database, Db::State).expect("write");
         {
             let mut table = write.open_table(ROUTES).expect("open");
             table
@@ -3991,7 +4027,7 @@ mod tests {
         }
         write.commit().expect("commit");
 
-        let err = load(&database).expect_err("an over-ceiling row");
+        let err = load(database).expect_err("an over-ceiling row");
         assert!(
             err.to_string().contains("ceiling"),
             "the ceiling must be what refused it, not the decode: {err}"
@@ -4002,12 +4038,13 @@ mod tests {
     /// An undefined rights bit is refused rather than carried into state.
     #[test]
     fn an_undefined_rights_bit_is_refused_at_load() {
-        let (_dir, database) = scratch_database();
+        let scratch = scratch_database();
+        let database = &scratch.database;
         let state = coherent_state();
-        commit(&database, state.clone(), &every_row(&state)).expect("commit");
+        commit(database, state.clone(), &every_row(&state)).expect("commit");
 
         let (resource, subject) = state.model.acl.keys().next().expect("a grant").clone();
-        let write = durable_write(&database, Db::State).expect("write");
+        let write = durable_write(database, Db::State).expect("write");
         {
             let mut table = write.open_table(ACL).expect("open");
             table
@@ -4019,7 +4056,7 @@ mod tests {
         }
         write.commit().expect("commit");
 
-        let err = load(&database).expect_err("an undefined bit");
+        let err = load(database).expect_err("an undefined bit");
         assert!(err.to_string().contains("does not define"), "got: {err}");
     }
 }
