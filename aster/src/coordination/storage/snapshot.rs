@@ -474,7 +474,8 @@ impl<R: Read> Read for Digesting<R> {
 pub(crate) mod fault {
     use super::{StorageError, StorageResult};
     use std::cell::Cell;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard};
 
     thread_local! {
         static FAIL_DIRECTORY_FSYNC: Cell<bool> = const { Cell::new(false) };
@@ -501,6 +502,69 @@ pub(crate) mod fault {
         }
         Ok(())
     }
+
+    /// Not thread-local, unlike the fsync seam above.
+    ///
+    /// An install runs on the state actor's thread, so a flag set by the test
+    /// thread is a flag the code under test never sees -- which is how the
+    /// first version of this passed while substituting nothing. Process-wide,
+    /// with a guard that holds a lock for its lifetime so two tests cannot
+    /// arm it at once, and clears it on drop so a panicking test cannot leave
+    /// it armed for the next one.
+    static SWAP_INSTALLED: Mutex<Option<(PathBuf, PathBuf)>> = Mutex::new(None);
+    static SWAP_IN_USE: Mutex<()> = Mutex::new(());
+
+    /// Armed until dropped.
+    pub(crate) struct SwapGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl Drop for SwapGuard {
+        fn drop(&mut self) {
+            *SWAP_INSTALLED.lock().unwrap_or_else(|err| err.into_inner()) = None;
+        }
+    }
+
+    /// Substitute `with` for the replaced `state.redb`, once, between the
+    /// rename and the reopen.
+    ///
+    /// The one boundary in the install that no external fixture can reach: the
+    /// candidate is proved before the rename and the file is the store's after
+    /// it, and the interval between belongs to a single function. A crash there
+    /// -- or a filesystem that put something else in place -- leaves a database
+    /// that opens, passes integrity, carries a correct binding and loads a
+    /// well-formed state, and only the comparison against what was installed
+    /// tells the difference.
+    ///
+    /// It substitutes a *real database file* rather than forcing an error
+    /// return, so what runs afterwards is the production reopen, the production
+    /// load and the production comparison. A seam that made
+    /// `open_installed_state` fail would have tested the seam.
+    /// Arm a substitution for **one** `state.redb`, named explicitly.
+    ///
+    /// Keyed on the target because the lock is not enough: it serialises
+    /// arming, not consumption, so a concurrently running test's install would
+    /// take a substitution meant for another store. It did, and failed a test
+    /// that had nothing to do with this seam.
+    #[must_use = "the substitution is disarmed when the guard drops"]
+    pub(crate) fn swap_installed_state(target: PathBuf, with: PathBuf) -> SwapGuard {
+        let in_use = SWAP_IN_USE.lock().unwrap_or_else(|err| err.into_inner());
+        *SWAP_INSTALLED.lock().unwrap_or_else(|err| err.into_inner()) = Some((target, with));
+        SwapGuard(in_use)
+    }
+
+    pub(super) fn maybe_swap_installed_state(target: &Path) -> StorageResult<()> {
+        let source = {
+            let mut armed = SWAP_INSTALLED.lock().unwrap_or_else(|err| err.into_inner());
+            match armed.as_ref() {
+                Some((armed_for, _)) if armed_for == target => {
+                    armed.take().map(|(_, with)| with).expect("just matched")
+                }
+                _ => return Ok(()),
+            }
+        };
+        std::fs::copy(&source, target)
+            .map(|_| ())
+            .map_err(|err| StorageError::io("substituting an installed database", target, err))
+    }
 }
 
 #[cfg(not(test))]
@@ -510,6 +574,11 @@ mod fault {
 
     #[inline]
     pub(super) fn maybe_fail_directory_fsync(_dir: &Path) -> StorageResult<()> {
+        Ok(())
+    }
+
+    #[inline]
+    pub(super) fn maybe_swap_installed_state(_target: &Path) -> StorageResult<()> {
         Ok(())
     }
 }
@@ -888,6 +957,10 @@ impl ReplacedInstall {
             staged,
             target,
         } = self;
+        // Between the rename and the reopen: the interval this function owns,
+        // and the only place a fixture can stand in for a crash or a
+        // filesystem that put something else in place.
+        fault::maybe_swap_installed_state(&target)?;
         let (database, reloaded) = super::schema::open_installed_state(&target)?;
 
         if reloaded != expected {

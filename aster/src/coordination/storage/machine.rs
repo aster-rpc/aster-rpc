@@ -3512,6 +3512,113 @@ mod tests {
             .expect("and the install completes once the lease is released");
     }
 
+    /// A replacement that lands the wrong database stops the install dead.
+    ///
+    /// M203's oracle, and the boundary no external fixture can reach: the
+    /// candidate is proved *before* the rename and the file is the store's
+    /// after it, so the interval between belongs to one function. A crash
+    /// there, or a filesystem that put something else in place, leaves a
+    /// database that opens, passes integrity, carries a correct binding and
+    /// loads a well-formed state -- every check before the comparison passes on
+    /// it.
+    ///
+    /// Driven by substituting a *real database* rather than forcing an error,
+    /// so what runs afterwards is the production reopen, the production load
+    /// and the production comparison. The assertions are about what the install
+    /// then does: it fails, it latches fatal before replying, and it publishes
+    /// nothing.
+    #[tokio::test]
+    async fn a_replacement_that_lands_the_wrong_database_fails_the_install() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+
+        // A valid database of the same group, holding different state: what a
+        // botched rename might leave behind.
+        let other_dir = scratch_dir();
+        drop(seeded_with(&other_dir, seven_section_state()));
+
+        let dir = scratch_dir();
+        let (mut machine, _shutdown, _drain) = machine(&dir);
+        let before = durable_of(&machine).await;
+        assert!(
+            !dir.join("snapshots").join("CURRENT").exists(),
+            "nothing published yet"
+        );
+
+        let _swap = super::super::snapshot::fault::swap_installed_state(
+            dir.join("state.redb"),
+            other_dir.join("state.redb"),
+        );
+        let err = machine
+            .install_snapshot(&published.meta, published.snapshot)
+            .await
+            .expect_err("a database that is not the installed one is not installed");
+        assert!(
+            format!("{err:?}").contains("not the one this install validated"),
+            "{err:?}"
+        );
+
+        assert!(
+            machine.handle().is_fatal(),
+            "a replacement whose result cannot be identified stops the store"
+        );
+        assert!(
+            !dir.join("snapshots").join("CURRENT").exists(),
+            "and publishes nothing: a marker here would name a body the state does not match"
+        );
+        assert!(machine.applied_state().await.is_err(), "nor serves further");
+        let _ = before;
+    }
+
+    /// Two stores at the same state produce the same bytes.
+    ///
+    /// §11.4's determinism invariant, which every equal-index comparison rests
+    /// on: if two voters at one `last_applied` could produce different bodies,
+    /// the idempotent-repair path would be indistinguishable from divergent
+    /// history. Independent directories, independent actors, no shared state
+    /// but the entries applied.
+    #[tokio::test]
+    async fn two_stores_at_the_same_state_build_identical_bodies() {
+        let build = |dir: std::path::PathBuf| async move {
+            let (mut machine, shutdown, drain) = CoordinationStateMachine::new(
+                seeded_with(&dir, seven_section_state()),
+                StorageLayout::new(&dir),
+            )
+            .expect("open");
+            machine
+                .apply([normal(2, acquire(1)), blank(3)])
+                .await
+                .expect("the same entries");
+            let built = {
+                let mut builder = machine.get_snapshot_builder().await;
+                builder.build_snapshot().await.expect("build")
+            };
+            let bytes = std::fs::read(body_path(&dir, &built.meta.snapshot_id)).expect("body");
+            drop(machine);
+            drop(drain);
+            drop(shutdown);
+            (built.meta, bytes)
+        };
+
+        let (left_meta, left) = build(scratch_dir()).await;
+        let (right_meta, right) = build(scratch_dir()).await;
+
+        // The ids first, so a regression reports two short strings rather than
+        // two half-kilobyte byte vectors -- and then the bytes, because equal
+        // ids with unequal bodies would be the worse failure of the two.
+        assert_eq!(
+            left_meta.snapshot_id, right_meta.snapshot_id,
+            "the content-derived ids must agree"
+        );
+        assert!(
+            left == right,
+            "two stores at one state produced {} and {} bytes that differ; the canonical \
+             body is supposed to be a pure function of replicated state",
+            left.len(),
+            right.len()
+        );
+    }
+
     /// The same snapshot arriving twice repairs the marker and nothing else.
     ///
     /// The lost-acknowledgement case §11.4 exists for: the install landed, the
