@@ -70,9 +70,18 @@ fn key(n: u8) -> ResourceKey {
     raw(n).validate().expect("valid")
 }
 
-/// A group with one administrator and rights granted to two actors on three
-/// resources -- enough for holder, non-holder and revocation paths to be
-/// reachable without every command being refused for authorization.
+/// A running group: one administrator, three resources, and rights granted to
+/// two actors on each -- enough for holder, non-holder and revocation paths to
+/// be reachable without every command being refused for authorization.
+///
+/// It is **not** the state `initialize` leaves behind; it already holds
+/// resources and grants that only later commands could have written. What it
+/// borrows from that state is the pair of index-zero facts: the membership was
+/// committed at `LogId::default()` and that entry has been applied. Both,
+/// together, because §11.3's validator refuses "a membership with nothing
+/// applied" -- so a fixture carrying only one of them is a state no store can
+/// hold, and every history built on it would be describing a group that cannot
+/// exist.
 fn genesis() -> State {
     let mut s = State::default();
     s.admins.insert(ADMIN);
@@ -82,7 +91,9 @@ fn genesis() -> State {
     // the three-voter plans it generates.
     s.authority = crate::coordination::model::authority::testing::authority();
     s.deployment_profile_code = crate::coordination::model::shape::PROFILE_PROD;
-    s.membership = CommittedMembership::uniform((1u8..=3).map(|b| [b; 32]));
+    s.membership = CommittedMembership::uniform(INITIAL_VOTERS);
+    s.membership_log_id = Some(initial_log_id());
+    s.last_applied = Some(initial_log_id());
     for n in 0..3u8 {
         // The resource row goes in with the grant. §8.1 moves the two together,
         // so a grant without one is a state apply cannot produce -- and §11.3's
@@ -209,13 +220,16 @@ fn step(state: &State, n: u64) -> Step {
             operation_id: [(n % 7) as u8; 16],
             expected_membership_log_id: state.membership_log_id,
             plan: MembershipPlan {
-                desired_voters: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
+                desired_voters: INITIAL_VOTERS.to_vec(),
                 retained_learners: Vec::new(),
-                // §9: every new node is seeded, sorted by node id, and a new
-                // node's seed carries a join permit. The generator's plan never
-                // matches the committed membership, so all three are new.
-                // The generator's plan is always the committed membership, so
-                // no seed is a join and none carries a permit.
+                // §9 requires every named node to be seeded, sorted by node id,
+                // and a *new* node's seed to carry a join permit. The plan here
+                // is exactly the committed membership, so no node is new: every
+                // seed is a restatement and none carries a permit. Reaching the
+                // join-permit branch needs a plan that adds a voter, which the
+                // membership driver covers -- §12.1 caps a change at two new
+                // voters, and a generated alphabet that added one each round
+                // would spend the history in flight rather than applying.
                 member_seeds: (1u8..=3)
                     .map(|b| MemberSeed {
                         node_id: [b; 32],
@@ -324,7 +338,9 @@ fn assert_invariants(state: &State, previous: Option<LogId>, at: u64) {
 fn run(steps: u64) -> (State, Vec<String>) {
     let mut state = genesis();
     let mut trace = Vec::new();
-    let mut previous = None;
+    // Index zero, because `genesis` has applied it. Starting from `None` would
+    // let a first command at index 0 through the monotonicity check.
+    let mut previous = state.last_applied;
 
     for n in 0..steps {
         let step = step(&state, n);
@@ -396,25 +412,16 @@ pub(crate) fn initial_log_id() -> LogId {
 
 /// `steps` generated commands, encoded for the log, with the model's answers.
 pub(crate) fn sample_history(steps: u64) -> SampleHistory {
-    let genesis = State {
-        // The state a voter is in the instant after `initialize`: index 0 is
-        // applied, and the committed membership carries the log id of the entry
-        // that committed it. Both fields, not one -- §11.3's validator refuses
-        // to open "a membership with nothing applied", so a genesis that set
-        // only `membership_log_id` was not a state any store can hold, and the
-        // routes reached agreement only because the native index-0 entry
-        // repaired the difference before command one.
-        last_applied: Some(initial_log_id()),
-        membership_log_id: Some(initial_log_id()),
-        ..genesis()
-    };
+    // The shared fixture already carries the index-zero facts, and carries them
+    // for every history rather than only this one. Overlaying them here left
+    // the coverage and change-set histories running from a state the durable
+    // validator would refuse to open.
+    let genesis = genesis();
 
     let group = genesis.authority.group_id;
     let mut state = genesis.clone();
     let mut entries = Vec::new();
     let mut replies = Vec::new();
-    // Index 0, because that is what `genesis` has applied. Starting from `None`
-    // would let a first command at index 0 through the monotonicity check.
     let mut previous = genesis.last_applied;
 
     for n in 0..steps {
@@ -528,8 +535,15 @@ pub(crate) struct SavedProbe {
     pub expected: CommandReplyV1,
 }
 
-/// Every persisted session with a saved answer, paired with the entry that
-/// saved it.
+/// One probe per **persisted saved reply** -- not per persisted session.
+///
+/// A session row with no `last_result` is skipped deliberately: it has no saved
+/// answer to ask for, so a resubmission would be classified afresh rather than
+/// replayed, and there is nothing here for it to be compared against. Those
+/// rows are covered by the state comparison instead, which sees the whole
+/// session table including result-less tombstones. [`saved_reply_count`] is the
+/// number this returns, so the caller can pin it rather than settle for
+/// "more than none".
 ///
 /// Located by **identity**, not by position: the session row carries the actor,
 /// client, sequence and request hash of the command whose reply it holds, and
@@ -571,7 +585,25 @@ pub(crate) fn saved_sessions(history: &SampleHistory) -> Vec<SavedProbe> {
             expected: replayed_answer(&history.replies[at]),
         });
     }
+    assert_eq!(
+        probes.len(),
+        saved_reply_count(history),
+        "a session with a saved answer produced no probe"
+    );
     probes
+}
+
+/// How many of the surviving sessions hold a saved answer.
+///
+/// Counted from the model's own session table, so a caller can pin
+/// [`saved_sessions`] to it rather than asserting the list is merely non-empty.
+pub(crate) fn saved_reply_count(history: &SampleHistory) -> usize {
+    history
+        .final_state
+        .sessions
+        .values()
+        .filter(|s| s.last_result.is_some())
+        .count()
 }
 
 /// What the answer to entry `at` becomes when it is asked for a second time.

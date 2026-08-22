@@ -4254,6 +4254,15 @@ mod tests {
         let direct = scratch_dir();
         let (direct_state, direct_replies, published) = {
             let mut storage = initialized(&direct, &history).await;
+            // What was seeded is what a route starts from, checked rather than
+            // assumed: a seed that quietly differed from the model's genesis
+            // would make every downstream comparison a comparison against the
+            // wrong initial condition.
+            assert_eq!(
+                durable_of(storage.state()).await,
+                expected_durable(history.genesis.clone()),
+                "the seeded store is not the state the model starts from"
+            );
             let replies = storage.state_mut().apply(entries()).await.expect("apply");
             let built = {
                 let mut builder = storage.state_mut().get_snapshot_builder().await;
@@ -4319,16 +4328,23 @@ mod tests {
         };
 
         // ── Against the model, not against each other ───────────────────────
+        //
+        // The **whole** durable state, not just `.model`. The other three fields
+        // are as much a part of what a route must reach: a shared error in the
+        // stored membership or in the recovery provenance would leave every
+        // model comparison green and every digest comparison green, because the
+        // digests were only ever compared with each other.
+        let expected = expected_durable(history.final_state.clone());
         assert_eq!(
-            direct_state.model, history.final_state,
+            direct_state, expected,
             "direct apply must reach the state the model computed"
         );
         assert_eq!(
-            replayed_state.model, history.final_state,
+            replayed_state, expected,
             "and so must committed-log recovery"
         );
         assert_eq!(
-            installed_state.model, history.final_state,
+            installed_state, expected,
             "and so must installing a snapshot of it"
         );
 
@@ -4349,12 +4365,23 @@ mod tests {
             );
         }
 
-        // And every persisted session answers a second delivery with what it
-        // saved. This runs last and in its own pass, because resubmitting
-        // writes: a route measured afterwards would be hashing a state the
-        // other two had not reached.
+        // And every persisted **saved reply** answers a second delivery with
+        // what it saved -- one probe per session row holding a `last_result`,
+        // pinned to the model's own count so a probe that silently went missing
+        // is a failure rather than a shorter loop. Session rows without a saved
+        // result have no answer to ask for; the state comparison above covers
+        // them, tombstones included.
+        //
+        // This runs last and in its own pass, because resubmitting writes: a
+        // route measured afterwards would be hashing a state the other two had
+        // not reached.
         let probes = history::saved_sessions(&history);
-        assert!(!probes.is_empty(), "the history persisted no session");
+        assert_eq!(
+            probes.len(),
+            history::saved_reply_count(&history),
+            "one probe per saved reply"
+        );
+        assert!(!probes.is_empty(), "the history persisted no saved reply");
         let saved = |dir: std::path::PathBuf| {
             let history = &history;
             let probes = &probes;
@@ -4416,6 +4443,41 @@ mod tests {
         }
     }
 
+    /// The complete durable state that goes with a generated model state.
+    ///
+    /// The three fields beside `.model` are stated once, here, and used both to
+    /// seed a store and to say what a route must reach -- so the seed and the
+    /// expectation cannot drift apart, and neither is derived from what a route
+    /// produced.
+    ///
+    /// The cost of stating them once, measured rather than assumed: injecting
+    /// recovery provenance *here* survives, because all three routes inherit
+    /// the seed and the expectation moves with it. Injecting it into the seed
+    /// alone is caught immediately by the caller's genesis assertion, and
+    /// caught again by the route comparisons if that assertion is removed. So
+    /// these fields are genuinely compared; what cannot be caught is this
+    /// function being wrong about them, which is the same class of limit as a
+    /// defect inside `apply_command`.
+    ///
+    /// The stored membership is the one index zero committed and nothing in the
+    /// history changes it: a `ChangeMembership` *action* writes an intent for a
+    /// controller to act on, and the `EntryPayload::Membership` entry that would
+    /// move this field never arrives in a generated history. The recovery
+    /// provenance is absent because no route here is a recovery: install
+    /// replaces a store from a peer's snapshot, which §11.4 does not treat as
+    /// the operator-driven recovery those two fields record.
+    fn expected_durable(model: crate::coordination::model::state::State) -> DurableState {
+        DurableState {
+            model,
+            membership: StoredMembership::new(
+                Some(RaftLogId::default()),
+                uniform_membership(&crate::coordination::model::history::INITIAL_VOTERS),
+            ),
+            recovery_export_hash: None,
+            recovered_from: None,
+        }
+    }
+
     /// A voter store in the state `initialize` leaves behind, holding the
     /// history's genesis.
     ///
@@ -4437,15 +4499,7 @@ mod tests {
         drop(voter(dir));
         {
             let database = opened(dir);
-            let state = DurableState {
-                model: history.genesis.clone(),
-                membership: StoredMembership::new(
-                    Some(RaftLogId::default()),
-                    uniform_membership(&crate::coordination::model::history::INITIAL_VOTERS),
-                ),
-                recovery_export_hash: None,
-                recovered_from: None,
-            };
+            let state = expected_durable(history.genesis.clone());
             rows::commit(&database, state.clone(), &every_key_in(&state))
                 .expect("seed the generated genesis");
         }
