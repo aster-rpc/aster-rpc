@@ -243,17 +243,24 @@ pub(crate) enum StorageError {
         detail: &'static str,
     },
 
-    /// A body crossed §11.4's aggregate ceiling.
+    /// An **install source** crossed §11.4's aggregate ceiling.
     ///
-    /// Typed, rather than the generic I/O failure it used to be, because the
-    /// same limit means opposite things on the two paths that share it. A body
-    /// this store is *building* that will not fit is this store's state having
-    /// outgrown what it can serialize -- a durability question. A body arriving
-    /// from a peer that will not fit is a message to refuse, and blurring the
-    /// two into `io::Error` meant an oversized source latched the actor fatal
-    /// after §12.3 had gone to the trouble of bounding it before allocation.
+    /// Typed, rather than the generic I/O failure it used to be, because that
+    /// was indistinguishable from a failed write -- so an oversized source
+    /// latched the actor fatal after §12.3 had gone to the trouble of bounding
+    /// it before allocation. Install reclassifies this as a refusal: a body a
+    /// peer sent that will not fit is a message, not a durability question.
     ///
-    /// Install reclassifies it; the build path leaves it alone.
+    /// **Only receiving raises it.** The same ceiling applies while *building*
+    /// a body, where it would mean this store's own state has outgrown what it
+    /// can serialize -- a durability failure, and correctly fatal today. But
+    /// that path reports it as a plain write failure: the bounded writer is
+    /// inside `rows::stream_body`, whose framing errors collapse into
+    /// `StorageError::Io` before anything can inspect them. The outcome is
+    /// right and the diagnosis is poor, and this variant does not yet cover
+    /// it. Saying so is the point of naming the receiving side explicitly --
+    /// the earlier wording claimed the build path "leaves it alone", which
+    /// reads as a decision rather than the gap it is.
     #[error("coordination snapshot body exceeds the {limit}-byte maximum ({found} bytes)")]
     SnapshotTooLarge { limit: u64, found: u64 },
 

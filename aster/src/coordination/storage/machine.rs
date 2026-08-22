@@ -546,8 +546,9 @@ fn rejected(err: StorageError) -> StorageError {
         StorageError::StoredCorruption { db, what, detail } => StorageError::SnapshotRejected {
             detail: format!("{db} {what}: {detail}"),
         },
-        // Same reasoning as the codec's verdict: a body this store could not
-        // build would be its own problem, and one a peer sent is a message.
+        // Same reasoning as the codec's verdict: the bytes are the sender's.
+        // Only `receive` raises this -- the build path's ceiling arrives as a
+        // plain write failure, which is fatal and correct but not this variant.
         too_large @ StorageError::SnapshotTooLarge { .. } => StorageError::SnapshotRejected {
             detail: too_large.to_string(),
         },
@@ -3713,6 +3714,58 @@ mod tests {
         assert!(
             !sealed.handle().is_fatal(),
             "so an unwritable staging directory is never reached"
+        );
+    }
+
+    /// An install sizes and reads the same bytes, even when the name moves.
+    ///
+    /// The regression for a check that was added one function above the
+    /// documentation forbidding it: the ceiling precheck asked the *path* how
+    /// long the source was, while the copy read the *descriptor*. For a
+    /// `Published` handle those are routinely different files -- its name may
+    /// have been retired, or may name a successor, while the handle pins the
+    /// original bytes -- so the bound applied to one file and the copy took
+    /// another.
+    ///
+    /// Driven by replacing the name beneath a pinned handle with a sparse file
+    /// past the ceiling. Sizing by name refuses it; sizing by descriptor
+    /// installs the bytes the handle actually holds.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_install_sizes_the_descriptor_it_reads_not_the_name() {
+        let source_dir = scratch_dir();
+        let (source, published) = a_published_source(&source_dir).await;
+        let sender = durable_of(&source.0).await;
+        let name = body_path(&source_dir, &published.meta.snapshot_id);
+
+        // The handle is open; the *name* now points at a different, enormous
+        // file. Renamed rather than created in place: `File::create` truncates
+        // the inode the handle holds, which would change the pinned bytes
+        // themselves and test nothing about names at all.
+        let usurper = source_dir.join("usurper");
+        let handle = std::fs::File::create(&usurper).expect("create");
+        handle
+            .set_len(crate::coordination::rowstream::MAX_SNAPSHOT_BODY_BYTES + 1)
+            .expect("sparse");
+        drop(handle);
+        std::fs::rename(&usurper, &name).expect("take the name");
+        assert!(
+            std::fs::metadata(&name).expect("stat").len()
+                > crate::coordination::rowstream::MAX_SNAPSHOT_BODY_BYTES,
+            "the name is now oversized"
+        );
+
+        let dir = scratch_dir();
+        let (mut machine, _shutdown, _drain) = machine(&dir);
+        machine
+            .install_snapshot(&published.meta, published.snapshot)
+            .await
+            .expect("the pinned bytes are what is sized and what is read");
+
+        assert_eq!(
+            durable_of(&machine).await,
+            sender,
+            "and they are the sender's state, not whatever took the name"
         );
     }
 

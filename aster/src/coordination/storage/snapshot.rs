@@ -1250,32 +1250,38 @@ pub(crate) fn receive(
     state: &super::rows::DurableState,
     supplied: &SnapshotMetaV1,
 ) -> StorageResult<StagedSnapshot> {
-    // Before a byte is copied. §12.3 wants the size refused before allocation,
-    // and a sparse file half a gigabyte long costs nothing to reject by its
-    // length -- while the streaming bound below still covers a source that
-    // grows, or lies, after this.
-    if let Some(declared) = source.declared_len()? {
-        if declared > MAX_SNAPSHOT_BODY_BYTES {
-            return Err(StorageError::SnapshotTooLarge {
-                limit: MAX_SNAPSHOT_BODY_BYTES,
-                found: declared,
-            });
-        }
-    }
-
     let dir = layout.incoming();
     std::fs::create_dir_all(&dir).map_err(io("creating the incoming directory", &dir))?;
-    let scratch = Scratch::new(layout, ScratchKind::Installing);
 
+    // Open once, size, and only then allocate. §12.3 asks for the size to be
+    // refused *before* allocation, so this precedes the staging file rather
+    // than sitting inside the block that writes it -- an oversized source must
+    // not first cost a file. And the length comes from the descriptor the copy
+    // will read, never from a path: for a `Published` source those are
+    // routinely different files, since its name may have been retired or may
+    // name a successor while the handle pins the original bytes.
+    let mut reader = source.reader()?;
+    let declared = reader
+        .declared_len()
+        .map_err(io("sizing an install source", &dir))?;
+    if declared > MAX_SNAPSHOT_BODY_BYTES {
+        return Err(StorageError::SnapshotTooLarge {
+            limit: MAX_SNAPSHOT_BODY_BYTES,
+            found: declared,
+        });
+    }
+
+    let scratch = Scratch::new(layout, ScratchKind::Installing);
     let copied = {
         let handle =
             File::create(scratch.path()).map_err(io("staging a snapshot body", scratch.path()))?;
         // Through `Digesting`, not a `take`: its own documentation is that every
         // byte of every body crosses it, so it is the one place the aggregate
         // ceiling cannot be applied to one path and forgotten on another. This
-        // is that other path.
+        // is that other path, and it still covers a source that grows after the
+        // length above was read.
         let mut writer = Digesting::new(BufWriter::new(handle));
-        let copied = std::io::copy(&mut source.reader()?, &mut writer);
+        let copied = std::io::copy(&mut reader, &mut writer);
         // Read the ceiling off the wrapper before the error is classified: an
         // oversized source is a message to refuse, and the `io::Error` it
         // arrives as cannot say so.
@@ -2455,6 +2461,24 @@ impl FileRef<'_> {
     }
 }
 
+impl SnapshotReader<'_> {
+    /// How long the descriptor this reader holds says it is.
+    ///
+    /// From the open file, never from a path. Sizing by name and reading by
+    /// descriptor are two different files the moment either can move -- which
+    /// for a `Published` source is the ordinary case, not the exotic one: its
+    /// name may already have been retired, or may name a successor, while the
+    /// bytes this reader is about to copy are pinned by the handle. Asking the
+    /// name would then bound one file and read another, which is exactly the
+    /// substitution the role-safe reader exists to make unspellable.
+    ///
+    /// A claim rather than a measurement even so: a source can grow after this,
+    /// so the streaming bound stays behind it.
+    fn declared_len(&self) -> std::io::Result<u64> {
+        self.file.get().metadata().map(|stat| stat.len())
+    }
+}
+
 impl Read for SnapshotReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         #[cfg(unix)]
@@ -2507,25 +2531,6 @@ impl CoordinationSnapshotFile {
                 })
             }
             CoordinationSnapshotFile::Published(published) => Ok(published.reader()),
-        }
-    }
-
-    /// How long the source claims to be, if it can say.
-    ///
-    /// A claim, not a measurement: it is read from the descriptor before any
-    /// byte is copied, so a source that grows afterwards is still the streaming
-    /// bound's problem. Cheap enough to run always, and it is what makes a
-    /// sparse oversized file free to refuse.
-    pub(crate) fn declared_len(&self) -> StorageResult<Option<u64>> {
-        let path = match self {
-            CoordinationSnapshotFile::Incoming(incoming) => incoming.path(),
-            CoordinationSnapshotFile::Published(published) => published.path.as_path(),
-        };
-        match std::fs::metadata(path) {
-            Ok(stat) => Ok(Some(stat.len())),
-            // Absent is not a size question; the read that follows reports it.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(StorageError::io("sizing an install source", path, err)),
         }
     }
 
