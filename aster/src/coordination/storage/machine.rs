@@ -3911,6 +3911,129 @@ mod tests {
         let _ = before;
     }
 
+    /// The same entries reach the same state by all three routes.
+    ///
+    /// §16's equivalence requirement, and the one that ties the rest together:
+    /// a voter can arrive at a state by applying entries as they arrive, by
+    /// replaying them after a restart, or by installing a snapshot somebody
+    /// else built of it. If those three could differ, every other guarantee
+    /// here is about one route only -- and the equal-index repair path in
+    /// particular compares a snapshot against a state that may have been
+    /// reached either way.
+    ///
+    /// Compared by canonical digest as well as by state, because the digest is
+    /// what the protocol actually compares: two states that are equal by the
+    /// model and hash differently would pass every assertion this suite makes
+    /// and fail against a peer.
+    #[tokio::test]
+    async fn direct_apply_log_replay_and_install_agree() {
+        // The entries, applied identically by every route.
+        let entries = || {
+            vec![
+                normal(2, acquire(1)),
+                blank(3),
+                blank(4),
+                normal(5, acquire(2)),
+            ]
+        };
+        let digest_of = |dir: &std::path::Path| {
+            let database = Database::create(dir.join("state.redb")).expect("reopen");
+            super::super::snapshot::canonical_digest(&database).expect("hash the state")
+        };
+
+        // 1. Applied in one batch, as a caught-up voter would.
+        let direct = scratch_dir();
+        let (direct_state, published) = {
+            let (mut machine, shutdown, drain) = CoordinationStateMachine::new(
+                seeded_with(&direct, seven_section_state()),
+                StorageLayout::new(&direct),
+            )
+            .expect("open");
+            machine.apply(entries()).await.expect("apply");
+            let state = durable_of(&machine).await;
+            let built = {
+                let mut builder = machine.get_snapshot_builder().await;
+                builder.build_snapshot().await.expect("build")
+            };
+            drop(machine);
+            drop(drain);
+            drop(shutdown);
+            (state, built)
+        };
+
+        // 2. Applied one at a time across two restarts, as replay does.
+        let replayed = scratch_dir();
+        {
+            let mut remaining = entries();
+            let mut store = Some(
+                CoordinationStateMachine::new(
+                    seeded_with(&replayed, seven_section_state()),
+                    StorageLayout::new(&replayed),
+                )
+                .expect("open"),
+            );
+            while !remaining.is_empty() {
+                let (mut machine, shutdown, drain) = store.take().expect("a store");
+                machine
+                    .apply([remaining.remove(0)])
+                    .await
+                    .expect("apply one");
+                drop(machine);
+                drop(drain);
+                drop(shutdown);
+                store = Some(reopen(&replayed));
+            }
+            let (machine, shutdown, drain) = store.take().expect("a store");
+            drop(machine);
+            drop(drain);
+            drop(shutdown);
+        }
+
+        // 3. Installed from the snapshot the first route built.
+        let installed = scratch_dir();
+        {
+            let (mut machine, shutdown, drain) = machine(&installed);
+            machine
+                .install_snapshot(&published.meta, published.snapshot)
+                .await
+                .expect("install");
+            drop(machine);
+            drop(drain);
+            drop(shutdown);
+        }
+
+        let replayed_state = {
+            let (machine, _s, _d) = reopen(&replayed);
+            durable_of(&machine).await
+        };
+        let installed_state = {
+            let (machine, _s, _d) = reopen(&installed);
+            durable_of(&machine).await
+        };
+
+        assert_eq!(
+            replayed_state, direct_state,
+            "replaying one entry at a time across restarts must reach the same state as \
+             applying them together"
+        );
+        assert_eq!(
+            installed_state, direct_state,
+            "and so must installing a snapshot of it"
+        );
+
+        let direct_digest = digest_of(&direct);
+        assert_eq!(
+            digest_of(&replayed),
+            direct_digest,
+            "the replayed state must also *hash* the same: a peer compares digests, not models"
+        );
+        assert_eq!(
+            digest_of(&installed),
+            direct_digest,
+            "and so must the installed one"
+        );
+    }
+
     /// Two stores at the same state produce the same bytes.
     ///
     /// §11.4's determinism invariant, which every equal-index comparison rests
