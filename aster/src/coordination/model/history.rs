@@ -29,6 +29,13 @@
 
 #![cfg(test)]
 
+use crate::coordination::contract::{
+    AcquireActionV1, ActionV1, CancelMembershipActionV1, ChangeMembershipActionV1, ClientCommandV1,
+    CommandV1, CompareAndSetActionV1, ExpireCommandV1, FenceV1, LogIdV1, MemberSeedV1,
+    MembershipProgressCommandV1, NodeIdV1, ReleaseActionV1, ReleaseWithValueActionV1,
+    RenewActionV1, ResourceKeyV1, RetireClientCommandV1, RevokeActionV1, SetAdminActionV1,
+    SetGrantActionV1,
+};
 use crate::coordination::reason::{Disposition, Outcome, Reason};
 
 use super::admin::AdminAction;
@@ -76,6 +83,14 @@ fn genesis() -> State {
     s.deployment_profile_code = crate::coordination::model::shape::PROFILE_PROD;
     s.membership = CommittedMembership::uniform((1u8..=3).map(|b| [b; 32]));
     for n in 0..3u8 {
+        // The resource row goes in with the grant. §8.1 moves the two together,
+        // so a grant without one is a state apply cannot produce -- and §11.3's
+        // validator refuses to open a store holding it. The pure model never
+        // opens a store, so this fixture described an impossible group for as
+        // long as nothing tried: driving the generated history through storage
+        // is what found it.
+        s.resources
+            .insert(key(n), super::state::ResourceRow::default());
         for actor in [ALICE, BOB] {
             s.acl.insert((key(n), actor), ALL_RIGHTS);
         }
@@ -334,6 +349,325 @@ fn run(steps: u64) -> (State, Vec<String>) {
 /// property the validator exists to check.
 pub(crate) fn sample_applied_state(steps: u64) -> State {
     run(steps).0
+}
+
+// ── A history the storage layer can drive ───────────────────────────────────
+
+/// A generated history in the form a voter's log carries it, together with what
+/// the **pure model** says it produces.
+///
+/// This exists so the storage layer's equivalence test has an oracle that did
+/// not come out of the storage layer. Direct apply, committed-log recovery and
+/// snapshot install all end in a state the state machine computed -- install
+/// merely copies one -- so a defect shared by the wire boundary and apply makes
+/// all three agree with each other and with nothing else. Here the commands
+/// were encoded by [`command_to_wire`], and the replies and the final state
+/// came from [`apply_command`] alone: neither has been through
+/// `boundary::command_from_wire`, which is the code the comparison is checking.
+pub(crate) struct SampleHistory {
+    /// The state every route starts from -- a running group, not a default.
+    pub genesis: State,
+    /// The committed entries in order, each with the log id it applied at.
+    pub entries: Vec<(LogId, CommandV1)>,
+    /// What the model replied to each entry, in the same order.
+    pub replies: Vec<CommandReply>,
+    /// The state the model ends in.
+    pub final_state: State,
+}
+
+/// The three voters `genesis` commits, and so the membership `initialize`
+/// would have written at index 0.
+pub(crate) const INITIAL_VOTERS: [NodeId; 3] = [[1u8; 32], [2u8; 32], [3u8; 32]];
+
+/// The model form of OpenRaft's `LogId::default()` -- term 0, node id zero,
+/// index 0 -- which is the log id `initialize` stamps on that entry
+/// (`raft_core.rs`: `Entry::new_membership(LogId::default(), ..)`).
+pub(crate) fn initial_log_id() -> LogId {
+    LogId::new(0, [0u8; 32], 0)
+}
+
+/// `steps` generated commands, encoded for the log, with the model's answers.
+pub(crate) fn sample_history(steps: u64) -> SampleHistory {
+    let genesis = State {
+        // The group was initialized, so its committed membership carries the
+        // log id of the entry that committed it. The pure generator leaves this
+        // `None` because it has no log at all; a store that replays the real
+        // index-0 entry would then differ from this oracle in that one field,
+        // and tuning the oracle afterwards to match is exactly the move a
+        // hand-written fixture makes. Stating it as an initial condition is
+        // the honest form: a committed membership with no log id is not a state
+        // any voter is ever in.
+        membership_log_id: Some(initial_log_id()),
+        ..genesis()
+    };
+
+    let group = genesis.authority.group_id;
+    let mut state = genesis.clone();
+    let mut entries = Vec::new();
+    let mut replies = Vec::new();
+    let mut previous = None;
+
+    for n in 0..steps {
+        let log_id = LogId::new(1, LEADER, n + 1);
+        let (model, wire) = canonical(step(&state, n).command, &group);
+        let reply = apply_command(&mut state, log_id, &model).expect("no fault");
+        assert_invariants(&state, previous, n);
+        previous = state.last_applied;
+        entries.push((log_id, wire));
+        replies.push(reply);
+    }
+
+    SampleHistory {
+        genesis,
+        entries,
+        replies,
+        final_state: state,
+    }
+}
+
+/// Encode a generated command for the log, returning the model command that
+/// exactly matches what was encoded.
+///
+/// The request hash is recomputed here rather than carried over from the
+/// generator, which invents one. §5.2.1 binds the hash to the encoded action
+/// and the boundary refuses a client command whose hash is not its own action's
+/// digest, so a history that kept the generator's bytes would reach the state
+/// machine as a committed shape rejection -- every client command in it,
+/// uniformly, while every assertion about "the history" still passed.
+fn canonical(command: Command, group: &NodeId) -> (Command, CommandV1) {
+    match command {
+        Command::Client { client, action } => {
+            let encoded = action_to_wire(&action, group);
+            let request_hash = crate::coordination::hash::request_hash(&encoded)
+                .expect("a generated action is hashable");
+            let wire = CommandV1::Client(ClientCommandV1 {
+                actor_node_id: client.actor.to_vec(),
+                client_id: client.client_id.to_vec(),
+                sequence: client.sequence,
+                request_hash: request_hash.to_vec(),
+                action: encoded,
+            });
+            let client = ClientRef {
+                request_hash,
+                ..client
+            };
+            (Command::Client { client, action }, wire)
+        }
+        Command::Expire(ref c) => {
+            let wire = CommandV1::Expire(ExpireCommandV1 {
+                resource: ResourceKeyV1 {
+                    namespace: c.resource.namespace().to_string(),
+                    key: c.resource.key().to_vec(),
+                },
+                epoch: c.epoch,
+                lease_revision: c.lease_revision,
+            });
+            (command, wire)
+        }
+        Command::MembershipProgress(ref c) => {
+            let wire = CommandV1::MembershipProgress(MembershipProgressCommandV1 {
+                operation_id: c.operation_id.to_vec(),
+                expected_phase: c.expected_phase,
+                new_phase: c.new_phase,
+                observed_membership_log_id: c
+                    .observed_membership_log_id
+                    .as_ref()
+                    .map(log_id_to_wire),
+                result_code: c.result_code,
+            });
+            (command, wire)
+        }
+        Command::RetireClient(ref c) => {
+            let wire = CommandV1::RetireClient(RetireClientCommandV1 {
+                actor_node_id: c.actor.to_vec(),
+                target_node_id: c.target_actor.to_vec(),
+                target_client_id: c.target_client_id.to_vec(),
+            });
+            (command, wire)
+        }
+        _ => unreachable!("the generated alphabet produces only client and system commands"),
+    }
+}
+
+fn key_to_wire(key: &RawResourceKey) -> ResourceKeyV1 {
+    ResourceKeyV1 {
+        namespace: key.namespace.clone(),
+        key: key.key.clone(),
+    }
+}
+
+fn fence_to_wire(fence: &Fence, group: &NodeId) -> FenceV1 {
+    FenceV1 {
+        group_id: group.to_vec(),
+        resource: key_to_wire(&fence.resource),
+        epoch: fence.epoch,
+        holder: fence.holder.to_vec(),
+    }
+}
+
+fn log_id_to_wire(id: &LogId) -> LogIdV1 {
+    LogIdV1 {
+        term: id.term,
+        leader_node_id: id.leader_node_id.to_vec(),
+        index: id.index,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn action_to_wire(action: &Action, group: &NodeId) -> ActionV1 {
+    match action {
+        Action::Resource(ResourceAction::Acquire { resource, ttl_ms }) => {
+            ActionV1::Acquire(AcquireActionV1 {
+                resource: key_to_wire(resource),
+                ttl_ms: *ttl_ms,
+            })
+        }
+        Action::Resource(ResourceAction::Renew { fence }) => ActionV1::Renew(RenewActionV1 {
+            fence: fence_to_wire(fence, group),
+        }),
+        Action::Resource(ResourceAction::CompareAndSet {
+            fence,
+            expected_value_revision,
+            new_value,
+        }) => ActionV1::CompareAndSet(CompareAndSetActionV1 {
+            fence: fence_to_wire(fence, group),
+            expected_value_revision: *expected_value_revision,
+            new_value: new_value.clone(),
+        }),
+        Action::Resource(ResourceAction::Release { fence }) => ActionV1::Release(ReleaseActionV1 {
+            fence: fence_to_wire(fence, group),
+        }),
+        Action::Resource(ResourceAction::ReleaseWithValue {
+            fence,
+            expected_value_revision,
+            final_value,
+        }) => ActionV1::ReleaseWithValue(ReleaseWithValueActionV1 {
+            fence: fence_to_wire(fence, group),
+            expected_value_revision: *expected_value_revision,
+            final_value: final_value.clone(),
+        }),
+        Action::Resource(ResourceAction::Revoke {
+            resource,
+            expected_epoch,
+        }) => ActionV1::Revoke(RevokeActionV1 {
+            resource: key_to_wire(resource),
+            expected_epoch: *expected_epoch,
+        }),
+        Action::Grant(a) => ActionV1::SetGrant(SetGrantActionV1 {
+            resource: key_to_wire(&a.resource),
+            target_node_id: a.subject.to_vec(),
+            rights: a.rights,
+            expected_acl_revision: a.expected_acl_revision,
+        }),
+        Action::Admin(a) => ActionV1::SetAdmin(SetAdminActionV1 {
+            target_node_id: a.target.to_vec(),
+            enabled: a.enabled,
+            expected_admin_revision: a.expected_admin_revision,
+        }),
+        Action::ChangeMembership(a) => ActionV1::ChangeMembership(ChangeMembershipActionV1 {
+            operation_id: a.operation_id.to_vec(),
+            expected_membership_log_id: a.expected_membership_log_id.as_ref().map(log_id_to_wire),
+            desired_voters: a
+                .plan
+                .desired_voters
+                .iter()
+                .map(|n| NodeIdV1 {
+                    node_id: n.to_vec(),
+                })
+                .collect(),
+            retained_learners: a
+                .plan
+                .retained_learners
+                .iter()
+                .map(|n| NodeIdV1 {
+                    node_id: n.to_vec(),
+                })
+                .collect(),
+            member_seeds: a
+                .plan
+                .member_seeds
+                .iter()
+                .map(|s| MemberSeedV1 {
+                    node_id: s.node_id.to_vec(),
+                    ticket: String::from_utf8(s.ticket.clone()).expect("a printable ticket"),
+                    signed_join_permit: s.join_permit.clone(),
+                })
+                .collect(),
+        }),
+        Action::CancelMembership(a) => ActionV1::CancelMembership(CancelMembershipActionV1 {
+            operation_id: a.operation_id.to_vec(),
+            expected_phase_code: a.expected_phase_code,
+        }),
+    }
+}
+
+/// Every action the generator can produce survives the round trip this module
+/// encodes it for.
+///
+/// The encoder above is one half of a pair whose other half is production, and
+/// a pair written separately is a pair that can disagree separately. If
+/// `action_to_wire` dropped a field, the storage equivalence test would fail
+/// with the model and the store disagreeing about the *state*, and the encoder
+/// is the last place anyone would look. Here it fails where the fault is.
+#[test]
+fn every_generated_action_survives_the_encoding_this_module_does() {
+    use super::boundary::{action_from_wire, command_from_wire};
+
+    let mut state = State {
+        membership_log_id: Some(initial_log_id()),
+        ..genesis()
+    };
+    let group = state.authority.group_id;
+    let mut seen = std::collections::BTreeSet::new();
+
+    for n in 0..400 {
+        let original = step(&state, n).command;
+        let (model, wire) = canonical(original, &group);
+        // Whatever a voter narrows this entry back to must be the command the
+        // oracle applied -- including the request hash, which the boundary
+        // verifies against the encoded action rather than trusting.
+        assert_eq!(
+            command_from_wire(&wire).expect("a generated command narrows"),
+            model,
+            "the encoding of step {n} did not narrow back to itself"
+        );
+        if let (Command::Client { action, .. }, CommandV1::Client(c)) = (&model, &wire) {
+            assert_eq!(
+                &action_from_wire(&c.action).expect("a generated action narrows"),
+                action
+            );
+            seen.insert(variant_name(&c.action));
+        }
+        let log_id = LogId::new(1, LEADER, n + 1);
+        apply_command(&mut state, log_id, &model).expect("no fault");
+    }
+
+    // Ten of the eleven `ActionV1` variants; `Unknown` is the one the generator
+    // must never produce, because §5.3.1 makes it fatal. The count is checked
+    // against a match that is exhaustive over `ActionV1`, so a new variant
+    // stops compiling here rather than quietly going untested.
+    assert!(
+        !seen.contains("Unknown"),
+        "the generated alphabet must never propose an unknown action"
+    );
+    assert_eq!(seen.len(), 10, "the alphabet did not reach every action");
+}
+
+/// The name of a wire action, over a match that is exhaustive by construction.
+fn variant_name(action: &ActionV1) -> &'static str {
+    match action {
+        ActionV1::Acquire(_) => "Acquire",
+        ActionV1::Renew(_) => "Renew",
+        ActionV1::CompareAndSet(_) => "CompareAndSet",
+        ActionV1::Release(_) => "Release",
+        ActionV1::ReleaseWithValue(_) => "ReleaseWithValue",
+        ActionV1::Revoke(_) => "Revoke",
+        ActionV1::SetGrant(_) => "SetGrant",
+        ActionV1::SetAdmin(_) => "SetAdmin",
+        ActionV1::ChangeMembership(_) => "ChangeMembership",
+        ActionV1::CancelMembership(_) => "CancelMembership",
+        ActionV1::Unknown(_) => "Unknown",
+    }
 }
 
 fn render(reply: &CommandReply) -> String {
@@ -900,7 +1234,12 @@ fn retirement_ordering_is_determined_in_both_directions() {
     // The business state differs between orderings, which is what makes the
     // client's replay the only way to tell them apart.
     assert!(a.resources.get(&key(0)).is_some_and(|r| r.held));
-    assert!(!b.resources.contains_key(&key(0)));
+    // The row itself exists in both: §8.1 puts it there with the grant. What
+    // differs is whether the acquire took it.
+    assert!(
+        b.resources.get(&key(0)).is_some_and(|r| !r.held),
+        "the refused acquire must have left the lease untaken"
+    );
 }
 
 /// A renew and an expiry for the same lease resolve by log order, and the loser

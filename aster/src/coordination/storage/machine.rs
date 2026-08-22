@@ -1150,6 +1150,27 @@ mod tests {
         }
     }
 
+    /// Every key a state holds, in every section.
+    ///
+    /// A change set that named only three of the seven wrote three of the seven
+    /// and left the counters describing a state the rows do not add up to --
+    /// which `validate` then reports, confusingly, as corruption.
+    fn every_key_in(state: &DurableState) -> ChangeSet {
+        let mut changes = ChangeSet::default();
+        changes.admins.extend(state.model.admins.iter().copied());
+        changes.grants.extend(state.model.acl.keys().cloned());
+        changes
+            .resources
+            .extend(state.model.resources.keys().cloned());
+        changes
+            .sessions
+            .extend(state.model.sessions.keys().cloned());
+        changes.intents.extend(state.model.intents.keys().copied());
+        changes.routes.extend(state.model.routes.keys().copied());
+        changes.audit.extend(state.model.audit.keys().copied());
+        changes
+    }
+
     /// A bound `state.redb` holding `genesis_state`, ready for an actor.
     fn seeded(dir: &std::path::Path) -> Database {
         seeded_with(dir, genesis_state())
@@ -1168,23 +1189,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("snapshots")).expect("snapshots dir");
         std::fs::create_dir_all(dir.join("incoming")).expect("incoming dir");
 
-        // Every key the state holds, in every section. A change set that named
-        // only three of the seven wrote three of the seven and left the
-        // counters describing a state the rows do not add up to -- which
-        // `validate` then reports, confusingly, as corruption.
-        let mut changes = ChangeSet::default();
-        changes.admins.extend(state.model.admins.iter().copied());
-        changes.grants.extend(state.model.acl.keys().cloned());
-        changes
-            .resources
-            .extend(state.model.resources.keys().cloned());
-        changes
-            .sessions
-            .extend(state.model.sessions.keys().cloned());
-        changes.intents.extend(state.model.intents.keys().copied());
-        changes.routes.extend(state.model.routes.keys().copied());
-        changes.audit.extend(state.model.audit.keys().copied());
-        rows::commit(&database, state.clone(), &changes).expect("seed");
+        rows::commit(&database, state.clone(), &every_key_in(&state)).expect("seed");
         // Written with the codec version the loader checks, exactly as
         // `schema::open` would.
         let write = super::super::schema::durable_write(&database, Db::State).expect("write");
@@ -1258,17 +1263,34 @@ mod tests {
         }
     }
 
-    fn membership_entry(index: u64, voters: &[[u8; 32]]) -> Entry {
+    fn uniform_membership(voters: &[[u8; 32]]) -> Membership<CoordinationNodeId, CoordinationNode> {
         let ids: std::collections::BTreeSet<CoordinationNodeId> = voters
             .iter()
             .map(|v| CoordinationNodeId::from_array(*v))
             .collect();
         let nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
             ids.iter().map(|id| (*id, CoordinationNode)).collect();
+        Membership::new(vec![ids], nodes)
+    }
+
+    fn membership_entry(index: u64, voters: &[[u8; 32]]) -> Entry {
         Entry {
             log_id: log_id(index),
-            payload: EntryPayload::Membership(Membership::new(vec![ids], nodes)),
+            payload: EntryPayload::Membership(uniform_membership(voters)),
         }
+    }
+
+    /// The entry `initialize` writes -- **exactly**, including its log id.
+    ///
+    /// `Raft::initialize` appends `Entry::new_membership(LogId::default(), ..)`
+    /// (`raft_core.rs:649`), so index 0 carries term 0 and the default node id,
+    /// not the term and leader a test happens to be using elsewhere. A route
+    /// that means to be evidence about production recovery has to start from
+    /// the log production writes, and this is the only entry in it a voter does
+    /// not choose.
+    fn initialize_entry(voters: &[[u8; 32]]) -> Entry {
+        use openraft::entry::RaftEntry as _;
+        Entry::new_membership(RaftLogId::default(), uniform_membership(voters))
     }
 
     fn normal(index: u64, command: CommandV1) -> Entry {
@@ -4022,14 +4044,17 @@ mod tests {
         let voters: Vec<[u8; 32]> = (1u8..=3).map(|b| [b; 32]).collect();
         let entries = || {
             vec![
-                membership_entry(0, &voters),
+                initialize_entry(&voters),
                 normal(1, acquire(1)),
                 blank(2),
                 normal(3, acquire(2)),
             ]
         };
         // Submitted again after each route, to draw the saved reply back out.
-        let replay_of = normal(4, acquire(1));
+        // It has to be the **latest** sequence: a session keeps one saved reply,
+        // so resubmitting an earlier sequence is classified `SequenceTooOld`
+        // and never reaches it.
+        let replay_of = normal(4, acquire(2));
 
         // ── Direct: apply, then snapshot for the third route ────────────────
         let direct = scratch_dir();
@@ -4153,13 +4178,413 @@ mod tests {
             }
         };
         let from_direct = saved(&direct).await;
+        // Against the **original**, not merely against the other two routes.
+        // `acquire(2)` is the command applied at index 3, so what comes back is
+        // its saved reply, and it has to say what apply said -- three routes
+        // agreeing on a uniformly wrong projection would satisfy every
+        // comparison below and none above.
+        assert_eq!(
+            saved_answer(&from_direct[0]),
+            saved_answer(&direct_replies[3]),
+            "the saved reply must say what the original apply returned"
+        );
         assert_eq!(
             saved(&replayed).await,
             from_direct,
             "replay must keep the saved replies, not merely the resulting rows"
         );
         assert_eq!(saved(&installed).await, from_direct, "and so must install");
-        let _ = direct_replies;
+    }
+
+    /// A generated history reaches the **pure model's** state by every route.
+    ///
+    /// `every_route_to_a_state_agrees` proves the three routes agree with each
+    /// other, which is a weaker claim than it reads as: all three end in a state
+    /// the state machine computed -- install merely copies one -- so a defect
+    /// shared by the wire boundary and apply would make them agree and be
+    /// invisible. This test supplies the missing oracle. §16's equivalence is
+    /// against the model, and the model is `model::history`, which generated
+    /// these commands, encoded them without going through `command_from_wire`,
+    /// and computed the expected replies and final state with `apply_command`
+    /// alone.
+    ///
+    /// Four hand-written entries are also not a history. The generator's
+    /// alphabet reaches all ten action variants, both membership actions, both
+    /// system commands and `retire_client`, against three resources and three
+    /// actors, over a state that already has grants -- so the commands that
+    /// *succeed* are exercised, not only the ones a freshly bound voter refuses.
+    ///
+    /// What this cannot catch, said plainly: a defect inside `apply_command`
+    /// itself. §16 defines equivalence *against the model*, so the model and
+    /// every route share that code by construction, and no arrangement of
+    /// routes here would separate them. What it does catch is everything
+    /// between the log and the model -- the wire narrowing, the row codecs,
+    /// the transaction boundaries, recovery and install. Dropping
+    /// `AcquireActionV1::ttl_ms` in `action_from_wire` fails this test at the
+    /// state comparison and leaves `every_route_to_a_state_agrees` green.
+    #[tokio::test]
+    async fn a_generated_history_reaches_the_model_s_state_by_every_route() {
+        use crate::coordination::model::apply::CommandReply;
+        use crate::coordination::model::history;
+        use openraft::storage::RaftLogStorage as _;
+        use openraft::storage::RaftLogStorageExt as _;
+        use openraft::StorageHelper;
+
+        let history = history::sample_history(400);
+        let voters = history::INITIAL_VOTERS;
+        let entries = || {
+            let mut entries = vec![initialize_entry(&voters)];
+            entries.extend(history.entries.iter().map(|(log_id, command)| Entry {
+                log_id: raft_log_id(log_id),
+                payload: EntryPayload::Normal(command.clone()),
+            }));
+            entries
+        };
+
+        // ── Direct: apply, then snapshot for the third route ────────────────
+        let direct = scratch_dir();
+        let (direct_state, direct_replies, published) = {
+            let mut storage = voter_seeded(&direct, history.genesis.clone());
+            let replies = storage.state_mut().apply(entries()).await.expect("apply");
+            let built = {
+                let mut builder = storage.state_mut().get_snapshot_builder().await;
+                builder.build_snapshot().await.expect("build")
+            };
+            let state = durable_of(storage.state()).await;
+            let body =
+                std::fs::read(body_path(&direct, &built.meta.snapshot_id)).expect("the built body");
+            drop(storage);
+            (state, replies, (built.meta, body))
+        };
+
+        // ── Replay: append and commit, apply nothing, recover on reopen ─────
+        let replayed = scratch_dir();
+        {
+            let mut storage = voter_seeded(&replayed, history.genesis.clone());
+            let last = entries().last().expect("entries").log_id;
+            storage
+                .log_mut()
+                .blocking_append(entries())
+                .await
+                .expect("append");
+            storage
+                .log_mut()
+                .save_committed(Some(last))
+                .await
+                .expect("commit");
+            drop(storage);
+        }
+        let replayed_state = {
+            let mut storage = voter(&replayed);
+            let (log, state) = storage.recovery_parts();
+            StorageHelper::new(log, state)
+                .get_initial_state()
+                .await
+                .expect("OpenRaft's own recovery reapplies the committed entries");
+            let recovered = durable_of(storage.state()).await;
+            drop(storage);
+            recovered
+        };
+
+        // ── Install: from the body the direct route built ───────────────────
+        let installed = scratch_dir();
+        {
+            let mut storage = voter_seeded(&installed, history.genesis.clone());
+            let body = installed.join("from-the-leader");
+            std::fs::write(&body, &published.1).expect("the sender's bytes");
+            storage
+                .state_mut()
+                .install_snapshot(
+                    &published.0,
+                    Box::new(CoordinationSnapshotFile::incoming(body)),
+                )
+                .await
+                .expect("install");
+            drop(storage);
+        }
+        let installed_state = {
+            let storage = voter(&installed);
+            let state = durable_of(storage.state()).await;
+            drop(storage);
+            state
+        };
+
+        // ── Against the model, not against each other ───────────────────────
+        assert_eq!(
+            direct_state.model, history.final_state,
+            "direct apply must reach the state the model computed"
+        );
+        assert_eq!(
+            replayed_state.model, history.final_state,
+            "and so must committed-log recovery"
+        );
+        assert_eq!(
+            installed_state.model, history.final_state,
+            "and so must installing a snapshot of it"
+        );
+
+        let direct_digest = canonical_digest_of(&direct);
+        assert_eq!(canonical_digest_of(&replayed), direct_digest, "same bytes");
+        assert_eq!(canonical_digest_of(&installed), direct_digest, "same bytes");
+
+        // Reply for reply, against what the model replied. `direct_replies[0]`
+        // answers the index-0 membership entry, which the model never sees.
+        assert_eq!(direct_replies.len(), history.replies.len() + 1);
+        assert!(matches!(direct_replies[0], CommandReplyV1::NonCommand(_)));
+        for (at, (actual, expected)) in direct_replies[1..]
+            .iter()
+            .zip(history.replies.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                wire_projection(actual),
+                model_projection(expected),
+                "the reply to entry {} was not the model's",
+                at + 1
+            );
+        }
+
+        // And the saved replies survive both recovery routes, compared against
+        // the originals rather than only against one another. This runs last
+        // and in its own pass, because resubmitting writes: a route measured
+        // after it would be hashing a state the other two had not reached.
+        let saved = |dir: std::path::PathBuf| {
+            let history = &history;
+            async move {
+                let mut storage = voter(&dir);
+                let replies = resubmitted(storage.state_mut(), history).await;
+                drop(storage);
+                replies
+            }
+        };
+        let from_direct = saved(direct.clone()).await;
+        assert!(
+            !from_direct.is_empty(),
+            "the history must contain session-bearing commands"
+        );
+
+        // Each saved answer against the model's own answer to the command that
+        // saved it -- for the commands the model says were consumed, which are
+        // the ones whose reply a session keeps.
+        let mut compared = 0;
+        for (answer, at) in from_direct.iter().zip(last_per_session(&history)) {
+            let expected = &history.replies[at];
+            let consumed = matches!(
+                expected,
+                CommandReply::Client(r)
+                    if r.disposition == crate::coordination::reason::Disposition::Consumed
+            );
+            if !consumed {
+                continue;
+            }
+            assert_eq!(
+                saved_answer(answer),
+                model_saved_answer(expected),
+                "the reply saved for entry {at} was not the model's"
+            );
+            compared += 1;
+        }
+        assert!(compared > 0, "no session saved a reply to compare");
+
+        assert_eq!(
+            saved(replayed.clone()).await,
+            from_direct,
+            "recovery must keep the saved replies, not merely the resulting rows"
+        );
+        assert_eq!(
+            saved(installed.clone()).await,
+            from_direct,
+            "and so must install"
+        );
+    }
+
+    /// Where each session's **last** client command sits in the history.
+    ///
+    /// One per `(actor, client)` pair, because a session keeps one saved reply:
+    /// resubmitting an earlier sequence is classified `SequenceTooOld` and never
+    /// reaches the saved answer at all. That mistake is why the four-entry
+    /// corridor test resubmitted `acquire(1)` after `acquire(2)` and believed it
+    /// was reading a saved reply back.
+    fn last_per_session(
+        history: &crate::coordination::model::history::SampleHistory,
+    ) -> Vec<usize> {
+        let mut latest = std::collections::BTreeMap::new();
+        for (at, (_, command)) in history.entries.iter().enumerate() {
+            if let CommandV1::Client(c) = command {
+                latest.insert((c.actor_node_id.clone(), c.client_id.clone()), at);
+            }
+        }
+        latest.into_values().collect()
+    }
+
+    /// Resubmit each session's last command and collect what the session
+    /// classifier answers.
+    ///
+    /// A store that reached the right rows and lost its sessions passes every
+    /// state and digest comparison and fails this one. The resubmission runs at
+    /// log indices past the history's own, since a voter never re-applies an
+    /// index it has already applied.
+    async fn resubmitted(
+        machine: &mut CoordinationStateMachine,
+        history: &crate::coordination::model::history::SampleHistory,
+    ) -> Vec<CommandReplyV1> {
+        let repeats: Vec<Entry> = last_per_session(history)
+            .into_iter()
+            .enumerate()
+            .map(|(n, at)| Entry {
+                log_id: log_id(history.entries.len() as u64 + 1 + n as u64),
+                payload: EntryPayload::Normal(history.entries[at].1.clone()),
+            })
+            .collect();
+        machine.apply(repeats).await.expect("resubmit the history")
+    }
+
+    /// A wire reply projected to the fields the pure model computes.
+    ///
+    /// Deliberately not `boundary::to_wire`: that sits on the same side of the
+    /// comparison as apply, so building the expectation with it would compare
+    /// production against itself. These two projections were written separately
+    /// and meet on integers.
+    ///
+    /// Two wire fields are absent by construction rather than by omission. A
+    /// client reply's `value` is read from state at projection time and is not
+    /// in the saved reply at all (§5.2.1), and a system reply's
+    /// `membership_log_id` is likewise derived from state -- both are covered by
+    /// the state comparison instead.
+    fn wire_projection(reply: &CommandReplyV1) -> String {
+        wire_projection_with(reply, None)
+    }
+
+    /// The part of a reply a **session** saves: everything but the disposition.
+    ///
+    /// §10 saves the answer, not the delivery. A first attempt consumes its
+    /// sequence and a retry of the same one does not, so the two dispositions
+    /// differ by design while the answer they carry must not.
+    fn saved_answer(reply: &CommandReplyV1) -> String {
+        wire_projection_with(reply, Some(0))
+    }
+
+    fn wire_projection_with(reply: &CommandReplyV1, disposition: Option<i32>) -> String {
+        match reply {
+            CommandReplyV1::Client(r) => format!(
+                "client d={} o={} r={} epoch={:?} held={:?} ttl={:?} lrev={:?} vrev={:?} \
+                 sacl={:?} acl={} admin={} op={:?} mlog={:?}",
+                disposition.unwrap_or(r.disposition_code),
+                r.outcome_code,
+                r.reason_code,
+                r.snapshot.as_ref().map(|s| s.epoch),
+                r.snapshot.as_ref().map(|s| s.held),
+                r.snapshot.as_ref().map(|s| s.ttl_ms),
+                r.snapshot.as_ref().map(|s| s.lease_revision),
+                r.snapshot.as_ref().map(|s| s.value_revision),
+                r.snapshot.as_ref().map(|s| s.acl_revision),
+                r.acl_revision,
+                r.admin_revision,
+                r.operation_id,
+                r.membership_log_id
+                    .as_ref()
+                    .map(|l| (l.term, l.leader_node_id.clone(), l.index)),
+            ),
+            CommandReplyV1::System(r) => {
+                format!(
+                    "system code={} lease={}",
+                    r.system_result_code, r.lease_revision
+                )
+            }
+            CommandReplyV1::Retirement(r) => {
+                format!("retire o={} r={}", r.outcome_code, r.reason_code)
+            }
+            CommandReplyV1::NonCommand(_) => "noncommand".to_string(),
+            CommandReplyV1::Unknown(_) => "unknown".to_string(),
+        }
+    }
+
+    /// The same projection of a model reply. See [`wire_projection`].
+    fn model_projection(reply: &crate::coordination::model::apply::CommandReply) -> String {
+        model_projection_with(reply, None)
+    }
+
+    /// The same elision as [`saved_answer`], on a model reply.
+    fn model_saved_answer(reply: &crate::coordination::model::apply::CommandReply) -> String {
+        model_projection_with(reply, Some(0))
+    }
+
+    fn model_projection_with(
+        reply: &crate::coordination::model::apply::CommandReply,
+        disposition: Option<i32>,
+    ) -> String {
+        use crate::coordination::model::apply::CommandReply;
+        use crate::coordination::reason::Disposition;
+        match reply {
+            CommandReply::Client(r) => format!(
+                "client d={} o={} r={} epoch={:?} held={:?} ttl={:?} lrev={:?} vrev={:?} \
+                 sacl={:?} acl={} admin={} op={:?} mlog={:?}",
+                // §5.2's two disposition codes, restated rather than borrowed
+                // from `project.rs` for the reason in [`wire_projection`].
+                disposition.unwrap_or(match r.disposition {
+                    Disposition::Consumed => 1,
+                    Disposition::NotConsumed => 2,
+                }),
+                r.reply.outcome.code(),
+                r.reply.reason.code(),
+                r.reply.snapshot.as_ref().map(|s| s.epoch),
+                r.reply.snapshot.as_ref().map(|s| s.held),
+                r.reply.snapshot.as_ref().map(|s| s.ttl_ms),
+                r.reply.snapshot.as_ref().map(|s| s.lease_revision),
+                r.reply.snapshot.as_ref().map(|s| s.value_revision),
+                r.reply.snapshot.as_ref().map(|s| s.acl_revision),
+                r.reply.acl_revision,
+                r.reply.admin_revision,
+                r.reply.operation_id.map(|id| id.to_vec()),
+                r.reply
+                    .membership_log_id
+                    .map(|l| (l.term, l.leader_node_id.to_vec(), l.index)),
+            ),
+            CommandReply::System(r) => {
+                format!(
+                    "system code={} lease={}",
+                    r.system_result_code, r.lease_revision
+                )
+            }
+            CommandReply::Retirement(r) => {
+                format!("retire o={} r={}", r.outcome.code(), r.reason.code())
+            }
+        }
+    }
+
+    /// A model log id in the form the log carries it.
+    fn raft_log_id(id: &crate::coordination::model::state::LogId) -> RaftLogId<CoordinationNodeId> {
+        RaftLogId {
+            leader_id: CommittedLeaderId::new(
+                id.term,
+                CoordinationNodeId::from_array(id.leader_node_id),
+            ),
+            index: id.index,
+        }
+    }
+
+    /// A complete voter store holding `model`, opened as production opens one.
+    ///
+    /// The first open is what makes the store: a `state.redb` carrying durable
+    /// state beside an absent `raft.redb` is a partial initialization and open
+    /// refuses it, so the rows go in afterwards rather than instead.
+    fn voter_seeded(
+        dir: &std::path::Path,
+        model: crate::coordination::model::state::State,
+    ) -> super::super::VoterStorage {
+        drop(voter(dir));
+        {
+            let database = opened(dir);
+            let state = DurableState {
+                model,
+                membership: StoredMembership::default(),
+                recovery_export_hash: None,
+                recovered_from: None,
+            };
+            rows::commit(&database, state.clone(), &every_key_in(&state))
+                .expect("seed the generated genesis");
+        }
+        voter(dir)
     }
 
     /// The canonical digest of whatever `state.redb` a directory holds.
