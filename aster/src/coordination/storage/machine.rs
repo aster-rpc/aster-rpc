@@ -4810,15 +4810,24 @@ mod tests {
     /// What a reopen finds, on both axes.
     ///
     /// Two, because a crash has two answers and they are not always the same
-    /// one. `on_disk` is what the killed process actually left, read the instant
-    /// the store is open and before OpenRaft is allowed to repair anything.
-    /// `recovered` is what the voter comes back holding once it has. An
-    /// observation that only recorded the second could not tell a transaction
-    /// that survived from one that was thrown away and replayed; one that only
-    /// recorded the first would call a replayed command a lost one.
+    /// one. `pre_replay` is what the store holds once it is open and before
+    /// OpenRaft is allowed to replay anything; `recovered` is what the voter
+    /// comes back holding once it has. An observation that only recorded the
+    /// second could not tell a transaction that survived from one that was
+    /// thrown away and replayed; one that only recorded the first would call a
+    /// replayed command a lost one.
+    ///
+    /// `pre_replay` and **not** `on_disk`, which is what this was first called
+    /// and is a stronger claim than the harness earns.
+    /// [`super::super::VoterStorage::open`] is the production open and it
+    /// repairs as it goes: redb runs its own recovery over the file, `CURRENT`
+    /// is validated against the bodies actually present, and the startup sweep
+    /// removes scratch files and abandoned candidates. Everything this axis
+    /// reports is therefore post-open. Reading the raw bytes a dead process
+    /// left would be a different harness, and nothing here does it.
     #[derive(Debug, PartialEq)]
     struct Observation {
-        on_disk: View,
+        pre_replay: View,
         recovered: Recovered,
     }
 
@@ -4865,20 +4874,24 @@ mod tests {
         }
     }
 
-    /// Open a store the way production does, read what is on disk, then run
-    /// OpenRaft's own recovery and read again.
+    /// Open a store the way production does, read it, then run OpenRaft's own
+    /// recovery and read it again.
     ///
     /// `get_initial_state` is not optional: `VoterStorage::open` starts the
-    /// actors and validates the files and performs no replay, so a store killed
-    /// between an entry being committed and its apply would be observed in the
-    /// state it had *before* recovery -- which is the wrong state, and the one a
-    /// naive harness would compare against. Reading on both sides of it is what
-    /// lets the harness say which of the two did the work.
+    /// actors and validates the files and performs no *log replay*, so a store
+    /// killed between an entry being committed and its apply would be observed
+    /// in the state it had before recovery -- which is the wrong state, and the
+    /// one a naive harness would compare against. Reading on both sides of it is
+    /// what lets the harness say which of the two did the work.
+    ///
+    /// The first read is `pre_replay`, not "on disk": the open before it has
+    /// already let redb recover the file and let the startup sweep tidy
+    /// `snapshots/` and `incoming/`. See [`Observation`].
     async fn observe(dir: &std::path::Path) -> Observation {
         use openraft::StorageHelper;
 
         let mut storage = voter(dir);
-        let on_disk = view_of(&mut storage).await;
+        let pre_replay = view_of(&mut storage).await;
         {
             let (log, state) = storage.recovery_parts();
             StorageHelper::new(log, state)
@@ -4891,7 +4904,7 @@ mod tests {
         // it already holds, and both of these need their own handle.
         drop(storage);
         Observation {
-            on_disk,
+            pre_replay,
             recovered: Recovered {
                 view,
                 digest: canonical_digest_of(dir),
@@ -5221,9 +5234,12 @@ mod tests {
     /// that is where it died.
     ///
     /// The child announces the boundary on stdout and parks; the parent kills
-    /// it there. `kill` is `SIGKILL`, so no destructor runs, no database is
-    /// closed and nothing Rust buffered is flushed -- which is the whole reason
-    /// this is a subprocess rather than a `drop`.
+    /// it there. `kill` is unconditional termination -- `SIGKILL` on Unix,
+    /// `TerminateProcess` on Windows -- so no destructor runs, no database is
+    /// closed and nothing Rust buffered is flushed, which is the whole reason
+    /// this is a subprocess rather than a `drop`. The signal number is checked
+    /// only where there is one; everywhere else the portable half of the claim
+    /// is that the child did not exit successfully.
     fn kill_at(dir: &std::path::Path, operation: Operation, point: CrashPoint) {
         use std::io::BufRead as _;
 
@@ -5349,6 +5365,93 @@ mod tests {
         }
     }
 
+    /// What each operation must be observable *as*, stated independently of the
+    /// `before`/`after` comparison.
+    ///
+    /// The comparison alone cannot say that the observation records the right
+    /// things: two stores that differ anywhere satisfy `assert_ne!`, so a field
+    /// no cell happens to distinguish can be captured and never checked. That is
+    /// not hypothetical -- blanking the recorded `LogState` left the whole matrix
+    /// green (mutation M260), because every operation that moves the purge marker
+    /// also changes the entries beside it, and the entries carried the difference
+    /// on their own.
+    ///
+    /// So the facts a reader would expect the matrix to be *about* are named
+    /// here, per operation, against the two stores the harness prepared.
+    /// Exhaustive rather than defaulted: an operation added to the table has to
+    /// say what makes it observable, even if the answer is "nothing beyond the
+    /// state the whole comparison already covers".
+    fn distinguishing_facts(operation: Operation, before: &Observation, after: &Observation) {
+        let purge_marker = |o: &Observation| o.recovered.view.log_state.last_purged_log_id;
+        match operation {
+            // The one operation whose whole point is a marker, and the reason
+            // `LogState` is in `View` at all. Asserted on the recovered side
+            // because that is the value a restarted voter replicates from.
+            Operation::Purge => {
+                assert_eq!(
+                    purge_marker(before),
+                    None,
+                    "the fixture must start with nothing purged, or the purge \
+                     has nothing to prove"
+                );
+                assert_eq!(
+                    purge_marker(after),
+                    Some(purge_upto()),
+                    "a completed purge must leave the marker it advanced, and a \
+                     reopen must report it"
+                );
+            }
+            // The other operation that moves the marker, and it does so without
+            // ever calling `purge`. This assertion was first written as "install
+            // must not move the purge marker" and failed, which is the whole
+            // argument for naming these facts: an install leaves the state
+            // machine ahead of the local log, and OpenRaft closes that hole
+            // itself -- `get_initial_state` purges to `last_applied` under the
+            // comment "snapshot is installed but logs are not cleaned". So the
+            // marker a reopened voter reports after an install is a real,
+            // install-specific observable, and one no other field carries.
+            Operation::Install => {
+                assert_eq!(
+                    purge_marker(before),
+                    None,
+                    "the fixture must start with nothing purged"
+                );
+                let applied = after.recovered.view.applied;
+                assert!(
+                    applied > before.recovered.view.applied,
+                    "the installed snapshot must be ahead of what the fixture \
+                     applied, or §11.4 would have classified it stale and no \
+                     install would have happened"
+                );
+                assert_eq!(
+                    purge_marker(after),
+                    applied,
+                    "a reopened voter must report the marker at `last_applied` \
+                     after an install, which is where OpenRaft's own recovery \
+                     purges the log to"
+                );
+            }
+            // Every other operation is fully covered by the whole-view
+            // comparison: each changes entries, a marker, the durable state or
+            // `CURRENT`, and `assert_ne!` above has already established that it
+            // changed something. None of them leaves the state machine ahead of
+            // the log, so none moves the marker.
+            Operation::Vote
+            | Operation::Append
+            | Operation::CommitMarker
+            | Operation::Truncate
+            | Operation::Apply
+            | Operation::Build => {
+                assert_eq!(
+                    purge_marker(before),
+                    purge_marker(after),
+                    "{} must not move the purge marker",
+                    operation.name()
+                );
+            }
+        }
+    }
+
     /// Every reachable boundary of every operation, killed and recovered.
     ///
     /// Both axes are held, separately. The on-disk axis says what the killed
@@ -5376,7 +5479,7 @@ mod tests {
             let after = observe(&after_dir).await;
             // On one axis or the other. An apply's two recovered views are
             // *equal* -- recovery replays the entry the crash lost, which is the
-            // whole point -- and it is the on-disk axis that tells the two
+            // whole point -- and it is the pre-replay axis that tells the two
             // stores apart.
             assert_ne!(
                 before,
@@ -5385,6 +5488,7 @@ mod tests {
                  distinguished from any other",
                 operation.name()
             );
+            distinguishing_facts(*operation, &before, &after);
 
             for (point, outcome) in operation.cells() {
                 let dir = scratch_dir();
@@ -5399,12 +5503,12 @@ mod tests {
                     point.name()
                 );
                 must_match(
-                    outcome.on_disk(),
-                    "what the killed process left on disk",
+                    outcome.pre_replay(),
+                    "what the opened store held before OpenRaft replayed",
                     &what,
-                    &crashed.on_disk,
-                    &before.on_disk,
-                    &after.on_disk,
+                    &crashed.pre_replay,
+                    &before.pre_replay,
+                    &after.pre_replay,
                 );
                 must_match(
                     outcome.recovered(),
@@ -5425,9 +5529,9 @@ mod tests {
                 // rather than a comment, and what makes swapping one for the
                 // other fail.
                 let owed = (
-                    crashed.on_disk.applied,
+                    crashed.pre_replay.applied,
                     crashed.recovered.view.applied,
-                    &crashed.on_disk.state,
+                    &crashed.pre_replay.state,
                     &crashed.recovered.view.state,
                 );
                 match outcome {
@@ -5483,6 +5587,98 @@ mod tests {
                 assert!(
                     seen.insert(point.name()),
                     "{} declares {} twice",
+                    operation.name(),
+                    point.name()
+                );
+            }
+        }
+    }
+
+    /// The whole matrix, spelled out.
+    ///
+    /// Neither of the two tests above can hold the matrix to a *size*.
+    /// `every_boundary_is_covered_by_some_operation` compares unions, so
+    /// deleting a whole operation, or any cell whose boundary another operation
+    /// also reaches, leaves it green -- and every boundary but `acknowledgement`
+    /// and `candidate-commit` is reached by more than one. Nor can either notice
+    /// an outcome changing.
+    ///
+    /// This is the inventory: thirty cells, each with the operation, the
+    /// boundary and what dying there means, written out rather than derived.
+    /// Deleting an operation, dropping a cell, adding one, or weakening an
+    /// outcome all fail here, and fail saying which. The published claim is
+    /// "thirty kills", so the number is checked as well as the contents -- but
+    /// the contents first, because a count alone passes when a cell is renamed
+    /// into something nobody asked for.
+    #[test]
+    fn the_matrix_is_the_thirty_cells_that_were_agreed() {
+        let actual: Vec<String> = Operation::ALL
+            .iter()
+            .flat_map(|operation| {
+                operation.cells().iter().map(move |(point, outcome)| {
+                    format!("{} {} {outcome:?}", operation.name(), point.name())
+                })
+            })
+            .collect();
+
+        let expected = vec![
+            "vote transaction-begin Discarded",
+            "vote transaction-write Discarded",
+            "vote transaction-commit Durable",
+            "append transaction-begin Discarded",
+            "append transaction-write Discarded",
+            "append transaction-commit Durable",
+            "commit-marker transaction-begin Discarded",
+            "commit-marker transaction-write Discarded",
+            "commit-marker transaction-commit Durable",
+            "truncate transaction-begin Discarded",
+            "truncate transaction-write Discarded",
+            "truncate transaction-commit Durable",
+            "purge transaction-begin Discarded",
+            "purge transaction-write Discarded",
+            "purge transaction-commit Durable",
+            "apply transaction-begin Replayed",
+            "apply transaction-write Replayed",
+            "apply transaction-commit Durable",
+            "apply acknowledgement Durable",
+            "build snapshot-body-write Discarded",
+            "build snapshot-body-fsync Discarded",
+            "build current-publication Durable",
+            "install transaction-begin Discarded",
+            "install transaction-write Discarded",
+            "install transaction-commit Discarded",
+            "install candidate-commit Discarded",
+            "install replacement-rename Durable",
+            "install replacement-directory-sync Durable",
+            "install post-replacement-reopen Durable",
+            "install current-publication Durable",
+        ];
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 30, "the matrix is thirty cells");
+    }
+
+    /// Nothing is declared `Undetermined`.
+    ///
+    /// The variant exists so that a boundary the protocol genuinely leaves open
+    /// can be *stated* as open rather than hidden inside a widened comparison.
+    /// While nothing needs it, its presence is a hole: `Undetermined` weakens
+    /// both axes to `Either` at once, so a cell quietly changed to it would keep
+    /// passing whichever way its behaviour went.
+    ///
+    /// Forbidden rather than deleted. Deleting it would mean the next genuinely
+    /// undetermined boundary gets a widened assertion with no name; this way
+    /// using it is a deliberate act that has to come here and say what makes
+    /// that cell open.
+    #[test]
+    fn no_cell_settles_for_an_undetermined_outcome() {
+        for operation in Operation::ALL {
+            for (point, outcome) in operation.cells() {
+                assert_ne!(
+                    *outcome,
+                    Outcome::Undetermined,
+                    "{} at {} is declared undetermined; if the protocol really \
+                     leaves it open, say here what makes it open",
                     operation.name(),
                     point.name()
                 );

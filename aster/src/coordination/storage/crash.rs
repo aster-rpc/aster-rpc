@@ -79,19 +79,27 @@ pub(crate) enum Expected {
 /// What dying at one boundary of one operation means, on both axes.
 ///
 /// Two axes because a crash has two honest answers and they are not always the
-/// same one. *On disk* is what the killed process left behind, read the instant
-/// the store is reopened. *Recovered* is what the voter comes back holding,
-/// after `StorageHelper::get_initial_state` has done what OpenRaft does on every
-/// restart. Collapsing them would force a choice between claiming a discarded
-/// transaction survived and claiming a committed command was lost.
+/// same one. *Pre-replay* is what the store holds once it has been opened but
+/// before OpenRaft's log replay. *Recovered* is what the voter comes back
+/// holding, after `StorageHelper::get_initial_state` has done what OpenRaft does
+/// on every restart. Collapsing them would force a choice between claiming a
+/// discarded transaction survived and claiming a committed command was lost.
+///
+/// "Pre-replay" and not "on disk": `VoterStorage::open` is a real open, and it
+/// repairs things. redb runs its own recovery on the file, `CURRENT` is
+/// validated against the bodies present, and the startup sweep removes scratch
+/// files and abandoned candidates. What this axis therefore says is what a
+/// *store* holds before OpenRaft replays anything -- not what bytes the dead
+/// process left, which nothing here reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum Outcome {
-    /// The operation left nothing, and nothing puts it back. redb throws away
-    /// an uncommitted transaction, and there is no committed log entry standing
-    /// behind this operation to make recovery redo it.
+    /// The operation left nothing an opened store can see, and nothing puts it
+    /// back. redb throws away an uncommitted transaction, and there is no
+    /// committed log entry standing behind this operation to make recovery redo
+    /// it.
     Discarded,
-    /// The operation's effect is on disk and recovery keeps it.
+    /// The operation's effect survived, and recovery keeps it.
     Durable,
     /// The write was thrown away and OpenRaft's recovery redoes it from the
     /// log. Only reachable where the log already holds the operation's input as
@@ -108,8 +116,8 @@ pub(crate) enum Outcome {
 
 #[allow(dead_code)]
 impl Outcome {
-    /// What the killed process must have left, before recovery runs.
-    pub(crate) fn on_disk(self) -> Expected {
+    /// What an opened store must hold before OpenRaft replays anything.
+    pub(crate) fn pre_replay(self) -> Expected {
         match self {
             Outcome::Discarded | Outcome::Replayed => Expected::Before,
             Outcome::Durable => Expected::After,
@@ -170,12 +178,17 @@ crash_points! {
     /// that produced it. This is the lost acknowledgement: the batch is durable
     /// and the caller never learned it.
     Acknowledgement = "acknowledgement",
-    /// Part-way through streaming a snapshot body into its scratch file.
-    /// Nothing is published, and the state the body was taken from is
+    /// The whole snapshot body has been streamed through the descriptor and the
+    /// buffer flushed into it, and `sync_all` has not been called. Not
+    /// part-way through the write: the seam sits between the last byte and the
+    /// fsync, because that is the only place in `build` where the two can be
+    /// told apart at all. It is still a scratch file under `snapshots/`,
+    /// nothing is published, and the state the body was taken from is
     /// untouched.
     SnapshotBodyWrite = "snapshot-body-write",
-    /// The body is written and about to be, or has just been, fsynced. Still a
-    /// scratch file under `snapshots/`: publication is the later rename.
+    /// `sync_all` on the body has returned. Still a scratch file: publication
+    /// is the later rename under the digest name. See this module's header for
+    /// why neither this boundary nor the one above is evidence about the fsync.
     SnapshotBodyFsync = "snapshot-body-fsync",
     /// The rebuilt incoming candidate has committed. It is a complete database
     /// under `incoming/`, and this store's `state.redb` is still the old one.
@@ -332,17 +345,17 @@ mod tests {
     /// that made replay indistinguishable from durability fails here as well as
     /// in the matrix -- and fails saying which of the two claims moved.
     #[test]
-    fn a_replayed_write_is_absent_on_disk_and_present_after_recovery() {
-        assert_eq!(Outcome::Discarded.on_disk(), Expected::Before);
+    fn a_replayed_write_is_absent_before_replay_and_present_after_it() {
+        assert_eq!(Outcome::Discarded.pre_replay(), Expected::Before);
         assert_eq!(Outcome::Discarded.recovered(), Expected::Before);
 
-        assert_eq!(Outcome::Durable.on_disk(), Expected::After);
+        assert_eq!(Outcome::Durable.pre_replay(), Expected::After);
         assert_eq!(Outcome::Durable.recovered(), Expected::After);
 
-        assert_eq!(Outcome::Replayed.on_disk(), Expected::Before);
+        assert_eq!(Outcome::Replayed.pre_replay(), Expected::Before);
         assert_eq!(Outcome::Replayed.recovered(), Expected::After);
 
-        assert_eq!(Outcome::Undetermined.on_disk(), Expected::Either);
+        assert_eq!(Outcome::Undetermined.pre_replay(), Expected::Either);
         assert_eq!(Outcome::Undetermined.recovered(), Expected::Either);
     }
 
