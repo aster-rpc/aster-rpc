@@ -228,13 +228,7 @@ fn plan_shape(
         let is_new = !current_members.contains(&seed.node_id);
         match (is_new, &seed.join_permit) {
             (true, Some(permit)) => {
-                if authority::verify_join_permit(
-                    authority_material,
-                    permit,
-                    &seed.node_id,
-                    &seed.ticket,
-                )
-                .is_err()
+                if authority::verify_join_permit(authority_material, permit, &seed.node_id).is_err()
                 {
                     return Some(ShapeLimit::MemberSeedPermit);
                 }
@@ -455,15 +449,11 @@ pub fn growth_delta(state: &State, effect: &IntentEffect) -> u64 {
 /// the validation this exists to test pass vacuously.
 #[cfg(test)]
 pub fn test_ticket(node: &NodeId) -> Vec<u8> {
-    aster_transport_core::ticket::AsterTicket {
-        endpoint_id: *node,
-        relay: None,
-        direct_addrs: Vec::new(),
-        credential: Some(aster_transport_core::ticket::TicketCredential::Open),
-    }
-    .to_base58_string()
-    .expect("a well-formed ticket")
-    .into_bytes()
+    // The same derivation a join permit's `candidate_ticket` must carry, so a
+    // fixture cannot mint a route spelling that production would refuse.
+    super::authority::canonical_candidate_ticket(node)
+        .expect("a well-formed ticket")
+        .into_bytes()
 }
 
 /// Validate one member-seed ticket (§9).

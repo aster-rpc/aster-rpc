@@ -1892,7 +1892,6 @@ fn check_intent_rows(state: &DurableState) -> Result<(), String> {
                     &state.model.authority,
                     permit,
                     &seed.node_id,
-                    &seed.ticket,
                 ) {
                     return Err(format!(
                         "intent {operation_id:02x?} seed {:02x?} carries a join permit that \

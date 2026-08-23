@@ -15,8 +15,8 @@
 //! ```
 //!
 //! Two steps have to be in that order and are easy to get wrong. The signature
-//! checks in `start::resolve` bind the **local NodeId and ticket**, neither of
-//! which exists before the endpoint does — so they cannot move earlier. And
+//! checks in `start::resolve` bind the **local NodeId**, which does not exist
+//! before the endpoint does — so they cannot move earlier. And
 //! `initialize` cannot run before peers can dial this node, because every other
 //! initial voter is doing the same thing and they have to reach each other — so
 //! it cannot move earlier either.
@@ -148,10 +148,9 @@ pub(crate) async fn start(
     node: &Node,
     endpoint: RaftEndpoint,
     local: CoordinationNodeId,
-    local_ticket: &[u8],
 ) -> Result<CoordinationRuntime> {
     // 3. Resolve the start mode against this node's verified identity.
-    let plan = resolve(config, root, local, local_ticket).map_err(Error::from)?;
+    let plan = resolve(config, root, local).map_err(Error::from)?;
     let corridor = CorridorPlan::of(&plan, &local);
 
     // 4. Open storage against that identity, and check the directory's state
@@ -252,7 +251,8 @@ pub(crate) async fn start(
     Ok(runtime)
 }
 
-/// Bootstrap initializes; join and existing do not.
+/// Bootstrap initializes, and so does an `Existing` whose Raft was never
+/// initialized — the interrupted-bootstrap recovery below. `Join` never does.
 async fn run_corridor(
     raft: &Raft<CoordinationTypeConfig>,
     resolved: &ResolvedStart,
@@ -429,13 +429,7 @@ mod tests {
     }
 
     fn plan_for(start: CoordinationStart) -> StartPlan {
-        resolve(
-            &config(start),
-            &authority().public_key,
-            node_id(LOCAL),
-            &test_ticket(&LOCAL),
-        )
-        .expect("resolve")
+        resolve(&config(start), &authority().public_key, node_id(LOCAL)).expect("resolve")
     }
 
     fn bootstrap_start() -> CoordinationStart {
@@ -586,14 +580,15 @@ mod tests {
         }
     }
 
-    /// **Only bootstrap initializes.**
+    /// **`Join` never initializes, and `Existing` only recovers.**
     ///
     /// Source-level, because the harm is a call that must not happen: a `Join`
-    /// or `Existing` that initialized would found a second group over an
-    /// existing one, and no test of a *correct* run observes a call that was
-    /// never made.
+    /// that initialized would found a second group over an existing one, and no
+    /// test of a *correct* run observes a call that was never made. There is one
+    /// `initialize` call site, reachable from `Bootstrap` and from `Existing`'s
+    /// interrupted-bootstrap arm, which is guarded on `is_initialized()`.
     #[test]
-    fn initialize_is_reachable_only_from_the_bootstrap_arm() {
+    fn initialize_is_reachable_only_from_bootstrap_and_the_recovery_arm() {
         let source = include_str!("boot.rs");
         let end = crate::coordination::guards::production_end(source);
         let production = &source[..end];
@@ -634,10 +629,10 @@ mod tests {
             "the join arm must do nothing: a permit grants no membership"
         );
 
-        // The `Existing` arm's initialize is gated on an empty membership, not
-        // unconditional. Asserted on the source because the alternative — an
-        // `Existing` start that initializes over a live group — is not
-        // something a test can safely provoke.
+        // The `Existing` arm's initialize is gated on OpenRaft's own
+        // `is_initialized()`, not unconditional. Asserted on the source because
+        // the alternative — an `Existing` start that initializes over a live
+        // group — is not something a test can safely provoke.
         let existing_at = arm
             .find("ResolvedStart::Existing { genesis }")
             .expect("an existing arm");
@@ -647,7 +642,8 @@ mod tests {
             .expect("the existing arm may initialize");
         assert!(
             existing[..init_at].contains("is_initialized()"),
-            "the existing arm must check for an empty membership before initializing"
+            "the existing arm must consult OpenRaft's own initialization \
+             predicate before initializing"
         );
     }
 }

@@ -489,15 +489,9 @@ impl AsterServerBuilder {
                         return Err(err);
                     }
                 };
-                let started = coordination_start(
-                    &coordination_config,
-                    root,
-                    &node,
-                    coordination_endpoint,
-                    &Ticket::from_node_addr(&node.addr(), Credential::Open)
-                        .and_then(|t| t.to_base58()),
-                )
-                .await;
+                let started =
+                    coordination_start(&coordination_config, root, &node, coordination_endpoint)
+                        .await;
                 match started {
                     Ok(runtime) => Some(runtime),
                     Err(err) => {
@@ -524,34 +518,26 @@ impl AsterServerBuilder {
 
 /// Run the §7.2 start corridor for a configured voter.
 ///
-/// A free function rather than an inline block so the ticket failure has one
-/// place to be handled: the local ticket is what a join permit binds, so a node
-/// that cannot render its own address cannot verify a permit minted for it, and
-/// that is a start failure rather than something to paper over.
+/// A free function rather than an inline block so the one identity failure has
+/// one place to be handled. **No ticket is rendered here.** A join permit binds
+/// the candidate's NodeId, and the `candidate_ticket` it carries is derived
+/// from that NodeId — an Aster node's UDP port is ephemeral and it is reached
+/// by discovery, so passing this node's current address ticket would have made
+/// a permit stop verifying the moment the candidate restarted.
 #[cfg(feature = "coordination")]
 async fn coordination_start(
     config: &crate::coordination::host::CoordinationConfig,
     root: [u8; 32],
     node: &Node,
     endpoint: crate::coordination::network::service::RaftEndpoint,
-    ticket: &Result<String>,
 ) -> Result<crate::coordination::runtime::owner::CoordinationRuntime> {
-    let ticket = match ticket {
-        Ok(ticket) => ticket,
-        Err(err) => {
-            return Err(Error::InvalidArgument(format!(
-                "coordination needs this node's own ticket to verify a join permit bound to \
-                 it, and it could not be rendered: {err}"
-            )))
-        }
-    };
     let local = crate::coordination::ids::CoordinationNodeId::parse_hex(node.id().as_str())
         .map_err(|err| {
             Error::InvalidArgument(format!(
                 "coordination requires a 32-byte endpoint identity: {err}"
             ))
         })?;
-    crate::coordination::boot::start(config, &root, node, endpoint, local, ticket.as_bytes()).await
+    crate::coordination::boot::start(config, &root, node, endpoint, local).await
 }
 
 /// A running, declarative Aster RPC server: a node serving blobs / docs / gossip

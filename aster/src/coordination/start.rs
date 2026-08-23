@@ -85,8 +85,9 @@ pub(crate) enum StartError {
     GenesisNotThisGroups,
     /// The storage directory's state does not match the mode.
     ///
-    /// `Bootstrap` and `Join` require an empty directory; `Existing` requires
-    /// an initialized one. Reported as one variant carrying both facts because
+    /// `Bootstrap` requires an empty directory and `Existing` a bound one;
+    /// `Join` admits either, because its own first start binds one. Reported as
+    /// one variant carrying both facts because
     /// the fix is always the same shape: the operator pointed a mode at the
     /// wrong directory, or restarted with the wrong mode.
     WrongDirectoryState {
@@ -250,10 +251,11 @@ impl StartPlan {
 
 /// Resolve a configured start against this node's verified identity.
 ///
-/// `local_ticket` is this endpoint's own canonical Open ticket. It is required
-/// for `Join` and unused otherwise; passing it unconditionally keeps the caller
-/// from having to know which modes need it, and a `Join` that was handed the
-/// wrong one fails the permit's ticket binding rather than silently proceeding.
+/// No ticket is threaded in. A `Join` permit binds the candidate's **NodeId**,
+/// and the `candidate_ticket` field it carries is derived from that NodeId by
+/// [`canonical_candidate_ticket`](crate::coordination::model::authority::canonical_candidate_ticket)
+/// — an Aster node's address is ephemeral, so a permit that bound one could
+/// never survive the candidate's own restart.
 ///
 /// `root` is the deployment's **ROOT public key**, already reconciled by
 /// [`CoordinationConfig::resolved_root_key`] against `AsterConfig`'s
@@ -264,7 +266,6 @@ pub(crate) fn resolve(
     config: &CoordinationConfig,
     root: &[u8; 32],
     local: CoordinationNodeId,
-    local_ticket: &[u8],
 ) -> Result<StartPlan, StartError> {
     let key = root;
     let domain = config.authority_domain();
@@ -341,14 +342,9 @@ pub(crate) fn resolve(
             signed_join_permit,
             expected_deployment_profile_code,
         } => {
-            let permit = verify_join_permit_for_start(
-                key,
-                domain,
-                signed_join_permit,
-                local.as_bytes(),
-                local_ticket,
-            )
-            .map_err(StartError::Permit)?;
+            let permit =
+                verify_join_permit_for_start(key, domain, signed_join_permit, local.as_bytes())
+                    .map_err(StartError::Permit)?;
             let group_id = CoordinationGroupId::from_array(*permit.group_id());
             let genesis_hash = *permit.genesis_hash();
             (
@@ -415,9 +411,8 @@ mod tests {
     fn resolve(
         config: &CoordinationConfig,
         local: CoordinationNodeId,
-        local_ticket: &[u8],
     ) -> Result<StartPlan, StartError> {
-        super::resolve(config, &authority().public_key, local, local_ticket)
+        super::resolve(config, &authority().public_key, local)
     }
 
     fn node() -> CoordinationNodeId {
@@ -491,12 +486,8 @@ mod tests {
     /// to the configured pins for the two values a genesis does not carry.
     #[test]
     fn bootstrap_binds_storage_to_the_verified_genesis() {
-        let plan = resolve(
-            &config(bootstrap(three_voter_genesis(), None)),
-            node(),
-            &ticket(),
-        )
-        .expect("resolve");
+        let plan =
+            resolve(&config(bootstrap(three_voter_genesis(), None)), node()).expect("resolve");
 
         let a = authority();
         assert_eq!(plan.identity().group_id().as_bytes(), &a.group_id);
@@ -528,11 +519,7 @@ mod tests {
     fn a_node_outside_the_initial_voters_cannot_bootstrap() {
         let outsider = CoordinationNodeId::from_array([9u8; 32]);
         assert_eq!(
-            resolve(
-                &config(bootstrap(three_voter_genesis(), None)),
-                outsider,
-                &test_ticket(&[9u8; 32])
-            ),
+            resolve(&config(bootstrap(three_voter_genesis(), None)), outsider),
             Err(StartError::NotAnInitialVoter { local: outsider })
         );
     }
@@ -546,7 +533,7 @@ mod tests {
             ..genesis_for(&[LOCAL, [2u8; 32], [3u8; 32]], shape::PROFILE_PROD)
         });
         assert_eq!(
-            resolve(&config(bootstrap(elsewhere, None)), node(), &ticket()),
+            resolve(&config(bootstrap(elsewhere, None)), node()),
             Err(StartError::Genesis(GenesisError::WrongDomain))
         );
     }
@@ -559,13 +546,12 @@ mod tests {
             ..genesis_for(&[LOCAL, [2u8; 32], [3u8; 32]], shape::PROFILE_PROD)
         });
         assert_eq!(
-            resolve(&config(bootstrap(bound.clone(), None)), node(), &ticket()),
+            resolve(&config(bootstrap(bound.clone(), None)), node()),
             Err(StartError::RecoveryExportMissing)
         );
         assert!(resolve(
             &config(bootstrap(bound, Some(PathBuf::from("/tmp/export.aster")))),
-            node(),
-            &ticket()
+            node()
         )
         .is_ok());
 
@@ -575,8 +561,7 @@ mod tests {
                     three_voter_genesis(),
                     Some(PathBuf::from("/tmp/export.aster"))
                 )),
-                node(),
-                &ticket()
+                node()
             ),
             Err(StartError::RecoveryExportUnexpected)
         );
@@ -589,7 +574,7 @@ mod tests {
     fn a_development_profile_needs_its_acknowledgement_to_resolve() {
         let single = sign_genesis(&genesis_for(&[LOCAL], shape::PROFILE_DEV_SINGLE));
         assert_eq!(
-            resolve(&config(bootstrap(single.clone(), None)), node(), &ticket()),
+            resolve(&config(bootstrap(single.clone(), None)), node()),
             Err(StartError::Unacknowledged(UnacknowledgedProfile {
                 profile: shape::PROFILE_DEV_SINGLE
             }))
@@ -597,14 +582,13 @@ mod tests {
         assert!(resolve(
             &config_with(bootstrap(single, None), |b| b
                 .acknowledge_single_voter_development_group(true)),
-            node(),
-            &ticket()
+            node()
         )
         .is_ok());
 
         let even = sign_genesis(&genesis_for(&[LOCAL, [2u8; 32]], shape::PROFILE_DEV_EVEN));
         assert_eq!(
-            resolve(&config(bootstrap(even.clone(), None)), node(), &ticket()),
+            resolve(&config(bootstrap(even.clone(), None)), node()),
             Err(StartError::Unacknowledged(UnacknowledgedProfile {
                 profile: shape::PROFILE_DEV_EVEN
             }))
@@ -613,15 +597,13 @@ mod tests {
         assert!(resolve(
             &config_with(bootstrap(even.clone(), None), |b| b
                 .acknowledge_single_voter_development_group(true)),
-            node(),
-            &ticket()
+            node()
         )
         .is_err());
         assert!(resolve(
             &config_with(bootstrap(even, None), |b| b
                 .acknowledge_even_quorum_development_group(true)),
-            node(),
-            &ticket()
+            node()
         )
         .is_ok());
     }
@@ -631,12 +613,7 @@ mod tests {
     /// the store.
     #[test]
     fn existing_binds_from_the_configured_expectation() {
-        let plan = resolve(
-            &config(existing_of(three_voter_genesis())),
-            node(),
-            &ticket(),
-        )
-        .expect("resolve");
+        let plan = resolve(&config(existing_of(three_voter_genesis())), node()).expect("resolve");
         // Both from the configured expectation, which `existing_of` derives from
         // the document it supplies — the two are now checked against each other
         // at resolve, so a fixture with unrelated literals could not get here.
@@ -664,7 +641,6 @@ mod tests {
                 expected_deployment_profile_code: shape::PROFILE_PROD,
             }),
             node(),
-            &ticket(),
         )
         .expect("resolve");
 
@@ -696,8 +672,7 @@ mod tests {
                     }),
                     expected_deployment_profile_code: shape::PROFILE_PROD,
                 }),
-                node(),
-                &ticket()
+                node()
             ),
             Err(StartError::Permit(PermitError::TicketMismatch))
         );
@@ -718,12 +693,7 @@ mod tests {
         let plans = [
             (
                 "Bootstrap",
-                resolve(
-                    &config(bootstrap(three_voter_genesis(), None)),
-                    node(),
-                    &ticket(),
-                )
-                .expect("resolve"),
+                resolve(&config(bootstrap(three_voter_genesis(), None)), node()).expect("resolve"),
             ),
             (
                 "Join",
@@ -733,18 +703,12 @@ mod tests {
                         expected_deployment_profile_code: shape::PROFILE_PROD,
                     }),
                     node(),
-                    &ticket(),
                 )
                 .expect("resolve"),
             ),
             (
                 "Existing",
-                resolve(
-                    &config(existing_of(three_voter_genesis())),
-                    node(),
-                    &ticket(),
-                )
-                .expect("resolve"),
+                resolve(&config(existing_of(three_voter_genesis())), node()).expect("resolve"),
             ),
         ];
 
@@ -777,12 +741,8 @@ mod tests {
     /// The development escape reaches the open policy, and nothing else does.
     #[test]
     fn the_permission_escape_is_the_only_negotiable_open_rule() {
-        let strict = resolve(
-            &config(bootstrap(three_voter_genesis(), None)),
-            node(),
-            &ticket(),
-        )
-        .expect("resolve");
+        let strict =
+            resolve(&config(bootstrap(three_voter_genesis(), None)), node()).expect("resolve");
         assert!(strict.policy().enforces_permissions());
 
         let relaxed = resolve(
@@ -790,7 +750,6 @@ mod tests {
                 b.allow_broad_storage_permissions(true)
             }),
             node(),
-            &ticket(),
         )
         .expect("resolve");
         assert!(!relaxed.policy().enforces_permissions());

@@ -88,19 +88,45 @@ pub enum PermitError {
     FieldWidth,
 }
 
+/// The one ticket a permit's `candidate_ticket` field may carry: the canonical,
+/// credential-free, **addressless** Aster ticket for `candidate`.
+///
+/// A permit binds identity, and an Aster node's identity is its NodeId. Its
+/// address is not: a node binds an ephemeral UDP port and is resolved from
+/// NodeId to a current address by discovery, so a fully rendered address ticket
+/// names something that changes on every restart. Binding one would mean a
+/// candidate could never restart under the permit it was given — which is
+/// exactly what happened, and what `S3-JOIN-TICKET` records.
+///
+/// Field 6 of `JoinPermitV1` is frozen, so it stays; what it *means* is fixed
+/// here instead. Derived, never accepted: nothing outside this function decides
+/// what the field should contain, so no caller can reintroduce address material
+/// by handing in a ticket it rendered itself. Current addresses remain advisory
+/// discovery hints — see the "Route hint" row of the authority matrix, which
+/// already said they are advisory only.
+pub fn canonical_candidate_ticket(candidate: &NodeId) -> Result<String, PermitError> {
+    aster_transport_core::ticket::AsterTicket {
+        endpoint_id: *candidate,
+        relay: None,
+        direct_addrs: Vec::new(),
+        credential: Some(aster_transport_core::ticket::TicketCredential::Open),
+    }
+    .to_base58_string()
+    .map_err(|_| PermitError::TicketMismatch)
+}
+
 /// Verify one seed's signed join permit against the group's authority.
 ///
-/// `ticket` is the seed's own ticket: §9 requires the permit to bind the route
-/// material it authorises, so a permit for a node says nothing about a ticket it
-/// was not minted with.
+/// The permit's ticket is checked against [`canonical_candidate_ticket`] for
+/// `candidate` rather than against a ticket the caller supplies, so a permit
+/// binds the candidate's identity and nothing transient.
 pub fn verify_join_permit(
     authority: &GroupAuthority,
     permit_bytes: &[u8],
     candidate: &NodeId,
-    ticket: &[u8],
 ) -> Result<(), PermitError> {
     let (permit, _) = open_signed_permit(&authority.public_key, permit_bytes)?;
-    check_permit(authority, &permit, candidate, ticket)
+    check_permit(authority, &permit, candidate)
 }
 
 /// Open a signed permit envelope: everything up to and including "these bytes
@@ -170,7 +196,6 @@ fn check_permit(
     authority: &GroupAuthority,
     permit: &JoinPermitV1,
     candidate: &NodeId,
-    ticket: &[u8],
 ) -> Result<(), PermitError> {
     check_permit_shape(permit)?;
 
@@ -186,7 +211,7 @@ fn check_permit(
     if permit.candidate_node_id != candidate.to_vec() {
         return Err(PermitError::WrongNode);
     }
-    if permit.candidate_ticket.as_bytes() != ticket {
+    if permit.candidate_ticket != canonical_candidate_ticket(candidate)? {
         return Err(PermitError::TicketMismatch);
     }
     Ok(())
@@ -321,7 +346,6 @@ pub fn verify_join_permit_for_start(
     authority_domain: &str,
     permit_bytes: &[u8],
     candidate: &NodeId,
-    ticket: &[u8],
 ) -> Result<VerifiedJoinPermit, PermitError> {
     let (permit, document_bytes) = open_signed_permit(authority_public_key, permit_bytes)?;
     check_permit_shape(&permit)?;
@@ -333,7 +357,7 @@ pub fn verify_join_permit_for_start(
     if permit.candidate_node_id != candidate.to_vec() {
         return Err(PermitError::WrongNode);
     }
-    if permit.candidate_ticket.as_bytes() != ticket {
+    if permit.candidate_ticket != canonical_candidate_ticket(candidate)? {
         return Err(PermitError::TicketMismatch);
     }
 
@@ -963,15 +987,23 @@ mod tests {
     use super::*;
 
     const CANDIDATE: NodeId = [7u8; 32];
-    const TICKET: &[u8] = b"aster1ticket";
+
+    /// The one ticket a permit for `CANDIDATE` may carry. Derived, not spelled:
+    /// a literal here would let the fixture and production disagree about what
+    /// the field means, which is the defect `S3-JOIN-TICKET` records.
+    fn ticket_bytes() -> Vec<u8> {
+        canonical_candidate_ticket(&CANDIDATE)
+            .expect("a canonical ticket")
+            .into_bytes()
+    }
 
     fn verify(bytes: &[u8]) -> Result<(), PermitError> {
-        verify_join_permit(&authority(), bytes, &CANDIDATE, TICKET)
+        verify_join_permit(&authority(), bytes, &CANDIDATE)
     }
 
     #[test]
     fn a_correctly_signed_permit_verifies() {
-        assert_eq!(verify(&valid(&CANDIDATE, TICKET)), Ok(()));
+        assert_eq!(verify(&valid(&CANDIDATE, &ticket_bytes())), Ok(()));
     }
 
     /// The case the old presence check accepted outright.
@@ -989,7 +1021,7 @@ mod tests {
         use ed25519_dalek::{Signer, SigningKey};
 
         let impostor = SigningKey::from_bytes(&[0x99u8; 32]);
-        let permit = permit_for(&CANDIDATE, TICKET);
+        let permit = permit_for(&CANDIDATE, &ticket_bytes());
         let document_bytes = payload_fory::<JoinPermitV1>()
             .serialize(&permit)
             .expect("encode");
@@ -1010,7 +1042,7 @@ mod tests {
     /// A permit whose contents were edited after signing.
     #[test]
     fn a_tampered_permit_fails_its_signature() {
-        let good = valid(&CANDIDATE, TICKET);
+        let good = valid(&CANDIDATE, &ticket_bytes());
         let mut envelope: SignedCoordinationDocumentV1 =
             payload_fory::<SignedCoordinationDocumentV1>()
                 .deserialize(&good)
@@ -1040,7 +1072,7 @@ mod tests {
                 "another deployment",
                 JoinPermitV1 {
                     authority_domain: "aster1.net".into(),
-                    ..permit_for(&CANDIDATE, TICKET)
+                    ..permit_for(&CANDIDATE, &ticket_bytes())
                 },
                 PermitError::WrongDomain,
             ),
@@ -1048,7 +1080,7 @@ mod tests {
                 "another group",
                 JoinPermitV1 {
                     group_id: vec![0xCDu8; 32],
-                    ..permit_for(&CANDIDATE, TICKET)
+                    ..permit_for(&CANDIDATE, &ticket_bytes())
                 },
                 PermitError::WrongGroup,
             ),
@@ -1056,7 +1088,7 @@ mod tests {
                 "a replacement group reusing the id",
                 JoinPermitV1 {
                     genesis_hash: vec![0x22u8; 32],
-                    ..permit_for(&CANDIDATE, TICKET)
+                    ..permit_for(&CANDIDATE, &ticket_bytes())
                 },
                 PermitError::WrongGenesis,
             ),
@@ -1064,7 +1096,7 @@ mod tests {
                 "another node",
                 JoinPermitV1 {
                     candidate_node_id: vec![8u8; 32],
-                    ..permit_for(&CANDIDATE, TICKET)
+                    ..permit_for(&CANDIDATE, &ticket_bytes())
                 },
                 PermitError::WrongNode,
             ),
@@ -1072,7 +1104,7 @@ mod tests {
                 "another ticket",
                 JoinPermitV1 {
                     candidate_ticket: "aster1other".into(),
-                    ..permit_for(&CANDIDATE, TICKET)
+                    ..permit_for(&CANDIDATE, &ticket_bytes())
                 },
                 PermitError::TicketMismatch,
             ),
@@ -1080,7 +1112,7 @@ mod tests {
                 "an empty ticket",
                 JoinPermitV1 {
                     candidate_ticket: String::new(),
-                    ..permit_for(&CANDIDATE, TICKET)
+                    ..permit_for(&CANDIDATE, &ticket_bytes())
                 },
                 PermitError::FieldWidth,
             ),
@@ -1088,7 +1120,7 @@ mod tests {
                 "no bootstrap senders",
                 JoinPermitV1 {
                     bootstrap_senders: Vec::new(),
-                    ..permit_for(&CANDIDATE, TICKET)
+                    ..permit_for(&CANDIDATE, &ticket_bytes())
                 },
                 PermitError::BootstrapSenders,
             ),
@@ -1103,7 +1135,7 @@ mod tests {
                             node_id: vec![1u8; 32],
                         },
                     ],
-                    ..permit_for(&CANDIDATE, TICKET)
+                    ..permit_for(&CANDIDATE, &ticket_bytes())
                 },
                 PermitError::BootstrapSenders,
             ),
@@ -1111,7 +1143,7 @@ mod tests {
                 "a future format",
                 JoinPermitV1 {
                     format_version: 2,
-                    ..permit_for(&CANDIDATE, TICKET)
+                    ..permit_for(&CANDIDATE, &ticket_bytes())
                 },
                 PermitError::UnknownFormat(2),
             ),
@@ -1122,22 +1154,53 @@ mod tests {
         }
     }
 
-    /// The ticket binding is what stops a valid permit authorising route
-    /// material it was not minted with.
+    /// **A permit may not carry address material, even for the right node.**
+    ///
+    /// This is the binding that changed. An Aster node binds an ephemeral UDP
+    /// port and is resolved from its NodeId by discovery, so a permit that
+    /// bound the candidate's rendered address would stop verifying the moment
+    /// that candidate restarted — the candidate could never come back. The
+    /// field now carries exactly one value, derived from the NodeId, and an
+    /// address-bearing ticket *for this very candidate* is refused.
     #[test]
-    fn a_valid_permit_does_not_authorise_a_different_ticket() {
-        let bytes = valid(&CANDIDATE, TICKET);
-        assert_eq!(
-            verify_join_permit(&authority(), &bytes, &CANDIDATE, b"aster1substituted"),
-            Err(PermitError::TicketMismatch),
+    fn a_permit_may_not_bind_the_candidates_address() {
+        let addressed = aster_transport_core::ticket::AsterTicket {
+            endpoint_id: CANDIDATE,
+            relay: None,
+            direct_addrs: vec!["127.0.0.1:47731".parse().expect("an address")],
+            credential: Some(aster_transport_core::ticket::TicketCredential::Open),
+        }
+        .to_base58_string()
+        .expect("a well-formed ticket");
+        assert_ne!(
+            addressed.as_bytes(),
+            ticket_bytes(),
+            "the fixture must actually differ from the canonical form"
         );
+
+        let bytes = sign(&JoinPermitV1 {
+            candidate_ticket: addressed,
+            ..permit_for(&CANDIDATE, &ticket_bytes())
+        });
+        assert_eq!(verify(&bytes), Err(PermitError::TicketMismatch));
+    }
+
+    /// And a canonical ticket for a *different* node is refused too, which is
+    /// what stops a permit authorising route material for someone else.
+    #[test]
+    fn a_valid_permit_does_not_authorise_another_nodes_ticket() {
+        let bytes = sign(&JoinPermitV1 {
+            candidate_ticket: canonical_candidate_ticket(&[9u8; 32]).expect("canonical"),
+            ..permit_for(&CANDIDATE, &ticket_bytes())
+        });
+        assert_eq!(verify(&bytes), Err(PermitError::TicketMismatch));
     }
 
     // ── the candidate's own view of its permit ──────────────────────────────
 
-    fn verify_start(bytes: &[u8], ticket: &[u8]) -> Result<VerifiedJoinPermit, PermitError> {
+    fn verify_start(bytes: &[u8]) -> Result<VerifiedJoinPermit, PermitError> {
         let a = authority();
-        verify_join_permit_for_start(&a.public_key, &a.domain, bytes, &CANDIDATE, ticket)
+        verify_join_permit_for_start(&a.public_key, &a.domain, bytes, &CANDIDATE)
     }
 
     /// The candidate learns the group from the permit, and what it learns is
@@ -1148,8 +1211,8 @@ mod tests {
     /// swapped the two 32-byte identifiers fails.
     #[test]
     fn a_candidate_learns_its_group_from_a_permit_it_verified() {
-        let verified = verify_start(&valid(&CANDIDATE, TICKET), TICKET).expect("verify");
-        let expected = permit_for(&CANDIDATE, TICKET);
+        let verified = verify_start(&valid(&CANDIDATE, &ticket_bytes())).expect("verify");
+        let expected = permit_for(&CANDIDATE, &ticket_bytes());
 
         assert_eq!(verified.group_id(), &authority().group_id);
         assert_eq!(verified.genesis_hash(), &authority().genesis_hash);
@@ -1165,8 +1228,8 @@ mod tests {
     /// re-encoding.
     #[test]
     fn a_verified_permit_carries_the_exact_signed_bytes() {
-        let bytes = valid(&CANDIDATE, TICKET);
-        let verified = verify_start(&bytes, TICKET).expect("verify");
+        let bytes = valid(&CANDIDATE, &ticket_bytes());
+        let verified = verify_start(&bytes).expect("verify");
         let envelope: SignedCoordinationDocumentV1 = payload_fory::<SignedCoordinationDocumentV1>()
             .deserialize(&bytes)
             .expect("decode");
@@ -1189,21 +1252,18 @@ mod tests {
 
         let wrong_domain = sign(&JoinPermitV1 {
             authority_domain: "aster1.net".into(),
-            ..permit_for(&CANDIDATE, TICKET)
+            ..permit_for(&CANDIDATE, &ticket_bytes())
         });
-        assert_eq!(
-            verify_start(&wrong_domain, TICKET),
-            Err(PermitError::WrongDomain)
-        );
+        assert_eq!(verify_start(&wrong_domain), Err(PermitError::WrongDomain));
 
-        let for_another_node = valid(&[8u8; 32], TICKET);
-        assert_eq!(
-            verify_start(&for_another_node, TICKET),
-            Err(PermitError::WrongNode)
-        );
+        let for_another_node = valid(&[8u8; 32], &ticket_bytes());
+        assert_eq!(verify_start(&for_another_node), Err(PermitError::WrongNode));
 
         assert_eq!(
-            verify_start(&valid(&CANDIDATE, TICKET), b"aster1substituted"),
+            verify_start(&sign(&JoinPermitV1 {
+                candidate_ticket: canonical_candidate_ticket(&[9u8; 32]).expect("canonical"),
+                ..permit_for(&CANDIDATE, &ticket_bytes())
+            })),
             Err(PermitError::TicketMismatch)
         );
 
@@ -1212,9 +1272,8 @@ mod tests {
             verify_join_permit_for_start(
                 &[0u8; 32],
                 &a.domain,
-                &valid(&CANDIDATE, TICKET),
+                &valid(&CANDIDATE, &ticket_bytes()),
                 &CANDIDATE,
-                TICKET
             ),
             Err(PermitError::WrongAuthorityKey)
         );
@@ -1232,16 +1291,16 @@ mod tests {
         let elsewhere = sign(&JoinPermitV1 {
             group_id: vec![0xCDu8; 32],
             genesis_hash: vec![0x22u8; 32],
-            ..permit_for(&CANDIDATE, TICKET)
+            ..permit_for(&CANDIDATE, &ticket_bytes())
         });
-        let verified = verify_start(&elsewhere, TICKET).expect("a signed permit for another group");
+        let verified = verify_start(&elsewhere).expect("a signed permit for another group");
         assert_eq!(verified.group_id(), &[0xCDu8; 32]);
         assert_eq!(verified.genesis_hash(), &[0x22u8; 32]);
 
         // The apply-time verifier, which *does* hold an expectation, refuses
         // the same bytes. The two answers differ because the questions do.
         assert_eq!(
-            verify_join_permit(&authority(), &elsewhere, &CANDIDATE, TICKET),
+            verify_join_permit(&authority(), &elsewhere, &CANDIDATE),
             Err(PermitError::WrongGroup)
         );
     }
@@ -1252,12 +1311,9 @@ mod tests {
     fn the_startup_verifier_enforces_the_sender_list_shape() {
         let empty = sign(&JoinPermitV1 {
             bootstrap_senders: Vec::new(),
-            ..permit_for(&CANDIDATE, TICKET)
+            ..permit_for(&CANDIDATE, &ticket_bytes())
         });
-        assert_eq!(
-            verify_start(&empty, TICKET),
-            Err(PermitError::BootstrapSenders)
-        );
+        assert_eq!(verify_start(&empty), Err(PermitError::BootstrapSenders));
 
         let unsorted = sign(&JoinPermitV1 {
             bootstrap_senders: vec![
@@ -1268,12 +1324,9 @@ mod tests {
                     node_id: vec![1u8; 32],
                 },
             ],
-            ..permit_for(&CANDIDATE, TICKET)
+            ..permit_for(&CANDIDATE, &ticket_bytes())
         });
-        assert_eq!(
-            verify_start(&unsorted, TICKET),
-            Err(PermitError::BootstrapSenders)
-        );
+        assert_eq!(verify_start(&unsorted), Err(PermitError::BootstrapSenders));
     }
 
     // ── genesis ─────────────────────────────────────────────────────────────

@@ -1067,10 +1067,16 @@ fn root_cannot_be_founded_as_a_delegate() {
 /// place for the group's opinion of this node to live, and the two could
 /// disagree after a revocation.
 ///
-/// The endpoint binds a fixed port so its rendered ticket is identical across
-/// starts. That is not a test artefact: a permit binds the ticket, so an
-/// operator mints one for a candidate whose address they already have — the
-/// same two-step this performs.
+/// Both starts are real: the candidate starts, is shut down, and starts again
+/// on the same directory, the same identity and the same permit. Nothing is
+/// constructed on its behalf, because "a restart works" is precisely the claim
+/// and a hand-built directory cannot support it.
+///
+/// **Both starts bind different UDP ports**, and that is the point rather than
+/// an accident: `AsterConfig` here names no `bind_addr`, so each start takes a
+/// fresh ephemeral port, exactly as a real node does. A permit that bound the
+/// candidate's rendered address would refuse the second start outright — see
+/// `S3-JOIN-TICKET`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joining_node_survives_restart_in_the_same_restricted_state() {
     let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x0E, 1);
@@ -1080,92 +1086,96 @@ async fn a_joining_node_survives_restart_in_the_same_restricted_state() {
     let node_config = || {
         aster::AsterConfig::builder()
             .relay(aster::RelayMode::Disabled)
-            .bind_addr("127.0.0.1:47731")
             .secret_key(aster::SecretKey::from_bytes(candidate))
             .root_pubkey(aster::PublicKey::from_bytes(fixture.authority_key()))
             .build()
     };
 
-    // The ticket the candidate will render at this address, constructed rather
-    // than probed: a permit binds the ticket byte for byte, so if the node
-    // rendered anything else the start below fails with `TicketMismatch` and
-    // says so — which is a better failure than a probe that has to hand the
-    // port back before the real start can take it.
-    let ticket = aster::Ticket::from_node_addr(
-        &aster::NodeAddr {
-            node_id: aster::NodeId::from_hex(hex::encode(fixture_node_id(candidate))),
-            relay_url: None,
-            direct_addresses: vec!["127.0.0.1:47731".to_string()],
-        },
-        aster::Credential::Open,
-    )
-    .and_then(|t| t.to_base58())
-    .expect("a canonical ticket");
+    // The permit is minted once, from the candidate's NodeId alone — which is
+    // all an operator has and all they need. No node is started to obtain it.
+    let ticket = canonical_ticket_for(candidate);
 
-    // The state a first `Join` start leaves: the directory bound to this
-    // group, and no membership, because a permit grants none.
-    //
-    // Constructed rather than produced by starting and stopping a server, and
-    // for the same reason the interrupted-bootstrap gate does it: one bind. A
-    // permit binds the candidate's rendered ticket, so both starts must share
-    // an address — and an endpoint's socket is not free the instant
-    // `shutdown()` returns, so a two-start version spends its time waiting on a
-    // port rather than on the property.
-    fixture.bind_without_initializing_for_testing(dir.path(), &fixture_node_id(candidate));
+    // First start: a fresh directory, which is what a candidate has the first
+    // time. Starting binds it.
+    let first = AsterServer::builder()
+        .config(node_config())
+        .builtin_coordination(fixture.join_config(dir.path(), candidate, &ticket, &[0]))
+        .start()
+        .await
+        .expect("a candidate joins with a valid permit");
+    assert_eq!(
+        first.coordination().expect("hosted").lifecycle_code(),
+        2,
+        "a permit grants no membership, so the first start is Joining"
+    );
+    // What the node is actually reachable at, which is *not* what the permit
+    // binds. Captured so the second start can be shown to differ — otherwise
+    // this gate would pass just as well against the old address binding.
+    let first_address = rendered_address_ticket(first.node()).await;
+    assert_ne!(
+        first_address, ticket,
+        "the permit must bind the addressless form, not the rendered address"
+    );
+    first.shutdown().await;
 
-    // This start therefore opens a **bound** directory, which is exactly what
-    // `Join` refused: it required `Fresh`, so a joining node could never
-    // restart. Wiping the directory is not the answer — the group's quorum may
+    // Second start: same directory — now bound — same identity, same permit.
+    // This is the case `Join` refused outright when it required a `Fresh`
+    // directory. Wiping instead is not a workaround: the group's quorum may
     // already count this candidate a voter, and a wiped store would rejoin as
     // a member with no log.
-    let restarted = start_on_the_fixed_port(|| {
-        AsterServer::builder()
-            .config(node_config())
-            .builtin_coordination(fixture.join_config(dir.path(), candidate, &ticket, &[0]))
-    })
-    .await
-    .expect("a joining candidate restarts into a directory it already bound");
+    let restarted = AsterServer::builder()
+        .config(node_config())
+        .builtin_coordination(fixture.join_config(dir.path(), candidate, &ticket, &[0]))
+        .start()
+        .await
+        .expect("a joining candidate restarts into a directory it already bound");
 
-    // Still restricted: `Joining`, not `Bootstrapping` and not `Ready`. A
-    // permit grants no membership, so nothing about the restart advances it.
     assert_eq!(
         restarted.coordination().expect("hosted").lifecycle_code(),
         2,
         "the restart retains the same restricted state until membership lands"
     );
 
+    // The load-bearing assertion. The candidate came back at a **different**
+    // address under the **same** permit: had the permit bound route material,
+    // the start above would have failed `TicketMismatch` instead.
+    assert_ne!(
+        rendered_address_ticket(restarted.node()).await,
+        first_address,
+        "the two starts must differ in address, or this proves nothing"
+    );
+
     restarted.shutdown().await;
 }
 
-/// The node id a secret produces, without starting anything.
-fn fixture_node_id(secret: [u8; 32]) -> [u8; 32] {
-    ed25519_dalek::SigningKey::from_bytes(&secret)
-        .verifying_key()
-        .to_bytes()
+/// The ticket a *running* node renders for itself, address material included —
+/// the advisory discovery hint, never the signed binding.
+async fn rendered_address_ticket(node: &aster::Node) -> String {
+    for _ in 0..100 {
+        if !node.addr().direct_addresses.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    aster::Ticket::from_node_addr(&node.addr(), aster::Credential::Open)
+        .and_then(|t| t.to_base58())
+        .expect("a canonical ticket")
 }
 
-/// Start a server on the test's fixed port, waiting for the previous one's
-/// socket to be released.
-///
-/// **Bounded**, so a port that never frees fails the test rather than hanging
-/// it. The fixed port is not a convenience: a join permit binds the candidate's
-/// rendered ticket, so a candidate that restarts at a different address needs a
-/// new permit — the address is part of what was signed for.
-async fn start_on_the_fixed_port<F>(mut build: F) -> aster::Result<AsterServer>
-where
-    F: FnMut() -> aster::rpc::AsterServerBuilder,
-{
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        match build().start().await {
-            Ok(server) => return Ok(server),
-            Err(err)
-                if err.to_string().contains("Address already in use")
-                    && tokio::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(err) => return Err(err),
-        }
-    }
+/// The one ticket a permit for this candidate may carry: canonical, Open, and
+/// **addressless**, derived from the NodeId the secret produces.
+fn canonical_ticket_for(secret: [u8; 32]) -> String {
+    let node_id = ed25519_dalek::SigningKey::from_bytes(&secret)
+        .verifying_key()
+        .to_bytes();
+    aster::Ticket::from_node_addr(
+        &aster::NodeAddr {
+            node_id: aster::NodeId::from_hex(hex::encode(node_id)),
+            relay_url: None,
+            direct_addresses: Vec::new(),
+        },
+        aster::Credential::Open,
+    )
+    .and_then(|t| t.to_base58())
+    .expect("a canonical ticket")
 }
