@@ -64,6 +64,7 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("model/tables.rs", include_str!("model/tables.rs")),
     ("model/wire.rs", include_str!("model/wire.rs")),
     ("network/admit.rs", include_str!("network/admit.rs")),
+    ("network/chaos.rs", include_str!("network/chaos.rs")),
     ("network/client.rs", include_str!("network/client.rs")),
     ("network/errors.rs", include_str!("network/errors.rs")),
     ("network/handoff.rs", include_str!("network/handoff.rs")),

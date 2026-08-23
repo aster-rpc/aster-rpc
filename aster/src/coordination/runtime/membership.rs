@@ -1274,6 +1274,102 @@ mod tests {
         );
     }
 
+    /// **`S3-JOINT-RESUME`: the four proof boundaries.**
+    ///
+    /// OpenRaft's blocking `change_membership` writes a joint entry and then a
+    /// uniform one. Leadership loss or process death **between** them leaves
+    /// the group joint, so a new generation must begin by *observing* rather
+    /// than by assuming a uniform membership.
+    ///
+    /// Each boundary below is a state a new generation could wake up in, and
+    /// each is driven against the **same durable intent** — which is the point:
+    /// nothing is carried across the loss, so the same function reaches the
+    /// right step from the state alone.
+    ///
+    /// The voter transition and the node-map replacement are two operations and
+    /// the pair is **not** atomic. `ReplaceAllNodes` is one entry and atomic on
+    /// its own, which is what makes it safe *after* the uniform entry is
+    /// verified and wrong before or merged with it.
+    #[test]
+    fn a_new_generation_resumes_the_joint_corridor_from_observation() {
+        let plan = intent(phases::PHASE_CHANGING_VOTERS, &[1, 2, 3], &[9], &[]);
+
+        // 1. Lost **before the joint entry committed**: membership is still the
+        //    old uniform set. Call the same desired change again; OpenRaft's
+        //    coherent next step emits the joint entry.
+        assert_eq!(
+            next_step(&plan, &view(&[&[1, 2]], &[3, 9], &[]), None),
+            Step::ChangeVoters,
+            "before the joint entry, the corridor restarts from the same desired change"
+        );
+
+        // 2. Lost **after the joint entry committed**: the group is joint. The
+        //    same call again is what makes OpenRaft emit the uniform entry —
+        //    not a different call, and not an assumption that it already did.
+        assert_eq!(
+            next_step(&plan, &view(&[&[1, 2], &[1, 2, 3]], &[9], &[]), None),
+            Step::ChangeVoters,
+            "a joint membership resumes by repeating the desired change"
+        );
+
+        // 3. Lost **after the uniform entry committed**, node map not yet
+        //    replaced: the voters are right and a stale learner remains. Only
+        //    step 5 is owed, and it is a separate operation.
+        assert_eq!(
+            next_step(&plan, &view(&[&[1, 2, 3]], &[7, 9], &[]), None),
+            Step::ReplaceNodes,
+            "after the uniform entry, only the node map is owed"
+        );
+
+        // 4. Lost **after the node-map replacement**: everything matches, and
+        //    all that remains is to report what has already been observed.
+        assert_eq!(
+            next_step(&plan, &view(&[&[1, 2, 3]], &[9], &[]), None),
+            Step::ReportComplete,
+            "after the replacement, completion is reported from observation"
+        );
+
+        // And the boundaries are genuinely different: a resume that answered
+        // the same thing everywhere would pass three of the four above by
+        // accident.
+        let answers = [
+            next_step(&plan, &view(&[&[1, 2]], &[3, 9], &[]), None),
+            next_step(&plan, &view(&[&[1, 2, 3]], &[7, 9], &[]), None),
+            next_step(&plan, &view(&[&[1, 2, 3]], &[9], &[]), None),
+        ];
+        let distinct: BTreeSet<String> = answers.iter().map(|a| format!("{a:?}")).collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "the boundaries must be distinguishable, or the resume is not observing"
+        );
+    }
+
+    /// The corridor never merges the voter change with the node-map
+    /// replacement.
+    ///
+    /// `ReplaceNodes` is reachable **only** once the voters already match and
+    /// the membership is uniform — so no state produces both in one pass, and
+    /// nothing can be written as though the pair were atomic.
+    #[test]
+    fn the_node_map_replacement_never_runs_before_the_uniform_entry() {
+        let plan = intent(phases::PHASE_CHANGING_VOTERS, &[1, 2, 3], &[9], &[]);
+        for membership in [
+            // Old uniform.
+            view(&[&[1, 2]], &[3, 9], &[]),
+            // Joint.
+            view(&[&[1, 2], &[1, 2, 3]], &[9], &[]),
+            // Joint, with the target already in one config.
+            view(&[&[1, 2, 3], &[1, 2]], &[9], &[]),
+        ] {
+            assert_ne!(
+                next_step(&plan, &membership, None),
+                Step::ReplaceNodes,
+                "the node map may only be replaced after the uniform voter entry"
+            );
+        }
+    }
+
     /// **A new generation carries nothing but the catch-up barrier.**
     ///
     /// This is what makes "membership resumes across leader loss" true rather

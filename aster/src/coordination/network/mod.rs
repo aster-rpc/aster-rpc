@@ -5,6 +5,7 @@
 //! | Module | Owns |
 //! |---|---|
 //! | [`admit`] | the §5.3 request-check order, as one function |
+//! | [`chaos`] | the deterministic seeded fault schedule (§6.2) |
 //! | [`client`] | `RaftNetwork`/`RaftNetworkFactory` over Aster RPC |
 //! | [`errors`] | `S3-NETERR`: the two exhaustive mappings into OpenRaft's error variants |
 //! | [`service`] | the live `aster.coordination.Raft` v1 dispatcher |
@@ -21,6 +22,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod admit;
+pub(crate) mod chaos;
 pub(crate) mod client;
 pub(crate) mod errors;
 pub(crate) mod handoff;
