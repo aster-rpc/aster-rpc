@@ -76,6 +76,13 @@ pub(crate) enum StartError {
     RecoveryExportMissing,
     /// A recovery export path was configured for a genesis that binds none.
     RecoveryExportUnexpected,
+    /// The signed genesis supplied to `Existing` is not this directory's.
+    ///
+    /// The group id, genesis hash or profile disagrees with the independently
+    /// configured expectation. Refused rather than preferred either way: a
+    /// restart that accepted a different document could propose a second
+    /// genesis into a running group.
+    GenesisNotThisGroups,
     /// The storage directory's state does not match the mode.
     ///
     /// `Bootstrap` and `Join` require an empty directory; `Existing` requires
@@ -99,6 +106,10 @@ impl std::fmt::Display for StartError {
                 f,
                 "this node ({local}) is not one of the genesis's signed initial voters; only an \
                  initial voter may bootstrap"
+            ),
+            StartError::GenesisNotThisGroups => f.write_str(
+                "the signed genesis supplied to CoordinationStart::Existing is not the \
+                 document this directory is bound to",
             ),
             StartError::Unacknowledged(e) => write!(f, "{e}"),
             StartError::RecoveryExportMissing => f.write_str(
@@ -138,7 +149,12 @@ pub(crate) enum ResolvedStart {
         /// checked before this value exists.
         recovery_export_path: Option<PathBuf>,
     },
-    Existing,
+    Existing {
+        /// The same signed genesis, verified and bound to this directory's
+        /// expected hash. Carried because a restart may still have to propose
+        /// it: an interrupted bootstrap comes back at `admin_revision = 0`.
+        genesis: VerifiedGenesis,
+    },
     Join {
         permit: VerifiedJoinPermit,
     },
@@ -148,7 +164,7 @@ impl ResolvedStart {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             ResolvedStart::Bootstrap { .. } => "Bootstrap",
-            ResolvedStart::Existing => "Existing",
+            ResolvedStart::Existing { .. } => "Existing",
             ResolvedStart::Join { .. } => "Join",
         }
     }
@@ -161,7 +177,7 @@ impl ResolvedStart {
     pub(crate) fn requires_empty_directory(&self) -> bool {
         match self {
             ResolvedStart::Bootstrap { .. } | ResolvedStart::Join { .. } => true,
-            ResolvedStart::Existing => false,
+            ResolvedStart::Existing { .. } => false,
         }
     }
 }
@@ -273,15 +289,36 @@ pub(crate) fn resolve(
             )
         }
         CoordinationStart::Existing {
+            signed_genesis,
             expected_group_id,
             expected_genesis_hash,
             expected_deployment_profile_code,
-        } => (
-            *expected_group_id,
-            *expected_genesis_hash,
-            *expected_deployment_profile_code,
-            ResolvedStart::Existing,
-        ),
+        } => {
+            // The genesis is verified here too, and bound to the hash this
+            // directory is expected to carry. A restart may still have to
+            // *propose* it — a voter that crashed between `Raft::initialize`
+            // and the genesis entry comes back at revision 0 — so the document
+            // has to be present and has to be the right one. Verifying it
+            // against the configured hash is what makes "present" mean the
+            // right one rather than any document that happens to verify.
+            let genesis =
+                verify_genesis(key, domain, signed_genesis).map_err(StartError::Genesis)?;
+            if genesis.genesis_hash() != expected_genesis_hash {
+                return Err(StartError::GenesisNotThisGroups);
+            }
+            if genesis.group_id() != expected_group_id.as_bytes() {
+                return Err(StartError::GenesisNotThisGroups);
+            }
+            if genesis.deployment_profile_code() != *expected_deployment_profile_code {
+                return Err(StartError::GenesisNotThisGroups);
+            }
+            (
+                *expected_group_id,
+                *expected_genesis_hash,
+                *expected_deployment_profile_code,
+                ResolvedStart::Existing { genesis },
+            )
+        }
         CoordinationStart::Join {
             signed_join_permit,
             expected_deployment_profile_code,
@@ -394,6 +431,29 @@ mod tests {
         )
         .build()
         .expect("a complete config")
+    }
+
+    /// The `Existing` mode for a group founded on `signed`.
+    ///
+    /// Derived from the document rather than assembled from separate literals:
+    /// `Existing` now verifies the genesis against its expectation, so a fixture
+    /// whose two halves were independent constants would be testing that
+    /// mismatch rather than the mode. A test that means to supply the wrong
+    /// document overrides a field explicitly, which is then visibly the point.
+    fn existing_of(signed: Vec<u8>) -> CoordinationStart {
+        use crate::coordination::raft::SignedCoordinationDocumentV1;
+        let envelope: SignedCoordinationDocumentV1 =
+            crate::coordination::contract::payload_fory::<SignedCoordinationDocumentV1>()
+                .deserialize(&signed)
+                .expect("the fixture's own genesis decodes");
+        let expected_genesis_hash =
+            crate::coordination::model::authority::genesis_hash(&envelope.document_bytes);
+        CoordinationStart::Existing {
+            signed_genesis: signed,
+            expected_group_id: CoordinationGroupId::from_array(authority().group_id),
+            expected_genesis_hash,
+            expected_deployment_profile_code: shape::PROFILE_PROD,
+        }
     }
 
     fn three_voter_genesis() -> Vec<u8> {
@@ -555,18 +615,25 @@ mod tests {
     #[test]
     fn existing_binds_from_the_configured_expectation() {
         let plan = resolve(
-            &config(CoordinationStart::Existing {
-                expected_group_id: CoordinationGroupId::from_array([0xAAu8; 32]),
-                expected_genesis_hash: [0xBBu8; 32],
-                expected_deployment_profile_code: shape::PROFILE_PROD,
-            }),
+            &config(existing_of(three_voter_genesis())),
             node(),
             &ticket(),
         )
         .expect("resolve");
-        assert_eq!(plan.identity().group_id().as_bytes(), &[0xAAu8; 32]);
-        assert_eq!(plan.identity().genesis_hash(), &[0xBBu8; 32]);
-        assert!(matches!(plan.resolved(), ResolvedStart::Existing));
+        // Both from the configured expectation, which `existing_of` derives from
+        // the document it supplies — the two are now checked against each other
+        // at resolve, so a fixture with unrelated literals could not get here.
+        let CoordinationStart::Existing {
+            expected_group_id,
+            expected_genesis_hash,
+            ..
+        } = existing_of(three_voter_genesis())
+        else {
+            unreachable!("the fixture is an existing start")
+        };
+        assert_eq!(plan.identity().group_id(), &expected_group_id);
+        assert_eq!(plan.identity().genesis_hash(), &expected_genesis_hash);
+        assert!(matches!(plan.resolved(), ResolvedStart::Existing { .. }));
     }
 
     /// `Join` learns the group from the permit and takes the profile from the
@@ -656,11 +723,7 @@ mod tests {
             (
                 "Existing",
                 resolve(
-                    &config(CoordinationStart::Existing {
-                        expected_group_id: CoordinationGroupId::from_array([0xAAu8; 32]),
-                        expected_genesis_hash: [0xBBu8; 32],
-                        expected_deployment_profile_code: shape::PROFILE_PROD,
-                    }),
+                    &config(existing_of(three_voter_genesis())),
                     node(),
                     &ticket(),
                 )

@@ -574,18 +574,34 @@ impl State {
 
     /// May `actor` take an administrative action?
     ///
-    /// **The one administrative predicate.** ROOT always passes; everyone else
-    /// must be in the delegated set. Written once because the alternative is
-    /// three transcriptions of it in `grant`, `admin` and `membership`, and the
-    /// bug that made this necessary was two transcriptions of a check order.
+    /// **The one administrative predicate.** Written once because the
+    /// alternative is a transcription of it in each of `grant`, `admin`,
+    /// `membership` and `retire` — and the defect that made this necessary was
+    /// exactly that: `retire` read `admins` directly, so ROOT could change
+    /// membership but not retire a client.
+    ///
+    /// ## Nothing is administrative before the genesis is applied
+    ///
+    /// `admin_revision == 0` with no delegated rows is the pre-Genesis state.
+    /// The authorization seed comes from the signed genesis and from nowhere
+    /// else, so **no** administrative action is available until that entry has
+    /// applied — including ROOT's.
+    ///
+    /// That is not a courtesy to the delegates. An earlier revision cut only
+    /// `set_admin` at revision 0 and let ROOT through everywhere else, so ROOT
+    /// could issue grants, change membership, cancel a change or retire a
+    /// client into a group whose genesis had not been installed — writing
+    /// authorization state the genesis would then arrive alongside rather than
+    /// establish. ROOT's authority is real; it is *this group's* ROOT only once
+    /// the document naming it has committed.
     ///
     /// ROOT is deliberately *not* a member of [`admins`](Self::admins). The
-    /// delegated set is mutable, `set_admin` may empty-but-one of it, and a
+    /// delegated set is mutable, `set_admin` may reduce it to one, and a
     /// snapshot round-trips it; ROOT is none of those things. Keeping it out is
     /// what makes "`set_admin` cannot revoke ROOT" true by construction rather
     /// than by a rule somebody has to remember to write.
     pub fn is_administrator(&self, actor: &NodeId) -> bool {
-        self.is_root(actor) || self.admins.contains(actor)
+        self.admin_revision > 0 && (self.is_root(actor) || self.admins.contains(actor))
     }
 
     /// Would `added` growth bytes fit the §12.1 budget?

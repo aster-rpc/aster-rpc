@@ -40,7 +40,6 @@ use aster::coordination::contract::{
 };
 use aster::coordination::testing::GroupFixture;
 use aster::rpc::AsterServer;
-use aster::{AsterConfig, RelayMode, SecretKey};
 
 const DOMAIN: &str = "process-loss.test";
 
@@ -69,13 +68,7 @@ async fn main() {
     std::fs::create_dir_all(&storage).expect("a storage directory");
 
     let server = AsterServer::builder()
-        .config(
-            AsterConfig::builder()
-                .relay(RelayMode::Disabled)
-                .bind_addr("127.0.0.1:0")
-                .secret_key(SecretKey::from_bytes(fixture.secret(index)))
-                .build(),
-        )
+        .config(fixture.aster_config(index))
         .builtin_coordination(if returning {
             fixture.existing_config(&storage)
         } else {

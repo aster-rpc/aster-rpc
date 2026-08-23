@@ -9,11 +9,15 @@
 //! administrators can never grant again, and no later command can rescue it:
 //! adding an administrator is itself a `set_admin`, which requires an
 //! administrator to issue. The refusal is `24 LastAdministrator`, and it is
-//! **retryable** rather than terminal: the last administrator can add a second
-//! one and then reissue the removal unchanged, so a v1 command clears the
-//! condition -- which is §10's test. (The removal must be reissued on a
-//! different client id, because a pre-proposal `NotConsumed` consumed no
-//! sequence and the original request may not be altered at that sequence.)
+//! **terminal for the request that received it**. The escape -- add a
+//! replacement, then reissue the removal -- clears the *condition*, but adding
+//! the replacement is itself a `set_admin` that advances `admin_revision`, so
+//! the unchanged revision-fenced removal can afterwards only fail
+//! `7 AdminRevisionMismatch`. §10's test is whether a v1 command makes *that
+//! request* apply unchanged, and none does: the operator must submit a newly
+//! fenced one, on a different client id, because a pre-proposal `NotConsumed`
+//! consumed no sequence and the original request may not be altered at that
+//! sequence.
 //!
 //! **The revision advances exactly when the set changes.** Enabling an existing
 //! administrator, or disabling one that is not there, is a no-op returning
@@ -85,22 +89,11 @@ pub fn decide(state: &State, actor: &NodeId, action: &AdminAction) -> Decision {
         return Decision::Refuse(RefusalReason::RootAuthorityImmutable);
     }
 
-    // **Revision 0 is the pre-Genesis state, and no ordinary command moves it.**
-    //
-    // Revision 0 with no delegated rows means the signed genesis has not been
-    // applied yet. The authorization seed comes from that document and from
-    // nowhere else — "seeding fresh admins outside Raft" is exactly the
-    // shortcut §7.1 forbids — and ROOT passing the predicate above is what
-    // makes the hole reachable: without this, ROOT could install delegates
-    // before the genesis arrived, and the genesis would then find a revision it
-    // did not write.
-    //
-    // Reported as a revision mismatch because that is what it is: the command
-    // is revision-fenced, and 0 is not a revision at which any `set_admin` may
-    // apply.
-    if state.admin_revision == 0 {
-        return Decision::Refuse(RefusalReason::AdminRevisionMismatch);
-    }
+    // Revision 0 needs no separate check here: it is the pre-Genesis state, and
+    // `is_administrator` refuses *every* administrative action at revision 0,
+    // ROOT's included. An earlier revision cut only this command, which left
+    // ROOT able to grant, change membership and retire clients before the
+    // genesis had installed anything.
 
     // The revision check precedes every other decision, for the same reason it
     // does in `set_grant`: a stale request was never going to apply, so any

@@ -249,6 +249,9 @@ async fn start_one(
                 .relay(RelayMode::Disabled)
                 .bind_addr("127.0.0.1:0")
                 .secret_key(SecretKey::from_bytes(secret))
+                .root_pubkey(aster::PublicKey::from_bytes(
+                    authority().verifying_key().to_bytes(),
+                ))
                 .build(),
         )
         .builtin_coordination(coordination_config(dir.path(), secrets, admission))

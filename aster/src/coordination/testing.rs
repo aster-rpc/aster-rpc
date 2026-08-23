@@ -380,8 +380,37 @@ impl GroupFixture {
         self.authority.verifying_key().to_bytes()
     }
 
+    /// An `AsterConfig` carrying this fixture's ROOT key and voter `index`'s
+    /// identity.
+    ///
+    /// **The ROOT key goes on `AsterConfig`**, which is where a deployment puts
+    /// it, and the coordination config does not carry one at all. Every fixture
+    /// took the coordination-local route until `resolved_root_key` was made to
+    /// require the deployment's — which meant the whole suite exercised a path
+    /// no deployment uses, and nothing proved a voter could start from
+    /// `ASTER_ROOT_PUBKEY`.
+    pub fn aster_config(&self, index: usize) -> crate::AsterConfig {
+        crate::AsterConfig::builder()
+            .relay(crate::RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0")
+            .secret_key(crate::SecretKey::from_bytes(self.secret(index)))
+            .root_pubkey(crate::PublicKey::from_bytes(self.authority_key()))
+            .build()
+    }
+
     pub fn domain(&self) -> &str {
         &self.domain
+    }
+
+    /// Sign `bytes` with this fixture's ROOT secret.
+    ///
+    /// For gates that mint a document the fixture's own builders will not — a
+    /// genesis naming ROOT as a voter, say. Such a document has to be
+    /// *correctly signed* to test the rule that refuses it; an unsigned one
+    /// would be refused for the signature and prove nothing.
+    pub fn sign_for_testing(&self, bytes: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        self.authority.sign(bytes).to_bytes()
     }
 
     pub fn node_id(&self, index: usize) -> Vec<u8> {
@@ -543,6 +572,11 @@ impl GroupFixture {
 
         self.finish(CoordinationConfig::builder().storage_dir(dir).start_mode(
             CoordinationStart::Existing {
+                // The same document. A restart may still have to *propose* it:
+                // a voter that crashed between `Raft::initialize` and the
+                // genesis entry comes back with no administrators and nothing
+                // able to appoint one.
+                signed_genesis: self.signed_genesis(),
                 expected_group_id: self.group_id(),
                 expected_genesis_hash: self.genesis_hash(),
                 expected_deployment_profile_code: self.profile(),

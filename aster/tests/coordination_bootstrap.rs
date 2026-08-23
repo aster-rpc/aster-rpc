@@ -110,6 +110,9 @@ fn node_config(secret: [u8; 32]) -> AsterConfig {
         .relay(RelayMode::Disabled)
         .bind_addr("127.0.0.1:0")
         .secret_key(SecretKey::from_bytes(secret))
+        // The deployment ROOT, where a deployment puts it. Coordination consumes
+        // this rather than carrying a key of its own.
+        .root_pubkey(aster::PublicKey::from_bytes(authority_key()))
         .build()
 }
 
@@ -425,7 +428,7 @@ async fn a_bootstrapped_group_reopens_through_existing() {
                 .authority_public_key(authority_key())
                 .authority_domain(DOMAIN)
                 .start_mode(CoordinationStart::Bootstrap {
-                    signed_genesis: genesis,
+                    signed_genesis: genesis.clone(),
                     recovery_export_path: None,
                 })
                 .verified_admission(admission_source(std::slice::from_ref(&node_id)))
@@ -455,6 +458,10 @@ async fn a_bootstrapped_group_reopens_through_existing() {
                 .authority_public_key(authority_key())
                 .authority_domain(DOMAIN)
                 .start_mode(CoordinationStart::Existing {
+                    // The same document: a restart may still have to propose
+                    // it if the first start was interrupted before the genesis
+                    // entry applied.
+                    signed_genesis: genesis.clone(),
                     expected_group_id: aster::coordination::ids::CoordinationGroupId::from_array(
                         GROUP,
                     ),

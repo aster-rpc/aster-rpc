@@ -169,6 +169,19 @@ fn plan_shape(
         return Some(ShapeLimit::MembershipPlanOrder);
     }
 
+    // §8.1: ROOT is never a committed member, in either role. A genesis naming
+    // it as an initial voter is refused by `verify_genesis`; this is the other
+    // way in, and without it a group could be founded correctly and then have
+    // ROOT added by an ordinary membership change.
+    if plan
+        .desired_voters
+        .iter()
+        .chain(&plan.retained_learners)
+        .any(|node| node == &authority_material.public_key)
+    {
+        return Some(ShapeLimit::MembershipPlanRoot);
+    }
+
     // §12.1: at most two new voter identities per change. Without it a single
     // command replaces an entire quorum -- a membership no surviving voter voted
     // for -- and `max_encoded_command`'s sizing, which assumes two new seeds,

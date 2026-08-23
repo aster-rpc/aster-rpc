@@ -40,7 +40,7 @@ use std::sync::Arc;
 use openraft::error::{InitializeError, RaftError};
 use openraft::Raft;
 
-use super::host::CoordinationConfig;
+use super::host::{CoordinationConfig, CoordinationStart};
 use super::ids::CoordinationNodeId;
 use super::network::admit::SenderAllowlist;
 use super::network::client::{CoordinationNetworkFactory, FaultLatch, NetworkContext, RouteTable};
@@ -107,7 +107,7 @@ impl CorridorPlan {
                 // itself. Discovery finds them, or the sender dials us first.
                 routes: Vec::new(),
             },
-            ResolvedStart::Existing => Self {
+            ResolvedStart::Existing { .. } => Self {
                 corridor: Corridor::Running,
                 // Storage is already bound, so a committed membership exists
                 // and a seed list would be a second, staler answer.
@@ -206,16 +206,32 @@ pub(crate) async fn start(
         allowlist,
         local,
         &raft_config,
-        // §7.1: only a bootstrapping voter holds the document, and only it
-        // proposes the entry that installs the group's administrators. The
-        // exact bytes the operator signed, carried through unchanged — apply
-        // verifies them again on every voter, this one included.
+        // §7.1's document, for the two modes that hold it.
+        //
+        // **`Existing` too**, and that is the whole point of requiring it there.
+        // The genesis is installed by a committed entry, so a voter that
+        // crashed after `Raft::initialize` committed and before that entry
+        // applied comes back at `admin_revision = 0` — no administrators, and
+        // no administrator able to appoint one. Without the document a restart
+        // could never finish the bootstrap it interrupted, and the group would
+        // sit at `NoQuorum` forever with nothing to explain it.
+        //
+        // Proposing is still gated on revision 0, so a healthy restart into a
+        // long-running group proposes nothing.
+        //
+        // `Join` holds no genesis and needs none: it receives the entry by
+        // replay or in the snapshot that subsumes it.
+        // The **signed envelope**, from the configuration: `VerifiedGenesis`
+        // seals the inner document, and the command carries the envelope the
+        // operator signed. `resolve` has already verified these exact bytes and
+        // bound them to this directory's hash, so passing them on is not a
+        // second decode of anything.
         match config.start_mode() {
-            crate::coordination::host::CoordinationStart::Bootstrap { signed_genesis, .. } => {
+            CoordinationStart::Bootstrap { signed_genesis, .. }
+            | CoordinationStart::Existing { signed_genesis, .. } => {
                 Some(Arc::new(signed_genesis.clone()))
             }
-            crate::coordination::host::CoordinationStart::Join { .. }
-            | crate::coordination::host::CoordinationStart::Existing { .. } => None,
+            CoordinationStart::Join { .. } => None,
         },
     )
     .await;
@@ -252,7 +268,7 @@ async fn run_corridor(
         }
         // A permit grants no membership, and reopening a bound directory must
         // never found a second group over the first.
-        ResolvedStart::Join { .. } | ResolvedStart::Existing => Ok(()),
+        ResolvedStart::Join { .. } | ResolvedStart::Existing { .. } => Ok(()),
     }
 }
 
@@ -333,6 +349,33 @@ mod tests {
             .verified_admission(Arc::new(source_admitting(&[LOCAL, PEER, THIRD])))
             .build()
             .expect("a complete config")
+    }
+
+    /// The `Existing` mode for this fixture's own group.
+    ///
+    /// The hash is derived from the document rather than taken from
+    /// `authority().genesis_hash`, which is a fixed constant unrelated to any
+    /// genesis these tests build. `Existing` now verifies the two against each
+    /// other, so a fixture pairing a real document with an unrelated hash would
+    /// fail on the mismatch rather than exercising the corridor.
+    fn existing_of() -> CoordinationStart {
+        use crate::coordination::raft::SignedCoordinationDocumentV1;
+
+        let signed = sign_genesis(&genesis_for(&[LOCAL, PEER, THIRD], shape::PROFILE_PROD));
+        let envelope: SignedCoordinationDocumentV1 =
+            crate::coordination::contract::payload_fory::<SignedCoordinationDocumentV1>()
+                .deserialize(&signed)
+                .expect("the fixture's own genesis decodes");
+        let expected_genesis_hash =
+            crate::coordination::model::authority::genesis_hash(&envelope.document_bytes);
+        CoordinationStart::Existing {
+            signed_genesis: signed,
+            expected_group_id: crate::coordination::ids::CoordinationGroupId::from_array(
+                authority().group_id,
+            ),
+            expected_genesis_hash,
+            expected_deployment_profile_code: shape::PROFILE_PROD,
+        }
     }
 
     fn plan_for(start: CoordinationStart) -> StartPlan {
@@ -433,13 +476,7 @@ mod tests {
     /// membership, and a seed list would be a second, staler answer.
     #[test]
     fn existing_reads_the_committed_membership_from_the_first_call() {
-        let plan = plan_for(CoordinationStart::Existing {
-            expected_group_id: crate::coordination::ids::CoordinationGroupId::from_array(
-                authority().group_id,
-            ),
-            expected_genesis_hash: authority().genesis_hash,
-            expected_deployment_profile_code: shape::PROFILE_PROD,
-        });
+        let plan = plan_for(existing_of());
         let corridor = CorridorPlan::of(&plan, &node_id(LOCAL));
 
         assert_eq!(corridor.corridor, Corridor::Running);
@@ -484,17 +521,7 @@ mod tests {
                 Corridor::Joining,
                 false,
             ),
-            (
-                CoordinationStart::Existing {
-                    expected_group_id: crate::coordination::ids::CoordinationGroupId::from_array(
-                        authority().group_id,
-                    ),
-                    expected_genesis_hash: authority().genesis_hash,
-                    expected_deployment_profile_code: shape::PROFILE_PROD,
-                },
-                Corridor::Running,
-                true,
-            ),
+            (existing_of(), Corridor::Running, true),
         ];
         for (start, expected_corridor, graduated) in cases {
             let plan = plan_for(start);
@@ -546,7 +573,7 @@ mod tests {
             .find("ResolvedStart::Bootstrap")
             .expect("a bootstrap arm");
         let other_at = arm
-            .find("ResolvedStart::Join { .. } | ResolvedStart::Existing => Ok(())")
+            .find("ResolvedStart::Join { .. } | ResolvedStart::Existing { .. } => Ok(())")
             .expect("join and existing do nothing");
         assert!(
             bootstrap_at < other_at,

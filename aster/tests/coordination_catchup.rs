@@ -41,7 +41,6 @@ use aster::coordination::contract::{
 };
 use aster::coordination::testing::GroupFixture;
 use aster::rpc::AsterServer;
-use aster::{AsterConfig, RelayMode, SecretKey};
 
 const DOMAIN: &str = "catchup.test";
 const SEED: u8 = 0x2D;
@@ -81,13 +80,7 @@ async fn start(fixture: &GroupFixture, index: usize, dir: tempfile::TempDir, fre
         fixture.existing_config(dir.path())
     };
     let server = AsterServer::builder()
-        .config(
-            AsterConfig::builder()
-                .relay(RelayMode::Disabled)
-                .bind_addr("127.0.0.1:0")
-                .secret_key(SecretKey::from_bytes(fixture.secret(index)))
-                .build(),
-        )
+        .config(fixture.aster_config(index))
         .builtin_coordination(config)
         .start()
         .await

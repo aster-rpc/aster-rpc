@@ -41,7 +41,6 @@ use aster::coordination::contract::{
 };
 use aster::coordination::testing::{Committed, GroupFixture};
 use aster::rpc::AsterServer;
-use aster::{AsterConfig, RelayMode, SecretKey};
 
 const DOMAIN: &str = "genesis.test";
 const SEED: u8 = 0x77;
@@ -54,6 +53,7 @@ const ADMIN_UPDATED: i32 = 7;
 const NO_REASON: i32 = 0;
 const ROOT_AUTHORITY_IMMUTABLE: i32 = 26;
 const ADMIN_REVISION_MISMATCH: i32 = 7;
+const PERMISSION_CHANGED: i32 = 12;
 const SYS_GENESIS_ALREADY_INSTALLED: i32 = 8;
 
 struct Voter {
@@ -75,13 +75,7 @@ impl Voter {
 async fn start(fixture: &GroupFixture) -> Voter {
     let dir = tempfile::tempdir().expect("a storage directory");
     let server = AsterServer::builder()
-        .config(
-            AsterConfig::builder()
-                .relay(RelayMode::Disabled)
-                .bind_addr("127.0.0.1:0")
-                .secret_key(SecretKey::from_bytes(fixture.secret(0)))
-                .build(),
-        )
+        .config(fixture.aster_config(0))
         .builtin_coordination(fixture.config(dir.path(), 0))
         .start()
         .await
@@ -325,4 +319,446 @@ async fn the_delegated_set_is_mutable_but_never_empty() {
     );
 
     voter.server.shutdown().await;
+}
+
+/// **ROOT acts as an administrator across every administrative surface.**
+///
+/// One predicate, four surfaces, and the reason to test all four rather than
+/// one: `retire_client` read `admins` directly until this was wired up, so ROOT
+/// could change membership and issue grants but not retire a client. A group
+/// with one administrative *authority* and a different answer per command is
+/// the failure this covers.
+///
+/// ROOT is not in `initial_admins` — a genesis naming it there does not verify
+/// — so every acceptance here is the ROOT branch of the predicate and nothing
+/// else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn root_is_an_administrator_on_every_administrative_path() {
+    use aster::coordination::contract::{
+        CancelMembershipActionV1, ChangeMembershipActionV1, NodeIdV1, RetireClientCommandV1,
+    };
+
+    let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x04, 1);
+    let voter = start(&fixture).await;
+    let coordination = voter.coordination();
+    let root = fixture.authority_key().to_vec();
+
+    assert!(
+        !coordination
+            .committed_nodes_for_testing()
+            .iter()
+            .any(|node| node.as_bytes() == root.as_slice()),
+        "ROOT is never a committed member"
+    );
+
+    // 1. A grant, as ROOT.
+    let action = ActionV1::SetGrant(SetGrantActionV1 {
+        resource: ResourceKeyV1 {
+            namespace: "root-gate".into(),
+            key: b"grant".to_vec(),
+        },
+        target_node_id: fixture.node_id(0),
+        rights: aster::coordination::model::limits::RIGHT_READ,
+        expected_acl_revision: 0,
+    });
+    let committed = coordination
+        .propose_for_testing_within(
+            CommandV1::Client(ClientCommandV1 {
+                actor_node_id: root.clone(),
+                client_id: aster::coordination::testing::id16(b"root-grant"),
+                sequence: 1,
+                request_hash: aster::coordination::hash::request_hash(&action)
+                    .expect("a canonical action hashes")
+                    .to_vec(),
+                action,
+            }),
+            PATIENCE,
+        )
+        .await
+        .expect("commits");
+    assert_eq!(
+        outcome_of(&committed),
+        (GRANT_UPDATED, NO_REASON),
+        "ROOT may grant"
+    );
+
+    // 2. `set_admin`, as ROOT, on a node that is not ROOT.
+    let action = ActionV1::SetAdmin(SetAdminActionV1 {
+        target_node_id: [0xC1u8; 32].to_vec(),
+        enabled: true,
+        expected_admin_revision: 1,
+    });
+    let committed = coordination
+        .propose_for_testing_within(
+            CommandV1::Client(ClientCommandV1 {
+                actor_node_id: root.clone(),
+                client_id: aster::coordination::testing::id16(b"root-admin"),
+                sequence: 1,
+                request_hash: aster::coordination::hash::request_hash(&action)
+                    .expect("a canonical action hashes")
+                    .to_vec(),
+                action,
+            }),
+            PATIENCE,
+        )
+        .await
+        .expect("commits");
+    assert_eq!(
+        outcome_of(&committed),
+        (ADMIN_UPDATED, NO_REASON),
+        "ROOT may appoint a delegate"
+    );
+
+    // 3. A membership change, as ROOT. Refused on its merits here — a one-voter
+    //    group has no other legal shape — but the *reason* is what matters: it
+    //    must not be `PermissionChanged`, which is what a ROOT that failed the
+    //    predicate would receive.
+    let action = ActionV1::ChangeMembership(ChangeMembershipActionV1 {
+        operation_id: aster::coordination::testing::id16(b"root-membership"),
+        expected_membership_log_id: coordination.membership_log_id_for_testing(),
+        desired_voters: vec![NodeIdV1 {
+            node_id: fixture.node_id(0),
+        }],
+        retained_learners: Vec::new(),
+        member_seeds: Vec::new(),
+    });
+    let committed = coordination
+        .propose_for_testing_within(
+            CommandV1::Client(ClientCommandV1 {
+                actor_node_id: root.clone(),
+                client_id: aster::coordination::testing::id16(b"root-membership"),
+                sequence: 1,
+                request_hash: aster::coordination::hash::request_hash(&action)
+                    .expect("a canonical action hashes")
+                    .to_vec(),
+                action,
+            }),
+            PATIENCE,
+        )
+        .await
+        .expect("commits");
+    assert_ne!(
+        outcome_of(&committed).1,
+        PERMISSION_CHANGED,
+        "ROOT must pass the administrative predicate for membership"
+    );
+
+    // 4. Cancellation, same rule.
+    let action = ActionV1::CancelMembership(CancelMembershipActionV1 {
+        operation_id: aster::coordination::testing::id16(b"root-membership"),
+        expected_phase_code: 1,
+    });
+    let committed = coordination
+        .propose_for_testing_within(
+            CommandV1::Client(ClientCommandV1 {
+                actor_node_id: root.clone(),
+                client_id: aster::coordination::testing::id16(b"root-cancel"),
+                sequence: 1,
+                request_hash: aster::coordination::hash::request_hash(&action)
+                    .expect("a canonical action hashes")
+                    .to_vec(),
+                action,
+            }),
+            PATIENCE,
+        )
+        .await
+        .expect("commits");
+    assert_ne!(
+        outcome_of(&committed).1,
+        PERMISSION_CHANGED,
+        "ROOT must pass the administrative predicate for cancellation"
+    );
+
+    // 5. Retiring **another actor's** session — the surface that read `admins`
+    //    directly and would have refused ROOT.
+    let committed = coordination
+        .propose_for_testing_within(
+            CommandV1::RetireClient(RetireClientCommandV1 {
+                actor_node_id: root,
+                target_node_id: fixture.node_id(0),
+                target_client_id: aster::coordination::testing::id16(b"someone-else"),
+            }),
+            PATIENCE,
+        )
+        .await
+        .expect("commits");
+    match &committed.reply {
+        CommandReplyV1::Retirement(reply) => assert_ne!(
+            reply.reason_code, PERMISSION_CHANGED,
+            "ROOT may retire another actor's session"
+        ),
+        other => panic!("a retirement answers with a Retirement reply, got {other:?}"),
+    }
+
+    voter.server.shutdown().await;
+}
+
+/// **An exact replay stays idempotent after the state has moved on.**
+///
+/// The check that compares the genesis's `initial_voters` with the committed
+/// membership belongs to *first installation* only. Running it on every arrival
+/// made idempotence expire: once the group legally changed its membership or
+/// its administrators, the same document the group was founded on would find a
+/// set that no longer matched and be answered `GenesisRefused` — fatal, on
+/// every voter, for the one document they all agree on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replay_survives_the_state_moving_on() {
+    let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x05, 1);
+    let voter = start(&fixture).await;
+    let coordination = voter.coordination();
+
+    // Move the administrator state on, so a replay is no longer arriving into
+    // the state the genesis installed.
+    let action = ActionV1::SetAdmin(SetAdminActionV1 {
+        target_node_id: [0xD4u8; 32].to_vec(),
+        enabled: true,
+        expected_admin_revision: 1,
+    });
+    let committed = coordination
+        .propose_for_testing_within(
+            CommandV1::Client(ClientCommandV1 {
+                actor_node_id: fixture.node_id(0),
+                client_id: aster::coordination::testing::id16(b"evolve"),
+                sequence: 1,
+                request_hash: aster::coordination::hash::request_hash(&action)
+                    .expect("a canonical action hashes")
+                    .to_vec(),
+                action,
+            }),
+            PATIENCE,
+        )
+        .await
+        .expect("commits");
+    assert_eq!(outcome_of(&committed), (ADMIN_UPDATED, NO_REASON));
+
+    let replay = coordination
+        .propose_for_testing_within(
+            CommandV1::Genesis(GenesisCommandV1 {
+                signed_genesis: fixture.signed_genesis(),
+            }),
+            PATIENCE,
+        )
+        .await
+        .expect("an exact replay commits after the state has evolved");
+    assert_eq!(system_code(&replay), SYS_GENESIS_ALREADY_INSTALLED);
+
+    // Unchanged and still serving: the replay is a business-state no-op, not a
+    // reinstallation that would have reset the delegated set to the genesis's.
+    assert_eq!(coordination.lifecycle_code(), 3, "still Ready");
+    let after = coordination
+        .propose_for_testing_within(
+            CommandV1::Client(ClientCommandV1 {
+                actor_node_id: fixture.node_id(0),
+                client_id: aster::coordination::testing::id16(b"after-replay"),
+                sequence: 1,
+                request_hash: aster::coordination::hash::request_hash(&ActionV1::SetAdmin(
+                    SetAdminActionV1 {
+                        target_node_id: [0xD5u8; 32].to_vec(),
+                        enabled: true,
+                        expected_admin_revision: 2,
+                    },
+                ))
+                .expect("a canonical action hashes")
+                .to_vec(),
+                action: ActionV1::SetAdmin(SetAdminActionV1 {
+                    target_node_id: [0xD5u8; 32].to_vec(),
+                    enabled: true,
+                    expected_admin_revision: 2,
+                }),
+            }),
+            PATIENCE,
+        )
+        .await
+        .expect("commits");
+    assert_eq!(
+        outcome_of(&after),
+        (ADMIN_UPDATED, NO_REASON),
+        "the revision the earlier change reached survived the replay"
+    );
+
+    voter.server.shutdown().await;
+}
+
+/// **A different genesis is fatal, and fatal before anything is written.**
+///
+/// Two genesis documents for one group is a disagreement no voter can resolve
+/// locally, so the entry stops this node rather than installing an
+/// administrator set the operator never signed for it. `Fault::GenesisRefused`
+/// is raised before `last_applied` moves, on the same rule as `UnknownCommand`:
+/// a voter that cannot interpret a committed entry must not record having
+/// applied it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_different_genesis_is_fatal_and_writes_nothing() {
+    let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x06, 1);
+    let voter = start(&fixture).await;
+    let coordination = voter.coordination();
+
+    let before = coordination
+        .last_applied_for_testing()
+        .expect("an applied index");
+
+    // A different group's genesis, signed by a different ROOT — so it does not
+    // even verify under ours, which is the first of the checks.
+    let other = GroupFixture::new(DOMAIN, SEED ^ 0x07, 1);
+    let outcome = coordination
+        .propose_for_testing_within(
+            CommandV1::Genesis(GenesisCommandV1 {
+                signed_genesis: other.signed_genesis(),
+            }),
+            PATIENCE,
+        )
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a foreign genesis must not be accepted: {outcome:?}"
+    );
+
+    // Nothing was written for it. The entry is committed — apply cannot skip a
+    // committed entry — but the *state machine* refused it before `last_applied`
+    // moved, so the node stops rather than recording it as applied.
+    let after = coordination.last_applied_for_testing();
+    assert!(
+        after <= Some(before),
+        "a refused genesis must not advance the applied index: {before} -> {after:?}"
+    );
+
+    // And the node reports Fatal rather than continuing to serve.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        if coordination.lifecycle_code() == 6 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a voter that refused a genesis must latch Fatal, reported {}",
+            coordination.lifecycle_code()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    voter.server.shutdown().await;
+}
+
+/// **A restart through `Existing` can still finish an interrupted bootstrap.**
+///
+/// The genesis is installed by a committed entry, so there is a window: native
+/// membership commits, and the genesis entry has not applied yet. A voter that
+/// crashed there comes back at `admin_revision = 0` — no administrators, and no
+/// administrator able to appoint one. `Existing` carried no genesis, so a
+/// restart could never propose it, and the group would sit at `NoQuorum`
+/// forever with nothing to explain why.
+///
+/// Requiring the document on `Existing` closes it. This gate takes the ordinary
+/// route — start, stop, restart through `Existing` — and requires the restarted
+/// voter to be `Ready` and able to authorize, which is only true if the genesis
+/// is installed. A restart into a group that already has one proposes nothing:
+/// the proposal is gated on revision 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_through_existing_reaches_ready_and_can_authorize() {
+    let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x08, 1);
+    let dir = tempfile::tempdir().expect("a storage directory");
+
+    let first = AsterServer::builder()
+        .config(fixture.aster_config(0))
+        .builtin_coordination(fixture.config(dir.path(), 0))
+        .start()
+        .await
+        .expect("the first start");
+    tokio::time::timeout(PATIENCE, first.coordination().expect("hosted").wait_ready())
+        .await
+        .expect("ready in time")
+        .expect("ready");
+    first.shutdown().await;
+
+    // Reopen. `Existing` verifies the supplied genesis against the directory's
+    // bound hash, so this is the same document by construction.
+    let second = AsterServer::builder()
+        .config(fixture.aster_config(0))
+        .builtin_coordination(fixture.existing_config(dir.path()))
+        .start()
+        .await
+        .expect("the group reopens");
+    let coordination = second.coordination().expect("hosted");
+    tokio::time::timeout(PATIENCE, coordination.wait_ready())
+        .await
+        .expect("ready in time")
+        .expect("ready");
+
+    assert!(
+        coordination.genesis_installed_for_testing().await,
+        "a restarted voter reporting Ready has its genesis"
+    );
+    let committed = coordination
+        .propose_for_testing_within(set_grant(&fixture, 0, "after-restart"), PATIENCE)
+        .await
+        .expect("the grant commits");
+    assert_eq!(
+        outcome_of(&committed),
+        (GRANT_UPDATED, NO_REASON),
+        "a restarted group can still authorize"
+    );
+
+    second.shutdown().await;
+}
+
+/// **ROOT is not a member, and cannot be made one.**
+///
+/// Frozen deliberately, and this is the reasoning rather than a preference. A
+/// voter or learner runs its identity's secret as its Aster endpoint secret on
+/// a live, dialable, always-on mesh node. ROOT's secret is the deployment's
+/// offline trust anchor. A short-lived administration endpoint holding it is
+/// fine — brought online on purpose, does one thing, stops; a *member* is the
+/// permanent version of the exposure that keeping ROOT offline exists to avoid.
+///
+/// Both doors: a genesis naming ROOT as an initial voter does not verify, and a
+/// membership plan naming ROOT is shapeless. Closing only the first would leave
+/// a group that was founded correctly and then had ROOT added by an ordinary
+/// change.
+#[test]
+fn root_cannot_be_founded_as_a_member() {
+    use aster::coordination::model::authority::{
+        canonical_document_bytes, genesis_signing_bytes, signed_document_from_parts, verify_genesis,
+    };
+    use aster::coordination::raft::{GenesisV1, NodeIdV1 as WireNodeId, VoterSeedV1};
+
+    let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x09, 1);
+    let root = fixture.authority_key().to_vec();
+
+    // A genesis that names ROOT as a voter, otherwise well formed and
+    // correctly signed by ROOT itself.
+    let ticket = aster_transport_core::ticket::AsterTicket {
+        endpoint_id: root.clone().try_into().expect("32 bytes"),
+        relay: None,
+        direct_addrs: Vec::new(),
+        credential: Some(aster_transport_core::ticket::TicketCredential::Open),
+    }
+    .to_base58_string()
+    .expect("a canonical ticket");
+
+    let genesis = GenesisV1 {
+        format_version: 1,
+        group_id: vec![SEED ^ 0x09; 32],
+        authority_domain: DOMAIN.into(),
+        genesis_nonce: vec![0x01u8; 32],
+        deployment_profile_code: 2,
+        initial_voters: vec![VoterSeedV1 {
+            node_id: root.clone(),
+            ticket,
+        }],
+        initial_admins: vec![WireNodeId {
+            node_id: fixture.node_id(0),
+        }],
+        recovery_export_hash: None,
+    };
+    let document = canonical_document_bytes(&genesis).expect("encode");
+    let signature = fixture.sign_for_testing(&genesis_signing_bytes(&document));
+    let signed =
+        signed_document_from_parts(document, &fixture.authority_key(), &signature).expect("encode");
+
+    let err = verify_genesis(&fixture.authority_key(), DOMAIN, &signed)
+        .expect_err("a genesis naming ROOT as a voter must not verify");
+    assert!(
+        format!("{err:?}").contains("RootIsNotAMember"),
+        "the refusal must name the rule, got {err:?}"
+    );
 }

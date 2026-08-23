@@ -213,8 +213,22 @@ pub(crate) async fn run_lifecycle(
         // exactly one publisher: a second `publish` for the genesis would make
         // the view have two writers, which is the thing this loop exists to
         // prevent. A genesis observed a tick late costs one heartbeat.
-        if !facts.genesis_installed() && state.genesis_installed().await.unwrap_or(false) {
-            facts.note_genesis_installed();
+        if !facts.genesis_installed() {
+            match state.genesis_installed().await {
+                Ok(true) => facts.note_genesis_installed(),
+                Ok(false) => {}
+                // **A failed read is not "not installed".**
+                //
+                // Swallowing it as `false` would hold this node at `NoQuorum`
+                // for as long as the store stayed broken — reporting a
+                // condition a later message repairs, for one that no message
+                // does. The state actor latches fatal on its own failures and
+                // answers `ActorStopped` afterwards, so this is the same
+                // failure arriving at the one loop that can publish it.
+                Err(err) => facts.latch_fatal(FatalCause::Storage(format!(
+                    "the genesis state could not be read: {err}"
+                ))),
+            }
         }
 
         {
@@ -274,6 +288,10 @@ pub(crate) async fn run_lifecycle(
             // second leader proposing it after a leadership change is safe;
             // that is why this can simply retry rather than having to know
             // whether an earlier attempt survived.
+            // `!facts.genesis_installed()` **is** the revision-0 gate: the fact
+            // is set from `admin_revision > 0`, so a healthy restart into a
+            // long-running group proposes nothing, and only a voter that came
+            // back before the entry applied still has work to do.
             if is_leader
                 && !facts.genesis_installed()
                 && proposing.as_ref().is_none_or(|task| task.is_finished())

@@ -568,21 +568,35 @@ impl AsterConfig {
     /// Missing files return `Ok(None)`. Malformed files return
     /// [`Error::InvalidArgument`].
     pub fn resolve_root_pubkey(&mut self) -> Result<Option<PublicKey>> {
-        if let Some(key) = self.root_pubkey {
-            return Ok(Some(key));
-        }
-
         let Some(path) = self.root_pubkey_file.as_ref() else {
-            return Ok(None);
+            return Ok(self.root_pubkey);
         };
         let path = expand_tilde(path);
         if !path.exists() {
-            return Ok(None);
+            return Ok(self.root_pubkey);
         }
 
         let content = fs::read_to_string(&path)
             .map_err(|e| Error::InvalidArgument(format!("{}: {e}", path.to_string_lossy())))?;
         let key = parse_pubkey_file(&path, &content)?;
+
+        // **Both sources are read, and they must agree.**
+        //
+        // The inline key used to short-circuit before the file was opened, so a
+        // deployment that set both and rotated only one ran under the stale
+        // value silently. There is one root key; two configured spellings of it
+        // that differ is a configuration error, not a precedence question, and
+        // guessing wrong here is not visible until a signature fails to verify
+        // somewhere far away.
+        if let Some(inline) = self.root_pubkey {
+            if inline != key {
+                return Err(Error::InvalidArgument(format!(
+                    "root_pubkey is {inline} and {} holds {key}; one deployment has one \
+                     ROOT, so set whichever is current and remove the other",
+                    path.to_string_lossy(),
+                )));
+            }
+        }
         self.root_pubkey = Some(key);
         Ok(Some(key))
     }
@@ -777,6 +791,18 @@ impl AsterConfigBuilder {
     /// [`NodeId`](crate::NodeId).
     pub fn secret_key(mut self, key: SecretKey) -> Self {
         self.config.set_secret_key(Some(key));
+        self
+    }
+
+    /// Pin the deployment's **ROOT** public key.
+    ///
+    /// The same value `ASTER_ROOT_PUBKEY`, `ASTER_ROOT_PUBKEY_FILE` and
+    /// `[trust] root_pubkey` supply; this is the in-code form, for a host that
+    /// already holds it. Coordination consumes it as the key every signed
+    /// genesis, join permit and recovery document verifies against, and as the
+    /// identity of the group's immutable super-administrator.
+    pub fn root_pubkey(mut self, key: PublicKey) -> Self {
+        self.config.root_pubkey = Some(key);
         self
     }
 

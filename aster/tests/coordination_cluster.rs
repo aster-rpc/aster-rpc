@@ -233,6 +233,7 @@ async fn start_group(secrets: &[[u8; 32]], profile: i32, acknowledge: bool) -> V
                     .relay(RelayMode::Disabled)
                     .bind_addr("127.0.0.1:0")
                     .secret_key(SecretKey::from_bytes(*secret))
+                    .root_pubkey(aster::PublicKey::from_bytes(authority_key()))
                     .build(),
             )
             .builtin_coordination(builder.build().expect("a complete configuration"))
@@ -534,6 +535,7 @@ async fn a_three_voter_group_reforms_after_a_full_restart() {
                     .relay(RelayMode::Disabled)
                     .bind_addr("127.0.0.1:0")
                     .secret_key(SecretKey::from_bytes(*secret))
+                    .root_pubkey(aster::PublicKey::from_bytes(authority_key()))
                     .build(),
             )
             .builtin_coordination(
@@ -591,6 +593,7 @@ async fn a_three_voter_group_reforms_after_a_full_restart() {
                     .relay(RelayMode::Disabled)
                     .bind_addr("127.0.0.1:0")
                     .secret_key(SecretKey::from_bytes(*secret))
+                    .root_pubkey(aster::PublicKey::from_bytes(authority_key()))
                     .build(),
             )
             .builtin_coordination(
@@ -599,6 +602,7 @@ async fn a_three_voter_group_reforms_after_a_full_restart() {
                     .authority_public_key(authority_key())
                     .authority_domain(DOMAIN)
                     .start_mode(CoordinationStart::Existing {
+                        signed_genesis: genesis.clone(),
                         expected_group_id:
                             aster::coordination::ids::CoordinationGroupId::from_array(GROUP),
                         expected_genesis_hash: genesis_hash,
@@ -684,6 +688,7 @@ async fn an_unauthorized_identity_never_reaches_openraft() {
             .relay(RelayMode::Disabled)
             .bind_addr("127.0.0.1:0")
             .secret_key(SecretKey::from_bytes(stranger_secret))
+            .root_pubkey(aster::PublicKey::from_bytes(authority_key()))
             .build(),
     )
     .await

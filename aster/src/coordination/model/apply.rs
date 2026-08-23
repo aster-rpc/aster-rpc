@@ -1042,9 +1042,43 @@ fn apply_genesis(
         ));
     }
 
-    // 3. The membership the group actually formed with. `raft.initialize` was
-    //    given this set; if the committed membership disagrees, one of the two
-    //    was not derived from this document.
+    // 3. Already installed? Then step 2 proved this is the *same* document, and
+    //    it changes nothing.
+    //
+    //    Decided **before** the initial-membership check, and the order is the
+    //    property. That check compares the genesis's `initial_voters` with the
+    //    committed membership, which is only meaningful at first installation:
+    //    afterwards the group legally changes membership, and an exact replay
+    //    would then find a set that no longer matches and be answered
+    //    `GenesisRefused` — fatal, on every voter, for the one document they
+    //    all agree on. Idempotence that expires is not idempotence.
+    if state.admin_revision > 0 {
+        write_audit_row(
+            state,
+            log_id,
+            AuditRow {
+                leader_node_id: log_id.leader_node_id,
+                actor: Some(log_id.leader_node_id),
+                operation_code: OPERATION_GENESIS,
+                resource: None,
+                result: AuditResult::System(
+                    crate::coordination::contract::SYS_GENESIS_ALREADY_INSTALLED,
+                ),
+                epoch: 0,
+                value_revision: 0,
+            },
+            changes,
+        );
+        return Ok(SystemResult {
+            system_result_code: crate::coordination::contract::SYS_GENESIS_ALREADY_INSTALLED,
+            lease_revision: 0,
+        });
+    }
+
+    // 4. First installation only: the membership the group actually formed
+    //    with. `raft.initialize` was given this set, so a committed membership
+    //    that disagrees means one of the two was not derived from this
+    //    document.
     let initial: BTreeSet<NodeId> = verified
         .initial_voters()
         .iter()
@@ -1056,25 +1090,19 @@ fn apply_genesis(
         ));
     }
 
-    let admins: BTreeSet<NodeId> = verified.initial_admins().iter().copied().collect();
-
-    // 4. Already installed? Then this is the exact document again — step 2
-    //    proved that — and it changes nothing.
-    let already = state.admin_revision > 0;
-    let code = if already {
-        crate::coordination::contract::SYS_GENESIS_ALREADY_INSTALLED
-    } else {
-        // The delegated set and its revision, in this one transaction. Revision
-        // 1 rather than 0: `set_admin` compares an expected revision, and a
-        // caller that had never observed the group would otherwise guess the
-        // starting value correctly by supplying the default.
-        for admin in &admins {
-            tables::put_admin(state, changes, *admin);
-        }
-        state.admin_revision = 1;
-        state.growth_bytes = state.recompute_growth();
-        crate::coordination::contract::SYS_GENESIS_INSTALLED
-    };
+    // 5. The delegated set and its revision, in this one transaction. Revision
+    //    1 rather than 0: `set_admin` compares an expected revision, and a
+    //    caller that had never observed the group would otherwise guess the
+    //    starting value correctly by supplying the default.
+    //
+    //    `verify_genesis` has already refused a document naming ROOT among its
+    //    administrators or voters, so this cannot install ROOT as a row.
+    for admin in verified.initial_admins() {
+        tables::put_admin(state, changes, *admin);
+    }
+    state.admin_revision = 1;
+    state.growth_bytes = state.recompute_growth();
+    let code = crate::coordination::contract::SYS_GENESIS_INSTALLED;
 
     write_audit_row(
         state,

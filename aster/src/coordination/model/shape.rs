@@ -113,6 +113,14 @@ shape_limits! {
     /// than two new voter identities, or more than two retained learners.
     MembershipPlanSize => "the membership plan is outside the v1 shape",
     MembershipPlanOrder => "a membership plan node vector is not sorted and unique",
+    /// The plan names ROOT as a voter or a retained learner.
+    ///
+    /// Refused for the reason a genesis naming ROOT as an initial voter is:
+    /// a member runs its identity's secret as its Aster endpoint secret on a
+    /// live node, and ROOT's secret is the deployment's offline trust anchor.
+    /// Shapeless rather than reason-coded because it does not depend on
+    /// replicated state — ROOT is ROOT at every revision.
+    MembershipPlanRoot => "a membership plan names the deployment ROOT as a member",
     MemberSeedUnknownNode => "a member seed names a node the plan does not contain",
     MemberSeedPermit => "a member seed's join permit does not match its node's status",
     MemberSeedTicketEmpty => "a member seed carries no ticket",
@@ -355,7 +363,7 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ShapeLimit::ALL.len());
-        assert_eq!(ShapeLimit::ALL.len(), 22, "update this count with the enum");
+        assert_eq!(ShapeLimit::ALL.len(), 23, "update this count with the enum");
         // Every variant has its own description; a shared one would make two
         // different failures read identically in a status message.
         let mut descriptions: Vec<_> = ShapeLimit::ALL.iter().map(|l| l.describe()).collect();

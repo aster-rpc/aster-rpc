@@ -403,6 +403,13 @@ mod tests {
     fn only_the_target_actor_or_an_administrator_may_retire() {
         let mut s = with_session(false);
         s.admins.insert(ADMIN);
+        // Post-Genesis. Nothing is administrative at revision 0, so a fixture
+        // that only added the row would be testing the pre-Genesis cut rather
+        // than the authorization rule this test is about.
+        s.admin_revision = 1;
+        // Post-Genesis: nothing is administrative at revision 0, so a fixture
+        // that only added the row would be testing the pre-Genesis cut instead.
+        s.admin_revision = 1;
 
         // Own session: allowed.
         assert!(matches!(decide(&s, &command(ACTOR)), Decision::Apply(_)));

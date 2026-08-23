@@ -398,6 +398,20 @@ pub enum GenesisError {
     },
     /// The initial voters are empty, unsorted, or duplicated.
     InitialVoters,
+    /// The genesis names **ROOT** among its initial administrators.
+    ///
+    /// §8.1: ROOT is immutable and is never a row in the mutable delegated
+    /// table. A document that would put it there is refused rather than
+    /// filtered, so no group can be founded holding one.
+    RootIsNotDelegable,
+    /// The genesis names **ROOT** among its initial voters.
+    ///
+    /// A voter runs its identity's secret as its Aster endpoint secret on a
+    /// live mesh node. ROOT's secret is the deployment's offline trust anchor,
+    /// and a permanent always-on holder of it is exactly the exposure keeping
+    /// it offline exists to avoid. A short-lived administration endpoint is
+    /// fine; a voter is not.
+    RootIsNotAMember,
     /// The initial admins are empty, over the §12.1 cap, unsorted, or
     /// duplicated.
     InitialAdmins,
@@ -573,7 +587,12 @@ pub fn verify_genesis(
         return Err(GenesisError::NonCanonical);
     }
 
-    seal_genesis(authority_domain, genesis, envelope.document_bytes)
+    seal_genesis(
+        authority_public_key,
+        authority_domain,
+        genesis,
+        envelope.document_bytes,
+    )
 }
 
 /// The bindings a verified genesis must carry, checked after the signature, and
@@ -583,6 +602,7 @@ pub fn verify_genesis(
 /// this line is "these bytes are the authority's"; below it is "and this is
 /// what they say".
 fn seal_genesis(
+    authority_public_key: &[u8; 32],
     authority_domain: &str,
     genesis: GenesisV1,
     document_bytes: Vec<u8>,
@@ -681,6 +701,33 @@ fn seal_genesis(
         || initial_admins.windows(2).any(|w| w[0] >= w[1])
     {
         return Err(GenesisError::InitialAdmins);
+    }
+
+    // **ROOT is neither a delegate nor a member**, and both are refused here so
+    // no group can be founded holding either.
+    //
+    // A delegated ROOT would be a mutable row: `set_admin` could remove it and
+    // the final-delegate rule would start counting it, so a group could "remove
+    // ROOT" and reach a state where the key that founded it authorizes nothing.
+    // §8.1 makes ROOT immutable, and the way to keep an immutable thing out of
+    // a mutable table is to refuse the document that would put it there —
+    // checking at apply would leave a signed genesis that verifies everywhere
+    // and installs nowhere.
+    //
+    // A ROOT **voter or learner** is worse. ROOT's secret is the deployment's
+    // offline trust anchor; a voter runs it as its Aster endpoint secret on a
+    // live mesh node, which is exactly the exposure keeping ROOT offline
+    // exists to avoid. A short-lived administration endpoint holding the secret
+    // is fine — it is brought online deliberately, does one thing and stops. A
+    // voter is a permanent, dialable, always-on holder of it.
+    if initial_admins.contains(authority_public_key) {
+        return Err(GenesisError::RootIsNotDelegable);
+    }
+    if initial_voters
+        .iter()
+        .any(|seed| &seed.node_id == authority_public_key)
+    {
+        return Err(GenesisError::RootIsNotAMember);
     }
 
     let group_id =

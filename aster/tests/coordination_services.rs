@@ -47,6 +47,9 @@ fn cfg() -> AsterConfig {
     AsterConfig::builder()
         .relay(RelayMode::Disabled)
         .bind_addr("127.0.0.1:0")
+        .root_pubkey(aster::PublicKey::from_bytes(
+            authority().verifying_key().to_bytes(),
+        ))
         .build()
 }
 
@@ -116,7 +119,7 @@ fn coordination_config(dir: &std::path::Path, secret: [u8; 32]) -> CoordinationC
 /// store, which is the point of the mode: they are what the store is checked
 /// against, so reading them from it would make the comparison tautological.
 fn existing_config(dir: &std::path::Path, secret: [u8; 32]) -> CoordinationConfig {
-    let genesis_hash = {
+    let (signed, genesis_hash) = {
         use aster::coordination::raft::SignedCoordinationDocumentV1;
         let CoordinationStart::Bootstrap { signed_genesis, .. } =
             coordination_config(dir, secret).start_mode().clone()
@@ -127,7 +130,10 @@ fn existing_config(dir: &std::path::Path, secret: [u8; 32]) -> CoordinationConfi
             aster::coordination::contract::payload_fory::<SignedCoordinationDocumentV1>()
                 .deserialize(&signed_genesis)
                 .expect("decode");
-        aster::coordination::model::authority::genesis_hash(&envelope.document_bytes)
+        (
+            signed_genesis,
+            aster::coordination::model::authority::genesis_hash(&envelope.document_bytes),
+        )
     };
 
     CoordinationConfig::builder()
@@ -135,6 +141,7 @@ fn existing_config(dir: &std::path::Path, secret: [u8; 32]) -> CoordinationConfi
         .authority_public_key(authority().verifying_key().to_bytes())
         .authority_domain(DOMAIN)
         .start_mode(CoordinationStart::Existing {
+            signed_genesis: signed,
             expected_group_id: aster::coordination::ids::CoordinationGroupId::from_array(
                 [0xC0u8; 32],
             ),
@@ -181,6 +188,9 @@ fn pinned_cfg() -> AsterConfig {
         .relay(RelayMode::Disabled)
         .bind_addr("127.0.0.1:0")
         .secret_key(SecretKey::from_bytes(PINNED_SECRET))
+        .root_pubkey(aster::PublicKey::from_bytes(
+            authority().verifying_key().to_bytes(),
+        ))
         .build()
 }
 

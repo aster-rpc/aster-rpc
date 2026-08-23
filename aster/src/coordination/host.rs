@@ -75,6 +75,21 @@ pub enum CoordinationStart {
     /// Never calls `initialize`. Every configured value must match what is
     /// persisted, including the top-level authority key and domain.
     Existing {
+        /// The **same signed genesis** the group was founded on.
+        ///
+        /// Required, and it is not redundant with the hash below. The genesis
+        /// is installed by a committed command, and a voter that crashed after
+        /// `Raft::initialize` committed but before that entry applied comes
+        /// back at `admin_revision = 0` — with no administrators, so nothing
+        /// can ever propose one. Without the document, restarting through
+        /// `Existing` could never finish the bootstrap it interrupted, and the
+        /// group would be permanently wedged at `NoQuorum` with no error to
+        /// explain it.
+        ///
+        /// Verified against `expected_genesis_hash`, so supplying a *different*
+        /// document is a start failure rather than a second genesis proposed
+        /// into a running group.
+        signed_genesis: Vec<u8>,
         /// The group this directory must be bound to.
         expected_group_id: CoordinationGroupId,
         /// The genesis hash this directory must be bound to.
@@ -326,22 +341,33 @@ impl CoordinationConfig {
     /// arrive much later, as a signature that does not check, on a node that
     /// could not say why.
     pub fn resolved_root_key(&self, deployment: Option<[u8; 32]>) -> Result<[u8; 32]> {
-        match (self.authority_public_key, deployment) {
-            (Some(local), Some(root)) if local != root => Err(Error::InvalidArgument(format!(
+        // **The deployment's key is the only source.** A coordination-local key
+        // may cross-check it and may not substitute for it.
+        //
+        // Accepting `(Some(local), None)` was the same defect one level up:
+        // coordination became a second place to configure the trust anchor, and
+        // — because every fixture took that route — nothing proved a voter
+        // could start from `AsterConfig` at all. The tests were exercising a
+        // path no deployment uses.
+        let Some(root) = deployment else {
+            return Err(Error::InvalidArgument(
+                "coordination requires the deployment ROOT public key: set \
+                 ASTER_ROOT_PUBKEY, ASTER_ROOT_PUBKEY_FILE, or [trust] \
+                 root_pubkey. It is the key every signed genesis, join permit and \
+                 recovery document is verified against, and the identity of the \
+                 group's immutable super-administrator; a coordination-local key \
+                 may confirm it but cannot stand in for it"
+                    .into(),
+            ));
+        };
+        match self.authority_public_key {
+            Some(local) if local != root => Err(Error::InvalidArgument(format!(
                 "coordination was configured with root key {} and this deployment's \
                  ASTER_ROOT_PUBKEY is {}; one deployment has one ROOT",
                 super::ids::CoordinationNodeId::from_array(local).to_hex(),
                 super::ids::CoordinationNodeId::from_array(root).to_hex(),
             ))),
-            (Some(key), _) | (None, Some(key)) => Ok(key),
-            (None, None) => Err(Error::InvalidArgument(
-                "coordination needs the deployment ROOT public key: set \
-                 ASTER_ROOT_PUBKEY (or ASTER_ROOT_PUBKEY_FILE, or [trust] \
-                 root_pubkey), which is the key every signed genesis, join permit \
-                 and recovery document is verified against and the identity of the \
-                 group's immutable super-administrator"
-                    .into(),
-            )),
+            _ => Ok(root),
         }
     }
 
@@ -685,18 +711,27 @@ mod tests {
             b.build().expect("a complete configuration")
         };
 
-        // Either source alone.
-        assert_eq!(
-            configured.resolved_root_key(None).expect("local"),
-            [7u8; 32]
-        );
+        // The deployment's alone is the ordinary case.
         assert_eq!(
             unconfigured
                 .resolved_root_key(Some([9u8; 32]))
                 .expect("deployment"),
             [9u8; 32]
         );
-        // Both, agreeing.
+
+        // **A coordination-local key alone is not a root key.** Accepting it
+        // made coordination a second place to configure the trust anchor — and,
+        // because every fixture then took that route, nothing in the suite
+        // proved a voter could start from `ASTER_ROOT_PUBKEY` at all.
+        let err = configured
+            .resolved_root_key(None)
+            .expect_err("a coordination-local key cannot stand in for the deployment's");
+        assert!(
+            err.to_string().contains("ASTER_ROOT_PUBKEY"),
+            "the refusal must name where the key comes from, got: {err}"
+        );
+
+        // Both, agreeing: the coordination key is a cross-check.
         assert_eq!(
             configured
                 .resolved_root_key(Some([7u8; 32]))
@@ -828,6 +863,7 @@ mod tests {
         assert_eq!(bootstrap().expected_deployment_profile_code(), None);
         assert_eq!(
             CoordinationStart::Existing {
+                signed_genesis: crate::coordination::model::authority::testing::valid_genesis(),
                 expected_group_id: CoordinationGroupId::from_array([1u8; 32]),
                 expected_genesis_hash: [2u8; 32],
                 expected_deployment_profile_code: shape::PROFILE_PROD,

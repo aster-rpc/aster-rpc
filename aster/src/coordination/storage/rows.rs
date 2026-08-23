@@ -1592,6 +1592,20 @@ fn check_grant_rows(state: &DurableState) -> Result<(), String> {
     Ok(())
 }
 
+/// The three invariants the delegated administrator table carries (§7.1, §8.1).
+///
+/// The ceiling is the least of them. The other two are what make
+/// `admin_revision` a *readable* fact rather than a counter:
+///
+/// * **revision 0 ⇔ no delegates.** Revision 0 with rows would be a set nothing
+///   installed, and a nonzero revision with none would be a group that had a
+///   genesis and lost its administrators — either way the store disagrees with
+///   itself about whether the genesis applied, which is the question readiness
+///   and every administrative decision turn on.
+/// * **ROOT is not a row.** `verify_genesis` refuses a document naming it and
+///   `set_admin` refuses it as a target, so a store holding one was written by
+///   neither — and if it were loaded, `set_admin` could then remove ROOT and
+///   the final-delegate rule would start counting it.
 fn check_admin_revision(state: &DurableState) -> Result<(), String> {
     if state.model.admin_revision > limits::MAX_COUNTER {
         return Err(format!(
@@ -1599,6 +1613,26 @@ fn check_admin_revision(state: &DurableState) -> Result<(), String> {
             state.model.admin_revision,
             limits::MAX_COUNTER
         ));
+    }
+    if (state.model.admin_revision == 0) != state.model.admins.is_empty() {
+        return Err(format!(
+            "admin_revision is {} and the delegated set holds {} rows; revision 0 is the \
+             pre-Genesis state and means no delegates, and any other revision means at \
+             least one",
+            state.model.admin_revision,
+            state.model.admins.len()
+        ));
+    }
+    if state
+        .model
+        .admins
+        .contains(&state.model.authority.public_key)
+    {
+        return Err(
+            "the delegated administrator set contains the ROOT key; ROOT is immutable and \
+             is never a row"
+                .into(),
+        );
     }
     Ok(())
 }
