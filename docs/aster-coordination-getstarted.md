@@ -71,11 +71,14 @@ The roles are independent:
 | Voter | A currently committed member that participates in consensus | exactly 3 |
 | Learner | A non-voting member catching up or deliberately retained | 0–2 |
 | Client or lease holder | A caller using a coordinated resource | any number |
-| Group administrator | An identity allowed to change ACLs or request membership plans | application-defined |
+| Deployment ROOT | Aster's immutable trust anchor and break-glass super-administrator | exactly 1 |
+| Delegated group administrator | A mutable identity allowed to change ACLs or request membership plans | application-defined, at least 1 |
 
 A voter receives no automatic application permission. An administrator need
 not be a voter, and a consumer laptop may hold a lease without ever becoming a
-producer or voter.
+producer or voter. ROOT is not a voter role and has no implicit right to read or
+mutate a coordinated resource; it can grant an exact right when an operator
+deliberately brings the ROOT identity online.
 
 **Benefit:** a large Aster network does not become a large consensus group.
 Only the small committed voter set pays the replication cost; every other node
@@ -243,18 +246,38 @@ Keep these together in the host's durable state:
 Each host has its own directory. Never copy a live voter's directory to create
 another voter.
 
-### 5.2 Application authority
+### 5.2 Reuse Aster's deployment ROOT
 
-Deployment tooling owns an Ed25519 authority key. It signs the group's genesis,
-join permits, and later recovery documents. Voters receive only:
+Coordination does not introduce another authority key. It reuses the one Aster
+deployment ROOT already defined by the
+[Aster trust specification](../ffi_spec/Aster-trust-spec.md) and configured
+through `AsterConfig`, including the normal production environment inputs:
 
-- the signed document;
-- the independently configured public key; and
-- the expected authority domain.
+```bash
+# Inline hex, or point at a hex/JSON public-key file.
+export ASTER_ROOT_PUBKEY=<64-hex-characters>
+# export ASTER_ROOT_PUBKEY_FILE=/secure/config/aster-root.pub
+```
 
-The signing secret does not live in the voter runtime or placement manager.
-The authority domain prevents a valid document for one deployment from being
-accepted by another deployment using the same key.
+That ROOT signs the group's genesis, join permits, admission set, and later
+recovery documents. A voter receives only the public key and signed material.
+The coordination-specific authority domain remains an independent expectation:
+one ROOT may operate more than one environment, so a correctly signed staging
+genesis must not open a production group.
+
+The ROOT secret does not live in a voter runtime or placement manager. Keep it
+offline in normal operation. When a break-glass or provisioning action really
+needs ROOT authority, a short-lived administration tool may deliberately use
+the ROOT secret as its Aster/Iroh endpoint identity. Its authenticated NodeId is
+then the configured ROOT public key, which every voter recognizes as the
+immutable super-administrator. A host-local setting that merely claims “ROOT is
+loaded” grants nothing.
+
+ROOT is separate from the mutable delegated administrator set recorded in the
+group. It cannot be added or removed with `set_admin`, does not consume a
+delegated-admin slot, and receives no implicit resource rights. The signed
+genesis supplies at least one day-to-day delegated administrator so routine
+operations do not require bringing ROOT online.
 
 ### 5.3 Verified producer admission
 
@@ -272,7 +295,7 @@ Producer admission is necessary but deliberately insufficient:
 ### 5.4 A random group identity
 
 The deployment tool creates one random 32-byte `CoordinationGroupId`. The group
-id, signed genesis hash, deployment profile, authority key, and authority domain
+id, signed genesis hash, deployment profile, Aster ROOT key, and authority domain
 are bound to both databases and checked on every restart.
 
 **Benefit:** an address, role claim, copied database, or self-signed document
@@ -283,7 +306,7 @@ cannot silently create or join the authoritative group.
 Before anything can commit membership, deployment tooling uses the verified
 eligible-host policy and one topology snapshot to run the same pure placement
 planner without starting a manager. For the reference 4/3/3 topology it selects
-one host from each positively separated cluster. The authority then freezes
+one host from each positively separated cluster. The deployment ROOT then freezes
 those exact three NodeIds into genesis; after bootstrap, the optional manager
 maintains the committed set rather than inventing a second ranking algorithm.
 
@@ -303,9 +326,10 @@ source:
 
 ```rust,ignore
 // Contract preview: exact constructors may change before release.
+let aster_config = AsterConfig::from_env()?;
+
 let coordination = CoordinationConfig::builder()
     .storage_dir("/var/lib/my-app/coordination")
-    .authority_public_key(authority_public_key)
     .authority_domain("example.my-app.production")
     .start_mode(CoordinationStart::Bootstrap {
         signed_genesis: signed_genesis.clone(),
@@ -315,6 +339,9 @@ let coordination = CoordinationConfig::builder()
     .build()?;
 
 let server = AsterServer::builder()
+    // Coordination consumes the ROOT public key resolved by ordinary Aster
+    // trust configuration. There is no second coordination authority key.
+    .config(aster_config)
     .identity("/var/lib/my-app/node.secret")
     .builtin_coordination(coordination)
     .start()
@@ -329,11 +356,26 @@ starts the runtime. `wait_ready()` is level-triggered: it returns immediately
 if this node is already ready, otherwise it waits for readiness. It is an
 observation, not a promise that the network will remain healthy forever.
 
+Bootstrap has two committed steps. OpenRaft first establishes the native voter
+membership. The leader then commits the exact signed genesis as a system
+command; every voter re-verifies it and atomically installs the signed delegated
+administrator set at revision 1. The group remains `Bootstrapping` between
+those steps. Retrying the same genesis after a lost acknowledgement is
+idempotent; another committed genesis is fatal. This is why initial
+administrators are reproduced by log replay and snapshots instead of being
+local rows written beside Raft.
+
 Only empty stores use `Bootstrap`. An initialized voter restarts with
 `CoordinationStart::Existing` and independently supplies the expected group id,
 genesis hash, and deployment profile. A new empty candidate uses
 `CoordinationStart::Join` with a signed permit; the permit lets it communicate
 with bootstrap senders but does not add it to membership.
+
+For routine control, run a durable client under one of the NodeIds named in
+`initial_admins`; do not turn a voter into ROOT. Keep a separate break-glass
+client profile whose endpoint secret is the ROOT secret, load it only for an
+explicit operation, and take it offline again. Both paths hit the same
+replicated authorization predicate and audit trail.
 
 **Benefit:** bootstrap is reproducible and identity-bound. Accidental second
 clusters, wrong profiles, foreign storage, and ephemeral voter identities fail
@@ -386,8 +428,11 @@ and a lost response cannot make the same sequenced operation take effect twice.
 
 ## 8. Grant exact rights to an exact resource
 
-Coordination is deny-by-default. Genesis administrators may commit ACL changes,
-but being an administrator does not implicitly grant access to resource values.
+Coordination is deny-by-default. The immutable ROOT or a delegated genesis
+administrator may commit ACL changes, but administrative authority does not
+implicitly grant access to resource values. `inspect_admins` lists the mutable
+delegates; ROOT remains part of the group's static identity and cannot be added
+or removed with `set_admin`.
 
 An application chooses an exact resource key:
 
@@ -560,7 +605,7 @@ The provisioner owns machines and credentials. It receives the idempotency tuple
 `(group, policy digest, membership LogId, candidate NodeId)`, starts a
 persistent-identity `Join` candidate, and returns its canonical route ticket and
 signed join permit. Repeating that tuple must be safe. Aster never receives the
-application authority signing secret.
+Aster ROOT signing secret.
 
 The planner normally preserves healthy current voters. It replaces one only
 after an explicit exclusion, removal from the eligible set, or continuous
@@ -592,6 +637,7 @@ has a bounded, unsurprising outcome.
 | Event | Aster behavior | Consumer behavior |
 | --- | --- | --- |
 | Current leader stops | Elects another caught-up voter and resumes from committed history | Retry through the durable client; do not select a leader yourself |
+| Native membership commits but Genesis acknowledgement is lost | Remains `Bootstrapping`; the leader retries the same signed Genesis and apply recognizes exact replay | Keep the same signed document; never seed admin rows locally |
 | One of three voters is unavailable | Remaining two retain quorum; placement may provision one replacement | Report degraded placement; keep eligible capacity available |
 | Two of three voters are unavailable | Stops authoritative writes and membership changes | Restore a voter or follow signed new-group recovery; never force a minority |
 | Reply is lost after commit | Retrying the same journaled sequence returns the saved result | Do not create a replacement request with a new sequence |
@@ -599,6 +645,7 @@ has a bounded, unsurprising outcome.
 | Holder loses quorum | Renew cannot commit; its self-limit stops yielding a fence | Stop protected work as soon as the fence disappears |
 | Old holder resumes | Its stale epoch or identity is rejected | Treat fence rejection as a survived race, not as an ordinary retry |
 | Membership leader changes mid-plan | New controller observes the durable intent and resumes its current phase | Do not submit a competing local membership edit |
+| A delegated administrator is lost | Another delegate or break-glass ROOT adds/replaces it through `set_admin`; the final delegate cannot simply be removed | Prefer a routine delegate; load ROOT only for the explicit recovery action |
 | Candidate cannot catch up | Intent remains observable and retryable until an administrator cancels | Repair connectivity/provisioning or cancel deliberately |
 | Snapshot from a peer is malformed | Rejects it before handing a prepared snapshot to OpenRaft | Investigate the sender; do not repair local durable state from unverified bytes |
 | Local storage becomes uncertain | Latches the voter fatal rather than serving from questionable state | Take it out of service; repair or replace that member through the surviving quorum |
