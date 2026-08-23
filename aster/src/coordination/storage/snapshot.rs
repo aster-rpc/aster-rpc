@@ -2495,15 +2495,164 @@ impl Read for SnapshotReader<'_> {
     }
 }
 
+/// A body that has already been streamed, bounds-checked, verified and rebuilt
+/// into a candidate database, sealed with the metadata proved against it.
+///
+/// **The only role production `install_snapshot` accepts**, and the reason the
+/// install boundary can be closed at all. `Incoming` and `Published` are *raw*:
+/// bytes whose validity is not yet established. This one carries the proof.
+///
+/// There is no public constructor and no way to build one from parts. The only
+/// producer is [`prepare_install`], which consumes a raw role and returns this
+/// or an error — so "has this body been proved?" is answered by the type rather
+/// than by remembering to check.
+#[derive(Debug)]
+pub struct PreparedSnapshot {
+    prepared: PreparedInstall,
+}
+
+impl PreparedSnapshot {
+    /// The metadata proved against this body.
+    ///
+    /// Exposed because `install_snapshot` must compare OpenRaft's separately
+    /// supplied `meta` against it, field for field. That comparison is the only
+    /// consumer.
+    pub(crate) fn meta(&self) -> &SnapshotMetaV1 {
+        self.prepared.staged().meta()
+    }
+
+    /// Give up the seal, on the actor, to resolve and act.
+    ///
+    /// Visible only inside `storage`, and consuming: the point of the wrapper
+    /// is that a `PreparedInstall` cannot be obtained anywhere a raw body could
+    /// be substituted for it. The state actor is the only caller.
+    pub(super) fn into_prepared(self) -> PreparedInstall {
+        self.prepared
+    }
+}
+
+/// Why [`prepare_install`] refused.
+///
+/// The two failures its caller must answer **differently**, and they are not
+/// collapsed into one "rejected" for that reason.
+///
+/// A caller that could not tell them apart would either tell a peer its
+/// snapshot was bad when this store's disk was full, or keep serving through
+/// its own storage failure. §5.4's outbound table turns the distinction into
+/// three different statuses, so losing it here loses it on the wire too.
+#[derive(Debug)]
+pub(crate) enum PrepareInstallError {
+    /// The source is the **sender's** problem: corrupt, truncated, foreign,
+    /// inconsistent, or over §11.4's ceiling.
+    ///
+    /// Answered to the peer, and this voter keeps serving.
+    Rejected(StorageError),
+    /// **This store** failed while staging: out of disk, a write error, a
+    /// latched fatal.
+    ///
+    /// Not the peer's fault however it arrived, and never answered as a bad
+    /// snapshot.
+    Storage(StorageError),
+}
+
+impl PrepareInstallError {
+    /// The underlying failure, for a log line.
+    pub(crate) fn source(&self) -> &StorageError {
+        match self {
+            PrepareInstallError::Rejected(e) | PrepareInstallError::Storage(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for PrepareInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrepareInstallError::Rejected(e) => write!(f, "the supplied snapshot was refused: {e}"),
+            PrepareInstallError::Storage(e) => {
+                write!(f, "this store failed while staging a snapshot: {e}")
+            }
+        }
+    }
+}
+
+/// Prove a raw snapshot source, **outside any OpenRaft call**.
+///
+/// ## The boundary this sits on
+///
+/// §11.4 divides install by *who controls the input*, not by where the code
+/// lives:
+///
+/// - **Peer-controlled validity** — is this a well-formed, in-bounds,
+///   correctly bound snapshot at all? Decided here, refused outside OpenRaft,
+///   and the voter keeps serving. OpenRaft turns any storage error out of
+///   `install_snapshot` into a `Fatal` that ends the state-machine worker, so a
+///   peer's bad bytes would otherwise stop a healthy voter.
+/// - **Local-state comparison** — is this candidate ahead of, equal to, or
+///   behind what *this store* has applied? Decided inside `install_snapshot`,
+///   under the same exclusion as the rename.
+///
+/// It deliberately does **not** resolve. [`PreparedInstall::resolve`] may be
+/// called only under exclusive access to the state it would overwrite, and
+/// preparation holds no exclusion and cannot hold one across an OpenRaft call.
+/// A `resolve` here would compare against a `last_applied` that an apply may
+/// move before the rename, turning an accepted higher snapshot into a rollback
+/// that nothing downstream could detect.
+///
+/// ## It returns a bare `PreparedSnapshot`
+///
+/// Not a `CoordinationSnapshotFile::Prepared`, and not a handoff. Wrapping is
+/// the caller's job precisely so this is not one of the two places the enum
+/// variant is constructed — see the source guard in `machine`. A
+/// `PreparedSnapshot` on its own cannot reach `Raft`.
+pub(crate) fn prepare_install(
+    layout: &StorageLayout,
+    source: &CoordinationSnapshotFile,
+    state: &super::rows::DurableState,
+    supplied: &SnapshotMetaV1,
+) -> Result<PreparedSnapshot, PrepareInstallError> {
+    let staged = receive(layout, source, state, supplied).map_err(classify_prepare)?;
+    let prepared = rebuild_candidate(layout, staged).map_err(classify_prepare)?;
+    Ok(PreparedSnapshot { prepared })
+}
+
+/// Split a staging failure into "the sender's bytes" and "our disk".
+///
+/// Exactly the classification `machine::rejected` already performs, reused
+/// rather than restated: `StoredCorruption` and `SnapshotTooLarge` are the
+/// sender's, and **nothing else is**. A local I/O failure is not reclassified —
+/// staging ran out of disk is this store's problem however it arrived.
+fn classify_prepare(err: StorageError) -> PrepareInstallError {
+    match err {
+        corrupt @ StorageError::StoredCorruption { .. } => PrepareInstallError::Rejected(corrupt),
+        too_large @ StorageError::SnapshotTooLarge { .. } => {
+            PrepareInstallError::Rejected(too_large)
+        }
+        other => PrepareInstallError::Storage(other),
+    }
+}
+
 /// The production `SnapshotData`.
 ///
 /// Not `Clone` by design; see the module documentation.
+///
+/// Three roles: two **raw** — bytes whose validity is not yet established, and
+/// which differ only in drop semantics — and one **proved**. Preparation is
+/// what turns a raw role into the proved one, and production installation
+/// accepts nothing else.
 #[derive(Debug)]
 pub enum CoordinationSnapshotFile {
-    /// Receiver-owned, delete-on-drop.
+    /// Receiver-owned, delete-on-drop. Raw.
     Incoming(IncomingSnapshot),
-    /// Immutable and leased; drop never unlinks.
+    /// Immutable and leased; drop never unlinks. Raw.
     Published(PublishedSnapshot),
+    /// Streamed, verified, and rebuilt. The only role installation accepts.
+    ///
+    /// Boxed: a prepared value carries a staged body handle and a verified
+    /// candidate database, which is an order of magnitude larger than either
+    /// raw role. Without the indirection every `CoordinationSnapshotFile` —
+    /// including the ones OpenRaft moves around during ordinary replication —
+    /// would be sized for the largest variant.
+    Prepared(Box<PreparedSnapshot>),
 }
 
 impl CoordinationSnapshotFile {
@@ -2535,12 +2684,122 @@ impl CoordinationSnapshotFile {
                 })
             }
             CoordinationSnapshotFile::Published(published) => Ok(published.reader()),
+            // A prepared value has already been streamed and rebuilt; its body
+            // lives in receiver-owned staging that install consumes directly.
+            // Re-reading it as a *source* would be preparation running twice,
+            // which is the only way a prepared body could be re-validated
+            // against a different state than the one it was proved against.
+            CoordinationSnapshotFile::Prepared(_) => Err(corrupt(
+                "a prepared snapshot is not an install source: it has already been streamed \
+                 and verified, and reading it as one would prepare it a second time",
+            )),
         }
     }
 
     /// Whether dropping this handle removes its file.
     pub(crate) fn deletes_on_drop(&self) -> bool {
-        matches!(self, CoordinationSnapshotFile::Incoming(_))
+        match self {
+            CoordinationSnapshotFile::Incoming(_) => true,
+            CoordinationSnapshotFile::Published(_) => false,
+            // Its staged body is receiver-owned scratch, removed on drop by
+            // the `Scratch` inside it, so dropping an uninstalled prepared
+            // value does clean up after itself.
+            CoordinationSnapshotFile::Prepared(_) => true,
+        }
+    }
+
+    /// Open a bounded writer over a receiver-owned `Incoming` body.
+    ///
+    /// The counterpart to [`reader`](Self::reader), and role-safe for the same
+    /// reason: the snapshot stream receiver needs somewhere to put a peer's
+    /// chunks, and handing it a `PathBuf` would reopen exactly the filename
+    /// trust the role-safe handle exists to close. Only `Incoming` is
+    /// writable — a `Published` body is immutable and may belong to another
+    /// store, and a `Prepared` one has already been verified.
+    ///
+    /// The ceiling is §11.4's, applied here as well as in `receive`: the
+    /// harm a bound prevents is the allocation, so it has to be applied where
+    /// the bytes arrive rather than only where they are re-read.
+    pub(crate) fn writer(&self) -> StorageResult<IncomingWriter> {
+        match self {
+            CoordinationSnapshotFile::Incoming(incoming) => {
+                let file = File::create(incoming.path())
+                    .map_err(io("opening an incoming snapshot", incoming.path()))?;
+                Ok(IncomingWriter {
+                    file: BufWriter::new(file),
+                    path: incoming.path().to_path_buf(),
+                    written: 0,
+                })
+            }
+            other => Err(corrupt(format!(
+                "a {} snapshot body is not writable; only a receiver-owned Incoming temporary is",
+                other.role()
+            ))),
+        }
+    }
+
+    /// A short name for the role, for diagnostics and invariant messages.
+    pub(crate) fn role(&self) -> &'static str {
+        match self {
+            CoordinationSnapshotFile::Incoming(_) => "Incoming",
+            CoordinationSnapshotFile::Published(_) => "Published",
+            CoordinationSnapshotFile::Prepared(_) => "Prepared",
+        }
+    }
+}
+
+/// A bounded, append-only writer over a receiver-owned `Incoming` body.
+///
+/// Bounded rather than trusting the sender's declared length: the declared
+/// length is a claim, and this is the only place that can refuse the bytes
+/// before they land on disk.
+#[derive(Debug)]
+pub(crate) struct IncomingWriter {
+    file: BufWriter<File>,
+    path: PathBuf,
+    written: u64,
+}
+
+impl IncomingWriter {
+    /// Append `data`, refusing the write that would cross §11.4's ceiling.
+    ///
+    /// Checked *before* writing, not after: a bound applied after the bytes are
+    /// on disk has bounded nothing.
+    pub(crate) fn append(&mut self, data: &[u8]) -> StorageResult<()> {
+        let after = self.written.saturating_add(data.len() as u64);
+        if after > MAX_SNAPSHOT_BODY_BYTES {
+            return Err(StorageError::SnapshotTooLarge {
+                limit: MAX_SNAPSHOT_BODY_BYTES,
+                found: after,
+            });
+        }
+        self.file
+            .write_all(data)
+            .map_err(io("writing an incoming snapshot", &self.path))?;
+        self.written = after;
+        Ok(())
+    }
+
+    /// How many bytes have been accepted so far.
+    pub(crate) fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Flush and fsync, so the body survives a crash between the last chunk and
+    /// the install that reads it.
+    pub(crate) fn finish(self) -> StorageResult<u64> {
+        let IncomingWriter {
+            file,
+            path,
+            written,
+        } = self;
+        let handle = file
+            .into_inner()
+            .map_err(|err| StorageError::io("flushing an incoming snapshot", &path, err.into()))?;
+        handle
+            .sync_all()
+            .map_err(io("fsyncing an incoming snapshot", &path))?;
+        Ok(written)
     }
 }
 
@@ -3074,7 +3333,7 @@ mod tests {
         let receiving = begin_receiving(&layout).expect("a receiver-owned temporary");
         let path = match &receiving {
             CoordinationSnapshotFile::Incoming(handle) => handle.path().to_path_buf(),
-            CoordinationSnapshotFile::Published(_) => panic!("begin_receiving yields Incoming"),
+            other => panic!("begin_receiving yields Incoming, not {}", other.role()),
         };
         assert_eq!(path.parent(), Some(layout.incoming().as_path()));
         assert!(

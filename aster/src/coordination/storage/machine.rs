@@ -86,6 +86,15 @@ type Applied = (
 type Entry = openraft::Entry<CoordinationTypeConfig>;
 type Reply<T> = oneshot::Sender<StorageResult<T>>;
 
+/// A reply whose failure is **not** a `StorageError`.
+///
+/// Preparation is the one command whose two failures must stay apart: a
+/// refusal of the sender's bytes and this store's own staging failure are
+/// answered to different audiences, so flattening them into `StorageResult`
+/// here would lose the distinction before the caller ever sees it.
+type PreparationReply =
+    oneshot::Sender<std::result::Result<snapshot::PreparedSnapshot, snapshot::PrepareInstallError>>;
+
 // ── Actor protocol ───────────────────────────────────────────────────────────
 
 pub(crate) enum StateCommand {
@@ -115,12 +124,27 @@ pub(crate) enum StateCommand {
     /// Force a fatal failure through the ordinary serve path.
     #[cfg(test)]
     InjectFatal(Reply<()>),
-    /// Install a snapshot over this store's state.
+    /// Stream, verify and rebuild a raw snapshot source (§11.4 preparation).
     ///
     /// Carries the source handle, so the actor owns it for the whole operation
     /// and drops it -- and, if it is Incoming, removes it -- when done.
-    Install {
+    ///
+    /// Separate from [`Install`](Self::Install) because the two halves are
+    /// answered differently: a refusal here is the sender's and is reported to
+    /// that sender **without ever entering OpenRaft**, where any storage error
+    /// becomes a `Fatal` that ends the state-machine worker.
+    PrepareInstall {
         source: Box<CoordinationSnapshotFile>,
+        supplied: crate::coordination::raft::SnapshotMetaV1,
+        reply: PreparationReply,
+    },
+    /// Install an already-prepared snapshot over this store's state.
+    ///
+    /// Takes the proved role only. `supplied` is OpenRaft's own copy of the
+    /// metadata, compared field for field against the metadata sealed inside
+    /// `prepared` before anything is replaced.
+    Install {
+        prepared: Box<snapshot::PreparedSnapshot>,
         supplied: crate::coordination::raft::SnapshotMetaV1,
         reply: Reply<()>,
     },
@@ -206,11 +230,20 @@ impl StateActor {
                 StateCommand::ReadTransaction(reply) => {
                     self.serve(reply, StateActor::read_transaction)
                 }
-                StateCommand::Install {
+                // Not through `serve`: preparation's failure type is not
+                // `StorageError`, precisely so a refusal of the sender's bytes
+                // cannot be mistaken for this store's own failure and latch it
+                // fatal. `serve` exists to do that latching.
+                StateCommand::PrepareInstall {
                     source,
                     supplied,
                     reply,
-                } => self.serve(reply, |a| a.install(&source, &supplied)),
+                } => self.serve_preparation(reply, &source, &supplied),
+                StateCommand::Install {
+                    prepared,
+                    supplied,
+                    reply,
+                } => self.serve(reply, |a| a.install(*prepared, &supplied)),
                 #[cfg(test)]
                 StateCommand::Snapshot(reply) => self.serve(reply, |a| a.published().map(Box::new)),
                 #[cfg(test)]
@@ -261,6 +294,39 @@ impl StateActor {
         outcome
     }
 
+    /// [`serve`](Self::serve) for preparation, whose failure type is not
+    /// `StorageError`.
+    ///
+    /// A separate method rather than a `map_err` into `serve`, because the
+    /// whole point of [`snapshot::PrepareInstallError`] is that its two arms
+    /// are answered differently — and that difference is exactly the latching
+    /// decision. Flattening them here would put a peer's corrupt bytes on the
+    /// same path as this store's failed disk, which is the failure the split
+    /// exists to prevent.
+    fn serve_preparation(
+        &mut self,
+        reply: PreparationReply,
+        source: &CoordinationSnapshotFile,
+        supplied: &crate::coordination::raft::SnapshotMetaV1,
+    ) -> Outcome {
+        let result = self.prepare_install(source, supplied);
+        let outcome = match &result {
+            // This store's own durability is in question. Same rule as every
+            // other command.
+            Err(snapshot::PrepareInstallError::Storage(err))
+                if err.puts_durability_in_question() =>
+            {
+                self.fatal.store(true, Ordering::SeqCst);
+                Outcome::Fatal
+            }
+            // A rejection is the sender's bytes. The voter keeps serving —
+            // that is the property the whole boundary exists for.
+            _ => Outcome::Continue,
+        };
+        let _ = reply.send(result);
+        outcome
+    }
+
     /// Refuse everything already queued behind a failure.
     ///
     /// Those commands were enqueued while the store still looked healthy, and
@@ -274,6 +340,14 @@ impl StateActor {
                 StateCommand::Apply { reply, .. } => fail(reply),
                 StateCommand::ReadTransaction(reply) => fail(reply),
                 StateCommand::Install { reply, .. } => fail(reply),
+                // Refused as a *storage* failure, not as a rejection: the store
+                // is fatal, which says nothing about the sender's bytes and
+                // must not be reported to that sender as if it did.
+                StateCommand::PrepareInstall { reply, .. } => {
+                    let _ = reply.send(Err(snapshot::PrepareInstallError::Storage(
+                        StorageError::Fatal,
+                    )));
+                }
                 #[cfg(test)]
                 StateCommand::Snapshot(reply) => fail(reply),
                 #[cfg(test)]
@@ -318,24 +392,61 @@ impl StateActor {
     /// reopen, revalidation, body promotion, `CURRENT`, retirement, and the
     /// in-memory update — because a store whose database and marker disagree is
     /// exactly what a reader must never be admitted to.
-    fn install(
+    /// Stream, verify and rebuild a raw source — the preparation half.
+    ///
+    /// Runs on the actor because [`snapshot::check_identity`] needs this
+    /// store's durable state, but holds **no** exclusion: nothing here touches
+    /// anything a reader can see, and the comparison that does need exclusion
+    /// is deliberately left to [`install`](Self::install).
+    ///
+    /// Its two failures are kept apart by [`snapshot::PrepareInstallError`],
+    /// because the caller must answer them differently: a refusal of the
+    /// sender's bytes is reported to that sender, and this store's own staging
+    /// failure is not.
+    fn prepare_install(
         &mut self,
         source: &CoordinationSnapshotFile,
         supplied: &crate::coordination::raft::SnapshotMetaV1,
+    ) -> Result<snapshot::PreparedSnapshot, snapshot::PrepareInstallError> {
+        let state = self
+            .state
+            .as_ref()
+            .ok_or(snapshot::PrepareInstallError::Storage(StorageError::Fatal))?;
+        snapshot::prepare_install(&self.layout, source, state, supplied)
+    }
+
+    /// Resolve a prepared snapshot against this store's state and act on the
+    /// verdict — the installation half.
+    ///
+    /// Accepts **only** a value preparation produced. A raw role reaching here
+    /// in production is a fatal invariant rather than a fallback: the type
+    /// carries the proof, so accepting an unproved one would silently reinstate
+    /// the boundary this split exists to close.
+    fn install(
+        &mut self,
+        prepared: snapshot::PreparedSnapshot,
+        supplied: &crate::coordination::raft::SnapshotMetaV1,
     ) -> StorageResult<()> {
-        // Outside exclusion: streaming and rebuilding are proportional to the
-        // state, and neither touches anything a reader can see.
+        // The token that owns the vote, the metadata and the body cannot reach
+        // across OpenRaft's call — `install_snapshot` receives `meta` as its own
+        // argument — so the binding is re-established here, field for field,
+        // against the metadata sealed inside the prepared value.
         //
-        // Failures here are about the *source*, so a decode or bounds refusal
-        // is reclassified as a rejection rather than left as the stored
-        // corruption it would be if this store had written those bytes. A
-        // local I/O failure is not reclassified: staging ran out of disk is
-        // this store's problem however it arrived.
-        let staged = {
-            let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
-            snapshot::receive(&self.layout, source, state, supplied).map_err(rejected)?
-        };
-        let prepared = snapshot::rebuild_candidate(&self.layout, staged).map_err(rejected)?;
+        // A mismatch is a **fatal invariant**, not a rejection: by this point
+        // both values are ours. The sender's copy was already checked against
+        // the body during preparation.
+        if prepared.meta() != supplied {
+            return Err(StorageError::corrupt(
+                Db::State,
+                "snapshot",
+                format!(
+                    "OpenRaft supplied metadata {supplied:?} for a body prepared against {:?}; \
+                     two valid preparations were crossed",
+                    prepared.meta()
+                ),
+            ));
+        }
+        let prepared = prepared.into_prepared();
 
         let _exclusive = self
             .reads
@@ -682,6 +793,47 @@ impl StateHandle {
     /// A snapshot-consistent read transaction over `state.redb`.
     pub(crate) async fn read_transaction(&self) -> StorageResult<GuardedRead> {
         self.call(StateCommand::ReadTransaction).await
+    }
+
+    /// Stream, verify and rebuild a raw snapshot source (§11.4 preparation).
+    ///
+    /// **This is the whole install boundary.** It runs outside any OpenRaft
+    /// call, so a refusal of the sender's bytes is answered here and the voter
+    /// keeps serving — where the same refusal inside `install_snapshot` becomes
+    /// an OpenRaft `Fatal` that ends the state-machine worker.
+    ///
+    /// It has its own body rather than reusing [`call`](Self::call) because its
+    /// failure type is not `StorageError`: preparation's two arms are answered
+    /// to different audiences, and a shared helper would have to flatten them.
+    /// The refusals it manufactures locally are `Storage`, not `Rejected` — a
+    /// dead actor says nothing about the sender's snapshot.
+    pub(crate) async fn prepare_install(
+        &self,
+        source: Box<CoordinationSnapshotFile>,
+        supplied: crate::coordination::raft::SnapshotMetaV1,
+    ) -> std::result::Result<snapshot::PreparedSnapshot, snapshot::PrepareInstallError> {
+        let stopped =
+            || snapshot::PrepareInstallError::Storage(StorageError::ActorStopped { db: Db::State });
+        if self.is_fatal() {
+            return Err(snapshot::PrepareInstallError::Storage(StorageError::Fatal));
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let command = StateCommand::PrepareInstall {
+            source,
+            supplied,
+            reply: reply_tx,
+        };
+        if self.tx.send(command).await.is_err() {
+            self.mark_fatal();
+            return Err(stopped());
+        }
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => {
+                self.mark_fatal();
+                Err(stopped())
+            }
+        }
     }
 
     /// A copy of the published state, for tests that compare memory with disk.
@@ -1064,15 +1216,38 @@ impl RaftStateMachine<CoordinationTypeConfig> for CoordinationStateMachine {
             .map_err(io_state)
     }
 
+    /// Install a snapshot OpenRaft has accepted a vote for.
+    ///
+    /// Accepts **only** [`CoordinationSnapshotFile::Prepared`]. A raw
+    /// `Incoming` or `Published` here is a fatal invariant, not a fallback: the
+    /// type carries the proof, and accepting an unproved role would silently
+    /// reinstate the boundary the split exists to close. There is deliberately
+    /// **no** `cfg(test)` arm — see `SuiteStateMachine` in the tests below for
+    /// why an arm here rather than an adapter around this type would make the
+    /// real-Raft boundary test prove a property the shipped build lacks.
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<CoordinationNodeId, CoordinationNode>,
         snapshot: Box<CoordinationSnapshotFile>,
     ) -> Result<(), RaftStorageError<CoordinationNodeId>> {
         let supplied = crate::coordination::raft::SnapshotMetaV1::from(meta);
+        let prepared = match *snapshot {
+            CoordinationSnapshotFile::Prepared(prepared) => *prepared,
+            raw => {
+                return Err(io_state(StorageError::corrupt(
+                    Db::State,
+                    "snapshot",
+                    format!(
+                        "install_snapshot was handed a raw {} role; a snapshot must be proved by \
+                         prepare_install outside OpenRaft before it reaches this boundary",
+                        raw.role()
+                    ),
+                )))
+            }
+        };
         self.handle
             .call(|reply| StateCommand::Install {
-                source: snapshot,
+                prepared: Box::new(prepared),
                 supplied,
                 reply,
             })
@@ -1085,6 +1260,125 @@ impl RaftStateMachine<CoordinationTypeConfig> for CoordinationStateMachine {
     ) -> Result<Option<Snapshot<CoordinationTypeConfig>>, RaftStorageError<CoordinationNodeId>>
     {
         self.current_snapshot().map_err(io_read_state)
+    }
+}
+
+// ── The test-only suite adapter ──────────────────────────────────────────────
+
+/// Run the **production** preparation in front of the **production** install.
+///
+/// The one body behind [`SuiteStateMachine`], and behind every storage test
+/// that installs a snapshot without a network in front of it. It adds no path
+/// production lacks: the same `prepare_install`, then the same
+/// `install_snapshot` with the resulting `Prepared`.
+///
+/// Preparation's two failures are flattened into one `RaftStorageError` here
+/// because that is what the trait returns — the split still exists on the
+/// production path, where the caller is the snapshot receiver and *does* answer
+/// them differently. A test asserting the store kept serving still asserts
+/// something real: a rejection does not latch the store fatal, and a storage
+/// failure does.
+#[cfg(test)]
+impl CoordinationStateMachine {
+    /// The adapter body, as an inherent method so the storage tests can reach
+    /// it on the machine they already hold.
+    ///
+    /// The trailing underscore keeps it visibly not-a-trait-method: this is a
+    /// test seam, and a name that read like `install_snapshot` would invite the
+    /// belief that production installs this way.
+    pub(crate) async fn prepare_then_install_(
+        &mut self,
+        meta: &SnapshotMeta<CoordinationNodeId, CoordinationNode>,
+        source: Box<CoordinationSnapshotFile>,
+    ) -> Result<(), RaftStorageError<CoordinationNodeId>> {
+        let supplied = crate::coordination::raft::SnapshotMetaV1::from(meta);
+        let prepared = self
+            .handle
+            .prepare_install(source, supplied)
+            .await
+            .map_err(|err| {
+                // Flattened into one `StorageError` because the trait returns
+                // one error type — but flattened **the way `rejected` already
+                // did**, so a refusal of the sender's bytes still arrives as
+                // `SnapshotRejected` and this store's own failure still arrives
+                // as itself. Collapsing both into a generic I/O error here
+                // would make every storage test that distinguishes them pass
+                // for the wrong reason.
+                io_state(match err {
+                    snapshot::PrepareInstallError::Rejected(e) => StorageError::SnapshotRejected {
+                        detail: e.to_string(),
+                    },
+                    snapshot::PrepareInstallError::Storage(e) => e,
+                })
+            })?;
+        self.install_snapshot(
+            meta,
+            Box::new(CoordinationSnapshotFile::Prepared(Box::new(prepared))),
+        )
+        .await
+    }
+}
+
+/// The seam that keeps `testing::Suite::transfer_snapshot` green **without a
+/// bypass**.
+///
+/// The suite hands `install_snapshot` a `Published` handle directly, which the
+/// production invariant refuses. The answer is this adapter around the
+/// production state machine, and explicitly **not** a `cfg(test)` arm inside
+/// `install_snapshot`.
+///
+/// The distinction is not stylistic. An arm inside the production method would
+/// delete the invariant from the very type the real-Raft boundary test
+/// exercises, so that test would be proving a property the shipped build does
+/// not have. This runs the same production preparation in front of the same
+/// production install, adds no path production lacks, and the boundary test
+/// runs against `CoordinationStateMachine` itself — never against this.
+#[cfg(test)]
+pub(crate) struct SuiteStateMachine(pub(crate) CoordinationStateMachine);
+
+#[cfg(test)]
+impl RaftStateMachine<CoordinationTypeConfig> for SuiteStateMachine {
+    type SnapshotBuilder = CoordinationSnapshotBuilder;
+
+    async fn applied_state(&mut self) -> Result<Applied, RaftStorageError<CoordinationNodeId>> {
+        self.0.applied_state().await
+    }
+
+    async fn apply<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<Vec<CommandReplyV1>, RaftStorageError<CoordinationNodeId>>
+    where
+        I: IntoIterator<Item = Entry> + Send,
+        I::IntoIter: Send,
+    {
+        self.0.apply(entries).await
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        self.0.get_snapshot_builder().await
+    }
+
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<CoordinationSnapshotFile>, RaftStorageError<CoordinationNodeId>> {
+        self.0.begin_receiving_snapshot().await
+    }
+
+    /// The raw role in, production preparation, production install.
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<CoordinationNodeId, CoordinationNode>,
+        snapshot: Box<CoordinationSnapshotFile>,
+    ) -> Result<(), RaftStorageError<CoordinationNodeId>> {
+        self.0.prepare_then_install_(meta, snapshot).await
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<CoordinationTypeConfig>>, RaftStorageError<CoordinationNodeId>>
+    {
+        self.0.get_current_snapshot().await
     }
 }
 
@@ -3441,7 +3735,7 @@ mod tests {
         assert!(durable_of(&machine).await.model.last_applied.is_none());
 
         machine
-            .install_snapshot(&published.meta, published.snapshot)
+            .prepare_then_install_(&published.meta, published.snapshot)
             .await
             .expect("the install succeeds");
 
@@ -3514,7 +3808,7 @@ mod tests {
             let mut machine = machine.clone();
             let meta = published.meta.clone();
             let source = published.snapshot;
-            tokio::spawn(async move { machine.install_snapshot(&meta, source).await })
+            tokio::spawn(async move { machine.prepare_then_install_(&meta, source).await })
         };
 
         // Wait until the install is actually inside `quiesce`. Without this the
@@ -3625,7 +3919,7 @@ mod tests {
             let source = CoordinationSnapshotFile::incoming(body);
 
             let err = machine
-                .install_snapshot(&published.meta, Box::new(source))
+                .prepare_then_install_(&published.meta, Box::new(source))
                 .await
                 .expect_err(&format!("{what}: a corrupt source must not install"));
             let detail = format!("{err:?}");
@@ -3680,7 +3974,7 @@ mod tests {
         drop(handle);
 
         let err = machine
-            .install_snapshot(
+            .prepare_then_install_(
                 &published.meta,
                 Box::new(CoordinationSnapshotFile::incoming(oversized)),
             )
@@ -3720,7 +4014,7 @@ mod tests {
         std::fs::create_dir_all(&incoming).expect("incoming");
         std::fs::set_permissions(&incoming, std::fs::Permissions::from_mode(0o555)).expect("chmod");
         let err = sealed
-            .install_snapshot(
+            .prepare_then_install_(
                 &published.meta,
                 Box::new(CoordinationSnapshotFile::incoming(oversized)),
             )
@@ -3780,7 +4074,7 @@ mod tests {
         let dir = scratch_dir();
         let (mut machine, _shutdown, _drain) = machine(&dir);
         machine
-            .install_snapshot(&published.meta, published.snapshot)
+            .prepare_then_install_(&published.meta, published.snapshot)
             .await
             .expect("the pinned bytes are what is sized and what is read");
 
@@ -3821,7 +4115,7 @@ mod tests {
         let meta = rows::snapshot_meta_from_wire(body.meta()).expect("meta");
         let source = CoordinationSnapshotFile::incoming(body.path().to_path_buf());
         let err = machine
-            .install_snapshot(&meta, Box::new(source))
+            .prepare_then_install_(&meta, Box::new(source))
             .await
             .expect_err("counters that do not describe the rows are not installable");
         let detail = format!("{err:?}");
@@ -3859,7 +4153,7 @@ mod tests {
         std::fs::set_permissions(&incoming, std::fs::Permissions::from_mode(0o555)).expect("chmod");
 
         let err = machine
-            .install_snapshot(&published.meta, published.snapshot)
+            .prepare_then_install_(&published.meta, published.snapshot)
             .await
             .expect_err("staging cannot write");
         std::fs::set_permissions(&incoming, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -3913,7 +4207,7 @@ mod tests {
             other_dir.join("state.redb"),
         );
         let err = machine
-            .install_snapshot(&published.meta, published.snapshot)
+            .prepare_then_install_(&published.meta, published.snapshot)
             .await
             .expect_err("a database that is not the installed one is not installed");
         assert!(
@@ -4122,7 +4416,7 @@ mod tests {
             std::fs::write(&body, &published.1).expect("the sender's bytes");
             storage
                 .state_mut()
-                .install_snapshot(
+                .prepare_then_install_(
                     &published.0,
                     Box::new(CoordinationSnapshotFile::incoming(body)),
                 )
@@ -4312,7 +4606,7 @@ mod tests {
             std::fs::write(&body, &published.1).expect("the sender's bytes");
             storage
                 .state_mut()
-                .install_snapshot(
+                .prepare_then_install_(
                     &published.0,
                     Box::new(CoordinationSnapshotFile::incoming(body)),
                 )
@@ -5055,7 +5349,10 @@ mod tests {
                 std::fs::write(&staged, &body).expect("the sender's bytes");
                 storage
                     .state_mut()
-                    .install_snapshot(&meta, Box::new(CoordinationSnapshotFile::incoming(staged)))
+                    .prepare_then_install_(
+                        &meta,
+                        Box::new(CoordinationSnapshotFile::incoming(staged)),
+                    )
                     .await
                     .expect("install");
             }
@@ -5831,7 +6128,7 @@ mod tests {
         let dir = scratch_dir();
         let (mut machine, _shutdown, _drain) = machine(&dir);
         machine
-            .install_snapshot(&first.meta, first.snapshot)
+            .prepare_then_install_(&first.meta, first.snapshot)
             .await
             .expect("the first install");
 
@@ -5851,7 +6148,7 @@ mod tests {
         assert_eq!(again.meta, first.meta, "the same snapshot, not a new one");
 
         machine
-            .install_snapshot(&again.meta, again.snapshot)
+            .prepare_then_install_(&again.meta, again.snapshot)
             .await
             .expect("the second install");
 
@@ -6102,7 +6399,7 @@ mod tests {
         let mut reader = std::fs::File::open(&target).expect("a reader on the orphan");
 
         machine
-            .install_snapshot(&published.meta, published.snapshot)
+            .prepare_then_install_(&published.meta, published.snapshot)
             .await
             .expect("the install succeeds");
 
@@ -6146,7 +6443,7 @@ mod tests {
         let before = durable_of(&machine).await;
 
         let err = machine
-            .install_snapshot(&published.meta, published.snapshot)
+            .prepare_then_install_(&published.meta, published.snapshot)
             .await
             .expect_err("a snapshot this store is past cannot be installed");
         assert!(
@@ -6472,6 +6769,262 @@ mod tests {
         // the fields changed and not about the fixture.
         super::super::snapshot::receive(&layout, &published.snapshot, &state, &truthful)
             .expect("the metadata the body actually implies");
+    }
+
+    /// **The metadata half of the crossing.**
+    ///
+    /// Two valid same-group preparations, installed with body A's `Prepared`
+    /// under body B's `SnapshotMeta`. Every individual value verifies — both
+    /// bodies passed preparation against their own metadata — and only the
+    /// binding catches it.
+    ///
+    /// The comparison is a *fatal invariant* rather than a rejection: by this
+    /// point both values are ours, and a peer sent neither of them crossed.
+    #[tokio::test]
+    async fn two_valid_preparations_cannot_be_crossed_by_their_metadata() {
+        let dir_a = scratch_dir();
+        let (_a, published_a) = a_published_source(&dir_a).await;
+
+        // A second source of the same group at a *different* applied index, so
+        // its metadata is genuinely different while remaining valid.
+        let dir_b = scratch_dir();
+        let (mut source_b, _) = a_published_source(&dir_b).await;
+        source_b
+            .0
+            .apply([normal(3, acquire(2))])
+            .await
+            .expect("a second command");
+        let published_b = {
+            let mut builder = source_b.0.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build")
+        };
+        assert_ne!(
+            published_a.meta, published_b.meta,
+            "the two preparations must differ, or the crossing is a no-op"
+        );
+
+        let dir = scratch_dir();
+        let (mut receiver, _shutdown, _drain) = machine(&dir);
+
+        // Body A, proved against A's own metadata — a completely valid
+        // preparation.
+        let prepared_a = receiver
+            .handle
+            .prepare_install(
+                published_a.snapshot,
+                crate::coordination::raft::SnapshotMetaV1::from(&published_a.meta),
+            )
+            .await
+            .expect("body A prepares against its own metadata");
+
+        // Now hand it to OpenRaft's boundary under B's metadata.
+        let err = receiver
+            .install_snapshot(
+                &published_b.meta,
+                Box::new(CoordinationSnapshotFile::Prepared(Box::new(prepared_a))),
+            )
+            .await
+            .expect_err("a crossed pair must not install");
+        assert!(
+            format!("{err:?}").contains("two valid preparations were crossed"),
+            "the failure must name the crossing rather than a generic mismatch: {err:?}"
+        );
+
+        // And the same body under its *own* metadata installs, so the refusal
+        // above is about the crossing and not about the fixture.
+        let (_a2, published_a2) = a_published_source(&scratch_dir()).await;
+        let dir2 = scratch_dir();
+        let (mut receiver2, _s2, _d2) = machine(&dir2);
+        receiver2
+            .prepare_then_install_(&published_a2.meta, published_a2.snapshot)
+            .await
+            .expect("an uncrossed pair installs");
+    }
+
+    /// **The property that forbids resolving during preparation.**
+    ///
+    /// No single-threaded install can fail this by accident: with a prepared
+    /// snapshot in hand, an apply lands that moves `last_applied` **past** the
+    /// candidate, and the install must be classified against the *post-apply*
+    /// state.
+    ///
+    /// An implementation that resolved during preparation would have decided
+    /// `Replace` — the candidate was ahead when it was prepared — and rolled
+    /// the state machine back, with nothing downstream able to tell. Resolving
+    /// on the actor under the same exclusion as the rename gives `Stale`.
+    ///
+    /// The two calls are deliberately separate here rather than going through
+    /// the adapter: the adapter runs them back to back, which is exactly the
+    /// window this test needs to open.
+    #[tokio::test]
+    async fn an_apply_between_preparation_and_install_decides_the_verdict() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+        let candidate_index = published
+            .meta
+            .last_log_id
+            .as_ref()
+            .map(|id| id.index)
+            .expect("the fixture snapshot has an applied index");
+
+        let dir = scratch_dir();
+        let (mut receiver, _shutdown, _drain) = CoordinationStateMachine::new(
+            seeded_with(&dir, seven_section_state()),
+            StorageLayout::new(&dir),
+        )
+        .expect("open");
+
+        // Prepared while this store is *behind* the candidate, so a verdict
+        // taken now would be `Replace`.
+        let before = durable_of(&receiver).await;
+        let behind = before
+            .model
+            .last_applied
+            .as_ref()
+            .map(|id| id.index)
+            .unwrap_or(0);
+        assert!(
+            behind < candidate_index,
+            "the store must start behind the candidate, or the window does not exist"
+        );
+        let prepared = receiver
+            .handle
+            .prepare_install(
+                published.snapshot,
+                crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+            )
+            .await
+            .expect("preparation succeeds against a candidate we are behind");
+
+        // The apply that lands in the window.
+        let past: Vec<_> = (candidate_index + 1..=candidate_index + 2)
+            .map(blank)
+            .collect();
+        receiver.apply(past).await.expect("move past the candidate");
+
+        // And now the install, which must see the post-apply state.
+        let err = receiver
+            .install_snapshot(
+                &published.meta,
+                Box::new(CoordinationSnapshotFile::Prepared(Box::new(prepared))),
+            )
+            .await
+            .expect_err("the candidate is now behind this store");
+        assert!(
+            format!("{err:?}").contains("roll the state machine back"),
+            "the verdict must be taken against the post-apply state: {err:?}"
+        );
+    }
+
+    /// **The vote half has no runtime test, and this states why.**
+    ///
+    /// `RaftStateMachine::install_snapshot(&mut self, meta, data)` has no vote
+    /// parameter, and a vote is derived from nothing the receiver retains — so
+    /// there is no value at this layer against which a substituted vote could
+    /// be compared. A test that appeared to exercise the crossing here would be
+    /// asserting a property no code path has.
+    ///
+    /// The obligation is carried structurally instead, by the source guards in
+    /// `network::handoff`: one constructor for `SnapshotHandoff`, one call site
+    /// for `install_full_snapshot`, and no constructor function that takes a
+    /// vote, a `SnapshotMeta` and a `PreparedSnapshot` as separate arguments.
+    /// This test asserts only the fact that makes that necessary.
+    #[test]
+    fn the_state_machine_never_receives_a_vote_to_compare() {
+        let machine = include_str!("machine.rs");
+        let at = machine
+            .find("    async fn install_snapshot(")
+            .expect("the state machine implements install_snapshot");
+        let signature: String = machine[at..].lines().take(6).collect::<Vec<_>>().join("\n");
+        assert!(
+            signature.contains("meta:") && signature.contains("snapshot:"),
+            "the signature under test moved: {signature}"
+        );
+        assert!(
+            !signature.contains("vote"),
+            "if install_snapshot ever received a vote, the vote-substitution obligation \
+             would become checkable at runtime and this note would be wrong: {signature}"
+        );
+    }
+
+    /// A raw role reaching production installation is a **fatal invariant**,
+    /// not a fallback.
+    ///
+    /// Both raw roles, because they fail for the same reason and an
+    /// implementation that special-cased one would look correct against a test
+    /// that only tried the other.
+    #[tokio::test]
+    async fn a_raw_role_at_the_production_boundary_is_an_invariant_failure() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+        let dir = scratch_dir();
+        let (mut receiver, _shutdown, _drain) = machine(&dir);
+
+        let err = receiver
+            .install_snapshot(&published.meta, published.snapshot)
+            .await
+            .expect_err("a Published role must not install");
+        assert!(
+            format!("{err:?}").contains("raw Published role"),
+            "the failure must name the role it refused: {err:?}"
+        );
+
+        let incoming = Box::new(CoordinationSnapshotFile::incoming(
+            StorageLayout::new(&dir).incoming().join("not-prepared"),
+        ));
+        let err = receiver
+            .install_snapshot(&published.meta, incoming)
+            .await
+            .expect_err("an Incoming role must not install either");
+        assert!(format!("{err:?}").contains("raw Incoming role"), "{err:?}");
+    }
+
+    /// Preparation's two failures are answered differently, which is the whole
+    /// reason it has its own error type.
+    ///
+    /// A refusal of the sender's bytes leaves the store serving; this store's
+    /// own staging failure does not. Both are driven here through the real
+    /// handle, so the classification is the one a caller would see.
+    #[tokio::test]
+    async fn preparation_keeps_a_refusal_and_a_storage_failure_apart() {
+        let source_dir = scratch_dir();
+        let (_source, published) = a_published_source(&source_dir).await;
+        let dir = scratch_dir();
+        let (receiver, _shutdown, _drain) = machine(&dir);
+
+        // A truncated body: the sender's bytes, refused.
+        let staged = StorageLayout::new(&dir).incoming().join("truncated");
+        std::fs::create_dir_all(staged.parent().expect("a directory")).expect("mkdir");
+        let bytes = std::fs::read(body_path(&source_dir, &published.meta.snapshot_id))
+            .expect("the sender's body");
+        std::fs::write(&staged, &bytes[..bytes.len() / 2]).expect("truncate");
+
+        let err = receiver
+            .handle
+            .prepare_install(
+                Box::new(CoordinationSnapshotFile::incoming(&staged)),
+                crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
+            )
+            .await
+            .expect_err("a truncated body is refused");
+        assert!(
+            matches!(
+                err,
+                super::super::snapshot::PrepareInstallError::Rejected(_)
+            ),
+            "a truncated body is the sender's problem, not ours: {err:?}"
+        );
+        assert!(
+            !receiver.handle.is_fatal(),
+            "and the voter keeps serving — the property the whole boundary exists for"
+        );
+
+        // The store still works afterwards.
+        receiver
+            .handle
+            .read_transaction()
+            .await
+            .expect("the store still serves reads after refusing a peer's bytes");
     }
 
     /// A body rebuilds the state it was streamed from, row for row.

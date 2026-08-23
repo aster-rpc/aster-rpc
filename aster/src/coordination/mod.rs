@@ -43,6 +43,11 @@ pub mod raft;
 #[cfg(feature = "coordination")]
 pub mod convert;
 
+/// The authenticated Raft transport over Aster RPC (§5.3, §5.4). Voter-only
+/// and crate-private.
+#[cfg(feature = "coordination")]
+pub(crate) mod network;
+
 /// The voter runtime: pinned OpenRaft configuration, lifecycle and readiness
 /// (§7.5, §7.6). Voter-only and crate-private.
 #[cfg(feature = "coordination")]

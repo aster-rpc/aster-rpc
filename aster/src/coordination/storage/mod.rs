@@ -73,6 +73,8 @@ use error::StorageResult;
 use fixture::SuiteFixture;
 use identity::{OpenPolicy, StorageIdentity};
 use log::{CoordinationLogStore, LogShutdown};
+#[cfg(test)]
+use machine::SuiteStateMachine;
 use machine::{CoordinationStateMachine, StateShutdown};
 use reads::ReadDrain;
 use schema::{DirectoryLock, IntegrityOutcome, OpenOutcome, StorageLayout};
@@ -125,14 +127,14 @@ impl
     openraft::testing::StoreBuilder<
         crate::coordination::typeconfig::CoordinationTypeConfig,
         CoordinationLogStore,
-        CoordinationStateMachine,
+        SuiteStateMachine,
         SuiteGuard,
     > for SuiteBuilder
 {
     async fn build(
         &self,
     ) -> Result<
-        (SuiteGuard, CoordinationLogStore, CoordinationStateMachine),
+        (SuiteGuard, CoordinationLogStore, SuiteStateMachine),
         openraft::StorageError<crate::coordination::ids::CoordinationNodeId>,
     > {
         let (dir, store) = self.fixture.build_at();
@@ -194,6 +196,7 @@ pub(crate) struct VoterStorage {
 /// Same four values in the same order as [`VoterStorage`], for the same
 /// reason: dropping this stops and joins both actors, releasing their database
 /// handles, before the directory lock is released.
+#[cfg(test)]
 pub(crate) struct SuiteGuard {
     _log_shutdown: LogShutdown,
     _reads: ReadDrain,
@@ -265,9 +268,8 @@ impl VoterStorage {
     /// the state machine separately would leave nothing holding it. Inside
     /// `SuiteGuard` the same four values sit in the same order, so both actors
     /// are still stopped and joined before the directory lock goes.
-    pub(crate) fn into_suite_parts(
-        self,
-    ) -> (SuiteGuard, CoordinationLogStore, CoordinationStateMachine) {
+    #[cfg(test)]
+    pub(crate) fn into_suite_parts(self) -> (SuiteGuard, CoordinationLogStore, SuiteStateMachine) {
         let VoterStorage {
             layout: _,
             identity: _,
@@ -288,7 +290,7 @@ impl VoterStorage {
                 _lock,
             },
             log,
-            state,
+            SuiteStateMachine(state),
         )
     }
 
