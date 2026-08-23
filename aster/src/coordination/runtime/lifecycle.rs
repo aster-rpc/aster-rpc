@@ -175,6 +175,19 @@ pub(crate) struct LocalFacts {
     /// §7.6's derived timeout, from
     /// [`config::leader_liveness_timeout`](super::config::leader_liveness_timeout).
     pub(crate) leader_liveness_timeout: Duration,
+    /// Whether this node has **applied** the group's signed genesis.
+    ///
+    /// A voter can be a healthy member of a quorum and still be unable to
+    /// authorize anything, because the delegated administrator set arrives in a
+    /// committed entry like any other state. Reporting `Ready` before it lands
+    /// would tell a caller the group is usable at the one moment every
+    /// administrative action is guaranteed to be refused.
+    ///
+    /// Uniform across start modes on purpose: a bootstrapping voter reaches it
+    /// by applying the entry its leader proposed, and a joining one by replay
+    /// or by the snapshot that subsumes it. Neither has a different question to
+    /// answer.
+    pub(crate) genesis_installed: bool,
 }
 
 /// What this node reports about itself.
@@ -240,12 +253,13 @@ pub(crate) fn classify(metrics: &Metrics, local: &LocalFacts) -> LifecycleView {
         Corridor::Running => {}
     }
 
-    // 5, 6. `Ready` requires three live facts, all of them. Anything short of
-    //       all three is `NoQuorum`, which is every condition a later message
-    //       repairs.
+    // 5, 6. `Ready` requires four live facts, all of them. Anything short of
+    //       all four is `NoQuorum`, which is every condition a later message
+    //       repairs — including a genesis that has not arrived yet.
     let ready = local_role == LocalRole::Voter
         && leader_observation_is_fresh(metrics, local)
-        && applied_through_the_leaders_blank_entry(metrics);
+        && applied_through_the_leaders_blank_entry(metrics)
+        && local.genesis_installed;
 
     view(
         if ready {
@@ -438,6 +452,10 @@ pub(crate) mod testing {
             fatal: None,
             follower_contact_age: None,
             leader_liveness_timeout: Duration::from_millis(3_000),
+            // The fixture's default is *installed*, so every existing case
+            // keeps testing what it was written to test. The genesis condition
+            // has its own cases, which set it false deliberately.
+            genesis_installed: true,
         }
     }
 }

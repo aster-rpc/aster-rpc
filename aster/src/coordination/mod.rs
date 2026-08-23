@@ -100,6 +100,9 @@ pub struct Coordination {
     /// `Arc` bump, so this costs the handle nothing when it is present.
     #[cfg(feature = "coordination-testing")]
     raft: openraft::Raft<typeconfig::CoordinationTypeConfig>,
+    /// The state actor, for reads the Raft metrics cannot answer.
+    #[cfg(feature = "coordination-testing")]
+    state: storage::machine::StateHandle,
 }
 
 #[cfg(feature = "coordination")]
@@ -109,6 +112,8 @@ impl Coordination {
             readiness: rt.readiness(),
             #[cfg(feature = "coordination-testing")]
             raft: rt.raft().clone(),
+            #[cfg(feature = "coordination-testing")]
+            state: rt.state().clone(),
         }
     }
 

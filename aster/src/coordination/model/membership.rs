@@ -284,7 +284,7 @@ pub fn decide_change(
     // This costs nothing in lost-response handling. A client re-sending a
     // sequence it already sent is answered by the session classifier from the
     // saved reply, before any of this runs.
-    if !state.admins.contains(actor) {
+    if !state.is_administrator(actor) {
         return Decision::Refuse(RefusalReason::PermissionChanged);
     }
 
@@ -563,7 +563,7 @@ fn routes_from(action: &ChangeMembershipAction) -> Vec<(NodeId, Route)> {
 
 /// Decide one `cancel_membership`.
 pub fn decide_cancel(state: &State, actor: &NodeId, action: &CancelMembershipAction) -> Decision {
-    if !state.admins.contains(actor) {
+    if !state.is_administrator(actor) {
         return Decision::Refuse(RefusalReason::PermissionChanged);
     }
 

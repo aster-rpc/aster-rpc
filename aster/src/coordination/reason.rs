@@ -264,6 +264,20 @@ reasons! {
         /// `23 AclSlotsExhausted` are the precedent — §12.1 caps carrying reason
         /// codes at stage 3.
         MembershipLearnerEnvelope = 25,
+        /// §8.1: ROOT cannot be enabled, disabled, or otherwise made a row in
+        /// the delegated administrator table.
+        ///
+        /// **Terminal**, and its own code rather than `12 PermissionChanged`
+        /// for the same reason `LastAdministrator` is not that code: the actor
+        /// may well hold every authority there is — ROOT itself does — and what
+        /// is refused is the *target*, not the caller. Answering
+        /// `PermissionChanged` would send an operator to check their own
+        /// credentials for a request that no credential can make.
+        ///
+        /// Terminal because nothing clears it. ROOT's immutability is not a
+        /// state a later command can change; that is what immutable means, and
+        /// a retryable code would invite a client to keep asking.
+        RootAuthorityImmutable = 26,
     }
 }
 
@@ -281,6 +295,9 @@ impl Reason {
             | Reason::ResourceSlotsExhausted
             | Reason::AclSlotsExhausted
             | Reason::LastAdministrator
+            // Visible from replicated state before proposing: the target either
+            // is the ROOT key or is not.
+            | Reason::RootAuthorityImmutable
             // A group condition a leader can see before proposing, and one a
             // cleanup plan clears -- so it must be answerable `NotConsumed`.
             // Classifying it with the apply-time refusals instead made
@@ -341,7 +358,18 @@ impl Reason {
             // a resource's ACL, epoch or lease revision.
             | Reason::CounterExhausted
             // v1 has no delete-resource command (§9.1).
-            | Reason::ResourceSlotsExhausted => true,
+            | Reason::ResourceSlotsExhausted
+            // ROOT's immutability is not a state a command can change.
+            | Reason::RootAuthorityImmutable
+            // **Terminal for the request that received it.** The escape --
+            // "add a second administrator, then retry" -- does clear the
+            // *condition*, but not for this request: `set_admin` carries
+            // `expected_admin_revision`, and adding the replacement is itself a
+            // `set_admin` that advances the revision. The original removal can
+            // then only fail `AdminRevisionMismatch`. §10's test is whether a
+            // v1 command makes *this* request apply unchanged, and none does;
+            // the operator must submit a newly revision-fenced one.
+            | Reason::LastAdministrator => true,
 
             // The instructive near misses: each has a v1 command that clears it.
             // Retiring frees an active slot; grant removal frees an ACL row; a
@@ -350,9 +378,6 @@ impl Reason {
             Reason::ActiveClientCap
             | Reason::AclSlotsExhausted
             | Reason::StateBudgetExhausted
-            // Adding a second administrator clears it, and that is an ordinary
-            // v1 command.
-            | Reason::LastAdministrator
             // A cleanup plan removes the stranded learners, and that is an
             // ordinary v1 command too.
             | Reason::MembershipLearnerEnvelope => false,
@@ -481,16 +506,22 @@ mod tests {
     // wrong arm left every case passing.
 
     /// §10 stage 3: the reason-coded admission denials.
-    const ADMISSION_DENIAL_CODES: [i32; 6] = [15, 19, 22, 23, 24, 25];
+    const ADMISSION_DENIAL_CODES: [i32; 7] = [15, 19, 22, 23, 24, 25, 26];
 
     /// §10: `NotConsumed` refusals no v1 command can clear.
-    const TERMINAL_NOT_CONSUMED_CODES: [i32; 4] = [11, 15, 18, 22];
+    ///
+    /// `24 LastAdministrator` joined this list when §8.1 was corrected: adding
+    /// the replacement administrator advances `admin_revision`, so the original
+    /// revision-fenced removal can then only fail `AdminRevisionMismatch`. The
+    /// condition clears; *that request* never applies. `26` is here because
+    /// ROOT's immutability is not a state any command changes.
+    const TERMINAL_NOT_CONSUMED_CODES: [i32; 6] = [11, 15, 18, 22, 24, 26];
 
     /// §5.2: defined so it cannot be reused, but never emitted.
     const RESERVED_CODES: [i32; 1] = [20];
 
-    /// §5.2 declares reasons 0 through 25 with no gaps.
-    const REASON_CODE_RANGE: std::ops::RangeInclusive<i32> = 0..=25;
+    /// §5.2 declares reasons 0 through 26 with no gaps.
+    const REASON_CODE_RANGE: std::ops::RangeInclusive<i32> = 0..=26;
 
     /// §5.2's outcome codes.
     const OUTCOME_CODES: [i32; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100];
@@ -525,9 +556,9 @@ mod tests {
             assert_eq!(Reason::from_code(reason.code()), Some(*reason));
         }
         // Data, not a bug: an unrecognised code must be reportable rather than
-        // fatal. -1 and 26 bracket the declared range; i32::MAX is the corrupt
+        // fatal. -1 and 27 bracket the declared range; i32::MAX is the corrupt
         // case.
-        for code in [-1, 26, 99, i32::MAX, i32::MIN] {
+        for code in [-1, 27, 99, i32::MAX, i32::MIN] {
             assert_eq!(Reason::from_code(code), None, "code {code} must not map");
         }
     }
@@ -610,8 +641,8 @@ mod tests {
                 "a value-shrinking compare_and_set frees growth bytes",
             ),
             (
-                Reason::LastAdministrator,
-                "adding a second administrator lets the removal succeed",
+                Reason::MembershipLearnerEnvelope,
+                "a cleanup plan removes the stranded learners",
             ),
         ] {
             assert!(
@@ -634,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_five_terminal_cases_exist() {
+    fn the_terminal_cases_are_the_ones_the_spec_names() {
         let consumed = Reason::ALL
             .iter()
             .filter(|r| Disposition::Consumed.is_terminal(**r))
@@ -643,12 +674,12 @@ mod tests {
             .iter()
             .filter(|r| Disposition::NotConsumed.is_terminal(**r))
             .count();
-        // Every Consumed is terminal, so the interesting count is the four
-        // NotConsumed ones -- "five cases" is 1 rule + 4 reasons, not 5 reasons.
+        // Every Consumed is terminal, so the interesting count is the
+        // NotConsumed ones.
         assert_eq!(consumed, Reason::ALL.len());
         assert_eq!(
-            not_consumed, 4,
-            "§10 names four terminal NotConsumed reasons; 25 is not one of them"
+            not_consumed, 6,
+            "§10 names six terminal NotConsumed reasons; 25 is not one of them"
         );
     }
 

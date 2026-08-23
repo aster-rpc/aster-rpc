@@ -213,6 +213,12 @@ async fn await_shape(
         if have_voters == want_voters
             && have_nodes == want_nodes
             && !c.membership_is_joint_for_testing()
+            // And the durable intent has reached a terminal phase. The
+            // committed membership reaches its final shape one entry *before*
+            // the controller records completion, so a gate that stopped at the
+            // shape would submit its next plan into a group that still has one
+            // in flight and be refused `MembershipIntentActive` — correctly.
+            && !c.membership_intent_active_for_testing().await
         {
             return;
         }
@@ -241,9 +247,6 @@ async fn await_shape(
 /// controller sees it. Both endpoints of this change are shapes the profile
 /// actually permits, which is what makes it a test of the controller rather
 /// than of the shape guard.
-#[ignore = "S3-GENESIS-ADMINS: a bootstrapped group has an empty replicated \
-           administrator set, so no membership plan can be accepted. The gate \
-           is written and runs the moment that closes."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn departing_voters_are_retained_as_learners_and_can_return() {
     let fixture = GroupFixture::new(DOMAIN, SEED, SIZE);
@@ -345,8 +348,6 @@ async fn departing_voters_are_retained_as_learners_and_can_return() {
 /// a controller that treated "another change is in flight" as a failure would
 /// abandon an operation that was about to succeed. The evidence is that the
 /// membership still reaches the *first* plan's shape after the refusal.
-#[ignore = "S3-GENESIS-ADMINS: see above; the first plan cannot be accepted, \
-           so the in-flight refusal it tests cannot arise yet."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_second_plan_is_refused_without_disturbing_the_first() {
     let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x01, SIZE);

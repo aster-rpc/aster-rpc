@@ -785,6 +785,17 @@ pub const SYS_EXPIRE_MALFORMED: i32 = 5;
 /// A committed `MembershipProgress` whose fields will not narrow (§10.1).
 pub const SYS_MEMBERSHIP_MALFORMED: i32 = 6;
 
+/// The signed genesis was verified and its administrators installed.
+pub const SYS_GENESIS_INSTALLED: i32 = 7;
+
+/// The same genesis arrived again after it had already been installed.
+///
+/// Not an error and not a second installation: exact replay is idempotent, so
+/// this reports that the entry was recognised and changed nothing. A *different*
+/// genesis is not this code — it is fatal, because two genesis documents for one
+/// group is a disagreement no voter can resolve locally.
+pub const SYS_GENESIS_ALREADY_INSTALLED: i32 = 8;
+
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/ClientReply")]
 pub struct ClientReplyV1 {
@@ -921,6 +932,34 @@ pub struct MembershipProgressCommandV1 {
     pub result_code: i32,
 }
 
+/// The signed genesis, replicated as a committed entry.
+///
+/// ## Why the genesis has to be a command
+///
+/// The group's initial administrators live in the signed genesis, and until
+/// this existed nothing installed them: `boot::initialize` writes OpenRaft's
+/// membership entry and nothing else, and `set_admin` requires an existing
+/// administrator, so the delegated set could never become non-empty. A group
+/// could form, elect and replicate, and never authorize an administrative
+/// action again — no grant, and therefore no membership change.
+///
+/// Seeding it beside the log would not do. State written before Raft
+/// initialization is state a full-log replay does not reproduce, and state
+/// derived from locally loaded key material is state two voters can disagree
+/// about. A committed entry is the only form every present and future member
+/// obtains identically — by replay, or by the snapshot that subsumes it.
+///
+/// Carries the **exact** signed document rather than its parts, so apply
+/// re-verifies the same bytes the operator signed instead of a projection of
+/// them that a proposer chose.
+#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "aster.coordination.v1/GenesisCommand")]
+pub struct GenesisCommandV1 {
+    /// The canonical `SignedCoordinationDocumentV1` bytes.
+    #[fory(id = 1, bytes)]
+    pub signed_genesis: Vec<u8>,
+}
+
 /// Sessionless (§10): no client id, no sequence, so it cannot be a
 /// `ClientCommandV1`, which is defined around one.
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
@@ -934,8 +973,14 @@ pub struct RetireClientCommandV1 {
     pub target_client_id: Vec<u8>,
 }
 
-/// OpenRaft's `D`. **Four** variants -- an earlier revision said three and
-/// omitted retirement after making it sessionless.
+/// OpenRaft's `D`. **Five** variants.
+///
+/// `Genesis` was added after the v1 shape was called frozen, deliberately: the
+/// frozen declaration described an authorization model — ROOT delegating to an
+/// initial administrator set — and omitted the transition that makes it
+/// reachable, so a group could never acquire an administrator. v1 has not
+/// shipped, and a format that cannot express its own bootstrap is not the
+/// format that was frozen.
 #[derive(ForyUnion, aster_macros::AsterType, Debug, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/Command")]
 pub enum CommandV1 {
@@ -948,6 +993,8 @@ pub enum CommandV1 {
     MembershipProgress(MembershipProgressCommandV1),
     #[fory(id = 4)]
     RetireClient(RetireClientCommandV1),
+    #[fory(id = 5)]
+    Genesis(GenesisCommandV1),
     #[fory(unknown)]
     Unknown(fory_core::UnknownCase),
 }
@@ -958,7 +1005,9 @@ impl CommandV1 {
     pub fn expected_reply_variant(&self) -> Option<u8> {
         Some(match self {
             CommandV1::Client(_) => 1,
-            CommandV1::Expire(_) | CommandV1::MembershipProgress(_) => 2,
+            // A genesis has no caller and no session; like the other system
+            // commands it answers with a `System` reply carrying a phase code.
+            CommandV1::Expire(_) | CommandV1::MembershipProgress(_) | CommandV1::Genesis(_) => 2,
             CommandV1::RetireClient(_) => 3,
             CommandV1::Unknown(_) => return None,
         })
@@ -1234,6 +1283,8 @@ mod command_tests {
             #[fory(id = 4)]
             RetireClient(RetireClientCommandV1),
             #[fory(id = 5)]
+            Genesis(GenesisCommandV1),
+            #[fory(id = 6)]
             TransferLeadership(TransferLeadershipCommandV2),
             #[fory(unknown)]
             Unknown(fory_core::UnknownCase),
@@ -1275,8 +1326,12 @@ mod command_tests {
             MembershipProgress(MembershipProgressCommandV1),
             #[fory(id = 4)]
             RetireClient(RetireClientCommandV1),
-            // New case id, but its payload is a type v1 already registers.
             #[fory(id = 5)]
+            Genesis(GenesisCommandV1),
+            // New case id, but its payload is a type v1 already registers.
+            // Six rather than five: v1 case 5 is `Genesis` now, and reusing it
+            // would test a *known* case rather than an unknown one.
+            #[fory(id = 6)]
             ExpireAll(ExpireCommandV1),
             #[fory(unknown)]
             Unknown(fory_core::UnknownCase),

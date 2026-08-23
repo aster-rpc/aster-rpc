@@ -74,6 +74,13 @@ pub(crate) struct RuntimeFacts {
     /// Latched. A `Fatal` that a later observation could clear would not be
     /// `Fatal`.
     fatal: std::sync::Mutex<Option<FatalCause>>,
+    /// Whether this node has applied the group's signed genesis (§7.6).
+    ///
+    /// Latched once true: the genesis is installed by a committed entry and
+    /// nothing un-installs it, so an observation that went back to false would
+    /// be a read failure rather than a state change — and it must not be able
+    /// to withdraw readiness.
+    genesis_installed: AtomicBool,
 }
 
 impl RuntimeFacts {
@@ -85,6 +92,7 @@ impl RuntimeFacts {
             last_leader_contact_ms: AtomicU64::new(u64::MAX),
             origin: Instant::now(),
             fatal: std::sync::Mutex::new(None),
+            genesis_installed: AtomicBool::new(false),
         }
     }
 
@@ -110,6 +118,20 @@ impl RuntimeFacts {
         self.draining.store(true, Ordering::SeqCst);
     }
 
+    /// Record that this node has applied the group's genesis.
+    ///
+    /// One-way. The caller polls a state read that can legitimately fail —
+    /// during shutdown, or while the actor is fatal — and a poll that answered
+    /// "not installed" for either reason must not take readiness away from a
+    /// node that had it.
+    pub(crate) fn note_genesis_installed(&self) {
+        self.genesis_installed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn genesis_installed(&self) -> bool {
+        self.genesis_installed.load(Ordering::SeqCst)
+    }
+
     /// Latch a fatal cause. The **first** one wins: it is the one that
     /// explains the others.
     pub(crate) fn latch_fatal(&self, cause: FatalCause) {
@@ -130,6 +152,7 @@ impl RuntimeFacts {
                 Duration::from_millis(now.saturating_sub(contact))
             }),
             leader_liveness_timeout: timeout,
+            genesis_installed: self.genesis_installed.load(Ordering::SeqCst),
         }
     }
 }
@@ -168,14 +191,32 @@ pub(crate) async fn run_lifecycle(
     timeout: Duration,
     state: crate::coordination::storage::machine::StateHandle,
     generation: Arc<AtomicU64>,
+    genesis: Option<Arc<Vec<u8>>>,
 ) {
     let mut metrics = raft.metrics();
     // The controller task for the generation this node currently holds.
     // Aborted and replaced on every leadership change, which is what makes
     // "one leader-generation task" true rather than aspirational.
     let mut controller: Option<tokio::task::JoinHandle<()>> = None;
+    // The in-flight genesis proposal, if any. Held so a second is not spawned
+    // beside it: a proposal into a group without a quorum does not fail, it
+    // waits, and one metrics change per heartbeat would otherwise queue an
+    // unbounded number of identical entries behind it.
+    let mut proposing: Option<tokio::task::JoinHandle<()>> = None;
     let mut leading = false;
     loop {
+        // Observe the genesis before classifying. Applying an entry moves
+        // `last_applied`, which is what wakes this loop, so this needs no timer
+        // of its own — and the read is skipped entirely once latched.
+        //
+        // Before the classification rather than after it, so the loop keeps
+        // exactly one publisher: a second `publish` for the genesis would make
+        // the view have two writers, which is the thing this loop exists to
+        // prevent. A genesis observed a tick late costs one heartbeat.
+        if !facts.genesis_installed() && state.genesis_installed().await.unwrap_or(false) {
+            facts.note_genesis_installed();
+        }
+
         {
             let current = metrics.borrow_and_update().clone();
 
@@ -226,10 +267,40 @@ pub(crate) async fn run_lifecycle(
                 leading = is_leader;
             }
 
+            // The bootstrap proposal (§7.1). Only a bootstrapping voter holds
+            // the document, only a leader can propose, and applying it is what
+            // makes `facts.genesis_installed()` true — on this node and, by
+            // replication, on every other. Exact replay is idempotent, so a
+            // second leader proposing it after a leadership change is safe;
+            // that is why this can simply retry rather than having to know
+            // whether an earlier attempt survived.
+            if is_leader
+                && !facts.genesis_installed()
+                && proposing.as_ref().is_none_or(|task| task.is_finished())
+            {
+                if let Some(document) = genesis.clone() {
+                    let raft = raft.clone();
+                    proposing = Some(tokio::spawn(async move {
+                        let command = crate::coordination::contract::CommandV1::Genesis(
+                            crate::coordination::contract::GenesisCommandV1 {
+                                signed_genesis: document.as_ref().clone(),
+                            },
+                        );
+                        // The outcome is not inspected. A refusal is fatal on
+                        // every voter including this one, and would arrive as a
+                        // `Fatal` through the same latch every other storage
+                        // failure uses; a timeout means no quorum yet, and the
+                        // next metrics change tries again.
+                        let _ = raft.client_write(command).await;
+                    }));
+                }
+            }
+
             publisher.publish(classify(&current, &facts.snapshot(timeout)));
         }
+
         if metrics.changed().await.is_err() {
-            if let Some(task) = controller.take() {
+            for task in [controller.take(), proposing.take()].into_iter().flatten() {
                 task.abort();
             }
             return;
@@ -280,6 +351,10 @@ impl CoordinationRuntime {
         allowlist: Arc<SenderAllowlist>,
         local: CoordinationNodeId,
         config: &openraft::Config,
+        // The signed genesis, for a voter that is bootstrapping. `None` for
+        // `Join` and `Existing`: neither founds a group, so neither proposes
+        // the entry — they receive it like any other committed state.
+        genesis: Option<Arc<Vec<u8>>>,
     ) -> Self {
         let state = attached.state.clone();
         let generation = Arc::new(AtomicU64::new(0));
@@ -310,6 +385,7 @@ impl CoordinationRuntime {
             timeout,
             state,
             Arc::clone(&generation),
+            genesis,
         ));
 
         Self {
@@ -344,6 +420,15 @@ impl CoordinationRuntime {
 
     pub(crate) fn local(&self) -> &CoordinationNodeId {
         &self.local
+    }
+
+    /// The state actor's handle.
+    ///
+    /// Reads the Raft metrics cannot answer — durable intent phase, the
+    /// installed genesis — come from here, because they are state-machine facts
+    /// rather than consensus facts.
+    pub(crate) fn state(&self) -> &crate::coordination::storage::machine::StateHandle {
+        self.storage.state().handle()
     }
 
     pub(crate) fn storage(&self) -> &crate::coordination::storage::VoterStorage {

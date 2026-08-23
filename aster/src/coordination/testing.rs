@@ -187,6 +187,26 @@ impl Coordination {
             .map(crate::coordination::contract::LogIdV1::from)
     }
 
+    /// Whether a membership intent is still in flight.
+    ///
+    /// The **durable** answer, from the state machine rather than from
+    /// `RaftMetrics`. The two settle at different moments and both are correct:
+    /// the committed membership reaches its final shape one entry before the
+    /// controller commits the intent's terminal phase, so a group can look
+    /// finished and still refuse the next plan with `MembershipIntentActive`.
+    ///
+    /// A gate that submits a follow-up plan therefore has to wait on this, not
+    /// on the shape — and a gate that retried until it was accepted would be
+    /// hiding exactly the interval this exposes.
+    pub async fn membership_intent_active_for_testing(&self) -> bool {
+        self.state.active_intent().await.ok().flatten().is_some()
+    }
+
+    /// Whether this node has applied the group's signed genesis.
+    pub async fn genesis_installed_for_testing(&self) -> bool {
+        self.state.genesis_installed().await.unwrap_or(false)
+    }
+
     /// The voter ids in the currently committed membership.
     ///
     /// Read from `RaftMetrics`, which is the group's agreed answer rather than

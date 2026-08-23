@@ -208,8 +208,10 @@ impl TryFrom<&AuditRowV1> for AuditRow {
             operation_code: row.operation_code,
             resource,
             // A stored row does not say which code space it is in, so the
-            // operation code decides: 100/101 are the system commands.
-            result: if row.operation_code == 100 || row.operation_code == 101 {
+            // operation code decides — through the one predicate the durable
+            // validator also uses, so the two cannot disagree about a command
+            // added later.
+            result: if crate::coordination::model::apply::is_system_operation(row.operation_code) {
                 AuditResult::System(row.result_code)
             } else {
                 AuditResult::Client(

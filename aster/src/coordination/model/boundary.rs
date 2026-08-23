@@ -20,7 +20,7 @@
 //! command this voter can apply -- and per §5.3.1 that is fatal, not skippable.
 
 use crate::coordination::contract::{
-    ActionV1, ClientCommandV1, CommandReplyV1, CommandV1, ExpireCommandV1,
+    ActionV1, ClientCommandV1, CommandReplyV1, CommandV1, ExpireCommandV1, GenesisCommandV1,
     MembershipProgressCommandV1, RetireClientCommandV1,
 };
 use crate::coordination::reason::Disposition;
@@ -28,7 +28,7 @@ use crate::coordination::reason::Disposition;
 use super::admin::AdminAction;
 use super::apply::{
     apply_command_recording, Action, ClientRef, ClientResult, Command, CommandReply, Fault,
-    ReplyShape, ShapelessCommand, OPERATION_EXPIRE, OPERATION_MEMBERSHIP_PROGRESS,
+    GenesisCommand, ReplyShape, ShapelessCommand, OPERATION_EXPIRE, OPERATION_MEMBERSHIP_PROGRESS,
     OPERATION_RETIRE_CLIENT,
 };
 use super::expire::ExpireCommand;
@@ -244,6 +244,16 @@ pub fn command_from_wire(command: &CommandV1) -> Result<Command, NarrowError> {
             target_actor: node_id(target_node_id)?,
             target_client_id: client_id(target_client_id)?,
         }),
+        // Not narrowed, deliberately: the document is verified by apply against
+        // replicated material, so there is nothing here to validate that would
+        // not be re-validated there — and a narrowing step that could reject it
+        // first would answer a genesis with a shapeless rejection rather than
+        // the fatal it must be.
+        CommandV1::Genesis(GenesisCommandV1 { signed_genesis }) => {
+            Command::Genesis(GenesisCommand {
+                signed_genesis: signed_genesis.clone(),
+            })
+        }
         CommandV1::Unknown(_) => Command::Unknown,
     })
 }
@@ -424,6 +434,15 @@ fn shape_rejection(command: &CommandV1) -> Command {
             system_result_code: SYS_MEMBERSHIP_MALFORMED,
             actor: None,
             resource: None,
+        }),
+        // A genesis has no shape to violate: it is opaque bytes here, and
+        // `command_from_wire` narrows it unconditionally. Reaching this arm
+        // would mean the narrowing failed, which it cannot — and answering a
+        // genesis with a *forced apply* would install nothing while recording
+        // that the group had dealt with it. It is fatal instead, which is what
+        // `Command::Genesis` produces when the document does not verify.
+        CommandV1::Genesis(g) => Command::Genesis(GenesisCommand {
+            signed_genesis: g.signed_genesis.clone(),
         }),
         // Unreachable: `command_for_apply` returns `UnknownVariant` first.
         CommandV1::Unknown(_) => Command::Unknown,

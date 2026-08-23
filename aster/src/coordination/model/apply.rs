@@ -72,6 +72,8 @@
 //! earlier version decided and mutated first and compared audit afterwards, so
 //! a command that then faulted had already changed business state.
 
+use std::collections::BTreeSet;
+
 use crate::coordination::reason::{Disposition, Outcome, Reason, RefusalReason};
 
 use super::admin::{self, AdminAction};
@@ -262,6 +264,20 @@ pub enum Fault {
         audit_tip: LogId,
         last_applied: Option<LogId>,
     },
+    /// A committed genesis entry that this group cannot accept.
+    ///
+    /// **Fatal, like `UnknownCommand`, and for the same reason.** The genesis
+    /// is the document every other authorization decision descends from. If a
+    /// committed entry claims to be this group's genesis and does not verify
+    /// against the replicated ROOT key, domain, group id, genesis hash, profile
+    /// or initial membership, then the log this voter is being fed disagrees
+    /// with the store it was bound to — and continuing would mean installing an
+    /// administrator set the operator did not sign, or diverging from voters
+    /// that refused it.
+    ///
+    /// Exact replay is **not** this: the same document arriving again is
+    /// idempotent and reports `SYS_GENESIS_ALREADY_INSTALLED`.
+    GenesisRefused { detail: String },
 }
 
 /// The result of a committed client command.
@@ -470,6 +486,20 @@ pub enum Command {
     Expire(ExpireCommand),
     MembershipProgress(MembershipProgressCommand),
     RetireClient(RetireCommand),
+    /// The signed genesis, installing the group's initial administrators.
+    ///
+    /// Carries the **exact** document rather than a narrowed projection of it,
+    /// because apply re-verifies the signature itself. A narrowed form would
+    /// mean the proposer decided what the operator signed, and every voter
+    /// would then be verifying the proposer's reading rather than the bytes.
+    Genesis(GenesisCommand),
+}
+
+/// The signed genesis document, as a committed entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenesisCommand {
+    /// Canonical `SignedCoordinationDocumentV1` bytes.
+    pub signed_genesis: Vec<u8>,
 }
 
 /// A committed command with no usable identity (§10.1).
@@ -602,6 +632,12 @@ pub fn apply_command_recording(
         }
         Command::RetireClient(retire) => {
             CommandReply::Retirement(apply_retire(state, log_id, retire, changes))
+        }
+        // Fatal before anything is written and before `last_applied` moves, on
+        // the same rule as `Unknown`: a voter that cannot accept this group's
+        // genesis must stop rather than record having applied it.
+        Command::Genesis(genesis) => {
+            CommandReply::System(apply_genesis(state, log_id, genesis, changes)?)
         }
     };
 
@@ -811,6 +847,26 @@ pub const OPERATION_EXPIRE: i32 = 100;
 /// `MembershipProgress` (§5.2).
 pub const OPERATION_MEMBERSHIP_PROGRESS: i32 = 101;
 
+/// The committed signed genesis (§7.1).
+pub const OPERATION_GENESIS: i32 = 102;
+
+/// Whether an operation code names a **system** command.
+///
+/// §5.2 puts client outcomes and system phase codes in two disjoint spaces, and
+/// a stored audit row does not say which one it is in — the operation code
+/// decides. That rule was written twice: the decoder tested `100 || 101` and the
+/// durable validator matched a list of constants. Both were right until a third
+/// system command was added, at which point the decoder rebuilt its rows into
+/// the client space and the validator rejected the store as unusable.
+///
+/// One predicate, exhaustive over the system codes, used by both.
+pub fn is_system_operation(operation_code: i32) -> bool {
+    matches!(
+        operation_code,
+        OPERATION_EXPIRE | OPERATION_MEMBERSHIP_PROGRESS | OPERATION_GENESIS
+    )
+}
+
 /// Apply one committed client command.
 ///
 /// `log_id` is the complete entry identity (§11.2). Delivery at or below
@@ -931,6 +987,116 @@ fn apply_expire(
         system_result_code: decision.system_result_code(),
         lease_revision,
     }
+}
+
+/// Apply the committed signed genesis: verify it, then install its
+/// administrators.
+///
+/// ## Everything is checked against replicated facts
+///
+/// The ROOT key, domain, group id, genesis hash and deployment profile all come
+/// from `state`, which every voter derived from the same binding, and the
+/// initial voter set is compared with the committed membership. Nothing is
+/// taken from the proposer except the document bytes — and those are verified,
+/// not trusted. A leader that proposed a genesis it had minted itself would
+/// fail here on every follower, including its own apply.
+///
+/// ## Idempotent on exact replay, fatal on anything else
+///
+/// The genesis hash *is* the document's identity, so "the same genesis" and
+/// "hashes to the value this store is bound to" are the same question. A second
+/// arrival of the same document changes nothing and says so; a different one
+/// cannot be reconciled by any voter acting alone, so it stops this one instead
+/// of installing an administrator set the operator never signed.
+fn apply_genesis(
+    state: &mut State,
+    log_id: LogId,
+    command: &GenesisCommand,
+    changes: &mut ChangeSet,
+) -> Result<SystemResult, Fault> {
+    use crate::coordination::model::authority::verify_genesis;
+
+    let refuse = |detail: String| Fault::GenesisRefused { detail };
+
+    // 1. The signature, under the **replicated** ROOT key and domain.
+    let verified = verify_genesis(
+        &state.authority.public_key,
+        &state.authority.domain,
+        &command.signed_genesis,
+    )
+    .map_err(|err| refuse(format!("the genesis does not verify: {err:?}")))?;
+
+    // 2. The bindings this store already holds. A document that verifies under
+    //    our ROOT key but names another group is a genesis — just not ours.
+    if verified.group_id() != &state.authority.group_id {
+        return Err(refuse("the genesis names another group".into()));
+    }
+    if verified.genesis_hash() != &state.authority.genesis_hash {
+        return Err(refuse(
+            "the genesis is not the document this store is bound to".into(),
+        ));
+    }
+    if verified.deployment_profile_code() != state.deployment_profile_code {
+        return Err(refuse(
+            "the genesis names a different deployment profile".into(),
+        ));
+    }
+
+    // 3. The membership the group actually formed with. `raft.initialize` was
+    //    given this set; if the committed membership disagrees, one of the two
+    //    was not derived from this document.
+    let initial: BTreeSet<NodeId> = verified
+        .initial_voters()
+        .iter()
+        .map(|seed| *seed.node_id())
+        .collect();
+    if initial != state.membership.voters {
+        return Err(refuse(
+            "the genesis's initial voters are not the committed membership".into(),
+        ));
+    }
+
+    let admins: BTreeSet<NodeId> = verified.initial_admins().iter().copied().collect();
+
+    // 4. Already installed? Then this is the exact document again — step 2
+    //    proved that — and it changes nothing.
+    let already = state.admin_revision > 0;
+    let code = if already {
+        crate::coordination::contract::SYS_GENESIS_ALREADY_INSTALLED
+    } else {
+        // The delegated set and its revision, in this one transaction. Revision
+        // 1 rather than 0: `set_admin` compares an expected revision, and a
+        // caller that had never observed the group would otherwise guess the
+        // starting value correctly by supplying the default.
+        for admin in &admins {
+            tables::put_admin(state, changes, *admin);
+        }
+        state.admin_revision = 1;
+        state.growth_bytes = state.recompute_growth();
+        crate::coordination::contract::SYS_GENESIS_INSTALLED
+    };
+
+    write_audit_row(
+        state,
+        log_id,
+        AuditRow {
+            leader_node_id: log_id.leader_node_id,
+            // No caller: like the other system commands, the proposing leader
+            // is the entry's identity and carries the attribution.
+            actor: Some(log_id.leader_node_id),
+            operation_code: OPERATION_GENESIS,
+            resource: None,
+            result: AuditResult::System(code),
+            epoch: 0,
+            value_revision: 0,
+        },
+        changes,
+    );
+
+    Ok(SystemResult {
+        system_result_code: code,
+        lease_revision: 0,
+    })
 }
 
 /// Apply a committed system `MembershipProgress` (§9).

@@ -116,7 +116,7 @@ pub fn decide(state: &State, actor: &NodeId, action: &GrantAction) -> Decision {
     // administrators may change ACL/admin/membership state but receive no
     // implicit resource rights, and holding rights on a resource confers no
     // power to grant them.
-    if !state.admins.contains(actor) {
+    if !state.is_administrator(actor) {
         return Decision::Refuse(RefusalReason::PermissionChanged);
     }
 

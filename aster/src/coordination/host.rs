@@ -248,7 +248,18 @@ impl std::error::Error for UnacknowledgedProfile {}
 #[non_exhaustive]
 pub struct CoordinationConfig {
     storage_dir: PathBuf,
-    authority_public_key: [u8; 32],
+    /// The deployment ROOT public key, when set here.
+    ///
+    /// `None` is the ordinary deployment case: `AsterConfig` already resolves
+    /// `ASTER_ROOT_PUBKEY` / `ASTER_ROOT_PUBKEY_FILE`, and coordination
+    /// consumes that rather than asking for the same key a second time. A
+    /// second place to configure one root key is a second place for it to be
+    /// wrong, and the disagreement would surface as "this genesis does not
+    /// verify" — a message about the document, from a mismatch about the key.
+    ///
+    /// Setting it explicitly is still supported and is what tests do; it is
+    /// then **cross-checked** against `AsterConfig`'s, not preferred over it.
+    authority_public_key: Option<[u8; 32]>,
     authority_domain: String,
     start_mode: CoordinationStart,
     verified_admission: Arc<dyn VerifiedAdmissionSource>,
@@ -268,7 +279,9 @@ impl std::fmt::Debug for CoordinationConfig {
             // against their provisioning record.
             .field(
                 "authority_public_key",
-                &super::ids::CoordinationNodeId::from_array(self.authority_public_key).to_hex(),
+                &self
+                    .authority_public_key
+                    .map(|key| super::ids::CoordinationNodeId::from_array(key).to_hex()),
             )
             .field("authority_domain", &self.authority_domain)
             .field("start_mode", &self.start_mode.name())
@@ -293,10 +306,43 @@ impl CoordinationConfig {
         &self.storage_dir
     }
 
-    /// The single pinned application authority key, used identically in all
-    /// three start modes.
-    pub fn authority_public_key(&self) -> &[u8; 32] {
-        &self.authority_public_key
+    /// The ROOT public key configured **here**, if one was.
+    ///
+    /// Prefer [`resolved_root_key`](Self::resolved_root_key), which reconciles
+    /// this with the deployment's.
+    pub fn authority_public_key(&self) -> Option<&[u8; 32]> {
+        self.authority_public_key.as_ref()
+    }
+
+    /// The one ROOT public key this voter runs under.
+    ///
+    /// `deployment` is `AsterConfig`'s resolved `ASTER_ROOT_PUBKEY`. The rule is
+    /// the same one any two-source configuration should follow: either may
+    /// supply it, both may, and if both do they must agree.
+    ///
+    /// Disagreement is refused rather than resolved by precedence. Whichever
+    /// key lost would produce a group whose genesis verifies under a key the
+    /// operator did not think they were deploying — and the failure would
+    /// arrive much later, as a signature that does not check, on a node that
+    /// could not say why.
+    pub fn resolved_root_key(&self, deployment: Option<[u8; 32]>) -> Result<[u8; 32]> {
+        match (self.authority_public_key, deployment) {
+            (Some(local), Some(root)) if local != root => Err(Error::InvalidArgument(format!(
+                "coordination was configured with root key {} and this deployment's \
+                 ASTER_ROOT_PUBKEY is {}; one deployment has one ROOT",
+                super::ids::CoordinationNodeId::from_array(local).to_hex(),
+                super::ids::CoordinationNodeId::from_array(root).to_hex(),
+            ))),
+            (Some(key), _) | (None, Some(key)) => Ok(key),
+            (None, None) => Err(Error::InvalidArgument(
+                "coordination needs the deployment ROOT public key: set \
+                 ASTER_ROOT_PUBKEY (or ASTER_ROOT_PUBKEY_FILE, or [trust] \
+                 root_pubkey), which is the key every signed genesis, join permit \
+                 and recovery document is verified against and the identity of the \
+                 group's immutable super-administrator"
+                    .into(),
+            )),
+        }
     }
 
     /// The expected `authority_domain`, compared against every signed
@@ -425,13 +471,12 @@ impl CoordinationConfigBuilder {
             ));
         }
 
-        let authority_public_key = self.authority_public_key.ok_or_else(|| {
-            missing(
-                "authority_public_key",
-                "every signed genesis, join permit and recovery document is verified \
-                 against this one pinned key",
-            )
-        })?;
+        // **Not required here**, and this is the one field that is not. The
+        // deployment ROOT key is resolved by `AsterConfig`; requiring it again
+        // would make coordination a second place to configure one key.
+        // `resolved_root_key` reconciles the two at start, and refuses when
+        // neither supplies one.
+        let authority_public_key = self.authority_public_key;
 
         let authority_domain = self.authority_domain.ok_or_else(|| {
             missing(
@@ -571,7 +616,7 @@ mod tests {
             config.storage_dir(),
             Path::new("/var/lib/example/coordination")
         );
-        assert_eq!(config.authority_public_key(), &[9u8; 32]);
+        assert_eq!(config.authority_public_key(), Some(&[9u8; 32]));
         assert_eq!(config.authority_domain(), "example.test");
         assert_eq!(config.start_mode().name(), "Bootstrap");
         assert!(!config.development().allows_single_voter());
@@ -590,11 +635,10 @@ mod tests {
                 b.storage_dir = None;
                 b
             }),
-            ("authority_public_key", {
-                let mut b = complete();
-                b.authority_public_key = None;
-                b
-            }),
+            // `authority_public_key` is deliberately **not** here: the ROOT key
+            // is the deployment's, resolved by `AsterConfig`, and requiring it
+            // again would make coordination a second place to configure one
+            // key. Its own rule is `resolved_root_key`, tested below.
             ("authority_domain", {
                 let mut b = complete();
                 b.authority_domain = None;
@@ -620,6 +664,70 @@ mod tests {
                 "the error must name the missing field {field}, got: {err}"
             );
         }
+    }
+
+    /// **One deployment has one ROOT.**
+    ///
+    /// Either source may supply it, both may, and if both do they must agree.
+    /// Disagreement is refused rather than resolved by precedence: whichever
+    /// key lost would produce a group whose genesis verifies under a key the
+    /// operator did not think they were deploying, and the failure would arrive
+    /// much later as a signature that does not check.
+    #[test]
+    fn the_root_key_comes_from_one_place_or_two_that_agree() {
+        let configured = complete()
+            .authority_public_key([7u8; 32])
+            .build()
+            .expect("a complete configuration");
+        let unconfigured = {
+            let mut b = complete();
+            b.authority_public_key = None;
+            b.build().expect("a complete configuration")
+        };
+
+        // Either source alone.
+        assert_eq!(
+            configured.resolved_root_key(None).expect("local"),
+            [7u8; 32]
+        );
+        assert_eq!(
+            unconfigured
+                .resolved_root_key(Some([9u8; 32]))
+                .expect("deployment"),
+            [9u8; 32]
+        );
+        // Both, agreeing.
+        assert_eq!(
+            configured
+                .resolved_root_key(Some([7u8; 32]))
+                .expect("agreement"),
+            [7u8; 32]
+        );
+
+        // Both, disagreeing: refused, and the message names both keys so an
+        // operator can see which record is stale.
+        let err = configured
+            .resolved_root_key(Some([9u8; 32]))
+            .expect_err("one deployment has one ROOT");
+        let rendered = err.to_string();
+        for key in [[7u8; 32], [9u8; 32]] {
+            assert!(
+                rendered.contains(
+                    &crate::coordination::ids::CoordinationNodeId::from_array(key).to_hex()
+                ),
+                "the refusal must name both keys, got: {rendered}"
+            );
+        }
+
+        // Neither: refused, naming the environment variable that supplies it
+        // rather than a coordination-only field that no longer exists.
+        let err = unconfigured
+            .resolved_root_key(None)
+            .expect_err("a group needs a ROOT");
+        assert!(
+            err.to_string().contains("ASTER_ROOT_PUBKEY"),
+            "the refusal must name where the key comes from, got: {err}"
+        );
     }
 
     /// There is no allow-all fallback: the source has no `Default`, so a

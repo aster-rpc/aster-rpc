@@ -346,7 +346,15 @@ impl AsterServerBuilder {
                 builder = builder.secret_key(key);
             }
         }
-        let config = builder.build();
+        let mut config = builder.build();
+
+        // The deployment ROOT public key, resolved once, here. Coordination
+        // consumes this rather than asking for the same key again: one
+        // deployment has one ROOT, and `resolved_root_key` refuses a
+        // coordination-local key that disagrees with it instead of silently
+        // preferring either.
+        #[cfg(feature = "coordination")]
+        let root_pubkey: Option<[u8; 32]> = config.resolve_root_pubkey()?.map(|key| key.to_bytes());
 
         // §3.3: a voter's NodeId is named by committed Raft membership, so it
         // MUST survive restart. Checked here -- after config resolution, before
@@ -472,9 +480,18 @@ impl AsterServerBuilder {
         #[cfg(feature = "coordination")]
         let coordination = match self.coordination {
             None => None,
-            Some(config) => {
+            Some(coordination_config) => {
+                let root = match coordination_config.resolved_root_key(root_pubkey) {
+                    Ok(root) => root,
+                    Err(err) => {
+                        handle.abort();
+                        node.shutdown().await;
+                        return Err(err);
+                    }
+                };
                 let started = coordination_start(
-                    &config,
+                    &coordination_config,
+                    root,
                     &node,
                     coordination_endpoint,
                     &Ticket::from_node_addr(&node.addr(), Credential::Open)
@@ -514,6 +531,7 @@ impl AsterServerBuilder {
 #[cfg(feature = "coordination")]
 async fn coordination_start(
     config: &crate::coordination::host::CoordinationConfig,
+    root: [u8; 32],
     node: &Node,
     endpoint: crate::coordination::network::service::RaftEndpoint,
     ticket: &Result<String>,
@@ -533,7 +551,7 @@ async fn coordination_start(
                 "coordination requires a 32-byte endpoint identity: {err}"
             ))
         })?;
-    crate::coordination::boot::start(config, node, endpoint, local, ticket.as_bytes()).await
+    crate::coordination::boot::start(config, &root, node, endpoint, local, ticket.as_bytes()).await
 }
 
 /// A running, declarative Aster RPC server: a node serving blobs / docs / gossip

@@ -1426,10 +1426,13 @@ fn check_audit_key_order(state: &DurableState) -> Result<(), String> {
 /// result code cannot be placed in either code space.
 fn check_audit_rows(state: &DurableState) -> Result<(), String> {
     use crate::coordination::contract::{
-        SYS_EXPIRED, SYS_EXPIRE_MALFORMED, SYS_EXPIRY_STALE, SYS_MEMBERSHIP_ADVANCED,
-        SYS_MEMBERSHIP_MALFORMED, SYS_MEMBERSHIP_PHASE_MISMATCH,
+        SYS_EXPIRED, SYS_EXPIRE_MALFORMED, SYS_EXPIRY_STALE, SYS_GENESIS_ALREADY_INSTALLED,
+        SYS_GENESIS_INSTALLED, SYS_MEMBERSHIP_ADVANCED, SYS_MEMBERSHIP_MALFORMED,
+        SYS_MEMBERSHIP_PHASE_MISMATCH,
     };
-    use crate::coordination::model::apply::{OPERATION_EXPIRE, OPERATION_MEMBERSHIP_PROGRESS};
+    use crate::coordination::model::apply::{
+        OPERATION_EXPIRE, OPERATION_GENESIS, OPERATION_MEMBERSHIP_PROGRESS,
+    };
     use crate::coordination::reason::Outcome;
 
     for (at, row) in &state.model.audit {
@@ -1458,6 +1461,9 @@ fn check_audit_rows(state: &DurableState) -> Result<(), String> {
                 SYS_MEMBERSHIP_PHASE_MISMATCH,
                 SYS_MEMBERSHIP_MALFORMED,
             ],
+            // Two results and no rejection: a genesis that does not verify is
+            // fatal before any row is written, so no audit row can record one.
+            OPERATION_GENESIS => &[SYS_GENESIS_INSTALLED, SYS_GENESIS_ALREADY_INSTALLED],
             other => {
                 return Err(format!(
                     "row {at:?} names operation code {other}, which §5.2 does not declare"
@@ -1468,10 +1474,7 @@ fn check_audit_rows(state: &DurableState) -> Result<(), String> {
         // Which code space the row is in is decided by its operation, and the
         // decoder used the same rule to build it -- so a mismatch here means
         // the stored code was reconstructed into the wrong space.
-        let system = matches!(
-            row.operation_code,
-            OPERATION_EXPIRE | OPERATION_MEMBERSHIP_PROGRESS
-        );
+        let system = crate::coordination::model::apply::is_system_operation(row.operation_code);
         if system == row.result.is_client() {
             return Err(format!(
                 "row {at:?} pairs operation code {} with a {} result",

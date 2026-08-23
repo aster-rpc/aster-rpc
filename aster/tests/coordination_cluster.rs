@@ -144,16 +144,14 @@ const WRITE_WINDOW: Duration = Duration::from_secs(5);
 /// One real client command: grant `key`'s rights to the actor.
 ///
 /// A **grant**, not an acquire. Acquiring needs `RIGHT_ACQUIRE`, which a fresh
-/// resource grants nobody, so an acquire is refused for a reason that has
-/// nothing to do with quorum. A grant is the shortest path to the authority
-/// question this group can actually answer, and the genesis names every voter
-/// an administrator.
+/// resource grants nobody, so an acquire would be refused for a reason that has
+/// nothing to do with quorum. Setting a grant is administrator-only, and this
+/// genesis names every voter an administrator — so it is the smallest command
+/// this group genuinely accepts.
 ///
-/// It is still refused today — see `S3-GENESIS-ADMINS` at the call site: the
-/// genesis's administrators reach no replicated state, so the group has none.
-/// What matters for a minority-safety gate is that the refusal is a *decision
-/// the group reached and recorded*, which is exactly what a minority cannot
-/// produce.
+/// That distinction is the point of the control: a minority-safety gate has to
+/// compare "the group accepts writes" with "the group cannot", and a command
+/// refused in both cases compares nothing.
 fn grant(secret: &[u8; 32], key: &[u8]) -> CommandV1 {
     use aster::coordination::contract::SetGrantActionV1;
     use aster::coordination::model::limits::{RIGHT_ACQUIRE, RIGHT_READ, RIGHT_RENEW};
@@ -179,14 +177,11 @@ fn grant(secret: &[u8; 32], key: &[u8]) -> CommandV1 {
     })
 }
 
-/// §5.2's rejection outcome.
-///
-/// **Every** refusal shares it and the reason carries the cause, so this is the
-/// one code that means "the group decided against this" regardless of why.
-const REJECTED: i32 = 100;
+/// §5.2 outcome 6: a grant was written.
+const GRANT_UPDATED: i32 = 6;
 
-/// §5.2 reason 12: the actor does not hold the authority the action needs.
-const PERMISSION_CHANGED: i32 = 12;
+/// §5.2 reason 0: no reason applies, which is what every success carries.
+const NO_REASON: i32 = 0;
 
 /// The outcome and reason a committed command answered with.
 fn outcome_of(committed: &aster::coordination::testing::Committed) -> (i32, i32) {
@@ -439,27 +434,18 @@ async fn a_minority_cannot_commit() {
         .propose_for_testing_within(grant(&secrets[leader], b"quorum-control"), WRITE_WINDOW)
         .await
         .expect("a three-voter group commits a write");
-    // The control asserts the group **reached a decision**, not that it accepted
-    // the write — and the difference is a finding, not a preference.
+    // Committed is not accepted. Apply is total, so a request the group refuses
+    // still commits and replies with a rejection — and a control that only
+    // checked for a commit would be satisfied by a write the group turned down,
+    // which says nothing about whether writes work.
     //
-    // A bootstrapped group's replicated administrator set is empty: the signed
-    // genesis's `initial_admins` is verified and bounded and then reaches no
-    // durable state, and `SetAdmin` itself requires an existing administrator.
-    // So no administrator command can be accepted, and no ordinary command can
-    // either, because every resource right comes from a grant only an
-    // administrator can issue. Today there is no command a fresh group accepts.
-    //
-    // What the control still establishes is exactly what the minority case is
-    // compared against: with a quorum the group decides and records the
-    // decision; without one it cannot decide at all. Recorded as
-    // `S3-GENESIS-ADMINS` in the evidence ledger; when it closes, this becomes
-    // an acceptance assertion.
+    // This asserted a *refusal* until the signed genesis became a committed
+    // command: before that, the delegated administrator set was empty and no
+    // command a fresh group received could be accepted at all.
     assert_eq!(
         outcome_of(&committed),
-        (REJECTED, PERMISSION_CHANGED),
-        "the control write must be decided by the group; if this outcome \
-         changed, S3-GENESIS-ADMINS has moved and this assertion should \
-         tighten to acceptance"
+        (GRANT_UPDATED, NO_REASON),
+        "a three-voter group with a leader must accept an administrator's grant"
     );
     assert!(
         Some(committed.index) > before,

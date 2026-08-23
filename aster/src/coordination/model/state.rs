@@ -398,6 +398,18 @@ impl ChangeSet {
 /// decides against, and startup refuses to proceed if the two disagree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GroupAuthority {
+    /// The **ROOT** public key (`ASTER_ROOT_PUBKEY`).
+    ///
+    /// Two roles in one value, and they are the same role: it verifies the
+    /// group's signed documents, and it *is* the identity of the immutable
+    /// super-administrator. A management client holding the matching secret
+    /// authenticates as that NodeId, and every voter reaches the same verdict
+    /// about it because this key is replicated.
+    ///
+    /// That is the whole reason ROOT is decided from here rather than from a
+    /// host-local "the root secret is loaded" flag: a flag is a per-node
+    /// opinion, and two voters holding different opinions about who may change
+    /// membership is a split group.
     pub public_key: [u8; 32],
     pub domain: String,
     pub group_id: [u8; 32],
@@ -549,6 +561,33 @@ pub struct State {
 }
 
 impl State {
+    /// Is `actor` **ROOT**?
+    ///
+    /// Decided from replicated material and the authenticated actor identity,
+    /// and from nothing else. A NodeId is a 32-byte public key and so is the
+    /// ROOT key, so holding the ROOT secret and speaking as that endpoint *is*
+    /// authenticating as ROOT — there is no separate credential to present, and
+    /// no local flag that could make one voter believe it and another not.
+    pub fn is_root(&self, actor: &NodeId) -> bool {
+        actor == &self.authority.public_key
+    }
+
+    /// May `actor` take an administrative action?
+    ///
+    /// **The one administrative predicate.** ROOT always passes; everyone else
+    /// must be in the delegated set. Written once because the alternative is
+    /// three transcriptions of it in `grant`, `admin` and `membership`, and the
+    /// bug that made this necessary was two transcriptions of a check order.
+    ///
+    /// ROOT is deliberately *not* a member of [`admins`](Self::admins). The
+    /// delegated set is mutable, `set_admin` may empty-but-one of it, and a
+    /// snapshot round-trips it; ROOT is none of those things. Keeping it out is
+    /// what makes "`set_admin` cannot revoke ROOT" true by construction rather
+    /// than by a rule somebody has to remember to write.
+    pub fn is_administrator(&self, actor: &NodeId) -> bool {
+        self.is_root(actor) || self.admins.contains(actor)
+    }
+
     /// Would `added` growth bytes fit the §12.1 budget?
     ///
     /// One place, so every growth-funded table is checked the same way. An

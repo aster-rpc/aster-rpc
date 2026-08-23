@@ -114,6 +114,8 @@ pub(crate) enum StateCommand {
     /// once: the version this pins does not move, and later applies do not wait
     /// for it.
     ReadTransaction(Reply<GuardedRead>),
+    /// Has the committed genesis been applied? (§7.6 readiness.)
+    GenesisInstalled(Reply<bool>),
     /// Hand out a copy of the published state.
     ///
     /// Test-only, and deliberately so. It clones the whole state — up to 192
@@ -229,6 +231,9 @@ impl StateActor {
                 // `StorageError`, precisely so a refusal of the sender's bytes
                 // cannot be mistaken for this store's own failure and latch it
                 // fatal. `serve` exists to do that latching.
+                StateCommand::GenesisInstalled(reply) => {
+                    self.serve(reply, StateActor::genesis_installed)
+                }
                 StateCommand::ActiveIntent(reply) => self.serve(reply, StateActor::active_intent),
                 StateCommand::Install {
                     prepared,
@@ -297,6 +302,7 @@ impl StateActor {
                 StateCommand::AppliedState(reply) => fail(reply),
                 StateCommand::Apply { reply, .. } => fail(reply),
                 StateCommand::ReadTransaction(reply) => fail(reply),
+                StateCommand::GenesisInstalled(reply) => fail(reply),
                 StateCommand::ActiveIntent(reply) => fail(reply),
                 StateCommand::Install { reply, .. } => fail(reply),
                 #[cfg(test)]
@@ -348,6 +354,18 @@ impl StateActor {
     /// `None` means there is none — which is not "we finished": that is a fact
     /// the intent's own terminal phase records, and it is exactly the
     /// distinction a controller must not blur.
+    /// Whether the committed genesis has been applied.
+    ///
+    /// `admin_revision > 0` is the fact, not a proxy for it: the only thing
+    /// that sets it to 1 is `apply_genesis` installing the delegated set, and
+    /// `set_admin` cannot run before that because it needs an administrator.
+    /// So a nonzero revision means the genesis entry is in this node's applied
+    /// state, whether it arrived by replay or inside a snapshot.
+    fn genesis_installed(&mut self) -> StorageResult<bool> {
+        let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
+        Ok(state.model.admin_revision > 0)
+    }
+
     fn active_intent(&mut self) -> StorageResult<Option<(OperationId, Intent)>> {
         let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
         Ok(state
@@ -747,6 +765,12 @@ impl StateHandle {
                 Err(StorageError::ActorStopped { db: Db::State })
             }
         }
+    }
+
+    /// The one active membership intent, for the §7.3 controller.
+    /// Whether the committed genesis has been applied (§7.6).
+    pub(crate) async fn genesis_installed(&self) -> StorageResult<bool> {
+        self.call(StateCommand::GenesisInstalled).await
     }
 
     /// The one active membership intent, for the §7.3 controller.

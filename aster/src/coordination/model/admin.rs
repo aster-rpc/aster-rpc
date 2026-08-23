@@ -66,9 +66,40 @@ impl Decision {
 
 /// Decide one `set_admin` against committed state.
 pub fn decide(state: &State, actor: &NodeId, action: &AdminAction) -> Decision {
-    // Administrator authority, checked against the committed set.
-    if !state.admins.contains(actor) {
+    // Administrator authority: ROOT, or the committed delegated set.
+    if !state.is_administrator(actor) {
         return Decision::Refuse(RefusalReason::PermissionChanged);
+    }
+
+    // **ROOT is not a row in this table and cannot be made one.**
+    //
+    // Immutable means immutable in both directions. Enabling ROOT would put it
+    // in the delegated set, where a later `set_admin` could remove it and the
+    // final-administrator rule would start counting it — so a group could
+    // "remove ROOT" and reach a state where the key that founded it no longer
+    // authorizes anything. Disabling it is the same request said plainly.
+    // Neither is a permission question, so neither is answered as one: the
+    // caller may hold every authority there is — ROOT itself does — and what is
+    // refused is the *target*.
+    if state.is_root(&action.target) {
+        return Decision::Refuse(RefusalReason::RootAuthorityImmutable);
+    }
+
+    // **Revision 0 is the pre-Genesis state, and no ordinary command moves it.**
+    //
+    // Revision 0 with no delegated rows means the signed genesis has not been
+    // applied yet. The authorization seed comes from that document and from
+    // nowhere else — "seeding fresh admins outside Raft" is exactly the
+    // shortcut §7.1 forbids — and ROOT passing the predicate above is what
+    // makes the hole reachable: without this, ROOT could install delegates
+    // before the genesis arrived, and the genesis would then find a revision it
+    // did not write.
+    //
+    // Reported as a revision mismatch because that is what it is: the command
+    // is revision-fenced, and 0 is not a revision at which any `set_admin` may
+    // apply.
+    if state.admin_revision == 0 {
+        return Decision::Refuse(RefusalReason::AdminRevisionMismatch);
     }
 
     // The revision check precedes every other decision, for the same reason it
@@ -214,27 +245,50 @@ mod tests {
         );
     }
 
-    /// §8.1: the final administrator cannot be removed -- and the refusal is
-    /// **retryable**, because a v1 command clears it.
+    /// §8.1: the final administrator cannot be removed, and the refusal is
+    /// **terminal for the request that received it**.
     ///
-    /// The last administrator can add a second one and then re-send the
-    /// unchanged removal. That is exactly §10's test for retryable, and an
-    /// earlier revision of this model had it backwards.
+    /// The escape — "add a second administrator, then re-send" — clears the
+    /// *condition* but not for that request. `set_admin` carries
+    /// `expected_admin_revision`, and adding the replacement is itself a
+    /// `set_admin` that advances the revision, so the unchanged removal can
+    /// then only fail `AdminRevisionMismatch`. §10's test is whether a v1
+    /// command makes *this* request apply unchanged; none does.
+    ///
+    /// Asserted by construction rather than argued: the second half of this
+    /// test performs the escape and shows the original request still fails.
     #[test]
-    fn the_final_administrator_cannot_be_removed_but_the_refusal_is_retryable() {
+    fn the_final_administrator_cannot_be_removed_and_the_refusal_is_terminal() {
         let s = genesis(&[A]);
-        let d = decide(&s, &A, &action(A, false, 1));
+        let removal = action(A, false, 1);
+        let d = decide(&s, &A, &removal);
         assert_eq!(reason(d.clone()), Reason::LastAdministrator);
         match d {
             Decision::Refuse(r) => {
                 assert!(
-                    !r.is_terminal_when_not_consumed(),
-                    "adding a second administrator lets the same removal succeed"
+                    r.is_terminal_when_not_consumed(),
+                    "the replacement advances admin_revision, so this exact \
+                     revision-fenced request can never apply"
                 );
                 assert!(r.is_admission_denial(), "denied pre-proposal at stage 3");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+
+        // The escape, performed: add B, and the *unchanged* removal is now
+        // refused for a different reason — which is the whole point.
+        let mut after = s.clone();
+        let Decision::Apply(effect) = decide(&s, &A, &action(B, true, 1)) else {
+            panic!("adding a second administrator is legal");
+        };
+        after.admins.insert(effect.target);
+        after.admin_revision = effect.admin_revision;
+        assert_eq!(
+            reason(decide(&after, &A, &removal)),
+            Reason::AdminRevisionMismatch,
+            "the same request cannot apply after the replacement advanced the \
+             revision it was fenced against"
+        );
     }
 
     /// With two administrators, removing either is legal -- the rule is about

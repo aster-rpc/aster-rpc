@@ -134,13 +134,14 @@ impl CorridorPlan {
 /// `FailedPrecondition` until the attach below.
 pub(crate) async fn start(
     config: &CoordinationConfig,
+    root: &[u8; 32],
     node: &Node,
     endpoint: RaftEndpoint,
     local: CoordinationNodeId,
     local_ticket: &[u8],
 ) -> Result<CoordinationRuntime> {
     // 3. Resolve the start mode against this node's verified identity.
-    let plan = resolve(config, local, local_ticket).map_err(Error::from)?;
+    let plan = resolve(config, root, local, local_ticket).map_err(Error::from)?;
     let corridor = CorridorPlan::of(&plan, &local);
 
     // 4. Open storage against that identity, and check the directory's state
@@ -205,6 +206,17 @@ pub(crate) async fn start(
         allowlist,
         local,
         &raft_config,
+        // §7.1: only a bootstrapping voter holds the document, and only it
+        // proposes the entry that installs the group's administrators. The
+        // exact bytes the operator signed, carried through unchanged — apply
+        // verifies them again on every voter, this one included.
+        match config.start_mode() {
+            crate::coordination::host::CoordinationStart::Bootstrap { signed_genesis, .. } => {
+                Some(Arc::new(signed_genesis.clone()))
+            }
+            crate::coordination::host::CoordinationStart::Join { .. }
+            | crate::coordination::host::CoordinationStart::Existing { .. } => None,
+        },
     )
     .await;
 
@@ -324,7 +336,13 @@ mod tests {
     }
 
     fn plan_for(start: CoordinationStart) -> StartPlan {
-        resolve(&config(start), node_id(LOCAL), &test_ticket(&LOCAL)).expect("resolve")
+        resolve(
+            &config(start),
+            &authority().public_key,
+            node_id(LOCAL),
+            &test_ticket(&LOCAL),
+        )
+        .expect("resolve")
     }
 
     fn bootstrap_start() -> CoordinationStart {

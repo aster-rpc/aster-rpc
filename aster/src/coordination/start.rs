@@ -220,12 +220,19 @@ impl StartPlan {
 /// for `Join` and unused otherwise; passing it unconditionally keeps the caller
 /// from having to know which modes need it, and a `Join` that was handed the
 /// wrong one fails the permit's ticket binding rather than silently proceeding.
+///
+/// `root` is the deployment's **ROOT public key**, already reconciled by
+/// [`CoordinationConfig::resolved_root_key`] against `AsterConfig`'s
+/// `ASTER_ROOT_PUBKEY`. Passed in rather than read from the coordination
+/// config, because one deployment has one ROOT and a second place to configure
+/// it is a second place for it to be wrong.
 pub(crate) fn resolve(
     config: &CoordinationConfig,
+    root: &[u8; 32],
     local: CoordinationNodeId,
     local_ticket: &[u8],
 ) -> Result<StartPlan, StartError> {
-    let key = config.authority_public_key();
+    let key = root;
     let domain = config.authority_domain();
 
     let (group_id, genesis_hash, profile, resolved) = match config.start_mode() {
@@ -342,6 +349,21 @@ mod tests {
     use std::sync::Arc;
 
     const LOCAL: [u8; 32] = [1u8; 32];
+
+    /// [`super::resolve`] under this fixture's ROOT key.
+    ///
+    /// A shim rather than the key threaded through every call: these tests are
+    /// about the *modes*, and the deployment's root key is a constant for all
+    /// of them. Naming it once here keeps a change of subject out of fifteen
+    /// call sites — and a test that meant to vary the key would call
+    /// `super::resolve` directly, which is then visibly the unusual thing.
+    fn resolve(
+        config: &CoordinationConfig,
+        local: CoordinationNodeId,
+        local_ticket: &[u8],
+    ) -> Result<StartPlan, StartError> {
+        super::resolve(config, &authority().public_key, local, local_ticket)
+    }
 
     fn node() -> CoordinationNodeId {
         CoordinationNodeId::from_array(LOCAL)

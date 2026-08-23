@@ -85,7 +85,13 @@ impl Decision {
 pub fn decide(state: &State, command: &RetireCommand) -> Decision {
     // §10: an actor may retire only sessions whose `target_node_id` equals its
     // own authenticated NodeId; a group administrator may retire any session.
-    let authorized = command.actor == command.target_actor || state.admins.contains(&command.actor);
+    // Self-retirement, or administrative authority — ROOT or a delegate, the
+    // same predicate every other administrative path uses. An earlier revision
+    // read `admins` directly here, which meant ROOT could change membership and
+    // issue grants but not retire a client: one administrative surface with a
+    // different answer to "who is an administrator".
+    let authorized =
+        command.actor == command.target_actor || state.is_administrator(&command.actor);
     if !authorized {
         return Decision::Refuse(RefusalReason::PermissionChanged);
     }

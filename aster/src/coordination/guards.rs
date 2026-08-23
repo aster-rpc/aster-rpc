@@ -473,7 +473,17 @@ mod tests {
         for (name, source) in SOURCES {
             // The verifier is the module that does the verifying; `raft.rs`
             // declares the type; this file names it in prose.
-            if matches!(*name, "model/authority.rs" | "raft.rs" | "guards.rs") {
+            //
+            // `testing.rs` **mints** genesis documents rather than reading
+            // them, which is the inverse of the operation this guard protects:
+            // the seal exists so no second decoder reads a genesis field, and a
+            // provisioning fixture that builds one and signs it has no field to
+            // read. It is also gated on `coordination-testing`, which no
+            // shipping profile enables.
+            if matches!(
+                *name,
+                "model/authority.rs" | "raft.rs" | "guards.rs" | "testing.rs"
+            ) {
                 continue;
             }
             for (n, line) in production_code(source) {
