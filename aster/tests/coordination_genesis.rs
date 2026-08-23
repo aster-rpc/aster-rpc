@@ -1056,29 +1056,39 @@ fn root_cannot_be_founded_as_a_delegate() {
 /// member with no log.
 ///
 /// §S3-JOIN is explicit that a restart "retains the same restricted state until
-/// membership lands", and that is what this checks: same permit, same `Joining`
-/// corridor, same restricted allowlist. The candidate stays at `Joining` across
-/// both starts because no administrator ever commits an intent for it — a
-/// permit grants no membership, which is the other half of the same rule.
+/// membership lands". What this gate observes is the **lifecycle** half of that:
+/// the same permit is accepted again, the corridor is `Joining` both times, and
+/// no membership appears. The candidate stays at `Joining` because no
+/// administrator ever commits an intent for it — a permit grants no membership,
+/// which is the other half of the same rule.
 ///
-/// The permit is **re-verified** at each start rather than persisted. It
-/// already binds the candidate's NodeId and its ticket, so re-verifying costs
-/// no new durable fact; a store that remembered a permit would be a second
-/// place for the group's opinion of this node to live, and the two could
-/// disagree after a revocation.
+/// It does **not** observe network admission. The permit's sender allowlist is
+/// covered where it can be checked directly, by
+/// `coordination_cluster::an_unauthorized_identity_never_reaches_openraft` and
+/// the `boot` corridor-plan tests, which compare admitted against unadmitted
+/// senders. Saying "same restricted allowlist" here would claim evidence this
+/// test does not hold.
+///
+/// The permit is **re-verified** at each start rather than persisted. It binds
+/// the candidate's NodeId, so re-verifying costs no new durable fact; a store
+/// that remembered a permit would be a second place for the group's opinion of
+/// this node to live, and the two could disagree after a revocation.
 ///
 /// Both starts are real: the candidate starts, is shut down, and starts again
 /// on the same directory, the same identity and the same permit. Nothing is
 /// constructed on its behalf, because "a restart works" is precisely the claim
 /// and a hand-built directory cannot support it.
 ///
-/// **Both starts bind different UDP ports**, and that is the point rather than
-/// an accident: `AsterConfig` here names no `bind_addr`, so each start takes a
-/// fresh ephemeral port, exactly as a real node does. A permit that bound the
-/// candidate's rendered address would refuse the second start outright — see
-/// `S3-JOIN-TICKET`.
+/// `AsterConfig` names no `bind_addr`, so each start takes whatever ephemeral
+/// port it is given, exactly as a real node does. The gate does not assert the
+/// two ports differ — port allocation is not contractual, and an OS that reused
+/// one would not make the old address binding correct. What makes this
+/// non-vacuous is the permit itself: it carries the **addressless** ticket, so
+/// the pre-`S3-JOIN-TICKET` verifier rejects it on the *first* start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joining_node_survives_restart_in_the_same_restricted_state() {
+    use aster::coordination::model::authority::canonical_candidate_ticket;
+
     let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x0E, 1);
     let candidate = [0xB9u8; 32];
     let dir = tempfile::tempdir().expect("a storage directory");
@@ -1092,8 +1102,19 @@ async fn a_joining_node_survives_restart_in_the_same_restricted_state() {
     };
 
     // The permit is minted once, from the candidate's NodeId alone — which is
-    // all an operator has and all they need. No node is started to obtain it.
-    let ticket = canonical_ticket_for(candidate);
+    // all an operator has and all they need. No node is started to obtain it,
+    // and this is production's own derivation rather than a second copy of it.
+    let node_id = fixture_node_id(candidate);
+    let ticket = canonical_candidate_ticket(&node_id).expect("a canonical ticket");
+
+    // The property that makes the permit restart-survivable, asserted rather
+    // than assumed: what it binds carries no address at all.
+    let decoded = aster::Ticket::from_base58(&ticket).expect("a well-formed ticket");
+    assert!(
+        decoded.direct_addresses().is_empty(),
+        "a permit's ticket must name no address: {:?}",
+        decoded.direct_addresses()
+    );
 
     // First start: a fresh directory, which is what a candidate has the first
     // time. Starting binds it.
@@ -1108,13 +1129,10 @@ async fn a_joining_node_survives_restart_in_the_same_restricted_state() {
         2,
         "a permit grants no membership, so the first start is Joining"
     );
-    // What the node is actually reachable at, which is *not* what the permit
-    // binds. Captured so the second start can be shown to differ — otherwise
-    // this gate would pass just as well against the old address binding.
-    let first_address = rendered_address_ticket(first.node()).await;
-    assert_ne!(
-        first_address, ticket,
-        "the permit must bind the addressless form, not the rendered address"
+    assert_eq!(
+        first.id().to_string(),
+        hex::encode(node_id),
+        "the permit is for this NodeId, and the node is running under it"
     );
     first.shutdown().await;
 
@@ -1133,49 +1151,22 @@ async fn a_joining_node_survives_restart_in_the_same_restricted_state() {
     assert_eq!(
         restarted.coordination().expect("hosted").lifecycle_code(),
         2,
-        "the restart retains the same restricted state until membership lands"
+        "the restart retains the same restricted lifecycle state until \
+         membership lands"
     );
-
-    // The load-bearing assertion. The candidate came back at a **different**
-    // address under the **same** permit: had the permit bound route material,
-    // the start above would have failed `TicketMismatch` instead.
-    assert_ne!(
-        rendered_address_ticket(restarted.node()).await,
-        first_address,
-        "the two starts must differ in address, or this proves nothing"
+    assert_eq!(
+        restarted.id().to_string(),
+        hex::encode(node_id),
+        "the same identity came back, which is what makes this a restart"
     );
 
     restarted.shutdown().await;
 }
 
-/// The ticket a *running* node renders for itself, address material included —
-/// the advisory discovery hint, never the signed binding.
-async fn rendered_address_ticket(node: &aster::Node) -> String {
-    for _ in 0..100 {
-        if !node.addr().direct_addresses.is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    aster::Ticket::from_node_addr(&node.addr(), aster::Credential::Open)
-        .and_then(|t| t.to_base58())
-        .expect("a canonical ticket")
-}
-
-/// The one ticket a permit for this candidate may carry: canonical, Open, and
-/// **addressless**, derived from the NodeId the secret produces.
-fn canonical_ticket_for(secret: [u8; 32]) -> String {
-    let node_id = ed25519_dalek::SigningKey::from_bytes(&secret)
+/// The NodeId a secret produces, without starting anything — all an operator
+/// needs to mint a permit, and the only input the permit's ticket derives from.
+fn fixture_node_id(secret: [u8; 32]) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&secret)
         .verifying_key()
-        .to_bytes();
-    aster::Ticket::from_node_addr(
-        &aster::NodeAddr {
-            node_id: aster::NodeId::from_hex(hex::encode(node_id)),
-            relay_url: None,
-            direct_addresses: Vec::new(),
-        },
-        aster::Credential::Open,
-    )
-    .and_then(|t| t.to_base58())
-    .expect("a canonical ticket")
+        .to_bytes()
 }

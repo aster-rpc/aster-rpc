@@ -405,11 +405,13 @@ impl GroupFixture {
     /// A signed join permit for `candidate`, naming `senders` as its bootstrap
     /// senders.
     ///
-    /// `candidate_ticket` must be the candidate's **own** canonical Open
-    /// ticket, because the permit binds it: `verify_join_permit_for_start`
-    /// compares it with the ticket the starting node renders for itself, which
-    /// is what stops a permit minted for one endpoint being replayed by
-    /// another.
+    /// `candidate_ticket` must be the canonical **addressless** Open ticket for
+    /// `candidate_secret`'s NodeId — what
+    /// [`canonical_candidate_ticket`](crate::coordination::model::authority::canonical_candidate_ticket)
+    /// derives. Both verifiers compare against that derivation, so a ticket
+    /// carrying address material is refused even for the right candidate; what
+    /// stops a permit minted for one endpoint being used by another is the
+    /// candidate NodeId, which is signed.
     pub fn join_permit_with_ticket(
         &self,
         candidate_secret: [u8; 32],
@@ -451,10 +453,10 @@ impl GroupFixture {
 
     /// A `Join` configuration for `dir` under this fixture's group.
     ///
-    /// `candidate_ticket` is the candidate's **own rendered** ticket, which a
-    /// caller learns by starting the endpoint once and reading it. That is not
-    /// a test artefact: a permit binds the ticket, so an operator mints one for
-    /// a candidate whose address they already have.
+    /// `candidate_ticket` is the canonical addressless ticket for the
+    /// candidate's NodeId — an operator needs nothing but that NodeId to mint a
+    /// permit, and no endpoint has to be started to learn an address. See
+    /// [`join_permit_with_ticket`](Self::join_permit_with_ticket).
     pub fn join_config(
         &self,
         dir: &std::path::Path,

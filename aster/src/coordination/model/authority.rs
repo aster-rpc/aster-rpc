@@ -80,7 +80,9 @@ pub enum PermitError {
     WrongGenesis,
     /// The permit was minted for a different candidate node.
     WrongNode,
-    /// The permit's ticket is not the ticket the seed carries.
+    /// The permit's `candidate_ticket` is not the canonical addressless ticket
+    /// derived from the candidate's NodeId — see [`canonical_candidate_ticket`].
+    /// Address material is refused even when it names the right candidate.
     TicketMismatch,
     /// The bootstrap-sender list is empty, unsorted, or has duplicates.
     BootstrapSenders,

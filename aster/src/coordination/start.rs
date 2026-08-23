@@ -657,9 +657,10 @@ mod tests {
         assert_eq!(permit.candidate(), &LOCAL);
     }
 
-    /// A permit minted for a different ticket does not resolve. This is the
-    /// binding that cannot be checked at `build()` — the endpoint does not
-    /// exist yet — so it has to hold here.
+    /// A permit carrying anything but this candidate's canonical addressless
+    /// ticket does not resolve. Checked here rather than at `build()` because
+    /// the local NodeId the derivation needs is not known until the endpoint
+    /// has started — not because the binding depends on an address.
     #[test]
     fn a_permit_bound_to_another_ticket_does_not_resolve() {
         assert_eq!(
