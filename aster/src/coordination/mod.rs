@@ -43,6 +43,11 @@ pub mod raft;
 #[cfg(feature = "coordination")]
 pub mod convert;
 
+/// The voter runtime: pinned OpenRaft configuration, lifecycle and readiness
+/// (§7.5, §7.6). Voter-only and crate-private.
+#[cfg(feature = "coordination")]
+pub(crate) mod runtime;
+
 /// Resolving a configured start mode into a verified storage binding (§7.2).
 /// Crate-private: it produces a `StorageIdentity`, which is itself crate-private.
 #[cfg(feature = "coordination")]
