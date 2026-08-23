@@ -4,6 +4,7 @@
 //!
 //! | Module | Owns |
 //! |---|---|
+//! | [`admit`] | the §5.3 request-check order, as one function |
 //! | [`errors`] | `S3-NETERR`: the two exhaustive mappings into OpenRaft's error variants |
 //! | [`handoff`] | one stream's vote, metadata and body, bound from the wire to `install_full_snapshot` |
 //!
@@ -17,5 +18,6 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod admit;
 pub(crate) mod errors;
 pub(crate) mod handoff;
