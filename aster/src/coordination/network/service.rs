@@ -79,6 +79,12 @@ pub(crate) struct AttachedRuntime {
     /// filesystem step the actor has no reason to serialise, and queuing it
     /// behind an apply would stall a snapshot transfer on unrelated work.
     pub(crate) layout: crate::coordination::storage::schema::StorageLayout,
+    /// The lifecycle facts an accepted append updates.
+    ///
+    /// A follower's `millis_since_quorum_ack` is always `None`, so §7.6's
+    /// advisory freshness comes from here — and it is only advisory because
+    /// one leader reaching us is not evidence of quorum.
+    pub(crate) facts: Arc<crate::coordination::runtime::owner::RuntimeFacts>,
 }
 
 impl RaftEndpoint {
@@ -261,7 +267,21 @@ async fn unary(runtime: &AttachedRuntime, method: &str, mut call: Call) {
         RaftMessageV1::AppendRequest(request) => {
             match openraft::raft::AppendEntriesRequest::try_from(&request) {
                 Ok(request) => match runtime.raft.append_entries(request).await {
-                    Ok(response) => Ok(RaftMessageV1::from(&response)),
+                    Ok(response) => {
+                        // §7.6's advisory follower observation. Recorded only
+                        // on a *success*: a rejected append proves the sender
+                        // is reachable and **not** that it is our leader, and
+                        // counting it would keep a stale contact fresh through
+                        // exactly the disagreement that should age it out.
+                        if matches!(
+                            response,
+                            openraft::raft::AppendEntriesResponse::Success
+                                | openraft::raft::AppendEntriesResponse::PartialSuccess(_)
+                        ) {
+                            runtime.facts.note_leader_contact();
+                        }
+                        Ok(RaftMessageV1::from(&response))
+                    }
                     Err(err) => Err(fatal_status(&err)),
                 },
                 Err(_) => Err(RpcStatus::error(

@@ -30,6 +30,7 @@
 #[cfg(test)]
 pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("admission.rs", include_str!("admission.rs")),
+    ("boot.rs", include_str!("boot.rs")),
     ("contract.rs", include_str!("contract.rs")),
     ("convert.rs", include_str!("convert.rs")),
     ("guards.rs", include_str!("guards.rs")),

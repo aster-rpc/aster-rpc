@@ -1,6 +1,14 @@
-//! Slice 0: the reserved coordination services exist only when a host asked
-//! for them, refuse an unauthenticatable transport, carry their §12.3 frame
-//! caps, and demand a restart-stable identity.
+//! The coordination services exist only when a host asked for them, refuse an
+//! unauthenticatable transport, carry their §12.3 frame caps, and demand a
+//! restart-stable identity.
+//!
+//! Slice 0 wrote these against two *reservations*. Slice 3 replaced the Raft
+//! reservation with a live dispatcher, and the properties are unchanged: the
+//! name is still taken, the caps are still installed before any handler runs,
+//! and `iroh_only` is still on. What changed is the answer a configured,
+//! authenticated caller gets — `FailedPrecondition` from a node whose runtime
+//! has not attached, rather than `UNIMPLEMENTED` from a reservation — and the
+//! tests assert the new one rather than being relaxed to accept either.
 //!
 //! Three of these are absence proofs, which are the easiest kind of test to
 //! write vacuously. Each is therefore paired with the positive case that would
@@ -20,7 +28,11 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use aster::coordination::host::CoordinationConfig;
+use aster::coordination::host::{CoordinationConfig, CoordinationStart};
+use aster::coordination::model::authority::{
+    canonical_document_bytes, genesis_signing_bytes, signed_document_from_parts,
+};
+use aster::coordination::raft::{GenesisV1, NodeIdV1, VoterSeedV1};
 use aster::coordination::service::{RAFT_SERVICE, STORE_SERVICE};
 use aster::rpc::{
     AsterServer, CallParts, Dispatcher, OutgoingFrame, PeerProvenance, RequestFrame, StreamHeader,
@@ -28,6 +40,7 @@ use aster::rpc::{
 use aster::{AsterConfig, RelayMode, SecretKey};
 use aster_transport_core::framing::FLAG_END_STREAM;
 use aster_transport_core::reactor::{response_channel, FrameLimit};
+use ed25519_dalek::{Signer, SigningKey};
 use tokio::sync::mpsc;
 
 fn cfg() -> AsterConfig {
@@ -37,11 +50,127 @@ fn cfg() -> AsterConfig {
         .build()
 }
 
-fn coordination_config() -> CoordinationConfig {
+/// A real one-voter configuration for `dir`, signed by a real authority.
+///
+/// Slice 0 used a config that never opened storage, because
+/// `builtin_coordination` only registered reservations. It now starts a voter,
+/// so these tests start one — which is strictly better evidence: the dispatcher
+/// they inspect is the dispatcher a running group serves, not one assembled for
+/// a test.
+fn coordination_config(dir: &std::path::Path, secret: [u8; 32]) -> CoordinationConfig {
+    let node_id = SigningKey::from_bytes(&secret)
+        .verifying_key()
+        .to_bytes()
+        .to_vec();
+    let ticket = aster_transport_core::ticket::AsterTicket {
+        endpoint_id: node_id.clone().try_into().expect("32 bytes"),
+        relay: None,
+        direct_addrs: Vec::new(),
+        credential: Some(aster_transport_core::ticket::TicketCredential::Open),
+    }
+    .to_base58_string()
+    .expect("a ticket");
+
+    let genesis = GenesisV1 {
+        format_version: 1,
+        group_id: [0xC0u8; 32].to_vec(),
+        authority_domain: DOMAIN.into(),
+        genesis_nonce: vec![0x5Au8; 32],
+        deployment_profile_code: 2,
+        initial_voters: vec![VoterSeedV1 {
+            node_id: node_id.clone(),
+            ticket,
+        }],
+        initial_admins: vec![NodeIdV1 {
+            node_id: node_id.clone(),
+        }],
+        recovery_export_hash: None,
+    };
+    let document = canonical_document_bytes(&genesis).expect("encode");
+    let signature = authority().sign(&genesis_signing_bytes(&document));
+    let signed = signed_document_from_parts(
+        document,
+        &authority().verifying_key().to_bytes(),
+        &signature.to_bytes(),
+    )
+    .expect("encode");
+
     CoordinationConfig::builder()
-        .storage_dir("/nonexistent/slice0-never-opened")
+        .storage_dir(dir)
+        .authority_public_key(authority().verifying_key().to_bytes())
+        .authority_domain(DOMAIN)
+        .start_mode(CoordinationStart::Bootstrap {
+            signed_genesis: signed,
+            recovery_export_path: None,
+        })
+        .verified_admission(Arc::new(NoAdmissions))
+        .acknowledge_single_voter_development_group(true)
         .build()
         .expect("build coordination config")
+}
+
+/// The `Existing` counterpart of [`coordination_config`], for a directory a
+/// previous start already bound.
+///
+/// The group id, genesis hash and profile are supplied **independently** of the
+/// store, which is the point of the mode: they are what the store is checked
+/// against, so reading them from it would make the comparison tautological.
+fn existing_config(dir: &std::path::Path, secret: [u8; 32]) -> CoordinationConfig {
+    let genesis_hash = {
+        use aster::coordination::raft::SignedCoordinationDocumentV1;
+        let CoordinationStart::Bootstrap { signed_genesis, .. } =
+            coordination_config(dir, secret).start_mode().clone()
+        else {
+            unreachable!("the fixture is a bootstrap")
+        };
+        let envelope: SignedCoordinationDocumentV1 =
+            aster::coordination::contract::payload_fory::<SignedCoordinationDocumentV1>()
+                .deserialize(&signed_genesis)
+                .expect("decode");
+        aster::coordination::model::authority::genesis_hash(&envelope.document_bytes)
+    };
+
+    CoordinationConfig::builder()
+        .storage_dir(dir)
+        .authority_public_key(authority().verifying_key().to_bytes())
+        .authority_domain(DOMAIN)
+        .start_mode(CoordinationStart::Existing {
+            expected_group_id: aster::coordination::ids::CoordinationGroupId::from_array(
+                [0xC0u8; 32],
+            ),
+            expected_genesis_hash: genesis_hash,
+            expected_deployment_profile_code: 2,
+        })
+        .verified_admission(Arc::new(NoAdmissions))
+        .acknowledge_single_voter_development_group(true)
+        .build()
+        .expect("build coordination config")
+}
+
+const DOMAIN: &str = "coordination.test";
+
+fn authority() -> SigningKey {
+    SigningKey::from_bytes(&[0x42u8; 32])
+}
+
+/// An admission source that admits nobody.
+///
+/// These tests are about registration, provenance and frame caps — never about
+/// step 3 — and an all-denying source makes that explicit. A permissive one
+/// would leave a reader wondering whether admission was what let a call
+/// through.
+struct NoAdmissions;
+
+impl aster::coordination::admission::VerifiedAdmissionSource for NoAdmissions {
+    fn get(
+        &self,
+        _node: aster::coordination::ids::CoordinationNodeId,
+    ) -> Result<
+        Option<aster::coordination::admission::VerifiedAdmission>,
+        aster::coordination::admission::AdmissionLookupError,
+    > {
+        Ok(None)
+    }
 }
 
 /// A voter that will not be started -- only its dispatcher is inspected -- so
@@ -51,9 +180,18 @@ fn pinned_cfg() -> AsterConfig {
     AsterConfig::builder()
         .relay(RelayMode::Disabled)
         .bind_addr("127.0.0.1:0")
-        .secret_key(SecretKey::from_bytes([7u8; 32]))
+        .secret_key(SecretKey::from_bytes(PINNED_SECRET))
         .build()
 }
+
+/// The endpoint secret every voter in this file runs under.
+///
+/// Fixed, and shared with `coordination_config`, because the signed genesis has
+/// to name the node id this secret produces: bootstrap refuses a node that is
+/// not one of its initial voters, and a fixture whose two halves disagreed
+/// would fail at start with a message about membership rather than about
+/// whatever the test is really checking.
+const PINNED_SECRET: [u8; 32] = [7u8; 32];
 
 fn header(service: &str, method: &str) -> Vec<u8> {
     aster::rpc::encode_stream_header(&StreamHeader {
@@ -133,13 +271,20 @@ async fn the_reserved_services_are_absent_unless_coordination_is_configured() {
     server.shutdown().await;
 }
 
-/// The partner to the absence proof: with `builtin_coordination` the reserved
-/// dispatcher answers, and it says something a missing service cannot.
+/// The partner to the absence proof: with `builtin_coordination` both services
+/// answer, and each says something a missing service cannot.
+///
+/// The two answers differ now, and deliberately. `Store` is still a
+/// reservation — Slice 4 owns it — so it says so. `Raft` is **live**, so it
+/// refuses the empty payload these probes send as a malformed envelope, which
+/// is stronger evidence than a reservation trailer: only the real §5.3 check
+/// order produces it.
 #[tokio::test]
-async fn configuring_coordination_registers_both_reserved_services() {
+async fn configuring_coordination_registers_the_store_reservation_and_the_live_raft() {
+    let dir = tempfile::tempdir().expect("a storage directory");
     let server = AsterServer::builder()
         .config(pinned_cfg())
-        .builtin_coordination(coordination_config())
+        .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
         .start()
         .await
         .expect("start");
@@ -165,8 +310,12 @@ async fn configuring_coordination_registers_both_reserved_services() {
     )
     .await;
     assert!(
-        raft.contains("aster.coordination.Raft v1 reserves 'vote'"),
-        "expected the reserved-raft trailer, got: {raft}"
+        raft.contains("not a coordination Raft envelope"),
+        "expected the live Raft dispatcher's step-2 refusal, got: {raft}"
+    );
+    assert!(
+        !raft.contains("reserves"),
+        "the Raft reservation must be gone: a reservation cannot check an envelope"
     );
 
     server.shutdown().await;
@@ -177,9 +326,10 @@ async fn configuring_coordination_registers_both_reserved_services() {
 /// would confirm the existence of methods the contract does not declare.
 #[tokio::test]
 async fn a_method_outside_the_reserved_table_is_not_answered_by_the_reservation() {
+    let dir = tempfile::tempdir().expect("a storage directory");
     let server = AsterServer::builder()
         .config(pinned_cfg())
-        .builtin_coordination(coordination_config())
+        .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
         .start()
         .await
         .expect("start");
@@ -203,9 +353,10 @@ async fn a_method_outside_the_reserved_table_is_not_answered_by_the_reservation(
 
 #[tokio::test]
 async fn the_reserved_services_refuse_an_unauthenticatable_transport() {
+    let dir = tempfile::tempdir().expect("a storage directory");
     let server = AsterServer::builder()
         .config(pinned_cfg())
-        .builtin_coordination(coordination_config())
+        .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
         .start()
         .await
         .expect("start");
@@ -234,9 +385,10 @@ async fn the_reserved_services_refuse_an_unauthenticatable_transport() {
 /// *returns* -- the path a frame is measured against.
 #[tokio::test]
 async fn the_reserved_frame_caps_reach_the_production_resolver() {
+    let dir = tempfile::tempdir().expect("a storage directory");
     let server = AsterServer::builder()
         .config(pinned_cfg())
-        .builtin_coordination(coordination_config())
+        .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
         .start()
         .await
         .expect("start");
@@ -301,9 +453,10 @@ async fn an_unconfigured_node_installs_no_coordination_frame_caps() {
 
 #[tokio::test]
 async fn a_voter_without_a_persistent_identity_is_refused_at_start() {
+    let dir = tempfile::tempdir().expect("a storage directory");
     let msg = match AsterServer::builder()
         .config(cfg())
-        .builtin_coordination(coordination_config())
+        .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
         .start()
         .await
     {
@@ -338,9 +491,10 @@ async fn an_ordinary_server_still_starts_without_a_persistent_identity() {
 
 #[tokio::test]
 async fn an_explicit_secret_key_satisfies_the_voter_identity_rule() {
+    let dir = tempfile::tempdir().expect("a storage directory");
     let server = AsterServer::builder()
         .config(pinned_cfg())
-        .builtin_coordination(coordination_config())
+        .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
         .start()
         .await
         .expect("an explicitly configured secret key is persistent");
@@ -358,22 +512,45 @@ async fn an_identity_path_yields_the_same_voter_node_id_after_a_restart() {
     let key_path = dir.path().join("node.secret");
     assert!(!key_path.exists(), "the file must not exist on first start");
 
+    // The genesis has to name the node this identity file will produce, and
+    // bootstrap refuses a node that is not one of its initial voters — so the
+    // key is minted here and written first. That is also what an operator does:
+    // provision the identity, then sign a genesis naming it.
+    let secret = [0x21u8; 32];
+    // The identity file is hex, which is what `AsterServerBuilder::identity`
+    // writes and reads.
+    std::fs::write(
+        &key_path,
+        secret
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    )
+    .expect("persist the identity");
+    let storage = dir.path().join("storage");
+    std::fs::create_dir_all(&storage).expect("a storage directory");
+
     let first = AsterServer::builder()
         .config(cfg())
         .identity(&key_path)
-        .builtin_coordination(coordination_config())
+        .builtin_coordination(coordination_config(&storage, secret))
         .start()
         .await
         .expect("first start");
     let first_id = first.id();
     first.shutdown().await;
 
-    assert!(key_path.exists(), "first start must persist the key");
+    assert!(
+        key_path.exists(),
+        "the key must still be there after a start"
+    );
 
+    // The second start reopens rather than re-founding: the directory is
+    // initialized now, so the mode is `Existing`.
     let second = AsterServer::builder()
         .config(cfg())
         .identity(&key_path)
-        .builtin_coordination(coordination_config())
+        .builtin_coordination(existing_config(&storage, secret))
         .start()
         .await
         .expect("restart");

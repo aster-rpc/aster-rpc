@@ -426,14 +426,29 @@ impl AsterServerBuilder {
                 requires: self.topology_requires,
             }));
         }
-        // Reserved coordination services -- registered only when the host asked
-        // for them (§3.3). Both declare `iroh_only`, so they are refused over a
-        // transport that cannot authenticate the peer even here.
+        // Coordination services -- registered only when the host asked for them
+        // (§3.3), and **before** the acceptor starts: bootstrap cannot run
+        // until peers can dial this node, and every other initial voter is
+        // waiting to dial it.
+        //
+        // The Raft service is live but late-bound. Its `Raft` does not exist
+        // yet -- it needs storage, which needs the verified start mode -- so
+        // until the runtime attaches below it answers `FailedPrecondition`,
+        // which a sender classifies transient. That is exactly right during a
+        // rolling start, and it is why the endpoint is a handle rather than a
+        // constructor argument.
+        //
+        // `Store` stays reserved: Slice 4 owns it.
+        #[cfg(feature = "coordination")]
+        let coordination_endpoint = crate::coordination::network::service::RaftEndpoint::new();
         #[cfg(feature = "coordination")]
         if self.coordination.is_some() {
-            use crate::coordination::service::{ReservedRaft, ReservedStore};
+            use crate::coordination::network::service::CoordinationRaftService;
+            use crate::coordination::service::ReservedStore;
             server = server.register_arc(Arc::new(ReservedStore));
-            server = server.register_arc(Arc::new(ReservedRaft));
+            server = server.register_arc(Arc::new(CoordinationRaftService::new(
+                coordination_endpoint.clone(),
+            )));
         }
         for apply in self.session_appliers {
             server = apply(server);
@@ -447,6 +462,36 @@ impl AsterServerBuilder {
         let handle = server.serve();
         let http = self.http.map(|t| t.serve(dispatcher.clone()));
 
+        // The acceptor is running, so a peer can reach us. Only now open
+        // storage, create the Raft, attach it, and run the start corridor.
+        //
+        // Any failure from here closes the node before returning: a half-started
+        // voter that kept its endpoint alive would be dialable, answer
+        // `FailedPrecondition` forever, and hold a storage directory lock that
+        // no restart could take.
+        #[cfg(feature = "coordination")]
+        let coordination = match self.coordination {
+            None => None,
+            Some(config) => {
+                let started = coordination_start(
+                    &config,
+                    &node,
+                    coordination_endpoint,
+                    &Ticket::from_node_addr(&node.addr(), Credential::Open)
+                        .and_then(|t| t.to_base58()),
+                )
+                .await;
+                match started {
+                    Ok(runtime) => Some(runtime),
+                    Err(err) => {
+                        handle.abort();
+                        node.shutdown().await;
+                        return Err(err);
+                    }
+                }
+            }
+        };
+
         Ok(AsterServer {
             node,
             handle,
@@ -454,8 +499,41 @@ impl AsterServerBuilder {
             dispatcher,
             http,
             identity_handle,
+            #[cfg(feature = "coordination")]
+            coordination,
         })
     }
+}
+
+/// Run the §7.2 start corridor for a configured voter.
+///
+/// A free function rather than an inline block so the ticket failure has one
+/// place to be handled: the local ticket is what a join permit binds, so a node
+/// that cannot render its own address cannot verify a permit minted for it, and
+/// that is a start failure rather than something to paper over.
+#[cfg(feature = "coordination")]
+async fn coordination_start(
+    config: &crate::coordination::host::CoordinationConfig,
+    node: &Node,
+    endpoint: crate::coordination::network::service::RaftEndpoint,
+    ticket: &Result<String>,
+) -> Result<crate::coordination::runtime::owner::CoordinationRuntime> {
+    let ticket = match ticket {
+        Ok(ticket) => ticket,
+        Err(err) => {
+            return Err(Error::InvalidArgument(format!(
+                "coordination needs this node's own ticket to verify a join permit bound to \
+                 it, and it could not be rendered: {err}"
+            )))
+        }
+    };
+    let local = crate::coordination::ids::CoordinationNodeId::parse_hex(node.id().as_str())
+        .map_err(|err| {
+            Error::InvalidArgument(format!(
+                "coordination requires a 32-byte endpoint identity: {err}"
+            ))
+        })?;
+    crate::coordination::boot::start(config, node, endpoint, local, ticket.as_bytes()).await
 }
 
 /// A running, declarative Aster RPC server: a node serving blobs / docs / gossip
@@ -474,6 +552,14 @@ pub struct AsterServer {
     /// Live identity served by the baseline `aster.ops.NodeInfo` service
     /// (`None` when the baseline service was disabled).
     identity_handle: Option<NodeIdentityHandle>,
+    /// The voter runtime, when this server hosts coordination.
+    ///
+    /// Owned here because §3.3 requires it: "AsterServer owns the
+    /// `CoordinationRuntime` handle so dropping/shutdown cannot orphan voter
+    /// tasks." A runtime held anywhere else would outlive the endpoint it
+    /// serves.
+    #[cfg(feature = "coordination")]
+    coordination: Option<crate::coordination::runtime::owner::CoordinationRuntime>,
 }
 
 impl AsterServer {
@@ -566,8 +652,32 @@ impl AsterServer {
         self.handle.joined().await;
     }
 
+    /// A handle on this server's coordination voter, when it hosts one.
+    ///
+    /// `None` unless [`builtin_coordination`](AsterServerBuilder::builtin_coordination)
+    /// was called. Use it to wait for readiness:
+    /// `server.coordination().unwrap().wait_ready().await?`.
+    #[cfg(feature = "coordination")]
+    pub fn coordination(&self) -> Option<crate::coordination::Coordination> {
+        self.coordination
+            .as_ref()
+            .map(crate::coordination::Coordination::of)
+    }
+
     /// Stop serving and cleanly shut the node down, flushing persistent state.
+    ///
+    /// §7.6's cancellation runs first and is the strict reverse of
+    /// construction: controllers, RPC deregistration, `Raft::shutdown()`, the
+    /// storage actors and read leases, and the directory lock last. Only then
+    /// does the transport stop — a node torn down first would leave a peer's
+    /// in-flight call reaching a Raft that is going away.
     pub async fn shutdown(self) {
+        // Moved out rather than taken through `&mut`, so this compiles
+        // identically with and without the feature.
+        #[cfg(feature = "coordination")]
+        if let Some(runtime) = self.coordination {
+            runtime.shutdown().await;
+        }
         if let Some(http) = &self.http {
             http.abort();
         }
