@@ -18,7 +18,7 @@
 //! so a seed ticket that goes stale costs a discovery round trip and cannot
 //! send a call to the wrong node.
 
-#![cfg(feature = "coordination")]
+#![cfg(feature = "coordination-testing")]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +26,9 @@ use std::time::Duration;
 use aster::coordination::admission::{
     AdmissionEntryV1, AdmissionSetV1, SignedAdmissionSet, VerifiedAdmissionSource,
     ADMISSION_CLASS_PRODUCER, ADMISSION_FORMAT_VERSION,
+};
+use aster::coordination::contract::{
+    AcquireActionV1, ActionV1, ClientCommandV1, CommandV1, ResourceKeyV1,
 };
 use aster::coordination::host::{CoordinationConfig, CoordinationStart};
 use aster::coordination::model::authority::{
@@ -131,6 +134,38 @@ fn admission_source(secrets: &[[u8; 32]]) -> Arc<dyn VerifiedAdmissionSource> {
     let signed = signed_document_from_parts(document, &authority_key(), &signature.to_bytes())
         .expect("encode");
     Arc::new(SignedAdmissionSet::verify(&authority_key(), DOMAIN, &signed).expect("a signed set"))
+}
+
+/// How long a write is given before the attempt is called failed.
+///
+/// Comfortably above a round trip on loopback and well below the point at which
+/// a stalled test looks like a hang. A minority write never resolves at all, so
+/// this is the bound on the harness's patience rather than on the group's.
+const WRITE_WINDOW: Duration = Duration::from_secs(5);
+
+/// One real client command: acquire a lease on `key`.
+///
+/// The full production shape — an `ActionV1` inside a `ClientCommandV1`, with
+/// the canonical request hash the state machine computes for itself. A command
+/// the apply path would reject is no evidence about commits, because it would
+/// fail identically in a quorum and out of one.
+fn acquire(secret: &[u8; 32], key: &[u8]) -> CommandV1 {
+    let action = ActionV1::Acquire(AcquireActionV1 {
+        resource: ResourceKeyV1 {
+            namespace: "cluster-gate".into(),
+            key: key.to_vec(),
+        },
+        ttl_ms: 60_000,
+    });
+    CommandV1::Client(ClientCommandV1 {
+        actor_node_id: node_id_of(*secret),
+        client_id: key.to_vec(),
+        sequence: 1,
+        request_hash: aster::coordination::hash::request_hash(&action)
+            .expect("a canonical action hashes")
+            .to_vec(),
+        action,
+    })
 }
 
 /// One running voter and the directory it owns.
@@ -343,42 +378,81 @@ async fn a_three_voter_group_survives_one_loss() {
     }
 }
 
-/// **A minority cannot commit.**
+/// **A minority cannot commit — a real write is attempted and does not.**
 ///
-/// Two of a three-voter group are shut down. The survivor cannot reach a
-/// quorum, so it must **not** report `Ready` — and must say so through
-/// `quorum_available` rather than staying silent.
+/// This once asserted only that the survivor stopped reporting `Ready`. That is
+/// a statement about *reporting*, and the property is about *committing*: a
+/// system that acknowledged writes while announcing `NoQuorum` would have
+/// passed, which is precisely the failure that matters. Lifecycle reporting is
+/// the symptom; the commit is the thing.
 ///
-/// This is the counterpart to the test above and the reason that one is not
-/// vacuous: if a lone node could report ready, "survives one loss" would be
-/// proving nothing.
+/// So the write is real, and it runs twice. First against the full group, where
+/// it must commit and advance the applied index — without that control, "the
+/// write did not commit" could mean the harness never managed to submit one.
+/// Then against the lone survivor, where it must not.
+///
+/// The survivor's failure is a **timeout**, not an error, and that is correct:
+/// OpenRaft has no basis to abandon a legitimately pending entry, so it waits.
+/// Which is why the applied index is checked independently afterwards — a
+/// proposal that timed out locally could still have committed, and only the log
+/// can say.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_minority_cannot_commit() {
     let secrets = [[0x51u8; 32], [0x52u8; 32], [0x53u8; 32]];
     let mut voters = start_group(&secrets, 1, false).await;
-    await_leader(&voters, "before the partition").await;
+    let leader = await_leader(&voters, "before the partition").await;
 
-    // Leave exactly one.
-    let survivor = voters.pop().expect("three voters");
+    // The control: with all three up, a write commits and the log moves.
+    let coordination = voters[leader].server.coordination().expect("hosted");
+    let before = coordination.last_applied_for_testing();
+    let committed = coordination
+        .propose_for_testing_within(acquire(&secrets[leader], b"quorum-control"), WRITE_WINDOW)
+        .await
+        .expect("a three-voter group commits a write");
+    assert!(
+        Some(committed.index) > before,
+        "the control write must land past the index the group was at: \
+         {before:?} -> {}",
+        committed.index
+    );
+
+    // Now leave exactly one — including the leader, so the survivor is the one
+    // that has to discover it cannot proceed.
+    let survivor = voters.remove(leader);
     for voter in voters {
         voter.server.shutdown().await;
     }
 
     let coordination = survivor.server.coordination().expect("hosted");
+    let before = coordination.last_applied_for_testing();
 
-    // Give the group longer than an election timeout to *fail* to elect. A
-    // shorter wait would pass while the survivor was merely mid-election, which
-    // is not the property.
+    // Longer than an election timeout, so a refusal is not merely a node caught
+    // mid-election.
     tokio::time::sleep(Duration::from_secs(8)).await;
 
+    let outcome = coordination
+        .propose_for_testing_within(acquire(&secrets[leader], b"minority-write"), WRITE_WINDOW)
+        .await;
+    assert!(
+        outcome.is_err(),
+        "one of three is not a quorum; a write must not be acknowledged: {outcome:?}"
+    );
+
+    // The independent oracle. A local timeout is not proof the entry did not
+    // commit — the log is.
+    let after = coordination.last_applied_for_testing();
+    assert_eq!(
+        after, before,
+        "a minority must not advance its applied index: {before:?} -> {after:?}"
+    );
+
+    // And the reporting agrees with the behaviour, which is the original
+    // assertion kept rather than replaced.
     assert_ne!(
         coordination.lifecycle_code(),
         3,
-        "one of three is not a quorum; a lone voter must not report Ready"
+        "a lone voter must not report Ready"
     );
-    // Whatever it reports, it must not claim a reachable quorum. A leader with
-    // a stale acknowledgement says `Some(false)`; a follower or candidate says
-    // `None`. Neither is `Some(true)`.
     assert_ne!(
         coordination.quorum_available(),
         Some(true),

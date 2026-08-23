@@ -149,6 +149,14 @@ required-features = ["blobs", "docs"]
 name = "shell"
 required-features = ["rpc"]
 
+# The §S3-F process-loss voter. Built only when the test harness feature is on,
+# so an ordinary `cargo build` neither compiles nor ships it. The integration
+# test finds it through `CARGO_BIN_EXE_coordination-voter`.
+[[bin]]
+name = "coordination-voter"
+path = "src/bin/coordination_voter.rs"
+required-features = ["coordination-testing"]
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"

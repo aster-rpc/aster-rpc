@@ -80,6 +80,24 @@ impl std::fmt::Display for ProposeError {
 
 impl std::error::Error for ProposeError {}
 
+/// A proposal that committed and applied.
+///
+/// Carries the log index from `client_write`'s own response rather than leaving
+/// a caller to read it from `RaftMetrics`. The metrics are published through a
+/// watch channel and lag the apply, so a gate that compared metrics before and
+/// after a write could see them unchanged on a write that had certainly
+/// committed — which reads as "the group did not commit" and is wrong.
+///
+/// Metrics remain the right oracle for the *negative* case: when there is no
+/// response, the log is the only thing that can speak.
+#[derive(Debug)]
+pub struct Committed {
+    /// The index this entry was assigned.
+    pub index: u64,
+    /// The state machine's own reply.
+    pub reply: CommandReplyV1,
+}
+
 impl Coordination {
     /// Propose one command through the production Raft path.
     ///
@@ -91,14 +109,14 @@ impl Coordination {
     ///
     /// The reply is the state machine's own — not a synthesised acknowledgement
     /// — so a caller can tell "applied" from "accepted for replication".
-    pub async fn propose_for_testing(
-        &self,
-        command: CommandV1,
-    ) -> Result<CommandReplyV1, ProposeError> {
+    pub async fn propose_for_testing(&self, command: CommandV1) -> Result<Committed, ProposeError> {
         self.raft
             .client_write(command)
             .await
-            .map(|response| response.data)
+            .map(|response| Committed {
+                index: response.log_id.index,
+                reply: response.data,
+            })
             .map_err(|err| ProposeError::Rejected(Box::new(err)))
     }
 
@@ -113,7 +131,7 @@ impl Coordination {
         &self,
         command: CommandV1,
         within: std::time::Duration,
-    ) -> Result<CommandReplyV1, ProposeError> {
+    ) -> Result<Committed, ProposeError> {
         match tokio::time::timeout(within, self.propose_for_testing(command)).await {
             Ok(result) => result,
             Err(_) => Err(ProposeError::TimedOut),
@@ -232,6 +250,18 @@ impl Coordination {
         self.raft.metrics().borrow().vote
     }
 
+    /// Who this node believes leads, if anyone.
+    ///
+    /// OpenRaft's committed-vote projection. It carries no liveness — which is
+    /// why §7.6 forbids it in the readiness predicate — but it is exactly the
+    /// right thing for a harness that needs to *find* the leader in order to
+    /// kill it.
+    pub fn current_leader_for_testing(
+        &self,
+    ) -> Option<crate::coordination::ids::CoordinationNodeId> {
+        self.raft.metrics().borrow().current_leader
+    }
+
     /// The `Raft` handle itself, for gates that must reach a boundary no
     /// narrower method exposes.
     ///
@@ -241,4 +271,261 @@ impl Coordination {
     pub fn raft_for_testing(&self) -> &Raft<CoordinationTypeConfig> {
         &self.raft
     }
+}
+
+/// A whole signed group, derived from one seed.
+///
+/// ## Why this is not left in the test files
+///
+/// The process-loss gate runs voters in **separate processes**. A parent that
+/// built the genesis one way and a child that built it another would be two
+/// transcriptions of one document, and the failure would arrive as "the voter
+/// is not one of its initial voters" — a message about membership, from a
+/// mismatch that is really about the fixture. Every party derives the group
+/// from this one type, so there is nothing to disagree about: the child is
+/// given an index, and everything else follows.
+///
+/// It also removes the argument-passing problem. A subprocess needs the signed
+/// genesis, the authority key, the domain, the group id and its own secret;
+/// passing five values on a command line is five chances to pass them slightly
+/// differently. It takes an index.
+pub struct GroupFixture {
+    domain: String,
+    group: [u8; 32],
+    authority: ed25519_dalek::SigningKey,
+    secrets: Vec<[u8; 32]>,
+}
+
+impl GroupFixture {
+    /// A group of `size` voters, deterministically derived.
+    ///
+    /// `seed` separates one fixture from another so two gates running
+    /// concurrently do not mint the same node ids and try to bind the same
+    /// identities.
+    pub fn new(domain: &str, seed: u8, size: usize) -> Self {
+        assert!(size > 0 && size <= 8, "a fixture group is 1..=8 voters");
+        Self {
+            domain: domain.to_string(),
+            group: [seed; 32],
+            authority: ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0xFF; 32]),
+            secrets: (0..size).map(|i| [seed ^ (0x10 + i as u8); 32]).collect(),
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.secrets.len()
+    }
+
+    pub fn secret(&self, index: usize) -> [u8; 32] {
+        self.secrets[index]
+    }
+
+    pub fn authority_key(&self) -> [u8; 32] {
+        self.authority.verifying_key().to_bytes()
+    }
+
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub fn node_id(&self, index: usize) -> Vec<u8> {
+        ed25519_dalek::SigningKey::from_bytes(&self.secrets[index])
+            .verifying_key()
+            .to_bytes()
+            .to_vec()
+    }
+
+    /// Which voter this node id is, if any.
+    pub fn index_of(&self, node_id: &[u8]) -> Option<usize> {
+        (0..self.size()).find(|i| self.node_id(*i) == node_id)
+    }
+
+    /// The §7.1 profile code this group's size requires.
+    ///
+    /// Derived rather than passed: a fixture that could be handed a profile its
+    /// size does not admit would fail at start with a shape complaint.
+    pub fn profile(&self) -> i32 {
+        match self.size() {
+            1 => 2,
+            2 => 3,
+            _ => 1,
+        }
+    }
+
+    /// The authority-signed genesis naming every voter.
+    pub fn signed_genesis(&self) -> Vec<u8> {
+        use crate::coordination::model::authority::{
+            canonical_document_bytes, genesis_signing_bytes, signed_document_from_parts,
+        };
+        use crate::coordination::raft::{GenesisV1, NodeIdV1, VoterSeedV1};
+        use ed25519_dalek::Signer;
+
+        let mut initial_voters: Vec<VoterSeedV1> = (0..self.size())
+            .map(|i| {
+                let node_id = self.node_id(i);
+                VoterSeedV1 {
+                    ticket: seed_ticket(&node_id),
+                    node_id,
+                }
+            })
+            .collect();
+        initial_voters.sort_by(|l, r| l.node_id.cmp(&r.node_id));
+
+        let mut initial_admins: Vec<NodeIdV1> = (0..self.size())
+            .map(|i| NodeIdV1 {
+                node_id: self.node_id(i),
+            })
+            .collect();
+        initial_admins.sort_by(|l, r| l.node_id.cmp(&r.node_id));
+
+        let genesis = GenesisV1 {
+            format_version: 1,
+            group_id: self.group.to_vec(),
+            authority_domain: self.domain.clone(),
+            genesis_nonce: vec![self.group[0]; 32],
+            deployment_profile_code: self.profile(),
+            initial_voters,
+            initial_admins,
+            recovery_export_hash: None,
+        };
+        let document = canonical_document_bytes(&genesis).expect("encode a genesis");
+        let signature = self.authority.sign(&genesis_signing_bytes(&document));
+        signed_document_from_parts(document, &self.authority_key(), &signature.to_bytes())
+            .expect("encode a signed genesis")
+    }
+
+    /// An authority-signed admission set naming every voter a producer.
+    pub fn admission(
+        &self,
+    ) -> std::sync::Arc<dyn crate::coordination::admission::VerifiedAdmissionSource> {
+        use crate::coordination::admission::{
+            admission_signing_bytes, AdmissionEntryV1, AdmissionSetV1, SignedAdmissionSet,
+            ADMISSION_CLASS_PRODUCER, ADMISSION_FORMAT_VERSION,
+        };
+        use crate::coordination::model::authority::{
+            canonical_document_bytes, signed_document_from_parts,
+        };
+        use ed25519_dalek::Signer;
+
+        let mut entries: Vec<AdmissionEntryV1> = (0..self.size())
+            .map(|i| AdmissionEntryV1 {
+                node_id: self.node_id(i),
+                class_code: ADMISSION_CLASS_PRODUCER,
+            })
+            .collect();
+        entries.sort_by(|l, r| l.node_id.cmp(&r.node_id));
+
+        let set = AdmissionSetV1 {
+            format_version: ADMISSION_FORMAT_VERSION,
+            authority_domain: self.domain.clone(),
+            revision: 1,
+            entries,
+        };
+        let document = canonical_document_bytes(&set).expect("encode an admission set");
+        let signature = self.authority.sign(&admission_signing_bytes(&document));
+        let signed =
+            signed_document_from_parts(document, &self.authority_key(), &signature.to_bytes())
+                .expect("encode a signed admission set");
+        std::sync::Arc::new(
+            SignedAdmissionSet::verify(&self.authority_key(), &self.domain, &signed)
+                .expect("the fixture's own set verifies"),
+        )
+    }
+
+    pub fn group_id(&self) -> crate::coordination::ids::CoordinationGroupId {
+        crate::coordination::ids::CoordinationGroupId::from_array(self.group)
+    }
+
+    /// The hash of this fixture's genesis **document**.
+    ///
+    /// Computed from the fixture's own definition, not read out of a store —
+    /// which is what makes it usable as the independent expectation an
+    /// `Existing` start is checked against. Reading it from the database being
+    /// validated would make that check tautological.
+    pub fn genesis_hash(&self) -> [u8; 32] {
+        use crate::coordination::raft::SignedCoordinationDocumentV1;
+
+        let signed = self.signed_genesis();
+        let envelope: SignedCoordinationDocumentV1 =
+            crate::coordination::contract::payload_fory::<SignedCoordinationDocumentV1>()
+                .deserialize(&signed)
+                .expect("the fixture's own genesis decodes");
+        crate::coordination::model::authority::genesis_hash(&envelope.document_bytes)
+    }
+
+    /// A **bootstrap** configuration for voter `index` in `dir`.
+    ///
+    /// For an empty directory only. A voter coming back onto a store it already
+    /// owns wants [`existing_config`](Self::existing_config); the two modes are
+    /// distinct in §7.2 precisely so that "found a store" and "founded a group"
+    /// cannot be confused.
+    pub fn config(
+        &self,
+        dir: &std::path::Path,
+        _index: usize,
+    ) -> crate::coordination::host::CoordinationConfig {
+        use crate::coordination::host::{CoordinationConfig, CoordinationStart};
+
+        self.finish(CoordinationConfig::builder().storage_dir(dir).start_mode(
+            CoordinationStart::Bootstrap {
+                signed_genesis: self.signed_genesis(),
+                recovery_export_path: None,
+            },
+        ))
+    }
+
+    /// An **existing**-store configuration for a directory a previous start
+    /// already bound.
+    ///
+    /// The group id, genesis hash and profile are supplied from the fixture,
+    /// independently of the store: they are what the store is checked against.
+    pub fn existing_config(
+        &self,
+        dir: &std::path::Path,
+    ) -> crate::coordination::host::CoordinationConfig {
+        use crate::coordination::host::{CoordinationConfig, CoordinationStart};
+
+        self.finish(CoordinationConfig::builder().storage_dir(dir).start_mode(
+            CoordinationStart::Existing {
+                expected_group_id: self.group_id(),
+                expected_genesis_hash: self.genesis_hash(),
+                expected_deployment_profile_code: self.profile(),
+            },
+        ))
+    }
+
+    fn finish(
+        &self,
+        builder: crate::coordination::host::CoordinationConfigBuilder,
+    ) -> crate::coordination::host::CoordinationConfig {
+        builder
+            .authority_public_key(self.authority_key())
+            .authority_domain(&self.domain)
+            .verified_admission(self.admission())
+            // §7.1 requires each acknowledgement only for the shape it names,
+            // and the profile is derived from the group's size above — so
+            // offering both is not a way to start a shape that was not asked
+            // for.
+            .acknowledge_single_voter_development_group(true)
+            .acknowledge_even_quorum_development_group(true)
+            .build()
+            .expect("a complete fixture configuration")
+    }
+}
+
+/// An address-only Open ticket naming `node_id`.
+///
+/// A genesis names its voters before any of them binds, so a seed ticket cannot
+/// carry addresses. §5.4 makes routes advisory dialling hints and identity the
+/// handshake's, so this costs a discovery round trip and cannot send a call to
+/// the wrong node.
+fn seed_ticket(node_id: &[u8]) -> String {
+    aster_transport_core::ticket::AsterTicket {
+        endpoint_id: node_id.to_vec().try_into().expect("32 bytes"),
+        relay: None,
+        direct_addrs: Vec::new(),
+        credential: Some(aster_transport_core::ticket::TicketCredential::Open),
+    }
+    .to_base58_string()
+    .expect("a canonical ticket")
 }
